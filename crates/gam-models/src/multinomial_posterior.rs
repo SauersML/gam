@@ -34,10 +34,9 @@ const SUMMATION_ROUNDOFF_MULTIPLIER: f64 = 16.0;
 
 /// Explicit accuracy and work controls for multinomial posterior integration.
 ///
-/// There is intentionally no implicit default here.  The prediction request
-/// owns these choices, so a caller cannot unknowingly inherit a hidden node
-/// count or tolerance.  `minimum_sparse_level >= 1` guarantees at least one
-/// comparison against a preceding Smolyak level.
+/// The production default is explicit through [`Default`] and is carried by
+/// the prediction request into this kernel. `minimum_sparse_level >= 1`
+/// guarantees at least one comparison against a preceding Smolyak level.
 #[derive(Clone, Copy, Debug)]
 pub struct MultinomialPosteriorIntegrationControl {
     /// Per raw moment absolute tolerance.  Raw moments comprise every `E[p_c]`
@@ -51,6 +50,117 @@ pub struct MultinomialPosteriorIntegrationControl {
     pub maximum_sparse_level: usize,
     /// Maximum total integrand evaluations across all attempted levels.
     pub maximum_function_evaluations: usize,
+}
+
+impl Default for MultinomialPosteriorIntegrationControl {
+    fn default() -> Self {
+        // sqrt(machine epsilon) is the natural accuracy target for a nonlinear
+        // transform of a covariance estimated in double precision: asking for
+        // substantially more would certify quadrature noise below the input's
+        // own numerical resolution. Three sparse levels are required before a
+        // result may certify; level eight reaches the 17-point one-dimensional
+        // Gauss-Hermite rule. The streaming evaluator never stores the node
+        // set, and the evaluation ceiling bounds work on high-rank rows.
+        let tolerance = f64::EPSILON.sqrt();
+        Self {
+            absolute_tolerance: tolerance,
+            relative_tolerance: tolerance,
+            minimum_sparse_level: 2,
+            maximum_sparse_level: 8,
+            maximum_function_evaluations: 2_000_000,
+        }
+    }
+}
+
+/// Integrated posterior means and marginal standard deviations for every row
+/// of a multinomial prediction design.
+#[derive(Clone, Debug)]
+pub struct MultinomialPosteriorRowMoments {
+    pub class_mean: Array2<f64>,
+    pub class_standard_deviation: Array2<f64>,
+}
+
+/// Integrate the logistic-normal posterior induced by a coefficient mode and
+/// its full joint covariance over every design row.
+///
+/// Coefficients have shape `(P, M)`, covariance has block-major shape
+/// `(P*M, P*M)`, and `design` has shape `(N, P)`. For row `x`, this constructs
+/// `mu_a = x' beta_a` and `V_ab = x' Sigma_ab x`, then delegates to the
+/// controlled one-row integrator. Cross-class covariance blocks are retained.
+pub fn integrate_multinomial_design_moments(
+    coefficients: ArrayView2<'_, f64>,
+    coefficient_covariance: ArrayView2<'_, f64>,
+    design: ArrayView2<'_, f64>,
+    control: &MultinomialPosteriorIntegrationControl,
+) -> Result<MultinomialPosteriorRowMoments, EstimationError> {
+    let (p, m) = coefficients.dim();
+    if p == 0 || m == 0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "multinomial posterior prediction needs nonempty coefficients, got {p}x{m}"
+        )));
+    }
+    if design.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "multinomial posterior prediction design has {} columns, expected {p}",
+            design.ncols()
+        )));
+    }
+    let d = p.checked_mul(m).ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "multinomial posterior prediction coefficient dimension overflowed usize".to_string(),
+        )
+    })?;
+    if coefficient_covariance.dim() != (d, d) {
+        return Err(EstimationError::InvalidInput(format!(
+            "multinomial posterior prediction covariance shape {:?} does not match (P*M, P*M) = ({d}, {d})",
+            coefficient_covariance.dim()
+        )));
+    }
+
+    let n = design.nrows();
+    let k = m + 1;
+    let mut class_mean = Array2::<f64>::zeros((n, k));
+    let mut class_standard_deviation = Array2::<f64>::zeros((n, k));
+    let mut active_mean = Array1::<f64>::zeros(m);
+    let mut active_covariance = Array2::<f64>::zeros((m, m));
+    for row in 0..n {
+        let x = design.row(row);
+        for a in 0..m {
+            active_mean[a] = x.dot(&coefficients.column(a));
+        }
+        for a in 0..m {
+            for b in 0..m {
+                let mut value = 0.0_f64;
+                let a_base = a * p;
+                let b_base = b * p;
+                for i in 0..p {
+                    let xi = x[i];
+                    if xi == 0.0 {
+                        continue;
+                    }
+                    let mut row_product = 0.0_f64;
+                    for j in 0..p {
+                        row_product += coefficient_covariance[[a_base + i, b_base + j]] * x[j];
+                    }
+                    value += xi * row_product;
+                }
+                active_covariance[[a, b]] = value;
+            }
+        }
+        let moments = integrate_logistic_normal_softmax_moments(
+            active_mean.view(),
+            active_covariance.view(),
+            control,
+        )?;
+        class_mean.row_mut(row).assign(&moments.class_mean);
+        class_standard_deviation
+            .row_mut(row)
+            .assign(&moments.class_standard_deviation);
+    }
+    Ok(MultinomialPosteriorRowMoments {
+        class_mean,
+        class_standard_deviation,
+    })
 }
 
 impl MultinomialPosteriorIntegrationControl {

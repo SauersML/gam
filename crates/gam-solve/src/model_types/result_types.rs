@@ -81,7 +81,7 @@ mod per_term_edf_tests {
 
     fn fit_with_legacy_tensor_block_sum() -> UnifiedFitResult {
         let beta = Array1::zeros(36);
-        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: beta.clone(),
                 role: BlockRole::Mean,
@@ -134,6 +134,7 @@ mod per_term_edf_tests {
             artifacts: FitArtifacts::default(),
             inner_cycles: 0,
         })
+        .expect("test fixture carries fixed-outer convergence evidence")
     }
 
     #[test]
@@ -165,7 +166,7 @@ mod per_term_edf_tests {
         }
         let edf_total: f64 = (0..p).map(|j| influence[[j, j]]).sum(); // tr(F) = 8.0
         let beta = Array1::zeros(p);
-        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: beta.clone(),
                 role: BlockRole::Mean,
@@ -219,6 +220,7 @@ mod per_term_edf_tests {
             artifacts: FitArtifacts::default(),
             inner_cycles: 0,
         })
+        .expect("test fixture carries fixed-outer convergence evidence")
     }
 
     /// Build a fit that mirrors a factor `by=` smooth's penalty layout for the
@@ -237,7 +239,7 @@ mod per_term_edf_tests {
         let edf_total = 4.0 + n_levels as f64 * edf_per_smooth;
         let p = 1 + dim * n_levels;
         let lambdas = Array1::from_vec(vec![1.0; n_levels]);
-        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: Array1::zeros(p),
                 role: BlockRole::Mean,
@@ -292,6 +294,7 @@ mod per_term_edf_tests {
             artifacts: FitArtifacts::default(),
             inner_cycles: 0,
         })
+        .expect("test fixture carries fixed-outer convergence evidence")
     }
 
     /// Regression for issue #1368. The summary smooth-term loop walks a
@@ -430,7 +433,7 @@ mod per_term_edf_tests {
         let n_blocks = traces.len();
         let p = 1 + 10 * block_traces.len().max(1);
         let lambdas = Array1::from_vec(vec![1.0; n_blocks]);
-        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: Array1::zeros(p),
                 role: BlockRole::Mean,
@@ -485,6 +488,7 @@ mod per_term_edf_tests {
             artifacts: FitArtifacts::default(),
             inner_cycles: 0,
         })
+        .expect("test fixture carries fixed-outer convergence evidence")
     }
 
     /// Regression for issue #1372. The fit's global penalty order is
@@ -579,8 +583,8 @@ pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 /// Analytic first-order optimality certificate at the returned optimum (#934).
 ///
 /// Certifies stationarity from the ANALYTIC objective alone — no
-/// finite-difference probes run in production (SPEC rule 2; the FD gradient
-/// oracle lives in the test-only `fd_audit` module). The certificate answers,
+/// finite-difference probes run in production (SPEC rule 2; derivative
+/// cross-checks live only in focused tests). The certificate answers,
 /// machine-checkably, the three questions every non-termination postmortem
 /// asks: is the KKT-projected gradient stationary HERE
 /// ([`Self::is_stationary`]); is the outer curvature admissible for a minimum
@@ -633,7 +637,13 @@ impl OuterCriterionCertificate {
     /// minimum. This is the load-bearing verdict: a `false` here rejects the
     /// fit with typed non-convergence.
     pub fn certifies(&self) -> bool {
-        self.is_stationary() && self.curvature_admissible()
+        self.grad_norm.is_finite()
+            && self.grad_norm >= 0.0
+            && self.projected_grad_norm >= 0.0
+            && self.stationarity_bound.is_finite()
+            && self.stationarity_bound >= 0.0
+            && self.is_stationary()
+            && self.curvature_admissible()
     }
 
     /// Whether every audited fact is clean (stationary, PSD-or-untracked
@@ -663,6 +673,95 @@ impl OuterCriterionCertificate {
                 "NOT STATIONARY"
             },
         )
+    }
+}
+
+/// Sealed proof that both optimization layers supporting a fitted model
+/// reached certified optima.
+///
+/// The fields are private and deserialization revalidates them, so downstream
+/// code cannot manufacture this proof from status booleans.  A
+/// [`UnifiedFitResult`] owns one of these proofs; therefore the existence of a
+/// fitted result is itself the convergence verdict.
+#[derive(Clone, Debug, Serialize)]
+pub struct FitConvergenceEvidence {
+    inner_status: crate::pirls::PirlsStatus,
+    outer_iterations: usize,
+    outer: FitOuterConvergenceEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum FitOuterConvergenceEvidence {
+    /// No smoothing coordinate was optimized. There is no outer stationarity
+    /// equation to solve, so a converged inner mode is the complete proof.
+    Fixed,
+    /// Analytic constrained-stationarity/curvature proof at the selected rho.
+    Analytic(OuterCriterionCertificate),
+}
+
+#[derive(Deserialize)]
+struct SerializedFitConvergenceEvidence {
+    inner_status: crate::pirls::PirlsStatus,
+    outer_iterations: usize,
+    outer: FitOuterConvergenceEvidence,
+}
+
+impl FitConvergenceEvidence {
+    fn from_serialized(raw: SerializedFitConvergenceEvidence) -> Result<Self, String> {
+        if raw.inner_status != crate::pirls::PirlsStatus::Converged {
+            return Err(format!(
+                "inner optimizer status {:?} is not certified convergence",
+                raw.inner_status
+            ));
+        }
+        match &raw.outer {
+            FitOuterConvergenceEvidence::Fixed if raw.outer_iterations != 0 => {
+                return Err(format!(
+                    "fixed-outer convergence evidence cannot carry {} outer iterations",
+                    raw.outer_iterations
+                ));
+            }
+            FitOuterConvergenceEvidence::Analytic(certificate) if !certificate.certifies() => {
+                return Err(format!(
+                    "analytic outer convergence evidence does not certify: {}",
+                    certificate.summary()
+                ));
+            }
+            _ => {}
+        }
+        Ok(Self {
+            inner_status: raw.inner_status,
+            outer_iterations: raw.outer_iterations,
+            outer: raw.outer,
+        })
+    }
+
+    /// The diagnostic terminal status of the certified inner solve.
+    pub fn inner_status(&self) -> crate::pirls::PirlsStatus {
+        self.inner_status
+    }
+
+    /// Number of outer iterations covered by this proof.
+    pub fn outer_iterations(&self) -> usize {
+        self.outer_iterations
+    }
+
+    /// Analytic outer certificate, or `None` when no outer coordinate existed.
+    pub fn outer_certificate(&self) -> Option<&OuterCriterionCertificate> {
+        match &self.outer {
+            FitOuterConvergenceEvidence::Fixed => None,
+            FitOuterConvergenceEvidence::Analytic(certificate) => Some(certificate),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FitConvergenceEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = SerializedFitConvergenceEvidence::deserialize(deserializer)?;
+        Self::from_serialized(raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1077,6 +1176,7 @@ pub struct FitGeometry {
     pub working_response: Array1<f64>,
 }
 
+#[derive(Clone)]
 pub struct UnifiedFitResultParts {
     pub blocks: Vec<FittedBlock>,
     pub log_lambdas: Array1<f64>,
@@ -1111,6 +1211,67 @@ pub struct UnifiedFitResultParts {
     pub artifacts: FitArtifacts,
     #[doc(hidden)]
     pub inner_cycles: usize,
+}
+
+impl FitConvergenceEvidence {
+    fn assembly_error(parts: &UnifiedFitResultParts, outer_status: String) -> EstimationError {
+        let certificate = parts.artifacts.criterion_certificate.as_ref();
+        EstimationError::FitDidNotConverge {
+            inner_status: format!("{:?}", parts.pirls_status),
+            outer_status,
+            outer_iterations: parts.outer_iterations,
+            final_value: parts.reml_score,
+            gradient_residual: certificate
+                .map(|value| value.projected_grad_norm)
+                .or(parts.outer_gradient_norm),
+            gradient_bound: certificate.map(|value| value.stationarity_bound),
+            step_residual: None,
+            step_bound: None,
+            rho_checkpoint: parts.log_lambdas.to_vec(),
+            resume_token: None,
+        }
+    }
+
+    fn try_from_parts(parts: &UnifiedFitResultParts) -> Result<Self, EstimationError> {
+        if parts.pirls_status != crate::pirls::PirlsStatus::Converged {
+            return Err(Self::assembly_error(
+                parts,
+                "outer evidence was not considered because the inner mode is uncertified"
+                    .to_string(),
+            ));
+        }
+        if !parts.outer_converged {
+            return Err(Self::assembly_error(
+                parts,
+                "optimizer reported non-convergence".to_string(),
+            ));
+        }
+
+        let outer = match parts.artifacts.criterion_certificate.as_ref() {
+            Some(certificate) if certificate.certifies() => {
+                FitOuterConvergenceEvidence::Analytic(certificate.clone())
+            }
+            Some(certificate) => {
+                return Err(Self::assembly_error(
+                    parts,
+                    format!("analytic certificate failed: {}", certificate.summary()),
+                ));
+            }
+            None if parts.outer_iterations == 0 => FitOuterConvergenceEvidence::Fixed,
+            None => {
+                return Err(Self::assembly_error(
+                    parts,
+                    "outer iterations ran without an analytic stationarity certificate".to_string(),
+                ));
+            }
+        };
+
+        Ok(Self {
+            inner_status: parts.pirls_status,
+            outer_iterations: parts.outer_iterations,
+            outer,
+        })
+    }
 }
 
 /// Unified fit result for all model types (standard GAM, GAMLSS, survival).
@@ -1148,13 +1309,15 @@ pub struct UnifiedFitResult {
     pub used_device: bool,
     /// Number of outer (smoothing parameter) iterations.
     pub outer_iterations: usize,
-    /// Whether the outer optimization converged.
-    pub outer_converged: bool,
+    /// Sealed proof that the inner and outer optimization layers converged.
+    /// Private so struct literals and deserialization cannot bypass the checked
+    /// constructor; inspect it through [`Self::convergence_evidence`].
+    convergence: FitConvergenceEvidence,
     /// Final gradient norm of the outer optimization. `None` when no
     /// gradient was measured at termination — cache-hit short-circuit
     /// (the prior fit's converged ρ was loaded from disk), gradient-free
     /// solver, or a degenerate early-exit path where no outer ran.
-    /// `outer_converged` is the authoritative convergence signal.
+    /// Fit existence is the authoritative convergence signal.
     pub outer_gradient_norm: Option<f64>,
     /// Residual scale on the response scale.
     ///
@@ -1179,15 +1342,6 @@ pub struct UnifiedFitResult {
     /// Joint coefficient vector (first block for standard GAMs, concatenated for multi-block).
     #[serde(default)]
     pub beta: Array1<f64>,
-    /// Inner solver convergence status. Required at decode time: a missing
-    /// field on an older-schema or corrupted saved model previously decoded
-    /// as `Converged` via a default, silently promoting non-converged β̂
-    /// through warm-start propagation, predict-time confidence intervals,
-    /// and outer-loop convergence semantics. With the MODEL_PAYLOAD_VERSION
-    /// gate in place, older schemas are rejected before this field is read,
-    /// so requiring the field here is safe and strictly removes the silent
-    /// default.
-    pub pirls_status: crate::pirls::PirlsStatus,
     /// Maximum absolute linear predictor value at convergence.
     #[serde(default)]
     pub max_abs_eta: f64,
@@ -1481,7 +1635,15 @@ fn flatten_block_lambdas(blocks: &[FittedBlock]) -> Array1<f64> {
 }
 
 impl UnifiedFitResult {
+    /// Proof carried by every fitted model. Callers never need to re-check a
+    /// convergence boolean; construction has already consumed and validated
+    /// the inner and outer evidence.
+    pub fn convergence_evidence(&self) -> &FitConvergenceEvidence {
+        &self.convergence
+    }
+
     pub fn try_from_parts(parts: UnifiedFitResultParts) -> Result<Self, EstimationError> {
+        let convergence = FitConvergenceEvidence::try_from_parts(&parts)?;
         let UnifiedFitResultParts {
             blocks,
             log_lambdas,
@@ -1496,7 +1658,7 @@ impl UnifiedFitResult {
             penalized_objective,
             used_device,
             outer_iterations,
-            outer_converged,
+            outer_converged: _,
             outer_gradient_norm,
             standard_deviation,
             covariance_conditional,
@@ -1505,7 +1667,7 @@ impl UnifiedFitResult {
             fitted_link,
             geometry,
             block_states,
-            pirls_status,
+            pirls_status: _,
             max_abs_eta,
             constraint_kkt,
             artifacts,
@@ -1809,7 +1971,7 @@ impl UnifiedFitResult {
             penalized_objective,
             used_device,
             outer_iterations,
-            outer_converged,
+            convergence,
             outer_gradient_norm,
             standard_deviation,
             covariance_conditional,
@@ -1819,7 +1981,6 @@ impl UnifiedFitResult {
             geometry,
             block_states,
             beta,
-            pirls_status,
             max_abs_eta,
             constraint_kkt,
             artifacts,
@@ -1834,6 +1995,11 @@ impl UnifiedFitResult {
         })
     }
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        if self.outer_iterations != self.convergence.outer_iterations() {
+            crate::bail_invalid_estim!(
+                "UnifiedFitResult outer iteration count does not match its sealed convergence evidence"
+            );
+        }
         let expected_beta = flatten_block_betas(&self.blocks);
         if self.beta != expected_beta {
             crate::bail_invalid_estim!("UnifiedFitResult decoded beta must match coefficient blocks concatenated in block order"
@@ -1853,7 +2019,7 @@ impl UnifiedFitResult {
             penalized_objective: self.penalized_objective,
             used_device: self.used_device,
             outer_iterations: self.outer_iterations,
-            outer_converged: self.outer_converged,
+            outer_converged: true,
             outer_gradient_norm: self.outer_gradient_norm,
             standard_deviation: self.standard_deviation,
             covariance_conditional: self.covariance_conditional.clone(),
@@ -1862,51 +2028,13 @@ impl UnifiedFitResult {
             fitted_link: self.fitted_link.clone(),
             geometry: self.geometry.clone(),
             block_states: self.block_states.clone(),
-            pirls_status: self.pirls_status,
+            pirls_status: self.convergence.inner_status(),
             max_abs_eta: self.max_abs_eta,
             constraint_kkt: self.constraint_kkt.clone(),
             artifacts: self.artifacts.clone(),
             inner_cycles: self.inner_cycles,
         })
         .map(|_| ())
-    }
-}
-
-impl UnifiedFitResult {
-    pub fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
-        let beta = flatten_block_betas(&parts.blocks);
-        Self {
-            blocks: parts.blocks,
-            log_lambdas: parts.log_lambdas,
-            lambdas: parts.lambdas,
-            likelihood_family: parts.likelihood_family,
-            likelihood_scale: parts.likelihood_scale,
-            log_likelihood_normalization: parts.log_likelihood_normalization,
-            log_likelihood: parts.log_likelihood,
-            deviance: parts.deviance,
-            reml_score: parts.reml_score,
-            stable_penalty_term: parts.stable_penalty_term,
-            penalized_objective: parts.penalized_objective,
-            used_device: parts.used_device,
-            outer_iterations: parts.outer_iterations,
-            outer_converged: parts.outer_converged,
-            outer_gradient_norm: parts.outer_gradient_norm,
-            standard_deviation: parts.standard_deviation,
-            covariance_conditional: parts.covariance_conditional,
-            covariance_corrected: parts.covariance_corrected,
-            inference: parts.inference,
-            fitted_link: parts.fitted_link,
-            geometry: parts.geometry,
-            block_states: parts.block_states,
-            beta,
-            pirls_status: parts.pirls_status,
-            max_abs_eta: parts.max_abs_eta,
-            constraint_kkt: parts.constraint_kkt,
-            artifacts: parts.artifacts,
-            inner_cycles: parts.inner_cycles,
-            outer_cost_evals: 0,
-            inner_pirls_solves: 0,
-        }
     }
 }
 

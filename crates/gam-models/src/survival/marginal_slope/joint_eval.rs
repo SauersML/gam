@@ -133,9 +133,8 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<(f64, Array1<f64>)>, String> {
-        let decision = crate::survival::marginal_slope::gpu::row_primary_hessian_decision(
-            self.n, N_PRIMARY,
-        );
+        let decision =
+            crate::survival::marginal_slope::gpu::row_primary_hessian_decision(self.n, N_PRIMARY);
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -149,10 +148,8 @@ impl SurvivalMarginalSlopeFamily {
             }
         };
         let inputs = batch.as_inputs(self);
-        match crate::survival::marginal_slope::gpu::try_survival_flex_gradient(
-            inputs, None, None,
-        )
-        .map_err(|e| e.to_string())?
+        match crate::survival::marginal_slope::gpu::try_survival_flex_gradient(inputs, None, None)
+            .map_err(|e| e.to_string())?
         {
             Some((nll, grad)) => {
                 if grad.len() != slices.total {
@@ -180,9 +177,8 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         v: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        let decision = crate::survival::marginal_slope::gpu::row_primary_hessian_decision(
-            self.n, N_PRIMARY,
-        );
+        let decision =
+            crate::survival::marginal_slope::gpu::row_primary_hessian_decision(self.n, N_PRIMARY);
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -202,10 +198,8 @@ impl SurvivalMarginalSlopeFamily {
         let v_slice = v
             .as_slice()
             .ok_or_else(|| "survival-flex GPU HVP requires contiguous v".to_string())?;
-        match crate::survival::marginal_slope::gpu::try_survival_flex_hvp(
-            inputs, v_slice, None,
-        )
-        .map_err(|e| e.to_string())?
+        match crate::survival::marginal_slope::gpu::try_survival_flex_hvp(inputs, v_slice, None)
+            .map_err(|e| e.to_string())?
         {
             Some(hv) => {
                 if hv.len() != slices.total {
@@ -232,9 +226,8 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<Array2<f64>>, String> {
-        let decision = crate::survival::marginal_slope::gpu::row_primary_hessian_decision(
-            self.n, N_PRIMARY,
-        );
+        let decision =
+            crate::survival::marginal_slope::gpu::row_primary_hessian_decision(self.n, N_PRIMARY);
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;

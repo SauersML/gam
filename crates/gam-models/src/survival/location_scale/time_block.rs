@@ -511,23 +511,20 @@ pub fn project_onto_linear_constraints(
         (worst, worst_row)
     };
 
-    if let Some(interior) = gam_solve::active_set::project_point_strictly_into_feasible_cone(
-        &beta0_vec,
-        constraints,
-    ) && worst_raw_violation(&interior).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
+    if let Some(interior) =
+        gam_solve::active_set::project_point_strictly_into_feasible_cone(&beta0_vec, constraints)
+        && worst_raw_violation(&interior).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
     {
         return Ok(interior);
     }
     let identity = Array2::<f64>::eye(dim);
-    if let Ok((boundary, _active)) =
-        gam_solve::active_set::solve_quadratic_with_linear_constraints(
-            &identity,
-            &beta0_vec,
-            &beta0_vec,
-            constraints,
-            None,
-        )
-        && worst_raw_violation(&boundary).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
+    if let Ok((boundary, _active)) = gam_solve::active_set::solve_quadratic_with_linear_constraints(
+        &identity,
+        &beta0_vec,
+        &beta0_vec,
+        constraints,
+        None,
+    ) && worst_raw_violation(&boundary).0 <= DOWNSTREAM_FEASIBILITY_GATE_TOL
     {
         return Ok(boundary);
     }

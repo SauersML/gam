@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,56 +16,6 @@ from ._penalty_bridge import (
 )
 from ._sparse_dictionary import sparse_dictionary_fit
 from ._sae_trust import atom_trust_scores
-
-
-class _SaeLazyFitArtifact:
-    """Lazy backing store for dense SAE result arrays.
-
-    The facade keeps this small handle instead of retaining duplicate dense
-    result arrays in every public slot. Values may be arrays, callables, or
-    sparse-code records shaped like ``{"indices", "values", "shape"}``.
-    """
-
-    __slots__ = ("_values", "_cache")
-
-    def __init__(self, values: Mapping[str, Any] | None = None) -> None:
-        self._values: dict[str, Any] = dict(values or {})
-        self._cache: dict[str, Any] = {}
-
-    def materialize(self, name: str) -> Any:
-        if name in self._cache:
-            return self._cache[name]
-        if name not in self._values:
-            raise AttributeError(f"SAE lazy artifact has no field {name!r}")
-        value = self._values[name]
-        if callable(value):
-            value = value()
-        elif isinstance(value, Mapping) and {"indices", "values", "shape"} <= set(value):
-            value = self._dense_from_sparse(value)
-        self._cache[name] = value
-        return value
-
-    def set(self, name: str, value: Any) -> None:
-        self._values[name] = value
-        self._cache.pop(name, None)
-
-    @staticmethod
-    def _dense_from_sparse(record: Mapping[str, Any]) -> np.ndarray:
-        shape = tuple(int(v) for v in record["shape"])
-        out = np.zeros(shape, dtype=float)
-        indices = np.asarray(record["indices"])
-        values = np.asarray(record["values"], dtype=float)
-        if indices.shape != values.shape:
-            raise ValueError(
-                f"sparse SAE code indices {indices.shape} and values {values.shape} must match"
-            )
-        if len(shape) != 2 or indices.ndim != 2:
-            raise ValueError(
-                "sparse SAE dense reconstruction expects indices/values with shape (N, active)"
-            )
-        rows = np.arange(indices.shape[0])[:, None]
-        out[rows, indices.astype(np.intp)] = values
-        return out
 
 
 class _SaeTrainingDataHandle:
@@ -148,55 +98,6 @@ def _sae_manifold_reconstruct_native(
     )
 
 
-def _lazy_getattr(owner: Any, lazy_names: set[str], name: str) -> Any:
-    if name in lazy_names:
-        try:
-            artifact = object.__getattribute__(owner, "_lazy_artifact")
-        except AttributeError:
-            artifact = None
-        if artifact is not None:
-            return artifact.materialize(name)
-    return object.__getattribute__(owner, name)
-
-
-def _lazy_setattr(owner: Any, lazy_names: set[str], name: str, value: Any) -> None:
-    if name in lazy_names:
-        try:
-            artifact = object.__getattribute__(owner, "_lazy_artifact")
-        except AttributeError:
-            artifact = None
-        if artifact is not None:
-            artifact.set(name, value)
-            object.__setattr__(owner, name, None)
-            return
-    object.__setattr__(owner, name, value)
-
-
-_ATOM_LAZY_FIELDS = {"assignments", "coords"}
-_LOW_LEVEL_LAZY_FIELDS = {"fitted", "assignments", "coords"}
-_MODEL_LAZY_FIELDS = {"fitted", "assignments", "coords", "training_data", "low_level_logits"}
-
-
-def _penalized_loss_score(payload: Mapping[str, Any]) -> float | None:
-    """Read the SAE fit's penalized-loss score honestly (#1231).
-
-    The Rust FFI surfaces the negative penalized loss under
-    ``penalized_loss_score`` (in-sample) / ``oos_penalized_loss`` (fixed-decoder OOS).
-    The closed-form Python shortcut payloads deliberately store ``None`` here (a
-    reconstruction R² lives under ``reconstruction_r2`` instead, since R² is not
-    the same quantity as the negative penalized loss), so ``None`` is a valid,
-    tolerated value and is propagated as-is.
-    """
-    for key in ("penalized_loss_score", "oos_penalized_loss"):
-        if key in payload:
-            value = payload[key]
-            return None if value is None else float(value)
-    raise KeyError(
-        "SAE fit payload is missing a penalized-loss score "
-        "(penalized_loss_score / oos_penalized_loss)"
-    )
-
-
 def _active_threshold_for_assignment(assignment: str, k_atoms: int) -> float:
     """Per-assignment-kind 'active atom' threshold for the inclusive (>=) counter.
 
@@ -228,80 +129,6 @@ def _active_threshold_for_assignment(assignment: str, k_atoms: int) -> float:
     return 1.0e-8
 
 
-def _channel_cov_factors(
-    decoder_covariance: np.ndarray | None, m_basis: int
-) -> list | None:
-    """Compact per-channel covariance factor a shape band consumes for save/load.
-
-    The dense phi-scaled decoder covariance is ``(M_k·p, M_k·p)`` in row-major
-    ``(basis, channel)`` flat layout (flat index ``b·p + c``). The posterior
-    shape band reads ONLY the same-channel blocks ``Cov[(b1,c),(b2,c)]`` — its
-    variance is ``Var_c(t) = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]`` — so those
-    ``p`` blocks of ``M_k × M_k`` are the complete, compact factor the band
-    needs. This extracts them as a ``(p, M_k, M_k)`` array (pure reshaping /
-    diagonal slicing — no numerical decomposition), replacing the dense
-    ``(M_k·p)²`` joint covariance in the on-disk format. ``None`` when the fit
-    carries no covariance (e.g. an LLM-scale ``p`` where even the fresh fit omits
-    the dense lift); the band's stored ``shape_band_sd`` still round-trips.
-    """
-    if decoder_covariance is None:
-        return None
-    cov = np.ascontiguousarray(np.asarray(decoder_covariance, dtype=float))
-    # Reshaping / diagonal-slicing math (#2091) lives in the Rust owner. `None`
-    # (layout does not match an (M_k, p) decoder) round-trips as before — the
-    # band's stored `shape_band_sd` still recovers.
-    blocks = rust_module().decoder_channel_cov_factors(cov, int(m_basis))
-    return None if blocks is None else blocks.tolist()
-
-
-def _channel_cov_from_factors(factors: Any) -> np.ndarray | None:
-    """Rebuild the full-shape ``(M_k·p, M_k·p)`` decoder covariance from the
-    compact per-channel factor written by :func:`_channel_cov_factors`.
-
-    The result is block-diagonal across channels: the same-channel ``M_k × M_k``
-    blocks are restored exactly and the cross-channel entries (which no band
-    reads) are zero. Reproduces the shape band ``Σ Φ Φ Cov[(·,c),(·,c)]`` to
-    machine precision. ``None`` when no factor was stored.
-    """
-    if factors is None:
-        return None
-    blocks = np.ascontiguousarray(np.asarray(factors, dtype=float))
-    if blocks.ndim != 3:
-        raise ValueError(
-            "decoder_covariance_channel_factors must be a (p, M_k, M_k) array; "
-            f"got shape {blocks.shape}"
-        )
-    # Block-diagonal reassembly math (#2091) lives in the Rust owner; it raises
-    # on a non-square trailing pair, matching the previous contract.
-    return rust_module().decoder_cov_from_channel_factors(blocks)
-
-
-def _canonical_n_harmonics(
-    basis_kinds: list[str],
-    raw_n_harmonics: list[int],
-    decoder_widths: list[int],
-) -> list[int]:
-    """Repair stale/degenerate periodic ``n_harmonics`` at ingestion (#1132/N).
-
-    A periodic atom's basis width is ``M = 2H + 1`` with ``H >= 1``. A plan
-    value that collapsed to ``<= 0`` (a born/fissioned atom recovered with a
-    degenerate constant-only width) is floored to the harmonic count implied by
-    the trained decoder width. The repair formula lives in the Rust owner
-    (#2091, SPEC thin-wrapper rule 8); canonicalizing ``self._n_harmonics`` at
-    ingestion ensures OOS reconstruct and :meth:`ManifoldSAE.steer` use the
-    recovered value rather than the raw (possibly 0/stale) plan value.
-    Non-periodic atoms pass through unchanged.
-    """
-    return [
-        int(h)
-        for h in rust_module().sae_canonical_n_harmonics(
-            [str(bk) for bk in basis_kinds],
-            [int(h) for h in raw_n_harmonics],
-            [int(w) for w in decoder_widths],
-        )
-    ]
-
-
 def _canonical_assignment(value: str, label: str) -> str:
     try:
         return str(rust_module().sae_canonical_assignment_kind(str(value)))
@@ -309,71 +136,6 @@ def _canonical_assignment(value: str, label: str) -> str:
         raise ValueError(
             f"{label}={value!r} is not a recognized assignment kind: {exc}"
         ) from None
-
-
-def _coerce_atom_inference(raw: Any) -> list[dict[str, Any]] | None:
-    """Normalize the Rust ``atom_inference`` payload list (#1097 / #1103).
-
-    Each Rust entry is a per-atom dict carrying ``atom_index`` / ``atom_name``,
-    an optional ``functionals`` block, and an optional ``smooth_significance``
-    block whose ``log_e_nonconstant`` is the #1103 any-n-valid split-LRT e-value.
-    We pass the report through as plain Python containers (a shallow copy so the
-    accessor never aliases the raw FFI object), coercing the e-value to ``float``
-    when present. ``None`` for payloads predating the report.
-    """
-    if raw is None:
-        return None
-    reports: list[dict[str, Any]] = []
-    for entry in raw:
-        report = dict(entry)
-        sig = report.get("smooth_significance")
-        if sig is not None:
-            sig = dict(sig)
-            log_e = sig.get("log_e_nonconstant")
-            sig["log_e_nonconstant"] = None if log_e is None else float(log_e)
-            report["smooth_significance"] = sig
-        if report.get("functionals") is not None:
-            report["functionals"] = dict(report["functionals"])
-        reports.append(report)
-    return reports
-
-
-def _coerce_cotrain_report(raw: Any) -> dict[str, Any] | None:
-    """Normalize the Rust co-trained amortized-encoder report (#1154)."""
-    if raw is None:
-        return None
-    report = dict(raw)
-    required = (
-        "recon_consistency",
-        "unconverged_fraction",
-        "n_unconverged",
-        "n_encodes",
-    )
-    missing = [key for key in required if key not in report]
-    if missing:
-        raise ValueError(f"SAE cotrain report missing keys: {missing}")
-    recon = float(report["recon_consistency"])
-    unconverged = float(report["unconverged_fraction"])
-    n_unconverged = int(report["n_unconverged"])
-    n_encodes = int(report["n_encodes"])
-    if not np.isfinite(recon) or recon < 0.0:
-        raise ValueError(f"SAE cotrain recon_consistency must be finite >= 0, got {recon}")
-    if not np.isfinite(unconverged) or unconverged < 0.0 or unconverged > 1.0:
-        raise ValueError(
-            "SAE cotrain unconverged_fraction must be finite in [0, 1], "
-            f"got {unconverged}"
-        )
-    if n_unconverged < 0 or n_encodes < 0 or n_unconverged > n_encodes:
-        raise ValueError(
-            "SAE cotrain counts must satisfy 0 <= n_unconverged <= n_encodes; "
-            f"got {n_unconverged} / {n_encodes}"
-        )
-    return {
-        "recon_consistency": recon,
-        "unconverged_fraction": unconverged,
-        "n_unconverged": n_unconverged,
-        "n_encodes": n_encodes,
-    }
 
 
 # Sentinel so ``assignment_prior`` can tell "not supplied" apart from any
@@ -447,170 +209,8 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
-def _atom_functional_evidence(
-    atom: Mapping[str, Any],
-    plan: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Pass through the Rust/Riesz per-atom functional-evidence payload.
-
-    A native payload is returned as a shallow copy so the accessor never
-    aliases the raw FFI object; absent, ``None``. There is no Python-side
-    plugin any more: the decoder functional evidence (average value /
-    derivative / peak contrast and their delta-method standard errors) is a
-    numeric result computed in the Rust core, not reconstructed in Python.
-    """
-    del plan  # plan-driven Python basis re-evaluation removed; Rust owns it.
-    native = atom.get("functional_evidence")
-    return None if native is None else dict(native)
-
-
-@dataclass(slots=True)
-class SaeManifoldAtomFit:
-    """Per-atom fit payload returned inside :class:`ManifoldSAE`.
-
-    Attributes
-    ----------
-    basis
-        Basis kind used by this atom, for example ``"periodic"``,
-        ``"euclidean"``, ``"duchon"``, ``"sphere"``, or ``"torus"``.
-    decoder_coefficients
-        Gauge-free physical decoder coefficients ``exp(s_k) B_k`` with shape
-        ``(M_k, p)`` where
-        ``M_k`` is the atom basis size and ``p`` is the ambient/output
-        dimension. The Rust fit's quotient-scale coordinate is materialized at
-        the boundary, so save/load, reconstruction, prediction, and steering all
-        consume this same block with no hidden scale state. Values are in the
-        same units as ``X`` because the basis functions are dimensionless.
-    assignments
-        Per-observation assignment/gate values for this atom, shape ``(N,)``.
-        For ``assignment="softmax"`` these are mixture masses; for
-        ``"ibp_map"`` and ``"jumprelu"`` these are
-        gate activations.
-    coords
-        Recovered on-atom latent coordinates ``t*`` for the training data,
-        shape ``(N, d_k)``. Units are the atom's raw latent coordinate system:
-        periodic/circle coordinates are normalized phase coordinates, while
-        euclidean/duchon coordinates are raw chart coordinates.
-    evidence
-        The MODEL-level penalized-loss score copied from the full SAE result
-        (the Rust ``penalized_loss_score``). This is NOT a REML / marginal-
-        likelihood score and is NOT atom-specific -- it is the same value for
-        every atom of a given fit. ``None`` for the closed-form shortcut
-        payloads, which do not compute a penalized-loss objective.
-    active_dim
-        Estimated active intrinsic coordinate dimension for this atom.
-    decoder_covariance
-        Optional phi-scaled posterior covariance of the flattened decoder
-        coefficients, shape ``(M_k * p, M_k * p)`` in row-major
-        ``(basis, channel)`` layout. Entries have squared ``X`` units. Present
-        on fresh fits when the Rust payload includes posterior uncertainty.
-        Across :meth:`ManifoldSAE.save` / :meth:`ManifoldSAE.load` only the
-        band-relevant same-channel Schur blocks are persisted (the compact
-        per-atom factor), so a restored covariance is block-diagonal across
-        channels: every quantity the shape band reads is reproduced exactly, and
-        the cross-channel entries the band never touches are zero.
-    shape_band_coords
-        Optional coordinate grid for the posterior shape band, shape
-        ``(G, d_k)``, in the same latent-coordinate units as ``coords``.
-    shape_band_mean
-        Optional fitted ambient manifold values on ``shape_band_coords``,
-        shape ``(G, p)``, in the same units as ``X``.
-    shape_band_sd
-        Optional per-channel posterior standard deviation of
-        ``shape_band_mean``, shape ``(G, p)``, in the same units as ``X``.
-    functional_evidence
-        Optional per-atom decoder functional evidence. Native Rust/Riesz
-        payloads are passed through as-is; otherwise fresh fits may populate a
-        conservative plugin block from decoder covariance with
-        ``average_value``, ``average_derivative`` (the conditional-on-fit mean
-        decoder derivative — NOT a population marginal slope; the latent
-        coordinate is a generated regressor), and ``peak_contrast``.
-    """
-
-    basis: str
-    decoder_coefficients: np.ndarray
-    assignments: np.ndarray
-    coords: np.ndarray
-    evidence: float | None
-    active_dim: int
-    # Posterior shape uncertainty. These fields are ``None`` only when the
-    # source payload did not include uncertainty arrays. ``decoder_covariance``
-    # is the phi-scaled posterior covariance of this atom's decoder
-    # coefficients, shape ``(M_k*p, M_k*p)`` in row-major ``(basis, channel)``
-    # flat layout. The shape band is the closed-form push-forward to ambient
-    # space along the on-atom coordinates: ``shape_band_mean`` is the fitted
-    # point ``(G, p)``, ``shape_band_sd`` its per-channel posterior sd
-    # ``(G, p)``, at ``shape_band_coords`` ``(G, d_k)``.
-    decoder_covariance: np.ndarray | None = None
-    shape_band_coords: np.ndarray | None = None
-    shape_band_mean: np.ndarray | None = None
-    shape_band_sd: np.ndarray | None = None
-    functional_evidence: dict[str, Any] | None = None
-    # #2081 — the honest arc-length coordinate ``u_arc = s(t_i)/L in [0, 1)`` for
-    # every training row, the gauge-fixed complement to the raw ``coords`` (which
-    # are chart-arbitrary: reconstruction EV cannot certify them). Present for a
-    # ``d = 1`` circle/interval atom whose chart is non-degenerate; ``None`` for
-    # higher-d atoms or a collapsed chart (see the coordinate-fidelity
-    # ``verdict``). Downstream angle/dose/adjacency claims should read this, not
-    # ``coords``, unless the certificate verdict is ``arclength_honest``. Use
-    # :meth:`ManifoldSAE.atom_angle_coordinate` for the certificate-gated reader.
-    coords_u_arc: np.ndarray | None = None
-    _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if self._lazy_artifact is not None:
-            return
-        values = {
-            "assignments": object.__getattribute__(self, "assignments"),
-            "coords": object.__getattribute__(self, "coords"),
-        }
-        object.__setattr__(self, "_lazy_artifact", _SaeLazyFitArtifact(values))
-        object.__setattr__(self, "assignments", None)
-        object.__setattr__(self, "coords", None)
-
-    def __getattribute__(self, name: str) -> Any:
-        return _lazy_getattr(self, _ATOM_LAZY_FIELDS, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        _lazy_setattr(self, _ATOM_LAZY_FIELDS, name, value)
-
-
-@dataclass(slots=True)
-class SaeManifoldFitResult:
-    atoms: list[SaeManifoldAtomFit]
-    chosen_k: int
-    evidence_by_candidate: dict[int, float]
-    comparison: dict[str, Any]
-    fitted: np.ndarray
-    assignments: np.ndarray
-    coords: list[np.ndarray]
-    reml_score: float
-    _lazy_artifact: _SaeLazyFitArtifact | None = field(default=None, init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        if self._lazy_artifact is not None:
-            return
-        values = {
-            "fitted": object.__getattribute__(self, "fitted"),
-            "assignments": object.__getattribute__(self, "assignments"),
-            "coords": object.__getattribute__(self, "coords"),
-        }
-        object.__setattr__(self, "_lazy_artifact", _SaeLazyFitArtifact(values))
-        object.__setattr__(self, "fitted", None)
-        object.__setattr__(self, "assignments", None)
-        object.__setattr__(self, "coords", None)
-
-    def __getattribute__(self, name: str) -> Any:
-        return _lazy_getattr(self, _LOW_LEVEL_LAZY_FIELDS, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        _lazy_setattr(self, _LOW_LEVEL_LAZY_FIELDS, name, value)
-
-
 class _LowLevelView:
-    """Read-only adapter reproducing the ``SaeManifoldFitResult`` surface consumers
-    touch off ``model.low_level`` (in practice only ``.chosen_k``); the remaining
-    fields are forwarded off the Rust-owned core for faithfulness. #2091."""
+    """Read-only view of the Rust-owned low-level fit state (#2091)."""
 
     __slots__ = ("_core",)
 
@@ -2084,7 +1684,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     -------
     ManifoldSAE
         Fitted result. Core attributes are ``atoms`` (list of
-        :class:`SaeManifoldAtomFit`), ``fitted`` ``(N, p)``, ``assignments``
+        Rust-owned atom objects), ``fitted`` ``(N, p)``, ``assignments``
         ``(N, K)``, ``coords`` as per-atom ``(N, d_k)`` arrays,
         ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices,
         ``basis_specs``, ``atom_topology``/``atom_topologies``, ``assignment``
@@ -2604,7 +2204,7 @@ class StagewiseAtom:
     ----------
     decoder
         Decoder basis coefficients ``(M_k, p)`` (same contract as
-        :attr:`SaeManifoldAtomFit.decoder_coefficients`).
+        each atom object's ``decoder_coefficients`` attribute).
     coords
         Recovered on-atom coordinates ``(N, d_k)``.
     assignments
@@ -3589,12 +3189,6 @@ def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     return [str(v) for v in raw]
 
 
-def _topologies_for_bases(bases: list[str]) -> list[str]:
-    """Per-atom topology labels from the Rust-owned semantic schema."""
-    _scalar, per_atom = rust_module().sae_atom_topologies([str(b) for b in bases])
-    return [str(value) for value in per_atom]
-
-
 def _topology_for_bases(bases: list[str]) -> str:
     """Collapse resolved bases through the Rust-owned semantic schema."""
     scalar, _per_atom = rust_module().sae_atom_topologies([str(b) for b in bases])
@@ -3674,6 +3268,6 @@ def plot(atom: Any, **kwargs: Any) -> Any:
     return _sae_viz.plot(atom, **kwargs)
 
 
-__all__ = ["GumbelTemperatureSchedule", "ManifoldSAE", "SaeManifoldAtomFit", "SaeManifoldFitResult",
+__all__ = ["GumbelTemperatureSchedule", "ManifoldSAE",
            "gumbel_geometric_schedule", "gumbel_linear_schedule", "gumbel_reciprocal_iter_schedule",
            "fit", "plot", "sae_manifold_fit"]

@@ -266,8 +266,10 @@ pub(crate) fn log_normal_cdf_diff_tower_ordered(
     // single-slot compose is bit-identical to the dense `Tower4<2>` form (see
     // `compose_unary_single_slot`) while skipping the structurally-zero mixed
     // channels.
-    let log_upper = compose_unary_single_slot(&upper_var, unary_derivatives_normal_logcdf(upper_var.v));
-    let log_lower = compose_unary_single_slot(&lower_var, unary_derivatives_normal_logcdf(lower_var.v));
+    let log_upper =
+        compose_unary_single_slot(&upper_var, unary_derivatives_normal_logcdf(upper_var.v));
+    let log_lower =
+        compose_unary_single_slot(&lower_var, unary_derivatives_normal_logcdf(lower_var.v));
     let gap = log_upper - log_lower;
     if !(gap.v.is_finite() && gap.v > 0.0) {
         return Err(TransformationNormalError::NumericalFailure { reason: format!(

@@ -299,10 +299,10 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
     };
 
     let outcome = fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights: Array1::ones(n),
-        offset: Array1::zeros(n),
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(Array1::ones(n)),
+        offset: std::sync::Arc::new(Array1::zeros(n)),
         spec,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
@@ -342,7 +342,6 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }));
     match outcome {
         Ok(FitResult::Standard(_)) => eprintln!("[ANISO-ETA-GRAD] fit returned Ok"),

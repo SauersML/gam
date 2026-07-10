@@ -9,8 +9,10 @@ passthrough. Unknown keys (added by future engine versions) survive on
 
 from __future__ import annotations
 
+import operator
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, overload
 
 from ._binding import rust_module
 
@@ -41,6 +43,94 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "group_metadata",
     "deployment_extensions",
 )
+
+
+class _ColumnarCoefficientRecords(Sequence[Mapping[str, Any]]):
+    """Lazy record view over typed posterior coefficient columns.
+
+    Posterior means, standard errors, and credible intervals stay in their
+    NumPy buffers until a caller asks for an individual record.  This keeps a
+    posterior summary proportional to its numeric columns instead of eagerly
+    allocating one Python ``dict`` (and five boxed floats) per coefficient.
+    """
+
+    __slots__ = ("_names", "_estimates", "_std_errors", "_intervals")
+
+    def __init__(
+        self,
+        names: Sequence[str],
+        estimates: Any,
+        std_errors: Any,
+        intervals: Any,
+    ) -> None:
+        count = len(names)
+        if getattr(estimates, "ndim", None) != 1 or len(estimates) != count:
+            raise ValueError(
+                "posterior_mean must be a one-dimensional array with one "
+                f"value per coefficient; got shape {getattr(estimates, 'shape', None)} "
+                f"for {count} coefficients"
+            )
+        if getattr(std_errors, "ndim", None) != 1 or len(std_errors) != count:
+            raise ValueError(
+                "posterior_std must be a one-dimensional array with one "
+                f"value per coefficient; got shape {getattr(std_errors, 'shape', None)} "
+                f"for {count} coefficients"
+            )
+        if getattr(intervals, "ndim", None) != 2 or tuple(intervals.shape) != (count, 2):
+            raise ValueError(
+                "posterior credible intervals must have shape "
+                f"({count}, 2); got {getattr(intervals, 'shape', None)}"
+            )
+        self._names = names
+        self._estimates = estimates
+        self._std_errors = std_errors
+        self._intervals = intervals
+
+    def __len__(self) -> int:
+        return len(self._names)
+
+    def _record(self, index: int) -> dict[str, Any]:
+        position = operator.index(index)
+        if position < 0:
+            position += len(self)
+        if position < 0 or position >= len(self):
+            raise IndexError("coefficient index out of range")
+        return {
+            "index": position,
+            "name": self._names[position],
+            "estimate": float(self._estimates[position]),
+            "std_error": float(self._std_errors[position]),
+            "ci_lower": float(self._intervals[position, 0]),
+            "ci_upper": float(self._intervals[position, 1]),
+        }
+
+    @overload
+    def __getitem__(self, index: int) -> Mapping[str, Any]: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[Mapping[str, Any]]: ...
+
+    def __getitem__(
+        self, index: int | slice
+    ) -> Mapping[str, Any] | list[Mapping[str, Any]]:
+        if isinstance(index, slice):
+            return [self._record(position) for position in range(*index.indices(len(self)))]
+        return self._record(index)
+
+    def __iter__(self) -> Iterator[Mapping[str, Any]]:
+        for index in range(len(self)):
+            yield self._record(index)
+
+    def columns(self) -> Mapping[str, Any]:
+        """Expose columns directly for dataframe construction."""
+        return {
+            "index": range(len(self)),
+            "name": self._names,
+            "estimate": self._estimates,
+            "std_error": self._std_errors,
+            "ci_lower": self._intervals[:, 0],
+            "ci_upper": self._intervals[:, 1],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +170,11 @@ class Summary:
         Total effective degrees of freedom across all blocks.
     lambdas : list of float
         Fitted smoothing / precision parameters in penalty-block order.
-    coefficients : list of dict
+    coefficients : sequence of mappings
         One record per fitted coefficient with keys ``index``, ``estimate``,
-        and ``std_error`` (when available).
+        and ``std_error`` (when available). Posterior summaries use a lazy
+        columnar sequence so indexing and iteration do not require an eager
+        list of per-coefficient dictionaries.
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
@@ -134,7 +226,7 @@ class Summary:
     iterations: int | None = None
     edf_total: float | None = None
     lambdas: list[float] = field(default_factory=list)
-    coefficients: list[dict[str, Any]] = field(default_factory=list)
+    coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)
     #: Fitted curvature κ̂ point estimates for any ``curv(...)`` constant-curvature
     #: smooths (#944): one dict per term with ``name``, ``term_idx``,
@@ -206,8 +298,14 @@ class Summary:
             return default
 
     def to_dict(self) -> dict[str, Any]:
-        """Flatten typed fields + extras into a single plain ``dict``."""
+        """Flatten typed fields + extras into a single plain ``dict``.
+
+        This is the explicit materialization boundary for lazy posterior
+        coefficient records.
+        """
         out: dict[str, Any] = {name: getattr(self, name) for name in _SUMMARY_FIELDS}
+        if isinstance(self.coefficients, _ColumnarCoefficientRecords):
+            out["coefficients"] = list(self.coefficients)
         out.update(self.extras)
         return out
 
@@ -215,6 +313,8 @@ class Summary:
         """Return :attr:`coefficients` as a :class:`pandas.DataFrame`."""
         import pandas as pd
 
+        if isinstance(self.coefficients, _ColumnarCoefficientRecords):
+            return pd.DataFrame(self.coefficients.columns(), copy=False)
         return pd.DataFrame(self.coefficients)
 
     def smooth_terms_frame(self) -> Any:

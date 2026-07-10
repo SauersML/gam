@@ -215,6 +215,7 @@ fn joint_competing_risks_transformation_recovers_true_cause_specific_cifs() {
         noise_offset: &noise_offset,
         time_grid: Some(&grid),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
     let result =
         predict_competing_risks_survival(request).expect("competing-risks survival predict");

@@ -1,8 +1,4 @@
-use gam_terms::basis::BasisOptions;
-use gam_solve::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::bms::{
-    LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
-};
+use crate::bms::{LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration};
 use crate::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
@@ -11,18 +7,20 @@ use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
-use gam_terms::inference::formula_dsl::{
-    inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
-    parse_surv_interval_response, parse_surv_response, parsed_term_column_names,
-};
-use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
-use gam_terms::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
+use gam_linalg::faer_ndarray::array2_to_nested_vec;
 use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
     SasLinkState, StandardLink,
 };
 use gam_runtime::span::span_index_for_breakpoints;
-use gam_linalg::faer_ndarray::array2_to_nested_vec;
+use gam_solve::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
+use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
+use gam_terms::basis::BasisOptions;
+use gam_terms::inference::formula_dsl::{
+    inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
+    parse_surv_interval_response, parse_surv_response, parsed_term_column_names,
+};
+use gam_terms::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 // The data-schema value types live in the `gam-data` foundation crate; they
 // were previously authored here and are still named `gam::inference::model::{
 // ColumnKindTag, DataSchema, SchemaColumn}` by a broad set of integration tests
@@ -3433,8 +3431,8 @@ impl FittedModel {
             CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability,
             PenaltySource,
         };
-        use gam_terms::smooth::build_term_collection_design;
         use gam_terms::smooth::SmoothBasisSpec;
+        use gam_terms::smooth::build_term_collection_design;
         let Some(saved_spec) = self.resolved_termspec.as_ref() else {
             return Ok(None);
         };
@@ -3905,10 +3903,7 @@ impl FittedModel {
     pub fn saved_residual_cascade(
         &self,
     ) -> Result<
-        Option<(
-            &[String],
-            gam_solve::residual_cascade::ResidualCascadeFit,
-        )>,
+        Option<(&[String], gam_solve::residual_cascade::ResidualCascadeFit)>,
         FittedModelError,
     > {
         let Some(saved) = self.residual_cascade.as_ref() else {
@@ -3993,12 +3988,7 @@ impl FittedModel {
                     .columns
                     .iter()
                     .find(|c| &c.name == name)
-                    .map(|c| {
-                        matches!(
-                            c.kind,
-                            ColumnKindTag::Continuous | ColumnKindTag::Binary
-                        )
-                    })
+                    .map(|c| matches!(c.kind, ColumnKindTag::Continuous | ColumnKindTag::Binary))
                     .unwrap_or(false);
                 if !is_numeric {
                     continue;
@@ -4821,10 +4811,10 @@ mod tests {
     use super::*;
     use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
     use crate::survival::lognormal_kernel::FrailtySpec;
-    use gam_solve::pirls::PirlsStatus;
-    use gam_solve::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
-    use gam_problem::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
     use gam_data::SchemaColumn;
+    use gam_problem::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
+    use gam_solve::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
+    use gam_solve::pirls::PirlsStatus;
     use ndarray::{Array1, Array2, array};
 
     fn empty_termspec() -> TermCollectionSpec {
@@ -5380,8 +5370,9 @@ mod tests {
                 "`{formula}` is a random effect; it must remain lenient on unseen levels \
                  (held-out-group policy)"
             );
-            encode_level(&grouped, "TYPO")
-                .unwrap_or_else(|err| panic!("`{formula}` must tolerate an unseen level, got: {err}"));
+            encode_level(&grouped, "TYPO").unwrap_or_else(|err| {
+                panic!("`{formula}` must tolerate an unseen level, got: {err}")
+            });
         }
     }
 

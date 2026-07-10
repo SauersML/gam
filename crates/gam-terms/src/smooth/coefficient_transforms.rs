@@ -1,12 +1,5 @@
-//! Cumulative-sum / divided-difference coefficient transforms for the
+//! Cumulative-sum / derivative-control coefficient transforms for the
 //! shape-constrained smooth arm.
-//!
-//! Pure numeric matrix/vector kernels relocated verbatim from `smooth.rs`
-//! (issue #780 decomposition): the monotone cumulative-exp maps, the integer
-//! double-cumulative-sum transform, the Greville-scaled convex/concave divided-
-//! difference transform, and the small integer binomial helper. No behavior
-//! change — the bodies are byte-identical to their former in-file definitions
-//! and are re-exported from the parent module to preserve every call site.
 
 use crate::basis::BasisError;
 use ndarray::{Array1, Array2};
@@ -57,7 +50,7 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
     t
 }
 
-/// Greville-scaled second-order cumulative transform for the convex/concave
+/// Knot-span-scaled second-order cumulative transform for the convex/concave
 /// box reparameterization on a B-spline coefficient vector `θ` (raw control
 /// points; the shape-constrained B-spline arm forces
 /// `BSplineIdentifiability::None`, so the design columns are the raw basis
@@ -80,43 +73,42 @@ pub(crate) fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f6
 /// difference but a *non-zero* plain second difference under non-uniform ξ, so
 /// the plain cone silently mis-orients the constraint.
 ///
-/// Returns `T` (`p × p`) such that `θ = T·γ` and, for `i ≥ 2`, the new
-/// coordinate `γ_i = sign · [D²θ]_{i−2}`. Pairing this `T` with the lower
-/// bounds `γ_i ≥ 0` (`i ≥ 2`) from [`shape_lower_bounds_local`] enforces
+/// Returns `T` (`p × p`) such that `θ = T·γ`. For `i ≥ 2`, `γ_i` is a positive
+/// common rescaling of `sign · [D²θ]_{i−2}`; the common scale comes from
+/// normalizing the supplied spans by their maximum so the coefficient chart is
+/// invariant to physical covariate units. Pairing this `T` with the lower bounds
+/// `γ_i ≥ 0` (`i ≥ 2`) from [`shape_lower_bounds_local`] therefore enforces
 /// convexity (`sign = +1`) or concavity (`sign = −1`) exactly for arbitrary
 /// (clamped / quantile) knot geometry. `γ_0` is the level and `γ_1` the initial
 /// slope, both unconstrained. When ξ is uniform this reduces (column-scaled) to
 /// `cumulative_sum_transform_matrix(p, 2, sign)`, recovering the original path.
-pub(crate) fn convex_divided_difference_transform_matrix(
-    greville: &Array1<f64>,
+pub(crate) fn convex_derivative_control_transform_matrix(
+    first_span: &Array1<f64>,
     sign: f64,
 ) -> Result<Array2<f64>, BasisError> {
-    let p = greville.len();
-    if p < 3 {
+    let p = first_span.len() + 1;
+    if first_span.is_empty() {
         crate::bail_invalid_basis!(
-            "convex/concave box reparameterization requires at least 3 basis functions; found {p}"
+            "convex/concave box reparameterization requires at least 2 basis functions; found {p}"
         );
     }
-    // First-difference spans (ξ_{i+1} − ξ_i) and second-difference spans
-    // (ξ_{i+2} − ξ_i). Reject degenerate (collapsed) Greville abscissae rather
-    // than dividing by zero — a degenerate span means the basis cannot separate
-    // the curvature directions the cone constrains. The degeneracy tolerance is
-    // relative to the TOTAL Greville span, not to |ξ_max|: convexity is
-    // translation invariant, and an |ξ|-anchored tolerance rejects a perfectly
-    // ordinary unit-spaced grid the moment it is translated to ~1e13.
-    let total_span = greville[p - 1] - greville[0];
-    let span_tol = 1e-12 * total_span.abs();
-    let mut first_span = Array1::<f64>::zeros(p - 1);
-    for i in 0..p - 1 {
-        let s = greville[i + 1] - greville[i];
-        if !(s > span_tol) {
+    // These spans come directly from knot-window differences through
+    // `bspline_first_derivative_control_spans`, rather than by subtracting two
+    // separately averaged Greville abscissae. Revalidate at this numeric seam so
+    // no degenerate transform can be constructed by a future caller.
+    let span_scale = first_span.iter().copied().fold(0.0_f64, f64::max);
+    for (i, &span) in first_span.iter().enumerate() {
+        if !span.is_finite() || span <= 0.0 {
             crate::bail_invalid_basis!(
-                "convex/concave box reparameterization requires strictly increasing Greville abscissae; span ξ[{}]−ξ[{i}] = {s:.3e} is non-positive",
-                i + 1
+                "convex/concave box reparameterization requires positive finite derivative-control spans; span[{i}]={span:.3e}"
             );
         }
-        first_span[i] = s;
     }
+    // A common positive rescaling changes only the free coordinate units, not
+    // the represented cone. Normalize once to keep T finite and invariant to a
+    // change of physical covariate units; every penalty is transformed by the
+    // matching congruence downstream.
+    let first_span = first_span.mapv(|span| span / span_scale);
 
     // Build T column by column: T[:, c] = θ for γ = e_c. Forward-accumulate
     // m_0 = γ_1, m_{i+1} = m_i + (ξ_{i+2} − ξ_i)·γ_{i+2}, θ_0 = γ_0,
@@ -130,7 +122,7 @@ pub(crate) fn convex_divided_difference_transform_matrix(
         for i in 0..p - 2 {
             // contribution of γ_{i+2} to the divided second difference
             let gamma_ip2 = if c == i + 2 { 1.0 } else { 0.0 };
-            let second_span = greville[i + 2] - greville[i];
+            let second_span = first_span[i] + first_span[i + 1];
             m[i + 1] = m[i] + second_span * gamma_ip2;
         }
         let theta0 = if c == 0 { 1.0 } else { 0.0 };
@@ -207,8 +199,18 @@ mod cumulative_sum_transform_tests {
 
 #[cfg(test)]
 mod convex_divided_difference_transform_tests {
-    use super::{convex_divided_difference_transform_matrix, cumulative_sum_transform_matrix};
+    use super::{convex_derivative_control_transform_matrix, cumulative_sum_transform_matrix};
+    use crate::smooth::{
+        ShapeConstraint,
+        shape_constraints::{
+            bspline_first_derivative_control_spans, bspline_shape_linear_constraints,
+        },
+    };
     use ndarray::Array1;
+
+    fn first_spans(g: &Array1<f64>) -> Array1<f64> {
+        Array1::from_iter((0..g.len() - 1).map(|i| g[i + 1] - g[i]))
+    }
 
     /// Second *divided* difference of `theta` over Greville abscissae `g`:
     /// `(m_{i+1} − m_i)/(g_{i+2} − g_i)` with `m_i = (θ_{i+1}−θ_i)/(g_{i+1}−g_i)`.
@@ -245,7 +247,7 @@ mod convex_divided_difference_transform_tests {
         let p = 7;
         let g = Array1::from_iter((0..p).map(|i| i as f64));
         for &sign in &[1.0_f64, -1.0] {
-            let t = convex_divided_difference_transform_matrix(&g, sign).unwrap();
+            let t = convex_derivative_control_transform_matrix(&first_spans(&g), sign).unwrap();
             let plain = cumulative_sum_transform_matrix(p, 2, sign);
 
             // Cone coordinates (c ≥ 2): identical up to a positive per-column scale.
@@ -304,7 +306,9 @@ mod convex_divided_difference_transform_tests {
         // Clustered (clamped/quantile-like) abscissae: γ_{≥2} ≥ 0 must certify a
         // non-negative second *divided* difference (true function convexity).
         let g = Array1::from(vec![0.0, 0.1, 0.3, 0.7, 1.4, 2.6, 4.5]);
-        let t = convex_divided_difference_transform_matrix(&g, 1.0).unwrap();
+        let spans = first_spans(&g);
+        let span_scale = spans.iter().copied().fold(0.0_f64, f64::max);
+        let t = convex_derivative_control_transform_matrix(&spans, 1.0).unwrap();
         // γ_0, γ_1 arbitrary (level/slope); γ_{≥2} ≥ 0 (convex cone interior).
         let gamma = Array1::from(vec![-2.0, 1.5, 0.4, 0.0, 1.2, 0.7, 0.9]);
         let theta = t.dot(&gamma);
@@ -314,11 +318,14 @@ mod convex_divided_difference_transform_tests {
                 v >= -1e-9,
                 "convex cone violated: second divided difference d2[{i}] = {v:.3e} < 0"
             );
-            // And it equals the corresponding γ exactly (the cone coordinate).
+            // The transform normalizes all spans by their maximum. In the
+            // original physical x units this makes the second divided
+            // difference γ/span_scale²: a positive coordinate rescaling that
+            // leaves the cone unchanged.
+            let expected = gamma[i + 2] / (span_scale * span_scale);
             assert!(
-                (v - gamma[i + 2]).abs() < 1e-9,
-                "cone coordinate mismatch at {i}: d2 = {v:.3e}, gamma = {:.3e}",
-                gamma[i + 2]
+                (v - expected).abs() < 1e-9,
+                "cone coordinate mismatch at {i}: d2 = {v:.3e}, expected = {expected:.3e}",
             );
         }
     }
@@ -352,5 +359,53 @@ mod convex_divided_difference_transform_tests {
             any_nonzero_plain,
             "non-uniform abscissae should make the plain second difference non-zero on affine data"
         );
+    }
+
+    #[test]
+    fn box_transforms_realize_the_canonical_linear_cones() {
+        let knots = Array1::from(vec![
+            0.0, 0.0, 0.0, 0.0, 0.08, 0.37, 0.62, 1.0, 1.0, 1.0, 1.0,
+        ]);
+        let spans = bspline_first_derivative_control_spans(knots.view(), 3).unwrap();
+        let p = spans.len() + 1;
+        for shape in [
+            ShapeConstraint::MonotoneIncreasing,
+            ShapeConstraint::MonotoneDecreasing,
+            ShapeConstraint::Convex,
+            ShapeConstraint::Concave,
+        ] {
+            let (order, sign) = match shape {
+                ShapeConstraint::MonotoneIncreasing => (1, 1.0),
+                ShapeConstraint::MonotoneDecreasing => (1, -1.0),
+                ShapeConstraint::Convex => (2, 1.0),
+                ShapeConstraint::Concave => (2, -1.0),
+                ShapeConstraint::None => unreachable!(),
+            };
+            let transform = if order == 1 {
+                cumulative_sum_transform_matrix(p, order, sign)
+            } else {
+                convex_derivative_control_transform_matrix(&spans, sign).unwrap()
+            };
+            let constraints = bspline_shape_linear_constraints(knots.view(), 3, shape)
+                .unwrap()
+                .unwrap();
+            let mapped = constraints.a.dot(&transform);
+            for row in 0..mapped.nrows() {
+                for col in 0..mapped.ncols() {
+                    if col == row + order {
+                        assert!(
+                            mapped[[row, col]] > 0.0,
+                            "shape={shape:?} mapped cone diagonal must be positive"
+                        );
+                    } else {
+                        assert!(
+                            mapped[[row, col]].abs() <= 64.0 * f64::EPSILON,
+                            "shape={shape:?} A*T must isolate cone coordinate; ({row},{col})={} ",
+                            mapped[[row, col]],
+                        );
+                    }
+                }
+            }
+        }
     }
 }

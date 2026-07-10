@@ -143,8 +143,9 @@ fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
 /// criterion whose center is silently shifted from the value path's.
-/// The optimizer happily converges where the WRONG gradient vanishes;
-/// the certificate's FD of the actual value path must expose it.
+/// The optimizer happily converges where the WRONG gradient vanishes; the
+/// analytic certificate must reject the two objective values measured at the
+/// identical returned point when they disagree beyond roundoff.
 #[test]
 fn certificate_flags_value_gradient_desync() {
     let value_center = array![0.0, 0.0];
@@ -180,26 +181,12 @@ fn certificate_flags_value_gradient_desync() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = problem
+    let error = problem
         .run(&mut obj, "certificate desynced quadratic")
-        .expect("desynced quadratic still returns a result");
-    let cert = result
-        .criterion_certificate
-        .as_ref()
-        .expect("gradient-based solve must ship a certificate");
-    // Post-FD-purge semantics: the production certificate attests ANALYTIC
-    // KKT stationarity only (the FD directional cross-audit was removed from
-    // the production path; value↔gradient desyncs are guarded by the
-    // structural single-evaluator design plus the FD gates that live in
-    // tests). The lying gradient drove the solve to ITS OWN stationary point,
-    // so the analytic certificate is stationary there — pin that so any
-    // future re-introduction of a production FD audit shows up here as an
-    // intentional semantic change rather than silent drift.
+        .expect_err("desynchronised value/gradient paths must not mint a result");
     assert!(
-        cert.is_stationary(),
-        "analytic-surface certificate unexpectedly non-stationary at the \
-         gradient's own optimum: {}",
-        cert.summary(),
+        matches!(error, EstimationError::RemlDidNotConverge { .. }),
+        "desynchronisation must be typed outer non-convergence, got {error}"
     );
 }
 
@@ -2897,7 +2884,7 @@ fn run_seed_materialization_failure_surfaces_arc_error_verbatim() {
 }
 
 #[test]
-fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
+fn run_nonconverged_arc_returns_typed_checkpoint_after_budget_retry_ladder() {
     // When an ARC primary exhausts its iteration budget, the runner
     // reseeds a fresh ARC attempt from the previous attempt's last
     // ρ and trust radius (up to two retries) and uncaps the inner
@@ -2907,8 +2894,8 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
     // The objective's analytic outer Hessian is preserved across
     // every attempt — no lateral demote to BFGS+BfgsApprox. After
     // the retries are exhausted (or the gate fires), the runner
-    // returns the final `Ok(OuterResult{converged:false})` from
-    // the last ARC attempt; the plan stays ARC + Analytic Hessian.
+    // returns typed non-convergence carrying the last rho checkpoint rather
+    // than an `OuterResult` that could reach fitted-model assembly.
     //
     // We use `cost = x^4`, `grad = 4 x^3`, `hess = 12 x^2` from
     // `initial_rho = [5.0]` with `max_iter = 1`. Newton-style ARC
@@ -2949,127 +2936,21 @@ fn run_nonconverged_arc_stays_on_arc_after_budget_retry_ladder() {
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let result = problem
+    let error = problem
         .run(&mut obj, "nonconverged arc should stay on arc")
-        .expect(
-            "ARC ladder must surface the last non-converged ARC result rather than \
-                 demoting to BFGS+BfgsApprox",
-        );
-    assert_eq!(
-        result.plan_used.solver,
-        Solver::Arc,
-        "ARC primary must not lateral-demote after budget exhaustion"
-    );
-    assert_eq!(
-        result.plan_used.hessian_source,
-        HessianSource::Analytic,
-        "analytic outer Hessian must be preserved across the budget-bump retry ladder"
-    );
-    assert!(
-        !result.converged,
-        "test fixture is engineered so the ladder cannot converge; \
-             converged=true would mean the fixture stopped exercising the ladder"
-    );
+        .expect_err("an exhausted ARC ladder must return typed non-convergence");
+    let EstimationError::RemlDidNotConverge { rho_checkpoint, .. } = error else {
+        panic!("expected typed REML non-convergence, got {error}");
+    };
     // The ladder must have genuinely stepped away from neither the optimum
     // (rho=0, where x⁴ is stationary) nor stalled at the seed: ARC contracts
     // toward 0 but cannot reach it in the single-iter budget, so the reported
     // ρ is strictly between the optimum and the [5.0] start.
     assert!(
-        result.rho[0].abs() > 1.0e-6 && result.rho[0] < 5.0,
+        rho_checkpoint[0].abs() > 1.0e-6 && rho_checkpoint[0] < 5.0,
         "the budget ladder must have made partial progress from the [5.0] seed \
          toward the x⁴ optimum without reaching it; got rho={:?}",
-        result.rho.to_vec()
-    );
-}
-
-#[test]
-fn candidate_selection_prefers_lower_cost_within_same_convergence_class() {
-    let plan = OuterPlan {
-        solver: Solver::Bfgs,
-        hessian_source: HessianSource::BfgsApprox,
-    };
-    let mut nonconverged_hi = OuterResult::new(array![0.0], 9.0, 1, false, plan);
-    nonconverged_hi.final_grad_norm = Some(1.0);
-    let mut nonconverged_lo = OuterResult::new(
-        array![1.0],
-        1.0,
-        1,
-        false,
-        OuterPlan {
-            solver: Solver::Bfgs,
-            hessian_source: HessianSource::BfgsApprox,
-        },
-    );
-    nonconverged_lo.final_grad_norm = Some(1.0);
-    let mut converged = OuterResult::new(
-        array![2.0],
-        5.0,
-        1,
-        true,
-        OuterPlan {
-            solver: Solver::Bfgs,
-            hessian_source: HessianSource::BfgsApprox,
-        },
-    );
-    converged.final_grad_norm = Some(0.0);
-
-    assert!(candidate_improves_best(&nonconverged_hi, None));
-    assert!(candidate_improves_best(
-        &nonconverged_lo,
-        Some(&nonconverged_hi)
-    ));
-    assert!(!candidate_improves_best(
-        &nonconverged_hi,
-        Some(&nonconverged_lo)
-    ));
-    assert!(candidate_improves_best(&converged, Some(&nonconverged_lo)));
-    assert!(!candidate_improves_best(&nonconverged_lo, Some(&converged)));
-}
-
-/// #1744: when BOTH multi-start seeds stall short of a stationary point (neither
-/// converged, both trustworthy flat-valley costs), a lower non-converged REML is
-/// only decisive on the SAME flat valley. A candidate that is BOTH more-smoothed
-/// (larger Σρ) AND farther from stationarity (larger residual gradient) than the
-/// flexible incumbent is the over-smoothing overshoot — it must NOT displace the
-/// flexible seed on cost alone. Every other shape still compares on cost.
-#[test]
-fn parsimonious_keep_best_rejects_less_stationary_over_smoothed_nonconverged_seed() {
-    let plan = OuterPlan {
-        solver: Solver::Bfgs,
-        hessian_source: HessianSource::BfgsApprox,
-    };
-    let rho_dim = 3usize;
-
-    // The #1744 signature: flexible incumbent (Σρ<0, closer to stationarity),
-    // over-smoothed candidate (Σρ>0, LOWER REML but LARGER residual gradient).
-    let mut flexible = OuterResult::new(array![-3.91, 0.08, -0.09], 74.40, 1, false, plan);
-    flexible.final_grad_norm = Some(1.12);
-    let mut over_smoothed = OuterResult::new(array![1.00, 0.997, 0.984], 67.30, 1, false, plan);
-    over_smoothed.final_grad_norm = Some(3.29);
-    // Both trustworthy (grad ≤ FLAT_VALLEY_STALL_GRAD_CEILING). The lower-REML
-    // over-smoothed seed must NOT win: more-smoothed AND less-stationary.
-    assert!(
-        !candidate_improves_best_parsimonious(&over_smoothed, Some(&flexible), rho_dim),
-        "a more-smoothed, less-stationary non-converged seed must not displace the flexible incumbent on cost alone"
-    );
-
-    // Symmetry / guard bounds: a more-smoothed candidate that is AT LEAST as
-    // close to stationarity (smaller residual gradient) still wins on lower cost
-    // — the pathology is specifically the LESS-stationary case.
-    let mut over_smoothed_sharper = over_smoothed.clone();
-    over_smoothed_sharper.final_grad_norm = Some(0.5);
-    assert!(
-        candidate_improves_best_parsimonious(&over_smoothed_sharper, Some(&flexible), rho_dim),
-        "a more-smoothed candidate closer to stationarity keeps the lower-cost win"
-    );
-
-    // A less-smoothed (more flexible) non-converged candidate with lower cost
-    // always wins regardless of gradient — the guard only fires on more-smoothed.
-    let mut flexible_lower = OuterResult::new(array![-6.0, -6.0, -6.0], 60.0, 1, false, plan);
-    flexible_lower.final_grad_norm = Some(4.0);
-    assert!(
-        candidate_improves_best_parsimonious(&flexible_lower, Some(&flexible), rho_dim),
-        "a less-smoothed lower-cost candidate is a genuine flexible improvement"
+        rho_checkpoint
     );
 }
 
@@ -3112,25 +2993,12 @@ fn parsimonious_keep_best_breaks_laml_tie_toward_more_smoothing() {
         rho_dim,
     ));
 
-    // The convergence-class rule is unchanged: a converged candidate always
-    // beats a non-converged incumbent regardless of LAML/parsimony.
-    let nonconverged = OuterResult::new(array![5.0, 5.0], 50.0, 1, false, plan);
-    assert!(candidate_improves_best_parsimonious(
-        &parsimonious,
-        Some(&nonconverged),
-        rho_dim,
-    ));
-    assert!(!candidate_improves_best_parsimonious(
-        &nonconverged,
-        Some(&parsimonious),
-        rho_dim,
-    ));
 }
 
 /// #1575: the parsimony-await second-seed waiver fires ONLY for a slot-0 result
-/// that is converged, curvature-pinned (score-relative |g| well inside the tie
-/// band), AND well-penalized (every leading smoothing λ ≥ 1). Every other shape
-/// — the cases the heavy seed actually exists to rescue — must keep slot 1.
+/// that is curvature-pinned (score-relative |g| well inside the tie band) AND
+/// well-penalized (every leading smoothing λ ≥ 1). Only analytically certified
+/// candidates can reach this predicate.
 #[test]
 fn parsimony_second_seed_waived_only_for_sharp_well_penalized_optimum() {
     let plan = OuterPlan {
@@ -3175,14 +3043,6 @@ fn parsimony_second_seed_waived_only_for_sharp_well_penalized_optimum() {
     assert!(
         !parsimony_second_seed_is_redundant(&flat_valley, rho_dim),
         "a converged-but-flat optimum above the tie band keeps the parsimony seed"
-    );
-
-    // Non-converged stall (#1426/#1477): never waive.
-    let mut stalled = redundant.clone();
-    stalled.converged = false;
-    assert!(
-        !parsimony_second_seed_is_redundant(&stalled, rho_dim),
-        "a non-converged slot 0 is precisely the stall the heavy seed rescues (#1426)"
     );
 
     // No measured gradient cannot certify sharpness.
@@ -3354,42 +3214,6 @@ fn parsimony_multistart_breaks_after_sharp_well_penalized_first_seed() {
     assert_eq!(
         under_penalized_seeds, 2,
         "an under-penalized (ρ<0) slot-0 optimum must keep the parsimony second seed (#1373)"
-    );
-}
-
-/// #1082 separable-multinomial guard: on an expensive-solver risk profile
-/// (ARC + GeneralizedLinear, `seed_budget = 2`), a first seed that lands a
-/// FEASIBLE cost-stall flat-valley result (the near-separable λ→0 ridge: finite
-/// cost, gradient never clears tolerance) must STOP the multi-start instead of
-/// paying a second expensive seed that cannot reach a stationary point.
-/// Regression for the penguin-species timeout where the wasted second seed
-/// crawled ~70s/eval.
-#[test]
-fn expensive_multistart_stops_after_feasible_nonstationary_seed() {
-    let plan = OuterPlan {
-        solver: Solver::Arc,
-        hessian_source: HessianSource::Analytic,
-    };
-    let mut result = OuterResult::new(array![0.0], 12.0, 9, false, plan);
-    result.final_grad_norm = Some(5.0);
-    result.operator_stop_reason = Some(OperatorTrustRegionStopReason::CostStallFlatValley);
-
-    assert!(
-        should_stop_expensive_multistart_after_best(Some(&result), Some(2), false),
-        "a finite cost-stall flat-valley result is the separable-fit signature; \
-         trying another expensive seed only repeats the λ→0 crawl (#1082)"
-    );
-
-    let mut plain_nonconverged = result.clone();
-    plain_nonconverged.operator_stop_reason = Some(OperatorTrustRegionStopReason::IterationBudget);
-    assert!(
-        !should_stop_expensive_multistart_after_best(Some(&plain_nonconverged), Some(2), false),
-        "ordinary finite nonconvergence may still be seed-sensitive and must keep the \
-         second expensive seed"
-    );
-    assert!(
-        !should_stop_expensive_multistart_after_best(Some(&result), Some(2), true),
-        "Gaussian quality-compare mode intentionally evaluates remaining seeds"
     );
 }
 

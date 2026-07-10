@@ -1,12 +1,7 @@
-//! Inference instruments and benchmark scoring kernels: the anytime-valid
-//! structure-discovery e-process / e-BH certificate and Lawley/Skovgaard
-//! likelihood instruments (#984/#939), plus the pure scalar metric kernels used
-//! to score predictions against a mature reference.
+//! Inference instruments: the anytime-valid structure-discovery e-process /
+//! e-BH certificate and Lawley/Skovgaard likelihood instruments (#984/#939).
 //!
-//! Re-exported at the crate root under their flat names so the `#[pymodule]`
-//! registration (`inference_instruments::register`) and the benchmark
-//! aggregators in the entrypoint fragments resolve unchanged.
+//! Re-exported at the crate root so the `#[pymodule]` registration
+//! (`inference_instruments::register`) resolves from the entrypoint fragments.
 
 pub(crate) mod inference_instruments;
-
-pub(crate) mod benchmark_scores;

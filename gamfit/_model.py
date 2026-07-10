@@ -1030,10 +1030,9 @@ class Model:
         predictor. Returns ``{term: share}`` for every non-intercept term, or
         the scalar share when ``term`` is given.
         """
-        headers, data_rows, _ = normalize_table(data)
-        rows = [[str(v) for v in row] for row in data_rows]
+        headers, rows, _ = normalize_table(data)
         pairs = rust_module().model_variance_share(
-            self._model_bytes, list(headers), rows, term
+            self._model_bytes, headers, rows, term
         )
         shares = {str(name): float(frac) for name, frac in pairs}
         if term is not None:

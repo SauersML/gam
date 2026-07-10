@@ -63,11 +63,8 @@ pub fn bspline_derivative_penalty_matrix(
     }
 
     validate_sobolev_knot_multiplicity(knot_vector, degree, order, num_basis)?;
-    let (normalized_knots, domain_scale) = normalized_open_knot_vector(
-        knot_vector,
-        degree,
-        num_basis,
-    )?;
+    let (normalized_knots, domain_scale) =
+        normalized_open_knot_vector(knot_vector, degree, num_basis)?;
 
     let mut s = Array2::<f64>::zeros((num_basis, num_basis));
     // The modeling interval is covered by spans `[t_k, t_{k+1}]` for
@@ -82,7 +79,7 @@ pub fn bspline_derivative_penalty_matrix(
         |col| col,
         &mut s,
     )?;
-    s *= derivative_gram_coordinate_scale(domain_scale, order)?;
+    rescale_derivative_gram(&mut s, domain_scale, order)?;
     symmetrize_in_place(&mut s);
     Ok(s)
 }
@@ -154,7 +151,7 @@ pub fn cyclic_bspline_derivative_penalty_matrix(
         |col| col % num_basis,
         &mut s,
     )?;
-    s *= derivative_gram_coordinate_scale(period, order)?;
+    rescale_derivative_gram(&mut s, period, order)?;
     symmetrize_in_place(&mut s);
     Ok(s)
 }
@@ -232,12 +229,34 @@ fn derivative_gram_coordinate_scale(domain_scale: f64, order: usize) -> Result<f
             ))
         })?;
     let scale = domain_scale.powi(1 - twice_order);
-    if !scale.is_finite() {
+    if !scale.is_finite() || scale <= 0.0 {
         return Err(BasisError::InvalidInput(format!(
             "order-{order} roughness scaling over domain width {domain_scale} is not representable"
         )));
     }
     Ok(scale)
+}
+
+/// Applies the exact coordinate covariance to a unit-domain derivative Gram
+/// and rejects scales whose floating-point representation would change the
+/// operator's rank. A finite scale factor alone is not sufficient: multiplying
+/// a large unit-domain entry can still overflow, while a positive subnormal
+/// factor can underflow one or more basis-function energies to zero.
+fn rescale_derivative_gram(
+    gram: &mut Array2<f64>,
+    domain_scale: f64,
+    order: usize,
+) -> Result<(), BasisError> {
+    let coordinate_scale = derivative_gram_coordinate_scale(domain_scale, order)?;
+    gram.mapv_inplace(|value| value * coordinate_scale);
+    let entries_are_finite = gram.iter().all(|value| value.is_finite());
+    let preserves_all_basis_diagonals = (0..gram.nrows()).all(|i| gram[[i, i]] > 0.0);
+    if !entries_are_finite || !preserves_all_basis_diagonals {
+        return Err(BasisError::InvalidInput(format!(
+            "order-{order} roughness Gram over domain width {domain_scale} is not representable"
+        )));
+    }
+    Ok(())
 }
 
 /// Span-by-span exact Gauss–Legendre accumulation of
@@ -323,6 +342,14 @@ mod tests {
     use super::*;
     use ndarray::array;
 
+    fn binomial(n: usize, k: usize) -> f64 {
+        let mut coefficient = 1.0_f64;
+        for i in 0..k {
+            coefficient = coefficient * (n - i) as f64 / (i + 1) as f64;
+        }
+        coefficient
+    }
+
     /// Blossom (polar form) coefficients representing the monomial `x^r`
     /// (`r ≤ degree`) exactly in the B-spline basis:
     /// `β_i = e_r(t_{i+1}, …, t_{i+degree}) / C(degree, r)`, the normalized
@@ -340,7 +367,7 @@ mod tests {
                     e[j] += t * e[j - 1];
                 }
             }
-            beta[i] = e[r] / crate::basis::cyclic::binomial(degree, r);
+            beta[i] = e[r] / binomial(degree, r);
         }
         beta
     }
@@ -364,16 +391,14 @@ mod tests {
             .iter()
             .fold(0.0_f64, |scale, value| scale.max(value.abs()))
             .max(1.0);
-        let psd_tolerance = default_rrqr_rank_alpha()
-            * f64::EPSILON
-            * s.nrows().max(1) as f64
-            * spectral_scale;
+        let psd_tolerance =
+            default_rrqr_rank_alpha() * f64::EPSILON * s.nrows().max(1) as f64 * spectral_scale;
         assert!(
             eigenvalues.iter().all(|&value| value >= -psd_tolerance),
             "penalty must be PSD; eigenvalues={eigenvalues:?}, tolerance={psd_tolerance}"
         );
-        let (_, rank) = rrqr_nullspace_basis(s, default_rrqr_rank_alpha())
-            .expect("penalty RRQR rank");
+        let (_, rank) =
+            rrqr_nullspace_basis(s, default_rrqr_rank_alpha()).expect("penalty RRQR rank");
         assert_eq!(
             rank,
             s.nrows() - expected_nullity,
@@ -442,7 +467,54 @@ mod tests {
             // Quadratic: ∫ (2)² = 4.
             let beta2 = monomial_coefficients(knots.view(), degree, 2);
             let j2 = beta2.dot(&s.dot(&beta2));
-            assert!((j2 - 4.0).abs() < 1e-9, "∫(f'')² for f=x² must be 4, got {j2}");
+            assert!(
+                (j2 - 4.0).abs() < 1e-9,
+                "∫(f'')² for f=x² must be 4, got {j2}"
+            );
+        }
+    }
+
+    /// Closed-form polynomial oracle over a translated, non-unit domain. For
+    /// `f(x)=(x-a)^r`,
+    ///
+    /// `integral (f^(m))^2 = (r!/(r-m)!)^2 (b-a)^(2(r-m)+1)/(2(r-m)+1)`.
+    ///
+    /// Exercising every supported derivative order through degree four checks
+    /// both the recurrence coefficients and the physical-coordinate Jacobian,
+    /// independently of a second quadrature implementation.
+    #[test]
+    fn open_penalty_matches_closed_form_polynomial_energies() {
+        let (a, b) = (-1.7_f64, 2.4_f64);
+        let width = b - a;
+        let interior = [
+            a + 0.11 * width,
+            a + 0.37 * width,
+            a + 0.52 * width,
+            a + 0.86 * width,
+        ];
+        for degree in 1..=4usize {
+            let knots = clamped_knots(&interior, degree, a, b);
+            let shifted_knots = knots.mapv(|knot| knot - a);
+            for order in 1..=degree {
+                let s = bspline_derivative_penalty_matrix(knots.view(), degree, order).unwrap();
+                for polynomial_degree in order..=degree {
+                    let beta =
+                        monomial_coefficients(shifted_knots.view(), degree, polynomial_degree);
+                    let derivative_factor = ((polynomial_degree - order + 1)..=polynomial_degree)
+                        .map(|factor| factor as f64)
+                        .product::<f64>();
+                    let residual_degree = polynomial_degree - order;
+                    let expected = derivative_factor.powi(2)
+                        * width.powi((2 * residual_degree + 1) as i32)
+                        / (2 * residual_degree + 1) as f64;
+                    let observed = beta.dot(&s.dot(&beta));
+                    let relative_error = (observed - expected).abs() / expected.max(1.0);
+                    assert!(
+                        relative_error < 1e-10,
+                        "degree={degree}, order={order}, polynomial degree={polynomial_degree}: expected {expected}, observed {observed}, relative error {relative_error}"
+                    );
+                }
+            }
         }
     }
 
@@ -485,8 +557,7 @@ mod tests {
         let order = 2usize;
         let coarse_knots = clamped_knots(&[0.2, 0.55, 0.8], degree, 0.0, 1.0);
         let coarse_beta = array![0.3, -1.2, 0.7, 2.1, -0.4, 0.9, -0.2];
-        let (fine_knots, fine_beta) =
-            insert_knot_once(&coarse_knots, &coarse_beta, degree, 0.37);
+        let (fine_knots, fine_beta) = insert_knot_once(&coarse_knots, &coarse_beta, degree, 0.37);
 
         let points = Array1::linspace(0.0, 1.0, 101);
         let (coarse_basis, _) = create_basis::<Dense>(
@@ -508,7 +579,10 @@ mod tests {
         let value_error = (&coarse_values - &fine_values)
             .iter()
             .fold(0.0_f64, |error, value| error.max(value.abs()));
-        assert!(value_error < 1e-12, "Boehm insertion changed f by {value_error}");
+        assert!(
+            value_error < 1e-12,
+            "Boehm insertion changed f by {value_error}"
+        );
 
         let coarse_s =
             bspline_derivative_penalty_matrix(coarse_knots.view(), degree, order).unwrap();
@@ -537,28 +611,29 @@ mod tests {
     }
 
     #[test]
-    fn open_penalty_scales_covariantly_on_small_physical_domains() {
+    fn open_penalty_is_affine_coordinate_covariant() {
         let degree = 3usize;
         let order = 2usize;
         let knots = clamped_knots(&[0.15, 0.4, 0.8], degree, 0.0, 1.0);
         let unit = bspline_derivative_penalty_matrix(knots.view(), degree, order).unwrap();
-        let coordinate_scale = 1e-13_f64;
-        let scaled_knots = knots.mapv(|knot| coordinate_scale * knot);
-        let scaled =
-            bspline_derivative_penalty_matrix(scaled_knots.view(), degree, order).unwrap();
-        let expected_scale = coordinate_scale.powi(1 - 2 * order as i32);
-        let max_relative_error = unit
-            .iter()
-            .zip(scaled.iter())
-            .map(|(&base, &observed)| {
-                (observed - expected_scale * base).abs()
-                    / observed.abs().max((expected_scale * base).abs()).max(1.0)
-            })
-            .fold(0.0_f64, f64::max);
-        assert!(
-            max_relative_error < 1e-12,
-            "coordinate covariance failed on a small domain: rel={max_relative_error}"
-        );
+        for (translation, coordinate_scale) in [(-8.25_f64, 3.75_f64), (4.5, 1.0), (0.0, 1e-13)] {
+            let transformed_knots = knots.mapv(|knot| translation + coordinate_scale * knot);
+            let transformed =
+                bspline_derivative_penalty_matrix(transformed_knots.view(), degree, order).unwrap();
+            let expected_scale = coordinate_scale.powi(1 - 2 * order as i32);
+            let max_relative_error = unit
+                .iter()
+                .zip(transformed.iter())
+                .map(|(&base, &observed)| {
+                    (observed - expected_scale * base).abs()
+                        / observed.abs().max((expected_scale * base).abs()).max(1.0)
+                })
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_relative_error < 1e-12,
+                "affine coordinate covariance failed for translation={translation}, scale={coordinate_scale}: rel={max_relative_error}"
+            );
+        }
     }
 
     /// The stated Gauss point count is EXACT: doubling the per-span points
@@ -584,7 +659,13 @@ mod tests {
                 for (node, weight) in nodes.iter().zip(weights.iter()) {
                     let x = 0.5 * (a + b) + 0.5 * (b - a) * node;
                     evaluate_bspline_derivative_recurrence_into(
-                        order, x, knots.view(), degree, &mut row, &mut ws, 0,
+                        order,
+                        x,
+                        knots.view(),
+                        degree,
+                        &mut row,
+                        &mut ws,
+                        0,
                     )
                     .unwrap();
                     let w = weight * 0.5 * (b - a);
@@ -595,9 +676,7 @@ mod tests {
                     }
                 }
             }
-            let max_err = (&s - &s_over)
-                .iter()
-                .fold(0.0_f64, |m, v| m.max(v.abs()));
+            let max_err = (&s - &s_over).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
             let scale = s.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
             assert!(
                 max_err < 1e-11 * scale,
@@ -620,6 +699,85 @@ mod tests {
         assert!(matches!(
             err,
             BasisError::InsufficientDegreeForDerivative { .. }
+        ));
+    }
+
+    /// Degree-one periodic splines are ordinary hat functions. Their exact
+    /// first-derivative Gram is the circular finite-element stiffness stencil:
+    /// diagonal `2/h`, immediate circular neighbours `-1/h`, and zero
+    /// elsewhere. In particular the `(0,n-1)` entry is a closed-form seam
+    /// oracle for the wrapped-support assembly.
+    #[test]
+    fn cyclic_linear_first_derivative_matches_exact_wrapped_stencil() {
+        let (degree, order, n, period) = (1usize, 1usize, 9usize, 2.75_f64);
+        let h = period / n as f64;
+        let s = cyclic_bspline_derivative_penalty_matrix(degree, n, period, order).unwrap();
+        let matrix_scale = 2.0 / h;
+        for i in 0..n {
+            for j in 0..n {
+                let expected = if i == j {
+                    2.0 / h
+                } else if j == (i + 1) % n || i == (j + 1) % n {
+                    -1.0 / h
+                } else {
+                    0.0
+                };
+                let error = (s[[i, j]] - expected).abs();
+                assert!(
+                    error <= 1e-12 * matrix_scale,
+                    "wrapped stiffness mismatch at ({i},{j}): expected {expected}, observed {}, error {error}",
+                    s[[i, j]],
+                );
+            }
+        }
+        assert!(s[[0, n - 1]] < 0.0, "the seam neighbours must overlap");
+    }
+
+    /// Default cubic/order-two closed form. For cardinal cubic splines the
+    /// circular stiffness stencil at lags `0,1,2,3` is
+    /// `(8/3,-3/2,0,1/6)/h^3`; larger circular separations have disjoint
+    /// derivative support and therefore an exactly zero integral.
+    #[test]
+    fn cyclic_cubic_second_derivative_matches_exact_compact_stencil() {
+        let (degree, order, n, period) = (3usize, 2usize, 11usize, 3.1_f64);
+        let h = period / n as f64;
+        let inverse_h_cubed = h.powi(-3);
+        let s = cyclic_bspline_derivative_penalty_matrix(degree, n, period, order).unwrap();
+        let matrix_scale = (8.0 / 3.0) * inverse_h_cubed;
+        for i in 0..n {
+            for j in 0..n {
+                let linear_distance = i.abs_diff(j);
+                let circular_distance = linear_distance.min(n - linear_distance);
+                let expected = match circular_distance {
+                    0 => (8.0 / 3.0) * inverse_h_cubed,
+                    1 => (-3.0 / 2.0) * inverse_h_cubed,
+                    2 => 0.0,
+                    3 => (1.0 / 6.0) * inverse_h_cubed,
+                    _ => 0.0,
+                };
+                let error = (s[[i, j]] - expected).abs();
+                assert!(
+                    error <= 1e-12 * matrix_scale,
+                    "cubic wrapped stiffness mismatch at ({i},{j}), circular lag {circular_distance}: expected {expected}, observed {}, error {error}",
+                    s[[i, j]],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrepresentable_coordinate_scaling_is_rejected() {
+        let underflow = cyclic_bspline_derivative_penalty_matrix(3, 8, 1e200, 2).unwrap_err();
+        assert!(matches!(underflow, BasisError::InvalidInput(_)));
+
+        // `period^-3` is finite here, but multiplying it by the unit-period
+        // cubic stiffness entries overflows. The assembled operator must be a
+        // typed error, never an infinite or silently rank-deficient matrix.
+        let post_multiply_overflow =
+            cyclic_bspline_derivative_penalty_matrix(3, 64, 1e-102, 2).unwrap_err();
+        assert!(matches!(
+            post_multiply_overflow,
+            BasisError::InvalidInput(_)
         ));
     }
 
@@ -661,7 +819,7 @@ mod tests {
         for i in 0..n {
             for k in 0..=degree + 1 {
                 fine[(2 * i + k) % (2 * n)] +=
-                    refinement_scale * crate::basis::cyclic::binomial(degree + 1, k) * coarse[i];
+                    refinement_scale * binomial(degree + 1, k) * coarse[i];
             }
         }
 
@@ -685,10 +843,12 @@ mod tests {
         let value_error = (&coarse_basis.dot(&coarse) - &fine_basis.dot(&fine))
             .iter()
             .fold(0.0_f64, |error, value| error.max(value.abs()));
-        assert!(value_error < 1e-12, "dyadic refinement changed f by {value_error}");
+        assert!(
+            value_error < 1e-12,
+            "dyadic refinement changed f by {value_error}"
+        );
 
-        let coarse_s =
-            cyclic_bspline_derivative_penalty_matrix(degree, n, period, order).unwrap();
+        let coarse_s = cyclic_bspline_derivative_penalty_matrix(degree, n, period, order).unwrap();
         let fine_s =
             cyclic_bspline_derivative_penalty_matrix(degree, 2 * n, period, order).unwrap();
         let coarse_energy = coarse.dot(&coarse_s.dot(&coarse));
@@ -711,14 +871,20 @@ mod tests {
         let period = 2.0_f64;
         let order = 2usize;
         let s = cyclic_bspline_derivative_penalty_matrix(degree, n, period, order).unwrap();
-        let beta =
-            Array1::from_iter((0..n).map(|i| ((i as f64) * 2.4 + 0.7).sin() * (1.0 + i as f64 * 0.1)));
+        let beta = Array1::from_iter(
+            (0..n).map(|i| ((i as f64) * 2.4 + 0.7).sin() * (1.0 + i as f64 * 0.1)),
+        );
 
         let eval = |x: f64| -> f64 {
             let pts = Array1::from(vec![crate::basis::cyclic::wrap_to_period(x, 0.0, period)]);
-            let (b, _) =
-                crate::basis::cyclic::create_cyclic_bspline_basis_dense(pts.view(), 0.0, period, degree, n)
-                    .unwrap();
+            let (b, _) = crate::basis::cyclic::create_cyclic_bspline_basis_dense(
+                pts.view(),
+                0.0,
+                period,
+                degree,
+                n,
+            )
+            .unwrap();
             (0..n).map(|j| b[[0, j]] * beta[j]).sum()
         };
         // Midpoint rule over a fine grid; central second difference of the value.

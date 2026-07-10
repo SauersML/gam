@@ -290,7 +290,8 @@ impl GaussianLocationScaleFamily {
             || x_ls.nrows() != n
         {
             return Err(GamlssError::DimensionMismatch {
-                reason: "GaussianLocationScaleFamily joint gradient input size mismatch".to_string(),
+                reason: "GaussianLocationScaleFamily joint gradient input size mismatch"
+                    .to_string(),
             }
             .into());
         }

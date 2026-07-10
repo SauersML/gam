@@ -31,9 +31,9 @@ pub struct BinomialMeanWiggleFamily {
     /// iterate (`active_set_incomplete`) even when the optimal warp is flat.
     /// Freezing `B(η̂)` makes `q = η + B⊥·β_w` linear in `(β_η, β_w)` with
     /// `∂q/∂η = 1` and no `∂B/∂η` chain term — a well-conditioned two-block GLM
-    /// that certifies. The caller re-freezes at the refit `η̂` across a few outer
-    /// Gauss-Newton iterations (`fit_binomial_mean_wiggle`) until `η̂` stops
-    /// moving.
+    /// that certifies. The caller re-freezes at the refit `η̂` and returns only
+    /// after the caller-supplied outer convergence policy certifies the resulting
+    /// Gauss-Newton fixed point (`fit_binomial_mean_wiggle`).
     ///
     /// **Why observation-space residualized (identifiable).** A monotone
     /// I-spline of the linear predictor `η` can represent mean-block directions,

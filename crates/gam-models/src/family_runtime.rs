@@ -1,8 +1,4 @@
-use crate::survival::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use crate::inference::generative::NoiseModel;
-use gam_solve::mixture_link::{
-    InverseLinkJet, inverse_link_jet_for_family_public, mixture_inverse_link_jet,
-};
 use crate::model_types::{EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::quadrature::{
     IntegratedMomentsJet, QuadratureContext, cloglog_posterior_meanvariance,
@@ -11,9 +7,13 @@ use crate::quadrature::{
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
+use crate::survival::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use gam_problem::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, ResponseFamily,
     StandardLink,
+};
+use gam_solve::mixture_link::{
+    InverseLinkJet, inverse_link_jet_for_family_public, mixture_inverse_link_jet,
 };
 use ndarray::{Array1, ArrayView1};
 
@@ -362,7 +362,8 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             (ResponseFamily::Binomial, InverseLink::Sas(_)) => {
                 let state = self.require_sas_state()?;
                 Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
-                    gam_solve::mixture_link::sas_inverse_link_jet(x, state.epsilon, state.log_delta).mu
+                    gam_solve::mixture_link::sas_inverse_link_jet(x, state.epsilon, state.log_delta)
+                        .mu
                 }))
             }
             (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
@@ -467,8 +468,8 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 #[cfg(test)]
 mod log_link_public_jet_tests {
     use super::*;
-    use gam_solve::mixture_link::inverse_link_jet_for_family;
     use gam_problem::LikelihoodSpec;
+    use gam_solve::mixture_link::inverse_link_jet_for_family;
     use ndarray::Array1;
 
     /// The PUBLIC predict surface for a log-link family (Poisson/Gamma/Tweedie/

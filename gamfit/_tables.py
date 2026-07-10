@@ -36,21 +36,19 @@ class PredictionResult(dict[str, list[Any]]):
 
 
 class PreNormalizedTable:
-    """A table already normalized to ``(headers, rows, kind)`` form.
+    """A table already normalized to ``(headers, native_table, kind)`` form.
 
-    ``normalize_table`` stringifies every cell of the input — an
-    ``O(n_rows * n_cols)`` pass that is invariant to the formula. Callers that
-    fit the *same* table many times (e.g. topology AUTO selection, which refits
-    one table across a budget cascade and several candidate topologies, #869)
-    can normalize once and wrap the result here; ``normalize_table`` then
-    short-circuits and returns the cached ``(headers, rows, kind)`` verbatim
-    instead of re-coercing and re-stringifying. ``kind`` is preserved so the
-    output-table restoration still reflects the original input library.
+    The native table is the Rust-owned, typed encoding produced by
+    :func:`normalize_table`.  Reusing it across topology candidates avoids both
+    reparsing and another dense numeric copy; categorical labels are retained
+    only once in the Rust schema rather than expanded into a Python string per
+    cell. ``kind`` is preserved so output restoration still reflects the input
+    library.
     """
 
     __slots__ = ("headers", "rows", "kind")
 
-    def __init__(self, headers: list[str], rows: list[list[str]], kind: str) -> None:
+    def __init__(self, headers: list[str], rows: Any, kind: str) -> None:
         self.headers = headers
         self.rows = rows
         self.kind = kind
@@ -79,30 +77,154 @@ def _try_import(name: str) -> Any | None:
 CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
-def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
+def normalize_table(data: Any) -> tuple[list[str], Any, str]:
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
-    columns, kind = table_columns(data)
+    columns, kind = _table_column_views(data)
     headers = list(columns)
     if not headers:
         raise ValueError("table must have at least one column")
+    reject_duplicate_column_names(headers, kind)
+    validate_column_lengths(columns)
     row_count = len(columns[headers[0]])
     if row_count == 0:
         raise ValueError("table data cannot be empty")
+
+    # Arrow-capable providers hand ownership of a fresh C stream capsule to
+    # arrow-rs.  Numeric buffers are then decoded directly from Arrow memory and
+    # only genuine string/dictionary-string columns allocate labels.  This is
+    # the preferred path for PyArrow and Polars, and for pandas versions that
+    # expose the Arrow PyCapsule protocol.
+    if kind in {"pandas", "polars", "pyarrow"} and hasattr(
+        data, "__arrow_c_stream__"
+    ):
+        from ._binding import rust_module
+
+        return headers, rust_module().encoded_table_from_arrow(headers, data), kind
+
     categorical = categorical_dtype_columns(data, kind, columns=columns)
-    rows = [
-        [
-            _stringify_marked(
-                columns[header][row_index],
-                header in categorical,
-                column=header,
-                row=row_index,
-            )
-            for header in headers
-        ]
-        for row_index in range(row_count)
+    numeric_positions = [
+        index for index, header in enumerate(headers) if header not in categorical
     ]
-    return headers, rows, kind
+    categorical_positions = [
+        index for index, header in enumerate(headers) if header in categorical
+    ]
+
+    # rust-numpy borrows this one typed block at the boundary.  `column_stack`
+    # may make one homogeneous numeric copy for a mixed-dtype frame, but it
+    # never creates Python scalar objects and the Rust engine's final N×P f64
+    # matrix is the only retained dense representation.
+    import numpy as np
+
+    if numeric_positions:
+        numeric_values = np.column_stack(
+            [
+                np.asarray(columns[headers[index]], dtype=np.float64)
+                for index in numeric_positions
+            ]
+        )
+        numeric_values = np.ascontiguousarray(numeric_values, dtype=np.float64)
+    else:
+        numeric_values = np.empty((row_count, 0), dtype=np.float64)
+
+    # Strings are the one column kind for which Python objects are intrinsic.
+    # Convert those columns only, column-major, and let Rust infer/canonicalize
+    # their levels without ever constructing a row-major Python table.
+    categorical_values = [
+        [
+            stringify_cell(
+                _external_scalar(columns[headers[index]][row]),
+                column=headers[index],
+                row=row,
+            )
+            for row in range(row_count)
+        ]
+        for index in categorical_positions
+    ]
+
+    from ._binding import rust_module
+
+    native = rust_module().encoded_table_from_columns(
+        headers,
+        numeric_values,
+        numeric_positions,
+        categorical_values,
+        categorical_positions,
+    )
+    return headers, native, kind
+
+
+def _external_scalar(value: Any) -> Any:
+    """Unwrap a scalar owned by an external table library.
+
+    Arrow scalar wrappers expose ``as_py``; converting only categorical cells
+    here avoids the former all-column ``to_pylist`` expansion.
+    """
+    as_py = getattr(value, "as_py", None)
+    return as_py() if callable(as_py) else value
+
+
+def _table_column_views(data: Any) -> tuple[dict[str, Any], str]:
+    """Return zero-copy/lazy column views for the primary Rust table boundary."""
+    kind = detect_table_kind(data)
+    if kind == "pandas":
+        names = [str(column) for column in data.columns]
+        reject_duplicate_column_names(names, kind)
+        return {name: data.iloc[:, index] for index, name in enumerate(names)}, kind
+    if kind == "polars":
+        names = [str(column) for column in data.columns]
+        reject_duplicate_column_names(names, kind)
+        return {name: data[name] for name in names}, kind
+    if kind == "pyarrow":
+        names = [str(name) for name in data.column_names]
+        reject_duplicate_column_names(names, kind)
+        return {name: data.column(index) for index, name in enumerate(names)}, kind
+    if kind == "numpy":
+        import numpy as np
+
+        values = np.asarray(data)
+        if values.ndim == 1:
+            return {"x0": values}, kind
+        if values.ndim != 2:
+            raise ValueError("numpy input must be 1D or 2D")
+        return {
+            f"x{index}": values[:, index] for index in range(values.shape[1])
+        }, kind
+    if isinstance(data, Mapping):
+        columns: dict[str, Any] = {}
+        for key, value in data.items():
+            name = str(key)
+            if name in columns:
+                raise ValueError(
+                    f"key collision: original key {key!r} normalizes to {name!r}, "
+                    "which is already used"
+                )
+            columns[name] = _vector_view(value)
+        validate_column_lengths(columns)
+        return columns, "mapping"
+    # Record and row inputs are Python objects already; their existing
+    # columnisation is the minimal representation and still avoids the former
+    # second N×P string matrix.
+    return table_columns(data)
+
+
+def _vector_view(values: Any) -> Any:
+    if isinstance(values, Mapping):
+        raise TypeError("target values must be a vector, not a mapping")
+    if isinstance(values, (str, bytes, bytearray)):
+        raise TypeError("target values must be a 1D array-like sequence")
+    ndim = getattr(values, "ndim", None)
+    if ndim is not None:
+        if int(ndim) != 1:
+            raise ValueError("target arrays must be 1D")
+        return values
+    if isinstance(values, Sequence):
+        return values
+    # pandas/Polars/Arrow vector objects are sized and indexable without being
+    # registered as collections.abc.Sequence.
+    if hasattr(values, "__len__") and hasattr(values, "__getitem__"):
+        return values
+    raise TypeError("target values must be a 1D array-like sequence")
 
 
 def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = None, row: int | None = None) -> str:

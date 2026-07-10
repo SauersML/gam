@@ -31,50 +31,131 @@ pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     };
 }
 
-pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
-    let frailty = crate::config_resolve::resolve_cli_frailty_spec(
-        cli_frailty_kind(args.frailty_kind),
-        args.frailty_sd,
-        cli_hazard_loading(args.hazard_loading),
-        "fit",
-    )?;
-    FitConfig {
-        family: family_arg_canonical_name(args.family).map(str::to_string),
-        expectile_tau: args.expectile_tau,
-        negative_binomial_theta: args.negative_binomial_theta,
-        offset_column: args.offset_column.clone(),
-        weight_column: args.weights_column.clone(),
-        noise_offset_column: args.noise_offset_column.clone(),
-        baseline_target: args.baseline_target.clone(),
+fn read_fit_request_json_file(path: &Path, label: &str) -> Result<String, String> {
+    std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {label} '{}': {error}", path.display()))
+}
+
+fn fit_request_document_from_fit_args(
+    args: &FitArgs,
+) -> Result<crate::config_resolve::FitRequestDocument, String> {
+    let formula = args
+        .formula_positional
+        .as_deref()
+        .ok_or_else(|| "fit requires FORMULA when --request is not provided".to_string())?;
+
+    let ctn_stage1 = args
+        .ctn_stage1
+        .as_ref()
+        .map(|path| {
+            let raw = read_fit_request_json_file(path, "--ctn-stage1 JSON")?;
+            serde_json::from_str::<crate::config_resolve::CtnStage1Document>(&raw)
+                .map_err(|error| format!("invalid --ctn-stage1 JSON: {error}"))
+        })
+        .transpose()?;
+    let precision_hyperpriors = args
+        .precision_hyperpriors
+        .as_ref()
+        .map(|path| {
+            let raw = read_fit_request_json_file(path, "--precision-hyperpriors JSON")?;
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid --precision-hyperpriors JSON: {error}"))
+        })
+        .transpose()?;
+    let latent_coordinates = args
+        .latent_coordinates
+        .as_ref()
+        .map(|path| {
+            let raw = read_fit_request_json_file(path, "--latent-coordinates JSON")?;
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid --latent-coordinates JSON: {error}"))
+        })
+        .transpose()?;
+    let analytic_penalties = args
+        .analytic_penalties
+        .as_ref()
+        .map(|path| {
+            let raw = read_fit_request_json_file(path, "--analytic-penalties JSON")?;
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid --analytic-penalties JSON: {error}"))
+        })
+        .transpose()?;
+    let smooth_descriptors = args
+        .smooth_descriptors
+        .as_ref()
+        .map(|path| {
+            let raw = read_fit_request_json_file(path, "--smooth-descriptors JSON")?;
+            serde_json::from_str(&raw)
+                .map_err(|error| format!("invalid --smooth-descriptors JSON: {error}"))
+        })
+        .transpose()?;
+
+    let frailty_kind = args.frailty_kind.map(|kind| match kind {
+        FrailtyKindArg::GaussianShift => "gaussian-shift".to_string(),
+        FrailtyKindArg::HazardMultiplier => "hazard-multiplier".to_string(),
+    });
+    let hazard_loading = args.hazard_loading.map(|loading| match loading {
+        HazardLoadingArg::Full => "full".to_string(),
+        HazardLoadingArg::LoadedVsUnloaded => "loaded-vs-unloaded".to_string(),
+    });
+    let config = crate::config_resolve::FitRequestConfigDocument {
+        adaptive_regularization: Some(args.adaptive_regularization),
+        baseline_makeham: args.baseline_makeham,
+        baseline_rate: args.baseline_rate,
         baseline_scale: args.baseline_scale,
         baseline_shape: args.baseline_shape,
-        baseline_rate: args.baseline_rate,
-        baseline_makeham: args.baseline_makeham,
-        time_basis: args.time_basis.clone(),
-        time_degree: args.time_degree,
-        time_num_internal_knots: args.time_num_internal_knots,
-        time_smooth_lambda: args.time_smooth_lambda,
-        survival_likelihood: args.survival_likelihood.clone(),
-        threshold_time_k: args.threshold_time_k,
-        threshold_time_degree: args.threshold_time_degree,
-        sigma_time_k: args.sigma_time_k,
-        sigma_time_degree: args.sigma_time_degree,
-        noise_formula: args.predict_noise.clone(),
+        baseline_target: Some(args.baseline_target.clone()),
+        ctn_stage1,
+        expectile_tau: args.expectile_tau,
+        family: family_arg_canonical_name(args.family).map(str::to_string),
+        firth: args.firth.then_some(true),
+        frailty_kind,
+        frailty_sd: args.frailty_sd,
+        hazard_loading,
+        latent_coordinates,
         logslope_formula: args.logslope_formula.clone(),
+        negative_binomial_theta: args.negative_binomial_theta,
+        noise_formula: args.predict_noise.clone(),
+        noise_offset: args.noise_offset_column.clone(),
+        offset: args.offset_column.clone(),
+        analytic_penalties,
+        pilot_subsample_threshold: Some(args.pilot_subsample_threshold),
+        precision_hyperpriors,
+        ridge_lambda: Some(args.ridge_lambda),
+        scale_dimensions: args.scale_dimensions.then_some(true),
+        sigma_time_degree: Some(args.sigma_time_degree),
+        sigma_time_k: args.sigma_time_k,
+        smooth_descriptors,
+        survival_likelihood: Some(args.survival_likelihood.clone()),
+        threshold_time_degree: Some(args.threshold_time_degree),
+        threshold_time_k: args.threshold_time_k,
+        time_basis: Some(args.time_basis.clone()),
+        time_degree: Some(args.time_degree),
+        time_num_internal_knots: Some(args.time_num_internal_knots),
+        time_smooth_lambda: Some(args.time_smooth_lambda),
+        transformation_normal: args.transformation_normal.then_some(true),
+        weights: args.weights_column.clone(),
         z_column: args.z_column.clone(),
-        scale_dimensions: args.scale_dimensions,
-        spatial_optimization: SpatialLengthScaleOptimizationOptions {
-            pilot_subsample_threshold: args.pilot_subsample_threshold,
-            ..SpatialLengthScaleOptimizationOptions::default()
-        },
-        adaptive_regularization: Some(args.adaptive_regularization),
-        ridge_lambda: args.ridge_lambda,
-        transformation_normal: args.transformation_normal,
-        firth: args.firth,
-        frailty,
-        ..FitConfig::default()
+        ..crate::config_resolve::FitRequestConfigDocument::default()
+    };
+    crate::config_resolve::FitRequestDocument::new(formula, config)
+}
+
+pub(crate) fn resolve_fit_invocation(
+    args: &FitArgs,
+) -> Result<crate::config_resolve::ResolvedFitRequest, String> {
+    if let Some(path) = args.request.as_ref() {
+        let raw = read_fit_request_json_file(path, "--request document")?;
+        crate::config_resolve::parse_fit_request_json(&raw)
+    } else {
+        crate::config_resolve::resolve_fit_request_document(
+            fit_request_document_from_fit_args(args)?,
+        )
     }
-    .resolve()
+}
+
+pub(crate) fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
+    resolve_fit_invocation(args).map(|resolved| resolved.fit_config)
 }
 
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
@@ -119,11 +200,72 @@ pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitCo
     .resolve()
 }
 
+fn required_columns_for_resolved_fit(
+    args: &FitArgs,
+    parsed: &ParsedFormula,
+    fit_config: &FitConfig,
+) -> Result<Vec<String>, String> {
+    let mut required = required_columns_for_fit(args, parsed)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    if let Some(noise_formula) = fit_config.noise_formula.as_deref() {
+        let (_, parsed_noise) =
+            parse_matching_auxiliary_formula(noise_formula, &parsed.response, "noise_formula")?;
+        required.extend(required_columns_for_formula(&parsed_noise)?);
+    }
+    if let Some(logslope_formula) = fit_config.logslope_formula.as_deref() {
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            logslope_formula,
+            &parsed.response,
+            "logslope_formula",
+        )?;
+        required.extend(required_columns_for_formula(&parsed_logslope)?);
+    }
+    required.extend(fit_config.z_column.iter().cloned());
+    required.extend(fit_config.weight_column.iter().cloned());
+    required.extend(fit_config.offset_column.iter().cloned());
+    required.extend(fit_config.noise_offset_column.iter().cloned());
+
+    if let Some(stage1) = fit_config.ctn_stage1.as_ref() {
+        let stage1_formula = format!(
+            "{} ~ {}",
+            stage1.response_column, stage1.covariate_formula_rhs
+        );
+        let parsed_stage1 = parse_formula(&stage1_formula)?;
+        required.extend(required_columns_for_formula(&parsed_stage1)?);
+        required.extend(stage1.weight_column.iter().cloned());
+        required.extend(stage1.offset_column.iter().cloned());
+    }
+
+    if let Some(descriptors) = fit_config
+        .smooth_overrides
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+    {
+        for descriptor in descriptors.values().filter_map(serde_json::Value::as_object) {
+            if let Some(vars) = descriptor.get("vars").and_then(serde_json::Value::as_array) {
+                required.extend(
+                    vars.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_string),
+                );
+            }
+            if let Some(by) = descriptor.get("by").and_then(serde_json::Value::as_str) {
+                required.insert(by.to_string());
+            }
+        }
+    }
+
+    Ok(required.into_iter().collect())
+}
+
 pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
-    let formula_text = choose_formula(&args)?;
+    let resolved_invocation = resolve_fit_invocation(&args)?;
+    let formula_text = resolved_invocation.formula;
+    let fit_config = resolved_invocation.fit_config;
     let parsed = parse_formula(&formula_text)?;
-    validate_fit_args_preflight(&args, &parsed)?;
-    let fit_config = fit_config_from_fit_args(&args)?;
+    validate_fit_args_preflight(&args, &parsed, &fit_config)?;
     let formula_link = parsed.linkspec.clone();
     let effective_link_arg = formula_link.as_ref().map(|s| s.link.clone());
     let effective_mixture_rho = formula_link.as_ref().and_then(|s| s.mixture_rho.clone());
@@ -193,10 +335,10 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // response forced to a factor) and persistence envelope, so dispatch it
     // before the scalar-response standard path. The stale note below about "the
     // CLI has no multinomial family" no longer holds for this early return.
-    if matches!(args.family, FamilyArg::Multinomial) {
+    if fit_config.family.as_deref() == Some("multinomial") {
         return run_fit_multinomial(&args, &parsed, &formula_text, &fit_config);
     }
-    let requested_columns = required_columns_for_fit(&args, &parsed)?;
+    let requested_columns = required_columns_for_resolved_fit(&args, &parsed, &fit_config)?;
     // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
     // encoding even when their labels are numeric. An untyped CSV cannot carry
     // the typed-frame categorical sentinel the Python path uses, so without this
@@ -211,7 +353,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     let col_map = ds.column_map();
 
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")?;
-    let y = ds.values.column(y_col).to_owned();
+    let y = ds.values.column(y_col);
     // Reject a constant response upfront with a clear message rather than
     // letting REML fail with the cryptic
     //   "no candidate seeds passed outer startup validation (standard REML)"
@@ -250,6 +392,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
                 "--noise-offset-column is not supported with --transformation-normal".to_string(),
             );
         }
+        let y = y.to_owned();
         return run_fit_transformation_normal(
             &args,
             &ds,
@@ -265,6 +408,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         if fit_config.logslope_formula.is_none() || fit_config.z_column.is_none() {
             return Err("--logslope-formula and --z-column must be provided together".to_string());
         }
+        let y = y.to_owned();
         return run_fit_bernoulli_marginal_slope(
             &args,
             &ds,
@@ -278,7 +422,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
 
     // `--expectile-tau` only has meaning under `--family expectile`; reject the
     // combination upfront rather than silently ignoring the asymmetry.
-    if args.expectile_tau.is_some() && !matches!(args.family, FamilyArg::Expectile) {
+    if fit_config.expectile_tau.is_some() && fit_config.family.as_deref() != Some("expectile") {
         return Err(
             "--expectile-tau requires --family expectile (the asymmetry is only used by the \
              expectile estimator)"
@@ -291,7 +435,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // which knows the expectile family — through the same shared seam the Python
     // FFI and the in-process `fit_from_formula` use, so the CLI reaches the same
     // estimator instead of failing with `unknown family 'expectile'`.
-    if matches!(args.family, FamilyArg::Expectile) {
+    if fit_config.family.as_deref() == Some("expectile") {
         return run_canonical_standard_fit(&args, &ds, &parsed, &formula_text, &fit_config);
     }
 
@@ -301,6 +445,11 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     if fit_config.noise_formula.is_none() {
         return run_canonical_standard_fit(&args, &ds, &parsed, &formula_text, &fit_config);
     }
+
+    // Specialized location-scale fitting owns the response beyond this point.
+    // Canonical standard/expectile fits returned above without making this
+    // redundant copy; their materializer creates the one request backing.
+    let y = y.to_owned();
 
     let link_choice = parse_link_choice(effective_link_arg.as_deref(), false)?;
     let mixture_linkspec = if let Some(choice) = link_choice.as_ref() {
@@ -408,10 +557,10 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     };
 
     let y_kind = response_column_kind(&ds, y_col);
-    let family = resolve_family(
-        args.family,
-        args.negative_binomial_theta,
-        link_choice.clone(),
+    let family = gam::families::fit_orchestration::resolve_family(
+        fit_config.family.as_deref(),
+        fit_config.negative_binomial_theta,
+        link_choice.as_ref(),
         y.view(),
         y_kind,
         &parsed.response,
@@ -424,7 +573,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     if let Err(violation) = family.response.validate_response_support(y.view()) {
         return Err(violation.message_for(&parsed.response));
     }
-    if link_choice.is_none() && matches!(args.family, FamilyArg::Auto) {
+    if link_choice.is_none() && fit_config.family.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
                 "Inferred binomial-logit family for response '{}' because all values are binary {{0,1}}. Override with link(type=...).",
@@ -541,7 +690,7 @@ fn run_canonical_standard_fit(
                 .likelihood_family
                 .clone()
                 .unwrap_or_else(LikelihoodSpec::gaussian_identity);
-            let model_label = if matches!(args.family, FamilyArg::Expectile) {
+            let model_label = if fit_config.family.as_deref() == Some("expectile") {
                 "expectile"
             } else {
                 "standard"
@@ -553,7 +702,7 @@ fn run_canonical_standard_fit(
                 "{} fit | family={} | status={} | iterations={} | terms={} | edf={:.3} | loglik={:.6e} | objective={:.6e}",
                 model_label,
                 family.name(),
-                result.fit.pirls_status.label(),
+                result.fit.convergence_evidence().inner_status().label(),
                 result.fit.outer_iterations,
                 result.resolvedspec.smooth_terms.len() + result.resolvedspec.linear_terms.len(),
                 result.fit.edf_total().unwrap_or(f64::NAN),
@@ -858,7 +1007,7 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_BERNOULLI_MARGINAL_SLOPE,
         solved.fit.outer_iterations,
-        solved.fit.pirls_status.label()
+        solved.fit.convergence_evidence().inner_status().label()
     );
     print_spatial_aniso_scales(&solved.marginalspec_resolved);
     print_spatial_aniso_scales(&solved.logslopespec_resolved);
@@ -1003,7 +1152,7 @@ pub(crate) fn run_fit_transformation_normal(
         "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_TRANSFORMATION_NORMAL,
         solved.fit.outer_iterations,
-        solved.fit.pirls_status.label()
+        solved.fit.convergence_evidence().inner_status().label()
     );
     print_spatial_aniso_scales(&solved.covariate_spec_resolved);
 
@@ -1160,7 +1309,7 @@ pub(crate) fn run_fitwith_predict_noise(
             "model fit complete | family={} | outer_iter={} | status={}",
             FAMILY_GAUSSIAN_LOCATION_SCALE,
             fit.outer_iterations,
-            fit.pirls_status.label()
+            fit.convergence_evidence().inner_status().label()
         );
         print_spatial_aniso_scales(&meanspec_resolved);
         print_spatial_aniso_scales(&noisespec_resolved);
@@ -1294,7 +1443,7 @@ pub(crate) fn run_fitwith_predict_noise(
             "model fit complete | family={} | outer_iter={} | status={}",
             kind.family_tag(),
             fit.outer_iterations,
-            fit.pirls_status.label()
+            fit.convergence_evidence().inner_status().label()
         );
         print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
         print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
@@ -1462,7 +1611,7 @@ pub(crate) fn run_fitwith_predict_noise(
         "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_BINOMIAL_LOCATION_SCALE,
         fit.outer_iterations,
-        fit.pirls_status.label()
+        fit.convergence_evidence().inner_status().label()
     );
     print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
     print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
@@ -1553,6 +1702,7 @@ pub(crate) fn block_role_label(role: &gam::estimate::BlockRole) -> &'static str 
 pub(crate) fn validate_fit_args_preflight(
     args: &FitArgs,
     parsed: &ParsedFormula,
+    fit_config: &FitConfig,
 ) -> Result<(), String> {
     if let (Some(logslope_formula), Some(z_column)) =
         (args.logslope_formula.as_deref(), args.z_column.as_deref())
@@ -1574,6 +1724,39 @@ pub(crate) fn validate_fit_args_preflight(
         return Err(
             "fit requires --out; refusing to run a training job that writes no model".to_string(),
         );
+    }
+    if args.request.is_some() {
+        let is_survival = parse_surv_response(&parsed.response)?.is_some();
+        if is_survival {
+            let likelihood = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
+            gam::families::fit_orchestration::validate_survival_baseline_config(
+                likelihood,
+                &fit_config.baseline_target,
+                fit_config.baseline_scale,
+                fit_config.baseline_shape,
+                fit_config.baseline_rate,
+                fit_config.baseline_makeham,
+            )?;
+            validate_time_margin_args(
+                "request.config.threshold_time_k",
+                fit_config.threshold_time_k,
+                fit_config.threshold_time_degree,
+            )?;
+            validate_time_margin_args(
+                "request.config.sigma_time_k",
+                fit_config.sigma_time_k,
+                fit_config.sigma_time_degree,
+            )?;
+            if fit_config.time_basis.trim().eq_ignore_ascii_case("ispline") {
+                parse_survival_time_basis_config(
+                    &fit_config.time_basis,
+                    fit_config.time_degree,
+                    fit_config.time_num_internal_knots,
+                    fit_config.time_smooth_lambda,
+                )?;
+            }
+        }
+        return Ok(());
     }
     if args.family == FamilyArg::TransformationNormal && !args.transformation_normal {
         return Err(
@@ -1652,7 +1835,6 @@ pub(crate) fn validate_fit_args_preflight(
     if args.negative_binomial_theta.is_some() && args.family != FamilyArg::NegativeBinomial {
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
     }
-    let fit_config = fit_config_from_fit_args(args)?;
     let is_survival = parse_surv_response(&parsed.response)?.is_some();
     let survival_likelihood = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
     let survival_likelihood_raw = fit_config.survival_likelihood.trim().to_ascii_lowercase();
@@ -1763,16 +1945,6 @@ pub(crate) fn validate_positive_optional_usize(
         return Err(format!("{flag} must be > 0"));
     }
     Ok::<(), _>(())
-}
-
-pub(crate) fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
-    let v = args.formula_positional.trim();
-    if v.is_empty() {
-        return Err(CliError::ArgumentInvalid {
-            reason: "FORMULA cannot be empty".to_string(),
-        });
-    }
-    Ok(v.to_string())
 }
 
 pub(crate) fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {

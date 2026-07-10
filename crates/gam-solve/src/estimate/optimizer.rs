@@ -1,6 +1,28 @@
 use super::*;
+use crate::estimate::evaluation::{
+    materialize_link_outer_hessian, sas_effective_epsilon, sas_effective_epsilon_second,
+    sas_log_delta_edge_barriercostgrad, sas_log_delta_edge_barriercostgradhess,
+    sas_log_deltaridgeweight,
+};
+use crate::estimate::penalty::{
+    REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP, REML_SEED_SCREENING_RHO_CAP,
+    scaled_covariance,
+};
+use crate::estimate::prefit::{
+    reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
+};
+use crate::estimate::reml::eval::{
+    AUTO_CUBATURE_HESSIAN_RIDGE_ABS, AUTO_CUBATURE_HESSIAN_RIDGE_REL,
+};
+use crate::estimate::smoothing_correction::{
+    AUTO_CUBATURE_MAX_EIGENVECTORS, MAX_FACTORIZATION_ATTEMPTS,
+};
+use gam_linalg::matrix::FactorizedSystem;
+use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
+use gam_problem::{SeedConfig, SeedRiskProfile};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 /// Max-abs entry of `H·H⁻¹ − I` — a scale-free trustworthiness probe for a
 /// computed inverse. It is `≈ κ(H)·ε` for a faithful inverse but blows up to
@@ -45,7 +67,11 @@ fn spectral_symmetric_inverse(h: &Array2<f64>) -> Option<Array2<f64>> {
     let floor = max_ev * 1e-14;
     let mut scaled = evecs.clone();
     for j in 0..p {
-        let inv_ev = if evals[j] > floor { 1.0 / evals[j] } else { 0.0 };
+        let inv_ev = if evals[j] > floor {
+            1.0 / evals[j]
+        } else {
+            0.0
+        };
         for i in 0..p {
             scaled[[i, j]] *= inv_ev;
         }
@@ -100,12 +126,16 @@ fn negbin_theta_stationarity_residual(theta: f64, score: f64, info: f64) -> f64 
     if (at_lower && score <= 0.0) || (at_upper && score >= 0.0) {
         return 0.0;
     }
-    if info <= 0.0 {
+    let log_theta_gradient = -theta * score;
+    let log_theta_curvature = theta * theta * info - theta * score;
+    if !log_theta_curvature.is_finite() || log_theta_curvature <= 0.0 {
         return f64::INFINITY;
     }
-    let log_theta_gradient = (theta * score).abs();
-    let log_theta_curvature = (theta * theta * info - theta * score).abs();
-    log_theta_gradient / log_theta_curvature.max(1.0)
+    // Both numerator and curvature scale linearly with case weights, so their
+    // ratio is invariant to objective rescaling. An absolute denominator floor
+    // would instead certify flat theta coordinates whenever raw weights happen
+    // to be small.
+    (log_theta_gradient / log_theta_curvature).abs()
 }
 
 #[derive(Clone)]
@@ -119,118 +149,218 @@ struct NegbinJointCheckpoint {
     theta_bound: f64,
 }
 
-/// Grid-free continuous 1-D descent used by the post-convergence KKT escapes.
-/// Minimizes `eval(t)` over the displacement `t ∈ (0, t_max]` along a
-/// fixed direction from the incumbent point: a geometric bracketing expansion
-/// (step doubling from one log-λ unit, the natural resolution of the ρ
-/// parameterization) locates a descending basin at any distance without fixed
-/// probe nodes, then golden-section refinement of the bracket around the best
-/// expansion probe converges to the continuous interior minimizer — so e.g.
-/// mirror-image data orientations land on the identical optimum (#1548).
-/// Returns the refined `(t, cost)` only when some probe strictly improves on
-/// the incumbent cost `f0` by the shared relative tolerance; otherwise `None`
-/// and the search was an exact no-op.
-fn continuous_directional_descent(
-    eval: &mut dyn FnMut(f64) -> Option<f64>,
-    t_max: f64,
-    f0: f64,
-) -> Option<(f64, f64)> {
-    const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
-    if !(t_max > 0.0) || !f0.is_finite() {
-        return None;
-    }
-    // Geometric expansion: 1, 2, 4, … log-λ units, always ending exactly on
-    // `t_max` so the full feasible segment is covered scale-freely.
-    let mut probes: Vec<f64> = Vec::new();
-    let mut t = 1.0_f64.min(t_max);
-    loop {
-        probes.push(t);
-        if t >= t_max {
-            break;
-        }
-        t = (t * 2.0).min(t_max);
-    }
-    let mut best: Option<(usize, f64, f64)> = None; // (probe index, t, cost)
-    for (idx, &ti) in probes.iter().enumerate() {
-        if let Some(c) = eval(ti)
-            && c.is_finite()
-            && c < f0 - 1e-6 * (1.0 + f0.abs())
-            && best.is_none_or(|(_, _, bc)| c < bc)
-        {
-            best = Some((idx, ti, c));
-        }
-    }
-    let (best_idx, mut t_best, mut f_best) = best?;
-    // Golden-section the bracket formed by the expansion neighbours of the
-    // best probe (clamped to the feasible segment): the continuous minimum of
-    // the basin containing the best probe lies inside it, and the bracket
-    // never re-enters territory the expansion already rejected.
-    let mut a = if best_idx == 0 {
-        0.0
-    } else {
-        probes[best_idx - 1]
-    };
-    let mut b = probes.get(best_idx + 1).copied().unwrap_or(t_max);
-    let mut c = b - GS_R * (b - a);
-    let mut d = a + GS_R * (b - a);
-    let mut fc = eval(c);
-    let mut fd = eval(d);
-    for _ in 0..40 {
-        if !(b - a > 1e-4) {
-            break;
-        }
-        match (fc, fd) {
-            (Some(vc), Some(vd)) if vc <= vd => {
-                b = d;
-                d = c;
-                fd = fc;
-                c = b - GS_R * (b - a);
-                fc = eval(c);
-            }
-            (Some(_), Some(_)) => {
-                a = c;
-                c = d;
-                fc = fd;
-                d = a + GS_R * (b - a);
-                fd = eval(d);
-            }
-            // An eval failed inside the bracket: keep the best expansion probe.
-            _ => break,
-        }
-    }
-    let xm = 0.5 * (a + b);
-    if let Some(fm) = eval(xm)
-        && fm.is_finite()
-        && fm < f_best
-    {
-        t_best = xm;
-        f_best = fm;
-    }
-    Some((t_best, f_best))
-}
+/// Reserve the complete peak live set of the optional dense inference path.
+///
+/// The count is assembled from named algorithmic owners rather than a
+/// dimension cliff: ten square matrices can survive into/alongside the fit
+/// payload, six are base factorization/GEMM workspaces, and eight belong to the
+/// first-order smoothing correction. Cubature can retain one inverse Hessian
+/// for each positive/negative sigma point while every concurrently evaluated
+/// point holds its Hessian and inverse workspace. Charging the whole set
+/// atomically prevents several individually acceptable p×p allocations from
+/// jointly exceeding the process-wide memory ledger.
+fn reserve_dense_covariance_bundle(
+    n_design_rows: usize,
+    p: usize,
+) -> Option<gam_runtime::resource::MemoryReservation> {
+    const STORED_SQUARE_MATRICES: usize = 10;
+    const BASE_FACTORIZATION_AND_GEMM_WORKSPACES: usize = 6;
+    const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
+    const CUBATURE_SIGMA_POINTS: usize = 2 * AUTO_CUBATURE_MAX_EIGENVECTORS;
+    const RETAINED_CUBATURE_INVERSES: usize = CUBATURE_SIGMA_POINTS;
+    const IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE: usize = 2 * CUBATURE_SIGMA_POINTS;
+    const PEAK_SQUARE_MATRIX_EQUIVALENTS: usize = STORED_SQUARE_MATRICES
+        + BASE_FACTORIZATION_AND_GEMM_WORKSPACES
+        + FIRST_ORDER_SMOOTHING_WORKSPACES
+        + RETAINED_CUBATURE_INVERSES
+        + IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE;
 
-/// Whether the simultaneous dense covariance bundle fits the runtime resource
-/// policy's single-materialization budget. The bundle holds ~7 dense p×p f64
-/// matrices live at once (posterior `H⁻¹`, the frequentist `Ve = H⁻¹X'WXH⁻¹φ`,
-/// the influence matrix `F = H⁻¹X'WX`, the smoothing-parameter correction and
-/// their workspaces), so the gate prices `7·p²·8` bytes against the policy —
-/// a byte budget, not a fixed p cliff. Beyond the budget the fit takes the
-/// factorized solve-on-demand SE path and the chunked trace reconciliation.
-fn dense_covariance_bundle_allowed(n_design_rows: usize, p: usize) -> bool {
-    const SIMULTANEOUS_DENSE_COVARIANCE_MATRICES: usize = 7;
     let policy = gam_runtime::resource::ResourcePolicy::for_problem(
         n_design_rows,
         p,
         gam_runtime::resource::ProblemHints::default(),
     );
-    let Some(bundle_bytes) = p
-        .checked_mul(p)
-        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
-        .and_then(|bytes| bytes.checked_mul(SIMULTANEOUS_DENSE_COVARIANCE_MATRICES))
-    else {
-        return false;
+    if !policy.material_policy().allow_operator_materialization {
+        return None;
+    }
+    match gam_runtime::resource::MemoryGovernor::global().try_reserve_dense_f64_copies(
+        p,
+        p,
+        PEAK_SQUARE_MATRIX_EQUIVALENTS,
+        "standard GAM dense covariance/influence bundle",
+    ) {
+        Ok(reservation) => Some(reservation),
+        Err(error) => {
+            log::info!(
+                "Dense covariance/influence bundle not reserved; using factorized inference: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Reserve the square matrices that remain live even when inference stays
+/// factorized: the two PIRLS Hessian surfaces, the fitted reparameterization,
+/// its exported copy, the reusable factor, the exported original-basis
+/// precision, and the transformed penalty surface retained by the fit.
+fn reserve_factorized_inference_state(
+    n_design_rows: usize,
+    p: usize,
+) -> Option<gam_runtime::resource::MemoryReservation> {
+    const RETAINED_FACTOR_AND_PRECISION_MATRICES: usize = 7;
+    let policy = gam_runtime::resource::ResourcePolicy::for_problem(
+        n_design_rows,
+        p,
+        gam_runtime::resource::ProblemHints::default(),
+    );
+    if !policy.material_policy().allow_operator_materialization {
+        return None;
+    }
+    match gam_runtime::resource::MemoryGovernor::global().try_reserve_dense_f64_copies(
+        p,
+        p,
+        RETAINED_FACTOR_AND_PRECISION_MATRICES,
+        "standard GAM factorized inference state",
+    ) {
+        Ok(reservation) => Some(reservation),
+        Err(error) => {
+            log::info!("Factorized inference state could not be fully reserved: {error}");
+            None
+        }
+    }
+}
+
+struct DiagonalSmoothingCorrection {
+    diagonal: Option<Array1<f64>>,
+    rho_covariance: Option<Array2<f64>>,
+}
+
+/// Diagonal of the low-rank smoothing correction `J V_rho J'` without ever
+/// materializing its p×p product. `mode_response` stores `H⁻¹ ∂g/∂rho`;
+/// the IFT Jacobian is its negative, which cancels in the covariance
+/// congruence.
+fn low_rank_covariance_diagonal(
+    mode_response: ndarray::ArrayView2<'_, f64>,
+    rho_covariance: &Array2<f64>,
+) -> Option<Array1<f64>> {
+    let (p, k) = mode_response.dim();
+    if rho_covariance.dim() != (k, k) {
+        return None;
+    }
+    let mut diagonal = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        let row = mode_response.row(i);
+        let mut value = KahanSum::default();
+        for a in 0..k {
+            for b in 0..k {
+                value.add(row[a] * rho_covariance[[a, b]] * row[b]);
+            }
+        }
+        let value = value.sum();
+        if !value.is_finite() {
+            return None;
+        }
+        // `rho_covariance` is the positive-eigenvalue pseudo-inverse, so this
+        // quadratic form is non-negative in exact arithmetic. Remove only a
+        // roundoff sign; no curvature direction has been discarded here.
+        diagonal[i] = value.max(0.0);
+    }
+    Some(diagonal)
+}
+
+/// First-order smoothing-parameter correction for the factorized inference
+/// path. The outer Hessian is only k×k and the cached IFT mode responses are
+/// p×k, so peak storage is linear in p for fixed smoothing dimension.
+fn compute_diagonal_smoothing_correction(
+    reml_state: &crate::estimate::reml::RemlState<'_>,
+    final_rho: &Array1<f64>,
+) -> DiagonalSmoothingCorrection {
+    if final_rho.is_empty() {
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: None,
+        };
+    }
+    let mut rho_hessian = match reml_state.compute_lamlhessian_consistent(final_rho) {
+        Ok(hessian) => hessian,
+        Err(error) => {
+            log::warn!("Outer Hessian unavailable for diagonal smoothing correction: {error}");
+            return DiagonalSmoothingCorrection {
+                diagonal: None,
+                rho_covariance: None,
+            };
+        }
     };
-    bundle_bytes <= policy.material_policy().max_single_dense_bytes
+    gam_linalg::matrix::symmetrize_in_place(&mut rho_hessian);
+    // Match the established first-order smoothing-correction V_rho exactly:
+    // one relative ridge with the shared absolute floor, then the same
+    // identified-subspace inverse. This keeps dense and diagonal inference on
+    // one rho-covariance definition.
+    gam_linalg::utils::add_relative_diag_ridge(
+        &mut rho_hessian,
+        AUTO_CUBATURE_HESSIAN_RIDGE_REL,
+        AUTO_CUBATURE_HESSIAN_RIDGE_ABS,
+    );
+    let Some(inverted) =
+        crate::estimate::smoothing_correction::invert_regularized_rho_hessian(&rho_hessian)
+    else {
+        log::warn!("Outer Hessian inversion failed for diagonal smoothing correction");
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: None,
+        };
+    };
+    let rho_covariance = inverted.inverse;
+    if inverted.active_rank == 0 {
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: Some(rho_covariance),
+        };
+    }
+
+    // `cached_ift_rho_mode_response_cols` clones the cache payload. Reserve
+    // both the resident cache matrix and that temporary clone as one atomic
+    // linear-memory live set before asking for it.
+    let p = reml_state.p;
+    let k = final_rho.len();
+    let Ok(_mode_response_reservation) = gam_runtime::resource::MemoryGovernor::global()
+        .try_reserve_dense_f64_copies(p, k, 2, "diagonal smoothing-correction IFT mode responses")
+    else {
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: Some(rho_covariance),
+        };
+    };
+    let cache_guard = reml_state.ift_warm_start_cache.read().unwrap();
+    let Some(cache) = cache_guard.as_ref() else {
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: Some(rho_covariance),
+        };
+    };
+    if cache.rho.len() != final_rho.len()
+        || cache
+            .rho
+            .iter()
+            .zip(final_rho.iter())
+            .any(|(&cached, &final_value)| cached.to_bits() != final_value.to_bits())
+    {
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: Some(rho_covariance),
+        };
+    }
+    let Some(mode_response) = reml_state.cached_ift_rho_mode_response_cols(cache) else {
+        return DiagonalSmoothingCorrection {
+            diagonal: None,
+            rho_covariance: Some(rho_covariance),
+        };
+    };
+    let diagonal = low_rank_covariance_diagonal(mode_response.view(), &rho_covariance);
+    DiagonalSmoothingCorrection {
+        diagonal,
+        rho_covariance: Some(rho_covariance),
+    }
 }
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
@@ -430,21 +560,25 @@ fn run_outer_inner_cap_guard(
     arm: RemlInnerCapGuardArm,
 ) -> Result<(), EstimationError> {
     let prev_cap = state.outer_inner_cap.swap(0, Ordering::Relaxed);
-    if prev_cap != 0 {
-        let guard_start = std::time::Instant::now();
-        state.compute_cost(rho)?;
-        match arm {
-            RemlInnerCapGuardArm::Standard => log::info!(
-                "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
-                guard_start.elapsed().as_secs_f64()
-            ),
-            RemlInnerCapGuardArm::MixtureSas => log::info!(
-                "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap}, elapsed={:.3}s)",
-                guard_start.elapsed().as_secs_f64()
-            ),
-        }
-    } else if matches!(arm, RemlInnerCapGuardArm::Standard) {
-        log::debug!("[OUTER guard] schedule never lifted (prev_cap=0); skipping refit");
+    let guard_start = std::time::Instant::now();
+    // The eval-bundle and cross-call PIRLS caches are keyed by rho, not by the
+    // inner iteration cap. Even `prev_cap == 0` does not prove that a cached
+    // visit to the selected rho was full fidelity: the adaptive schedule can
+    // lift its cap after that entry was written. Always invalidate before the
+    // guard evaluation so the shipped point is necessarily a fresh
+    // full-tolerance inner solve and the later projected-KKT audit cannot reuse
+    // coarse beta/gradient state.
+    state.reset_outer_seed_state();
+    state.compute_cost(rho)?;
+    match arm {
+        RemlInnerCapGuardArm::Standard => log::info!(
+            "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
+            guard_start.elapsed().as_secs_f64()
+        ),
+        RemlInnerCapGuardArm::MixtureSas => log::info!(
+            "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap}, elapsed={:.3}s)",
+            guard_start.elapsed().as_secs_f64()
+        ),
     }
     Ok(())
 }
@@ -1081,19 +1215,20 @@ where
                 // The generated-seed screen (`generate_rho_candidates` +
                 // `rank_seeds_with_screening`) remains the multi-basin backstop.
                 let initial_sp = reml_state.analytic_initial_sp_rho(&base, (lo, hi));
-                let closed_form = reml_state
-                    .analytic_gaussian_closed_form_rho((lo, hi))
-                    .map(|rho_blocks| {
-                        // Map the per-block ρ onto the leading penalty
-                        // coordinates; any trailing ext/ψ coordinates in `base`
-                        // are not smoothing parameters and pass through unchanged
-                        // (the same 1:1 layout `analytic_initial_sp_rho` uses).
-                        let mut seed = base.clone();
-                        for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
-                            *coord = r.clamp(lo, hi);
-                        }
-                        seed
-                    });
+                let closed_form =
+                    reml_state
+                        .analytic_gaussian_closed_form_rho((lo, hi))
+                        .map(|rho_blocks| {
+                            // Map the per-block ρ onto the leading penalty
+                            // coordinates; any trailing ext/ψ coordinates in `base`
+                            // are not smoothing parameters and pass through unchanged
+                            // (the same 1:1 layout `analytic_initial_sp_rho` uses).
+                            let mut seed = base.clone();
+                            for (coord, &r) in seed.iter_mut().zip(rho_blocks.iter()) {
+                                *coord = r.clamp(lo, hi);
+                            }
+                            seed
+                        });
                 //   3. The GLOBAL single-λ (diagonal) closed-form optimum on the
                 //      SUMMED penalty `Σ_j S_j`, broadcast to a uniform per-block
                 //      ρ. The per-block cyclic solver (candidate 2) descends one
@@ -1121,7 +1256,10 @@ where
                 // Keep the strictly-cheapest of {anchor, initial.sp, closed-form}.
                 let mut refined = base.clone();
                 let mut best_cost = base_cost;
-                for candidate in [initial_sp, closed_form, summed_diagonal].into_iter().flatten() {
+                for candidate in [initial_sp, closed_form, summed_diagonal]
+                    .into_iter()
+                    .flatten()
+                {
                     let candidate_cost = reml_state
                         .compute_cost(&candidate)
                         .ok()
@@ -1659,25 +1797,22 @@ where
             // through one cache generation. Both partial stationarity checks below
             // therefore refer to the identical (rho, theta, beta) point.
             reml_state.reset_outer_seed_state();
-            let (joint_cost, rho_gradient) =
-                reml_state.compute_cost_and_gradient(&final_rho)?;
+            let (joint_cost, rho_gradient) = reml_state.compute_cost_and_gradient(&final_rho)?;
             let joint_bundle = reml_state.obtain_eval_bundle(&final_rho)?;
             pirls_res = joint_bundle.pirls_result.as_ref().clone();
             pirls_res.likelihood = cfg.likelihood.clone().with_negbin_theta(theta);
 
             let final_eta = pirls_res.final_eta.to_owned();
-            let (theta_score, theta_info) = pirls::negbin_theta_score_and_info(
-                y_o.view(),
-                &final_eta,
-                w_o.view(),
-                theta,
-            );
-            let theta_residual =
-                negbin_theta_stationarity_residual(theta, theta_score, theta_info);
-            let theta_bound = cfg.pirls_convergence_tolerance.max(f64::EPSILON);
+            let (theta_score, theta_info) =
+                pirls::negbin_theta_score_and_info(y_o.view(), &final_eta, w_o.view(), theta);
+            let theta_residual = negbin_theta_stationarity_residual(theta, theta_score, theta_info);
+            // This residual is a Newton displacement in the outer log-theta
+            // coordinate, so it shares the outer REML tolerance. The beta
+            // PIRLS tolerance certifies a different coordinate system and must
+            // not silently set the theta fixed-point threshold.
+            let theta_bound = reml_tol;
 
-            let rho_lower =
-                Array1::from_elem(final_rho.len(), -crate::estimate::RHO_BOUND);
+            let rho_lower = Array1::from_elem(final_rho.len(), -crate::estimate::RHO_BOUND);
             let rho_upper = Array1::from_elem(final_rho.len(), crate::estimate::RHO_BOUND);
             let rho_residual = crate::rho_optimizer::projected_gradient_norm(
                 &final_rho,
@@ -1690,19 +1825,19 @@ where
                 .map(|certificate| certificate.stationarity_bound)
                 .unwrap_or(reml_tol)
                 .max(f64::EPSILON);
-            let rho_certificate_ok = outer_result.converged
-                && outer_result
-                    .criterion_certificate
-                    .as_ref()
-                    .is_some_and(|certificate| certificate.certifies())
-                && rho_residual.is_finite()
-                && rho_residual <= rho_bound;
-            let pirls_certificate_ok = matches!(
-                pirls_res.status,
-                pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
-            );
-            let theta_certificate_ok =
-                theta_residual.is_finite() && theta_residual <= theta_bound;
+            let rho_certificate_ok = final_rho.is_empty()
+                || (outer_result.converged
+                    && outer_result
+                        .criterion_certificate
+                        .as_ref()
+                        .is_some_and(|certificate| certificate.certifies())
+                    && rho_residual.is_finite()
+                    && rho_residual <= rho_bound);
+            // `StalledAtValidMinimum` is deliberately only a wider near-KKT
+            // rescue band. It is useful diagnostic state, but cannot certify
+            // the inner mode of a joint (theta, rho) optimum.
+            let pirls_certificate_ok = pirls_res.status == pirls::PirlsStatus::Converged;
+            let theta_certificate_ok = theta_residual.is_finite() && theta_residual <= theta_bound;
 
             let merit = (rho_residual / rho_bound)
                 .max(theta_residual / theta_bound)
@@ -1722,7 +1857,7 @@ where
             };
             if negbin_best_checkpoint
                 .as_ref()
-                .is_none_or(|best| checkpoint.merit < best.merit)
+                .is_none_or(|best| checkpoint.merit <= best.merit)
             {
                 negbin_best_checkpoint = Some(checkpoint);
             }
@@ -1747,27 +1882,22 @@ where
                 let best = negbin_best_checkpoint
                     .as_ref()
                     .expect("the current joint checkpoint was just recorded");
-                return Err(
-                    EstimationError::NegativeBinomialAlternationDidNotConverge {
-                        rounds: negbin_alternation_round + 1,
-                        theta_checkpoint: best.theta,
-                        rho_projected_grad_norm: best.rho_residual,
-                        rho_stationarity_bound: best.rho_bound,
-                        theta_score_residual: best.theta_residual,
-                        theta_stationarity_bound: best.theta_bound,
-                        rho_checkpoint: best.rho.to_vec(),
-                    },
-                );
+                return Err(EstimationError::NegativeBinomialAlternationDidNotConverge {
+                    rounds: negbin_alternation_round + 1,
+                    theta_checkpoint: best.theta,
+                    rho_projected_grad_norm: best.rho_residual,
+                    rho_stationarity_bound: best.rho_bound,
+                    theta_score_residual: best.theta_residual,
+                    theta_stationarity_bound: best.theta_bound,
+                    rho_checkpoint: best.rho.to_vec(),
+                });
             }
 
             // Exact block update: maximize the conditional NB likelihood in
             // theta at the current converged eta, then re-optimize rho with theta
             // fixed. No secant/grid extrapolation and no unreported answer cap.
-            let theta_next = pirls::estimate_negbin_theta_from_eta(
-                y_o.view(),
-                &final_eta,
-                w_o.view(),
-            );
+            let theta_next =
+                pirls::estimate_negbin_theta_from_eta(y_o.view(), &final_eta, w_o.view());
             log::info!(
                 "[OUTER] negative-binomial joint round {} not yet certified: \
                  rho residual {:.3e}/{:.3e}, theta residual {:.3e}/{:.3e}; \
@@ -1934,6 +2064,25 @@ where
     let mut bias_correction_beta = None;
     let mut rho_posterior_certificate = None;
     let mut rho_posterior_escalation = None;
+    // Hold the governor charge across every dense inference allocation in this
+    // fit. A refusal selects the factorized/diagonal path before any optional
+    // covariance, influence, or smoothing-correction matrix is built.
+    let mut dense_covariance_reservation = opts
+        .compute_inference
+        .then(|| {
+            reserve_dense_covariance_bundle(n_design_rows, pirls_res.reparam_result.qs.nrows())
+        })
+        .flatten();
+    let mut _factorized_inference_reservation = if opts.compute_inference
+        && dense_covariance_reservation.is_none()
+    {
+        reserve_factorized_inference_state(
+            n_design_rows,
+            pirls_res.reparam_result.qs.nrows(),
+        )
+    } else {
+        None
+    };
 
     if opts.compute_inference {
         // EDF by block using stabilized H and penalty roots in transformed basis.
@@ -2087,7 +2236,7 @@ where
         // together and the trace-channel value stands.
         {
             let p_orig = pirls_res.reparam_result.qs.nrows();
-            if dense_covariance_bundle_allowed(n_design_rows, p_orig) {
+            if dense_covariance_reservation.is_some() {
                 let h_orig = map_hessian_to_original_basis(&pirls_res)?;
                 // Use the SAME inverse the influence matrix `F = I − H⁻¹S` is
                 // built from (`posterior_covariance_inverse`, below), not the bare
@@ -2103,9 +2252,7 @@ where
                 // #1027 basis/PSD-floor inconsistency, ~2.4e-5 on a heavily-smoothed
                 // `s(x)`). Sharing `posterior_covariance_inverse` makes both traces
                 // read the identical `H⁻¹`, restoring the identity to round-off.
-                if let Some(h_inv) =
-                    posterior_covariance_inverse(&h_orig, "edf reconciliation")
-                {
+                if let Some(h_inv) = posterior_covariance_inverse(&h_orig, "edf reconciliation") {
                     let qs = &pirls_res.reparam_result.qs;
                     let p_t = qs.ncols();
                     let mut traces_f = vec![0.0f64; k];
@@ -2316,7 +2463,7 @@ where
         // Auto-select covariance strategy from the runtime resource policy.
         //
         // When the WHOLE simultaneous dense bundle fits the policy's
-        // materialization budget (`dense_covariance_bundle_allowed`) we can
+        // process-wide reservation (`reserve_dense_covariance_bundle`) we can
         // afford the full p×p inverse: O(p³) compute, O(p²) memory. The full
         // matrix is needed for the frequentist covariance Ve = H⁻¹ X'WX H⁻¹ φ,
         // the influence matrix F = H⁻¹ X'WX, and the smoothing-parameter
@@ -2330,23 +2477,28 @@ where
         // the factorised-Hessian path in PredictionCovarianceBackend::Factorized.
 
         // Attempt the full inverse when the bundle fits the policy budget.
-        let beta_covariance_unscaled: Option<Array2<f64>> = if dense_covariance_bundle_allowed(
-            n_design_rows,
-            p_cov,
-        ) {
-            match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
-                Some(h_inv) => Some(h_inv),
-                None => {
-                    log::warn!(
-                        "posterior covariance inversion failed (p={p_cov}): \
+        let beta_covariance_unscaled: Option<Array2<f64>> =
+            if dense_covariance_reservation.is_some() {
+                match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
+                    Some(h_inv) => Some(h_inv),
+                    None => {
+                        log::warn!(
+                            "posterior covariance inversion failed (p={p_cov}): \
                          falling back to solve-on-demand standard errors"
-                    );
-                    None
+                        );
+                        // Release the optional 24-matrix live-set charge before
+                        // the chunked path asks the governor for workspaces,
+                        // then retain only the factor/precision state that is
+                        // genuinely still live.
+                        drop(dense_covariance_reservation.take());
+                        _factorized_inference_reservation =
+                            reserve_factorized_inference_state(n_design_rows, p_cov);
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         if let Some(ref h_inv) = beta_covariance_unscaled {
             // Full inverse available: wrap as phi-scaled covariance, compute
@@ -2426,8 +2578,12 @@ where
         }
 
         // Smoothing-parameter correction (first-order delta + optional cubature).
-        // Passes None for large models; compute_smoothing_correction_auto falls
-        // back to first-order correction when no base covariance is supplied.
+        // The dense branch can return the complete matrix and optionally
+        // upgrade it by cubature. On governor refusal the factorized branch
+        // computes only diag(J V_rho J') from cached p×k mode responses; calling
+        // `compute_smoothing_correction_auto(..., None, ...)` is not sufficient
+        // because that routine constructs the full p×p first-order product
+        // before it notices that the base covariance is absent.
         // `cov_scale` is the coefficient-covariance multiplier at the optimum
         // (σ̂² for profiled Gaussian, 1 for every weight-carries-dispersion
         // family). The cubature path multiplies its dispersion-free curvature
@@ -2435,15 +2591,22 @@ where
         // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
         // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
         // stays unscaled.
-        let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
-            &final_rho,
-            &pirls_res,
-            beta_covariance_unscaled.as_ref(),
-            cov_scale,
-            finalgrad_norm,
-        );
-        rho_covariance = smoothing_outcome.rho_covariance().cloned();
-        smoothing_correction = smoothing_outcome.into_correction();
+        let smoothing_correction_diagonal = if beta_covariance_unscaled.is_some() {
+            let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
+                &final_rho,
+                &pirls_res,
+                beta_covariance_unscaled.as_ref(),
+                cov_scale,
+                finalgrad_norm,
+            );
+            rho_covariance = smoothing_outcome.rho_covariance().cloned();
+            smoothing_correction = smoothing_outcome.into_correction();
+            None
+        } else {
+            let diagonal_outcome = compute_diagonal_smoothing_correction(&reml_state, &final_rho);
+            rho_covariance = diagonal_outcome.rho_covariance;
+            diagonal_outcome.diagonal
+        };
 
         // Tier-0 marginal-smoothing certificate (#938): while the REML objective
         // is still live, sample the outer criterion around the converged ρ̂ to
@@ -2477,14 +2640,18 @@ where
         // from the runtime resource policy's per-chunk byte target: each
         // chunk keeps ~2 dense p×chunk workspaces (the RHS slice and the
         // solved block) live at once.
+        let resource_policy = gam_runtime::resource::ResourcePolicy::for_problem(
+            n_design_rows,
+            p_cov,
+            gam_runtime::resource::ProblemHints::default(),
+        );
+        let governor = gam_runtime::resource::MemoryGovernor::global();
+        let se_chunk_target_bytes = resource_policy
+            .row_chunk_target_bytes
+            .min(governor.remaining_bytes());
         let se_chunk_cols = gam_runtime::resource::rows_for_target_bytes(
-            gam_runtime::resource::ResourcePolicy::for_problem(
-                n_design_rows,
-                p_cov,
-                gam_runtime::resource::ProblemHints::default(),
-            )
-            .row_chunk_target_bytes,
-            2 * p_cov,
+            se_chunk_target_bytes,
+            qs.ncols().saturating_mul(2),
         );
         beta_standard_errors = if let Some(ref h_inv) = beta_covariance_unscaled {
             // Fast path: SE from stored full inverse (already phi-scaled via
@@ -2504,9 +2671,22 @@ where
             // then dot each solution column back with the corresponding Qs row.
             let mut diag_inv = Array1::<f64>::zeros(p_cov);
             let mut col_start = 0usize;
+            let mut solve_failed = false;
             while col_start < p_cov {
                 let col_end = (col_start + se_chunk_cols).min(p_cov);
                 let chunk = col_end - col_start;
+                let Ok(_chunk_reservation) = governor.try_reserve_dense_f64_copies(
+                    qs.ncols(),
+                    chunk,
+                    2,
+                    "factorized coefficient-SE solve chunk",
+                ) else {
+                    log::warn!(
+                        "SE solve-on-demand could not reserve chunk {col_start}..{col_end}; discarding coefficient SEs"
+                    );
+                    solve_failed = true;
+                    break;
+                };
                 // qs.t() has shape (p_t, p_cov); slice to (p_t, chunk).
                 let rhs = qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned();
                 match factor_t.solvemulti(&rhs) {
@@ -2524,17 +2704,19 @@ where
                         log::warn!(
                             "SE solve-on-demand failed at chunk {col_start}..{col_end}: {e}"
                         );
-                        // Leave remaining entries as 0 (no SE).
+                        solve_failed = true;
                         break;
                     }
                 }
                 col_start = col_end;
             }
             let se = diag_inv.mapv(|v| (cov_scale * v.max(0.0)).sqrt());
-            if se.iter().all(|v| v.is_finite()) {
+            if !solve_failed && se.iter().all(|v| v.is_finite()) {
                 Some(se)
             } else {
-                log::warn!("SE solve-on-demand produced non-finite entries; discarding");
+                if !solve_failed {
+                    log::warn!("SE solve-on-demand produced non-finite entries; discarding");
+                }
                 None
             }
         } else {
@@ -2577,7 +2759,26 @@ where
             }
             _ => None,
         };
-        beta_standard_errors_corrected = beta_covariance_corrected.as_ref().map(se_from_covariance);
+        beta_standard_errors_corrected = beta_covariance_corrected
+            .as_ref()
+            .map(se_from_covariance)
+            .or_else(|| {
+                let base = beta_standard_errors.as_ref()?;
+                let correction = smoothing_correction_diagonal.as_ref()?;
+                if base.len() != correction.len() {
+                    log::warn!(
+                        "Skipping corrected standard errors: base length {} != smoothing diagonal length {}",
+                        base.len(),
+                        correction.len(),
+                    );
+                    return None;
+                }
+                Some(Array1::from_iter(
+                    base.iter()
+                        .zip(correction.iter())
+                        .map(|(&se, &delta)| (se * se + delta.max(0.0)).sqrt()),
+                ))
+            });
     }
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
@@ -3063,66 +3264,140 @@ mod reported_loglikelihood_normalization_tests {
 }
 
 #[cfg(test)]
-mod continuous_descent_and_resource_gate_tests {
-    //! Focused coverage for the grid-free KKT-escape line search that replaced
-    //! the banned fixed probe grids (SPEC: no grid search), and for the
-    //! resource-policy gate that replaced the fixed `p <= 10_000` dense
-    //! posterior-covariance cap (SPEC: never run out of memory).
-
-    use super::{continuous_directional_descent, dense_covariance_bundle_allowed};
+mod negative_binomial_joint_certificate_tests {
+    use super::{negbin_theta_stationarity_residual, optimize_external_design};
+    use crate::estimate::external_options::ExternalOptimOptions;
+    use crate::pirls::{NEGBIN_THETA_MAX, NEGBIN_THETA_MIN};
+    use gam_problem::{EstimationError, LikelihoodSpec};
+    use ndarray::{Array1, Array2, array};
 
     #[test]
-    fn descent_converges_to_continuous_interior_minimizer() {
-        // Quadratic basin with a NON-grid-node minimizer: the search must land
-        // on the continuous optimum, not a probe node.
-        let t_star = 7.3_f64;
-        let f = |t: f64| (t - t_star).powi(2) - 5.0;
-        let f0 = f(0.0);
-        let mut eval = |t: f64| Some(f(t));
-        let (t_best, f_best) =
-            continuous_directional_descent(&mut eval, 20.0, f0).expect("strict descent exists");
-        assert!(
-            (t_best - t_star).abs() < 1e-3,
-            "refined minimizer {t_best} should match the continuous optimum {t_star}"
+    fn theta_residual_is_the_log_scale_newton_displacement() {
+        let theta = 2.0;
+        let score = 3.0;
+        let info = 5.0;
+        let expected = (theta * score).abs() / (theta * theta * info - theta * score);
+        assert_eq!(
+            negbin_theta_stationarity_residual(theta, score, info),
+            expected
         );
-        assert!(f_best <= f(t_star) + 1e-6);
+        let weight_scale = 1.0e-9;
+        let scaled =
+            negbin_theta_stationarity_residual(theta, weight_scale * score, weight_scale * info);
+        assert!(
+            (scaled - expected).abs() <= 8.0 * f64::EPSILON * expected.max(1.0),
+            "the theta certificate must be invariant to uniform case-weight scaling: {scaled} vs {expected}"
+        );
     }
 
     #[test]
-    fn descent_reaches_basins_beyond_the_last_doubling_probe() {
-        // Minimum between the last doubling probe (16) and the clamped segment
-        // end (29): the expansion must include t_max itself and the refinement
-        // must recover the interior optimum.
-        let t_star = 25.0_f64;
-        let f = |t: f64| (t - t_star).powi(2);
-        let f0 = f(0.0);
-        let mut eval = |t: f64| Some(f(t));
-        let (t_best, _) =
-            continuous_directional_descent(&mut eval, 29.0, f0).expect("strict descent exists");
-        assert!((t_best - t_star).abs() < 1e-3, "found {t_best}, want {t_star}");
+    fn theta_residual_projects_only_outward_boundary_gradients() {
+        assert_eq!(
+            negbin_theta_stationarity_residual(NEGBIN_THETA_MIN, -1.0, 1.0),
+            0.0
+        );
+        assert_eq!(
+            negbin_theta_stationarity_residual(NEGBIN_THETA_MAX, 1.0, 1.0),
+            0.0
+        );
+        assert!(negbin_theta_stationarity_residual(NEGBIN_THETA_MIN, 1.0, 1.0) > 0.0);
+        assert!(negbin_theta_stationarity_residual(NEGBIN_THETA_MAX, -1.0, 1.0) > 0.0);
     }
 
     #[test]
-    fn descent_is_a_noop_without_strict_improvement() {
-        // Monotone ascent: no probe beats the incumbent.
-        let mut ascent = |t: f64| Some(100.0 + t);
-        assert!(continuous_directional_descent(&mut ascent, 10.0, 100.0).is_none());
-        // Sub-tolerance improvement is rejected too (matches the escapes'
-        // shared strict-improvement gate).
-        let mut flat = |_t: f64| Some(100.0 - 1e-9);
-        assert!(continuous_directional_descent(&mut flat, 10.0, 100.0).is_none());
-        // Degenerate segment.
-        let mut any = |t: f64| Some(-t);
-        assert!(continuous_directional_descent(&mut any, 0.0, 100.0).is_none());
+    fn theta_residual_rejects_invalid_curvature_or_coordinates() {
+        assert!(negbin_theta_stationarity_residual(f64::NAN, 0.0, 1.0).is_infinite());
+        assert!(negbin_theta_stationarity_residual(1.0, 1.0, 0.0).is_infinite());
+        assert!(negbin_theta_stationarity_residual(1.0, 2.0, 1.0).is_infinite());
     }
 
     #[test]
-    fn dense_covariance_gate_admits_small_and_rejects_800mb_scale() {
-        // Ordinary small-model inference keeps the dense bundle.
-        assert!(dense_covariance_bundle_allowed(500, 200));
-        // The old fixed cap admitted p = 10_000 — seven simultaneous ~800 MB
-        // matrices. The policy gate must reject that regime so the fit takes
-        // the factorized solve-on-demand path instead.
-        assert!(!dense_covariance_bundle_allowed(500, 10_000));
+    fn exhausted_joint_solve_returns_typed_checkpoint_instead_of_a_fit() {
+        // Intercept-only overdispersed counts make the large theta seed
+        // decisively non-stationary. With one joint round available the rho
+        // block is already vacuous, so exhaustion must be attributed to the
+        // theta partial and returned through the resumable typed error.
+        let y = array![0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 40.0, 0.0, 75.0, 0.0, 3.0, 0.0];
+        let n = y.len();
+        let design = Array2::<f64>::ones((n, 1));
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let opts = ExternalOptimOptions {
+            family: LikelihoodSpec::negative_binomial_log(1_000.0),
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: true,
+            max_iter: 1,
+            tol: 1.0e-8,
+            nullspace_dims: Vec::new(),
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        };
+        let error = match optimize_external_design(
+            y.view(),
+            weights.view(),
+            design,
+            offset.view(),
+            Vec::new(),
+            &opts,
+        ) {
+            Ok(_) => panic!("one round cannot certify this deliberately displaced theta seed"),
+            Err(error) => error,
+        };
+        match error {
+            EstimationError::NegativeBinomialAlternationDidNotConverge {
+                rounds,
+                theta_checkpoint,
+                theta_score_residual,
+                rho_checkpoint,
+                ..
+            } => {
+                assert_eq!(rounds, 1);
+                assert!(theta_checkpoint.is_finite() && theta_checkpoint > 0.0);
+                assert!(!theta_score_residual.is_nan() && theta_score_residual > opts.tol);
+                assert!(rho_checkpoint.is_empty());
+            }
+            other => panic!("expected typed negative-binomial joint exhaustion, got {other}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagonal_smoothing_correction_tests {
+    use super::low_rank_covariance_diagonal;
+    use ndarray::array;
+
+    #[test]
+    fn low_rank_diagonal_matches_the_full_congruence() {
+        let mode_response = array![[1.0, 2.0], [-3.0, 0.5], [0.0, 4.0]];
+        let rho_covariance = array![[2.0, 0.25], [0.25, 1.5]];
+        let expected = mode_response
+            .dot(&rho_covariance)
+            .dot(&mode_response.t())
+            .diag()
+            .to_owned();
+        let actual = low_rank_covariance_diagonal(mode_response.view(), &rho_covariance)
+            .expect("compatible finite low-rank factors");
+        for (&got, &want) in actual.iter().zip(expected.iter()) {
+            assert!((got - want).abs() <= 16.0 * f64::EPSILON * want.abs().max(1.0));
+        }
+    }
+
+    #[test]
+    fn low_rank_diagonal_rejects_shape_mismatch() {
+        let mode_response = array![[1.0, 2.0]];
+        let wrong_rho_covariance = array![[1.0]];
+        assert!(
+            low_rank_covariance_diagonal(mode_response.view(), &wrong_rho_covariance).is_none()
+        );
     }
 }

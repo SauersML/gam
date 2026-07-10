@@ -14,14 +14,13 @@
 //! constraints, #1507) through a truncated-Gaussian Gibbs sampler whose every
 //! draw satisfies `A·β ≥ b` by construction.
 //!
-//! The constraint rows `A` are exactly the monotonicity differences of the
-//! design evaluated at sorted unique covariate locations: `A·β ≥ 0` is the
-//! statement "the curve is non-decreasing across the grid". This test fits a
-//! clean monotone-increasing signal, confirms the fitted curve is in the cone,
-//! samples the posterior, and asserts that essentially every drawn coefficient
-//! vector satisfies the same monotone-cone inequalities (a tiny tolerance
-//! absorbs round-off) — the faithful, coordinate-exact form of "every drawn
-//! curve is monotone".
+//! The constraint rows `A` are exactly the first-derivative B-spline control
+//! differences, independent of observed covariate locations or an evaluation
+//! grid. Non-negative derivative controls certify the curve on every knot span.
+//! This test fits a clean monotone-increasing signal, confirms the fitted curve
+//! is in the cone, samples the posterior, and asserts that essentially every
+//! drawn coefficient vector satisfies the same continuum monotone-cone
+//! inequalities (a tiny tolerance absorbs round-off).
 
 use gam::hmc::NutsConfig;
 use gam::inference::model::{

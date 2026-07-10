@@ -720,9 +720,7 @@ pub(crate) fn gaussian_jointsecond_directionalweights(
             2.0 * wi * a_coef * (dmu * dmv)
                 + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * de_sym
                 + (ktp * ai - 2.0 * ki * ni * e_coef
-                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi
-                        - 12.0 * ki * ki * kpi
-                        - ktp))
+                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi - 12.0 * ki * ki * kpi - ktp))
                     * de_eta,
         );
     }
@@ -903,9 +901,7 @@ pub(crate) fn gaussian_joint_psisecondweights(
             2.0 * wi * a_coef * ma_mb
                 + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * cross_eta
                 + (ktp * ai - 2.0 * ki * ni * e_coef
-                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi
-                        - 12.0 * ki * ki * kpi
-                        - ktp))
+                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi - 12.0 * ki * ki * kpi - ktp))
                     * ea_eb
                 - 2.0 * mi * a_coef * mab
                 + (kdpi * amn + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * eab,
@@ -999,9 +995,7 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
             2.0 * wi * a_coef * (dmu * ma)
                 + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * (dmu * ea + ma * de)
                 + (ktp * ai - 2.0 * ki * ni * e_coef
-                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi
-                        - 12.0 * ki * ki * kpi
-                        - ktp))
+                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi - 12.0 * ki * ki * kpi - ktp))
                     * de_ea
                 - 2.0 * mi * a_coef * dma
                 + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * dea,
@@ -1459,13 +1453,13 @@ mod observed_single_source_oracle_tests {
         ];
         let t = 1e-6;
         for &(mu, eta_ls, a, xi_mu, xi_ls, y) in &cases {
-            let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
-                .expect("row scalars");
+            let rows =
+                gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                    .expect("row scalars");
             let (w_u, c_u, d_u) =
                 gaussian_joint_first_directionalweights(&rows, &array![xi_mu], &array![xi_ls]);
-            let coeffs_at = |m: f64, e: f64| -> (f64, f64, f64) {
-                production_observed_row(y, m, e, a)
-            };
+            let coeffs_at =
+                |m: f64, e: f64| -> (f64, f64, f64) { production_observed_row(y, m, e, a) };
             let (mmp, mlp, llp) = coeffs_at(mu + t * xi_mu, eta_ls + t * xi_ls);
             let (mmm, mlm, llm) = coeffs_at(mu - t * xi_mu, eta_ls - t * xi_ls);
             let fd_w = (mmp - mmm) / (2.0 * t);
@@ -1502,8 +1496,9 @@ mod observed_single_source_oracle_tests {
         ];
         let t = 1e-5;
         for &(mu, eta_ls, a, xi_mu_u, xi_ls_u, xi_mu_v, xi_ls_v, y) in &cases {
-            let rows = gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
-                .expect("row scalars");
+            let rows =
+                gaussian_jointrow_scalars(&array![y], &array![mu], &array![eta_ls], &array![a])
+                    .expect("row scalars");
             let (w_uv, c_uv, d_uv) = gaussian_jointsecond_directionalweights(
                 &rows,
                 &array![xi_mu_u],

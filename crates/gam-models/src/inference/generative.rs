@@ -1,9 +1,9 @@
-use gam_custom_family::{CustomFamily, ParameterBlockState};
-use gam_solve::estimate::EstimationError;
 use crate::inference::predict_io::PredictResult;
+use gam_custom_family::{CustomFamily, ParameterBlockState};
 use gam_problem::types::{
     LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily, is_valid_tweedie_power,
 };
+use gam_solve::estimate::EstimationError;
 use ndarray::{Array1, Array2};
 
 /// THE single source of truth for the scalar dispersion the generative
@@ -118,7 +118,11 @@ pub enum NoiseModel {
 /// endpoints (the finite-support tails carry no mass between the clamp and the
 /// endpoint). This is the same bracketing inversion the CTM `predict` mean
 /// (#1612) uses on its quadrature nodes, applied here to a random latent draw.
-fn invert_monotone_grid(grid_y: &Array1<f64>, h_row: ndarray::ArrayView1<'_, f64>, target: f64) -> f64 {
+fn invert_monotone_grid(
+    grid_y: &Array1<f64>,
+    h_row: ndarray::ArrayView1<'_, f64>,
+    target: f64,
+) -> f64 {
     let g = grid_y.len();
     if target <= h_row[0] {
         return grid_y[0];
@@ -674,9 +678,8 @@ mod tests {
 
         let g = 801usize;
         let (y_lo, y_hi) = (-12.0_f64, 12.0_f64);
-        let grid_y = Array1::from_shape_fn(g, |k| {
-            y_lo + (y_hi - y_lo) * (k as f64) / ((g - 1) as f64)
-        });
+        let grid_y =
+            Array1::from_shape_fn(g, |k| y_lo + (y_hi - y_lo) * (k as f64) / ((g - 1) as f64));
         // Row 0: center -1, slope 2 (sd 0.5). Row 1: center +2, slope 4 (sd 0.25).
         let centers = [-1.0_f64, 2.0_f64];
         let slopes = [2.0_f64, 4.0_f64];
@@ -703,8 +706,7 @@ mod tests {
         for i in 0..2 {
             let col = draws.column(i);
             let mean = col.sum() / (n_draws as f64);
-            let var =
-                col.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n_draws as f64);
+            let var = col.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n_draws as f64);
             let sd = var.sqrt();
             row_means[i] = mean;
             assert!(

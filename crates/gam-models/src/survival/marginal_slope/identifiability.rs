@@ -125,7 +125,6 @@ impl SurvivalRowHessian {
             derivative_guard,
         })
     }
-
 }
 
 impl RowHessian for SurvivalRowHessian {
@@ -2563,16 +2562,13 @@ mod tests {
         let log =
             Array2::from_shape_vec((n, 2), vec![1.0, 10.0, 1.0, -10.0, 1.0, 10.0, 1.0, -10.0])
                 .unwrap();
-        let t = match survival_reduced_logslope_transform_effective(
-            marg.view(),
-            log.view(),
-            &row_hess,
-        )
-        .expect("contraction must succeed")
-        {
-            crate::bms::block_specs::ReducedLogslopeOutcome::Reduced(t) => t,
-            other => panic!("a partial confound must yield a reduced transform, got {other:?}"),
-        };
+        let t =
+            match survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
+                .expect("contraction must succeed")
+            {
+                crate::bms::block_specs::ReducedLogslopeOutcome::Reduced(t) => t,
+                other => panic!("a partial confound must yield a reduced transform, got {other:?}"),
+            };
         assert_eq!(t.dim(), (2, 1), "exactly one logslope direction survives");
         // The kept eigenvector is the free column ≈ e2 (up to sign); the
         // confounded e1 component is dropped.

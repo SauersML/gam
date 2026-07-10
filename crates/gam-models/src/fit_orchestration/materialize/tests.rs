@@ -2,7 +2,10 @@ use super::*;
 use gam_data::load_dataset_projected;
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam_solve::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
-use gam_terms::basis::{DuchonNullspaceOrder, minimum_duchon_power_for_operator_penalties};
+use gam_terms::basis::{
+    DuchonNullspaceOrder, center_strategy_is_auto, minimum_duchon_power_for_operator_penalties,
+    starting_num_centers,
+};
 use gam_terms::inference::formula_dsl::{
     default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec,
 };
@@ -840,6 +843,64 @@ fn duchon_workflow_dataset() -> Dataset {
             ColumnKindTag::Continuous,
         ],
     }
+}
+
+#[test]
+fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
+    let data = duchon_workflow_dataset();
+
+    let raw = materialize("y ~ duchon(ct, st)", &data, &FitConfig::default())
+        .expect("raw Duchon materialization");
+    let FitRequest::Standard(raw_request) = raw.request else {
+        panic!("expected standard request");
+    };
+    let SmoothBasisSpec::Duchon { spec: raw_spec, .. } = &raw_request.spec.smooth_terms[0].basis
+    else {
+        panic!("expected Duchon smooth");
+    };
+    let raw_centers = raw_spec.center_strategy.planned_num_centers(2);
+
+    let adaptive_config = FitConfig {
+        spatial_center_counts: Some(Vec::new()),
+        ..FitConfig::default()
+    };
+    let adaptive = materialize("y ~ duchon(ct, st)", &data, &adaptive_config)
+        .expect("adaptive-start Duchon materialization");
+    let FitRequest::Standard(adaptive_request) = adaptive.request else {
+        panic!("expected standard request");
+    };
+    let SmoothBasisSpec::Duchon {
+        spec: adaptive_spec,
+        ..
+    } = &adaptive_request.spec.smooth_terms[0].basis
+    else {
+        panic!("expected Duchon smooth");
+    };
+    let adaptive_centers = adaptive_spec.center_strategy.planned_num_centers(2);
+    assert_eq!(
+        adaptive_centers,
+        starting_num_centers(data.values.nrows(), 2)
+    );
+    assert!(
+        raw_centers > adaptive_centers,
+        "raw materialization must retain the ordinary basis because it has no grow-loop owner"
+    );
+    assert!(center_strategy_is_auto(&adaptive_spec.center_strategy));
+
+    let explicit = materialize("y ~ duchon(ct, st, centers=12)", &data, &adaptive_config)
+        .expect("explicit-center Duchon materialization");
+    let FitRequest::Standard(explicit_request) = explicit.request else {
+        panic!("expected standard request");
+    };
+    let SmoothBasisSpec::Duchon {
+        spec: explicit_spec,
+        ..
+    } = &explicit_request.spec.smooth_terms[0].basis
+    else {
+        panic!("expected Duchon smooth");
+    };
+    assert_eq!(explicit_spec.center_strategy.planned_num_centers(2), 12);
+    assert!(!center_strategy_is_auto(&explicit_spec.center_strategy));
 }
 
 #[test]

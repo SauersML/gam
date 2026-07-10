@@ -291,11 +291,7 @@ fn splitting_dynamics_theorem_group_l2_kills_splitting_gradient() {
 
     let lambda = 0.17f64;
     let block_code = [3.0f64, -4.0, 12.0];
-    let rotation = [
-        [0.6f64, -0.8, 0.0],
-        [0.8f64, 0.6, 0.0],
-        [0.0f64, 0.0, -1.0],
-    ];
+    let rotation = [[0.6f64, -0.8, 0.0], [0.8f64, 0.6, 0.0], [0.0f64, 0.0, -1.0]];
     let rotated = [
         rotation[0][0] * block_code[0]
             + rotation[0][1] * block_code[1]
@@ -420,7 +416,10 @@ fn small_k_block_fit_runs_on_cpu_baseline_2134() {
     let recon = fit.reconstruct();
     assert_eq!(recon.dim(), (x.nrows(), p));
     let energy: f32 = recon.iter().map(|v| v * v).sum();
-    assert!(energy > 0.0, "small-K CPU baseline reconstruction must be non-trivial");
+    assert!(
+        energy > 0.0,
+        "small-K CPU baseline reconstruction must be non-trivial"
+    );
 }
 
 #[test]
@@ -612,9 +611,8 @@ fn matryoshka_prefix_losses_are_monotone_and_match_truncated_readout() {
         )
         .expect("truncated prefix transform");
         assert_eq!(gates.nrows(), x.nrows(), "truncated prefix gate row count");
-        let recon =
-            reconstruct_block_sparse_rows(prefix_decoder, blocks.view(), codes.view(), b)
-                .expect("truncated prefix reconstruction");
+        let recon = reconstruct_block_sparse_rows(prefix_decoder, blocks.view(), codes.view(), b)
+            .expect("truncated prefix reconstruction");
         let mut loss = 0.0f64;
         for i in 0..x.nrows() {
             for c in 0..x.ncols() {
@@ -692,7 +690,10 @@ fn block_seed_manifest_is_rust_owned_and_gauge_shaped() {
     // (flat is the shorter code at these firings).
     let rec = &manifest.blocks[0];
     assert_eq!(rec.matched_dl_flat.coded_columns, config.block_size as i64);
-    assert_eq!(rec.matched_dl_chart.coded_columns, config.n_basis_chart as i64);
+    assert_eq!(
+        rec.matched_dl_chart.coded_columns,
+        config.n_basis_chart as i64
+    );
     assert_eq!(rec.matched_dl_flat.n_firings, n as i64);
     assert!(rec.matched_dl_flat.total_dl_bits.is_finite());
     assert!(rec.matched_dl_chart.total_dl_bits.is_finite());

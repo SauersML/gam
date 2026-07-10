@@ -13,13 +13,11 @@
 //! `gam-models` (`crate::inference::predict_io`, `crate::bms`), so the tests are
 //! homed back next to it.
 
-use crate::bms::{
-    EmpiricalZGrid, LatentMeasureKind, empirical_intercept_from_marginal,
-};
+use crate::bms::{EmpiricalZGrid, LatentMeasureKind, empirical_intercept_from_marginal};
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
 use crate::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
-use gam_linalg::matrix::DesignMatrix;
 use crate::probability::normal_cdf;
+use gam_linalg::matrix::DesignMatrix;
 use gam_problem::types::InverseLink;
 use ndarray::{Array1, Array2, array};
 
@@ -131,8 +129,7 @@ fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
     .expect("build saved anchored deviation runtime");
     let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
     let beta = Array1::from_iter(
-        (0..runtime.basis_dim)
-            .map(|idx| 0.02 * (idx as f64 + 1.0) * (-1.0_f64).powi(idx as i32)),
+        (0..runtime.basis_dim).map(|idx| 0.02 * (idx as f64 + 1.0) * (-1.0_f64).powi(idx as i32)),
     );
     let n_spans = runtime.span_count().expect("span count");
     assert!(n_spans >= 2);

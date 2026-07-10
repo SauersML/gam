@@ -101,7 +101,7 @@ def plot(target: Any, atom: int | None = None, *, ax: Any = None, color_by: str 
 
     ``plot(fit, atom=0)`` renders the fitted atom shape in its leading decoder
     SVD subspace. ``plot(atom)`` renders a lightweight coordinate scatter for a
-    standalone :class:`SaeManifoldAtomFit`-like object or atom dictionary.
+    standalone Rust atom object or atom dictionary.
     Matplotlib is imported only when this function is called.
     """
     if atom is not None or hasattr(target, "atoms"):
@@ -147,7 +147,7 @@ def _atom_field(atom: Any, name: str) -> Any:
         return atom[name]
     if hasattr(atom, name):
         return getattr(atom, name)
-    raise TypeError("atom must be a SaeManifoldAtomFit-like object or atom dictionary")
+    raise TypeError("atom must expose the SAE atom fields or be an atom dictionary")
 
 
 def _atom_at(fit: Any, k: int) -> Any:

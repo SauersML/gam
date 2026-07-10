@@ -1482,18 +1482,16 @@ impl BernoulliMarginalSlopeFamily {
             &self.policy,
         )?;
         let psi_map_ij = if block_i == block_j {
-            Some(
-                gam_custom_family::resolve_custom_family_x_psi_psi_map(
-                    deriv_i,
-                    deriv_j,
-                    local_j,
-                    n,
-                    p_psi_i,
-                    0..n,
-                    label_i,
-                    &self.policy,
-                )?,
-            )
+            Some(gam_custom_family::resolve_custom_family_x_psi_psi_map(
+                deriv_i,
+                deriv_j,
+                local_j,
+                n,
+                p_psi_i,
+                0..n,
+                label_i,
+                &self.policy,
+            )?)
         } else {
             None
         };

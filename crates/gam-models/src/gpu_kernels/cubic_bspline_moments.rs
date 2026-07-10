@@ -70,9 +70,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_err;
+use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuResultExt;
 

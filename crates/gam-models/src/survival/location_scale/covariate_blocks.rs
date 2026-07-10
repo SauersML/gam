@@ -452,9 +452,9 @@ pub(crate) fn prepare_cov_block_kind(
                             total_dim: p,
                         },
                         gam_terms::penalty_spec::PenaltySpec::Dense(m)
-                        | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                            PenaltyMatrix::Dense(m.clone())
-                        }
+                        | gam_terms::penalty_spec::PenaltySpec::DenseWithMean {
+                            matrix: m, ..
+                        } => PenaltyMatrix::Dense(m.clone()),
                     })
                     .collect()
             },
@@ -564,9 +564,7 @@ pub(crate) struct SurvivalTimeVaryingPsiTransform {
     pub(crate) time_basis_derivative_exit: Array2<f64>,
 }
 
-impl crate::spatial_psi_bridge::SpatialPsiBlockTransform
-    for SurvivalTimeVaryingPsiTransform
-{
+impl crate::spatial_psi_bridge::SpatialPsiBlockTransform for SurvivalTimeVaryingPsiTransform {
     fn transform_operator(
         &self,
         op: Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator>,

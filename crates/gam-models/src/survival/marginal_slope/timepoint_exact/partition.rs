@@ -29,18 +29,16 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<CachedPartitionCells, String> {
         // ── 1. partition cells via the device seam, CPU fallback on decline ──
         let raw_cells = {
-            let row_input =
-                crate::survival::marginal_slope::gpu_prep::PartitionCellsRowInputs {
-                    a,
-                    b,
-                    beta_h: beta_h.and_then(|b| b.as_slice()),
-                    beta_w: beta_w.and_then(|b| b.as_slice()),
-                };
-            let dev =
-                crate::survival::marginal_slope::gpu_prep::try_device_partition_cells(
-                    std::slice::from_ref(&row_input),
-                )
-                .map_err(|e| e.to_string())?;
+            let row_input = crate::survival::marginal_slope::gpu_prep::PartitionCellsRowInputs {
+                a,
+                b,
+                beta_h: beta_h.and_then(|b| b.as_slice()),
+                beta_w: beta_w.and_then(|b| b.as_slice()),
+            };
+            let dev = crate::survival::marginal_slope::gpu_prep::try_device_partition_cells(
+                std::slice::from_ref(&row_input),
+            )
+            .map_err(|e| e.to_string())?;
             match dev {
                 Some(mut by_row) if by_row.len() == 1 => by_row.remove(0),
                 _ => self.denested_partition_cells(a, b, beta_h, beta_w)?,
@@ -91,10 +89,11 @@ impl SurvivalMarginalSlopeFamily {
                 cells: &fp_inputs,
                 layout,
             };
-        let dev_fixed = crate::survival::marginal_slope::gpu_prep::try_device_cell_primary_fixed_partials(
-            std::slice::from_ref(&row_fp_input),
-        )
-        .map_err(|e| e.to_string())?;
+        let dev_fixed =
+            crate::survival::marginal_slope::gpu_prep::try_device_cell_primary_fixed_partials(
+                std::slice::from_ref(&row_fp_input),
+            )
+            .map_err(|e| e.to_string())?;
         // When the device path returns flat-packed partials, reconstruct
         // the per-cell `DenestedCellPrimaryFixedPartials` from the device
         // buffer via the `from_flat_slice` shim — byte-identical to what

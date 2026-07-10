@@ -153,6 +153,14 @@ create_exception!(
 
 create_exception!(
     _rust,
+    DictionaryConvergenceError,
+    GamError,
+    "A dictionary optimizer failed to reach its certified fixed point. Instances \
+     carry the solver's structured residual evidence; no partial fit is returned."
+);
+
+create_exception!(
+    _rust,
     GradientUnavailableError,
     GamError,
     "The unified evaluator returned no gradient in the requested mode."
@@ -607,6 +615,29 @@ where
     match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(message)) => Err(py_value_error(message)),
+        Err(payload) => Err(py_panic_error(context, payload)),
+    }
+}
+
+/// Panic-safe GIL-detached execution for an engine result whose error enum has a
+/// typed Python dispatcher. Unlike [`detach_py_result`], this preserves the enum
+/// until the closure rejoins the GIL, so variant identity and structured evidence
+/// are not flattened through `String`.
+pub(crate) fn detach_typed_py_result<T, E, F, M>(
+    py: Python<'_>,
+    context: &'static str,
+    f: F,
+    map_error: M,
+) -> PyResult<T>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    M: FnOnce(Python<'_>, E) -> PyErr,
+{
+    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(map_error(py, error)),
         Err(payload) => Err(py_panic_error(context, payload)),
     }
 }

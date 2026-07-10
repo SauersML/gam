@@ -29,8 +29,8 @@
 //! Hessian structure for a fixed row set; subsampling reduces the row
 //! set itself for the family-specific row-trace path.
 
-use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
+use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 use gam_math::jet_partitions::MultiDirJet;
 use ndarray::{Array1, Array2, Axis};
@@ -55,8 +55,7 @@ pub fn make_beta_seed_validator(
     pending: &std::cell::RefCell<Option<Array1<f64>>>,
 ) -> impl FnMut(
     &Array1<f64>,
-)
-    -> Result<gam_solve::rho_optimizer::SeedOutcome, crate::model_types::EstimationError>
+) -> Result<gam_solve::rho_optimizer::SeedOutcome, crate::model_types::EstimationError>
 + '_ {
     move |beta: &Array1<f64>| {
         bail_if_cached_beta_non_finite(beta)?;
@@ -111,10 +110,7 @@ pub fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     if sigma <= 0.0 {
         1.0
     } else {
-        crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(
-            sigma.ln(),
-        )
-        .s
+        crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()).s
     }
 }
 
@@ -126,9 +122,7 @@ pub(crate) fn probit_frailty_scale_multi_dir_jet(
     second_masks: &[usize],
 ) -> Result<MultiDirJet, String> {
     let sigma = gaussian_frailty_sd.ok_or_else(|| missing_sigma_message.to_string())?;
-    let jet = crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(
-        sigma.ln(),
-    );
+    let jet = crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln());
     let mut coeffs = Vec::with_capacity(1 + first_masks.len() + second_masks.len());
     coeffs.push((0usize, jet.s));
     coeffs.extend(first_masks.iter().copied().map(|mask| (mask, jet.ds)));

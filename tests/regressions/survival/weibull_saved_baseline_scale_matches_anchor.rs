@@ -198,6 +198,7 @@ fn weibull_saved_baseline_scale_recovered_from_anchor_not_stale_beta0() {
         noise_offset: &noise_offset,
         time_grid: Some(&grid),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
     let result = predict_survival(request).expect("library Weibull survival predict");
     let surv: Vec<f64> = result.survival.row(0).to_vec();

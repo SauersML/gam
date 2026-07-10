@@ -55,16 +55,12 @@ pub(crate) fn moving_density_boundary_flux_a(entry: &CachedCellEntry, poly: &[f6
     let v_r = edge_velocity(entry.partition_cell.right_edge);
     let v_l = edge_velocity(entry.partition_cell.left_edge);
     let right = if v_r != 0.0 {
-        v_r * crate::cubic_cell_kernel::cell_density_boundary_integrand(
-            cell, poly, cell.right,
-        )
+        v_r * crate::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, cell.right)
     } else {
         0.0
     };
     let left = if v_l != 0.0 {
-        v_l * crate::cubic_cell_kernel::cell_density_boundary_integrand(
-            cell, poly, cell.left,
-        )
+        v_l * crate::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, cell.left)
     } else {
         0.0
     };
@@ -155,8 +151,7 @@ impl SurvivalMarginalSlopeFamily {
                 let mut d_uv = vec![0.0; p * p];
                 for u in 0..p {
                     eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
-                    chi_u_poly[u] =
-                        poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
+                    chi_u_poly[u] = poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
                     d_u_integrand_poly[u] = poly_sub(
                         &chi_u_poly[u],
                         &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
@@ -245,35 +240,35 @@ impl SurvivalMarginalSlopeFamily {
                                          z: f64|
                              -> f64 {
                                 match edge {
-                                    crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                    crate::cubic_cell_kernel::PartitionEdge::Crossing {
+                                        ..
+                                    } => {
                                         let direct_g = if axis == primary.g { z } else { 0.0 };
                                         -(a_u[axis] + direct_g) / b
                                     }
                                     crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                                 }
                             };
-                            let z_cross = |edge: crate::cubic_cell_kernel::PartitionEdge,
-                                           z: f64|
-                             -> f64 {
-                                let zu = z_vel(u, edge, z);
-                                let zv = z_vel(v, edge, z);
-                                let ug = if u == primary.g { 1.0 } else { 0.0 };
-                                let vg = if v == primary.g { 1.0 } else { 0.0 };
-                                match edge {
-                                    crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                        -(a_uv[[u, v]] + zu * vg + zv * ug) / b
+                            let z_cross =
+                                |edge: crate::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                                    let zu = z_vel(u, edge, z);
+                                    let zv = z_vel(v, edge, z);
+                                    let ug = if u == primary.g { 1.0 } else { 0.0 };
+                                    let vg = if v == primary.g { 1.0 } else { 0.0 };
+                                    match edge {
+                                        crate::cubic_cell_kernel::PartitionEdge::Crossing {
+                                            ..
+                                        } => -(a_uv[[u, v]] + zu * vg + zv * ug) / b,
+                                        crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                                     }
-                                    crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-                                }
-                            };
+                                };
                             let g0_z = |z: f64| -> f64 {
                                 let eta = cell.eta(z);
                                 let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
                                 let amp = poly_eval_slice(&chi_poly, z);
                                 let amp_z = poly_eval_deriv_slice(&chi_poly, z);
                                 let q_z = z + eta * eta_z;
-                                (amp_z - amp * q_z) * (-cell.q(z)).exp()
-                                    / std::f64::consts::TAU
+                                (amp_z - amp * q_z) * (-cell.q(z)).exp() / std::f64::consts::TAU
                             };
                             let edge_term = |edge: crate::cubic_cell_kernel::PartitionEdge,
                                              z: f64|
@@ -287,12 +282,18 @@ impl SurvivalMarginalSlopeFamily {
                                 let g0 = crate::cubic_cell_kernel::cell_density_boundary_integrand(
                                     cell, &chi_poly, z,
                                 );
-                                let part_a = crate::cubic_cell_kernel::cell_density_boundary_integrand(
-                                    cell, &d_u_integrand_poly[u], z,
-                                ) * zv;
-                                let part_b1 = crate::cubic_cell_kernel::cell_density_boundary_integrand(
-                                    cell, &d_u_integrand_poly[v], z,
-                                ) * zu;
+                                let part_a =
+                                    crate::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell,
+                                        &d_u_integrand_poly[u],
+                                        z,
+                                    ) * zv;
+                                let part_b1 =
+                                    crate::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell,
+                                        &d_u_integrand_poly[v],
+                                        z,
+                                    ) * zu;
                                 part_a + part_b1 + g0_z(z) * zu * zv + g0 * zuv
                             };
                             edge_term(part.right_edge, cell.right)
@@ -469,23 +470,19 @@ impl SurvivalMarginalSlopeFamily {
                 // flux/self-flux (feeding the total velocity double-counts it —
                 // gam#1454). `a_edge_vel` (z_a = −1/b) is the genuine a-motion
                 // and is unchanged. Mirrors directional.rs's base `edge_vel`.
-                let edge_vel = |axis: usize,
-                                edge: crate::cubic_cell_kernel::PartitionEdge,
-                                z: f64|
-                 -> f64 {
-                    match edge {
-                        crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                            let direct_g = if axis == primary.g { z } else { 0.0 };
-                            -direct_g / b
+                let edge_vel =
+                    |axis: usize, edge: crate::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                        match edge {
+                            crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                let direct_g = if axis == primary.g { z } else { 0.0 };
+                                -direct_g / b
+                            }
+                            crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                         }
-                        crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-                    }
-                };
+                    };
                 let a_edge_vel = |edge: crate::cubic_cell_kernel::PartitionEdge| -> f64 {
                     match edge {
-                        crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                            -1.0 / b
-                        }
+                        crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => -1.0 / b,
                         crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                     }
                 };

@@ -11,8 +11,8 @@
 //!
 //! A convex/concave shape constraint puts the smooth on the box-reparameterized
 //! PIRLS path: the coefficients are written `β = Tγ` where `T` is the order-2
-//! Greville-scaled second *divided*-difference transform
-//! (`convex_divided_difference_transform_matrix`). A reparameterization must
+//! knot-span-scaled derivative-control transform
+//! (`convex_derivative_control_transform_matrix`). A reparameterization must
 //! leave the penalized REML fit invariant, which requires EVERY penalty block to
 //! transform by the SAME congruence `S ↦ TᵀST`. The wiggliness penalty did; but
 //! the double-penalty nullspace ridge (`PenaltySource::DoublePenaltyNullspace`,

@@ -264,8 +264,10 @@ pub enum EstimationError {
 
     #[error(
         "Block-orthogonal Gaussian REML did not converge within {iterations} outer passes: \
-         max relative rho-score residual {max_score_residual:.6e} exceeds tolerance \
-         {score_tol:.3e} (last scale fixed-point step {last_scale_step:.6e}{}). \
+         max relative rho-score residual {max_score_residual:.6e}/{score_tol:.3e}, \
+         minimum profiled curvature {min_profile_curvature:.6e} (negative allowance \
+         {profile_curvature_roundoff:.3e}; last scale fixed-point step \
+         {last_scale_step:.6e}{}). \
          A fit is only minted from a converged optimization; resume from the \
          checkpoint by passing `init_rhos` = {rho_checkpoint:?}.",
         if *cycle_detected { ", deterministic limit cycle detected" } else { "" }
@@ -278,6 +280,12 @@ pub enum EstimationError {
         max_score_residual: f64,
         /// Tolerance the residual had to meet for the convergence certificate.
         score_tol: f64,
+        /// Smallest eigenvalue of the analytic rho Hessian after profiling out
+        /// the exact conditional scale block.
+        min_profile_curvature: f64,
+        /// Dimension-scaled eigensolver roundoff allowed below zero when
+        /// certifying positive semidefiniteness.
+        profile_curvature_roundoff: f64,
         /// Last max |Δ log scale-precision| fixed-point movement (evidence of
         /// whether the alternation was still moving or had stalled).
         last_scale_step: f64,
@@ -427,6 +435,41 @@ pub enum EstimationError {
         /// is work-preservation evidence for resume — it is NOT a fit and no
         /// fitted-model API is reachable from it.
         rho_checkpoint: Vec<f64>,
+    },
+
+    #[error(
+        "Fit assembly rejected a non-converged optimization state: inner status \
+         {inner_status}, outer status {outer_status}, after {outer_iterations} outer \
+         iteration(s); final objective {final_value:.6e}; gradient residual \
+         {gradient_residual:?} against {gradient_bound:?}, step residual \
+         {step_residual:?} against {step_bound:?}. The best rho checkpoint is \
+         {rho_checkpoint:?} and the resume token is {resume_token:?}; no fitted-model \
+         API was constructed."
+    )]
+    FitDidNotConverge {
+        /// Diagnostic inner-solver terminal status. This is deliberately a
+        /// string at the neutral problem layer; concrete solver status enums
+        /// live in downstream fitting crates.
+        inner_status: String,
+        /// Outer terminal/certificate verdict.
+        outer_status: String,
+        /// Completed outer iterations at the rejected checkpoint.
+        outer_iterations: usize,
+        /// Objective value at the best available checkpoint.
+        final_value: f64,
+        /// Exact analytic first-order residual, when it was measured.
+        gradient_residual: Option<f64>,
+        /// Bound the first-order residual had to clear.
+        gradient_bound: Option<f64>,
+        /// Final accepted-step residual, when the solver exported it.
+        step_residual: Option<f64>,
+        /// Bound the step residual had to clear.
+        step_bound: Option<f64>,
+        /// Work-preserving smoothing checkpoint; this is not a fit.
+        rho_checkpoint: Vec<f64>,
+        /// Opaque durable-cache resume token, when checkpoint persistence was
+        /// enabled for the failed run.
+        resume_token: Option<String>,
     },
 
     #[error("{context}: unified evaluator returned no gradient in {mode} mode")]

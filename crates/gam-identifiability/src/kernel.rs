@@ -468,19 +468,19 @@ pub struct AnchorConsistencyReport {
 impl AnchorConsistencyReport {
     /// `true` iff every precondition holds.
     pub fn passes(&self) -> bool {
-        self.preconditions.enough_anchors_total
-            && self.preconditions.anchors_cover_all_atoms
+        self.preconditions.enough_anchors_total && self.preconditions.anchors_cover_all_atoms
     }
 }
 
-/// Default anchor-dominance threshold.
+/// Default anchor-dominance threshold: the exact floating-point encoding of a
+/// strict majority.
 ///
-/// The separability argument only *requires* the dominant atom to outweigh
-/// all others combined (`> 1/2`); this convention adds a robustness margin so
-/// that near-boundary rows produced by soft assignments do not count as
-/// anchors. It is the project-wide atom-anchor convention shared by the
-/// kernel tests and the Python diagnostic default.
-pub const ANCHOR_DOMINANCE_DEFAULT: f64 = 0.95;
+/// Anchor separability requires the dominant atom to outweigh all remaining
+/// atoms combined (`share > 1/2`). Because [`anchor_consistency_metrics`] uses
+/// `>= threshold`, the next representable `f64` above one-half implements that
+/// theorem-derived strict inequality without an arbitrary robustness margin.
+/// Callers that want a stronger practical margin may request one explicitly.
+pub const ANCHOR_DOMINANCE_DEFAULT: f64 = f64::from_bits(0.5_f64.to_bits() + 1);
 
 /// Run the full anchor-consistency identifiability check and return the typed
 /// verdict. `assignments` is `(N, K)`; `anchor_dominance` defaults to
@@ -489,6 +489,14 @@ pub fn anchor_consistency_report(
     assignments: ArrayView2<f64>,
     anchor_dominance: Option<f64>,
 ) -> Result<AnchorConsistencyReport, String> {
+    if let Some(((row, atom), value)) = assignments
+        .indexed_iter()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "assignments must be finite; entry ({row}, {atom}) is {value}"
+        ));
+    }
     let anchor_dominance = anchor_dominance.unwrap_or(ANCHOR_DOMINANCE_DEFAULT);
     if !(anchor_dominance > 0.5 && anchor_dominance <= 1.0) {
         return Err(format!(
@@ -757,6 +765,28 @@ mod tests {
         let a = Array2::<f64>::ones((2, 2));
         let error = anchor_consistency_report(a.view(), Some(0.0)).unwrap_err();
         assert!(error.contains("anchor_dominance must be in (0.5, 1]"));
+    }
+
+    #[test]
+    fn default_anchor_rule_is_theorem_derived_strict_majority() {
+        let tied = array![[0.5_f64, 0.5], [0.5, 0.5]];
+        let tied_report = anchor_consistency_report(tied.view(), None).unwrap();
+        assert_eq!(tied_report.metrics.n_anchors, 0);
+
+        let majority = array![[0.5_f64.next_up(), 0.5], [0.5, 0.5_f64.next_up()]];
+        let majority_report = anchor_consistency_report(majority.view(), None).unwrap();
+        assert_eq!(majority_report.metrics.n_anchors, 2);
+        assert!(majority_report.passes());
+    }
+
+    #[test]
+    fn anchor_consistency_report_rejects_non_finite_assignments() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let assignments = array![[1.0_f64, 0.0], [0.0, value]];
+            let error = anchor_consistency_report(assignments.view(), None).unwrap_err();
+            assert!(error.contains("assignments must be finite"));
+            assert!(error.contains("(1, 1)"));
+        }
     }
 
     #[test]

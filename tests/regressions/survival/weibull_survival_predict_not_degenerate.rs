@@ -156,6 +156,7 @@ fn weibull_survival_predict_surface_is_not_degenerate_unit_survival() {
         noise_offset: &noise_offset,
         time_grid: Some(&grid),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
     let result = predict_survival(request).expect("library Weibull survival predict");
 

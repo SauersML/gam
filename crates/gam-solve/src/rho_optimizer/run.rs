@@ -1064,9 +1064,11 @@ pub(crate) fn certify_outer_optimality(
     let layout = capability.theta_layout();
     layout
         .validate_point_len(&result.rho, "outer certificate point")
-        .map_err(|err| EstimationError::RemlOptimizationFailed(format!(
-            "{context}: invalid outer certificate point: {err}"
-        )))?;
+        .map_err(|err| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "{context}: invalid outer certificate point: {err}"
+            ))
+        })?;
     if result.rho.iter().any(|value| !value.is_finite()) {
         return Err(outer_nonconvergence_error(
             context,
@@ -1107,6 +1109,7 @@ pub(crate) fn certify_outer_optimality(
         result.final_gradient = Some(Array1::zeros(0));
         result.final_hessian = None;
         result.converged = true;
+        result.criterion_certificate = Some(certificate.clone());
         return Ok(certificate);
     }
     if capability.gradient != Derivative::Analytic {
@@ -1168,6 +1171,39 @@ pub(crate) fn certify_outer_optimality(
         solver_bound
     };
 
+    // The cost-only and derivative-bearing interfaces must describe the same
+    // objective.  This is an analytic consistency check, not a finite
+    // difference: the solver's terminal value came from the value path and
+    // `evaluation.cost` came from the unified analytic sample at the identical
+    // point.  A scale-aware roundoff bound catches structurally desynchronised
+    // closures without rejecting harmless evaluation-order noise.
+    let solver_final_value = result.final_value;
+    let cost_agreement_bound =
+        f64::EPSILON.sqrt() * solver_final_value.abs().max(evaluation.cost.abs()).max(1.0);
+
+    // Install measured first-order evidence before any fallible curvature
+    // processing. If curvature is malformed, the retained resume checkpoint
+    // still carries the exact value/gradient that caused certification to stop.
+    result.final_value = evaluation.cost;
+    result.final_grad_norm = Some(projected_grad_norm);
+    result.final_gradient = Some(evaluation.gradient);
+    result.converged = false;
+    if !solver_final_value.is_finite()
+        || (solver_final_value - result.final_value).abs() > cost_agreement_bound
+    {
+        return Err(outer_nonconvergence_error(
+            context,
+            &format!(
+                "cost-only value {solver_final_value:.16e} disagrees with analytic-sample value \
+                 {:.16e} at the selected point (roundoff bound {cost_agreement_bound:.3e})",
+                result.final_value,
+            ),
+            result,
+            Some(projected_grad_norm),
+            stationarity_bound,
+        ));
+    }
+
     let analytic_hessian = if capability.hessian.is_analytic() {
         match evaluation.hessian.materialize_dense() {
             Ok(Some(hessian)) => {
@@ -1182,6 +1218,15 @@ pub(crate) fn certify_outer_optimality(
                             stationarity_bound,
                         )
                     })?;
+                if hessian.iter().any(|value| !value.is_finite()) {
+                    return Err(outer_nonconvergence_error(
+                        context,
+                        "the analytic final Hessian contains non-finite entries",
+                        result,
+                        Some(projected_grad_norm),
+                        stationarity_bound,
+                    ));
+                }
                 Some(hessian)
             }
             Ok(None) => {
@@ -1213,13 +1258,17 @@ pub(crate) fn certify_outer_optimality(
         hessian_psd: analytic_hessian
             .as_ref()
             .and_then(certificate_hessian_is_psd),
-        lambdas_railed: certificate_railed_lambdas(
-            &result.rho,
-            layout.rho_dim(),
-            config,
-        ),
+        lambdas_railed: certificate_railed_lambdas(&result.rho, layout.rho_dim(), config),
     };
+    // Install the measured evidence before deciding its verdict.  A rejected
+    // candidate is retained only as a resumable checkpoint, and that
+    // checkpoint must carry the actual analytic residual/curvature evidence
+    // that caused the rejection rather than the optimizer's stale terminal
+    // status.
+    result.final_hessian = analytic_hessian;
+    result.criterion_certificate = Some(certificate.clone());
     if !certificate.certifies() {
+        result.converged = false;
         return Err(outer_nonconvergence_error(
             context,
             &certificate.summary(),
@@ -1229,10 +1278,6 @@ pub(crate) fn certify_outer_optimality(
         ));
     }
 
-    result.final_value = evaluation.cost;
-    result.final_grad_norm = Some(projected_grad_norm);
-    result.final_gradient = Some(evaluation.gradient);
-    result.final_hessian = analytic_hessian;
     result.converged = true;
     log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
     Ok(certificate)
@@ -1441,12 +1486,8 @@ pub(crate) fn run_outer(
     // point, outside every hot loop, for every solver path and every iteration
     // budget. Missing or failed evidence is typed non-convergence; there is no
     // max-iteration or logging-level bypass.
-    result.criterion_certificate = Some(certify_outer_optimality(
-        obj,
-        config,
-        context,
-        &mut result,
-    )?);
+    result.criterion_certificate =
+        Some(certify_outer_optimality(obj, config, context, &mut result)?);
     result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
         obj,
         config,

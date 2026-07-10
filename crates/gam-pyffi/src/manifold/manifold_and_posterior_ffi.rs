@@ -8,14 +8,6 @@ fn normalize_coefficient_names_value(
     }
 }
 
-fn normalize_coefficient_names_vec(names: Vec<String>, n_coeffs: usize) -> Vec<String> {
-    if names.len() == n_coeffs {
-        names
-    } else {
-        default_coefficient_names(n_coeffs)
-    }
-}
-
 fn posterior_coefficient_names_json_impl(request_json: &str) -> Result<String, String> {
     let request: PosteriorCoefficientNamesRequest = serde_json::from_str(request_json)
         .map_err(|err| format!("posterior_coefficient_names_json: parse request: {err}"))?;
@@ -23,76 +15,6 @@ fn posterior_coefficient_names_json_impl(request_json: &str) -> Result<String, S
         normalize_coefficient_names_value(request.coefficient_names.as_ref(), request.n_coeffs);
     serde_json::to_string(&names)
         .map_err(|err| format!("posterior_coefficient_names_json: serialise names: {err}"))
-}
-
-/// Metadata half of the posterior-summary request. The draw matrix itself
-/// crosses the boundary as a typed numpy buffer (SPEC rule 10: bulk arrays
-/// never travel as JSON); only the O(n_coeffs) descriptive fields ride here.
-#[derive(Deserialize)]
-struct PosteriorSamplesSummaryRequest {
-    level: f64,
-    coefficient_names: Vec<String>,
-    rhat: f64,
-    ess: f64,
-    converged: bool,
-    method: String,
-    model_class: String,
-    family_kind: String,
-    config: serde_json::Value,
-}
-
-fn require_len(actual: usize, expected: usize, label: &str) -> Result<(), String> {
-    if actual != expected {
-        return Err(format!(
-            "{label} length mismatch: got {actual}, expected {expected}"
-        ));
-    }
-    Ok(())
-}
-
-fn posterior_samples_summary_json_impl(
-    samples: Array2<f64>,
-    posterior_mean: Array1<f64>,
-    posterior_std: Array1<f64>,
-    request_json: &str,
-) -> Result<String, String> {
-    let request: PosteriorSamplesSummaryRequest = serde_json::from_str(request_json)
-        .map_err(|err| format!("posterior_samples_summary_json: parse request: {err}"))?;
-    let (n_draws, n_coeffs) = samples.dim();
-    require_len(posterior_mean.len(), n_coeffs, "posterior_mean")?;
-    require_len(posterior_std.len(), n_coeffs, "posterior_std")?;
-    let ci = posterior_credible_interval_impl(samples, request.level)?;
-    require_len(ci.nrows(), n_coeffs, "credible interval rows")?;
-    require_len(ci.ncols(), 2, "credible interval columns")?;
-    let names = normalize_coefficient_names_vec(request.coefficient_names, n_coeffs);
-    let coefficients: Vec<serde_json::Value> = (0..n_coeffs)
-        .map(|j| {
-            serde_json::json!({
-                "index": j,
-                "name": names[j],
-                "estimate": posterior_mean[j],
-                "std_error": posterior_std[j],
-                "ci_lower": ci[[j, 0]],
-                "ci_upper": ci[[j, 1]],
-            })
-        })
-        .collect();
-    let payload = serde_json::json!({
-        "kind": "posterior_samples",
-        "method": request.method,
-        "model_class": request.model_class,
-        "family_kind": request.family_kind,
-        "n_draws": n_draws,
-        "n_coeffs": n_coeffs,
-        "rhat": request.rhat,
-        "ess": request.ess,
-        "converged": request.converged,
-        "credible_interval": request.level,
-        "config": request.config,
-        "coefficients": coefficients,
-    });
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("posterior_samples_summary_json: serialise payload: {err}"))
 }
 
 #[derive(Deserialize)]
@@ -205,48 +127,65 @@ fn posterior_eta_bands_impl(
     })
 }
 
+fn posterior_draw_bands_impl(
+    eta: Array2<f64>,
+    mean: Array2<f64>,
+    level: f64,
+) -> Result<PosteriorPredictBandsPayload, String> {
+    let (n_draws, n_rows) = eta.dim();
+    let (
+        linear_predictor,
+        linear_predictor_lower,
+        linear_predictor_upper,
+        mean,
+        mean_lower,
+        mean_upper,
+    ) = posterior_bands::draw_bands_from_matrices(eta.view(), mean.view(), level)?;
+    Ok(PosteriorPredictBandsPayload {
+        linear_predictor,
+        linear_predictor_lower,
+        linear_predictor_upper,
+        mean,
+        mean_lower,
+        mean_upper,
+        n_rows,
+        n_draws,
+        model_class: String::new(),
+        family_kind: String::new(),
+    })
+}
+
 /// Typed result of a posterior-predictive η evaluation. Carried as ndarray /
 /// plain fields between the predict and bands paths and converted to numpy at
 /// the pyfunction edge; the `(n_draws, n_rows)` matrix never rides JSON.
 struct PosteriorPredictResult {
     eta: Array2<f64>,
+    mean: Array2<f64>,
     model_class: String,
     family_kind: String,
-    /// Serialized parameterized `InverseLink` (JSON) carrying the per-fit state
-    /// the bare `family_kind` tag drops; consumed by `predict_draws` /
-    /// `posterior_predict_bands_table` to route the parameterized links'
-    /// response-scale draws (issue #1133). `None` falls back to the tag.
+    /// Serialized parameterized `InverseLink` metadata for callers that inspect
+    /// the fitted link. Response draws themselves come from the polymorphic core
+    /// predictor and never reconstruct a mean from this metadata.
     link_spec: Option<String>,
 }
 
-fn posterior_predict_bands_table_impl(
+fn posterior_predict_bands_encoded_table_impl(
     model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    source: EncodedDataset,
     samples: Array2<f64>,
     level: f64,
 ) -> Result<PosteriorPredictBandsPayload, String> {
-    // Reuse the existing predict pipeline to get an eta matrix, then collapse
-    // to per-row bands inside Rust so the predict() path never materializes
-    // the (n_draws, n_rows) matrix on the Python side.
-    let result = posterior_predict_table_impl(model_bytes, headers, rows, samples)?;
-    // Prefer the typed link spec carried by the predict result so the
-    // parameterized links push their per-fit state through to response-scale
-    // bands; otherwise fall back to the bare `family_kind` tag (issue #1133).
-    let parsed_link: Option<InverseLink> = match result.link_spec.as_deref() {
-        Some(spec_json) => Some(
-            serde_json::from_str(spec_json)
-                .map_err(|err| format!("failed to parse link_spec for posterior bands: {err}"))?,
-        ),
-        None => None,
-    };
-    let selector = match parsed_link.as_ref() {
-        Some(link) => posterior_bands::LinkSelector::Spec(link),
-        None => posterior_bands::LinkSelector::Tag(result.family_kind.as_str()),
-    };
+    // Reuse the polymorphic core prediction pipeline, then collapse both its
+    // canonical-predictor and response-mean matrices inside Rust so predict()
+    // never materializes either draw matrix on the Python side.
+    let result = posterior_predict_encoded_table_impl(model_bytes, source, samples)?;
     let (n_draws, n_rows) = result.eta.dim();
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        posterior_bands::eta_bands_from_matrix_link(result.eta.view(), selector, level)?;
+        posterior_bands::draw_bands_from_matrices(
+            result.eta.view(),
+            result.mean.view(),
+            level,
+        )?;
     Ok(PosteriorPredictBandsPayload {
         linear_predictor: eta_mean,
         linear_predictor_lower: eta_lower,
@@ -261,178 +200,39 @@ fn posterior_predict_bands_table_impl(
     })
 }
 
-/// Posterior predictive η matrix for a bernoulli marginal-slope model (#1049).
-///
-/// Unlike a standard GAM (`η = X·β`), the marginal-slope linear predictor is a
-/// nonlinear rigid-kernel map of the marginal + logslope coefficient blocks and
-/// the latent-z column. We propagate the full β-posterior through that map: for
-/// each saved Laplace draw `θ_k` (in the saved `[marginal | logslope |
-/// score_warp? | link_dev?]` block order) we evaluate the exact per-row final η
-/// via `BernoulliMarginalSlopePredictor::final_eta_from_theta`. The resulting
-/// `(n_draws × n_rows)` η matrix is collapsed by the shared eta→bands path with
-/// the probit inverse link (`μ = Φ(η)`), identical to the point predict path, so
-/// the credible band and the point predictor agree by construction.
-fn posterior_predict_marginal_slope_eta(
-    model: &FittedModel,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+fn posterior_predict_encoded_table_impl(
+    model_bytes: &[u8],
+    source: EncodedDataset,
     samples: Array2<f64>,
 ) -> Result<PosteriorPredictResult, String> {
-    let (n_draws, n_coeffs) = samples.dim();
-    if n_draws == 0 {
-        return Err("posterior_predict requires at least one posterior draw".to_string());
-    }
-    let predictor = model.bernoulli_marginal_slope_predictor()?;
-    let theta_len = predictor.theta_len();
-    if n_coeffs != theta_len {
-        return Err(format!(
-            "posterior_predict coefficient count mismatch: samples have {n_coeffs} coefficients \
-             but the marginal-slope predictor consumes {theta_len} (marginal + logslope + any \
-             score-warp / link-deviation blocks). The posterior was likely produced from a \
-             different fit than this model; rerun model.sample(...) on the same model."
-        ));
-    }
-    let dataset = dataset_with_model_schema(model, &headers, &rows)?;
-    drop(rows);
-    drop(headers);
+    let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let col_map = dataset.column_map();
-    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
-    let offset_noise =
-        resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
-    let predict_input = build_predict_input_for_model(
-        model,
+    let prediction = gam_predict::predict_posterior_draws(
+        &model,
         dataset.values.view(),
         &col_map,
         model.training_headers.as_ref(),
-        &offset,
-        &offset_noise,
-        false,
-    )?;
-    // Per-draw final η. Each row of `samples` is one posterior draw of the full
-    // coefficient vector; map it through the marginal-slope kernel to its η
-    // surface over the prediction rows.
-    let mut eta_matrix: Option<Array2<f64>> = None;
-    for k in 0..n_draws {
-        let theta = samples.row(k).to_owned();
-        let eta = predictor
-            .final_eta_from_theta(&predict_input, &theta)
-            .map_err(|err| format!("marginal-slope posterior predict draw {k}: {err}"))?;
-        let matrix = eta_matrix.get_or_insert_with(|| Array2::zeros((n_draws, eta.len())));
-        if eta.len() != matrix.ncols() {
-            return Err(format!(
-                "marginal-slope posterior predict draw {k} produced {} rows, expected {n_rows}",
-                eta.len(),
-                n_rows = matrix.ncols(),
-            ));
-        }
-        matrix.row_mut(k).assign(&eta);
-    }
-    let eta = eta_matrix.ok_or_else(|| {
-        "marginal-slope posterior predict produced no posterior draws".to_string()
-    })?;
+        samples.view(),
+    )
+    .map_err(|error| error.to_string())?;
+    let matrices = prediction.into_matrices();
     Ok(PosteriorPredictResult {
-        eta,
-        model_class: prediction_model_class_label(model),
-        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
-        link_spec: model_link_spec_json(model),
-    })
-}
-
-fn posterior_predict_table_impl(
-    model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-    samples: Array2<f64>,
-) -> Result<PosteriorPredictResult, String> {
-    let (_n_draws, n_coeffs) = samples.dim();
-    let model = load_model_impl(model_bytes)?;
-    // Bernoulli marginal-slope posterior predictive (#1049): η is not X·β —
-    // each draw must be mapped through the marginal-slope rigid kernel — so it
-    // gets its own per-draw eta path. The Laplace draws already exist
-    // (sample() works); we propagate the full β-posterior through the
-    // marginal-slope link to get a principled predictive η matrix.
-    if matches!(
-        model.predict_model_class(),
-        PredictModelClass::BernoulliMarginalSlope
-    ) {
-        return posterior_predict_marginal_slope_eta(&model, headers, rows, samples);
-    }
-    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
-        return Err(format!(
-            "posterior_predict currently supports only standard GAM and bernoulli \
-             marginal-slope models; got '{}'. Per-class posterior-predict paths for \
-             location-scale / transformation-normal will be wired in a follow-up.",
-            prediction_model_class_label(&model)
-        ));
-    }
-    if model.has_link_wiggle() {
-        return Err(
-            "posterior_predict does not yet support link-wiggle models. The basis \
-             chain rule q0 + B(q0)·theta means eta is not X·beta and per-draw \
-             evaluation needs the link-wiggle runtime, which is a follow-up."
-                .to_string(),
-        );
-    }
-    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
-    drop(rows);
-    drop(headers);
-    let col_map = dataset.column_map();
-    let training_headers = model.training_headers.as_ref();
-    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        &col_map,
-        "resolved_termspec",
-    )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
-        .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    let base_dense = design
-        .design
-        .try_to_dense_by_chunks("posterior_predict design")?;
-    let dense = append_deployment_extension_columns(
-        model.payload(),
-        dataset.values.view(),
-        &col_map,
-        training_headers,
-        base_dense,
-    )?;
-    if dense.ncols() != n_coeffs {
-        return Err(format!(
-            "posterior_predict coefficient count mismatch: samples have {} coefficients \
-             but rebuilt design has {} columns. The posterior was likely produced from a \
-             different fit than this model; rerun model.sample(...) on the same model.",
-            n_coeffs,
-            dense.ncols()
-        ));
-    }
-    // A GLM fitted with `offset=...` targets the linear predictor η = X·β + offset.
-    // The point-predict path (`design.dot(beta) + input.offset`) and the
-    // coefficient sampler (#882) both re-apply that offset; the posterior-
-    // *predictive* η must too. Omitting it made every draw an offset-less X·β, so
-    // a rate model's predictive mean came out exp(-offset)× too small and silently
-    // reproduced the offset-less prediction.
-    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
-    // eta[k, i] = sum_j samples[k, j] * X[i, j] + offset[i]
-    //           = (samples · Xᵀ)[k, i] + offset[i]  (offset broadcasts over draws).
-    let eta = samples.dot(&dense.t()) + &offset;
-    Ok(PosteriorPredictResult {
-        eta,
+        eta: matrices.eta,
+        mean: matrices.mean,
         model_class: prediction_model_class_label(&model),
         family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         link_spec: model_link_spec_json(&model),
     })
 }
 
-fn sample_table_impl(
+fn sample_encoded_table_impl(
     model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    source: EncodedDataset,
     options_json: Option<&str>,
 ) -> Result<SamplePayload, String> {
     let model = load_model_impl(model_bytes)?;
-    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
-    drop(rows);
-    drop(headers);
+    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let options = parse_sample_options(options_json)?;
     let cfg = resolve_nuts_config(&model, options);
     let col_map = dataset.column_map();
@@ -895,9 +695,9 @@ struct DifferenceSmoothRequest {
     group: Option<String>,
     pairs: Option<Vec<(serde_json::Value, serde_json::Value)>>,
     n: usize,
-    level: f64,
+    level: Option<f64>,
     simultaneous: bool,
-    n_sim: usize,
+    n_sim: Option<usize>,
     seed: Option<u64>,
     marginalise_random: bool,
     group_means: bool,
@@ -910,9 +710,9 @@ struct DifferenceSmoothRequestJson<'a> {
     group: Option<String>,
     pairs: Option<Vec<(String, String)>>,
     n: usize,
-    level: f64,
+    level: Option<f64>,
     simultaneous: bool,
-    n_sim: usize,
+    n_sim: Option<usize>,
     seed: Option<u64>,
     marginalise_random: bool,
     group_means: bool,
@@ -925,9 +725,9 @@ fn build_difference_smooth_request_json(
     group: Option<String>,
     pairs: Option<Vec<(String, String)>>,
     n: usize,
-    level: f64,
+    level: Option<f64>,
     simultaneous: bool,
-    n_sim: usize,
+    n_sim: Option<usize>,
     seed: Option<u64>,
     marginalise_random: bool,
     group_means: bool,
@@ -1043,35 +843,6 @@ fn difference_training_ranges(state: &serde_json::Value) -> Vec<(f64, f64)> {
         .unwrap_or_default()
 }
 
-fn difference_smooth_covariance(
-    state: &serde_json::Value,
-    beta_len: usize,
-) -> Result<(Array2<f64>, String, bool), String> {
-    let corrected = state.get("covariance_corrected_flat").is_some()
-        || state.get("covariance_corrected_n").is_some();
-    let (flat_key, n_key, kind) = if corrected {
-        (
-            "covariance_corrected_flat",
-            "covariance_corrected_n",
-            "corrected",
-        )
-    } else {
-        ("covariance_flat", "covariance_n", "conditional")
-    };
-    let cov_n = state
-        .get(n_key)
-        .and_then(|raw| raw.as_u64())
-        .ok_or_else(|| format!("model coefficient state does not include {n_key}"))?
-        as usize;
-    let cov_flat = json_f64_vec(state, flat_key)?;
-    if cov_flat.len() != cov_n * cov_n || beta_len != cov_n {
-        return Err("coefficient covariance payload has inconsistent dimensions".to_string());
-    }
-    let cov = Array2::from_shape_vec((cov_n, cov_n), cov_flat)
-        .map_err(|err| format!("failed to reshape coefficient covariance: {err}"))?;
-    Ok((cov, kind.to_string(), corrected))
-}
-
 fn difference_group_ranges(
     state: &serde_json::Value,
     group: &str,
@@ -1161,142 +932,19 @@ fn zero_design_ranges(x: &mut Array2<f64>, ranges: &[(usize, usize)]) {
     }
 }
 
-struct SplitMixNormalRng {
-    state: u64,
-    spare: Option<f64>,
-}
-
-impl SplitMixNormalRng {
-    fn new(seed: u64) -> Self {
-        Self {
-            state: seed,
-            spare: None,
-        }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn uniform_open01(&mut self) -> f64 {
-        let value = self.next_u64() >> 11;
-        ((value as f64) + 0.5) * (1.0 / ((1_u64 << 53) as f64))
-    }
-
-    fn uniform_range(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.uniform_open01()
-    }
-
-    fn bernoulli(&mut self, p: f64) -> bool {
-        self.uniform_open01() < p.clamp(0.0, 1.0)
-    }
-
-    fn standard_normal(&mut self) -> f64 {
-        if let Some(value) = self.spare.take() {
-            return value;
-        }
-        let u1 = self.uniform_open01();
-        let u2 = self.uniform_open01();
-        let radius = (-2.0 * u1.ln()).sqrt();
-        let angle = std::f64::consts::TAU * u2;
-        self.spare = Some(radius * angle.sin());
-        radius * angle.cos()
-    }
-
-    fn normal(&mut self, mean: f64, sd: f64) -> f64 {
-        mean + sd * self.standard_normal()
-    }
-}
-
-fn difference_quantile(mut values: Vec<f64>, level: f64) -> Result<f64, String> {
-    values.retain(|value| value.is_finite());
-    if values.is_empty() {
-        return Err(
-            "simultaneous difference_smooth simulation produced no finite draws".to_string(),
-        );
-    }
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    if values.len() == 1 {
-        return Ok(values[0]);
-    }
-    let pos = level * ((values.len() - 1) as f64);
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    if lo == hi {
-        Ok(values[lo])
-    } else {
-        let weight = pos - (lo as f64);
-        Ok(values[lo] * (1.0 - weight) + values[hi] * weight)
-    }
-}
-
-fn difference_simultaneous_critical(
-    beta: &Array1<f64>,
-    cov: &Array2<f64>,
-    xd: &Array2<f64>,
-    diff: &Array1<f64>,
-    se: &Array1<f64>,
-    n_sim: usize,
-    seed: u64,
-    level: f64,
-) -> Result<f64, String> {
-    if n_sim == 0 {
-        return Err(
-            "difference_smooth n_sim must be at least 1 when simultaneous=True".to_string(),
-        );
-    }
-    let sym = (cov.to_owned() + cov.t()) * 0.5;
-    let chol = sym
-        .cholesky(Side::Lower)
-        .map_err(|err| format!("coefficient covariance Cholesky failed: {err}"))?;
-    let lower = chol.lower_triangular();
-    let n_coeff = beta.len();
-    let n_rows = xd.nrows();
-    let mut rng = SplitMixNormalRng::new(seed);
-    let mut z = vec![0.0; n_coeff];
-    let mut draw = vec![0.0; n_coeff];
-    let mut max_devs = Vec::with_capacity(n_sim);
-    for _ in 0..n_sim {
-        for value in &mut z {
-            *value = rng.standard_normal();
-        }
-        for row in 0..n_coeff {
-            let mut value = beta[row];
-            for col in 0..=row {
-                value += lower[[row, col]] * z[col];
-            }
-            draw[row] = value;
-        }
-        let mut max_dev = 0.0_f64;
-        for i in 0..n_rows {
-            let denom = if se[i] > 0.0 { se[i] } else { f64::INFINITY };
-            let mut draw_diff = 0.0;
-            for j in 0..n_coeff {
-                draw_diff += draw[j] * xd[[i, j]];
-            }
-            let dev = ((draw_diff - diff[i]) / denom).abs();
-            if dev.is_finite() && dev > max_dev {
-                max_dev = dev;
-            }
-        }
-        max_devs.push(max_dev);
-    }
-    difference_quantile(max_devs, level)
-}
-
 fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result<String, String> {
-    use statrs::distribution::ContinuousCDF;
-
     let state_json = coefficient_state_json_impl(model_bytes)?;
     let state: serde_json::Value = serde_json::from_str(&state_json)
         .map_err(|err| format!("failed to parse coefficient state json: {err}"))?;
     let request: DifferenceSmoothRequest = serde_json::from_str(request_json)
         .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
-    if !(0.0 < request.level && request.level < 1.0) {
+    let level = request
+        .level
+        .unwrap_or(gam::inference::effects::DEFAULT_BAND_LEVEL);
+    let simulations = request
+        .n_sim
+        .unwrap_or(gam::inference::effects::DEFAULT_SIMULATIONS);
+    if !(0.0 < level && level < 1.0) {
         return Err("difference_smooth level must be in (0, 1)".to_string());
     }
     if request.n < 2 {
@@ -1429,14 +1077,39 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
         }
     }
 
-    let beta = Array1::from_vec(json_f64_vec(&state, "beta")?);
-    let (cov, cov_kind, cov_corrected) = difference_smooth_covariance(&state, beta.len())?;
+    let model = load_model_impl(model_bytes)?;
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let selected_covariance = gam::inference::effects::select_covariance(
+        &fit,
+        gam::inference::effects::CovarianceSelection::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let beta = &fit.beta;
+    let cov = selected_covariance.matrix;
+    let cov_kind = selected_covariance.source.to_string();
+    let cov_corrected = matches!(
+        selected_covariance.source,
+        gam::inference::effects::CovarianceSource::SmoothingCorrected
+    );
     let random_ranges = difference_json_ranges(&state, "random_column_ranges")?;
     let group_ranges = difference_group_ranges(&state, &group)?;
-    let normal = statrs::distribution::Normal::new(0.0, 1.0)
-        .map_err(|err| format!("failed to construct standard normal: {err}"))?;
-    let pointwise_crit = normal.inverse_cdf(0.5 + request.level / 2.0);
-    let model = load_model_impl(model_bytes)?;
+    let band_options = if request.simultaneous {
+        gam::inference::effects::BandOptions::Simultaneous(
+            gam::inference::effects::SimultaneousBandOptions {
+                level,
+                simulations,
+                seed: request.seed.unwrap_or(
+                    gam::inference::effects::DEFAULT_SIMULATION_SEED,
+                ),
+            },
+        )
+    } else {
+        gam::inference::effects::BandOptions::Pointwise(
+            gam::inference::effects::PointwiseBandOptions {
+                level,
+            },
+        )
+    };
     let mut rows_out = Vec::<serde_json::Value>::new();
 
     for (level_1, level_2) in pairs {
@@ -1496,49 +1169,32 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
         if !request.group_means {
             zero_design_ranges(&mut xd, &group_ranges);
         }
-        let diff = xd.dot(&beta);
-        let tmp = xd.dot(&cov);
-        let mut var = Array1::<f64>::zeros(xd.nrows());
-        for i in 0..xd.nrows() {
-            let mut value = 0.0;
-            for j in 0..xd.ncols() {
-                value += tmp[[i, j]] * xd[[i, j]];
-            }
-            var[i] = value;
-        }
-        let se = var.mapv(|value| value.max(0.0).sqrt());
-        let crit = if request.simultaneous {
-            difference_simultaneous_critical(
-                &beta,
-                &cov,
-                &xd,
-                &diff,
-                &se,
-                request.n_sim,
-                request.seed.unwrap_or(12345),
-                request.level,
-            )?
-        } else {
-            pointwise_crit
-        };
+        let report = gam::inference::effects::effect_report(
+            beta.view(),
+            cov,
+            xd.view(),
+            band_options,
+        )
+        .map_err(|error| error.to_string())?;
         for (idx, x) in grid.iter().enumerate() {
-            let lower = diff[idx] - crit * se[idx];
-            let upper = diff[idx] + crit * se[idx];
             let mut row = serde_json::Map::new();
             row.insert(request.view.clone(), serde_json::json!(x));
             row.insert("group".to_string(), serde_json::json!(group.clone()));
             row.insert("level_1".to_string(), serde_json::json!(level_1.clone()));
             row.insert("level_2".to_string(), serde_json::json!(level_2.clone()));
-            row.insert("diff".to_string(), serde_json::json!(diff[idx]));
-            row.insert("se".to_string(), serde_json::json!(se[idx]));
-            row.insert("lower".to_string(), serde_json::json!(lower));
-            row.insert("upper".to_string(), serde_json::json!(upper));
-            row.insert("level".to_string(), serde_json::json!(request.level));
+            row.insert("diff".to_string(), serde_json::json!(report.center[idx]));
+            row.insert("se".to_string(), serde_json::json!(report.se[idx]));
+            row.insert("lower".to_string(), serde_json::json!(report.lower[idx]));
+            row.insert("upper".to_string(), serde_json::json!(report.upper[idx]));
+            row.insert("level".to_string(), serde_json::json!(level));
             row.insert(
                 "simultaneous".to_string(),
                 serde_json::json!(request.simultaneous),
             );
-            row.insert("critical".to_string(), serde_json::json!(crit));
+            row.insert(
+                "critical".to_string(),
+                serde_json::json!(report.critical),
+            );
             row.insert(
                 "covariance_kind".to_string(),
                 serde_json::json!(cov_kind.clone()),
@@ -2568,10 +2224,9 @@ fn curvature_verdict_label(v: gam::geometry::CurvatureVerdict) -> &'static str {
 /// materialize a Standard fit request from the model's training formula + data,
 /// then swap in the model's fitted spec and family so the profile oracle refits
 /// at the EXACT estimand the model was fitted under — only κ moves.
-fn curvature_inference_json_impl(
+fn curvature_inference_dataset_json_impl(
     model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    dataset: EncodedDataset,
     level: f64,
 ) -> Result<String, String> {
     use gam::terms::smooth::SmoothBasisSpec;
@@ -2609,7 +2264,6 @@ fn curvature_inference_json_impl(
     // Materialize responses/weights/offset/options from the training data under
     // the model's own family. We replace the materialized (default-κ) spec with
     // the FITTED spec so the V_p oracle profiles around κ̂ — only κ moves.
-    let dataset = dataset_with_inferred_schema(headers, rows)?;
     let fit_config = postfit_standard_materialization_config(&model)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let standard = match materialized.request {
@@ -2674,10 +2328,9 @@ fn curvature_inference_json_impl(
 /// + data, swap in the model's fitted (frozen) spec and family, then run the
 /// core LR + Bartlett driver. The fitted spec carries the exact estimand the
 /// model was fitted under.
-fn smooth_term_lr_inference_json_impl(
+fn smooth_term_lr_inference_dataset_json_impl(
     model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    dataset: EncodedDataset,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let formula = model.payload().formula.clone();
@@ -2698,7 +2351,6 @@ fn smooth_term_lr_inference_json_impl(
             .map_err(|err| format!("failed to serialize smooth-term LR inference: {err}"));
     }
 
-    let dataset = dataset_with_inferred_schema(headers, rows)?;
     let fit_config = postfit_standard_materialization_config(&model)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let standard = match materialized.request {
@@ -2754,13 +2406,12 @@ fn postfit_standard_materialization_config(model: &FittedModel) -> Result<FitCon
     Ok(fit_config)
 }
 
-fn check_json_impl(
+fn check_dataset_json_impl(
     model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    dataset: EncodedDataset,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
-    let check = schema_check(&model, &headers, &rows)?;
+    let check = schema_check_encoded(&model, &dataset)?;
     serde_json::to_string(&check).map_err(|err| format!("failed to serialize schema check: {err}"))
 }
 
@@ -2850,8 +2501,12 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
-        convergence_status: fit.pirls_status.label().to_string(),
-        converged: fit.pirls_status.is_converged(),
+        convergence_status: fit
+            .convergence_evidence()
+            .inner_status()
+            .label()
+            .to_string(),
+        converged: true,
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: None,
         smoothing_forensics: Vec::new(),
@@ -6864,7 +6519,7 @@ fn predict_competing_risks_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictRequest, predict_competing_risks_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_competing_risks_survival,
     };
 
     let col_map = dataset.column_map();
@@ -6886,6 +6541,7 @@ fn predict_competing_risks_survival_result(
         // `interval=`. The inner kernel keeps its own boolean knob — that
         // is an internal cost-control, not a public API flag.
         with_uncertainty: options.interval.is_some(),
+        estimand: SurvivalPredictEstimand::PosteriorMean,
     };
     Ok(predict_competing_risks_survival(request)?)
 }
@@ -6895,7 +6551,9 @@ fn predict_survival_result(
     dataset: &EncodedDataset,
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::SurvivalPredictResult, String> {
-    use gam::families::survival::predict::{SurvivalPredictRequest, predict_survival};
+    use gam::families::survival::predict::{
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_survival,
+    };
 
     let col_map = dataset.column_map();
     let payload = model.payload();
@@ -6925,6 +6583,7 @@ fn predict_survival_result(
         // `interval=`. The inner kernel keeps its own boolean knob — that
         // is an internal cost-control, not a public API flag.
         with_uncertainty: options.interval.is_some(),
+        estimand: SurvivalPredictEstimand::PosteriorMean,
     };
     Ok(predict_survival(request)?)
 }

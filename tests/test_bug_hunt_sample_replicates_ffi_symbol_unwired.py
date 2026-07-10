@@ -8,8 +8,8 @@ pyffi `generative_replicates(model_bytes, headers, rows, n_draws, seed)`" was
 added, but the commit's diff only touched `gamfit/_model.py` and a test — the
 `#[pyfunction] generative_replicates` it describes was never committed to
 `crates/gam-pyffi/src/lib.rs`.  The Rust extension module therefore exposes
-`build_sample_payload_json`, `posterior_samples_summary_json`, and
-`sample_table`, but NOT `generative_replicates`:
+`build_sample_payload_json` and `sample_table`, but NOT
+`generative_replicates`:
 
     >>> import gamfit._rust as r
     >>> [s for s in dir(r) if "replic" in s or "generat" in s]

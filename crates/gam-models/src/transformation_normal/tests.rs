@@ -1634,17 +1634,16 @@ pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
 
     let rho_dim = spec.initial_log_lambdas.len();
     let psi_dim = derivative_blocks[0].len();
-    let outer_plan =
-        gam_solve::rho_optimizer::plan(&gam_solve::rho_optimizer::OuterCapability {
-            gradient,
-            hessian,
-            n_params: rho_dim + psi_dim,
-            psi_dim,
-            fixed_point_available: false,
-            barrier_config: None,
-            prefer_gradient_only: false,
-            disable_fixed_point: true,
-        });
+    let outer_plan = gam_solve::rho_optimizer::plan(&gam_solve::rho_optimizer::OuterCapability {
+        gradient,
+        hessian,
+        n_params: rho_dim + psi_dim,
+        psi_dim,
+        fixed_point_available: false,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: true,
+    });
     assert_eq!(outer_plan.solver, gam_solve::rho_optimizer::Solver::Arc);
     assert_eq!(
         outer_plan.hessian_source,

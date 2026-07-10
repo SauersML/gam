@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
-gamfit = pytest.importorskip("gamfit")
-from gamfit._sae_manifold import ManifoldSAE, SaeManifoldAtomFit, SaeManifoldFitResult  # noqa: E402
+pytest.importorskip("gamfit")
+from gamfit._sae_manifold import ManifoldSAE  # noqa: E402
+
+
+_GOLDEN_FULL = (
+    Path(__file__).resolve().parent / "fixtures" / "manifold_sae" / "golden_full.json"
+)
+_GOLDEN_PAYLOAD = json.loads(_GOLDEN_FULL.read_text())
 
 
 def _coordinate_fidelity() -> dict:
@@ -22,7 +32,7 @@ def _coordinate_fidelity() -> dict:
                 "n_coords": 4,
                 "verdict": "recoverable_via_arclength",
                 "certified": True,
-                "coords_u_arc": np.array([0.0, 0.25, 0.5, 0.75]),
+                "coords_u_arc": [0.0, 0.25, 0.5, 0.75],
                 "raw_arclength_defect_rms": 0.12,
                 "raw_arclength_defect_max": 0.2,
                 "min_speed_over_mean": 0.8,
@@ -32,18 +42,20 @@ def _coordinate_fidelity() -> dict:
             {
                 "atom": 1,
                 "topology": "circle",
-                "uniformity_statistic": float("nan"),
-                "uniformity_p_value": float("nan"),
-                "arclength_defect": float("nan"),
+                # The Rust-owned persisted surface is JSON. Undefined metrics
+                # for a degenerate chart are represented as null, not NaN.
+                "uniformity_statistic": None,
+                "uniformity_p_value": None,
+                "arclength_defect": None,
                 "n_coords": 4,
                 "verdict": "degenerate",
                 "certified": False,
                 "coords_u_arc": None,
-                "raw_arclength_defect_rms": float("nan"),
-                "raw_arclength_defect_max": float("nan"),
+                "raw_arclength_defect_rms": None,
+                "raw_arclength_defect_max": None,
                 "min_speed_over_mean": 0.0,
                 "max_speed_over_mean": 2.0,
-                "log_speed_rms": float("nan"),
+                "log_speed_rms": None,
             },
         ],
     }
@@ -70,85 +82,16 @@ def _certificates() -> dict:
     }
 
 
-def _trust_atom() -> dict:
-    return {
-        "trust_score": 1.0,
-        "sigma_min_tangent": 1.0,
-        "sigma_max_tangent": 1.0,
-        "tangent_condition_score": 1.0,
-        "coverage": 1.0,
-        "activation_frequency": 1.0,
-        "untyped": False,
-        "active_token_count": 4,
-    }
-
-
 def _model() -> ManifoldSAE:
-    n, p = 4, 2
-    fitted = np.zeros((n, p))
-    assignments = np.ones((n, 2))
-    logits = np.zeros((n, 2))
-    coords = [
-        np.array([[0.0], [0.2], [0.7], [0.9]]),
-        np.array([[0.0], [0.0], [0.0], [0.0]]),
-    ]
-    atoms = [
-        SaeManifoldAtomFit(
-            basis="periodic",
-            decoder_coefficients=np.zeros((3, p)),
-            assignments=assignments[:, 0],
-            coords=coords[0],
-            evidence=0.0,
-            active_dim=1,
-            coords_u_arc=np.array([0.0, 0.25, 0.5, 0.75]),
-        ),
-        SaeManifoldAtomFit(
-            basis="periodic",
-            decoder_coefficients=np.zeros((3, p)),
-            assignments=assignments[:, 1],
-            coords=coords[1],
-            evidence=0.0,
-            active_dim=1,
-            coords_u_arc=None,
-        ),
-    ]
-    low = SaeManifoldFitResult(
-        atoms=atoms,
-        chosen_k=2,
-        evidence_by_candidate={2: 0.0},
-        comparison={"winner": "K=2"},
-        fitted=fitted,
-        assignments=assignments,
-        coords=coords,
-        reml_score=0.0,
+    payload = deepcopy(_GOLDEN_PAYLOAD)
+    coordinate_fidelity = _coordinate_fidelity()
+    payload["coordinate_fidelity"] = coordinate_fidelity
+    payload["certificates"] = _certificates()
+    payload["atoms"][0]["coords_u_arc"] = deepcopy(
+        coordinate_fidelity["atoms"][0]["coords_u_arc"]
     )
-    return ManifoldSAE(
-        atoms=atoms,
-        atom_topology="circle",
-        atom_topologies=["circle", "circle"],
-        assignment="ibp_map",
-        assignment_label="ibp_map",
-        primitive_names=["rust_module.sae_manifold_fit_minimal"],
-        fitted=fitted,
-        assignments=assignments,
-        coords=coords,
-        decoder_blocks=[atom.decoder_coefficients.copy() for atom in atoms],
-        basis_specs=["periodic", "periodic"],
-        penalized_loss_score=0.0,
-        reconstruction_r2=0.0,
-        training_mean=np.zeros(p),
-        training_data=np.zeros((n, p)),
-        low_level=low,
-        low_level_logits=logits,
-        diagnostics={"atom_trust": [1.0, 1.0], "atoms": [_trust_atom(), _trust_atom()]},
-        _basis_kinds=["periodic", "periodic"],
-        _atom_dims=[1, 1],
-        _basis_sizes=[3, 3],
-        _n_harmonics=[1, 1],
-        _duchon_centers=[None, None],
-        coordinate_fidelity=_coordinate_fidelity(),
-        certificates=_certificates(),
-    )
+    payload["atoms"][1]["coords_u_arc"] = None
+    return ManifoldSAE.from_dict(payload)
 
 
 def test_coordinate_fidelity_report_and_gated_angle_reader() -> None:

@@ -101,10 +101,12 @@ from ._compare import compare_models
 from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
 from ._sparse_dictionary import (
     BlockSparseDictStream,
+    BlockSparseDictionaryConvergence,
     BlockSparseDictionaryFit,
     BlockSparseStreamArtifact,
     SparseDictStream,
     SparseDictStreamArtifact,
+    SparseDictionaryConvergence,
     SparseDictionaryFit,
     block_sparse_dictionary_fit,
     block_sparse_dictionary_fit_begin,
@@ -187,6 +189,8 @@ from ._select_topology import (
     TopologyAutoSelector,
     TopologyAutoSelectorRank,
     TopologyAutoSelectorResult,
+    TopologyCandidateFailure,
+    TopologySelectionError,
     TopologyStack,
     select_topology,
     stack_topologies,
@@ -266,6 +270,7 @@ from ._exceptions import (
     CustomFamilyError,
     DataError,
     DeviationRuntimeError,
+    DictionaryConvergenceError,
     EigendecompositionError,
     FittedModelError,
     FormulaError,
@@ -343,8 +348,6 @@ from ._tables import PredictionResult
 from ._sae_manifold import (
     GumbelTemperatureSchedule,
     ManifoldSAE,
-    SaeManifoldAtomFit,
-    SaeManifoldFitResult,
     StagewiseAtom,
     StagewiseSAE,
     fit as sae_fit,

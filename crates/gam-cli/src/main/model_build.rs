@@ -335,7 +335,7 @@ impl SavedFitSummary {
             // gates on status. The bool is itself just a projection of this
             // field (`outer_converged == matches!(status, Converged)`), so the
             // status is strictly more informative.
-            pirls_status: fit.pirls_status,
+            pirls_status: fit.convergence_evidence().inner_status(),
             deviance: fit.deviance,
             stable_penalty_term,
             max_abs_eta,

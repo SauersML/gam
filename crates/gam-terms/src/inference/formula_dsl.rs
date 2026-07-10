@@ -996,7 +996,9 @@ mod tests {
             .iter()
             .map(|t| match t {
                 ParsedTerm::Linear { name, .. } => format!("Linear({name})"),
-                ParsedTerm::Interaction { vars } => format!("Interaction({})", vars.join(":")),
+                ParsedTerm::Interaction { vars, .. } => {
+                    format!("Interaction({})", vars.join(":"))
+                }
                 other => format!("Other({other:?})"),
             })
             .collect();
@@ -1020,7 +1022,9 @@ mod tests {
             .iter()
             .map(|t| match t {
                 ParsedTerm::Linear { name, .. } => format!("Linear({name})"),
-                ParsedTerm::Interaction { vars } => format!("Interaction({})", vars.join(":")),
+                ParsedTerm::Interaction { vars, .. } => {
+                    format!("Interaction({})", vars.join(":"))
+                }
                 other => format!("Other({other:?})"),
             })
             .collect();
@@ -1057,7 +1061,9 @@ mod tests {
             .iter()
             .map(|t| match t {
                 ParsedTerm::Linear { name, .. } => format!("Linear({name})"),
-                ParsedTerm::Interaction { vars } => format!("Interaction({})", vars.join(":")),
+                ParsedTerm::Interaction { vars, .. } => {
+                    format!("Interaction({})", vars.join(":"))
+                }
                 other => format!("Other({other:?})"),
             })
             .collect();
@@ -1283,6 +1289,7 @@ pub enum ParsedTerm {
     Linear {
         name: String,
         explicit: bool,
+        double_penalty: bool,
         coefficient_min: Option<f64>,
         coefficient_max: Option<f64>,
     },
@@ -1291,6 +1298,7 @@ pub enum ParsedTerm {
         min: f64,
         max: f64,
         prior: BoundedCoefficientPriorSpec,
+        double_penalty: bool,
     },
     RandomEffect {
         name: String,
@@ -1337,6 +1345,7 @@ pub enum ParsedTerm {
     /// product of the referenced numeric columns.
     Interaction {
         vars: Vec<String>,
+        double_penalty: bool,
     },
 }
 
@@ -1365,7 +1374,7 @@ pub fn parsed_term_column_names(
                     out.insert(by.clone());
                 }
             }
-            ParsedTerm::Interaction { vars } => {
+            ParsedTerm::Interaction { vars, .. } => {
                 out.extend(vars.iter().cloned());
             }
             ParsedTerm::LinkWiggle { .. }
@@ -1389,7 +1398,7 @@ pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) ->
             vars.iter().any(|var| var == column_name)
                 || options.get("by").is_some_and(|by| by == column_name)
         }
-        ParsedTerm::Interaction { vars } => vars.iter().any(|var| var == column_name),
+        ParsedTerm::Interaction { vars, .. } => vars.iter().any(|var| var == column_name),
         ParsedTerm::LinkWiggle { .. }
         | ParsedTerm::TimeWiggle { .. }
         | ParsedTerm::LinkConfig { .. }
@@ -2517,7 +2526,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 .into());
             }
-            return Ok(ParsedTerm::Interaction { vars: sorted });
+            return Ok(ParsedTerm::Interaction {
+                vars: sorted,
+                double_penalty: true,
+            });
         }
     }
 
@@ -2538,7 +2550,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(
                     "constrain",
                     &options,
-                    &["min", "lower", "max", "upper"],
+                    &["min", "lower", "max", "upper", "double_penalty"],
                     raw,
                 )?;
                 let (coefficient_min, coefficient_max) =
@@ -2554,6 +2566,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
+                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(true),
                     coefficient_min,
                     coefficient_max,
                 });
@@ -2565,10 +2578,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                validate_known_term_options("nonnegative", &options, &[], raw)?;
+                validate_known_term_options("nonnegative", &options, &["double_penalty"], raw)?;
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
+                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(true),
                     coefficient_min: Some(0.0),
                     coefficient_max: None,
                 });
@@ -2580,10 +2594,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                validate_known_term_options("nonpositive", &options, &[], raw)?;
+                validate_known_term_options("nonpositive", &options, &["double_penalty"], raw)?;
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
+                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(true),
                     coefficient_min: None,
                     coefficient_max: Some(0.0),
                 });
@@ -2598,7 +2613,15 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(
                     "bounded",
                     &options,
-                    &["min", "max", "prior", "pull", "target", "strength"],
+                    &[
+                        "min",
+                        "max",
+                        "prior",
+                        "pull",
+                        "target",
+                        "strength",
+                        "double_penalty",
+                    ],
                     raw,
                 )?;
                 let min = parse_required_f64_option(&options, "min", raw)?;
@@ -2617,6 +2640,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     min,
                     max,
                     prior,
+                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(true),
                 });
             }
             "group" | "re" | "factor" => {
@@ -2967,14 +2991,57 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(
                     "linear",
                     &options,
-                    &["min", "lower", "max", "upper"],
+                    &["min", "lower", "max", "upper", "double_penalty"],
                     raw,
                 )?;
                 let (coefficient_min, coefficient_max) =
                     parse_linear_constraint_bounds(&options, raw)?;
+                let double_penalty =
+                    option_bool_strict(&options, "double_penalty")?.unwrap_or(true);
+                if vars[0].contains(':') {
+                    if coefficient_min.is_some() || coefficient_max.is_some() {
+                        return Err(FormulaDslError::IncompatibleTerm {
+                            reason: format!(
+                                "linear() coefficient bounds are not supported on an interaction: {raw}"
+                            ),
+                        }
+                        .into());
+                    }
+                    let mut interaction_vars = vars[0]
+                        .split(':')
+                        .map(str::trim)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+                    if interaction_vars.len() < 2
+                        || interaction_vars.iter().any(|var| !is_exact_ident(var))
+                    {
+                        return Err(FormulaDslError::InvalidArgument {
+                            reason: format!(
+                                "linear() interaction must contain at least two bare column names: {raw}"
+                            ),
+                        }
+                        .into());
+                    }
+                    interaction_vars.sort();
+                    let original_len = interaction_vars.len();
+                    interaction_vars.dedup();
+                    if interaction_vars.len() != original_len {
+                        return Err(FormulaDslError::IncompatibleTerm {
+                            reason: format!(
+                                "linear() interaction references the same variable more than once: {raw}"
+                            ),
+                        }
+                        .into());
+                    }
+                    return Ok(ParsedTerm::Interaction {
+                        vars: interaction_vars,
+                        double_penalty,
+                    });
+                }
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
+                    double_penalty,
                     coefficient_min,
                     coefficient_max,
                 });
@@ -2998,6 +3065,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
     Ok(ParsedTerm::Linear {
         name: ident.to_string(),
         explicit: false,
+        double_penalty: true,
         coefficient_min: None,
         coefficient_max: None,
     })

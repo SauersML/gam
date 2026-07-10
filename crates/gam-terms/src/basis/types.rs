@@ -367,8 +367,9 @@ impl CenterStrategy {
     /// The number of centers this strategy will select, computed from the
     /// strategy alone (no data pass). `d` is the smooth's covariate
     /// dimensionality, needed only by `UniformGrid` whose count is
-    /// `points_per_dim^d`. This is what resource planning consults to estimate
-    /// a spatial term's column contribution before any basis is built.
+    /// `points_per_dim^d`. Adaptive-fit provenance consults this before freeze,
+    /// because the frozen center matrix can contain periodic image expansion
+    /// and therefore is not the requested resolution for the next refit.
     pub fn planned_num_centers(&self, d: usize) -> usize {
         match self {
             Self::Auto(inner) => inner.planned_num_centers(d),
@@ -487,16 +488,20 @@ pub fn starting_num_centers(n: usize, d: usize) -> usize {
     d.saturating_add(2).min(n).max(1)
 }
 
-/// Center count at escalation `level` (0 = [`starting_num_centers`]) for #1689.
+/// Next evidence-backed center count for a saturated spatial basis.
 ///
-/// Geometric growth from the structural start, capped only by the observed row
-/// support. The cap is information-theoretic rather than heuristic: more than
-/// `n` selected centers cannot add a training-data direction. Resource policy
-/// independently decides whether a candidate must stay operator-backed.
-pub fn escalated_num_centers(n: usize, d: usize, level: u32) -> usize {
-    let start = starting_num_centers(n, d);
-    let grown = start.saturating_mul(2usize.saturating_pow(level.min(32)));
-    grown.min(n).max(1)
+/// Growth is geometric so the number of certified refits is logarithmic, then
+/// clipped at the observed row support. The cap is information-theoretic rather
+/// than a sample-size heuristic: more selected centers than observations cannot
+/// add a training-data direction. `None` means the row-supported function space
+/// is exhausted, which the workflow reports as typed underresolution when the
+/// fitted EDF is still saturated.
+pub fn expanded_num_centers(current: usize, n: usize) -> Option<usize> {
+    if current >= n {
+        return None;
+    }
+    let expanded = current.saturating_mul(2).min(n);
+    (expanded > current).then_some(expanded)
 }
 
 /// Is a fitted spatial smooth's basis SATURATED — i.e. does its own evidence say
@@ -509,26 +514,29 @@ pub fn escalated_num_centers(n: usize, d: usize, level: u32) -> usize {
 /// toward that capacity exactly as REML drives the penalty
 /// λ toward its floor to chase structure the basis cannot resolve. Saturated ⟺
 /// `edf ≥ capacity − ε`, with the margin `ε` DERIVED from the outer REML
-/// convergence tolerance (`ε = capacity · outer_tol`, floored at `outer_tol` so a
-/// tiny-capacity block still has a positive margin) rather than a tuned knob:
-/// escalation only fires when the fit has converged with edf pinned within outer
-/// tolerance of the ceiling. Non-positive capacity (a block whose null space
-/// already exhausts its columns) is never saturated. The absolute scale of `ε`
-/// is what the MSI truth-recovery sweep (sin8/kappa/large_scale + #1074)
-/// validates — the criterion SHAPE (edf-vs-capacity, nullspace excluded, tol-tied
-/// margin) is the load-bearing contract this function pins.
+/// numerical resolution (`ε = capacity · resolution_tol`, floored at
+/// `resolution_tol` so a tiny-capacity block still has a positive margin) rather
+/// than a tuned knob. The workflow derives `resolution_tol` from the maximum of
+/// its outer convergence tolerance and any rho-independent penalty shrinkage
+/// floor, because that floor bounds how closely EDF can approach the algebraic
+/// ceiling even as lambda tends to zero. Non-positive capacity (a block whose
+/// null space already exhausts its columns) is never saturated. The absolute
+/// scale of `ε` is what the MSI truth-recovery sweep
+/// (sin8/kappa/large_scale + #1074) validates — the criterion SHAPE
+/// (edf-vs-capacity, nullspace excluded, tol-tied margin) is the load-bearing
+/// contract this function pins.
 pub fn basis_is_saturated(
     edf: f64,
     realized_width: usize,
     nullspace_dim: usize,
-    outer_tol: f64,
+    resolution_tol: f64,
 ) -> bool {
     let capacity = realized_width.saturating_sub(nullspace_dim) as f64;
     if !(capacity > 0.0) || !edf.is_finite() {
         return false;
     }
     let penalized_edf = (edf - nullspace_dim as f64).clamp(0.0, capacity);
-    let margin = (capacity * outer_tol).max(outer_tol);
+    let margin = (capacity * resolution_tol).max(resolution_tol);
     penalized_edf >= capacity - margin
 }
 
@@ -2250,21 +2258,14 @@ mod saturation_escalation_tests {
     }
 
     #[test]
-    fn escalation_doubles_then_pins_at_observed_support() {
-        let n = 800;
-        let d = 2;
-        let start = starting_num_centers(n, d);
-        assert_eq!(escalated_num_centers(n, d, 0), start);
-        assert_eq!(escalated_num_centers(n, d, 1), 2 * start);
-        assert_eq!(escalated_num_centers(n, d, 20), n);
-        // Monotone non-decreasing in level.
-        let mut prev = 0;
-        for level in 0..16 {
-            let k = escalated_num_centers(n, d, level);
-            assert!(k >= prev);
-            assert!(k <= n);
-            prev = k;
-        }
+    fn saturated_expansion_doubles_then_pins_at_observed_support() {
+        assert_eq!(expanded_num_centers(4, 800), Some(8));
+        assert_eq!(expanded_num_centers(512, 800), Some(800));
+        assert_eq!(expanded_num_centers(800, 800), None);
+        assert_eq!(
+            expanded_num_centers(usize::MAX - 1, usize::MAX),
+            Some(usize::MAX)
+        );
     }
 
     #[test]

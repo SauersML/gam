@@ -780,10 +780,7 @@ impl<const LIN: u32> JetScalar<4> for SparseTower4<LIN> {
 /// arithmetic (same accumulation order), used by the build-once first-directional
 /// path on the pruned [`SparseTower3`] towers.
 #[inline]
-pub(crate) fn tower3_third_contracted(
-    t3: &[[[f64; 4]; 4]; 4],
-    dir: &[f64; 4],
-) -> [[f64; 4]; 4] {
+pub(crate) fn tower3_third_contracted(t3: &[[[f64; 4]; 4]; 4], dir: &[f64; 4]) -> [[f64; 4]; 4] {
     let mut out = [[0.0; 4]; 4];
     for a in 0..4 {
         for b in 0..4 {

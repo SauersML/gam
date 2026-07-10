@@ -27,16 +27,19 @@ __all__ = ["check_anchor_consistency"]
 
 def _extract_assignments(model: Any) -> np.ndarray:
     """Return the ``(N, K)`` assignment matrix from a manifold-SAE-like model."""
-    if hasattr(model, "assignments"):
-        A = np.ascontiguousarray(np.asarray(model.assignments, dtype=float))
-        if A.ndim == 1:
-            A = A.reshape(-1, 1)
-        return np.ascontiguousarray(A)
-    raise TypeError(
-        f"Cannot extract atom assignments from object of type "
-        f"{type(model).__name__}; expected a `.assignments` attribute "
-        f"with shape (N, K)."
-    )
+    if not hasattr(model, "assignments"):
+        raise TypeError(
+            f"Cannot extract atom assignments from object of type "
+            f"{type(model).__name__}; expected a `.assignments` attribute "
+            f"with shape (N, K)."
+        )
+    assignments = np.asarray(model.assignments, dtype=float)
+    if assignments.ndim != 2:
+        raise ValueError(
+            "assignments must be a 2-D (N, K) matrix; "
+            f"got shape {assignments.shape}."
+        )
+    return np.ascontiguousarray(assignments)
 
 
 def check_anchor_consistency(
@@ -61,49 +64,18 @@ def check_anchor_consistency(
     name = "anchor_consistency"
     theorem = "gam manifold-SAE atom-anchor convention"
 
-    try:
-        A = _extract_assignments(model)
-    except TypeError as exc:
-        return IdentifiabilityReport(
-            name=name,
-            theorem=theorem,
-            preconditions={"assignments_available": False},
-            violations=[str(exc)],
-            recommendations=[
-                "Pass a manifold-SAE model (gamfit.ManifoldSAE) or any object "
-                "exposing an (N, K) `assignments` ndarray."
-            ],
-        )
-
-    if A.ndim != 2 or A.shape[1] < 1:
-        return IdentifiabilityReport(
-            name=name,
-            theorem=theorem,
-            preconditions={
-                "assignments_available": True,
-                "assignments_2d": False,
-            },
-            violations=[
-                "assignments must be 2D with at least one atom column; "
-                f"got shape {A.shape}."
-            ],
-            recommendations=[
-                "Refit the model so that `assignments` is an (N, K) ndarray."
-            ],
-        )
+    A = _extract_assignments(model)
 
     rust = rust_module()
     threshold = None if anchor_dominance is None else float(anchor_dominance)
     core = rust.diagnostics_anchor_consistency_report(A, threshold)
-    preconditions = {
-        "assignments_available": True,
-        "assignments_2d": True,
-        **{str(key): bool(value) for key, value in core["preconditions"].items()},
-    }
     return IdentifiabilityReport(
         name=name,
         theorem=theorem,
-        preconditions=preconditions,
+        preconditions={
+            str(key): bool(value)
+            for key, value in core["preconditions"].items()
+        },
         violations=[str(value) for value in core["violations"]],
         recommendations=[str(value) for value in core["recommendations"]],
         details=dict(core["details"]),

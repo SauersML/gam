@@ -222,10 +222,10 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
     };
 
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights: Array1::ones(n),
-        offset: Array1::zeros(n),
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(Array1::ones(n)),
+        offset: std::sync::Arc::new(Array1::zeros(n)),
         spec,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
@@ -265,7 +265,6 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }))
     .expect("anisotropic Matérn full-outer-loop fit should converge");
 
@@ -361,10 +360,10 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
     };
 
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights: Array1::ones(n),
-        offset: Array1::zeros(n),
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(Array1::ones(n)),
+        offset: std::sync::Arc::new(Array1::zeros(n)),
         spec,
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
@@ -404,7 +403,6 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }))
     .expect("anisotropic Matérn ablation fit should converge");
 

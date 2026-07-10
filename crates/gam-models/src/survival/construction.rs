@@ -9,11 +9,7 @@
 //! These are the building blocks a library consumer needs to construct
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
-use gam_terms::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
-    BasisMetadata, BasisOptions, Dense, KnotSource, OneDimensionalBoundary, build_bspline_basis_1d,
-    create_basis, evaluate_bspline_derivative_scalar,
-};
+use crate::probability::{normal_pdf, standard_normal_quantile};
 use crate::survival::location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, ResidualDistribution,
     SurvivalCovariateTermBlockTemplate,
@@ -24,11 +20,17 @@ use crate::wiggle::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
-use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
-use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place};
-use crate::probability::{normal_pdf, standard_normal_quantile};
+use gam_linalg::matrix::{
+    DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place,
+};
 use gam_problem::outer_subsample::RowSet;
 use gam_problem::{InverseLink, StandardLink};
+use gam_terms::basis::{
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+    BasisMetadata, BasisOptions, Dense, KnotSource, OneDimensionalBoundary, build_bspline_basis_1d,
+    create_basis, evaluate_bspline_derivative_scalar,
+};
+use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
 use ndarray::{Array1, Array2, array, s};
 use rayon::prelude::*;
 
@@ -1954,10 +1956,7 @@ pub fn resolve_survival_transformation_time_anchor_value(
             "survival transformation time anchor requires non-empty exit times".to_string(),
         );
     }
-    let min_entry = age_entry
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let min_entry = age_entry.iter().copied().fold(f64::INFINITY, f64::min);
     if min_entry > SURVIVAL_DELAYED_ENTRY_THRESHOLD {
         Ok(robust_interior_exit_anchor(age_exit).max(SURVIVAL_TIME_FLOOR))
     } else {
@@ -3670,9 +3669,9 @@ mod tests {
         resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
         survival_baseline_theta_from_config,
     };
+    use crate::probability::normal_cdf;
     use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
     use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
-    use crate::probability::normal_cdf;
     use ndarray::{Array1, Array2, array};
 
     #[test]
@@ -4004,8 +4003,8 @@ mod tests {
         assert_eq!(s.nrows(), keep_cols.len());
         assert_eq!(s.ncols(), keep_cols.len());
 
-        let (evals, _) =
-            gam_linalg::faer_ndarray::FaerEigh::eigh(s, faer::Side::Lower).expect("eigh of penalty");
+        let (evals, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(s, faer::Side::Lower)
+            .expect("eigh of penalty");
         let evals_slice = evals.as_slice().expect("contiguous eigenvalues");
         let max_abs = evals_slice
             .iter()

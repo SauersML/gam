@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple, overload
+from typing import TYPE_CHECKING, Any, NamedTuple, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
@@ -24,6 +24,9 @@ from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
+
+if TYPE_CHECKING:
+    from ._sae_manifold import ManifoldSAE
 
 
 @dataclass(frozen=True, slots=True)
@@ -668,7 +671,7 @@ def fit(
     formula: None = ...,
     *,
     config: Mapping[str, Any] | None = ...,
-) -> dict[str, Any]: ...
+) -> ManifoldSAE: ...
 
 
 @overload
@@ -793,12 +796,13 @@ def fit(
     penalties: Sequence[Any] | None = None,
     smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
-) -> Model | ResponseGeometryModel | dict[str, Any]:
+) -> Model | ResponseGeometryModel | ManifoldSAE:
     """Fit a GAM model, or fit SAE activations when ``formula`` is omitted.
 
     ``gamfit.fit(data, formula, ...)`` keeps the formula-first GAM API.
     ``gamfit.fit(activations, config=...)`` dispatches to the SAE research-loop
-    API and returns typed atoms, coordinates, and trust-score hooks.
+    API and returns an explicit :class:`ManifoldSAE` handle. New activations are
+    featurized with ``model.featurize(X)`` on that handle.
 
     Parameters
     ----------
@@ -1006,11 +1010,12 @@ def fit(
 
     Returns
     -------
-    Model or ResponseGeometryModel or MultinomialModel
+    Model or ResponseGeometryModel or MultinomialModel or ManifoldSAE
         A fitted scalar GAM :class:`Model` by default. When
         ``response_geometry`` is supplied, returns a
         :class:`ResponseGeometryModel`; when ``family`` requests the
-        multinomial/softmax path, returns a :class:`MultinomialModel`.
+        multinomial/softmax path, returns a :class:`MultinomialModel`. When
+        ``formula`` is omitted, returns a model-scoped :class:`ManifoldSAE`.
 
     Raises
     ------

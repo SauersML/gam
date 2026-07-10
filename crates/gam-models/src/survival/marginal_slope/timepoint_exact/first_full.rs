@@ -51,16 +51,12 @@ pub(super) fn moving_density_boundary_flux(
     let v_r = edge_velocity(entry.partition_cell.right_edge, cell.right);
     let v_l = edge_velocity(entry.partition_cell.left_edge, cell.left);
     let right = if v_r != 0.0 {
-        v_r * crate::cubic_cell_kernel::cell_density_boundary_integrand(
-            cell, poly, cell.right,
-        )
+        v_r * crate::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, cell.right)
     } else {
         0.0
     };
     let left = if v_l != 0.0 {
-        v_l * crate::cubic_cell_kernel::cell_density_boundary_integrand(
-            cell, poly, cell.left,
-        )
+        v_l * crate::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, cell.left)
     } else {
         0.0
     };

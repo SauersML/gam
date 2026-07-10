@@ -97,13 +97,13 @@ pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 
 pub(crate) use crate::probability::signed_probit_logcdf_and_mills_ratio;
 
-pub(crate) use gam_terms::smooth::{
-    BlockwisePenalty, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec,
-};
 pub(crate) use crate::fit_orchestration::drivers::{
     ExactJointHyperSetup, build_term_collection_designs_and_freeze_joint,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+};
+pub(crate) use gam_terms::smooth::{
+    BlockwisePenalty, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec,
 };
 
 pub(crate) use gam_problem::HyperOperator;
@@ -153,8 +153,8 @@ pub mod gpu_prep;
 mod hessian;
 mod intercept;
 mod joint_eval;
-mod kkt_refusal;
 mod joint_workspace;
+mod kkt_refusal;
 mod newton_operators;
 mod poly_arith;
 mod primary_geometry;

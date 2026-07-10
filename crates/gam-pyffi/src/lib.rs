@@ -15,7 +15,7 @@
 
 // Concern modules are grouped into a submodule tree on disk (issue #1521
 // navigability carve): `ffi/` (foundation prelude/errors + literal/JSON
-// helpers), `inference/` (inference instruments + benchmark scoring),
+// helpers), `inference/` (inference instruments),
 // `io/` (summary render, competing-risks decode, survival-surface I/O),
 // `sklearn/` (sklearn-compat metadata), and `manifold/` (manifold
 // descriptor `#[pyclass]`es alongside the geometry/posterior entrypoint
@@ -47,8 +47,8 @@ pub(crate) use ffi::ffi_prelude::*;
 
 // Re-export every concern module at the crate root under its historical flat
 // name. The `include!`-fragment entrypoint code is textually inlined at the
-// crate root and reaches these modules by bare name (`benchmark_scores::…`,
-// `crate::finite_safe_json::…`, `inference_instruments::register`, …); the flat
+// crate root and reaches these modules by bare name (`crate::finite_safe_json::…`,
+// `inference_instruments::register`, …); the flat
 // re-export keeps every such path resolving while the source files live in the
 // grouped subdirectories above. The Rust module paths now also exist in their
 // canonical grouped form (`crate::ffi::finite_safe_json`, …); the Python
@@ -57,7 +57,7 @@ pub(crate) use ffi::ffi_prelude::*;
 // include!-fragment entrypoints reach them by item name, not via a
 // `crate::ffi_errors::…` module path, so the module itself needs no flat alias.
 pub(crate) use ffi::{ffi_prelude, finite_safe_json, python_literal};
-pub(crate) use inference::{benchmark_scores, inference_instruments};
+pub(crate) use inference::inference_instruments;
 pub(crate) use io::{competing_risks_decode, summary_render, survival_surface_io};
 pub(crate) use manifold::manifold_pyclasses;
 pub(crate) use sklearn::sklearn_metadata;

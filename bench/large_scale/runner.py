@@ -33,6 +33,21 @@ HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
 _OUTPUT_LOCK = threading.Lock()
+_SURVIVAL_CALIBRATION: Any = None
+
+
+def _survival_calibration() -> Any:
+    global _SURVIVAL_CALIBRATION
+    if _SURVIVAL_CALIBRATION is not None:
+        return _SURVIVAL_CALIBRATION
+    module_path = BENCH_DIR.parent / "_survival_calibration.py"
+    spec = importlib.util.spec_from_file_location("bench_survival_calibration", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load survival calibration helpers from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _SURVIVAL_CALIBRATION = module
+    return module
 
 
 class _TerminalOutputSanitizer:
@@ -1052,10 +1067,7 @@ def survival_concordance(event_times: np.ndarray, risk_score: np.ndarray, events
 
 
 def _survival_null_curve(train_times: np.ndarray, train_events: np.ndarray, grid: np.ndarray) -> np.ndarray:
-    return np.asarray(
-        _rust().survival_null_curve_from_train(_f64_list(train_times), _f64_list(train_events), _f64_list(grid)),
-        dtype=float,
-    )
+    return _survival_calibration().kaplan_meier_curve(train_times, train_events, grid)
 
 
 def calibrated_survival_matrix(
@@ -1065,15 +1077,12 @@ def calibrated_survival_matrix(
     test_risk: np.ndarray,
     grid: np.ndarray,
 ) -> np.ndarray:
-    return np.asarray(
-        _rust().survival_matrix_from_risk_calibration(
-            _f64_list(train_times),
-            _f64_list(train_events),
-            _f64_list(train_risk),
-            _f64_list(test_risk),
-            _f64_list(grid),
-        ),
-        dtype=float,
+    return _survival_calibration().calibrated_survival_matrix(
+        train_times,
+        train_events,
+        train_risk,
+        test_risk,
+        grid,
     )
 
 

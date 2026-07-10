@@ -1057,47 +1057,48 @@ pub fn should_use_sparse_basis(num_basis_cols: usize, degree: usize, dim: usize)
     density < 0.20 && num_basis_cols > 32
 }
 
-/// Creates a penalty matrix `S` for a B-spline basis from a difference matrix `D`.
-/// The penalty is of the form `S = D' * D`, penalizing the squared `order`-th
-/// differences of the spline coefficients. This is the core of P-splines.
+/// Creates the discrete coefficient-sequence operator `S = D' * D`, penalizing
+/// squared `order`-th differences of the supplied coordinates.
 ///
-/// This function supports both uniform knots (using ordinary differences) and
-/// non-uniform knots (using divided differences), which is critical for
-/// correctly penalizing curvature when knots are irregularly spaced (e.g. quantiles).
+/// This is **not** a B-spline roughness functional: for a spline use
+/// [`bspline_derivative_penalty_matrix`], which assembles
+/// `S_ij = ∫ B_i^(order) B_j^(order)` from the actual knot vector. This
+/// discrete operator remains for models whose coordinates themselves form the
+/// object being differenced (including explicitly declared latent priors).
 ///
 /// # Arguments
-/// * `num_basis_functions`: The number of basis functions (i.e., columns in the basis matrix).
-/// * `order`: The order of the difference penalty (e.g., 2 for second differences).
-/// * `greville_abscissae`: Optional Greville abscissae for divided differences.
-///   If `None`, assumes uniform knots and uses ordinary integer differences.
-///   If `Some`, uses divided differences scaled by the inverse of the knot spans.
+/// * `num_coefficients`: Length of the coefficient sequence.
+/// * `order`: Order of the discrete difference.
+/// * `coefficient_abscissae`: Optional coordinate attached to each coefficient.
+///   `None` uses ordinary integer-grid differences; `Some` uses divided
+///   differences scaled by relative coordinate spans.
 ///
 /// # Returns
-/// A square `Array2<f64>` of shape `[num_basis, num_basis]` representing the penalty `S`.
+/// A square `Array2<f64>` of shape `[num_coefficients, num_coefficients]`.
 pub fn create_difference_penalty_matrix(
-    num_basis_functions: usize,
+    num_coefficients: usize,
     order: usize,
-    greville_abscissae: Option<ArrayView1<f64>>,
+    coefficient_abscissae: Option<ArrayView1<f64>>,
 ) -> Result<Array2<f64>, BasisError> {
-    if order == 0 || order >= num_basis_functions {
+    if order == 0 || order >= num_coefficients {
         return Err(BasisError::InvalidPenaltyOrder {
             order,
-            num_basis: num_basis_functions,
+            num_basis: num_coefficients,
         });
     }
 
-    if let Some(g) = greville_abscissae
-        && g.len() != num_basis_functions
+    if let Some(g) = coefficient_abscissae
+        && g.len() != num_coefficients
     {
         crate::bail_dim_basis!(
-            "Greville abscissae length {} does not match num_basis_functions {}",
+            "coefficient abscissae length {} does not match coefficient count {}",
             g.len(),
-            num_basis_functions
+            num_coefficients
         );
     }
 
     // Start with the identity matrix
-    let mut d = Array2::<f64>::eye(num_basis_functions);
+    let mut d = Array2::<f64>::eye(num_coefficients);
 
     // Apply the differencing operation `order` times.
     // Each `diff` reduces the number of rows by 1.
@@ -1105,30 +1106,24 @@ pub fn create_difference_penalty_matrix(
         // Calculate the difference between adjacent rows: D^{(o)} = Delta * D^{(o-1)}
         d = &d.slice(s![1.., ..]) - &d.slice(s![..-1, ..]);
 
-        // If using non-uniform knots, apply divided difference scaling:
+        // If using non-uniform coefficient coordinates, apply divided-difference scaling:
         // D^{(o)}_i = D^{(o)}_i / (xi_{i+o} - xi_i)
         //
         // The raw divided-difference divisor `g[i+o] - g[i]` carries the units
         // of the covariate, so a pure rescaling `g -> c*g` (a change of physical
-        // units for `x`) would multiply every divisor by `c` and hence scale the
-        // resulting penalty `S = DᵀD` by `c^(-2*order)`. That makes the smooth
-        // NOT scale-equivariant: REML would select a different `lambda` and the
-        // fit would drift purely from the abscissa magnitude (#1364). The
-        // divided difference's *purpose* is to weight each row by the relative
-        // local span (so non-uniform knots approximate a derivative penalty),
-        // which is an inherently dimensionless notion. We therefore normalize
-        // each order's spans by their geometric-mean span at that order, so the
-        // divisor is a unitless local/typical-span ratio: invariant to a global
-        // rescaling of `x` and identically `1` for uniform knots (recovering the
-        // plain integer-difference penalty).
-        if let Some(g) = greville_abscissae {
+        // units for `x`) would multiply every divisor by `c` and hence scale
+        // `S = DᵀD` by `c^(-2*order)`. This discrete operator uses only relative
+        // coefficient spacing, so normalize each order's spans by their
+        // geometric mean. The divisor is then invariant to a global rescaling
+        // and identically one on a uniform coordinate grid.
+        if let Some(g) = coefficient_abscissae {
             let nrows = d.nrows();
             let mut log_span_sum = 0.0_f64;
             for i in 0..nrows {
                 let span = g[i + o] - g[i];
                 if span.abs() <= KNOT_SPAN_DEGENERACY_FLOOR {
                     return Err(BasisError::InvalidKnotVector(format!(
-                        "singular divided-difference span at order {o}, row {i}: Greville abscissae g[{}]={:.6e} and g[{i}]={:.6e} collapse",
+                        "singular divided-difference span at order {o}, row {i}: coefficient coordinates g[{}]={:.6e} and g[{i}]={:.6e} collapse",
                         i + o,
                         g[i + o],
                         g[i]
@@ -1225,67 +1220,4 @@ pub(crate) fn bspline_raw_row_chunk(
         )?;
         Ok((*basis).clone())
     }
-}
-
-/// Selects Greville abscissae for difference-penalty scaling.
-///
-/// The classical P-spline integer-difference penalty `D'D` penalizes the squared
-/// `m`-th differences of the *coefficients*. Those differences represent the
-/// squared `m`-th derivative of the *function* — with the correct polynomial null
-/// space `{1, x, …, x^{m-1}}` — only when the basis has *evenly spaced Greville
-/// abscissae*, because a coefficient sequence that is linear in its index then
-/// reproduces a function linear in `x` (B-spline linear precision, `Σ ξ_i B_i(x)
-/// = x`).
-///
-/// Equally spaced *breakpoints* are **not** sufficient. gam's B-splines are
-/// clamped (boundary knots repeated `degree + 1` times), so even on a uniform
-/// interior grid the Greville abscissae `ξ_i = (1/m)·Σ_{k=1}^{degree} t_{i+k}`
-/// cluster toward the ends. With such a basis the integer-difference null space
-/// is a *rotated approximation* of the polynomial space rather than the exact
-/// `{1, x, …}`. That tilts the direction REML shrinks toward as `λ → ∞`, so the
-/// recovered surface is biased and the selected smoothing parameters land off
-/// the true optimum (e.g. anisotropic tensor `te`/`ti` recovery degrades).
-///
-/// We therefore gate the integer-difference fast path on uniformity of the
-/// **Greville abscissae** and otherwise return them, so divided-difference
-/// scaling in [`create_difference_penalty_matrix`] restores the exact polynomial
-/// null space for any knot geometry (clamped, quantile, or otherwise). When the
-/// abscissae are already uniform (e.g. a non-clamped Eilers–Marx grid), the
-/// divided differences reduce to the integer differences up to an overall scale,
-/// so returning `None` there is exact and cheaper.
-pub fn penalty_greville_abscissae_for_knots(
-    knot_vector: &Array1<f64>,
-    degree: usize,
-) -> Result<Option<Array1<f64>>, BasisError> {
-    // Degenerate / too-short knot vectors have no meaningful divided-difference
-    // scaling (and `compute_greville_abscissae` rejects them); fall back to the
-    // plain integer-difference penalty exactly as before.
-    let greville = match compute_greville_abscissae(knot_vector, degree) {
-        Ok(g) => g,
-        Err(_) => return Ok(None),
-    };
-    if is_uniformly_spaced_sequence(greville.view()) {
-        Ok(None)
-    } else {
-        Ok(Some(greville))
-    }
-}
-
-/// True when the entries of `values` are (numerically) evenly spaced. Used to
-/// decide whether classical integer-difference penalties coincide with the
-/// geometry-correct divided-difference penalty for a basis.
-pub(crate) fn is_uniformly_spaced_sequence(values: ArrayView1<'_, f64>) -> bool {
-    let n = values.len();
-    if n <= 2 {
-        return true;
-    }
-    let span = (values[n - 1] - values[0]).abs().max(1.0);
-    let h0 = values[1] - values[0];
-    for i in 2..n {
-        let hi = values[i] - values[i - 1];
-        if (hi - h0).abs() > 1e-8 * span {
-            return false;
-        }
-    }
-    true
 }

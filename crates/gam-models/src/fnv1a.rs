@@ -85,7 +85,10 @@ mod tests {
     #[test]
     fn new_starts_at_fnv_offset_basis() {
         let h = Fnv1a::new();
-        assert_eq!(h.hash, 0xcbf2_9ce4_8422_2325u64, "initial hash is FNV offset basis");
+        assert_eq!(
+            h.hash, 0xcbf2_9ce4_8422_2325u64,
+            "initial hash is FNV offset basis"
+        );
     }
 
     /// `finish_nonzero` returns the hash unchanged when nonzero.
@@ -125,7 +128,11 @@ mod tests {
         a.mix_byte(0x01);
         let mut b = Fnv1a::new();
         b.mix_byte(0x02);
-        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "distinct bytes → distinct hashes");
+        assert_ne!(
+            a.finish_nonzero(),
+            b.finish_nonzero(),
+            "distinct bytes → distinct hashes"
+        );
     }
 
     /// `mix_f64` canonicalizes -0.0 to +0.0 so they hash identically.
@@ -135,7 +142,11 @@ mod tests {
         a.mix_f64(-0.0_f64);
         let mut b = Fnv1a::new();
         b.mix_f64(0.0_f64);
-        assert_eq!(a.finish_nonzero(), b.finish_nonzero(), "-0.0 and +0.0 should hash equally");
+        assert_eq!(
+            a.finish_nonzero(),
+            b.finish_nonzero(),
+            "-0.0 and +0.0 should hash equally"
+        );
     }
 
     /// `mix_f64` distinguishes distinct nonzero values.
@@ -145,7 +156,11 @@ mod tests {
         a.mix_f64(1.0_f64);
         let mut b = Fnv1a::new();
         b.mix_f64(2.0_f64);
-        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "1.0 and 2.0 hash differently");
+        assert_ne!(
+            a.finish_nonzero(),
+            b.finish_nonzero(),
+            "1.0 and 2.0 hash differently"
+        );
     }
 
     /// `mix_opt_beta(Some([]))` and `mix_opt_beta(None)` produce different hashes.
@@ -155,7 +170,11 @@ mod tests {
         a.mix_opt_beta(0, None);
         let mut b = Fnv1a::new();
         b.mix_opt_beta(0, Some(&array![]));
-        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "None vs Some([]) must differ");
+        assert_ne!(
+            a.finish_nonzero(),
+            b.finish_nonzero(),
+            "None vs Some([]) must differ"
+        );
     }
 
     /// `mix_opt_beta` with two different arrays produces different hashes.
@@ -167,7 +186,11 @@ mod tests {
         a.mix_opt_beta(0, Some(&v1));
         let mut b = Fnv1a::new();
         b.mix_opt_beta(0, Some(&v2));
-        assert_ne!(a.finish_nonzero(), b.finish_nonzero(), "distinct arrays → distinct hashes");
+        assert_ne!(
+            a.finish_nonzero(),
+            b.finish_nonzero(),
+            "distinct arrays → distinct hashes"
+        );
     }
 
     /// `mix_opt_beta` with the same array produces the same hash (determinism).
@@ -178,6 +201,10 @@ mod tests {
         a.mix_opt_beta(1, Some(&v));
         let mut b = Fnv1a::new();
         b.mix_opt_beta(1, Some(&v));
-        assert_eq!(a.finish_nonzero(), b.finish_nonzero(), "same array → same hash");
+        assert_eq!(
+            a.finish_nonzero(),
+            b.finish_nonzero(),
+            "same array → same hash"
+        );
     }
 }

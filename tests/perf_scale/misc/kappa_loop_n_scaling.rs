@@ -234,10 +234,10 @@ fn run_fit(
 
     let t0 = Instant::now();
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights,
-        offset,
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(weights),
+        offset: std::sync::Arc::new(offset),
         spec: spec_1d(aniso),
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
@@ -250,7 +250,6 @@ fn run_fit(
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }))
     .map_err(|e| format!("{e:?}"))?;
     let dt = t0.elapsed().as_secs_f64();
@@ -901,10 +900,10 @@ fn run_fit_poisson(n: usize, bounds: (f64, f64)) -> Result<FitTiming, String> {
 
     let t0 = Instant::now();
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights,
-        offset,
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(weights),
+        offset: std::sync::Arc::new(offset),
         spec: spec_1d(false),
         family: LikelihoodSpec::new(
             ResponseFamily::Poisson,
@@ -917,7 +916,6 @@ fn run_fit_poisson(n: usize, bounds: (f64, f64)) -> Result<FitTiming, String> {
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }))
     .map_err(|e| format!("{e:?}"))?;
     let dt = t0.elapsed().as_secs_f64();

@@ -117,7 +117,7 @@ def test_block_firing_coordinates_smoke():
         z = np.float32([math.cos(theta), math.sin(theta)])
         x[row] = z[0] * frames[2 * blk] + z[1] * frames[2 * blk + 1]
     fit = block_sparse_dictionary_fit(x, n_blocks=g, block_size=2, block_topk=1, max_epochs=12)
-    report = block_firing_coordinates(fit.decoder, fit.blocks, fit.gates, fit.codes, block=0)
+    report = block_firing_coordinates(fit.decoder, fit.blocks, fit.codes, block=0)
     assert report.n_firings == report.t.shape[0]
     assert report.t.shape == report.amplitude.shape
     if report.n_firings > 0:
@@ -171,13 +171,13 @@ def test_loop_holonomy_smoke():
 
 
 def test_atlas_nerve_diagram_smoke():
-    # Two b = 2 blocks (K = 4) firing on disjoint rows: a 2-chart nerve.
-    rng = np.random.default_rng(3)
+    # Two b = 2 blocks co-fire through an identity chart transfer.
     n = 64
-    codes = np.zeros((n, 4), dtype=np.float32)
-    codes[: n // 2, 0:2] = rng.standard_normal((n // 2, 2)).astype(np.float32) + 1.0
-    codes[n // 2 :, 2:4] = rng.standard_normal((n // 2, 2)).astype(np.float32) + 1.0
-    report = atlas_nerve_diagram(codes, block_size=2)
+    theta = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False, dtype=np.float32)
+    circle = np.stack((np.cos(theta), np.sin(theta)), axis=1).astype(np.float32)
+    indices = np.tile(np.array([[0, 1]], dtype=np.uint32), (n, 1))
+    values = np.stack((circle, circle), axis=1)
+    report = atlas_nerve_diagram((indices, values), n_units=2, block_size=2)
     assert report.computed
     assert report.chart_blocks == [0, 1]
     assert set(report.betti) == {"b0", "b1", "b2"}
@@ -187,7 +187,10 @@ def test_atlas_nerve_diagram_smoke():
     assert math.isfinite(report.max_filtration)
     assert isinstance(report.note, str)
     # A scalar (block_size == 1) shape is not applicable: computed is False.
-    skipped = atlas_nerve_diagram(codes, block_size=1)
+    scalar_values = np.ones((n, 2, 1), dtype=np.float32)
+    skipped = atlas_nerve_diagram(
+        (indices, scalar_values), n_units=2, block_size=1
+    )
     assert not skipped.computed
     assert skipped.reason is not None
 

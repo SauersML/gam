@@ -717,9 +717,21 @@ mod tests {
         let mut qm = query.clone();
         qp[0] += h;
         qm[0] -= h;
-        let fd = (eval_fitted(qp.view(), centers.view(), z.view(), length_scale, None, empty.view())
-            - eval_fitted(qm.view(), centers.view(), z.view(), length_scale, None, empty.view()))
-            / (2.0 * h);
+        let fd = (eval_fitted(
+            qp.view(),
+            centers.view(),
+            z.view(),
+            length_scale,
+            None,
+            empty.view(),
+        ) - eval_fitted(
+            qm.view(),
+            centers.view(),
+            z.view(),
+            length_scale,
+            None,
+            empty.view(),
+        )) / (2.0 * h);
         assert!((grad[0] - fd).abs() <= 1e-6 * (1.0 + fd.abs()));
 
         let stray = arr1(&[1.0]);

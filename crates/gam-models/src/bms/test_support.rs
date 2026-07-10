@@ -314,8 +314,10 @@ pub(crate) fn edge_sliver_jet(
         deta = deta.add(&c_jets[k].sub(&cst(c0_scalar[k])).scale(z_pow));
         z_pow *= ze0;
     }
-    let eta0 =
-        c0_scalar[0] + c0_scalar[1] * ze0 + c0_scalar[2] * ze0 * ze0 + c0_scalar[3] * ze0 * ze0 * ze0;
+    let eta0 = c0_scalar[0]
+        + c0_scalar[1] * ze0
+        + c0_scalar[2] * ze0 * ze0
+        + c0_scalar[3] * ze0 * ze0 * ze0;
     // Δq(zE0) = η₀·δη + ½·δη²  (jet, value 0); e^{−Δq} = 1 − Δq + ½Δq².
     let dq = deta.scale(eta0).add(&deta.mul(&deta).scale(0.5));
     let edq = cst(1.0).sub(&dq).add(&dq.mul(&dq).scale(0.5));
@@ -537,8 +539,16 @@ mod tests {
         let a_t1t1 = -(f_aa * a_t1 * a_t1) / f_a;
 
         assert!((a_jet.value() - a0).abs() < 1e-12);
-        assert!((a_jet.g[0] - a_t0).abs() < 1e-12, "a_t0 {} vs {a_t0}", a_jet.g[0]);
-        assert!((a_jet.g[1] - a_t1).abs() < 1e-12, "a_t1 {} vs {a_t1}", a_jet.g[1]);
+        assert!(
+            (a_jet.g[0] - a_t0).abs() < 1e-12,
+            "a_t0 {} vs {a_t0}",
+            a_jet.g[0]
+        );
+        assert!(
+            (a_jet.g[1] - a_t1).abs() < 1e-12,
+            "a_t1 {} vs {a_t1}",
+            a_jet.g[1]
+        );
         assert!(
             (a_jet.h[0] - a_t0t0).abs() < 1e-12,
             "a_t0t0 {} vs {a_t0t0}",
@@ -774,8 +784,7 @@ mod tests {
 
         let c0 = denested_cell_coefficients(score_span, link_span, a0, b0);
         let (dc_da, dc_db) = denested_cell_coefficient_partials(score_span, link_span, a0, b0);
-        let (dc_daa, dc_dab, dc_dbb) =
-            denested_cell_second_partials(score_span, link_span, a0, b0);
+        let (dc_daa, dc_dab, dc_dbb) = denested_cell_second_partials(score_span, link_span, a0, b0);
         let part = CellCoeffAbPartials {
             c0,
             dc_da,
@@ -815,7 +824,8 @@ mod tests {
             );
             let h_aa = (coeff_at(a0 + h, b0)[k] - 2.0 * c0[k] + coeff_at(a0 - h, b0)[k]) / (h * h);
             let h_bb = (coeff_at(a0, b0 + h)[k] - 2.0 * c0[k] + coeff_at(a0, b0 - h)[k]) / (h * h);
-            let h_ab = (coeff_at(a0 + h, b0 + h)[k] - coeff_at(a0 + h, b0 - h)[k]
+            let h_ab = (coeff_at(a0 + h, b0 + h)[k]
+                - coeff_at(a0 + h, b0 - h)[k]
                 - coeff_at(a0 - h, b0 + h)[k]
                 + coeff_at(a0 - h, b0 - h)[k])
                 / (4.0 * h * h);

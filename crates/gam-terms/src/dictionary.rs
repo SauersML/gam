@@ -52,7 +52,9 @@ pub enum LinearDictionaryError {
     NonConvergence {
         iterations: usize,
         explained_variance: f64,
-        last_improvement: f64,
+        ev_residual: f64,
+        routing_residual: f64,
+        accepted_births: usize,
         tolerance: f64,
     },
 }
@@ -80,14 +82,17 @@ impl fmt::Display for LinearDictionaryError {
             Self::NonConvergence {
                 iterations,
                 explained_variance,
-                last_improvement,
+                ev_residual,
+                routing_residual,
+                accepted_births,
                 tolerance,
             } => write!(
                 f,
                 "linear_dictionary_fit did not converge: {iterations} coordinate-descent sweeps \
-                 ended at EV {explained_variance:.6} with last improvement \
-                 {last_improvement:.3e} still above tolerance {tolerance:.3e}; a non-converged \
-                 iterate is not a model"
+                 ended at EV {explained_variance:.6} with canonical EV residual \
+                 {ev_residual:.3e}, reroute residual {routing_residual:.3e}, and \
+                 {accepted_births} accepted dead-atom births (tolerance {tolerance:.3e}); a \
+                 non-converged iterate is not a model"
             ),
         }
     }
@@ -156,8 +161,24 @@ pub struct LinearDictionaryFit {
     pub reml_scores: Array1<f64>,
     pub explained_variance: f64,
     pub iterations: usize,
+    pub convergence: LinearDictionaryConvergence,
     pub assignment: LinearDictionaryAssignment,
     pub top_k: usize,
+}
+
+/// Fixed-point evidence attached to every converged [`LinearDictionaryFit`].
+///
+/// The two residuals certify the exact canonical routing stored in the model:
+/// `ev_residual` compares consecutive full atom-sweep + reroute states, while
+/// `routing_residual` compares the final atom-sweep state with a fresh global
+/// routing against those same final atoms. A fit is constructed only when both
+/// are below `tolerance` and no proposed dead-atom birth entered the routing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearDictionaryConvergence {
+    pub ev_residual: f64,
+    pub routing_residual: f64,
+    pub accepted_births: usize,
+    pub tolerance: f64,
 }
 
 /// Fit a linear (flat) dictionary by block coordinate descent: each sweep
@@ -165,17 +186,13 @@ pub struct LinearDictionaryFit {
 /// its assignment column by a penalized least-squares update against the residual.
 ///
 /// CONTRACT: this is a heuristic coordinate-descent dictionary learner, not a
-/// globally-optimal linear SAE. The coordinate-descent sweep leaves `assignments`
-/// as the per-atom-refined routing from the final sweep (each atom's column is the
-/// LS solve against the residual of the *then-current* dictionary), which is NOT a
-/// fresh global routing against the FINAL atoms. After the loop we therefore run a
-/// FINAL REROUTE (see [`reroute_against_atoms`]): a single fresh global assignment
-/// of every row against the final atoms using the configured rule. We ADOPT that
-/// rerouted routing only when it does not lower EV, so the returned model is the
-/// better of {coordinate-descent routing, fresh global reroute} and is never worse
-/// than before this step. `fitted` and `explained_variance` are always recomputed
-/// from the adopted `assignments`, so the reported EV is exactly the EV of the
-/// model that is returned (honest, and now the better of the two cheap routings).
+/// globally-optimal linear SAE. Every sweep closes with a fresh global routing
+/// against the updated atoms. Convergence is certified on that exact canonical
+/// state: both its change from the previous canonical state and its discrepancy
+/// from the just-completed atom sweep must be below tolerance, and no proposed
+/// dead-atom birth may enter the routing. The returned assignments, fitted values,
+/// EV, and diagnostics are therefore the state that passed the certificate; no
+/// post-certificate reroute or best-effort adoption occurs.
 pub fn fit_linear_dictionary(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
@@ -184,45 +201,30 @@ pub fn fit_linear_dictionary(
     if config.n_atoms == 1 {
         return fit_rank_one_pca_lane(x, config);
     }
-    Ok(fit_multi_atom_dictionary(x, config)?.fit)
-}
-
-/// Diagnostics returned by the internal multi-atom solver: the fitted model plus
-/// the EV of the coordinate-descent routing as it stood *before* the final reroute
-/// adoption decision. The reroute-never-regresses invariant is exactly
-/// `fit.explained_variance >= pre_reroute_ev`; exposing both lets the unit tests
-/// assert it without re-running the private routing logic.
-struct MultiAtomDictionaryFit {
-    fit: LinearDictionaryFit,
-    // Read only by the reroute-never-regresses unit test; the production caller
-    // takes `.fit` and discards the diagnostic.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pre_reroute_ev: f64,
+    fit_multi_atom_dictionary(x, config)
 }
 
 fn fit_multi_atom_dictionary(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
-) -> Result<MultiAtomDictionaryFit, LinearDictionaryError> {
+) -> Result<LinearDictionaryFit, LinearDictionaryError> {
     let top_k = config.top_k.min(config.n_atoms).max(1);
     let mut atoms = initialize_atoms(x, config.n_atoms);
-    let mut assignments = Array2::<f64>::zeros((x.nrows(), config.n_atoms));
-    let mut fitted = Array2::<f64>::zeros(x.dim());
+    let mut assignments = reroute_against_atoms(x, atoms.view(), top_k, config)?;
+    let mut fitted = assignments.dot(&atoms);
     let mut lambdas = Array1::<f64>::from_elem(config.n_atoms, INACTIVE_LAMBDA);
     let mut reml_scores = Array1::<f64>::zeros(config.n_atoms);
-    let mut previous_ev = f64::NEG_INFINITY;
-    let mut converged = false;
+    let mut previous_ev = explained_variance(x, fitted.view());
     let mut completed_iterations = 0usize;
-    let mut last_ev = f64::NEG_INFINITY;
-    let mut last_improvement = f64::INFINITY;
+    let mut last_ev = previous_ev;
+    let mut ev_residual = f64::INFINITY;
+    let mut routing_residual = f64::INFINITY;
+    let mut accepted_births = 0usize;
 
-    for iter in 0..config.max_iter {
-        assignments = reroute_against_atoms(x, atoms.view(), top_k, config)?;
-
-        fitted = assignments.dot(&atoms);
-        let mut any_reseeded = false;
+    for iteration in 0..config.max_iter {
+        let mut reseeded = vec![false; config.n_atoms];
         for atom_idx in 0..config.n_atoms {
-            any_reseeded |= fit_one_atom_penalized_ls(
+            reseeded[atom_idx] = fit_one_atom_penalized_ls(
                 x,
                 &mut atoms,
                 &mut assignments,
@@ -234,61 +236,86 @@ fn fit_multi_atom_dictionary(
             )?;
         }
 
-        completed_iterations = iter + 1;
-        let ev = explained_variance(x, fitted.view());
-        last_ev = ev;
-        last_improvement = ev - previous_ev;
-        // #1500: never declare convergence on an iteration that re-seeded a dead
-        // atom — its revived direction carries no code yet, so EV is momentarily
-        // flat; one more sweep lets the assignment step route rows to it.
-        if !any_reseeded && last_improvement.abs() <= config.tolerance.max(0.0) {
-            converged = true;
-            break;
+        let sweep_ev = explained_variance(x, fitted.view());
+        let rerouted = reroute_against_atoms(x, atoms.view(), top_k, config)?;
+        let rerouted_fitted = rerouted.dot(&atoms);
+        let rerouted_ev = explained_variance(x, rerouted_fitted.view());
+
+        // A reseed is only an unsettled birth when the canonical routing actually
+        // uses it. Overcomplete dictionaries necessarily propose redundant atoms;
+        // rejected proposals are null capacity, not perpetual non-convergence.
+        // Zero them immediately so held-out transforms cannot expose an arbitrary
+        // residual direction that was absent from the certified training model.
+        accepted_births = 0;
+        for atom_idx in 0..config.n_atoms {
+            if !reseeded[atom_idx] {
+                continue;
+            }
+            let accepted = rerouted
+                .column(atom_idx)
+                .iter()
+                .any(|coefficient| *coefficient != 0.0);
+            if accepted {
+                accepted_births += 1;
+            } else {
+                atoms.row_mut(atom_idx).fill(0.0);
+                lambdas[atom_idx] = INACTIVE_LAMBDA;
+                reml_scores[atom_idx] = 0.0;
+            }
         }
-        previous_ev = ev;
+
+        completed_iterations = iteration + 1;
+        ev_residual = (rerouted_ev - previous_ev).abs();
+        routing_residual = (rerouted_ev - sweep_ev).abs();
+        last_ev = rerouted_ev;
+        assignments = rerouted;
+        fitted = rerouted_fitted;
+
+        if accepted_births == 0
+            && ev_residual <= config.tolerance
+            && routing_residual <= config.tolerance
+        {
+            // The per-atom update recorded scores at intermediate Gauss-Seidel
+            // states. Recompute every active score from the exact canonical state
+            // that passed the fixed-point certificate.
+            let final_score =
+                penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
+            for atom_idx in 0..config.n_atoms {
+                if atoms.row(atom_idx).dot(&atoms.row(atom_idx)) > MIN_NORM2 {
+                    reml_scores[atom_idx] = final_score;
+                }
+            }
+            return Ok(LinearDictionaryFit {
+                atoms,
+                assignments,
+                fitted,
+                lambdas,
+                reml_scores,
+                explained_variance: last_ev,
+                iterations: completed_iterations,
+                convergence: LinearDictionaryConvergence {
+                    ev_residual,
+                    routing_residual,
+                    accepted_births,
+                    tolerance: config.tolerance,
+                },
+                assignment: config.assignment,
+                top_k,
+            });
+        }
+        previous_ev = rerouted_ev;
     }
 
-    // SPEC 20: a fit object only ever comes from a converged optimization. An
-    // iterate that exhausted `max_iter` without an EV plateau is work state, not
-    // a model — refuse it with the convergence evidence instead of minting a
-    // best-effort fit whose coefficients/EV are known-unsettled.
-    if !converged {
-        return Err(LinearDictionaryError::NonConvergence {
-            iterations: completed_iterations,
-            explained_variance: last_ev,
-            last_improvement,
-            tolerance: config.tolerance.max(0.0),
-        });
-    }
-
-    // FINAL REROUTE: the loop's last assignment step routed rows against the atoms
-    // as they were BEFORE that sweep's per-atom refinement, and the atoms have
-    // since moved. Recompute a fresh global routing of every row against the FINAL
-    // atoms with the configured rule, and ADOPT it only when it does not lower EV —
-    // guaranteeing no regression and keeping assignments / fitted / EV consistent.
-    let pre_reroute_ev = explained_variance(x, fitted.view());
-    let rerouted = reroute_against_atoms(x, atoms.view(), top_k, config)?;
-    let rerouted_fitted = rerouted.dot(&atoms);
-    let rerouted_ev = explained_variance(x, rerouted_fitted.view());
-    let (assignments, fitted, final_ev) = if rerouted_ev >= pre_reroute_ev {
-        (rerouted, rerouted_fitted, rerouted_ev)
-    } else {
-        (assignments, fitted, pre_reroute_ev)
-    };
-
-    Ok(MultiAtomDictionaryFit {
-        fit: LinearDictionaryFit {
-            atoms,
-            assignments,
-            fitted,
-            lambdas,
-            reml_scores,
-            explained_variance: final_ev,
-            iterations: completed_iterations,
-            assignment: config.assignment,
-            top_k,
-        },
-        pre_reroute_ev,
+    // SPEC 20: the final canonical work state failed at least one fixed-point
+    // condition. Preserve its numerical evidence in a typed error; never mint a
+    // degraded/best-effort model from it.
+    Err(LinearDictionaryError::NonConvergence {
+        iterations: completed_iterations,
+        explained_variance: last_ev,
+        ev_residual,
+        routing_residual,
+        accepted_births,
+        tolerance: config.tolerance,
     })
 }
 
@@ -353,10 +380,11 @@ fn validate_inputs(
             config.code_ridge
         )));
     }
-    if !config.tolerance.is_finite() {
-        return Err(LinearDictionaryError::invalid_input(
-            "linear_dictionary_fit tolerance must be finite",
-        ));
+    if !(config.tolerance.is_finite() && config.tolerance >= 0.0) {
+        return Err(LinearDictionaryError::invalid_input(format!(
+            "linear_dictionary_fit tolerance must be finite and non-negative; got {}",
+            config.tolerance
+        )));
     }
     Ok(())
 }
@@ -406,6 +434,12 @@ fn fit_rank_one_pca_lane(
         reml_scores: Array1::from_elem(1, score),
         explained_variance: explained_variance(x, fitted.view()),
         iterations: 1.min(config.max_iter),
+        convergence: LinearDictionaryConvergence {
+            ev_residual: 0.0,
+            routing_residual: 0.0,
+            accepted_births: 0,
+            tolerance: config.tolerance,
+        },
         assignment: config.assignment,
         top_k: 1,
     })
@@ -439,6 +473,12 @@ fn fit_rank_one_centered_lane(
         reml_scores: Array1::from_elem(1, score),
         explained_variance: ev,
         iterations: 1.min(config.max_iter),
+        convergence: LinearDictionaryConvergence {
+            ev_residual: 0.0,
+            routing_residual: 0.0,
+            accepted_births: 0,
+            tolerance: config.tolerance,
+        },
         assignment: config.assignment,
         top_k: 1,
     })
@@ -1011,9 +1051,10 @@ mod tests {
     }
 
     #[test]
-    fn final_reroute_never_regresses_and_stays_consistent() {
+    fn returned_state_is_the_certified_canonical_routing() {
         // Planted sparse problem where the coordinate-descent routing and a fresh
-        // global reroute against the final atoms generally differ.
+        // global reroute against updated atoms generally differ. The model must be
+        // the exact rerouted state that passed both fixed-point residual tests.
         let truth = array![
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1038,34 +1079,27 @@ mod tests {
             center_rank_one: false,
         };
 
-        // Internal solver exposes the pre-reroute (coordinate-descent) EV so we can
-        // assert the no-regression invariant directly.
-        let diag = fit_multi_atom_dictionary(x.view(), &config).expect("multi-atom dictionary fit");
-        assert!(
-            diag.fit.explained_variance >= diag.pre_reroute_ev - 1.0e-12,
-            "final reroute regressed EV: pre={}, returned={}",
-            diag.pre_reroute_ev,
-            diag.fit.explained_variance
-        );
+        let fit = fit_linear_dictionary(x.view(), &config).expect("linear dictionary fit");
+        assert!(fit.convergence.ev_residual <= fit.convergence.tolerance);
+        assert!(fit.convergence.routing_residual <= fit.convergence.tolerance);
+        assert_eq!(fit.convergence.accepted_births, 0);
 
         // Returned fitted must be exactly assignments.dot(atoms) for the adopted
         // routing, and the reported EV must match that fitted.
-        let recomputed_fitted = diag.fit.assignments.dot(&diag.fit.atoms);
-        for (a, b) in diag.fit.fitted.iter().zip(recomputed_fitted.iter()) {
+        let canonical = reroute_against_atoms(x.view(), fit.atoms.view(), fit.top_k, &config)
+            .expect("canonical reroute");
+        for (returned, rerouted) in fit.assignments.iter().zip(canonical.iter()) {
+            assert_abs_diff_eq!(*returned, *rerouted, epsilon = 1.0e-12);
+        }
+        let recomputed_fitted = fit.assignments.dot(&fit.atoms);
+        for (a, b) in fit.fitted.iter().zip(recomputed_fitted.iter()) {
             assert_abs_diff_eq!(*a, *b, epsilon = 1.0e-10);
         }
         assert_abs_diff_eq!(
-            diag.fit.explained_variance,
-            explained_variance(x.view(), diag.fit.fitted.view()),
+            fit.explained_variance,
+            explained_variance(x.view(), fit.fitted.view()),
             epsilon = 1.0e-10
         );
-
-        // Public entry point returns the adopted result and is also self-consistent.
-        let public = fit_linear_dictionary(x.view(), &config).expect("public fit");
-        let public_fitted = public.assignments.dot(&public.atoms);
-        for (a, b) in public.fitted.iter().zip(public_fitted.iter()) {
-            assert_abs_diff_eq!(*a, *b, epsilon = 1.0e-10);
-        }
     }
 
     #[test]
@@ -1170,9 +1204,9 @@ mod tests {
 
     #[test]
     fn nonconverged_multi_atom_fit_is_an_error_not_a_model() {
-        // SPEC 20: the EV-plateau certificate compares two consecutive sweeps, so
-        // max_iter = 1 can never certify convergence — the solver must refuse to
-        // mint a model and return the convergence evidence instead.
+        // SPEC 20: this problem moves on its first full sweep, so a one-sweep
+        // budget cannot satisfy the canonical fixed-point certificate. The solver
+        // must return finite numerical evidence instead of a partial model.
         let mut x = Array2::<f64>::zeros((24, 3));
         for row in 0..24 {
             x[[row, row % 3]] = 1.0 + 0.01 * row as f64;
@@ -1193,16 +1227,32 @@ mod tests {
             LinearDictionaryError::NonConvergence {
                 iterations,
                 explained_variance,
-                last_improvement,
+                ev_residual,
+                routing_residual,
+                accepted_births,
                 tolerance,
             } => {
                 assert_eq!(iterations, 1);
                 assert!(explained_variance.is_finite());
-                assert!(last_improvement.abs() > tolerance);
+                assert!(ev_residual.is_finite());
+                assert!(routing_residual.is_finite());
+                assert!(
+                    ev_residual > tolerance || routing_residual > tolerance || accepted_births > 0
+                );
                 assert_eq!(tolerance, DEFAULT_TOLERANCE);
             }
             other => panic!("expected typed non-convergence evidence, got: {other}"),
         }
+    }
+
+    #[test]
+    fn negative_convergence_tolerance_is_rejected() {
+        let x = array![[1.0, 0.0], [0.0, 1.0]];
+        let mut config = LinearDictionaryConfig::new(2);
+        config.tolerance = -f64::EPSILON;
+        let error = fit_linear_dictionary(x.view(), &config)
+            .expect_err("a negative residual tolerance has no convergence meaning");
+        assert!(matches!(error, LinearDictionaryError::InvalidInput { .. }));
     }
 
     #[test]

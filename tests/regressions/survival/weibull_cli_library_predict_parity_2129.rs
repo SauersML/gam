@@ -197,6 +197,7 @@ fn weibull_cli_and_library_predict_surfaces_agree() {
         noise_offset: &noise_offset,
         time_grid: Some(&GRID_TIMES),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
     let lib = predict_survival(request).expect("library Weibull survival predict");
     assert_eq!(

@@ -565,7 +565,13 @@ fn location_scale_fit_args(
     FitArgs {
         expectile_tau: None,
         data,
-        formula_positional: formula.to_string(),
+        request: None,
+        formula_positional: Some(formula.to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: Some(noise_formula.to_string()),
         logslope_formula: None,
         z_column: None,
@@ -617,6 +623,48 @@ fn cli_predict_defaults_to_posterior_mean_instead_of_map() {
     };
     assert_eq!(args.mode, PredictModeArg::PosteriorMean);
     assert_ne!(args.mode, PredictModeArg::Map);
+}
+
+#[test]
+fn cli_fit_request_replaces_formula_and_scientific_flags() {
+    let cli = Cli::try_parse_from([
+        "gam",
+        "fit",
+        "train.csv",
+        "--request",
+        "request.json",
+        "--out",
+        "model.json",
+    ])
+    .expect("request mode should require only DATA, --request, and --out");
+    let Command::Fit(args) = cli.command else {
+        panic!("expected fit command");
+    };
+    assert_eq!(args.request, Some(PathBuf::from("request.json")));
+    assert_eq!(args.formula_positional, None);
+
+    for conflicting_args in [
+        vec!["y ~ x"],
+        vec!["--family", "auto"],
+        vec!["--ridge-lambda", "0.000001"],
+        vec!["--transformation-normal"],
+        vec!["--latent-coordinates", "latents.json"],
+    ] {
+        let mut argv = vec![
+            "gam",
+            "fit",
+            "train.csv",
+            "--request",
+            "request.json",
+            "--out",
+            "model.json",
+        ];
+        argv.extend(conflicting_args);
+        assert!(
+            Cli::try_parse_from(argv).is_err(),
+            "request mode must reject formula/scientific flag overlays"
+        );
+    }
 }
 
 #[test]
@@ -1121,7 +1169,8 @@ fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
     args.survival_likelihood = "marginal-slope".to_string();
     args.firth = true;
 
-    let result = validate_fit_args_preflight(&args, &parsed);
+    let fit_config = fit_config_from_fit_args(&args).expect("fit config should resolve");
+    let result = validate_fit_args_preflight(&args, &parsed, &fit_config);
     assert!(
         result.is_ok(),
         "--firth is redundant, not rejected, for marginal-slope: {result:?}"
@@ -1199,7 +1248,13 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
     run_fit(FitArgs {
         expectile_tau: None,
         data: train_path,
-        formula_positional: "y ~ s(pc1, pc2, type=duchon, centers=6)".to_string(),
+        request: None,
+        formula_positional: Some("y ~ s(pc1, pc2, type=duchon, centers=6)".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: None,
         z_column: None,
@@ -1289,7 +1344,13 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
     run_fit(FitArgs {
         expectile_tau: None,
         data: train_path.clone(),
-        formula_positional: "Surv(entry, exit, event) ~ 1".to_string(),
+        request: None,
+        formula_positional: Some("Surv(entry, exit, event) ~ 1".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: Some("1".to_string()),
         logslope_formula: None,
         z_column: None,
@@ -1565,7 +1626,13 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     run_fit(FitArgs {
         expectile_tau: None,
         data: train_path.clone(),
-        formula_positional: "y ~ x".to_string(),
+        request: None,
+        formula_positional: Some("y ~ x".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
@@ -1659,7 +1726,13 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
     let err = run_fit(FitArgs {
         expectile_tau: None,
         data: train_path,
-        formula_positional: "y ~ x + z".to_string(),
+        request: None,
+        formula_positional: Some("y ~ x + z".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: Some("1".to_string()),
         z_column: Some("z".to_string()),
@@ -1709,7 +1782,13 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_logslope_formula() {
     let err = run_fit(FitArgs {
         expectile_tau: None,
         data: train_path,
-        formula_positional: "y ~ x".to_string(),
+        request: None,
+        formula_positional: Some("y ~ x".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: Some("1 + s(z, type=duchon, centers=6)".to_string()),
         z_column: Some("z".to_string()),
@@ -1980,7 +2059,13 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     let fit_args = FitArgs {
         expectile_tau: None,
         data: train_path.clone(),
-        formula_positional: "y ~ x1 + x2".to_string(),
+        request: None,
+        formula_positional: Some("y ~ x1 + x2".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: None,
         z_column: None,
@@ -2066,7 +2151,13 @@ fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs
     FitArgs {
         expectile_tau: None,
         data,
-        formula_positional: formula.to_string(),
+        request: None,
+        formula_positional: Some(formula.to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: None,
         z_column: None,
@@ -2213,7 +2304,13 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         // probit (96df9f5/b0590db), so the formula must request logit
         // explicitly for this CLI Firth-fit smoke to exercise the actual
         // Firth code path.
-        formula_positional: "y ~ x1 + x2 + link(type=logit)".to_string(),
+        request: None,
+        formula_positional: Some("y ~ x1 + x2 + link(type=logit)".to_string()),
+        ctn_stage1: None,
+        precision_hyperpriors: None,
+        latent_coordinates: None,
+        analytic_penalties: None,
+        smooth_descriptors: None,
         predict_noise: None,
         logslope_formula: None,
         z_column: None,
@@ -3314,11 +3411,13 @@ fn parse_linear_termwith_box_constraints() {
         ParsedTerm::Linear {
             name,
             explicit,
+            double_penalty,
             coefficient_min,
             coefficient_max,
         } => {
             assert_eq!(name, "mu_hat");
             assert!(*explicit);
+            assert!(*double_penalty);
             assert_eq!(*coefficient_min, Some(0.0));
             assert_eq!(*coefficient_max, Some(1.0));
         }
@@ -3340,7 +3439,7 @@ fn parse_linear_termwith_box_constraints() {
 }
 
 #[test]
-fn build_termspec_leaves_parametric_linear_terms_unpenalized_by_default() {
+fn build_termspec_makes_parametric_linear_terms_recoverable_by_default() {
     let parsed = parse_formula("y ~ x + linear(z) + nonnegative(w)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let ds = Dataset {

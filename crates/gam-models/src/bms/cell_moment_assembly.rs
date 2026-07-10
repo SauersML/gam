@@ -4459,10 +4459,7 @@ mod empirical_flex_jet_oracle_tests {
     /// directly in the jet via [`filtered_implicit_solve_jet2`]; the observed
     /// signed-probit NLL `−w·logΦ((2y−1)·η)` is then composed on top. No hand
     /// intercept/slope derivative formulas.
-    fn empirical_flex_row_nll_jet2(
-        fx: &FlexFixture,
-        p0: &[f64],
-    ) -> crate::bms::test_support::Jet2 {
+    fn empirical_flex_row_nll_jet2(fx: &FlexFixture, p0: &[f64]) -> crate::bms::test_support::Jet2 {
         use crate::bms::test_support::{Jet2, RuntimeJet, filtered_implicit_solve_jet2};
         let r = fx.primary.total;
         let q0 = p0[fx.primary.q];
@@ -4540,7 +4537,8 @@ mod empirical_flex_jet_oracle_tests {
         let constraint = |a: &Jet2| -> Jet2 {
             let mut acc = neg_mu.clone();
             for (node, weight) in fx.grid.pairs() {
-                let eta = flex_eta_row_jet2(fx, a, &b_jet, &beta_jets, node, basis_arg(node), scale);
+                let eta =
+                    flex_eta_row_jet2(fx, a, &b_jet, &beta_jets, node, basis_arg(node), scale);
                 let cdf = eta.compose_unary(unary_derivatives_normal_cdf(eta.value()));
                 acc = acc.add(&cdf.scale(weight));
             }
@@ -4584,7 +4582,11 @@ mod empirical_flex_jet_oracle_tests {
             let q = fx.primary.q;
             let b = fx.primary.logslope;
             let dev0 = dev_range.start;
-            let label = if is_score_warp { "score-warp" } else { "link-dev" };
+            let label = if is_score_warp {
+                "score-warp"
+            } else {
+                "link-dev"
+            };
 
             let jet = empirical_flex_row_nll_jet2(&fx, &p0);
             let tower = flex_tower_witness(&fx, &p0);
@@ -4671,7 +4673,11 @@ mod empirical_flex_jet_oracle_tests {
             for (k, i) in dev_range.clone().enumerate() {
                 p0[i] = fx.beta_dev[k];
             }
-            let label = if is_score_warp { "score-warp" } else { "link-dev" };
+            let label = if is_score_warp {
+                "score-warp"
+            } else {
+                "link-dev"
+            };
 
             let beta: Array1<f64> = Array1::from_iter(dev_range.clone().map(|i| p0[i]));
             let (beta_h, beta_w) = if is_score_warp {
@@ -4690,13 +4696,8 @@ mod empirical_flex_jet_oracle_tests {
             // calibration Jacobian F_a = Σ_k π_k φ(η₀)·∂η/∂a — the exact `m_a` the
             // hand IFT divides by, computed identically to the jet's internal F_a.
             let a0 = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
-            let basis_arg = |node: f64| -> f64 {
-                if is_score_warp {
-                    node
-                } else {
-                    a0 + b0 * node
-                }
-            };
+            let basis_arg =
+                |node: f64| -> f64 { if is_score_warp { node } else { a0 + b0 * node } };
             let mut f_a = 0.0_f64;
             for (node, weight) in fx.grid.pairs() {
                 let eta0 = witness_eta(&fx, a0, b0, &beta, node, scale);
@@ -4790,8 +4791,9 @@ mod empirical_flex_jet_oracle_tests {
                 // Route BOTH the production path (via latent_measure) and jet2
                 // (via fx.grid) through the degenerate sparse grid.
                 fx.grid = sparse.clone();
-                fx.family.latent_measure =
-                    LatentMeasureKind::GlobalEmpirical { grid: sparse.clone() };
+                fx.family.latent_measure = LatentMeasureKind::GlobalEmpirical {
+                    grid: sparse.clone(),
+                };
                 let r = fx.primary.total;
                 let q0 = 0.2_f64;
                 let mut p0 = vec![0.0; r];
@@ -4818,13 +4820,8 @@ mod empirical_flex_jet_oracle_tests {
                 )
                 .expect("link map");
                 let a0 = witness_intercept(&fx, marginal.mu, b0, &beta, scale);
-                let basis_arg = |node: f64| -> f64 {
-                    if is_score_warp {
-                        node
-                    } else {
-                        a0 + b0 * node
-                    }
-                };
+                let basis_arg =
+                    |node: f64| -> f64 { if is_score_warp { node } else { a0 + b0 * node } };
                 let mut f_a = 0.0_f64;
                 for (node, weight) in fx.grid.pairs() {
                     let eta0 = witness_eta(&fx, a0, b0, &beta, node, scale);
@@ -4851,12 +4848,25 @@ mod empirical_flex_jet_oracle_tests {
                 let neglog = fx
                     .family
                     .compute_row_analytic_flex_from_parts_into(
-                        0, &fx.primary, q0, b0, beta_h, beta_w, &row_ctx, None, None, true,
+                        0,
+                        &fx.primary,
+                        q0,
+                        b0,
+                        beta_h,
+                        beta_w,
+                        &row_ctx,
+                        None,
+                        None,
+                        true,
                         &mut scratch,
                     )
                     .expect("factored flex path");
                 let jet = empirical_flex_row_nll_jet2(&fx, &p0);
-                let label = if is_score_warp { "score-warp" } else { "link-dev" };
+                let label = if is_score_warp {
+                    "score-warp"
+                } else {
+                    "link-dev"
+                };
                 let tol = |x: f64| 1e-9 * x.abs().max(1.0);
                 assert!(
                     (neglog - jet.v).abs() <= tol(jet.v),

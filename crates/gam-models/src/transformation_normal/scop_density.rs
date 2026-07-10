@@ -253,7 +253,17 @@ mod tests {
         let gij = [11.0];
         let out = scop_second_order_h(rv.view(), rd.view(), 1, &gamma, &gi, &gj, &gij);
         // [h_i, h_j, h_ij, hp_i, hp_j, hp_ij]
-        assert_eq!(out, [3.0 * 2.0, 3.0 * 7.0, 3.0 * 11.0, 5.0 * 2.0, 5.0 * 7.0, 5.0 * 11.0]);
+        assert_eq!(
+            out,
+            [
+                3.0 * 2.0,
+                3.0 * 7.0,
+                3.0 * 11.0,
+                5.0 * 2.0,
+                5.0 * 7.0,
+                5.0 * 11.0
+            ]
+        );
     }
 
     #[test]
@@ -313,8 +323,14 @@ mod tests {
         let upper = [3.0, 4.0];
         let gamma = [0.0, 5.0];
         let gamma_psi = [9.0, 10.0];
-        let (h_psi, hp_psi, endpoint_psi) =
-            scop_psi_marginal(rv.view(), rd.view(), 2, [&lower, &upper], &gamma, &gamma_psi);
+        let (h_psi, hp_psi, endpoint_psi) = scop_psi_marginal(
+            rv.view(),
+            rd.view(),
+            2,
+            [&lower, &upper],
+            &gamma,
+            &gamma_psi,
+        );
         // h_psi = rv0*gpsi0 + 2*rv1*g1*gpsi1 = 9 + 2*4*5*10 = 409
         assert_eq!(h_psi, 9.0 + 2.0 * 4.0 * 5.0 * 10.0);
         // hp_psi = rd0*gpsi0 + 2*rd1*g1*gpsi1 = 9 + 2*6*5*10 = 609

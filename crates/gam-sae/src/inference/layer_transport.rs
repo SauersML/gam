@@ -51,17 +51,18 @@
 //!   such an alignment would erase genuine composition violations.
 //!
 //! All smooths reuse the engine's existing periodic cardinal-B-spline basis
-//! ([`build_periodic_bspline_basis_1d`]) with the cyclic difference penalty on
-//! circular domains, and the open B-spline basis with the standard difference
-//! penalty on interval domains — constructed directly, not via the string DSL.
+//! ([`build_periodic_bspline_basis_1d`]) with the exact periodic derivative
+//! Gram on circular domains, and the open B-spline basis with its exact
+//! derivative Gram on interval domains — constructed directly, not via the
+//! string DSL.
 
 use crate::chart_canonicalization::CanonicalChartTopology;
 use gam_solve::gaussian_reml::{
     gaussian_reml_closed_form_with_nullspace_dim, gaussian_reml_stationary_set,
 };
 use gam_terms::basis::{
-    BasisOptions, Dense, KnotSource, PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d,
-    create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
+    BasisOptions, Dense, KnotSource, PeriodicBSplineBasisSpec, bspline_derivative_penalty_matrix,
+    build_periodic_bspline_basis_1d, create_basis, cyclic_bspline_derivative_penalty_matrix,
     periodic_bspline_first_derivative_nd,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis};
@@ -70,9 +71,9 @@ use std::f64::consts::{PI, TAU};
 
 /// Cubic splines for every transport smooth.
 const TRANSPORT_SPLINE_DEGREE: usize = 3;
-/// Second-order (curvature) difference penalty: the cyclic variant leaves
-/// constants unpenalized on a circle; the open variant leaves affine maps
-/// unpenalized on an interval — exactly the isometry-adjacent null spaces.
+/// Second-order function-curvature penalty: the cyclic variant leaves constants
+/// unpenalized on a circle; the open variant leaves affine maps unpenalized on
+/// an interval — exactly the isometry-adjacent null spaces.
 const TRANSPORT_PENALTY_ORDER: usize = 2;
 /// Minimum paired observations for a transport fit.
 const MIN_TRANSPORT_OBS: usize = 16;
@@ -247,9 +248,9 @@ impl DomainBasis {
         }
     }
 
-    /// Rank of the smoothing penalty: the cyclic 2nd-difference penalty
+    /// Rank of the smoothing penalty: the cyclic second-derivative Gram
     /// annihilates only constants (a linear map is not periodic), the open
-    /// 2nd-difference penalty annihilates affine maps.
+    /// second-derivative Gram annihilates affine maps.
     fn penalty_rank(&self) -> usize {
         match self {
             DomainBasis::Periodic(spec) => spec.num_basis - 1,
@@ -259,13 +260,16 @@ impl DomainBasis {
 
     fn penalty(&self) -> Result<Array2<f64>, String> {
         match self {
-            DomainBasis::Periodic(spec) => {
-                create_cyclic_difference_penalty_matrix(spec.num_basis, TRANSPORT_PENALTY_ORDER)
-                    .map_err(|e| format!("cyclic transport penalty failed: {e}"))
-            }
-            DomainBasis::Open { .. } => {
-                create_difference_penalty_matrix(self.num_basis(), TRANSPORT_PENALTY_ORDER, None)
-                    .map_err(|e| format!("open transport penalty failed: {e}"))
+            DomainBasis::Periodic(spec) => cyclic_bspline_derivative_penalty_matrix(
+                spec.degree,
+                spec.num_basis,
+                spec.period,
+                TRANSPORT_PENALTY_ORDER,
+            )
+            .map_err(|e| format!("cyclic transport roughness failed: {e}")),
+            DomainBasis::Open { knots, degree } => {
+                bspline_derivative_penalty_matrix(knots.view(), *degree, TRANSPORT_PENALTY_ORDER)
+                    .map_err(|e| format!("open transport roughness failed: {e}"))
             }
         }
     }

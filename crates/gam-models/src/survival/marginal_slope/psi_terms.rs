@@ -765,18 +765,16 @@ impl SurvivalMarginalSlopeFamily {
             &policy,
         )?;
         let psi_map_ij = if same_block {
-            Some(
-                crate::custom_family::resolve_custom_family_x_psi_psi_map(
-                    deriv_i,
-                    deriv_j,
-                    local_idx_j,
-                    self.n,
-                    p_psi_i,
-                    0..self.n,
-                    label_i,
-                    &policy,
-                )?,
-            )
+            Some(crate::custom_family::resolve_custom_family_x_psi_psi_map(
+                deriv_i,
+                deriv_j,
+                local_idx_j,
+                self.n,
+                p_psi_i,
+                0..self.n,
+                label_i,
+                &policy,
+            )?)
         } else {
             None
         };

@@ -23,12 +23,16 @@ pub enum CandidateTopology {
         n_knots: usize,
         degree: usize,
         penalty_order: usize,
+        #[serde(default)]
+        double_penalty: Option<bool>,
     },
     Sphere {
         n_centers: usize,
         penalty_order: usize,
         kernel: String,
         radians: bool,
+        #[serde(default)]
+        double_penalty: Option<bool>,
     },
     Tensor {
         k: Vec<usize>,
@@ -38,6 +42,8 @@ pub enum CandidateTopology {
         /// marginal to override (each entry is either `None` or a literal
         /// string emitted verbatim).
         periods: Option<Vec<Option<String>>>,
+        #[serde(default)]
+        double_penalty: Option<bool>,
     },
     Duchon {
         m: usize,
@@ -51,6 +57,8 @@ pub enum CandidateTopology {
         per_axis_periodic: bool,
         length_scale: Option<f64>,
         required_dim: Option<usize>,
+        #[serde(default)]
+        double_penalty: Option<bool>,
     },
 }
 
@@ -392,6 +400,7 @@ fn topology_term(
             n_knots,
             degree,
             penalty_order,
+            double_penalty,
         } => {
             let mut options: Vec<String> = vec!["type=cyclic".to_string()];
             if !has_size {
@@ -403,6 +412,7 @@ fn topology_term(
             if *penalty_order != 2 {
                 options.push(format!("penalty_order={penalty_order}"));
             }
+            append_double_penalty(&mut options, *double_penalty, option_keys);
             Ok(TopologyTerm {
                 call: "s",
                 options,
@@ -414,6 +424,7 @@ fn topology_term(
             penalty_order,
             kernel,
             radians,
+            double_penalty,
         } => {
             let mut options: Vec<String> = vec!["type=sphere".to_string()];
             if !has_size {
@@ -428,6 +439,7 @@ fn topology_term(
             if *radians {
                 options.push("radians=true".to_string());
             }
+            append_double_penalty(&mut options, *double_penalty, option_keys);
             Ok(TopologyTerm {
                 call: "s",
                 options,
@@ -438,6 +450,7 @@ fn topology_term(
             k,
             periodic,
             periods,
+            double_penalty,
         } => {
             let mut options: Vec<String> = Vec::new();
             if !has_size && !k.is_empty() {
@@ -456,6 +469,7 @@ fn topology_term(
                 options.push(format!("period={}", format_period_list(&owned_periods)));
             }
             options.push("identifiability=sum_tozero".to_string());
+            append_double_penalty(&mut options, *double_penalty, option_keys);
             Ok(TopologyTerm {
                 call: "te",
                 options,
@@ -468,6 +482,7 @@ fn topology_term(
             per_axis_periodic,
             length_scale,
             required_dim,
+            double_penalty,
         } => {
             if *per_axis_periodic {
                 return Err(
@@ -488,12 +503,26 @@ fn topology_term(
             if let Some(ls) = length_scale {
                 options.push(format!("length_scale={}", python_repr_float(*ls)));
             }
+            append_double_penalty(&mut options, *double_penalty, option_keys);
             Ok(TopologyTerm {
                 call: "s",
                 options,
                 required_dim: *required_dim,
             })
         }
+    }
+}
+
+fn append_double_penalty(
+    options: &mut Vec<String>,
+    candidate_value: Option<bool>,
+    user_option_keys: &[String],
+) {
+    if user_option_keys.iter().any(|key| key == "double_penalty") {
+        return;
+    }
+    if let Some(enabled) = candidate_value {
+        options.push(format!("double_penalty={enabled}"));
     }
 }
 
@@ -574,6 +603,7 @@ mod tests {
             n_knots: 20,
             degree: 3,
             penalty_order: 2,
+            double_penalty: None,
         };
         let out = assemble_candidate_formula("y ~ s(t, type=AUTO)", &candidate, true)
             .unwrap()
@@ -588,6 +618,7 @@ mod tests {
             penalty_order: 2,
             kernel: "sobolev".to_string(),
             radians: false,
+            double_penalty: None,
         };
         let out = assemble_candidate_formula("y ~ s(lat, lon, type=AUTO)", &candidate, true)
             .unwrap()
@@ -601,6 +632,7 @@ mod tests {
             k: vec![12, 12],
             periodic: vec![true, true],
             periods: None,
+            double_penalty: None,
         };
         let out = assemble_candidate_formula("y ~ s(theta, phi, type=AUTO)", &candidate, true)
             .unwrap()
@@ -616,6 +648,7 @@ mod tests {
             penalty_order: 2,
             kernel: "sobolev".to_string(),
             radians: false,
+            double_penalty: None,
         };
         let err = assemble_candidate_formula("y ~ s(x, type=AUTO)", &candidate, true).unwrap_err();
         assert!(err.contains("2-D covariate"));
@@ -628,6 +661,7 @@ mod tests {
             penalty_order: 2,
             kernel: "sobolev".to_string(),
             radians: false,
+            double_penalty: None,
         };
         let out = assemble_candidate_formula("y ~ s(x, type=AUTO)", &candidate, false).unwrap();
         assert!(out.is_none());
@@ -641,6 +675,7 @@ mod tests {
             per_axis_periodic: true,
             length_scale: None,
             required_dim: Some(2),
+            double_penalty: None,
         };
         let err =
             assemble_candidate_formula("y ~ s(x1, x2, type=AUTO)", &candidate, true).unwrap_err();
@@ -653,6 +688,7 @@ mod tests {
             n_knots: 20,
             degree: 3,
             penalty_order: 2,
+            double_penalty: None,
         };
         let out = assemble_candidate_formula("y ~ s(t, k=8, type=AUTO)", &candidate, true)
             .unwrap()
@@ -663,11 +699,36 @@ mod tests {
     }
 
     #[test]
+    fn candidate_null_recovery_choice_is_emitted_unless_formula_pins_it() {
+        let candidate = CandidateTopology::PeriodicSplineCurve {
+            n_knots: 20,
+            degree: 3,
+            penalty_order: 2,
+            double_penalty: Some(false),
+        };
+        let out = assemble_candidate_formula("y ~ s(t, type=AUTO)", &candidate, true)
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("double_penalty=false"));
+
+        let pinned = assemble_candidate_formula(
+            "y ~ s(t, type=AUTO, double_penalty=true)",
+            &candidate,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(pinned.contains("double_penalty=true"));
+        assert!(!pinned.contains("double_penalty=false"));
+    }
+
+    #[test]
     fn missing_auto_term_errors() {
         let candidate = CandidateTopology::PeriodicSplineCurve {
             n_knots: 20,
             degree: 3,
             penalty_order: 2,
+            double_penalty: None,
         };
         let err = assemble_candidate_formula("y ~ s(t, k=8)", &candidate, true).unwrap_err();
         assert!(err.contains("type=AUTO"));

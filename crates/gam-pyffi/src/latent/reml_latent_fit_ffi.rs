@@ -1591,15 +1591,13 @@ struct TangentRemlMultiResult {
     reml_score: f64,
 }
 
-fn gaussian_reml_fit_formula_table_impl(
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+fn gaussian_reml_fit_formula_dataset_impl(
+    dataset: EncodedDataset,
     formula: String,
     y: ArrayView2<'_, f64>,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<TangentRemlMultiResult, String> {
-    let dataset = dataset_with_inferred_schema(headers, rows)?;
     let (mut fit_config, _training_table_kind) = parse_fit_config(config_json)?;
     fit_config.family = Some("gaussian".to_string());
     fit_config.link = Some("identity".to_string());
@@ -3802,6 +3800,7 @@ fn posterior_predict_result_to_py(
 ) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
     out.set_item("eta", result.eta.into_pyarray(py))?;
+    out.set_item("mean", result.mean.into_pyarray(py))?;
     out.set_item("model_class", result.model_class)?;
     out.set_item("family_kind", result.family_kind)?;
     out.set_item("link_spec", result.link_spec)?;
@@ -3813,12 +3812,14 @@ fn posterior_predict_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     samples: PyReadonlyArray2<'_, f64>,
 ) -> PyResult<Py<PyDict>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let result = detach_py_result(py, "posterior_predict_table", move || {
-        posterior_predict_table_impl(&model_bytes, headers, rows, samples)
+        posterior_predict_encoded_table_impl(&model_bytes, dataset, samples)
     })?;
     posterior_predict_result_to_py(py, result)
 }
@@ -3828,19 +3829,35 @@ fn posterior_predict_bands_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     samples: PyReadonlyArray2<'_, f64>,
     level: f64,
 ) -> PyResult<Py<PyDict>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let payload = detach_py_result(py, "posterior_predict_bands_table", move || {
-        posterior_predict_bands_table_impl(
+        posterior_predict_bands_encoded_table_impl(
             &model_bytes,
-            headers,
-            rows,
+            dataset,
             samples,
             level,
         )
+    })?;
+    posterior_bands_payload_to_py(py, payload)
+}
+
+#[pyfunction]
+fn posterior_draw_bands(
+    py: Python<'_>,
+    eta: PyReadonlyArray2<'_, f64>,
+    mean: PyReadonlyArray2<'_, f64>,
+    level: f64,
+) -> PyResult<Py<PyDict>> {
+    let eta = owned_row_major_f64(eta.as_array());
+    let mean = owned_row_major_f64(mean.as_array());
+    let payload = detach_py_result(py, "posterior_draw_bands", move || {
+        posterior_draw_bands_impl(eta, mean, level)
     })?;
     posterior_bands_payload_to_py(py, payload)
 }
@@ -3877,27 +3894,6 @@ fn posterior_credible_interval(
 #[pyfunction]
 fn posterior_coefficient_names_json(request_json: &str) -> PyResult<String> {
     posterior_coefficient_names_json_impl(request_json).map_err(py_value_error)
-}
-
-#[pyfunction]
-fn posterior_samples_summary_json(
-    py: Python<'_>,
-    samples: PyReadonlyArray2<'_, f64>,
-    posterior_mean: PyReadonlyArray1<'_, f64>,
-    posterior_std: PyReadonlyArray1<'_, f64>,
-    request_json: String,
-) -> PyResult<String> {
-    let samples = owned_row_major_f64(samples.as_array());
-    let posterior_mean = posterior_mean.as_array().to_owned();
-    let posterior_std = posterior_std.as_array().to_owned();
-    detach_py_result(py, "posterior_samples_summary_json", move || {
-        posterior_samples_summary_json_impl(
-            samples,
-            posterior_mean,
-            posterior_std,
-            &request_json,
-        )
-    })
 }
 
 #[pyfunction]
@@ -3962,11 +3958,13 @@ fn curvature_inference_json(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     level: Option<f64>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     detach_py_result(py, "curvature_inference_json", move || {
-        curvature_inference_json_impl(&model_bytes, headers, rows, level.unwrap_or(0.95))
+        curvature_inference_dataset_json_impl(&model_bytes, dataset, level.unwrap_or(0.95))
     })
 }
 
@@ -3987,10 +3985,12 @@ fn smooth_term_lr_inference_json(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     detach_py_result(py, "smooth_term_lr_inference_json", move || {
-        smooth_term_lr_inference_json_impl(&model_bytes, headers, rows)
+        smooth_term_lr_inference_dataset_json_impl(&model_bytes, dataset)
     })
 }
 
@@ -4025,11 +4025,13 @@ fn model_debiased_functional_json(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     target_spec_json: String,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     detach_py_result(py, "model_debiased_functional_json", move || {
-        model_debiased_functional_json_impl(&model_bytes, headers, rows, &target_spec_json)
+        model_debiased_functional_dataset_json_impl(&model_bytes, dataset, &target_spec_json)
     })
 }
 
@@ -4134,10 +4136,9 @@ fn debiased_query_design_full_schema(
     Ok(qx.row(0).to_owned())
 }
 
-fn model_debiased_functional_json_impl(
+fn model_debiased_functional_dataset_json_impl(
     model_bytes: &[u8],
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    dataset: EncodedDataset,
     target_spec_json: &str,
 ) -> Result<String, String> {
     use gam::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
@@ -4163,14 +4164,13 @@ fn model_debiased_functional_json_impl(
         })?
         .clone();
 
-    // Preserve the exact training-frame column order before `headers` is moved
+    // Preserve the exact training-frame column order before the dataset is moved
     // into the encoder. `standard.data` (below) inherits this order verbatim
     // (`StandardFitRequest::data == dataset.values`, no reordering), and the
     // saved `TermCollectionSpec` resolves every term's feature column by its
     // offset in THIS layout. The `point`/`contrast` query design must be built
     // against the same full layout, not just the columns named in `x0` (#1621).
-    let training_headers = headers.clone();
-    let dataset = dataset_with_inferred_schema(headers, rows)?;
+    let training_headers = dataset.headers.clone();
     let (fit_config, _) = parse_fit_config(None)?;
     let materialized = materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
     let standard = match materialized.request {
@@ -4772,10 +4772,12 @@ fn check_json(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     detach_py_result(py, "check_json", move || {
-        check_json_impl(&model_bytes, headers, rows)
+        check_dataset_json_impl(&model_bytes, dataset)
     })
 }
 
@@ -4784,10 +4786,12 @@ fn check_payload_from_model(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<PyObject> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let payload = detach_py_result(py, "check_payload_from_model", move || {
-        let check_json = check_json_impl(&model_bytes, headers, rows)?;
+        let check_json = check_dataset_json_impl(&model_bytes, dataset)?;
         serde_json::from_str::<serde_json::Value>(&check_json)
             .map_err(|err| format!("invalid schema check JSON: {err}"))
     })?;
@@ -4849,135 +4853,9 @@ fn diagnostics_from_predictions(
 }
 
 #[pyfunction]
-fn benchmark_prediction_metrics(
-    py: Python<'_>,
-    family: String,
-    observed: Vec<f64>,
-    predicted_mean: Vec<f64>,
-    train_observed: Vec<f64>,
-    sigma: Option<Vec<f64>>,
-) -> PyResult<Py<PyDict>> {
-    let diagnostics =
-        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
-            .map_err(py_value_error)?;
-    let metrics = PyDict::new(py);
-    match family.as_str() {
-        "binomial" => {
-            metrics.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
-            metrics.set_item("brier", diagnostics.rmse * diagnostics.rmse)?;
-            metrics.set_item(
-                "logloss",
-                benchmark_binary_logloss(&observed, &predicted_mean)?,
-            )?;
-            if let Some(nagelkerke_r2) =
-                benchmark_nagelkerke_r2(&observed, &predicted_mean, &train_observed)?
-            {
-                metrics.set_item("nagelkerke_r2", nagelkerke_r2)?;
-            }
-        }
-        "gaussian" => {
-            metrics.set_item("r2", diagnostics.r_squared.unwrap_or(0.0))?;
-            metrics.set_item("rmse", diagnostics.rmse)?;
-            metrics.set_item("mae", diagnostics.mae)?;
-            metrics.set_item("mse", diagnostics.rmse * diagnostics.rmse)?;
-            if let Some(sigma_values) = sigma {
-                metrics.set_item(
-                    "logloss",
-                    benchmark_gaussian_logloss(&observed, &predicted_mean, &sigma_values)?,
-                )?;
-            }
-        }
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "unsupported benchmark metric family: {other}"
-            )));
-        }
-    }
-    Ok(metrics.unbind())
-}
-
-fn benchmark_pr_auc_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
-    if observed.len() != predicted_mean.len() {
-        return Err(PyValueError::new_err(format!(
-            "pr_auc length mismatch: observed={} predicted={}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    let mut pairs: Vec<(f64, bool)> = observed
-        .iter()
-        .zip(predicted_mean.iter())
-        .map(|(&y, &p)| (p, y > 0.5))
-        .collect();
-    let n_pos = pairs.iter().filter(|(_, is_pos)| *is_pos).count();
-    if n_pos == 0 {
-        return Ok(0.0);
-    }
-    pairs.sort_by(|(a, _), (b, _)| b.total_cmp(a));
-    let mut tp = 0usize;
-    let mut fp = 0usize;
-    let mut prev_precision = 1.0;
-    let mut prev_recall = 0.0;
-    let mut area = 0.0;
-    let mut i = 0usize;
-    while i < pairs.len() {
-        // A decision threshold cannot fall between equal scores, so an entire
-        // tied-score group enters the confusion matrix as one unit; advancing
-        // the curve row-by-row inside a tie would make the area depend on the
-        // input order of the tied rows.
-        let group_score = pairs[i].0;
-        while i < pairs.len() && pairs[i].0.total_cmp(&group_score).is_eq() {
-            if pairs[i].1 {
-                tp += 1;
-            } else {
-                fp += 1;
-            }
-            i += 1;
-        }
-        let precision = tp as f64 / (tp + fp) as f64;
-        let recall = tp as f64 / n_pos as f64;
-        area += 0.5 * (precision + prev_precision) * (recall - prev_recall);
-        prev_precision = precision;
-        prev_recall = recall;
-    }
-    Ok(area)
-}
-
-fn benchmark_ece_score(observed: &[f64], predicted_mean: &[f64]) -> PyResult<f64> {
-    if observed.len() != predicted_mean.len() {
-        return Err(PyValueError::new_err(format!(
-            "ece length mismatch: observed={} predicted={}",
-            observed.len(),
-            predicted_mean.len()
-        )));
-    }
-    if observed.is_empty() {
-        return Err(PyValueError::new_err("ece requires at least one row"));
-    }
-    let mut bins = vec![(0usize, 0.0, 0.0); 20];
-    for (&y, &p) in observed.iter().zip(predicted_mean.iter()) {
-        let mut idx = (p.clamp(0.0, 1.0) * 20.0).floor() as usize;
-        if idx >= 20 {
-            idx = 19;
-        }
-        bins[idx].0 += 1;
-        bins[idx].1 += y;
-        bins[idx].2 += p;
-    }
-    let n = observed.len() as f64;
-    Ok(bins
-        .into_iter()
-        .filter(|(count, _, _)| *count > 0)
-        .map(|(count, y_sum, p_sum)| {
-            let c = count as f64;
-            (c / n) * ((y_sum / c) - (p_sum / c)).abs()
-        })
-        .sum())
-}
-
-#[pyfunction]
 fn auc_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
-    benchmark_auc_score(&observed, &predicted_mean)
+    gam::inference::diagnostics::auc_from_predictions(&observed, &predicted_mean)
+        .map_err(py_value_error)
 }
 
 #[pyfunction]
@@ -4986,15 +4864,18 @@ fn weighted_auc_from_predictions(
     predicted_mean: Vec<f64>,
     weights: Vec<f64>,
 ) -> PyResult<f64> {
-    benchmark_scores::benchmark_weighted_auc_score(&observed, &predicted_mean, Some(&weights))
+    gam::inference::diagnostics::weighted_auc_from_predictions(
+        &observed,
+        &predicted_mean,
+        Some(&weights),
+    )
+    .map_err(py_value_error)
 }
 
 #[pyfunction]
 fn brier_from_predictions(observed: Vec<f64>, predicted_mean: Vec<f64>) -> PyResult<f64> {
-    let diagnostics =
-        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
-            .map_err(py_value_error)?;
-    Ok(diagnostics.rmse * diagnostics.rmse)
+    gam::inference::diagnostics::brier_from_predictions(&observed, &predicted_mean)
+        .map_err(py_value_error)
 }
 
 #[pyfunction(signature = (observed, predicted_mean, eps = 1e-12))]
@@ -5003,7 +4884,12 @@ fn log_loss_from_predictions(
     predicted_mean: Vec<f64>,
     eps: f64,
 ) -> PyResult<f64> {
-    benchmark_binary_logloss_eps(&observed, &predicted_mean, eps)
+    gam::inference::diagnostics::binary_log_loss_from_predictions(
+        &observed,
+        &predicted_mean,
+        eps,
+    )
+    .map_err(py_value_error)
 }
 
 #[pyfunction(signature = (observed, predicted_mean, null_mean, eps = 1e-12))]
@@ -5013,7 +4899,13 @@ fn nagelkerke_r2_from_predictions(
     null_mean: f64,
     eps: f64,
 ) -> PyResult<Option<f64>> {
-    benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, null_mean, eps)
+    gam::inference::diagnostics::nagelkerke_r_squared_from_predictions(
+        &observed,
+        &predicted_mean,
+        null_mean,
+        eps,
+    )
+    .map_err(py_value_error)
 }
 
 #[pyfunction(signature = (y, n_splits, seed, stratified))]
@@ -5163,61 +5055,13 @@ fn gaussian_log_loss_value(
     sigma: &[f64],
     eps: f64,
 ) -> PyResult<f64> {
-    let n = observed.len();
-    if n == 0 {
-        return Err(py_value_error(
-            "gaussian_log_loss_from_predictions: observed must be non-empty".to_string(),
-        ));
-    }
-    if predicted_mean.len() != n {
-        return Err(py_value_error(format!(
-            "gaussian_log_loss_from_predictions length mismatch: observed={n} predicted_mean={}",
-            predicted_mean.len()
-        )));
-    }
-    if sigma.len() != 1 && sigma.len() != n {
-        return Err(py_value_error(format!(
-            "gaussian_log_loss_from_predictions: sigma length must be 1 or {n}; got {}",
-            sigma.len()
-        )));
-    }
-    if !eps.is_finite() || eps <= 0.0 {
-        return Err(py_value_error(format!(
-            "gaussian_log_loss_from_predictions: eps must be positive and finite; got {eps}"
-        )));
-    }
-    let scalar_sigma = sigma.len() == 1;
-    let two_pi = std::f64::consts::TAU;
-    let mut total = 0.0_f64;
-    for i in 0..n {
-        let y = observed[i];
-        let mu = predicted_mean[i];
-        if !y.is_finite() {
-            return Err(py_value_error(format!(
-                "gaussian_log_loss_from_predictions: observed[{i}] is not finite ({y})"
-            )));
-        }
-        if !mu.is_finite() {
-            return Err(py_value_error(format!(
-                "gaussian_log_loss_from_predictions: predicted_mean[{i}] is not finite ({mu})"
-            )));
-        }
-        let s_raw = if scalar_sigma { sigma[0] } else { sigma[i] };
-        if !s_raw.is_finite() || s_raw <= 0.0 {
-            // A standard deviation is strictly positive by definition; folding
-            // a negative or zero scale into a usable one (abs, eps floor) would
-            // score a density that was never predicted.
-            return Err(py_value_error(format!(
-                "gaussian_log_loss_from_predictions: sigma[{}] must be strictly positive \
-                 and finite; got {s_raw}",
-                if scalar_sigma { 0 } else { i }
-            )));
-        }
-        let s = s_raw.max(eps);
-        let r = y - mu;
-        total += 0.5 * (two_pi * s * s).ln() + 0.5 * (r / s) * (r / s);
-    }
-    Ok(total / n as f64)
+    gam::inference::diagnostics::gaussian_log_loss_from_predictions(
+        observed,
+        predicted_mean,
+        sigma,
+        eps,
+    )
+    .map_err(py_value_error)
 }
 
 #[pyfunction(signature = (observed, predicted_mean, sigma, eps = 1e-12))]
@@ -5240,7 +5084,12 @@ fn gaussian_prediction_scores_from_predictions(
     let diag =
         gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
             .map_err(py_value_error)?;
-    let logloss = gaussian_log_loss_value(&observed, &predicted_mean, &sigma, 1.0e-12)?;
+    let logloss = gaussian_log_loss_value(
+        &observed,
+        &predicted_mean,
+        &sigma,
+        gam::inference::diagnostics::DEFAULT_GAUSSIAN_SCALE_FLOOR,
+    )?;
 
     let out = PyDict::new(py);
     out.set_item("n_obs", diag.n_obs)?;
@@ -5353,25 +5202,22 @@ fn classification_metrics(
     predicted_mean: Vec<f64>,
     train_prev: f64,
 ) -> PyResult<Py<PyDict>> {
+    let metrics = gam::inference::diagnostics::classification_metrics_from_predictions(
+        &observed,
+        &predicted_mean,
+        train_prev,
+    )
+    .map_err(py_value_error)?;
     let out = PyDict::new(py);
-    out.set_item("auc", benchmark_auc_score(&observed, &predicted_mean)?)?;
-    out.set_item(
-        "pr_auc",
-        benchmark_pr_auc_score(&observed, &predicted_mean)?,
-    )?;
-    out.set_item(
-        "brier",
-        brier_from_predictions(observed.clone(), predicted_mean.clone())?,
-    )?;
-    out.set_item(
-        "logloss",
-        benchmark_binary_logloss(&observed, &predicted_mean)?,
-    )?;
-    match benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, train_prev, 1.0e-12)? {
+    out.set_item("auc", metrics.auc)?;
+    out.set_item("pr_auc", metrics.precision_recall_auc)?;
+    out.set_item("brier", metrics.brier)?;
+    out.set_item("logloss", metrics.log_loss)?;
+    match metrics.nagelkerke_r_squared {
         Some(value) => out.set_item("nagelkerke_r2", value)?,
         None => out.set_item("nagelkerke_r2", py.None())?,
     }
-    out.set_item("ece", benchmark_ece_score(&observed, &predicted_mean)?)?;
+    out.set_item("ece", metrics.expected_calibration_error)?;
     Ok(out.unbind())
 }
 
@@ -5472,77 +5318,6 @@ fn repeat_survival_curve<'py>(
         }
     }
     Ok(out.into_pyarray(py).unbind())
-}
-
-#[pyfunction]
-fn survival_null_curve_from_train<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-    train_events: Vec<f64>,
-    grid: Vec<f64>,
-) -> PyResult<Py<PyArray1<f64>>> {
-    if train_times.len() != train_events.len() {
-        return Err(PyValueError::new_err(format!(
-            "survival null curve length mismatch: times={} events={}",
-            train_times.len(),
-            train_events.len()
-        )));
-    }
-    Ok(
-        Array1::from_vec(benchmark_km_curve(&train_times, &train_events, &grid))
-            .into_pyarray(py)
-            .unbind(),
-    )
-}
-
-fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
-    let mut rows: Vec<(f64, bool)> = times
-        .iter()
-        .zip(events.iter())
-        .filter_map(|(&time, &event)| {
-            (time.is_finite() && event.is_finite() && time > 0.0).then_some((time, event > 0.5))
-        })
-        .collect();
-    if rows.is_empty() {
-        return vec![1.0; grid.len()];
-    }
-    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let mut steps = Vec::<(f64, f64)>::new();
-    let mut at_risk = rows.len() as f64;
-    let mut survival = 1.0;
-    let mut i = 0usize;
-    while i < rows.len() {
-        let time = rows[i].0;
-        let mut j = i + 1;
-        let mut events_at_time = usize::from(rows[i].1);
-        while j < rows.len() && rows[j].0 == time {
-            events_at_time += usize::from(rows[j].1);
-            j += 1;
-        }
-        if events_at_time > 0 && at_risk > 0.0 {
-            survival *= ((at_risk - events_at_time as f64) / at_risk).max(0.0);
-            steps.push((time, survival));
-        }
-        at_risk -= (j - i) as f64;
-        i = j;
-    }
-    let mut out = Vec::with_capacity(grid.len());
-    let mut step_idx = 0usize;
-    let mut current = 1.0;
-    for &time in grid {
-        while step_idx < steps.len() && steps[step_idx].0 <= time {
-            current = steps[step_idx].1;
-            step_idx += 1;
-        }
-        out.push(current.clamp(1.0e-12, 1.0));
-    }
-    if let Some(first) = out.first_mut() {
-        *first = 1.0;
-    }
-    for idx in 1..out.len() {
-        out[idx] = out[idx].min(out[idx - 1]);
-    }
-    out
 }
 
 fn benchmark_survival_matrix_from_risk(
@@ -5921,12 +5696,12 @@ fn survival_lifted_metrics_from_predictions<'py>(
             )?;
             let ll_model = -log_losses.iter().sum::<f64>();
             let ll_null = -null_log_losses.iter().sum::<f64>();
-            let n = event_times.len() as f64;
-            let r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * (ll_null - ll_model));
-            let max_r2_cs = 1.0 - benchmark_exp_saturated((2.0 / n) * ll_null);
-            if r2_cs.is_finite() && max_r2_cs.is_finite() && max_r2_cs > 0.0 {
-                nagelkerke = Some(r2_cs / max_r2_cs);
-            }
+            nagelkerke =
+                gam::inference::diagnostics::nagelkerke_r_squared_from_log_likelihoods(
+                    ll_model,
+                    ll_null,
+                    event_times.len(),
+                );
         }
     }
     match nagelkerke {

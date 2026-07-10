@@ -131,7 +131,7 @@
 use super::block::BlockSparseFit;
 use crate::dual_certificate::harmonic_dual_birth_eta;
 use crate::super_resolution::{recover_spikes, separation_limit};
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, ArrayView3};
 use std::f64::consts::TAU;
 
 /// The phase and amplitude of one firing on a coordinate (circle/harmonic)
@@ -219,30 +219,90 @@ fn uniform_phase_sd() -> f64 {
     (1.0f64 / 12.0).sqrt()
 }
 
-/// Collect one block's firings from a fit as `(row, z)` with `z` the signed
-/// within-block code lifted to f64. A genuine firing is one whose stored gate
-/// `‖z_g‖₂` is non-zero (padded routing slots carry a zero gate).
-fn collect_firings(fit: &BlockSparseFit, block: usize, b: usize) -> Vec<(usize, Vec<f64>)> {
-    let n = fit.blocks.nrows();
-    let k = fit.blocks.ncols();
+/// Collect one block's firings from a fixed-width sparse route as `(row, z)`.
+///
+/// Presence is the intrinsic `‖z_g‖₂ > 0` predicate, so callers do not need a
+/// redundant `N×s` gate matrix. This validator is shared by fit-oriented and
+/// route-oriented diagnostics; a route view never needs fabricated optimizer
+/// metadata.
+fn collect_route_firings(
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    n_blocks: usize,
+    block: usize,
+    block_size: usize,
+) -> Result<Vec<(usize, Vec<f64>)>, String> {
+    if block_size == 0 {
+        return Err("coordinate route block_size must be >= 1".to_string());
+    }
+    let (n, width) = blocks.dim();
+    if codes.shape() != [n, width, block_size] {
+        return Err(format!(
+            "coordinate route codes shape {:?} does not match blocks {:?} and block_size {block_size}",
+            codes.shape(),
+            blocks.dim()
+        ));
+    }
+    if block >= n_blocks {
+        return Err(format!(
+            "coordinate route block {block} out of range 0..{n_blocks}"
+        ));
+    }
     let mut out = Vec::new();
     for i in 0..n {
-        for j in 0..k {
-            if fit.blocks[[i, j]] as usize != block {
+        let mut found = false;
+        for j in 0..width {
+            let routed_block = blocks[[i, j]] as usize;
+            if routed_block >= n_blocks {
+                return Err(format!(
+                    "coordinate route block index {routed_block} at row {i}, slot {j} is outside 0..{n_blocks}"
+                ));
+            }
+            let mut norm2 = 0.0_f64;
+            let mut z = Vec::with_capacity(block_size);
+            for r in 0..block_size {
+                let value = codes[[i, j, r]] as f64;
+                if !value.is_finite() {
+                    return Err(format!(
+                        "coordinate route code at row {i}, slot {j}, offset {r} is not finite"
+                    ));
+                }
+                norm2 += value * value;
+                z.push(value);
+            }
+            if routed_block != block || norm2 == 0.0 {
                 continue;
             }
-            if fit.gates[[i, j]] == 0.0 {
-                continue; // padded slot
-            }
-            let mut z = Vec::with_capacity(b);
-            for r in 0..b {
-                z.push(fit.codes[[i, j, r]] as f64);
+            if found {
+                return Err(format!(
+                    "coordinate route repeats live block {block} in row {i}"
+                ));
             }
             out.push((i, z));
-            break; // a block fires at most once per row
+            found = true;
         }
     }
-    out
+    Ok(out)
+}
+
+fn collect_firings(
+    fit: &BlockSparseFit,
+    block: usize,
+    block_size: usize,
+) -> Result<Vec<(usize, Vec<f64>)>, String> {
+    if block_size == 0 || fit.decoder.nrows() % block_size != 0 {
+        return Err(format!(
+            "coordinate fit decoder rows {} not divisible by block_size {block_size}",
+            fit.decoder.nrows()
+        ));
+    }
+    collect_route_firings(
+        fit.blocks.view(),
+        fit.codes.view(),
+        fit.decoder.nrows() / block_size,
+        block,
+        block_size,
+    )
 }
 
 /// Mean radius `r̄` and unbiased radial-scatter noise `σ̂` from the firing codes.
@@ -487,20 +547,40 @@ pub fn block_firing_coordinates(
     fit: &BlockSparseFit,
     block: usize,
 ) -> Result<BlockCoordinateReport, String> {
-    let b = fit.block_size;
+    let block_size = fit.block_size;
+    if block_size == 0 || fit.decoder.nrows() % block_size != 0 {
+        return Err(format!(
+            "block_firing_coordinates: decoder rows {} not divisible by block_size {block_size}",
+            fit.decoder.nrows()
+        ));
+    }
+    block_route_firing_coordinates(
+        fit.blocks.view(),
+        fit.codes.view(),
+        fit.decoder.nrows() / block_size,
+        block,
+    )
+}
+
+/// Per-firing circle-coordinate readout directly from sparse block routing.
+///
+/// `blocks` is `N×s` and `codes` is `N×s×2`; implicit dictionary zeros are
+/// never expanded. `n_blocks` retains empty dictionary charts in the validated
+/// block domain without requiring a decoder or a synthetic fit object.
+pub fn block_route_firing_coordinates(
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    n_blocks: usize,
+    block: usize,
+) -> Result<BlockCoordinateReport, String> {
+    let b = codes.shape()[2];
     if b != 2 {
         return Err(format!(
-            "block_firing_coordinates: circle readout requires block_size b = 2, got b = {b}; \
+            "block_route_firing_coordinates: circle readout requires block_size b = 2, got b = {b}; \
              use harmonic_firing_coordinates for b = 2H"
         ));
     }
-    let g_total = fit.decoder.nrows() / b;
-    if block >= g_total {
-        return Err(format!(
-            "block_firing_coordinates: block {block} out of range 0..{g_total}"
-        ));
-    }
-    let firings = collect_firings(fit, block, b);
+    let firings = collect_route_firings(blocks, codes, n_blocks, block, b)?;
     let (mean_radius, sigma_hat) = radius_and_sigma(&firings);
 
     let mut coords = Vec::with_capacity(firings.len());
@@ -814,24 +894,41 @@ pub fn harmonic_firing_coordinates(
     fit: &BlockSparseFit,
     block: usize,
 ) -> Result<BlockCoordinateReport, String> {
-    let b = fit.block_size;
-    if b < 2 || b % 2 != 0 {
+    let block_size = fit.block_size;
+    if block_size == 0 || fit.decoder.nrows() % block_size != 0 {
         return Err(format!(
-            "harmonic_firing_coordinates: harmonic readout requires block_size b = 2H (even, \
-             ≥ 2), got b = {b}"
+            "harmonic_firing_coordinates: decoder rows {} not divisible by block_size {block_size}",
+            fit.decoder.nrows()
         ));
     }
-    let g_total = fit.decoder.nrows() / b;
-    if block >= g_total {
+    harmonic_route_firing_coordinates(
+        fit.blocks.view(),
+        fit.codes.view(),
+        fit.decoder.nrows() / block_size,
+        block,
+    )
+}
+
+/// Harmonic coordinate readout directly from `blocks[N,s]` /
+/// `codes[N,s,b]` sparse routing, without constructing a fit result.
+pub fn harmonic_route_firing_coordinates(
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    n_blocks: usize,
+    block: usize,
+) -> Result<BlockCoordinateReport, String> {
+    let b = codes.shape()[2];
+    if b < 2 || b % 2 != 0 {
         return Err(format!(
-            "harmonic_firing_coordinates: block {block} out of range 0..{g_total}"
+            "harmonic_route_firing_coordinates: harmonic readout requires block_size b = 2H (even, \
+             ≥ 2), got b = {b}"
         ));
     }
     let h_count = b / 2;
     // Σ_h ω_h² with ω_h = 2π h.
     let omega_sq_sum: f64 = (1..=h_count).map(|h| TAU * h as f64).map(|w| w * w).sum();
 
-    let firings = collect_firings(fit, block, b);
+    let firings = collect_route_firings(blocks, codes, n_blocks, block, b)?;
     let (mean_radius, sigma_hat) = radius_and_sigma(&firings);
     let ceiling = uniform_phase_sd();
 
@@ -894,7 +991,7 @@ pub fn harmonic_measure_coordinates(
         ));
     }
 
-    let firings = collect_firings(fit, block, b);
+    let firings = collect_firings(fit, block, b)?;
     let (mean_radius, sigma_hat) = radius_and_sigma(&firings);
     let mut measures = Vec::with_capacity(firings.len());
     for (row, z) in &firings {
@@ -1001,7 +1098,7 @@ pub fn reconstruct_single_coordinate_rows(fit: &BlockSparseFit) -> Result<Array2
     }
     let mut measures = Vec::new();
     for block in 0..fit.decoder.nrows() / b {
-        for (row, z) in collect_firings(fit, block, b) {
+        for (row, z) in collect_firings(fit, block, b)? {
             let (spike, residual, residual_norm) = single_harmonic_spike(&z, 0.0);
             assert_eq!(residual.len(), b);
             assert!(residual_norm.is_finite());

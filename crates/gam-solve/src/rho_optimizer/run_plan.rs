@@ -57,7 +57,8 @@ impl<'a> FinalizeInnerCapGuard<'a> {
 
 impl Drop for FinalizeInnerCapGuard<'_> {
     fn drop(&mut self) {
-        self.cap.store(self.prev_cap, std::sync::atomic::Ordering::Relaxed);
+        self.cap
+            .store(self.prev_cap, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -159,6 +160,51 @@ pub(crate) fn continuation_prewarm_step_budget(
     cost_scaled_prewarm_budget(base_budget, p_coefficients)
 }
 
+/// A multistart candidate that has cleared the analytic outer certificate.
+///
+/// Keeping the winner slot typed this way prevents a solver status bit from
+/// participating in ranking.  Raw solver iterates and exhausted checkpoints
+/// remain `OuterResult`s, but only this private wrapper can enter `best`.
+struct CertifiedOuterCandidate(OuterResult);
+
+impl CertifiedOuterCandidate {
+    fn from_solver_claim(
+        obj: &mut dyn OuterObjective,
+        config: &OuterConfig,
+        context: &str,
+        mut candidate: OuterResult,
+    ) -> Result<Self, (OuterResult, EstimationError)> {
+        match certify_outer_optimality(obj, config, context, &mut candidate) {
+            Ok(certificate) => {
+                candidate.criterion_certificate = Some(certificate);
+                Ok(Self(candidate))
+            }
+            Err(error) => {
+                candidate.converged = false;
+                Err((candidate, error))
+            }
+        }
+    }
+
+    fn result(&self) -> &OuterResult {
+        &self.0
+    }
+
+    fn into_result(self) -> OuterResult {
+        self.0
+    }
+}
+
+fn retain_best_outer_checkpoint(slot: &mut Option<OuterResult>, candidate: OuterResult) {
+    let improves = candidate.final_value.is_finite()
+        && slot.as_ref().is_none_or(|checkpoint| {
+            !checkpoint.final_value.is_finite() || candidate.final_value < checkpoint.final_value
+        });
+    if improves {
+        *slot = Some(candidate);
+    }
+}
+
 /// Execute a single plan attempt (seed generation → solver loop → best result).
 pub(crate) fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
@@ -191,9 +237,7 @@ pub(crate) fn run_outer_with_plan(
     }
 
     let (lower, upper) = outer_bounds_template(config, cap.n_params);
-    crate::estimate::reml::outer_eval::record_current_outer_rho_upper_bounds_for_ift(
-        &upper,
-    );
+    crate::estimate::reml::outer_eval::record_current_outer_rho_upper_bounds_for_ift(&upper);
     let bounds_template = (lower, upper);
     let mut projected_seeds = Vec::with_capacity(seeds.len());
     for seed in seeds {
@@ -245,7 +289,7 @@ pub(crate) fn run_outer_with_plan(
         );
     }
 
-    let mut best: Option<OuterResult> = None;
+    let mut best: Option<CertifiedOuterCandidate> = None;
     let mut best_checkpoint: Option<OuterResult> = None;
     // Object 1 — ContinuationPath. Every SAE-manifold joint fit ENTERS through
     // the continuation path at a heavy-smoothing regime. When the objective
@@ -282,8 +326,7 @@ pub(crate) fn run_outer_with_plan(
             "[OUTER] {context}: continuation pre-warm skipped: warm-start cache hit \
              (seed already near-optimal); proceeding straight to BFGS/Newton certificate"
         );
-    } else if continuation_prewarm_budget < crate::estimate::reml::continuation::PATH_BUDGET
-    {
+    } else if continuation_prewarm_budget < crate::estimate::reml::continuation::PATH_BUDGET {
         let p_coefficients = config
             .rho_uncertainty_problem_size
             .p_coefficients
@@ -420,12 +463,10 @@ pub(crate) fn run_outer_with_plan(
             && generic_structural_bail.is_none()
             && continuation_path.is_none()
         {
-            if let Some((sig, run_len)) =
-                crate::startup_stats::consecutive_generic_signature(
-                    &seed_rejections,
-                    GENERIC_STRUCTURAL_BAIL_MIN_RUN,
-                )
-            {
+            if let Some((sig, run_len)) = crate::startup_stats::consecutive_generic_signature(
+                &seed_rejections,
+                GENERIC_STRUCTURAL_BAIL_MIN_RUN,
+            ) {
                 let first_seed = seed_rejections[seed_rejections.len() - run_len].seed_idx;
                 let last_seed = seed_rejections[seed_rejections.len() - 1].seed_idx;
                 let label = crate::startup_stats::generic_signature_label(&sig);
@@ -496,10 +537,26 @@ pub(crate) fn run_outer_with_plan(
         if let Some(seed_cost) = obj.accept_seed_without_outer_iterations(seed)? {
             started_seeds += 1;
             let candidate = OuterResult::new(seed.clone(), seed_cost, 0, true, *the_plan);
-            if candidate_improves_best(&candidate, best.as_ref()) {
-                best = Some(candidate);
+            match CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate) {
+                Ok(candidate) => {
+                    if candidate_improves_best(
+                        candidate.result(),
+                        best.as_ref().map(CertifiedOuterCandidate::result),
+                    ) {
+                        best = Some(candidate);
+                    }
+                    break;
+                }
+                Err((checkpoint, error)) => {
+                    log::warn!(
+                        "[OUTER] {context}: zero-iteration seed {seed_idx} claimed acceptance but \
+                         failed analytic certification: {error}"
+                    );
+                    retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
+                    rejection_reasons.push((seed_idx, "certificate", error.to_string()));
+                    continue 'seed_attempts;
+                }
             }
-            break;
         }
         // Magic-by-default continuation pre-warm. On hard fits this
         // walks ρ from an oversmoothing ρ₀ down to `seed`, leaving the
@@ -583,10 +640,7 @@ pub(crate) fn run_outer_with_plan(
                         break;
                     }
                     match path.step(obj, &warm_beta) {
-                        crate::continuation_path::ContinuationStep::Descended {
-                            s,
-                            state,
-                        } => {
+                        crate::continuation_path::ContinuationStep::Descended { s, state } => {
                             // Warm-start the next leg from this leg's converged
                             // inner β. `NoSlot` is fine (the objective simply
                             // starts the next spine pass cold); a genuine
@@ -620,10 +674,7 @@ pub(crate) fn run_outer_with_plan(
                             arrived = true;
                             break;
                         }
-                        crate::continuation_path::ContinuationStep::Reentered {
-                            s,
-                            reason,
-                        } => {
+                        crate::continuation_path::ContinuationStep::Reentered { s, reason } => {
                             use crate::continuation_path::ReentryReason;
                             // The homotopy FLOOR: never reject. Each reason is a
                             // re-entry into a heavier regime (the path already
@@ -1216,7 +1267,9 @@ pub(crate) fn run_outer_with_plan(
                                         *the_plan,
                                     ))
                                 }
-                                _ => Ok(solution_into_outer_result(*last_solution, false, *the_plan)),
+                                _ => {
+                                    Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                                }
                             }
                         }
                         Err(ArcError::ObjectiveFailed { message })
@@ -1356,10 +1409,7 @@ pub(crate) fn run_outer_with_plan(
                                 gradient: eval.gradient,
                             })
                         };
-                        crate::gpu::reml_outer::run_reml_outer_on_device(
-                            device_input,
-                            evaluator,
-                        )
+                        crate::gpu::reml_outer::run_reml_outer_on_device(device_input, evaluator)
                     };
                     // `seed_slot` is the per-seed index assigned above; it is
                     // consumed only by the host-BFGS logging summary, which
@@ -1603,9 +1653,7 @@ pub(crate) fn run_outer_with_plan(
                                     && h.ncols() == layout.n_params
                                     && h.iter().all(|v| v.is_finite())
                             })
-                            .and_then(|h| {
-                                gam_linalg::utils::invert_spd_with_ridge(h, 1.0e-8).ok()
-                            })
+                            .and_then(|h| gam_linalg::utils::invert_spd_with_ridge(h, 1.0e-8).ok())
                             .filter(|h_inv| h_inv.iter().all(|v| v.is_finite()));
                         if let Some(h_inv) = dense_metric {
                             log::info!(
@@ -1619,8 +1667,7 @@ pub(crate) fn run_outer_with_plan(
                         }
                     }
                     if !installed_initial_metric {
-                        let g0_norm =
-                            seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+                        let g0_norm = seed_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                         if g0_norm.is_finite() && g0_norm > 0.0 {
                             let scale = (1.0 / g0_norm).clamp(1.0e-3, 1.0e3);
                             optimizer = optimizer.with_initial_metric(InitialMetric::Scalar(scale));
@@ -1865,20 +1912,27 @@ pub(crate) fn run_outer_with_plan(
                     candidate.converged,
                 );
                 if !candidate.converged {
-                    let improves_checkpoint = candidate.final_value.is_finite()
-                        && best_checkpoint.as_ref().is_none_or(|checkpoint| {
-                            !checkpoint.final_value.is_finite()
-                                || candidate.final_value < checkpoint.final_value
-                        });
-                    if improves_checkpoint {
-                        best_checkpoint = Some(candidate);
-                    }
+                    retain_best_outer_checkpoint(&mut best_checkpoint, candidate);
                     // An exhausted iterate is resumable work, not a fit
                     // candidate. Continue the declared multistart budget in
                     // search of a stationary seed; it may never populate or
                     // short-circuit the certified winner slot.
                     continue 'seed_attempts;
                 }
+                let candidate = match CertifiedOuterCandidate::from_solver_claim(
+                    obj, config, context, candidate,
+                ) {
+                    Ok(candidate) => candidate,
+                    Err((checkpoint, error)) => {
+                        log::warn!(
+                            "[OUTER] {context}: seed {seed_idx} solver convergence claim failed \
+                             analytic certification: {error}; retaining only a resume checkpoint"
+                        );
+                        retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
+                        rejection_reasons.push((seed_idx, "certificate", error.to_string()));
+                        continue 'seed_attempts;
+                    }
+                };
                 // #1373: for GLM/survival models the seed screening deliberately
                 // places the most-flexible (low-lambda) seed at slot 0 and the
                 // heaviest interior (high-lambda) seed at slot 1 so the budget-2
@@ -1893,9 +1947,16 @@ pub(crate) fn run_outer_with_plan(
                     .risk_profile
                     .uses_parsimonious_keep_best();
                 let candidate_improved = if parsimonious_keep_best {
-                    candidate_improves_best_parsimonious(&candidate, best.as_ref(), rho_dim)
+                    candidate_improves_best_parsimonious(
+                        candidate.result(),
+                        best.as_ref().map(CertifiedOuterCandidate::result),
+                        rho_dim,
+                    )
                 } else {
-                    candidate_improves_best(&candidate, best.as_ref())
+                    candidate_improves_best(
+                        candidate.result(),
+                        best.as_ref().map(CertifiedOuterCandidate::result),
+                    )
                 };
                 if candidate_improved {
                     best = Some(candidate);
@@ -1927,8 +1988,8 @@ pub(crate) fn run_outer_with_plan(
                     && started_seeds < seed_budget
                     && !best
                         .as_ref()
-                        .is_some_and(|b| parsimony_second_seed_is_redundant(b, rho_dim));
-                if best.as_ref().is_some_and(|b| b.converged)
+                        .is_some_and(|b| parsimony_second_seed_is_redundant(b.result(), rho_dim));
+                if best.is_some()
                     && !quality_compare_remaining_gaussian_seeds
                     && !non_gaussian_await_parsimony_seed
                 {
@@ -1952,7 +2013,8 @@ pub(crate) fn run_outer_with_plan(
         }
     }
 
-    if let Some(result) = best {
+    if let Some(certified) = best {
+        let result = certified.into_result();
         // The finalize evaluation re-installs the selected outer result by
         // re-running the inner P-IRLS at θ̂. During the outer search the ARC /
         // BFGS bridge schedule throttles `RemlState::outer_inner_cap` down to a

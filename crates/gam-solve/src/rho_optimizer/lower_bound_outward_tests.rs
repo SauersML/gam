@@ -15,8 +15,8 @@
 //! descent and certified a railed/under-fit optimum as converged. These tests
 //! pin the correct sign and fail loudly on that inversion.
 
-use super::{lower_bound_outward_active_count, LOWER_BOUND_SEPARATION_ACTIVE_MIN};
-use ndarray::{array, Array1};
+use super::{LOWER_BOUND_SEPARATION_ACTIVE_MIN, lower_bound_outward_active_count};
+use ndarray::{Array1, array};
 
 // `outward_floor = grad_threshold.max(COST_STALL_PROJECTED_GRAD_FLOOR)` with
 // `COST_STALL_PROJECTED_GRAD_FLOOR = 1e-3`, so this pins the floor at 1e-3.

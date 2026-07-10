@@ -58,6 +58,7 @@ PirlsConvergenceError: type = _rust.PirlsConvergenceError
 PerfectSeparationError: type = _rust.PerfectSeparationError
 HessianNotPositiveDefiniteError: type = _rust.HessianNotPositiveDefiniteError
 RemlConvergenceError: type = _rust.RemlConvergenceError
+DictionaryConvergenceError: type = _rust.DictionaryConvergenceError
 GradientUnavailableError: type = _rust.GradientUnavailableError
 LayoutError: type = _rust.LayoutError
 ModelOverparameterizedError: type = _rust.ModelOverparameterizedError

@@ -855,9 +855,7 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
     }
 }
 
-impl<const KW: usize> crate::row_kernel::RowKernel<KW>
-    for SurvivalLsWiggleRowKernel<'_, KW>
-{
+impl<const KW: usize> crate::row_kernel::RowKernel<KW> for SurvivalLsWiggleRowKernel<'_, KW> {
     fn n_rows(&self) -> usize {
         self.base.family.n
     }
@@ -1263,9 +1261,24 @@ fn sls_row_nll_onesseed_batch(
                 &u1.compose_unary([
                     pk([k[0].logphi1, k[1].logphi1, k[2].logphi1, k[3].logphi1]),
                     pk([k[0].dlogphi1, k[1].dlogphi1, k[2].dlogphi1, k[3].dlogphi1]),
-                    pk([k[0].d2logphi1, k[1].d2logphi1, k[2].d2logphi1, k[3].d2logphi1]),
-                    pk([k[0].d3logphi1, k[1].d3logphi1, k[2].d3logphi1, k[3].d3logphi1]),
-                    pk([k[0].d4logphi1, k[1].d4logphi1, k[2].d4logphi1, k[3].d4logphi1]),
+                    pk([
+                        k[0].d2logphi1,
+                        k[1].d2logphi1,
+                        k[2].d2logphi1,
+                        k[3].d2logphi1,
+                    ]),
+                    pk([
+                        k[0].d3logphi1,
+                        k[1].d3logphi1,
+                        k[2].d3logphi1,
+                        k[3].d3logphi1,
+                    ]),
+                    pk([
+                        k[0].d4logphi1,
+                        k[1].d4logphi1,
+                        k[2].d4logphi1,
+                        k[3].d4logphi1,
+                    ]),
                 ]),
                 ewpk,
             ))
@@ -1330,11 +1343,13 @@ fn batched_axis_thirds(
             let kers: [&SurvivalExactRowKernel; 4] =
                 std::array::from_fn(|lane| &inputs[start + li_of(lane)].1);
             let vars: [OneSeedBatch<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(|c| {
-                let value = f64x4::new(std::array::from_fn(|lane| inputs[start + li_of(lane)].0[c]));
+                let value =
+                    f64x4::new(std::array::from_fn(|lane| inputs[start + li_of(lane)].0[c]));
                 let dir = f64x4::new(std::array::from_fn(|lane| dirs[li_of(lane)][c]));
                 OneSeedBatch::seed_direction(value, c, dir)
             });
-            let third = sls_row_nll_onesseed_batch(&vars, &kers, cens_on, event_on).contracted_third();
+            let third =
+                sls_row_nll_onesseed_batch(&vars, &kers, cens_on, event_on).contracted_third();
             for (lane, &li) in batch.iter().enumerate() {
                 for x in 0..SLS_ROW_K {
                     for y in 0..SLS_ROW_K {
@@ -2047,9 +2062,7 @@ impl SurvivalLocationScaleFamily {
         ),
         String,
     > {
-        crate::block_layout::block_count::validate_block_count::<
-            SurvivalLocationScaleError,
-        >(
+        crate::block_layout::block_count::validate_block_count::<SurvivalLocationScaleError>(
             "SurvivalLocationScaleFamily",
             self.expected_blocks(),
             block_states.len(),
@@ -3050,12 +3063,15 @@ impl SurvivalLocationScaleFamily {
         let u0 = state.h0 + state.q0;
         let u1 = state.h1 + state.q1;
 
-        let (log_s0, r0, dr0, ddr0, dddr0) = Self::exact_survival_neglog_derivatives_fourth_rescaled(
-            &self.inverse_link,
-            u0,
-            deriv_log_scale,
-        )
-        .map_err(|e| format!("inverse-link survival evaluation failed at row {row} entry: {e}"))?;
+        let (log_s0, r0, dr0, ddr0, dddr0) =
+            Self::exact_survival_neglog_derivatives_fourth_rescaled(
+                &self.inverse_link,
+                u0,
+                deriv_log_scale,
+            )
+            .map_err(|e| {
+                format!("inverse-link survival evaluation failed at row {row} entry: {e}")
+            })?;
 
         // Fast path: for CLogLog the survival and log-pdf evaluators both need
         // `exp(u1)`, and the PDF derivatives also need
@@ -3334,10 +3350,10 @@ mod simd_batch_bit_identity_tests {
 
     fn make_kernel(rng: &mut Lcg, sig: usize) -> SurvivalExactRowKernel {
         let (w, d) = match sig {
-            0 => (rng.val().abs() + 0.2, 0.0),                              // pure censored
-            1 => (rng.val().abs() + 0.2, 1.0),                             // pure event
+            0 => (rng.val().abs() + 0.2, 0.0), // pure censored
+            1 => (rng.val().abs() + 0.2, 1.0), // pure event
             2 => (rng.val().abs() + 0.2, 0.25 + (rng.range(50) as f64) / 100.0), // fractional
-            _ => (0.0, if rng.step() & 1 == 0 { 0.0 } else { 1.0 }),       // null (w = 0)
+            _ => (0.0, if rng.step() & 1 == 0 { 0.0 } else { 1.0 }), // null (w = 0)
         };
         let cens = w * (1.0 - d) != 0.0;
         let ev = w * d != 0.0;
@@ -3402,9 +3418,10 @@ mod simd_batch_bit_identity_tests {
                         if (c == 5 || c == 8) && rng.step() & 1 == 0 {
                             None
                         } else {
-                            let row = Array1::from_iter((0..widths[blk]).map(|_| {
-                                if rng.step() & 3 == 0 { 0.0 } else { rng.val() }
-                            }));
+                            let row = Array1::from_iter(
+                                (0..widths[blk])
+                                    .map(|_| if rng.step() & 3 == 0 { 0.0 } else { rng.val() }),
+                            );
                             Some((offs[blk], row))
                         }
                     })

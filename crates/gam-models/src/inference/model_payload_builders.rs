@@ -15,16 +15,18 @@
 //! content to the same assembler, payload drift becomes impossible by
 //! construction.
 
-use faer::Side;
-use gam_solve::estimate::{
-    FittedLinkState, UnifiedFitResult, saved_latent_cloglog_state_from_fit,
-    saved_mixture_state_from_fit, saved_sas_state_from_fit,
-};
 use crate::bms::deviation_runtime::AnchorComponentTag;
 use crate::bms::{
     DeviationRuntime, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
 };
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
+use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
+use crate::fit_orchestration::{FitConfig, StandardFitResult};
+use crate::inference::model::{
+    FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent,
+    SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization, SavedResidualCascade,
+    SavedSplineScan, TransformationScoreCalibration,
+};
 use crate::scale_design::ScaleDeviationTransform;
 use crate::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
@@ -33,19 +35,17 @@ use crate::survival::location_scale::{
     ResidualDistribution, residual_distribution_from_inverse_link,
 };
 use crate::transformation_normal::TransformationNormalFamily;
-use crate::fit_orchestration::{FitConfig, StandardFitResult};
-use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
-use crate::inference::model::{
-    FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent,
-    SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization, SavedResidualCascade,
-    SavedSplineScan, TransformationScoreCalibration,
-};
-use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
+use faer::Side;
+use gam_data::{DataSchema, EncodedDataset};
+use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
 };
-use gam_data::{DataSchema, EncodedDataset};
-use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
+use gam_solve::estimate::{
+    FittedLinkState, UnifiedFitResult, saved_latent_cloglog_state_from_fit,
+    saved_mixture_state_from_fit, saved_sas_state_from_fit,
+};
+use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
 use ndarray::{Array1, Array2, s};
 
 /// Family tag persisted for Bernoulli marginal-slope saved models.
@@ -243,10 +243,7 @@ fn standard_null_space_metadata(
     }
 }
 
-fn response_for_standard_payload(
-    formula: &str,
-    dataset: &EncodedDataset,
-) -> Option<Array1<f64>> {
+fn response_for_standard_payload(formula: &str, dataset: &EncodedDataset) -> Option<Array1<f64>> {
     let response = gam_terms::inference::formula_dsl::parse_formula(formula)
         .ok()?
         .response;
@@ -342,14 +339,8 @@ pub fn assemble_standard_payload(
         .likelihood_family
         .clone()
         .unwrap_or_else(LikelihoodSpec::gaussian_identity);
-    let (gaussian_jackknife_plus, full_conformal) = standard_conformal_substrates(
-        &formula,
-        dataset,
-        fit_config,
-        &family,
-        &fit,
-        &design,
-    );
+    let (gaussian_jackknife_plus, full_conformal) =
+        standard_conformal_substrates(&formula, dataset, fit_config, &family, &fit, &design);
     let latent_cloglog_state = if family.is_latent_cloglog() {
         Some(saved_latent_cloglog_state_from_fit(&fit).ok_or_else(|| {
             "latent-cloglog-binomial fit did not produce a fitted latent-cloglog state".to_string()

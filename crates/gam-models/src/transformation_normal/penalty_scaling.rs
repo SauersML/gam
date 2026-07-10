@@ -140,9 +140,9 @@ pub(crate) fn chunked_weighted_bt_d(
     d: &Array2<f64>,
     policy: &ResourcePolicy,
 ) -> Array2<f64> {
-    use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
     use faer::Accum;
     use faer::linalg::matmul::matmul;
+    use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
 
     let n = weights.len();
     let pb = b.ncols();
@@ -202,9 +202,9 @@ pub(crate) fn chunked_weighted_bt_d_designmatrix(
     d: &DesignMatrix,
     policy: &ResourcePolicy,
 ) -> Result<Array2<f64>, String> {
-    use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
     use faer::Accum;
     use faer::linalg::matmul::matmul;
+    use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, matmul_parallelism};
 
     let n = weights.len();
     let pb = b.ncols();

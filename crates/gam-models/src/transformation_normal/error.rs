@@ -50,9 +50,7 @@ impl_reason_error_boilerplate! {
     }
 }
 
-impl From<crate::block_layout::block_count::BlockCountMismatch>
-    for TransformationNormalError
-{
+impl From<crate::block_layout::block_count::BlockCountMismatch> for TransformationNormalError {
     fn from(
         err: crate::block_layout::block_count::BlockCountMismatch,
     ) -> TransformationNormalError {

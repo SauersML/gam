@@ -8,22 +8,28 @@ had no field for it, and ``to_dict`` omitted it. Callers had to monkey-patch
 ``from_payload`` (see ``examples/structural_truth_ledger.py``) to read the raw
 block, which is exactly the "frontier not queryable off the normal object" bug.
 
-These tests pin the plumbing WITHOUT needing the built Rust wheel: they build a
-``ManifoldSAE`` dataclass directly with a representative ``hybrid_split`` dict and
-assert it survives ``to_dict`` and the ``to_dict → from_dict`` round-trip, and
-that the dataclass exposes the field (defaulting to ``None`` for older payloads).
+These tests pin the Rust-owned serialization plumbing by loading the canonical
+``ManifoldSAE`` fixture, replacing its ``hybrid_split`` report, and constructing
+the public model through ``from_dict``.  They assert the report survives
+``to_dict`` and the ``to_dict → from_dict`` round-trip, and that the public
+object exposes the field (defaulting to ``None`` for older payloads).
 """
 from __future__ import annotations
 
-import numpy as np
+from copy import deepcopy
+import json
+from pathlib import Path
+
 import pytest
 
-gamfit = pytest.importorskip("gamfit")
-from gamfit._sae_manifold import (  # noqa: E402
-    ManifoldSAE,
-    SaeManifoldFitResult,
-    _penalized_loss_score,
+pytest.importorskip("gamfit")
+from gamfit._sae_manifold import ManifoldSAE  # noqa: E402
+
+
+_GOLDEN_FULL = (
+    Path(__file__).resolve().parent / "fixtures" / "manifold_sae" / "golden_full.json"
 )
+_GOLDEN_PAYLOAD = json.loads(_GOLDEN_FULL.read_text())
 
 
 def _representative_hybrid_split() -> dict:
@@ -69,55 +75,22 @@ def _representative_hybrid_split() -> dict:
     }
 
 
-def _minimal_model(hybrid_split: dict | None) -> ManifoldSAE:
-    """A zero-atom ManifoldSAE — enough to exercise to_dict / from_dict plumbing
-    without the Rust fit path (which to_dict / from_dict do not touch)."""
-    n, p = 4, 3
-    fitted = np.zeros((n, p))
-    assigns = np.zeros((n, 0))
-    logits = np.zeros((n, 0))
-    diagnostics = {"atom_trust": [], "atoms": []}
-    low = SaeManifoldFitResult(
-        [], 0, {0: 0.0}, {"winner": "K=0"}, fitted, assigns, [], 0.0,
-    )
-    return ManifoldSAE(
-        atoms=[],
-        atom_topology="euclidean",
-        atom_topologies=[],
-        assignment="ibp_map",
-        assignment_label="ibp_map",
-        primitive_names=["rust_module.sae_manifold_fit_minimal"],
-        fitted=fitted,
-        assignments=assigns,
-        coords=[],
-        decoder_blocks=[],
-        basis_specs=[],
-        reml_score=0.0,
-        reconstruction_r2=0.0,
-        training_mean=np.zeros(p),
-        training_data=np.zeros((n, p)),
-        low_level=low,
-        low_level_logits=logits,
-        diagnostics=diagnostics,
-        _basis_kinds=[],
-        _atom_dims=[],
-        _basis_sizes=[],
-        _n_harmonics=[],
-        _duchon_centers=[],
-        hybrid_split=hybrid_split,
-    )
+def _model(hybrid_split: dict | None) -> ManifoldSAE:
+    payload = deepcopy(_GOLDEN_PAYLOAD)
+    payload["hybrid_split"] = deepcopy(hybrid_split)
+    return ManifoldSAE.from_dict(payload)
 
 
 def test_manifoldsae_has_hybrid_split_field_defaulting_none():
     # Field exists and defaults to None when the Rust payload has no report.
-    m = _minimal_model(None)
+    m = _model(None)
     assert hasattr(m, "hybrid_split"), "ManifoldSAE must expose a hybrid_split field"
     assert m.hybrid_split is None
 
 
 def test_to_dict_emits_hybrid_split():
     hs = _representative_hybrid_split()
-    d = _minimal_model(hs).to_dict()
+    d = _model(hs).to_dict()
     assert "hybrid_split" in d, "to_dict() must include the hybrid_split key"
     assert d["hybrid_split"]["curved_atom_count"] == 1
     assert len(d["hybrid_split"]["atoms"]) == 2
@@ -133,13 +106,13 @@ def test_to_dict_emits_hybrid_split():
 
 
 def test_to_dict_emits_none_when_absent():
-    d = _minimal_model(None).to_dict()
+    d = _model(None).to_dict()
     assert d["hybrid_split"] is None
 
 
 def test_hybrid_split_round_trips_through_from_dict():
     hs = _representative_hybrid_split()
-    restored = ManifoldSAE.from_dict(_minimal_model(hs).to_dict())
+    restored = ManifoldSAE.from_dict(_model(hs).to_dict())
     assert restored.hybrid_split is not None, (
         "from_dict must read the hybrid_split block back, not drop it"
     )
@@ -155,8 +128,3 @@ def test_hybrid_split_round_trips_through_from_dict():
         0.42857142857142855
     )
     assert restored.hybrid_split["atoms"][1]["parameterization"] == "linear"
-
-
-def test_penalized_loss_score_rejects_legacy_reml_alias():
-    with pytest.raises(KeyError, match="penalized-loss score"):
-        _penalized_loss_score({"reml_score": 1.25})

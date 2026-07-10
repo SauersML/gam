@@ -39,6 +39,7 @@ class LinearDictionaryFit:
     reml_scores: np.ndarray
     explained_variance: float
     iterations: int
+    convergence: dict[str, float | int]
     assignment: str
     top_k: int
     code_ridge: float
@@ -126,6 +127,12 @@ def linear_dictionary_fit(
         reml_scores=np.ascontiguousarray(data["reml_scores"], dtype=np.float64),
         explained_variance=float(data["explained_variance"]),
         iterations=int(data["iterations"]),
+        convergence={
+            "ev_residual": float(data["convergence"]["ev_residual"]),
+            "routing_residual": float(data["convergence"]["routing_residual"]),
+            "accepted_births": int(data["convergence"]["accepted_births"]),
+            "tolerance": float(data["convergence"]["tolerance"]),
+        },
         assignment=str(data["assignment"]),
         top_k=int(data["top_k"]),
         code_ridge=float(code_ridge),

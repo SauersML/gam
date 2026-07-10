@@ -214,83 +214,13 @@ fn real_spherical_harmonic_design_up_to_degree(
     out
 }
 
-fn orthonormal_column_basis(matrix: ArrayView2<'_, f64>, rel_tol: f64) -> Array2<f64> {
-    let n = matrix.nrows();
-    let mut cols: Vec<Vec<f64>> = Vec::new();
-    let mut scale = 0.0_f64;
-    for col in matrix.columns() {
-        scale = scale.max(col.iter().map(|v| v * v).sum::<f64>().sqrt());
-    }
-    let tol = rel_tol * scale.max(1.0);
-    for col in matrix.columns() {
-        let mut v = col.to_vec();
-        for _ in 0..2 {
-            for q in &cols {
-                let dot = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum::<f64>();
-                for (vi, qi) in v.iter_mut().zip(q.iter()) {
-                    *vi -= dot * qi;
-                }
-            }
-        }
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm > tol {
-            for vi in &mut v {
-                *vi /= norm;
-            }
-            cols.push(v);
-        }
-    }
-    let mut q = Array2::<f64>::zeros((n, cols.len()));
-    for (j, col) in cols.iter().enumerate() {
-        for i in 0..n {
-            q[(i, j)] = col[i];
-        }
-    }
-    q
-}
-
-fn orthonormal_complement(q: ArrayView2<'_, f64>, rel_tol: f64) -> Array2<f64> {
-    let n = q.nrows();
-    let mut cols: Vec<Vec<f64>> = Vec::new();
-    let tol = rel_tol.max(0.0);
-    for i in 0..n {
-        let mut v = vec![0.0_f64; n];
-        v[i] = 1.0;
-        for _ in 0..2 {
-            for q_col in q.columns() {
-                let dot = v.iter().zip(q_col.iter()).map(|(a, b)| a * b).sum::<f64>();
-                for (vi, qi) in v.iter_mut().zip(q_col.iter()) {
-                    *vi -= dot * qi;
-                }
-            }
-            for c in &cols {
-                let dot = v.iter().zip(c.iter()).map(|(a, b)| a * b).sum::<f64>();
-                for (vi, ci) in v.iter_mut().zip(c.iter()) {
-                    *vi -= dot * ci;
-                }
-            }
-        }
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm > tol {
-            for vi in &mut v {
-                *vi /= norm;
-            }
-            cols.push(v);
-        }
-    }
-    let mut out = Array2::<f64>::zeros((n, cols.len()));
-    for (j, col) in cols.iter().enumerate() {
-        for i in 0..n {
-            out[[i, j]] = col[i];
-        }
-    }
-    out
-}
-
 pub(crate) struct WahbaLowDegreeDecomposition {
     pub(crate) kernel_basis: Array2<f64>,
     pub(crate) low_degree_centers: Option<Array2<f64>>,
     pub(crate) kernel_low_projection: Option<Array2<f64>>,
+    /// Columns of the complete degree-1 harmonic design retained by canonical
+    /// RRQR. Prediction and input-location jets replay this exact selection.
+    pub(crate) low_degree_columns: Vec<usize>,
     pub(crate) low_degree_cols: usize,
 }
 
@@ -299,41 +229,58 @@ pub(crate) fn wahba_low_degree_decomposition(
     radians: bool,
     center_kernel: ArrayView2<'_, f64>,
 ) -> Result<WahbaLowDegreeDecomposition, BasisError> {
-    let low_cols = SPHERE_UNPENALIZED_LOW_DEGREE * (SPHERE_UNPENALIZED_LOW_DEGREE + 2);
-    if centers.nrows() <= low_cols {
-        return Ok(WahbaLowDegreeDecomposition {
-            kernel_basis: Array2::<f64>::eye(centers.nrows()),
-            low_degree_centers: None,
-            kernel_low_projection: None,
-            low_degree_cols: 0,
-        });
-    }
-    let harmonics = real_spherical_harmonic_design_up_to_degree(
+    let complete_harmonics = real_spherical_harmonic_design_up_to_degree(
         centers,
         SPHERE_UNPENALIZED_LOW_DEGREE,
         radians,
     );
-    let low_degree_coefficients = solve_spd_columns_ridged(center_kernel, harmonics.view())?;
-    let low_coeff_basis = orthonormal_column_basis(low_degree_coefficients.view(), 1e-10);
-    let kernel_basis = orthonormal_complement(low_coeff_basis.view(), 1e-10);
-    let low_degree_centers = harmonics;
-    if low_degree_centers.ncols() == 0 || kernel_basis.ncols() == centers.nrows() {
+    let rank_alpha = gam_linalg::faer_ndarray::default_rrqr_rank_alpha();
+    let low_rrqr = gam_linalg::faer_ndarray::rrqr_with_permutation(&complete_harmonics, rank_alpha)
+        .map_err(BasisError::LinalgError)?;
+    let low_degree_columns = low_rrqr.column_permutation[..low_rrqr.rank].to_vec();
+    if low_degree_columns.is_empty() {
         return Ok(WahbaLowDegreeDecomposition {
-            kernel_basis,
+            kernel_basis: Array2::<f64>::eye(centers.nrows()),
             low_degree_centers: None,
             kernel_low_projection: None,
+            low_degree_columns,
             low_degree_cols: 0,
         });
     }
+
+    let low_degree_centers = complete_harmonics.select(Axis(1), &low_degree_columns);
+    // Native-space gauge for a conditionally positive-definite spherical
+    // spline: the kernel coefficients satisfy H^T c = 0, where H is the
+    // supported low-degree harmonic block. This removes the exact overlap
+    // between Kc and H alpha without perturbing K. The previous chart solved
+    // (K + delta I) C = H with a fixed delta and then complemented C, so the
+    // realized function space changed with coefficient scaling and the fixed
+    // shift was frozen into prediction. Canonical RRQR supplies the exact,
+    // rank-adapted section instead.
+    let (kernel_basis, low_rank) =
+        gam_linalg::faer_ndarray::rrqr_nullspace_basis(&low_degree_centers, rank_alpha)
+            .map_err(BasisError::LinalgError)?;
+    if low_rank != low_degree_centers.ncols() {
+        crate::bail_invalid_basis!(
+            "sphere Wahba low-degree RRQR selection lost rank: selected {} harmonics but resolved rank {}",
+            low_degree_centers.ncols(),
+            low_rank
+        );
+    }
     let center_kernel_reduced = center_kernel.dot(&kernel_basis);
-    let low_normal = low_degree_centers.t().dot(&low_degree_centers);
-    let low_cross = low_degree_centers.t().dot(&center_kernel_reduced);
-    let kernel_low_projection = solve_spd_columns_ridged(low_normal.view(), low_cross.view())?;
+    // Express the empirical projection of KZ onto H through a pivoted-QR
+    // least-squares solve. Forming (H^T H)^{-1} H^T KZ would square H's
+    // condition number and can fail precisely for a supported direction near
+    // the RRQR rank boundary. QR operates on the resolved design itself and
+    // introduces no diagonal shift.
+    let kernel_low_projection =
+        solve_least_squares_columns(low_degree_centers.view(), center_kernel_reduced.view())?;
     let low_degree_cols = low_degree_centers.ncols();
     Ok(WahbaLowDegreeDecomposition {
         kernel_basis,
         low_degree_centers: Some(low_degree_centers),
         kernel_low_projection: Some(kernel_low_projection),
+        low_degree_columns,
         low_degree_cols,
     })
 }
@@ -367,17 +314,13 @@ fn build_wahba_decomposed_design(
         &decomposition.kernel_low_projection,
     ) {
         (Some(low_degree_centers), Some(kernel_low_projection)) => {
-            let raw_low = real_spherical_harmonic_design_up_to_degree(
+            let complete_low = real_spherical_harmonic_design_up_to_degree(
                 data,
                 SPHERE_UNPENALIZED_LOW_DEGREE,
                 radians,
             );
-            assert_eq!(
-                raw_low.ncols(),
-                low_degree_centers.ncols(),
-                "low-degree spherical harmonic design width must match its centers"
-            );
-            let low_design = raw_low;
+            let low_design = complete_low.select(Axis(1), &decomposition.low_degree_columns);
+            assert_eq!(low_design.ncols(), low_degree_centers.ncols());
             // `(n × low) · (low × k)` — `low` is tiny (3 for degree 1), so this
             // stays on the host SIMD path; `.dot` is fine here.
             kernel_design -= &low_design.dot(kernel_low_projection);
@@ -397,7 +340,7 @@ fn build_wahba_decomposed_design(
 /// per-row jets:
 ///   `kernel_jet = raw_kernel_jet·kernel_basis − low_jet·kernel_low_projection`,
 ///   `out_jet    = [ kernel_jet | low_jet ]`.
-/// Without the low-degree split (centers ≤ low span) the design is just
+/// If the realized harmonic block has rank zero, the design is just
 /// `raw_kernel·kernel_basis`, so the jet is `raw_kernel_jet·kernel_basis`.
 pub(crate) fn build_wahba_decomposed_jet(
     raw_kernel_jet: &Array3<f64>,
@@ -413,6 +356,7 @@ pub(crate) fn build_wahba_decomposed_jet(
         (Some(kernel_low_projection), Some(low_jet), Some(_)) => {
             let kernel_cols = decomposition.kernel_basis.ncols();
             let low_cols = decomposition.low_degree_cols;
+            let low_jet = low_jet.select(Axis(1), &decomposition.low_degree_columns);
             let mut out = Array3::<f64>::zeros((n, kernel_cols + low_cols, 2));
             for axis in 0..2 {
                 let raw_axis = raw_kernel_jet.index_axis(ndarray::Axis(2), axis);
@@ -453,51 +397,39 @@ fn build_wahba_decomposed_penalty(
     (&out + &out.t()) * 0.5
 }
 
-fn solve_spd_columns_ridged(
+fn solve_least_squares_columns(
     a: ArrayView2<'_, f64>,
     b: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    use faer::Side;
-    use gam_linalg::faer_ndarray::{FaerArrayView, FaerLlt, FaerSolve};
+    use faer::prelude::*;
+    use gam_linalg::faer_ndarray::FaerArrayView;
 
-    let n = a.nrows();
-    if n == 0 || a.ncols() != n || b.nrows() != n {
+    if a.nrows() == 0 || a.ncols() == 0 || a.nrows() < a.ncols() || b.nrows() != a.nrows() {
         crate::bail_dim_basis!(
-            "ridged SPD solve needs square A and matching RHS rows, got A={}x{} and B={}x{}",
+            "least-squares solve needs a nonempty tall A and matching RHS rows, got A={}x{} and B={}x{}",
             a.nrows(),
             a.ncols(),
             b.nrows(),
             b.ncols()
         );
     }
-    let trace: f64 = (0..n).map(|i| a[[i, i]].abs()).sum();
-    let ridge = if trace.is_finite() && trace > 0.0 {
-        1e-8 * trace / n as f64
-    } else {
-        1e-12
-    };
-    let mut m = a.to_owned();
-    for i in 0..n {
-        m[[i, i]] += ridge;
+    if b.ncols() == 0 {
+        return Ok(Array2::<f64>::zeros((a.ncols(), 0)));
     }
-    let mview = FaerArrayView::new(&m);
-    let factor = FaerLlt::new(mview.as_ref(), Side::Lower).map_err(|err| {
-        BasisError::InvalidInput(format!(
-            "sphere Wahba low-degree Gram solve failed after ridge {ridge:.3e}: {err:?}"
-        ))
-    })?;
-    let rhs_owned = b.to_owned();
-    let rhs = FaerArrayView::new(&rhs_owned);
-    let solved = factor.solve(rhs.as_ref());
-    let mut out = Array2::<f64>::zeros((n, b.ncols()));
-    for j in 0..b.ncols() {
-        for i in 0..n {
-            out[[i, j]] = solved[(i, j)];
+    let a_owned = a.to_owned();
+    let b_owned = b.to_owned();
+    let a_view = FaerArrayView::new(&a_owned);
+    let b_view = FaerArrayView::new(&b_owned);
+    let solved = a_view.as_ref().col_piv_qr().solve_lstsq(b_view.as_ref());
+    let mut out = Array2::<f64>::zeros((a.ncols(), b.ncols()));
+    for col in 0..out.ncols() {
+        for row in 0..out.nrows() {
+            out[[row, col]] = solved[(row, col)];
         }
     }
     if !out.iter().all(|v| v.is_finite()) {
         return Err(BasisError::InvalidInput(
-            "sphere Wahba low-degree Gram solve produced non-finite coefficients".to_string(),
+            "sphere Wahba low-degree QR projection produced non-finite coefficients".to_string(),
         ));
     }
     Ok(out)
@@ -3640,6 +3572,176 @@ mod wahba_penalty_invariants_tests {
         assert!(
             error <= 1.0e-12,
             "primary Wahba penalty must be exactly the normalized RKHS seminorm; max error={error:.3e}"
+        );
+    }
+
+    #[test]
+    fn wahba_low_degree_chart_satisfies_exact_native_gauge() {
+        let centers = array![
+            [-1.1, 0.1],
+            [-0.7, 1.0],
+            [-0.2, 2.0],
+            [0.3, 2.8],
+            [0.8, -2.5],
+            [1.1, -1.4],
+            [0.5, -0.4],
+            [-0.4, -1.8],
+        ];
+        let center_kernel = spherical_wahba_kernel_matrix_with_kind(
+            centers.view(),
+            centers.view(),
+            2,
+            true,
+            SphereWahbaKernel::Sobolev,
+        )
+        .expect("center kernel");
+        let decomposition =
+            wahba_low_degree_decomposition(centers.view(), true, center_kernel.view())
+                .expect("low-degree decomposition");
+        let low = decomposition
+            .low_degree_centers
+            .as_ref()
+            .expect("degree-1 harmonics are supported");
+        let projection = decomposition
+            .kernel_low_projection
+            .as_ref()
+            .expect("kernel/low projection");
+
+        assert_eq!(
+            decomposition.kernel_basis.ncols() + low.ncols(),
+            centers.nrows(),
+            "native gauge must remove exactly the supported harmonic rank"
+        );
+        let gauge_residual = low.t().dot(&decomposition.kernel_basis);
+        let centered_kernel = center_kernel.dot(&decomposition.kernel_basis) - low.dot(projection);
+        let design_residual = low.t().dot(&centered_kernel);
+        let max_abs = |matrix: &Array2<f64>| {
+            matrix
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max)
+        };
+        let roundoff_factor = gam_linalg::faer_ndarray::default_rrqr_rank_alpha()
+            * f64::EPSILON
+            * centers.nrows() as f64;
+        let gauge_roundoff =
+            roundoff_factor * max_abs(low).max(1.0) * max_abs(&decomposition.kernel_basis).max(1.0);
+        let design_roundoff =
+            roundoff_factor * max_abs(low).max(1.0) * max_abs(&centered_kernel).max(1.0);
+        assert!(
+            max_abs(&gauge_residual) <= gauge_roundoff,
+            "Wahba kernel chart must satisfy H^T Z = 0 without a ridge; residual={:.3e}, bound={gauge_roundoff:.3e}",
+            max_abs(&gauge_residual)
+        );
+        assert!(
+            max_abs(&design_residual) <= design_roundoff,
+            "centered kernel design must be orthogonal to H; residual={:.3e}, bound={design_roundoff:.3e}",
+            max_abs(&design_residual)
+        );
+    }
+
+    #[test]
+    fn wahba_native_gauge_rank_adapts_at_minimum_center_counts() {
+        let center_sets = vec![
+            array![[-0.6, -0.4], [0.8, 1.7]],
+            array![[-0.8, -0.2], [0.1, 2.1], [0.9, -1.3]],
+        ];
+        for centers in center_sets {
+            let center_kernel = spherical_wahba_kernel_matrix_with_kind(
+                centers.view(),
+                centers.view(),
+                2,
+                true,
+                SphereWahbaKernel::Sobolev,
+            )
+            .expect("center kernel");
+            let decomposition =
+                wahba_low_degree_decomposition(centers.view(), true, center_kernel.view())
+                    .expect("minimum-center decomposition");
+            assert_eq!(decomposition.low_degree_cols, centers.nrows());
+            assert_eq!(decomposition.kernel_basis.ncols(), 0);
+            assert_eq!(
+                decomposition
+                    .kernel_low_projection
+                    .as_ref()
+                    .expect("empty kernel projection")
+                    .dim(),
+                (centers.nrows(), 0)
+            );
+            let design = build_wahba_decomposed_design(
+                center_kernel.view(),
+                centers.view(),
+                true,
+                &decomposition,
+            );
+            assert_eq!(design.dim(), (centers.nrows(), centers.nrows()));
+            assert!(design.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    #[test]
+    fn wahba_great_circle_rank_adaptation_replays_selected_jet_columns() {
+        let centers = array![[0.0, -2.4], [0.0, -1.1], [0.0, 0.2], [0.0, 1.5], [0.0, 2.8],];
+        let center_kernel = spherical_wahba_kernel_matrix_with_kind(
+            centers.view(),
+            centers.view(),
+            2,
+            true,
+            SphereWahbaKernel::Sobolev,
+        )
+        .expect("center kernel");
+        let decomposition =
+            wahba_low_degree_decomposition(centers.view(), true, center_kernel.view())
+                .expect("great-circle decomposition");
+        assert_eq!(decomposition.low_degree_cols, 2);
+        assert_eq!(decomposition.kernel_basis.ncols(), centers.nrows() - 2);
+
+        let points = array![[-0.4, -0.8], [0.7, 1.2]];
+        let raw_kernel_jet = spherical_wahba_kernel_jet_with_kind(
+            points.view(),
+            centers.view(),
+            2,
+            true,
+            SphereWahbaKernel::Sobolev,
+        )
+        .expect("raw kernel jet");
+        let complete_low_jet =
+            spherical_harmonic_jet(points.view(), SPHERE_UNPENALIZED_LOW_DEGREE, true)
+                .expect("complete harmonic jet");
+        let selected_low_jet = complete_low_jet.select(Axis(1), &decomposition.low_degree_columns);
+        let decomposed =
+            build_wahba_decomposed_jet(&raw_kernel_jet, Some(&complete_low_jet), &decomposition);
+        let kernel_cols = decomposition.kernel_basis.ncols();
+        for axis in 0..2 {
+            let observed = decomposed.slice(s![.., kernel_cols.., axis]);
+            let expected = selected_low_jet.slice(s![.., .., axis]);
+            assert_eq!(observed, expected);
+        }
+
+        let near_great_circle = array![
+            [-1.0e-10, -2.4],
+            [0.0, -1.1],
+            [1.0e-10, 0.2],
+            [-1.0e-10, 1.5],
+            [1.0e-10, 2.8],
+        ];
+        let near_kernel = spherical_wahba_kernel_matrix_with_kind(
+            near_great_circle.view(),
+            near_great_circle.view(),
+            2,
+            true,
+            SphereWahbaKernel::Sobolev,
+        )
+        .expect("near-great-circle kernel");
+        let near =
+            wahba_low_degree_decomposition(near_great_circle.view(), true, near_kernel.view())
+                .expect("QR projection must remain defined near the rank boundary");
+        assert!(
+            near.kernel_low_projection
+                .as_ref()
+                .expect("near-great-circle projection")
+                .iter()
+                .all(|value| value.is_finite())
         );
     }
 }

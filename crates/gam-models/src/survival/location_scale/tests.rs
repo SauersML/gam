@@ -1,9 +1,9 @@
 use super::*;
 use crate::custom_family::BlockWorkingSet;
-use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-use gam_solve::gauge::Gauge;
-use gam_problem::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use faer::sparse::{SparseColMat, Triplet};
+use gam_problem::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
+use gam_solve::gauge::Gauge;
+use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use ndarray::{Array1, array};
 
 #[derive(Clone, Copy)]
@@ -763,10 +763,14 @@ fn survival_ls_exact_row_kernel(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         time_linear_constraints: lower_bound_constraints(&array![0.0]),
-        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
         x_threshold_entry: None,
         x_threshold_deriv: None,
-        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
         x_log_sigma_entry: None,
         x_log_sigma_deriv: None,
         x_link_wiggle: None,
@@ -806,10 +810,14 @@ fn survival_ls_default_guard_unit_family() -> SurvivalLocationScaleFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         time_linear_constraints: lower_bound_constraints(&array![0.0]),
-        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
         x_threshold_entry: None,
         x_threshold_deriv: None,
-        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
         x_log_sigma_entry: None,
         x_log_sigma_deriv: None,
         x_link_wiggle: None,
@@ -1109,7 +1117,8 @@ fn survival_ls_joint_oracle_family(
 ) -> SurvivalLocationScaleFamily {
     let n = primaries.len();
     let col = |ch: usize| Array2::from_shape_fn((n, 1), |(r, _)| primaries[r][ch]);
-    let dense = |ch: usize| DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(col(ch)));
+    let dense =
+        |ch: usize| DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(col(ch)));
     SurvivalLocationScaleFamily {
         n,
         y: Array1::from(event.to_vec()),
@@ -3638,10 +3647,9 @@ fn identified_time_block_degenerate_entry_preserves_full_dimension() {
 #[test]
 fn resolve_survival_time_anchor_defaults_to_earliest_entry() {
     let age_entry = array![5.0, 1.0, 3.0];
-    let anchor = crate::survival::construction::resolve_survival_time_anchor_value(
-        &age_entry, None,
-    )
-    .expect("resolve default anchor");
+    let anchor =
+        crate::survival::construction::resolve_survival_time_anchor_value(&age_entry, None)
+            .expect("resolve default anchor");
     assert!((anchor - 1.0).abs() <= 1e-12);
 }
 
@@ -5237,9 +5245,9 @@ fn sparse_prediction_and_uncertainty_match_dense() {
             x_log_sigma_dense.clone(),
         )),
         eta_log_sigma_offset: array![0.4, 0.1],
-        x_link_wiggle: Some(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            xwiggle_dense.clone(),
-        ))),
+        x_link_wiggle: Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle_dense.clone()),
+        )),
         link_wiggle_knots: Some(link_wiggle_knots.clone()),
         link_wiggle_degree: Some(link_wiggle_degree),
         inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
@@ -5513,13 +5521,17 @@ fn wiggle_posterior_mean_matches_exact_nested_4d_quadrature_small_case() {
         time_wiggle_knots: None,
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
-        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_threshold_dense)),
+        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            x_threshold_dense,
+        )),
         eta_threshold_offset: array![0.0],
-        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x_log_sigma_dense)),
+        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            x_log_sigma_dense,
+        )),
         eta_log_sigma_offset: array![0.0],
-        x_link_wiggle: Some(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            x_link_wiggle,
-        ))),
+        x_link_wiggle: Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(x_link_wiggle),
+        )),
         link_wiggle_knots: Some(link_wiggle_knots),
         link_wiggle_degree: Some(link_wiggle_degree),
         inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
@@ -5790,9 +5802,9 @@ fn heart_failure_full_fit_structural_time_coefficients() {
             initial_beta: None,
         },
         threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones((
-                n, 1,
-            )))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones(
+                (n, 1),
+            ))),
             offset: Array1::zeros(n),
             penalties: Vec::new(),
             nullspace_dims: vec![],
@@ -5800,9 +5812,9 @@ fn heart_failure_full_fit_structural_time_coefficients() {
             initial_beta: None,
         }),
         log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
-            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones((
-                n, 1,
-            )))),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones(
+                (n, 1),
+            ))),
             offset: Array1::zeros(n),
             penalties: Vec::new(),
             nullspace_dims: vec![],
@@ -5897,14 +5909,14 @@ fn heart_failure_structural_time_small() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         time_linear_constraints: lower_bound_constraints(&array![0.0, 0.0]),
-        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones((
-            n, 1,
-        )))),
+        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::ones((n, 1)),
+        )),
         x_threshold_entry: None,
         x_threshold_deriv: None,
-        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones((
-            n, 1,
-        )))),
+        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::ones((n, 1)),
+        )),
         x_log_sigma_entry: None,
         x_log_sigma_deriv: None,
         x_link_wiggle: None,
@@ -6026,14 +6038,14 @@ fn evaluate_survival_location_scale_rejects_non_finite_d_eta_dt() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         time_linear_constraints: lower_bound_constraints(&array![0.0]),
-        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones((
-            n, 1,
-        )))),
+        x_threshold: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::ones((n, 1)),
+        )),
         x_threshold_entry: None,
         x_threshold_deriv: None,
-        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones((
-            n, 1,
-        )))),
+        x_log_sigma: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::ones((n, 1)),
+        )),
         x_log_sigma_entry: None,
         x_log_sigma_deriv: None,
         x_link_wiggle: None,
@@ -6543,9 +6555,9 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         let inverse_link = residual_distribution_inverse_link(distribution);
         let mut family =
             survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
-        family.x_link_wiggle = Some(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            xwiggle.clone(),
-        )));
+        family.x_link_wiggle = Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+        ));
         family.wiggle_knots = Some(knots.clone());
         family.wiggle_degree = Some(degree);
 
@@ -6734,10 +6746,9 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         // tower by ~15% at [0][0] (the duplicate-engine genus #932 eliminates),
         // and is FD-cross-checked separately by
         // `survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932`.
-        let dense = super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-            &family, &q, &dynamic, 0.0,
-        )
-        .expect("§13 dense wiggle Hessian");
+        let dense =
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(&family, &q, &dynamic, 0.0)
+                .expect("§13 dense wiggle Hessian");
         for ((a, b), &dj) in dense.indexed_iter() {
             let tj = h_tower[[a, b]];
             assert!(
@@ -6923,7 +6934,9 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
         .assemble_joint_hessian_from_quantities(&q, &states)
         .expect("joint hessian")
         .expect("dense joint hessian");
-    let raw_diag: Vec<f64> = (loc_start..loc_end).map(|j| h_joint[[j, j]].abs()).collect();
+    let raw_diag: Vec<f64> = (loc_start..loc_end)
+        .map(|j| h_joint[[j, j]].abs())
+        .collect();
     let raw_max = raw_diag.iter().copied().fold(0.0_f64, f64::max);
     let raw_min = raw_diag.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
@@ -6959,10 +6972,16 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
         offsets[SurvivalLocationScaleFamily::BLOCK_TIME + 1],
     );
     for j in time_start..time_end {
-        assert_eq!(floor[j], 0.0, "floor must be zero on the scale-free time block at {j}");
+        assert_eq!(
+            floor[j], 0.0,
+            "floor must be zero on the scale-free time block at {j}"
+        );
     }
     for j in loc_start..loc_end {
-        assert!(floor[j] > 0.0, "floor must be positive on the location block at {j}");
+        assert!(
+            floor[j] > 0.0,
+            "floor must be positive on the location block at {j}"
+        );
     }
     // Apply the floor exactly as the driver does: D_i ← max(D_i, floor_i).
     let floored: Vec<f64> = (0..2)
@@ -7149,7 +7168,12 @@ fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
 
 /// Deterministic lognormal AFT sample: `log t ~ Normal(mu, sigma)`, fully
 /// observed. Returns `(age_exit, event, log_t)`.
-fn reduced_aft_lognormal_sample(n: usize, mu: f64, sigma: f64, seed: u64) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+fn reduced_aft_lognormal_sample(
+    n: usize,
+    mu: f64,
+    sigma: f64,
+    seed: u64,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let mut state = seed;
     let next_u01 = |state: &mut u64| -> f64 {
         *state = state
@@ -7330,7 +7354,10 @@ fn reduced_parametric_aft_stopping_criterion_is_weight_scale_invariant() {
     let fit_at_weight = |w: f64| -> (f64, f64) {
         let spec = reduced_aft_lognormal_spec(&age_exit, &event, w);
         let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
-        assert!(prepared.is_reduced_parametric_aft(), "expected reduced parametric-AFT regime");
+        assert!(
+            prepared.is_reduced_parametric_aft(),
+            "expected reduced parametric-AFT regime"
+        );
         let (fit, _) = fit_survival_location_scale_with_geometry(spec).unwrap_or_else(|e| {
             panic!("reduced parametric-AFT MLE must converge at total-weight scale w={w}: {e}")
         });

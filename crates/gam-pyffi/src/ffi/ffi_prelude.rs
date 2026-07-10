@@ -173,14 +173,16 @@ pub(crate) use gam::terms::decoders::interchange_decoder::{
 pub(crate) use gam::terms::latent::{AuxPriorFamily, aux_prior_targets};
 
 pub(crate) use gam::terms::dictionary::{
-    LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
+    LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryError,
+    fit_linear_dictionary,
     linear_dictionary_transform,
 };
 
 pub(crate) use gam::terms::sae::sparse_dict::{
     BlockChartComposeConfig, BlockChartRecord, BlockSeedManifest, BlockSeedManifestConfig,
-    BlockSeedRecord, BlockSparseConfig, BlockSparseStreamState, MdlFeaturizerRow, SparseDictConfig,
-    SparseDictStreamState, block_sparse_dictionary_block_coords, block_sparse_dictionary_firings,
+    BlockSeedRecord, BlockSparseConfig, BlockSparseFitError, BlockSparseStreamState,
+    MdlFeaturizerRow, SparseDictConfig, SparseDictStreamState, SparseDictionaryError,
+    block_sparse_dictionary_block_coords, block_sparse_dictionary_firings,
     block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
     block_sparse_dictionary_seed_manifest, block_sparse_dictionary_transform,
     compose_block_coordinate_charts, fit_block_sparse_dictionary, fit_sparse_dictionary,
@@ -246,7 +248,6 @@ pub(crate) use serde::de::{MapAccess, Visitor};
 
 pub(crate) use serde::{Deserialize, Serialize};
 
-pub(crate) use std::cmp::Ordering;
 
 pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap};
 

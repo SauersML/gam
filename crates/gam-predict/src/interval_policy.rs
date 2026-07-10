@@ -307,22 +307,25 @@ impl EtaInterval {
     }
 }
 
-/// Optional observation (prediction) interval half-width `z·σ` on the response
-/// scale, added to / subtracted from the point prediction. `None` for families
-/// that do not expose an observation-scale noise term.
-pub struct ObservationInterval<'a> {
-    /// Per-row response-scale noise standard deviation.
-    pub noise_sd: &'a Array1<f64>,
-    /// Response-support clamp applied to the predictive band `μ ± z·σ` so it
-    /// cannot report values outside the family support. [`ResponseBounds::UNBOUNDED`]
-    /// for real-line responses (the band is passed through unchanged).
-    pub bounds: ResponseBounds,
-    /// Optional precomputed skew-aware **equal-tailed** band `(lower, upper)`.
-    /// When `Some`, it replaces the symmetric `μ ± z·σ` construction (the
-    /// dispersion location-scale skewed families route their per-row equal-tailed
-    /// quantiles here, #817/#1193/#1194). When `None`, the symmetric band is built
-    /// from `noise_sd`.
-    pub override_band: Option<(Array1<f64>, Array1<f64>)>,
+/// Observation (prediction) interval construction selected by a predictor.
+/// Keeping the analytic override as its own variant matters for families such
+/// as Royston–Parmar: their fresh-response law has an exact discrete predictive
+/// set but no additive response-noise standard deviation.
+pub enum ObservationInterval<'a> {
+    /// Symmetric `μ ± z·√(SE(μ̂)² + σ²)` band from a per-row
+    /// response-scale noise standard deviation.
+    Symmetric {
+        noise_sd: &'a Array1<f64>,
+        /// Response-support clamp; [`ResponseBounds::UNBOUNDED`] for real-line
+        /// responses.
+        bounds: ResponseBounds,
+    },
+    /// Precomputed family-aware predictive endpoints (for example a skewed
+    /// equal-tailed interval or the discrete Bernoulli set on `{0, 1}`).
+    Override {
+        lower: Array1<f64>,
+        upper: Array1<f64>,
+    },
 }
 
 /// Static metadata threaded into every [`PredictUncertaintyResult`].
@@ -362,11 +365,8 @@ pub fn assemble_uncertainty_result(
     let (observation_lower, observation_upper) = match observation {
         // A skew-aware predictor (dispersion location-scale) supplies its
         // equal-tailed band directly; use it verbatim (already support-clamped).
-        Some(ObservationInterval {
-            override_band: Some((lower, upper)),
-            ..
-        }) => (Some(lower), Some(upper)),
-        Some(obs) => {
+        Some(ObservationInterval::Override { lower, upper }) => (Some(lower), Some(upper)),
+        Some(ObservationInterval::Symmetric { noise_sd, bounds }) => {
             // A prediction (observation) interval covers a *future* response
             // `Y = μ + ε` at the query point. The point `μ̂` is itself estimated
             // (`Var(μ̂) = mean_standard_error²`) and the observation noise has
@@ -379,7 +379,7 @@ pub fn assemble_uncertainty_result(
             let predictive_se = Array1::from_iter(
                 mean_standard_error
                     .iter()
-                    .zip(obs.noise_sd.iter())
+                    .zip(noise_sd.iter())
                     .map(|(&mse, &sd)| (mse * mse + sd * sd).max(0.0).sqrt()),
             );
             let half = predictive_se.mapv(|s| z * s);
@@ -388,8 +388,8 @@ pub fn assemble_uncertainty_result(
             // The predictive band must lie within the response support; a
             // symmetric band on a bounded/half-bounded response otherwise
             // reports impossible values (a count band going negative).
-            obs.bounds.clamp_in_place(&mut lower);
-            obs.bounds.clamp_in_place(&mut upper);
+            bounds.clamp_in_place(&mut lower);
+            bounds.clamp_in_place(&mut upper);
             (Some(lower), Some(upper))
         }
         None => (None, None),
@@ -679,12 +679,28 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
     fit: &UnifiedFitResult,
     options: &PredictUncertaintyOptions,
 ) -> Result<PredictUncertaintyResult, EstimationError> {
-    let state = transform.linear_state(
+    let response_family = transform.response_family();
+    let mut state = transform.linear_state(
         input,
         fit,
         PredictPass::FullUncertainty,
         options.covariance_mode,
     )?;
+    // Royston–Parmar's reported point is the survival probability S(t).  The
+    // default estimand is its conditional-posterior mean E[S(t) | D], not the
+    // plug-in S(t; β̂).  Keep the requested covariance mode for the attached
+    // uncertainty, but source the point itself from the transform's conditional
+    // posterior-mean pass so full prediction and conformal calibration target
+    // the same marginal Bernoulli law as posterior-mean prediction.
+    if matches!(&response_family, ResponseFamily::RoystonParmar) {
+        let posterior_state = transform.linear_state(
+            input,
+            fit,
+            PredictPass::PosteriorMean,
+            InferenceCovarianceMode::Conditional,
+        )?;
+        state.mean = posterior_state.mean;
+    }
     let covariance_corrected_used = state.covariance_corrected_used;
     let eta_se = state.eta_se.ok_or_else(|| {
         EstimationError::InvalidInput(
@@ -706,12 +722,55 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
     // A skew-aware predictor (the dispersion location-scale families) builds an
     // equal-tailed band per row from its moment-matched predictive; when present
     // it replaces the symmetric `μ ± z·σ` construction below (#817/#1193/#1194).
-    let override_band = if options.includeobservation_interval {
+    let mut override_band = if options.includeobservation_interval {
         let z = validated_central_z(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
         transform.observation_band(input, &state.mean, &mean_se, &z_row, &z_row)?
     } else {
         None
+    };
+    // A single-distribution transform can have no separate per-row noise
+    // channel while still possessing a family-defined predictive law.  This is
+    // exactly Royston–Parmar: the point is S(t), and a fresh response at the
+    // requested horizon is the Bernoulli indicator 1{T > t}.  Mirror the
+    // posterior-mean driver's dispatch instead of gating the family band on
+    // `observation_noise` being present.
+    if options.includeobservation_interval && override_band.is_none() && observation.is_none() {
+        let z = validated_central_z(options.confidence_level)?;
+        let z_row = Array1::from_elem(state.mean.len(), z);
+        let eta_variance = eta_se.mapv(|standard_error| standard_error * standard_error);
+        let (lower, upper) = family_observation_band(
+            &response_family,
+            &state.eta,
+            &eta_variance,
+            &state.mean,
+            &mean_se,
+            &z_row,
+            &z_row,
+            fit,
+            None,
+        );
+        override_band = match (lower, upper) {
+            (Some(lower), Some(upper)) => Some((lower, upper)),
+            (None, None) => None,
+            _ => {
+                return Err(EstimationError::InvalidInput(
+                    "family observation band returned only one endpoint".to_string(),
+                ));
+            }
+        };
+    }
+    let observation_interval = match override_band {
+        Some((lower, upper)) => Some(ObservationInterval::Override { lower, upper }),
+        None => observation
+            .as_ref()
+            .map(|noise_sd| ObservationInterval::Symmetric {
+                noise_sd,
+                // The transform's response-scale support is exactly the clamp
+                // the observation band must respect (unbounded for Gaussian
+                // location-scale identity, `[0, 1]` for probability families).
+                bounds: transform.bounds(),
+            }),
     };
     assemble_uncertainty_result(
         options.confidence_level,
@@ -721,15 +780,7 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
         mean_se.clone(),
         eta_interval_for(&policy),
         mean_bound_method_for(transform, &policy, &response_map, &mean_se),
-        observation.as_ref().map(|noise_sd| ObservationInterval {
-            noise_sd,
-            // The transform's response-scale support is exactly the clamp the
-            // observation band must respect (unbounded for the Gaussian
-            // location-scale identity link, `[0, 1]` for threshold-scale
-            // probability families).
-            bounds: transform.bounds(),
-            override_band,
-        }),
+        observation_interval,
         UncertaintyProvenance {
             covariance_mode_requested: options.covariance_mode,
             covariance_corrected_used,
@@ -1110,10 +1161,9 @@ mod parity_tests {
             eta_se.clone(),
             EtaInterval::Symmetric,
             MeanBoundMethod::IdentityEta,
-            Some(ObservationInterval {
+            Some(ObservationInterval::Symmetric {
                 noise_sd: &sigma,
                 bounds: ResponseBounds::UNBOUNDED,
-                override_band: None,
             }),
             UncertaintyProvenance {
                 covariance_mode_requested: InferenceCovarianceMode::Conditional,

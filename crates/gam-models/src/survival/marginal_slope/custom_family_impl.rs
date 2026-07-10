@@ -86,10 +86,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // Hv at O(n · (p_time + p_marginal + p_logslope + p_flex)) per call.
         // Report the operator work model so diagnostics and first-order-only
         // policies reflect the representation that actually executes.
-        crate::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
-            self.n as u64,
-            specs,
-        )
+        crate::coefficient_cost::joint_coupled_operator_aware_hessian_cost(self.n as u64, specs)
     }
 
     fn outer_derivative_policy(
@@ -527,12 +524,11 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         {
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
             let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
-            let axes =
-                crate::row_kernel::row_kernel_second_directional_derivative_all_axes(
-                    &kern,
-                    &crate::row_kernel::RowSet::All,
-                    su,
-                )?;
+            let axes = crate::row_kernel::row_kernel_second_directional_derivative_all_axes(
+                &kern,
+                &crate::row_kernel::RowSet::All,
+                su,
+            )?;
             return Ok(Some(axes));
         }
 

@@ -2221,9 +2221,9 @@ fn constant_curvature_radial_reference(
 }
 
 /// Value and exact first derivative of the continuously smoothing-profiled
-/// curvature-fair deviance. Both the observed response and its curvature-neutral
-/// reference are profiled independently, then differenced on the conventional
-/// deviance (twice negative-log-evidence) scale.
+/// curvature-fair negative log evidence. Both the observed response and its
+/// curvature-neutral reference are profiled independently, then differenced on
+/// the scale consumed by likelihood-ratio inference.
 fn constant_curvature_kappa_fair_profile_value_gradient(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2300,24 +2300,74 @@ fn constant_curvature_kappa_fair_profile_value_gradient(
         &penalty_kappa,
         y_ref,
     )?;
-    Ok((
-        2.0 * (value_y - value_ref),
-        2.0 * (derivative_y - derivative_ref),
-    ))
+    Ok((value_y - value_ref, derivative_y - derivative_ref))
 }
 
-/// Globally minimize the continuously smoothing-profiled curvature-fair
-/// deviance on the chart-valid interval. The shared one-dimensional search
-/// isolates analytic profile-score roots, refines every sign-change bracket,
-/// compares all stationary candidates with both bounds, and the bounded KKT
-/// check below is the certificate that permits the estimate to leave this
-/// function.
+struct ConstantCurvatureFairProfile<'a> {
+    data: ArrayView2<'a, f64>,
+    response: ArrayView1<'a, f64>,
+    radial_reference: Array1<f64>,
+    spec: gam_terms::basis::ConstantCurvatureBasisSpec,
+    cache: std::cell::RefCell<std::collections::HashMap<u64, (f64, f64)>>,
+}
+
+impl ConstantCurvatureFairProfile<'_> {
+    fn evaluate(&self, kappa: f64) -> Result<(f64, f64), EstimationError> {
+        if !kappa.is_finite() {
+            crate::bail_invalid_estim!("constant-curvature fair profile probed a non-finite kappa");
+        }
+        let key = kappa.to_bits();
+        if let Some(&cached) = self.cache.borrow().get(&key) {
+            return Ok(cached);
+        }
+        let mut probe_spec = self.spec.clone();
+        probe_spec.kappa = kappa;
+        let sample = constant_curvature_kappa_fair_profile_value_gradient(
+            self.data,
+            self.response,
+            self.radial_reference.view(),
+            &probe_spec,
+        )?;
+        self.cache.borrow_mut().insert(key, sample);
+        Ok(sample)
+    }
+}
+
+fn validate_constant_curvature_fair_profile_inputs(
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    family: &LikelihoodSpec,
+) -> Result<(), EstimationError> {
+    if *family != LikelihoodSpec::gaussian_identity() {
+        crate::bail_invalid_estim!(
+            "curvature-as-an-estimand profile currently requires Gaussian identity likelihood"
+        );
+    }
+    let input_tolerance = f64::EPSILON.sqrt();
+    if weights
+        .iter()
+        .any(|&weight| (weight - 1.0).abs() > input_tolerance)
+        || offset.iter().any(|&value| value.abs() > input_tolerance)
+    {
+        crate::bail_invalid_estim!(
+            "curvature-as-an-estimand profile requires unit weights and zero offset"
+        );
+    }
+    Ok(())
+}
+
+/// Minimize the continuously smoothing-profiled curvature-fair evidence on the
+/// chart-valid interval with the shared bounded analytic outer solver. The
+/// curvature coordinate is the sole auxiliary coordinate, so every accepted
+/// result has passed the solver's final box-KKT projected-gradient certificate.
+/// No sampled point is ever returned as the estimate: samples are only line-
+/// search probes for the continuous BFGS solve.
 fn constant_curvature_kappa_fair_optimum(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     term_idx: usize,
-    stationarity_tolerance: f64,
+    options: &FitOptions,
 ) -> Result<f64, EstimationError> {
     let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
     if !(kappa_min.is_finite() && kappa_max.is_finite() && kappa_max > kappa_min) {
@@ -2341,70 +2391,72 @@ fn constant_curvature_kappa_fair_optimum(
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let y_ref = constant_curvature_radial_reference(x_term.view(), y)?;
-    let span = kappa_max - kappa_min;
-    let x_tolerance = f64::EPSILON.sqrt()
-        * (1.0 + kappa_min.abs().max(kappa_max.abs()));
-    let evaluations = std::cell::Cell::new(0usize);
-    let mut objective = |kappa: f64| -> Result<(f64, f64), String> {
-        evaluations.set(evaluations.get() + 1);
-        let mut probe_spec = base_spec.clone();
-        probe_spec.kappa = kappa;
-        constant_curvature_kappa_fair_profile_value_gradient(
-            x_term.view(),
-            y,
-            y_ref.view(),
-            &probe_spec,
+    let profile = ConstantCurvatureFairProfile {
+        data: x_term.view(),
+        response: y,
+        radial_reference: y_ref,
+        spec: base_spec,
+        cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+    };
+    let mut seed_config = gam_problem::SeedConfig::default();
+    seed_config.bounds = (kappa_min, kappa_max);
+    seed_config.max_seeds = 1;
+    seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
+    seed_config.num_auxiliary_trailing = 1;
+    seed_config.over_smoothing_probe_rho = None;
+    let initial_kappa = profile.spec.kappa.clamp(kappa_min, kappa_max);
+    let problem = gam_solve::rho_optimizer::OuterProblem::new(1)
+        .with_gradient(gam_problem::Derivative::Analytic)
+        .with_hessian(gam_problem::DeclaredHessianForm::Unavailable)
+        .with_prefer_gradient_only(true)
+        .with_disable_fixed_point(true)
+        .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
+        .with_continuation_prewarm(false)
+        .with_psi_dim(1)
+        .with_tolerance(options.tol.max(f64::EPSILON.sqrt()))
+        .with_max_iter(options.max_iter.max(1))
+        .with_bounds(
+            Array1::from_vec(vec![kappa_min]),
+            Array1::from_vec(vec![kappa_max]),
         )
-        .map(|(value, derivative)| (-value, -derivative))
-        .map_err(|error| error.to_string())
-    };
-    let optimum = gam_math::score_opt::maximize_score_1d::<String>(
-        kappa_min,
-        kappa_max,
-        x_tolerance,
+        .with_initial_rho(Array1::from_vec(vec![initial_kappa]))
+        .with_seed_config(seed_config);
+    let mut objective = problem.build_objective(
+        profile,
+        |profile: &mut ConstantCurvatureFairProfile<'_>, theta: &Array1<f64>| {
+            profile.evaluate(theta[0]).map(|(value, _)| value)
+        },
+        |profile: &mut ConstantCurvatureFairProfile<'_>, theta: &Array1<f64>| {
+            let (cost, derivative) = profile.evaluate(theta[0])?;
+            Ok(gam_problem::OuterEval {
+                cost,
+                gradient: Array1::from_vec(vec![derivative]),
+                hessian: gam_problem::HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ConstantCurvatureFairProfile<'_>)>,
+        None::<
+            fn(
+                &mut ConstantCurvatureFairProfile<'_>,
+                &Array1<f64>,
+            ) -> Result<gam_problem::EfsEval, EstimationError>,
+        >,
+    );
+    let result = problem.run(
         &mut objective,
-    )
-    .map_err(|message| {
-        EstimationError::RemlOptimizationFailed(format!(
-            "constant-curvature analytic stationary search failed for term {term_idx}: {message}"
-        ))
-    })?;
-
-    // `maximize_score_1d` compares all isolated stationary candidates with both
-    // chart bounds. Require the winning point itself to satisfy the bounded KKT
-    // condition before it can become a fitted curvature.
-    let gradient = -optimum.derivative;
-    let gradient_bound = stationarity_tolerance
-        .max(f64::EPSILON.sqrt())
-        * (1.0 + optimum.value.abs())
-        / span.max(f64::MIN_POSITIVE);
-    let at_lower = (optimum.x - kappa_min).abs() <= x_tolerance;
-    let at_upper = (optimum.x - kappa_max).abs() <= x_tolerance;
-    let certifies = if at_lower {
-        gradient >= -gradient_bound
-    } else if at_upper {
-        gradient <= gradient_bound
-    } else {
-        gradient.abs() <= gradient_bound
-    };
-    if !certifies {
-        return Err(EstimationError::RemlDidNotConverge {
-            context: format!("constant-curvature term {term_idx}"),
-            reason: "bounded analytic profile-score certificate failed".to_string(),
-            iterations: evaluations.get(),
-            final_value: -optimum.value,
-            projected_grad_norm: Some(gradient.abs()),
-            stationarity_bound: gradient_bound,
-            rho_checkpoint: vec![optimum.x],
-        });
-    }
+        &format!("constant-curvature fair profile term {term_idx}"),
+    )?;
+    let kappa_hat = result.rho[0];
     log::info!(
         "[spatial-kappa] continuous fair-profile optimum kappa_hat={:.6} \
-         (deviance={:.6e}, gradient={gradient:.3e}) for term {term_idx}",
-        optimum.x,
-        -optimum.value,
+         (negative_log_evidence={:.6e}, projected_gradient={}) for term {term_idx}",
+        kappa_hat,
+        result.final_value,
+        result.final_grad_norm_report(),
     );
-    Ok(optimum.x)
+    Ok(kappa_hat)
 }
 
 fn try_exact_joint_spatial_length_scale_optimization(
@@ -4122,12 +4174,7 @@ fn run_exact_joint_spatial_optimization(
         SpatialHyperKind::Anisotropic => "aniso-psi joint REML",
         SpatialHyperKind::Isotropic => "iso-kappa joint REML",
     };
-    let result = problem.run(&mut obj, run_label).map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "{} analytic optimization failed after exhausting strategy fallbacks: {e}",
-            kind.adjective(),
-        ))
-    })?;
+    let result = problem.run(&mut obj, run_label)?;
     drop(obj);
     let kphase_total_s = kphase_optim_start.elapsed().as_secs_f64();
     let kphase_slow_resets = ctx
@@ -4182,50 +4229,6 @@ fn run_exact_joint_spatial_optimization(
         nfree_miss_other: kphase_nfree_miss_other.get(),
         optim_total_s: kphase_total_s,
     };
-    if !result.converged {
-        // Mirror `fit_term_collectionwith_exact_spatial_adaptive_regularization`
-        // (commit 0267d082): the strict absolute-floor gradient criterion is too
-        // tight when the outer Hessian carries a near-null direction (η-anchor
-        // drift, ill-conditioned operator-collocation Gram, etc.) — the iterate
-        // settles into a flat valley with ‖g‖_proj at numerical-noise scale
-        // (~1e-5 for cost ~1e1 in double precision) which is above the 1e-6
-        // absolute floor but well below the textbook mgcv `magic` REML rule
-        // ‖g‖_proj ≤ τ·(1 + |f|). Accept the iterate under the rel-to-cost
-        // form when the absolute form has timed out; divergent runs (‖g‖
-        // large relative to |f|) still surface as errors.
-        let rel_to_cost_threshold = options.tol * (1.0_f64 + result.final_value.abs());
-        if let Some(final_grad) = result
-            .final_grad_norm
-            .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
-        {
-            log::info!(
-                "[{}] outer optimization hit max_iter={} but \
-                 projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
-                 (τ={:.3e}, |f|={:.3e}); accepting iterate under the mgcv-style \
-                 relative-to-cost REML convergence criterion.",
-                label,
-                result.iterations,
-                final_grad,
-                rel_to_cost_threshold,
-                options.tol,
-                result.final_value.abs(),
-            );
-        } else {
-            return Err(EstimationError::RemlDidNotConverge {
-                context: label.to_string(),
-                reason: if result.final_value.is_finite() {
-                    "analytic projected-gradient stationarity certificate failed".to_string()
-                } else {
-                    "analytic objective diverged to a non-finite value".to_string()
-                },
-                iterations: result.iterations,
-                final_value: result.final_value,
-                projected_grad_norm: result.final_grad_norm,
-                stationarity_bound: rel_to_cost_threshold,
-                rho_checkpoint: result.rho.to_vec(),
-            });
-        }
-    }
     log::trace!(
         "[{}] converged in {} iterations, final_value={:.6e}, grad_norm={}",
         label,
@@ -4316,8 +4319,7 @@ pub fn get_constant_curvature_kappa(spec: &TermCollectionSpec, term_idx: usize) 
 /// `true` when `term_idx` is a `curv(...)` smooth whose user PINNED the
 /// sectional curvature with an explicit `kappa=` (the mgcv-`sp=` convention,
 /// gam#2152). A pinned κ is a fixed geometry: the outer loop must hold it
-/// constant and never run any of its κ re-derivation heuristics (the κ-fair
-/// sign scan, the κ-fair argmin override, or the joint [ρ, κ] refinement) on
+/// constant and never run the continuous curvature-fair profile optimizer on
 /// that term. Non-CC terms and CC terms whose `kappa=` was omitted (κ free,
 /// #944/#1464 estimation) return `false`.
 pub fn constant_curvature_kappa_is_fixed(spec: &TermCollectionSpec, term_idx: usize) -> bool {
@@ -6354,16 +6356,12 @@ pub(crate) fn exact_joint_multistart_outer_problem(
                 // and reduces to the monotone log-det Occam term, so keep-best
                 // adopts the low-Occam collapsed null regardless of the true κ sign
                 // — the bit-identical κ̂ → +chart-bound rail for both ±κ datasets
-                // (the headline #1464 sign-blindness). The κ-sign basin is instead
-                // seeded from the sign-correct fixed-κ profiled-REML scan
-                // (`select_constant_curvature_kappa_sign_seed`, applied to
-                // `log_kappa0` above), which routes through the same κ-opt-OFF
-                // profiled fit the `curvature_inference_forspec` CI oracle trusts,
-                // so the joint solve starts inside the correct sign basin with a
-                // non-degenerate (κ-resolving) kernel rather than at the collapsed
-                // corner. The widened ρ ceiling is retained: legitimate
-                // over-smoothing is still reachable via the gradient solve and the
-                // sweep grid, just not pre-pinned to the collapse point.
+                // (the headline #1464 sign-blindness). Curvature is instead chosen
+                // once by the sign-correct continuous fair-profile solve before
+                // this joint nuisance optimization, and its coordinate is pinned
+                // here. The widened ρ ceiling is retained: legitimate
+                // over-smoothing remains reachable by the analytic gradient solve
+                // without pre-pinning a start at the collapsed corner.
             }
             sc
         })
@@ -6389,22 +6387,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
             .with_screen_initial_rho(true);
     }
     problem
-}
-
-/// True iff a κ-phase (`n-block exact-joint spatial`) optimizer failure is a
-/// NUMERICAL pathology of the length-scale search that the fixed-κ fallback can
-/// recover from (gam#787/#860), rather than a structural failure that must
-/// propagate.
-///
-/// By the time the κ optimizer runs, the structural identifiability audits have
-/// already passed upstream, so an all-seeds-rejected / rho-dimension-mismatch
-/// here means a κ-driven design-rebuild penalty-topology flip starved the
-/// startup validation — recoverable by fitting at the bootstrap κ. Any other
-/// optimizer error (a genuine solver contract violation) still propagates.
-fn kappa_phase_failure_is_fixed_kappa_recoverable(message: &str) -> bool {
-    message.contains("no candidate seeds passed outer startup validation")
-        || message.contains("joint hyper rho dimension mismatch")
-        || message.contains("objective returned a non-finite cost")
 }
 
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn, SeedFn>(
@@ -6990,61 +6972,9 @@ where
             },
         );
 
-        match problem.run(&mut obj, "n-block exact-joint spatial") {
-            Ok(result) => result,
-            Err(e) => {
-                let message = e.to_string();
-                // Kappa-phase graceful degradation (gam#787/#860). The
-                // length-scale (κ) optimizer rebuilds the spatial design at each
-                // trial κ; a κ-driven matern penalty-topology flip (the
-                // FrozenTransform spectral-tolerance crossing in
-                // `build_nullspace_shrinkage_penalty`) can make the rebuilt
-                // design's learned-penalty count disagree with the frozen
-                // joint-setup ρ dimension, so EVERY κ seed fails startup
-                // validation ("joint hyper rho dimension mismatch" → all seeds
-                // rejected → "no candidate seeds passed outer startup
-                // validation"). That is a NUMERICAL pathology of the κ search on
-                // a structurally-well-posed design (the structural audits already
-                // passed upstream) — NOT a reason to fail the whole fit. Fall
-                // back to a FIXED κ (the bootstrap length-scale, skipping κ
-                // optimization): build + freeze the joint designs at the initial
-                // κ and fit there. We lose κ tuning but return a REAL, valid
-                // model — graceful degradation, exactly mirroring the
-                // `kappa_options.enabled == false` fixed-κ path above. Only the
-                // startup-validation / mismatch class is caught; any other κ
-                // optimizer error still propagates.
-                if kappa_phase_failure_is_fixed_kappa_recoverable(&message) {
-                    drop(obj);
-                    log::warn!(
-                        "[KAPPA-PHASE] length-scale optimization could not validate any seed \
-                         ({message}); falling back to a FIXED bootstrap κ (skipping κ \
-                         optimization) and fitting there — a real model at the initial \
-                         length-scale rather than raising (gam#787/#860)."
-                    );
-                    let (designs, resolved_specs) =
-                        build_term_collection_designs_and_freeze_joint(data, block_specs).map_err(
-                            |build_err| {
-                                format!(
-                                    "fixed-κ fallback failed to build and freeze joint block \
-                                     designs after κ optimization could not validate a seed \
-                                     ({message}): {build_err}"
-                                )
-                            },
-                        )?;
-                    let fixed_theta0 = joint_setup.theta0();
-                    let spec_refs: Vec<TermCollectionSpec> = resolved_specs.clone();
-                    let design_refs: Vec<TermCollectionDesign> = designs.clone();
-                    let fit = fit_fn(&fixed_theta0, &spec_refs, &design_refs)?;
-                    return Ok(SpatialLengthScaleOptimizationResult {
-                        resolved_specs,
-                        designs,
-                        fit,
-                        timing: None,
-                    });
-                }
-                return Err(message);
-            }
-        }
+        problem
+            .run(&mut obj, "n-block exact-joint spatial")
+            .map_err(|error| error.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
 
     // ── κ-optimization scaling summary ──
@@ -7706,16 +7636,24 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // Select every free constant-curvature coordinate once from its continuous,
     // analytically differentiated fair profile before fitting the baseline. The
     // subsequent joint solve profiles rho at this certified curvature.
-    for term_idx in constant_curvature_term_indices(&resolvedspec) {
-        if constant_curvature_kappa_is_fixed(&resolvedspec, term_idx) {
-            continue;
-        }
+    let free_curvature_terms: Vec<usize> = constant_curvature_term_indices(&resolvedspec)
+        .into_iter()
+        .filter(|&term_idx| !constant_curvature_kappa_is_fixed(&resolvedspec, term_idx))
+        .collect();
+    if !free_curvature_terms.is_empty() {
+        validate_constant_curvature_fair_profile_inputs(
+            weights.view(),
+            offset.view(),
+            &family,
+        )?;
+    }
+    for term_idx in free_curvature_terms {
         let kappa_hat = constant_curvature_kappa_fair_optimum(
             data,
             y.view(),
             &resolvedspec,
             term_idx,
-            options.tol,
+            options,
         )?;
         if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) = resolvedspec
             .smooth_terms
@@ -7813,8 +7751,8 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 pub struct CurvatureInference {
     /// Smooth-term index of the `curv(...)` term this report is about.
     pub term_idx: usize,
-    /// The fitted signed sectional curvature κ̂ (the outer optimiser's argmin of
-    /// the profiled REML/LAML criterion over κ).
+    /// The fitted signed sectional curvature κ̂ (the bounded analytic
+    /// curvature-fair profile optimum).
     pub kappa_hat: f64,
     /// Profile-likelihood CI for κ and the geometry verdict from its sign.
     pub ci: gam_geometry::curvature_estimand::KappaProfileCi,
@@ -7828,19 +7766,174 @@ pub struct CurvatureInference {
 /// `term_idx`, given the already-fitted resolved spec (carrying κ̂) and the same
 /// fit inputs used to produce it.
 ///
-/// The profiled criterion `V_p(κ) = max_{ρ} V(κ, ρ)` is evaluated as an oracle:
-/// for each probe κ, pin the term's curvature to κ, fit with κ-optimisation
-/// **disabled** (so only the smoothing parameters ρ are profiled), and read the
-/// resulting `reml_score` (the negative-log-evidence the outer loop minimises,
-/// so κ̂ is its argmin). The exact same criterion the joint κ-fit minimised —
-/// the only difference is which coordinates move — so κ̂ is a genuine stationary
-/// point of this oracle. The statistics (profile-CI walk, interior κ=0 LR test)
-/// are then the principled likelihood-set / Wilks constructions in
-/// [`gam_geometry::curvature_estimand`].
-///
-/// `v_pp` (the initial Wald step size) is taken from a central finite difference
-/// of `V_p` at κ̂; the CI itself is the exact χ²₁ likelihood crossing, not the
-/// Wald ellipsoid, so this only sizes the first bracket step.
+/// The point estimate and inference share the same continuously smoothing-
+/// profiled curvature-fair evidence and its analytic profile score. Each CI
+/// endpoint solves the Wilks likelihood-ratio equation directly inside the
+/// chart-bound bracket with safeguarded Newton steps; bisection is the
+/// guaranteed-progress fallback. A bound is reported as open only when the
+/// analytic score certifies that the connected likelihood set containing κ̂
+/// remains monotone all the way to that bound.
+fn curvature_profile_lr_endpoint<F>(
+    profile: &mut F,
+    kappa_hat: f64,
+    value_hat: f64,
+    bound: f64,
+    half_threshold: f64,
+    x_tolerance: f64,
+    score_tolerance: f64,
+) -> Result<(f64, bool), String>
+where
+    F: FnMut(f64) -> Result<(f64, f64), String>,
+{
+    let direction = (bound - kappa_hat).signum();
+    let span = (bound - kappa_hat).abs();
+    if direction == 0.0 || span <= x_tolerance {
+        return Ok((bound, true));
+    }
+
+    let (bound_value, bound_score) = profile(bound)?;
+    let outward_score = direction * bound_score;
+    if outward_score < -score_tolerance {
+        return Err(format!(
+            "curvature profile is not outward-monotone at chart bound {bound}: \
+             outward score {outward_score:.6e} is below tolerance {score_tolerance:.6e}"
+        ));
+    }
+    let value_tolerance = score_tolerance * span;
+    if bound_value < value_hat - value_tolerance {
+        return Err(format!(
+            "fitted curvature is not the minimum of its inference profile: \
+             V(bound={bound})={bound_value:.6e} < V(kappa_hat)={value_hat:.6e}"
+        ));
+    }
+    let bound_residual = bound_value - value_hat - half_threshold;
+    if bound_residual < 0.0 {
+        return Ok((bound, true));
+    }
+    if bound_residual == 0.0 {
+        return Ok((bound, false));
+    }
+
+    // `inside` is in the connected likelihood set and `outside` is beyond its
+    // first threshold crossing. Newton uses the exact profile score. It is
+    // accepted only in the central half of the current bracket, so every other
+    // iteration is a bisection-quality contraction even on a nearly flat score.
+    let mut inside_x = kappa_hat;
+    let mut outside_x = bound;
+    let mut outside_residual = bound_residual;
+    let mut outside_score = bound_score;
+    while (outside_x - inside_x).abs() > x_tolerance {
+        let lo = inside_x.min(outside_x);
+        let hi = inside_x.max(outside_x);
+        let width = hi - lo;
+        let central_lo = lo + 0.25 * width;
+        let central_hi = hi - 0.25 * width;
+        let newton = outside_x - outside_residual / outside_score;
+        let probe = if newton.is_finite() && newton > central_lo && newton < central_hi {
+            newton
+        } else {
+            lo + 0.5 * width
+        };
+        if !(probe > lo && probe < hi) {
+            break;
+        }
+        let (value, score) = profile(probe)?;
+        let outward_score = direction * score;
+        if outward_score < -score_tolerance {
+            return Err(format!(
+                "curvature profile changed direction before its likelihood crossing at \
+                 kappa={probe}: outward score {outward_score:.6e} is below tolerance \
+                 {score_tolerance:.6e}"
+            ));
+        }
+        let residual = value - value_hat - half_threshold;
+        if residual >= 0.0 {
+            outside_x = probe;
+            outside_residual = residual;
+            outside_score = score;
+        } else {
+            inside_x = probe;
+        }
+    }
+    Ok((inside_x + 0.5 * (outside_x - inside_x), false))
+}
+
+fn curvature_profile_ci_from_analytic_score<F>(
+    profile: &mut F,
+    kappa_hat: f64,
+    kappa_min: f64,
+    kappa_max: f64,
+    level: f64,
+    relative_tolerance: f64,
+) -> Result<gam_geometry::curvature_estimand::KappaProfileCi, String>
+where
+    F: FnMut(f64) -> Result<(f64, f64), String>,
+{
+    if !(kappa_min < kappa_max && kappa_hat >= kappa_min && kappa_hat <= kappa_max) {
+        return Err("curvature profile requires kappa_hat inside valid chart bounds".to_string());
+    }
+    if !(level > 0.0 && level < 1.0) {
+        return Err("curvature profile level must lie in (0, 1)".to_string());
+    }
+    let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+        .ok_or_else(|| "curvature profile threshold is not finite".to_string())?;
+    let half_threshold = 0.5 * z * z;
+    let (value_hat, score_hat) = profile(kappa_hat)?;
+    let relative_tolerance = relative_tolerance.max(f64::EPSILON.sqrt());
+    let x_tolerance = relative_tolerance * (1.0 + kappa_min.abs().max(kappa_max.abs()));
+    let score_tolerance = relative_tolerance * (1.0 + value_hat.abs());
+    let at_lower = (kappa_hat - kappa_min).abs() <= x_tolerance;
+    let at_upper = (kappa_hat - kappa_max).abs() <= x_tolerance;
+    let stationary = if at_lower {
+        score_hat >= -score_tolerance
+    } else if at_upper {
+        score_hat <= score_tolerance
+    } else {
+        score_hat.abs() <= score_tolerance
+    };
+    if !stationary {
+        return Err(format!(
+            "curvature inference rejected a non-stationary point estimate: \
+             kappa_hat={kappa_hat}, score={score_hat:.6e}, \
+             stationarity_bound={score_tolerance:.6e}"
+        ));
+    }
+
+    let (ci_lo, lo_at_bound) = curvature_profile_lr_endpoint(
+        profile,
+        kappa_hat,
+        value_hat,
+        kappa_min,
+        half_threshold,
+        x_tolerance,
+        score_tolerance,
+    )?;
+    let (ci_hi, hi_at_bound) = curvature_profile_lr_endpoint(
+        profile,
+        kappa_hat,
+        value_hat,
+        kappa_max,
+        half_threshold,
+        x_tolerance,
+        score_tolerance,
+    )?;
+    let verdict = if ci_lo > 0.0 {
+        gam_geometry::curvature_estimand::CurvatureVerdict::Spherical
+    } else if ci_hi < 0.0 {
+        gam_geometry::curvature_estimand::CurvatureVerdict::Hyperbolic
+    } else {
+        gam_geometry::curvature_estimand::CurvatureVerdict::Flat
+    };
+    Ok(gam_geometry::curvature_estimand::KappaProfileCi {
+        kappa_hat,
+        ci_lo,
+        ci_hi,
+        lo_at_bound,
+        hi_at_bound,
+        verdict,
+    })
+}
+
 pub fn curvature_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -7857,98 +7950,67 @@ pub fn curvature_inference_forspec(
             "curvature_inference_forspec: term {term_idx} is not a constant-curvature smooth"
         ))
     })?;
+    if constant_curvature_kappa_is_fixed(resolvedspec, term_idx) {
+        crate::bail_invalid_estim!(
+            "curvature inference requires an estimated curvature; term {term_idx} has user-pinned kappa={kappa_hat}"
+        );
+    }
+    if y.len() != data.nrows() || weights.len() != data.nrows() || offset.len() != data.nrows() {
+        crate::bail_invalid_estim!(
+            "curvature inference row mismatch: data={}, y={}, weights={}, offset={}",
+            data.nrows(),
+            y.len(),
+            weights.len(),
+            offset.len(),
+        );
+    }
+    validate_constant_curvature_fair_profile_inputs(weights, offset, &family)?;
     let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
+    let (feature_cols, base_spec) = match resolvedspec
+        .smooth_terms
+        .get(term_idx)
+        .map(|term| &term.basis)
+    {
+        Some(SmoothBasisSpec::ConstantCurvature {
+            feature_cols, spec, ..
+        }) => (feature_cols, spec.clone()),
+        _ => unreachable!("get_constant_curvature_kappa already validated the term"),
+    };
+    let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+    let radial_reference = constant_curvature_radial_reference(x_term.view(), y)?;
+    let fair_profile = ConstantCurvatureFairProfile {
+        data: x_term.view(),
+        response: y,
+        radial_reference,
+        spec: base_spec,
+        cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+    };
 
-    // Profiled criterion oracle V_p(κ) for the CI walk and the κ = 0 flatness LR
-    // test. This MUST be the same criterion that selected κ̂, otherwise the
-    // statistics are inconsistent with the point estimate. For a constant-
-    // curvature smooth κ̂ is chosen by the κ-FAIR criterion
-    // (`constant_curvature_kappa_fair_sign_score`, #1464) — the raw
-    // `fixed_kappa_profiled_reml_score` is sign-BLIND in κ on a generic radial
-    // signal (the +κ chart's distance-compression is a uniformly better
-    // interpolator regardless of the true sign, so raw V_p rails to the +chart
-    // bound for both signs and would report `V_p(0) < V_p(κ̂)`, i.e. a flatness
-    // p-value of 1 even for genuinely curved truth). We therefore evaluate the
-    // CI/flatness criterion with the κ-fair score, which subtracts the design's
-    // generic radial-peak-fitting power so only the genuine curvature-shape
-    // signal remains and `V_fair(κ̂) < V_fair(0)` for curved truth. The κ-fair
-    // score is the basis-level criterion; resolve this term's feature columns and
-    // base spec so each κ-probe scores the production constant-curvature basis.
-    // Use the κ-fair criterion for the CI/flatness ONLY when κ̂ is in the
-    // hyperbolic basin (κ̂ < 0) — the regime where κ̂ was chosen by the κ-fair
-    // fast-path (`constant_curvature_kappa_fair_argmin`), so the flatness LR and
-    // CI must use the SAME criterion to be consistent (raw V_p is sign-blind and
-    // would report `V_p(0) < V_p(κ̂)`, a flatness p-value of 1 even for genuinely
-    // hyperbolic truth). For κ̂ ≥ 0 (spherical via the joint solver, or a genuinely
-    // flat κ̂ ≈ 0) the raw production V_p is the right, scale-correct criterion and
-    // already sizes flatness correctly, so we keep it — this preserves the
-    // spherical and flat statistics unchanged.
-    let cc_fair_inputs: Option<(Array2<f64>, gam_terms::basis::ConstantCurvatureBasisSpec)> =
-        if kappa_hat < 0.0 {
-            match resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis) {
-                Some(SmoothBasisSpec::ConstantCurvature {
-                    feature_cols, spec, ..
-                }) => select_columns(data, feature_cols)
-                    .ok()
-                    .map(|x| (x, spec.clone())),
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-    // Memoize across κ probes. The CI walk's bracketing/bisection, the
-    // central-difference v_pp seed, and the flatness LR test all re-evaluate
-    // the criterion at the SAME κ, so caching by the raw bits of κ removes
-    // redundant evaluations with no change to the statistical answer.
-    let v_p_cache: std::cell::RefCell<std::collections::HashMap<u64, f64>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    let v_p = |kappa: f64| -> Result<f64, String> {
+    // CI and flatness revisit κ̂ and κ=0. The shared profile caches each joint
+    // value/analytic-score pair so every statistic consumes the same evaluation.
+    let mut v_p = |kappa: f64| -> Result<(f64, f64), String> {
         if !kappa.is_finite() {
             return Err(format!("V_p probed a non-finite κ = {kappa}"));
         }
-        let key = kappa.to_bits();
-        if let Some(&cached) = v_p_cache.borrow().get(&key) {
-            return Ok(cached);
-        }
-        let score = if let Some((x_term, base_spec)) = &cc_fair_inputs {
-            let mut probe_spec = base_spec.clone();
-            probe_spec.kappa = kappa;
-            gam_terms::basis::constant_curvature_kappa_fair_sign_score(x_term.view(), y, &probe_spec)
-                .map_err(|e| format!("κ-fair criterion at κ={kappa} failed: {e}"))?
-        } else {
-            fixed_kappa_profiled_reml_score(
-                data,
-                y,
-                weights,
-                offset,
-                resolvedspec,
-                term_idx,
-                kappa,
-                family.clone(),
-                options,
-            )
-            .map_err(|e| format!("V_p fixed-κ fit at κ={kappa} failed: {e}"))?
-        };
-        v_p_cache.borrow_mut().insert(key, score);
-        Ok(score)
+        let sample = fair_profile.evaluate(kappa).map_err(|error| {
+            format!("analytic curvature profile at kappa={kappa} failed: {error}")
+        })?;
+        Ok(sample)
     };
-
-    // Wald step seed: central FD of V_p at κ̂ (only sizes the first bracket; the
-    // CI is the exact likelihood crossing). Step a small fraction of the κ
-    // window so the FD straddles κ̂ without leaving the chart.
-    let h = (1e-3 * (kappa_max - kappa_min)).max(1e-4);
-    let v_pp = match (v_p(kappa_hat + h), v_p(kappa_hat), v_p(kappa_hat - h)) {
-        (Ok(vp), Ok(v0), Ok(vm)) => (vp - 2.0 * v0 + vm) / (h * h),
-        _ => f64::NAN, // profile_ci_walk falls back to a default step
-    };
-
-    let ci = gam_geometry::curvature_estimand::profile_ci_walk(
-        &v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, 1e-4,
+    let ci = curvature_profile_ci_from_analytic_score(
+        &mut v_p,
+        kappa_hat,
+        kappa_min,
+        kappa_max,
+        level,
+        options.tol,
     )
-    .map_err(EstimationError::InvalidInput)?;
-    let flatness = gam_geometry::curvature_estimand::flatness_lr_test(&v_p, kappa_hat)
-        .map_err(EstimationError::InvalidInput)?;
+    .map_err(EstimationError::RemlOptimizationFailed)?;
+    let flatness = gam_geometry::curvature_estimand::flatness_lr_test(
+        |kappa| v_p(kappa).map(|(value, _)| value),
+        kappa_hat,
+    )
+    .map_err(EstimationError::RemlOptimizationFailed)?;
 
     Ok(CurvatureInference {
         term_idx,
@@ -7956,6 +8018,52 @@ pub fn curvature_inference_forspec(
         ci,
         flatness,
     })
+}
+
+#[cfg(test)]
+mod curvature_profile_score_tests {
+    use super::*;
+
+    #[test]
+    fn analytic_profile_score_finds_exact_quadratic_lr_crossings() {
+        let kappa_hat = -0.37;
+        let curvature = 16.0;
+        let level = 0.95;
+        let mut profile = |kappa: f64| -> Result<(f64, f64), String> {
+            let displacement = kappa - kappa_hat;
+            Ok((
+                7.0 + 0.5 * curvature * displacement * displacement,
+                curvature * displacement,
+            ))
+        };
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            kappa_hat,
+            -3.0,
+            3.0,
+            level,
+            1.0e-10,
+        )
+        .expect("analytic quadratic profile CI");
+        let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
+            .expect("valid normal quantile");
+        let expected_half_width = z / curvature.sqrt();
+        assert!((ci.ci_lo - (kappa_hat - expected_half_width)).abs() <= 1.0e-8);
+        assert!((ci.ci_hi - (kappa_hat + expected_half_width)).abs() <= 1.0e-8);
+        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
+    }
+
+    #[test]
+    fn analytic_profile_marks_chart_bound_when_wilks_set_never_crosses() {
+        let mut profile =
+            |kappa: f64| -> Result<(f64, f64), String> { Ok((0.5 * kappa * kappa, kappa)) };
+        let ci =
+            curvature_profile_ci_from_analytic_score(&mut profile, 0.0, -0.1, 0.1, 0.95, 1.0e-10)
+                .expect("open bounded profile CI");
+        assert_eq!(ci.ci_lo, -0.1);
+        assert_eq!(ci.ci_hi, 0.1);
+        assert!(ci.lo_at_bound && ci.hi_at_bound);
+    }
 }
 
 /// Provenance tag for the smooth-term significance correction (#1063): which
@@ -8237,44 +8345,6 @@ pub fn smooth_term_lr_inference_forspec(
         // collapse; `edf` and `null_dim` never exceed `edf1` in a healthy fit.
         // This mirrors the summary Wald path, which floors its reference at the
         // statistic's own rank for the same reason.
-        //
-        // Guard the ONE state where `edf1` cannot be trusted: a non-converged fit
-        // whose influence-based `edf` has collapsed BELOW the term's guaranteed
-        // floor. The flat-valley REML stall on an unidentified term (#1762) rails
-        // the outer iterations out and returns an INCONSISTENT state — the term
-        // still carries a large, wiggly `β` (so the refit LR statistic `W` is
-        // large) yet `tr(F) = edf` reads ~0, a combination a genuine penalized
-        // least-squares solution cannot produce (large `β` ⇒ `edf ≫ 0`).
-        // Referencing that large `W` against `edf1 ≈ edf ≈ 0` manufactures
-        // significance: measured null FPR ~0.62 on those stalled noise fits vs a
-        // well-calibrated ~0.06 on the converged ones — the entire residual
-        // miscalibration lives here. The summary Wald path already sidesteps it
-        // (its statistic truncates to the ~0-`edf` rank and the term is skipped);
-        // the whole-term LR statistic cannot self-truncate (it is a refit deviance
-        // difference), so we widen its REFERENCE instead: floor `ref_df` at the
-        // term's full basis dimension — the maximally-honest reference for an
-        // untrusted term (it may occupy up to all its columns). A genuine effect
-        // still rejects (`W` ≫ its column count); a tiny-`W` collapse still gives
-        // `p ≈ 1`; only the spurious large-`W`/zero-`edf` artifact is neutralised.
-        //
-        // The trigger is NARROW on purpose. `outer_converged` alone is far too
-        // broad: the null-space double-penalty's shrinkage λ routinely rails to
-        // its ~1e13 ceiling on perfectly good fits (a `te` interaction, a
-        // multi-term model), flipping `outer_converged` to false while `edf`
-        // stays healthy (~3, ~9). Flooring THOSE at the full basis dimension
-        // would bury real effects (a `te` with `W ≈ 49` on a 48-column basis).
-        // Requiring BOTH non-convergence AND `edf < max(null_dim, 1)` — the term
-        // shrunk below even its unpenalized floor, the inconsistency fingerprint —
-        // fires on the zero-`edf` stall alone and leaves every healthy-`edf` fit
-        // on the tight `edf1` reference. The underlying stall itself is #1762;
-        // this keeps the inference honest on top of whatever fit it is handed.
-        let edf_floor = (null_dim.max(1)) as f64;
-        let untrusted_edf_collapse = !full.fit.outer_converged && edf < edf_floor;
-        let unconverged_dim_floor = if untrusted_edf_collapse {
-            coeff_range.len() as f64
-        } else {
-            0.0
-        };
         let rho_uncertainty_df = wps_block_uncertainty_df(
             full.fit.weighted_gram(),
             full.fit.smoothing_correction(),
@@ -8286,7 +8356,6 @@ pub fn smooth_term_lr_inference_forspec(
             .max(edf)
             + rho_uncertainty_df)
             .max(null_dim as f64)
-            .max(unconverged_dim_floor)
             .max(1.0);
         if !(ref_df.is_finite() && ref_df > 0.0) {
             continue;

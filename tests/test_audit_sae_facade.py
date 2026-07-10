@@ -26,20 +26,15 @@ def test_audit_sae_loads_npy_checkpoint_and_returns_report(tmp_path):
     )
     checkpoint = tmp_path / "decoder.npy"
     np.save(checkpoint, decoder)
-    random_weight_codes = np.asarray(
-        [
-            [0.2, 0.8],
-            [0.7, 0.1],
-            [0.4, 0.3],
-            [0.9, 0.6],
-        ],
-        dtype=np.float32,
+    donor_indices = np.asarray([[1], [0], [1], [0]], dtype=np.uint32)
+    donor_values = np.asarray(
+        [[[0.8]], [[0.7]], [[0.3]], [[0.9]]], dtype=np.float32
     )
 
     report = gamfit.audit_sae(
         checkpoint,
         activations,
-        random_weight_codes=random_weight_codes,
+        random_weight_codes=(donor_indices, donor_values),
         active=1,
         score_mode="off",
     )
@@ -56,7 +51,7 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
     import gamfit
 
     decoder = np.eye(4, dtype=np.float32)
-    codes = np.asarray(
+    dense_codes = np.asarray(
         [
             [1.0, 0.0, 1.0, 0.0],
             [0.0, 1.0, 0.0, 1.0],
@@ -65,8 +60,8 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
         ],
         dtype=np.float32,
     )
-    activations = codes.copy()
-    random_weight_codes = np.asarray(
+    activations = dense_codes.copy()
+    random_weight_dense = np.asarray(
         [
             [0.3, 0.1, 0.4, 0.2],
             [0.2, 0.6, 0.1, 0.7],
@@ -75,14 +70,16 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
         ],
         dtype=np.float32,
     )
+    route_indices = np.tile(np.asarray([[0, 1]], dtype=np.uint32), (4, 1))
+    route_values = dense_codes.reshape(4, 2, 2)
+    donor_values = random_weight_dense.reshape(4, 2, 2)
 
     report = gamfit.audit_sae(
         decoder,
         activations,
-        codes=codes,
-        random_weight_codes=random_weight_codes,
+        codes=(route_indices, route_values),
+        random_weight_codes=(route_indices, donor_values),
         block_size=2,
-        block_topk=2,
         active=2,
         score_mode="off",
     )

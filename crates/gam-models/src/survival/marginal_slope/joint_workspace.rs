@@ -286,9 +286,7 @@ impl SurvivalMarginalSlopePsiWorkspace {
     }
 }
 
-impl crate::marginal_slope_shared::MarginalSlopePsiFamily
-    for SurvivalMarginalSlopePsiWorkspace
-{
+impl crate::marginal_slope_shared::MarginalSlopePsiFamily for SurvivalMarginalSlopePsiWorkspace {
     fn is_sigma_aux(&self, psi_index: usize) -> bool {
         self.family
             .is_sigma_aux_index(&self.derivative_blocks, psi_index)

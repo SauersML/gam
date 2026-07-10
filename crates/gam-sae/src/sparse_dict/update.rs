@@ -44,9 +44,22 @@ pub enum SparseDictionaryError {
         ev_residual: f64,
         tolerance: f64,
         accepted_births: usize,
-        decoder_residual: f64,
-        decoder_tolerance: f64,
+        decoder_fixed_point_residual: f64,
+        routing_residual: f64,
+        solve_residual: f64,
+        solve_tolerance: f64,
         decoder_nonconverged_columns: usize,
+        decoder_factorization_failures: usize,
+    },
+    TraceNonConvergence {
+        rho: f64,
+        probe: usize,
+        iterations: usize,
+        residual: f64,
+        tolerance: f64,
+    },
+    InvalidRemlEvidence {
+        reason: String,
     },
 }
 
@@ -76,17 +89,41 @@ impl fmt::Display for SparseDictionaryError {
                 ev_residual,
                 tolerance,
                 accepted_births,
-                decoder_residual,
-                decoder_tolerance,
+                decoder_fixed_point_residual,
+                routing_residual,
+                solve_residual,
+                solve_tolerance,
                 decoder_nonconverged_columns,
+                decoder_factorization_failures,
             } => write!(
                 f,
                 "fit_sparse_dictionary did not converge after {epochs} epochs: EV \
                  {explained_variance:.6}, EV residual {ev_residual:.3e} (tolerance \
-                 {tolerance:.3e}), accepted births {accepted_births}, decoder residual \
-                 {decoder_residual:.3e} (tolerance {decoder_tolerance:.3e}), \
-                 nonconverged decoder columns {decoder_nonconverged_columns}"
+                 {tolerance:.3e}), decoder fixed-point residual \
+                 {decoder_fixed_point_residual:.3e}, routing residual {routing_residual:.3e}, \
+                 accepted births {accepted_births}, linear-solve residual \
+                 {solve_residual:.3e} (tolerance {solve_tolerance:.3e}), nonconverged decoder \
+                 columns {decoder_nonconverged_columns}, dense factorization failures \
+                 {decoder_factorization_failures}"
             ),
+            Self::TraceNonConvergence {
+                rho,
+                probe,
+                iterations,
+                residual,
+                tolerance,
+            } => write!(
+                f,
+                "fit_sparse_dictionary REML trace solve did not converge at rho={rho:.6e}, \
+                 probe {probe}, after {iterations} iterations: relative residual \
+                 {residual:.3e} exceeds {tolerance:.3e}"
+            ),
+            Self::InvalidRemlEvidence { reason } => {
+                write!(
+                    f,
+                    "fit_sparse_dictionary REML evidence is invalid: {reason}"
+                )
+            }
         }
     }
 }
@@ -112,6 +149,8 @@ pub(crate) struct SparseDictIterate {
     pub(crate) score_route_stats: ScoreRouteStats,
     pub(crate) decoder_solve_stats: DecoderSolveStats,
     inner_ev_residual: f64,
+    decoder_fixed_point_residual: f64,
+    routing_residual: f64,
     inner_tolerance: f64,
 }
 
@@ -221,6 +260,118 @@ pub(super) fn route_and_code_all(
     Ok(codes)
 }
 
+/// Gauge-invariant displacement of two unit-row dictionaries. Active atoms are
+/// compared as rank-one projectors (`1 - cos² θ`), so a harmless sign flip is
+/// zero; a transition between active and dormant (zero) capacity is one.
+fn decoder_fixed_point_residual(previous: &Array2<f32>, next: &Array2<f32>) -> f64 {
+    previous
+        .axis_iter(Axis(0))
+        .zip(next.axis_iter(Axis(0)))
+        .map(|(left, right)| {
+            let left_norm2 = left.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+            let right_norm2 = right.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>();
+            if left_norm2 <= DEAD_DENOM && right_norm2 <= DEAD_DENOM {
+                return 0.0;
+            }
+            if left_norm2 <= DEAD_DENOM || right_norm2 <= DEAD_DENOM {
+                return 1.0;
+            }
+            let dot = left
+                .iter()
+                .zip(right.iter())
+                .map(|(&a, &b)| (a as f64) * (b as f64))
+                .sum::<f64>();
+            (1.0 - dot * dot / (left_norm2 * right_norm2)).clamp(0.0, 1.0)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Fixed-point residual of the exposed sparse routing. It is the larger of the
+/// relative coefficient displacement and the reconstruction displacement,
+/// evaluated without materialising either `N×K` codes or a second `N×P` matrix.
+fn routing_fixed_point_residual(
+    x: ArrayView2<'_, f32>,
+    previous_decoder: ArrayView2<'_, f32>,
+    previous: &[SparseCode],
+    next_decoder: ArrayView2<'_, f32>,
+    next: &[SparseCode],
+) -> f64 {
+    let mut code_delta2 = 0.0f64;
+    let mut code_scale2 = 0.0f64;
+    let mut reconstruction_delta2 = 0.0f64;
+    let mut data_scale2 = 0.0f64;
+
+    for row in 0..x.nrows() {
+        let old = &previous[row];
+        let new = &next[row];
+        for (slot, &atom) in old.indices.iter().enumerate() {
+            let old_value = old.codes[slot] as f64;
+            if old_value == 0.0 {
+                continue;
+            }
+            let new_value = new
+                .indices
+                .iter()
+                .zip(new.codes.iter())
+                .filter(|(candidate, _)| **candidate == atom)
+                .map(|(_, &value)| value as f64)
+                .sum::<f64>();
+            let delta = new_value - old_value;
+            code_delta2 += delta * delta;
+            code_scale2 += old_value * old_value + new_value * new_value;
+        }
+        for (slot, &atom) in new.indices.iter().enumerate() {
+            let new_value = new.codes[slot] as f64;
+            if new_value == 0.0
+                || old
+                    .indices
+                    .iter()
+                    .zip(old.codes.iter())
+                    .any(|(&candidate, &value)| candidate == atom && value != 0.0)
+            {
+                continue;
+            }
+            code_delta2 += new_value * new_value;
+            code_scale2 += new_value * new_value;
+        }
+
+        for column in 0..x.ncols() {
+            let old_value = old
+                .indices
+                .iter()
+                .zip(old.codes.iter())
+                .map(|(&atom, &code)| {
+                    (code as f64) * previous_decoder[[atom as usize, column]] as f64
+                })
+                .sum::<f64>();
+            let new_value = new
+                .indices
+                .iter()
+                .zip(new.codes.iter())
+                .map(|(&atom, &code)| (code as f64) * next_decoder[[atom as usize, column]] as f64)
+                .sum::<f64>();
+            let delta = new_value - old_value;
+            reconstruction_delta2 += delta * delta;
+            let observed = x[[row, column]] as f64;
+            data_scale2 += observed * observed;
+        }
+    }
+
+    let code_residual = if code_scale2 > 0.0 {
+        code_delta2 / code_scale2
+    } else {
+        0.0
+    };
+    let reconstruction_residual = if data_scale2 > 0.0 {
+        reconstruction_delta2 / data_scale2
+    } else if reconstruction_delta2 == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    };
+    code_residual.max(reconstruction_residual)
+}
+
 pub(super) fn run(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
@@ -246,12 +397,11 @@ pub(super) fn run(
 
     let scorer = TileScorer::new(s, config.score_tile);
     let mut score_route_stats = ScoreRouteStats::default();
-    let mut pending_eq = DecoderNormalEq::zeros(k, p);
-    let mut prev_ev = f64::NEG_INFINITY;
-    let mut converged = false;
     let mut epochs_run = 0usize;
     let mut decoder_solve_stats = DecoderSolveStats::default();
-    let mut last_improve = f64::INFINITY;
+    let mut ev_residual = f64::INFINITY;
+    let mut decoder_residual = f64::INFINITY;
+    let mut routing_residual = f64::INFINITY;
     let mut accepted_births = 0usize;
 
     // (a)+(b) route + sparse codes for every row against the seeded, unit-normed
@@ -280,24 +430,36 @@ pub(super) fn run(
         initial_route_start.elapsed().as_secs_f64(),
         fit_start.elapsed().as_secs_f64(),
     );
+    let mut current_ev = explained_variance(x, &codes, decoder.view());
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
         let epoch_start = Instant::now();
 
-        // (c) decoder refresh: stream the current codes into each atom's pending
-        // normal equations, then refresh only atoms whose evidence clears the
-        // routability SE gate. Deferred atoms keep accumulating across epochs.
-        pending_eq.accumulate(x, &codes);
+        // `decoder` + `codes` is the canonical state being tested. Advance the
+        // full deterministic map once, then certify THIS input state from the
+        // distance to its image. Returning the input (not the freshly mutated
+        // image) makes the model arrays exactly the state whose fixed-point
+        // residuals were measured.
+        let certified_decoder = decoder.clone();
+        let certified_codes = codes.clone();
+        let certified_ev = current_ev;
+
+        // (c) decoder refresh from this state alone. Re-accumulating the same
+        // corpus across epochs made the update depend on hidden, non-model state
+        // and prevented a replayable fixed-point certificate. Streaming still
+        // assembles one epoch from shards; the one-shot map assembles one corpus
+        // exactly once per step.
+        let mut normal_eq = DecoderNormalEq::zeros(k, p);
+        normal_eq.accumulate(x, &certified_codes);
         let sigma = residual_scale(x, &codes, decoder.view());
-        let (stats, gate) = solve_decoder_with_routability_gate(
+        let (stats, _gate) = solve_decoder_with_routability_gate(
             &mut decoder,
-            &pending_eq,
+            &normal_eq,
             config.decoder_ridge as f64,
             sigma,
         );
         decoder_solve_stats = stats;
-        pending_eq.clear_refreshed_atoms(&gate);
         let refresh_secs = epoch_start.elapsed().as_secs_f64();
 
         // (d) unit-norm projection (identifies code scale) + stable sign.
@@ -324,7 +486,7 @@ pub(super) fn run(
         // the new decoder against codes solved before the refresh + normalisation):
         // the convergence decision now uses exactly the codes that define the
         // returned model, so there is no stale-code surrogate gap.
-        codes = route_and_code_all(
+        let mut next_codes = route_and_code_all(
             x,
             decoder.view(),
             &scorer,
@@ -338,15 +500,14 @@ pub(super) fn run(
         let route_secs = epoch_start.elapsed().as_secs_f64() - refresh_secs;
 
         // Convergence-decision EV, computed from the FRESH post-normalisation codes.
-        let ev = explained_variance(x, &codes, decoder.view());
-        let improve = ev - prev_ev;
-        last_improve = improve;
+        let next_ev = explained_variance(x, &next_codes, decoder.view());
+        let improve = next_ev - certified_ev;
         let mut revived_mask = vec![false; k];
         for &atom in &revived_atoms {
             revived_mask[atom] = true;
         }
         let mut accepted_mask = vec![false; k];
-        for code in &codes {
+        for code in &next_codes {
             for (slot, &atom) in code.indices.iter().enumerate() {
                 let atom = atom as usize;
                 if code.codes[slot] != 0.0 && revived_mask[atom] {
@@ -354,7 +515,35 @@ pub(super) fn run(
                 }
             }
         }
-        accepted_births = accepted_mask.into_iter().filter(|accepted| *accepted).count();
+        accepted_births = accepted_mask
+            .into_iter()
+            .filter(|accepted| *accepted)
+            .count();
+
+        // Rejected residual-row proposals are dormant capacity, not trained
+        // model parameters. Null them before measuring/adopting the next state so
+        // held-out transforms can never expose an arbitrary rejected direction.
+        for &atom in &revived_atoms {
+            let accepted = next_codes.iter().any(|code| {
+                code.indices
+                    .iter()
+                    .zip(code.codes.iter())
+                    .any(|(&candidate, &value)| candidate as usize == atom && value != 0.0)
+            });
+            if !accepted {
+                decoder.row_mut(atom).fill(0.0);
+            }
+        }
+
+        ev_residual = improve.abs();
+        decoder_residual = decoder_fixed_point_residual(&certified_decoder, &decoder);
+        routing_residual = routing_fixed_point_residual(
+            x,
+            certified_decoder.view(),
+            &certified_codes,
+            decoder.view(),
+            &next_codes,
+        );
 
         // Per-epoch heartbeat on the log::warn channel (log::info is dropped by
         // the RUST_LOG=warn harnesses, which is why a multi-hour host fit went
@@ -367,7 +556,7 @@ pub(super) fn run(
              cg_kappa_bound={:?} cg_relative_residual={:.3e}",
             epochs_run,
             config.max_epochs,
-            ev,
+            next_ev,
             improve,
             revived_atoms.len(),
             refresh_secs,
@@ -379,57 +568,51 @@ pub(super) fn run(
             decoder_solve_stats.cg_kappa_bound,
             decoder_solve_stats.cg_relative_residual,
         );
-        // A proposed dead-atom birth is work, not automatically progress. At
-        // overcomplete K > N·s there must always be unused atoms, so requiring
-        // literally zero proposals makes convergence impossible. The checkable
-        // condition is instead that no proposed atom entered the fresh optimal
-        // routing: every residual-row birth was tested and rejected. Couple that
-        // no-beneficial-birth certificate to the EV residual and the decoder's
-        // normal-equation certificate; a diagonal fallback can never mint a fit.
+        // A proposed dead-atom birth is work only when it entered the canonical
+        // routing. Couple that test to full-map state residuals and the linear
+        // subsolve evidence. Raw normal-equation convergence alone cannot certify
+        // a model because unit projection and rerouting happen afterward.
         if accepted_births == 0
             && decoder_solve_stats.cg_nonconverged_columns == 0
+            && decoder_solve_stats.dense_factorization_failures == 0
             && decoder_solve_stats.cg_relative_residual
                 <= decoder_solve_stats.cg_residual_stop.max(f64::MIN_POSITIVE)
-            && improve.abs() <= config.tolerance
-            && epoch > 0
+            && ev_residual <= config.tolerance
+            && decoder_residual <= config.tolerance
+            && routing_residual <= config.tolerance
         {
-            converged = true;
-            break;
+            let (indices, code_mat) = pack_codes(&certified_codes, n, s);
+            return Ok(SparseDictIterate {
+                decoder: certified_decoder,
+                indices,
+                codes: code_mat,
+                explained_variance: certified_ev,
+                epochs: epochs_run,
+                active: s,
+                score_route_stats,
+                decoder_solve_stats,
+                inner_ev_residual: ev_residual,
+                decoder_fixed_point_residual: decoder_residual,
+                routing_residual,
+                inner_tolerance: config.tolerance,
+            });
         }
-        prev_ev = ev;
+        codes = std::mem::take(&mut next_codes);
+        current_ev = next_ev;
     }
 
-    // `codes` already hold the re-route against the final, unit-normed decoder
-    // (the last epoch's step-(a)+(b)), so the stored codes and the returned EV
-    // match the returned dictionary exactly — no extra reroute needed, and the
-    // returned EV equals the convergence-decision EV from the final epoch.
-    let final_ev = explained_variance(x, &codes, decoder.view());
-
-    if !converged {
-        return Err(SparseDictionaryError::InnerNonConvergence {
-            epochs: epochs_run,
-            explained_variance: final_ev,
-            ev_residual: last_improve.abs(),
-            tolerance: config.tolerance,
-            accepted_births,
-            decoder_residual: decoder_solve_stats.cg_relative_residual,
-            decoder_tolerance: decoder_solve_stats.cg_residual_stop,
-            decoder_nonconverged_columns: decoder_solve_stats.cg_nonconverged_columns,
-        });
-    }
-
-    let (indices, code_mat) = pack_codes(&codes, n, s);
-    Ok(SparseDictIterate {
-        decoder,
-        indices,
-        codes: code_mat,
-        explained_variance: final_ev,
+    Err(SparseDictionaryError::InnerNonConvergence {
         epochs: epochs_run,
-        active: s,
-        score_route_stats,
-        decoder_solve_stats,
-        inner_ev_residual: last_improve.abs(),
-        inner_tolerance: config.tolerance,
+        explained_variance: current_ev,
+        ev_residual,
+        tolerance: config.tolerance,
+        accepted_births,
+        decoder_fixed_point_residual: decoder_residual,
+        routing_residual,
+        solve_residual: decoder_solve_stats.cg_relative_residual,
+        solve_tolerance: decoder_solve_stats.cg_residual_stop,
+        decoder_nonconverged_columns: decoder_solve_stats.cg_nonconverged_columns,
+        decoder_factorization_failures: decoder_solve_stats.dense_factorization_failures,
     })
 }
 
@@ -515,24 +698,49 @@ pub struct LinearBlockRemlStats {
 ///
 /// This is the ONE shared REML variance component of the design — no per-atom
 /// λ, no new optimizer, the same Fellner–Schall fixed point the outer engine
-/// runs, specialized to the `d = 1` linear block. It is guarded to stay strictly
-/// positive and finite so the next `(A + ρI)` solve stays SPD; a degenerate
-/// aggregate (all dof consumed, zero penalty energy) leaves ρ unchanged.
-pub fn linear_shared_rho_fs_step(stats: &LinearBlockRemlStats, rho: f64) -> f64 {
+/// runs, specialized to the `d = 1` linear block. Invalid or boundary evidence
+/// is a typed error; returning the old `ρ` would manufacture a false zero outer
+/// residual and is therefore forbidden.
+pub fn linear_shared_rho_fs_step(
+    stats: &LinearBlockRemlStats,
+    rho: f64,
+) -> Result<f64, SparseDictionaryError> {
+    if !(rho.is_finite() && rho > 0.0) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!("rho must be finite and positive; got {rho}"),
+        });
+    }
     let gamma_tot = (stats.p_cols as f64) * stats.gram_edof;
     let total_obs = (stats.n_obs.saturating_mul(stats.p_cols)) as f64;
-    let resid_dof = (total_obs - gamma_tot).max(1.0);
+    if !(gamma_tot.is_finite() && gamma_tot > 0.0 && gamma_tot < total_obs) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!(
+                "pooled effective dof must lie strictly inside (0, {total_obs}); got {gamma_tot}"
+            ),
+        });
+    }
+    if !(stats.rss.is_finite() && stats.rss >= 0.0) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!("RSS must be finite and non-negative; got {}", stats.rss),
+        });
+    }
+    if !(stats.penalty_energy.is_finite() && stats.penalty_energy > 0.0) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!(
+                "decoder penalty energy must be finite and positive; got {}",
+                stats.penalty_energy
+            ),
+        });
+    }
+    let resid_dof = total_obs - gamma_tot;
     let sigma2 = stats.rss / resid_dof;
-    let energy = stats.penalty_energy;
-    if !(energy > 0.0) || !gamma_tot.is_finite() || gamma_tot <= 0.0 {
-        return rho;
+    let rho_new = gamma_tot * sigma2 / stats.penalty_energy;
+    if !(rho_new.is_finite() && rho_new > 0.0) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!("Fellner-Schall update produced invalid rho {rho_new}"),
+        });
     }
-    let rho_new = gamma_tot * sigma2 / energy;
-    if rho_new.is_finite() && rho_new > 0.0 {
-        rho_new
-    } else {
-        rho
-    }
+    Ok(rho_new)
 }
 
 /// Variance ceiling for the matrix-free effective-dof estimator, expressed as a
@@ -550,15 +758,6 @@ pub fn linear_shared_rho_fs_step(stats: &LinearBlockRemlStats, rho: f64) -> f64 
 /// PSD-trace bound. This is the single documented quality knob; the probe count
 /// is derived from it, not tuned.
 const EDOF_TRACE_VARIANCE_PER_UNIT_TRACE: f64 = 0.05;
-
-/// Relative normal-equation residual at which each Hutchinson trace solve stops.
-///
-/// The solve `(A + ρI) w = z` supplies the per-probe `zᵀ(A+ρI)⁻¹z`; a residual
-/// this small is orders of magnitude below the stochastic Hutchinson error
-/// (variance `≈ v·tr` per [`EDOF_TRACE_VARIANCE_PER_UNIT_TRACE`]), so the
-/// per-solve bias never dominates — the same tolerance convention the crate's
-/// REML trace probes use elsewhere (`gam_linalg::pcg`, ≈1e-6 per-probe residual).
-const EDOF_TRACE_CG_RELATIVE_RESIDUAL: f64 = 1.0e-6;
 
 /// Matrix-free effective degrees of freedom `γ = tr(A(A+ρI)⁻¹)` of the shared-ρ
 /// code Gram `A = CᵀC`, via Hutchinson stochastic-trace probes solved with the
@@ -578,9 +777,14 @@ fn hutchinson_gram_edof(
     off: &HashMap<(u32, u32), f64>,
     rho: f64,
     k: usize,
-) -> f64 {
+) -> Result<f64, SparseDictionaryError> {
+    if !(rho.is_finite() && rho > 0.0) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!("trace ridge must be finite and positive; got {rho}"),
+        });
+    }
     if k == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
 
     // Symmetric coupling adjacency (sorted per atom for deterministic matvec),
@@ -623,23 +827,20 @@ fn hutchinson_gram_edof(
     let lambda_min = rho.max(DEAD_DENOM);
     let kappa_bound = (lambda_max_bound / lambda_min).max(1.0);
     let root = kappa_bound.sqrt();
-    let charge_floor = EDOF_TRACE_CG_RELATIVE_RESIDUAL;
-    let chebyshev = 0.5 * root * (2.0 * root / charge_floor).ln();
-    let finite = k.saturating_mul(2).saturating_add(16);
-    let cap = (chebyshev.max(0.0).ceil() as usize)
-        .saturating_add(16)
-        .min(finite)
-        .max(1);
+    let residual_tolerance = decoder_solve_relative_tolerance();
+    let chebyshev = 0.5 * root * (2.0 * root / residual_tolerance).ln();
+    let cap = (chebyshev.max(0.0).ceil() as usize).min(k).max(1);
 
     // Probe count derived from the documented variance target: m = ⌈2/v⌉.
     let m_probes = (2.0 / EDOF_TRACE_VARIANCE_PER_UNIT_TRACE).ceil() as usize;
     let m_probes = m_probes.max(1);
 
     // Deterministic per-probe Rademacher signs from the crate's canonical
-    // `splitmix64` mixer (NO `rand` crate): the seed is a content hash of the
-    // Gram diagonal, ρ, and K, so the estimate is reproducible across runs and
-    // moves with the problem. Mixing `probe · atom` gives independent ±1 draws.
-    let mut base_seed = gam_linalg::utils::splitmix64_hash((k as u64) ^ rho.to_bits());
+    // `splitmix64` mixer (NO `rand` crate): the probe bank is a content hash of
+    // the Gram and K, deliberately independent of rho. Every outer iteration
+    // therefore evaluates one deterministic fixed-point map rather than changing
+    // its Monte-Carlo sample with the optimization coordinate.
+    let mut base_seed = gam_linalg::utils::splitmix64_hash(k as u64);
     base_seed = gam_linalg::utils::splitmix64_hash(base_seed ^ (off.len() as u64).wrapping_add(1));
     for &d in diag.iter() {
         base_seed = gam_linalg::utils::splitmix64_hash(base_seed ^ d.to_bits());
@@ -647,20 +848,38 @@ fn hutchinson_gram_edof(
 
     let mut complementary_trace_acc = 0.0f64;
     for probe in 0..m_probes {
-        let probe_salt = gam_linalg::utils::splitmix64_hash(base_seed ^ (probe as u64).wrapping_add(1));
+        let probe_salt =
+            gam_linalg::utils::splitmix64_hash(base_seed ^ (probe as u64).wrapping_add(1));
         let mut z = vec![0.0f64; k];
         for (a, zi) in z.iter_mut().enumerate() {
             let h = gam_linalg::utils::splitmix64_hash(probe_salt ^ (a as u64).wrapping_add(1));
             // High bit of a well-mixed hash → an unbiased ±1 Rademacher draw.
             *zi = if h >> 63 == 0 { 1.0 } else { -1.0 };
         }
-        let result = cg_solve(&matvec, &z, charge_floor, cap);
+        let result = cg_solve(&matvec, &z, residual_tolerance, cap);
+        if result.stop != CgStop::Converged {
+            return Err(SparseDictionaryError::TraceNonConvergence {
+                rho,
+                probe,
+                iterations: result.iterations,
+                residual: result.relative_residual,
+                tolerance: residual_tolerance,
+            });
+        }
         // zᵀ(A+ρI)⁻¹z; ρ·zᵀ(A+ρI)⁻¹z is one sample of tr(ρ(A+ρI)⁻¹).
         let zt_minv_z: f64 = z.iter().zip(result.x.iter()).map(|(zi, wi)| zi * wi).sum();
         complementary_trace_acc += rho * zt_minv_z;
     }
     let complementary_trace = complementary_trace_acc / m_probes as f64;
-    (k as f64 - complementary_trace).clamp(0.0, k as f64)
+    let edof = k as f64 - complementary_trace;
+    if !(edof.is_finite() && (0.0..=k as f64).contains(&edof)) {
+        return Err(SparseDictionaryError::InvalidRemlEvidence {
+            reason: format!(
+                "Hutchinson effective dof must lie in [0, {k}]; got {edof} without clamping"
+            ),
+        });
+    }
+    Ok(edof)
 }
 
 /// Assemble ONLY the shared-ρ code Gram `A = CᵀC` (diagonal + strictly-upper
@@ -753,7 +972,7 @@ pub fn linear_block_reml_stats(
     x: ArrayView2<'_, f32>,
     fit: &SparseDictFit,
     rho: f64,
-) -> LinearBlockRemlStats {
+) -> Result<LinearBlockRemlStats, SparseDictionaryError> {
     linear_block_reml_stats_from_parts(
         x,
         fit.decoder.view(),
@@ -769,30 +988,27 @@ fn linear_block_reml_stats_from_parts(
     indices: ArrayView2<'_, u32>,
     codes: ArrayView2<'_, f32>,
     rho: f64,
-) -> LinearBlockRemlStats {
+) -> Result<LinearBlockRemlStats, SparseDictionaryError> {
     let k = decoder.nrows();
     let (diag, off) = code_gram_from_routing(indices, codes, k);
-    let gram_edof = hutchinson_gram_edof(&diag, &off, rho, k);
+    let gram_edof = hutchinson_gram_edof(&diag, &off, rho, k)?;
     let penalty_energy: f64 = decoder.iter().map(|&d| (d as f64) * (d as f64)).sum();
     let rss = reconstruction_rss_from_parts(x, decoder, indices, codes);
-    LinearBlockRemlStats {
+    Ok(LinearBlockRemlStats {
         gram_edof,
         p_cols: x.ncols(),
         penalty_energy,
         rss,
         n_obs: x.nrows(),
-    }
+    })
 }
 
-/// Relative-ρ stopping band for the shared-ρ REML schedule, DERIVED from the
-/// edof probe variance target: the Hutchinson estimator resolves a PSD trace to a
-/// coefficient of variation of at best `√v` (variance-per-unit-trace `v`, at unit
-/// trace; see [`EDOF_TRACE_VARIANCE_PER_UNIT_TRACE`]), so a relative-ρ change
-/// below `√v` is already within the stochastic resolution of the edof that drives
-/// the update — iterating tighter would chase Monte-Carlo noise. Not a tuned knob:
-/// it is `√v` of the one documented quality target.
-fn reml_schedule_rho_rel_tol() -> f64 {
-    EDOF_TRACE_VARIANCE_PER_UNIT_TRACE.sqrt()
+/// Log-rho stopping band for the shared-ρ REML schedule. A variance coordinate
+/// perturbs a quadratic criterion to second order at its fixed point, so the
+/// coordinate residual corresponding to an objective tolerance `ε` is `√ε`.
+/// The arithmetic floor prevents requesting distinctions below f64 resolution.
+fn reml_schedule_rho_log_tol(inner_tolerance: f64) -> f64 {
+    inner_tolerance.sqrt().max(f64::EPSILON.sqrt())
 }
 
 /// The shared-ρ REML schedule (design gam#2232, Increment 2, plug 4): the outer
@@ -805,14 +1021,15 @@ fn reml_schedule_rho_rel_tol() -> f64 {
 /// The initial ρ is the shared default ridge (`config.decoder_ridge`, equal to
 /// `config.code_ridge` on the shared-default entry) — the historical magic
 /// constant becomes only the WARM START of the evidence loop. Iteration stops
-/// when the relative ρ change falls below the solver-derived stochastic floor
-/// ([`reml_schedule_rho_rel_tol`]) — at which point the current fit already
+/// when the symmetric log-ρ change falls below the objective-derived floor
+/// ([`reml_schedule_rho_log_tol`]) — at which point the current fit already
 /// reflects a ρ within that band, so no redundant refit is issued. There is no
 /// fixed pass count: an unsettled outer iterate is work, not a model.
 pub fn run_linear_reml_schedule(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
 ) -> Result<SparseDictFit, SparseDictionaryError> {
+    validate(x, config)?;
     if config.code_ridge != config.decoder_ridge {
         return Err(SparseDictionaryError::invalid_input(format!(
             "fit_sparse_dictionary has one shared REML ridge, so code_ridge ({}) and \
@@ -820,10 +1037,44 @@ pub fn run_linear_reml_schedule(
             config.code_ridge, config.decoder_ridge
         )));
     }
+    let data_energy = x
+        .iter()
+        .map(|&value| (value as f64) * (value as f64))
+        .sum::<f64>();
+    if data_energy == 0.0 {
+        // Analytic null boundary: no variance component is identifiable because
+        // both signal and residual energy are exactly zero. The unique predictive
+        // function is nevertheless known (zero), so return that certified null
+        // model with rho at the null boundary instead of arbitrary seeded atoms.
+        let active = config.active.min(config.n_atoms).max(1);
+        let tolerance = reml_schedule_rho_log_tol(config.tolerance);
+        return Ok(SparseDictFit {
+            decoder: Array2::<f32>::zeros((config.n_atoms, x.ncols())),
+            indices: Array2::<u32>::zeros((x.nrows(), active)),
+            codes: Array2::<f32>::zeros((x.nrows(), active)),
+            explained_variance: 1.0,
+            epochs: 0,
+            convergence: SparseDictConvergence {
+                inner_ev_residual: 0.0,
+                inner_tolerance: config.tolerance,
+                decoder_residual: 0.0,
+                decoder_tolerance: config.tolerance,
+                routing_residual: 0.0,
+                routing_tolerance: config.tolerance,
+                outer_rho_residual: 0.0,
+                outer_tolerance: tolerance,
+                selected_rho: f64::INFINITY,
+                outer_iterations: 0,
+            },
+            active,
+            score_route_stats: ScoreRouteStats::default(),
+            decoder_solve_stats: DecoderSolveStats::default(),
+        });
+    }
     // Warm start at the caller's shared ridge; from here ρ is REML-selected.
     let mut rho = config.decoder_ridge as f64;
     let mut fit = run_linear_fast_kernel(x, config, rho)?;
-    let tol = reml_schedule_rho_rel_tol();
+    let tol = reml_schedule_rho_log_tol(config.tolerance);
     let mut outer_iterations = 0usize;
 
     loop {
@@ -834,33 +1085,35 @@ pub fn run_linear_reml_schedule(
             fit.indices.view(),
             fit.codes.view(),
             rho,
-        );
-        let rho_new = linear_shared_rho_fs_step(&stats, rho);
-        let rel_change = (rho_new - rho).abs() / rho.abs().max(f64::MIN_POSITIVE);
+        )?;
+        let rho_new = linear_shared_rho_fs_step(&stats, rho)?;
+        let log_change = (rho_new.ln() - rho.ln()).abs();
         // Per-iteration heartbeat on the warn channel (survives RUST_LOG=warn
         // harnesses), at outer-loop cadence only — never per row or minibatch.
         log::warn!(
-            "[SAE reml-schedule iter {}] rho={:.6e} rho_new={:.6e} rel_change={:.3e} \
+            "[SAE reml-schedule iter {}] rho={:.6e} rho_new={:.6e} log_change={:.3e} \
              edof={:.2} rss={:.6e} penalty_energy={:.6e} tol={:.3e}",
             outer_iterations,
             rho,
             rho_new,
-            rel_change,
+            log_change,
             stats.gram_edof,
             stats.rss,
             stats.penalty_energy,
             tol,
         );
-        if rel_change <= tol {
+        if log_change <= tol {
             // The current `fit` was produced at `rho`, which is within `tol` of
             // `rho_new`: it already reflects the fixed point. Stop without a
             // redundant refit.
             let convergence = SparseDictConvergence {
                 inner_ev_residual: fit.inner_ev_residual,
                 inner_tolerance: fit.inner_tolerance,
-                decoder_residual: fit.decoder_solve_stats.cg_relative_residual,
-                decoder_tolerance: fit.decoder_solve_stats.cg_residual_stop,
-                outer_rho_residual: rel_change,
+                decoder_residual: fit.decoder_fixed_point_residual,
+                decoder_tolerance: fit.inner_tolerance,
+                routing_residual: fit.routing_residual,
+                routing_tolerance: fit.inner_tolerance,
+                outer_rho_residual: log_change,
                 outer_tolerance: tol,
                 selected_rho: rho,
                 outer_iterations,
@@ -982,7 +1235,11 @@ pub(super) fn seed_decoder(x: ArrayView2<'_, f32>, k: usize) -> Array2<f32> {
                     |a, b| {
                         // Strictly-greater wins; on ties keep the lower index —
                         // exactly the serial scan's first-max semantics.
-                        if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) { b } else { a }
+                        if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                            b
+                        } else {
+                            a
+                        }
                     },
                 );
             bi
@@ -1103,6 +1360,14 @@ impl DecoderNormalEq {
 /// seeded direction so a later epoch can still route rows to them.
 pub(super) const DEAD_DENOM: f64 = 1.0e-12;
 
+/// Dimensionless residual target for the f64 normal-equation solve. This is the
+/// square root of unit roundoff: below it, the residual norm is dominated by the
+/// dot products used to evaluate that norm. Crucially it is independent of the
+/// REML ridge `ρ`; regularisation changes conditioning, never what “solved” means.
+fn decoder_solve_relative_tolerance() -> f64 {
+    f64::EPSILON.sqrt()
+}
+
 /// Percolation-derived size ceiling for the exact dense-Cholesky path.
 ///
 /// The co-firing graph is, at realistic scale, an Erdős–Rényi graph `G(K, p)`:
@@ -1153,8 +1418,8 @@ pub struct DecoderSolveStats {
     pub cg_kappa_hat: Option<f64>,
     /// Largest final relative normal-equation residual among CG solves.
     pub cg_relative_residual: f64,
-    /// Relative residual threshold used by CG, derived from the ridge/charge
-    /// floor rather than an arbitrary numerical tolerance.
+    /// Dimensionless relative residual threshold used by CG, derived solely from
+    /// f64 arithmetic precision and independent of the model ridge.
     pub cg_residual_stop: f64,
     /// Decoder columns whose CG did NOT reach the charge floor before the
     /// conditioning-derived iteration cap (or broke down on a non-SPD step).
@@ -1162,6 +1427,9 @@ pub struct DecoderSolveStats {
     /// ill-conditioned to solve to tolerance and fell back to the ridge-diagonal
     /// best effort — a TYPED non-convergence, surfaced instead of a silent spin.
     pub cg_nonconverged_columns: usize,
+    /// Dense SPD components whose Cholesky factorization failed. No bumped-ridge
+    /// or diagonal substitute is installed; a non-zero count forbids a fit.
+    pub dense_factorization_failures: usize,
     /// Largest a-priori Gershgorin condition-number bound over the CG-solved
     /// components. This is the `κ̂` that sets the derived iteration cap
     /// `⌈½√κ̂·ln(2√κ̂/ε)⌉` before any CG step runs, so an ill-conditioned block is
@@ -1182,6 +1450,7 @@ impl Default for DecoderSolveStats {
             cg_relative_residual: 0.0,
             cg_residual_stop: 0.0,
             cg_nonconverged_columns: 0,
+            dense_factorization_failures: 0,
             cg_kappa_bound: None,
         }
     }
@@ -1455,7 +1724,7 @@ pub(super) fn solve_decoder(
         } else {
             2.0 * eq.off.len() as f64 / k as f64
         },
-        cg_residual_stop: ridge.max(DEAD_DENOM),
+        cg_residual_stop: decoder_solve_relative_tolerance(),
         ..DecoderSolveStats::default()
     };
 
@@ -1580,7 +1849,10 @@ fn solve_component(
                 rhs[[i, c]] = eq.b[[a, c]];
             }
         }
-        let sol = cholesky_solve_block(&mat, &rhs);
+        let Some(sol) = cholesky_solve_block(&mat, &rhs) else {
+            stats.dense_factorization_failures += 1;
+            return;
+        };
         for (i, &a) in comp.iter().enumerate() {
             for c in 0..p {
                 decoder[[a, c]] = sol[[i, c]] as f32;
@@ -1605,7 +1877,7 @@ fn solve_component(
         }
         y
     };
-    let charge_floor = ridge.max(DEAD_DENOM);
+    let residual_tolerance = decoder_solve_relative_tolerance();
 
     // A-priori spectral bounds of the component operator M = A_sub + ρI via
     // Gershgorin discs over the stored (in-component) co-firing entries. M is SPD
@@ -1632,21 +1904,15 @@ fn solve_component(
     stats.record_kappa_bound(kappa_bound);
     let root = kappa_bound.sqrt();
     // ⌈½√κ·ln(2√κ/ε)⌉: CG's Chebyshev bound on the steps to reach relative 2-norm
-    // residual ε = charge_floor. The √κ inside the log is the A-norm→2-norm
+    // residual ε. The √κ inside the log is the A-norm→2-norm
     // residual correction, making this a genuine UPPER bound on the iterations
     // needed — a well-conditioned block still converges well inside it (no early
     // cut, since κ̂ ≥ κ), while a giant near-singular block is bounded instead of
-    // spinning. Exact CG also terminates in ≤ m steps; keep the historical +16
-    // round-off allowance and never exceed that finite-termination bound.
-    let chebyshev = 0.5 * root * (2.0 * root / charge_floor).ln();
-    let finite = m.saturating_mul(2).saturating_add(16);
-    let round_off_grace = 16usize;
-    let cap = (chebyshev.max(0.0).ceil() as usize)
-        .saturating_add(round_off_grace)
-        .min(finite)
-        .max(1);
+    // spinning. Exact CG terminates in at most `m` steps in exact arithmetic; a
+    // cap hit in floating point is typed non-convergence.
+    let chebyshev = 0.5 * root * (2.0 * root / residual_tolerance).ln();
+    let cap = (chebyshev.max(0.0).ceil() as usize).min(m).max(1);
 
-    let mut component_failed = false;
     for c in 0..p {
         let mut bvec = vec![0.0f64; m];
         let mut bnorm2 = 0.0f64;
@@ -1660,72 +1926,39 @@ fn solve_component(
             }
             continue;
         }
-        if component_failed {
-            // A prior column already proved this block un-solvable to tolerance;
-            // do not grind CG on every remaining column — take the ridge-diagonal
-            // best effort (exact if the block were decoupled) so the epoch still
-            // makes progress rather than repeating the same non-converging spin.
-            write_diagonal_column(decoder, eq, ridge, comp, c);
-            continue;
-        }
-        let result = cg_solve(&matvec, &bvec, charge_floor, cap);
+        let result = cg_solve(&matvec, &bvec, residual_tolerance, cap);
         stats.record_cg(&result);
         if result.stop == CgStop::Converged {
             for (i, &a) in comp.iter().enumerate() {
                 decoder[[a, c]] = result.x[i] as f32;
             }
         } else {
-            // TYPED non-convergence: the derived cap was hit or CG broke down on a
-            // non-SPD step for a near-singular block. Surface it loudly (once per
-            // component) and fall back to the ridge-diagonal solve for this and all
-            // remaining columns instead of a silent unbounded spin.
-            component_failed = true;
+            // The derived cap was hit or CG broke down. Keep the previous decoder
+            // column; the recorded failure forbids the enclosing optimizer from
+            // minting a model, with no diagonal substitute.
             log::warn!(
                 "[SAE CG] component size={m} did not converge: stop={:?} iters={} \
-                 rel_residual={:.3e} charge_floor={:.3e} kappa_bound={:.3e} cap={cap}; \
-                 falling back to ridge-diagonal for remaining columns",
+                 rel_residual={:.3e} residual_tolerance={:.3e} \
+                 kappa_bound={:.3e} cap={cap}",
                 result.stop,
                 result.iterations,
                 result.relative_residual,
-                charge_floor,
+                residual_tolerance,
                 kappa_bound,
             );
-            write_diagonal_column(decoder, eq, ridge, comp, c);
         }
     }
 }
 
-/// Ridge-diagonal best-effort solve of one decoder column over a component: the
-/// exact solve if the block were decoupled (`d_a = b_a / (A_aa + ρ)`), used as
-/// the honest fallback once matrix-free CG is known not to reach the charge floor
-/// on an ill-conditioned block.
-fn write_diagonal_column(
-    decoder: &mut Array2<f32>,
-    eq: &DecoderNormalEq,
-    ridge: f64,
-    comp: &[usize],
-    c: usize,
-) {
-    for &a in comp {
-        let denom = eq.diag[a] + ridge;
-        decoder[[a, c]] = if denom > DEAD_DENOM {
-            (eq.b[[a, c]] / denom) as f32
-        } else {
-            0.0
-        };
-    }
-}
-
 /// Why a CG solve returned. Only [`CgStop::Converged`] means the column reached
-/// the charge floor; the others are TYPED non-convergence the caller surfaces and
-/// falls back on rather than spinning.
+/// the precision-derived residual floor; every other status forbids a fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CgStop {
-    /// Relative normal-equation residual fell to/below the charge floor.
+    /// Relative normal-equation residual fell to/below the precision floor.
     Converged,
     /// A non-SPD / non-finite curvature step (`pᵀAp ≤ 0`) or a non-finite `β`.
     Breakdown,
-    /// The conditioning-derived iteration cap was hit before the charge floor.
+    /// The conditioning-derived iteration cap was hit before the residual floor.
     CapReached,
 }
 
@@ -1737,7 +1970,7 @@ struct CgSolveResult {
     stop: CgStop,
 }
 
-fn cg_solve<F>(matvec: &F, b: &[f64], charge_floor: f64, cap: usize) -> CgSolveResult
+fn cg_solve<F>(matvec: &F, b: &[f64], residual_tolerance: f64, cap: usize) -> CgSolveResult
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
@@ -1780,7 +2013,7 @@ where
         apply,
         &rhs.view(),
         &precond.view(),
-        charge_floor,
+        residual_tolerance,
         cap,
         0,
         true,
@@ -1849,36 +2082,15 @@ fn kappa_from_cg_tridiagonal(alphas: &[f64], betas: &[f64]) -> Option<f64> {
     }
 }
 
-/// Dense SPD solve `mat · X = rhs` (multiple RHS columns) via Cholesky, with the
-/// same tiny-ridge bump fallback as the per-row code solve for near-singular /
-/// exactly-collinear blocks, and a diagonal last resort.
-fn cholesky_solve_block(mat: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+/// Dense SPD solve `mat · X = rhs` (multiple RHS columns) via the stated matrix.
+/// A failed factorization is evidence that this subproblem was not solved; the
+/// caller records it and refuses convergence instead of changing the ridge.
+fn cholesky_solve_block(mat: &Array2<f64>, rhs: &Array2<f64>) -> Option<Array2<f64>> {
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerCholesky;
 
-    let m = mat.nrows();
-    let mut a = mat.clone();
-    let mut bump = 0.0f64;
-    for _attempt in 0..6 {
-        if let Ok(factor) = a.cholesky(Side::Lower) {
-            return factor.solve_mat(rhs);
-        }
-        bump = if bump == 0.0 { 1.0e-8 } else { bump * 16.0 };
-        a = mat.clone();
-        for i in 0..m {
-            a[[i, i]] += bump;
-        }
-    }
-    // Degenerate beyond recovery: per-row diagonal solve (independent atoms).
-    let p = rhs.ncols();
-    let mut out = Array2::<f64>::zeros((m, p));
-    for i in 0..m {
-        let d = mat[[i, i]].max(DEAD_DENOM);
-        for c in 0..p {
-            out[[i, c]] = rhs[[i, c]] / d;
-        }
-    }
-    out
+    let factor = mat.cholesky(Side::Lower).ok()?;
+    Some(factor.solve_mat(rhs))
 }
 
 pub(super) fn unit_norm_rows(decoder: &mut Array2<f32>) {
@@ -2438,12 +2650,16 @@ mod exact_solve_tests {
     fn cg_reports_cap_reached_when_iterations_exhausted() {
         // A spread SPD spectrum needs several CG steps; a cap of 1 must return the
         // TYPED `CapReached` (not a silent partial), with iterations == cap and a
-        // finite iterate — the signal the refresh uses to fall back instead of
-        // spinning.
+        // finite iterate — evidence the refresh propagates without substituting
+        // another solve.
         let eigenvalues = [1.0f64, 5.0, 25.0, 125.0, 625.0];
         let b = vec![1.0f64; eigenvalues.len()];
         let matvec = |x: &[f64]| -> Vec<f64> {
-            eigenvalues.iter().zip(x.iter()).map(|(&l, &xi)| l * xi).collect()
+            eigenvalues
+                .iter()
+                .zip(x.iter())
+                .map(|(&l, &xi)| l * xi)
+                .collect()
         };
         let result = cg_solve(&matvec, &b, 1.0e-12, 1);
         assert_eq!(result.stop, CgStop::CapReached);
@@ -2458,7 +2674,11 @@ mod exact_solve_tests {
         let eigenvalues = [1.0f64, -3.0, 2.0];
         let b = vec![1.0f64, 1.0, 1.0];
         let matvec = |x: &[f64]| -> Vec<f64> {
-            eigenvalues.iter().zip(x.iter()).map(|(&l, &xi)| l * xi).collect()
+            eigenvalues
+                .iter()
+                .zip(x.iter())
+                .map(|(&l, &xi)| l * xi)
+                .collect()
         };
         let result = cg_solve(&matvec, &b, 1.0e-12, 64);
         assert_eq!(result.stop, CgStop::Breakdown);
@@ -2474,10 +2694,9 @@ mod exact_solve_tests {
         // condition number is `~10⁴`. A GENERIC right-hand side excites the whole
         // spread spectrum (the worst case for CG), so reaching the 1e-9 charge
         // floor needs `~½√κ·ln(2/ε) ≈ 1.3e3` iterations — far beyond the derived
-        // cap `≤ 2m+16 = 416`. The solve must therefore (i) bound the iterations
+        // cap `≤ m`. The solve must therefore (i) bound the iterations
         // (no unbounded spin), (ii) report the large a-priori κ bound, (iii)
-        // register a TYPED non-convergence, and (iv) leave a FINITE decoder via the
-        // ridge-diagonal fallback.
+        // register a TYPED non-convergence, and (iv) never install a substitute.
         let k = 200usize;
         let p = 2usize;
         let diag = vec![1.0f64; k];
@@ -2503,7 +2722,10 @@ mod exact_solve_tests {
         let ridge = 1.0e-9f64;
         let stats = solve_decoder(&mut decoder, &eq, ridge);
 
-        assert_eq!(stats.max_component_size, k, "path graph is one giant component");
+        assert_eq!(
+            stats.max_component_size, k,
+            "path graph is one giant component"
+        );
         let kappa_bound = stats.cg_kappa_bound.expect("a-priori kappa bound recorded");
         assert!(
             kappa_bound > 1.0e6,
@@ -2514,13 +2736,13 @@ mod exact_solve_tests {
             "an under-resolved column must be a TYPED non-convergence, not a silent spin"
         );
         assert!(
-            stats.cg_iterations <= (2 * k + 16) * p,
+            stats.cg_iterations <= k * p,
             "iterations must be bounded by the derived cap, got {}",
             stats.cg_iterations
         );
         assert!(
             decoder.iter().all(|v| v.is_finite()),
-            "the ridge-diagonal fallback must leave a finite decoder"
+            "failed columns must leave the prior finite decoder untouched"
         );
     }
 
@@ -2600,21 +2822,26 @@ mod exact_solve_tests {
         };
         // γ_tot = 3·2.5 = 7.5; resid_dof = 24 − 7.5 = 16.5; σ̂² = 10/16.5;
         // ρ_new = 7.5·σ̂²/4 = 1.1363636363636365.
-        let rho_new = linear_shared_rho_fs_step(&stats, 1.0e-3);
+        let rho_new = linear_shared_rho_fs_step(&stats, 1.0e-3).expect("valid FS evidence");
         assert!(
             (rho_new - 1.136_363_636_363_636_5).abs() < 1.0e-12,
             "FS step must match the closed-form evidence fixed point, got {rho_new}"
         );
 
-        // Degenerate aggregates leave ρ unchanged (SPD-preserving guard):
-        // zero penalty energy, and non-positive effective dof.
-        let zero_energy = LinearBlockRemlStats { penalty_energy: 0.0, ..stats };
-        assert_eq!(linear_shared_rho_fs_step(&zero_energy, 7.0e-4), 7.0e-4);
-        let zero_edof = LinearBlockRemlStats { gram_edof: 0.0, ..stats };
-        assert_eq!(linear_shared_rho_fs_step(&zero_edof, 7.0e-4), 7.0e-4);
+        // Degenerate aggregates are typed errors. Returning the old rho would
+        // falsely report an exact outer fixed point.
+        let zero_energy = LinearBlockRemlStats {
+            penalty_energy: 0.0,
+            ..stats
+        };
+        assert!(linear_shared_rho_fs_step(&zero_energy, 7.0e-4).is_err());
+        let zero_edof = LinearBlockRemlStats {
+            gram_edof: 0.0,
+            ..stats
+        };
+        assert!(linear_shared_rho_fs_step(&zero_edof, 7.0e-4).is_err());
 
-        // All dof consumed (γ_tot ≥ N·P) floors the residual dof at 1 rather than
-        // dividing by a non-positive denominator, keeping ρ_new finite/positive.
+        // All dof consumed is invalid evidence, not a floored denominator.
         let saturated = LinearBlockRemlStats {
             gram_edof: 100.0,
             p_cols: 3,
@@ -2622,8 +2849,7 @@ mod exact_solve_tests {
             rss: 10.0,
             n_obs: 8,
         };
-        let rho_sat = linear_shared_rho_fs_step(&saturated, 1.0e-3);
-        assert!(rho_sat.is_finite() && rho_sat > 0.0, "saturated dof keeps ρ finite/positive");
+        assert!(linear_shared_rho_fs_step(&saturated, 1.0e-3).is_err());
     }
 
     /// Deterministic splitmix-backed uniform draw in `[0, 1)` (NO `rand` crate),
@@ -2657,10 +2883,7 @@ mod exact_solve_tests {
         for i in 0..k {
             m[[i, i]] += rho;
         }
-        let y = m
-            .cholesky(Side::Lower)
-            .expect("A+ρI is SPD")
-            .solve_mat(a);
+        let y = m.cholesky(Side::Lower).expect("A+ρI is SPD").solve_mat(a);
         (0..k).map(|i| y[[i, i]]).sum()
     }
 
@@ -2696,7 +2919,8 @@ mod exact_solve_tests {
 
         for &rho in &[1.0e-3_f64, 1.0e-1, 1.0] {
             let exact = exact_gram_edof(&a_dense, rho);
-            let approx = hutchinson_gram_edof(&diag, &off, rho, k);
+            let approx = hutchinson_gram_edof(&diag, &off, rho, k)
+                .expect("every trace probe must reach its residual certificate");
 
             // Derived tolerance: with `m = ⌈2/v⌉` probes and complementary trace
             // `c = K − γ`, the Rademacher estimator's standard error is at most
@@ -2727,8 +2951,8 @@ mod exact_solve_tests {
         // the schedule's loop body (fit → stats → FS step) so the test exercises
         // production math, and read the fixed point off at two noise levels.
         use super::{
-            linear_block_reml_stats, linear_shared_rho_fs_step, reml_schedule_rho_rel_tol,
-            run_linear_fast_kernel,
+            linear_block_reml_stats_from_parts, linear_shared_rho_fs_step,
+            reml_schedule_rho_log_tol, run_linear_fast_kernel,
         };
 
         // Planted 2-sparse mixture over K orthonormal-ish atoms + additive noise.
@@ -2783,9 +3007,17 @@ mod exact_solve_tests {
             let mut last_rel = f64::INFINITY;
             for _ in 0..16 {
                 let fit = run_linear_fast_kernel(x, &config, rho).expect("kernel fit");
-                let stats = linear_block_reml_stats(x, &fit, rho);
-                let rho_new = linear_shared_rho_fs_step(&stats, rho);
-                last_rel = (rho_new - rho).abs() / rho.abs().max(f64::MIN_POSITIVE);
+                let stats = linear_block_reml_stats_from_parts(
+                    x,
+                    fit.decoder.view(),
+                    fit.indices.view(),
+                    fit.codes.view(),
+                    rho,
+                )
+                .expect("trace evidence");
+                let rho_new =
+                    linear_shared_rho_fs_step(&stats, rho).expect("valid FS evidence");
+                last_rel = (rho_new.ln() - rho.ln()).abs();
                 rho = rho_new;
             }
             (rho, last_rel)
@@ -2805,7 +3037,7 @@ mod exact_solve_tests {
         // Settled = the last relative move is within the schedule's derived
         // stopping band (the stochastic edof floor √v); iterating tighter would
         // chase Monte-Carlo noise, so this IS convergence for this estimator.
-        let band = reml_schedule_rho_rel_tol();
+        let band = reml_schedule_rho_log_tol(config.tolerance);
         assert!(
             rel_low <= band && rel_high <= band,
             "FS fixed point must settle within the derived stopping band {band}: \
@@ -2949,8 +3181,20 @@ mod exact_solve_tests {
         // REML-selected shared ρ: the new default schedule.
         let reml = run_linear_reml_schedule(x_train.view(), &config).expect("reml schedule fit");
 
-        let magic_ev = held_out_ev(magic.decoder.view(), x_test.view(), s, tile, config.code_ridge);
-        let reml_ev = held_out_ev(reml.decoder.view(), x_test.view(), s, tile, config.code_ridge);
+        let magic_ev = held_out_ev(
+            magic.decoder.view(),
+            x_test.view(),
+            s,
+            tile,
+            config.code_ridge,
+        );
+        let reml_ev = held_out_ev(
+            reml.decoder.view(),
+            x_test.view(),
+            s,
+            tile,
+            config.code_ridge,
+        );
 
         // REML must MATCH-OR-BEAT the magic ridge on held-out EV (small epsilon
         // absorbs f32 routing noise); it selects the ridge by evidence rather than

@@ -343,15 +343,39 @@ def _metrics_from_predictions(
     pred: np.ndarray,
     sigma: np.ndarray | float | None = None,
 ) -> dict[str, typing.Any]:
-    return dict(
-        rust_module().benchmark_prediction_metrics(
-            family,
-            [float(v) for v in np.asarray(y_test, dtype=float).reshape(-1)],
-            [float(v) for v in np.asarray(pred, dtype=float).reshape(-1)],
-            [float(v) for v in np.asarray(y_train, dtype=float).reshape(-1)],
-            _sigma_payload(sigma),
+    rust = rust_module()
+    observed = [float(v) for v in np.asarray(y_test, dtype=float).reshape(-1)]
+    predicted = [float(v) for v in np.asarray(pred, dtype=float).reshape(-1)]
+    if family == "binomial":
+        train_prev = float(np.asarray(y_train, dtype=float).mean())
+        return dict(rust.classification_metrics(observed, predicted, train_prev))
+    if family != "gaussian":
+        raise ValueError(f"unsupported prediction-metric family: {family}")
+
+    sigma_values = _sigma_payload(sigma)
+    if sigma_values is not None:
+        scores = dict(
+            rust.gaussian_prediction_scores_from_predictions(
+                observed,
+                predicted,
+                sigma_values,
+            )
         )
-    )
+        if scores["r2"] is None:
+            scores["r2"] = 0.0
+        return {
+            key: scores[key]
+            for key in ("r2", "rmse", "mae", "mse", "logloss")
+        }
+
+    diagnostics = dict(rust.diagnostics_from_predictions(observed, predicted))["metrics"]
+    rmse = float(diagnostics["rmse"])
+    return {
+        "r2": float(diagnostics.get("r_squared", 0.0)),
+        "rmse": rmse,
+        "mae": float(diagnostics["mae"]),
+        "mse": rmse * rmse,
+    }
 
 
 def run_gamfit(

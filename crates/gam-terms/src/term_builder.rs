@@ -329,6 +329,7 @@ pub fn build_termspec(
             ParsedTerm::Linear {
                 name,
                 explicit,
+                double_penalty,
                 coefficient_min,
                 coefficient_max,
             } => {
@@ -347,7 +348,7 @@ pub fn build_termspec(
                         categorical_levels: vec![],
                         // Only the intercept is structurally unpenalized by
                         // default; REML may shrink an unsupported slope to zero.
-                        double_penalty: true,
+                        double_penalty: *double_penalty,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: *coefficient_min,
                         coefficient_max: *coefficient_max,
@@ -360,7 +361,7 @@ pub fn build_termspec(
                                 feature_col: col,
                                 feature_cols: vec![col],
                                 categorical_levels: vec![],
-                                double_penalty: true,
+                                double_penalty: *double_penalty,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
                                 coefficient_max: *coefficient_max,
@@ -394,6 +395,7 @@ pub fn build_termspec(
                 min,
                 max,
                 prior,
+                double_penalty,
             } => {
                 let col = resolve_col(col_map, name)?;
                 let auto_kind = ds.column_kinds.get(col).copied().ok_or_else(|| {
@@ -412,7 +414,7 @@ pub fn build_termspec(
                     feature_col: col,
                     feature_cols: vec![col],
                     categorical_levels: vec![],
-                    double_penalty: true,
+                    double_penalty: *double_penalty,
                     coefficient_geometry: LinearCoefficientGeometry::Bounded {
                         min: *min,
                         max: *max,
@@ -615,7 +617,10 @@ pub fn build_termspec(
                     "logslope(...) declarations must be resolved by the marginal-slope formula path before building a term spec",
                 ));
             }
-            ParsedTerm::Interaction { vars } => {
+            ParsedTerm::Interaction {
+                vars,
+                double_penalty,
+            } => {
                 // A linear `:` interaction realizes one design column equal to
                 // the elementwise product of its operands. Numeric (continuous/
                 // binary) operands multiply directly; a categorical operand is
@@ -713,7 +718,7 @@ pub fn build_termspec(
                         feature_cols: numeric_cols,
                         categorical_levels: vec![],
                         // Interactions are recoverable as zero by default.
-                        double_penalty: true,
+                        double_penalty: *double_penalty,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: None,
                         coefficient_max: None,
@@ -795,7 +800,7 @@ pub fn build_termspec(
                             feature_col,
                             feature_cols: numeric_cols.clone(),
                             categorical_levels,
-                            double_penalty: true,
+                            double_penalty: *double_penalty,
                             coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                             coefficient_min: None,
                             coefficient_max: None,
@@ -2203,10 +2208,9 @@ pub fn build_smooth_basis(
             // shrinkage twin) are penalized cubic-regression smooths that span
             // the same per-axis function space as gamfit's `bspline` (cubic
             // B-spline, second-derivative penalty). Route both through the
-            // 1-D B-spline arm; the only semantic difference is whether the
-            // null space is shrunk: `cr` is the no-shrinkage form (mgcv's
-            // default) and `cs` is the shrinkage form (mgcv's `cs`/gamfit's
-            // double_penalty). Without this route, a stand-alone
+            // 1-D B-spline arm. Both recover unsupported null-space effects by
+            // default; `double_penalty=false` is the explicit unpenalized
+            // opt-out. Without this route, a stand-alone
             // `s(x, bs='cr')` (which is otherwise a routine 1-D smooth in
             // mgcv-compatible formulae) reached the dispatch's default arm
             // and aborted the whole fit with `unsupported smooth type 'cr'`,
@@ -2676,12 +2680,15 @@ pub fn build_smooth_basis(
             if centers < 2 {
                 return Err("curvature smooth requires at least 2 centers".to_string());
             }
+            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                spatial_center_strategy_for_dimension(centers, cols.len())
+            } else {
+                auto_spatial_center_strategy(centers, cols.len())
+            };
             Ok(SmoothBasisSpec::ConstantCurvature {
                 feature_cols: cols.to_vec(),
                 spec: ConstantCurvatureBasisSpec {
-                    center_strategy: CenterStrategy::FarthestPoint {
-                        num_centers: centers,
-                    },
+                    center_strategy,
                     kappa,
                     kappa_fixed,
                     // 0.0 sentinel = κ-independent auto initialization in the
@@ -2770,6 +2777,11 @@ pub fn build_smooth_basis(
             if centers < 3 {
                 return Err("measurejet smooth requires at least 3 centers".to_string());
             }
+            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+                spatial_center_strategy_for_dimension(centers, cols.len())
+            } else {
+                auto_spatial_center_strategy(centers, cols.len())
+            };
             // Multiscale (per-scale spectral split + (α, lnτ) ψ dials + the
             // affine-preserving ridge) is an explicit opt-in (#1116): default
             // single-scale at any center count, the Duchon/Matérn footprint.
@@ -2782,9 +2794,7 @@ pub fn build_smooth_basis(
             Ok(SmoothBasisSpec::MeasureJet {
                 feature_cols: cols.to_vec(),
                 spec: MeasureJetBasisSpec {
-                    center_strategy: CenterStrategy::FarthestPoint {
-                        num_centers: centers,
-                    },
+                    center_strategy,
                     order_s,
                     alpha,
                     tau0,
@@ -3202,8 +3212,8 @@ pub fn build_smooth_basis(
             // Tensor-product contract (#1082). `te(x1, x2, ...)` ALWAYS builds a
             // genuine anisotropic tensor product of per-margin bases (the arm
             // below), exactly as mgcv's `te()` does — one smoothing parameter per
-            // margin, a marginal-Kronecker-sum penalty, and the bilinear null
-            // space left unpenalized under the default `select = FALSE`. A margin
+            // margin, a marginal-Kronecker-sum penalty, and a separate default
+            // function-space ridge on the joint polynomial null space. A margin
             // vector `bs=c('tp','tp')` requests a thin-plate FUNCTION SPACE per
             // axis; the tensor realizes each axis as a 1-D penalized B-spline
             // margin spanning that same per-axis space (tp/ps/cr/bs/cc all share
@@ -3477,20 +3487,15 @@ pub fn build_smooth_basis(
                     };
                     (knotspec, OneDimensionalBoundary::Open, None)
                 };
-                // A `cr` margin fixes cubic regression geometry; the cr builder
-                // reads only the knot set + `double_penalty`. Enable null-space
-                // shrinkage for an explicit `cs` margin. B-spline margins keep
-                // the resolved effective degree / penalty order with no extra
-                // null-space penalty (mgcv `select = FALSE` tensor default).
-                let is_cr_margin =
-                    matches!(knotspec, BSplineKnotSpec::NaturalCubicRegression { .. });
-                let margin_double_penalty =
-                    is_cr_margin && matches!(per_axis_bs[axis].as_deref(), Some("cs"));
+                // Margins contribute only their roughness operators. The tensor
+                // builder constructs exactly one joint function-space null
+                // penalty, avoiding unused per-margin ridge candidates and
+                // duplicate λ coordinates.
                 margins.push(BSplineBasisSpec {
                     degree: effective_degree,
                     penalty_order: effective_penalty_order,
                     knotspec,
-                    double_penalty: margin_double_penalty,
+                    double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
                     boundary,
                     boundary_conditions: BSplineBoundaryConditions::default(),
@@ -4913,6 +4918,106 @@ mod tests {
         }
     }
 
+    fn build_two_dimensional_spatial_basis(
+        ds: &Dataset,
+        selector: &str,
+        count_option: Option<&str>,
+    ) -> SmoothBasisSpec {
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), selector.to_string());
+        if let Some(option) = count_option {
+            options.insert(option.to_string(), "7".to_string());
+        }
+        let mut notes = Vec::new();
+        build_smooth_basis(
+            SmoothKind::S,
+            &["x".to_string(), "z".to_string()],
+            &[1, 2],
+            &options,
+            ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to build {selector} with count option {count_option:?}: {error}")
+        })
+    }
+
+    fn curvature_or_measurejet_center_strategy(basis: &SmoothBasisSpec) -> &CenterStrategy {
+        match basis {
+            SmoothBasisSpec::ConstantCurvature { spec, .. } => &spec.center_strategy,
+            SmoothBasisSpec::MeasureJet { spec, .. } => &spec.center_strategy,
+            other => panic!("expected curvature or measure-jet basis, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn curvature_and_measurejet_omitted_counts_retain_auto_provenance() {
+        let ds = continuous_dataset(
+            &["y", "x", "z"],
+            (0..64)
+                .map(|i| {
+                    let x = i as f64 / 63.0;
+                    let z = ((i * 17) % 64) as f64 / 63.0;
+                    vec![x.sin() + z.cos(), x, z]
+                })
+                .collect(),
+        );
+        let expected = default_num_centers(ds.values.nrows(), 2);
+
+        for selector in ["curv", "mjs"] {
+            let basis = build_two_dimensional_spatial_basis(&ds, selector, None);
+            let strategy = curvature_or_measurejet_center_strategy(&basis);
+            assert!(
+                matches!(strategy, CenterStrategy::Auto(_)),
+                "an omitted count on {selector} must retain Auto provenance, got {strategy:?}",
+            );
+            assert_eq!(
+                strategy.planned_num_centers(2),
+                expected,
+                "Auto provenance must preserve {selector}'s resolved default count",
+            );
+        }
+    }
+
+    #[test]
+    fn curvature_and_measurejet_explicit_count_aliases_remain_pinned() {
+        let ds = continuous_dataset(
+            &["y", "x", "z"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    let z = ((i * 11) % 32) as f64 / 31.0;
+                    vec![x - z, x, z]
+                })
+                .collect(),
+        );
+
+        for selector in ["curv", "mjs"] {
+            for alias in [
+                "centers",
+                "k",
+                "basis_dim",
+                "basis-dim",
+                "basisdim",
+                "knots",
+            ] {
+                let basis = build_two_dimensional_spatial_basis(&ds, selector, Some(alias));
+                let strategy = curvature_or_measurejet_center_strategy(&basis);
+                assert!(
+                    !matches!(strategy, CenterStrategy::Auto(_)),
+                    "explicit {alias}= on {selector} must remain pinned, got {strategy:?}",
+                );
+                assert_eq!(
+                    strategy.planned_num_centers(2),
+                    7,
+                    "explicit {alias}= must remain the exact {selector} center count",
+                );
+            }
+        }
+    }
+
     /// #1378: the DEFAULT univariate `s(x, bs="tp")` must build a *modest*
     /// mgcv-sized basis, not the n-scaled spatial heuristic. The oversized
     /// default basis left the two-penalty REML ρ-surface with a flat valley
@@ -5570,10 +5675,8 @@ mod tests {
                 })
                 .collect(),
         );
-        let parsed = parse_formula(
-            "y ~ x + bounded(z, min=-2, max=2) + x:z",
-        )
-        .expect("parse linear defaults");
+        let parsed = parse_formula("y ~ x + bounded(z, min=-2, max=2) + x:z")
+            .expect("parse linear defaults");
         let mut notes = Vec::new();
         let terms = build_termspec(
             &parsed.terms,
@@ -5585,16 +5688,40 @@ mod tests {
         .expect("build linear defaults");
         assert!(!terms.linear_terms.is_empty());
         assert!(
-            terms
-                .linear_terms
-                .iter()
-                .all(|term| term.double_penalty),
+            terms.linear_terms.iter().all(|term| term.double_penalty),
             "every non-intercept linear effect must be shrinkable by default: {:?}",
             terms
                 .linear_terms
                 .iter()
                 .map(|term| (&term.name, term.double_penalty))
                 .collect::<Vec<_>>()
+        );
+
+        for formula in [
+            "y ~ linear(x, double_penalty=false)",
+            "y ~ bounded(z, min=-2, max=2, double_penalty=false)",
+            "y ~ linear(x:z, double_penalty=false)",
+        ] {
+            let parsed = parse_formula(formula).expect("parse explicit linear opt-out");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &ds.column_map(),
+                &mut notes,
+                &gam_runtime::resource::ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|error| panic!("{formula} must build: {error}"));
+            assert_eq!(terms.linear_terms.len(), 1, "{formula}");
+            assert!(
+                !terms.linear_terms[0].double_penalty,
+                "{formula} must preserve the explicit MLE opt-out"
+            );
+        }
+
+        assert!(
+            parse_formula("y ~ linear(x, double_penalty=ture)").is_err(),
+            "a misspelled opt-out must be rejected instead of silently using the default"
         );
     }
 
@@ -5624,8 +5751,7 @@ mod tests {
                     &gam_runtime::resource::ResourcePolicy::default_library(),
                 )
                 .unwrap_or_else(|error| panic!("{formula} must build: {error}"));
-                let SmoothBasisSpec::TensorBSpline { spec, .. } =
-                    &terms.smooth_terms[0].basis
+                let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis
                 else {
                     panic!("{formula} must lower to TensorBSpline");
                 };

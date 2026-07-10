@@ -245,10 +245,8 @@ pub(crate) struct FlexThirdRowBase {
     pub(crate) beta_w: Option<Array1<f64>>,
     pub(crate) entry_cached: CachedPartitionCells,
     pub(crate) exit_cached: CachedPartitionCells,
-    pub(crate) entry_base:
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
-    pub(crate) exit_base:
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+    pub(crate) entry_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+    pub(crate) exit_base: crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
 }
 
 pub(crate) struct CachedCellEntry {

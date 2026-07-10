@@ -72,6 +72,9 @@ use crate::fit_orchestration::{
 };
 use crate::model_types::EstimationError;
 use crate::multinomial_reml::MultinomialFamily;
+use crate::multinomial_posterior::{
+    MultinomialPosteriorIntegrationControl, integrate_multinomial_design_moments,
+};
 use crate::penalized_vector_glm::{
     PenalizedVectorGlmInputs, VectorGlmResume, VectorGlmSolve, fit_penalized_vector_glm,
 };
@@ -540,88 +543,33 @@ impl MultinomialFitOutputs {
         self.coefficients_active.nrows()
     }
 
-    /// Evaluate `softmax(X·β̂)` AND its delta-method per-class probability
-    /// standard error at fresh design rows `X_new` (#1101), using the joint
-    /// Laplace covariance [`Self::coefficient_covariance`].
-    ///
-    /// The softmax Jacobian is `∂p_c/∂η_b = p_c (δ_{cb} − p_b)` for active class
-    /// `b ∈ 0..M`, and `∂η_b/∂β[i,a] = X[i]·δ_{ab}`, so the gradient of the
-    /// class-`c` probability w.r.t. the block-ordered coefficient vector is
-    /// `g_c[a·P + i] = X[i]·p_c (δ_{ca} − p_a)` (the reference class `M`
-    /// contributes only through `−p_a` in every active block). The delta-method
-    /// variance is `Var(p_c) = g_cᵀ Σ g_c` with `Σ = H⁻¹`, and
-    /// `SE(p_c) = √Var(p_c)`. Returns `(probs (N,K), prob_se (N,K))`. `X_new`
-    /// must have `P` columns (the same design basis used at fit time); its row
-    /// count sets `N`. The SE is unclamped (the interval consumer applies the
-    /// simplex `[0,1]` clamp).
+    /// Integrate the logistic-normal coefficient posterior at fresh design rows.
+    /// Returns posterior-mean class probabilities and their exact-under-the-
+    /// quadrature marginal standard deviations. The full joint coefficient
+    /// covariance, including cross-class blocks, is contracted into each row's
+    /// active-logit covariance before deterministic adaptive integration.
     pub fn predict_probabilities_with_se(
         &self,
         x_new: ArrayView2<'_, f64>,
     ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
-        let p = self.p_per_class();
-        let m = self.n_active_classes();
-        let k = m + 1;
-        if x_new.ncols() != p {
-            crate::bail_invalid_estim!(
-                "predict_probabilities_with_se: X has {} cols, expected P={p}",
-                x_new.ncols()
-            );
-        }
-        let d = p * m;
-        let cov = &self.coefficient_covariance;
-        if cov.dim() != (d, d) {
-            crate::bail_invalid_estim!(
-                "predict_probabilities_with_se: covariance shape {:?} ≠ (P·M, P·M) = ({d}, {d})",
-                cov.dim()
-            );
-        }
-        let n_new = x_new.nrows();
-        let beta = &self.coefficients_active;
-        let mut probs = Array2::<f64>::zeros((n_new, k));
-        let mut prob_se = Array2::<f64>::zeros((n_new, k));
-        let mut eta_active = vec![0.0_f64; m];
-        let mut row_probs = vec![0.0_f64; k];
-        let mut grad = vec![0.0_f64; d];
-        for row in 0..n_new {
-            for a in 0..m {
-                let mut v = 0.0_f64;
-                for i in 0..p {
-                    v += x_new[[row, i]] * beta[[i, a]];
-                }
-                eta_active[a] = v;
-            }
-            MultinomialLogitLikelihood::softmax_with_baseline(&eta_active, &mut row_probs);
-            for c in 0..k {
-                probs[[row, c]] = row_probs[c];
-            }
-            for c in 0..k {
-                let pc = row_probs[c];
-                // g_c[a·P + i] = X[i] · p_c · (δ_{ca} − p_a), a active.
-                for a in 0..m {
-                    let pa = row_probs[a];
-                    let factor = pc * (if c == a { 1.0 - pa } else { -pa });
-                    let base = a * p;
-                    for i in 0..p {
-                        grad[base + i] = x_new[[row, i]] * factor;
-                    }
-                }
-                // Var = gᵀ Σ g.
-                let mut var = 0.0_f64;
-                for r in 0..d {
-                    let gr = grad[r];
-                    if gr == 0.0 {
-                        continue;
-                    }
-                    let mut acc = 0.0_f64;
-                    for s in 0..d {
-                        acc += cov[[r, s]] * grad[s];
-                    }
-                    var += gr * acc;
-                }
-                prob_se[[row, c]] = var.max(0.0).sqrt();
-            }
-        }
-        Ok((probs, prob_se))
+        self.predict_probabilities_with_se_and_control(
+            x_new,
+            &MultinomialPosteriorIntegrationControl::default(),
+        )
+    }
+
+    pub fn predict_probabilities_with_se_and_control(
+        &self,
+        x_new: ArrayView2<'_, f64>,
+        control: &MultinomialPosteriorIntegrationControl,
+    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
+        let moments = integrate_multinomial_design_moments(
+            self.coefficients_active.view(),
+            self.coefficient_covariance.view(),
+            x_new,
+            control,
+        )?;
+        Ok((moments.class_mean, moments.class_standard_deviation))
     }
 }
 
@@ -1571,12 +1519,11 @@ pub struct MultinomialSavedModel {
     /// match the stacked active-class coefficient vector `β = [β_0; …; β_{K-2}]`
     /// (class `a`'s `P` coefficients occupy rows/cols `a·P .. (a+1)·P`). This is
     /// the Laplace covariance the REML driver already computes from the factored
-    /// penalized Hessian; storing it gives the predict path delta-method
-    /// per-class probability standard errors and the summary its Wald
-    /// smooth-term tests. Flattened row-major over the `(P·M)×(P·M)` matrix.
-    /// `None` for a model fitted before covariance was surfaced.
-    #[serde(default)]
-    pub coefficient_covariance_flat: Option<Vec<f64>>,
+    /// penalized Hessian; storing it makes posterior-mean prediction and its
+    /// integrated uncertainty well-defined. Flattened row-major over the
+    /// `(P·M)×(P·M)` matrix. This is required by the versioned persistence
+    /// schema: a payload without covariance is not a usable multinomial model.
+    pub coefficient_covariance_flat: Vec<f64>,
     /// Joint coefficient-space influence matrix `F = H⁻¹ X'WX` (#1101),
     /// block-ordered identically to [`Self::coefficient_covariance_flat`].
     /// Its per-term diagonal block trace is the term's effective degrees of
@@ -1661,60 +1608,98 @@ fn penalty_component_label(info: Option<&PenaltyBlockInfo>, pen_idx: usize) -> S
 }
 
 impl MultinomialSavedModel {
+    pub fn validate(&self) -> Result<(), EstimationError> {
+        if self.p_per_class == 0 || self.n_active_classes == 0 {
+            crate::bail_invalid_estim!(
+                "multinomial saved model dimensions must be nonzero, got P={} and K-1={}",
+                self.p_per_class,
+                self.n_active_classes,
+            );
+        }
+        if self.class_levels.len() != self.n_active_classes + 1 {
+            crate::bail_invalid_estim!(
+                "multinomial saved model has {} class levels but K-1={}",
+                self.class_levels.len(),
+                self.n_active_classes,
+            );
+        }
+        if self.reference_class_index != self.n_active_classes {
+            crate::bail_invalid_estim!(
+                "multinomial saved reference index {} does not equal the final class index {}",
+                self.reference_class_index,
+                self.n_active_classes,
+            );
+        }
+        let d = self
+            .p_per_class
+            .checked_mul(self.n_active_classes)
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "multinomial saved coefficient dimension overflowed usize".to_string(),
+                )
+            })?;
+        if self.coefficients_flat.len() != d {
+            crate::bail_invalid_estim!(
+                "multinomial saved model has {} coefficient values, expected {d}",
+                self.coefficients_flat.len(),
+            );
+        }
+        let covariance_len = d.checked_mul(d).ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "multinomial saved covariance dimension overflowed usize".to_string(),
+            )
+        })?;
+        if self.coefficient_covariance_flat.len() != covariance_len {
+            crate::bail_invalid_estim!(
+                "multinomial saved model has {} covariance values, expected {covariance_len}",
+                self.coefficient_covariance_flat.len(),
+            );
+        }
+        if let Some((index, value)) = self
+            .coefficients_flat
+            .iter()
+            .chain(self.coefficient_covariance_flat.iter())
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            crate::bail_invalid_estim!(
+                "multinomial saved numeric payload is non-finite at combined index {index}: {value}"
+            );
+        }
+        Ok(())
+    }
+
     /// Active-class coefficient block as an `(P, K-1)` `ndarray` view.
-    pub fn coefficients_active(&self) -> Array2<f64> {
+    pub fn coefficients_active(&self) -> Result<Array2<f64>, EstimationError> {
         Array2::from_shape_vec(
             (self.p_per_class, self.n_active_classes),
             self.coefficients_flat.clone(),
         )
-        .expect(
-            "MultinomialSavedModel.coefficients_flat length must equal p_per_class * n_active_classes",
-        )
-    }
-
-    /// Evaluate `softmax(X · β)` at fresh data rows. `X_new` must have
-    /// `self.p_per_class` columns (i.e. it was built from the same
-    /// `resolved_termspec` as fit time). Returns an `(N_new, K)` matrix
-    /// with rows summing to 1; column order matches `self.class_levels`.
-    pub fn predict_probabilities(&self, x_new: ArrayView2<'_, f64>) -> Array2<f64> {
-        let n_new = x_new.nrows();
-        let p = self.p_per_class;
-        let m = self.n_active_classes;
-        let k = m + 1;
-        assert_eq!(
-            x_new.ncols(),
-            p,
-            "MultinomialSavedModel.predict_probabilities: X has {} cols, expected {p}",
-            x_new.ncols()
-        );
-        let beta = self.coefficients_active();
-        let mut probs = Array2::<f64>::zeros((n_new, k));
-        let mut eta_active = vec![0.0_f64; m];
-        let mut row_probs = vec![0.0_f64; k];
-        for row in 0..n_new {
-            for a in 0..m {
-                let mut v = 0.0_f64;
-                for i in 0..p {
-                    v += x_new[[row, i]] * beta[[i, a]];
-                }
-                eta_active[a] = v;
-            }
-            MultinomialLogitLikelihood::softmax_with_baseline(&eta_active, &mut row_probs);
-            for c in 0..k {
-                probs[[row, c]] = row_probs[c];
-            }
-        }
-        probs
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "multinomial saved coefficient payload is inconsistent with P x (K-1): {error}"
+            ))
+        })
     }
 
     /// Reconstruct the joint posterior covariance `H⁻¹` as a `(P·M)×(P·M)`
     /// `ndarray`, block-ordered to match the stacked coefficient vector
-    /// `θ[a·P + i] = β[i, a]` (#1101). `None` when the model was fitted before
-    /// covariance was surfaced (legacy payload).
-    pub fn coefficient_covariance(&self) -> Option<Array2<f64>> {
-        let d = self.p_per_class.checked_mul(self.n_active_classes)?;
-        let flat = self.coefficient_covariance_flat.as_ref()?;
-        Array2::from_shape_vec((d, d), flat.clone()).ok()
+    /// `θ[a·P + i] = β[i, a]` (#1101).
+    pub fn coefficient_covariance(&self) -> Result<Array2<f64>, EstimationError> {
+        let d = self
+            .p_per_class
+            .checked_mul(self.n_active_classes)
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "multinomial saved covariance dimension overflowed usize".to_string(),
+                )
+            })?;
+        Array2::from_shape_vec((d, d), self.coefficient_covariance_flat.clone()).map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "multinomial saved covariance payload is inconsistent with (P*(K-1)) squared: {error}"
+            ))
+        })
     }
 
     /// Reconstruct the joint influence matrix `F = H⁻¹ X'WX` as a
@@ -1726,64 +1711,43 @@ impl MultinomialSavedModel {
         Array2::from_shape_vec((d, d), flat.clone()).ok()
     }
 
-    /// Evaluate `softmax(X·β)` AND its delta-method per-class probability
-    /// standard error at fresh data rows (#1101).
-    ///
-    /// For active classes `b ∈ 0..M` the softmax Jacobian is
-    /// `∂p_c/∂η_b = p_c (δ_{cb} − p_b)`, and `∂η_b/∂β[i,a] = X[i]·δ_{ab}`, so the
-    /// gradient of class-`c` probability w.r.t. the block-ordered coefficient
-    /// vector is `g_c[a·P + i] = X[i]·p_c (δ_{ca} − p_a)` (active `a`; the
-    /// reference class `M` contributes `p_c(0 − p_a)` via every active block).
-    /// The delta-method variance is `Var(p_c) = g_cᵀ Σ g_c` with `Σ = H⁻¹` the
-    /// joint posterior covariance, and `SE(p_c) = √Var(p_c)`. Returns
-    /// `(probs (N,K), prob_se (N,K))`; `prob_se` is `None` when no covariance is
-    /// stored. The simplex `[0,1]` clamp is applied by the interval consumer, not
-    /// here (the SE itself is unclamped).
+    /// Default posterior-mean class probabilities. This integrates
+    /// `softmax(eta)` under the per-row Gaussian predictor posterior rather than
+    /// evaluating softmax at the coefficient mode.
+    pub fn predict_probabilities(
+        &self,
+        x_new: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        self.predict_probabilities_with_se(x_new)
+            .map(|(mean, _)| mean)
+    }
+
+    /// Posterior-mean class probabilities and integrated marginal standard
+    /// deviations at fresh design rows.
     pub fn predict_probabilities_with_se(
         &self,
         x_new: ArrayView2<'_, f64>,
-    ) -> (Array2<f64>, Option<Array2<f64>>) {
-        let probs = self.predict_probabilities(x_new);
-        let Some(cov) = self.coefficient_covariance() else {
-            return (probs, None);
-        };
-        let n_new = x_new.nrows();
-        let p = self.p_per_class;
-        let m = self.n_active_classes;
-        let k = m + 1;
-        let d = p * m;
-        let mut prob_se = Array2::<f64>::zeros((n_new, k));
-        let mut grad = vec![0.0_f64; d];
-        for row in 0..n_new {
-            let prow = probs.row(row);
-            for c in 0..k {
-                let pc = prow[c];
-                // g_c[a·P + i] = X[i] · p_c · (δ_{ca} − p_a), a active.
-                for a in 0..m {
-                    let pa = prow[a];
-                    let factor = pc * (if c == a { 1.0 - pa } else { -pa });
-                    let base = a * p;
-                    for i in 0..p {
-                        grad[base + i] = x_new[[row, i]] * factor;
-                    }
-                }
-                // Var = gᵀ Σ g.
-                let mut var = 0.0_f64;
-                for r in 0..d {
-                    let gr = grad[r];
-                    if gr == 0.0 {
-                        continue;
-                    }
-                    let mut acc = 0.0_f64;
-                    for s in 0..d {
-                        acc += cov[[r, s]] * grad[s];
-                    }
-                    var += gr * acc;
-                }
-                prob_se[[row, c]] = var.max(0.0).sqrt();
-            }
-        }
-        (probs, Some(prob_se))
+    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
+        self.predict_probabilities_with_se_and_control(
+            x_new,
+            &MultinomialPosteriorIntegrationControl::default(),
+        )
+    }
+
+    pub fn predict_probabilities_with_se_and_control(
+        &self,
+        x_new: ArrayView2<'_, f64>,
+        control: &MultinomialPosteriorIntegrationControl,
+    ) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
+        let coefficients = self.coefficients_active()?;
+        let covariance = self.coefficient_covariance()?;
+        let moments = integrate_multinomial_design_moments(
+            coefficients.view(),
+            covariance.view(),
+            x_new,
+            control,
+        )?;
+        Ok((moments.class_mean, moments.class_standard_deviation))
     }
 
     /// Wood (2013) rank-truncated Wald smooth-significance test per
@@ -1801,13 +1765,15 @@ impl MultinomialSavedModel {
         let mut out = Vec::new();
         let p = self.p_per_class;
         let m = self.n_active_classes;
-        let Some(cov) = self.coefficient_covariance() else {
+        let Ok(cov) = self.coefficient_covariance() else {
             return out;
         };
         if self.smooth_term_spans.is_empty() {
             return out;
         }
-        let beta = self.coefficients_active();
+        let Ok(beta) = self.coefficients_active() else {
+            return out;
+        };
         // Block-ordered θ = [β_0; …; β_{M-1}], θ[a·P + i] = β[i, a].
         let d = p * m;
         let mut theta = Array1::<f64>::zeros(d);
@@ -1868,10 +1834,9 @@ impl MultinomialSavedModel {
 
     /// Draw `n_draws` posterior-predictive replicate class assignments at fresh
     /// rows (#1101). Each draw independently samples every row's class from
-    /// `Categorical(p_row)` with `p = softmax(X·β̂)` — the plug-in predictive
-    /// distribution, i.e. the multinomial observation noise wrapped around the
-    /// fitted mean (the categorical analogue of the scalar families'
-    /// `sample_replicates`). The returned `(n_draws, N)` matrix holds class
+    /// `Categorical(p_row)` with `p = E[softmax(eta) | data]`, so coefficient
+    /// uncertainty is integrated before adding categorical observation noise.
+    /// The returned `(n_draws, N)` matrix holds class
     /// INDICES `0..K`, aligned to [`Self::class_levels`]. The draw stream is a
     /// `StdRng` seeded by `seed`, so `(x_new, n_draws, seed)` reproduce
     /// bit-identically — the engine for posterior-predictive checks and
@@ -1882,9 +1847,9 @@ impl MultinomialSavedModel {
         x_new: ArrayView2<'_, f64>,
         n_draws: usize,
         seed: u64,
-    ) -> Array2<u32> {
+    ) -> Result<Array2<u32>, EstimationError> {
         use rand::{RngExt, SeedableRng};
-        let probs = self.predict_probabilities(x_new);
+        let probs = self.predict_probabilities(x_new)?;
         let n = probs.nrows();
         let k = probs.ncols();
         let mut out = Array2::<u32>::zeros((n_draws, n));
@@ -1905,7 +1870,7 @@ impl MultinomialSavedModel {
                 out[[d, row]] = chosen as u32;
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -1938,16 +1903,18 @@ pub struct MultinomialModelEnvelope {
 
 impl MultinomialModelEnvelope {
     /// Wrap a fitted model with the canonical `model_class` tag.
-    pub fn new(saved: MultinomialSavedModel) -> Self {
-        Self {
+    pub fn new(saved: MultinomialSavedModel) -> Result<Self, EstimationError> {
+        saved.validate()?;
+        Ok(Self {
             model_class: MULTINOMIAL_MODEL_CLASS.to_string(),
             format_version: MULTINOMIAL_MODEL_FORMAT_VERSION,
             saved,
-        }
+        })
     }
 
     /// Serialize to the canonical JSON byte payload.
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, EstimationError> {
+        self.saved.validate()?;
         serde_json::to_vec(self).map_err(|err| {
             EstimationError::InvalidInput(format!("failed to serialize multinomial model: {err}"))
         })
@@ -1972,6 +1939,7 @@ impl MultinomialModelEnvelope {
                 envelope.format_version, MULTINOMIAL_MODEL_FORMAT_VERSION,
             )));
         }
+        envelope.saved.validate()?;
         Ok(envelope)
     }
 }
@@ -2808,7 +2776,11 @@ pub fn fit_penalized_multinomial_formula(
     // to RAW units (see below) so it pairs with the raw predict design; the
     // influence is kept in the fitted basis (the Wald table only slices penalized
     // columns, which the standardization affine leaves identity-mapped).
-    let expected_joint = p_per_class.saturating_mul(m);
+    let expected_joint = p_per_class.checked_mul(m).ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "multinomial posterior covariance dimension overflowed usize".to_string(),
+        )
+    })?;
     // The joint Hessian (and thus `H⁻¹`) was assembled in the STANDARDIZED
     // parametric basis used during fitting, while the saved coefficients and the
     // raw predict design are in raw units. Map the covariance to raw units with
@@ -2856,7 +2828,12 @@ pub fn fit_penalized_multinomial_formula(
             }
             let cov_raw = a_joint.dot(cov_std).dot(&a_joint.t());
             cov_raw.iter().copied().collect::<Vec<f64>>()
-        });
+        })
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "multinomial REML converged without the required {expected_joint}x{expected_joint} joint posterior covariance"
+            ))
+        })?;
     // The influence matrix `F = H⁻¹ X'WX = H⁻¹(H − S_λ) = I − H⁻¹ S_λ`. The
     // exact-Newton multinomial blocks carry no IRLS pseudo-data, so the generic
     // inference path does not export `coefficient_influence`; reconstruct it
@@ -3046,14 +3023,15 @@ pub fn predict_multinomial_formula(
     model: &MultinomialSavedModel,
     data: &EncodedDataset,
 ) -> Result<Array2<f64>, EstimationError> {
+    model.validate()?;
     let x_dense = build_multinomial_predict_design(model, data)?;
-    Ok(model.predict_probabilities(x_dense.view()))
+    model.predict_probabilities(x_dense.view())
 }
 
 /// Draw `n_draws` posterior-predictive replicate class-label assignments for a
 /// saved multinomial model on fresh data (#1101). Rebuilds the predict design
 /// exactly as [`predict_multinomial_formula`], then samples each row's class
-/// from `Categorical(softmax(X·β̂))` (see
+/// from `Categorical(E[softmax(η) | data])` (see
 /// [`MultinomialSavedModel::sample_replicate_classes`]). Returns an
 /// `(n_draws, N)` matrix of class INDICES `0..K` aligned to `model.class_levels`,
 /// deterministic in `seed`.
@@ -3066,23 +3044,60 @@ pub fn posterior_predict_multinomial_formula(
     if n_draws == 0 {
         crate::bail_invalid_estim!("multinomial posterior_predict: n_draws must be >= 1");
     }
+    model.validate()?;
     let x_dense = build_multinomial_predict_design(model, data)?;
-    Ok(model.sample_replicate_classes(x_dense.view(), n_draws, seed))
+    model.sample_replicate_classes(x_dense.view(), n_draws, seed)
 }
 
-/// Predict class probabilities AND delta-method per-class probability standard
-/// errors for a saved multinomial model on fresh data (#1101). Replays the
-/// saved termspec to build the predict design exactly as
-/// [`predict_multinomial_formula`], then applies the softmax-Jacobian delta
-/// method against the stored joint posterior covariance. Returns
-/// `(probs (N,K), prob_se (N,K) | None)`; `prob_se` is `None` for a legacy
-/// model fitted before covariance was surfaced.
+/// Predict posterior-mean class probabilities and integrated marginal
+/// standard deviations for a saved multinomial model on fresh data.
 pub fn predict_multinomial_formula_with_se(
     model: &MultinomialSavedModel,
     data: &EncodedDataset,
-) -> Result<(Array2<f64>, Option<Array2<f64>>), EstimationError> {
+) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
+    model.validate()?;
     let x_dense = build_multinomial_predict_design(model, data)?;
-    Ok(model.predict_probabilities_with_se(x_dense.view()))
+    model.predict_probabilities_with_se(x_dense.view())
+}
+
+#[derive(Debug, Clone)]
+pub struct MultinomialPredictionIntervals {
+    pub mean: Array2<f64>,
+    pub standard_error: Array2<f64>,
+    pub mean_lower: Array2<f64>,
+    pub mean_upper: Array2<f64>,
+    pub level: f64,
+}
+
+/// Build simplex-clamped normal moment intervals around the integrated
+/// logistic-normal posterior mean. Both center and spread come from the same
+/// deterministic posterior integral; no plug-in/delta quantity enters.
+pub fn predict_multinomial_formula_with_intervals(
+    model: &MultinomialSavedModel,
+    data: &EncodedDataset,
+    level: f64,
+) -> Result<MultinomialPredictionIntervals, EstimationError> {
+    if !(level.is_finite() && level > 0.0 && level < 1.0) {
+        crate::bail_invalid_estim!(
+            "multinomial prediction interval level must be finite and in (0, 1), got {level}"
+        );
+    }
+    let (mean, standard_error) = predict_multinomial_formula_with_se(model, data)?;
+    let z = gam_math::probability::standard_normal_quantile(0.5 + 0.5 * level)
+        .map_err(EstimationError::InvalidInput)?;
+    let mut mean_lower = mean.clone();
+    let mut mean_upper = mean.clone();
+    for ((row, class), &se) in standard_error.indexed_iter() {
+        mean_lower[[row, class]] = (mean[[row, class]] - z * se).clamp(0.0, 1.0);
+        mean_upper[[row, class]] = (mean[[row, class]] + z * se).clamp(0.0, 1.0);
+    }
+    Ok(MultinomialPredictionIntervals {
+        mean,
+        standard_error,
+        mean_lower,
+        mean_upper,
+        level,
+    })
 }
 
 #[cfg(test)]

@@ -68,11 +68,7 @@ fn make_dataset(n: usize) -> gam_data::EncodedDataset {
     let headers = vec!["x1".to_string(), "x2".to_string(), "y".to_string()];
     let rows: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x1[i].to_string(),
-                x2[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x1[i].to_string(), x2[i].to_string(), y[i].to_string()])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -161,4 +157,3 @@ fn matern_cold_design_does_not_collapse_and_k_has_effect_1629() {
          the #1629 basis-collapse must not depend on the Matérn smoothness order"
     );
 }
-

@@ -153,6 +153,7 @@ fn gam_rmst(model: &FittedModel, dataset: &EncodedDataset, grid: &[f64], tau: f6
         noise_offset: &noise_offset,
         time_grid: Some(grid),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
     let result = predict_survival(request).expect("RMST capability: predict survival surface");
     let rmst = result

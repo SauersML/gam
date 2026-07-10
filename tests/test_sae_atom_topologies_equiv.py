@@ -8,7 +8,6 @@ from gamfit._sae_manifold import (  # noqa: E402
     _basis_to_topology,
     _canonical_basis_kind,
     _canonical_topology,
-    _topologies_for_bases,
     _topology_for_bases,
     rust_module,
 )
@@ -31,7 +30,9 @@ from gamfit._sae_manifold import (  # noqa: E402
     ],
 )
 def test_python_topology_helpers_consume_rust_schema(bases, expected_scalar, expected_per_atom):
-    assert _topologies_for_bases(bases) == expected_per_atom
+    scalar, per_atom = rust_module().sae_atom_topologies(bases)
+    assert per_atom == expected_per_atom
+    assert scalar == expected_scalar
     assert _topology_for_bases(bases) == expected_scalar
 
 

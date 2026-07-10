@@ -71,7 +71,9 @@ pub mod model_types {
 pub mod inference;
 
 pub mod fit_orchestration;
+pub mod latent_coordinate;
 pub mod protocol;
+pub mod response_geometry;
 
 pub mod binomial_multi;
 pub mod block_layout;
@@ -88,6 +90,7 @@ pub(crate) mod location_scale_engine;
 pub mod marginal_slope_orthogonal;
 pub mod marginal_slope_shared;
 pub mod multinomial;
+pub mod multinomial_posterior;
 pub(crate) mod multinomial_reml;
 pub mod outer_subsample;
 pub mod parameter_block;

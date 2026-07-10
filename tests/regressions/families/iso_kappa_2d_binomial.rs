@@ -119,10 +119,10 @@ fn fit_geo_matern(n: usize, num_centers: usize) -> Result<Array1<f64>, String> {
     let offset = Array1::zeros(n);
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights,
-        offset,
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(weights),
+        offset: std::sync::Arc::new(offset),
         spec: matern_2d_spec(num_centers),
         family: LikelihoodSpec::new(
             ResponseFamily::Binomial,
@@ -135,7 +135,6 @@ fn fit_geo_matern(n: usize, num_centers: usize) -> Result<Array1<f64>, String> {
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }))
     .map_err(|e| format!("{e:?}"))?;
     match result {

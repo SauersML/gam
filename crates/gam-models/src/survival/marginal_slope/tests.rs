@@ -5,9 +5,9 @@ use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 use crate::survival::marginal_slope::flex_oracle_structs_tests::{
     SurvivalFlexTimepointBiDirectionalExact, SurvivalFlexTimepointDirectionalExact,
 };
-use gam_linalg::matrix::{DenseDesignMatrix, SymmetricMatrix};
 use approx::assert_relative_eq;
 use faer::sparse::{SparseColMat, Triplet};
+use gam_linalg::matrix::{DenseDesignMatrix, SymmetricMatrix};
 use ndarray::array;
 
 /// Local scalar closeness assertion used throughout this module's exactness
@@ -560,7 +560,8 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
             offset_entry: Array1::zeros(2),
             offset_exit: Array1::zeros(2),
             derivative_offset_exit: Array1::zeros(2),
-            time_monotonicity: crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            time_monotonicity:
+                crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
             ..base_time_block()
         },
         timewiggle_block: None,
@@ -1110,10 +1111,8 @@ fn rigid_row_kernel_propagates_invalid_nonfinite_signed_margin_errors() {
     );
 
     let err =
-        <SurvivalMarginalSlopeRowKernel as crate::row_kernel::RowKernel<4>>::row_kernel(
-            &kernel, 0,
-        )
-        .expect_err("row kernel should propagate exact probit boundary failures");
+        <SurvivalMarginalSlopeRowKernel as crate::row_kernel::RowKernel<4>>::row_kernel(&kernel, 0)
+            .expect_err("row kernel should propagate exact probit boundary failures");
     assert!(err.contains("non-finite signed margin"));
 }
 
@@ -1144,10 +1143,8 @@ fn rigid_row_kernel_propagates_nan_signed_margin_errors() {
     );
 
     let err =
-        <SurvivalMarginalSlopeRowKernel as crate::row_kernel::RowKernel<4>>::row_kernel(
-            &kernel, 0,
-        )
-        .expect_err("row kernel should propagate NaN probit boundary failures");
+        <SurvivalMarginalSlopeRowKernel as crate::row_kernel::RowKernel<4>>::row_kernel(&kernel, 0)
+            .expect_err("row kernel should propagate NaN probit boundary failures");
     assert!(err.contains("non-finite signed margin"));
 }
 
@@ -3623,9 +3620,7 @@ fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
         ExactOuterDerivativeOrder::Second
     );
     assert!(
-        gam_solve::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(
-            50_001, 2, 32,
-        )
+        gam_solve::estimate::reml::reml_outer_engine::prefer_outer_hessian_operator(50_001, 2, 32,)
     );
     assert_eq!(gradient, gam_problem::Derivative::Analytic);
     assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
@@ -5253,12 +5248,12 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
         derivative_guard: 1e-4,
-        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, 1,
-        )))),
-        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, 1,
-        )))),
+        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::zeros((1, 1)),
+        )),
+        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::zeros((1, 1)),
+        )),
         design_derivative_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::ones((1, 1)),
         )),
@@ -5324,8 +5319,12 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
         derivative_guard: 1e-4,
-        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0]])),
-        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0]])),
+        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0
+        ]])),
+        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0
+        ]])),
         design_derivative_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             array![[1.0]],
         )),
@@ -5384,12 +5383,12 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
         derivative_guard: 1e-4,
-        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            2, 2,
-        )))),
-        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            2, 2,
-        )))),
+        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::zeros((2, 2)),
+        )),
+        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::zeros((2, 2)),
+        )),
         design_derivative_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             array![[1.0, 2.0], [3.0, 4.0]],
         )),
@@ -5500,7 +5499,9 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0, 0.0
+        ]])),
         offset: Array1::zeros(1),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -5575,7 +5576,9 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
 #[test]
 fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
     let constraints = time_derivative_guard_constraints(
-        &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0, 1.0]])),
+        &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            1.0, 1.0
+        ]])),
         &array![0.0],
         1.0,
     )
@@ -5734,7 +5737,9 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         logslope_surface_ranges: empty_logslope_surface_ranges(),
         time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
             time_derivative_guard_constraints(
-                &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+                &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+                    1.0, 0.0
+                ]])),
                 &array![1e-6],
                 1e-6,
             )
@@ -5755,7 +5760,9 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            1.0, 0.0
+        ]])),
         offset: Array1::zeros(1),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -5798,8 +5805,12 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
         derivative_guard: 1e-6,
-        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0]])),
-        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0]])),
+        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0
+        ]])),
+        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0
+        ]])),
         // qd1 = 1.0 · β[0] + 0.0 · β[1] + offset
         design_derivative_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             array![[1.0, 0.0]],
@@ -5828,7 +5839,9 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0, 0.0]])),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0, 0.0
+        ]])),
         offset: Array1::zeros(1),
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
@@ -5877,8 +5890,12 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         score_covariance: unit_score_covariance(),
         gaussian_frailty_sd: None,
         derivative_guard: 1e-6,
-        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0]])),
-        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[0.0]])),
+        design_entry: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0
+        ]])),
+        design_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+            0.0
+        ]])),
         design_derivative_exit: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             array![[1.0]],
         )),
@@ -5967,7 +5984,9 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         link_dev: None,
         influence_absorber: None,
         time_linear_constraints: time_derivative_guard_constraints(
-            &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
+            &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+                1.0, 0.0
+            ]])),
             &array![0.2],
             1e-4,
         )

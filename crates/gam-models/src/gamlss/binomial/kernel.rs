@@ -852,8 +852,8 @@ mod packed_scalar_oracle_tests {
     //! replaced — value/grad/Hessian for `Order2`, the contracted third for
     //! `OneSeed`, the contracted fourth for `TwoSeed`.
     use super::*;
-    use gam_problem::{InverseLink, StandardLink};
     use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+    use gam_problem::{InverseLink, StandardLink};
 
     fn rel_close(a: f64, b: f64, label: &str) {
         let band = 1e-9 + 1e-9 * a.abs().max(b.abs());
@@ -1016,9 +1016,7 @@ mod simd_directional_bit_identity_tests {
     /// hot paths now evaluate the directional contractions through the SIMD
     /// lane-batched kernels.
     #[inline]
-    fn binomial_location_scale_nll_generic_from_core_row<
-        S: gam_math::jet_scalar::JetScalar<2>,
-    >(
+    fn binomial_location_scale_nll_generic_from_core_row<S: gam_math::jet_scalar::JetScalar<2>>(
         y: f64,
         weight: f64,
         core: &BinomialLocationScaleCore,
@@ -1100,9 +1098,8 @@ mod simd_directional_bit_identity_tests {
                 let weights = Array1::from_iter((0..n).map(|_| rng.val().abs() + 0.3));
                 let eta_t = Array1::from_iter((0..n).map(|_| rng.val()));
                 let eta_ls = Array1::from_iter((0..n).map(|_| rng.val() * 0.5));
-                let core =
-                    binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, link)
-                        .expect("core");
+                let core = binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, link)
+                    .expect("core");
 
                 let d_eta_t = Array1::from_iter((0..n).map(|_| rng.val()));
                 let d_eta_ls = Array1::from_iter((0..n).map(|_| rng.val()));
@@ -1136,7 +1133,14 @@ mod simd_directional_bit_identity_tests {
 
                 // ---- Second directional (TwoSeed contracted fourth) ----
                 let (tt2, tl2, ll2) = binomial_location_scalesecond_directional_coefficients(
-                    &y, &weights, &core, &d_eta_t, &d_eta_ls, &d_eta_t_v, &d_eta_ls_v, link,
+                    &y,
+                    &weights,
+                    &core,
+                    &d_eta_t,
+                    &d_eta_ls,
+                    &d_eta_t_v,
+                    &d_eta_ls_v,
+                    link,
                 )
                 .expect("second directional");
                 for i in 0..n {
@@ -1162,6 +1166,9 @@ mod simd_directional_bit_identity_tests {
             }
         }
         assert!(tail_seen, "tail (n % 4 != 0) never exercised");
-        assert!(compared >= 1000, "expected >=1000 comparisons, got {compared}");
+        assert!(
+            compared >= 1000,
+            "expected >=1000 comparisons, got {compared}"
+        );
     }
 }

@@ -344,13 +344,19 @@ pub(crate) fn build_refusal_report_from_hessian(
 ) -> Result<SurvivalKktRefusalReport, String> {
     let p = m.nrows();
     if m.ncols() != p {
-        return Err(format!("kkt_refusal: M is {}x{}, must be square", p, m.ncols()));
+        return Err(format!(
+            "kkt_refusal: M is {}x{}, must be square",
+            p,
+            m.ncols()
+        ));
     }
     if g.len() != p {
         return Err(format!("kkt_refusal: g len {} != M dim {p}", g.len()));
     }
     if !step.is_finite() || step <= 0.0 {
-        return Err(format!("kkt_refusal: step must be finite and positive, got {step}"));
+        return Err(format!(
+            "kkt_refusal: step must be finite and positive, got {step}"
+        ));
     }
     let (evals, evecs) = m
         .eigh(Side::Lower)
@@ -358,7 +364,11 @@ pub(crate) fn build_refusal_report_from_hessian(
     // `eigh` yields ascending eigenvalues with eigenvectors in matching
     // columns, but do not rely on that ordering — sort an index permutation.
     let mut order: Vec<usize> = (0..p).collect();
-    order.sort_by(|&a, &b| evals[a].partial_cmp(&evals[b]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        evals[a]
+            .partial_cmp(&evals[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let eigenvalues_ascending: Vec<f64> = order.iter().map(|&i| evals[i]).collect();
     let lambda_min = eigenvalues_ascending.first().copied().unwrap_or(0.0);
     let lambda_max = eigenvalues_ascending.last().copied().unwrap_or(0.0);
@@ -438,8 +448,7 @@ pub(crate) fn survival_kkt_refusal_report_from_designs(
     s_total: &Array2<f64>,
     step: f64,
 ) -> Result<SurvivalKktRefusalReport, String> {
-    let (m, g) =
-        assemble_joint_penalized_hessian_and_score(designs, row_hess, row_grad, s_total)?;
+    let (m, g) = assemble_joint_penalized_hessian_and_score(designs, row_hess, row_grad, s_total)?;
     build_refusal_report_from_hessian(&m, &g, step)
 }
 

@@ -30,8 +30,8 @@
 //! [`binomial_q_derivs`], [`binomial_q_coeffs`], [`validation`],
 //! [`weighted_design_products`], [`row_linalg`], and [`joint_packing`].
 
-use gam_terms::basis::{BasisOptions, PenaltyInfo, PenaltySource};
 use gam_problem::MIN_WEIGHT;
+use gam_terms::basis::{BasisOptions, PenaltyInfo, PenaltySource};
 
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
@@ -57,9 +57,7 @@ use crate::location_scale_engine::build_location_scale_exact_joint_setup;
 
 use crate::parameter_block::ParameterBlockInput;
 
-use crate::scale_design::{
-    build_scale_deviation_operator, build_scale_deviation_transform_design,
-};
+use crate::scale_design::{build_scale_deviation_operator, build_scale_deviation_transform_design};
 
 use crate::sigma_link::{
     LOGB_SIGMA_FLOOR, SigmaJet1, exp_sigma_derivs_up_to_fourth_scalar,
@@ -89,20 +87,22 @@ use gam_linalg::matrix::SymmetricMatrix;
 
 use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
 
-use gam_solve::mixture_link::{inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link};
+use gam_solve::mixture_link::{
+    inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
+};
 
 use gam_solve::pirls::LinearInequalityConstraints;
 
 use crate::probability::{normal_logcdf, normal_logsf, standard_normal_quantile};
 
-use gam_terms::smooth::{
-    BlockwisePenalty, PenaltyBlockInfo, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec,
-};
 use crate::fit_orchestration::drivers::{
     ExactJointHyperSetup, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_dims_per_term,
     spatial_length_scale_term_indices,
+};
+use gam_terms::smooth::{
+    BlockwisePenalty, PenaltyBlockInfo, SpatialLengthScaleOptimizationOptions,
+    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
 };
 // #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
 use gam_terms::smooth::build_term_collection_design;

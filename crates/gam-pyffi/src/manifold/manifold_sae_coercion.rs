@@ -53,7 +53,13 @@ pub(crate) fn canonical_n_harmonics(
 pub(crate) fn column_mean(x: ArrayView2<'_, f64>) -> Vec<f64> {
     let (n, p) = x.dim();
     (0..p)
-        .map(|j| if n == 0 { 0.0 } else { x.column(j).sum() / n as f64 })
+        .map(|j| {
+            if n == 0 {
+                0.0
+            } else {
+                x.column(j).sum() / n as f64
+            }
+        })
         .collect()
 }
 
@@ -250,6 +256,48 @@ pub(crate) fn canonical_topology(name: &str) -> String {
     basis_to_topology(&canonical_basis_kind(name))
 }
 
+/// Structural coordinate periods for a fitted basis. `None` marks an open
+/// axis; finite values are the chart's exact wrap period.
+fn coordinate_periods_for_basis(
+    basis: &str,
+    latent_dim: usize,
+) -> Result<Vec<Option<f64>>, String> {
+    let kind = canonical_basis_kind(basis);
+    match kind.as_str() {
+        "periodic" | "torus" => Ok(vec![Some(1.0); latent_dim]),
+        "cylinder" if latent_dim == 2 => Ok(vec![Some(1.0), None]),
+        "sphere" if latent_dim == 2 => Ok(vec![None, Some(std::f64::consts::TAU)]),
+        // The Möbius chart is represented on its double cover: angle period 2,
+        // open width axis. Deck invariance lives in the basis parity.
+        "mobius" if latent_dim == 2 => Ok(vec![Some(2.0), None]),
+        "cylinder" | "sphere" | "mobius" => Err(format!(
+            "{kind} atoms require latent dimension 2; got {latent_dim}"
+        )),
+        _ => Ok(vec![None; latent_dim]),
+    }
+}
+
+/// Python bridge for the complete dictionary's structural chart periods.
+#[pyfunction]
+pub(crate) fn sae_coordinate_periods(
+    basis_kinds: Vec<String>,
+    atom_dims: Vec<usize>,
+) -> PyResult<Vec<Vec<Option<f64>>>> {
+    if basis_kinds.len() != atom_dims.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "basis_kinds and atom_dims must have equal length; got {} and {}",
+            basis_kinds.len(),
+            atom_dims.len()
+        )));
+    }
+    basis_kinds
+        .iter()
+        .zip(atom_dims)
+        .map(|(basis, dim)| coordinate_periods_for_basis(basis, dim))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
 /// Assignment family implied by the public flat-block gating vocabulary.
 pub(crate) fn flat_block_assignment(gating: &str) -> Result<&'static str, String> {
     match canon_name(gating).as_str() {
@@ -306,7 +354,10 @@ pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {
 /// with the exact production kernel used by the Rust fit. This deletes the
 /// former NumPy reimplementation (including its independently-maintained IBP
 /// exponent) from `gamfit.distill`.
-#[pyfunction(signature = (logits, assignment, temperature, alpha, threshold))]
+#[pyfunction(signature = (
+    logits, assignment, temperature, alpha, threshold,
+    learnable_alpha=false, log_lambda_sparse=None, top_k=None
+))]
 pub(crate) fn sae_activation_matrix_from_logits<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray2<'py, f64>,
@@ -314,13 +365,62 @@ pub(crate) fn sae_activation_matrix_from_logits<'py>(
     temperature: f64,
     alpha: f64,
     threshold: f64,
+    learnable_alpha: bool,
+    log_lambda_sparse: Option<f64>,
+    top_k: Option<usize>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let kind = canonical_assignment_kind(assignment)
-        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    let kind =
+        canonical_assignment_kind(assignment).map_err(pyo3::exceptions::PyValueError::new_err)?;
     if kind == "ibp_map" && !(alpha.is_finite() && alpha > 0.0) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "alpha must be finite and positive; got {alpha}"
         )));
+    }
+    let effective_alpha = if kind == "ibp_map" && learnable_alpha {
+        let rho = log_lambda_sparse.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "learnable IBP activation requires terminal log_lambda_sparse",
+            )
+        })?;
+        if !rho.is_finite() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "log_lambda_sparse must be finite; got {rho}"
+            )));
+        }
+        gam::terms::sae::manifold::resolve_learnable_weight(alpha, rho)
+    } else {
+        alpha
+    };
+    if kind == "topk" {
+        let support = top_k.ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "topk activation requires the fitted top_k support size",
+            )
+        })?;
+        let logits = logits.as_array();
+        let (n_rows, k_atoms) = logits.dim();
+        if support == 0 || support > k_atoms {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "top_k must be in [1, K={k_atoms}]; got {support}"
+            )));
+        }
+        if let Some(((row, atom), value)) =
+            logits.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "assignment logits contain non-finite value at ({row}, {atom}): {value}"
+            )));
+        }
+        let mut values = Array2::<f64>::zeros((n_rows, k_atoms));
+        for row in 0..n_rows {
+            values
+                .row_mut(row)
+                .assign(&gam::terms::sae::assignment::topk_row(
+                    logits.row(row),
+                    support,
+                ));
+        }
+        return Ok(values.into_pyarray(py).unbind());
     }
     if kind == "threshold_gate" && !threshold.is_finite() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -331,7 +431,7 @@ pub(crate) fn sae_activation_matrix_from_logits<'py>(
         logits.as_array(),
         kind,
         temperature,
-        alpha,
+        effective_alpha,
         threshold,
     )
     .map(|values| values.into_pyarray(py).unbind())
@@ -339,16 +439,12 @@ pub(crate) fn sae_activation_matrix_from_logits<'py>(
 }
 
 /// Per-atom topology labels for a resolved bases list (`basis_specs` order).
-/// Mirrors `_topologies_for_bases`.
 pub(crate) fn topologies_for_bases(bases: &[String]) -> Vec<String> {
     bases.iter().map(|b| basis_to_topology(b)).collect()
 }
 
-/// Collapse a resolved bases list to a single topology label. Mirrors
-/// `_topology_for_bases`: the common label when all atoms agree, else the honest
-/// `"mixed"`. The caller guards the empty case (`_topology_for_bases(kinds) if
-/// kinds else str(topology)`); this returns `None` for an empty list so the
-/// caller supplies its own fallback rather than this guessing one.
+/// Collapse a resolved bases list to its common topology or the honest
+/// `"mixed"` label. Empty dictionaries have no topology and return `None`.
 pub(crate) fn topology_for_bases(bases: &[String]) -> Option<String> {
     let per_atom = topologies_for_bases(bases);
     let first = per_atom.first()?;
@@ -472,7 +568,13 @@ fn build_stagewise_manifold_sae_payload(
     let raw_n_harmonics: Vec<i64> = basis_kinds
         .iter()
         .zip(&basis_sizes)
-        .map(|(kind, &size)| if kind == "periodic" { (size - 1) / 2 } else { 0 })
+        .map(|(kind, &size)| {
+            if kind == "periodic" {
+                (size - 1) / 2
+            } else {
+                0
+            }
+        })
         .collect();
     let n_harmonics = canonical_n_harmonics(&basis_kinds, &raw_n_harmonics, &basis_sizes);
     let decoder_nested: Vec<Vec<Vec<f64>>> = decoder_blocks.iter().map(array2_to_nested).collect();
@@ -483,10 +585,7 @@ fn build_stagewise_manifold_sae_payload(
         .map(|atom| AtomPayload {
             basis: basis_kinds[atom].clone(),
             decoder_coefficients: decoder_nested[atom].clone(),
-            assignments: assignments_nested
-                .iter()
-                .map(|row| row[atom])
-                .collect(),
+            assignments: assignments_nested.iter().map(|row| row[atom]).collect(),
             coords: coords_nested[atom].clone(),
             coords_u_arc: None,
             evidence: None,
@@ -642,11 +741,11 @@ pub(crate) fn sae_manifold_core_from_stagewise<'py>(
 }
 
 /// Restore the `linear_block` label a flat-block fit reports as the generic
-/// `linear`, mirroring `_preserve_linear_block_labels`: for each atom the caller
+/// `linear`: for each atom the caller
 /// DECLARED as `linear_block`/`flat_block` AND that the fit left at topology
 /// `linear` (K unchanged), relabel its `basis_kinds` entry and topology to
-/// `linear_block`. `basis_specs` (the fitted kinds) is intentionally NOT patched
-/// — only `basis_kinds` / `atom_topologies`, exactly as the Python does. No-op
+/// `linear_block`. `basis_specs` (the fitted kinds) is intentionally not patched;
+/// only the public `basis_kinds` / `atom_topologies` labels change. No-op
 /// when `bases` is empty, length-mismatched (an evidence-gated K change), or
 /// declares no block; positions the fit RETYPED keep their discovered topology.
 pub(crate) fn preserve_linear_block_labels(
@@ -673,12 +772,12 @@ pub(crate) fn preserve_linear_block_labels(
 }
 
 /// Stable ascending reorder of a periodic atom's shape band by its single
-/// coordinate column, mirroring `_periodic_shape_band` in `from_payload`:
+/// coordinate column:
 ///
 ///   * `coords` is `(G, 1)` (one coordinate column, `d_k = 1` for a periodic
-///     atom) — an error otherwise, matching the Python `ValueError`.
+///     atom) — an error otherwise.
 ///   * `mean` / `sd` are `(G, p)` (the ambient band value / per-channel sd on
-///     the `G`-point coordinate grid — NOT 1-D; see `SaeManifoldAtomFit`).
+///     the `G`-point coordinate grid — not 1-D.
 ///   * `order = argsort(coords[:, 0], kind="mergesort")` — a STABLE ascending
 ///     sort; `coords` and the ROWS of `mean` / `sd` are all reindexed by it.
 ///   * When `coords` is absent OR `mean` is absent the band is dropped entirely
@@ -694,7 +793,14 @@ pub(crate) fn periodic_shape_band_reorder(
     coords: Option<Array2<f64>>,
     mean: Option<Array2<f64>>,
     sd: Option<Array2<f64>>,
-) -> Result<(Option<Array2<f64>>, Option<Array2<f64>>, Option<Array2<f64>>), String> {
+) -> Result<
+    (
+        Option<Array2<f64>>,
+        Option<Array2<f64>>,
+        Option<Array2<f64>>,
+    ),
+    String,
+> {
     let Some(coords) = coords else {
         return Ok((None, None, None));
     };
@@ -739,12 +845,9 @@ pub(crate) fn periodic_shape_band_reorder(
     Ok((Some(coords_sorted), Some(mean_sorted), sd_sorted))
 }
 
-/// Fit-time config the raw payload does not carry — the scalars/labels
-/// `sae_manifold_fit` passes to `from_payload`. Threaded into
-/// [`build_manifold_sae_payload`] so the assembled payload matches the dataclass
-/// `to_dict` exactly. `assignment` is the already-canonical string
-/// (`_canonical_assignment` stays Python-side interop glue, like the fisher
-/// normalizer).
+/// Fit-time scalars and labels absent from the raw solver payload. Threaded into
+/// [`build_manifold_sae_payload`] so the Rust-owned persisted schema is complete.
+/// `assignment` is already canonicalized by this module's shared parser.
 pub(crate) struct FitConfig {
     pub(crate) topology_fallback: String,
     pub(crate) assignment: String,
@@ -760,22 +863,19 @@ pub(crate) struct FitConfig {
     pub(crate) random_state: i64,
     pub(crate) top_k: Option<i64>,
     pub(crate) jumprelu_threshold: f64,
-    /// The retained WP-D output-Fisher shard `U` `(n, p, r)`, set by
-    /// `sae_manifold_fit` AFTER `from_payload` when a shard was passed
-    /// (`model.fisher_factors = ascontiguousarray(shard[0])`); `None` for a
+    /// The retained WP-D output-Fisher shard `U` `(n, p, r)`; `None` for a
     /// Euclidean fit. When present, `metric_provenance` still comes from the raw
-    /// payload (the Rust fit stamped `"OutputFisher"`).
+    /// solver payload (the Rust fit stamped `"OutputFisher"`).
     pub(crate) fisher_factors: Option<Vec<Vec<Vec<f64>>>>,
     /// The shard's provenance tag (`shard[2]`); serialized only when
     /// `fisher_factors` is present, mirroring `to_dict`.
     pub(crate) fisher_provenance: Option<String>,
-    /// The caller's DECLARED per-atom bases (`_bases(...)`), for the
-    /// `linear_block` relabel `sae_manifold_fit` applies post-`from_payload` via
+    /// The caller's declared per-atom bases, used by
     /// [`preserve_linear_block_labels`]. `None`/empty leaves the fitted labels.
     pub(crate) declared_bases: Option<Vec<String>>,
 }
 
-// --- serde_json::Value accessors (mirror from_payload's `payload[...]` reads) --
+// --- typed serde_json::Value accessors for the raw solver payload -------------
 fn vget<'a>(v: &'a Value, key: &str) -> Result<&'a Value, String> {
     v.get(key)
         .ok_or_else(|| format!("sae fit payload missing '{key}'"))
@@ -836,7 +936,7 @@ fn array3_to_nested(a: &Array3<f64>) -> Vec<Vec<Vec<f64>>> {
         .collect()
 }
 
-/// The honest penalized-loss score (#1231, mirror `_penalized_loss_score`):
+/// The honest penalized-loss score (#1231):
 /// `penalized_loss_score` else `oos_penalized_loss`; a present-but-null value
 /// stays `None`; neither key present -> error.
 fn penalized_loss_score(raw: &Value) -> Result<Option<f64>, String> {
@@ -855,8 +955,8 @@ fn penalized_loss_score(raw: &Value) -> Result<Option<f64>, String> {
     Err("sae fit payload is missing a penalized-loss score".to_string())
 }
 
-/// Reorder (periodic) or pass through (else) an atom's shape band, mirroring
-/// `_shape_band_arrays`: a `periodic` atom's `(G, .)` band is stably reordered by
+/// Reorder (periodic) or pass through (else) an atom's shape band. A
+/// `periodic` atom's `(G, .)` band is stably reordered by
 /// its coordinate column via [`periodic_shape_band_reorder`]; every other kind
 /// keeps the arrays verbatim.
 fn shape_band_for_kind(
@@ -887,16 +987,9 @@ fn shape_band_for_kind(
 }
 
 /// Build a [`ManifoldSaePayload`] (the flat `to_dict` schema) directly from the
-/// raw `sae_manifold_fit_minimal` payload (as a `serde_json::Value`) +
-/// `training_mean` + [`FitConfig`], reproducing `from_payload` ∘ `to_dict` with
-/// NO Python dataclass in the middle (#2091 design A).
-///
-/// MAINLINE ONLY: no Fisher shard (`fisher_factors`/`fisher_provenance` = None)
-/// and no `linear_block` relabel — both are POST-`from_payload` steps in
-/// `sae_manifold_fit` and land as follow-up arms before the fit-return flip. The
-/// caller passes the raw payload as JSON (numpy already `.tolist()`-flattened),
-/// which — like `ManifoldSaeCore::new` — rejects non-finite values at parse, so
-/// this path is NaN-consistent with the legacy `from_json` reader.
+/// raw `sae_manifold_fit_minimal` payload (as a `serde_json::Value`), the
+/// training mean, and [`FitConfig`]. Fisher retention and `linear_block`
+/// relabeling happen in this same builder, with no parallel Python schema.
 pub(crate) fn build_manifold_sae_payload(
     raw: &Value,
     training_mean: Vec<f64>,
@@ -1010,8 +1103,8 @@ pub(crate) fn build_manifold_sae_payload(
     primitive_names.push("rust_module.sae_manifold_fit_minimal".to_string());
     primitive_names.extend(cfg.penalties.iter().cloned());
 
-    // `basis_specs` keeps the fitted kinds; `basis_kinds` / `atom_topologies` may
-    // be relabeled to `linear_block` for a flat-block fit (post-from_payload).
+    // `basis_specs` keeps the fitted kinds; public labels may be restored to
+    // `linear_block` for a flat-block fit.
     let mut basis_kinds = kinds.clone();
     let mut atom_topologies = topologies_for_bases(&kinds);
     if let Some(bases) = cfg.declared_bases.as_deref() {
@@ -1140,7 +1233,11 @@ mod manifold_sae_coercion_tests {
             ("topk", "topk"),
             ("top-k", "topk"),
         ] {
-            assert_eq!(canonical_assignment_kind(alias), Ok(canonical), "alias {alias}");
+            assert_eq!(
+                canonical_assignment_kind(alias),
+                Ok(canonical),
+                "alias {alias}"
+            );
         }
         let err = canonical_assignment_kind("unknown").expect_err("unknown kind");
         assert!(err.contains("not a recognized assignment kind"));
@@ -1169,9 +1266,33 @@ mod manifold_sae_coercion_tests {
     }
 
     #[test]
+    fn coordinate_periods_cover_compact_and_twisted_charts() {
+        assert_eq!(
+            coordinate_periods_for_basis("torus", 2),
+            Ok(vec![Some(1.0), Some(1.0)])
+        );
+        assert_eq!(
+            coordinate_periods_for_basis("cylinder", 2),
+            Ok(vec![Some(1.0), None])
+        );
+        assert_eq!(
+            coordinate_periods_for_basis("sphere", 2),
+            Ok(vec![None, Some(std::f64::consts::TAU)])
+        );
+        assert_eq!(
+            coordinate_periods_for_basis("mobius-band", 2),
+            Ok(vec![Some(2.0), None])
+        );
+        assert!(coordinate_periods_for_basis("mobius", 1).is_err());
+    }
+
+    #[test]
     fn flat_block_gating_uses_rust_owned_assignment_tokens() {
         assert_eq!(flat_block_assignment("norm-selection"), Ok("ibp_map"));
-        assert_eq!(flat_block_assignment(" Separate-Gate "), Ok("threshold_gate"));
+        assert_eq!(
+            flat_block_assignment(" Separate-Gate "),
+            Ok("threshold_gate")
+        );
         assert!(flat_block_assignment("unknown").is_err());
     }
 
@@ -1304,12 +1425,9 @@ mod manifold_sae_coercion_tests {
     #[test]
     fn periodic_shape_band_reorder_rejects_multicolumn_coords() {
         let coords = array![[0.1, 0.2], [0.3, 0.4]];
-        assert!(periodic_shape_band_reorder(
-            Some(coords),
-            Some(array![[1.0], [2.0]]),
-            None
-        )
-        .is_err());
+        assert!(
+            periodic_shape_band_reorder(Some(coords), Some(array![[1.0], [2.0]]), None).is_err()
+        );
     }
 
     #[test]
@@ -1319,8 +1437,14 @@ mod manifold_sae_coercion_tests {
         let bases = vec!["linear_block".to_string(), "periodic".to_string()];
         preserve_linear_block_labels(&mut basis_kinds, &mut topos, &bases);
         // Declared-block + fitted-linear atom relabels; the periodic atom is left.
-        assert_eq!(basis_kinds, vec!["linear_block".to_string(), "periodic".to_string()]);
-        assert_eq!(topos, vec!["linear_block".to_string(), "circle".to_string()]);
+        assert_eq!(
+            basis_kinds,
+            vec!["linear_block".to_string(), "periodic".to_string()]
+        );
+        assert_eq!(
+            topos,
+            vec!["linear_block".to_string(), "circle".to_string()]
+        );
     }
 
     #[test]

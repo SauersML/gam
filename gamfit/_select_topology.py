@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -90,24 +90,6 @@ TopologyName: TypeAlias = Literal[
 ]
 TopologyScoreScale: TypeAlias = Literal["per_effective_dim", "per_observation"]
 TopologyAutoSelectorRank: TypeAlias = tuple[str, float, float, float, int, Any]
-_TOPOLOGY_SCREEN_OUTER_MAX_ITER = 4
-_TOPOLOGY_SCREEN_SURVIVORS = 2
-
-# Escalating cheap-cap cascade for candidate enumeration (#781). A single fixed
-# screening cap silently drops every candidate when none converges inside it,
-# forcing the caller into the empty-screen error even though a slightly larger
-# budget would have admitted survivors. Mirror the seed-screening contract in
-# `solver::outer_strategy` (`SEED_SCREENING_CASCADE_MULTIPLIERS = [1, 4, 16]`
-# then uncapped): run every candidate at the cheapest cap, and escalate to the
-# next cap ONLY when the whole stage rejected everything as non-finite. The
-# first stage that admits at least one finite-scored candidate wins, so the
-# common case still pays a single cheap pass over all candidates. `None`
-# denotes the uncapped final stage (no `outer_max_iter` override).
-_TOPOLOGY_SCREEN_CAP_MULTIPLIERS: tuple[int, ...] = (1, 4, 16)
-_TOPOLOGY_SCREEN_CASCADE_CAPS: tuple[int | None, ...] = (
-    *(_TOPOLOGY_SCREEN_OUTER_MAX_ITER * m for m in _TOPOLOGY_SCREEN_CAP_MULTIPLIERS),
-    None,
-)
 
 _DEFAULT_TOPOLOGY_NAMES: tuple[TopologyName, ...] = (
     "euclidean",
@@ -125,67 +107,51 @@ _NULL_HESSIAN_LOGDET_KEYS: tuple[str, ...] = (
 )
 
 
-def _fit_kwargs_with_outer_max_iter(fit_kwargs: Mapping[str, Any], cap: int) -> dict[str, Any]:
-    if cap < 1:
-        raise ValueError(f"outer_max_iter cap must be >= 1, got {cap}")
-    out = dict(fit_kwargs)
-    cfg = dict(cast(Mapping[str, Any], out.get("config") or {}))
-    existing = cfg.get("outer_max_iter")
-    cfg["outer_max_iter"] = min(int(existing), cap) if existing is not None else cap
-    out["config"] = cfg
-    return out
+FailureStage: TypeAlias = Literal["assembly", "fit", "evidence"]
 
 
-def _survivor_count(n_candidates: int) -> int:
-    return min(n_candidates, _TOPOLOGY_SCREEN_SURVIVORS)
+@dataclass(frozen=True, slots=True)
+class TopologyCandidateFailure:
+    """One requested topology that could not enter the evidence ranking."""
+
+    name: str
+    stage: FailureStage
+    error_type: str
+    message: str
+    evidence_at_failure: float | None = None
+    checkpoint: object | None = None
 
 
-def _screen_kwargs_for_cap(
-    fit_kwargs: Mapping[str, Any], cap: int | None
-) -> dict[str, Any]:
-    """Fit kwargs for one cascade stage: cap the outer iterations, or run
-    uncapped when ``cap`` is ``None`` (the final escalation stage)."""
-    if cap is None:
-        return dict(fit_kwargs)
-    return _fit_kwargs_with_outer_max_iter(fit_kwargs, cap)
+class TopologySelectionError(ValueError):
+    """No topology candidate produced a converged, selectable fit."""
+
+    def __init__(self, failures: Sequence[TopologyCandidateFailure]) -> None:
+        self.failures = tuple(failures)
+        detail = "; ".join(
+            f"{failure.name} [{failure.stage}]: {failure.message}"
+            for failure in self.failures
+        )
+        super().__init__(
+            "no topology candidate produced a converged selectable fit"
+            + (f" ({detail})" if detail else "")
+        )
 
 
-def _screen_candidates_with_budget_cascade(
-    candidates: Sequence[_Candidate],
-    fit_kwargs: Mapping[str, Any],
-    score_one: "Callable[[_Candidate, Mapping[str, Any]], float]",
-) -> tuple[list[tuple[float, int, _Candidate]], dict[str, str]]:
-    """Run candidate screening through the escalating cheap-cap cascade (#781).
-
-    ``score_one`` fits ``candidate`` under the stage's capped ``fit_kwargs`` and
-    returns a finite lower-is-better comparison score, or raises to reject the
-    candidate at this cap. The cascade evaluates every candidate at the cheapest
-    cap and escalates to the next cap only when the entire stage rejected every
-    candidate as non-finite/errored — matching ``rank_indices_with_budget_cascade``
-    in ``solver::priority_selection``, which breaks the moment a stage admits a
-    finite survivor. Returns ``(screened, errors)`` where ``screened`` is the
-    ``(score, original_index, candidate)`` list from the first non-empty stage
-    and ``errors`` carries the most recent rejection reason per candidate name.
-    """
-    errors: dict[str, str] = {}
-    for cap in _TOPOLOGY_SCREEN_CASCADE_CAPS:
-        stage_kwargs = _screen_kwargs_for_cap(fit_kwargs, cap)
-        screened: list[tuple[float, int, _Candidate]] = []
-        stage_errors: dict[str, str] = {}
-        for idx, candidate in enumerate(candidates):
-            try:
-                score = score_one(candidate, stage_kwargs)
-            except Exception as exc:
-                stage_errors[candidate.name] = str(exc)
-                continue
-            if not math.isfinite(score):
-                stage_errors[candidate.name] = f"non-finite screening score {score!r}"
-                continue
-            screened.append((score, idx, candidate))
-        if screened:
-            return screened, stage_errors
-        errors = stage_errors
-    return [], errors
+def _candidate_failure(
+    candidate: _Candidate,
+    stage: FailureStage,
+    error: BaseException,
+    *,
+    evidence_at_failure: float | None = None,
+) -> TopologyCandidateFailure:
+    return TopologyCandidateFailure(
+        name=candidate.name,
+        stage=stage,
+        error_type=f"{type(error).__module__}.{type(error).__qualname__}",
+        message=str(error),
+        evidence_at_failure=evidence_at_failure,
+        checkpoint=getattr(error, "checkpoint", None),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +195,7 @@ class SelectTopologyResult:
     effective_dim: dict[str, float]
     n_obs: dict[str, int]
     warnings: list[str]
+    failures: tuple[TopologyCandidateFailure, ...]
     fits: dict[str, Any] | None = None
 
 
@@ -292,107 +259,86 @@ def select_topology(
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
     _find_auto_smooth_call(formula)
 
-    # Hoist topology-independent shared work above the AUTO candidate loop
-    # (#869). Two computations are invariant to the candidate topology and to
-    # the budget-cascade cap, yet were recomputed for every (candidate, stage)
-    # pair plus each survivor refit:
-    #
-    #   1. Table ingestion. ``gamfit.fit`` re-runs ``normalize_table(data)`` —
-    #      an O(n_rows * n_cols) cell-stringification — on every call. The same
-    #      table is fit up to (#cascade_stages * #candidates + #survivors)
-    #      times, so normalize it once here and pass a ``PreNormalizedTable``
-    #      that ``fit`` returns verbatim instead of re-coercing.
-    #   2. Candidate formula surgery. ``_formula_for_candidate`` depends only on
-    #      ``(formula, candidate)``, not on the cap or the eventual winner, so
-    #      build each candidate's formula once and reuse it across every
-    #      screening stage and the survivor refit.
+    # Table ingestion is topology-independent. Normalize once, then run one
+    # complete converged fit for every genuinely discrete candidate. There is
+    # no capped screening pass and no survivor truncation that can change the
+    # winner.
     headers, rows, table_kind = normalize_table(data)
     shared_table = PreNormalizedTable(headers, rows, table_kind)
-    candidate_formulas: dict[int, str] = {}
-
-    def _candidate_formula_cached(candidate: _Candidate) -> str:
-        cached = candidate_formulas.get(id(candidate))
-        if cached is not None:
-            return cached
-        candidate_formula = _formula_for_candidate(
-            formula,
-            candidate,
-            strict_dimension=True,
-        )
-        if candidate_formula is None:  # defensive; strict_dimension=True raises.
-            raise ValueError(f"candidate {candidate.name!r} is not constructible")
-        candidate_formulas[id(candidate)] = candidate_formula
-        return candidate_formula
-
-    def _screen_score(candidate: _Candidate, stage_kwargs: Mapping[str, Any]) -> float:
-        candidate_formula = _candidate_formula_cached(candidate)
-        model = fit(shared_table, candidate_formula, **stage_kwargs)
-        reml_score = _extract_reml_score_raw(model)
-        if not math.isfinite(reml_score):
-            raise ValueError(f"degenerate REML score {reml_score!r}")
-        basis_size = _basis_size(model)
-        null_dim = _fitted_null_dim(model)
-        raw_score = _score_for_kind(model, score_kind, n_obs, basis_size, null_dim)
-        screen_score = _scale_score(raw_score, score_scale_kind, n_obs, _effective_dim(model))
-        return _comparison_score(screen_score, score_kind)
-
-    screened, screen_errors = _screen_candidates_with_budget_cascade(
-        normalized,
-        fit_kwargs,
-        _screen_score,
-    )
-
-    if not screened:
-        detail = "; ".join(f"{name}: {err}" for name, err in screen_errors.items())
-        raise ValueError(
-            "select_topology: no candidate produced a finite screening score"
-            + (f" ({detail})" if detail else "")
-        )
-
-    screened.sort(key=lambda row: (row[0], row[1]))
-    survivors = [row[2] for row in screened[:_survivor_count(len(screened))]]
-
     fits: dict[str, Any] = {}
     names: list[str] = []
     fit_list: list[Any] = []
-    for candidate in survivors:
-        candidate_formula = _candidate_formula_cached(candidate)
-        model = fit(shared_table, candidate_formula, **fit_kwargs)
-        reml_score = _extract_reml_score_raw(model)
-        if not math.isfinite(reml_score):
-            raise ValueError(
-                f"select_topology: survivor {candidate.name!r} produced "
-                f"degenerate REML score {reml_score!r}"
+    basis_sizes: dict[str, int] = {}
+    effective_dim: dict[str, float] = {}
+    null_dims: dict[str, float] = {}
+    selected_scores: dict[str, float] = {}
+    failures: list[TopologyCandidateFailure] = []
+
+    for candidate in normalized:
+        try:
+            candidate_formula = _formula_for_candidate(
+                formula,
+                candidate,
+                strict_dimension=True,
             )
+            if candidate_formula is None:
+                raise ValueError(f"candidate {candidate.name!r} is not constructible")
+        except Exception as error:
+            failures.append(_candidate_failure(candidate, "assembly", error))
+            continue
+
+        try:
+            model = fit(shared_table, candidate_formula, **fit_kwargs)
+        except Exception as error:
+            failures.append(_candidate_failure(candidate, "fit", error))
+            continue
+
+        raw_reml: float | None = None
+        try:
+            raw_reml = float(_extract_reml_score_raw(model))
+            if not math.isfinite(raw_reml):
+                raise ValueError(f"non-finite REML evidence {raw_reml!r}")
+            basis_size = _basis_size(model)
+            fitted_effective_dim = _effective_dim(model)
+            null_dim = _fitted_null_dim(model)
+            raw_score = _score_for_kind(
+                model,
+                score_kind,
+                n_obs,
+                basis_size,
+                null_dim,
+            )
+            selected_score = _scale_score(
+                raw_score,
+                score_scale_kind,
+                n_obs,
+                fitted_effective_dim,
+            )
+            if not math.isfinite(selected_score):
+                raise ValueError(f"non-finite selected evidence {selected_score!r}")
+        except Exception as error:
+            failures.append(
+                _candidate_failure(
+                    candidate,
+                    "evidence",
+                    error,
+                    evidence_at_failure=raw_reml,
+                )
+            )
+            continue
+
         fits[candidate.name] = model
         names.append(candidate.name)
         fit_list.append(model)
+        basis_sizes[candidate.name] = basis_size
+        effective_dim[candidate.name] = fitted_effective_dim
+        null_dims[candidate.name] = null_dim
+        selected_scores[candidate.name] = selected_score
 
-    basis_sizes = {name: _basis_size(fit_obj) for name, fit_obj in fits.items()}
-    effective_dim = {
-        name: _effective_dim(fit_obj)
-        for name, fit_obj in fits.items()
-    }
+    if not fits:
+        raise TopologySelectionError(failures)
+
     n_obs_by_candidate = {name: n_obs for name in fits}
-    null_dims = {
-        candidate.name: _fitted_null_dim(fits[candidate.name])
-        for candidate in survivors
-        if candidate.name in fits
-    }
-    raw_scores = {
-        name: _score_for_kind(
-            fit_obj,
-            score_kind,
-            n_obs,
-            basis_sizes[name],
-            null_dims[name],
-        )
-        for name, fit_obj in fits.items()
-    }
-    selected_scores = {
-        name: _scale_score(raw_scores[name], score_scale_kind, n_obs, effective_dim[name])
-        for name in fits
-    }
     comparison_scores = {
         name: _comparison_score(value, score_kind)
         for name, value in selected_scores.items()
@@ -427,6 +373,7 @@ def select_topology(
         effective_dim=effective_dim,
         n_obs=n_obs_by_candidate,
         warnings=warnings_out,
+        failures=tuple(failures),
         fits=fits if return_fits else None,
     )
 
@@ -760,12 +707,16 @@ def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
     Rust formula assembler consumes.
     """
     topo = candidate.topology
+    double_penalty = (
+        None if topo.double_penalty is None else bool(topo.double_penalty)
+    )
     if isinstance(topo, PeriodicSplineCurve):
         return {
             "kind": "periodic_spline_curve",
             "n_knots": int(topo.n_knots),
             "degree": int(topo.degree),
             "penalty_order": int(topo.penalty_order),
+            "double_penalty": double_penalty,
         }
     if isinstance(topo, Sphere):
         return {
@@ -774,6 +725,7 @@ def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
             "penalty_order": int(topo.penalty_order),
             "kernel": str(topo.kernel),
             "radians": bool(topo.radians),
+            "double_penalty": double_penalty,
         }
     if isinstance(topo, TensorBSpline):
         k_attr = getattr(topo, "_gamfit_tensor_k", None)
@@ -792,6 +744,7 @@ def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
             "k": [int(value) for value in (k_attr or ())],
             "periodic": periodic,
             "periods": periods_payload,
+            "double_penalty": double_penalty,
         }
     if isinstance(topo, Duchon):
         per_axis_periodic = bool(
@@ -808,6 +761,7 @@ def _candidate_to_rust_payload(candidate: _Candidate) -> dict[str, Any]:
             "per_axis_periodic": per_axis_periodic,
             "length_scale": length_scale,
             "required_dim": _candidate_required_dim(topo),
+            "double_penalty": double_penalty,
         }
     raise TypeError(f"unsupported topology candidate {type(topo).__name__}")
 
@@ -1186,13 +1140,13 @@ class TopologyAutoSelectorResult:
 
     ``ranked`` is a best-first list of
     ``(name, tk_score, raw_reml, effective_dim, n_obs, model)`` tuples.
-    ``winner`` is the selected tuple from that list. ``errors`` records
-    candidate-specific fit failures for candidates skipped during ranking.
+    ``winner`` is the selected tuple from that list. ``failures`` retains every
+    requested candidate that could not enter the ranking.
     """
 
     ranked: list[TopologyAutoSelectorRank]
     winner: TopologyAutoSelectorRank
-    errors: dict[str, str]
+    failures: tuple[TopologyCandidateFailure, ...]
 
 
 class TopologyAutoSelector:
@@ -1294,80 +1248,27 @@ class TopologyAutoSelector:
         auto = _maybe_auto_smooth(formula)
         normalized = _normalize_selector_candidates(self.candidates, latent.d)
 
-        # Hoist topology-independent shared work above the candidate loop
-        # (#869): the table ingestion (normalize_table) and the per-candidate
-        # AUTO-formula surgery (_candidate_formula) and per-candidate latent
-        # projection (_latent_for_topology) are invariant to the budget cap, so
-        # the budget cascade and the survivor refit would otherwise recompute
-        # them on every pass. Normalize the table once and cache each
-        # candidate's (formula, latent) pair keyed by candidate identity.
+        # Normalize topology-independent data once. Each requested topology is
+        # then assembled and fit exactly once at the caller's full convergence
+        # configuration; failures remain explicit lifecycle records.
         headers, rows, table_kind = normalize_table(data)
         shared_table = PreNormalizedTable(headers, rows, table_kind)
-        candidate_inputs: dict[int, tuple[str, Any]] = {}
-
-        def _candidate_inputs_cached(candidate: _Candidate) -> tuple[str, Any]:
-            cached = candidate_inputs.get(id(candidate))
-            if cached is not None:
-                return cached
-            built = (
-                _candidate_formula(formula, auto, candidate),
-                _latent_for_topology(latent, candidate.name),
-            )
-            candidate_inputs[id(candidate)] = built
-            return built
-
-        def _screen_score(
-            candidate: _Candidate, stage_kwargs: Mapping[str, Any]
-        ) -> float:
-            candidate_formula, candidate_latent = _candidate_inputs_cached(candidate)
-            model = fit(
-                shared_table,
-                candidate_formula,
-                latents={latent_name: candidate_latent},
-                penalties=penalties,
-                **stage_kwargs,
-            )
-            raw_reml = _extract_reml_score_raw(model)
-            effective_dim = _effective_dim(model)
-            null_dim = _extract_null_dim(model)
-            if null_dim is None:
-                raise ValueError(
-                    "TopologyAutoSelector requires TK null-dimension metadata; "
-                    "fit summary is missing null_dim"
-                )
-            return _tk_score_from_parts(
-                float(raw_reml),
-                float(null_dim),
-                _extract_null_hessian_logdet(model),
-                float(effective_dim),
-                int(n_obs),
-                self.score_scale,
-            )
-
-        screened, screen_errors = _screen_candidates_with_budget_cascade(
-            normalized,
-            fit_kwargs,
-            _screen_score,
-        )
-
-        if not screened:
-            detail = "; ".join(f"{name}: {err}" for name, err in screen_errors.items())
-            raise ValueError(
-                "TopologyAutoSelector found no fittable topology candidates during screening"
-                + (f" ({detail})" if detail else "")
-            )
-        screened.sort(key=lambda row: (row[0], row[1]))
-        survivors = [row[2] for row in screened[:_survivor_count(len(screened))]]
 
         evidence_inputs: list[dict[str, Any]] = []
         models_by_name: dict[str, Any] = {}
         raw_reml_by_name: dict[str, float] = {}
         effective_dim_by_name: dict[str, float] = {}
-        errors: dict[str, str] = {}
+        failures: list[TopologyCandidateFailure] = []
 
-        for candidate in survivors:
+        for candidate in normalized:
             try:
-                candidate_formula, candidate_latent = _candidate_inputs_cached(candidate)
+                candidate_formula = _candidate_formula(formula, auto, candidate)
+                candidate_latent = _latent_for_topology(latent, candidate.name)
+            except Exception as error:
+                failures.append(_candidate_failure(candidate, "assembly", error))
+                continue
+
+            try:
                 model = fit(
                     shared_table,
                     candidate_formula,
@@ -1375,37 +1276,59 @@ class TopologyAutoSelector:
                     penalties=penalties,
                     **fit_kwargs,
                 )
-                raw_reml = _extract_reml_score_raw(model)
-                effective_dim = _effective_dim(model)
+            except Exception as error:
+                failures.append(_candidate_failure(candidate, "fit", error))
+                continue
+
+            raw_reml: float | None = None
+            try:
+                raw_reml = float(_extract_reml_score_raw(model))
+                if not math.isfinite(raw_reml):
+                    raise ValueError(f"non-finite REML evidence {raw_reml!r}")
+                effective_dim = float(_effective_dim(model))
                 null_dim = _extract_null_dim(model)
                 if null_dim is None:
                     raise ValueError(
                         "TopologyAutoSelector requires TK null-dimension metadata; "
                         "fit summary is missing null_dim"
                     )
-            except Exception as exc:
-                errors[candidate.name] = str(exc)
+                null_hessian_logdet = _extract_null_hessian_logdet(model)
+                # Validate the exact same score payload before handing it to
+                # Rust, so a metadata failure is attached to this candidate.
+                _tk_score_from_parts(
+                    raw_reml,
+                    float(null_dim),
+                    null_hessian_logdet,
+                    effective_dim,
+                    int(n_obs),
+                    self.score_scale,
+                )
+            except Exception as error:
+                failures.append(
+                    _candidate_failure(
+                        candidate,
+                        "evidence",
+                        error,
+                        evidence_at_failure=raw_reml,
+                    )
+                )
                 continue
             models_by_name[candidate.name] = model
-            raw_reml_by_name[candidate.name] = float(raw_reml)
-            effective_dim_by_name[candidate.name] = float(effective_dim)
+            raw_reml_by_name[candidate.name] = raw_reml
+            effective_dim_by_name[candidate.name] = effective_dim
             evidence_inputs.append(
                 {
                     "name": candidate.name,
-                    "raw_reml": float(raw_reml),
+                    "raw_reml": raw_reml,
                     "null_dim": float(null_dim),
-                    "null_space_logdet": _extract_null_hessian_logdet(model),
-                    "effective_dim": float(effective_dim),
+                    "null_space_logdet": null_hessian_logdet,
+                    "effective_dim": effective_dim,
                     "n_obs": int(n_obs),
                 }
             )
 
         if not evidence_inputs:
-            detail = "; ".join(f"{name}: {err}" for name, err in errors.items())
-            raise ValueError(
-                "TopologyAutoSelector found no fittable topology candidates"
-                + (f" ({detail})" if detail else "")
-            )
+            raise TopologySelectionError(failures)
 
         ranking_json = _topology_rust().rank_topology_candidates(
             json.dumps(
@@ -1416,6 +1339,20 @@ class TopologyAutoSelector:
             )
         )
         ranking = json.loads(ranking_json)
+        for failure in ranking.get("failed", ()):
+            failures.append(
+                TopologyCandidateFailure(
+                    name=str(failure["name"]),
+                    stage=cast(FailureStage, str(failure["stage"])),
+                    error_type="gamfit.rust.TopologyCandidateFailure",
+                    message=str(failure["message"]),
+                    evidence_at_failure=(
+                        None
+                        if failure.get("evidence_at_failure") is None
+                        else float(failure["evidence_at_failure"])
+                    ),
+                )
+            )
         ranked: list[TopologyAutoSelectorRank] = []
         for entry in ranking["ranked"]:
             name = entry["name"]
@@ -1432,7 +1369,7 @@ class TopologyAutoSelector:
         return TopologyAutoSelectorResult(
             ranked=ranked,
             winner=ranked[ranking["winner_index"]],
-            errors=errors,
+            failures=tuple(failures),
         )
 
     select = fit
@@ -1589,10 +1526,12 @@ __all__ = [
     "ScoreKind",
     "ScoreScale",
     "SelectTopologyResult",
+    "TopologyCandidateFailure",
     "TopologyAutoSelector",
     "TopologyAutoSelectorRank",
     "TopologyAutoSelectorResult",
     "TopologyName",
+    "TopologySelectionError",
     "TopologyScoreScale",
     "select_topology",
 ]

@@ -188,9 +188,9 @@ fn fit_standard_base(
         }
         fit_term_collectionwith_latent_coord_optimization(
             request.data.view(),
-            request.y.clone(),
-            request.weights.clone(),
-            request.offset.clone(),
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
             &request.spec,
             latent_coord,
             family.clone(),
@@ -226,80 +226,14 @@ fn fit_standard_base(
     } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
             request.data.view(),
-            request.y.clone(),
-            request.weights.clone(),
-            request.offset.clone(),
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
             &request.spec,
             family.clone(),
             options,
             &request.kappa_options,
         )
-    }
-}
-
-fn standard_status_is_certified(
-    outer_converged: bool,
-    pirls_status: gam_solve::pirls::PirlsStatus,
-) -> bool {
-    outer_converged && pirls_status.is_converged()
-}
-
-fn standard_fit_is_certified(fit: &UnifiedFitResult) -> bool {
-    standard_status_is_certified(fit.outer_converged, fit.pirls_status)
-        && fit
-            .artifacts
-            .criterion_certificate
-            .as_ref()
-            .is_none_or(|certificate| certificate.certifies())
-}
-
-/// Defensive conversion for legacy drivers that still return `Ok` with an
-/// explicit failed convergence verdict. New outer drivers return the same
-/// evidence directly as `EstimationError::RemlDidNotConverge`; this seam keeps
-/// a stale `Ok(false)` from ever becoming a fitted model while carrying its
-/// rho checkpoint forward for resume.
-fn uncertified_standard_fit_error(
-    fit: &UnifiedFitResult,
-    context: &str,
-    configured_stationarity_bound: f64,
-) -> gam_solve::estimate::EstimationError {
-    let certificate = fit.artifacts.criterion_certificate.as_ref();
-    gam_solve::estimate::EstimationError::RemlDidNotConverge {
-        context: context.to_string(),
-        reason: format!(
-            "returned outer_converged={} with inner PIRLS status {:?}{}",
-            fit.outer_converged,
-            fit.pirls_status,
-            certificate
-                .map(|value| format!("; final certificate: {}", value.summary()))
-                .unwrap_or_default(),
-        ),
-        iterations: fit.outer_iterations,
-        final_value: fit.reml_score,
-        projected_grad_norm: certificate
-            .map(|value| value.projected_grad_norm)
-            .or(fit.outer_gradient_norm),
-        stationarity_bound: certificate
-            .map(|value| value.stationarity_bound)
-            .unwrap_or(configured_stationarity_bound),
-        rho_checkpoint: fit.log_lambdas.to_vec(),
-    }
-}
-
-fn require_certified_standard_fit(
-    attempt: Result<StandardBaseFit, gam_solve::estimate::EstimationError>,
-    context: &str,
-    configured_stationarity_bound: f64,
-) -> Result<StandardBaseFit, gam_solve::estimate::EstimationError> {
-    let fitted = attempt?;
-    if standard_fit_is_certified(&fitted.fit) {
-        Ok(fitted)
-    } else {
-        Err(uncertified_standard_fit_error(
-            &fitted.fit,
-            context,
-            configured_stationarity_bound,
-        ))
     }
 }
 
@@ -324,26 +258,12 @@ fn certified_retry_or_original<T, E>(original: E, retry: Result<T, E>) -> Result
 #[cfg(test)]
 mod standard_convergence_gate_tests {
     use super::{
-        certified_retry_or_original, firth_can_rescue, standard_status_is_certified,
-        survival_baseline_parameter_checkpoint, survival_pirls_status_is_certified,
+        certified_retry_or_original, firth_can_rescue, survival_baseline_parameter_checkpoint,
+        survival_pirls_status_is_certified,
     };
     use crate::survival::construction::{SurvivalBaselineConfig, SurvivalBaselineTarget};
     use gam_solve::estimate::EstimationError;
     use gam_solve::pirls::PirlsStatus;
-
-    #[test]
-    fn standard_gate_requires_outer_and_inner_certificates() {
-        assert!(standard_status_is_certified(true, PirlsStatus::Converged));
-        assert!(!standard_status_is_certified(false, PirlsStatus::Converged));
-        for status in [
-            PirlsStatus::StalledAtValidMinimum,
-            PirlsStatus::MaxIterationsReached,
-            PirlsStatus::LmStepSearchExhausted,
-            PirlsStatus::Unstable,
-        ] {
-            assert!(!standard_status_is_certified(true, status));
-        }
-    }
 
     #[test]
     fn failed_retry_returns_original_evidence() {
@@ -437,7 +357,7 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
     if mu.len() != request.y.len() {
         return None;
     }
-    mu += &request.offset;
+    mu += request.offset.as_ref();
     mu.mapv_inplace(f64::exp);
     // Profile the dispersion out at this `p` with the SAME prior-weighted Pearson
     // moment estimator the inner solver uses to report the Tweedie `φ̂`
@@ -584,11 +504,7 @@ pub(crate) fn fit_standard_model(
             request.family.link,
             InverseLink::Standard(StandardLink::Logit)
         );
-    let base = require_certified_standard_fit(
-        fit_standard_base(&request, &request.family, &request.options),
-        "standard REML/LAML fit",
-        request.options.tol,
-    );
+    let base = fit_standard_base(&request, &request.family, &request.options);
     let fitted = match base {
         Ok(fitted) => fitted,
         Err(original_error)
@@ -599,11 +515,7 @@ pub(crate) fn fit_standard_model(
             let original_report = original_error.to_string();
             let mut firth_options = request.options.clone();
             firth_options.firth_bias_reduction = true;
-            let firth = require_certified_standard_fit(
-                fit_standard_base(&request, &request.family, &firth_options),
-                "Firth binomial-logit REML/LAML retry",
-                firth_options.tol,
-            );
+            let firth = fit_standard_base(&request, &request.family, &firth_options);
             let firth_failure = firth.as_ref().err().map(ToString::to_string);
             match certified_retry_or_original(original_error, firth) {
                 Ok(firth_fitted) => {
@@ -695,8 +607,8 @@ pub(crate) fn fit_standard_model(
         &result.resolvedspec,
         &result.design,
         &result.fit,
-        &request.y,
-        &request.weights,
+        request.y.as_ref(),
+        request.weights.as_ref(),
         wiggle_link_kind,
         selected_wiggle_basis,
         &wiggle_options,

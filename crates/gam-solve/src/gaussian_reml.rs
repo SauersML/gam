@@ -47,11 +47,12 @@ const GRAD_TOL: f64 = 1.0e-12;
 const MIN_DEVIANCE: f64 = 1.0e-300;
 /// Relative first-order convergence certificate for the block-orthogonal
 /// alternation: the largest per-block |dV/drho|, normalized by the score's
-/// natural magnitude `d * max(1, rank)`, must fall below this before a fit is
-/// minted. See `gaussian_reml_blocks_orthogonal_shared_scale`.
+/// natural magnitude `d * max(1, rank)`, must fall below this and the analytic
+/// profiled Hessian must be PSD before a fit is minted. See
+/// `gaussian_reml_blocks_orthogonal_shared_scale`.
 const BLOCK_ORTHOGONAL_SCORE_TOL: f64 = 1.0e-7;
 /// Exhaustion-escalation bound on outer alternation passes. It never selects
-/// the estimator: reaching it without the score certificate is a typed
+/// the estimator: reaching it without the score/curvature certificate is a typed
 /// `BlockOrthogonalRemlDidNotConverge` error carrying the rho checkpoint.
 const BLOCK_ORTHOGONAL_MAX_OUTER_PASSES: usize = 200;
 /// Work allocated to each one-dimensional block polish within an outer pass.
@@ -983,6 +984,145 @@ fn block_orthogonal_conditional_scale(
     Ok(scale)
 }
 
+/// Verify the defining contract of the decomposed block objective.  For every
+/// pair of design columns this checks `x_a' W x_b = 0` against the standard
+/// `gamma_m` forward-error bound for the two multiplications and two
+/// accumulations performed per row.  The tolerance therefore scales with the
+/// actual product magnitudes and row count; it is not a data-scale knob.
+fn validate_weighted_block_orthogonality(
+    designs: &[Array2<f64>],
+    weight: ArrayView1<'_, f64>,
+) -> Result<(), EstimationError> {
+    let unit_roundoff = 0.5 * f64::EPSILON;
+    let operation_count = weight.len().saturating_mul(4);
+    let accumulated = operation_count as f64 * unit_roundoff;
+    if accumulated >= 1.0 {
+        crate::bail_invalid_estim!(
+            "block-orthogonality verification has no finite floating-point error bound for {} rows",
+            weight.len()
+        );
+    }
+    let gamma = accumulated / (1.0 - accumulated);
+    for left_block in 0..designs.len() {
+        for right_block in (left_block + 1)..designs.len() {
+            let left = &designs[left_block];
+            let right = &designs[right_block];
+            for left_col in 0..left.ncols() {
+                for right_col in 0..right.ncols() {
+                    let mut cross_product = 0.0_f64;
+                    let mut magnitude_sum = 0.0_f64;
+                    for row in 0..weight.len() {
+                        let term = weight[row] * left[[row, left_col]] * right[[row, right_col]];
+                        cross_product += term;
+                        magnitude_sum += term.abs();
+                    }
+                    let roundoff = gamma * magnitude_sum;
+                    if !cross_product.is_finite()
+                        || !roundoff.is_finite()
+                        || cross_product.abs() > roundoff
+                    {
+                        crate::bail_invalid_estim!(
+                            "block-orthogonal Gaussian REML requires X[{left_block}]' W X[{right_block}] = 0, but columns ({left_col}, {right_col}) have weighted cross-product {cross_product:.6e} beyond the arithmetic bound {roundoff:.3e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockOrthogonalProfileCurvature {
+    min_eigenvalue: f64,
+    roundoff: f64,
+}
+
+/// Analytic rho Hessian after profiling out the exact conditional scale.
+///
+/// With `tau_o = nu / q_o` and `e_bo = beta_bo' lambda_b S_b beta_bo`,
+/// eliminating the exact conditional scale block contributes the dense Schur
+/// correction
+///
+/// `H_profile[b,c] = 1[b=c] H_fixed_scale[b,b]
+///                    - (1/(2 nu)) sum_o tau_o^2 e_bo e_co`.
+///
+fn block_orthogonal_profile_hessian(
+    evals: &[BlockOrthogonalEval],
+    rhos: ArrayView1<'_, f64>,
+    scale_precision: ArrayView1<'_, f64>,
+    ranks: &[usize],
+    nu: f64,
+) -> Result<Array2<f64>, EstimationError> {
+    let blocks = evals.len();
+    let mut hessian = Array2::<f64>::zeros((blocks, blocks));
+    for block in 0..blocks {
+        hessian[[block, block]] = block_orthogonal_scale_objective(
+            &evals[block],
+            rhos[block],
+            scale_precision.view(),
+            ranks[block],
+        )
+        .hess;
+    }
+    for left in 0..blocks {
+        for right in 0..=left {
+            let correction = evals[left]
+                .penalty_energy
+                .iter()
+                .zip(evals[right].penalty_energy.iter())
+                .zip(scale_precision.iter())
+                .map(|((&left_energy, &right_energy), &scale)| {
+                    0.5 * scale * scale * left_energy * right_energy / nu
+                })
+                .sum::<f64>();
+            hessian[[left, right]] -= correction;
+            if left != right {
+                hessian[[right, left]] -= correction;
+            }
+        }
+    }
+    if hessian.iter().any(|value| !value.is_finite()) {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    Ok(hessian)
+}
+
+/// Smallest eigenvalue of the analytic profiled Hessian. A first-order score
+/// can vanish at a REML maximum or saddle; requiring this curvature to be
+/// nonnegative up to eigensolver roundoff prevents such a point from being
+/// minted as a converged fit.
+fn block_orthogonal_profile_curvature(
+    evals: &[BlockOrthogonalEval],
+    rhos: ArrayView1<'_, f64>,
+    scale_precision: ArrayView1<'_, f64>,
+    ranks: &[usize],
+    nu: f64,
+) -> Result<BlockOrthogonalProfileCurvature, EstimationError> {
+    let hessian =
+        block_orthogonal_profile_hessian(evals, rhos, scale_precision, ranks, nu)?;
+    let blocks = hessian.nrows();
+    let eigenvalues = hessian
+        .eigh(Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?
+        .0;
+    let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+    let spectral_scale = eigenvalues
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max);
+    let roundoff = f64::EPSILON * blocks.max(1) as f64 * spectral_scale.max(f64::MIN_POSITIVE);
+    Ok(BlockOrthogonalProfileCurvature {
+        min_eigenvalue,
+        roundoff,
+    })
+}
+
 pub fn gaussian_reml_blocks_orthogonal_shared_scale(
     designs: &[Array2<f64>],
     penalties: &[Array2<f64>],
@@ -1071,6 +1211,7 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
         ranks.push(rank);
         penalty_logdets.push(logdet);
     }
+    validate_weighted_block_orthogonality(designs, weight.view())?;
     let n_effective = effective_observation_count(weight.view());
     if n_effective <= nullity_total {
         crate::bail_invalid_estim!(
@@ -1106,16 +1247,21 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
     // profiled objective's total rho-derivative equals the partial
     // rho-gradient there. That gradient is available exactly from the cached
     // block evaluations because `block_orthogonal_eval` depends only on rho,
-    // not on the scale precisions. The certificate is therefore
+    // not on the scale precisions. First-order certification is therefore
     // `max_b |dV/drho_b| / (d * max(1, rank_b)) <= BLOCK_ORTHOGONAL_SCORE_TOL`
     // (the normalizer is the score's natural magnitude: every gradient term is
-    // a sum of `d * rank`-order quantities, making the test relative).
+    // a sum of `d * rank`-order quantities, making the test relative). The
+    // analytic Schur-profiled rho Hessian must additionally be PSD within its
+    // dimension-scaled eigensolver roundoff; score-zero maxima and saddles are
+    // not converged estimators.
     // Exhausting the pass budget without the certificate is a typed error
     // carrying the rho checkpoint, resumable through `init_rhos`.
     let mut converged = false;
     let mut cycle_detected = false;
     let mut outer_passes = 0usize;
     let mut last_score_residual = f64::INFINITY;
+    let mut last_min_profile_curvature = f64::NEG_INFINITY;
+    let mut last_profile_curvature_roundoff = 0.0_f64;
     let mut last_scale_step = f64::INFINITY;
     let mut recent_states: [Option<(Array1<f64>, Array1<f64>)>; 2] = [None, None];
     while outer_passes < controls.max_outer_passes {
@@ -1157,7 +1303,18 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
             }
             last_score_residual = last_score_residual.max(residual);
         }
-        if last_score_residual <= controls.score_tol {
+        let curvature = block_orthogonal_profile_curvature(
+            &evals,
+            rhos.view(),
+            scale_precision.view(),
+            &ranks,
+            nu,
+        )?;
+        last_min_profile_curvature = curvature.min_eigenvalue;
+        last_profile_curvature_roundoff = curvature.roundoff;
+        if last_score_residual <= controls.score_tol
+            && last_min_profile_curvature >= -last_profile_curvature_roundoff
+        {
             converged = true;
             break;
         }
@@ -1183,6 +1340,8 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
             iterations: outer_passes,
             max_score_residual: last_score_residual,
             score_tol: controls.score_tol,
+            min_profile_curvature: last_min_profile_curvature,
+            profile_curvature_roundoff: last_profile_curvature_roundoff,
             last_scale_step,
             cycle_detected,
             rho_checkpoint: rhos.to_vec(),
@@ -3834,6 +3993,104 @@ mod tests {
     }
 
     #[test]
+    fn block_orthogonal_profile_hessian_matches_the_profiled_objective() {
+        let grams = [array![[3.0, 0.4], [0.4, 2.0]], array![[2.5, -0.2], [-0.2, 1.8]]];
+        let rhs = [array![[1.2, -0.3], [0.6, 0.9]], array![[0.5, 0.8], [-0.4, 0.7]]];
+        let penalties = [array![[1.0, 0.2], [0.2, 0.8]], array![[0.9, -0.1], [-0.1, 1.1]]];
+        let ranks = [2_usize, 2_usize];
+        let ywy = array![8.0, 9.0];
+        let nu = 7.0;
+        let rhos = array![0.37, -0.21];
+        let profile_value = |candidate_rhos: ArrayView1<'_, f64>| {
+            let evals = (0..2)
+                .map(|block| {
+                    block_orthogonal_eval(
+                        &grams[block],
+                        &rhs[block],
+                        &penalties[block],
+                        candidate_rhos[block],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut q = ywy.clone();
+            for eval in &evals {
+                q -= &eval.fitted_energy;
+            }
+            let determinant_term = evals
+                .iter()
+                .enumerate()
+                .map(|(block, eval)| {
+                    eval.logdet - ranks[block] as f64 * candidate_rhos[block]
+                })
+                .sum::<f64>();
+            0.5 * 2.0 * determinant_term + 0.5 * nu * q.iter().map(|value| value.ln()).sum::<f64>()
+        };
+        let evals = (0..2)
+            .map(|block| {
+                block_orthogonal_eval(
+                    &grams[block],
+                    &rhs[block],
+                    &penalties[block],
+                    rhos[block],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let scale = block_orthogonal_conditional_scale(&evals, ywy.view(), nu).unwrap();
+        let analytic = block_orthogonal_profile_hessian(
+            &evals,
+            rhos.view(),
+            scale.view(),
+            &ranks,
+            nu,
+        )
+        .unwrap();
+        let step = 1.0e-4;
+        let center = profile_value(rhos.view());
+        let mut numerical = Array2::<f64>::zeros((2, 2));
+        for coordinate in 0..2 {
+            let mut plus = rhos.clone();
+            let mut minus = rhos.clone();
+            plus[coordinate] += step;
+            minus[coordinate] -= step;
+            numerical[[coordinate, coordinate]] =
+                (profile_value(plus.view()) - 2.0 * center + profile_value(minus.view()))
+                    / (step * step);
+        }
+        let mut plus_plus = rhos.clone();
+        let mut plus_minus = rhos.clone();
+        let mut minus_plus = rhos.clone();
+        let mut minus_minus = rhos.clone();
+        plus_plus[0] += step;
+        plus_plus[1] += step;
+        plus_minus[0] += step;
+        plus_minus[1] -= step;
+        minus_plus[0] -= step;
+        minus_plus[1] += step;
+        minus_minus[0] -= step;
+        minus_minus[1] -= step;
+        let cross = (profile_value(plus_plus.view())
+            - profile_value(plus_minus.view())
+            - profile_value(minus_plus.view())
+            + profile_value(minus_minus.view()))
+            / (4.0 * step * step);
+        numerical[[0, 1]] = cross;
+        numerical[[1, 0]] = cross;
+        for row in 0..2 {
+            for col in 0..2 {
+                assert!(
+                    (analytic[[row, col]] - numerical[[row, col]]).abs()
+                        <= 2.0e-6 * analytic[[row, col]].abs().max(1.0),
+                    "profile Hessian ({row}, {col}) analytic {:.12e} != numerical {:.12e}",
+                    analytic[[row, col]],
+                    numerical[[row, col]]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn block_orthogonal_shared_scale_fit_carries_a_score_certificate() {
         // Two mutually orthogonal ±1 blocks (Hadamard columns) with full-rank
         // penalties. A minted fit must satisfy the joint first-order REML
@@ -3895,6 +4152,20 @@ mod tests {
                 "block {block} score residual {residual:.3e} exceeds the certificate tolerance"
             );
         }
+        let curvature = block_orthogonal_profile_curvature(
+            &evals,
+            result.log_lambdas.view(),
+            scale.view(),
+            &[2, 2],
+            nu,
+        )
+        .unwrap();
+        assert!(
+            curvature.min_eigenvalue >= -curvature.roundoff,
+            "minted fit has negative profiled curvature {:.6e} beyond roundoff {:.3e}",
+            curvature.min_eigenvalue,
+            curvature.roundoff
+        );
 
         let err = gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
             &[d1, d2],
@@ -3921,6 +4192,27 @@ mod tests {
             }
             other => panic!("expected typed block-orthogonal exhaustion, got {other}"),
         }
+    }
+
+    #[test]
+    fn block_orthogonal_solver_rejects_cross_block_signal() {
+        let first = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
+        let second = array![[0.0], [1.0], [2.0], [3.0], [4.0], [5.0]];
+        let penalties = vec![Array2::<f64>::eye(1), Array2::<f64>::eye(1)];
+        let y = array![[0.2], [0.8], [1.7], [3.1], [3.9], [5.2]];
+        let err = gaussian_reml_blocks_orthogonal_shared_scale(
+            &[first, second],
+            &penalties,
+            y.view(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, EstimationError::InvalidInput(_)),
+            "nonorthogonal blocks must fail the decomposed-objective contract: {err}"
+        );
+        assert!(err.to_string().contains("weighted cross-product"));
     }
 
     #[test]

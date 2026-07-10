@@ -88,9 +88,7 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
     data: ArrayView2<'_, f64>,
     row: &LatentIntervalRowView<'_>,
 ) -> Result<Option<f64>, crate::survival::latent::LatentSurvivalError> {
-    use crate::survival::latent::{
-        LatentSurvivalError, validate_unloaded_components_for_loading,
-    };
+    use crate::survival::latent::{LatentSurvivalError, validate_unloaded_components_for_loading};
 
     let context = M::context();
     let resolution = M::frailty_policy(row.frailty)?;
@@ -154,8 +152,7 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
                 ),
             });
         }
-        let is_interval =
-            event == crate::survival::latent::LATENT_SURVIVAL_EVENT_INTERVAL;
+        let is_interval = event == crate::survival::latent::LATENT_SURVIVAL_EVENT_INTERVAL;
         if is_interval && !M::allows_interval() {
             return Err(LatentSurvivalError::InvalidDataset {
                 reason: format!(

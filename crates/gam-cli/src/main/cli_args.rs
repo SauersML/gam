@@ -56,12 +56,81 @@ pub(crate) struct FitArgs {
         help = "Training dataset (CSV or parquet) — must contain every column referenced in <FORMULA>"
     )]
     pub(crate) data: PathBuf,
+    /// Read the formula and complete scientific model configuration from a
+    /// versioned `gam.fit-request` JSON document. DATA and --out remain CLI
+    /// transport arguments and are intentionally not embedded in the document.
+    #[arg(
+        long = "request",
+        value_name = "FILE",
+        conflicts_with_all = [
+            "formula_positional",
+            "predict_noise",
+            "logslope_formula",
+            "z_column",
+            "weights_column",
+            "offset_column",
+            "noise_offset_column",
+            "frailty_kind",
+            "frailty_sd",
+            "hazard_loading",
+            "transformation_normal",
+            "firth",
+            "family",
+            "negative_binomial_theta",
+            "expectile_tau",
+            "survival_likelihood",
+            "survival_time_anchor",
+            "baseline_target",
+            "baseline_scale",
+            "baseline_shape",
+            "baseline_rate",
+            "baseline_makeham",
+            "time_basis",
+            "time_degree",
+            "time_num_internal_knots",
+            "time_smooth_lambda",
+            "ridge_lambda",
+            "threshold_time_k",
+            "threshold_time_degree",
+            "sigma_time_k",
+            "sigma_time_degree",
+            "adaptive_regularization",
+            "scale_dimensions",
+            "pilot_subsample_threshold",
+            "ctn_stage1",
+            "precision_hyperpriors",
+            "latent_coordinates",
+            "analytic_penalties",
+            "smooth_descriptors"
+        ]
+    )]
+    pub(crate) request: Option<PathBuf>,
     #[arg(
         value_name = "FORMULA",
+        required_unless_present = "request",
+        conflicts_with = "request",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary unpenalized parametric linear term (MLE by default)\n- linear(x, min=..., max=...): unpenalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): parametric effect with its own zero-centered REML shrinkage penalty\n- linear(x, double_penalty=false): explicit unpenalized/MLE parametric effect\n- linear(x, min=..., max=...): shrinkable linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints\n- bounded(x, min=..., max=...): shrinkable bounded linear coefficient with exact interval transform and no extra coefficient prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- linear shrinkage uses each realized effect's function mass and is invariant to coefficient-basis rescaling\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ linear(age, double_penalty=false) + smooth(bmi)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
-    pub(crate) formula_positional: String,
+    pub(crate) formula_positional: Option<String>,
+    /// CTN Stage-1 object (`ctn_stage1`) as a JSON file. This is the ergonomic
+    /// fragment form for direct-flag fits; `--request` carries the same typed
+    /// object inside a complete request document.
+    #[arg(long = "ctn-stage1", value_name = "JSON_FILE")]
+    pub(crate) ctn_stage1: Option<PathBuf>,
+    /// Precision-hyperprior map as a JSON file. Values are typed objects
+    /// `{ "shape": ..., "rate": ... }`.
+    #[arg(long = "precision-hyperpriors", value_name = "JSON_FILE")]
+    pub(crate) precision_hyperpriors: Option<PathBuf>,
+    /// Named latent-coordinate map as a JSON file.
+    #[arg(long = "latent-coordinates", value_name = "JSON_FILE")]
+    pub(crate) latent_coordinates: Option<PathBuf>,
+    /// Analytic-penalty descriptor list as a JSON file.
+    #[arg(long = "analytic-penalties", value_name = "JSON_FILE")]
+    pub(crate) analytic_penalties: Option<PathBuf>,
+    /// Explicit smooth-descriptor map as a JSON file.
+    #[arg(long = "smooth-descriptors", value_name = "JSON_FILE")]
+    pub(crate) smooth_descriptors: Option<PathBuf>,
     /// Fit a second RHS-only formula for the scale/noise block in
     /// location-scale mode. Pass terms like `smooth(x)` or `1`, not `y ~ ...`.
     /// This does not change the base mean link; use `link(type=...)` when you

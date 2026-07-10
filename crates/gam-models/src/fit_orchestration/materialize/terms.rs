@@ -23,7 +23,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
-    // The standard formula path starts every auto-sized 2-D+ spatial smooth at
+    // The standard formula path starts every auto-sized radial spatial smooth at
     // its structural minimum and threads per-term evidence-backed expansions
     // back through this same materializer. Explicit formula counts are not
     // `Auto`, and Python overrides apply afterward, so both remain authoritative.
@@ -46,8 +46,8 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 ///
 /// Eligibility (never clobber a pinned basis):
 /// * spatial radial family only (thin-plate / Duchon / Matérn / constant-curvature
-///   / measure-jet) with covariate dimension `d ≥ 2` — the `default_num_centers`
-///   -from-`n` cost driver; 1-D `s(x)` P-splines are already lean and untouched;
+///   / measure-jet); ordinary 1-D `s(x)` P-splines are a different basis and
+///   remain untouched, while an explicitly radial 1-D basis is evidence-sized;
 /// * the current strategy must retain [`CenterStrategy::Auto`] provenance;
 ///   every explicit formula/programmatic strategy is therefore left alone;
 /// Python `smooths={...}` overrides are applied by the caller AFTER this, so they
@@ -72,7 +72,7 @@ fn apply_adaptive_spatial_center_counts(
             continue;
         };
         let d = feature_cols.len();
-        if d < 2 {
+        if d == 0 {
             continue;
         }
         if !center_strategy_is_auto(strategy) {

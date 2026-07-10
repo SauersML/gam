@@ -246,12 +246,12 @@ impl BinomialLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
-            threshold_design: Some(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                x_t.into_owned(),
-            ))),
-            log_sigma_design: Some(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                x_ls.into_owned(),
-            ))),
+            threshold_design: Some(DesignMatrix::Dense(
+                gam_linalg::matrix::DenseDesignMatrix::from(x_t.into_owned()),
+            )),
+            log_sigma_design: Some(DesignMatrix::Dense(
+                gam_linalg::matrix::DenseDesignMatrix::from(x_ls.into_owned()),
+            )),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: self.policy.clone(),

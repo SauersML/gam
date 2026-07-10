@@ -25,9 +25,7 @@
 //! (`build_host_moments` + `HostMomentBatch`) lives in the test module below
 //! as a comparison oracle for the device kernel's row-major moment buffer.
 
-use crate::cubic_cell_kernel::{
-    DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
-};
+use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_derivative_moments_uncached};
 use crate::gpu_kernels::cubic_cell::branch::classify_cell_for_gpu;
 use crate::gpu_kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellMomentStatus, GpuCellBranchTag,
@@ -96,9 +94,7 @@ pub(crate) fn build_host_cell_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cubic_cell_kernel::{
-        DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
-    };
+    use crate::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_derivative_moments_uncached};
     use crate::gpu_kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
         GpuDenestedCubicCell,

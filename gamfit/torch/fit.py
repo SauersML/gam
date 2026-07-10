@@ -248,7 +248,10 @@ def _kron_eye(left: int, mat: torch.Tensor, right: int) -> torch.Tensor:
 
 
 def _build_design_penalty(
-    smooth: Smooth, points: torch.Tensor,
+    smooth: Smooth,
+    points: torch.Tensor,
+    *,
+    resolved_bspline: tuple[torch.Tensor, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the (design, penalty) pair for one smooth at given input points.
 
@@ -317,8 +320,10 @@ def _build_design_penalty(
             )
         bspline_periodic = smooth.periodic
         bspline_penalty_order = smooth.penalty_order
-        knots, eff_degree = _resolve_bspline_knots_for_fit(
-            smooth, points.squeeze(1),
+        knots, eff_degree = (
+            resolved_bspline
+            if resolved_bspline is not None
+            else _resolve_bspline_knots_for_fit(smooth, points.squeeze(1))
         )
         knots_np = knots.detach().cpu().numpy()
         design = bspline_basis(
@@ -591,6 +596,8 @@ def _build_shape_constraint_inequality(
     points: torch.Tensor,
     shape_kind: str,
     coefficient_count: int,
+    *,
+    resolved_bspline: tuple[torch.Tensor, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``A·β ≥ 0`` certifying shape on every open knot span.
 
@@ -618,7 +625,11 @@ def _build_shape_constraint_inequality(
             "cyclic coefficient chart."
         )
 
-    knots, degree = _resolve_bspline_knots_for_fit(smooth, points.squeeze(1))
+    knots, degree = (
+        resolved_bspline
+        if resolved_bspline is not None
+        else _resolve_bspline_knots_for_fit(smooth, points.squeeze(1))
+    )
     if degree < 1:
         raise ValueError("shape_constraint requires BSpline degree >= 1")
     basis_width = int(knots.numel()) - degree - 1
@@ -628,54 +639,23 @@ def _build_shape_constraint_inequality(
             f"imply {basis_width} coefficients, design has {coefficient_count}"
         )
 
-    sk = shape_kind.lower()
-    if sk in ("monotone_increasing", "monotone_decreasing"):
-        if coefficient_count < 2:
-            raise ValueError("monotonicity requires at least two B-spline coefficients")
-        sign = 1.0 if sk == "monotone_increasing" else -1.0
-        a = torch.zeros(
-            (coefficient_count - 1, coefficient_count),
-            dtype=torch.float64,
-            device=points.device,
-        )
-        row = torch.arange(coefficient_count - 1, device=points.device)
-        a[row, row] = -sign
-        a[row, row + 1] = sign
-    elif sk in ("convex", "concave"):
-        if coefficient_count < 3:
-            raise ValueError(
-                "curvature constraints require at least three B-spline coefficients"
-            )
-        sign = 1.0 if sk == "convex" else -1.0
-        # ξ_i = mean(t[i+1 : i+d+1]); derivative controls are
-        # (β[i+1]-β[i]) / (ξ[i+1]-ξ[i]).
-        greville = knots[1:-1].unfold(0, degree, 1).mean(dim=1)
-        spans = greville[1:] - greville[:-1]
-        if spans.numel() != coefficient_count - 1 or not bool((spans > 0.0).all()):
-            raise ValueError(
-                "shape_constraint requires strictly increasing B-spline "
-                "Greville abscissae"
-            )
-        inverse_spans = spans.reciprocal()
-        a = torch.zeros(
-            (coefficient_count - 2, coefficient_count),
-            dtype=torch.float64,
-            device=points.device,
-        )
-        row = torch.arange(coefficient_count - 2, device=points.device)
-        a[row, row] = sign * inverse_spans[:-1]
-        a[row, row + 1] = -sign * (inverse_spans[:-1] + inverse_spans[1:])
-        a[row, row + 2] = sign * inverse_spans[1:]
-    else:
-        raise ValueError(
-            f"unknown shape_constraint kind {shape_kind!r}; expected one of "
-            "monotone_increasing, monotone_decreasing, convex, concave"
-        )
+    # Knot validation, derivative-control geometry, row scaling, and shape-kind
+    # parsing live in Rust. Torch only transfers the canonical linear cone to
+    # the target device; it does not maintain a second implementation of the
+    # spline mathematics.
+    from .._binding import rust_module
 
-    # Positive row scaling preserves the cone and keeps the constrained solve
-    # insensitive to the physical units of an irregular knot sequence.
-    a = (a / torch.linalg.vector_norm(a, dim=1, keepdim=True)).contiguous()
-    b = torch.zeros(a.shape[0], dtype=torch.float64, device=a.device)
+    a_np, b_np = rust_module().bspline_shape_constraints(
+        knots.detach().cpu().numpy(), int(degree), str(shape_kind),
+    )
+    a = torch.as_tensor(a_np, dtype=torch.float64, device=points.device).contiguous()
+    b = torch.as_tensor(b_np, dtype=torch.float64, device=points.device).contiguous()
+    if a.dim() != 2 or a.shape[1] != coefficient_count or b.shape != (a.shape[0],):
+        raise RuntimeError(
+            "Rust shape-constraint payload does not match the realized "
+            f"B-spline chart: A={tuple(a.shape)}, b={tuple(b.shape)}, "
+            f"coefficients={coefficient_count}"
+        )
     return a, b
 
 
@@ -688,9 +668,23 @@ def _fit_single_constrained(
     shape_kind: str,
     init_lambdas: torch.Tensor | None,
 ) -> "FitResult":
-    design, penalty = _build_design_penalty(smooth, points)
+    points_2d = _coerce_2d(points, "points")
+    if not isinstance(smooth, BSpline):
+        raise NotImplementedError(
+            "shape_constraint on the torch fit path requires an open BSpline"
+        )
+    realized_bspline = _resolve_bspline_knots_for_fit(
+        smooth, points_2d.squeeze(1),
+    )
+    design, penalty = _build_design_penalty(
+        smooth, points_2d, resolved_bspline=realized_bspline,
+    )
     a_ineq, b_ineq = _build_shape_constraint_inequality(
-        smooth, points, shape_kind, design.shape[1],
+        smooth,
+        points_2d,
+        shape_kind,
+        design.shape[1],
+        resolved_bspline=realized_bspline,
     )
     if smooth.by is not None:
         raise NotImplementedError(

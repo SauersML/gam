@@ -634,9 +634,7 @@ pub fn run_pcg_against_row_hessian_device(
 #[cfg(all(test, target_os = "linux"))]
 mod pcg_device_parity_tests {
     use super::*;
-    use crate::bms::gpu::row::{
-        BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess,
-    };
+    use crate::bms::gpu::row::{BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess};
     use ndarray::Array2;
 
     /// Dense oracle for `H_full = Σ_i P_iᵀ H_i P_i` consistent with

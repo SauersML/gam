@@ -180,13 +180,12 @@ fn binomial_logit_reml_outer_cost_is_bounded_1575() {
 
     eprintln!(
         "#1575 binomial/logit REML: n={N} k={K} p={}  time={:.3}s  \
-         outer_cost_evals={}  inner_pirls_solves={}  converged={}  \
+         outer_cost_evals={}  inner_pirls_solves={}  \
          grad_norm={:?}  reml={:.6}  edf={:.4}  lambdas={:?}",
         1 + N_SMOOTH * K,
         dt.as_secs_f64(),
         fit.outer_cost_evals,
         fit.inner_pirls_solves,
-        fit.outer_converged,
         fit.outer_gradient_norm,
         fit.reml_score,
         fit.edf_total().unwrap_or(f64::NAN),
@@ -197,8 +196,8 @@ fn binomial_logit_reml_outer_cost_is_bounded_1575() {
     );
 
     assert!(
-        fit.outer_converged,
-        "outer REML must certify convergence, not grind to the iter cap"
+        fit.convergence_evidence().outer_certificate().is_some(),
+        "outer REML fit must carry its analytic convergence certificate"
     );
     // mgcv's REML Newton converges in well under ~15 outer iterations on this
     // family of problem. Pin a generous multiple so the test fails loudly if
@@ -236,8 +235,8 @@ fn binomial_logit_reml_outer_cost_is_bounded_1575() {
 #[test]
 fn binomial_logit_reml_outer_cost_is_n_independent_1575() {
     eprintln!(
-        "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10} {:>10} {:>9}",
-        "n", "k", "p", "outer", "inner", "time_s", "time/inner", "conv"
+        "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10} {:>10}",
+        "n", "k", "p", "outer", "inner", "time_s", "time/inner"
     );
     let mut outer_by_n: Vec<(usize, usize)> = Vec::new();
     for &n in &[1000usize, 2000] {
@@ -263,7 +262,7 @@ fn binomial_logit_reml_outer_cost_is_n_independent_1575() {
         .expect("binomial/logit REML fit should succeed");
         let dt = t0.elapsed().as_secs_f64();
         eprintln!(
-            "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10.3} {:>10.4} {:>9}",
+            "{:>7} {:>4} {:>4} {:>8} {:>8} {:>10.3} {:>10.4}",
             n,
             k,
             1 + N_SMOOTH * k,
@@ -271,11 +270,10 @@ fn binomial_logit_reml_outer_cost_is_n_independent_1575() {
             fit.inner_pirls_solves,
             dt,
             dt / (fit.inner_pirls_solves.max(1) as f64),
-            fit.outer_converged,
         );
         assert!(
-            fit.outer_converged,
-            "n={n}: outer REML must certify convergence, not grind to the iter cap"
+            fit.convergence_evidence().outer_certificate().is_some(),
+            "n={n}: outer REML fit must carry its analytic convergence certificate"
         );
         // Same bounded outer budget the single-`n` sibling gate pins: the count
         // must stay bounded as `n` grows (that IS n-independence). mgcv's Newton

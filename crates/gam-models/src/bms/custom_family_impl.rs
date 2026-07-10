@@ -401,14 +401,17 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         penalty_cursor = 0;
         for (block_idx, block_rho) in per_block_rho.iter().enumerate() {
             let lambdas = block_rho.mapv(f64::exp).to_vec();
-            let pld = gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
-                &penalties_dense[block_idx],
-                &lambdas,
-                penalty_logdet_ridge,
-            )
-            .map_err(|e| {
-                format!("bernoulli marginal-slope penalty logdet failed for block {block_idx}: {e}")
-            })?;
+            let pld =
+                gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
+                    &penalties_dense[block_idx],
+                    &lambdas,
+                    penalty_logdet_ridge,
+                )
+                .map_err(|e| {
+                    format!(
+                        "bernoulli marginal-slope penalty logdet failed for block {block_idx}: {e}"
+                    )
+                })?;
             let first = pld.rho_derivatives(&penalties_dense[block_idx], &lambdas).0;
             for (local_idx, value) in first.iter().enumerate() {
                 trace_s_pinv_sdot[penalty_cursor + local_idx] = *value;
@@ -496,9 +499,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 && derivative_blocks.iter().any(|block| !block.is_empty())
             {
                 match self.joint_jeffreys_information_with_specs(block_states, specs)? {
-                    Some(h_info)
-                        if h_info.nrows() == total && h_info.ncols() == total =>
-                    {
+                    Some(h_info) if h_info.nrows() == total && h_info.ncols() == total => {
                         Some((Array2::<f64>::eye(total), h_info))
                     }
                     _ => None,
@@ -797,10 +798,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::row_kernel::RowSet::All)?;
             return Ok(Some(ExactNewtonJointGradientEvaluation {
-                log_likelihood: row_kernel_log_likelihood(
-                    &cache,
-                    &crate::row_kernel::RowSet::All,
-                ),
+                log_likelihood: row_kernel_log_likelihood(&cache, &crate::row_kernel::RowSet::All),
                 gradient: Self::exact_newton_score_from_objective_gradient(row_kernel_gradient(
                     &kern,
                     &cache,
@@ -1275,12 +1273,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             // Same feasibility-preserving segment clamp as the score-warp
             // block: this is a globalization guard for the analytic linear
             // constraints, not an unconstrained post-hoc fit alteration.
-            return project_monotone_feasible_beta(
-                runtime,
-                current,
-                &beta,
-                "link_dev post-update",
-            );
+            return project_monotone_feasible_beta(runtime, current, &beta, "link_dev post-update");
         }
         Ok(beta)
     }
@@ -1422,9 +1415,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             if let Some(device_state) = self.cache.row_primary_hessians.device() {
                 let p_total = self.cache.slices.total;
                 if p_total <= crate::bms::gpu::row::DENSE_BLOCK_MAX_P {
-                    match crate::bms::gpu::row::launch_bms_flex_row_dense_block(
-                        device_state,
-                    ) {
+                    match crate::bms::gpu::row::launch_bms_flex_row_dense_block(device_state) {
                         Ok(flat) => {
                             let h_arr =
                                 Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
@@ -1491,9 +1482,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             if let Some(device_state) = self.cache.row_primary_hessians.device() {
                 let p_total = self.cache.slices.total;
                 if p_total <= crate::bms::gpu::row::DENSE_BLOCK_MAX_P {
-                    match crate::bms::gpu::row::launch_bms_flex_row_dense_block(
-                        device_state,
-                    ) {
+                    match crate::bms::gpu::row::launch_bms_flex_row_dense_block(device_state) {
                         Ok(flat) => {
                             let h_arr =
                                 Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {

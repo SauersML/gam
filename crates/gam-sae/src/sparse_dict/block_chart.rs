@@ -2,8 +2,7 @@ use ndarray::{Array2, ArrayView2, ArrayView3};
 
 use super::block::{
     block_sparse_dictionary_block_coords, block_sparse_dictionary_project_residual,
-    block_sparse_dictionary_project_residual_with_codes,
-    reconstruct_block_sparse_rows,
+    block_sparse_dictionary_project_residual_with_codes, reconstruct_block_sparse_rows,
 };
 
 #[derive(Clone, Debug)]
@@ -27,6 +26,16 @@ pub struct BlockChartComposeConfig {
     /// parameter owned by the caller, not a hidden constant inside composition.
     pub block_tile: usize,
 }
+
+/// Declared target FDR level `α` for the genuine universal-inference split-LR
+/// e-value + full-family e-BH discovery certificate (#2246). Distinct from the
+/// descriptive `selected_by_bic` gate: the screened family FEEDS e-BH at this
+/// level, and [`BlockChartComposeResult::fdr_selected_chart_blocks`] /
+/// `fdr_selected_chart_pairs` are the candidates confirmed at FDR ≤ `α`. A
+/// module constant (not a `BlockChartComposeConfig` field) so the honest
+/// discovery certificate is always emitted without churning every caller's
+/// explicit config literal.
+pub const CHART_FDR_ALPHA: f64 = 0.1;
 
 impl Default for BlockChartComposeConfig {
     fn default() -> Self {
@@ -76,6 +85,19 @@ pub struct ChartEvidence {
     /// `min_effect`, with a positive lower confidence bound on mean deviance.
     /// This is not a p-value, e-value, or FDR-controlled discovery.
     pub selected_by_bic: bool,
+    /// Genuine universal-inference split-LR log-e-value (#2246): `ln Ē` for the
+    /// cross-fit e-value `Ē = p_alt(D1; θ̂_{D0}) / sup_{H0} p_null(D1)` with the
+    /// radial-ring alternative fit on a disjoint split and the linear-shell null
+    /// re-maximized on the held-out fold. Satisfies `E_{H0}[E] ≤ 1` (unlike the
+    /// BIC `margin`), so it — not `margin` — is the quantity fed to e-BH. `−∞`
+    /// for a candidate too degenerate to support a curved claim. See
+    /// [`super::shell_vs_ring_log_evalue`].
+    pub log_e: f64,
+    /// Whether the full-family e-BH over every screened candidate's `log_e`
+    /// confirmed THIS candidate as genuine curved structure at the configured
+    /// `fdr_alpha`. Set by [`compose_block_coordinate_charts`] after the family
+    /// is assembled; `false` in a standalone [`ChartEvidence`].
+    pub fdr_selected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +116,15 @@ pub struct BlockChartComposeResult {
     pub selected_blocks: Vec<usize>,
     pub selected_chart_blocks: Vec<usize>,
     pub selected_chart_pairs: Vec<(usize, usize)>,
+    /// Declared FDR level `α` the discovery certificate below controls at.
+    pub fdr_alpha: f64,
+    /// Single blocks whose curved chart the full-family e-BH confirms as genuine
+    /// structure at FDR ≤ `fdr_alpha` (#2246). This is the honest discovery list;
+    /// `selected_chart_blocks` above is the descriptive BIC gate for comparison.
+    pub fdr_selected_chart_blocks: Vec<usize>,
+    /// Block pairs whose curved chart the full-family e-BH confirms at FDR ≤
+    /// `fdr_alpha`.
+    pub fdr_selected_chart_pairs: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +333,34 @@ pub fn compose_block_coordinate_charts(
         }
     }
 
+    // Genuine FDR-controlled discovery (#2246): the screened family — EVERY
+    // single and pair the energy/score screen surfaced — feeds one full-family
+    // e-BH over the universal-inference split-LR log-e-values. The screen feeds
+    // the family, it does NOT gate it: running e-BH over only the BIC-selected
+    // subset would redefine the family post hoc and void the guarantee. Order is
+    // singles first, then pairs, so a rejected index < singles.len() is a single.
+    let mut family_log_e: Vec<f64> = Vec::with_capacity(singles.len() + pairs.len());
+    family_log_e.extend(singles.iter().map(|c| c.evidence.log_e));
+    family_log_e.extend(pairs.iter().map(|c| c.evidence.log_e));
+    let fdr = super::split_lr_fdr::family_fdr_certificate(family_log_e, CHART_FDR_ALPHA);
+    for &idx in &fdr.rejected {
+        if idx < singles.len() {
+            singles[idx].evidence.fdr_selected = true;
+        } else {
+            pairs[idx - singles.len()].evidence.fdr_selected = true;
+        }
+    }
+    let fdr_selected_chart_blocks = singles
+        .iter()
+        .filter(|c| c.evidence.fdr_selected)
+        .map(|c| c.blocks[0])
+        .collect::<Vec<_>>();
+    let fdr_selected_chart_pairs = pairs
+        .iter()
+        .filter(|c| c.evidence.fdr_selected)
+        .map(|c| (c.blocks[0], c.blocks[1]))
+        .collect::<Vec<_>>();
+
     let block_records = singles
         .iter()
         .map(|c| BlockChartRecord {
@@ -337,6 +396,9 @@ pub fn compose_block_coordinate_charts(
         selected_blocks: selected,
         selected_chart_blocks,
         selected_chart_pairs,
+        fdr_alpha: CHART_FDR_ALPHA,
+        fdr_selected_chart_blocks,
+        fdr_selected_chart_pairs,
     })
 }
 
@@ -517,7 +579,12 @@ fn matched_dl_for_block(
     let n_fire = firing_coords.nrows();
     let mut norms: Vec<f64> = Vec::with_capacity(n_fire);
     for row in firing_coords.rows() {
-        norms.push(row.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>().sqrt());
+        norms.push(
+            row.iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum::<f64>()
+                .sqrt(),
+        );
     }
     let sigma_hat = if n_fire >= 2 {
         let mean = norms.iter().sum::<f64>() / n_fire as f64;
@@ -539,7 +606,13 @@ fn matched_dl_for_block(
         .collect();
     let amp_ses: Vec<f64> = norms
         .iter()
-        .map(|&nz| if nz > 0.0 { sigma_hat / nz } else { f64::INFINITY })
+        .map(|&nz| {
+            if nz > 0.0 {
+                sigma_hat / nz
+            } else {
+                f64::INFINITY
+            }
+        })
         .collect();
     // Distortion-matched per-scalar decoder precision, PER ARM: the mean per-firing
     // coding rate of THAT arm's coordinate (the `description_length::score`
@@ -812,6 +885,13 @@ fn crossfit_evidence(
     let gain = n_eff.max(2.0) * mean_delta;
     let charge = 0.5 * d_eff * n_eff.max(2.0).ln();
     let margin = gain - charge;
+    // Genuine universal-inference split-LR log-e-value on the SAME coordinate
+    // rows (#2246): a valid `E_{H0}[E] ≤ 1` instrument, unlike the descriptive
+    // BIC `margin` above. Fed to the full-family e-BH in
+    // `compose_block_coordinate_charts`; `fdr_selected` is set there.
+    let coords64 = to_f64(coords);
+    let log_e =
+        super::split_lr_fdr::shell_vs_ring_log_evalue(&coords64, folds, config.whitening_ridge)?;
     Ok(ChartEvidence {
         n_rows: n,
         n_effective: n_eff,
@@ -825,6 +905,8 @@ fn crossfit_evidence(
         charge,
         margin,
         selected_by_bic: margin >= config.min_effect && ci_low > 0.0,
+        log_e,
+        fdr_selected: false,
     })
 }
 
@@ -862,7 +944,9 @@ fn fit_whitening(coords: &Array2<f32>, ridge: f64) -> Result<Whitening, String> 
     let (vals, eigvec) = jacobi_eigh(cov, d)?;
     let max_eval = vals.iter().copied().fold(0.0, f64::max);
     if !(ridge.is_finite() && ridge >= 0.0) {
-        return Err(format!("whitening ridge fraction must be finite and non-negative; got {ridge}"));
+        return Err(format!(
+            "whitening ridge fraction must be finite and non-negative; got {ridge}"
+        ));
     }
     let spectral_scale = max_eval.max(f64::MIN_POSITIVE);
     let floor = (ridge * spectral_scale).max(f64::EPSILON * spectral_scale);
@@ -986,7 +1070,7 @@ fn radial_predict(train: &Array2<f64>, eval: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-fn jacobi_eigh(mut a: Vec<f64>, n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+pub(crate) fn jacobi_eigh(mut a: Vec<f64>, n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
     if a.len() != n * n {
         return Err("jacobi_eigh: matrix length mismatch".to_string());
     }
@@ -1343,7 +1427,10 @@ mod tests {
         // The ring is a genuine curved structure: the chart must beat the linear
         // comparator (a meaningful ACCEPT, not a trivial tie).
         assert!(base.deviance_gain > 0.0, "chart must beat linear on a ring");
-        assert!(base.selected_by_bic, "the ring must be selected by held-out BIC");
+        assert!(
+            base.selected_by_bic,
+            "the ring must be selected by held-out BIC"
+        );
 
         // Rescale every coordinate by 10 (SSE ×100). Deviance-scale scoring must
         // leave the verdict and margin unchanged.

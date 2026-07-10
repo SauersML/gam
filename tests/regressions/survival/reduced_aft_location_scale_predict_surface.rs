@@ -148,6 +148,7 @@ fn predict_surface(model: &FittedModel, dataset: &EncodedDataset, grid: &[f64]) 
         noise_offset: &noise_offset,
         time_grid: Some(grid),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
     let result = predict_survival(request)
         .expect("reduced-AFT location-scale survival predict must succeed");

@@ -23,8 +23,8 @@ from gamfit._sae_manifold import (
     _basis_to_topology,
     _bases,
     _canonical_topology,
-    _topologies_for_bases,
     flat_block_assignment,
+    rust_module,
 )
 
 
@@ -33,7 +33,8 @@ def test_linear_block_is_its_own_topology_label():
     # per-atom topology list round-trips through save/load (which stores
     # atom_topologies / basis_kinds verbatim).
     assert _bases(3, None, "linear_block") == ["linear_block"] * 3
-    assert _topologies_for_bases(["linear_block"] * 3) == ["linear_block"] * 3
+    _scalar, topologies = rust_module().sae_atom_topologies(["linear_block"] * 3)
+    assert topologies == ["linear_block"] * 3
     assert _basis_to_topology("linear_block") == "linear_block"
     # flat_block is an accepted alias; case / dash normalise.
     assert _basis_to_topology("flat_block") == "linear_block"

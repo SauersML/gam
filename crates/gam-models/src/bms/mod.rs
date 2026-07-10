@@ -1,3 +1,4 @@
+use crate::cubic_cell_kernel as exact_kernel;
 use crate::custom_family::{
     BatchedOuterGradientTerms, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
     CustomFamily, CustomFamilyWarmStart, EvalMode, ExactNewtonJointGradientEvaluation,
@@ -8,8 +9,11 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
     joint_hyper_options_for_outer_tolerance,
 };
-use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianFactorization};
-use crate::cubic_cell_kernel as exact_kernel;
+use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, apply_spatial_anisotropy_pilot_initializer,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
+};
 use crate::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
     add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
@@ -19,7 +23,13 @@ use crate::marginal_slope_shared::{
     outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
     probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
 };
+use crate::model_types::UnifiedFitResult;
+use crate::outer_subsample::WeightedOuterRow;
 use crate::parameter_block::ParameterBlockInput;
+use crate::probability::{
+    normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
+    standard_normal_quantile,
+};
 use crate::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
@@ -28,25 +38,15 @@ use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::initializewiggle_knots_from_seed;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
-use crate::model_types::UnifiedFitResult;
-use crate::outer_subsample::WeightedOuterRow;
+use gam_math::jet_partitions::MultiDirJet;
+use gam_problem::HyperOperator;
+use gam_problem::{InverseLink, StandardLink, WigglePenaltyConfig};
+use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianFactorization};
 use gam_solve::pirls::LinearInequalityConstraints;
-use crate::probability::{
-    normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
-    standard_normal_quantile,
-};
 use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
     TermCollectionSpec,
 };
-use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, apply_spatial_anisotropy_pilot_initializer,
-    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
-};
-use gam_problem::{InverseLink, StandardLink, WigglePenaltyConfig};
-use gam_math::jet_partitions::MultiDirJet;
-use gam_problem::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -1667,7 +1667,10 @@ pub(crate) fn build_latent_measure_with_geometry(
                         "global-empirical"
                     },
                 );
-                return Ok((kind, LatentMeasureCalibration::ConditionalLocationScale(cal)));
+                return Ok((
+                    kind,
+                    LatentMeasureCalibration::ConditionalLocationScale(cal),
+                ));
             }
             if latent_z_is_standard_normal_enough(z, weights, policy)? {
                 Ok((
@@ -2108,9 +2111,9 @@ mod test_support;
 // allowed `*_tests` name so the build.rs ban-scanner exempts it; owned solely by
 // the verifier (never edits the implementer's row_primary_hessian /
 // gradient_paths / cell_moment_assembly).
+pub(crate) mod custom_family_impl;
 #[cfg(test)]
 mod flex_verify_932_tests;
-pub(crate) mod custom_family_impl;
 pub(crate) mod row_primary_hessian;
 
 pub use block_specs::fit_bernoulli_marginal_slope_terms;

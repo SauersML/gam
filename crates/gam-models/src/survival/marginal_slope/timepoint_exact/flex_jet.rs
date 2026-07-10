@@ -81,8 +81,8 @@
 
 use super::*;
 use crate::bms::signed_probit_neglog_derivatives_up_to_fourth;
-use crate::survival::marginal_slope::gpu;
 use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
+use crate::survival::marginal_slope::gpu;
 
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
 ///
@@ -821,12 +821,36 @@ impl SurvivalMarginalSlopeFamily {
             qd1_g[primary.qd1] = 1.0;
         }
         let out = fused_row_nll_jet2(
-            &FusedSrc { v: eta0_v, g: &eta0_gv, h: &eta0_hv },
-            &FusedSrc { v: eta1_v, g: &eta1_gv, h: &eta1_hv },
-            &FusedSrc { v: chi1_v, g: &chi1_gv, h: &chi1_hv },
-            &FusedSrc { v: d1_v, g: &d1_gv, h: &d1_hv },
-            &FusedSrc { v: q1, g: &q1_g, h: &zero_h },
-            &FusedSrc { v: qd1, g: &qd1_g, h: &zero_h },
+            &FusedSrc {
+                v: eta0_v,
+                g: &eta0_gv,
+                h: &eta0_hv,
+            },
+            &FusedSrc {
+                v: eta1_v,
+                g: &eta1_gv,
+                h: &eta1_hv,
+            },
+            &FusedSrc {
+                v: chi1_v,
+                g: &chi1_gv,
+                h: &chi1_hv,
+            },
+            &FusedSrc {
+                v: d1_v,
+                g: &d1_gv,
+                h: &d1_hv,
+            },
+            &FusedSrc {
+                v: q1,
+                g: &q1_g,
+                h: &zero_h,
+            },
+            &FusedSrc {
+                v: qd1,
+                g: &qd1_g,
+                h: &zero_h,
+            },
             surv0,
             surv1,
             wi,
@@ -1606,9 +1630,7 @@ fn cell_edge_jet<J: FlexJet>(
             // z = (τ − a)·(1/b).
             const_jet_like(a_jet, tau).sub(a_jet).mul(&recip(b_jet))
         }
-        crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
-            const_jet_like(a_jet, z_value)
-        }
+        crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => const_jet_like(a_jet, z_value),
     }
 }
 
@@ -2163,10 +2185,8 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         cached: &CachedPartitionCells,
         dir: &Array1<f64>,
-    ) -> Result<
-        crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional,
-        String,
-    > {
+    ) -> Result<crate::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional, String>
+    {
         let p = primary.total;
         let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         let z_obs = self.observed_score_projection(row);
@@ -4739,12 +4759,36 @@ mod fused_jet2_oracle_tests {
                 let mut qdg = vec![0.0; p];
                 qdg[qdax] = 1.0;
                 let f_out = fused_row_nll_jet2(
-                    &FusedSrc { v: e0v, g: &e0g, h: &e0h },
-                    &FusedSrc { v: e1v, g: &e1g, h: &e1h },
-                    &FusedSrc { v: cv, g: &cg, h: &ch },
-                    &FusedSrc { v: dv, g: &dg, h: &dh },
-                    &FusedSrc { v: q1v, g: &qg, h: &zero_h },
-                    &FusedSrc { v: qd1v, g: &qdg, h: &zero_h },
+                    &FusedSrc {
+                        v: e0v,
+                        g: &e0g,
+                        h: &e0h,
+                    },
+                    &FusedSrc {
+                        v: e1v,
+                        g: &e1g,
+                        h: &e1h,
+                    },
+                    &FusedSrc {
+                        v: cv,
+                        g: &cg,
+                        h: &ch,
+                    },
+                    &FusedSrc {
+                        v: dv,
+                        g: &dg,
+                        h: &dh,
+                    },
+                    &FusedSrc {
+                        v: q1v,
+                        g: &qg,
+                        h: &zero_h,
+                    },
+                    &FusedSrc {
+                        v: qd1v,
+                        g: &qdg,
+                        h: &zero_h,
+                    },
                     surv0,
                     surv1,
                     wi,
@@ -4754,10 +4798,18 @@ mod fused_jet2_oracle_tests {
 
                 assert_eq!(g_out.v.to_bits(), f_out.v.to_bits(), "value p={p}");
                 for i in 0..p {
-                    assert_eq!(g_out.g[i].to_bits(), f_out.g[i].to_bits(), "grad[{i}] p={p}");
+                    assert_eq!(
+                        g_out.g[i].to_bits(),
+                        f_out.g[i].to_bits(),
+                        "grad[{i}] p={p}"
+                    );
                 }
                 for k in 0..p * p {
-                    assert_eq!(g_out.h[k].to_bits(), f_out.h[k].to_bits(), "hess[{k}] p={p}");
+                    assert_eq!(
+                        g_out.h[k].to_bits(),
+                        f_out.h[k].to_bits(),
+                        "hess[{k}] p={p}"
+                    );
                 }
             }
         }
@@ -4826,7 +4878,10 @@ mod hand_vs_jet_bench_tests {
         let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
         let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
         let row_nll = wi
-            * (log_surv0 - (1.0 - di) * log_surv1 - di * log_phi_eta1 - di * chi1.ln()
+            * (log_surv0
+                - (1.0 - di) * log_surv1
+                - di * log_phi_eta1
+                - di * chi1.ln()
                 - di * log_phi_q1
                 + di * d1.ln()
                 - di * qd1.ln());
@@ -4858,9 +4913,8 @@ mod hand_vs_jet_bench_tests {
                 value += entry_u2 * eta0_u[u] * eta0_u[v] + entry_u1 * eta0_uv[[u, v]];
                 value += exit_surv_u2 * eta1_u[u] * eta1_u[v] + exit_surv_u1 * eta1_uv[[u, v]];
                 value += wi * di * (eta1_u[u] * eta1_u[v] + eta1 * eta1_uv[[u, v]]);
-                value -= wi
-                    * di
-                    * (chi1_uv[[u, v]] / chi1 - (chi1_u[u] * chi1_u[v]) / (chi1 * chi1));
+                value -=
+                    wi * di * (chi1_uv[[u, v]] / chi1 - (chi1_u[u] * chi1_u[v]) / (chi1 * chi1));
                 if u == q1_idx && v == q1_idx {
                     value += wi * di;
                 }
@@ -4918,12 +4972,36 @@ mod hand_vs_jet_bench_tests {
             qd1_g[qd1_idx] = 1.0;
         }
         let out = fused_row_nll_jet2(
-            &FusedSrc { v: eta0, g: &e0g, h: &e0h },
-            &FusedSrc { v: eta1, g: &e1g, h: &e1h },
-            &FusedSrc { v: chi1, g: &cg, h: &ch },
-            &FusedSrc { v: d1, g: &dg, h: &dh },
-            &FusedSrc { v: q1, g: &q1_g, h: &zero_h },
-            &FusedSrc { v: qd1, g: &qd1_g, h: &zero_h },
+            &FusedSrc {
+                v: eta0,
+                g: &e0g,
+                h: &e0h,
+            },
+            &FusedSrc {
+                v: eta1,
+                g: &e1g,
+                h: &e1h,
+            },
+            &FusedSrc {
+                v: chi1,
+                g: &cg,
+                h: &ch,
+            },
+            &FusedSrc {
+                v: d1,
+                g: &dg,
+                h: &dh,
+            },
+            &FusedSrc {
+                v: q1,
+                g: &q1_g,
+                h: &zero_h,
+            },
+            &FusedSrc {
+                v: qd1,
+                g: &qd1_g,
+                h: &zero_h,
+            },
             surv0,
             surv1,
             wi,

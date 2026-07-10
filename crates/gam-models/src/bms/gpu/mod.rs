@@ -3,6 +3,6 @@
 //! These modules contain BMS-specific row math. Generic CUDA runtime, memory,
 //! policy, and diagnostic plumbing stays under [`gam_gpu`].
 
+pub mod device_pcg;
 pub mod flex;
 pub mod row;
-pub mod device_pcg;

@@ -89,7 +89,7 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
-use gam_math::score_opt::maximize_score_1d;
+use gam_math::score_opt::{AffineRemlProfile, ScoreOptimumLocation};
 use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
@@ -391,149 +391,35 @@ pub fn piecewise_linear_eval(
     out
 }
 
-/// Outcome of a 2D log-λ grid-search weight selection.
+/// Evaluate the fixed-hyperparameter Gaussian profile evidence used by the
+/// identifiable-factor Torch interaction boundary.
 ///
-/// `evidence_grid[i, j]` is the Laplace-style log marginal-likelihood proxy
-/// at `(lam1_grid[i], lam2_grid[j])`:
-/// `evidence = −½ N log(RSS/N) − ½ (penalty)` with `RSS = rss_grid[i, j]`
-/// and `penalty = penalty_grid[i, j]`.
-///
-/// The winner is `argmax` over the grid; ties are broken by selecting the
-/// `(i, j)` with the smallest `i + j` (i.e. smallest log-weight sum on a
-/// log-spaced grid), then by smallest `i`, then smallest `j` — a fully
-/// deterministic, reproducible policy.
-#[derive(Debug, Clone)]
-pub struct WeightSearchResult {
-    pub best_i: usize,
-    pub best_j: usize,
-    pub best_lam1: f64,
-    pub best_lam2: f64,
-    pub best_evidence: f64,
-    pub evidence_grid: Array2<f64>,
-}
-
-/// Generic 2D log-λ weight-selection driver.
-///
-/// Given a precomputed `(G1, G2)` grid of residual sums-of-squares
-/// `rss_grid`, a matching grid of total-penalty values `penalty_grid`, and
-/// the two 1D weight grids `lam1_grid` / `lam2_grid`, computes the Laplace
-/// log marginal-likelihood proxy on every cell and returns the maximising
-/// cell with deterministic tie-breaking.
-///
-/// The primitive is intentionally agnostic to *what* the two penalty
-/// weights regularise — it takes only the RSS and penalty surfaces, so it
-/// can drive weight selection for any two-penalty model (identifiable
-/// factor model, double-penalty smooths, IBP + sparsity, etc.).
-pub fn identifiable_factor_select_weights(
-    rss_grid: ArrayView2<'_, f64>,
-    penalty_grid: ArrayView2<'_, f64>,
-    lam1_grid: ArrayView1<'_, f64>,
-    lam2_grid: ArrayView1<'_, f64>,
+/// This function deliberately evaluates one converged fit. It is not a model
+/// selector and accepts no candidate array: sampled RSS/penalty surfaces do not
+/// contain the analytic derivatives needed to certify a continuous optimum in
+/// two log-weights. A zero residual makes the concentrated Gaussian likelihood
+/// unbounded and is therefore an error rather than a floored finite score.
+pub fn identifiable_factor_log_evidence(
+    residual_sum_squares: f64,
+    penalty: f64,
     n_obs: usize,
-) -> Result<WeightSearchResult, String> {
-    let (g1, g2) = rss_grid.dim();
-    if penalty_grid.dim() != (g1, g2) {
-        return Err(format!(
-            "identifiable_factor_select_weights: penalty_grid shape {:?} \
-             must match rss_grid shape ({}, {})",
-            penalty_grid.dim(),
-            g1,
-            g2
-        ));
-    }
-    if lam1_grid.len() != g1 {
-        return Err(format!(
-            "identifiable_factor_select_weights: lam1_grid len {} must \
-             equal rss_grid rows {}",
-            lam1_grid.len(),
-            g1
-        ));
-    }
-    if lam2_grid.len() != g2 {
-        return Err(format!(
-            "identifiable_factor_select_weights: lam2_grid len {} must \
-             equal rss_grid cols {}",
-            lam2_grid.len(),
-            g2
-        ));
-    }
-    if g1 == 0 || g2 == 0 {
-        return Err("identifiable_factor_select_weights: grids must be non-empty".to_string());
-    }
+) -> Result<f64, String> {
     if n_obs == 0 {
-        return Err("identifiable_factor_select_weights: n_obs must be > 0".to_string());
+        return Err("identifiable_factor_log_evidence: n_obs must be > 0".to_string());
     }
-    for v in rss_grid.iter() {
-        if !v.is_finite() || *v < 0.0 {
-            return Err(format!(
-                "identifiable_factor_select_weights: rss_grid contains non-finite or \
-                 negative value {v}"
-            ));
-        }
+    if !(residual_sum_squares.is_finite() && residual_sum_squares > 0.0) {
+        return Err(format!(
+            "identifiable_factor_log_evidence: residual_sum_squares must be finite and \
+             positive; got {residual_sum_squares}"
+        ));
     }
-    for v in penalty_grid.iter() {
-        if !v.is_finite() {
-            return Err(format!(
-                "identifiable_factor_select_weights: penalty_grid contains non-finite value {v}"
-            ));
-        }
+    if !penalty.is_finite() {
+        return Err(format!(
+            "identifiable_factor_log_evidence: penalty must be finite; got {penalty}"
+        ));
     }
-    for v in lam1_grid.iter().chain(lam2_grid.iter()) {
-        if !v.is_finite() || *v <= 0.0 {
-            return Err(format!(
-                "identifiable_factor_select_weights: λ grids must contain finite positive \
-                 values, got {v}"
-            ));
-        }
-    }
-
-    let n = n_obs as f64;
-    let rss_floor = 1.0e-300_f64;
-    let mut evidence_grid = Array2::<f64>::zeros((g1, g2));
-    let mut best: Option<(usize, usize, f64)> = None;
-    for i in 0..g1 {
-        for j in 0..g2 {
-            let rss = rss_grid[[i, j]];
-            let pen = penalty_grid[[i, j]];
-            let mean_sq = (rss / n).max(rss_floor);
-            let ev = -0.5 * n * mean_sq.ln() - 0.5 * pen;
-            evidence_grid[[i, j]] = ev;
-            let better = match best {
-                None => true,
-                Some((bi, bj, bev)) => {
-                    if ev > bev {
-                        true
-                    } else if ev == bev {
-                        let cur_sum = i + j;
-                        let best_sum = bi + bj;
-                        if cur_sum < best_sum {
-                            true
-                        } else if cur_sum == best_sum && i < bi {
-                            true
-                        } else {
-                            cur_sum == best_sum && i == bi && j < bj
-                        }
-                    } else {
-                        false
-                    }
-                }
-            };
-            if better {
-                best = Some((i, j, ev));
-            }
-        }
-    }
-    let (best_i, best_j, best_evidence) = best.ok_or_else(|| {
-        "identifiable_factor_select_weights: empty search (this is a bug)".to_string()
-    })?;
-    Ok(WeightSearchResult {
-        best_i,
-        best_j,
-        best_lam1: lam1_grid[best_i],
-        best_lam2: lam2_grid[best_j],
-        best_evidence,
-        evidence_grid,
-    })
+    let observations = n_obs as f64;
+    Ok(-0.5 * observations * (residual_sum_squares / observations).ln() - 0.5 * penalty)
 }
 
 /// Outcome of the continuous shared-λ ridge REML weight selection.
@@ -624,13 +510,31 @@ pub fn ridge_reml_select_weight(
     let response_multiplicity = n_responses as f64;
     let scalar_observations = (n_obs as f64) * response_multiplicity;
     let gamma_max = eigvals.iter().cloned().fold(0.0_f64, f64::max);
-    // Exact-arithmetic null directions of G carry zero signal energy; keep
-    // only numerically nonzero eigen-directions.
-    let rank_resolution = f64::EPSILON * eigvals.len().max(1) as f64;
+    let spectral_scale = eigvals
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    // Exact-arithmetic null directions of G carry zero signal energy. Resolve
+    // numerical rank at the eigensolver's dimension-scaled roundoff and reject
+    // a materially indefinite "Gram" spectrum rather than silently dropping it.
+    let rank_resolution = f64::EPSILON * eigvals.len().max(1) as f64 * spectral_scale;
+    for (&g, &m) in eigvals.iter().zip(signal_energy) {
+        if g < -rank_resolution {
+            return Err(format!(
+                "ridge_reml_select_weight: Gram spectrum is materially negative ({g})"
+            ));
+        }
+        if g <= rank_resolution && m > rank_resolution * aux_norm_sq {
+            return Err(format!(
+                "ridge_reml_select_weight: numerical Gram-null direction carries signal \
+                 energy {m}; sufficient statistics are inconsistent"
+            ));
+        }
+    }
     let pairs: Vec<(f64, f64)> = eigvals
         .iter()
         .zip(signal_energy)
-        .filter(|(&g, _)| g > gamma_max * rank_resolution)
+        .filter(|(&g, _)| g > rank_resolution)
         // Work in u = λ/γ_max so every retained spectral abscissa lies in
         // (0, 1].  This keeps the score and its derivatives finite across the
         // complete representable log-domain even for ill-scaled Gram matrices.
@@ -644,59 +548,56 @@ pub fn ridge_reml_select_weight(
         });
     }
 
-    // Score, gradient (d/dρ), and curvature (d²/dρ²) in
-    // ρ = log(λ/γ_max). Err = S ≤ 0, i.e. the ridge interpolates aux and
-    // the Gaussian profile evidence degenerates.
-    let eval = |rho: f64| -> Result<(f64, f64, f64), String> {
-        let scaled_lambda = rho.exp();
-        let mut s = aux_norm_sq;
-        let mut s1 = 0.0_f64;
-        let mut s2_tail = 0.0_f64;
-        let mut l = 0.0_f64;
-        let mut l1 = 0.0_f64;
-        let mut l2 = 0.0_f64;
+    // `AffineRemlProfile` already owns the certified scalar REML search:
+    // analytic value/gradient/curvature jets plus outward-rounded derivative
+    // enclosures on every interval.  Duplicate each spectral direction once
+    // per response while retaining one pooled residual.  This makes its score
+    // exactly
+    //
+    //   -1/2 { nq log(S/(nq)) + q sum_r log(1 + gamma_r/lambda) },
+    //
+    // i.e. minus one half of the criterion documented above.  It is not an
+    // approximation and introduces no lattice of candidate weights.
+    let repeated_modes = pairs.len().saturating_mul(n_responses);
+    let mut gram_modes = Vec::with_capacity(repeated_modes);
+    let penalty_modes = vec![1.0_f64; repeated_modes];
+    let mut projected_rhs_squared = Vec::with_capacity(repeated_modes);
+    for _ in 0..n_responses {
         for &(g, m) in &pairs {
-            let d = g + scaled_lambda;
-            s -= m / d;
-            s1 += m / (d * d);
-            s2_tail += m / (d * d * d);
-            // log(1 + g/u) = log(g + u) - log(u), without forming g/u.
-            l += d.ln() - rho;
-            l1 -= g / d;
-            l2 += g / (d * d);
+            gram_modes.push(g);
+            projected_rhs_squared.push(m / response_multiplicity);
         }
-        s1 *= scaled_lambda;
-        let s2 = s1 - 2.0 * scaled_lambda * scaled_lambda * s2_tail;
-        l2 *= scaled_lambda;
-        if !(s.is_finite() && s > 0.0) {
-            let lambda = gamma_max * scaled_lambda;
-            return Err(format!(
-                "ridge_reml_select_weight: profile RSS S(λ)={s} degenerates at λ={lambda} \
-                 (ridge map interpolates aux; Gaussian evidence is unbounded)"
-            ));
-        }
-        let score =
-            scalar_observations * (s / scalar_observations).ln() + response_multiplicity * l;
-        let grad = scalar_observations * s1 / s + response_multiplicity * l1;
-        let hess = scalar_observations * (s2 * s - s1 * s1) / (s * s) + response_multiplicity * l2;
-        Ok((score, grad, hess))
-    };
+    }
+    let response_energy = [aux_norm_sq];
+    let profile = AffineRemlProfile::new(
+        &gram_modes,
+        &penalty_modes,
+        &projected_rhs_squared,
+        &response_energy,
+        scalar_observations,
+        repeated_modes,
+        0.0,
+    )
+    .map_err(|error| format!("ridge_reml_select_weight: {error}"))?;
 
-    // Search the entire representable positive-λ domain adaptively from the
-    // analytic score and gradient.  `maximize_score_1d` isolates stationary
-    // intervals; it does not choose among lattice nodes.  The λ=∞ null is
-    // evaluated analytically below rather than approximated by the upper end.
+    // Search the complete finite log(λ/γ_max) domain. The exact λ=∞
+    // empirical-Bayes null is compared separately below, so it is never
+    // represented by an arbitrary large finite weight.
     let rho_lo = f64::MIN_POSITIVE.ln();
     let rho_hi = (f64::MAX / 2.0).ln();
-    let rho_tol = f64::EPSILON.sqrt();
-    let mut objective = |rho: f64| {
-        let (score, gradient, _) = eval(rho)?;
-        Ok::<_, String>((-score, -gradient))
-    };
-    let optimum = maximize_score_1d(rho_lo, rho_hi, rho_tol, &mut objective)?;
-    let (score, gradient, curvature) = eval(optimum.x)?;
-    let gradient_tolerance =
-        f64::EPSILON.sqrt() * (scalar_observations + response_multiplicity * pairs.len() as f64);
+    let rho_tolerance = f64::EPSILON.sqrt();
+    let search = profile
+        .maximize(rho_lo, rho_hi, rho_tolerance)
+        .map_err(|error| format!("ridge_reml_select_weight: {error}"))?;
+    let optimum = search.optimum;
+    let score = -2.0 * optimum.value;
+    let gradient = -2.0 * optimum.derivative;
+    let curvature = -2.0 * optimum.curvature;
+    let gradient_scale = 1.0
+        + 2.0 * search.lower_boundary.derivative.abs()
+        + 2.0 * search.upper_boundary.derivative.abs()
+        + curvature.abs();
+    let gradient_tolerance = f64::EPSILON.sqrt() * gradient_scale;
     let score_roundoff = f64::EPSILON * (1.0 + score.abs() + boundary_score.abs());
 
     if score + score_roundoff >= boundary_score {
@@ -704,14 +605,17 @@ pub fn ridge_reml_select_weight(
             score: boundary_score,
         });
     }
-    if optimum.x <= rho_lo + rho_tol {
+    if search.location == ScoreOptimumLocation::LowerBoundary {
         return Err(
             "ridge_reml_select_weight: REML is unbounded at the λ → 0 interpolation \
              boundary; no converged Gaussian evidence fit exists"
                 .to_string(),
         );
     }
-    if gradient.abs() > gradient_tolerance || curvature <= 0.0 {
+    if !matches!(search.location, ScoreOptimumLocation::Stationary(_))
+        || gradient.abs() > gradient_tolerance
+        || curvature <= 0.0
+    {
         return Err(format!(
             "ridge_reml_select_weight: continuous REML search did not certify an interior \
              minimum (d/dlogλ={gradient}, curvature={curvature}, tolerance={gradient_tolerance})"
@@ -4131,42 +4035,16 @@ mod tests {
     }
 
     #[test]
-    fn select_weights_picks_max_evidence() {
-        let rss = array![[10.0, 9.0, 9.5], [8.0, 4.0, 5.0], [9.0, 6.0, 7.0]];
-        let pen = Array2::<f64>::zeros((3, 3));
-        let l1 = Array1::from(vec![0.1, 1.0, 10.0]);
-        let l2 = Array1::from(vec![0.1, 1.0, 10.0]);
-        let res =
-            identifiable_factor_select_weights(rss.view(), pen.view(), l1.view(), l2.view(), 80)
-                .unwrap();
-        assert_eq!((res.best_i, res.best_j), (1, 1));
-        assert!((res.best_lam1 - 1.0).abs() < 1e-12);
-        assert!((res.best_lam2 - 1.0).abs() < 1e-12);
-        assert!(res.best_evidence.is_finite());
+    fn identifiable_factor_evidence_scores_one_converged_fit() {
+        let score = identifiable_factor_log_evidence(4.0, 1.5, 8).unwrap();
+        let expected = -4.0 * (0.5_f64).ln() - 0.75;
+        assert!((score - expected).abs() < f64::EPSILON.sqrt());
     }
 
     #[test]
-    fn select_weights_breaks_ties_by_smallest_log_weight_sum() {
-        let rss = Array2::<f64>::from_elem((2, 2), 4.0);
-        let pen = Array2::<f64>::from_elem((2, 2), 1.0);
-        let l1 = Array1::from(vec![0.1, 10.0]);
-        let l2 = Array1::from(vec![0.1, 10.0]);
-        let res =
-            identifiable_factor_select_weights(rss.view(), pen.view(), l1.view(), l2.view(), 8)
-                .unwrap();
-        assert_eq!((res.best_i, res.best_j), (0, 0));
-    }
-
-    #[test]
-    fn select_weights_rejects_shape_mismatch() {
-        let rss = Array2::<f64>::zeros((2, 3));
-        let pen = Array2::<f64>::zeros((2, 2));
-        let l1 = Array1::from(vec![1.0, 1.0]);
-        let l2 = Array1::from(vec![1.0, 1.0, 1.0]);
-        let err =
-            identifiable_factor_select_weights(rss.view(), pen.view(), l1.view(), l2.view(), 8)
-                .unwrap_err();
-        assert!(err.contains("penalty_grid"));
+    fn identifiable_factor_evidence_rejects_unbounded_zero_residual() {
+        let error = identifiable_factor_log_evidence(0.0, 1.0, 8).unwrap_err();
+        assert!(error.contains("positive"));
     }
 
     #[test]

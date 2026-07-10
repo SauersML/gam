@@ -22,7 +22,11 @@ use crate::custom_family::{
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
+use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::gamlss::{FamilyMetadata, ParameterLink};
+use crate::model_types::UnifiedFitResult;
+use crate::probability::signed_log_sum_exp;
+use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
 use crate::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from_eta_scalar};
 use crate::survival::latent::interval::{
     LatentFrailtyResolution, LatentIntervalModel, LatentIntervalRowView,
@@ -36,15 +40,9 @@ use crate::survival::lognormal_kernel::{
     log_kernel_bundle,
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
-use crate::model_types::UnifiedFitResult;
-use gam_solve::pirls::LinearInequalityConstraints;
-use crate::probability::signed_log_sum_exp;
-use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
-use gam_terms::smooth::{
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-};
-use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use gam_problem::MIN_WEIGHT;
+use gam_solve::pirls::LinearInequalityConstraints;
+use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec, build_term_collection_design};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -87,9 +85,7 @@ impl_reason_error_boilerplate! {
 }
 
 impl From<crate::block_layout::block_count::BlockCountMismatch> for LatentSurvivalError {
-    fn from(
-        err: crate::block_layout::block_count::BlockCountMismatch,
-    ) -> LatentSurvivalError {
+    fn from(err: crate::block_layout::block_count::BlockCountMismatch) -> LatentSurvivalError {
         LatentSurvivalError::BlockMismatch {
             reason: err.message(),
         }

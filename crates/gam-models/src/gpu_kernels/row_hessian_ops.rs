@@ -260,13 +260,11 @@ impl RowOpsBackend {
         static BACKEND: OnceLock<Result<RowOpsBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
-                let runtime =
-                    gam_gpu::device_runtime::GpuRuntime::global().ok_or_else(|| {
-                        GpuError::DriverLibraryUnavailable {
-                            reason: "row_hessian_ops backend: no CUDA runtime available"
-                                .to_string(),
-                        }
-                    })?;
+                let runtime = gam_gpu::device_runtime::GpuRuntime::global().ok_or_else(|| {
+                    GpuError::DriverLibraryUnavailable {
+                        reason: "row_hessian_ops backend: no CUDA runtime available".to_string(),
+                    }
+                })?;
                 let ctx = gam_gpu::device_runtime::cuda_context_for(
                     runtime.selected_device().ordinal,
                 )

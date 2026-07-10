@@ -795,8 +795,10 @@ def gaussian_reml_fit_with_constraints(
     returns exact analytic gradients w.r.t. ``x``, ``y``, ``penalty`` and
     ``weights`` in both the interior cert (envelope theorem in full p-space)
     and a locally stable active cert, including nonzero affine bounds
-    ``A_act·β = b_act``. Active-set transition points are non-differentiable;
-    backward reports them with ``GradientUnavailableError``.
+    ``A_act·β = b_act``. On an active face, ``edf`` is the tangent influence
+    trace ``tr[Z(ZᵀHZ)⁻¹ZᵀXᵀWX]``. Active-set transition points are
+    non-differentiable; backward reports them with
+    ``GradientUnavailableError``.
     """
     apply = cast(
         Callable[

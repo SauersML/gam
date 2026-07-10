@@ -1,9 +1,3 @@
-use benchmark_scores::{
-    benchmark_auc_score, benchmark_binary_logloss, benchmark_binary_logloss_eps,
-    benchmark_exp_saturated, benchmark_gaussian_logloss, benchmark_nagelkerke_r2,
-    benchmark_nagelkerke_r2_with_null_mean,
-};
-
 use competing_risks_decode::{
     competing_risks_columns, competing_risks_numeric_list, competing_risks_string_list,
     set_optional_competing_risks_matrix, set_optional_competing_risks_vector,
@@ -24,9 +18,8 @@ use survival_surface_io::{
     hazard_from_cumulative_knots, interpolate_rows, survival_block,
     survival_block_cumulative_hazard, survival_block_failure, survival_block_hazard,
     survival_chunk_defaults, survival_chunk_iter_collect, survival_chunk_ranges,
-    survival_coerce_times, survival_cumulative_from_survival, survival_should_chunk,
-    survival_failure_from_survival, survival_ffi_surface, survival_parameters_matrix,
-    write_survival_csv,
+    survival_coerce_times, survival_cumulative_from_survival, survival_failure_from_survival,
+    survival_ffi_surface, survival_parameters_matrix, survival_should_chunk, write_survival_csv,
 };
 
 #[derive(Default, Deserialize)]
@@ -133,9 +126,7 @@ fn parse_covariance_mode(
         return Ok(None);
     };
     match text.trim().to_ascii_lowercase().as_str() {
-        "conditional" => Ok(Some(
-            gam_predict::InferenceCovarianceMode::Conditional,
-        )),
+        "conditional" => Ok(Some(gam_predict::InferenceCovarianceMode::Conditional)),
         "smoothing" => Ok(Some(
             gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         )),
@@ -399,12 +390,18 @@ struct SurvivalPredictionPayload {
     /// Delta-method standard errors on the survival surface, when the
     /// caller requested uncertainty via `interval=...`.  Same shape as
     /// `survival`.  `None` otherwise.
-    #[serde(skip_serializing_if = "Option::is_none", with = "crate::finite_safe_json::opt_matrix")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "crate::finite_safe_json::opt_matrix"
+    )]
     survival_se: Option<Vec<Vec<f64>>>,
     /// Delta-method SE on the linear predictor at each row's own exit
     /// time, when uncertainty was requested.  Length equals
     /// `linear_predictor.len()`.
-    #[serde(skip_serializing_if = "Option::is_none", with = "crate::finite_safe_json::opt_vec")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "crate::finite_safe_json::opt_vec"
+    )]
     eta_se: Option<Vec<f64>>,
 }
 
@@ -528,7 +525,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "glm_reml_fit_latent_backward",
             "equivariant_penalty_value",
             "skip_transcoder_reml_metrics",
-            "skip_transcoder_select_reml",
             "_block_diag",
             "tierney_kadane_normalized_score",
             "gaussian_reml_fit_formula_table",
@@ -585,6 +581,455 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
         gam::terms::sae::manifold::sae_row_block_penalty_kinds().to_vec(),
     )?;
     Ok(info.unbind())
+}
+
+/// Rust-owned typed table used by every named-table Python entry point.
+///
+/// The old boundary accepted `Vec<Vec<String>>`, forcing numeric cells through
+/// Python objects and then reparsing their string representations. This class
+/// owns the canonical `EncodedDataset`. Its sequence protocol renders only a
+/// requested row for the few metadata helpers that still consume text.
+#[pyclass(name = "_EncodedTable", frozen)]
+#[derive(Clone)]
+struct PyEncodedTable {
+    dataset: EncodedDataset,
+}
+
+impl PyEncodedTable {
+    fn require_headers(&self, headers: &[String]) -> Result<(), String> {
+        if self.dataset.headers == headers {
+            Ok(())
+        } else {
+            Err(format!(
+                "encoded table headers {:?} do not match call headers {:?}",
+                self.dataset.headers, headers
+            ))
+        }
+    }
+
+    fn rendered_row(&self, row: usize) -> Result<Vec<String>, String> {
+        if row >= self.dataset.values.nrows() {
+            return Err(format!(
+                "encoded table row {row} is outside 0..{}",
+                self.dataset.values.nrows()
+            ));
+        }
+        self.dataset
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(column, schema)| {
+                let value = self.dataset.values[[row, column]];
+                match schema.kind {
+                    ColumnKindTag::Categorical => {
+                        let code = value as usize;
+                        if value < 0.0 || value.fract() != 0.0 || code >= schema.levels.len() {
+                            return Err(format!(
+                                "categorical column '{}' has invalid encoded value {value} at row {}",
+                                schema.name,
+                                row + 1
+                            ));
+                        }
+                        // Legacy table entry points still infer from strings. Mark
+                        // this one lazily-rendered row so numeric-looking labels
+                        // retain their categorical source intent.
+                        Ok(format!(
+                            "{}{}",
+                            gam::data::CATEGORICAL_CELL_SENTINEL,
+                            schema.levels[code]
+                        ))
+                    }
+                    ColumnKindTag::Binary => Ok(if value == 0.0 {
+                        "0".to_string()
+                    } else {
+                        "1".to_string()
+                    }),
+                    ColumnKindTag::Continuous => Ok(format!("{value:?}")),
+                }
+            })
+            .collect()
+    }
+}
+
+#[pymethods]
+impl PyEncodedTable {
+    fn __len__(&self) -> usize {
+        self.dataset.values.nrows()
+    }
+
+    fn __getitem__(&self, index: isize) -> PyResult<Vec<String>> {
+        let n = self.dataset.values.nrows() as isize;
+        let normalized = if index < 0 { index + n } else { index };
+        if normalized < 0 || normalized >= n {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "encoded table row index {index} out of range for {n} rows"
+            )));
+        }
+        self.rendered_row(normalized as usize)
+            .map_err(py_value_error)
+    }
+
+    #[getter]
+    fn headers(&self) -> Vec<String> {
+        self.dataset.headers.clone()
+    }
+
+    #[getter]
+    fn shape(&self) -> (usize, usize) {
+        self.dataset.values.dim()
+    }
+
+    fn __repr__(&self) -> String {
+        let (rows, columns) = self.dataset.values.dim();
+        format!("_EncodedTable(n_rows={rows}, n_columns={columns})")
+    }
+}
+
+fn validate_column_partition(
+    n_columns: usize,
+    numeric_positions: &[usize],
+    categorical_positions: &[usize],
+) -> Result<(), String> {
+    let mut seen = vec![false; n_columns];
+    for (kind, positions) in [
+        ("numeric", numeric_positions),
+        ("categorical", categorical_positions),
+    ] {
+        for &position in positions {
+            if position >= n_columns {
+                return Err(format!(
+                    "{kind} column position {position} is outside 0..{n_columns}"
+                ));
+            }
+            if std::mem::replace(&mut seen[position], true) {
+                return Err(format!("column position {position} is repeated"));
+            }
+        }
+    }
+    if let Some(position) = seen.iter().position(|present| !present) {
+        return Err(format!(
+            "column position {position} is missing from the numeric/categorical partition"
+        ));
+    }
+    Ok(())
+}
+
+/// Construct an encoded table from one homogeneous numeric matrix plus the
+/// genuinely categorical string columns. Numeric cells cross through
+/// rust-numpy; only categorical labels are Python strings.
+#[pyfunction]
+fn encoded_table_from_columns(
+    headers: Vec<String>,
+    numeric_values: PyReadonlyArray2<'_, f64>,
+    numeric_positions: Vec<usize>,
+    categorical_values: Vec<Vec<String>>,
+    categorical_positions: Vec<usize>,
+) -> PyResult<PyEncodedTable> {
+    ensure_unique_headers(&headers).map_err(py_value_error)?;
+    validate_column_partition(headers.len(), &numeric_positions, &categorical_positions)
+        .map_err(py_value_error)?;
+    let numeric = numeric_values.as_array();
+    if numeric.ncols() != numeric_positions.len() {
+        return Err(py_value_error(format!(
+            "numeric matrix has {} columns but {} numeric positions were supplied",
+            numeric.ncols(),
+            numeric_positions.len()
+        )));
+    }
+    if categorical_values.len() != categorical_positions.len() {
+        return Err(py_value_error(format!(
+            "received {} categorical columns but {} categorical positions",
+            categorical_values.len(),
+            categorical_positions.len()
+        )));
+    }
+    let n_rows = if !numeric_positions.is_empty() {
+        numeric.nrows()
+    } else {
+        categorical_values.first().map(Vec::len).unwrap_or(0)
+    };
+    if n_rows == 0 {
+        return Err(py_value_error("table data cannot be empty".to_string()));
+    }
+    for (index, column) in categorical_values.iter().enumerate() {
+        if column.len() != n_rows {
+            return Err(py_value_error(format!(
+                "categorical column '{}' has {} rows but expected {n_rows}",
+                headers[categorical_positions[index]],
+                column.len()
+            )));
+        }
+    }
+
+    let mut values = Array2::<f64>::zeros((n_rows, headers.len()));
+    let mut schema_columns = vec![None::<SchemaColumn>; headers.len()];
+    let mut column_kinds = vec![ColumnKindTag::Continuous; headers.len()];
+    for (matrix_column, &table_column) in numeric_positions.iter().enumerate() {
+        let column = numeric.column(matrix_column);
+        if let Some(row) = column.iter().position(|value| !value.is_finite()) {
+            return Err(py_value_error(format!(
+                "non-finite value at row {}, column '{}'",
+                row + 1,
+                headers[table_column]
+            )));
+        }
+        let kind = infer_numeric_array_column_kind(column);
+        values.column_mut(table_column).assign(&column);
+        column_kinds[table_column] = kind;
+        schema_columns[table_column] = Some(SchemaColumn {
+            name: headers[table_column].clone(),
+            kind,
+            levels: Vec::new(),
+        });
+    }
+    for (source_column, &table_column) in
+        categorical_values.iter().zip(categorical_positions.iter())
+    {
+        let marked = source_column
+            .iter()
+            .map(|value| format!("{}{}", gam::data::CATEGORICAL_CELL_SENTINEL, value))
+            .collect::<Vec<_>>();
+        let refs = marked.iter().map(String::as_str).collect::<Vec<_>>();
+        let (schema, encoded) =
+            infer_and_encode_column_major(&headers[table_column], &refs, table_column + 1)
+                .map_err(py_value_error)?;
+        values
+            .column_mut(table_column)
+            .assign(&ndarray::ArrayView1::from(&encoded));
+        column_kinds[table_column] = schema.kind;
+        schema_columns[table_column] = Some(schema);
+    }
+    let schema_columns = schema_columns
+        .into_iter()
+        .enumerate()
+        .map(|(column, schema)| schema.ok_or_else(|| format!("missing schema for column {column}")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(py_value_error)?;
+    Ok(PyEncodedTable {
+        dataset: EncodedDataset {
+            headers,
+            values,
+            schema: DataSchema {
+                columns: schema_columns,
+            },
+            column_kinds,
+        },
+    })
+}
+
+/// Import a pandas/Polars/PyArrow provider through the Arrow C Stream
+/// PyCapsule protocol. The producer owns its buffers until arrow-rs consumes
+/// the stream; numeric primitives are read directly and only string columns
+/// allocate level labels.
+#[pyfunction]
+fn encoded_table_from_arrow(
+    headers: Vec<String>,
+    source: &Bound<'_, PyAny>,
+) -> PyResult<PyEncodedTable> {
+    use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+    use pyo3::types::{PyCapsule, PyCapsuleMethods};
+
+    let capsule = source
+        .getattr("__arrow_c_stream__")?
+        .call0()?
+        .cast_into::<PyCapsule>()?;
+    let stream_pointer = capsule
+        .pointer_checked(Some(c"arrow_array_stream"))?
+        .cast::<FFI_ArrowArrayStream>()
+        .as_ptr();
+    // SAFETY: the capsule name is validated above and the Arrow PyCapsule
+    // protocol guarantees a writable, initialized FFI_ArrowArrayStream. The
+    // move nulls the capsule's release callback, so ownership is unique.
+    let stream = unsafe { FFI_ArrowArrayStream::from_raw(stream_pointer) };
+    let mut reader = ArrowArrayStreamReader::try_new(stream)
+        .map_err(|error| py_value_error(format!("failed to import Arrow C stream: {error}")))?;
+    let dataset =
+        gam::data::encode_arrow_record_batch_reader_with_inferred_schema(&mut reader, headers)
+            .map_err(|error| py_value_error(error.to_string()))?;
+    Ok(PyEncodedTable { dataset })
+}
+
+/// Project and re-encode a typed prediction table against a saved model schema.
+///
+/// Both sides are already numeric/categorical columns, so matching a category
+/// means mapping its source level label to the frozen training-level code. No
+/// cell is rendered to a string and numeric columns are copied exactly once
+/// into the projected dense matrix.
+fn dataset_with_model_schema_from_encoded(
+    model: &FittedModel,
+    source: &EncodedDataset,
+) -> Result<EncodedDataset, String> {
+    let required = required_prediction_columns(model)?;
+    let present = source.headers.iter().cloned().collect::<BTreeSet<_>>();
+    let missing = required
+        .difference(&present)
+        .map(|name| format!("missing required column '{name}'"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(missing.join(" "));
+    }
+    let consumable = prediction_consumable_columns(model)?;
+    let mut keep = source
+        .headers
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| consumable.contains(name.as_str()))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    // Preserve row count for intercept-only models, exactly like the textual
+    // projection path: a zero-column dataset cannot represent N.
+    if keep.is_empty() {
+        keep = (0..source.headers.len()).collect();
+    }
+
+    let training_schema = model.require_data_schema()?;
+    let training_by_name = training_schema
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect::<HashMap<_, _>>();
+    let encode_unknown = model.random_effect_group_columns();
+    let n_rows = source.values.nrows();
+    let mut headers = Vec::with_capacity(keep.len());
+    let mut values = Array2::<f64>::zeros((n_rows, keep.len()));
+    let mut schema_columns = Vec::with_capacity(keep.len());
+    let mut column_kinds = Vec::with_capacity(keep.len());
+
+    for (destination, &source_index) in keep.iter().enumerate() {
+        let name = &source.headers[source_index];
+        let source_schema = source
+            .schema
+            .columns
+            .get(source_index)
+            .ok_or_else(|| format!("encoded table column '{name}' has no source schema"))?;
+        let target_schema = training_by_name
+            .get(name.as_str())
+            .ok_or_else(|| format!("column '{name}' was not present in the training schema"))?;
+        match (source_schema.kind, target_schema.kind) {
+            (ColumnKindTag::Categorical, ColumnKindTag::Categorical) => {
+                let target_levels = target_schema
+                    .levels
+                    .iter()
+                    .enumerate()
+                    .map(|(index, level)| (level.as_str(), index))
+                    .collect::<HashMap<_, _>>();
+                for row in 0..n_rows {
+                    let raw_code = source.values[[row, source_index]];
+                    let code = raw_code as usize;
+                    if raw_code < 0.0
+                        || raw_code.fract() != 0.0
+                        || code >= source_schema.levels.len()
+                    {
+                        return Err(format!(
+                            "categorical column '{name}' has invalid encoded value {raw_code} at row {}",
+                            row + 1
+                        ));
+                    }
+                    let label = &source_schema.levels[code];
+                    values[[row, destination]] = match target_levels.get(label.as_str()) {
+                        Some(index) => *index as f64,
+                        None if encode_unknown.contains(name) => target_schema.levels.len() as f64,
+                        None => {
+                            return Err(format!(
+                                "unseen level '{}' in categorical column '{}' at row {}",
+                                label,
+                                name,
+                                row + 1
+                            ));
+                        }
+                    };
+                }
+            }
+            (ColumnKindTag::Categorical, _) => {
+                return Err(format!(
+                    "column '{name}' is categorical in prediction data but numeric in the training schema"
+                ));
+            }
+            (_, ColumnKindTag::Categorical) => {
+                return Err(format!(
+                    "column '{name}' is numeric in prediction data but categorical in the training schema"
+                ));
+            }
+            (_, ColumnKindTag::Binary) => {
+                for row in 0..n_rows {
+                    let value = source.values[[row, source_index]];
+                    if (value - 0.0).abs() >= 1e-12 && (value - 1.0).abs() >= 1e-12 {
+                        return Err(format!(
+                            "column '{name}' is binary in schema but row {} has value {value}; expected 0 or 1",
+                            row + 1
+                        ));
+                    }
+                    values[[row, destination]] = value;
+                }
+            }
+            (_, ColumnKindTag::Continuous) => {
+                values
+                    .column_mut(destination)
+                    .assign(&source.values.column(source_index));
+            }
+        }
+        headers.push(name.clone());
+        schema_columns.push((*target_schema).clone());
+        column_kinds.push(target_schema.kind);
+    }
+    Ok(EncodedDataset {
+        headers,
+        values,
+        schema: DataSchema {
+            columns: schema_columns,
+        },
+        column_kinds,
+    })
+}
+
+fn schema_check_encoded(
+    model: &FittedModel,
+    source: &EncodedDataset,
+) -> Result<SchemaCheckPayload, String> {
+    let expected = required_prediction_columns(model)?;
+    let present = source.headers.iter().cloned().collect::<BTreeSet<_>>();
+    let mut issues = expected
+        .difference(&present)
+        .map(|missing| SchemaIssue {
+            kind: "missing_column".to_string(),
+            message: format!("missing required column '{missing}'"),
+            column: Some(missing.clone()),
+        })
+        .collect::<Vec<_>>();
+    if issues.is_empty()
+        && let Err(message) = dataset_with_model_schema_from_encoded(model, source)
+    {
+        issues.push(SchemaIssue {
+            kind: "schema_error".to_string(),
+            message,
+            column: None,
+        });
+    }
+    if issues.is_empty() {
+        for (column, vocabulary) in model.numeric_fixed_factor_vocabularies() {
+            let Some(index) = source.headers.iter().position(|header| header == &column) else {
+                continue;
+            };
+            for value in source.values.column(index) {
+                if !vocabulary.contains(&gam::data::canonical_level_bits(*value)) {
+                    issues.push(SchemaIssue {
+                        kind: "schema_error".to_string(),
+                        message: format!(
+                            "unseen level '{value}' in fixed factor column '{column}'; \
+                             the factor's levels were fixed at fit time"
+                        ),
+                        column: Some(column.clone()),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    Ok(SchemaCheckPayload {
+        ok: issues.is_empty(),
+        issues,
+    })
 }
 
 #[pyfunction]
@@ -910,7 +1355,7 @@ fn competing_risks_prediction_payload_from_json(py: Python<'_>, raw: &str) -> Py
 #[pyfunction]
 fn extract_row_ids(
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     id_column: Option<String>,
 ) -> PyResult<Option<Vec<String>>> {
     let Some(id_column) = id_column else {
@@ -924,18 +1369,27 @@ fn extract_row_ids(
                 "id_column '{id_column}' is missing from prediction data"
             ))
         })?;
-    let mut row_ids = Vec::with_capacity(rows.len());
-    for (row_idx, row) in rows.iter().enumerate() {
-        let value = row.get(index).ok_or_else(|| {
-            py_value_error(format!(
-                "row {row_idx} is missing id_column '{id_column}' at index {index}"
-            ))
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let schema =
+        rows.dataset.schema.columns.get(index).ok_or_else(|| {
+            py_value_error(format!("id_column '{id_column}' has no encoded schema"))
         })?;
-        // A string/categorical id column arrives sentinel-prefixed from the
-        // Python `normalize_table` layer (#1317 leading-NUL marks dtype intent).
-        // The passthrough must echo the user's original label, so strip the
-        // sentinel exactly as the level-inference path does before recording it.
-        row_ids.push(gam::data::strip_categorical_sentinel(value).0.to_string());
+    let mut row_ids = Vec::with_capacity(rows.dataset.values.nrows());
+    for row in 0..rows.dataset.values.nrows() {
+        let value = rows.dataset.values[[row, index]];
+        row_ids.push(match schema.kind {
+            ColumnKindTag::Categorical => {
+                let code = value as usize;
+                schema.levels.get(code).cloned().ok_or_else(|| {
+                    py_value_error(format!(
+                        "id_column '{id_column}' has invalid category code {value} at row {}",
+                        row + 1
+                    ))
+                })?
+            }
+            ColumnKindTag::Binary => if value == 0.0 { "0" } else { "1" }.to_string(),
+            ColumnKindTag::Continuous => format!("{value:?}"),
+        });
     }
     Ok(Some(row_ids))
 }
@@ -1053,8 +1507,18 @@ fn default_survival_time_grid(
     model_class: &str,
     formula: &str,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     model_bytes: Option<Vec<u8>>,
+) -> PyResult<Option<Vec<f64>>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    default_survival_time_grid_impl(model_class, formula, &rows.dataset, model_bytes.as_deref())
+}
+
+fn default_survival_time_grid_impl(
+    model_class: &str,
+    formula: &str,
+    dataset: &EncodedDataset,
+    model_bytes: Option<&[u8]>,
 ) -> PyResult<Option<Vec<f64>>> {
     match model_class {
         "survival"
@@ -1082,7 +1546,8 @@ fn default_survival_time_grid(
         return Ok(None);
     };
 
-    let header_to_index: HashMap<&str, usize> = headers
+    let header_to_index: HashMap<&str, usize> = dataset
+        .headers
         .iter()
         .enumerate()
         .map(|(index, name)| (name.as_str(), index))
@@ -1110,46 +1575,34 @@ fn default_survival_time_grid(
         }
     };
 
-    let entry_name_repr = entry_name
-        .as_deref()
-        .map(python_string_repr)
-        .unwrap_or_else(|| "<implicit zero entry>".to_string());
-    let exit_name_repr = python_string_repr(&exit_name);
+    if let Some(index) = entry_idx
+        && matches!(
+            dataset.schema.columns[index].kind,
+            ColumnKindTag::Categorical
+        )
+    {
+        return Err(py_value_error(format!(
+            "survival entry column {} is categorical, expected numeric times",
+            python_string_repr(entry_name.as_deref().unwrap_or_default())
+        )));
+    }
+    if matches!(
+        dataset.schema.columns[exit_idx].kind,
+        ColumnKindTag::Categorical
+    ) {
+        return Err(py_value_error(format!(
+            "survival exit column {} is categorical, expected numeric times",
+            python_string_repr(&exit_name)
+        )));
+    }
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
-    let mut observed = false;
-    for (row_index, row) in rows.iter().enumerate() {
-        let exit_cell = row.get(exit_idx).ok_or_else(|| {
-            py_value_error(format!(
-                "survival exit column {exit_name_repr} is missing at row {}",
-                row_index + 1
-            ))
-        })?;
+    for row_index in 0..dataset.values.nrows() {
         let entry_value = match entry_idx {
             None => 0.0,
-            Some(idx) => {
-                let entry_cell = row.get(idx).ok_or_else(|| {
-                    py_value_error(format!(
-                        "survival entry column {entry_name_repr} is missing at row {}",
-                        row_index + 1
-                    ))
-                })?;
-                entry_cell.parse::<f64>().map_err(|_| {
-                    let entry_cell_repr = python_string_repr(entry_cell);
-                    py_value_error(format!(
-                        "survival entry column {entry_name_repr} has a non-numeric value at row {}: {entry_cell_repr}",
-                        row_index + 1
-                    ))
-                })?
-            }
+            Some(index) => dataset.values[[row_index, index]],
         };
-        let exit_value = exit_cell.parse::<f64>().map_err(|_| {
-            let exit_cell_repr = python_string_repr(exit_cell);
-            py_value_error(format!(
-                "survival exit column {exit_name_repr} has a non-numeric value at row {}: {exit_cell_repr}",
-                row_index + 1
-            ))
-        })?;
+        let exit_value = dataset.values[[row_index, exit_idx]];
         if !entry_value.is_finite() || !exit_value.is_finite() {
             return Err(py_value_error(
                 "survival time columns must contain only finite values".to_string(),
@@ -1157,9 +1610,8 @@ fn default_survival_time_grid(
         }
         lo = lo.min(entry_value);
         hi = hi.max(exit_value);
-        observed = true;
     }
-    if !observed {
+    if dataset.values.nrows() == 0 {
         return Ok(None);
     }
     // Anchor the grid's upper edge to the fitted model's training time support,
@@ -1175,7 +1627,7 @@ fn default_survival_time_grid(
     // extrapolation (#1595), not by the grid. When the model carries no
     // training-time signal (e.g. legacy models) the prediction-frame range is
     // used alone, exactly as before.
-    if let Some(bytes) = model_bytes.as_deref()
+    if let Some(bytes) = model_bytes
         && let Some(training_hi) = saved_survival_training_time_upper_bound(bytes)
         && training_hi.is_finite()
     {
@@ -1200,7 +1652,7 @@ fn default_survival_time_grid(
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     formula: String,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
@@ -1208,9 +1660,10 @@ fn fit_table(
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
     // SIGALRM handlers, etc.) can run while the Rust solver is in progress.
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
     let model_bytes = detach_workflow_result(py, "fit_table", move || {
-        let dataset = dataset_with_inferred_schema(headers, rows)?;
         fit_dataset_impl(
             dataset,
             formula,
@@ -1410,12 +1863,14 @@ fn apply_shape_constraints_to_formula(
 fn validate_formula_json(
     py: Python<'_>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     formula: String,
     config_json: Option<String>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     detach_py_result(py, "validate_formula_json", move || {
-        validate_formula_json_impl(headers, rows, formula, config_json.as_deref())
+        validate_formula_dataset_json_impl(dataset, formula, config_json.as_deref())
     })
 }
 
@@ -1490,15 +1945,16 @@ fn build_predict_payload_json(
 fn build_model_predict_payload_json(
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     interval: Option<f64>,
     covariance_mode: Option<String>,
     observation_interval: Option<bool>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
     let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
     let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
     let time_grid =
-        default_survival_time_grid(&model_class, &formula, headers, rows, Some(model_bytes))?;
+        default_survival_time_grid_impl(&model_class, &formula, &rows.dataset, Some(&model_bytes))?;
     build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 
@@ -1507,11 +1963,13 @@ fn predict_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     options_json: Option<String>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     detach_predict_result(py, "predict_table", move || {
-        predict_table_impl(&model_bytes, headers, rows, options_json.as_deref())
+        predict_encoded_table_impl(&model_bytes, dataset, options_json.as_deref())
     })
 }
 
@@ -1528,19 +1986,23 @@ fn predict_table_conformal(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     calibration_headers: Vec<String>,
-    calibration_rows: Vec<Vec<String>>,
+    calibration_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
     options_json: Option<String>,
 ) -> PyResult<String> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    calibration_rows
+        .require_headers(&calibration_headers)
+        .map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let calibration_dataset = calibration_rows.dataset.clone();
     detach_py_result(py, "predict_table_conformal", move || {
-        predict_table_conformal_impl(
+        predict_encoded_table_conformal_impl(
             &model_bytes,
-            headers,
-            rows,
-            calibration_headers,
-            calibration_rows,
+            dataset,
+            calibration_dataset,
             conformal_level,
             options_json.as_deref(),
         )
@@ -1724,11 +2186,13 @@ fn sample_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
     options_json: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let payload = detach_py_result(py, "sample_table", move || {
-        sample_table_impl(&model_bytes, headers, rows, options_json.as_deref())
+        sample_encoded_table_impl(&model_bytes, dataset, options_json.as_deref())
     })?;
     let config = PyDict::new(py);
     config.set_item("n_samples", payload.config.n_samples)?;
@@ -1758,27 +2222,16 @@ fn sample_table(
 // implementations and their helpers were deleted below.
 
 #[pyfunction]
-fn design_matrix_table(
-    py: Python<'_>,
-    model_bytes: Vec<u8>,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-) -> PyResult<String> {
-    detach_py_result(py, "design_matrix_table", move || {
-        design_matrix_table_impl(&model_bytes, headers, rows)
-    })
-}
-
-#[pyfunction]
 fn design_matrix_table_dense(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'_, PyEncodedTable>,
 ) -> PyResult<Py<PyArray2<f64>>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let out = detach_py_result(py, "design_matrix_table_dense", move || {
-        let raw = design_matrix_table_impl(&model_bytes, headers, rows)?;
-        design_matrix_payload_to_dense(&raw)
+        design_matrix_encoded_table_impl(&model_bytes, dataset)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -1842,9 +2295,8 @@ fn periodic_spline_curve_basis<'py>(
     let spec = PeriodicBSplineBasisSpec::new(degree, n_knots, 1.0, 0.0, penalty_order);
     let basis =
         build_periodic_bspline_basis_1d(t.as_array(), &spec).map_err(basis_error_to_pyerr)?;
-    let penalty =
-        cyclic_bspline_derivative_penalty_matrix(degree, n_knots, 1.0, penalty_order)
-            .map_err(basis_error_to_pyerr)?;
+    let penalty = cyclic_bspline_derivative_penalty_matrix(degree, n_knots, 1.0, penalty_order)
+        .map_err(basis_error_to_pyerr)?;
     Ok((
         basis.into_pyarray(py).unbind(),
         penalty.into_pyarray(py).unbind(),
@@ -1861,8 +2313,8 @@ fn cyclic_difference_penalty(
     num_basis: usize,
     order: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let penalty = create_cyclic_difference_penalty_matrix(num_basis, order)
-        .map_err(basis_error_to_pyerr)?;
+    let penalty =
+        create_cyclic_difference_penalty_matrix(num_basis, order).map_err(basis_error_to_pyerr)?;
     Ok(penalty.into_pyarray(py).unbind())
 }
 
@@ -1879,6 +2331,32 @@ fn cyclic_bspline_roughness_penalty(
     let penalty = cyclic_bspline_derivative_penalty_matrix(degree, num_basis, period, order)
         .map_err(basis_error_to_pyerr)?;
     Ok(penalty.into_pyarray(py).unbind())
+}
+
+/// Exact continuum shape cone `A * beta >= b` for raw open-B-spline control
+/// coefficients. The Rust terms layer owns the knot geometry so Torch and the
+/// native fit path cannot drift into different monotonicity/curvature rules.
+#[pyfunction]
+fn bspline_shape_constraints(
+    py: Python<'_>,
+    knots: PyReadonlyArray1<'_, f64>,
+    degree: usize,
+    shape: &str,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>)> {
+    let shape = gam::terms::smooth::parse_shape_constraint(shape).map_err(py_value_error)?;
+    let constraints = gam::terms::smooth::shape_constraints::bspline_shape_linear_constraints(
+        knots.as_array(),
+        degree,
+        shape,
+    )
+    .map_err(basis_error_to_pyerr)?
+    .ok_or_else(|| {
+        py_value_error("bspline_shape_constraints requires a non-None shape".to_string())
+    })?;
+    Ok((
+        constraints.a.into_pyarray(py).unbind(),
+        constraints.b.into_pyarray(py).unbind(),
+    ))
 }
 
 fn build_wrapped_periodic_harmonic_basis_with_jet(
@@ -2686,8 +3164,14 @@ fn duchon_function_norm_penalty<'py>(
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
         None => {
-            let cfg =
-                resolve_duchon_hybrid_config(d, length_scale, nullspace_order, None, 0, any_periodic)?;
+            let cfg = resolve_duchon_hybrid_config(
+                d,
+                length_scale,
+                nullspace_order,
+                None,
+                0,
+                any_periodic,
+            )?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
@@ -3336,22 +3820,6 @@ fn skip_transcoder_reml_metrics<'py>(
 }
 
 #[pyfunction]
-fn skip_transcoder_select_reml(scores: Vec<f64>) -> PyResult<usize> {
-    let mut best: Option<(usize, f64)> = None;
-    for (idx, score) in scores.into_iter().enumerate() {
-        if score.is_nan() {
-            continue;
-        }
-        if best.map_or(true, |(_, best_score)| score < best_score) {
-            best = Some((idx, score));
-        }
-    }
-    best.map(|(idx, _)| idx).ok_or_else(|| {
-        py_value_error("No scored candidates; call reml_score_skip_transcoder first.".to_string())
-    })
-}
-
-#[pyfunction]
 fn tierney_kadane_normalized_score(
     raw_reml: f64,
     null_dim: f64,
@@ -3599,6 +4067,18 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
         })
     })
     .map_err(PyValueError::new_err)?;
+    let failed_rows: Vec<serde_json::Value> = ranked
+        .failed
+        .iter()
+        .map(|failure| {
+            serde_json::json!({
+                "name": failure.topology_name,
+                "stage": failure.stage.as_str(),
+                "message": failure.message,
+                "evidence_at_failure": failure.evidence_at_failure,
+            })
+        })
+        .collect();
     let ranked_rows: Vec<serde_json::Value> = ranked
         .ranked
         .into_iter()
@@ -3615,6 +4095,7 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
     let out = serde_json::json!({
         "ranked": ranked_rows,
         "winner_index": ranked.winner_index,
+        "failed": failed_rows,
     });
     serde_json::to_string(&out)
         .map_err(|err| py_value_error(format!("rank_topology_candidates: serialise: {err}")))
@@ -4550,18 +5031,19 @@ fn gaussian_reml_fit_backward<'py>(
 fn gaussian_reml_fit_formula_table<'py>(
     py: Python<'py>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'py, PyEncodedTable>,
     formula: String,
     y: PyReadonlyArray2<'py, f64>,
     config_json: Option<String>,
     fisher_rao_w: Option<PyReadonlyArray3<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let y_values = y.as_array().to_owned();
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
     let result = detach_py_result(py, "gaussian_reml_fit_formula_table", move || {
-        gaussian_reml_fit_formula_table_impl(
-            headers,
-            rows,
+        gaussian_reml_fit_formula_dataset_impl(
+            dataset,
             formula,
             y_values.view(),
             config_json.as_deref(),
@@ -5137,7 +5619,6 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         )));
     }
 
-    let y_col: Array1<f64> = y_view.column(0).to_owned();
     let weights_owned: Array1<f64> = match weights.as_ref() {
         Some(w) => {
             let wa = w.as_array();
@@ -5152,7 +5633,6 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         }
         None => Array1::from_elem(n_rows, 1.0),
     };
-    let offset_zero: Array1<f64> = Array1::zeros(n_rows);
 
     // Build the constraint payload. An empty A (0 rows) is treated as "no
     // constraint" — same convention used internally when no shape constraint
@@ -5196,228 +5676,35 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             }
         };
 
-    // With no active inequality system the constrained forward is, by
-    // definition, the unconstrained Gaussian REML fit. Route it through the
-    // exact same closed-form solver that `gaussian_reml_fit` uses so the two
-    // agree to the last bit rather than merely "close" — the general PIRLS
-    // outer loop converges to a slightly different smoothing parameter and
-    // would otherwise violate the documented no-constraint invariant.
-    if constraints_opt.is_none() {
-        let init_lambda = init_log_lambda.map(f64::exp);
-        let x_cf = x_view.to_owned();
-        let y_cf = y_view.to_owned();
-        let penalty_cf = penalty_view.to_owned();
-        let weights_cf: Option<Array1<f64>> = weights.as_ref().map(|w| w.as_array().to_owned());
-        let fit = detach_estimation_result(
-            py,
-            "gaussian_reml_fit_with_constraints_forward",
-            move || {
-                gaussian_reml_multi_closed_form_with_cache(
-                    x_cf.view(),
-                    y_cf.view(),
-                    penalty_cf.view(),
-                    weights_cf.as_ref().map(|w| w.view()),
-                    init_lambda,
-                    None,
-                )
-            },
-        )?;
-
-        let lambda_scalar = fit.lambda;
-        let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
-        let active_indices_arr: Array1<u64> = Array1::from_vec(Vec::new());
-
-        let out = PyDict::new(py);
-        out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
-        out.set_item("fitted", fit.fitted.into_pyarray(py))?;
-        out.set_item("lambda", lambda_scalar)?;
-        out.set_item("log_lambda", log_lambda_scalar)?;
-        out.set_item("reml_score", fit.reml_score)?;
-        out.set_item("edf", fit.edf)?;
-        out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
-        return Ok(out.unbind());
-    }
-
-    // Interior-cert fast path. Even with an inequality system present, if the
-    // *unconstrained* closed-form optimum is already strictly interior — every
-    // row `a_i·β̂ > b_i` beyond the boundary tolerance — then no constraint
-    // binds, so by the KKT conditions (all multipliers zero) that unconstrained
-    // optimum IS the constrained solution. Returning the closed form here makes
-    // a present-but-non-binding constraint (e.g. the degenerate `0·β ≥ −1`)
-    // agree bit-for-bit with the unconstrained `gaussian_reml_fit` and with the
-    // interior-cert branch of the analytic backward, which already
-    // differentiates this same closed form; the PIRLS outer loop otherwise
-    // settles on a slightly different smoothing parameter and desynchronises the
-    // forward from both. The strict-interior predicate is the exact negation of
-    // the active-set report's binding test below (same tolerance), so taking
-    // this path ⟺ the reported active set is empty. Only when the unconstrained
-    // optimum actually reaches or violates a row do we pay for the constrained
-    // PIRLS solve.
-    if let Some(constraints) = constraints_opt.as_ref() {
-        let init_lambda = init_log_lambda.map(f64::exp);
-        let x_cf = x_view.to_owned();
-        let y_cf = y_view.to_owned();
-        let penalty_cf = penalty_view.to_owned();
-        let weights_cf: Option<Array1<f64>> = weights.as_ref().map(|w| w.as_array().to_owned());
-        let cf = detach_estimation_result(
-            py,
-            "gaussian_reml_fit_with_constraints_forward",
-            move || {
-                gaussian_reml_multi_closed_form_with_cache(
-                    x_cf.view(),
-                    y_cf.view(),
-                    penalty_cf.view(),
-                    weights_cf.as_ref().map(|w| w.view()),
-                    init_lambda,
-                    None,
-                )
-            },
-        )?;
-        let beta_cf = cf.coefficients.column(0).to_owned();
-        let beta_scale = beta_cf.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
-        let ab: Array1<f64> = constraints.a.dot(&beta_cf);
-        let strictly_interior = (0..constraints.a.nrows()).all(|i| {
-            let row_scale =
-                constraints
-                    .a
-                    .row(i)
-                    .iter()
-                    .fold(0.0_f64, |m, &v| m.max(v.abs()))
-                    .max(1.0);
-            let tol = gam::solver::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                * row_scale
-                * beta_scale.max(constraints.b[i].abs().max(1.0));
-            ab[i] > constraints.b[i] + tol
-        });
-        if strictly_interior {
-            let lambda_scalar = cf.lambda;
-            let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
-            let active_indices_arr: Array1<u64> = Array1::from_vec(Vec::new());
-            let out = PyDict::new(py);
-            out.set_item("coefficients", cf.coefficients.into_pyarray(py))?;
-            out.set_item("fitted", cf.fitted.into_pyarray(py))?;
-            out.set_item("lambda", lambda_scalar)?;
-            out.set_item("log_lambda", log_lambda_scalar)?;
-            out.set_item("reml_score", cf.reml_score)?;
-            out.set_item("edf", cf.edf)?;
-            out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
-            return Ok(out.unbind());
-        }
-    }
-
-    let s_list: Vec<gam::terms::smooth::BlockwisePenalty> =
-        vec![gam::terms::smooth::BlockwisePenalty::new(
-            0..p_cols,
-            penalty_view.to_owned(),
-        )];
-
-    let opts = gam::solver::estimate::FitOptions {
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        compute_inference: true,
-        skip_rho_posterior_inference: false,
-        max_iter: 200,
-        tol: 1e-7,
-        nullspace_dims: vec![0; s_list.len()],
-        linear_constraints: constraints_opt.clone(),
-        firth_bias_reduction: false,
-        adaptive_regularization: None,
-        penalty_shrinkage_floor: Some(1e-6),
-        rho_prior: Default::default(),
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-        persist_warm_start_disk: false,
-    };
-
-    let heuristic_owned: Option<Vec<f64>> = init_log_lambda.map(|rho| vec![rho]);
-
     let x_owned = x_view.to_owned();
-    let x_for_active = x_owned.clone();
+    let y_owned = y_view.to_owned();
+    let penalty_owned = penalty_view.to_owned();
+    let init_lambda = init_log_lambda.map(f64::exp);
     let fit = detach_estimation_result(
         py,
         "gaussian_reml_fit_with_constraints_forward",
         move || {
-            let heuristic_slice = heuristic_owned.as_ref().map(|v| v.as_slice());
-            gam::solver::estimate::fit_gamwith_heuristic_lambdas(
-                x_owned,
-                y_col.view(),
-                weights_owned.view(),
-                offset_zero.view(),
-                &s_list,
-                heuristic_slice,
-                LikelihoodSpec::new(
-                    ResponseFamily::Gaussian,
-                    InverseLink::Standard(StandardLink::Identity),
-                ),
-                &opts,
+            gam::solver::constrained_gaussian_reml::constrained_gaussian_reml_forward(
+                gam::solver::constrained_gaussian_reml::ConstrainedGaussianRemlForwardProblem {
+                    x: x_owned.view(),
+                    y: y_owned.view(),
+                    penalty: penalty_owned.view(),
+                    weights: Some(weights_owned.view()),
+                    constraints: constraints_opt.as_ref(),
+                    init_lambda,
+                },
             )
         },
     )?;
 
-    let beta = fit.beta.clone();
-    let coefficients_2d = beta.clone().insert_axis(Axis(1));
-    let fitted_vec: Array1<f64> = x_for_active.dot(&beta);
-    let fitted_2d = fitted_vec.insert_axis(Axis(1));
-
-    let lambdas: Array1<f64> = fit.lambdas.clone();
-    let lambda_scalar = lambdas.iter().copied().next().unwrap_or(0.0);
-    let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
-
-    let edf_total: f64 = fit
-        .inference
-        .as_ref()
-        .map(|inf| inf.edf_total)
-        .unwrap_or(0.0);
-
-    // Honest KKT active set at the accepted β. Constraints are `A·β ≥ b`
-    // (the convention in `active_set.rs`), so a row is *active* (binding)
-    // exactly when its slack `a_i·β − b_i` sits at or below the boundary
-    // tolerance — `a_i·β ≤ b_i + tol`. A row with a large positive slack is
-    // strictly interior and MUST NOT be reported active. The boundary
-    // tolerance is the solver's own primal-feasibility band
-    // `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`, scaled by the row norm and the
-    // solution magnitude so the test is invariant to constraint/coefficient
-    // rescaling — the same derived tolerance the constrained solver accepts a
-    // step against, so this report agrees with the solver's own active-set
-    // notion rather than a private magic threshold. This set is the sole
-    // active-set contract; the Python autograd wrapper consumes it directly
-    // (it drives the envelope-theorem backward, which restricts the KKT face
-    // to exactly these rows) and does not recompute its own.
-    let active_indices: Vec<u64> = match constraints_opt.as_ref() {
-        Some(c) if c.a.nrows() > 0 => {
-            let beta_scale = beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
-            let mut out: Vec<u64> = Vec::new();
-            let ab: Array1<f64> = c.a.dot(&beta);
-            for i in 0..c.a.nrows() {
-                let row_scale =
-                    c.a.row(i)
-                        .iter()
-                        .fold(0.0_f64, |m, &v| m.max(v.abs()))
-                        .max(1.0);
-                let tol = gam::solver::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                    * row_scale
-                    * beta_scale.max(c.b[i].abs().max(1.0));
-                if ab[i] <= c.b[i] + tol {
-                    out.push(i as u64);
-                }
-            }
-            out
-        }
-        _ => Vec::new(),
-    };
-    let active_indices_arr: Array1<u64> = Array1::from_vec(active_indices);
-
     let out = PyDict::new(py);
-    out.set_item("coefficients", coefficients_2d.into_pyarray(py))?;
-    out.set_item("fitted", fitted_2d.into_pyarray(py))?;
-    out.set_item("lambda", lambda_scalar)?;
-    out.set_item("log_lambda", log_lambda_scalar)?;
+    out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+    out.set_item("lambda", fit.lambda)?;
+    out.set_item("log_lambda", fit.lambda.ln())?;
     out.set_item("reml_score", fit.reml_score)?;
-    out.set_item("edf", edf_total)?;
-    out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
+    out.set_item("edf", fit.edf)?;
+    out.set_item("active_indices", fit.active_indices.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -5549,10 +5836,12 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
         let b_owned = b.as_array().to_owned();
         let active_owned = active.as_array().to_owned();
         let coefficients_owned = coefficients.as_array().to_owned();
-        let grad_coefficients_owned =
-            grad_coefficients.as_ref().map(|values| values.as_array().to_owned());
-        let grad_fitted_owned =
-            grad_fitted.as_ref().map(|values| values.as_array().to_owned());
+        let grad_coefficients_owned = grad_coefficients
+            .as_ref()
+            .map(|values| values.as_array().to_owned());
+        let grad_fitted_owned = grad_fitted
+            .as_ref()
+            .map(|values| values.as_array().to_owned());
         let backward = detach_pyresult(
             py,
             "gaussian_reml_fit_with_constraints_backward",

@@ -364,8 +364,7 @@ pub fn try_row_batched_cell_moments(
             Ok(tag) => {
                 cells.push(cell);
                 branches.push(tag);
-                prelim_status
-                    .push(crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8);
+                prelim_status.push(crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8);
             }
             Err(code) => {
                 // Substrate would also reject this cell.  Keep a placeholder
@@ -2722,7 +2721,11 @@ mod step6_tests {
             .expect("step6 dense Hessian should be assembled before backend gate");
         for a in 0..p {
             for b in 0..p {
-                close(hess[[a, b]], expected_hess[[a, b]], &format!("hess[{a},{b}]"));
+                close(
+                    hess[[a, b]],
+                    expected_hess[[a, b]],
+                    &format!("hess[{a},{b}]"),
+                );
             }
         }
     }

@@ -22,6 +22,45 @@ use crate::basis::{
     SphericalSplineIdentifiability, orthogonality_transform_for_design,
 };
 use gam_linalg::matrix::{CoefficientTransformOperator, RandomEffectOperator};
+use ndarray::ArrayView1;
+
+/// Empirical L² mass of a scalar basis function under the uniform measure on
+/// the observed rows. A linear term has one realized basis column `b`; using
+/// `G = n⁻¹ bᵀb` makes its shrinkage energy `β²G = n⁻¹‖bβ‖²`, a property of
+/// the fitted function values rather than of the arbitrary coefficient scale.
+fn linear_function_mass(column: ArrayView1<'_, f64>, term_name: &str) -> Result<f64, BasisError> {
+    if column.is_empty() {
+        crate::bail_invalid_basis!(
+            "linear term '{term_name}' cannot define a function-space penalty on zero rows"
+        );
+    }
+    let scale = column.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+    if !scale.is_finite() {
+        crate::bail_invalid_basis!(
+            "linear term '{term_name}' has a non-finite realized design column"
+        );
+    }
+    if scale == 0.0 {
+        crate::bail_invalid_basis!(
+            "linear term '{term_name}' is identically zero and cannot carry a recoverable effect"
+        );
+    }
+    let scaled_mean_square = column
+        .iter()
+        .map(|&value| {
+            let normalized = value / scale;
+            normalized * normalized
+        })
+        .sum::<f64>()
+        / column.len() as f64;
+    let mass = scale * scale * scaled_mean_square;
+    if !mass.is_finite() || mass <= 0.0 {
+        crate::bail_invalid_basis!(
+            "linear term '{term_name}' has an invalid empirical function mass {mass}"
+        );
+    }
+    Ok(mass)
+}
 
 pub fn build_term_collection_design_inner(
     data: ArrayView2<'_, f64>,
@@ -88,6 +127,19 @@ pub fn build_term_collection_design_inner(
     let smooth_raw = smooth_raw_result?;
     let random_blocks = random_blocks_result?;
     let linear_block = linear_block_result?;
+    let linear_function_masses = match linear_block.as_ref() {
+        Some(block) => spec
+            .linear_terms
+            .iter()
+            .enumerate()
+            .map(|(j, term)| {
+                term.double_penalty
+                    .then(|| linear_function_mass(block.column(j), &term.name))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
 
     let smooth = apply_global_smooth_identifiability(
         smooth_raw,
@@ -198,54 +250,32 @@ pub fn build_term_collection_design_inner(
         }
     }
 
-    // Linear terms with `double_penalty=true` are aggregated into a single
-    // shared ridge block named "linear" that spans the union of their
-    // coefficient columns. Two reasons this is the only correct shape:
-    //
-    //   (i) Per-term redundancy: a penalized linear term is a single scalar
-    //   coefficient β_j; the only shrinkage direction is β_j² itself. The
-    //   earlier per-term form emitted two identical 1×1 ridges per term
-    //   (`LinearTermRidge` + `LinearTermDoubleRidge`); for the two λ's that
-    //   the outer REML/LAML places on those blocks, the total penalty is
-    //   `(λ₁ + λ₂) β_j²` and the outer score is flat along
-    //   `λ₁ + λ₂ = const`. Unidentifiable hyperparameters by construction.
-    //
-    //   (ii) Cross-term aliasing: each penalized linear term in its own 1×1
-    //   block gives the outer optimizer a separate λ per term, when the
-    //   mgcv-equivalent "ridge over the parametric linear columns" is one
-    //   shared λ that shrinks every penalized linear coefficient with the
-    //   same scale. The shared block emits exactly one outer hyperparameter
-    //   and pins each penalized column's diagonal entry to 1.0; unpenalized
-    //   linear columns sit at diagonal 0, so they are mathematically
-    //   unaffected (S β = 0 on those rows) while keeping the block range
-    //   contiguous over the linear coefficient run.
-    //
-    // The block's `termname` is the literal "linear" so keyed hyperpriors
-    // / coefficient groups address the shared lever directly. The
-    // per-term identity is preserved through `linear_ranges`, which still
-    // names each individual column.
-    let any_double_penalty_linear = spec.linear_terms.iter().any(|t| t.double_penalty);
-    if any_double_penalty_linear && p_lin > 0 {
-        let block_range = p_intercept..(p_intercept + p_lin);
-        let mut s = Array2::<f64>::zeros((p_lin, p_lin));
-        let mut effective_rank = 0usize;
-        for (j, linear) in spec.linear_terms.iter().enumerate() {
-            if linear.double_penalty {
-                s[[j, j]] = 1.0;
-                effective_rank += 1;
-            }
-        }
+    // Every non-intercept effect owns one independent REML coordinate. For a
+    // scalar linear basis `b_j`, the physical null-recovery penalty is its
+    // empirical function Gram `G_j = n⁻¹b_jᵀb_j`, so `β_j²G_j` is exactly the
+    // mean squared fitted effect. Under a harmless rescaling `b_j -> c b_j`,
+    // `β_j -> β_j/c`, the quadratic functional is unchanged. Keeping each
+    // term in its own one-column block also lets REML remove unsupported
+    // effects independently instead of forcing unrelated slopes to share λ.
+    for (j, linear) in spec.linear_terms.iter().enumerate() {
+        let Some(function_mass) = linear_function_masses.get(j).copied().flatten() else {
+            continue;
+        };
+        let col = p_intercept + j;
         let global_index = penalties.len();
-        penalties.push(BlockwisePenalty::new(block_range, s));
+        penalties.push(BlockwisePenalty::new(
+            col..(col + 1),
+            Array2::from_elem((1, 1), function_mass),
+        ));
         nullspace_dims.push(0);
         penaltyinfo.push(PenaltyBlockInfo {
             global_index,
-            termname: Some("linear".to_string()),
+            termname: Some(linear.name.clone()),
             penalty: PenaltyInfo {
                 source: PenaltySource::Other("LinearTermRidge".to_string()),
-                original_index: 0,
+                original_index: j,
                 active: true,
-                effective_rank,
+                effective_rank: 1,
                 dropped_reason: None,
                 nullspace_dim_hint: 0,
                 normalization_scale: 1.0,
@@ -371,7 +401,7 @@ pub fn build_term_collection_design_inner(
         })
     };
     let linear_constraints =
-        merge_linear_constraints_global(explicit_linear_constraints, lower_bound_constraints);
+        merge_linear_constraints_global(explicit_linear_constraints, lower_bound_constraints)?;
 
     Ok(TermCollectionDesign {
         design,
@@ -1142,8 +1172,7 @@ fn apply_global_smooth_identifiability(
                 .map(|c| {
                     (
                         support_rows(&c.matrix),
-                        c.matrix
-                            .mapv(|value| value * c.normalization_scale),
+                        c.matrix.mapv(|value| value * c.normalization_scale),
                     )
                 })
                 .collect();
@@ -1175,9 +1204,7 @@ fn apply_global_smooth_identifiability(
                 let ridge_full = candidate
                     .matrix
                     .mapv(|value| value * candidate.normalization_scale);
-                let ridge_block = ridge_full
-                    .slice(s![*plo..*phi, *plo..*phi])
-                    .to_owned();
+                let ridge_block = ridge_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
                 let rebuilt_block =
                     crate::basis::rebuild_metric_consistent_ridge(&block, &ridge_block)?;
                 match rebuilt_block {

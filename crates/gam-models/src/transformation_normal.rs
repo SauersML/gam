@@ -34,11 +34,6 @@ pub(crate) use endpoint_normalizer::{
     log_normal_cdf_diff_derivatives,
 };
 
-pub(crate) use gam_terms::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
-    create_ispline_derivative_dense,
-};
-pub(crate) use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
@@ -48,33 +43,38 @@ pub(crate) use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
-pub(crate) use crate::penalized_projection::solve_penalizedweighted_projection;
-pub(crate) use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
-pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;
-pub(crate) use crate::inference::model::{
-    TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration,
-};
-pub(crate) use gam_linalg::matrix::{
-    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
-    dense_rowwise_kronecker,
-};
-pub(crate) use crate::model_types::UnifiedFitResult;
-pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
-pub(crate) use crate::probability::standard_normal_quantile;
-pub(crate) use gam_terms::smooth::{
-    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec,
-};
 pub(crate) use crate::fit_orchestration::drivers::{
     ExactJointHyperSetup, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
+pub(crate) use crate::inference::model::{
+    TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration,
+};
+pub(crate) use crate::model_types::UnifiedFitResult;
+pub(crate) use crate::penalized_projection::solve_penalizedweighted_projection;
+pub(crate) use crate::probability::standard_normal_quantile;
+pub(crate) use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+pub(crate) use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+pub(crate) use gam_linalg::matrix::{
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
+    dense_rowwise_kronecker,
+};
+pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
+pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;
+pub(crate) use gam_terms::basis::{
+    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    create_ispline_derivative_dense,
+};
+pub(crate) use gam_terms::smooth::{
+    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec,
+};
 // #1521: relocated DOWN into gam_terms::smooth (was drivers::build_term_collection_design).
-pub(crate) use gam_terms::smooth::build_term_collection_design;
 pub(crate) use gam_problem::{
     DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
 pub(crate) use gam_runtime::resource::{MatrixMaterializationError, ResourcePolicy};
+pub(crate) use gam_terms::smooth::build_term_collection_design;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::sync::{Arc, Mutex, OnceLock};

@@ -76,9 +76,14 @@ impl<'a> StandardFitData<'a> {
 
 pub struct StandardFitRequest<'a> {
     pub data: StandardFitData<'a>,
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub offset: Array1<f64>,
+    /// Clone-cheap immutable response backing. Iterative estimators retain one
+    /// allocation while issuing multiple standard-fit requests.
+    pub y: Arc<Array1<f64>>,
+    /// Clone-cheap prior/working-weight backing. A new allocation is made only
+    /// when an estimator actually changes the weights.
+    pub weights: Arc<Array1<f64>>,
+    /// Clone-cheap immutable offset backing.
+    pub offset: Arc<Array1<f64>>,
     pub spec: TermCollectionSpec,
     pub family: LikelihoodSpec,
     /// #2026: estimate the Tweedie variance power `p` by profile likelihood
@@ -215,7 +220,7 @@ pub struct StandardFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
-    /// Which resolved smooth positions originated from an auto-sized 2-D+
+    /// Which resolved smooth positions originated from an auto-sized radial
     /// spatial basis. Freeze replaces center strategies with explicit center
     /// matrices, so this provenance must travel beside the result for the
     /// adaptive resolution loop.
@@ -246,36 +251,34 @@ pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool>
     fn auto_spatial(basis: &gam_terms::smooth::SmoothBasisSpec) -> bool {
         use gam_terms::smooth::SmoothBasisSpec as B;
         match basis {
-            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
-                auto_spatial(inner)
-            }
+            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => auto_spatial(inner),
             B::BySmooth { smooth, .. } => auto_spatial(smooth),
             B::ThinPlate {
                 feature_cols, spec, ..
             } => {
-                feature_cols.len() >= 2
+                !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
             }
             B::Duchon {
                 feature_cols, spec, ..
             } => {
-                feature_cols.len() >= 2
+                !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
             }
             B::Matern {
                 feature_cols, spec, ..
             } => {
-                feature_cols.len() >= 2
+                !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
             }
             B::ConstantCurvature { feature_cols, spec } => {
-                feature_cols.len() >= 2
+                !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
             }
             B::MeasureJet {
                 feature_cols, spec, ..
             } => {
-                feature_cols.len() >= 2
+                !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
             }
             _ => false,
@@ -288,44 +291,35 @@ pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool>
         .collect()
 }
 
-pub(crate) fn adaptive_spatial_center_counts(
-    spec: &TermCollectionSpec,
-) -> Vec<Option<usize>> {
+pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<Option<usize>> {
     fn center_count(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
         use gam_terms::smooth::SmoothBasisSpec as B;
         match basis {
-            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
-                center_count(inner)
-            }
+            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => center_count(inner),
             B::BySmooth { smooth, .. } => center_count(smooth),
             B::ThinPlate {
                 feature_cols, spec, ..
-            } if feature_cols.len() >= 2 => Some(
-                spec.center_strategy
-                    .planned_num_centers(feature_cols.len()),
-            ),
+            } if !feature_cols.is_empty() => {
+                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
+            }
             B::Duchon {
                 feature_cols, spec, ..
-            } if feature_cols.len() >= 2 => Some(
-                spec.center_strategy
-                    .planned_num_centers(feature_cols.len()),
-            ),
+            } if !feature_cols.is_empty() => {
+                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
+            }
             B::Matern {
                 feature_cols, spec, ..
-            } if feature_cols.len() >= 2 => Some(
-                spec.center_strategy
-                    .planned_num_centers(feature_cols.len()),
-            ),
-            B::ConstantCurvature { feature_cols, spec } if feature_cols.len() >= 2 => Some(
-                spec.center_strategy
-                    .planned_num_centers(feature_cols.len()),
-            ),
+            } if !feature_cols.is_empty() => {
+                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
+            }
+            B::ConstantCurvature { feature_cols, spec } if !feature_cols.is_empty() => {
+                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
+            }
             B::MeasureJet {
                 feature_cols, spec, ..
-            } if feature_cols.len() >= 2 => Some(
-                spec.center_strategy
-                    .planned_num_centers(feature_cols.len()),
-            ),
+            } if !feature_cols.is_empty() => {
+                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
+            }
             _ => None,
         }
     }
@@ -670,11 +664,13 @@ pub struct FitConfig {
     /// stronger external checkpoint transaction.
     pub persist_warm_start_disk: bool,
     /// Per-smooth spatial center requests maintained by the adaptive
-    /// fit→expand→refit loop. Empty/`None` entries select the structural
-    /// identifiable start; `Some(k)` requests the next evidence-backed
+    /// fit→expand→refit loop. Outer `None` means no loop owns this request, so
+    /// raw materialization keeps the ordinary full basis. `Some` activates the
+    /// canonical formula workflow: missing inner entries select the structural
+    /// identifiable start and `Some(k)` requests the next evidence-backed
     /// resolution for that smooth only. This is in-process orchestration state,
     /// never a user knob or environment setting.
-    pub spatial_center_counts: Vec<Option<usize>>,
+    pub spatial_center_counts: Option<Vec<Option<usize>>>,
 }
 
 impl Default for FitConfig {
@@ -725,7 +721,7 @@ impl Default for FitConfig {
             topology_auto_selector: None,
             smooth_overrides: None,
             persist_warm_start_disk: true,
-            spatial_center_counts: Vec::new(),
+            spatial_center_counts: None,
         }
     }
 }
@@ -762,7 +758,7 @@ pub struct ResidualCascadeInputs {
 }
 
 #[cfg(test)]
-mod checkpoint_policy_tests {
+mod default_workflow_policy_tests {
     use super::*;
 
     #[test]
@@ -771,6 +767,14 @@ mod checkpoint_policy_tests {
         assert!(config.persist_warm_start_disk);
         let options = canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
         assert!(options.persist_warm_start_disk);
+    }
+
+    #[test]
+    fn raw_materialization_does_not_activate_adaptive_spatial_resolution() {
+        assert!(
+            FitConfig::default().spatial_center_counts.is_none(),
+            "raw materialization must not activate a grow loop it does not own"
+        );
     }
 
     #[test]

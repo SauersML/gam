@@ -134,10 +134,10 @@ fn run_fit(n: usize, outer_iters: usize) -> Result<f64, String> {
 
     let t0 = Instant::now();
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x,
-        y,
-        weights,
-        offset,
+        data: gam::solver::fit_orchestration::StandardFitData::shared(x),
+        y: std::sync::Arc::new(y),
+        weights: std::sync::Arc::new(weights),
+        offset: std::sync::Arc::new(offset),
         spec: spec_2d(),
         family: LikelihoodSpec::new(
             ResponseFamily::Gaussian,
@@ -150,7 +150,6 @@ fn run_fit(n: usize, outer_iters: usize) -> Result<f64, String> {
         penalty_block_gamma_priors: Vec::new(),
         latent_coord: None,
         estimate_tweedie_p: false,
-        _marker: std::marker::PhantomData,
     }))
     .map_err(|e| format!("{e:?}"))?;
     let dt = t0.elapsed().as_secs_f64();

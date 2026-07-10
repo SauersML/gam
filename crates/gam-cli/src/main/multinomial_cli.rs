@@ -55,6 +55,7 @@ fn load_multinomial_model(path: &Path) -> Result<MultinomialSavedModel, String> 
 
 fn write_multinomial_model(path: &Path, saved: MultinomialSavedModel) -> Result<(), String> {
     let bytes = MultinomialModelEnvelope::new(saved)
+        .map_err(|e| e.to_string())?
         .to_json_bytes()
         .map_err(|e| e.to_string())?;
     std::fs::write(path, bytes)

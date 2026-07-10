@@ -37,9 +37,7 @@ impl_reason_error_boilerplate! {
     }
 }
 
-impl From<crate::block_layout::block_count::BlockCountMismatch>
-    for SurvivalLocationScaleError
-{
+impl From<crate::block_layout::block_count::BlockCountMismatch> for SurvivalLocationScaleError {
     fn from(
         err: crate::block_layout::block_count::BlockCountMismatch,
     ) -> SurvivalLocationScaleError {

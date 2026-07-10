@@ -640,8 +640,8 @@ fn sas_log_delta_barrier_hessian_matches_gradient_slope() {
     );
 }
 
-fn decode_invariant_test_fit() -> UnifiedFitResult {
-    UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+fn decode_invariant_test_parts() -> UnifiedFitResultParts {
+    UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: array![0.25, -0.5],
             role: BlockRole::Mean,
@@ -698,10 +698,50 @@ fn decode_invariant_test_fit() -> UnifiedFitResult {
         pirls_status: crate::pirls::PirlsStatus::Converged,
         max_abs_eta: 1.25,
         constraint_kkt: None,
-        artifacts: FitArtifacts::default(),
+        artifacts: FitArtifacts {
+            criterion_certificate: Some(crate::model_types::OuterCriterionCertificate {
+                grad_norm: 0.05,
+                projected_grad_norm: 0.05,
+                stationarity_bound: 0.1,
+                hessian_psd: Some(true),
+                lambdas_railed: Vec::new(),
+            }),
+            ..Default::default()
+        },
         inner_cycles: 0,
-    })
+    }
+}
+
+fn decode_invariant_test_fit() -> UnifiedFitResult {
+    UnifiedFitResult::try_from_parts(decode_invariant_test_parts())
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct decode invariant test fit", e))
+}
+
+#[test]
+fn unified_fit_constructor_rejects_nonconverged_outer_state() {
+    let mut parts = decode_invariant_test_parts();
+    parts.outer_converged = false;
+    let error = UnifiedFitResult::try_from_parts(parts)
+        .expect_err("an outer checkpoint must not mint a fitted model");
+    assert!(matches!(error, EstimationError::FitDidNotConverge { .. }));
+}
+
+#[test]
+fn unified_fit_constructor_rejects_uncertified_inner_state() {
+    let mut parts = decode_invariant_test_parts();
+    parts.pirls_status = crate::pirls::PirlsStatus::StalledAtValidMinimum;
+    let error = UnifiedFitResult::try_from_parts(parts)
+        .expect_err("a status label without quantitative inner convergence must be rejected");
+    assert!(matches!(error, EstimationError::FitDidNotConverge { .. }));
+}
+
+#[test]
+fn unified_fit_constructor_requires_outer_certificate_after_iterations() {
+    let mut parts = decode_invariant_test_parts();
+    parts.artifacts.criterion_certificate = None;
+    let error = UnifiedFitResult::try_from_parts(parts)
+        .expect_err("outer iterations without analytic evidence must be rejected");
+    assert!(matches!(error, EstimationError::FitDidNotConverge { .. }));
 }
 
 #[test]

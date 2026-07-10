@@ -71,17 +71,10 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     "crates/gam-report/src/lib.rs",        // reports the audit certificate
     "crates/gam-cli/src/main/run_sample_generate_report.rs", // copies certificate fields into the report
     "crates/gam-sae/src/certificates.rs", // SAE analogue of the audit certificate
-    // ── Tracked REDUCIBLE production FD (NOT theoretically irreducible) ──
-    // The SAE sphere-boost Gauss-Newton chart Jacobian. The residual is
-    //     `r(θ) = svec(ÃᵀÃ − s·Ĝ)`; its θ-Jacobian is the closed-form chain rule
-    //     `∂(ÃᵀÃ)/∂θ_k = (∂Ã/∂θ_k)ᵀÃ + Ãᵀ(∂Ã/∂θ_k)`, and `∂Ã/∂θ` is the known
-    //     sphere-boost transform derivative composed with the moved-latitude cos
-    //     (the file's own comment calls it "a chain rule"). So it is REDUCIBLE to a
-    //     closed-form Jacobian, not irreducible. Reachable in production (called
-    //     from `sphere_minimize_boost_defect`). Owned by the SAE agent — flagged
-    //     for analytic substitution + an oracle; tracked here meanwhile so it
-    //     cannot hide off-allowlist.
-    "crates/gam-sae/src/chart_canonicalization.rs",
+    // The SAE sphere-boost Gauss–Newton chart Jacobian is now the exact analytic
+    // chain through the boost, moved-latitude whitening, `AᵀA`, and profiled
+    // scale. Its finite-difference comparison is confined to `#[cfg(test)]`, so
+    // the production file needs no exemption.
     // SAE manifold outer-ρ files carry NO finite difference (the #1273 fallback was
     // removed; the descent direction is the plain analytic `DeflatedArrowSolver`
     // gradient) and so are NOT listed — they need no exemption.
@@ -627,12 +620,15 @@ fn sanctioned_fd_allowlist_membership_is_correct() {
     assert!(fd_ok_markers_allowed(Path::new(
         "/Users/anyone/gam/crates/gam-solve/src/rho_optimizer/run.rs"
     )));
-    // The remaining production sphere-boost GN chart Jacobian is allowlisted,
-    // so it is tracked here rather than hidden behind off-allowlist markers.
+    // The dead geodesic-acceleration probe was removed, so the P-IRLS update
+    // path is not allowlisted.
     assert!(!fd_ok_markers_allowed(Path::new(
         "crates/gam-solve/src/pirls/reweight.rs"
     )));
-    assert!(fd_ok_markers_allowed(Path::new(
+    // The sphere-boost GN chart Jacobian is analytic in production; its
+    // finite-difference oracle is test-only, so the production file is not
+    // allowlisted.
+    assert!(!fd_ok_markers_allowed(Path::new(
         "crates/gam-sae/src/chart_canonicalization.rs"
     )));
     // (#1440) The survival pilot W-metric chain is now the closed-form

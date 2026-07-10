@@ -204,9 +204,7 @@ impl SurvivalMarginalSlopeFamily {
                                         z: f64|
                      -> f64 {
                         match edge {
-                            crate::cubic_cell_kernel::PartitionEdge::Crossing {
-                                ..
-                            } => {
+                            crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
                                 let direct_g = if axis == primary.g { z } else { 0.0 };
                                 -direct_g / b
                             }
@@ -215,9 +213,7 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     let a_vel = |edge: crate::cubic_cell_kernel::PartitionEdge| -> f64 {
                         match edge {
-                            crate::cubic_cell_kernel::PartitionEdge::Crossing {
-                                ..
-                            } => -1.0 / b,
+                            crate::cubic_cell_kernel::PartitionEdge::Crossing { .. } => -1.0 / b,
                             crate::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                         }
                     };

@@ -56,19 +56,13 @@
 //! bounding box the boundary cell's cubic polynomial extends naturally (the
 //! cell index clamps, the local coordinate does not).
 
+use faer::{Mat, Side};
+use gam_math::score_opt::AffineRemlProfile;
 
 /// Dimension of the penalty null space: span{1, x1, x2}. The mixed
 /// `2·a1·a2·f_{x1x2}²` term excludes `x1·x2` (its cross derivative is 1).
 const PENALTY_NULLITY: usize = 3;
 
-/// Search interval for log λ (natural log), generous on both sides.
-const LOG_LAMBDA_LO: f64 = -18.0;
-const LOG_LAMBDA_HI: f64 = 18.0;
-/// Coarse REML grid resolution over [LOG_LAMBDA_LO, LOG_LAMBDA_HI] before
-/// golden-section refinement (matches the residual-cascade selector).
-const LOG_LAMBDA_GRID: usize = 25;
-/// Golden-section convergence width on log λ.
-const LOG_LAMBDA_TOL: f64 = 1e-6;
 /// Cholesky pivot floor below which the penalized system is declared singular.
 const PIVOT_FLOOR: f64 = 1e-300;
 /// Dense-Cholesky sizing contract documented in the module header.
@@ -207,8 +201,8 @@ pub fn cholesky_logdet(a: &mut [f64], p: usize) -> Result<f64, String> {
     Ok(logdet)
 }
 
-/// Solve `L Lᵀ x = b` from the stored lower factor.
-pub fn chol_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
+/// Solve `L z = b` from a dense row-major lower-triangular factor.
+fn lower_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
     let mut z = b.to_vec();
     for i in 0..p {
         let mut s = z[i];
@@ -217,6 +211,12 @@ pub fn chol_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
         }
         z[i] = s / l[i * p + i];
     }
+    z
+}
+
+/// Solve `L Lᵀ x = b` from the stored lower factor.
+pub fn chol_solve(l: &[f64], p: usize, b: &[f64]) -> Vec<f64> {
+    let mut z = lower_solve(l, p, b);
     for i in (0..p).rev() {
         let mut s = z[i];
         for t in i + 1..p {
@@ -259,6 +259,63 @@ struct Solved {
     /// Per dimension: penalized residual quadratic `y'Wy − c'X'Wy` =
     /// `‖√W(y − Xc)‖² + λ c'Sc` at the minimizer.
     rss_pen: Vec<f64>,
+}
+
+/// Owned spectral data for the shared affine REML profile.  Keeping the
+/// eigensystem reduction separate from the search makes every score evaluation
+/// O(pD) and ensures the final dense system is factored only at the selected λ.
+struct RemlSpectrum {
+    gram_modes: Vec<f64>,
+    penalty_modes: Vec<f64>,
+    projected_rhs_squared: Vec<f64>,
+    response_energy: Vec<f64>,
+    residual_dof: f64,
+    logdet_constant: f64,
+}
+
+impl RemlSpectrum {
+    fn profile(&self) -> Result<AffineRemlProfile<'_>, String> {
+        AffineRemlProfile::new(
+            &self.gram_modes,
+            &self.penalty_modes,
+            &self.projected_rhs_squared,
+            &self.response_energy,
+            self.residual_dof,
+            self.penalty_modes.len() - PENALTY_NULLITY,
+            self.logdet_constant,
+        )
+        .map_err(|error| format!("grid spline 2d: invalid REML spectrum: {error}"))
+    }
+
+    /// Derive a bounded, penalty-scale-equivariant log-λ domain from the
+    /// pencil's positive transition scales `g/s`. Extending the smallest and
+    /// largest transition by `sqrt(ε)` reaches both numerically distinct
+    /// asymptotes. If there is no mixed mode, the same arithmetic margin around
+    /// the reference λ=1 supplies a principled constant domain.
+    fn log_lambda_domain(&self) -> Result<(f64, f64), String> {
+        let mut lowest_transition = f64::INFINITY;
+        let mut highest_transition = f64::NEG_INFINITY;
+        for (&gram, &penalty) in self.gram_modes.iter().zip(&self.penalty_modes) {
+            if gram > 0.0 && penalty > 0.0 {
+                let transition = gram.ln() - penalty.ln();
+                lowest_transition = lowest_transition.min(transition);
+                highest_transition = highest_transition.max(transition);
+            }
+        }
+        if !(lowest_transition.is_finite() && highest_transition.is_finite()) {
+            lowest_transition = 0.0;
+            highest_transition = 0.0;
+        }
+        let margin = -f64::EPSILON.sqrt().ln();
+        let lo = (lowest_transition - margin).max(f64::MIN_POSITIVE.ln());
+        let hi = (highest_transition + margin).min(f64::MAX.ln());
+        if !(lo < hi) {
+            return Err(format!(
+                "grid spline 2d: no representable REML search domain after spectral scaling ({lo}, {hi})"
+            ));
+        }
+        Ok((lo, hi))
+    }
 }
 
 impl GridSpline2dDesign {
@@ -563,6 +620,155 @@ impl GridSpline2dDesign {
         a
     }
 
+    /// Expand the exact penalty band to a dense symmetric matrix.
+    fn dense_penalty(&self) -> Vec<f64> {
+        let p = self.p;
+        let stride = self.band_half + 1;
+        let mut penalty = vec![0.0_f64; p * p];
+        for g in 0..p {
+            let dmax = self.band_half.min(p - 1 - g);
+            for d in 0..=dmax {
+                let value = self.pen_band[g * stride + d];
+                penalty[g * p + g + d] = value;
+                penalty[(g + d) * p + g] = value;
+            }
+        }
+        penalty
+    }
+
+    /// Build the affine modes of
+    /// `H(λ) = H(1) + (λ-1)S = L U diag(1-μ+λμ) Uᵀ Lᵀ`.
+    /// The known three-dimensional biharmonic null space is represented by
+    /// exact zero penalty modes; all other modes retain the eigensolver's
+    /// analytic generalized eigenvalues.
+    fn reml_spectrum(&self) -> Result<RemlSpectrum, String> {
+        let p = self.p;
+        let mut reference_chol = self.dense_system(1.0);
+        let logdet_constant = cholesky_logdet(&mut reference_chol, p)?;
+
+        let lower = Mat::from_fn(p, p, |row, col| {
+            if row >= col {
+                reference_chol[row * p + col]
+            } else {
+                0.0
+            }
+        });
+        let dense_penalty = self.dense_penalty();
+        let mut whitened = Mat::from_fn(p, p, |row, col| dense_penalty[row * p + col]);
+        // L X = S, followed by L Bᵀ = Xᵀ, gives B = L⁻¹ S L⁻ᵀ.
+        // faer's blocked matrix solves avoid constructing L⁻¹ and retain the
+        // reference factor's numerical conditioning.
+        lower
+            .as_ref()
+            .solve_lower_triangular_in_place(whitened.as_mut());
+        lower
+            .as_ref()
+            .solve_lower_triangular_in_place(whitened.as_mut().transpose_mut());
+        if (0..p).any(|row| (0..p).any(|col| !whitened[(row, col)].is_finite())) {
+            return Err("grid spline 2d: non-finite whitened penalty".to_string());
+        }
+        // The two solves accumulate in a different order above and below the
+        // diagonal. Eigensolve their symmetric average.
+        let mut symmetry_correction_rows = vec![0.0_f64; p];
+        for row in 0..p {
+            for col in row + 1..p {
+                let correction = 0.5 * (whitened[(row, col)] - whitened[(col, row)]).abs();
+                symmetry_correction_rows[row] += correction;
+                symmetry_correction_rows[col] += correction;
+                let value = 0.5 * (whitened[(row, col)] + whitened[(col, row)]);
+                whitened[(row, col)] = value;
+                whitened[(col, row)] = value;
+            }
+        }
+        let matrix_inf_norm = (0..p).fold(0.0_f64, |norm, row| {
+            let row_sum = (0..p).map(|col| whitened[(row, col)].abs()).sum();
+            norm.max(row_sum)
+        });
+        // Standard dot-product backward-error factor γ_p = pε/(1-pε),
+        // scaled by an infinity-norm bound for the symmetric pencil. This is a
+        // dimension- and arithmetic-derived acceptance band, not a rank knob.
+        let p_epsilon = p as f64 * f64::EPSILON;
+        let symmetrization_error = symmetry_correction_rows.into_iter().fold(0.0_f64, f64::max);
+        let eigenvalue_roundoff =
+            symmetrization_error + (p_epsilon / (1.0 - p_epsilon)) * matrix_inf_norm.max(1.0);
+        let eigensystem = whitened
+            .as_ref()
+            .self_adjoint_eigen(Side::Lower)
+            .map_err(|error| {
+                format!("grid spline 2d: reference-pencil eigendecomposition failed: {error:?}")
+            })?;
+        let eigenvalues = eigensystem.S();
+        let eigenvectors = eigensystem.U();
+
+        // Do not depend on a backend-specific ordering convention.
+        let mut order: Vec<usize> = (0..p).collect();
+        order.sort_unstable_by(|&left, &right| eigenvalues[left].total_cmp(&eigenvalues[right]));
+
+        let mut gram_modes = Vec::with_capacity(p);
+        let mut penalty_modes = Vec::with_capacity(p);
+        for (position, &mode) in order.iter().enumerate() {
+            let raw = eigenvalues[mode];
+            if !raw.is_finite() {
+                return Err(format!(
+                    "grid spline 2d: non-finite reference-pencil eigenvalue at mode {position}"
+                ));
+            }
+
+            // Exact arithmetic gives 0 ≤ μ ≤ 1 because G,S are PSD and
+            // H(1)=G+S. Reject a pencil outside its backward-error band instead
+            // of hiding a material violation behind projection.
+            if raw < -eigenvalue_roundoff || raw > 1.0 + eigenvalue_roundoff {
+                return Err(format!(
+                    "grid spline 2d: reference-pencil eigenvalue {raw} at mode {position} lies outside the certified [0, 1] roundoff band ±{eigenvalue_roundoff}"
+                ));
+            }
+            let penalty = if position < PENALTY_NULLITY {
+                if raw.abs() > eigenvalue_roundoff {
+                    return Err(format!(
+                        "grid spline 2d: expected null mode {position} has eigenvalue {raw}, outside zero roundoff band ±{eigenvalue_roundoff}"
+                    ));
+                }
+                0.0
+            } else if raw <= eigenvalue_roundoff {
+                return Err(format!(
+                    "grid spline 2d: penalty rank is below {}: non-null mode {position} has eigenvalue {raw} inside zero roundoff band ±{eigenvalue_roundoff}",
+                    p - PENALTY_NULLITY,
+                ));
+            } else {
+                // Only the admitted upper-band eigensolver excursion is
+                // projected back to the exact generalized-spectrum boundary.
+                raw.min(1.0)
+            };
+            penalty_modes.push(penalty);
+            gram_modes.push(1.0 - penalty);
+        }
+
+        let n_dims = self.rhs.len();
+        let mut projected_rhs_squared = Vec::with_capacity(n_dims * p);
+        for rhs in &self.rhs {
+            let whitened_rhs = lower_solve(&reference_chol, p, rhs);
+            for &mode in &order {
+                let mut coordinate = 0.0;
+                for row in 0..p {
+                    coordinate += eigenvectors[(row, mode)] * whitened_rhs[row];
+                }
+                projected_rhs_squared.push(coordinate * coordinate);
+            }
+        }
+
+        let response_energy = (0..n_dims)
+            .map(|dimension| self.cross_moments[dimension * n_dims + dimension])
+            .collect();
+        Ok(RemlSpectrum {
+            gram_modes,
+            penalty_modes,
+            projected_rhs_squared,
+            response_energy,
+            residual_dof: (self.n_obs - PENALTY_NULLITY) as f64,
+            logdet_constant,
+        })
+    }
+
     fn solve_at(&self, log_lambda: f64) -> Result<Solved, String> {
         if !log_lambda.is_finite() {
             return Err(format!(
@@ -589,27 +795,6 @@ impl GridSpline2dDesign {
             coeffs,
             rss_pen,
         })
-    }
-
-    /// Profiled-σ² REML criterion at `log λ`, pooled across the response
-    /// dimensions sharing the design and λ, up to λ- and data-independent
-    /// additive constants (differences across λ are exact REML differences):
-    ///   `−½ Σ_d [ log|X'WX+λS| − r·log λ + (n−3)·log σ̂²_d(λ) ]`.
-    fn criterion(&self, log_lambda: f64) -> Result<f64, String> {
-        let solved = self.solve_at(log_lambda)?;
-        let dof = (self.n_obs - PENALTY_NULLITY) as f64;
-        let r = (self.p - PENALTY_NULLITY) as f64;
-        let shared = solved.logdet - r * log_lambda;
-        let mut v = 0.0;
-        for &rss in &solved.rss_pen {
-            if !(rss > 0.0) {
-                return Err(format!(
-                    "grid spline 2d: degenerate penalized residual {rss}"
-                ));
-            }
-            v += shared + dof * (rss / dof).ln();
-        }
-        Ok(-0.5 * v)
     }
 
     /// Fit at a FIXED `log λ`, with σ² either supplied (applied to every
@@ -639,7 +824,7 @@ impl GridSpline2dDesign {
         // Full restricted log-likelihood at this (λ, σ²) up to λ- and σ-free
         // constants, pooled across dimensions: at the profiled σ̂²_d the
         // quadratic collapses to the λ-free constant `dof` per dimension,
-        // matching `criterion` up to that constant.
+        // matching the profiled spectral score up to that constant.
         let r = (self.p - PENALTY_NULLITY) as f64;
         let mut restricted_loglik = 0.0;
         for (d, &rss) in solved.rss_pen.iter().enumerate() {
@@ -659,44 +844,18 @@ impl GridSpline2dDesign {
         })
     }
 
-    /// Fit with `log λ` selected by the profiled REML criterion: deterministic
-    /// coarse grid then golden-section refinement (no RNG — same data, same fit).
+    /// Fit with `log λ` selected by the profiled REML criterion.  The affine
+    /// score supplies exact analytic first/second derivatives and rigorous
+    /// interval enclosures to isolate every stationary point on the bounded
+    /// domain. Both boundaries compete directly with all isolated optima.
     pub fn fit_reml(&self) -> Result<GridSpline2dFit, String> {
-        let mut best_i = 0usize;
-        let mut best_v = f64::NEG_INFINITY;
-        let step = (LOG_LAMBDA_HI - LOG_LAMBDA_LO) / (LOG_LAMBDA_GRID - 1) as f64;
-        for i in 0..LOG_LAMBDA_GRID {
-            let ll = LOG_LAMBDA_LO + step * i as f64;
-            let v = self.criterion(ll)?;
-            if v > best_v {
-                best_v = v;
-                best_i = i;
-            }
-        }
-        let mut lo = LOG_LAMBDA_LO + step * best_i.saturating_sub(1) as f64;
-        let mut hi = (LOG_LAMBDA_LO + step * (best_i + 1) as f64).min(LOG_LAMBDA_HI);
-        // Golden-section maximization on [lo, hi].
-        let inv_phi = 0.618_033_988_749_894_9_f64;
-        let mut x1 = hi - inv_phi * (hi - lo);
-        let mut x2 = lo + inv_phi * (hi - lo);
-        let mut f1 = self.criterion(x1)?;
-        let mut f2 = self.criterion(x2)?;
-        while hi - lo > LOG_LAMBDA_TOL {
-            if f1 < f2 {
-                lo = x1;
-                x1 = x2;
-                f1 = f2;
-                x2 = lo + inv_phi * (hi - lo);
-                f2 = self.criterion(x2)?;
-            } else {
-                hi = x2;
-                x2 = x1;
-                f2 = f1;
-                x1 = hi - inv_phi * (hi - lo);
-                f1 = self.criterion(x1)?;
-            }
-        }
-        self.fit_at(0.5 * (lo + hi), None)
+        let spectrum = self.reml_spectrum()?;
+        let profile = spectrum.profile()?;
+        let (log_lambda_lo, log_lambda_hi) = spectrum.log_lambda_domain()?;
+        let search = profile
+            .maximize(log_lambda_lo, log_lambda_hi, f64::EPSILON.sqrt())
+            .map_err(|error| format!("grid spline 2d: REML optimization failed: {error}"))?;
+        self.fit_at(search.optimum.x, None)
     }
 
     /// `a'(X'WX)b` through the retained upper band (exact, O(p·bandwidth)).
@@ -1045,6 +1204,49 @@ pub fn fit_grid_spline_2d_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_reml_profile_matches_direct_factorizations() {
+        let side = 10usize;
+        let mut x1 = Vec::with_capacity(side * side);
+        let mut x2 = Vec::with_capacity(side * side);
+        let mut y0 = Vec::with_capacity(side * side);
+        let mut y1 = Vec::with_capacity(side * side);
+        for i in 0..side {
+            for j in 0..side {
+                let a = i as f64 / (side - 1) as f64;
+                let b = j as f64 / (side - 1) as f64;
+                x1.push(a);
+                x2.push(b);
+                y0.push((2.0 * a).sin() * (3.0 * b).cos() + a * b);
+                y1.push(a * a - b * b + (a + 2.0 * b).sin());
+            }
+        }
+        let weights = vec![1.0; x1.len()];
+        let responses: [&[f64]; 2] = [&y0, &y1];
+        let design = GridSpline2dDesign::build_multi(&x1, &x2, &responses, &weights, 3, [1.0, 1.5])
+            .expect("design");
+        let spectrum = design.reml_spectrum().expect("reference pencil");
+        let profile = spectrum.profile().expect("affine profile");
+        let dof = (design.n_obs - PENALTY_NULLITY) as f64;
+        let rank = (design.p - PENALTY_NULLITY) as f64;
+
+        for log_lambda in [-5.0, 0.0, 6.0] {
+            let solved = design.solve_at(log_lambda).expect("direct solve");
+            let shared = solved.logdet - rank * log_lambda;
+            let direct = -0.5
+                * solved
+                    .rss_pen
+                    .iter()
+                    .map(|rss| shared + dof * (rss / dof).ln())
+                    .sum::<f64>();
+            let spectral = profile.evaluate(log_lambda).expect("spectral score").value;
+            assert!(
+                (direct - spectral).abs() <= f64::EPSILON.sqrt() * (1.0 + direct.abs()),
+                "score mismatch at log lambda {log_lambda}: direct={direct}, spectral={spectral}"
+            );
+        }
+    }
 
     /// State → JSON → from_state replays the posterior mean+variance bit-for-bit
     /// at held-out points (the grid carries no training CSR, so the snapshot is

@@ -1,5 +1,5 @@
 use coefficient_transforms::{
-    convex_divided_difference_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
+    convex_derivative_control_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
     second_cumulative_exp,
 };
 
@@ -11,8 +11,8 @@ use input_standardization::{
 };
 
 use shape_constraints::{
-    shape_lower_bounds_local, shape_order_and_sign, shape_supports_basis,
-    shape_uses_box_reparameterization,
+    bspline_first_derivative_control_spans, shape_lower_bounds_local, shape_order_and_sign,
+    shape_supports_basis, shape_uses_box_reparameterization,
 };
 
 pub fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -1110,7 +1110,8 @@ pub struct LinearTermSpec {
     pub categorical_levels: Vec<(usize, u64)>,
     /// Zero-centered shrinkage ridge with a REML-selected `λ`. It is enabled
     /// by default so an unsupported non-intercept effect can be recovered as
-    /// zero; set `false` for an explicit unpenalized/MLE effect.
+    /// zero; `linear(x, double_penalty=false)` requests an explicit
+    /// unpenalized/MLE effect.
     #[serde(default = "default_linear_term_double_penalty")]
     pub double_penalty: bool,
     #[serde(default)]
@@ -5340,12 +5341,12 @@ pub fn build_tensor_bspline_basis(
                 let gram = if spec.double_penalty {
                     Some(match periodic {
                         Some((start, period, num_basis)) => {
-                        crate::basis::periodic_bspline_function_gram(
-                            start,
-                            start + period,
-                            effective_degree,
-                            num_basis,
-                        )?
+                            crate::basis::periodic_bspline_function_gram(
+                                start,
+                                start + period,
+                                effective_degree,
+                                num_basis,
+                            )?
                         }
                         None => crate::basis::bspline_function_gram(&knots, effective_degree)?,
                     })
@@ -5539,8 +5540,7 @@ pub fn build_tensor_bspline_basis(
                 && let Some(shrink) =
                     crate::basis::function_space_nullspace_shrinkage(primary, gram)?
             {
-                let (matrix, normalization_scale) =
-                    normalize_penalty_in_constrained_space(&shrink);
+                let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&shrink);
                 candidates.push(PenaltyCandidate {
                     matrix,
                     nullspace_dim_hint: 0,
@@ -5808,7 +5808,14 @@ pub fn build_tensor_bspline_basis(
             is_cr: marginal_is_cr_flags,
             identifiability_transform: z_opt,
         },
-        kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None)
+        // The current Kronecker runtime diagonalizes only the marginal
+        // roughness operators and represents its optional joint-null block as
+        // a Euclidean selector. A function-space ridge generally does not
+        // commute with those marginals, so advertising it as factored would
+        // make PIRLS and REML solve a different objective. Keep the exact
+        // canonical matrices whenever null recovery is active.
+        kronecker_factored: if !spec.double_penalty
+            && matches!(spec.identifiability, TensorBSplineIdentifiability::None)
             && matches!(
                 spec.penalty_decomposition,
                 TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
@@ -5823,6 +5830,65 @@ pub fn build_tensor_bspline_basis(
             None
         },
     })
+}
+
+#[cfg(test)]
+mod tensor_function_space_runtime_tests {
+    use super::*;
+    use ndarray::array;
+
+    fn marginal() -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 2,
+            penalty_order: 1,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 2,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        }
+    }
+
+    #[test]
+    fn function_space_tensor_ridge_uses_exact_canonical_runtime() {
+        let data = array![
+            [0.00, 0.13],
+            [0.15, 0.82],
+            [0.29, 0.37],
+            [0.43, 0.95],
+            [0.58, 0.21],
+            [0.71, 0.66],
+            [0.86, 0.48],
+            [1.00, 0.04]
+        ];
+        let mut spec = TensorBSplineSpec {
+            marginalspecs: vec![marginal(), marginal()],
+            periods: Vec::new(),
+            double_penalty: true,
+            identifiability: TensorBSplineIdentifiability::None,
+            penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+        };
+        let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+            .expect("double-penalty tensor basis");
+        assert!(built.penaltyinfo.iter().any(|info| {
+            info.active && matches!(info.source, PenaltySource::TensorGlobalRidge)
+        }));
+        assert!(
+            built.kronecker_factored.is_none(),
+            "the legacy factored runtime cannot represent a function-metric global ridge"
+        );
+
+        spec.double_penalty = false;
+        let singly_penalized = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+            .expect("single-penalty tensor basis");
+        assert!(
+            singly_penalized.kronecker_factored.is_some(),
+            "the exact marginal-only fast path must remain available"
+        );
+    }
 }
 
 pub fn tensor_product_design_from_marginals(
@@ -8431,35 +8497,35 @@ pub fn build_single_local_smooth_term(
         // correct for evenly spaced Greville abscissae. gam's B-splines are
         // clamped (and may use quantile knots), so the abscissae are not
         // uniform and the geometrically-correct cone is the second *divided*
-        // difference. Build the Greville-scaled transform so γ_{≥2} ≥ 0
+        // difference. Build the knot-span-scaled transform so γ_{≥2} ≥ 0
         // certifies convexity of the function, not of the raw coefficient
         // index. Periodic splines are rejected by the exact-support gate: their
         // cyclic coefficient chart cannot use this open divided-difference cone.
         let t = if order == 2 {
-            let bspline_meta = match &metadata {
+            let (knots, degree) = match &metadata {
                 BasisMetadata::BSpline1D {
                     knots,
-                    degree,
+                    degree: Some(degree),
                     periodic,
                     ..
-                } if periodic.is_none() => Some((knots.clone(), degree.unwrap_or(0))),
-                _ => None,
-            };
-            match bspline_meta {
-                Some((knots, degree)) if degree >= 1 => {
-                    let greville = crate::basis::compute_greville_abscissae(&knots, degree)?;
-                    if greville.len() != p_local {
-                        crate::bail_invalid_basis!(
-                            "shape-constraint Greville abscissae count {} does not match basis dim {} for term '{}'",
-                            greville.len(),
-                            p_local,
-                            term.name
-                        );
-                    }
-                    convex_divided_difference_transform_matrix(&greville, sign)?
+                } if periodic.is_none() => (knots, *degree),
+                _ => {
+                    crate::bail_invalid_basis!(
+                        "shape-constrained convex/concave term '{}' requires realized open B-spline knot and degree metadata",
+                        term.name
+                    );
                 }
-                _ => cumulative_sum_transform_matrix(p_local, order, sign),
+            };
+            let spans = bspline_first_derivative_control_spans(knots.view(), degree)?;
+            if spans.len() + 1 != p_local {
+                crate::bail_invalid_basis!(
+                    "shape-constraint derivative-control span count {} does not match basis dim {} for term '{}'",
+                    spans.len(),
+                    p_local,
+                    term.name
+                );
             }
+            convex_derivative_control_transform_matrix(&spans, sign)?
         } else {
             cumulative_sum_transform_matrix(p_local, order, sign)
         };

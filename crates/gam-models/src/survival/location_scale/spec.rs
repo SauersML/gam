@@ -582,10 +582,7 @@ pub fn survival_fit_from_parts(
         (ncoef as f64 - trace_sum).clamp(0.0, ncoef as f64)
     };
     let edf_time = effective_edf(beta_time.len(), block_trace_sum(0, n_time));
-    let edf_threshold = effective_edf(
-        beta_threshold.len(),
-        block_trace_sum(n_time, n_threshold),
-    );
+    let edf_threshold = effective_edf(beta_threshold.len(), block_trace_sum(n_time, n_threshold));
     let edf_log_sigma = effective_edf(
         beta_log_sigma.len(),
         block_trace_sum(n_time + n_threshold, n_log_sigma),
@@ -652,28 +649,30 @@ pub fn survival_fit_from_parts(
     } else {
         Vec::new()
     };
-    let inference = geometry.as_ref().map(|geom| gam_solve::estimate::FitInference {
-        edf_by_block: inference_edf_by_block.clone(),
-        penalty_block_trace: inference_penalty_block_trace.clone(),
-        edf_total,
-        smoothing_correction: None,
-        penalized_hessian: geom.penalized_hessian.clone(),
-        working_weights: geom.working_weights.clone(),
-        working_response: geom.working_response.clone(),
-        reparam_qs: None,
-        dispersion: gam_solve::estimate::Dispersion::Known(1.0),
-        beta_covariance: covariance_conditional.clone().map(Into::into),
-        beta_standard_errors: covariance_conditional.as_ref().map(|cov| {
-            Array1::from_iter(cov.diag().iter().map(|&v| v.max(0.0).sqrt()))
-        }),
-        beta_covariance_corrected: None,
-        beta_standard_errors_corrected: None,
-        beta_covariance_frequentist: None,
-        coefficient_influence: None,
-        weighted_gram: None,
-        bias_correction_beta: None,
-        bias_correction_jacobian: None,
-    });
+    let inference = geometry
+        .as_ref()
+        .map(|geom| gam_solve::estimate::FitInference {
+            edf_by_block: inference_edf_by_block.clone(),
+            penalty_block_trace: inference_penalty_block_trace.clone(),
+            edf_total,
+            smoothing_correction: None,
+            penalized_hessian: geom.penalized_hessian.clone(),
+            working_weights: geom.working_weights.clone(),
+            working_response: geom.working_response.clone(),
+            reparam_qs: None,
+            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+            beta_covariance: covariance_conditional.clone().map(Into::into),
+            beta_standard_errors: covariance_conditional
+                .as_ref()
+                .map(|cov| Array1::from_iter(cov.diag().iter().map(|&v| v.max(0.0).sqrt()))),
+            beta_covariance_corrected: None,
+            beta_standard_errors_corrected: None,
+            beta_covariance_frequentist: None,
+            coefficient_influence: None,
+            weighted_gram: None,
+            bias_correction_beta: None,
+            bias_correction_jacobian: None,
+        });
 
     let deviance = -2.0 * log_likelihood;
     crate::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {

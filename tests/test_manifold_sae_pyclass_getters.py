@@ -107,7 +107,7 @@ def test_scalar_and_list_getters() -> None:
 
 def test_atoms_is_an_object_surface() -> None:
     """model.atoms is a list of AtomCore handles read by attribute (the
-    SaeManifoldAtomFit duck-type), NOT a list of dicts."""
+    Rust-owned AtomCore surface), NOT a list of dicts."""
     golden = _golden()
     core = ManifoldSaeCore(golden)
     atoms = core.atoms

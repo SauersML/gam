@@ -7,7 +7,10 @@ import pytest
 
 from gamfit import _sae_manifold
 from gamfit import _sparse_dictionary
-from gamfit._sparse_dictionary import SparseDictionaryFit
+from gamfit._sparse_dictionary import (
+    SparseDictionaryConvergence,
+    SparseDictionaryFit,
+)
 
 
 class _ReachedCurvedEngine(RuntimeError):
@@ -85,7 +88,18 @@ def test_public_sae_fit_uses_sparse_artifact_above_front_door_crossover(monkeypa
             codes=np.zeros((x.shape[0], active), dtype=np.float32),
             explained_variance=0.0,
             epochs=1,
-            converged=True,
+            convergence=SparseDictionaryConvergence(
+                inner_ev_residual=0.0,
+                inner_tolerance=1.0e-6,
+                decoder_residual=0.0,
+                decoder_tolerance=1.0e-6,
+                routing_residual=0.0,
+                routing_tolerance=1.0e-6,
+                outer_rho_residual=0.0,
+                outer_tolerance=1.0e-6,
+                selected_rho=1.0e-6,
+                outer_iterations=1,
+            ),
             active=active,
             score_route_stats={},
         )
@@ -170,7 +184,18 @@ def test_sparse_dictionary_facade_accepts_no_eager_fitted_payload(monkeypatch: A
                 "codes": np.zeros((x.shape[0], active), dtype=np.float32),
                 "explained_variance": 0.0,
                 "epochs": 1,
-                "converged": True,
+                "convergence": {
+                    "inner_ev_residual": 0.0,
+                    "inner_tolerance": 1.0e-6,
+                    "decoder_residual": 0.0,
+                    "decoder_tolerance": 1.0e-6,
+                    "routing_residual": 0.0,
+                    "routing_tolerance": 1.0e-6,
+                    "outer_rho_residual": 0.0,
+                    "outer_tolerance": 1.0e-6,
+                    "selected_rho": 1.0e-6,
+                    "outer_iterations": 1,
+                },
                 "active": active,
                 "score_route_stats": {},
             }
@@ -193,5 +218,10 @@ def test_sparse_dictionary_facade_accepts_no_eager_fitted_payload(monkeypatch: A
 
     assert fit.retained_training_payload_cells == 16
     assert "fitted" not in SparseDictionaryFit.__dataclass_fields__
+    assert "converged" not in SparseDictionaryFit.__dataclass_fields__
+    assert fit.convergence.outer_iterations == 1
+    assert not hasattr(fit.convergence, "__dict__")
+    with pytest.raises(AttributeError):
+        setattr(fit.convergence, "outer_iterations", 2)
     materialized = fit.fitted
     assert materialized.shape == (8, 3)

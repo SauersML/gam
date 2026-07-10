@@ -347,7 +347,7 @@ the full surface):
 
 | Attribute | Meaning |
 | --- | --- |
-| `atoms` | list of `SaeManifoldAtomFit` (decoder, coords, `active_dim`, uncertainty) |
+| `atoms` | list of Rust-owned atom objects (decoder, coords, `active_dim`, uncertainty) |
 | `atom_topology` / `atom_topologies` | scalar (`"mixed"` if heterogeneous) / per-atom topology |
 | `assignment` / `assignment_label` | canonical gate kind / the string you passed |
 | `coords` | `[ (N, d_k) ]` per-atom per-token coordinates |

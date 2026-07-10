@@ -998,16 +998,6 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
         - "^__init__$"
         - "^__repr__$"
 
-::: gamfit.SaeManifoldAtomFit
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.SaeManifoldFitResult
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.GumbelTemperatureSchedule
     options:
       show_root_heading: true

@@ -2,9 +2,7 @@ use super::family::clamp_bernoulli_link_probability;
 use super::*;
 use gam_linalg::matrix::{LinearOperator, SignedWeightsView};
 use gam_math::jet_tower::Tower4;
-use opt::{
-    BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge,
-};
+use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
 
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,
@@ -329,9 +327,7 @@ pub(super) fn pooled_probit_baseline(
                 if (obj_prev - obj).abs() < POOLED_PILOT_STALL_TOL {
                     break;
                 }
-                return Err(
-                    "pooled bernoulli-marginal-slope pilot line search failed".to_string()
-                );
+                return Err("pooled bernoulli-marginal-slope pilot line search failed".to_string());
             }
         }
     }
@@ -2624,9 +2620,15 @@ mod jet_tower_oracle_tests {
                     eta[r],
                 )
                 .expect("link map");
-                let (jv, jg, jh) =
-                    rigid_standard_normal_row_kernel(marginal, g[r], z[r], y[r], w[r], probit_scale)
-                        .expect("jet kernel");
+                let (jv, jg, jh) = rigid_standard_normal_row_kernel(
+                    marginal,
+                    g[r],
+                    z[r],
+                    y[r],
+                    w[r],
+                    probit_scale,
+                )
+                .expect("jet kernel");
                 let (hv, hg, hh) = hand_rigid_vgh(marginal, g[r], z[r], y[r], w[r], probit_scale);
                 close(jv, hv, "value");
                 for a in 0..2 {

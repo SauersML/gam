@@ -343,7 +343,6 @@ fn sparse_transform_with_explicit_mode_reports_cpu_route_stats() {
     );
 }
 
-
 #[test]
 fn sparse_fit_default_auto_uses_cpu_below_device_floor() {
     let (k, p, n) = (8usize, 10usize, 64usize);

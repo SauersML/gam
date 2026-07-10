@@ -17,59 +17,6 @@
 // paths and the Python surface is a thin wrapper (SPEC rule 8): every number is
 // computed in Rust, the FFI only marshals arrays and dicts.
 
-/// Reconstruct a linear-lane [`SparseDictFit`] from the columnar arrays the
-/// `sparse_dictionary_fit` FFI hands back to Python, so the diagnostics that
-/// take a fitted dictionary (`sparse_dict_dual_certificate`) can be driven from
-/// the facade without a live Rust handle. The metadata the diagnostics never
-/// read (EV/epochs/route-stats) is filled with neutral defaults.
-fn sparse_dict_fit_from_arrays(
-    decoder: ndarray::Array2<f32>,
-    indices: ndarray::Array2<u32>,
-    codes: ndarray::Array2<f32>,
-) -> gam::terms::sae::sparse_dict::SparseDictFit {
-    let active = codes.ncols();
-    gam::terms::sae::sparse_dict::SparseDictFit {
-        decoder,
-        indices,
-        codes,
-        explained_variance: 0.0,
-        epochs: 0,
-        converged: false,
-        active,
-        score_route_stats: gam::terms::sae::sparse_dict::ScoreRouteStats::default(),
-        decoder_solve_stats: gam::terms::sae::sparse_dict::DecoderSolveStats::default(),
-    }
-}
-
-/// Reconstruct a block-lane [`BlockSparseFit`] from the columnar arrays the
-/// `block_sparse_dictionary_fit` FFI hands back, for the per-block firing
-/// readout. The per-block utilisation / stable-rank / γ metadata the readout
-/// never reads is left neutral.
-fn block_sparse_fit_from_arrays(
-    decoder: ndarray::Array2<f32>,
-    blocks: ndarray::Array2<u32>,
-    gates: ndarray::Array2<f32>,
-    codes: ndarray::Array3<f32>,
-    block_topk: usize,
-    block_size: usize,
-) -> gam::terms::sae::sparse_dict::BlockSparseFit {
-    gam::terms::sae::sparse_dict::BlockSparseFit {
-        decoder,
-        blocks,
-        gates,
-        codes,
-        gamma: 1.0,
-        block_utilization: Vec::new(),
-        block_stable_rank: Vec::new(),
-        matryoshka_prefix_losses: Vec::new(),
-        explained_variance: 0.0,
-        epochs: 0,
-        converged: false,
-        block_topk,
-        block_size,
-    }
-}
-
 #[derive(Clone)]
 struct AuditSparseRoute {
     indices: ndarray::Array2<u32>,
@@ -90,7 +37,9 @@ impl AuditSparseRoute {
             return Err("audit_sae block_size must be >= 1".to_string());
         }
         if n_units == 0 {
-            return Err(format!("audit_sae {label} requires at least one routing unit"));
+            return Err(format!(
+                "audit_sae {label} requires at least one routing unit"
+            ));
         }
         let (n_rows, width) = indices.dim();
         if n_rows == 0 || width == 0 {
@@ -155,16 +104,6 @@ impl AuditSparseRoute {
             norm2 += value * value;
         }
         norm2.sqrt()
-    }
-
-    fn linear_codes(&self) -> ndarray::Array2<f32> {
-        self.values.index_axis(ndarray::Axis(2), 0).to_owned()
-    }
-
-    fn gates(&self) -> ndarray::Array2<f32> {
-        ndarray::Array2::from_shape_fn(self.indices.dim(), |(row, slot)| {
-            self.gate(row, slot) as f32
-        })
     }
 
     fn reconstruct(
@@ -259,14 +198,23 @@ fn block_coordinate_report_dict<'py>(
     out.set_item("sigma_hat", report.sigma_hat)?;
     out.set_item("mean_radius", report.mean_radius)?;
     out.set_item("n_firings", report.n_firings)?;
-    out.set_item("block", ndarray::Array1::from_vec(firing_block).into_pyarray(py))?;
-    out.set_item("row", ndarray::Array1::from_vec(firing_row).into_pyarray(py))?;
+    out.set_item(
+        "block",
+        ndarray::Array1::from_vec(firing_block).into_pyarray(py),
+    )?;
+    out.set_item(
+        "row",
+        ndarray::Array1::from_vec(firing_row).into_pyarray(py),
+    )?;
     out.set_item("t", ndarray::Array1::from_vec(firing_t).into_pyarray(py))?;
     out.set_item(
         "amplitude",
         ndarray::Array1::from_vec(firing_amplitude).into_pyarray(py),
     )?;
-    out.set_item("t_se", ndarray::Array1::from_vec(firing_t_se).into_pyarray(py))?;
+    out.set_item(
+        "t_se",
+        ndarray::Array1::from_vec(firing_t_se).into_pyarray(py),
+    )?;
     out.set_item(
         "amplitude_se",
         ndarray::Array1::from_vec(firing_amplitude_se).into_pyarray(py),
@@ -516,8 +464,14 @@ fn topology_records_dict<'py>(
         row.set_item("support_size", record.support_size)?;
         row.set_item("landmark_count", record.landmark_count)?;
         row.set_item("covering_side", &record.covering_side)?;
-        row.set_item("measured_betti", betti_signature_dict(py, record.measured_betti)?)?;
-        row.set_item("expected_betti", betti_signature_dict(py, record.expected_betti)?)?;
+        row.set_item(
+            "measured_betti",
+            betti_signature_dict(py, record.measured_betti)?,
+        )?;
+        row.set_item(
+            "expected_betti",
+            betti_signature_dict(py, record.expected_betti)?,
+        )?;
         row.set_item("contested", record.contested)?;
         row.set_item("dominant_h1_persistence", record.dominant_h1_persistence)?;
         row.set_item("dominant_h2_persistence", record.dominant_h2_persistence)?;
@@ -636,11 +590,12 @@ fn topology_records_from_codes(
 /// charts read; `chart_a`/`chart_b` are the nerve-vertex labels.
 fn chart_transfer_gate_sparse(
     route: &AuditSparseRoute,
+    support_a: &gam::terms::sae::inference::atlas_nerve::AtlasChart,
+    support_b: &gam::terms::sae::inference::atlas_nerve::AtlasChart,
     block_a: usize,
     block_b: usize,
     chart_a: usize,
     chart_b: usize,
-    activation_threshold: f64,
 ) -> gam::terms::sae::inference::atlas_nerve::AtlasTransferGate {
     use gam::terms::sae::inference::atlas_nerve::AtlasTransferGate;
     let uncertified = || AtlasTransferGate {
@@ -655,19 +610,32 @@ fn chart_transfer_gate_sparse(
     }
     let mut xa: Vec<f64> = Vec::new();
     let mut xb: Vec<f64> = Vec::new();
-    for row in 0..route.nrows() {
+    let mut position_a = 0usize;
+    let mut position_b = 0usize;
+    while position_a < support_a.support_rows().len() && position_b < support_b.support_rows().len()
+    {
+        let row_a = support_a.support_rows()[position_a];
+        let row_b = support_b.support_rows()[position_b];
+        if row_a < row_b {
+            position_a += 1;
+            continue;
+        }
+        if row_b < row_a {
+            position_b += 1;
+            continue;
+        }
+        let row = row_a;
         let mut a = None;
         let mut b = None;
         for slot in 0..route.width() {
             let unit = route.indices[[row, slot]] as usize;
-            let gate = route.gate(row, slot);
-            if gate <= activation_threshold {
-                continue;
-            }
             let value = [
                 route.values[[row, slot, 0]] as f64,
                 route.values[[row, slot, 1]] as f64,
             ];
+            if value[0] * value[0] + value[1] * value[1] == 0.0 {
+                continue;
+            }
             if unit == block_a {
                 a = Some(value);
             } else if unit == block_b {
@@ -678,6 +646,8 @@ fn chart_transfer_gate_sparse(
             xa.extend([a0, a1]);
             xb.extend([b0, b1]);
         }
+        position_a += 1;
+        position_b += 1;
     }
     let n_co = xa.len() / 2;
     if n_co < 2 {
@@ -713,7 +683,6 @@ fn atlas_nerve_from_sparse_route(
     route: &AuditSparseRoute,
     activation_threshold: f32,
     requested_blocks: Option<&[usize]>,
-    max_charts: usize,
 ) -> Result<Option<AuditAtlasReport>, String> {
     if route.block_size == 1 {
         return Ok(None);
@@ -721,55 +690,69 @@ fn atlas_nerve_from_sparse_route(
     let n_blocks = route.n_units;
     let chart_blocks: Vec<usize> = match requested_blocks {
         Some(blocks) => blocks.to_vec(),
-        None if n_blocks <= max_charts => (0..n_blocks).collect(),
-        None => return Ok(None),
+        None => (0..n_blocks).collect(),
     };
     if chart_blocks.len() < 2 {
         return Ok(None);
     }
     let mut chart_positions = std::collections::HashMap::with_capacity(chart_blocks.len());
-    let mut chart_weights = (0..chart_blocks.len())
-        .map(|_| ndarray::Array1::<f64>::zeros(route.nrows()))
-        .collect::<Vec<_>>();
     for (chart_idx, &block) in chart_blocks.iter().enumerate() {
         if block >= n_blocks {
             return Err(format!(
                 "audit_sae atlas block {block} out of range 0..{n_blocks}"
             ));
         }
-        chart_positions.insert(block, chart_idx);
+        if chart_positions.insert(block, chart_idx).is_some() {
+            return Err(format!(
+                "audit_sae atlas block {block} is selected more than once"
+            ));
+        }
     }
+    let mut chart_rows = vec![Vec::<usize>::new(); chart_blocks.len()];
+    let mut chart_weights = vec![Vec::<f64>::new(); chart_blocks.len()];
+    let mut coactive_pairs = std::collections::BTreeSet::<(usize, usize)>::new();
     for row in 0..route.nrows() {
+        let mut live_charts = Vec::with_capacity(route.width());
         for slot in 0..route.width() {
             let unit = route.indices[[row, slot]] as usize;
             if let Some(&chart_idx) = chart_positions.get(&unit) {
                 let gate = route.gate(row, slot);
                 if gate > activation_threshold as f64 {
-                    chart_weights[chart_idx][row] = gate;
+                    chart_rows[chart_idx].push(row);
+                    chart_weights[chart_idx].push(gate);
+                    live_charts.push(chart_idx);
                 }
+            }
+        }
+        live_charts.sort_unstable();
+        for left in 0..live_charts.len() {
+            for right in (left + 1)..live_charts.len() {
+                coactive_pairs.insert((live_charts[left], live_charts[right]));
             }
         }
     }
     let mut charts = Vec::with_capacity(chart_blocks.len());
-    for (chart_idx, weights) in chart_weights.into_iter().enumerate() {
+    for (chart_idx, (rows, weights)) in chart_rows.into_iter().zip(chart_weights).enumerate() {
         charts.push(
-            gam::terms::sae::inference::atlas_nerve::AtlasChart::from_weights(
-                chart_idx, weights,
+            gam::terms::sae::inference::atlas_nerve::AtlasChart::from_sparse_weights(
+                chart_idx,
+                route.nrows(),
+                rows,
+                weights,
             )?,
         );
     }
-    let mut gates = Vec::new();
-    for a in 0..chart_blocks.len() {
-        for b in (a + 1)..chart_blocks.len() {
-            gates.push(chart_transfer_gate_sparse(
-                route,
-                chart_blocks[a],
-                chart_blocks[b],
-                a,
-                b,
-                activation_threshold as f64,
-            ));
-        }
+    let mut gates = Vec::with_capacity(coactive_pairs.len());
+    for (a, b) in coactive_pairs {
+        gates.push(chart_transfer_gate_sparse(
+            route,
+            &charts[a],
+            &charts[b],
+            chart_blocks[a],
+            chart_blocks[b],
+            a,
+            b,
+        ));
     }
     let diagram = gam::terms::sae::inference::atlas_nerve::build_atlas_nerve(&charts, &gates)?;
     Ok(Some(AuditAtlasReport {
@@ -807,13 +790,12 @@ fn atlas_nerve_dict<'py>(
 /// Standalone atlas-nerve diagram from fixed-width sparse block routing (#985 /
 /// E1 FFI completeness). This exposes the same Čech-nerve reduction `audit_sae`
 /// computes internally as its own front-door accessor: build one `AtlasChart` per
-/// requested `b`-wide block from the per-row block-energy weights, wire the charts
-/// with all-valid transfer gates, and reduce the nerve to its Betti signature and
-/// simplex counts. Every number is computed in the `gam::terms::sae::inference::
+/// requested `b`-wide block from sparse per-row block-energy support, certify only
+/// genuinely co-active chart transfers, and reduce the nerve to its Betti signature
+/// and simplex counts. Every number is computed in the `gam::terms::sae::inference::
 /// atlas_nerve` core; this only marshals the sparse route in and the diagram dict
 /// out. Returns `{computed: false, reason}` for shapes the nerve does not apply to
-/// (scalar `block_size == 1`, a width that does not divide `K`, fewer than two
-/// charts, or more blocks than `max_charts` with no explicit `blocks`), matching
+/// (scalar `block_size == 1` or fewer than two selected charts), matching
 /// `atlas_nerve_dict`'s skipped-report contract.
 #[pyfunction(signature = (
     indices,
@@ -821,8 +803,7 @@ fn atlas_nerve_dict<'py>(
     n_units,
     block_size,
     activation_threshold = 1.0e-6,
-    blocks = None,
-    max_charts = 16
+    blocks = None
 ))]
 fn atlas_nerve_diagram<'py>(
     py: Python<'py>,
@@ -832,7 +813,6 @@ fn atlas_nerve_diagram<'py>(
     block_size: usize,
     activation_threshold: f32,
     blocks: Option<Vec<usize>>,
-    max_charts: usize,
 ) -> PyResult<Py<PyDict>> {
     let route = AuditSparseRoute::new(
         indices.as_array().to_owned(),
@@ -843,18 +823,12 @@ fn atlas_nerve_diagram<'py>(
     )
     .map_err(PyValueError::new_err)?;
     let report = detach_py_result(py, "atlas_nerve_diagram", move || {
-        atlas_nerve_from_sparse_route(
-            &route,
-            activation_threshold,
-            blocks.as_deref(),
-            max_charts,
-        )
+        atlas_nerve_from_sparse_route(&route, activation_threshold, blocks.as_deref())
     })?;
     let reason = if block_size == 1 {
         "scalar block_size == 1 exposes no atlas nerve"
     } else {
-        "atlas nerve not applicable: block_size must divide K into >= 2 charts \
-         (or supply `blocks`, or raise `max_charts`)"
+        "atlas nerve requires at least two selected block charts"
     };
     Ok(atlas_nerve_dict(py, report.as_ref(), reason)?.unbind())
 }
@@ -926,70 +900,35 @@ fn dimension_spectrometer<'py>(
 /// Per-firing circle-coordinate readout for one `b = 2` block of a fitted
 /// block-sparse dictionary: phase `t̂ ∈ [0,1)`, amplitude `‖z‖`, and their
 /// closed-form SEs (`σ̂` from the block's radial scatter). Takes the block-lane
-/// fit as its columnar arrays; the firings are returned as aligned columns.
-#[pyfunction(signature = (decoder, blocks, gates, codes, block, block_topk = 1))]
+/// route as `blocks[N,s]` / `codes[N,s,2]`; no fit status or redundant gate
+/// matrix is constructed. The firings are returned as aligned columns.
+#[pyfunction(signature = (decoder, blocks, codes, block))]
 fn block_firing_coordinates<'py>(
     py: Python<'py>,
     decoder: PyReadonlyArray2<'py, f32>,
     blocks: PyReadonlyArray2<'py, u32>,
-    gates: PyReadonlyArray2<'py, f32>,
     codes: PyReadonlyArray3<'py, f32>,
     block: usize,
-    block_topk: usize,
 ) -> PyResult<Py<PyDict>> {
-    let decoder_values = decoder.as_array().to_owned();
     let block_values = blocks.as_array().to_owned();
-    let gate_values = gates.as_array().to_owned();
     let code_values = codes.as_array().to_owned();
     let block_size = code_values.shape()[2];
-    let report = detach_py_result(py, "block_firing_coordinates", move || {
-        let fit = block_sparse_fit_from_arrays(
-            decoder_values,
-            block_values,
-            gate_values,
-            code_values,
-            block_topk,
-            block_size,
-        );
-        gam::terms::sae::sparse_dict::block_firing_coordinates(&fit, block)
-    })?;
-
-    let n = report.firings.len();
-    let mut firing_block = Vec::with_capacity(n);
-    let mut firing_row = Vec::with_capacity(n);
-    let mut firing_t = Vec::with_capacity(n);
-    let mut firing_amplitude = Vec::with_capacity(n);
-    let mut firing_t_se = Vec::with_capacity(n);
-    let mut firing_amplitude_se = Vec::with_capacity(n);
-    let mut firing_t_se_clamped = Vec::with_capacity(n);
-    for f in &report.firings {
-        firing_block.push(f.block as u64);
-        firing_row.push(f.row as u64);
-        firing_t.push(f.t);
-        firing_amplitude.push(f.amplitude);
-        firing_t_se.push(f.t_se);
-        firing_amplitude_se.push(f.amplitude_se);
-        firing_t_se_clamped.push(f.t_se_clamped);
+    if block_size == 0 || decoder.as_array().nrows() % block_size != 0 {
+        return Err(PyValueError::new_err(format!(
+            "block_firing_coordinates decoder has K={} rows, not a multiple of block_size {block_size}",
+            decoder.as_array().nrows()
+        )));
     }
-
-    let out = PyDict::new(py);
-    out.set_item("sigma_hat", report.sigma_hat)?;
-    out.set_item("mean_radius", report.mean_radius)?;
-    out.set_item("n_firings", report.n_firings)?;
-    out.set_item("block", ndarray::Array1::from_vec(firing_block).into_pyarray(py))?;
-    out.set_item("row", ndarray::Array1::from_vec(firing_row).into_pyarray(py))?;
-    out.set_item("t", ndarray::Array1::from_vec(firing_t).into_pyarray(py))?;
-    out.set_item(
-        "amplitude",
-        ndarray::Array1::from_vec(firing_amplitude).into_pyarray(py),
-    )?;
-    out.set_item("t_se", ndarray::Array1::from_vec(firing_t_se).into_pyarray(py))?;
-    out.set_item(
-        "amplitude_se",
-        ndarray::Array1::from_vec(firing_amplitude_se).into_pyarray(py),
-    )?;
-    out.set_item("t_se_clamped", firing_t_se_clamped)?;
-    Ok(out.unbind())
+    let n_blocks = decoder.as_array().nrows() / block_size;
+    let report = detach_py_result(py, "block_firing_coordinates", move || {
+        gam::terms::sae::sparse_dict::block_route_firing_coordinates(
+            block_values.view(),
+            code_values.view(),
+            n_blocks,
+            block,
+        )
+    })?;
+    Ok(block_coordinate_report_dict(py, &report)?.unbind())
 }
 
 /// Build the dict form of a [`RoutabilityFloor`].
@@ -1098,10 +1037,11 @@ fn sparse_dict_dual_certificate<'py>(
     let index_values = indices.as_array().to_owned();
     let code_values = codes.as_array().to_owned();
     let report = detach_py_result(py, "sparse_dict_dual_certificate", move || {
-        let fit = sparse_dict_fit_from_arrays(decoder_values, index_values, code_values);
-        gam::terms::sae::dual_certificate::sparse_dict_dual_certificate(
+        gam::terms::sae::dual_certificate::sparse_route_dual_certificate(
             data_values.view(),
-            &fit,
+            decoder_values.view(),
+            index_values.view(),
+            code_values.view(),
             max_candidates,
         )
     })?;
@@ -1172,13 +1112,9 @@ fn sparse_atlas_nerve_richness_statistic(
     chart_blocks: &[usize],
     activation_threshold: f64,
 ) -> Result<f64, String> {
-    let report = atlas_nerve_from_sparse_route(
-        route,
-        activation_threshold as f32,
-        Some(chart_blocks),
-        chart_blocks.len(),
-    )?
-    .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
+    let report =
+        atlas_nerve_from_sparse_route(route, activation_threshold as f32, Some(chart_blocks))?
+            .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
     Ok((report.diagram.n_edges + report.diagram.n_triangles + report.diagram.n_tetrahedra) as f64)
 }
 
@@ -1235,11 +1171,8 @@ fn resample_sparse_architecture_null<R: rand::Rng + ?Sized>(
     let observed_moments = live_amplitude_moments(observed);
     let donor_moments = live_amplitude_moments(donor);
     let mut indices = ndarray::Array2::<u32>::zeros((observed.nrows(), donor.width()));
-    let mut values = ndarray::Array3::<f32>::zeros((
-        observed.nrows(),
-        donor.width(),
-        donor.block_size,
-    ));
+    let mut values =
+        ndarray::Array3::<f32>::zeros((observed.nrows(), donor.width(), donor.block_size));
     for row in 0..observed.nrows() {
         let source = rng.random_range(0..donor.nrows());
         for slot in 0..donor.width() {
@@ -1364,8 +1297,11 @@ fn standing_sparse_null_calibration(
     // measure the default block-chart/topology detector's recovery rate at the
     // requested false-positive operating point. Bootstrapping the empirical
     // residual rows keeps the real post-fit covariance and tails in the loop.
-    let mut roc_config =
-        nb::SpikeInRocConfig::circle(vec![0.0, cfg.spikein_snr], cfg.spikein_trials, cfg.null_seed);
+    let mut roc_config = nb::SpikeInRocConfig::circle(
+        vec![0.0, cfg.spikein_snr],
+        cfg.spikein_trials,
+        cfg.null_seed,
+    );
     roc_config.noise_mode = nb::SpikeInNoiseMode::EmpiricalResidualBootstrap;
     roc_config.fpr_levels = vec![cfg.spikein_false_positive_rate];
     let roc = nb::default_spike_in_roc_curve(residuals_f64, &roc_config)?;
@@ -1494,9 +1430,9 @@ impl SaeAuditOptions {
             return Ok(cfg);
         };
         for (key_any, value) in options.iter() {
-            let key = key_any.extract::<String>().map_err(|_| {
-                PyValueError::new_err("audit_sae options keys must be strings")
-            })?;
+            let key = key_any
+                .extract::<String>()
+                .map_err(|_| PyValueError::new_err("audit_sae options keys must be strings"))?;
             match key.as_str() {
                 "block_size" => {
                     cfg.block_size = value
@@ -1710,7 +1646,9 @@ fn audit_sae<'py>(
         ));
     }
     if spikein_trials == 0 {
-        return Err(PyValueError::new_err("audit_sae spikein_trials must be >= 1"));
+        return Err(PyValueError::new_err(
+            "audit_sae spikein_trials must be >= 1",
+        ));
     }
     if !spikein_snr.is_finite() || spikein_snr < 0.0 {
         return Err(PyValueError::new_err(
@@ -1739,11 +1677,8 @@ fn audit_sae<'py>(
     let route_width = route.width();
 
     let audit = detach_py_result(py, "audit_sae", move || {
-        let residuals = residuals_from_sparse_sae(
-            data_values.view(),
-            decoder_values.view(),
-            &route,
-        )?;
+        let residuals =
+            residuals_from_sparse_sae(data_values.view(), decoder_values.view(), &route)?;
         let routability = gam::terms::sae::routability::routability_audit(
             decoder_values.view(),
             residuals.view(),
@@ -1753,29 +1688,21 @@ fn audit_sae<'py>(
         )?;
 
         let (dual, coordinate_reports) = if block_size == 1 {
-            let fit = sparse_dict_fit_from_arrays(
-                decoder_values.clone(),
-                route.indices.clone(),
-                route.linear_codes(),
-            );
-            let report = gam::terms::sae::dual_certificate::sparse_dict_dual_certificate(
+            let report = gam::terms::sae::dual_certificate::sparse_route_dual_certificate(
                 data_values.view(),
-                &fit,
+                decoder_values.view(),
+                route.indices.view(),
+                route.values.index_axis(ndarray::Axis(2), 0),
                 max_candidates,
             )?;
             (report, Vec::new())
         } else {
-            let fit = block_sparse_fit_from_arrays(
-                decoder_values.clone(),
-                route.indices.clone(),
-                route.gates(),
-                route.values.clone(),
-                route.width(),
-                block_size,
-            );
-            let report = gam::terms::sae::dual_certificate::block_dual_certificate(
+            let report = gam::terms::sae::dual_certificate::block_route_dual_certificate(
                 data_values.view(),
-                &fit,
+                decoder_values.view(),
+                route.indices.view(),
+                route.values.view(),
+                block_size,
                 max_candidates,
             )?;
             let mut coordinates = Vec::new();
@@ -1791,29 +1718,26 @@ fn audit_sae<'py>(
                         ));
                     }
                     coordinates.push(
-                        gam::terms::sae::sparse_dict::harmonic_firing_coordinates(&fit, block)?,
+                        gam::terms::sae::sparse_dict::harmonic_route_firing_coordinates(
+                            route.indices.view(),
+                            route.values.view(),
+                            n_units,
+                            block,
+                        )?,
                     );
                 }
             }
             (report, coordinates)
         };
 
-        let topology_records = topology_records_from_codes(
-            &coordinate_reports,
-            block_size,
-            activation_threshold,
-        );
+        let topology_records =
+            topology_records_from_codes(&coordinate_reports, block_size, activation_threshold);
         let atlas_nerve = atlas_nerve_from_sparse_route(
             &route,
             activation_threshold,
             coordinate_blocks.as_deref(),
-            max_absorption_pairs,
         )?;
-        let absorption = absorption_audit(
-            &route,
-            activation_threshold,
-            max_absorption_pairs,
-        );
+        let absorption = absorption_audit(&route, activation_threshold, max_absorption_pairs);
 
         let transport = match (theta_in_values, theta_out_values) {
             (Some(theta_in), Some(theta_out)) => Some(
@@ -1894,7 +1818,10 @@ fn audit_sae<'py>(
     routability_dict.set_item("confidence_quantile", routability.confidence_quantile)?;
     routability_dict.set_item("coherence_excess", routability.coherence_excess)?;
     routability_dict.set_item("fraction_below_floor", routability.fraction_below_floor)?;
-    routability_dict.set_item("dark_matter_fraction", 1.0 - routability.fraction_below_floor)?;
+    routability_dict.set_item(
+        "dark_matter_fraction",
+        1.0 - routability.fraction_below_floor,
+    )?;
     out.set_item("routability", routability_dict)?;
     out.set_item("dual_certificate", dual_certificate_report_dict(py, &dual)?)?;
     out.set_item("absorption", absorption_audit_dict(py, &absorption)?)?;
@@ -1961,6 +1888,16 @@ mod sae_spectral_ffi_tests {
                 [0.71_f32, 0.09_f32],
                 [0.38_f32, 0.86_f32],
             ];
+            let indices =
+                ndarray::Array2::from_shape_fn((codes.nrows(), 2), |(_, slot)| slot as u32);
+            let route_values =
+                ndarray::Array3::from_shape_fn((codes.nrows(), 2, 1), |(row, slot, _)| {
+                    codes[[row, slot]]
+                });
+            let donor_values = ndarray::Array3::from_shape_fn(
+                (random_weight_codes.nrows(), 2, 1),
+                |(row, slot, _)| random_weight_codes[[row, slot]],
+            );
             let theta_in = ndarray::array![
                 0.0_f64,
                 std::f64::consts::FRAC_PI_4,
@@ -1974,9 +1911,10 @@ mod sae_spectral_ffi_tests {
             let theta_out = theta_in.mapv(|theta| theta + 0.25);
 
             let decoder_py = decoder.into_pyarray(py);
-            let codes_py = codes.into_pyarray(py);
+            let indices_py = indices.into_pyarray(py);
+            let route_py = route_values.into_pyarray(py);
             let data_py = data.into_pyarray(py);
-            let donor_py = random_weight_codes.into_pyarray(py);
+            let donor_py = donor_values.into_pyarray(py);
             let theta_in_py = theta_in.into_pyarray(py);
             let theta_out_py = theta_out.into_pyarray(py);
 
@@ -2006,8 +1944,10 @@ mod sae_spectral_ffi_tests {
             let payload = audit_sae(
                 py,
                 decoder_py.readonly(),
-                codes_py.readonly(),
+                indices_py.readonly(),
+                route_py.readonly(),
                 data_py.readonly(),
+                indices_py.readonly(),
                 donor_py.readonly(),
                 Some(&options),
             )
@@ -2074,20 +2014,17 @@ mod sae_spectral_ffi_tests {
 /// total defect, its per-stage additive contributions, and the drift-only
 /// domain-feasibility flag.
 #[pyfunction(signature = (chain,))]
-fn compose_contracts(
-    py: Python<'_>,
-    chain: Vec<(String, f64, f64, f64)>,
-) -> PyResult<Py<PyDict>> {
+fn compose_contracts(py: Python<'_>, chain: Vec<(String, f64, f64, f64)>) -> PyResult<Py<PyDict>> {
     let contracts: Vec<gam::terms::sae::inference::contracts::Contract> = chain
         .into_iter()
-        .map(
-            |(name, domain_radius, defect, lipschitz)| gam::terms::sae::inference::contracts::Contract {
+        .map(|(name, domain_radius, defect, lipschitz)| {
+            gam::terms::sae::inference::contracts::Contract {
                 name,
                 domain_radius,
                 defect,
                 lipschitz,
-            },
-        )
+            }
+        })
         .collect();
     let report = gam::terms::sae::inference::contracts::compose_contracts(&contracts);
     let out = PyDict::new(py);
@@ -2148,11 +2085,7 @@ fn recover_spikes(
 /// tolerance. Returns the net sign/angle and the measure-don't-latch triviality
 /// verdict.
 #[pyfunction(signature = (edges, defects))]
-fn loop_holonomy(
-    py: Python<'_>,
-    edges: Vec<(i8, f64)>,
-    defects: Vec<f64>,
-) -> PyResult<Py<PyDict>> {
+fn loop_holonomy(py: Python<'_>, edges: Vec<(i8, f64)>, defects: Vec<f64>) -> PyResult<Py<PyDict>> {
     let report = gam::terms::sae::inference::contracts::loop_holonomy(&edges, &defects);
     let out = PyDict::new(py);
     out.set_item("loop_len", report.loop_len)?;
@@ -2227,7 +2160,10 @@ fn coupling_robustness_certificate(
     out.set_item("normalized_weights", influence.normalized_weights)?;
     out.set_item("influence_variance", certificate.influence_variance)?;
     out.set_item("influence_mean_abs", certificate.influence_mean_abs)?;
-    out.set_item("robustness_radius_epsilon", certificate.robustness_radius_epsilon)?;
+    out.set_item(
+        "robustness_radius_epsilon",
+        certificate.robustness_radius_epsilon,
+    )?;
     out.set_item("epsilon", epsilon)?;
     out.set_item("worst_case_coupling", worst_case)?;
     Ok(out.unbind())
@@ -2291,8 +2227,14 @@ fn effect_weighted_retention(
             Some(e) => {
                 let ed = PyDict::new(py);
                 ed.set_item("atom", e.atom)?;
-                ed.set_item("mean_fisher_quadratic_kl_nats", e.mean_fisher_quadratic_kl_nats)?;
-                ed.set_item("max_fisher_quadratic_kl_nats", e.max_fisher_quadratic_kl_nats)?;
+                ed.set_item(
+                    "mean_fisher_quadratic_kl_nats",
+                    e.mean_fisher_quadratic_kl_nats,
+                )?;
+                ed.set_item(
+                    "max_fisher_quadratic_kl_nats",
+                    e.max_fisher_quadratic_kl_nats,
+                )?;
                 ed.set_item("n_firings", e.n_firings)?;
                 ed.set_item("threshold_nats", e.threshold_nats)?;
                 ed.set_item("margin", e.margin())?;
@@ -2317,10 +2259,7 @@ fn effect_weighted_retention(
 /// definition — the orientation-quotiented weighted cyclic phase-lock the #1942
 /// chart-interp metric reports.
 #[pyfunction(signature = (observations,))]
-fn chart_interp_score(
-    py: Python<'_>,
-    observations: Vec<(f64, f64, f64)>,
-) -> PyResult<Py<PyDict>> {
+fn chart_interp_score(py: Python<'_>, observations: Vec<(f64, f64, f64)>) -> PyResult<Py<PyDict>> {
     let report = detach_py_result(py, "chart_interp_score", move || {
         let rows: Vec<gam::terms::sae::saebench_metrics::ChartInterpObservation> = observations
             .iter()
@@ -2364,16 +2303,14 @@ fn dose_response_calibration(
     let report = detach_py_result(py, "dose_response_calibration", move || {
         let rows: Vec<gam::terms::sae::saebench_metrics::DoseResponseObservation> = observations
             .iter()
-            .map(
-                |&(arc_length, predicted_nats, measured_nats, weight)| {
-                    gam::terms::sae::saebench_metrics::DoseResponseObservation {
-                        arc_length,
-                        predicted_nats,
-                        measured_nats,
-                        weight,
-                    }
-                },
-            )
+            .map(|&(arc_length, predicted_nats, measured_nats, weight)| {
+                gam::terms::sae::saebench_metrics::DoseResponseObservation {
+                    arc_length,
+                    predicted_nats,
+                    measured_nats,
+                    weight,
+                }
+            })
             .collect();
         gam::terms::sae::saebench_metrics::dose_response_calibration(&rows)
     })?;
@@ -2446,7 +2383,12 @@ mod ffi_completeness_tests {
                 .extract()
                 .unwrap();
             assert!((cp - 0.5).abs() < 1e-12, "conditional_probability = {cp}");
-            let mass: f64 = d.get_item("active_mass_i").unwrap().unwrap().extract().unwrap();
+            let mass: f64 = d
+                .get_item("active_mass_i")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
             assert!((mass - 2.0 / 3.0).abs() < 1e-12, "active_mass_i = {mass}");
             let psi: Vec<f64> = d.get_item("psi").unwrap().unwrap().extract().unwrap();
             assert_eq!(psi.len(), 3);
@@ -2584,12 +2526,9 @@ mod ffi_completeness_tests {
     #[test]
     fn coordinate_posterior_inverts_precision_block_over_the_ffi_boundary() {
         Python::attach(|py| {
-            let out = coordinate_posterior_from_precision(
-                py,
-                vec![0.25, 0.75],
-                vec![4.0, 1.0, 1.0, 3.0],
-            )
-            .expect("coordinate posterior");
+            let out =
+                coordinate_posterior_from_precision(py, vec![0.25, 0.75], vec![4.0, 1.0, 1.0, 3.0])
+                    .expect("coordinate posterior");
             let d = out.bind(py);
             let diag: Vec<f64> = d
                 .get_item("covariance_diag")

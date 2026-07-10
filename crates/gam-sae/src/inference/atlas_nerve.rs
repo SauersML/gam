@@ -8,13 +8,12 @@
 //! co-activation. The resulting filtered clique complex is read by exact GF(2)
 //! homology through H2.
 
-use crate::assignment::SupportMeasure;
 use crate::chart_transfer::TransferCertificate;
 use crate::inference::layer_transport::FittedTransport;
 use crate::manifold::{BettiSignature, GraphCompressionKind, GraphCompressionReport};
 use crate::null_battery::ClaimNullCalibration;
-use ndarray::Array1;
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 
 /// Which side of the chart-covering sample count the diagram sits on.
 ///
@@ -41,27 +40,88 @@ impl AtlasCoveringSide {
 #[derive(Clone, Debug)]
 pub struct AtlasChart {
     pub chart_idx: usize,
-    pub row_weights: Array1<f64>,
+    row_count: usize,
+    support_rows: Vec<usize>,
+    support_weights: Vec<f64>,
     pub support_mass: f64,
     pub support_ess: f64,
 }
 
 impl AtlasChart {
+    /// Construct a chart from its strictly-positive sparse row support.
+    ///
+    /// `support_rows` must be strictly increasing and every row must be below
+    /// `row_count`. Storing only positive weights makes atlas memory scale with
+    /// route nonzeros rather than `row_count × number_of_charts`.
     #[must_use = "atlas chart construction errors must be handled"]
-    pub fn from_support(support: SupportMeasure) -> Result<Self, String> {
-        let weights = support.weights().to_owned();
-        Self::from_weights(support.atom_idx(), weights)
-    }
-
-    #[must_use = "atlas chart construction errors must be handled"]
-    pub fn from_weights(chart_idx: usize, row_weights: Array1<f64>) -> Result<Self, String> {
-        let support = SupportMeasure::from_weights(chart_idx, row_weights.clone())?;
+    pub fn from_sparse_weights(
+        chart_idx: usize,
+        row_count: usize,
+        support_rows: Vec<usize>,
+        support_weights: Vec<f64>,
+    ) -> Result<Self, String> {
+        if support_rows.len() != support_weights.len() {
+            return Err(format!(
+                "atlas chart {chart_idx} has {} support rows but {} weights",
+                support_rows.len(),
+                support_weights.len()
+            ));
+        }
+        let mut previous = None;
+        let mut support_mass = 0.0_f64;
+        let mut fisher_mass = 0.0_f64;
+        for (position, (&row, &weight)) in
+            support_rows.iter().zip(support_weights.iter()).enumerate()
+        {
+            if row >= row_count {
+                return Err(format!(
+                    "atlas chart {chart_idx} support row {row} at position {position} is outside 0..{row_count}"
+                ));
+            }
+            if previous.is_some_and(|prior| prior >= row) {
+                return Err(format!(
+                    "atlas chart {chart_idx} support rows must be strictly increasing"
+                ));
+            }
+            if !(weight.is_finite() && weight > 0.0) {
+                return Err(format!(
+                    "atlas chart {chart_idx} sparse weight at row {row} must be finite and positive, got {weight}"
+                ));
+            }
+            previous = Some(row);
+            support_mass += weight;
+            fisher_mass += weight * weight;
+        }
+        if !(support_mass.is_finite() && fisher_mass.is_finite()) {
+            return Err(format!(
+                "atlas chart {chart_idx} support moments overflowed"
+            ));
+        }
+        let support_ess = if fisher_mass > 0.0 {
+            support_mass * support_mass / fisher_mass
+        } else {
+            0.0
+        };
         Ok(Self {
             chart_idx,
-            row_weights,
-            support_mass: support.mass(),
-            support_ess: support.ess(),
+            row_count,
+            support_rows,
+            support_weights,
+            support_mass,
+            support_ess,
         })
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    pub fn support_rows(&self) -> &[usize] {
+        &self.support_rows
+    }
+
+    pub fn support_weights(&self) -> &[f64] {
+        &self.support_weights
     }
 }
 
@@ -154,34 +214,29 @@ impl AtlasNerveDiagram {
             0
         };
         let max_tetrahedra = if self.n_vertices >= 4 {
-            self.n_vertices
-                * (self.n_vertices - 1)
-                * (self.n_vertices - 2)
-                * (self.n_vertices - 3)
+            self.n_vertices * (self.n_vertices - 1) * (self.n_vertices - 2) * (self.n_vertices - 3)
                 / 24
         } else {
             0
         };
-        let generic = crate::description_length::selection_bits(
-            max_edges as i64,
-            self.n_edges as i64,
-        )
-            + crate::description_length::selection_bits(
-                max_triangles as i64,
-                self.n_triangles as i64,
-            )
-            + crate::description_length::selection_bits(
-                max_tetrahedra as i64,
-                self.n_tetrahedra as i64,
-            );
+        let generic =
+            crate::description_length::selection_bits(max_edges as i64, self.n_edges as i64)
+                + crate::description_length::selection_bits(
+                    max_triangles as i64,
+                    self.n_triangles as i64,
+                )
+                + crate::description_length::selection_bits(
+                    max_tetrahedra as i64,
+                    self.n_tetrahedra as i64,
+                );
         let log_vertices = (self.n_vertices.max(2) as f64).log2();
         let named = match (self.betti.b0, self.betti.b1, self.betti.b2) {
-            (1, 2, Some(1)) => {
-                Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices))
-            }
-            (1, 1, Some(0)) => {
-                Some((GraphCompressionKind::Cylinder, "cylinder", 2.0 * log_vertices))
-            }
+            (1, 2, Some(1)) => Some((GraphCompressionKind::Torus, "torus", 2.0 * log_vertices)),
+            (1, 1, Some(0)) => Some((
+                GraphCompressionKind::Cylinder,
+                "cylinder",
+                2.0 * log_vertices,
+            )),
             (1, 0, Some(1)) => Some((GraphCompressionKind::Sphere, "sphere", log_vertices)),
             _ => None,
         };
@@ -199,7 +254,7 @@ fn validate_charts(charts: &[AtlasChart]) -> Result<usize, String> {
     let Some(first) = charts.first() else {
         return Ok(0);
     };
-    let n = first.row_weights.len();
+    let n = first.row_count;
     for (pos, chart) in charts.iter().enumerate() {
         if chart.chart_idx != pos {
             return Err(format!(
@@ -207,22 +262,33 @@ fn validate_charts(charts: &[AtlasChart]) -> Result<usize, String> {
                 chart.chart_idx
             ));
         }
-        if chart.row_weights.len() != n {
+        if chart.row_count != n {
             return Err(format!(
                 "atlas chart {} has {} rows but expected {n}",
-                chart.chart_idx,
-                chart.row_weights.len()
+                chart.chart_idx, chart.row_count
             ));
         }
-        if chart
-            .row_weights
-            .iter()
-            .any(|&w| !(w.is_finite() && w >= 0.0))
-        {
+        if chart.support_rows.len() != chart.support_weights.len() {
             return Err(format!(
-                "atlas chart {} has non-finite or negative row weights",
+                "atlas chart {} has mismatched sparse row and weight lengths",
                 chart.chart_idx
             ));
+        }
+        let mut previous = None;
+        for (&row, &weight) in chart.support_rows.iter().zip(&chart.support_weights) {
+            if row >= n || previous.is_some_and(|prior| prior >= row) {
+                return Err(format!(
+                    "atlas chart {} has invalid sparse support ordering/domain",
+                    chart.chart_idx
+                ));
+            }
+            if !(weight.is_finite() && weight > 0.0) {
+                return Err(format!(
+                    "atlas chart {} has non-finite or non-positive sparse weight",
+                    chart.chart_idx
+                ));
+            }
+            previous = Some(row);
         }
     }
     Ok(n)
@@ -233,17 +299,56 @@ fn gate_key(a: usize, b: usize) -> (usize, usize) {
 }
 
 fn mutual_row_mass(charts: &[AtlasChart], simplex: &[usize]) -> (f64, f64) {
-    let n = charts[0].row_weights.len();
+    if simplex.is_empty() {
+        return (0.0, f64::INFINITY);
+    }
+    let mut positions = vec![0usize; simplex.len()];
     let mut total = 0.0_f64;
     let mut positive_count = 0usize;
-    for row in 0..n {
-        let mut row_mass = f64::INFINITY;
-        for &chart_idx in simplex {
-            row_mass = row_mass.min(charts[chart_idx].row_weights[row]);
+
+    loop {
+        if simplex
+            .iter()
+            .zip(&positions)
+            .any(|(&chart_idx, &position)| position == charts[chart_idx].support_rows.len())
+        {
+            break;
         }
-        if row_mass.is_finite() && row_mass > 0.0 {
+        let target_row = simplex
+            .iter()
+            .zip(&positions)
+            .map(|(&chart_idx, &position)| charts[chart_idx].support_rows[position])
+            .max()
+            .expect("non-empty simplex");
+        for (&chart_idx, position) in simplex.iter().zip(&mut positions) {
+            while *position < charts[chart_idx].support_rows.len()
+                && charts[chart_idx].support_rows[*position] < target_row
+            {
+                *position += 1;
+            }
+        }
+        if simplex
+            .iter()
+            .zip(&positions)
+            .any(|(&chart_idx, &position)| position == charts[chart_idx].support_rows.len())
+        {
+            break;
+        }
+        if simplex
+            .iter()
+            .zip(&positions)
+            .all(|(&chart_idx, &position)| charts[chart_idx].support_rows[position] == target_row)
+        {
+            let row_mass = simplex
+                .iter()
+                .zip(&positions)
+                .map(|(&chart_idx, &position)| charts[chart_idx].support_weights[position])
+                .fold(f64::INFINITY, f64::min);
             total += row_mass;
             positive_count += 1;
+            for position in &mut positions {
+                *position += 1;
+            }
         }
     }
     let threshold = if positive_count > 0 {
@@ -254,25 +359,54 @@ fn mutual_row_mass(charts: &[AtlasChart], simplex: &[usize]) -> (f64, f64) {
     (total, threshold)
 }
 
-fn sampled_support_size(charts: &[AtlasChart]) -> usize {
-    if charts.is_empty() {
-        return 0;
-    }
-    let n = charts[0].row_weights.len();
-    let mut count = 0usize;
-    for row in 0..n {
-        if charts.iter().any(|chart| chart.row_weights[row] > 0.0) {
-            count += 1;
-        }
-    }
-    count
+#[derive(Clone, Copy, Debug, Default)]
+struct PairOverlap {
+    mass: f64,
+    positive_rows: usize,
 }
 
-fn chart_distance(a: &AtlasChart, b: &AtlasChart) -> f64 {
-    let mut overlap = 0.0_f64;
-    for row in 0..a.row_weights.len() {
-        overlap += a.row_weights[row].min(b.row_weights[row]);
+/// Merge the per-chart sorted support lists by row and accumulate only chart
+/// pairs that genuinely co-activate. Working memory is `O(charts + row_width)`;
+/// the output is proportional to observed pair support, never all chart pairs.
+fn sparse_pair_overlaps(charts: &[AtlasChart]) -> (BTreeMap<(usize, usize), PairOverlap>, usize) {
+    let mut heap = BinaryHeap::<Reverse<(usize, usize, usize)>>::new();
+    for (chart_idx, chart) in charts.iter().enumerate() {
+        if let Some(&row) = chart.support_rows.first() {
+            heap.push(Reverse((row, chart_idx, 0)));
+        }
     }
+    let mut overlaps = BTreeMap::<(usize, usize), PairOverlap>::new();
+    let mut sampled_rows = 0usize;
+    let mut live = Vec::<(usize, f64)>::new();
+    while let Some(Reverse((row, _, _))) = heap.peek().copied() {
+        live.clear();
+        while heap
+            .peek()
+            .is_some_and(|Reverse((candidate, _, _))| *candidate == row)
+        {
+            let Reverse((_, chart_idx, position)) = heap.pop().expect("peeked atlas support entry");
+            let chart = &charts[chart_idx];
+            live.push((chart_idx, chart.support_weights[position]));
+            let next = position + 1;
+            if next < chart.support_rows.len() {
+                heap.push(Reverse((chart.support_rows[next], chart_idx, next)));
+            }
+        }
+        sampled_rows += 1;
+        for left in 0..live.len() {
+            for right in (left + 1)..live.len() {
+                let (a, wa) = live[left];
+                let (b, wb) = live[right];
+                let pair = overlaps.entry((a, b)).or_default();
+                pair.mass += wa.min(wb);
+                pair.positive_rows += 1;
+            }
+        }
+    }
+    (overlaps, sampled_rows)
+}
+
+fn chart_distance(a: &AtlasChart, b: &AtlasChart, overlap: f64) -> f64 {
     let denom = a.support_mass.min(b.support_mass);
     if denom > 0.0 {
         (1.0 - overlap / denom).clamp(0.0, 1.0)
@@ -281,7 +415,7 @@ fn chart_distance(a: &AtlasChart, b: &AtlasChart) -> f64 {
     }
 }
 
-fn dtm_radii(charts: &[AtlasChart], distances: &[Vec<f64>]) -> Vec<f64> {
+fn dtm_radii(charts: &[AtlasChart], overlaps: &BTreeMap<(usize, usize), PairOverlap>) -> Vec<f64> {
     let n = charts.len();
     if n <= 1 {
         return vec![0.0; n];
@@ -291,14 +425,17 @@ fn dtm_radii(charts: &[AtlasChart], distances: &[Vec<f64>]) -> Vec<f64> {
         return vec![0.0; n];
     }
     let target_mass = total_mass / n as f64;
+    let mut sparse_neighbors = vec![Vec::<(f64, f64)>::new(); n];
+    for (&(a, b), overlap) in overlaps {
+        let distance = chart_distance(&charts[a], &charts[b], overlap.mass);
+        sparse_neighbors[a].push((distance, charts[b].support_mass));
+        sparse_neighbors[b].push((distance, charts[a].support_mass));
+    }
     let mut radii = vec![0.0_f64; n];
     for i in 0..n {
-        let mut neighbors = Vec::with_capacity(n);
-        for j in 0..n {
-            if charts[j].support_mass > 0.0 {
-                let distance = if i == j { 0.0 } else { distances[i][j] };
-                neighbors.push((distance, charts[j].support_mass));
-            }
+        let mut neighbors = std::mem::take(&mut sparse_neighbors[i]);
+        if charts[i].support_mass > 0.0 {
+            neighbors.push((0.0, charts[i].support_mass));
         }
         neighbors.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         let mut mass = 0.0_f64;
@@ -312,6 +449,12 @@ fn dtm_radii(charts: &[AtlasChart], distances: &[Vec<f64>]) -> Vec<f64> {
             if mass >= target_mass {
                 break;
             }
+        }
+        // Every omitted chart has zero overlap and therefore distance exactly
+        // one. Their individual masses need not be materialised or sorted.
+        if mass < target_mass {
+            moment += target_mass - mass;
+            mass = target_mass;
         }
         if mass > 0.0 {
             radii[i] = (moment / mass).sqrt();
@@ -439,101 +582,88 @@ pub fn build_atlas_nerve(
                 gate.a, gate.b
             ));
         }
-        gate_map.insert(gate_key(gate.a, gate.b), gate);
-    }
-
-    let mut distances = vec![vec![0.0_f64; n]; n];
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let d = chart_distance(&charts[i], &charts[j]);
-            distances[i][j] = d;
-            distances[j][i] = d;
+        if gate_map.insert(gate_key(gate.a, gate.b), gate).is_some() {
+            return Err(format!(
+                "duplicate transfer gate for atlas pair ({}, {})",
+                gate.a.min(gate.b),
+                gate.a.max(gate.b)
+            ));
         }
     }
-    let dtm = dtm_radii(charts, &distances);
+
+    let (overlaps, sampled) = sparse_pair_overlaps(charts);
+    let dtm = dtm_radii(charts, &overlaps);
 
     let vertices: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
-    let mut edge_set = vec![vec![false; n]; n];
-    let mut edge_filtration = vec![vec![0.0_f64; n]; n];
+    let mut adjacency = vec![BTreeSet::<usize>::new(); n];
+    let mut edge_filtration = BTreeMap::<(usize, usize), f64>::new();
     let mut edge_reports = Vec::new();
     let mut edge_simplices = Vec::new();
     let mut max_filtration = 0.0_f64;
-    for a in 0..n {
-        for b in (a + 1)..n {
-            let pair = [a, b];
-            let (coactivation, threshold) = mutual_row_mass(charts, &pair);
-            let transfer_valid = gate_map
-                .get(&gate_key(a, b))
-                .is_some_and(|gate| gate.valid);
-            let coactive = coactivation.is_finite() && coactivation >= threshold;
-            let filtration = distances[a][b].max(dtm[a]).max(dtm[b]);
-            let admitted = coactive && transfer_valid;
-            if admitted {
-                edge_set[a][b] = true;
-                edge_set[b][a] = true;
-                edge_filtration[a][b] = filtration;
-                edge_filtration[b][a] = filtration;
-                edge_simplices.push(vec![a, b]);
-                max_filtration = max_filtration.max(filtration);
-            }
-            edge_reports.push(AtlasNerveEdge {
-                a,
-                b,
-                coactivation_mass: coactivation,
-                coactivation_threshold: threshold,
-                transfer_valid,
-                admitted,
-                filtration,
-            });
+    for (&(a, b), overlap) in &overlaps {
+        let threshold = overlap.mass / overlap.positive_rows as f64;
+        let transfer_valid = gate_map.get(&gate_key(a, b)).is_some_and(|gate| gate.valid);
+        let coactive = overlap.mass.is_finite() && overlap.mass >= threshold;
+        let filtration = chart_distance(&charts[a], &charts[b], overlap.mass)
+            .max(dtm[a])
+            .max(dtm[b]);
+        let admitted = coactive && transfer_valid;
+        if admitted {
+            adjacency[a].insert(b);
+            adjacency[b].insert(a);
+            edge_filtration.insert((a, b), filtration);
+            edge_simplices.push(vec![a, b]);
+            max_filtration = max_filtration.max(filtration);
         }
+        edge_reports.push(AtlasNerveEdge {
+            a,
+            b,
+            coactivation_mass: overlap.mass,
+            coactivation_threshold: threshold,
+            transfer_valid,
+            admitted,
+            filtration,
+        });
     }
 
     let mut triangles = Vec::new();
     let mut triangle_set = BTreeSet::new();
     for a in 0..n {
-        for b in (a + 1)..n {
-            for c in (b + 1)..n {
-                if edge_set[a][b] && edge_set[a][c] && edge_set[b][c] {
-                    let simplex = [a, b, c];
-                    let (coactivation, threshold) = mutual_row_mass(charts, &simplex);
-                    if coactivation.is_finite() && coactivation >= threshold {
-                        let tri = vec![a, b, c];
-                        triangle_set.insert(tri.clone());
-                        triangles.push(tri);
-                        let filt = edge_filtration[a][b]
-                            .max(edge_filtration[a][c])
-                            .max(edge_filtration[b][c]);
-                        max_filtration = max_filtration.max(filt);
-                    }
+        for &b in adjacency[a].iter().filter(|&&candidate| candidate > a) {
+            for &c in adjacency[a]
+                .intersection(&adjacency[b])
+                .filter(|&&candidate| candidate > b)
+            {
+                let simplex = [a, b, c];
+                let (coactivation, threshold) = mutual_row_mass(charts, &simplex);
+                if coactivation.is_finite() && coactivation >= threshold {
+                    let tri = vec![a, b, c];
+                    triangle_set.insert(tri.clone());
+                    triangles.push(tri);
+                    let filt = edge_filtration[&(a, b)]
+                        .max(edge_filtration[&(a, c)])
+                        .max(edge_filtration[&(b, c)]);
+                    max_filtration = max_filtration.max(filt);
                 }
             }
         }
     }
 
     let mut tetrahedra = Vec::new();
-    for a in 0..n {
-        for b in (a + 1)..n {
-            for c in (b + 1)..n {
-                for d in (c + 1)..n {
-                    let faces = [
-                        vec![a, b, c],
-                        vec![a, b, d],
-                        vec![a, c, d],
-                        vec![b, c, d],
-                    ];
-                    if faces.iter().all(|face| triangle_set.contains(face)) {
-                        let simplex = [a, b, c, d];
-                        let (coactivation, threshold) = mutual_row_mass(charts, &simplex);
-                        if coactivation.is_finite() && coactivation >= threshold {
-                            tetrahedra.push(vec![a, b, c, d]);
-                        }
-                    }
+    for triangle in &triangles {
+        let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
+        for &d in adjacency[a].iter().filter(|&&candidate| candidate > c) {
+            let faces = [vec![a, b, c], vec![a, b, d], vec![a, c, d], vec![b, c, d]];
+            if faces.iter().all(|face| triangle_set.contains(face)) {
+                let simplex = [a, b, c, d];
+                let (coactivation, threshold) = mutual_row_mass(charts, &simplex);
+                if coactivation.is_finite() && coactivation >= threshold {
+                    tetrahedra.push(vec![a, b, c, d]);
                 }
             }
         }
     }
 
-    let sampled = sampled_support_size(charts);
     let covering_side = if sampled >= n {
         AtlasCoveringSide::AtOrAboveCoveringNumber
     } else {
@@ -565,29 +695,38 @@ pub fn build_atlas_nerve(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AtlasChart, AtlasCoveringSide, AtlasTransferGate, build_atlas_nerve,
-    };
-    use crate::assignment::SupportMeasure;
+    use super::{AtlasChart, AtlasCoveringSide, AtlasTransferGate, build_atlas_nerve};
     use crate::chart_transfer::certify_square_transfer;
     use crate::manifold::GraphCompressionKind;
     use ndarray::{Array2, arr2};
     use std::collections::BTreeSet;
 
     fn charts_from_faces(n_charts: usize, faces: &[Vec<usize>]) -> Vec<AtlasChart> {
-        let mut assignments = Array2::<f64>::zeros((faces.len(), n_charts));
+        let mut support_rows = vec![Vec::new(); n_charts];
         for (row, face) in faces.iter().enumerate() {
             for &chart in face {
-                assignments[[row, chart]] = 1.0;
+                support_rows[chart].push(row);
             }
         }
-        (0..n_charts)
-            .map(|chart| {
-                let support =
-                    SupportMeasure::from_assignment_matrix(assignments.view(), chart).unwrap();
-                AtlasChart::from_support(support).unwrap()
+        support_rows
+            .into_iter()
+            .enumerate()
+            .map(|(chart, rows)| {
+                let weights = vec![1.0; rows.len()];
+                AtlasChart::from_sparse_weights(chart, faces.len(), rows, weights).unwrap()
             })
             .collect()
+    }
+
+    #[test]
+    fn chart_storage_tracks_sparse_support_not_row_count() {
+        let chart =
+            AtlasChart::from_sparse_weights(0, 1_000_000, vec![7, 900_001], vec![0.25, 0.75])
+                .unwrap();
+        assert_eq!(chart.row_count(), 1_000_000);
+        assert_eq!(chart.support_rows(), &[7, 900_001]);
+        assert_eq!(chart.support_weights(), &[0.25, 0.75]);
+        assert_eq!(chart.support_mass, 1.0);
     }
 
     fn all_valid_pair_gates(n_charts: usize) -> Vec<AtlasTransferGate> {
@@ -616,7 +755,10 @@ mod tests {
         assert_eq!(diagram.betti.b2, Some(1));
         assert_eq!(diagram.n_triangles, 4);
         assert_eq!(diagram.n_tetrahedra, 0);
-        assert_eq!(diagram.covering_side, AtlasCoveringSide::AtOrAboveCoveringNumber);
+        assert_eq!(
+            diagram.covering_side,
+            AtlasCoveringSide::AtOrAboveCoveringNumber
+        );
     }
 
     #[test]
@@ -674,7 +816,10 @@ mod tests {
         assert_eq!(diagram.betti.b0, 1);
         assert_eq!(diagram.betti.b1, 2);
         assert_eq!(diagram.betti.b2, Some(1));
-        assert_eq!(diagram.covering_side, AtlasCoveringSide::AtOrAboveCoveringNumber);
+        assert_eq!(
+            diagram.covering_side,
+            AtlasCoveringSide::AtOrAboveCoveringNumber
+        );
         let compression = diagram.certified_compression();
         assert_eq!(compression.kind, GraphCompressionKind::Torus);
         assert_eq!(compression.name, "torus");

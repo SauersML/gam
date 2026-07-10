@@ -3,9 +3,9 @@ use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
 use super::*;
-use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
 use crate::marginal_slope_orthogonal::influence_absorber_log_lambda;
 use faer::Side;
+use gam_linalg::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
 
 /// Sup-norm of the FITTED marginal linear predictor `η = X·β` at which the
 /// probit model becomes numerically degenerate. This is the decisive
@@ -545,7 +545,7 @@ fn build_reduced_logslope_reparam(
              marginal and score-slope surfaces and the smoothing penalty would select an \
              arbitrary decomposition between them. Refusing to fit; remove the score-slope \
              terms or supply covariates that separate them from the marginal index."
-            .to_string(),
+                .to_string(),
         ),
     }
 }
@@ -1028,7 +1028,9 @@ pub(crate) fn bernoulli_marginal_slope_runaway_error(
 #[cfg(test)]
 mod runaway_tests {
     use super::*;
-    use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y};
+    use gam_linalg::faer_ndarray::{
+        FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y,
+    };
     use gam_terms::smooth::{LinearCoefficientGeometry, LinearTermSpec};
 
     // The marginal↔logslope overlap penalty is no longer installed as a pinned
@@ -1861,8 +1863,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // at the box corner and never recovers), then falls through to the
     // ρ-only "custom family" path which is what we wanted all along.
     // Short-circuit straight to the ρ-only path.
-    let kappa_locked_marginal = gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
-    let kappa_locked_logslope = gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
+    let kappa_locked_marginal =
+        gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
+    let kappa_locked_logslope =
+        gam_terms::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
     if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_logslope {
         log::info!(
             "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \
@@ -2455,7 +2459,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     .expect("dense marginal design for influence widening");
                 let widened = widen_marginal_dense_with_influence(&raw, Some(z_infl))
                     .expect("widen marginal design with influence columns");
-                DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from((*widened).clone()))
+                DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                    (*widened).clone(),
+                ))
             }
             None => marginal_design.design.clone(),
         };
@@ -2642,7 +2648,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     block.beta.view(),
                     &designs[0],
                     &specs[0],
-                    fit.outer_converged,
+                    true,
                     "final fit",
                 )
             {

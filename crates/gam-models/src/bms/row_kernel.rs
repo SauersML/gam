@@ -567,11 +567,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             end,
         );
 
-        crate::row_kernel::row_kernel_pack_jf_axes::<2>(
-            b,
-            rank,
-            [(0, jf_marg), (1, jf_logs)],
-        )
+        crate::row_kernel::row_kernel_pack_jf_axes::<2>(b, rank, [(0, jf_marg), (1, jf_logs)])
     }
 
     /// BLAS-3 override of the first directional derivative of the dense joint

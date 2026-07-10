@@ -1,10 +1,10 @@
+use crate::parameter_block::ParameterBlockInput;
+use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
     create_ispline_derivative_dense,
 };
-use crate::parameter_block::ParameterBlockInput;
-use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam_solve::pirls::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1};
 
 #[derive(Clone, Debug)]
@@ -342,8 +342,9 @@ mod tests {
             penalty_order,
             double_penalty,
         };
-        let knots = initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)
-            .expect("knot init");
+        let knots =
+            initializewiggle_knots_from_seed(seed.view(), cfg.degree, cfg.num_internal_knots)
+                .expect("knot init");
         let block = buildwiggle_block_input_from_knots(
             seed.view(),
             &knots,

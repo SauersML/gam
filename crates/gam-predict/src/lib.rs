@@ -93,6 +93,72 @@ fn spec_from_family_link(
     }
 }
 
+/// Validate the dense covariance contract needed by posterior integration.
+///
+/// A covariance with the right row count is not necessarily usable: a
+/// rectangular matrix panics in the dense matrix product, and a non-finite or
+/// negative diagonal can turn the projected variance into NaN/negative.  The
+/// old `.max(0.0)` consumers then converted that invalid variance to zero,
+/// silently changing `E[g⁻¹(η)]` back into the plug-in `g⁻¹(E[η])`.
+/// Reject those producer/data errors before constructing a backend.  Full PSD
+/// factorization is deliberately not repeated here: prediction only consumes
+/// the queried marginal quadratic forms, which are validated after projection
+/// in [`local_covariances_with_backend`].
+fn validate_dense_prediction_covariance(
+    covariance: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    label: &str,
+) -> Result<(), String> {
+    if covariance.nrows() != expected_dim || covariance.ncols() != expected_dim {
+        return Err(format!(
+            "{label} covariance is {}x{}; expected {expected_dim}x{expected_dim}",
+            covariance.nrows(),
+            covariance.ncols()
+        ));
+    }
+    if let Some(((row, column), value)) = covariance
+        .indexed_iter()
+        .map(|(index, &value)| (index, value))
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "{label} covariance[{row},{column}] is non-finite: {value}"
+        ));
+    }
+    if let Some((index, value)) = covariance
+        .diag()
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value < 0.0)
+    {
+        return Err(format!(
+            "{label} covariance diagonal[{index}] is negative: {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_posterior_mean_backend(
+    backend: &PredictionCovarianceBackend<'_>,
+    expected_dim: usize,
+    label: &str,
+) -> Result<(), EstimationError> {
+    match backend {
+        PredictionCovarianceBackend::Dense(covariance) => {
+            validate_dense_prediction_covariance(covariance.view(), expected_dim, label)
+                .map_err(EstimationError::InvalidInput)
+        }
+        PredictionCovarianceBackend::Factorized { dim, .. } if *dim == expected_dim => Ok(()),
+        PredictionCovarianceBackend::Factorized { dim, .. } => {
+            Err(EstimationError::InvalidInput(format!(
+                "{label} covariance/backend dimension mismatch: expected parameter dimension \
+                 {expected_dim}, got {dim}"
+            )))
+        }
+    }
+}
+
 fn local_covariances_with_backend<F>(
     backend: &PredictionCovarianceBackend<'_>,
     n_rows: usize,
@@ -102,8 +168,28 @@ fn local_covariances_with_backend<F>(
 where
     F: Fn(std::ops::Range<usize>) -> Result<Vec<Array2<f64>>, String> + Sync,
 {
-    rowwise_local_covariances_parallel(backend, n_rows, local_dim, build_chunk)
-        .map_err(EstimationError::InvalidInput)
+    let local = rowwise_local_covariances_parallel(backend, n_rows, local_dim, build_chunk)
+        .map_err(EstimationError::InvalidInput)?;
+    for first in 0..local_dim {
+        for second in 0..local_dim {
+            for (row, &value) in local[first][second].iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "projected prediction covariance[{first},{second}] at row {row} is \
+                         non-finite: {value}"
+                    )));
+                }
+                if first == second && value < 0.0 {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "projected prediction variance[{first}] at row {row} is negative: \
+                         {value}; the supplied covariance is not positive semidefinite along \
+                         this prediction gradient"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(local)
 }
 
 fn usable_penalized_hessian<'a>(
@@ -149,16 +235,10 @@ fn conditional_prediction_backend<'a>(
     // `require_posterior_mean_backend`, which already prefers
     // `fit.beta_covariance()` over any indirect derivation.
     if let Some(covariance) = fit.beta_covariance() {
-        if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
-            return Some(PredictionCovarianceBackend::from_dense(covariance.view()));
+        match validate_dense_prediction_covariance(covariance.view(), expected_dim, label) {
+            Ok(()) => return Some(PredictionCovarianceBackend::from_dense(covariance.view())),
+            Err(reason) => log::warn!("{label}: ignoring invalid conditional {reason}"),
         }
-        log::warn!(
-            "{label}: ignoring conditional covariance with shape {}x{}; expected {}x{}",
-            covariance.nrows(),
-            covariance.ncols(),
-            expected_dim,
-            expected_dim
-        );
     }
     if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
         // The penalized Hessian is the *unscaled* precision `H = X'WX + S`,
@@ -633,14 +713,10 @@ fn require_posterior_mean_backend<'a>(
         let Some(covariance) = covariance else {
             continue;
         };
-        if covariance.nrows() == expected_dim && covariance.ncols() == expected_dim {
-            return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
+        match validate_dense_prediction_covariance(covariance.view(), expected_dim, source) {
+            Ok(()) => return Ok(PredictionCovarianceBackend::from_dense(covariance.view())),
+            Err(reason) => rejected.push(reason),
         }
-        rejected.push(format!(
-            "{source} covariance is {}x{}",
-            covariance.nrows(),
-            covariance.ncols()
-        ));
     }
     if let Some(backend) = conditional_prediction_backend(fit, expected_dim, label) {
         return Ok(backend);
@@ -648,8 +724,8 @@ fn require_posterior_mean_backend<'a>(
     // The posterior mean E[g⁻¹(η)] is the estimand of this pass; without a
     // usable coefficient covariance the integral cannot be formed, and quietly
     // reporting the plug-in g⁻¹(η̂) instead would silently change the estimand.
-    // Missing or dimension-mismatched covariance is therefore a typed error
-    // carrying every rejected source, never a degraded prediction.
+    // Missing, malformed, or dimension-mismatched covariance is therefore a
+    // typed error carrying every rejected source, never a degraded prediction.
     let detail = if rejected.is_empty() {
         String::new()
     } else {
@@ -1718,13 +1794,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
             offset.len()
         )));
     }
-    if backend.nrows() != beta.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "{label} covariance/backend dimension mismatch: expected parameter dimension {}, got {}",
-            beta.len(),
-            backend.nrows()
-        )));
-    }
+    validate_posterior_mean_backend(backend, beta.len(), label)?;
 
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
@@ -1745,7 +1815,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     // so the raw conditional Vb band is already self-consistent — no A·V·Aᵀ
     // adjustment is applicable here.
     let etavar = linear_predictorvariance_from_backend(&x, backend, None)?;
-    let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
+    let eta_standard_error = etavar.mapv(f64::sqrt);
     let quadctx = gam_solve::quadrature::QuadratureContext::new();
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
@@ -2106,6 +2176,15 @@ where
     }
 }
 
+#[inline]
+fn bernoulli_predictive_quantile(success_probability: f64, cumulative_probability: f64) -> f64 {
+    if cumulative_probability <= 1.0 - success_probability {
+        0.0
+    } else {
+        1.0
+    }
+}
+
 pub(crate) fn family_observation_band<S>(
     response: &ResponseFamily,
     eta: &Array1<f64>,
@@ -2353,7 +2432,7 @@ where
             // support point (p = 0.5, no parameter uncertainty: the 50% band
             // [0.163, 0.837] excludes both 0 and 1 — actual coverage zero).
             // Report equal-tailed quantiles of the marginal predictive
-            // P(Y = 1) = E[μ] instead: F⁻¹(q) = 0 for q < 1 − m, else 1, at
+            // P(Y = 1) = E[μ] instead: F⁻¹(q) = 0 for q ≤ 1 − m, else 1, at
             // the same per-row tail masses Φ(−z_lower) / Φ(z_upper) every
             // other family's band targets. Coverage of [F⁻¹(p_lo), F⁻¹(p_hi)]
             // is ≥ p_hi − p_lo by construction of the quantile function.
@@ -2364,8 +2443,8 @@ where
                 let m = mean[i].clamp(0.0, 1.0);
                 let p_lo = normal_cdf(-z_lower_per_row[i]);
                 let p_hi = normal_cdf(z_upper_per_row[i]);
-                lower[i] = if p_lo < 1.0 - m { 0.0 } else { 1.0 };
-                upper[i] = if p_hi < 1.0 - m { 0.0 } else { 1.0 };
+                lower[i] = bernoulli_predictive_quantile(m, p_lo);
+                upper[i] = bernoulli_predictive_quantile(m, p_hi);
             }
             (Some(lower), Some(upper))
         }
@@ -3014,9 +3093,9 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
         &cal_result.mean,
         &cal_result.mean_standard_error,
         fit,
-    );
+    )?;
     let test_scale =
-        predictive_standard_error(family, &result.mean, &result.mean_standard_error, fit);
+        predictive_standard_error(family, &result.mean, &result.mean_standard_error, fit)?;
     let calibrator = ConformalCalibrator::from_held_out_fold(
         calibration.y,
         cal_result.mean.view(),
@@ -3032,29 +3111,83 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
 
 /// Predictive (observation-scale) standard error `√(SE(μ̂)² + Var(Y|μ))` per row,
 /// the spread of a fresh response the conformal prediction interval must cover.
-/// Falls back to the epistemic mean SE only when the fit exposes no dispersion
-/// hint for the family ([`family_response_variance`] returns `None`); split
-/// conformal retains its marginal coverage guarantee under any positive scale,
-/// so that degrade costs interval locality, never validity.
+/// A missing fitted dispersion is a typed error: substituting the epistemic
+/// mean SE would silently change an outcome-scale interval into a mean interval.
+/// For Bernoulli and Royston–Parmar horizon indicators the marginal predictive
+/// variance is exactly `m(1−m)`, independently of how an approximate mean SE
+/// partitions total variance into epistemic and conditional components.
 fn predictive_standard_error<S>(
     family: &LikelihoodSpec,
     mean: &Array1<f64>,
     mean_standard_error: &Array1<f64>,
     source: &S,
-) -> Array1<f64>
+) -> Result<Array1<f64>, EstimationError>
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
-    let mean_variance = mean_standard_error.mapv(|s| s * s);
-    match family_response_variance(&family.response, mean, source, None, Some(&mean_variance)) {
-        Some(response_var) => Array1::from_iter(
-            mean_standard_error
-                .iter()
-                .zip(response_var.iter())
-                .map(|(&se, &var)| (se.powi(2) + var.max(0.0)).max(0.0).sqrt()),
-        ),
-        None => mean_standard_error.clone(),
+    if mean.len() != mean_standard_error.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "conformal predictive scale length mismatch: mean has {}, mean SE has {}",
+            mean.len(),
+            mean_standard_error.len()
+        )));
     }
+    if let Some((row, value)) = mean
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "conformal predictive mean[{row}] is non-finite: {value}"
+        )));
+    }
+    if let Some((row, value)) = mean_standard_error
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || *value < 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "conformal predictive mean SE[{row}] must be finite and non-negative, got {value}"
+        )));
+    }
+    if matches!(
+        &family.response,
+        ResponseFamily::Binomial | ResponseFamily::RoystonParmar
+    ) {
+        return Ok(mean.mapv(|value| {
+            let probability = value.clamp(0.0, 1.0);
+            (probability * (1.0 - probability)).sqrt()
+        }));
+    }
+    let mean_variance = mean_standard_error.mapv(|s| s * s);
+    let response_var =
+        family_response_variance(&family.response, mean, source, None, Some(&mean_variance))
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "conformal prediction for {} requires fitted observation-scale dispersion; \
+             the epistemic mean SE cannot substitute for fresh-response variability",
+                    family.response.name()
+                ))
+            })?;
+    if let Some((row, value)) = response_var
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || *value < 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "conformal conditional response variance[{row}] must be finite and non-negative, \
+             got {value}"
+        )));
+    }
+    Ok(Array1::from_iter(
+        mean_standard_error
+            .iter()
+            .zip(response_var.iter())
+            .map(|(&se, &var)| (se.powi(2) + var).sqrt()),
+    ))
 }
 
 /// Coefficient-level uncertainty and confidence intervals.
@@ -3150,6 +3283,16 @@ mod tests {
     use gam_solve::pirls::PirlsStatus;
     use gam_spec::{LinkFunction, StandardLink};
     use ndarray::{Array1, Array2, array};
+
+    fn expect_estimation_error<T>(
+        result: Result<T, EstimationError>,
+        message: &str,
+    ) -> EstimationError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("{message}"),
+        }
+    }
 
     #[test]
     fn raw_covariance_observation_intervals_require_fitted_scale_hints() {
@@ -4146,7 +4289,7 @@ mod tests {
             bias_correction_beta,
             bias_correction_jacobian: None,
         };
-        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+        UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: beta.clone(),
                 role: BlockRole::Mean,
@@ -4183,6 +4326,7 @@ mod tests {
             },
             inner_cycles: 0,
         })
+        .expect("prediction fixture carries fixed-outer convergence evidence")
     }
 
     fn bc_options(apply: bool) -> PredictUncertaintyOptions {
@@ -5574,8 +5718,10 @@ mod tests {
         // integral: the mismatch must surface as a typed error naming the
         // rejected source, never degrade to a plug-in point prediction.
         let fit = test_fit_with_covariance(array![1.0, 2.0], Array2::eye(2));
-        let err = require_posterior_mean_backend(&fit, None, 3, "test posterior mean")
-            .expect_err("mismatched covariance must be a typed error");
+        let err = expect_estimation_error(
+            require_posterior_mean_backend(&fit, None, 3, "test posterior mean"),
+            "mismatched covariance must be a typed error",
+        );
         let message = err.to_string();
         assert!(
             message.contains("rejected") && message.contains("2x2"),
@@ -5586,6 +5732,123 @@ mod tests {
         let backend = require_posterior_mean_backend(&fit, None, 2, "test posterior mean")
             .expect("matching covariance must be accepted");
         assert_eq!(backend.nrows(), 2);
+
+        let mut missing_fit = test_fit_with_covariance(array![1.0, 2.0], Array2::eye(2));
+        missing_fit.covariance_conditional = None;
+        let missing_error = expect_estimation_error(
+            require_posterior_mean_backend(
+                &missing_fit,
+                None,
+                2,
+                "test posterior mean without covariance",
+            ),
+            "missing covariance and Hessian must be a typed error",
+        );
+        assert!(
+            missing_error
+                .to_string()
+                .contains("requires a coefficient covariance or penalized Hessian")
+        );
+    }
+
+    #[test]
+    fn posterior_mean_rejects_unusable_dense_covariance_instead_of_becoming_plugin() {
+        let beta = array![0.0, 0.0];
+        let offset = array![0.0];
+        let family = LikelihoodSpec::poisson_log();
+
+        let rectangular = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let rectangular_error = expect_estimation_error(
+            predict_gam_posterior_mean(
+                array![[1.0, 0.0]],
+                beta.view(),
+                offset.view(),
+                family.clone(),
+                rectangular.view(),
+            ),
+            "rectangular covariance must be a typed error, not a dot-product panic",
+        );
+        assert!(rectangular_error.to_string().contains("2x3"));
+
+        let non_finite = array![[f64::NAN, 0.0], [0.0, 1.0]];
+        let non_finite_error = expect_estimation_error(
+            predict_gam_posterior_mean(
+                array![[1.0, 0.0]],
+                beta.view(),
+                offset.view(),
+                family.clone(),
+                non_finite.view(),
+            ),
+            "non-finite covariance must not collapse posterior variance to zero",
+        );
+        assert!(non_finite_error.to_string().contains("non-finite"));
+
+        // This matrix has positive diagonal but eigenvalues 3 and -1.  Along
+        // x=(1,-1), xᵀVx=-2; clamping that to zero would reproduce the finite
+        // plug-in exp(0)=1 instead of reporting the invalid covariance.
+        let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
+        let indefinite_error = expect_estimation_error(
+            predict_gam_posterior_mean(
+                array![[1.0, -1.0]],
+                beta.view(),
+                offset.view(),
+                family,
+                indefinite.view(),
+            ),
+            "negative projected variance must be a typed error",
+        );
+        assert!(
+            indefinite_error
+                .to_string()
+                .contains("not positive semidefinite")
+        );
+    }
+
+    #[test]
+    fn standard_posterior_mean_missing_covariance_is_an_end_to_end_error() {
+        let mut fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        fit.covariance_conditional = None;
+        let predictor = StandardPredictor {
+            beta: array![0.0],
+            family: LikelihoodSpec::poisson_log(),
+            link_kind: None,
+            covariance: None,
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let error = expect_estimation_error(
+            predictor.predict_posterior_mean(&input, &fit, &PosteriorMeanOptions::point_only()),
+            "standard posterior mean must not degrade to its plug-in point",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("requires a coefficient covariance or penalized Hessian")
+        );
+    }
+
+    #[test]
+    fn posterior_mean_overflow_remains_explicit_infinity() {
+        let result = predict_gam_posterior_mean(
+            array![[1.0]],
+            array![0.0].view(),
+            array![0.0].view(),
+            LikelihoodSpec::poisson_log(),
+            array![[1600.0]].view(),
+        )
+        .expect("a representable covariance with an overflowing integral is valid");
+        assert_eq!(result.eta[0], 0.0);
+        assert!(
+            result.mean[0].is_infinite() && result.mean[0].is_sign_positive(),
+            "E[exp(η)] = exp(800) must be reported as +inf, not plug-in exp(0)=1"
+        );
     }
 
     #[test]
@@ -5597,8 +5860,13 @@ mod tests {
         let fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
         let family = LikelihoodSpec::royston_parmar();
         let mean = array![0.2, 0.5, 0.9];
-        let mean_se = array![0.05, 0.1, 0.02];
-        let scale = predictive_standard_error(&family, &mean, &mean_se, &fit);
+        // Deliberately include approximate epistemic variances larger than the
+        // Bernoulli marginal variance.  The marginal fresh-response law is
+        // still Bernoulli(m), so its scale remains sqrt(m(1-m)); it must not
+        // silently become the oversized epistemic SE.
+        let mean_se = array![0.5, 0.8, 0.4];
+        let scale = predictive_standard_error(&family, &mean, &mean_se, &fit)
+            .expect("Royston-Parmar has an analytic Bernoulli predictive scale");
         for i in 0..mean.len() {
             let expected = (mean[i] * (1.0 - mean[i])).sqrt();
             assert!(
@@ -5606,11 +5874,108 @@ mod tests {
                 "row {i}: conformal scale {} must be the Bernoulli predictive SD {expected}",
                 scale[i]
             );
-            assert!(
-                scale[i] > mean_se[i],
-                "row {i}: outcome spread must exceed the epistemic mean SE alone"
-            );
         }
+    }
+
+    #[test]
+    fn conformal_predictive_scale_requires_fitted_observation_dispersion() {
+        let error = predictive_standard_error(
+            &LikelihoodSpec::gamma_log(),
+            &array![2.0],
+            &array![0.1],
+            &Array2::eye(1),
+        )
+        .expect_err("missing Gamma dispersion must not fall back to the mean SE");
+        assert!(
+            error
+                .to_string()
+                .contains("epistemic mean SE cannot substitute")
+        );
+    }
+
+    struct FixedRoystonParmarTransform;
+
+    impl PredictionTransform for FixedRoystonParmarTransform {
+        fn point_state(&self, _: &PredictInput) -> Result<LinearState, EstimationError> {
+            // Deliberately different from the posterior-integrated mean below;
+            // the full driver must not parameterize a fresh-response law with
+            // this plug-in state.
+            let mean = array![0.4_f64, 0.9, 0.1];
+            let eta = mean.mapv(|survival| (-survival.ln()).ln());
+            Ok(LinearState {
+                eta,
+                mean,
+                eta_se: Some(Array1::from_elem(3, 0.01)),
+                mean_se: Some(Array1::from_elem(3, 0.01)),
+                covariance_corrected_used: false,
+            })
+        }
+
+        fn linear_state(
+            &self,
+            input: &PredictInput,
+            _: &UnifiedFitResult,
+            pass: PredictPass,
+            _: InferenceCovarianceMode,
+        ) -> Result<LinearState, EstimationError> {
+            let mut state = self.point_state(input)?;
+            if matches!(pass, PredictPass::PosteriorMean) {
+                state.mean = array![0.5, 0.999, 0.001];
+            }
+            Ok(state)
+        }
+
+        fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
+            Ok(eta.mapv(|value| (-value.exp()).exp()))
+        }
+
+        fn response_jacobian_rows(&self, _: PredictPass) -> ResponseInterval {
+            ResponseInterval::SymmetricDelta
+        }
+
+        fn bounds(&self) -> ResponseBounds {
+            ResponseBounds::UNIT_PROBABILITY
+        }
+
+        fn response_family(&self) -> ResponseFamily {
+            ResponseFamily::RoystonParmar
+        }
+    }
+
+    #[test]
+    fn generic_full_uncertainty_emits_royston_parmar_indicator_band() {
+        let input = PredictInput {
+            design: DesignMatrix::from(Array2::<f64>::ones((3, 1))),
+            offset: Array1::zeros(3),
+            design_noise: None,
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            includeobservation_interval: true,
+            ..PredictUncertaintyOptions::default()
+        };
+        let result =
+            predict_full_uncertainty_generic(&FixedRoystonParmarTransform, &input, &fit, &options)
+                .expect("generic survival prediction must build its family observation band");
+        assert_eq!(
+            result.mean,
+            array![0.5, 0.999, 0.001],
+            "full survival prediction must use E[S(t)|D], not the plug-in S(t; beta_hat)"
+        );
+        let lower = result
+            .observation_lower
+            .expect("Royston-Parmar full prediction must emit a lower endpoint");
+        let upper = result
+            .observation_upper
+            .expect("Royston-Parmar full prediction must emit an upper endpoint");
+        assert_eq!((lower[0], upper[0]), (0.0, 1.0));
+        assert_eq!((lower[1], upper[1]), (1.0, 1.0));
+        assert_eq!((lower[2], upper[2]), (0.0, 0.0));
     }
 
     #[test]
@@ -5639,5 +6004,10 @@ mod tests {
         assert_eq!((lower[0], upper[0]), (0.0, 1.0), "interior m covers both support points");
         assert_eq!((lower[1], upper[1]), (1.0, 1.0), "near-certain survival collapses to {{1}}");
         assert_eq!((lower[2], upper[2]), (0.0, 0.0), "near-certain event collapses to {{0}}");
+        assert_eq!(
+            bernoulli_predictive_quantile(0.75, 0.25),
+            0.0,
+            "the generalized inverse at F(0) must return the support point 0"
+        );
     }
 }

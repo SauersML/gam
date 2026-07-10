@@ -73,11 +73,7 @@ impl DispersionLocationScalePredictor {
     /// The family's conditional response variance `Var(Y | μ, precision)`.
     /// `None` for a response that is not a dispersion location-scale family
     /// (a classification error upstream; callers choose their own degrade).
-    fn conditional_response_variance(
-        response: &ResponseFamily,
-        mu: f64,
-        prec: f64,
-    ) -> Option<f64> {
+    fn conditional_response_variance(response: &ResponseFamily, mu: f64, prec: f64) -> Option<f64> {
         let var = match response {
             ResponseFamily::NegativeBinomial { .. } => mu + mu * mu / prec,
             ResponseFamily::Gamma => mu * mu / prec,
@@ -322,7 +318,9 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         // posterior, not the plug-in law — see `integrated_response_variance`.
         // The fitted noise *surface* (plug-in) remains available through
         // `predict_noise_scale`.
-        Ok(Some(self.integrated_response_variance(input)?.mapv(f64::sqrt)))
+        Ok(Some(
+            self.integrated_response_variance(input)?.mapv(f64::sqrt),
+        ))
     }
 
     /// Skew-aware **equal-tailed** observation band for the dispersion

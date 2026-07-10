@@ -727,11 +727,9 @@ def _one_fit(
         rss = float(recon.detach().cpu().item())
         total_pen = float(aux_val) + float(mech_val)
 
-    # Final-pass true (RSS, penalty) used by the Rust weight-selection /
-    # evidence primitive. The Laplace-style log marginal-likelihood proxy
-    # itself is computed entirely in Rust by
-    # ``identifiable_factor_select_weights_array`` — no statistical math
-    # lives in this Python file.
+    # Final-pass true (RSS, penalty) used by the scalar Rust evidence
+    # primitive. Hyperparameter selection is not inferred from these two
+    # numbers; they describe this fixed-weight converged fit only.
     with torch.no_grad():
         t = encoder(x_t)
         t_sup = t[:, :n_supervised]
@@ -841,17 +839,16 @@ def identifiable_factor_fit(
         aux_w, mech_w, int(max_iter), float(learning_rate),
         int(random_state), torch_mod,
     )
-    # Route the single-pair evidence through the Rust primitive used by
-    # Rust-side weight-selection tests so the Laplace evidence formula has a
-    # single source of truth in ``src/identifiability/sae.rs``.
-    selection = rust_module().identifiable_factor_select_weights_array(
-        np.ascontiguousarray(np.array([[rss_val]], dtype=np.float64)),
-        np.ascontiguousarray(np.array([[pen_val]], dtype=np.float64)),
-        np.ascontiguousarray(np.array([aux_w], dtype=np.float64)),
-        np.ascontiguousarray(np.array([mech_w], dtype=np.float64)),
-        int(x_t.shape[0]),
+    # Score this one converged fixed-weight fit. The Rust boundary is scalar on
+    # purpose: a 1x1 "grid" is not hyperparameter selection, and sampled
+    # surfaces cannot certify a continuous two-log-weight optimum.
+    evidence = float(
+        rust_module().identifiable_factor_log_evidence(
+            float(rss_val),
+            float(pen_val),
+            int(x_t.shape[0]),
+        )
     )
-    evidence = float(selection["best_evidence"])
 
     with torch_mod.no_grad():
         t = encoder_module(x_t)

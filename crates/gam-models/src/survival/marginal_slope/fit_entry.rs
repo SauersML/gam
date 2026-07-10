@@ -2328,7 +2328,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
                 eval_started.elapsed().as_secs_f64(),
                 fit.inner_cycles,
-                fit.pirls_status,
+                fit.convergence_evidence().inner_status(),
             );
             Ok(fit)
         },
@@ -2510,11 +2510,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
     };
     log::info!(
-        "[survival-marginal-slope/outer] solve end n={n} elapsed={:.3}s outer_iters={} inner_cycles={} outer_converged={}",
+        "[survival-marginal-slope/outer] solve end n={n} elapsed={:.3}s outer_iters={} inner_cycles={} certified",
         fit_started.elapsed().as_secs_f64(),
         solved.fit.outer_iterations,
         solved.fit.inner_cycles,
-        solved.fit.outer_converged,
     );
     // Recompile-after-first-PIRLS-accept refinement (math-agent review).
     //

@@ -32,6 +32,7 @@ def configure(context: dict[str, typing.Any]) -> None:
 
 
 _BENCH_RUST_LOADER: typing.Any = None
+_SURVIVAL_CALIBRATION: typing.Any = None
 
 
 def _read_partitioned_dataset_csv(name: str) -> pd.DataFrame:
@@ -63,6 +64,20 @@ def _gamfit_rust() -> typing.Any:
     # package (the source-tree shadow case) or only in the
     # pip-installed wheel's site-packages directory.
     return _load_bench_rust_loader().load_gamfit_rust_module(ROOT)
+
+
+def _survival_calibration() -> typing.Any:
+    global _SURVIVAL_CALIBRATION
+    if _SURVIVAL_CALIBRATION is not None:
+        return _SURVIVAL_CALIBRATION
+    module_path = Path(__file__).resolve().parent / "_survival_calibration.py"
+    spec = importlib.util.spec_from_file_location("bench_survival_calibration", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load survival calibration helpers from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _SURVIVAL_CALIBRATION = module
+    return module
 
 
 def _matrix_rows(matrix: typing.Any, y: typing.Any, prefix: str = "pc") -> list[dict[str, float]]:
@@ -525,15 +540,12 @@ def _survival_matrix_from_risk_calibration(
     test_risk: np.ndarray,
     grid: np.ndarray,
 ) -> np.ndarray:
-    return np.asarray(
-        _gamfit_rust().survival_matrix_from_risk_calibration(
-            _flat_float_list(train_df[time_col]),
-            _flat_float_list(train_df[event_col]),
-            _flat_float_list(train_risk),
-            _flat_float_list(test_risk),
-            _flat_float_list(grid),
-        ),
-        dtype=float,
+    return _survival_calibration().calibrated_survival_matrix(
+        train_df[time_col],
+        train_df[event_col],
+        train_risk,
+        test_risk,
+        grid,
     )
 
 
@@ -544,13 +556,10 @@ def _survival_null_curve_from_train(
     event_col: str,
     grid: np.ndarray,
 ) -> np.ndarray:
-    return np.asarray(
-        _gamfit_rust().survival_null_curve_from_train(
-            _flat_float_list(train_df[time_col]),
-            _flat_float_list(train_df[event_col]),
-            _flat_float_list(grid),
-        ),
-        dtype=float,
+    return _survival_calibration().kaplan_meier_curve(
+        train_df[time_col],
+        train_df[event_col],
+        grid,
     )
 
 

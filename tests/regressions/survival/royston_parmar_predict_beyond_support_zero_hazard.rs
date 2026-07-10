@@ -155,6 +155,7 @@ fn royston_parmar_saved_predict_at_grid_top_does_not_fail() {
         noise_offset: &noise_offset,
         time_grid: Some(&grid),
         with_uncertainty: false,
+        estimand: gam::families::survival::predict::SurvivalPredictEstimand::Plugin,
     };
 
     // The core regression: predict must NOT abort with `eta_t=0` at the grid top.

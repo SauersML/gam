@@ -698,14 +698,10 @@ mod adaptive_bounded_duchon_tests {
     }
 
     #[test]
-    fn linear_termspec_defaults_to_unpenalizedwhen_field_is_omitted() {
-        // Parametric/linear terms are unpenalized by default — mature tools
-        // (mgcv/glm/survreg/VGAM) leave parametric terms unpenalized and gam
-        // matches that, reporting the MLE rather than a ridge-shrunk estimate.
-        // See `default_linear_term_double_penalty`.
+    fn linear_termspec_defaults_to_null_recovery_when_field_is_omitted() {
         let json = r#"{"name":"x","feature_col":0}"#;
         let term: LinearTermSpec = serde_json::from_str(json).expect("deserialize linear term");
-        assert!(!term.double_penalty);
+        assert!(term.double_penalty);
         assert!(matches!(
             term.coefficient_geometry,
             LinearCoefficientGeometry::Unconstrained
@@ -713,7 +709,7 @@ mod adaptive_bounded_duchon_tests {
     }
 
     #[test]
-    fn linear_double_penalties_share_one_globalridge_block() {
+    fn linear_effects_get_distinct_function_space_penalty_blocks() {
         let data = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let spec = TermCollectionSpec {
             linear_terms: vec![
@@ -742,17 +738,36 @@ mod adaptive_bounded_duchon_tests {
             smooth_terms: vec![],
         };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
-        assert_eq!(design.penalties.len(), 1);
-        assert_eq!(design.penaltyinfo.len(), 1);
-        assert_eq!(design.penaltyinfo[0].termname.as_deref(), Some("linear"));
-        assert_eq!(design.penaltyinfo[0].penalty.effective_rank, 2);
+        assert_eq!(design.penalties.len(), 2);
+        assert_eq!(design.penaltyinfo.len(), 2);
+        assert_eq!(design.penaltyinfo[0].termname.as_deref(), Some("x1"));
+        assert_eq!(design.penaltyinfo[1].termname.as_deref(), Some("x2"));
+        assert_eq!(design.penaltyinfo[0].penalty.effective_rank, 1);
+        assert_eq!(design.penaltyinfo[1].penalty.effective_rank, 1);
         let x1 = design.linear_ranges[0].1.start;
         let x2 = design.linear_ranges[1].1.start;
-        let bp = &design.penalties[0];
-        let x1_local = x1 - bp.col_range.start;
-        let x2_local = x2 - bp.col_range.start;
-        assert_eq!(bp.local[[x1_local, x1_local]], 1.0);
-        assert_eq!(bp.local[[x2_local, x2_local]], 1.0);
+        assert_eq!(design.penalties[0].col_range, x1..(x1 + 1));
+        assert_eq!(design.penalties[1].col_range, x2..(x2 + 1));
+        assert!((design.penalties[0].local[[0, 0]] - 35.0 / 3.0).abs() < 1e-12);
+        assert!((design.penalties[1].local[[0, 0]] - 56.0 / 3.0).abs() < 1e-12);
+
+        let scale = 7.0;
+        let mut scaled_data = data.clone();
+        scaled_data
+            .column_mut(0)
+            .mapv_inplace(|value| value * scale);
+        let scaled = build_term_collection_design(scaled_data.view(), &spec)
+            .expect("rescaled linear design");
+        let original_mass = design.penalties[0].local[[0, 0]];
+        let scaled_mass = scaled.penalties[0].local[[0, 0]];
+        assert!((scaled_mass - scale * scale * original_mass).abs() < 1e-10);
+        let beta = 0.37;
+        let rescaled_beta = beta / scale;
+        assert!(
+            (beta * beta * original_mass - rescaled_beta * rescaled_beta * scaled_mass).abs()
+                < 1e-12,
+            "the physical shrinkage energy must be invariant to basis rescaling"
+        );
     }
 
     #[test]

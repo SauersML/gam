@@ -71,8 +71,11 @@
 //! `N×K` correlation matrix is never materialised (only the data-size `N×P`
 //! reconstruction the lanes already expose is formed).
 
-use crate::sparse_dict::{BlockSparseFit, SparseDictFit, block_gates, block_projections_row};
-use ndarray::ArrayView2;
+use crate::sparse_dict::{
+    BlockSparseFit, SparseDictFit, block_gates, block_projections_row,
+    reconstruct_block_sparse_rows, reconstruct_sparse_rows,
+};
+use ndarray::{ArrayView2, ArrayView3};
 use std::collections::HashSet;
 use std::f64::consts::TAU;
 
@@ -292,33 +295,55 @@ pub fn sparse_dict_dual_certificate(
     fit: &SparseDictFit,
     max_candidates: usize,
 ) -> Result<DualCertificateReport, String> {
-    let decoder = fit.decoder.view();
+    sparse_route_dual_certificate(
+        data,
+        fit.decoder.view(),
+        fit.indices.view(),
+        fit.codes.view(),
+        max_candidates,
+    )
+}
+
+/// Global-optimality dual certificate for a fixed-width sparse linear route.
+///
+/// This is the diagnostic core for callers that own a frozen dictionary and
+/// its route, but not the optimizer state that produced a [`SparseDictFit`].
+/// Keeping the route as `indices[N,s]` / `codes[N,s]` avoids both an `N×K`
+/// expansion and the invalid practice of fabricating convergence evidence just
+/// to call a fit-oriented diagnostic.
+pub fn sparse_route_dual_certificate(
+    data: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    indices: ArrayView2<'_, u32>,
+    codes: ArrayView2<'_, f32>,
+    max_candidates: usize,
+) -> Result<DualCertificateReport, String> {
     let (k, p) = decoder.dim();
     if k == 0 {
-        return Err("sparse_dict_dual_certificate: dictionary has no atoms".to_string());
+        return Err("sparse_route_dual_certificate: dictionary has no atoms".to_string());
     }
     if data.ncols() != p {
         return Err(format!(
-            "sparse_dict_dual_certificate: data has P={} columns but the decoder has P={p}",
+            "sparse_route_dual_certificate: data has P={} columns but the decoder has P={p}",
             data.ncols()
         ));
     }
     let n = data.nrows();
-    if fit.indices.nrows() != n || fit.codes.nrows() != n {
+    if indices.nrows() != n || codes.nrows() != n {
         return Err(format!(
-            "sparse_dict_dual_certificate: fit routing has {} rows but data has {n}",
-            fit.indices.nrows()
+            "sparse_route_dual_certificate: routing has {} rows but data has {n}",
+            indices.nrows()
         ));
     }
-    let s = fit.indices.ncols();
-    if fit.codes.ncols() != s {
+    let s = indices.ncols();
+    if codes.ncols() != s {
         return Err(format!(
-            "sparse_dict_dual_certificate: indices width {s} != codes width {}",
-            fit.codes.ncols()
+            "sparse_route_dual_certificate: indices width {s} != codes width {}",
+            codes.ncols()
         ));
     }
 
-    let recon = fit.reconstruct();
+    let recon = reconstruct_sparse_rows(decoder, indices, codes)?;
     let mut rows: Vec<RowCertificate> = Vec::with_capacity(n);
     let mut residual: Vec<f64> = vec![0.0; p];
     let mut active: HashSet<u32> = HashSet::new();
@@ -331,11 +356,11 @@ pub fn sparse_dict_dual_certificate(
         active.clear();
         let mut min_active_mass = f64::INFINITY;
         for j in 0..s {
-            let code = fit.codes[[i, j]] as f64;
+            let code = codes[[i, j]] as f64;
             if code == 0.0 {
                 continue;
             }
-            active.insert(fit.indices[[i, j]]);
+            active.insert(indices[[i, j]]);
             let mass = code.abs();
             if mass < min_active_mass {
                 min_active_mass = mass;
@@ -388,35 +413,92 @@ pub fn block_dual_certificate(
     fit: &BlockSparseFit,
     max_candidates: usize,
 ) -> Result<DualCertificateReport, String> {
-    let decoder = fit.decoder.view();
+    block_route_dual_certificate_scaled(
+        data,
+        fit.decoder.view(),
+        fit.blocks.view(),
+        fit.codes.view(),
+        fit.block_size,
+        fit.gamma as f64,
+        max_candidates,
+    )
+}
+
+/// Global-optimality dual certificate for a fixed-width sparse block route.
+///
+/// The route stores `blocks[N,s]` and signed within-block `codes[N,s,b]`.
+/// Presence is derived exactly as `‖code‖₂`, so a redundant gate matrix and a
+/// synthetic [`BlockSparseFit`] are unnecessary. For an external frozen route
+/// the residual dual uses the decoder-coordinate scale (`dual_scale = 1`); the
+/// fitted-object convenience [`block_dual_certificate`] supplies its learned
+/// tied-encoder scale internally.
+pub fn block_route_dual_certificate(
+    data: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    block_size: usize,
+    max_candidates: usize,
+) -> Result<DualCertificateReport, String> {
+    block_route_dual_certificate_scaled(
+        data,
+        decoder,
+        blocks,
+        codes,
+        block_size,
+        1.0,
+        max_candidates,
+    )
+}
+
+fn block_route_dual_certificate_scaled(
+    data: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    block_size: usize,
+    dual_scale: f64,
+    max_candidates: usize,
+) -> Result<DualCertificateReport, String> {
     let (k, p) = decoder.dim();
-    let b = fit.block_size;
+    let b = block_size;
     if b == 0 || k == 0 {
-        return Err("block_dual_certificate: empty dictionary or block size".to_string());
+        return Err("block_route_dual_certificate: empty dictionary or block size".to_string());
     }
     if k % b != 0 {
         return Err(format!(
-            "block_dual_certificate: decoder has K={k} rows, not a multiple of block size {b}"
+            "block_route_dual_certificate: decoder has K={k} rows, not a multiple of block size {b}"
+        ));
+    }
+    if !(dual_scale.is_finite() && dual_scale > 0.0) {
+        return Err(format!(
+            "block_route_dual_certificate: dual scale must be finite and positive, got {dual_scale}"
         ));
     }
     let n_blocks = k / b;
     if data.ncols() != p {
         return Err(format!(
-            "block_dual_certificate: data has P={} columns but the decoder has P={p}",
+            "block_route_dual_certificate: data has P={} columns but the decoder has P={p}",
             data.ncols()
         ));
     }
     let n = data.nrows();
-    if fit.blocks.nrows() != n || fit.gates.nrows() != n {
+    if blocks.nrows() != n || codes.shape()[0] != n {
         return Err(format!(
-            "block_dual_certificate: fit routing has {} rows but data has {n}",
-            fit.blocks.nrows()
+            "block_route_dual_certificate: routing has {} rows but data has {n}",
+            blocks.nrows()
         ));
     }
-    let topk = fit.blocks.ncols();
-    let gamma = fit.gamma as f64;
+    let topk = blocks.ncols();
+    if codes.shape() != [n, topk, b] {
+        return Err(format!(
+            "block_route_dual_certificate: codes shape {:?} does not match blocks {:?} and block size {b}",
+            codes.shape(),
+            blocks.dim()
+        ));
+    }
 
-    let recon = fit.reconstruct();
+    let recon = reconstruct_block_sparse_rows(decoder, blocks, codes, b)?;
     let mut rows: Vec<RowCertificate> = Vec::with_capacity(n);
     let mut residual = ndarray::Array1::<f32>::zeros(p);
     let mut active: HashSet<u32> = HashSet::new();
@@ -428,11 +510,16 @@ pub fn block_dual_certificate(
         active.clear();
         let mut min_active_gate = f64::INFINITY;
         for j in 0..topk {
-            let gate = fit.gates[[i, j]] as f64;
+            let mut gate2 = 0.0_f64;
+            for r in 0..b {
+                let code = codes[[i, j, r]] as f64;
+                gate2 += code * code;
+            }
+            let gate = gate2.sqrt();
             if gate == 0.0 {
                 continue;
             }
-            active.insert(fit.blocks[[i, j]]);
+            active.insert(blocks[[i, j]]);
             if gate < min_active_gate {
                 min_active_gate = gate;
             }
@@ -452,7 +539,7 @@ pub fn block_dual_certificate(
             if active.contains(&(g as u32)) {
                 continue;
             }
-            let gate = gamma * rg as f64;
+            let gate = dual_scale * rg as f64;
             if gate > max_off_gate {
                 max_off_gate = gate;
                 argmax_block = Some(g as u32);
@@ -475,9 +562,7 @@ pub fn block_dual_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sparse_dict::{
-        BlockSparseFit, DecoderSolveStats, ScoreRouteStats, SparseDictFit,
-    };
+    use crate::sparse_dict::{BlockSparseFit, DecoderSolveStats, ScoreRouteStats, SparseDictFit};
     use ndarray::{Array2, Array3};
 
     /// Tiny deterministic LCG so the synthetic dictionaries need no rng crate in
@@ -489,7 +574,10 @@ mod tests {
         }
         fn next_f32(&mut self) -> f32 {
             // Numerical Recipes LCG, upper bits → (−1, 1).
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let u = (self.0 >> 40) as f32 / (1u64 << 24) as f32; // [0, 1)
             2.0 * u - 1.0
         }
@@ -530,11 +618,7 @@ mod tests {
         }
     }
 
-    fn make_fit(
-        decoder: Array2<f32>,
-        indices: Array2<u32>,
-        codes: Array2<f32>,
-    ) -> SparseDictFit {
+    fn make_fit(decoder: Array2<f32>, indices: Array2<u32>, codes: Array2<f32>) -> SparseDictFit {
         let active = indices.ncols();
         SparseDictFit {
             decoder,
@@ -648,8 +732,7 @@ mod tests {
             let c0 = rng.next_f32() * 2.0 + 2.1; // bounded away from 0
             let c1 = rng.next_f32() * 2.0 - 2.1;
             for c in 0..p {
-                data[[i, c]] +=
-                    c0 * decoder[[a0 as usize, c]] + c1 * decoder[[a1 as usize, c]];
+                data[[i, c]] += c0 * decoder[[a0 as usize, c]] + c1 * decoder[[a1 as usize, c]];
             }
             let (idx, cds) = codes_on_support(data.row(i), decoder.view(), &[a0, a1], s);
             for j in 0..s {
@@ -673,7 +756,10 @@ mod tests {
         );
         // Worst-row ratio is far below the unit threshold.
         let worst = report.optimality_ratio_quantiles.last().unwrap().1;
-        assert!(worst < 1e-2, "worst ratio {worst} should be ~0 at exact recovery");
+        assert!(
+            worst < 1e-2,
+            "worst ratio {worst} should be ~0 at exact recovery"
+        );
     }
 
     #[test]
@@ -705,7 +791,10 @@ mod tests {
 
         let fit = make_fit(decoder, indices, codes);
         let report = sparse_dict_dual_certificate(data.view(), &fit, 8).unwrap();
-        assert_eq!(report.frac_certified, 0.0, "broken support must not certify");
+        assert_eq!(
+            report.frac_certified, 0.0,
+            "broken support must not certify"
+        );
         let birth = report
             .birth_candidates
             .iter()
@@ -717,7 +806,11 @@ mod tests {
             birth.2
         );
         // Its contribution (5) dwarfs the kept mass (1), so η ≈ 5.
-        assert!(birth.2 > 3.0, "expected η ≈ 5 for the dropped atom, got {}", birth.2);
+        assert!(
+            birth.2 > 3.0,
+            "expected η ≈ 5 for the dropped atom, got {}",
+            birth.2
+        );
     }
 
     #[test]
@@ -870,6 +963,10 @@ mod tests {
             .iter()
             .find(|(r, a, _)| *r == 0 && *a == 0)
             .expect("dropped block 0 must surface as a birth candidate");
-        assert!(birth.2 > 3.0, "expected η ≈ 5 for the dropped block, got {}", birth.2);
+        assert!(
+            birth.2 > 3.0,
+            "expected η ≈ 5 for the dropped block, got {}",
+            birth.2
+        );
     }
 }

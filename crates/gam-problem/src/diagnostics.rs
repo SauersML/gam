@@ -15,6 +15,7 @@
 //!    solver (PIRLS) matches what the outer gradient calculation assumes.
 
 use ndarray::Array1;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
@@ -185,6 +186,448 @@ pub struct PredictionDiagnostics {
     pub bias: f64,
     pub r_squared: Option<f64>,
     pub residuals: Vec<f64>,
+}
+
+/// Probability clipping used by the bundled classification diagnostic panel.
+/// Individual log-loss and Nagelkerke APIs accept an explicit clipping value;
+/// this named policy keeps the combined Rust/Python diagnostic contract in one
+/// core location.
+pub const DEFAULT_PROBABILITY_CLIP: f64 = 1.0e-12;
+
+/// Smallest standard deviation used by the bundled Gaussian score panel.
+pub const DEFAULT_GAUSSIAN_SCALE_FLOOR: f64 = 1.0e-12;
+
+/// Number of equal-width probability bins in the bundled expected-calibration
+/// error diagnostic.
+pub const DEFAULT_CALIBRATION_BINS: usize = 20;
+
+/// Production classification scores computed from one prediction vector.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassificationPredictionMetrics {
+    pub auc: f64,
+    pub precision_recall_auc: f64,
+    pub brier: f64,
+    pub log_loss: f64,
+    pub nagelkerke_r_squared: Option<f64>,
+    pub expected_calibration_error: f64,
+}
+
+fn validate_metric_inputs(
+    metric: &str,
+    observed: &[f64],
+    predicted_mean: &[f64],
+) -> Result<(), String> {
+    if observed.is_empty() {
+        return Err(format!("{metric} requires at least one observation"));
+    }
+    if observed.len() != predicted_mean.len() {
+        return Err(format!(
+            "{metric} length mismatch: observed={} predicted={}",
+            observed.len(),
+            predicted_mean.len()
+        ));
+    }
+    if let Some((index, value)) = observed
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "{metric}: observed[{index}] must be finite; got {value}"
+        ));
+    }
+    if let Some((index, value)) = predicted_mean
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "{metric}: predicted_mean[{index}] must be finite; got {value}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_probability_clip(metric: &str, probability_clip: f64) -> Result<(), String> {
+    if !(probability_clip.is_finite() && probability_clip > 0.0 && probability_clip < 0.5) {
+        return Err(format!(
+            "{metric}: probability_clip must be finite and in (0, 0.5); got {probability_clip}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_probability_inputs(
+    metric: &str,
+    observed: &[f64],
+    predicted_mean: &[f64],
+) -> Result<(), String> {
+    validate_metric_inputs(metric, observed, predicted_mean)?;
+    if let Some((index, value)) = observed
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value < 0.0 || *value > 1.0)
+    {
+        return Err(format!(
+            "{metric}: observed[{index}] must be in [0, 1]; got {value}"
+        ));
+    }
+    if let Some((index, value)) = predicted_mean
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value < 0.0 || *value > 1.0)
+    {
+        return Err(format!(
+            "{metric}: predicted_mean[{index}] must be in [0, 1]; got {value}"
+        ));
+    }
+    Ok(())
+}
+
+/// Tie-aware Mann-Whitney AUC. Observations greater than `0.5` are the
+/// positive class, matching the package's binomial response convention.
+pub fn auc_from_predictions(observed: &[f64], predicted_mean: &[f64]) -> Result<f64, String> {
+    weighted_auc_from_predictions(observed, predicted_mean, None)
+}
+
+/// Weighted tie-aware Mann-Whitney AUC. Each positive/negative pair carries
+/// weight `w_positive * w_negative`; `None` is exactly the unit-weight score.
+pub fn weighted_auc_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    weights: Option<&[f64]>,
+) -> Result<f64, String> {
+    validate_metric_inputs("auc", observed, predicted_mean)?;
+    if let Some(weights) = weights {
+        if weights.len() != observed.len() {
+            return Err(format!(
+                "auc length mismatch: observed={} weights={}",
+                observed.len(),
+                weights.len()
+            ));
+        }
+        if let Some((index, value)) = weights
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "auc: weights[{index}] must be finite and non-negative; got {value}"
+            ));
+        }
+    }
+
+    let weight_at = |index: usize| weights.map_or(1.0, |values| values[index]);
+    let mut pairs: Vec<(f64, bool, f64)> = observed
+        .iter()
+        .zip(predicted_mean)
+        .enumerate()
+        .map(|(index, (&y, &prediction))| (prediction, y > 0.5, weight_at(index)))
+        .collect();
+    // AUC is invariant to independent positive/negative class weight scales.
+    // Normalize twice (by class maximum, then class total) so a harmless common
+    // factor near f64::MAX cannot overflow the pair products or denominator.
+    let positive_scale = pairs
+        .iter()
+        .filter(|(_, positive, _)| *positive)
+        .map(|(_, _, weight)| weight)
+        .copied()
+        .fold(0.0_f64, f64::max);
+    let negative_scale = pairs
+        .iter()
+        .filter(|(_, positive, _)| !*positive)
+        .map(|(_, _, weight)| weight)
+        .copied()
+        .fold(0.0_f64, f64::max);
+    if positive_scale <= 0.0 || negative_scale <= 0.0 {
+        return Ok(0.5);
+    }
+    let positive_weight: f64 = pairs
+        .iter()
+        .filter(|(_, positive, _)| *positive)
+        .map(|(_, _, weight)| weight / positive_scale)
+        .sum();
+    let negative_weight: f64 = pairs
+        .iter()
+        .filter(|(_, positive, _)| !*positive)
+        .map(|(_, _, weight)| weight / negative_scale)
+        .sum();
+    pairs.sort_by(|(left, _, _), (right, _, _)| left.total_cmp(right));
+
+    let mut concordant = 0.0_f64;
+    let mut negative_weight_below = 0.0_f64;
+    let mut start = 0usize;
+    while start < pairs.len() {
+        let mut end = start + 1;
+        while end < pairs.len() && pairs[end].0 == pairs[start].0 {
+            end += 1;
+        }
+        let positive_in_group: f64 = pairs[start..end]
+            .iter()
+            .filter(|(_, positive, _)| *positive)
+            .map(|(_, _, weight)| (weight / positive_scale) / positive_weight)
+            .sum();
+        let negative_in_group: f64 = pairs[start..end]
+            .iter()
+            .filter(|(_, positive, _)| !*positive)
+            .map(|(_, _, weight)| (weight / negative_scale) / negative_weight)
+            .sum();
+        concordant += positive_in_group * negative_weight_below;
+        concordant += 0.5 * positive_in_group * negative_in_group;
+        negative_weight_below += negative_in_group;
+        start = end;
+    }
+    let auc = concordant;
+    if auc.is_finite() {
+        Ok(auc)
+    } else {
+        Err("auc: weighted pair total is not representable in f64".to_string())
+    }
+}
+
+/// Mean squared probability error.
+pub fn brier_from_predictions(observed: &[f64], predicted_mean: &[f64]) -> Result<f64, String> {
+    validate_probability_inputs("brier", observed, predicted_mean)?;
+    let diagnostics = diagnostics_from_predictions(observed, predicted_mean)?;
+    Ok(diagnostics.rmse * diagnostics.rmse)
+}
+
+/// Mean Bernoulli log loss with a caller-selected probability clip.
+pub fn binary_log_loss_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    probability_clip: f64,
+) -> Result<f64, String> {
+    validate_probability_inputs("log_loss", observed, predicted_mean)?;
+    validate_probability_clip("log_loss", probability_clip)?;
+    let loss = observed
+        .iter()
+        .zip(predicted_mean)
+        .map(|(&y, &prediction)| {
+            let probability = prediction.clamp(probability_clip, 1.0 - probability_clip);
+            -(y * probability.ln() + (1.0 - y) * (1.0 - probability).ln())
+        })
+        .sum::<f64>()
+        / observed.len() as f64;
+    if loss.is_finite() {
+        Ok(loss)
+    } else {
+        Err("log_loss: result is not representable in f64".to_string())
+    }
+}
+
+/// Nagelkerke's rescaling of Cox-Snell R² from model/null log likelihoods.
+/// Returns `None` when the null normalization is undefined.
+pub fn nagelkerke_r_squared_from_log_likelihoods(
+    model_log_likelihood: f64,
+    null_log_likelihood: f64,
+    n_observations: usize,
+) -> Option<f64> {
+    if n_observations == 0 || !model_log_likelihood.is_finite() || !null_log_likelihood.is_finite()
+    {
+        return None;
+    }
+    let scale = 2.0 / n_observations as f64;
+    let cox_snell = -(scale * (null_log_likelihood - model_log_likelihood)).exp_m1();
+    let maximum_cox_snell = -(scale * null_log_likelihood).exp_m1();
+    if cox_snell.is_finite() && maximum_cox_snell.is_finite() && maximum_cox_snell > 0.0 {
+        Some(cox_snell / maximum_cox_snell)
+    } else {
+        None
+    }
+}
+
+/// Nagelkerke R² for binomial predictions against an explicit null mean.
+pub fn nagelkerke_r_squared_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    null_mean: f64,
+    probability_clip: f64,
+) -> Result<Option<f64>, String> {
+    if observed.is_empty() {
+        return Ok(None);
+    }
+    validate_probability_inputs("nagelkerke_r_squared", observed, predicted_mean)?;
+    validate_probability_clip("nagelkerke_r_squared", probability_clip)?;
+    if !null_mean.is_finite() || null_mean <= 0.0 || null_mean >= 1.0 {
+        return Ok(None);
+    }
+
+    let log_null = null_mean.ln();
+    let log_not_null = (1.0 - null_mean).ln();
+    let null_log_likelihood = observed
+        .iter()
+        .map(|&y| y * log_null + (1.0 - y) * log_not_null)
+        .sum::<f64>();
+    let model_log_likelihood = observed
+        .iter()
+        .zip(predicted_mean)
+        .map(|(&y, &prediction)| {
+            let probability = prediction.clamp(probability_clip, 1.0 - probability_clip);
+            y * probability.ln() + (1.0 - y) * (1.0 - probability).ln()
+        })
+        .sum::<f64>();
+    Ok(nagelkerke_r_squared_from_log_likelihoods(
+        model_log_likelihood,
+        null_log_likelihood,
+        observed.len(),
+    ))
+}
+
+/// Trapezoidal area under the precision-recall curve. Equal predicted scores
+/// enter as one threshold group, so row order within a tie cannot change the
+/// score.
+pub fn precision_recall_auc_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+) -> Result<f64, String> {
+    validate_metric_inputs("precision_recall_auc", observed, predicted_mean)?;
+    let mut pairs: Vec<(f64, bool)> = observed
+        .iter()
+        .zip(predicted_mean)
+        .map(|(&y, &prediction)| (prediction, y > 0.5))
+        .collect();
+    let positives = pairs.iter().filter(|(_, positive)| *positive).count();
+    if positives == 0 {
+        return Ok(0.0);
+    }
+    pairs.sort_by(|(left, _), (right, _)| right.total_cmp(left));
+    let mut true_positives = 0usize;
+    let mut false_positives = 0usize;
+    let mut previous_precision = 1.0_f64;
+    let mut previous_recall = 0.0_f64;
+    let mut area = 0.0_f64;
+    let mut start = 0usize;
+    while start < pairs.len() {
+        let score = pairs[start].0;
+        let mut end = start;
+        while end < pairs.len() && pairs[end].0 == score {
+            if pairs[end].1 {
+                true_positives += 1;
+            } else {
+                false_positives += 1;
+            }
+            end += 1;
+        }
+        let precision = true_positives as f64 / (true_positives + false_positives) as f64;
+        let recall = true_positives as f64 / positives as f64;
+        area += 0.5 * (precision + previous_precision) * (recall - previous_recall);
+        previous_precision = precision;
+        previous_recall = recall;
+        start = end;
+    }
+    Ok(area)
+}
+
+/// Equal-width-bin expected calibration error.
+pub fn expected_calibration_error_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    n_bins: usize,
+) -> Result<f64, String> {
+    validate_probability_inputs("expected_calibration_error", observed, predicted_mean)?;
+    if n_bins == 0 {
+        return Err("expected_calibration_error requires at least one bin".to_string());
+    }
+    // Only occupied bins need storage. A dense `vec![..; n_bins]` lets an
+    // otherwise valid diagnostic request allocate independently of the data
+    // size, whereas at most `observed.len()` bins can be occupied.
+    let mut bins: BTreeMap<usize, (usize, f64, f64)> = BTreeMap::new();
+    for (&y, &prediction) in observed.iter().zip(predicted_mean) {
+        let index = ((prediction.clamp(0.0, 1.0) * n_bins as f64).floor() as usize).min(n_bins - 1);
+        let bin = bins.entry(index).or_insert((0, 0.0, 0.0));
+        bin.0 += 1;
+        bin.1 += y;
+        bin.2 += prediction;
+    }
+    let n = observed.len() as f64;
+    Ok(bins
+        .into_values()
+        .map(|(count, observed_sum, predicted_sum)| {
+            let count = count as f64;
+            (count / n) * ((observed_sum / count) - (predicted_sum / count)).abs()
+        })
+        .sum())
+}
+
+/// Gaussian negative log predictive density, allowing either one shared
+/// standard deviation or one per observation.
+pub fn gaussian_log_loss_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    sigma: &[f64],
+    sigma_floor: f64,
+) -> Result<f64, String> {
+    validate_metric_inputs("gaussian_log_loss", observed, predicted_mean)?;
+    if sigma.len() != 1 && sigma.len() != observed.len() {
+        return Err(format!(
+            "gaussian_log_loss: sigma length must be 1 or {}; got {}",
+            observed.len(),
+            sigma.len()
+        ));
+    }
+    if !(sigma_floor.is_finite() && sigma_floor > 0.0) {
+        return Err(format!(
+            "gaussian_log_loss: sigma_floor must be finite and positive; got {sigma_floor}"
+        ));
+    }
+    let shared_sigma = sigma.len() == 1;
+    let mut total = 0.0_f64;
+    for (index, (&y, &mean)) in observed.iter().zip(predicted_mean).enumerate() {
+        let raw_sigma = if shared_sigma { sigma[0] } else { sigma[index] };
+        if !raw_sigma.is_finite() || raw_sigma <= 0.0 {
+            return Err(format!(
+                "gaussian_log_loss: sigma[{}] must be finite and positive; got {raw_sigma}",
+                if shared_sigma { 0 } else { index }
+            ));
+        }
+        let sigma = raw_sigma.max(sigma_floor);
+        let standardized_residual = (y - mean) / sigma;
+        total += 0.5 * std::f64::consts::TAU.ln()
+            + sigma.ln()
+            + 0.5 * standardized_residual * standardized_residual;
+    }
+    let loss = total / observed.len() as f64;
+    if loss.is_finite() {
+        Ok(loss)
+    } else {
+        Err("gaussian_log_loss: result is not representable in f64".to_string())
+    }
+}
+
+/// The package's standard classification diagnostic panel.
+pub fn classification_metrics_from_predictions(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    null_mean: f64,
+) -> Result<ClassificationPredictionMetrics, String> {
+    validate_probability_inputs("classification_metrics", observed, predicted_mean)?;
+    Ok(ClassificationPredictionMetrics {
+        auc: auc_from_predictions(observed, predicted_mean)?,
+        precision_recall_auc: precision_recall_auc_from_predictions(observed, predicted_mean)?,
+        brier: brier_from_predictions(observed, predicted_mean)?,
+        log_loss: binary_log_loss_from_predictions(
+            observed,
+            predicted_mean,
+            DEFAULT_PROBABILITY_CLIP,
+        )?,
+        nagelkerke_r_squared: nagelkerke_r_squared_from_predictions(
+            observed,
+            predicted_mean,
+            null_mean,
+            DEFAULT_PROBABILITY_CLIP,
+        )?,
+        expected_calibration_error: expected_calibration_error_from_predictions(
+            observed,
+            predicted_mean,
+            DEFAULT_CALIBRATION_BINS,
+        )?,
+    })
 }
 
 /// Compute prediction residual diagnostics from observed values and predicted means.
@@ -617,6 +1060,127 @@ mod tests {
         assert_eq!(
             diagnostics_from_predictions(&[1.0], &[f64::INFINITY]),
             Err("predicted mean values must contain only finite numbers".to_string())
+        );
+    }
+
+    #[test]
+    fn auc_is_tie_aware_and_weighted_auc_reduces_to_unit_weights() {
+        let observed = [0.0, 1.0, 0.0, 1.0];
+        let predicted = [0.1, 0.8, 0.8, 0.9];
+        let auc = auc_from_predictions(&observed, &predicted).unwrap();
+        assert_eq!(auc, 0.875);
+        assert_eq!(
+            weighted_auc_from_predictions(&observed, &predicted, Some(&[1.0; 4])).unwrap(),
+            auc
+        );
+
+        let weighted = weighted_auc_from_predictions(
+            &[1.0, 0.0, 1.0],
+            &[0.5, 0.5, 0.9],
+            Some(&[2.0, 3.0, 1.0]),
+        )
+        .unwrap();
+        assert_eq!(weighted, 2.0 / 3.0);
+        assert!(
+            weighted_auc_from_predictions(&[0.0, 1.0], &[0.2, 0.8], Some(&[1.0, -1.0])).is_err()
+        );
+        assert_eq!(
+            weighted_auc_from_predictions(&[1.0, 0.0], &[0.5, 0.5], Some(&[f64::MAX, f64::MAX]),)
+                .unwrap(),
+            0.5
+        );
+    }
+
+    #[test]
+    fn precision_recall_auc_consumes_ties_as_one_threshold() {
+        let first = precision_recall_auc_from_predictions(&[1.0, 0.0], &[0.5, 0.5]).unwrap();
+        let reversed = precision_recall_auc_from_predictions(&[0.0, 1.0], &[0.5, 0.5]).unwrap();
+        assert_eq!(first, 0.75);
+        assert_eq!(first, reversed);
+    }
+
+    #[test]
+    fn probability_scores_match_closed_forms() {
+        let observed = [0.0, 1.0];
+        let predicted = [0.5, 0.5];
+        let log_loss =
+            binary_log_loss_from_predictions(&observed, &predicted, DEFAULT_PROBABILITY_CLIP)
+                .unwrap();
+        assert!((log_loss - std::f64::consts::LN_2).abs() < 1.0e-15);
+        assert_eq!(brier_from_predictions(&observed, &predicted).unwrap(), 0.25);
+        assert_eq!(
+            expected_calibration_error_from_predictions(&observed, &predicted, 2).unwrap(),
+            0.0
+        );
+        assert!(
+            binary_log_loss_from_predictions(&observed, &predicted, 0.5).is_err(),
+            "a clip that collapses the probability interval must be rejected"
+        );
+        assert!(classification_metrics_from_predictions(&observed, &[0.5, 2.0], 0.5).is_err());
+        assert!(classification_metrics_from_predictions(&[-0.1, 1.0], &predicted, 0.5).is_err());
+    }
+
+    #[test]
+    fn nagelkerke_and_classification_panel_share_the_core_kernels() {
+        let observed = [0.0, 0.0, 1.0, 1.0];
+        let predicted = [0.1, 0.2, 0.8, 0.9];
+        let metrics = classification_metrics_from_predictions(&observed, &predicted, 0.5).unwrap();
+        assert_eq!(metrics.auc, 1.0);
+        assert_eq!(metrics.precision_recall_auc, 1.0);
+        assert_eq!(
+            metrics.nagelkerke_r_squared,
+            nagelkerke_r_squared_from_predictions(
+                &observed,
+                &predicted,
+                0.5,
+                DEFAULT_PROBABILITY_CLIP,
+            )
+            .unwrap()
+        );
+        assert!(metrics.nagelkerke_r_squared.unwrap() > 0.8);
+        assert_eq!(
+            nagelkerke_r_squared_from_predictions(
+                &observed,
+                &predicted,
+                1.0,
+                DEFAULT_PROBABILITY_CLIP,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn gaussian_log_loss_matches_closed_form_and_rejects_invalid_sigma() {
+        let observed = [1.0, 2.0, 3.0, 4.0];
+        let predicted = observed;
+        let sigma = [1.5];
+        let got = gaussian_log_loss_from_predictions(
+            &observed,
+            &predicted,
+            &sigma,
+            DEFAULT_GAUSSIAN_SCALE_FLOOR,
+        )
+        .unwrap();
+        let expected = 0.5 * (std::f64::consts::TAU * 1.5 * 1.5).ln();
+        assert!((got - expected).abs() < 1.0e-12);
+        assert!(
+            gaussian_log_loss_from_predictions(
+                &observed,
+                &predicted,
+                &[1.0, 2.0],
+                DEFAULT_GAUSSIAN_SCALE_FLOOR,
+            )
+            .is_err()
+        );
+        assert!(
+            gaussian_log_loss_from_predictions(
+                &observed,
+                &predicted,
+                &[0.0],
+                DEFAULT_GAUSSIAN_SCALE_FLOOR,
+            )
+            .is_err()
         );
     }
 }

@@ -586,12 +586,8 @@ pub(crate) fn seed_is_oversmoothing_boundary(
 
 #[inline]
 pub(crate) fn candidate_improves_best(candidate: &OuterResult, best: Option<&OuterResult>) -> bool {
-    if !candidate.converged {
-        return false;
-    }
     match best {
         None => true,
-        Some(best) if !best.converged => true,
         Some(best) => candidate.final_value < best.final_value,
     }
 }
@@ -634,8 +630,8 @@ pub(crate) const PARSIMONY_SHARP_GRAD_REL_BAND: f64 = 1e-5;
 ///   - a **non-sharp** converged optimum sitting on the flat LAML valley, where
 ///     the parsimony tie-break ([`candidate_improves_best_parsimonious`]) would
 ///     prefer the heavier basin; or
-///   - a **non-converged** stall (#1426/#1477) whose cached cost is untrustworthy
-///     (handled by the converged guard below, never reaching this predicate).
+/// Exhausted checkpoints never reach this predicate: the runner stores them in
+/// a separate resume slot before constructing the certified winner wrapper.
 ///
 /// When slot 0 instead CONVERGED to a curvature-pinned optimum (score-relative
 /// `|g| ≤ PARSIMONY_SHARP_GRAD_REL_BAND·(1+|score|)`) whose every leading
@@ -651,14 +647,10 @@ pub(crate) const PARSIMONY_SHARP_GRAD_REL_BAND: f64 = 1e-5;
 /// redundant case, so any borderline fit this rejects simply runs slot 1 exactly
 /// as before. The waiver can only ever remove wasted work, never quality.
 #[inline]
-pub(crate) fn parsimony_second_seed_is_redundant(
-    slot0_best: &OuterResult,
-    rho_dim: usize,
-) -> bool {
-    // A non-converged slot 0 is precisely the #1426/#1477 case the heavy seed
-    // exists to rescue; never waive it. With no smoothing dimension the parsimony
-    // tie-break is a no-op, so there is nothing for the second seed to decide.
-    if !slot0_best.converged || rho_dim == 0 {
+pub(crate) fn parsimony_second_seed_is_redundant(slot0_best: &OuterResult, rho_dim: usize) -> bool {
+    // With no smoothing dimension the parsimony tie-break is a no-op, so there
+    // is nothing for the second seed to decide.
+    if rho_dim == 0 {
         return false;
     }
     // Curvature-pinned: a measured residual gradient well inside the flat-valley
@@ -699,12 +691,8 @@ pub(crate) fn candidate_improves_best_parsimonious(
     best: Option<&OuterResult>,
     rho_dim: usize,
 ) -> bool {
-    if !candidate.converged {
-        return false;
-    }
     match best {
         None => true,
-        Some(best) if !best.converged => true,
         Some(best) if rho_dim > 0 => {
             let scale = candidate
                 .final_value

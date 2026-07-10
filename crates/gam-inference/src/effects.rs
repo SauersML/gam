@@ -303,11 +303,11 @@ pub fn effect_report_from_fit(
 ///
 /// For `m x p` contrast design `C`, coefficient vector `beta`, and covariance
 /// `V`, the report center is `C beta` and its covariance is `C V C'`.
-/// Simultaneous bands calibrate `max_i |Z_i|` for the standardized Gaussian
-/// curve.  The coefficient covariance is projected first; symmetric
-/// eigendecomposition is applied only to the resulting `m x m` curve covariance,
-/// so positive-semidefinite singular matrices are supported without a ridge or
-/// a cubic factorization in coefficient dimension.
+/// Pointwise bands compute only the diagonal of that covariance, with O(p)
+/// working memory. Simultaneous bands calibrate `max_i |Z_i|` for the
+/// standardized Gaussian curve and factor whichever covariance space is
+/// smaller: coefficient space when `p <= m`, projected curve space otherwise.
+/// Positive-semidefinite singular matrices are supported without a ridge.
 pub fn effect_report(
     beta: ArrayView1<'_, f64>,
     covariance: ArrayView2<'_, f64>,
@@ -318,32 +318,25 @@ pub fn effect_report(
 
     let covariance = validated_symmetric_matrix(covariance)?;
     let center = contrast_design.dot(&beta);
-    let mut curve_covariance = contrast_design
-        .dot(&covariance)
-        .dot(&contrast_design.t());
-    if curve_covariance.iter().any(|value| !value.is_finite()) {
-        return Err(EffectError::NonFiniteInput {
-            input: "projected curve covariance",
-        });
-    }
-    symmetrize_in_place(&mut curve_covariance);
-    let curve_eigen =
-        psd_eigendecomposition(curve_covariance.view(), "projected curve covariance")?;
-    let curve_factor = covariance_factor(&curve_eigen);
-    let se = factor_standard_errors(&curve_factor);
-
-    let critical = match options {
+    let (se, critical) = match options {
         BandOptions::Pointwise(pointwise) => {
-            standard_normal_quantile(0.5 * (1.0 + pointwise.level))
-                .map_err(|detail| EffectError::NormalQuantile { detail })?
+            let se = pointwise_standard_errors(contrast_design, covariance.view())?;
+            let critical = standard_normal_quantile(0.5 * (1.0 + pointwise.level))
+                .map_err(|detail| EffectError::NormalQuantile { detail })?;
+            (se, critical)
         }
-        BandOptions::Simultaneous(simultaneous) => simultaneous_critical(
-            &curve_factor,
-            se.view(),
-            simultaneous.level,
-            simultaneous.simulations,
-            simultaneous.seed,
-        ),
+        BandOptions::Simultaneous(simultaneous) => {
+            let curve_factor = simultaneous_curve_factor(contrast_design, covariance.view())?;
+            let se = factor_standard_errors(&curve_factor);
+            let critical = simultaneous_critical(
+                &curve_factor,
+                se.view(),
+                simultaneous.level,
+                simultaneous.simulations,
+                simultaneous.seed,
+            );
+            (se, critical)
+        }
     };
 
     let half_width = se.mapv(|value| critical * value);
@@ -356,6 +349,71 @@ pub fn effect_report(
         upper,
         critical,
     })
+}
+
+fn pointwise_standard_errors(
+    contrast_design: ArrayView2<'_, f64>,
+    covariance: ArrayView2<'_, f64>,
+) -> Result<Array1<f64>, EffectError> {
+    let p = covariance.nrows();
+    let mut se = Array1::<f64>::zeros(contrast_design.nrows());
+    let mut product = vec![0.0_f64; p];
+    for (row_index, row) in contrast_design.rows().into_iter().enumerate() {
+        product.fill(0.0);
+        for covariance_row in 0..p {
+            for column in 0..p {
+                product[covariance_row] += covariance[[covariance_row, column]] * row[column];
+            }
+        }
+        let variance = row
+            .iter()
+            .zip(&product)
+            .map(|(&loading, &projected)| loading * projected)
+            .sum::<f64>();
+        let scale = row
+            .iter()
+            .zip(&product)
+            .map(|(&loading, &projected)| (loading * projected).abs())
+            .sum::<f64>();
+        let tolerance = roundoff_tolerance(scale, p);
+        if variance < -tolerance {
+            return Err(EffectError::IndefiniteCovariance {
+                matrix: "projected curve covariance",
+                minimum_eigenvalue: variance,
+                tolerance,
+            });
+        }
+        se[row_index] = variance.max(0.0).sqrt();
+    }
+    Ok(se)
+}
+
+fn simultaneous_curve_factor(
+    contrast_design: ArrayView2<'_, f64>,
+    covariance: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, EffectError> {
+    if covariance.nrows() <= contrast_design.nrows() {
+        let coefficient_eigen = psd_eigendecomposition(covariance, "coefficient covariance")?;
+        let coefficient_factor = covariance_factor(&coefficient_eigen);
+        let factor = contrast_design.dot(&coefficient_factor);
+        if factor.iter().any(|value| !value.is_finite()) {
+            return Err(EffectError::NonFiniteInput {
+                input: "projected curve factor",
+            });
+        }
+        return Ok(factor);
+    }
+
+    let mut curve_covariance = contrast_design.dot(&covariance).dot(&contrast_design.t());
+    if curve_covariance.iter().any(|value| !value.is_finite()) {
+        return Err(EffectError::NonFiniteInput {
+            input: "projected curve covariance",
+        });
+    }
+    symmetrize_in_place(&mut curve_covariance);
+    let curve_eigen =
+        psd_eigendecomposition(curve_covariance.view(), "projected curve covariance")?;
+    Ok(covariance_factor(&curve_eigen))
 }
 
 fn validate_inputs(
@@ -418,9 +476,7 @@ struct PsdEigen {
     active: Vec<(usize, f64)>,
 }
 
-fn validated_symmetric_matrix(
-    matrix: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, EffectError> {
+fn validated_symmetric_matrix(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, EffectError> {
     let n = matrix.nrows();
     let scale = matrix
         .iter()
@@ -499,8 +555,7 @@ fn covariance_factor(eigen: &PsdEigen) -> Array2<f64> {
     let mut factor = Array2::zeros((eigen.vectors.nrows(), eigen.active.len()));
     for (active_column, &(eigen_column, eigenvalue_sqrt)) in eigen.active.iter().enumerate() {
         for row in 0..eigen.vectors.nrows() {
-            factor[[row, active_column]] =
-                eigen.vectors[[row, eigen_column]] * eigenvalue_sqrt;
+            factor[[row, active_column]] = eigen.vectors[[row, eigen_column]] * eigenvalue_sqrt;
         }
     }
     factor

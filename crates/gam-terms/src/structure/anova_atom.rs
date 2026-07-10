@@ -94,6 +94,7 @@ use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };
 use gam_linalg::faer_ndarray::FaerEigh;
+use gam_math::score_opt::AffineRemlProfile;
 
 /// Interaction energy fraction at or below which the interaction block is
 /// energetically negligible and lossless fission is on the table. The bar is
@@ -278,16 +279,6 @@ pub enum FissionDecision {
     Keep,
 }
 
-/// Width of the deterministic log-λ grid the REML profile is scanned on
-/// before golden-section refinement. 121 points over 18 decades resolves
-/// the criterion's single basin to ~0.15 decades before refinement; the
-/// refinement then closes to machine-level. Fixed (no adaptivity) so the
-/// fit is a pure function of its inputs.
-const REML_LAMBDA_GRID: usize = 121;
-/// Golden-section refinement iterations after the grid scan (~1e-9
-/// relative bracket width — far past where the criterion is flat).
-const REML_GOLDEN_ITERS: usize = 60;
-
 /// A penalized tensor-surface fit over the code sample: the producer of
 /// [`CarveInput`]s for BOTH binding notions (#993 items 1–2).
 ///
@@ -412,7 +403,28 @@ pub fn fit_tensor_surface(
     let (evals, evecs) = xtx
         .eigh(faer::Side::Lower)
         .map_err(|e| format!("fit_tensor_surface: design eigendecomposition failed: {e:?}"))?;
-    let d_max = evals.iter().cloned().fold(0.0f64, f64::max);
+    let spectral_radius = evals
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if !spectral_radius.is_finite() {
+        return Err("fit_tensor_surface: design eigendecomposition is non-finite".to_string());
+    }
+    // XᵀX is positive semidefinite.  Permit projection to the PSD cone only
+    // inside the eigensolver's dimension-scaled backward-error band; a mode
+    // below that band is evidence of invalid arithmetic, not a zero mode.
+    let spectral_roundoff = f64::EPSILON * mm as f64 * spectral_radius;
+    let mut gram_modes = Vec::with_capacity(mm);
+    for (index, &value) in evals.iter().enumerate() {
+        if value < -spectral_roundoff {
+            return Err(format!(
+                "fit_tensor_surface: Gram eigenvalue {index} is {value}, below the PSD \
+                 roundoff band -{spectral_roundoff}"
+            ));
+        }
+        gram_modes.push(value.max(0.0));
+    }
+    let d_max = gram_modes.iter().copied().fold(0.0f64, f64::max);
     if !(d_max > 0.0) {
         return Err("fit_tensor_surface: design is identically zero".to_string());
     }
@@ -420,73 +432,90 @@ pub fn fit_tensor_surface(
     let yty: Vec<f64> = (0..d_dims)
         .map(|d| responses.column(d).dot(&responses.column(d)))
         .collect();
-
-    // Pooled Gaussian REML criterion in the eigenbasis, σ² profiled per
-    // dimension: V(λ) = Σ_d n·log PRSS_d(λ) + D·[Σᵢ log(dᵢ+λ) − M·log λ],
-    // with PRSS_d = yᵀy − Σᵢ bᵢ²/(dᵢ+λ). Exact and O(M·D) per evaluation.
-    let criterion = |lambda: f64| -> f64 {
-        let mut v = 0.0f64;
-        for d in 0..d_dims {
-            let mut prss = yty[d];
-            for i in 0..mm {
-                prss -= b[[i, d]] * b[[i, d]] / (evals[i].max(0.0) + lambda);
-            }
-            v += (n as f64) * prss.max(f64::MIN_POSITIVE).ln();
+    let mut null_score = 0.0_f64;
+    for (output, &energy) in yty.iter().enumerate() {
+        if !(energy.is_finite() && energy > 0.0) {
+            return Err(format!(
+                "fit_tensor_surface: response {output} has non-positive energy {energy}; \
+                 its profiled Gaussian scale has no finite REML optimum"
+            ));
         }
-        let mut logdet = 0.0f64;
+        null_score += energy.ln() - (n as f64).ln();
+    }
+    null_score *= -0.5 * n as f64;
+
+    // Pooled Gaussian REML in the eigensystem.  For h_i(λ) = d_i + λ,
+    // the profiled score is
+    //
+    //   -1/2 { n Σ_d log(PRSS_d/n)
+    //          + D [Σ_i log h_i - M log λ] },
+    //   PRSS_d = y_dᵀy_d - Σ_i b_id²/h_i.
+    //
+    // `AffineRemlProfile` evaluates this expression together with its exact
+    // first two log-λ derivatives and rigorous derivative enclosures.  The
+    // global search can therefore discard an interval only after proving that
+    // it contains no stationary point; every isolated stationary point and
+    // both finite boundaries participate in the final comparison.
+    // Normalize the pencil by its largest Gram eigenvalue.  This is an exact
+    // change of smoothing-parameter coordinates, λ = d_max·exp(ρ): every
+    // `log(d_i + λ) - log(λ)` contribution is invariant, while exponentiating
+    // ρ cannot underflow merely because the input basis carries extreme units.
+    let profile_gram_modes: Vec<f64> = gram_modes.iter().map(|&value| value / d_max).collect();
+    let penalty_modes = vec![1.0; mm];
+    let rhs_scale = d_max.sqrt();
+    let mut projected_rhs_squared = Vec::with_capacity(mm * d_dims);
+    for d in 0..d_dims {
         for i in 0..mm {
-            logdet += (evals[i].max(0.0) + lambda).ln();
+            let normalized_rhs = b[[i, d]] / rhs_scale;
+            projected_rhs_squared.push(normalized_rhs * normalized_rhs);
         }
-        v + (d_dims as f64) * (logdet - (mm as f64) * lambda.ln())
-    };
+    }
+    let profile = AffineRemlProfile::new(
+        &profile_gram_modes,
+        &penalty_modes,
+        &projected_rhs_squared,
+        &yty,
+        n as f64,
+        mm,
+        0.0,
+    )
+    .map_err(|error| format!("fit_tensor_surface: invalid REML profile: {error}"))?;
 
-    // Deterministic grid scan over 18 decades anchored at the design's
-    // spectral scale, then golden-section refinement in the best bracket.
-    let lo = d_max * 1e-9;
-    let hi = d_max * 1e9;
-    let mut best_idx = 0usize;
-    let mut best_val = f64::INFINITY;
-    let grid: Vec<f64> = (0..REML_LAMBDA_GRID)
-        .map(|i| {
-            let t = i as f64 / (REML_LAMBDA_GRID - 1) as f64;
-            lo * (hi / lo).powf(t)
-        })
-        .collect();
-    for (i, &lam) in grid.iter().enumerate() {
-        let v = criterion(lam);
-        if v < best_val {
-            best_val = v;
-            best_idx = i;
-        }
-    }
-    let mut a_log = grid[best_idx.saturating_sub(1)].ln();
-    let mut c_log = grid[(best_idx + 1).min(REML_LAMBDA_GRID - 1)].ln();
-    let phi = (5.0f64.sqrt() - 1.0) / 2.0;
-    let mut x1 = c_log - phi * (c_log - a_log);
-    let mut x2 = a_log + phi * (c_log - a_log);
-    let mut f1 = criterion(x1.exp());
-    let mut f2 = criterion(x2.exp());
-    for _ in 0..REML_GOLDEN_ITERS {
-        if f1 <= f2 {
-            c_log = x2;
-            x2 = x1;
-            f2 = f1;
-            x1 = c_log - phi * (c_log - a_log);
-            f1 = criterion(x1.exp());
-        } else {
-            a_log = x1;
-            x1 = x2;
-            f1 = f2;
-            x2 = a_log + phi * (c_log - a_log);
-            f2 = criterion(x2.exp());
-        }
-    }
-    let lambda = (0.5 * (a_log + c_log)).exp();
+    // Cover every spectral transition without a user- or lattice-resolution
+    // knob. At the lower bound λ/d_min = sqrt(machine epsilon), so every
+    // positive Gram mode is numerically at its λ→0 limit; at the upper
+    // bound d_max/λ has the same relation and every mode is at its null-fit
+    // limit. The true λ=∞ null is compared analytically below instead of
+    // being approximated by that finite upper bound.
+    let d_min_relative = profile_gram_modes
+        .iter()
+        .copied()
+        .filter(|&value| value > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let relative_resolution = f64::EPSILON.sqrt();
+    let log_relative_resolution = relative_resolution.ln();
+    let log_lambda_lo = (d_min_relative.ln() + log_relative_resolution).max(f64::MIN_POSITIVE.ln());
+    let log_lambda_hi = -log_relative_resolution;
+    let search = profile
+        .maximize(log_lambda_lo, log_lambda_hi, relative_resolution)
+        .map_err(|error| {
+            format!("fit_tensor_surface: REML stationary isolation failed: {error}")
+        })?;
+
+    // Exact full-shrinkage boundary. As λ→∞ the determinant correction
+    // is identically zero and PRSS_d→y_dᵀy_d. Choosing infinity is safe for
+    // the algebra below (coefficients, EDF, and covariance all become zero) and
+    // makes null recovery exact rather than a large-finite-λ approximation.
+    let lambda = if null_score >= search.optimum.value {
+        f64::INFINITY
+    } else {
+        d_max * search.optimum.x.exp()
+    };
 
     // Coefficients, EDF, residuals, covariances at the selected λ.
     let mut edf = 0.0f64;
     for i in 0..mm {
-        let d_i = evals[i].max(0.0);
+        let d_i = gram_modes[i];
         edf += d_i / (d_i + lambda);
     }
     let residual_df = n as f64 - edf;
@@ -499,7 +528,7 @@ pub fn fit_tensor_surface(
     // β̂ in the eigenbasis, then rotate back: beta = V (Λ+λ)⁻¹ b.
     let mut beta_rot = Array2::<f64>::zeros((mm, d_dims));
     for i in 0..mm {
-        let denom = evals[i].max(0.0) + lambda;
+        let denom = gram_modes[i] + lambda;
         for d in 0..d_dims {
             beta_rot[[i, d]] = b[[i, d]] / denom;
         }
@@ -521,7 +550,7 @@ pub fn fit_tensor_surface(
     // Scale-free V (Λ+λ)⁻¹ Vᵀ.
     let mut scaled_evecs = evecs.clone();
     for i in 0..mm {
-        let denom = evals[i].max(0.0) + lambda;
+        let denom = gram_modes[i] + lambda;
         for row in 0..mm {
             scaled_evecs[[row, i]] = evecs[[row, i]] / denom;
         }

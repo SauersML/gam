@@ -39,9 +39,7 @@
 //! plumbing, and DtoH re-pack stay device-shaped so the eventual general
 //! body lands behind the same call boundary.
 
-use crate::cubic_cell_kernel::{
-    DenestedCubicCell, DenestedPartitionCell, LocalSpanCubic,
-};
+use crate::cubic_cell_kernel::{DenestedCubicCell, DenestedPartitionCell, LocalSpanCubic};
 use gam_gpu::gpu_error::GpuError;
 
 /// CUDA C++ kernel source strings for the two NVRTC kernels.  Both bodies are
@@ -353,11 +351,11 @@ pub fn trivial_partition_cell(a: f64, b: f64, scale: f64) -> DenestedPartitionCe
 mod device_dispatch {
     use super::kernel_src::DENESTED_PARTITION_CELLS_KERNEL_SRC;
     use super::{PartitionCellsOutput, PartitionCellsRowInputs, trivial_partition_cell};
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
     use gam_gpu::device_cache::PtxModuleCache;
     use gam_gpu::gpu_err as gam_gpu_err;
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use gam_gpu::solver::context_and_stream;
-    use cudarc::driver::{LaunchConfig, PushKernelArg};
 
     static PARTITION_PTX_CACHE: PtxModuleCache = PtxModuleCache::new();
 

@@ -136,47 +136,132 @@ class _StubModule:
         self.threshold = float(threshold)
         return (0.0, 0.0)
 
+    def sae_canonical_assignment_kind(self, assignment):
+        return _CANONICAL_ASSIGNMENT(assignment)
 
-def _make_fit(kind: str, n_atoms: int = 4) -> sae.ManifoldSAE:
-    """Build a minimal ManifoldSAE with a known canonical kind, no Rust fit."""
+
+_MANIFOLD_SAE_CORE = sae.rust_module().ManifoldSaeCore
+_TOPOLOGY_FOR_BASIS = sae.rust_module().sae_topology_for_basis
+_CANONICAL_ASSIGNMENT = sae.rust_module().sae_canonical_assignment_kind
+
+
+def _make_fit(
+    kind: str,
+    n_atoms: int = 4,
+    *,
+    assignments: np.ndarray | None = None,
+    diagnostics: dict[str, object] | None = None,
+    basis_kinds: list[str] | None = None,
+    decoder_blocks: list[np.ndarray] | None = None,
+    functional_evidence: list[dict[str, object] | None] | None = None,
+    topology_persistence: dict[str, object] | None = None,
+) -> sae.ManifoldSAE:
+    """Build a real Rust-owned model handle without running a fit."""
+    kinds = ["euclidean"] * n_atoms if basis_kinds is None else list(basis_kinds)
+    if len(kinds) != n_atoms:
+        raise ValueError("basis_kinds length must equal n_atoms")
+    blocks = (
+        [np.zeros((1, 1), dtype=float) for _ in range(n_atoms)]
+        if decoder_blocks is None
+        else [np.asarray(block, dtype=float) for block in decoder_blocks]
+    )
+    if len(blocks) != n_atoms:
+        raise ValueError("decoder_blocks length must equal n_atoms")
+    n_rows = 1 if assignments is None else int(np.asarray(assignments).shape[0])
+    p_out = 1 if not blocks else int(blocks[0].shape[1])
+    assignment_values = (
+        np.zeros((n_rows, n_atoms), dtype=float)
+        if assignments is None
+        else np.asarray(assignments, dtype=float)
+    )
+    if assignment_values.shape != (n_rows, n_atoms):
+        raise ValueError("assignments must be (n_rows, n_atoms)")
+    dims = [1] * n_atoms
+    coords = [np.zeros((n_rows, 1), dtype=float) for _ in range(n_atoms)]
+    evidence = [None] * n_atoms if functional_evidence is None else functional_evidence
     atoms = [
-        sae.SaeManifoldAtomFit(
-            basis="periodic",
-            decoder_coefficients=np.zeros((1, 1)),
-            assignments=np.zeros((1,)),
-            coords=np.zeros((1, 1)),
-            evidence=0.0,
-            active_dim=1,
-        )
-        for _ in range(n_atoms)
+        {
+            "basis": kinds[k],
+            "decoder_coefficients": blocks[k].tolist(),
+            "assignments": assignment_values[:, k].tolist(),
+            "coords": coords[k].tolist(),
+            "coords_u_arc": None,
+            "evidence": 0.0,
+            "active_dim": 1,
+            "decoder_covariance_channel_factors": None,
+            "shape_band_coords": None,
+            "shape_band_mean": None,
+            "shape_band_sd": None,
+            "functional_evidence": evidence[k],
+        }
+        for k in range(n_atoms)
     ]
-    diagnostics = _diagnostics(n_atoms)
-    return sae.ManifoldSAE(
-        atoms=atoms,
-        atom_topology="circle",
-        atom_topologies=["circle"] * n_atoms,
-        assignment=kind,
-        assignment_label=kind,
-        primitive_names=[],
-        fitted=np.zeros((1, 1)),
-        assignments=np.zeros((1, n_atoms)),
-        coords=[np.zeros((1, 1)) for _ in range(n_atoms)],
-        decoder_blocks=[np.zeros((1, 1)) for _ in range(n_atoms)],
-        basis_specs=["periodic"] * n_atoms,
-        penalized_loss_score=0.0,
-        reconstruction_r2=0.0,
-        training_mean=np.zeros(1),
-        training_data=np.zeros((1, 1)),
-        low_level=sae.SaeManifoldFitResult(
-            atoms, n_atoms, {}, {}, np.zeros((1, 1)), np.zeros((1, n_atoms)), [], 0.0
+    topologies = [str(_TOPOLOGY_FOR_BASIS(name)) for name in kinds]
+    payload = {
+        "schema": "gamfit.ManifoldSAE/v1",
+        "atom_topology": topologies[0] if topologies and len(set(topologies)) == 1 else "mixed",
+        "atom_topologies": topologies,
+        "assignment": kind,
+        "assignment_label": kind,
+        "alpha": 1.0,
+        "learnable_alpha": False,
+        "tau": 0.5,
+        "sparsity_strength": 1.0,
+        "smoothness": 1.0,
+        "learning_rate": 1.0,
+        "max_iter": 1,
+        "random_state": 0,
+        "top_k": None,
+        "jumprelu_threshold": 0.0,
+        "oos_projection_top1": False,
+        "dispersion": 1.0,
+        "penalized_loss_score": 0.0,
+        "reml_score": 0.0,
+        "reconstruction_r2": 0.0,
+        "primitive_names": [],
+        "basis_specs": kinds,
+        "basis_kinds": kinds,
+        "atom_dims": dims,
+        "basis_sizes": [int(block.shape[0]) for block in blocks],
+        "n_harmonics": [0] * n_atoms,
+        "training_mean": [0.0] * p_out,
+        "training_data": None,
+        "training_data_retained": False,
+        "fitted": np.zeros((n_rows, p_out), dtype=float).tolist(),
+        "assignments": assignment_values.tolist(),
+        "logits": np.zeros((n_rows, n_atoms), dtype=float).tolist(),
+        "coords": [coord.tolist() for coord in coords],
+        "decoder_blocks": [block.tolist() for block in blocks],
+        "duchon_centers": [None] * n_atoms,
+        "atoms": atoms,
+        "diagnostics": sae._json_ready(
+            _diagnostics(n_atoms) if diagnostics is None else diagnostics
         ),
-        low_level_logits=np.zeros((1, n_atoms)),
-        diagnostics=diagnostics,
-        _basis_kinds=["periodic"] * n_atoms,
-        _atom_dims=[1] * n_atoms,
-        _basis_sizes=[1] * n_atoms,
-        _n_harmonics=[0] * n_atoms,
-        _duchon_centers=[None] * n_atoms,
+        "top_k_projection": None,
+        "pre_topk": None,
+        "solver_plan": None,
+        "atom_two_lens": None,
+        "residual_gauge": None,
+        "incoherence_report": None,
+        "curvature_report": None,
+        "coordinate_fidelity": None,
+        "topology_persistence": topology_persistence,
+        "atom_inference": None,
+        "certificates": None,
+        "structure_certificate": None,
+        "cotrain": None,
+        "hybrid_split": None,
+        "fisher_factors": None,
+        "fisher_provenance": None,
+        "metric_provenance": "Euclidean",
+        "fisher_mass_residual": None,
+        "selected_log_lambda_sparse": 0.0,
+        "selected_log_lambda_smooth": [0.0] * n_atoms,
+        "selected_log_ard": [[] for _ in range(n_atoms)],
+    }
+    return sae.ManifoldSAE(
+        _MANIFOLD_SAE_CORE(payload),
+        training_data=np.zeros((n_rows, p_out), dtype=float),
     )
 
 
@@ -225,9 +310,8 @@ class _FakeRustModule:
         by the `_periodic_shape_band` round-trip. For any other manifold kind
         (e.g. ``sphere`` in the mixed-topology fit) a generic affine design
         ``[1, t_1, ..., t_d]`` (width 1+d) plus its identity jet is returned; the
-        `_atom_functional_evidence` reader gracefully skips an atom whose basis
-        width does not match its decoder, so an exact analytic basis is not
-        required to keep the surface contract deterministic.
+        exact analytic basis is not required to keep this fake fit's surface
+        contract deterministic.
         """
         coords = np.asarray(coords, dtype=float)
         if str(kind) == "periodic":
@@ -327,6 +411,9 @@ def test_oos_payload_threads_trained_basis_sizes(monkeypatch):
         def __init__(self):
             self.basis_sizes = None
 
+        def sae_canonical_assignment_kind(self, assignment):
+            return _CANONICAL_ASSIGNMENT(assignment)
+
         def sae_manifold_predict_oos(self, *args, **kwargs):
             x_new = np.asarray(args[0], dtype=float)
             decoder_blocks = args[3]
@@ -338,18 +425,14 @@ def test_oos_payload_threads_trained_basis_sizes(monkeypatch):
                 "fitted": np.zeros((x_new.shape[0], decoder_blocks[0].shape[1]), dtype=float),
             }
 
+    fit = _make_fit(
+        "softmax",
+        n_atoms=1,
+        basis_kinds=["euclidean"],
+        decoder_blocks=[np.zeros((1, 2), dtype=float)],
+    )
     fake = _OosFake()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
-    fit = _make_fit("softmax", n_atoms=1)
-    fit._basis_kinds = ["euclidean"]
-    fit._atom_dims = [1]
-    fit._basis_sizes = [1]
-    fit._n_harmonics = [0]
-    fit._duchon_centers = [np.zeros((1, 1), dtype=float)]
-    fit.decoder_blocks = [np.zeros((1, 2), dtype=float)]
-    fit.training_data = np.zeros((1, 2), dtype=float)
-    fit.fitted = np.zeros((1, 2), dtype=float)
-    fit._oos_projection_top1 = False
 
     reconstructed = fit.reconstruct(np.ones((2, 2), dtype=float))
 
@@ -375,6 +458,24 @@ def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
 
     stagewise_signature = inspect.signature(sae.sae_manifold_fit_stagewise)
     assert stagewise_signature.parameters["assignment"].default == "softmax"
+
+
+def test_research_fit_returns_each_explicit_model_handle(monkeypatch):
+    first_model = object()
+    second_model = object()
+    fitted = iter((first_model, second_model))
+
+    def fake_fit(_x, **_config):
+        return next(fitted)
+
+    monkeypatch.setattr(sae, "sae_manifold_fit", fake_fit)
+    first = sae.fit(np.zeros((3, 1)), {"K": 1})
+    second = sae.fit(np.ones((3, 1)), {"K": 1})
+
+    assert first is first_model
+    assert second is second_model
+    assert not hasattr(sae, "_LAST_RESEARCH_LOOP_MODEL")
+    assert not hasattr(sae, "featurize")
 
 
 def test_trust_diagnostics_normalize_and_round_trip():
@@ -440,9 +541,7 @@ def test_small_sae_fit_trust_diagnostics_round_trip_new_schema():
 
 
 def test_research_trust_scores_are_assignment_weighted():
-    fit = _make_fit("softmax", n_atoms=2)
-    fit.training_data = np.zeros((3, 1))
-    fit.assignments = np.asarray(
+    assignments = np.asarray(
         [
             [1.0, 0.0],
             [0.0, 1.0],
@@ -450,7 +549,12 @@ def test_research_trust_scores_are_assignment_weighted():
         ],
         dtype=float,
     )
-    fit.diagnostics = _diagnostics(2, trust=[0.2, 0.8])
+    fit = _make_fit(
+        "softmax",
+        n_atoms=2,
+        assignments=assignments,
+        diagnostics=_diagnostics(2, trust=[0.2, 0.8]),
+    )
 
     trust = fit.trust_scores()
     np.testing.assert_allclose(trust["atom"], [0.2, 0.8])
@@ -481,16 +585,12 @@ def test_summary_canonical_kind_for_ibp_map_label(monkeypatch):
     """The canonical ibp_map label drives the responsibility-mass threshold."""
     stub = _StubModule()
     monkeypatch.setattr(sae, "rust_module", lambda: stub)
-    # Even if the stored label is the raw alias, the canonical field governs.
     fit = _make_fit("ibp_map", n_atoms=4)
-    fit.assignment_label = "ibp_map"
     fit.summary()
     assert stub.threshold == pytest.approx(1.0e-8)
 
 
-def test_summary_and_roundtrip_surface_atom_functional_evidence(monkeypatch):
-    stub = _StubModule()
-    monkeypatch.setattr(sae, "rust_module", lambda: stub)
+def test_summary_and_roundtrip_surface_atom_functional_evidence():
     evidence = {
         "source": "riesz",
         "marginal_slope": {"estimate": [0.5], "se": [0.1], "norm": 0.5},
@@ -503,8 +603,7 @@ def test_summary_and_roundtrip_surface_atom_functional_evidence(monkeypatch):
             "to_coord": [1.0],
         },
     }
-    fit = _make_fit("softmax", n_atoms=1)
-    fit.atoms[0].functional_evidence = evidence
+    fit = _make_fit("softmax", n_atoms=1, functional_evidence=[evidence])
 
     summary = fit.summary()
     assert summary["atom_functionals"] == [evidence]
@@ -517,8 +616,7 @@ def test_summary_and_roundtrip_surface_atom_functional_evidence(monkeypatch):
 
 
 def test_topology_persistence_report_surfaces_covering_side():
-    fit = _make_fit("softmax", n_atoms=1)
-    fit.topology_persistence = {
+    persistence = {
         "atoms": [
             {
                 "atom": 0,
@@ -534,6 +632,7 @@ def test_topology_persistence_report_surfaces_covering_side():
             }
         ]
     }
+    fit = _make_fit("softmax", n_atoms=1, topology_persistence=persistence)
 
     row = fit.topology_persistence_report()[0]
     assert row["covering_side"] == "at_or_above_covering_number"
@@ -555,7 +654,9 @@ def test_mixed_topology_reports_mixed():
 
 
 def test_per_atom_topologies_preserved():
-    per_atom = sae._topologies_for_bases(["periodic", "sphere", "duchon"])
+    _scalar, per_atom = sae.rust_module().sae_atom_topologies(
+        ["periodic", "sphere", "duchon"]
+    )
     assert per_atom == ["circle", "sphere", "euclidean"]
 
 

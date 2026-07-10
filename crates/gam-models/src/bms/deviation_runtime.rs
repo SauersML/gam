@@ -1,8 +1,8 @@
-use gam_terms::basis::create_ispline_derivative_dense;
-use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
 use crate::cubic_cell_kernel as exact_kernel;
-use gam_solve::pirls::LinearInequalityConstraints;
 use crate::util::span::span_index_for_breakpoints;
+use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
+use gam_solve::pirls::LinearInequalityConstraints;
+use gam_terms::basis::create_ispline_derivative_dense;
 use ndarray::{Array1, Array2, ArrayView2};
 
 /// Require a breakpoint sequence suitable for BMS span lookup: finite,
@@ -299,7 +299,8 @@ pub(crate) fn smoothness_nullspace_orthogonal_complement(
     let evals = eigenvalues
         .as_slice()
         .ok_or_else(|| "raw smoothness penalty eigenvalues are not contiguous".to_string())?;
-    let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals);
+    let threshold =
+        gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals);
     let kept: Vec<usize> = evals
         .iter()
         .enumerate()

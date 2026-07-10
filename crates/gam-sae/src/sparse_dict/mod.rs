@@ -36,6 +36,7 @@ mod coordinate;
 mod scoring;
 #[cfg(target_os = "linux")]
 mod scoring_gpu;
+mod split_lr_fdr;
 mod stream;
 mod update;
 
@@ -51,7 +52,7 @@ pub use block::{
 };
 pub use block_chart::{
     BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest,
-    BlockSeedManifestConfig, BlockSeedRecord, ChartEvidence, MdlFeaturizerRow,
+    BlockSeedManifestConfig, BlockSeedRecord, CHART_FDR_ALPHA, ChartEvidence, MdlFeaturizerRow,
     block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest,
     compose_block_coordinate_charts,
 };
@@ -64,15 +65,16 @@ pub use block_stream::{
     BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
 };
 pub use codes::SparseCode;
-pub use cofit::{
-    CofitConfig, CofitReport, CofitRound, cofit_block_and_curved,
+pub use split_lr_fdr::{
+    FdrCertificate, crossfit_ui_log_evalue, family_fdr_certificate, shell_vs_ring_log_evalue,
 };
+pub use cofit::{CofitConfig, CofitReport, CofitRound, cofit_block_and_curved};
 pub use coordinate::{
     BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate,
     MeasureValuedCode, block_firing_coordinates, block_measure_valued_codes,
-    explained_variance_from_reconstruction, harmonic_firing_coordinates,
-    harmonic_measure_coordinates, recover_measure_from_code, reconstruct_measure_valued_rows,
-    reconstruct_single_coordinate_rows,
+    block_route_firing_coordinates, explained_variance_from_reconstruction,
+    harmonic_firing_coordinates, harmonic_measure_coordinates, harmonic_route_firing_coordinates,
+    reconstruct_measure_valued_rows, reconstruct_single_coordinate_rows, recover_measure_from_code,
 };
 pub use scoring::{ScoreRoutePath, ScoreRouteResult, ScoreRouteStats, TileScorer, top_s_online};
 #[cfg(target_os = "linux")]
@@ -80,11 +82,11 @@ pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
+pub(crate) use update::run_linear_fast_kernel;
 pub use update::{
     DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_block_reml_stats,
     linear_shared_rho_fs_step,
 };
-pub(crate) use update::run_linear_fast_kernel;
 
 use ndarray::{Array2, ArrayView2};
 
@@ -189,10 +191,14 @@ pub struct SparseDictConvergence {
     pub inner_ev_residual: f64,
     /// Configured inner EV tolerance.
     pub inner_tolerance: f64,
-    /// Largest relative normal-equation residual in the final decoder refresh.
+    /// Gauge-invariant decoder displacement under one full inner update map.
     pub decoder_residual: f64,
-    /// Solver-derived decoder residual threshold.
+    /// Full-map, gauge-invariant decoder fixed-point threshold.
     pub decoder_tolerance: f64,
+    /// Relative sparse-code/reconstruction displacement under one full inner map.
+    pub routing_residual: f64,
+    /// Full-map routing fixed-point threshold.
+    pub routing_tolerance: f64,
     /// REML fixed-point residual `|ρ_new - ρ| / ρ`.
     pub outer_rho_residual: f64,
     /// Estimator-derived REML fixed-point tolerance.

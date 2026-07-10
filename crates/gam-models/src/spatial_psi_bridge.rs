@@ -14,11 +14,11 @@ use crate::custom_family::{
     CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
     EmbeddedImplicitPsiDerivativeOperator, build_embedded_dense_psi_operator,
 };
-use gam_linalg::matrix::{EmbeddedColumnBlock, EmbeddedSquareBlock};
-use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
 use crate::fit_orchestration::drivers::{
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
+use gam_linalg::matrix::{EmbeddedColumnBlock, EmbeddedSquareBlock};
+use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
 use ndarray::Array2;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -245,13 +245,13 @@ pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::custom_family::resolve_custom_family_x_psi_psi_map;
+    use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
+    use gam_runtime::resource::ResourcePolicy;
+    use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use gam_terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
     };
-    use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
-    use gam_runtime::resource::ResourcePolicy;
 
     #[test]
     fn build_block_spatial_psi_derivatives_populates_aniso_cross_rows() {

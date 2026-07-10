@@ -56,33 +56,15 @@ def _coordinate_periods(
     model: Any,
     atom_dims: Sequence[int],
 ) -> tuple[tuple[float | None, ...], ...]:
-    """Return each fitted atom's structural chart periods."""
-    kinds = tuple(
-        str(kind).strip().lower().replace("-", "_") for kind in model._basis_kinds
+    """Return each fitted atom's Rust-owned structural chart periods."""
+    periods = rust_module().sae_coordinate_periods(
+        [str(kind) for kind in model._basis_kinds],
+        [int(dim) for dim in atom_dims],
     )
-    if len(kinds) != len(atom_dims):
-        raise ValueError(f"expected {len(atom_dims)} basis kinds, got {len(kinds)}")
-    result: list[tuple[float | None, ...]] = []
-    for atom, (kind, dim_value) in enumerate(zip(kinds, atom_dims)):
-        dim = int(dim_value)
-        if kind in {"periodic", "periodic_spline", "circle", "torus"}:
-            periods: tuple[float | None, ...] = (1.0,) * dim
-        elif kind == "cylinder":
-            if dim != 2:
-                raise ValueError(
-                    f"cylinder atom {atom} must have latent dimension 2; got {dim}"
-                )
-            periods = (1.0, None)
-        elif kind == "sphere":
-            if dim != 2:
-                raise ValueError(
-                    f"sphere atom {atom} must have latitude/longitude dimension 2; got {dim}"
-                )
-            periods = (None, float(2.0 * np.pi))
-        else:
-            periods = (None,) * dim
-        result.append(periods)
-    return tuple(result)
+    return tuple(
+        tuple(None if period is None else float(period) for period in block)
+        for block in periods
+    )
 
 
 def _flatten_targets(
@@ -183,6 +165,9 @@ def _activation_from_logits(
     tau: float,
     alpha: float,
     jumprelu_threshold: float,
+    learnable_alpha: bool = False,
+    log_lambda_sparse: float | None = None,
+    top_k: int | None = None,
 ) -> np.ndarray:
     values = rust_module().sae_activation_matrix_from_logits(
         np.ascontiguousarray(np.asarray(logits, dtype=np.float64)),
@@ -190,6 +175,9 @@ def _activation_from_logits(
         float(tau),
         float(alpha),
         float(jumprelu_threshold),
+        bool(learnable_alpha),
+        None if log_lambda_sparse is None else float(log_lambda_sparse),
+        None if top_k is None else int(top_k),
     )
     return np.ascontiguousarray(np.asarray(values, dtype=np.float64))
 
@@ -241,6 +229,9 @@ class DistilledEncoder:
     tau: float
     alpha: float
     jumprelu_threshold: float
+    learnable_alpha: bool
+    log_lambda_sparse: float | None
+    top_k: int | None
     assignment_tolerance: float
     coord_tolerance: float
     training_history: dict[str, list[float] | float | int]
@@ -289,6 +280,9 @@ class DistilledEncoder:
             tau=self.tau,
             alpha=self.alpha,
             jumprelu_threshold=self.jumprelu_threshold,
+            learnable_alpha=self.learnable_alpha,
+            log_lambda_sparse=self.log_lambda_sparse,
+            top_k=self.top_k,
         )
 
 
@@ -412,6 +406,9 @@ def distill_encoder(
         tau=float(model.tau),
         alpha=float(model.alpha),
         jumprelu_threshold=float(model.jumprelu_threshold),
+        learnable_alpha=bool(model.learnable_alpha),
+        log_lambda_sparse=model.selected_log_lambda_sparse,
+        top_k=model.top_k,
     )
     exact_assign = np.asarray(exact["assignments"], dtype=np.float64)
     coord_err = _coordinate_linf(pred_coords, exact_coords, coord_periods)
@@ -441,6 +438,13 @@ def distill_encoder(
         tau=float(model.tau),
         alpha=float(model.alpha),
         jumprelu_threshold=float(model.jumprelu_threshold),
+        learnable_alpha=bool(model.learnable_alpha),
+        log_lambda_sparse=(
+            None
+            if model.selected_log_lambda_sparse is None
+            else float(model.selected_log_lambda_sparse)
+        ),
+        top_k=None if model.top_k is None else int(model.top_k),
         assignment_tolerance=assign_tol,
         coord_tolerance=coord_tol,
         training_history=history,
@@ -462,6 +466,9 @@ def encode_with_fallback(
         tau=encoder.tau,
         alpha=encoder.alpha,
         jumprelu_threshold=encoder.jumprelu_threshold,
+        learnable_alpha=encoder.learnable_alpha,
+        log_lambda_sparse=encoder.log_lambda_sparse,
+        top_k=encoder.top_k,
     )
     # #1166 — the acceptance gate MUST be cold-started. The "exact" reference
     # probe is solved with NO `t_init`/`a_init`, so it is the canonical

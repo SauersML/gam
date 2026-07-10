@@ -1,7 +1,5 @@
 use super::*;
-use opt::{
-    BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge,
-};
+use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge};
 use std::convert::Infallible;
 
 impl SurvivalLocationScaleFamily {
@@ -383,7 +381,8 @@ impl SurvivalLocationScaleFamily {
                     Ok(Some((cand_ll, (trial_theta, cand_states))))
                 },
                 |alpha, cand_ll| {
-                    cand_ll.is_finite() && cand_ll >= ll + constants::ARMIJO_C1 * alpha * directional
+                    cand_ll.is_finite()
+                        && cand_ll >= ll + constants::ARMIJO_C1 * alpha * directional
                 },
             ) {
                 Ok(result) => result,
@@ -1662,9 +1661,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if self.row_kernel_directional_supported() {
             let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
             let rows = crate::row_kernel::RowSet::All;
-            let axes = crate::row_kernel::row_kernel_directional_derivative_all_axes(
-                &kernel, &rows,
-            )?;
+            let axes =
+                crate::row_kernel::row_kernel_directional_derivative_all_axes(&kernel, &rows)?;
             return Ok(Some(axes));
         }
 
@@ -1781,10 +1779,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let rows = crate::row_kernel::RowSet::All;
             let cache = crate::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
             let ll = crate::row_kernel::row_kernel_log_likelihood(&cache, &rows);
-            let gradient =
-                -crate::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
-            let hessian =
-                crate::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows);
+            let gradient = -crate::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
+            let hessian = crate::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows);
             let offsets = self.joint_block_offsets();
             let blockworking_sets = (0..self.expected_blocks())
                 .map(|block_idx| {
@@ -2258,9 +2254,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        crate::block_layout::block_count::validate_block_count::<
-            SurvivalLocationScaleError,
-        >(
+        crate::block_layout::block_count::validate_block_count::<SurvivalLocationScaleError>(
             "SurvivalLocationScaleFamily joint Hessian second directional derivative",
             self.expected_blocks(),
             block_states.len(),
@@ -2397,7 +2391,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // (`survival_ls_row_kernel_matches_bespoke_assembly`).
         let h_joint = if self.x_link_wiggle.is_some() {
             let dynamic = self.build_dynamic_geometry(block_states)?;
-            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &q, &dynamic, log_scale)?
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
+                self, &q, &dynamic, log_scale,
+            )?
         } else {
             match self.assemble_joint_hessian_from_quantities(&q, block_states)? {
                 Some(h) => h,

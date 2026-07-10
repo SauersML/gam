@@ -87,7 +87,7 @@ pub(crate) fn materialize_standard<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
-        Some(&config.spatial_center_counts),
+        config.spatial_center_counts.as_deref(),
     )?;
     // #1074: the Duchon default penalty is a Hilbert scale (curvature +
     // mass/tension operator dials). REML deselects the lower orders faithfully
@@ -320,9 +320,9 @@ pub(crate) fn materialize_standard<'a>(
     Ok(MaterializedModel {
         request: FitRequest::Standard(StandardFitRequest {
             data: request_data,
-            y,
-            weights,
-            offset,
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            offset: Arc::new(offset),
             spec,
             family,
             estimate_tweedie_p,

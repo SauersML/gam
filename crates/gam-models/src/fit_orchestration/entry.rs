@@ -136,18 +136,13 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
 /// Resolve the [`gam_runtime::resource::ResourcePolicy`] backing term construction
 /// for a given [`FitConfig`] + dataset.
 ///
-/// If the caller hasn't supplied an explicit policy override, derive one from
-/// the shape of the problem via
-/// [`gam_runtime::resource::ResourcePolicy::for_problem`]. At large scale (n_rows
-/// >= 100k or the marginal-slope large-scale path active) this returns
-/// > `analytic_operator_required` so that any silent dense materialization in
-/// > the term-construction layer fails fast rather than allocating tens of GiB;
-/// > at small scale it falls through to the permissive default-library policy
-/// > so that non-operator bases still build cleanly.
-///
-/// `p_estimate = 0` because the per-block coefficient count isn't known until
-/// the spec has been built; the n_rows and hints triggers are sufficient to
-/// flip strict mode for every shape that needs it.
+/// If the caller hasn't supplied an explicit policy override, delegate to
+/// [`gam_runtime::resource::ResourcePolicy::for_problem`]. Non-structural paths
+/// no longer switch mode at row/column thresholds: each planned allocation is
+/// admitted from its checked live-byte footprint against the process-wide
+/// memory governor. Consequently there is no speculative pre-spec coefficient
+/// estimate to compute here (and no small-n/large-p classification cliff);
+/// `ProblemHints` remains the structural signal for operator-only estimators.
 pub(crate) fn resolved_resource_policy(
     config: &FitConfig,
     data: &Dataset,
@@ -308,13 +303,14 @@ fn expectile_kkt_residual(
             .chain(target_weights.iter())
             .any(|v| !v.is_finite() || *v < 0.0)
     {
-        return Err("expectile KKT audit requires finite residuals and finite non-negative weights"
-            .to_string());
+        return Err(
+            "expectile KKT audit requires finite residuals and finite non-negative weights"
+                .to_string(),
+        );
     }
 
-    let mut row_scratch = Array1::from_shape_fn(n, |i| {
-        (frozen_weights[i] - target_weights[i]) * residual[i]
-    });
+    let mut row_scratch =
+        Array1::from_shape_fn(n, |i| (frozen_weights[i] - target_weights[i]) * residual[i]);
     let defect = design.apply_transpose(&row_scratch);
     for i in 0..n {
         row_scratch[i] = frozen_weights[i].max(target_weights[i]);
@@ -392,13 +388,8 @@ mod expectile_convergence_tests {
         let residual = array![-1.0, 1.0];
         let frozen = array![1.0, 1.0];
         let target = array![1.0, 1.0 + 1.0e-12];
-        let kkt = expectile_kkt_residual(
-            &design,
-            residual.view(),
-            frozen.view(),
-            target.view(),
-        )
-        .expect("finite KKT audit");
+        let kkt = expectile_kkt_residual(&design, residual.view(), frozen.view(), target.view())
+            .expect("finite KKT audit");
         assert!(kkt < 1.0e-10, "normalized residual was {kkt:.3e}");
     }
 
@@ -410,13 +401,8 @@ mod expectile_convergence_tests {
         let x = array![[1.0], [2.0], [-1.0]];
         let base = DesignMatrix::Dense(DenseDesignMatrix::from(x.clone()));
         let scaled = DesignMatrix::Dense(DenseDesignMatrix::from(x * 1.0e6));
-        let base_kkt = expectile_kkt_residual(
-            &base,
-            residual.view(),
-            frozen.view(),
-            target.view(),
-        )
-        .expect("base KKT audit");
+        let base_kkt = expectile_kkt_residual(&base, residual.view(), frozen.view(), target.view())
+            .expect("base KKT audit");
         let scaled_kkt = expectile_kkt_residual(
             &scaled,
             residual.view(),
@@ -582,76 +568,84 @@ pub fn fit_from_formula_with_notes(
         .clone()
         .resolve()
         .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+    // Only this entry point owns the fit→measure→expand loop. Raw public
+    // `materialize()` callers receive the ordinary fully provisioned basis;
+    // activating the structural start without an owner would strand them in an
+    // under-resolved function space.
+    config.spatial_center_counts = Some(Vec::new());
     let mut current = fit_from_formula_once_with_notes(formula, data, &config)?;
-    let mut rejected = Vec::<bool>::new();
 
     loop {
         let Some(current_standard) = standard_result(&current) else {
             return Ok(current);
         };
-        certify_adaptive_spatial_fit(current_standard)?;
-        let candidates = adaptive_spatial_candidates(current_standard, data.values.nrows())?;
+        // Saturation is assessed at the same outer-optimization tolerance that
+        // certified this formula fit. `canonical_standard_fit_options` is the
+        // single policy source for that tolerance, so the expansion decision
+        // cannot drift between the CLI and library entry points.
+        let standard_options =
+            canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
+        // A rho-independent shrinkage floor prevents EDF from approaching the
+        // algebraic ceiling more closely than that floor even when lambda tends
+        // to zero. Include it in the resolution tolerance; otherwise the
+        // canonical 1e-6 floor would make a 1e-10 saturation predicate
+        // unreachable and the grow loop would remain dormant in production.
+        let resolution_tol = standard_options
+            .tol
+            .max(standard_options.penalty_shrinkage_floor.unwrap_or(0.0));
+        let candidates =
+            adaptive_spatial_candidates(current_standard, data.values.nrows(), resolution_tol)?;
         if candidates.is_empty() {
             return Ok(current);
         }
-        if rejected.len() != candidates.term_count {
-            rejected = vec![false; candidates.term_count];
-        }
 
-        let mut accepted = false;
-        for candidate in candidates
+        // Grow one saturated term at a time in stable formula order. The next
+        // loop iteration re-fits and re-measures every term, so interactions
+        // between smooths are handled from a converged joint optimum instead
+        // of applying several decisions made against stale EDF evidence.
+        let term_count = candidates.term_count;
+        let candidate = candidates
             .terms
-            .iter()
-            .filter(|candidate| !rejected[candidate.term_index])
-        {
-            let mut candidate_config = config.clone();
-            if candidate_config.spatial_center_counts.len() < candidates.term_count {
-                candidate_config
-                    .spatial_center_counts
-                    .resize(candidates.term_count, None);
-            }
-            candidate_config.spatial_center_counts[candidate.term_index] =
-                Some(candidate.proposed_centers);
-            let candidate_outcome = fit_from_formula_once_with_notes(
-                formula,
-                data,
-                &candidate_config,
-            )
+            .into_iter()
+            .next()
+            .expect("non-empty adaptive candidate set");
+        // Expansion is mandatory once a certified fit is saturated, so the
+        // old design/covariance can be released before constructing the larger
+        // one. Keeping both complete fits alive would make adaptive resolution
+        // itself an avoidable peak-memory multiplier.
+        drop(current);
+        let mut candidate_config = config.clone();
+        let center_counts = candidate_config
+            .spatial_center_counts
+            .get_or_insert_with(Vec::new);
+        if center_counts.len() < term_count {
+            center_counts.resize(term_count, None);
+        }
+        center_counts[candidate.term_index] = Some(candidate.proposed_centers);
+        let candidate_outcome = fit_from_formula_once_with_notes(formula, data, &candidate_config)
             .map_err(|error| WorkflowError::SpatialUnderresolved {
                 term: candidate.term_name.clone(),
                 current_centers: candidate.current_centers,
                 attempted_centers: candidate.proposed_centers,
                 reason: error.to_string(),
             })?;
-            let Some(candidate_standard) = standard_result(&candidate_outcome) else {
-                return Err(WorkflowError::SpatialUnderresolved {
-                    term: candidate.term_name.clone(),
-                    current_centers: candidate.current_centers,
-                    attempted_centers: candidate.proposed_centers,
-                    reason: "the certification refit changed estimator representation"
-                        .to_string(),
-                });
-            };
-            certify_adaptive_spatial_fit(candidate_standard)?;
-
-            // Both sides are fully converged REML/LAML optima. A strictly lower
-            // criterion is direct evidence that the smaller function space was
-            // under-resolved; no tuned EDF fraction or sample-size cutoff enters
-            // the decision. If the larger span cannot improve the criterion,
-            // the current term is certified unsaturated at its smaller size.
-            if candidate_standard.fit.reml_score < current_standard.fit.reml_score {
-                config = candidate_config;
-                current = candidate_outcome;
-                rejected.fill(false);
-                accepted = true;
-                break;
-            }
-            rejected[candidate.term_index] = true;
+        if standard_result(&candidate_outcome).is_none() {
+            return Err(WorkflowError::SpatialUnderresolved {
+                term: candidate.term_name.clone(),
+                current_centers: candidate.current_centers,
+                attempted_centers: candidate.proposed_centers,
+                reason: "the certification refit changed estimator representation".to_string(),
+            });
         }
 
-        if !accepted {
-            return Ok(current);
-        }
+        // The current fit's EDF reached its realizable function-space ceiling;
+        // once the larger fit is certified it is the estimator state to resume
+        // from. Comparing raw REML/LAML values across different center charts
+        // is not a valid rejection gate (and a strict `<` accepts numerical
+        // noise), so resolution growth is controlled solely by the next
+        // converged fit's saturation evidence.
+        config = candidate_config;
+        current = candidate_outcome;
     }
 }
 
@@ -671,7 +665,30 @@ struct AdaptiveSpatialCandidate {
     term_name: String,
     current_centers: usize,
     proposed_centers: usize,
-    edf_saturated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdaptiveCenterDecision {
+    Certified,
+    Expand(usize),
+    Exhausted,
+}
+
+fn adaptive_center_decision(
+    current_centers: usize,
+    n_rows: usize,
+    edf: f64,
+    realized_width: usize,
+    nullspace_dim: usize,
+    resolution_tol: f64,
+) -> AdaptiveCenterDecision {
+    if !gam_terms::basis::basis_is_saturated(edf, realized_width, nullspace_dim, resolution_tol) {
+        return AdaptiveCenterDecision::Certified;
+    }
+    match gam_terms::basis::expanded_num_centers(current_centers, n_rows) {
+        Some(proposed) => AdaptiveCenterDecision::Expand(proposed),
+        None => AdaptiveCenterDecision::Exhausted,
+    }
 }
 
 fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
@@ -681,31 +698,10 @@ fn standard_result(outcome: &FormulaFitResult) -> Option<&StandardFitResult> {
     }
 }
 
-fn certify_adaptive_spatial_fit(result: &StandardFitResult) -> Result<(), WorkflowError> {
-    let criterion_certifies = result
-        .fit
-        .artifacts
-        .criterion_certificate
-        .as_ref()
-        .is_none_or(|certificate| certificate.certifies());
-    if result.fit.outer_converged
-        && result.fit.pirls_status.is_converged()
-        && criterion_certifies
-    {
-        return Ok(());
-    }
-    Err(WorkflowError::IntegrationFailed {
-        reason: format!(
-            "adaptive spatial resolution requires a fully certified fit before comparing \
-             function spaces (outer_converged={}, pirls_status={:?}, criterion_certifies={})",
-            result.fit.outer_converged, result.fit.pirls_status, criterion_certifies
-        ),
-    })
-}
-
 fn adaptive_spatial_candidates(
     result: &StandardFitResult,
     n_rows: usize,
+    resolution_tol: f64,
 ) -> Result<AdaptiveSpatialCandidates, WorkflowError> {
     let term_count = result.resolvedspec.smooth_terms.len();
     if result.adaptive_spatial_terms.len() != term_count
@@ -734,9 +730,7 @@ fn adaptive_spatial_candidates(
         let realized = &result.design.smooth.terms[term_index];
         let penalty_count = realized.penalties_local.len();
         if result.adaptive_spatial_terms[term_index]
-            && let Some(current_centers) =
-                result.adaptive_spatial_center_counts[term_index]
-            && current_centers < n_rows
+            && let Some(current_centers) = result.adaptive_spatial_center_counts[term_index]
         {
             let global_range = (smooth_offset + realized.coeff_range.start)
                 ..(smooth_offset + realized.coeff_range.end);
@@ -744,33 +738,75 @@ fn adaptive_spatial_candidates(
                 .fit
                 .per_term_edf(global_range, penalty_cursor, penalty_count);
             let nullspace_dim = realized.wald_unpenalized_dim();
-            let edf_saturated = gam_terms::basis::basis_is_saturated(
+            match adaptive_center_decision(
+                current_centers,
+                n_rows,
                 edf,
                 realized.coeff_range.len(),
                 nullspace_dim,
-                f64::EPSILON.sqrt(),
-            );
-            let proposed_centers = current_centers.saturating_mul(2).min(n_rows);
-            if proposed_centers > current_centers {
-                candidates.push(AdaptiveSpatialCandidate {
-                    term_index,
-                    term_name: result.resolvedspec.smooth_terms[term_index].name.clone(),
-                    current_centers,
-                    proposed_centers,
-                    edf_saturated,
-                });
+                resolution_tol,
+            ) {
+                AdaptiveCenterDecision::Certified => {}
+                AdaptiveCenterDecision::Expand(proposed_centers) => {
+                    candidates.push(AdaptiveSpatialCandidate {
+                        term_index,
+                        term_name: result.resolvedspec.smooth_terms[term_index].name.clone(),
+                        current_centers,
+                        proposed_centers,
+                    });
+                }
+                AdaptiveCenterDecision::Exhausted => {
+                    return Err(WorkflowError::SpatialUnderresolved {
+                        term: result.resolvedspec.smooth_terms[term_index].name.clone(),
+                        current_centers,
+                        attempted_centers: n_rows,
+                        reason: format!(
+                            "term EDF {edf:.6} remains at its realized basis ceiling with all \
+                             {n_rows} row-supported centers already requested"
+                        ),
+                    });
+                }
             }
         }
         penalty_cursor = penalty_cursor.saturating_add(penalty_count);
     }
-    // EDF-at-capacity is useful scheduling evidence, but never the acceptance
-    // rule: every candidate still has to improve the converged REML/LAML
-    // criterion. Stable index order makes the adaptive path deterministic.
-    candidates.sort_by_key(|candidate| (!candidate.edf_saturated, candidate.term_index));
     Ok(AdaptiveSpatialCandidates {
         term_count,
         terms: candidates,
     })
+}
+
+#[cfg(test)]
+mod adaptive_spatial_resolution_tests {
+    use super::{AdaptiveCenterDecision, adaptive_center_decision};
+
+    #[test]
+    fn unsaturated_basis_is_certified_without_a_probe_refit() {
+        assert_eq!(
+            adaptive_center_decision(8, 100, 5.0, 10, 2, 1.0e-6),
+            AdaptiveCenterDecision::Certified
+        );
+    }
+
+    #[test]
+    fn saturated_basis_expands_geometrically_and_respects_row_support() {
+        assert_eq!(
+            adaptive_center_decision(8, 100, 10.0, 10, 2, 1.0e-6),
+            AdaptiveCenterDecision::Expand(16)
+        );
+        assert_eq!(
+            adaptive_center_decision(64, 100, 10.0, 10, 2, 1.0e-6),
+            AdaptiveCenterDecision::Expand(100)
+        );
+    }
+
+    #[test]
+    fn saturated_basis_at_row_support_is_typed_exhaustion() {
+        assert_eq!(
+            adaptive_center_decision(100, 100, 10.0, 10, 2, 1.0e-6),
+            AdaptiveCenterDecision::Exhausted
+        );
+    }
 }
 
 fn fit_from_formula_once_with_notes(
@@ -989,7 +1025,7 @@ fn fit_expectile_laws(
     let gaussian_family = LikelihoodSpec::gaussian_identity();
     // Cold start: unweighted base weights ⇒ the first inner fit is the OLS
     // mean GAM, the natural warm start for any τ.
-    let mut weights = base_weights.clone();
+    let mut weights = Arc::clone(&base_weights);
     // The LAWS map is deterministic given a sign pattern. Brent detection
     // proves recurrence using one O(n) sign checkpoint; no iteration-count
     // multiple of the training data is retained.
@@ -1016,9 +1052,9 @@ fn fit_expectile_laws(
     for iteration in 1..=max_laws_iters {
         let request = StandardFitRequest {
             data: design_data.clone(),
-            y: y.clone(),
-            weights: weights.clone(),
-            offset: offset.clone(),
+            y: Arc::clone(&y),
+            weights: Arc::clone(&weights),
+            offset: Arc::clone(&offset),
             spec: spec.clone(),
             family: gaussian_family.clone(),
             // Expectile LAWS fits a Gaussian-identity inner family; no Tweedie
@@ -1033,23 +1069,6 @@ fn fit_expectile_laws(
         };
         let result = fit_standard_model(request)
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
-        let inner_certified =
-            result.fit.outer_converged && result.fit.pirls_status.is_converged();
-        if !inner_certified {
-            return Err(WorkflowError::IntegrationFailed {
-                reason: format!(
-                    "expectile LAWS inner Gaussian fit did not carry a convergence certificate \
-                     (iteration={iteration}, outer_converged={}, PIRLS status={:?}, \
-                     outer_gradient_norm={:?}, rho_checkpoint={:?}); the iterate is retained \
-                     only as non-convergence evidence",
-                    result.fit.outer_converged,
-                    result.fit.pirls_status,
-                    result.fit.outer_gradient_norm,
-                    result.fit.log_lambdas.to_vec(),
-                ),
-            });
-        }
-
         // Training-scale fitted mean μ = X·β (identity link, zero-checked
         // offset folded by the design path). The design columns match the
         // combined coefficient vector exactly (the same contract `predict`
@@ -1064,7 +1083,7 @@ fn fit_expectile_laws(
             });
         }
         let mut mu_off = mu;
-        mu_off += &offset;
+        mu_off += offset.as_ref();
 
         let sign: Vec<bool> = (0..n).map(|i| y[i] > mu_off[i]).collect();
         let next_weights = expectile_row_weights(y.view(), mu_off.view(), base_weights.view(), tau);
@@ -1082,7 +1101,7 @@ fn fit_expectile_laws(
         // each coefficient defect by its Cauchy–Schwarz score scale, making the
         // result invariant to column, response, and prior-weight scale while
         // remaining defined when an unpenalized frozen score cancels to zero.
-        let residual = &y - &mu_off;
+        let residual = y.as_ref() - &mu_off;
         let kkt = expectile_kkt_residual(
             &result.design.design,
             residual.view(),
@@ -1117,7 +1136,7 @@ fn fit_expectile_laws(
                 ),
             });
         }
-        weights = next_weights;
+        weights = Arc::new(next_weights);
     }
 
     Err(WorkflowError::IntegrationFailed {
@@ -1127,8 +1146,7 @@ fn fit_expectile_laws(
              final KKT residual={:.3e} vs scaled tolerance {:.3e}, \
              rho_checkpoint={last_rho_checkpoint:?}); the iteration cap \
              never selects the estimator — non-convergence is a typed error",
-            last_kkt.0,
-            last_kkt.1,
+            last_kkt.0, last_kkt.1,
         ),
     })
 }

@@ -843,5 +843,4 @@ mod tests {
             eprintln!("[#415] device-only parity PASSED on GPU for all regimes × variants");
         }
     }
-
 }

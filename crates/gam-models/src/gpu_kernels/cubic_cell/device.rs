@@ -20,16 +20,16 @@
 //! substrate.
 
 #[cfg(target_os = "linux")]
-use gam_gpu::gpu_error::GpuError;
-#[cfg(target_os = "linux")]
-use gam_gpu::gpu_err;
-#[cfg(target_os = "linux")]
-use gam_gpu::gpu_error::GpuResultExt;
-#[cfg(target_os = "linux")]
 use crate::gpu_kernels::cubic_cell::{
     CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput, CubicCellMomentStatus,
     GpuCellBranchTag, branch::classify_cell_for_gpu,
 };
+#[cfg(target_os = "linux")]
+use gam_gpu::gpu_err;
+#[cfg(target_os = "linux")]
+use gam_gpu::gpu_error::GpuError;
+#[cfg(target_os = "linux")]
+use gam_gpu::gpu_error::GpuResultExt;
 
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, OnceLock};
@@ -321,14 +321,14 @@ impl CubicCellGpuBackend {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use gam_gpu::device_runtime::GpuRuntime;
-    use gam_gpu::gpu_error::GpuError;
-    use gam_gpu::gpu_error::GpuResultExt;
     use crate::gpu_kernels::cubic_cell::{
         CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
         CubicCellMomentResidency, CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
         try_build_cubic_cell_derivative_moments,
     };
+    use gam_gpu::device_runtime::GpuRuntime;
+    use gam_gpu::gpu_error::GpuError;
+    use gam_gpu::gpu_error::GpuResultExt;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.
     fn download_moments(

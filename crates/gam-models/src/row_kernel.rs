@@ -21,9 +21,9 @@ use crate::custom_family::{
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     JointHessianSourcePreference, MaterializationIntent, use_joint_matrix_free_path,
 };
+use crate::util::loop_progress::LoopProgress;
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::matrix::DesignMatrix;
-use crate::util::loop_progress::LoopProgress;
 use gam_problem::{EvalMode, HyperOperator, ProjectedFactorCache, ProjectedFactorKey};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
@@ -282,9 +282,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     fn warm_up_directional_caches(&self, eval_mode: EvalMode) -> Result<(), String> {
         // Default: no per-row jet cache to prime, for any mode.
         match eval_mode {
-            EvalMode::ValueOnly
-            | EvalMode::ValueAndGradient
-            | EvalMode::ValueGradientHessian => Ok(()),
+            EvalMode::ValueOnly | EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian => {
+                Ok(())
+            }
         }
     }
 

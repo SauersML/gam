@@ -619,7 +619,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         notes.push(format!(
             "Outer iterations: {} (status: {})",
             unified.outer_iterations,
-            unified.pirls_status.label()
+            unified.convergence_evidence().inner_status().label()
         ));
         notes.push(format!(
             "Log-likelihood: {:.4}, penalized objective: {:.4}",
@@ -965,8 +965,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
-        convergence_status: fit.pirls_status.label().to_string(),
-        converged: fit.pirls_status.is_converged(),
+        convergence_status: fit
+            .convergence_evidence()
+            .inner_status()
+            .label()
+            .to_string(),
+        converged: true,
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: fit.artifacts.criterion_certificate.as_ref().map(|cert| {
             report::CriterionCertificateRow {

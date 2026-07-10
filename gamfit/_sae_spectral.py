@@ -185,21 +185,17 @@ class BlockCoordinateReport:
 def block_firing_coordinates(
     decoder: Any,
     blocks: Any,
-    gates: Any,
     codes: Any,
     block: int,
-    *,
-    block_topk: int = 1,
 ) -> BlockCoordinateReport:
     """Recover per-firing circle coordinates (phase, amplitude, SEs) for one
-    ``b = 2`` block of a fitted block-sparse dictionary."""
+    ``b = 2`` block from fixed-width sparse ``blocks`` / ``codes`` routing."""
     dec = _as_2d_f32(decoder, "decoder")
     blk = _as_2d_u32(blocks, "blocks")
-    gat = _as_2d_f32(gates, "gates")
     cod = np.ascontiguousarray(np.asarray(codes, dtype=np.float32))
     if cod.ndim != 3:
         raise ValueError(f"codes must be a 3-D N x k x b array; got shape {cod.shape}")
-    payload = rust_module().block_firing_coordinates(dec, blk, gat, cod, block, block_topk)
+    payload = rust_module().block_firing_coordinates(dec, blk, cod, block)
     return BlockCoordinateReport(
         sigma_hat=float(payload["sigma_hat"]),
         mean_radius=float(payload["mean_radius"]),
@@ -390,7 +386,6 @@ def audit_sae(
     decoder_key: str | None = None,
     active: int | None = None,
     block_size: int = 1,
-    block_topk: int | None = None,
     delta: float = 0.05,
     quantile_levels: tuple[float, ...] | None = (0.5, 0.9, 0.99),
     max_candidates: int = 16,
@@ -721,9 +716,8 @@ class AtlasNerveDiagram:
     """Čech-nerve reduction of a block-sparse dictionary's per-block charts.
 
     ``computed`` is False for shapes the nerve does not apply to (scalar
-    ``block_size == 1``, a width that does not divide ``K`` into >= 2 charts, or
-    more blocks than ``max_charts`` without an explicit ``blocks`` list), in which
-    case only ``reason`` is populated. When ``computed`` is True, ``betti`` is the
+    ``block_size == 1`` or fewer than two selected charts), in which case only
+    ``reason`` is populated. When ``computed`` is True, ``betti`` is the
     ``{b0, b1, b2}`` signature and the simplex counts / covering side describe the
     reduced nerve complex.
     """
@@ -743,21 +737,29 @@ class AtlasNerveDiagram:
 
 
 def atlas_nerve_diagram(
-    codes: Any,
+    route: Any,
+    n_units: int,
     block_size: int,
     *,
     activation_threshold: float = 1.0e-6,
     blocks: Any | None = None,
-    max_charts: int = 16,
 ) -> AtlasNerveDiagram:
-    """Build the atlas-nerve Betti signature from a dense ``N x K`` block-sparse
-    code matrix, one chart per ``block_size``-wide block. Returns a report whose
-    ``computed`` flag is False (with a ``reason``) for shapes the nerve does not
-    apply to."""
-    cod = _as_2d_f32(codes, "codes")
+    """Build an atlas nerve from fixed-width sparse block routing.
+
+    ``route`` is an ``(indices, values)`` pair (or equivalent mapping/object),
+    with ``indices`` shaped ``N x s`` and values shaped
+    ``N x s x block_size``. ``n_units`` preserves charts with no observed
+    firing; the logical ``N x K`` code matrix is never materialized.
+    """
+    indices, values = _sparse_route_arrays(route, "route", int(block_size))
     block_list = None if blocks is None else [int(b) for b in blocks]
     payload = rust_module().atlas_nerve_diagram(
-        cod, int(block_size), float(activation_threshold), block_list, int(max_charts)
+        indices,
+        values,
+        int(n_units),
+        int(block_size),
+        float(activation_threshold),
+        block_list,
     )
     if not bool(payload["computed"]):
         return AtlasNerveDiagram(computed=False, reason=str(payload["reason"]))

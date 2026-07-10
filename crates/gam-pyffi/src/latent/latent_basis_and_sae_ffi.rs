@@ -917,14 +917,15 @@ use gam::families::multinomial::MultinomialModelEnvelope;
 fn fit_multinomial_formula_pyfunc<'py>(
     py: Python<'py>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'py, PyEncodedTable>,
     formula: String,
     init_lambda: f64,
     max_iter: usize,
     tol: f64,
 ) -> PyResult<Py<PyBytes>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
-        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343).
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
@@ -937,6 +938,7 @@ fn fit_multinomial_formula_pyfunc<'py>(
         )
         .map_err(estimation_error_to_pyerr)?;
         MultinomialModelEnvelope::new(saved)
+            .map_err(estimation_error_to_pyerr)?
             .to_json_bytes()
             .map_err(estimation_error_to_pyerr)
     })?;
@@ -950,12 +952,13 @@ fn predict_multinomial_formula_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'py, PyEncodedTable>,
 ) -> PyResult<Py<PyArray2<f64>>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let probs = detach_pyresult(py, "predict_multinomial_formula", move || {
         let envelope =
             MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
-        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343).
         gam::families::multinomial::predict_multinomial_formula(&envelope.saved, &dataset)
@@ -977,13 +980,14 @@ fn predict_multinomial_intervals_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'py, PyEncodedTable>,
     z: f64,
 ) -> PyResult<Py<PyDict>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let (probs, prob_se) = detach_pyresult(py, "predict_multinomial_intervals", move || {
         let envelope =
             MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
-        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         gam::families::multinomial::predict_multinomial_formula_with_se(&envelope.saved, &dataset)
             .map_err(estimation_error_to_pyerr)
     })?;
@@ -1024,14 +1028,15 @@ fn posterior_predict_multinomial_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    rows: PyRef<'py, PyEncodedTable>,
     n_draws: usize,
     seed: u64,
 ) -> PyResult<Py<PyDict>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
     let (draws, class_levels) = detach_pyresult(py, "posterior_predict_multinomial", move || {
         let envelope =
             MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
-        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
         let draws = gam::families::multinomial::posterior_predict_multinomial_formula(
             &envelope.saved,
             &dataset,

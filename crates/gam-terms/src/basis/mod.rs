@@ -104,10 +104,7 @@ pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
 };
 
-pub use cyclic::{
-    create_closure_difference_penalty_jet, create_cyclic_difference_penalty_matrix,
-    create_open_difference_penalty_matrix,
-};
+pub use cyclic::create_cyclic_difference_penalty_matrix;
 
 pub(crate) use cyclic::{
     create_cyclic_bspline_basis_dense, cyclic_distance_1d, cyclic_knot_anchor,

@@ -346,11 +346,8 @@ pub fn build_bspline_basis_1d(
         None
     };
     if let Some((knots, p_raw, chunk)) = auto_chunk_streaming {
-        let s_bend_raw = bspline_derivative_penalty_matrix(
-            knots.view(),
-            spec.degree,
-            spec.penalty_order,
-        )?;
+        let s_bend_raw =
+            bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order)?;
         let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
         let penalties_raw_mats = penalties_raw
             .iter()
@@ -735,6 +732,11 @@ pub fn build_cubic_regression_basis_1d(
              RemoveLinearTrend identifiability; use the default sum-to-zero centering"
         );
     }
+    if !spec.boundary_conditions.is_free() {
+        crate::bail_invalid_basis!(
+            "natural cubic regression splines do not support additional endpoint boundary conditions; their natural second-derivative conditions are structural"
+        );
+    }
 
     let cr = CubicRegressionBasis::new(knots.clone())?;
     let raw_design = cr.design(data);
@@ -743,7 +745,7 @@ pub fn build_cubic_regression_basis_1d(
     // Raw (pre-identifiability) candidates: Frobenius-normalized bending penalty
     // plus, for `cs`/double-penalty, the null-space shrinkage ridge — exactly as
     // `bspline_penalty_candidates` assembles them.
-    let want_nullspace = spec.double_penalty && spec.boundary_conditions.is_free();
+    let want_nullspace = spec.double_penalty;
     let (bend_norm, bend_scale) = normalize_penalty(&s_bend_raw);
     let mut penalties_raw = vec![PenaltyCandidate {
         matrix: bend_norm,
@@ -1997,10 +1999,7 @@ fn rebuild_double_penalty_nullspace_in_constrained_chart(
     let primary_constrained = candidates
         .iter()
         .find(|c| matches!(c.source, PenaltySource::Primary))
-        .map(|c| {
-            c.matrix
-                .mapv(|value| value * c.normalization_scale)
-        });
+        .map(|c| c.matrix.mapv(|value| value * c.normalization_scale));
     let Some(s_c) = primary_constrained else {
         crate::bail_invalid_basis!(
             "double-penalty B-spline has a null-space shrinkage ridge but no primary \
@@ -2079,7 +2078,12 @@ fn bspline_penalty_candidates(
     spec: &BSplineBasisSpec,
     knots: &Array1<f64>,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let want_nullspace = spec.double_penalty && spec.boundary_conditions.is_free();
+    // Build in the raw chart whenever requested. Endpoint conditions and
+    // identifiability transforms may remove only part of the polynomial null
+    // space; the metric-consistent constrained-chart rebuild below retains the
+    // surviving function component and the active-candidate filter drops the
+    // block only when no null direction remains.
+    let want_nullspace = spec.double_penalty;
     let shrinkage = if want_nullspace {
         // Function-space shrinkage (SPEC rule 5): the ridge penalizes
         // `∫(null component of f)²` via the exact basis Gram, so the penalized
@@ -2163,9 +2167,7 @@ pub(crate) fn piecewise_polynomial_function_gram(
         crate::bail_invalid_basis!("function-space Gram breakpoints must all be finite");
     }
     if breaks.windows(2).any(|span| span[1] < span[0]) {
-        crate::bail_invalid_basis!(
-            "function-space Gram breakpoints must be nondecreasing"
-        );
+        crate::bail_invalid_basis!("function-space Gram breakpoints must be nondecreasing");
     }
     let (nodes, weights) = gam_math::special::gauss_legendre(points_per_span);
     let mut quad_x = Vec::with_capacity((breaks.len() - 1) * points_per_span);
@@ -2296,28 +2298,20 @@ fn generalized_nullspace_basis(
     }
 
     let metric_sym = symmetrize_penalty(metric);
-    let factor = gam_linalg::faer_ndarray::FaerCholesky::cholesky(
-        &metric_sym,
-        Side::Lower,
-    )
-    .map_err(|error| {
-        BasisError::InvalidInput(format!(
-            "{context}: function metric is not strictly positive definite: {error}"
-        ))
-    })?;
+    let factor = gam_linalg::faer_ndarray::FaerCholesky::cholesky(&metric_sym, Side::Lower)
+        .map_err(|error| {
+            BasisError::InvalidInput(format!(
+                "{context}: function metric is not strictly positive definite: {error}"
+            ))
+        })?;
     let lower = factor.lower_triangular();
     let penalty_sym = symmetrize_penalty(penalty);
-    let left = gam_linalg::triangular::forward_substitution_lower_matrix(
-        lower.view(),
-        penalty_sym.view(),
-    );
-    let whitened = gam_linalg::triangular::forward_substitution_lower_matrix(
-        lower.view(),
-        left.t(),
-    );
+    let left =
+        gam_linalg::triangular::forward_substitution_lower_matrix(lower.view(), penalty_sym.view());
+    let whitened =
+        gam_linalg::triangular::forward_substitution_lower_matrix(lower.view(), left.t());
     let whitened = symmetrize_penalty(&whitened);
-    let (evals, evecs) =
-        FaerEigh::eigh(&whitened, Side::Lower).map_err(BasisError::LinalgError)?;
+    let (evals, evecs) = FaerEigh::eigh(&whitened, Side::Lower).map_err(BasisError::LinalgError)?;
     let tol = generalized_spectral_tolerance(&evals, p);
     if let Some(&negative) = evals.iter().find(|&&value| value < -tol) {
         crate::bail_invalid_basis!(
@@ -2410,7 +2404,8 @@ pub(crate) fn function_space_nullspace_shrinkage(
         penalty,
         gram,
         "function-space null-shrinkage generalized eigenproblem",
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     let gz = gram.dot(&z);
@@ -2457,7 +2452,8 @@ pub(crate) fn rebuild_metric_consistent_ridge(
         primary_constrained,
         &metric,
         "metric-consistent ridge rebuild generalized eigenproblem",
-    )? else {
+    )?
+    else {
         return Ok(None);
     };
     let w = ridge_constrained.dot(&n);
@@ -2723,7 +2719,7 @@ pub fn expand_periodic_centers(
 #[cfg(test)]
 mod function_space_null_shrinkage_tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     fn congruence(matrix: &Array2<f64>, transform: &Array2<f64>) -> Array2<f64> {
         fast_atb(transform, &fast_ab(matrix, transform))
@@ -2753,11 +2749,7 @@ mod function_space_null_shrinkage_tests {
     fn generalized_null_classification_is_covariant_under_ill_scaled_shear() {
         let penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let gram = Array2::<f64>::eye(3);
-        let transform = array![
-            [1.0, 0.3, 0.0],
-            [0.0, 1.0, 0.2],
-            [0.0, 0.0, 1.0e-6]
-        ];
+        let transform = array![[1.0, 0.3, 0.0], [0.0, 1.0, 0.2], [0.0, 0.0, 1.0e-6]];
         let ridge = function_space_nullspace_shrinkage(&penalty, &gram)
             .expect("base generalized solve")
             .expect("one-dimensional null space");
@@ -2833,5 +2825,64 @@ mod function_space_null_shrinkage_tests {
         let error = function_space_nullspace_shrinkage(&penalty, &singular_gram)
             .expect_err("singular Gram must be rejected");
         assert!(error.to_string().contains("not strictly positive definite"));
+    }
+
+    #[test]
+    fn one_sided_endpoint_constraint_keeps_surviving_null_recovery() {
+        let data = Array1::linspace(0.0, 1.0, 32);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            double_penalty: true,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+                right: BSplineEndpointBoundaryCondition::Free,
+            },
+        };
+        let built = build_bspline_basis_1d(data.view(), &spec)
+            .expect("one-sided anchored double-penalty basis");
+        assert_eq!(
+            built.penalties.len(),
+            2,
+            "the anchor removes the constant null direction but the linear direction must remain shrinkable"
+        );
+        assert!(built.penaltyinfo.iter().any(|info| {
+            info.active
+                && matches!(info.source, PenaltySource::DoublePenaltyNullspace)
+                && info.effective_rank == 1
+        }));
+    }
+
+    #[test]
+    fn cubic_regression_rejects_unimplemented_endpoint_conditions() {
+        let data = Array1::linspace(0.0, 1.0, 16);
+        let knots = Array1::linspace(0.0, 1.0, 6);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::NaturalCubicRegression {
+                knots: knots.clone(),
+            },
+            double_penalty: true,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Clamped,
+                right: BSplineEndpointBoundaryCondition::Free,
+            },
+        };
+        let error = build_bspline_basis_1d(data.view(), &spec)
+            .expect_err("cr endpoint conditions must not be silently ignored");
+        assert!(
+            error
+                .to_string()
+                .contains("do not support additional endpoint")
+        );
     }
 }
