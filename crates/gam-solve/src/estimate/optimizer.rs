@@ -2073,7 +2073,7 @@ where
             reserve_dense_covariance_bundle(n_design_rows, pirls_res.reparam_result.qs.nrows())
         })
         .flatten();
-    let mut _factorized_inference_reservation = if opts.compute_inference
+    let mut factorized_inference_reservation = if opts.compute_inference
         && dense_covariance_reservation.is_none()
     {
         reserve_factorized_inference_state(
@@ -2491,7 +2491,7 @@ where
                         // then retain only the factor/precision state that is
                         // genuinely still live.
                         drop(dense_covariance_reservation.take());
-                        _factorized_inference_reservation =
+                        factorized_inference_reservation =
                             reserve_factorized_inference_state(n_design_rows, p_cov);
                         None
                     }
@@ -2936,6 +2936,10 @@ where
             FittedLinkState::Standard(None)
         },
     };
+    // Every inference allocation the governor charges is behind us; release
+    // both holds explicitly before handing the assembled result back.
+    drop(dense_covariance_reservation);
+    drop(factorized_inference_reservation);
     Ok(conditioning.backtransform_external_result(result))
 }
 

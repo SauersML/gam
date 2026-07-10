@@ -286,10 +286,11 @@ fn accumulate_derivative_gram_spans(
         let left = knot_vector[k];
         let right = knot_vector[k + 1];
         let width = right - left;
-        if width == 0.0 {
+        if width <= 0.0 {
+            // Validated knots are non-decreasing, so a non-positive width is a
+            // zero-length span with no quadrature mass.
             continue;
         }
-        debug_assert!(width > 0.0, "validated knots are non-decreasing");
         let mid = 0.5 * (left + right);
         let half = 0.5 * width;
         for (node, weight) in nodes.iter().zip(weights.iter()) {

@@ -162,7 +162,11 @@ impl ClosedInterval {
 
     /// Divide by an interval known to be strictly positive.
     fn div_positive(self, denominator: Self) -> Self {
-        debug_assert!(denominator.lo > 0.0);
+        assert!(
+            denominator.lo > 0.0,
+            "div_positive requires a strictly positive denominator interval, got lo={}",
+            denominator.lo
+        );
         let reciprocal = Self {
             lo: next_down(1.0 / denominator.hi).max(0.0),
             hi: next_up(1.0 / denominator.lo),
@@ -393,8 +397,18 @@ fn refine_unique_root<E, F>(
 where
     F: FnMut(f64) -> Result<ScoreJet, E>,
 {
-    debug_assert!(left.derivative != 0.0 && right.derivative != 0.0);
-    debug_assert!(left.derivative.is_sign_positive() != right.derivative.is_sign_positive());
+    // A unique-root refinement is only meaningful on a strict sign-change
+    // bracket; anything else is a caller error surfaced as a typed rejection.
+    if left.derivative == 0.0
+        || right.derivative == 0.0
+        || left.derivative.is_sign_positive() == right.derivative.is_sign_positive()
+    {
+        return Err(ScoreSearchError::InvalidEnclosure {
+            lo: left.x,
+            hi: right.x,
+            enclosure,
+        });
+    }
 
     while right.x - left.x > resolution {
         let width = right.x - left.x;

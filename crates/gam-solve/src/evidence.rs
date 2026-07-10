@@ -569,7 +569,15 @@ fn solve_stacking_weights_impl(
             })?;
         weights = candidate;
     }
-    unreachable!("inclusive iteration loop always returns")
+    Err(StackingError::NumericalFailure {
+        message: format!(
+            "stacking solver exhausted its inclusive iteration budget ({}) without producing a \
+             terminal verdict",
+            config.max_iter
+        ),
+        certificate: None,
+        checkpoint: None,
+    })
 }
 
 fn stacking_newton_step(
@@ -1586,7 +1594,14 @@ fn run_gaussian_mixture_em(
             covariance_floor: config.covariance_floor,
         };
     }
-    unreachable!("inclusive EM loop always returns")
+    Err(GaussianMixtureError::NumericalFailure {
+        message: format!(
+            "EM refinement exhausted its inclusive update budget ({}) without producing a \
+             terminal verdict",
+            config.max_iter
+        ),
+        checkpoint: Some(checkpoint),
+    })
 }
 
 struct GaussianMixtureEStep {

@@ -37,7 +37,10 @@ pub struct TransformationNormalPredictor {
 /// clamping the grid inversion itself applies at the response support).
 fn ladder_quantile(ladder_row: ndarray::ArrayView1<'_, f64>, z: f64) -> f64 {
     let m = ladder_row.len();
-    debug_assert_eq!(m, TRANSFORMATION_NORMAL_BAND_Z_NODES);
+    assert_eq!(
+        m, TRANSFORMATION_NORMAL_BAND_Z_NODES,
+        "quantile ladder row must be tabulated on the fixed even z grid"
+    );
     let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
     let t = ((z + z_max) / (2.0 * z_max)) * ((m - 1) as f64);
     if t <= 0.0 {

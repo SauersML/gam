@@ -119,7 +119,7 @@ mod tests {
     fn pg1_rejects_non_finite_tilt_before_calling_upstream() {
         let pg = PolyaGamma::new();
         let mut rng = StdRng::seed_from_u64(7);
-        let _ = pg.draw(&mut rng, f64::NAN);
+        pg.draw(&mut rng, f64::NAN);
     }
 
     #[test]

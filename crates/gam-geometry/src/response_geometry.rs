@@ -1156,7 +1156,10 @@ fn response_kappa_bounds(values: ArrayView2<'_, f64>) -> (f64, f64, f64) {
             }
         }
     }
-    debug_assert!(r2_max > 0.0 && s2_max > 0.0);
+    assert!(
+        r2_max > 0.0 && s2_max > 0.0,
+        "response κ bounds require a non-degenerate cloud: max ‖y‖²={r2_max}, max ‖y−μ‖²={s2_max}"
+    );
     // Stay one square-root-epsilon relative step inside both open singular
     // boundaries. This is derived from f64 resolution, not a tuning knob.
     let open_boundary = 1.0 - f64::EPSILON.sqrt();

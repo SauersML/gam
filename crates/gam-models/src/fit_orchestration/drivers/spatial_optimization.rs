@@ -7974,7 +7974,12 @@ pub fn curvature_inference_forspec(
         Some(SmoothBasisSpec::ConstantCurvature {
             feature_cols, spec, ..
         }) => (feature_cols, spec.clone()),
-        _ => unreachable!("get_constant_curvature_kappa already validated the term"),
+        _ => {
+            return Err(EstimationError::InvalidInput(format!(
+                "constant-curvature κ profile: smooth term {term_idx} is not a \
+                 constant-curvature basis"
+            )));
+        }
     };
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let radial_reference = constant_curvature_radial_reference(x_term.view(), y)?;

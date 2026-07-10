@@ -9347,7 +9347,11 @@ fn population_variance(values: &[f64]) -> f64 {
 /// Population covariance (divide by `n`, matching `population_variance`).
 fn population_covariance(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len();
-    debug_assert_eq!(n, b.len());
+    assert_eq!(
+        n,
+        b.len(),
+        "population covariance requires equal-length slices"
+    );
     if n == 0 {
         return 0.0;
     }

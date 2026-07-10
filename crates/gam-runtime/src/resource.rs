@@ -1058,7 +1058,7 @@ mod resource_policy_tests {
         // this is exactly the independent-budgets failure the ledger exists
         // to prevent.
         let governor = MemoryGovernor::with_budget(1_000);
-        let _held = governor.try_reserve(600, "test-held").expect("fits alone");
+        let held = governor.try_reserve(600, "test-held").expect("fits alone");
         let refusal = governor
             .try_reserve(600, "test-joint")
             .expect_err("600 + 600 exceeds the 1000-byte budget");
@@ -1073,7 +1073,7 @@ mod resource_policy_tests {
         );
         // After releasing the holder, the same request succeeds: refusal is a
         // routing signal, not a terminal state.
-        drop(_held);
+        drop(held);
         governor
             .try_reserve(600, "test-joint")
             .expect("fits after release");

@@ -65,11 +65,10 @@ impl LatentCoordinateManifold {
         n_observations: usize,
         latent_dimension: usize,
     ) -> GeometryResult<Box<dyn RiemannianManifold>> {
-        if self == Self::Euclidean {
-            return ManifoldSpec::Euclidean(n_observations * latent_dimension).build();
-        }
         let per_observation = match self {
-            Self::Euclidean => unreachable!("the Euclidean case returns above"),
+            Self::Euclidean => {
+                return ManifoldSpec::Euclidean(n_observations * latent_dimension).build();
+            }
             Self::Circle => ManifoldSpec::Circle,
             Self::Sphere => ManifoldSpec::Sphere {
                 intrinsic_dim: latent_dimension - 1,
