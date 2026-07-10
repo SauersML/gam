@@ -78,20 +78,18 @@ mod outer_gradient_error_classification_1451_tests {
     /// #1451 — the three numerical/linear-algebra failure sites inside the
     /// deflation path (`apply_cached_arrow_hessian`, the projected `h_span.eigh`,
     /// and `DeflatedArrowSolver::from_orthonormal_gauges`) must distinguish a
-    /// genuine near-singular conditioning trip (FD-eligible `IllConditioned`)
-    /// from an internal-invariant defect — a shape/dimension mismatch or a
-    /// non-finite intermediate — which MUST propagate (`InternalInvariant`, NOT
-    /// FD-eligible).
+    /// genuine near-singular conditioning trip (`IllConditioned`) from an
+    /// internal-invariant defect — a shape/dimension mismatch or a non-finite
+    /// intermediate (`InternalInvariant`). Both propagate if the projected
+    /// implicit solve cannot complete, but the typed diagnosis must stay exact.
     ///
     /// `OuterGradientError::classify_arrow_solver_error` is the helper all three
     /// sites route through. Before the #1451 fix every failure there was
     /// re-labelled `IllConditioned` (the original `conditioning_err`), so the
-    /// shape/non-finite cases below would have been FD-eligible — masking an
-    /// internal defect behind a plausible-but-wrong FD descent direction, exactly
-    /// the regression #1436 set out to eliminate. This test pins that a
-    /// shape/non-finite error classifies to `InternalInvariant` (so it
-    /// propagates) while a genuine finite, correctly-shaped near-singular failure
-    /// stays `IllConditioned` (so it keeps the #1273 FD fallback).
+    /// shape/non-finite cases below would have been misdiagnosed as numerical
+    /// conditioning. This test pins that a shape/non-finite error classifies to
+    /// `InternalInvariant` while a genuine finite, correctly-shaped
+    /// near-singular failure stays `IllConditioned`.
     #[test]
     fn classify_arrow_solver_error_routes_shape_and_nonfinite_to_internal_1451() {
         let conditioning = || OuterGradientError::IllConditioned {
@@ -99,7 +97,7 @@ mod outer_gradient_error_classification_1451_tests {
         };
 
         // Shape/dimension-mismatch markers emitted by the deflation helpers must
-        // classify as InternalInvariant and therefore be NOT FD-eligible.
+        // classify as InternalInvariant.
         let shape_messages = [
             "apply_cached_arrow_hessian: vector shapes (t=3, beta=2) != cache shapes (t=4, beta=2)",
             "DeflatedArrowSolver: gauge length 5 != cache full length 6",
@@ -110,14 +108,6 @@ mod outer_gradient_error_classification_1451_tests {
             assert!(
                 matches!(classified, OuterGradientError::InternalInvariant { .. }),
                 "shape mismatch must classify to InternalInvariant (#1451); got {classified}"
-            );
-            assert!(
-                !classified.is_conditioning_recoverable(),
-                "a shape mismatch must NOT be conditioning-recoverable (#1451); got {classified}"
-            );
-            assert!(
-                !classified.admits_plain_solver_fallback(1.0),
-                "a shape mismatch must NOT admit the plain-solver fallback even at finite cost (#1451)"
             );
         }
 
@@ -133,16 +123,12 @@ mod outer_gradient_error_classification_1451_tests {
                 "non-finite intermediate must classify to InternalInvariant (#1451); \
                  got {classified}"
             );
-            assert!(
-                !classified.is_conditioning_recoverable(),
-                "a non-finite intermediate must NOT be conditioning-recoverable (#1451); got {classified}"
-            );
         }
 
         // A genuine near-singular linear-algebra failure on a finite, correctly
         // shaped input (back-solve / Cholesky/Woodbury factor that tripped on
         // rank-deficiency) is the legitimate #1273 conditioning case: it must
-        // KEEP IllConditioned and stay conditioning-recoverable.
+        // KEEP IllConditioned.
         let conditioning_messages = [
             "DeflatedArrowSolver: gauge Woodbury factor failed: matrix is not positive definite",
             "DeflatedArrowSolver: gauge back-solve: singular factor",
@@ -153,14 +139,6 @@ mod outer_gradient_error_classification_1451_tests {
                 matches!(classified, OuterGradientError::IllConditioned { .. }),
                 "a finite, correctly-shaped near-singular failure must KEEP \
                  IllConditioned (#1451 / #1273); got {classified}"
-            );
-            assert!(
-                classified.is_conditioning_recoverable(),
-                "a genuine conditioning failure must remain conditioning-recoverable (#1273); got {classified}"
-            );
-            assert!(
-                classified.admits_plain_solver_fallback(1.0),
-                "a genuine conditioning failure at finite cost must admit the plain-solver fallback (#1273)"
             );
         }
     }
@@ -425,6 +403,95 @@ mod exact_stationarity_solve_1418_tests {
         assert!(
             exact_resid < 1.0e-3 * surrogate_resid,
             "exact A-solve residual {exact_resid:.3e} must be far below surrogate {surrogate_resid:.3e}"
+        );
+    }
+
+    /// #2080 defect 4 — with a SATURATED gate logit, the exact stationarity
+    /// Jacobian `A` develops a near-null pencil direction (data curvature
+    /// `∝ σ'(ℓ)² ≈ 0` against an O(1) majorizer entry in `B`), and the raw
+    /// GMRES solve of `A x = rhs` amplifies any rhs mass there by `1/μ` —
+    /// the objective↔gradient desync class (#931) that flipped the analytic
+    /// λ-gradient's sign. `solve_exact_stationarity` must DEFLATE it: the
+    /// returned solution's generalized Rayleigh quotient `xᵀAx/xᵀBx` must sit
+    /// at or above the identifiability floor. Non-vacuity is asserted first:
+    /// the UNDEFLATED solve must actually collapse below the floor on this
+    /// fixture, so the test can only pass through genuine deflation.
+    #[test]
+    fn ift_solve_deflates_saturated_gate_near_null_direction_2080() {
+        let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+        term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+        // Saturate atom 1's gate logits hard OFF: σ'(−40)² ≈ 1e-35 kills the
+        // data curvature along those logit coordinates while the assembled
+        // majorizer keeps an O(1) diagonal there.
+        for row in 0..term.n_obs() {
+            term.assignment.logits[[row, 1]] = -40.0;
+        }
+        rho.log_lambda_sparse = -1.0;
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged saturated-gate IBP cache");
+        let solver = DeflatedArrowSolver::plain(&cache);
+
+        // Deterministic rhs with mass on every coordinate (including the
+        // saturated logit slots).
+        let total_t = cache.delta_t_len();
+        let rhs = SaeArrowVector {
+            t: Array1::from_shape_fn(total_t, |i| 0.3 + 0.1 * ((i % 5) as f64) - 0.02 * i as f64),
+            beta: Array1::from_shape_fn(cache.k, |j| 0.2 - 0.05 * ((j % 3) as f64)),
+        };
+
+        let pencil_mu = |x: &SaeArrowVector| -> f64 {
+            let ax = term
+                .apply_exact_hessian(&rho, target.view(), &cache, x)
+                .expect("A matvec");
+            let bx = apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view())
+                .expect("B matvec");
+            sae_inner(x, &ax) / sae_inner(x, &bx)
+        };
+
+        // Non-vacuity: the raw (undeflated) exact solve is dominated by the
+        // saturated near-null direction.
+        let raw = solve_b_preconditioned_gmres(&solver, &rhs, |v| {
+            term.apply_exact_hessian(&rho, target.view(), &cache, v)
+        })
+        .expect("raw exact solve");
+        let raw_mu = pencil_mu(&raw);
+        assert!(
+            raw_mu < SAE_IFT_MIN_CURVATURE_FRACTION,
+            "fixture must exercise the defect: raw solve pencil Rayleigh {raw_mu:.3e} \
+             should collapse below the {SAE_IFT_MIN_CURVATURE_FRACTION:.1e} floor \
+             (saturated gate produced no near-null direction — strengthen the fixture)"
+        );
+
+        // The production solve deflates: identifiable-curvature fraction is
+        // restored at or above the floor, and the solution is finite.
+        let deflated = term
+            .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &rhs)
+            .expect("deflated exact stationarity solve");
+        assert!(
+            deflated
+                .t
+                .iter()
+                .chain(deflated.beta.iter())
+                .all(|v| v.is_finite()),
+            "deflated IFT solution must be finite"
+        );
+        let deflated_mu = pencil_mu(&deflated);
+        assert!(
+            deflated_mu >= SAE_IFT_MIN_CURVATURE_FRACTION,
+            "deflated solve must remove the unidentifiable component: pencil Rayleigh \
+             {deflated_mu:.3e} still below the {SAE_IFT_MIN_CURVATURE_FRACTION:.1e} floor"
+        );
+        // Deflation only removes, never adds: the deflated solution is no
+        // larger than the raw one in the B-metric.
+        let b_norm = |x: &SaeArrowVector| -> f64 {
+            let bx = apply_cached_arrow_hessian(&cache, x.t.view(), x.beta.view())
+                .expect("B matvec");
+            sae_inner(x, &bx).max(0.0).sqrt()
+        };
+        assert!(
+            b_norm(&deflated) <= b_norm(&raw) * (1.0 + 1.0e-8),
+            "deflation must be a projection (B-norm non-increasing)"
         );
     }
 
