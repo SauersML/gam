@@ -5547,12 +5547,26 @@ pub fn run_production_structure_search(
         // Full-iter POLISH of each round's adopted winner before it becomes the
         // next round's parent / the returned dictionary, so the cap is a
         // scoring-only economy and the adopted state matches a full-iter refit.
-        move |adopted_term, adopted_rho, estimation_rows| {
+        //
+        // #1890 — the polish refits on ALL rows, NOT the held-out estimation
+        // split the per-candidate scoring uses. The estimation/eval split is
+        // CONTIGUOUS (`estimation_rows = 0..n_est`), and a disjoint-support
+        // dictionary (e.g. the over-tiled / orientation-reversing arcs of the
+        // chart-glue fixtures) can place an entire atom's support inside the
+        // held-out shard. Refitting the polish on estimation-only then weights
+        // that atom's rows at ~0, leaving its decoder UNCONSTRAINED: it drifts
+        // or blows up (the reversing pin's `try_fitted()` diverges to ~1.9) or is
+        // demoted for lack of support (the over-tile partner). The held-out split
+        // exists solely so the per-candidate SCORING refit is an honest
+        // predictable plug-in for the e-process; the adopted winner's polish is
+        // the RETURNED dictionary and must fit every row it will be evaluated on.
+        move |adopted_term, adopted_rho, _estimation_rows| {
+            let all_rows: Vec<usize> = (0..n).collect();
             refit_at(
                 full_target_polish.view(),
                 adopted_term,
                 adopted_rho,
-                estimation_rows,
+                &all_rows,
                 full_iters,
             )
         },
