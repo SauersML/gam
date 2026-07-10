@@ -11,7 +11,9 @@
 //! `RawFitPayload -> ManifoldSaePayload` assembly below consumes those same
 //! helpers; Python only marshals typed inputs to this owner.
 
-use crate::manifold::manifold_sae_payload::{AtomPayload, ManifoldSaePayload, SCHEMA_TAG};
+use crate::manifold::manifold_sae_payload::{
+    AtomPayload, CrosscoderPayload, ManifoldSaePayload, SCHEMA_TAG,
+};
 use ndarray::{Array2, Array3, ArrayView2};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::prelude::*;
@@ -487,6 +489,7 @@ fn build_stagewise_manifold_sae_payload(
         coords: coords_nested,
         decoder_blocks: decoder_nested,
         duchon_centers: vec![None; k],
+        crosscoder: None,
         atoms,
         diagnostics: serde_json::json!({"atom_trust": [], "atoms": []}),
         top_k_projection: None,
@@ -978,6 +981,12 @@ pub(crate) fn build_manifold_sae_payload(
     let structure_certificate = vopt(raw, "structure_certificate")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let crosscoder = vopt(raw, "crosscoder")
+        .map(|value| {
+            serde_json::from_value::<CrosscoderPayload>(value.clone())
+                .map_err(|error| format!("invalid crosscoder payload: {error}"))
+        })
+        .transpose()?;
     let report = |key: &str| vopt(raw, key).cloned();
 
     Ok(ManifoldSaePayload {
@@ -1019,6 +1028,7 @@ pub(crate) fn build_manifold_sae_payload(
         coords,
         decoder_blocks,
         duchon_centers,
+        crosscoder,
         atoms: atom_payloads,
         diagnostics: vget(raw, "diagnostics")?.clone(),
         top_k_projection: report("top_k_projection"),

@@ -40,8 +40,8 @@
 
 use csv::StringRecord;
 use gam::families::multinomial::{
-    MultinomialFitInputs, fit_penalized_multinomial, fit_penalized_multinomial_formula,
-    predict_multinomial_formula_with_se,
+    MultinomialFitInputs, MultinomialFitRequest, fit_penalized_multinomial,
+    fit_penalized_multinomial_formula, predict_multinomial_formula_with_se,
 };
 use gam::test_support::reference::{Column, relative_l2, run_python};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
@@ -921,14 +921,14 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
     let headers = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode train dataset");
 
-    let model = fit_penalized_multinomial_formula(
-        &data,
-        "y ~ x1 + x2",
-        &FitConfig::default(),
-        1.0,
-        100,
-        1e-9,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &data,
+        formula: "y ~ x1 + x2",
+        config: &FitConfig::default(),
+        init_lambda: 1.0,
+        max_iter: 100,
+        tol: 1e-9,
+    })
     .expect("multinomial formula fit");
     let p = model.p_per_class;
     let m = model.n_active_classes;
@@ -1047,14 +1047,14 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated_over_refits() {
         let rheaders = ["x1", "x2", "y"].into_iter().map(str::to_string).collect();
         let rdata =
             encode_recordswith_inferred_schema(rheaders, rrows).expect("encode refit dataset");
-        let rmodel = fit_penalized_multinomial_formula(
-            &rdata,
-            "y ~ x1 + x2",
-            &FitConfig::default(),
-            1.0,
-            100,
-            1e-9,
-        )
+        let rmodel = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            data: &rdata,
+            formula: "y ~ x1 + x2",
+            config: &FitConfig::default(),
+            init_lambda: 1.0,
+            max_iter: 100,
+            tol: 1e-9,
+        })
         .expect("multinomial refit");
         let (pp, pse) =
             predict_multinomial_formula_with_se(&rmodel, &pt_data).expect("predict probs + SE");

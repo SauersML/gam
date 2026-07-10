@@ -333,10 +333,8 @@ fn sae_crosscoder_fit<'py>(
         layers.append(layer)?;
     }
     out.set_item("layers", layers)?;
-    out.set_item(
-        "drift",
-        crosscoder_drift_dict(py, &report.drift, &anchor_label, &block_labels)?,
-    )?;
+    let drift = crosscoder_drift_dict(py, &report.drift, &anchor_label, &block_labels)?;
+    out.set_item("drift", &drift)?;
 
     let transport = PyList::empty(py);
     let chain: Vec<gam::terms::sae::manifold::CrosscoderLayer> =
@@ -366,6 +364,21 @@ fn sae_crosscoder_fit<'py>(
             )?)?;
         }
     }
-    out.set_item("transport", transport)?;
+    out.set_item("transport", &transport)?;
+    // Same typed shape `ManifoldSaePayload.crosscoder` persists. Keeping the
+    // flat convenience keys above makes the live report ergonomic while this
+    // nested block is the single serialization unit.
+    let crosscoder = PyDict::new(py);
+    crosscoder.set_item("anchor_label", &anchor_label)?;
+    crosscoder.set_item("anchor_dim", report.layout.anchor_dim())?;
+    crosscoder.set_item("block_dims", report.layout.block_dims().to_vec())?;
+    crosscoder.set_item("labels", block_labels)?;
+    crosscoder.set_item(
+        "log_lambda_block",
+        report.layout.block_log_lambda().to_vec(),
+    )?;
+    crosscoder.set_item("drift", drift)?;
+    crosscoder.set_item("transport", transport)?;
+    out.set_item("crosscoder", crosscoder)?;
     Ok(out.unbind())
 }

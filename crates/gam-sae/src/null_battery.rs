@@ -20,6 +20,50 @@ pub enum Tail {
     Smaller,
 }
 
+/// Plus-one-corrected Monte Carlo tail probability and its sampling uncertainty.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EmpiricalPValue {
+    pub p_value: f64,
+    pub monte_carlo_standard_error: f64,
+    pub extreme_draws: usize,
+    pub draws: usize,
+}
+
+/// Evaluate a scalar statistic against an explicit Monte Carlo null distribution.
+///
+/// This is the single plus-one correction used by every native null-calibrated
+/// report. Ties count as extreme in the requested tail, so a null statistic equal
+/// to the observation is evidence against rejection rather than a free win.
+pub fn empirical_p_value(
+    observed: f64,
+    null_samples: &[f64],
+    tail: Tail,
+) -> Result<EmpiricalPValue, String> {
+    require_finite(observed, "observed statistic")?;
+    if null_samples.is_empty() {
+        return Err("empirical p-value requires at least one null draw".to_string());
+    }
+    for (draw, &sample) in null_samples.iter().enumerate() {
+        require_finite(sample, &format!("null statistic draw {draw}"))?;
+    }
+    let extreme_draws = null_samples
+        .iter()
+        .filter(|&&sample| match tail {
+            Tail::Larger => sample >= observed,
+            Tail::Smaller => sample <= observed,
+        })
+        .count();
+    let draws = null_samples.len();
+    let p_value = (extreme_draws as f64 + 1.0) / (draws as f64 + 1.0);
+    let monte_carlo_standard_error = (p_value * (1.0 - p_value) / (draws as f64 + 1.0)).sqrt();
+    Ok(EmpiricalPValue {
+        p_value,
+        monte_carlo_standard_error,
+        extreme_draws,
+        draws,
+    })
+}
+
 /// One member of the standing null battery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NullKind {
@@ -1336,14 +1380,9 @@ fn summarize_null(kind: NullKind, observed: f64, mut samples: Vec<f64>, tail: Ta
     } else {
         0.0
     };
-    let extreme = samples
-        .iter()
-        .filter(|&&x| match tail {
-            Tail::Larger => x >= observed,
-            Tail::Smaller => x <= observed,
-        })
-        .count();
-    let p_value = (extreme + 1) as f64 / (n + 1) as f64;
+    let p_value = empirical_p_value(observed, &samples, tail)
+        .expect("run_null_battery validates observed and null statistics")
+        .p_value;
     NullSummary {
         kind,
         observed,

@@ -7347,6 +7347,18 @@ impl ManifoldSaeCore {
     fn decoder_blocks<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         manifold_sae_list2(py, &self.inner.decoder_blocks)
     }
+    /// Typed manifold-crosscoder layout and reports, or `None` for a plain SAE.
+    #[getter]
+    fn crosscoder(&self, py: Python<'_>) -> PyResult<PyObject> {
+        match &self.inner.crosscoder {
+            Some(payload) => {
+                let value = serde_json::to_value(payload)
+                    .map_err(|error| py_value_error(error.to_string()))?;
+                json_value_to_py(py, value)
+            }
+            None => Ok(py.None()),
+        }
+    }
     /// The per-atom object surface — a list of [`AtomCore`] handles, each read by
     /// attribute (`atom.basis`, `atom.decoder_coefficients`, …), NOT a list of
     /// dicts. This preserves the `SaeManifoldAtomFit` duck-type consumers use.

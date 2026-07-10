@@ -110,19 +110,9 @@ def _saebench_envelope(
     }
 
 
-def _dose_predicted(row: dict[str, Any], predicted_key: str) -> float:
-    """Local output-Fisher prediction in nats for a dose row.
-
-    ``predicted_key`` selects the prediction variant the ledger stores
-    (``predicted_nats`` tangent quadratic form, ``predicted_nats_pathint``
-    path-integrated, ``predicted_nats_tangent``)."""
-    return float(row[predicted_key])
-
-
 def dose_response_report(
     ledger_path: Path,
     *,
-    predicted_key: str = "predicted_nats",
     within_validity_only: bool = True,
     heldout_only: bool = False,
 ) -> dict[str, Any]:
@@ -143,7 +133,10 @@ def dose_response_report(
         if heldout_only and not row.get("heldout", False):
             continue
         arc = float(row["dt"])
-        pred = _dose_predicted(row, predicted_key)
+        # The only auditable prediction is the endpoint Fisher quadratic of the
+        # exact activation delta the patched forward applies (#2249). Legacy
+        # path-integrated/tangent lanes intentionally have no selector here.
+        pred = float(row["predicted_nats"])
         meas = float(row["measured_kl"])
         if not (math.isfinite(arc) and math.isfinite(pred) and math.isfinite(meas)):
             continue
@@ -154,7 +147,7 @@ def dose_response_report(
 
     out: dict[str, Any] = {
         "ledger": str(ledger_path),
-        "predicted_key": predicted_key,
+        "prediction": "endpoint_output_fisher_exact_applied_delta",
         "within_validity_only": within_validity_only,
         "heldout_only": heldout_only,
         "model": doc.get("model"),
@@ -174,8 +167,8 @@ def dose_response_report(
             "n": len(obs),
             "slope_through_origin": rep.slope_through_origin,
             "r2_through_origin": rep.r2_through_origin,
-            "mean_measured_nats_per_arc": rep.mean_measured_nats_per_arc,
-            "cv_measured_nats_per_arc": rep.cv_measured_nats_per_arc,
+            "mean_measured_nats_per_arc_squared": rep.mean_measured_nats_per_arc_squared,
+            "cv_measured_nats_per_arc_squared": rep.cv_measured_nats_per_arc_squared,
             "effective_weight": rep.effective_weight,
         }
     # SAEBench-shaped view: the headline `manifold` method's calibration R² and
@@ -187,12 +180,14 @@ def dose_response_report(
         metrics["dose_response_calibration"] = {
             "r2_through_origin": headline["r2_through_origin"],
             "slope_through_origin": headline["slope_through_origin"],
-            "cv_measured_nats_per_arc": headline["cv_measured_nats_per_arc"],
+            "cv_measured_nats_per_arc_squared": headline[
+                "cv_measured_nats_per_arc_squared"
+            ],
         }
     out["eval_output"] = _saebench_envelope(
         "dose_response_calibration",
         {
-            "predicted_key": predicted_key,
+            "prediction": "endpoint_output_fisher_exact_applied_delta",
             "within_validity_only": within_validity_only,
             "heldout_only": heldout_only,
             "model": out["model"],
@@ -221,10 +216,11 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
     The fit json is the manifold-SAE chart fit: ``fit.per_atom[k].cyclic_ordering``
     carries ``words_present`` and their recovered ``angles_rad``. The recovered
     angle is converted to turns and scored against the ground-truth calendar
-    cyclic label by ``gamfit.chart_interp_score``. NOTE (#1942 honesty rule):
-    weekday-style features fail the matched-spectrum null and must not be cited
-    as evidence; the ``null_robust`` flag records this so the number is reported
-    but qualified."""
+    cyclic label by ``gamfit.chart_interp_score``. Each cyclic-ordering record
+    must also carry a ``matched_spectrum_null`` object with the null fit's
+    ``angles_rad`` draws, generator/seed/draw policy, and significance level.
+    Missing null evidence is an error: a scalar correlation is not a
+    chart-interpretability result (#2250)."""
     doc = json.loads(fit_path.read_text())
     atoms = doc.get("fit", {}).get("per_atom", [])
     results = []
@@ -244,7 +240,34 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
             (float(a) / (2.0 * math.pi), float(i) / float(period), 1.0)
             for a, i in zip(angles, indices)
         ]
-        rep = gamfit.chart_interp_score(obs)
+        null = cyc.get("matched_spectrum_null")
+        if not isinstance(null, dict):
+            raise ValueError(
+                f"atom {entry.get('atom')!r} has cyclic ordering but no "
+                "matched_spectrum_null artifact; refusing scalar-only chart score"
+            )
+        null_angles = null.get("angles_rad")
+        if not isinstance(null_angles, list) or not null_angles:
+            raise ValueError(
+                f"atom {entry.get('atom')!r} matched_spectrum_null.angles_rad "
+                "must contain at least one complete null draw"
+            )
+        null_obs = []
+        for draw_idx, draw_angles in enumerate(null_angles):
+            if not isinstance(draw_angles, list) or len(draw_angles) != len(indices):
+                count = len(draw_angles) if isinstance(draw_angles, list) else "non-list"
+                raise ValueError(
+                    f"atom {entry.get('atom')!r} matched-spectrum draw {draw_idx} "
+                    f"has {count} angles; expected {len(indices)}"
+                )
+            null_obs.append(
+                [
+                    (float(a) / (2.0 * math.pi), float(i) / float(period), 1.0)
+                    for a, i in zip(draw_angles, indices)
+                ]
+            )
+        alpha = float(null["significance_level"])
+        rep = gamfit.chart_interp_score(obs, null_obs, alpha)
         family = "weekday" if period == 7 else ("month" if period == 12 else f"period{period}")
         results.append(
             {
@@ -254,15 +277,24 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                 "n_words": len(words),
                 "circular_correlation": rep.circular_correlation,
                 "signed_circular_correlation": rep.signed_circular_correlation,
-                # weekday fails the matched-spectrum null (Manifold-SAE#2); month
-                # is the null-robust example the issue names.
-                "null_robust": family != "weekday",
+                "matched_spectrum_null_mean": rep.matched_spectrum_null_mean,
+                "matched_spectrum_p_value": rep.matched_spectrum_p_value,
+                "monte_carlo_standard_error": rep.monte_carlo_standard_error,
+                "matched_spectrum_draws": rep.matched_spectrum_draws,
+                "significance_level": rep.significance_level,
+                "evidentially_valid": rep.evidentially_valid,
+                "null_policy": {
+                    "generator": null["generator"],
+                    "seed": null["seed"],
+                    "draw_policy": null["draw_policy"],
+                    "draws": rep.matched_spectrum_draws,
+                },
             }
         )
     # SAEBench-shaped view: report the mean circular correlation over the
     # null-robust atoms only (weekday-style atoms fail the matched-spectrum null
     # and must not be scored into the headline, per #1942's honesty rule).
-    null_robust = [r for r in results if r["null_robust"]]
+    null_robust = [r for r in results if r["evidentially_valid"]]
     metrics = {"chart_interp": {"n_atoms": len(results), "n_null_robust": len(null_robust)}}
     if null_robust:
         metrics["chart_interp"]["mean_circular_correlation_null_robust"] = float(
@@ -676,8 +708,6 @@ def saebench_suite(
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dose-ledger", type=Path, default=None, help="dose-response ledger json")
-    ap.add_argument("--dose-predicted-key", default="predicted_nats",
-                    choices=["predicted_nats", "predicted_nats_pathint", "predicted_nats_tangent"])
     ap.add_argument("--dose-all-rows", action="store_true",
                     help="score all rows, not only within-validity ones")
     ap.add_argument("--chart-fit", type=Path, default=None, help="per-atom cyclic chart fit json")
@@ -716,7 +746,6 @@ def main() -> None:
     if args.dose_ledger is not None:
         report["dose_response"] = dose_response_report(
             args.dose_ledger,
-            predicted_key=args.dose_predicted_key,
             within_validity_only=not args.dose_all_rows,
         )
     if args.chart_fit is not None:

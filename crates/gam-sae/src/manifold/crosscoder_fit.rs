@@ -13,6 +13,7 @@ use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
 use gam_solve::seeding::SeedConfig;
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
 use ndarray::{Array2, s};
+use serde::Serialize;
 
 use super::*;
 
@@ -42,6 +43,96 @@ pub struct SaeCrosscoderFitRequest {
     pub ridge_beta: f64,
     pub run_outer_rho_search: bool,
     pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Single source of truth for the automatic circle-crosscoder fit controls used
+/// by the Python and CLI front doors. Callers may replace any field, but neither
+/// binding owns a second set of defaults.
+#[derive(Clone, Debug)]
+pub struct SaeCrosscoderAutoFitConfig {
+    pub n_atoms: usize,
+    pub n_harmonics: usize,
+    pub sparsity_strength: f64,
+    pub smoothness: f64,
+    pub max_iter: usize,
+    pub learning_rate: f64,
+    pub ridge_ext_coord: f64,
+    pub ridge_beta: f64,
+    pub random_state: u64,
+    pub run_outer_rho_search: bool,
+}
+
+impl SaeCrosscoderAutoFitConfig {
+    /// Established manifold-SAE defaults, centralized in the Rust owner. Atom
+    /// count and harmonic order are structural choices and therefore required.
+    pub fn standard(n_atoms: usize, n_harmonics: usize) -> Self {
+        Self {
+            n_atoms,
+            n_harmonics,
+            sparsity_strength: 1.0,
+            smoothness: 1.0,
+            max_iter: 50,
+            learning_rate: 0.05,
+            ridge_ext_coord: 1.0e-6,
+            ridge_beta: 1.0e-6,
+            random_state: 0,
+            run_outer_rho_search: true,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.n_atoms == 0 {
+            return Err("SaeCrosscoderAutoFitConfig: n_atoms must be positive".to_string());
+        }
+        if self.n_harmonics == 0 {
+            return Err("SaeCrosscoderAutoFitConfig: n_harmonics must be positive".to_string());
+        }
+        if self.max_iter == 0 {
+            return Err("SaeCrosscoderAutoFitConfig: max_iter must be positive".to_string());
+        }
+        for (name, value) in [
+            ("sparsity_strength", self.sparsity_strength),
+            ("smoothness", self.smoothness),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "SaeCrosscoderAutoFitConfig: {name} must be finite and non-negative; got {value}"
+                ));
+            }
+        }
+        for (name, value) in [
+            ("learning_rate", self.learning_rate),
+            ("ridge_ext_coord", self.ridge_ext_coord),
+            ("ridge_beta", self.ridge_beta),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!(
+                    "SaeCrosscoderAutoFitConfig: {name} must be finite and positive; got {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Automatic crosscoder request shared by non-Rust front doors. It owns only
+/// row-aligned activations and one Rust-owned config; seed construction and all
+/// model policy stay below the bindings.
+pub struct SaeCrosscoderAutoFitRequest {
+    pub anchor_label: String,
+    pub anchor: Array2<f64>,
+    pub blocks: Vec<NamedCrosscoderTarget>,
+    pub config: SaeCrosscoderAutoFitConfig,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Optional scientific measurements to materialize from a completed fit.
+/// Transport is not run implicitly: its grid resolution is a caller-owned
+/// experimental resolution, and its law threshold is an optional claim rule.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SaeCrosscoderEvaluationConfig {
+    pub transport_grid_resolution: Option<usize>,
+    pub law_gap_tolerance: Option<f64>,
 }
 
 /// Honest-unit reconstruction and per-atom decoders for one fitted layer.
@@ -74,6 +165,102 @@ pub struct SaeCrosscoderFitReport {
     pub layout: CrosscoderLayout,
     pub layers: Vec<CrosscoderLayerFit>,
     pub drift: CrosscoderDriftStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireLayout {
+    pub anchor_label: String,
+    pub anchor_dim: usize,
+    pub block_dims: Vec<usize>,
+    pub labels: Vec<String>,
+    pub log_lambda_block: Vec<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireLayer {
+    pub label: String,
+    pub fitted: Vec<Vec<f64>>,
+    pub reconstruction_r2: f64,
+    pub decoders: Vec<Vec<Vec<f64>>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireLoss {
+    pub data_fit: f64,
+    pub assignment_sparsity: f64,
+    pub smoothness: f64,
+    pub ard: f64,
+    pub total_penalized_loss: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireTermination {
+    pub verdict: String,
+    pub evals: u64,
+    pub evals_since_improvement: u64,
+    pub wall_seconds: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireDriftStep {
+    pub atom: usize,
+    pub source: String,
+    pub target: String,
+    pub drift: f64,
+    pub principal_angles: Vec<f64>,
+    pub max_principal_angle: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SaeCrosscoderWireDrift {
+    Measured {
+        num_atoms: usize,
+        mean_drift: f64,
+        most_drifting_atom: Option<usize>,
+        most_stable_atom: Option<usize>,
+        layer_chain: Vec<String>,
+        steps: Vec<SaeCrosscoderWireDriftStep>,
+    },
+    Undefined {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireTransport {
+    pub atom: usize,
+    pub source: String,
+    pub target: String,
+    pub grid_resolution: usize,
+    pub n_harmonics: usize,
+    pub phase_shift: (f64, f64),
+    pub phase_r2: f64,
+    pub smooth_r2: f64,
+    pub law_gap: f64,
+    pub law_holds: Option<bool>,
+    pub deviation_locus: Option<f64>,
+    pub drift: f64,
+    pub principal_angles: Vec<f64>,
+    pub transport_grid: Vec<(f64, f64)>,
+}
+
+/// Stable, binding-neutral report shape owned by GAM-SAE. pyffi and CLI only
+/// serialize this value; neither derives diagnostics or chooses measurements.
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWireReport {
+    pub layout: SaeCrosscoderWireLayout,
+    pub log_lambda_block: Vec<f64>,
+    pub log_lambda_sparse: f64,
+    pub log_lambda_smooth: Vec<f64>,
+    pub assignments: Vec<Vec<f64>>,
+    pub logits: Vec<Vec<f64>>,
+    pub coords: Vec<Vec<Vec<f64>>>,
+    pub loss: SaeCrosscoderWireLoss,
+    pub termination: SaeCrosscoderWireTermination,
+    pub layers: Vec<SaeCrosscoderWireLayer>,
+    pub drift: SaeCrosscoderWireDrift,
+    pub transport: Vec<SaeCrosscoderWireTransport>,
 }
 
 fn validate_label(label: &str, role: &str) -> Result<(), String> {

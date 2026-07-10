@@ -215,7 +215,7 @@ fn nystrom_recovers_noisy_circle_angle() {
             }
         })
         .collect();
-    let report = chart_interp_score(&obs).expect("chart interp");
+    let report = chart_interp_score(&obs, &[obs.clone()], 0.05).expect("chart interp");
     assert!(
         report.circular_correlation > 0.95,
         "noisy-circle circular correlation {} should exceed 0.95",

@@ -99,6 +99,42 @@ pub struct AtomBehaviorIsometry {
     /// re-gauge drives this to a constant (`≈ 2` in the calibrated gauge); this is
     /// the raw readout. `NaN` when not engaged.
     pub nats_per_unit_t: f64,
+    /// Behavior-pinned canonical chart coordinate.  This is the arc length of
+    /// the fitted behavior image, divided by `sqrt(2)`, with its origin pinned
+    /// at the point closest to the behavior embedding's Frechet basepoint and
+    /// its orientation pinned by the first non-zero tangent component there.
+    /// Consequently a displacement `du` has the universal local calibration
+    /// `KL = 2 du^2 + O(du^3)`, independently of the atom, layer, or model.
+    /// `None` when behavior is inert or the behavior image is degenerate.
+    pub behavior_pinned_chart: Option<BehaviorPinnedChart>,
+}
+
+/// The behavior block's canonical representative of a one-dimensional chart.
+///
+/// This is a quotient coordinate, not a second fitted latent: activation and
+/// behavior still share the fit's single `t`, while `coords` records the exact
+/// post-fit reparameterization of that shared chart into behavior arc length.
+/// It therefore remains valid when a finite basis cannot recompose an active
+/// nonlinear reparameterization without approximation (the same read-only
+/// quotient discipline used by the activation `coords_u_arc` certificate).
+#[derive(Debug, Clone)]
+pub struct BehaviorPinnedChart {
+    /// Per-row behavior-arc coordinate in `sqrt(nats / 2)` units.
+    pub coords: Array1<f64>,
+    /// Fitted row nearest the behavior embedding basepoint; its coordinate is
+    /// exactly zero (modulo `period` for a circle).
+    pub anchor_row: usize,
+    /// `+1` or `-1`, selected deterministically from the behavior tangent at
+    /// the pinned origin.
+    pub orientation: i8,
+    /// Total behavior-image length in nats-unit tangent space.
+    pub behavior_length: f64,
+    /// Period of `coords` for a circular chart (`behavior_length / sqrt(2)`),
+    /// or `None` for an interval.
+    pub period: Option<f64>,
+    /// Universal calibration of this quotient coordinate.  Equal to exactly
+    /// `2.0` by construction, not an empirical average.
+    pub nats_per_unit_coordinate: f64,
 }
 
 /// Numerical floor below which a behavior induced speed is treated as zero (the
@@ -125,9 +161,9 @@ pub fn atom_behavior_isometry(
     };
     // The induced-speed construction (curve_speeds) is a 1-D latent property; use
     // the same d = 1 gate the in-loop unit-speed retraction uses.
-    if term.d1_unit_speed_topology(atom_idx).is_none() {
+    let Some(topology) = term.d1_unit_speed_topology(atom_idx) else {
         return Ok(None);
-    }
+    };
     let atom = &term.atoms[atom_idx];
     let evaluator = atom
         .basis_evaluator
@@ -186,13 +222,180 @@ pub fn atom_behavior_isometry(
         ));
     }
 
-    Ok(Some(assemble(
+    let mut report = assemble(
         atom_idx,
         &s_x,
         &s_y,
         weights,
         support.mass(),
-    )))
+    );
+    if report.behavior_engaged && report.behavior_metric_collapse_rows == 0 {
+        report.behavior_pinned_chart = behavior_pinned_chart(
+            evaluator.as_ref(),
+            c_k.view(),
+            coords.column(0),
+            &topology,
+        )?;
+    }
+    Ok(Some(report))
+}
+
+/// Construct the behavior-pinned arc-length representative on a dense audit
+/// grid, then interpolate the fitted rows into that coordinate.  The grid size
+/// is the same public arc-length integration resolution used by the activation
+/// chart canonicalizer, so the two quotient reads have one numerical contract.
+fn behavior_pinned_chart(
+    evaluator: &dyn SaeBasisEvaluator,
+    behavior_decoder: ArrayView2<'_, f64>,
+    row_coords: ArrayView1<'_, f64>,
+    topology: &crate::chart_canonicalization::CanonicalChartTopology,
+) -> Result<Option<BehaviorPinnedChart>, String> {
+    use crate::chart_canonicalization::{ARC_LENGTH_GRID_CELLS, CanonicalChartTopology};
+
+    if row_coords.is_empty() {
+        return Ok(None);
+    }
+    let (lo, hi, circular) = match topology {
+        CanonicalChartTopology::Circle { period } => {
+            if !period.is_finite() || *period <= 0.0 {
+                return Ok(None);
+            }
+            (0.0, *period, true)
+        }
+        CanonicalChartTopology::Interval => {
+            let lo = row_coords.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = row_coords
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+                return Ok(None);
+            }
+            (lo, hi, false)
+        }
+    };
+    let cells = ARC_LENGTH_GRID_CELLS;
+    let step = (hi - lo) / cells as f64;
+    let mut grid = Array2::<f64>::zeros((cells + 1, 1));
+    for i in 0..=cells {
+        grid[[i, 0]] = lo + step * i as f64;
+    }
+    let (phi, jet) = evaluator.evaluate(grid.view())?;
+    let behavior_points = phi.dot(&behavior_decoder);
+    let speeds = curve_speeds(&jet, behavior_decoder)?;
+    if speeds.len() != cells + 1
+        || speeds
+            .iter()
+            .any(|speed| !speed.is_finite() || *speed < 0.0)
+    {
+        return Ok(None);
+    }
+    let mut cumulative = Array1::<f64>::zeros(cells + 1);
+    for i in 1..=cells {
+        cumulative[i] = cumulative[i - 1] + 0.5 * step * (speeds[i - 1] + speeds[i]);
+    }
+    let behavior_length = cumulative[cells];
+    if !(behavior_length.is_finite() && behavior_length > f64::MIN_POSITIVE) {
+        return Ok(None);
+    }
+
+    // Origin: closest decoded behavior tangent point to the embedding's
+    // Frechet basepoint (the zero vector in tangent coordinates).
+    let mut anchor_grid = 0usize;
+    let mut anchor_norm_sq = f64::INFINITY;
+    for i in 0..=cells {
+        let norm_sq = behavior_points.row(i).dot(&behavior_points.row(i));
+        if norm_sq < anchor_norm_sq {
+            anchor_norm_sq = norm_sq;
+            anchor_grid = i;
+        }
+    }
+    let anchor_arc = cumulative[anchor_grid];
+
+    // Orientation: lexicographic sign of the physical behavior tangent at the
+    // pinned origin.  If the exact anchor is stationary, use the nearest grid
+    // point with a resolved tangent; a globally stationary image was rejected
+    // by the positive-length gate above.
+    let tangent_floor = speeds.iter().copied().fold(0.0_f64, f64::max) * 1.0e-12;
+    let mut orientation = 0_i8;
+    for radius in 0..=cells {
+        for idx in [anchor_grid.saturating_sub(radius), (anchor_grid + radius).min(cells)] {
+            if speeds[idx] <= tangent_floor {
+                continue;
+            }
+            for out in 0..behavior_decoder.ncols() {
+                let mut derivative = 0.0_f64;
+                for basis in 0..behavior_decoder.nrows() {
+                    derivative += jet[[idx, basis, 0]] * behavior_decoder[[basis, out]];
+                }
+                if derivative.abs() > tangent_floor {
+                    orientation = if derivative > 0.0 { 1 } else { -1 };
+                    break;
+                }
+            }
+            if orientation != 0 {
+                break;
+            }
+        }
+        if orientation != 0 {
+            break;
+        }
+    }
+    if orientation == 0 {
+        return Ok(None);
+    }
+
+    let interpolate_arc = |coord: f64| -> f64 {
+        let coord = if circular {
+            (coord - lo).rem_euclid(hi - lo) + lo
+        } else {
+            coord.clamp(lo, hi)
+        };
+        let pos = ((coord - lo) / step).clamp(0.0, cells as f64);
+        let left = (pos.floor() as usize).min(cells - 1);
+        let frac = pos - left as f64;
+        cumulative[left] + frac * (cumulative[left + 1] - cumulative[left])
+    };
+    let coordinate_period = behavior_length * std::f64::consts::FRAC_1_SQRT_2;
+    let mut canonical = Array1::<f64>::zeros(row_coords.len());
+    for (row, &coord) in row_coords.iter().enumerate() {
+        let arc = interpolate_arc(coord);
+        let signed = orientation as f64 * (arc - anchor_arc);
+        canonical[row] = if circular {
+            (signed * std::f64::consts::FRAC_1_SQRT_2).rem_euclid(coordinate_period)
+        } else {
+            signed * std::f64::consts::FRAC_1_SQRT_2
+        };
+    }
+    let anchor_row = canonical
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(row, _)| row)
+        .unwrap_or(0);
+    // Pin the reported fitted row exactly at the origin.  This is a constant
+    // rotation of the already arc-length coordinate and changes no distances.
+    let row_shift = canonical[anchor_row];
+    for value in canonical.iter_mut() {
+        *value = if circular {
+            (*value - row_shift).rem_euclid(coordinate_period)
+        } else {
+            *value - row_shift
+        };
+    }
+
+    Ok(Some(BehaviorPinnedChart {
+        coords: canonical,
+        anchor_row,
+        orientation,
+        behavior_length,
+        period: circular.then_some(coordinate_period),
+        nats_per_unit_coordinate: 2.0,
+    }))
 }
 
 /// The representation–behavior isometry certificate for every atom of the term

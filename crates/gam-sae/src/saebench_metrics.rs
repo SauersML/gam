@@ -7,6 +7,8 @@
 //! single audited definition with the steering code instead of reimplementing
 //! math in Python notebooks.
 
+use crate::null_battery::{Tail, empirical_p_value};
+
 /// One row in the chart-interpretability evaluation: a recovered coordinate,
 /// its ground-truth cyclic label, and the posterior/evidence weight assigned to
 /// that row.
@@ -103,38 +105,33 @@ pub fn chart_interp_score(
     if matched_spectrum_null_draws.is_empty() {
         return Err("chart_interp: at least one matched-spectrum null draw is required".into());
     }
-    if !(significance_level.is_finite() && significance_level > 0.0 && significance_level < 1.0)
-    {
+    if !(significance_level.is_finite() && significance_level > 0.0 && significance_level < 1.0) {
         return Err(format!(
             "chart_interp: significance_level must be finite and in (0, 1), got {significance_level}"
         ));
     }
     let (circular_correlation, signed_circular_correlation, weight_sum) =
         chart_correlation(observations, "chart_interp observed")?;
-    let mut null_sum = 0.0;
-    let mut exceedances = 0usize;
+    let mut null_statistics = Vec::with_capacity(matched_spectrum_null_draws.len());
     for (draw_idx, draw) in matched_spectrum_null_draws.iter().enumerate() {
-        let (null_statistic, _, _) =
-            chart_correlation(draw, &format!("chart_interp matched-spectrum draw {draw_idx}"))?;
-        null_sum += null_statistic;
-        if null_statistic >= circular_correlation - 1.0e-12 {
-            exceedances += 1;
-        }
+        let (null_statistic, _, _) = chart_correlation(
+            draw,
+            &format!("chart_interp matched-spectrum draw {draw_idx}"),
+        )?;
+        null_statistics.push(null_statistic);
     }
-    let draws = matched_spectrum_null_draws.len();
-    let p_value = (exceedances as f64 + 1.0) / (draws as f64 + 1.0);
-    let monte_carlo_standard_error =
-        (p_value * (1.0 - p_value) / (draws as f64 + 1.0)).sqrt();
+    let null_mean = null_statistics.iter().sum::<f64>() / null_statistics.len() as f64;
+    let calibration = empirical_p_value(circular_correlation, &null_statistics, Tail::Larger)?;
     Ok(ChartInterpReport {
         circular_correlation,
         signed_circular_correlation,
         effective_weight: weight_sum,
-        matched_spectrum_null_mean: null_sum / draws as f64,
-        matched_spectrum_p_value: p_value,
-        monte_carlo_standard_error,
-        matched_spectrum_draws: draws,
+        matched_spectrum_null_mean: null_mean,
+        matched_spectrum_p_value: calibration.p_value,
+        monte_carlo_standard_error: calibration.monte_carlo_standard_error,
+        matched_spectrum_draws: calibration.draws,
         significance_level,
-        evidentially_valid: p_value <= significance_level,
+        evidentially_valid: calibration.p_value <= significance_level,
     })
 }
 

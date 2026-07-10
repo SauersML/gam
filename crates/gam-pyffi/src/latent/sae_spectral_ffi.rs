@@ -2307,10 +2307,7 @@ fn chart_interp_score(
         "matched_spectrum_null_mean",
         report.matched_spectrum_null_mean,
     )?;
-    out.set_item(
-        "matched_spectrum_p_value",
-        report.matched_spectrum_p_value,
-    )?;
+    out.set_item("matched_spectrum_p_value", report.matched_spectrum_p_value)?;
     out.set_item(
         "monte_carlo_standard_error",
         report.monte_carlo_standard_error,
@@ -2503,16 +2500,14 @@ mod ffi_completeness_tests {
             // Recovered coordinate runs backwards relative to the cyclic label;
             // the orientation-quotiented score still locks phase, and the signed
             // score records the reversal.
-            let out = chart_interp_score(
-                py,
-                vec![
-                    (0.99, 0.01, 1.0),
-                    (0.24, 0.76, 1.0),
-                    (0.49, 0.51, 1.0),
-                    (0.74, 0.26, 1.0),
-                ],
-            )
-            .expect("chart interp score");
+            let observations = vec![
+                (0.99, 0.01, 1.0),
+                (0.24, 0.76, 1.0),
+                (0.49, 0.51, 1.0),
+                (0.74, 0.26, 1.0),
+            ];
+            let out = chart_interp_score(py, observations.clone(), vec![observations], 0.05)
+                .expect("chart interp score");
             let d = out.bind(py);
             let cc: f64 = d
                 .get_item("circular_correlation")
@@ -2528,6 +2523,13 @@ mod ffi_completeness_tests {
                 .extract()
                 .unwrap();
             assert!(signed < 0.0, "signed_circular_correlation = {signed}");
+            let valid: bool = d
+                .get_item("evidentially_valid")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(!valid, "a draw equal to observed must not pass the null");
         });
     }
 
