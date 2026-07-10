@@ -1587,6 +1587,10 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .filter(|data| data.frame.is_some())
         .expect("framed assembly returns its device descriptor");
     let first_device_frame_ptr = Arc::as_ptr(first_device) as usize;
+    let first_device_frame_blocks_ptr = first_device
+        .frame
+        .as_ref()
+        .map_or(0, |frame| frame.frame_blocks.as_ptr() as usize);
     let first_device_row_htbeta_ptr = first_device
         .frame
         .as_ref()
@@ -1645,6 +1649,10 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .filter(|data| data.frame.is_some())
         .expect("reused framed assembly returns its device descriptor");
     let second_device_frame_ptr = Arc::as_ptr(second_device) as usize;
+    let second_device_frame_blocks_ptr = second_device
+        .frame
+        .as_ref()
+        .map_or(0, |frame| frame.frame_blocks.as_ptr() as usize);
     let second_device_row_htbeta_ptr = second_device
         .frame
         .as_ref()
@@ -1678,6 +1686,11 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         "framed assembly must install DeviceSaePcgData"
     );
     assert_eq!(first_device_frame_ptr, second_device_frame_ptr);
+    assert_ne!(first_device_frame_blocks_ptr, 0);
+    assert_eq!(
+        first_device_frame_blocks_ptr, second_device_frame_blocks_ptr,
+        "framed data-fit block vector must retain its allocation"
+    );
     assert_ne!(first_device_row_htbeta_ptr, 0);
     assert_eq!(
         first_device_row_htbeta_ptr, second_device_row_htbeta_ptr,
@@ -1724,12 +1737,14 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
     eprintln!(
         "#1017 accepted-iteration residency telemetry: iterations=2 row_htt_ptr={} \
          row_htbeta_ptr={} gb_ptr={} device_frame_ptr={} device_row_htbeta_ptr={} \
-         device_frame_g_ptr={} device_frame_w_ptr={} numerical_content_changed=true",
+         device_frame_blocks_ptr={} device_frame_g_ptr={} device_frame_w_ptr={} \
+         numerical_content_changed=true",
         first_row_htt_ptr,
         first_row_htbeta_ptr,
         first_gb_ptr,
         first_device_frame_ptr,
         first_device_row_htbeta_ptr,
+        first_device_frame_blocks_ptr,
         first_device_frame_g_ptr,
         first_device_frame_w_ptr,
     );
