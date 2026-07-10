@@ -37,7 +37,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
     let y = data.values.column(y_col).to_owned();
     let mut inference_notes = Vec::new();
 
-    let policy = resolved_resource_policy(config, data, marginal_slope_hints(config));
+    let policy = resolved_resource_policy(config, marginal_slope_hints(config));
     let covariate_spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
