@@ -144,11 +144,10 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
     eprintln!(
         "[{label}] pearson={corr:.5} rmse_ls={rmse_ls:.5} rmse_mu={rmse_mu:.5} reml={reml:.4} \
          | lambdas={} log_lambdas={} | edf_by_block={} edf_total={edf_total:.3} \
-         | response_scale={response_scale:.4} outer_conv={} iters={}",
+         | response_scale={response_scale:.4} outer_conv=certified iters={}",
         fmt_vec(&lambdas),
         fmt_vec(&log_lambdas),
         fmt_vec(&edf_by_block),
-        fit.fit.outer_converged,
         fit.fit.outer_iterations
     );
     corr

@@ -241,17 +241,19 @@ class SparseDictStreamArtifact:
         ``K x P`` unit-norm decoder (one atom per row), FP32.
     explained_variance:
         EV of the final epoch's pass (the pre-refresh decoder of the last epoch);
-        for a converged fit this equals the returned decoder's EV to tolerance.
-    epochs, converged, active:
+        this equals the returned decoder's EV to tolerance.
+    epochs, active:
         Run metadata.
     score_route_stats:
         Aggregate CPU/GPU route telemetry across streamed shards.
+
+    Every instance is converged: :meth:`SparseDictStream.finalize` raises instead
+    of returning a best-effort iterate.
     """
 
     decoder: np.ndarray
     explained_variance: float
     epochs: int
-    converged: bool
     active: int
     score_route_stats: dict[str, Any]
 
@@ -379,14 +381,18 @@ class SparseDictStream:
         return dict(self._handle.end_epoch())
 
     def finalize(self) -> SparseDictStreamArtifact:
-        """Hand back the trained decoder plus run metadata as a
-        :class:`SparseDictStreamArtifact`."""
+        """Hand back the converged decoder plus run metadata as a
+        :class:`SparseDictStreamArtifact`.
+
+        Raises if the streaming loop has not converged (SPEC 20): the stream
+        handle remains a resumable checkpoint — run more epochs until
+        :meth:`end_epoch` reports convergence, then finalize.
+        """
         data = dict(self._handle.finalize())
         return SparseDictStreamArtifact(
             decoder=np.ascontiguousarray(data["decoder"], dtype=np.float32),
             explained_variance=float(data["explained_variance"]),
             epochs=int(data["epochs"]),
-            converged=bool(data["converged"]),
             active=int(data["active"]),
             score_route_stats=_route_stats(data["score_route_stats"]),
         )

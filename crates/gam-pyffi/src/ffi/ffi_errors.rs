@@ -545,6 +545,24 @@ pub(crate) fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
             ParameterConstraintError::new_err(message)
         }
         EstimationError::PirlsDidNotConverge { .. } => PirlsConvergenceError::new_err(message),
+        // The fixed-lambda Newton lanes (multinomial softmax, vector GLM,
+        // Firth refit) are the inner conditional solve, exactly the PIRLS
+        // role, so their typed exhaustion shares the PIRLS exception class.
+        EstimationError::FixedLambdaNewtonDidNotConverge { .. } => {
+            PirlsConvergenceError::new_err(message)
+        }
+        // Outer smoothing-parameter searches that ended without a stationarity
+        // certificate all carry REML-convergence identity: the caller's remedy
+        // (resume from the carried checkpoint / loosen the outer tolerance) is
+        // the same across these lanes.
+        EstimationError::RemlDidNotConverge { .. } => RemlConvergenceError::new_err(message),
+        EstimationError::BlockOrthogonalRemlDidNotConverge { .. } => {
+            RemlConvergenceError::new_err(message)
+        }
+        EstimationError::NegativeBinomialAlternationDidNotConverge { .. } => {
+            RemlConvergenceError::new_err(message)
+        }
+        EstimationError::FitDidNotConverge { .. } => RemlConvergenceError::new_err(message),
         EstimationError::PerfectSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }

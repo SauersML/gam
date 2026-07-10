@@ -4947,14 +4947,8 @@ mod tests {
     }
 
     fn saved_fit(blocks: Vec<FittedBlock>) -> UnifiedFitResult {
-        let beta = Array1::from_vec(
-            blocks
-                .iter()
-                .flat_map(|block| block.beta.iter().copied())
-                .collect(),
-        );
-        let p = beta.len();
-        UnifiedFitResult {
+        let p: usize = blocks.iter().map(|block| block.beta.len()).sum();
+        UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
             blocks,
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
@@ -4968,8 +4962,6 @@ mod tests {
             penalized_objective: 0.0,
             used_device: false,
             outer_iterations: 0,
-            outer_cost_evals: 0,
-            inner_pirls_solves: 0,
             outer_converged: true,
             outer_gradient_norm: None,
             standard_deviation: 1.0,
@@ -4979,7 +4971,6 @@ mod tests {
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
             block_states: vec![],
-            beta,
             pirls_status: PirlsStatus::Converged,
             max_abs_eta: 0.0,
             constraint_kkt: None,
@@ -4996,7 +4987,8 @@ mod tests {
                 joint_log_lambdas: None,
             },
             inner_cycles: 0,
-        }
+        })
+        .expect("test fixture fit must assemble")
     }
 
     fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {

@@ -315,11 +315,37 @@ impl OuterTerminationLedger {
         self.last_improvement_eval = self.evals;
     }
 
-    pub(crate) fn report(&self) -> SaeOuterTermination {
+    pub(crate) fn report(&self, verdict: SaeOuterVerdict) -> SaeOuterTermination {
         SaeOuterTermination {
+            verdict,
             evals: self.evals,
             evals_since_improvement: self.evals.saturating_sub(self.last_improvement_eval),
             wall: self.wall_start.elapsed(),
+        }
+    }
+}
+
+/// #2235 — how the outer search of a minted fit concluded. Every variant is a
+/// CONVERGED ending (non-convergence raises a typed error before a fit
+/// exists), so this is certificate provenance, not a success/failure flag —
+/// there is deliberately no budget/freeze variant.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SaeOuterVerdict {
+    /// The generic outer ρ-search ran and concluded with this certificate
+    /// (gradient-stationary / criterion-flat #2241 / recurrent-incumbent).
+    Search(OuterConvergedVia),
+    /// No outer ρ-search ran: the caller pinned ρ, so only the inner solve's
+    /// KKT certificate applies.
+    FixedRho,
+}
+
+impl SaeOuterVerdict {
+    /// Stable wire name; the enums own the vocabulary so bindings marshal
+    /// instead of mapping (precedent: ba57254af).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Search(via) => via.as_str(),
+            Self::FixedRho => "fixed_rho",
         }
     }
 }
@@ -328,6 +354,8 @@ impl OuterTerminationLedger {
 /// kind that exists: a defect raises before a fit is minted).
 #[derive(Debug, Clone, Copy)]
 pub struct SaeOuterTermination {
+    /// Which certificate concluded the search (#2235/#2241).
+    pub verdict: SaeOuterVerdict,
     pub evals: u64,
     pub evals_since_improvement: u64,
     pub wall: std::time::Duration,
@@ -820,6 +848,11 @@ pub struct SaeManifoldOuterObjective {
     /// stationary / budget-exhausted). Freezes the criterion once a verdict
     /// fires so the bridge converges onto the banked incumbent.
     pub(crate) termination: OuterTerminationLedger,
+    /// #2235/#2241 — the converged-via certificate of the outer ρ-search,
+    /// stamped by `certify_outer_stage` from the certified `OuterResult`.
+    /// `None` means no outer search ran on this objective (the fixed-ρ lane),
+    /// which `into_fitted` reports as [`SaeOuterVerdict::FixedRho`].
+    pub(crate) outer_search_verdict: Option<OuterConvergedVia>,
     /// SPEC wall-survival: the full-`N` data fingerprint + content-addressed
     /// store path for the fit checkpoint (see [`super::checkpoint`]). Computed
     /// once at construction on the full-data target. Checkpoints are written

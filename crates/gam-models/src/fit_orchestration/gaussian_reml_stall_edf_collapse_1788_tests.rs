@@ -54,9 +54,6 @@ fn truth(a: f64, b: f64, c: f64) -> f64 {
 struct StallProbe {
     edf_total: f64,
     edf_by_block: Vec<f64>,
-    outer_converged: bool,
-    outer_iterations: usize,
-    lambda_max: f64,
     /// Pearson correlation between fitted and observed response on the training
     /// rows — a coefficient-side "wiggliness" witness independent of the EDF.
     corr: f64,
@@ -70,12 +67,6 @@ impl StallProbe {
     /// THIS, so it is the shared precondition for asserting on EDF.
     fn coefficients_are_wiggly(&self) -> bool {
         self.corr > 0.5 && self.n_active_cols >= 10
-    }
-
-    /// The outer REML parked at the `λ` ceiling without converging — the
-    /// flat-valley stall that used to collapse the reported EDF.
-    fn is_railed_stall(&self) -> bool {
-        !self.outer_converged && self.lambda_max > 1e5
     }
 
     /// The reported EDF is internally consistent with wiggly coefficients:
@@ -95,7 +86,11 @@ impl StallProbe {
     }
 }
 
-fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> StallProbe {
+/// `Err` carries the typed non-convergence report: under the sealed
+/// `FitConvergenceEvidence` contract a stalled fixture refuses to mint a fit
+/// (and therefore never reports an EDF), which is the #1788 fix at its
+/// strongest — there is no collapsed EDF to observe.
+fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> Result<StallProbe, String> {
     let mut rng = StdRng::seed_from_u64(seed);
     let unif = Uniform::new(0.0_f64, 1.0).unwrap();
     let noise = Normal::new(0.0, noise_sd).unwrap();
@@ -130,7 +125,7 @@ fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> StallProbe {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ smooth(x1) + smooth(x2) + smooth(x3)", &ds, &cfg)
-        .expect("3-smooth gaussian fit");
+        .map_err(|e| e.to_string())?;
     let StandardFitResult {
         fit, resolvedspec, ..
     } = match result {
@@ -166,17 +161,13 @@ fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> StallProbe {
         0.0
     };
     let n_active_cols = fit.beta.iter().filter(|&&b| b.abs() > 1e-6).count();
-    let lambda_max = fit.lambdas.iter().cloned().fold(0.0_f64, f64::max);
 
-    StallProbe {
+    Ok(StallProbe {
         edf_total: fit.edf_total().expect("edf_total"),
         edf_by_block: fit.edf_by_block().to_vec(),
-        outer_converged: fit.outer_converged,
-        outer_iterations: fit.outer_iterations,
-        lambda_max,
         corr,
         n_active_cols,
-    }
+    })
 }
 
 /// #1788 headline contract, re-pinned to the post-101b087e8 optimizer. The
@@ -193,7 +184,17 @@ fn fit_three_smooth(n: usize, seed: u64, noise_sd: f64) -> StallProbe {
 /// must stay additive and consistent with the fitted coefficients.
 #[test]
 fn stalled_reml_edf_not_collapsed_to_intercept_1788() {
-    let p = fit_three_smooth(600, 2, 0.5);
+    // Post-101b087e8 contract: the grid-free stationary-point enumeration
+    // lands the interior ρ optimum instead of parking at the `λ` ceiling, so
+    // this fixture now CONVERGES — and under the sealed convergence-evidence
+    // contract a fit existing at all IS the convergence proof. A regression
+    // that re-strands the optimizer at the rail surfaces as `Err` here.
+    let p = fit_three_smooth(600, 2, 0.5).expect(
+        "#1788 re-pin: post-101b087e8 the seed=2 fixture is expected to CONVERGE \
+         (grid-free stationary-point enumeration lands the interior ρ optimum); \
+         a typed non-convergence means the optimizer is back at the rail — treat \
+         as a live regression, not a stale re-pin",
+    );
 
     // The coefficients are wiggly — they track the response and light up many
     // basis columns. This is the anchor the reported EDF must not contradict.
@@ -203,22 +204,6 @@ fn stalled_reml_edf_not_collapsed_to_intercept_1788() {
          got corr={:.3} active={}",
         p.corr,
         p.n_active_cols,
-    );
-
-    // Post-101b087e8 contract: the grid-free stationary-point enumeration lands
-    // the interior ρ optimum instead of parking at the `λ` ceiling, so this
-    // fixture now CONVERGES. Pinning the fix (not the earlier stall) makes a
-    // future regression that re-strands the optimizer at the rail loud here.
-    // (If the probe shows this fixture STILL stalls, the reproduction contract
-    // has not moved and this re-pin must be discarded in favour of the guard
-    // path — see the seed-scan test below, which covers the stall case.)
-    assert!(
-        p.outer_converged,
-        "#1788 re-pin: post-101b087e8 the seed=2 fixture is expected to CONVERGE \
-         (grid-free stationary-point enumeration lands the interior ρ optimum), \
-         got converged=false lambda_max={:.3e} (iters={}); the optimizer is back \
-         at the rail — treat as a live regression, not a stale re-pin",
-        p.lambda_max, p.outer_iterations,
     );
 
     // The reported EDF is self-consistent with those wiggly coefficients:
@@ -235,45 +220,45 @@ fn stalled_reml_edf_not_collapsed_to_intercept_1788() {
     );
 }
 
-/// Collapse-guard coverage without a hand-picked stalling seed. The
-/// `guard_untrusted_edf_collapse` correction is defensive-only once the
-/// optimizer robustly converges, and it is a private `fn` on the sibling `fit`
-/// module (not directly callable from this test module without widening its
-/// visibility). We instead scan a small band of seeds through the real fit
-/// pipeline: for EVERY fixture that still exhibits the #1788 flat-valley stall
-/// (railed `λ`, `outer_converged == false`) with wiggly coefficients, the
-/// guard must keep the reported EDF self-consistent — never collapsed to the
-/// intercept-only floor. If no seed stalls in the band the optimizer is robust
-/// post-101b087e8 and the collapse branch is simply unreachable via this
-/// pipeline (its inert path is covered by
-/// `converged_fit_edf_untouched_by_guard_1788`).
+/// EDF-consistency coverage without a hand-picked seed. We scan a small band
+/// of seeds through the real fit pipeline. Under the sealed
+/// `FitConvergenceEvidence` contract the old #1788 stall lane (railed `λ`,
+/// `outer_converged == false`, collapsed EDF) is unrepresentable: a stalled
+/// fixture returns a typed non-convergence error and never reports an EDF at
+/// all. What remains to pin is the positive half of the invariant — every fit
+/// that IS minted (and therefore carries a convergence certificate) must
+/// report an EDF consistent with its wiggly coefficients, never collapsed to
+/// the intercept-only floor.
 #[test]
 fn stalled_fixtures_keep_edf_consistent_via_guard_1788() {
     for seed in 0..12u64 {
-        let p = fit_three_smooth(600, seed, 0.5);
-        if !(p.is_railed_stall() && p.coefficients_are_wiggly()) {
+        let p = match fit_three_smooth(600, seed, 0.5) {
+            Ok(p) => p,
+            // A stalled fixture now refuses to mint a fit (typed
+            // non-convergence from the sealed evidence constructor), so there
+            // is no reported EDF to collapse — the #1788 laundering surface
+            // is gone by construction on the stall lane.
+            Err(_) => continue,
+        };
+        if !p.coefficients_are_wiggly() {
             continue;
         }
         assert!(
             p.edf_is_self_consistent(),
-            "#1788 guard: seed={seed} stalled at the λ rail (lambda_max={:.3e}, \
-             iters={}) with wiggly coefficients (corr={:.3}, active={}) yet the \
-             reported EDF collapsed — edf_total={:.4}, edf_by_block={:?}; the \
-             untrusted_edf_collapse guard must substitute the per-term dimension \
-             floor",
-            p.lambda_max,
-            p.outer_iterations,
+            "#1788: seed={seed} minted a fit with wiggly coefficients \
+             (corr={:.3}, active={}) yet the reported EDF collapsed — \
+             edf_total={:.4}, edf_by_block={:?}; a fit that exists carries a \
+             convergence certificate, so its EDF may never contradict the \
+             coefficients",
             p.corr,
             p.n_active_cols,
             p.edf_total,
             p.edf_by_block,
         );
     }
-    // Not a failure if the scan finds no stall: that means the optimizer is
-    // robust across the band and the collapse branch is genuinely unreachable
-    // via this pipeline (its inert path is covered by
-    // `converged_fit_edf_untouched_by_guard_1788`). The assertion above is a
-    // property over every stalling fixture, so it holds vacuously in that case.
+    // Not a failure if every seed converges: the EDF invariant above is a
+    // property over every minted fit, and the stall lane is covered by the
+    // typed-refusal contract (`Err` ⇒ no EDF is ever reported).
 }
 
 /// The guard must be INERT on a healthy converged fit: `n=600, noise_sd=0.5,
@@ -282,12 +267,8 @@ fn stalled_fixtures_keep_edf_consistent_via_guard_1788() {
 /// additivity drift.
 #[test]
 fn converged_fit_edf_untouched_by_guard_1788() {
-    let p = fit_three_smooth(600, 3, 0.5);
-    assert!(
-        p.outer_converged,
-        "#1788 sanity seed expected to converge, got converged=false (iters={})",
-        p.outer_iterations,
-    );
+    let p = fit_three_smooth(600, 3, 0.5)
+        .expect("#1788 sanity seed expected to converge (fit existence is the proof)");
     assert!(
         p.edf_total > 8.0 && p.edf_total < 30.0,
         "#1788 converged fit reports an unexpected edf_total={:.3}",

@@ -7137,10 +7137,8 @@ fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
     // fit must CONVERGE (pre-fix it hard-errored after 200 Newton iterations).
     let (fit, _geo) = fit_survival_location_scale_with_geometry(spec)
         .expect("reduced parametric-AFT MLE must converge on benign lognormal data (gam#2112)");
-    assert!(
-        fit.outer_converged,
-        "reduced parametric-AFT fit must report convergence (gam#2112)"
-    );
+    // The fit existing at all is the convergence proof: the sealed
+    // `FitConvergenceEvidence` constructor refuses non-converged assembly.
 
     // Closed-form MLE recovery: μ̂ = mean(log t), σ̂ = sd(log t).
     let mu_hat = fit.beta_threshold()[0];

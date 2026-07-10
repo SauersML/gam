@@ -475,6 +475,10 @@ fn truncate_marginal_slope_influence_absorber(
     }
     let p_influence = widened_len - p_marginal;
 
+    // The input fit's existence is its convergence proof (sealed
+    // `FitConvergenceEvidence`); carry the certified inner status into the
+    // narrowed reassembly, which revalidates the preserved artifacts.
+    let pirls_status = fit_result.convergence_evidence().inner_status();
     let UnifiedFitResult {
         mut blocks,
         log_lambdas,
@@ -489,7 +493,6 @@ fn truncate_marginal_slope_influence_absorber(
         penalized_objective,
         used_device,
         outer_iterations,
-        outer_converged,
         outer_gradient_norm,
         standard_deviation,
         covariance_conditional,
@@ -499,13 +502,13 @@ fn truncate_marginal_slope_influence_absorber(
         geometry: _,
         mut block_states,
         beta: _,
-        pirls_status,
         max_abs_eta,
         constraint_kkt,
         artifacts,
         inner_cycles,
         outer_cost_evals: _,
         inner_pirls_solves: _,
+        ..
     } = fit_result;
 
     // Slice block 0's coefficients (and matching block-state) to the raw p_m,
@@ -552,7 +555,7 @@ fn truncate_marginal_slope_influence_absorber(
         // device ran the solve.
         used_device,
         outer_iterations,
-        outer_converged,
+        outer_converged: true,
         outer_gradient_norm,
         standard_deviation,
         covariance_conditional,

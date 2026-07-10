@@ -1,31 +1,27 @@
-//! Regression: a Royston-Parmar (survival "transformation") fit must report
-//! `outer_converged` HONESTLY — derived from the real inner-PIRLS verdict, not
-//! a hardcoded `true`.
+//! Regression: a Royston-Parmar (survival "transformation") fit must carry an
+//! HONEST convergence verdict — historically `survival_unified_fit_result` set
+//! `outer_converged: true` unconditionally while carrying the REAL
+//! `pirls_status`, so a `MaxIterationsReached` / `LmStepSearchExhausted` /
+//! `Unstable` optimum was silently mislabelled as converged (#1426-class).
 //!
-//! `survival_unified_fit_result` used to set `outer_converged: true`
-//! unconditionally while carrying the REAL `outer_gradient_norm`
-//! (`summary.lastgradient_norm`) and the REAL `pirls_status` (`summary.status`).
-//! The survival fit path (#1123) deliberately ACCEPTS a finite-but-non-converged
-//! inner solve at the selected λ rather than aborting the model — so a
-//! `MaxIterationsReached` / `LmStepSearchExhausted` / `Unstable` optimum can
-//! legitimately reach the result builder. Stamping all of those `converged=true`
-//! is the same silent-non-convergence mislabelling #1426 cured for the REML
-//! path: a caller reading `outer_converged` was told the optimizer reached a
-//! stationary point even when `pirls_status` said it had not.
+//! The contract has since been strengthened past the boolean entirely (SPEC
+//! 20): `UnifiedFitResult` seals its convergence proof in a private
+//! `FitConvergenceEvidence` that the checked constructor mints only from a
+//! `Converged` inner status plus outer evidence — the survival fit path gates
+//! every exhausted/stalled PIRLS status behind
+//! `survival_pirls_status_is_certified` and returns a typed error instead of a
+//! fit. The mislabelling this file was written against is therefore
+//! unrepresentable: there is no flag to disagree with the status, because a
+//! fit that exists IS the verdict.
 //!
-//! The honest contract this test pins (on a well-posed, genuinely-converging
-//! synthetic cohort, driven entirely through the public `fit_from_formula`
-//! path): `outer_converged` must AGREE with the reported `pirls_status` — it is
-//! `true` exactly when the inner solve reached a stationary verdict
-//! (`Converged` or `StalledAtValidMinimum`, the two statuses the survival fit
-//! path treats as a valid minimum), and a `converged == true` fit must carry a
-//! finite `outer_gradient_norm`. A reversion to the hardcoded `true` would make
-//! `outer_converged` disagree with a non-stationary `pirls_status`, which this
-//! invariant forbids.
+//! What remains worth pinning through the public `fit_from_formula` path:
+//! (1) the well-posed cohort still converges (a regression that starts
+//! refusing it is loud), and (2) the minted fit's sealed evidence reports the
+//! certified `Converged` inner status and a finite residual gradient when one
+//! was measured.
 //!
 //! DGP: deterministic right-censored Weibull (shape 1.5, log-hazard slope 0.7),
-//! the well-posed #898 repro shape, so the RP fit converges cleanly and the
-//! invariant is exercised on its `true` branch with a real stationary status.
+//! the well-posed #898 repro shape, so the RP fit converges cleanly.
 
 use csv::StringRecord;
 use gam::pirls::PirlsStatus;
@@ -85,7 +81,7 @@ fn build_survival_frame() -> gam::data::EncodedDataset {
 }
 
 #[test]
-fn survival_outer_converged_agrees_with_pirls_status_not_hardcoded() {
+fn survival_fit_existence_is_the_certified_convergence_verdict() {
     let ds = build_survival_frame();
     let cfg = FitConfig {
         survival_likelihood: "transformation".to_string(),
@@ -94,58 +90,42 @@ fn survival_outer_converged_agrees_with_pirls_status_not_hardcoded() {
         time_num_internal_knots: 2,
         ..FitConfig::default()
     };
+    // A non-converged solve now surfaces here as a typed error; the well-posed
+    // cohort regressing into refusal is exactly as loud as the old
+    // mislabelling assertion.
     let result = fit_from_formula("Surv(t, event) ~ x + survmodel(spec=net)", &ds, &cfg)
         .expect("Royston-Parmar net-survival fit on the synthetic Weibull cohort");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
 
-    let status = fit.fit.pirls_status;
-    let outer_converged = fit.fit.outer_converged;
+    let evidence = fit.fit.convergence_evidence();
     let grad = fit.fit.outer_gradient_norm;
 
     eprintln!(
-        "[survival-honest] outer_converged={outer_converged} pirls_status={status:?} \
-         outer_gradient_norm={grad:?}"
+        "[survival-honest] inner_status={:?} outer_iterations={} outer_gradient_norm={grad:?}",
+        evidence.inner_status(),
+        evidence.outer_iterations(),
     );
 
-    // The two stationary verdicts the survival fit path treats as a valid
-    // minimum. Every other status (MaxIterationsReached / LmStepSearchExhausted /
-    // Unstable) is an honest NON-convergence even though the finite optimum is
-    // still shipped (#1123).
-    let status_is_stationary = matches!(
-        status,
-        PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
-    );
-
-    // The honest-flag invariant: `outer_converged` MUST equal the real verdict.
-    // The hardcoded-`true` bug breaks this exactly when `status_is_stationary`
-    // is false.
+    // The sealed constructor only certifies a `Converged` inner mode; the
+    // exhausted/stalled statuses (`MaxIterationsReached` /
+    // `LmStepSearchExhausted` / `Unstable` / `StalledAtValidMinimum`) are
+    // rejected by `survival_pirls_status_is_certified` before assembly.
     assert_eq!(
-        outer_converged, status_is_stationary,
-        "outer_converged ({outer_converged}) must agree with the real inner verdict \
-         (pirls_status={status:?}, stationary={status_is_stationary}); a hardcoded \
-         `true` silently mislabels a non-converged survival fit (#1426-class)."
+        evidence.inner_status(),
+        PirlsStatus::Converged,
+        "a minted survival fit must carry the certified Converged inner status; \
+         any other value means the sealed evidence constructor regressed"
     );
 
-    // A converged verdict must carry a finite residual gradient (the #1426
-    // contract): a `converged == true` with a missing/non-finite gradient is the
+    // A measured residual gradient on the shipped fit must be finite (the
+    // #1426 contract): a certified fit with a non-finite gradient is the
     // inverse mislabelling.
-    if outer_converged {
-        let g = grad.expect("a converged survival fit must report an outer_gradient_norm");
+    if let Some(g) = grad {
         assert!(
             g.is_finite(),
-            "converged survival fit reported a non-finite outer_gradient_norm ({g})"
+            "certified survival fit reported a non-finite outer_gradient_norm ({g})"
         );
     }
-
-    // Sanity: this well-posed cohort must actually reach the stationary basin,
-    // so the invariant is exercised on its `true` branch (a fix that simply
-    // tagged everything non-converged would be caught here).
-    assert!(
-        status_is_stationary && outer_converged,
-        "the well-posed synthetic RP cohort must converge to a valid minimum \
-         (got pirls_status={status:?}, outer_converged={outer_converged}); if this \
-         fails the fixture stopped exercising the honest `true` branch."
-    );
 }

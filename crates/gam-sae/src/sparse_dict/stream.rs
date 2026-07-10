@@ -202,6 +202,7 @@ pub struct SparseDictStreamState {
     // ---- cross-epoch state ----
     prev_ev: f64,
     last_ev: f64,
+    last_ev_residual: f64,
     epochs_run: usize,
     last_revived: usize,
     converged: bool,
@@ -251,6 +252,7 @@ impl SparseDictStreamState {
             reservoir: ResidualReservoir::new(k),
             prev_ev: f64::NEG_INFINITY,
             last_ev: f64::NEG_INFINITY,
+            last_ev_residual: f64::INFINITY,
             epochs_run: 0,
             last_revived: 0,
             converged: false,
@@ -410,6 +412,7 @@ impl SparseDictStreamState {
 
         self.prev_ev = ev;
         self.last_ev = ev;
+        self.last_ev_residual = improve.abs();
         self.last_revived = revived;
         self.converged = converged;
         self.epochs_run += 1;
@@ -477,20 +480,37 @@ impl SparseDictStreamState {
         self.reservoir.clear();
     }
 
-    /// finalize: hand back the warm-started decoder and run metadata. The routing
+    /// finalize: hand back the converged decoder and run metadata. The routing
     /// itself is not materialised here (a streamed corpus has no `N×s` object to
     /// return); route held-out or training shards back through
     /// [`super::sparse_dictionary_transform`] against this decoder to encode them.
-    pub fn finalize(&self) -> SparseDictArtifact {
-        SparseDictArtifact {
+    ///
+    /// A fit object must only ever come from a converged optimization (SPEC 20):
+    /// if the streaming loop has not met the convergence rule, this is a typed
+    /// error and the state itself remains the resumable checkpoint — stream more
+    /// epochs and finalize again.
+    pub fn finalize(&self) -> Result<SparseDictArtifact, String> {
+        if !self.converged {
+            return Err(format!(
+                "SparseDictStream.finalize: streaming fit has not converged after {} epoch(s) \
+                 (last EV {:.6e}, EV residual {:.3e} vs tolerance {:.3e}, {} atom(s) revived in \
+                 the last epoch); the stream state is a resumable checkpoint, not a model — run \
+                 more epochs until end_epoch reports convergence",
+                self.epochs_run,
+                self.last_ev,
+                self.last_ev_residual,
+                self.config.tolerance,
+                self.last_revived,
+            ));
+        }
+        Ok(SparseDictArtifact {
             decoder: self.decoder.clone(),
             active: self.s,
             epochs: self.epochs_run,
             explained_variance: self.last_ev,
-            converged: self.converged,
             score_route_stats: self.score_route_stats,
             decoder_solve_stats: self.last_decoder_solve_stats,
-        }
+        })
     }
 
     /// Read-only view of the current warm-started decoder (`K×P`, unit-norm rows).
@@ -512,6 +532,7 @@ impl SparseDictStreamState {
 /// The artifact [`SparseDictStreamState::finalize`] returns: the trained decoder
 /// plus run metadata. Deliberately has no `N×s` routing — the streamed corpus is
 /// re-encoded shard-by-shard through the frozen decoder, not held in the fit.
+/// Every instance is converged: `finalize` refuses to mint one otherwise.
 #[derive(Clone, Debug)]
 pub struct SparseDictArtifact {
     /// Decoder, `K×P`, unit-norm rows.
@@ -520,11 +541,9 @@ pub struct SparseDictArtifact {
     pub active: usize,
     /// Epochs closed.
     pub epochs: usize,
-    /// EV of the final epoch's pass (pre-refresh decoder of the last epoch); for a
-    /// converged fit this equals the returned decoder's EV to tolerance.
+    /// EV of the final epoch's pass (pre-refresh decoder of the last epoch); this
+    /// equals the returned decoder's EV to tolerance.
     pub explained_variance: f64,
-    /// Whether the streaming loop met the convergence rule.
-    pub converged: bool,
     /// Aggregate CPU/GPU scoring counters across streamed shards.
     pub score_route_stats: ScoreRouteStats,
     /// Decoder refresh percolation/CG certificate from the final epoch.
@@ -651,7 +670,7 @@ mod stream_tests {
                 break;
             }
         }
-        let artifact = state.finalize();
+        let artifact = state.finalize().expect("finalize");
         (artifact.decoder, artifact.active)
     }
 

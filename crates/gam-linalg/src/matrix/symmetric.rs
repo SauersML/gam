@@ -389,12 +389,13 @@ pub fn xt_diag_x_symmetric(
             let dense_regime = 4 * avg_nnz_row >= p;
             if dense_regime {
                 let mut xtwx = Array2::<f64>::zeros((p, p));
-                let dense_bytes =
-                    checked_dense_nbytes(n, p, "xt_diag_x_symmetric dense sparse route")?;
-                if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
-                    let xd = xs.try_to_dense_arc("xt_diag_x_symmetric dense sparse route")?;
+                // Reserve-or-stream: the dense BLAS route runs only while its
+                // full dense footprint is admitted by the process-wide
+                // governor; a refusal picks the bounded streaming CSC path.
+                if let Ok(xd) = xs.try_to_dense_governed("xt_diag_x_symmetric dense sparse route")
+                {
                     stream_weighted_crossprod_into(
-                        xd.as_ref(),
+                        &**xd,
                         diag,
                         &mut xtwx,
                         CrossprodStructure::Full,

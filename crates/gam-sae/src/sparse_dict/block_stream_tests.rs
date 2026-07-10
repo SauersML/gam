@@ -158,7 +158,7 @@ fn streaming_over_shards_matches_one_shot() {
             break;
         }
     }
-    let art = state.finalize();
+    let art = state.finalize().expect("finalize");
 
     assert_eq!(
         art.decoder.shape(),
@@ -240,7 +240,7 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
             break;
         }
     }
-    let art = state.finalize();
+    let art = state.finalize().expect("finalize");
     // Every planted subspace is used: no block ends with zero utilisation.
     let live = art.block_utilization.iter().filter(|&&u| u > 0.0).count();
     assert_eq!(

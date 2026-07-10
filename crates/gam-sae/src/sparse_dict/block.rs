@@ -1639,6 +1639,25 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), Bl
 /// atoms, block-TopK routing by group ℓ₂ gate, tied signed codes with one shared
 /// scalar `γ`, Stiefel-constrained frames refreshed by polar steps, and AuxK
 /// dead-block revival. Never forms a dense `N×K` object.
+///
+/// # One-engine position (design gam#2232, Increment 5b)
+///
+/// A block IS a framed Euclidean `d = b` atom of the one engine: decoder
+/// `B_g = C_g·U_gᵀ` with `U_g ∈ Gr(b, P)` (the same profiled-frame
+/// representation the curved engine's `decoder_frame` / `factored_border_dim`
+/// carry), block-TopK = hard top-k support at atom granularity, and the
+/// within-block code `z_g` = the atom's Euclidean latent coordinate. This
+/// alternation — projection code solve on orthonormal frames, polar frame
+/// refresh — is the BLOCK FAST KERNEL of that model (the `d = b` sibling of
+/// [`super::update::run_linear_fast_kernel`]): the code solve is the exact
+/// degenerate arrow-Schur inner solve for read-only gates on linear atoms
+/// (projection, no ridge pair to unify), and the polar step is the Grassmann
+/// retraction of the framed decoder refresh. The single public entry
+/// (`sae_manifold_fit`, `atom_topology="linear"` + uniform `d_atom = b ≥ 2` +
+/// hard top-k) reaches this kernel through
+/// [`crate::front_door::admit_linear_dictionary`] — an explicit
+/// linear-dictionary request is a modeling choice admitted at ANY `K`, not a
+/// shape-derived demotion.
 pub fn fit_block_sparse_dictionary(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,

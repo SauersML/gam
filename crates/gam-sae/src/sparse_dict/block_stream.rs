@@ -204,6 +204,7 @@ pub struct BlockSparseStreamState {
     // ---- cross-epoch state ----
     prev_ev: f64,
     last_ev: f64,
+    last_ev_residual: f64,
     epochs_run: usize,
     last_revived: usize,
     converged: bool,
@@ -303,6 +304,7 @@ impl BlockSparseStreamState {
             reservoir: ResidualReservoir::new(cap),
             prev_ev: f64::NEG_INFINITY,
             last_ev: f64::NEG_INFINITY,
+            last_ev_residual: f64::INFINITY,
             epochs_run: 0,
             last_revived: 0,
             converged: false,
@@ -372,6 +374,7 @@ impl BlockSparseStreamState {
             reservoir: ResidualReservoir::new(cap),
             prev_ev: f64::NEG_INFINITY,
             last_ev: f64::NEG_INFINITY,
+            last_ev_residual: f64::INFINITY,
             epochs_run: 0,
             last_revived: 0,
             converged: false,
@@ -644,6 +647,7 @@ impl BlockSparseStreamState {
 
         self.prev_ev = ev;
         self.last_ev = ev;
+        self.last_ev_residual = improve.abs();
         self.last_revived = revived;
         self.converged = converged;
         self.last_decoder_solve_stats = decoder_solve_stats;
@@ -739,12 +743,30 @@ impl BlockSparseStreamState {
         self.reservoir.clear();
     }
 
-    /// finalize: hand back the warm-started block frames, γ, and run metadata,
+    /// finalize: hand back the converged block frames, γ, and run metadata,
     /// including the last epoch's per-block utilisation + stable-rank report. The
     /// routing is not materialised (a streamed corpus has no `N×k` object); route
     /// held-out or training shards back through the frozen frames to encode them.
-    pub fn finalize(&self) -> BlockSparseStreamArtifact {
-        BlockSparseStreamArtifact {
+    ///
+    /// A fit object must only ever come from a converged optimization (SPEC 20):
+    /// if the streaming loop has not met the convergence rule, this is a typed
+    /// error and the state itself remains the resumable checkpoint — stream more
+    /// epochs and finalize again.
+    pub fn finalize(&self) -> Result<BlockSparseStreamArtifact, String> {
+        if !self.converged {
+            return Err(format!(
+                "BlockSparseStream.finalize: streaming fit has not converged after {} epoch(s) \
+                 (last EV {:.6e}, EV residual {:.3e} vs tolerance {:.3e}, {} block(s) revived in \
+                 the last epoch); the stream state is a resumable checkpoint, not a model — run \
+                 more epochs until end_epoch reports convergence",
+                self.epochs_run,
+                self.last_ev,
+                self.last_ev_residual,
+                self.config.tolerance,
+                self.last_revived,
+            ));
+        }
+        Ok(BlockSparseStreamArtifact {
             decoder: self.decoder.clone(),
             gamma: self.gamma,
             block_topk: self.k,
@@ -753,9 +775,8 @@ impl BlockSparseStreamState {
             block_stable_rank: self.last_stable.clone(),
             epochs: self.epochs_run,
             explained_variance: self.last_ev,
-            converged: self.converged,
             decoder_solve_stats: self.last_decoder_solve_stats,
-        }
+        })
     }
 
     /// Per-block honest-charge ledger from the LAST CLOSED epoch (#23
@@ -871,8 +892,6 @@ pub struct BlockSparseStreamArtifact {
     pub epochs: usize,
     /// EV of the final epoch's pass (pre-refresh frames of the last epoch).
     pub explained_variance: f64,
-    /// Whether the streaming loop met the convergence rule.
-    pub converged: bool,
     /// Solve certificate placeholder (default/zeroed): the block lane refreshes its
     /// small `b×b` frames by an exact polar step, not the matrix-free CG/percolation
     /// solver that serves the atom/dict lane.

@@ -67,5 +67,9 @@ pub use run::OuterProblem;
 // above is `pub(crate)`) so the lifted gam-models fit-orchestration driver can
 // name `gam_solve::rho_optimizer::OuterResult` (#1521).
 pub use run::OuterResult;
+// Re-export the converged-via certificate vocabulary (#2235/#2241) so callers
+// that thread the termination verdict into their own payloads (gam-sae's
+// SaeOuterTermination) can name the variants.
+pub use run::OuterConvergedVia;
 pub(crate) use run_plan::*;
 pub(crate) use seed_screening::*;

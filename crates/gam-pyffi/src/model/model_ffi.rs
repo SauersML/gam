@@ -5041,15 +5041,23 @@ fn gaussian_reml_fit_formula_table<'py>(
     let dataset = rows.dataset.clone();
     let y_values = y.as_array().to_owned();
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
-    let result = detach_py_result(py, "gaussian_reml_fit_formula_table", move || {
-        gaussian_reml_fit_formula_dataset_impl(
-            dataset,
-            formula,
-            y_values.view(),
-            config_json.as_deref(),
-            fisher_values.as_ref().map(|w| w.view()),
-        )
-    })?;
+    let result = detach_typed_py_result(
+        py,
+        "gaussian_reml_fit_formula_table",
+        move || {
+            gaussian_reml_fit_formula_dataset_impl(
+                dataset,
+                formula,
+                y_values.view(),
+                config_json.as_deref(),
+                fisher_values.as_ref().map(|w| w.view()),
+            )
+        },
+        |_, error| match error {
+            SharedTangentFfiError::Spec(message) => py_value_error(message),
+            SharedTangentFfiError::Engine(engine) => estimation_error_to_pyerr(engine),
+        },
+    )?;
     tangent_reml_result_to_pydict(py, result)
 }
 

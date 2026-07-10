@@ -1565,13 +1565,12 @@ struct BatchedPositionGaussianRemlBackwardResult {
 ///
 /// One full Gaussian GAM is fitted per tangent coordinate (matching the
 /// documented `response_geometry` contract: "one scalar Gaussian GAM is fitted
-/// for each tangent coordinate"), but all coordinates are estimated jointly so
-/// that an optional cross-coordinate Fisher-Rao precision metric can couple
-/// their residuals. The fit routes through the *general* multi-penalty REML
-/// driver (`fit_gamwith_heuristic_lambdas`) — the very solver `gamfit.fit`
-/// uses — so smooth terms (`s()`, `te()`, `duchon()`, ...) that expand to
-/// several penalty blocks (wiggle + null-space ridge) are fully supported.
-/// Each tangent coordinate carries its own per-block smoothing parameters.
+/// for each tangent coordinate"), but all coordinates are estimated jointly
+/// under one smoothing parameter per formula smooth shared across every
+/// coordinate, and an optional cross-coordinate Fisher-Rao precision metric
+/// couples their residuals. The numerical engine is
+/// `gam::families::response_geometry::fit_shared_tangent_reml`; this FFI layer
+/// only marshals the formula artifacts into its typed request.
 struct TangentRemlMultiResult {
     /// Per-output coefficients, shape `(K, D)`.
     coefficients: Array2<f64>,
@@ -1591,561 +1590,95 @@ struct TangentRemlMultiResult {
     reml_score: f64,
 }
 
+/// Marshaling-vs-engine error split for the shared-tangent formula fit. The
+/// engine's typed `EstimationError` must reach `estimation_error_to_pyerr`
+/// unflattened so a non-converged outer search keeps its
+/// `RemlConvergenceError` class identity and structured resume evidence.
+enum SharedTangentFfiError {
+    Spec(String),
+    Engine(EstimationError),
+}
+
 fn gaussian_reml_fit_formula_dataset_impl(
     dataset: EncodedDataset,
     formula: String,
     y: ArrayView2<'_, f64>,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-) -> Result<TangentRemlMultiResult, String> {
-    let (mut fit_config, _training_table_kind) = parse_fit_config(config_json)?;
+) -> Result<TangentRemlMultiResult, SharedTangentFfiError> {
+    let (mut fit_config, _training_table_kind) =
+        parse_fit_config(config_json).map_err(SharedTangentFfiError::Spec)?;
     fit_config.family = Some("gaussian".to_string());
     fit_config.link = Some("identity".to_string());
-    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    let materialized =
+        materialize(&formula, &dataset, &fit_config).map_err(SharedTangentFfiError::Spec)?;
     let standard = match materialized.request {
         FitRequest::Standard(request) => request,
         _ => {
-            return Err(
+            return Err(SharedTangentFfiError::Spec(
                 "shared-tangent Gaussian REML fitting requires a standard Gaussian formula"
                     .to_string(),
-            );
+            ));
         }
     };
     if !standard.family.is_gaussian_identity() {
-        return Err("shared-tangent Gaussian REML fitting requires Gaussian identity".to_string());
+        return Err(SharedTangentFfiError::Spec(
+            "shared-tangent Gaussian REML fitting requires Gaussian identity".to_string(),
+        ));
     }
     if standard.wiggle.is_some() {
-        return Err(
+        return Err(SharedTangentFfiError::Spec(
             "shared-tangent Gaussian REML fitting does not support link wiggle".to_string(),
-        );
+        ));
     }
     if standard.offset.iter().any(|value| value.abs() > 0.0) {
-        return Err("shared-tangent Gaussian REML fitting does not support offsets".to_string());
+        return Err(SharedTangentFfiError::Spec(
+            "shared-tangent Gaussian REML fitting does not support offsets".to_string(),
+        ));
     }
+    // Build the formula design and hand the joint problem to the core
+    // shared-tangent REML engine. The engine consumes the design through
+    // bounded row chunks and streams exact joint sufficient statistics, so the
+    // stacked `(N·D) × (K·D)` system and the `Sᵇ ⊗ I_D` Kronecker penalties are
+    // never materialized on this side of the boundary; all remaining input
+    // validation (shapes, finiteness, weight signs, metric shape/PD) is owned
+    // by the engine's typed request preparation.
     let design =
         gam::terms::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
-            .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
-    let x = design
-        .design
-        .try_to_dense_by_chunks("shared_tangent_gaussian_reml design")?;
-    let n = x.nrows();
-    let k = x.ncols();
-    if y.nrows() != n {
-        return Err(format!(
-            "shared-tangent Gaussian REML response row mismatch: formula design has {} rows but Y has {}",
-            n,
-            y.nrows()
-        ));
-    }
-    let d = y.ncols();
-    if d == 0 {
-        return Err(
-            "shared-tangent Gaussian REML requires at least one tangent output".to_string(),
-        );
-    }
-    if k == 0 {
-        return Err(
-            "shared-tangent Gaussian REML requires a design with at least one column".to_string(),
-        );
-    }
-    if y.iter().any(|value| !value.is_finite()) {
-        return Err("shared-tangent Gaussian REML response must be finite".to_string());
-    }
-
-    let weights = standard.weights.view();
-    if weights.len() != n {
-        return Err(format!(
-            "shared-tangent Gaussian REML weight length mismatch: expected {n}, got {}",
-            weights.len()
-        ));
-    }
-    if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return Err(
-            "shared-tangent Gaussian REML weights must be finite and non-negative".to_string(),
-        );
-    }
-    if let Some(w) = fisher_rao_w.as_ref() {
-        validate_dense_fisher_w(n, d, *w)?;
-    }
-
-    // Fit in the response's own principal-axis frame so the shared-λ tangent fit
-    // is EXACTLY output-rotation equivariant (issue #967), not just equivariant
-    // to the REML optimizer's flat-valley convergence slop.
-    //
-    // At a FIXED smoothing parameter the joint system's hat operator is
-    // `H_X(λ) ⊗ I_D`, which commutes with any output rotation `I_n ⊗ R`, so the
-    // coefficients are already exactly equivariant. The one non-equivariant step
-    // is REML λ-selection: the two frame-related responses `Y` and `Y Rᵀ` feed
-    // the multi-start optimizer arrays that differ at the float epsilon, so it
-    // can settle at different points on the (near-flat) LAML valley — a ≈1e-5
-    // wander in λ that shows up as ≈1e-6 in the coefficients even though the
-    // objective `tr(Yᵀ M(λ) Y)` is analytically rotation-invariant.
-    //
-    // Remove the frame dependence at the source: rotate `Y` (and any Fisher–Rao
-    // metric) into the eigenbasis `V` of the pooled output Gram
-    // `G = Σ_row w_row · y_row y_rowᵀ`, run the identical fit there, then rotate
-    // the coefficients back by `Vᵀ`. Under `Y ↦ Y Rᵀ` the Gram maps
-    // `G ↦ R G Rᵀ`, so its eigenbasis maps `V ↦ R V` (the per-vector sign is
-    // pinned frame-covariantly below), hence the canonical response `Y V` is
-    // frame-invariant to the float floor and every downstream quantity — the
-    // multi-start seeds, the λ optimum, the coefficients — is identical for the
-    // two frames. `V` is orthogonal, so this is an EXACT reparameterization: it
-    // does not change the fit for any single frame, it only makes the numerics
-    // frame-stable (`B(Y·Rᵀ) = B(Y)·Rᵀ` to ~1e-12).
-    let mut gram = Array2::<f64>::zeros((d, d));
-    let mut mean_dir = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        let w = weights[row];
-        for a in 0..d {
-            mean_dir[a] += w * y[[row, a]];
-            for b in 0..d {
-                gram[[a, b]] += w * y[[row, a]] * y[[row, b]];
-            }
-        }
-    }
-    // Eigenvectors of the symmetric PSD Gram via its SVD: for a symmetric PSD
-    // matrix the left singular vectors ARE the eigenvectors, already ordered by
-    // descending eigenvalue.
-    let (u_opt, svals, _vt) = gram
-        .svd(true, false)
-        .map_err(|err| format!("shared-tangent output-frame SVD failed: {err}"))?;
-    let mut v_rot = u_opt.ok_or_else(|| {
-        "shared-tangent output-frame SVD returned no left singular vectors".to_string()
-    })?;
-    // Eigenvector directions are only well-conditioned when consecutive
-    // eigenvalues are separated by more than the sqrt(ε) resolvability floor:
-    // the perturbation of an eigenvector scales as ‖ΔG‖ / gap, so a gap near the
-    // float noise leaves `V` defined only up to an internal rotation of the
-    // (near-)degenerate eigenspace, and the frame-covariance `V(R G Rᵀ) = R·V(G)`
-    // that this rewrite relies on can silently fail there. In exactly that
-    // regime the response is rotationally symmetric within the degenerate
-    // subspace, so output-frame equivariance is ill-defined and the frame choice
-    // cannot matter for a well-posed target. Fall back to the identity (fit in
-    // the caller's original frame — an exact no-op reparameterization) rather
-    // than risk an unstable rotation. `svals` are sorted descending by the SVD.
-    let s_max = svals.iter().copied().fold(0.0_f64, f64::max);
-    let gap_floor = f64::EPSILON.sqrt() * s_max.max(1.0);
-    let well_separated = (1..d).all(|j| svals[j - 1] - svals[j] > gap_floor);
-    if well_separated {
-        // Pin each eigenvector's sign frame-COVARIANTLY: make its projection on
-        // the pooled mean output direction non-negative. Both the eigenvector and
-        // the mean direction rotate by `R` under `Y ↦ Y Rᵀ`, so this
-        // inner-product sign is preserved and `V ↦ R V` holds exactly,
-        // cancelling the SVD's arbitrary per-column sign.
-        for j in 0..d {
-            let mut dot = 0.0;
-            for a in 0..d {
-                dot += v_rot[[a, j]] * mean_dir[a];
-            }
-            if dot < 0.0 {
-                for a in 0..d {
-                    v_rot[[a, j]] = -v_rot[[a, j]];
-                }
-            }
-        }
-    } else {
-        v_rot = Array2::<f64>::eye(d);
-    }
-    // Canonical (frame-invariant) response `Y V` and metric `Vᵀ M V`. Shadow the
-    // originals so the whole fit below runs in the canonical frame; the
-    // coefficients and fitted values are rotated back by `Vᵀ` at each return.
-    let y_canon_owned = y.dot(&v_rot);
-    let fisher_canon_owned: Option<Array3<f64>> = fisher_rao_w.as_ref().map(|w| {
-        let mut out = Array3::<f64>::zeros((n, d, d));
-        for row in 0..n {
-            let m = w.slice(s![row, .., ..]);
-            let vtmv = v_rot.t().dot(&m.dot(&v_rot));
-            out.slice_mut(s![row, .., ..]).assign(&vtmv);
-        }
-        out
-    });
-    let y = y_canon_owned.view();
-    let fisher_rao_w = fisher_canon_owned.as_ref().map(|a| a.view());
-
-    // Build the joint multi-output system with a SHARED smoothing parameter per
-    // formula smooth, common to all `D` tangent output coordinates. This is what
-    // makes the fit frame-equivariant: the tangent vector field `f: x ↦ T_μ M` is
-    // a single vector-valued function whose smoothness is a property of the
-    // predictor `x`, NOT of the arbitrary ambient coordinate axis. One λ per
-    // smooth (shared across outputs) makes the smoother output-isotropic,
-    // `B = S(λ)·Y`, so a rotation `Y ↦ Y Rᵀ` of the response frame maps
-    // `B ↦ B Rᵀ` and the predictions `X B ↦ (X B) Rᵀ` exactly. Per-output
-    // independent λ (the old scheme) broke this: a rotation that mixes a
-    // high-curvature tangent direction with a low-curvature one is smoothed
-    // differently after the mix, so the fitted surface — and the predictions —
-    // depended on the axis labelling.
-    //
-    // Coefficients use an INTERLEAVED layout: basis column `c` (0..K) of output
-    // `o` (0..D) lives at global index `c*D + o` (the row-major flatten of the
-    // `(K, D)` coefficient matrix). Interleaving makes the `D` copies of every
-    // formula penalty block contiguous, so a single shared λ can drive the
-    // Kronecker penalty `Sᵇ ⊗ I_D` over them. Each observation still contributes
-    // `D` stacked rows indexed by a metric axis; the per-row whitening factor
-    // `L Lᵀ = W_row · metric` couples the coordinate blocks across outputs
-    // (`L = sqrt(weight)·I` without a Fisher-Rao metric).
-    let p_total = k * d;
-    let mut joint_x = Array2::<f64>::zeros((n * d, p_total));
-    let mut joint_y = Array1::<f64>::zeros(n * d);
-    for row in 0..n {
-        let scale = weights[row].sqrt();
-        // Lower-triangular whitening factor `L` (D×D) with `L Lᵀ = metric`.
-        let lower: Array2<f64> = match fisher_rao_w.as_ref() {
-            Some(w) => {
-                let mut block = w.slice(s![row, .., ..]).to_owned();
-                for a in 0..d {
-                    for b in (a + 1)..d {
-                        let avg = 0.5 * (block[[a, b]] + block[[b, a]]);
-                        block[[a, b]] = avg;
-                        block[[b, a]] = avg;
-                    }
-                }
-                block
-                    .cholesky(Side::Lower)
-                    .map_err(|err| {
-                        format!(
-                            "fisher_rao_w row {row} must be positive-definite for shared-tangent REML: {err}"
-                        )
-                    })?
-                    .lower_triangular()
-            }
-            None => {
-                let mut id = Array2::<f64>::zeros((d, d));
-                for axis in 0..d {
-                    id[[axis, axis]] = 1.0;
-                }
-                id
-            }
-        };
-        for metric_axis in 0..d {
-            let stacked_row = row * d + metric_axis;
-            let mut y_value = 0.0;
-            for output in 0..d {
-                let l_t = scale * lower[[output, metric_axis]];
-                if l_t == 0.0 {
-                    continue;
-                }
-                y_value += l_t * y[[row, output]];
-                for col in 0..k {
-                    joint_x[[stacked_row, col * d + output]] = l_t * x[[row, col]];
-                }
-            }
-            joint_y[stacked_row] = y_value;
-        }
-    }
-
-    // One SHARED penalty per formula smooth: the Kronecker block `Sᵇ ⊗ I_D` over
-    // the interleaved columns `bs*D .. be*D`, driven by a single λ_b common to all
-    // `D` outputs. The general REML driver assigns one λ per `BlockwisePenalty`, so
-    // emitting `M` blocks — not `M*D` — is exactly what ties the smoothing across
-    // tangent coordinates and yields the output-isotropic, frame-equivariant fit.
-    let m = design.penalties.len();
-    let mut s_list: Vec<gam::terms::smooth::BlockwisePenalty> = Vec::with_capacity(m);
-    for penalty in &design.penalties {
-        if penalty.col_range.start > penalty.col_range.end
-            || penalty.col_range.end > k
-            || penalty.col_range.len() != penalty.local.nrows()
-            || penalty.col_range.len() != penalty.local.ncols()
-        {
-            return Err(format!(
-                "formula penalty range {:?} is incompatible with design width {k}",
-                penalty.col_range
-            ));
-        }
-        let q = penalty.col_range.len();
-        // `Sᵇ ⊗ I_D` over the interleaved columns: the entry at local
-        // `(i*D + o, j*D + p)` is `Sᵇ[i, j]·δ(o, p)`, so output `o`'s copy of
-        // the block sees exactly `Sᵇ` and the single λ penalizes every output's
-        // copy identically — the shared-smoothing coupling.
-        let mut kron = Array2::<f64>::zeros((q * d, q * d));
-        for i in 0..q {
-            for j in 0..q {
-                let value = penalty.local[[i, j]];
-                if value == 0.0 {
-                    continue;
-                }
-                for o in 0..d {
-                    kron[[i * d + o, j * d + o]] = value;
-                }
-            }
-        }
-        let shifted = (penalty.col_range.start * d)..(penalty.col_range.end * d);
-        s_list.push(gam::terms::smooth::BlockwisePenalty::new(shifted, kron));
-    }
-    if s_list.is_empty() {
-        // A purely parametric RHS (`y ~ 1`, `y ~ x`) carries NO smoothing
-        // penalty, so there is nothing for REML to select. Rather than erroring,
-        // fit it DIRECTLY: an ordinary (unpenalized) least-squares solve on the
-        // shared tangent design at the base point (#2103). For the intercept-only
-        // model this is the constant Fréchet-mean fit — at the intrinsic Fréchet
-        // (Karcher) mean base point `Σ_i log_base(Y_i) = 0`, so the fitted tangent
-        // intercept is `0` and `exp_base(0) = base` recovers the intrinsic mean.
-        let mut result =
-            direct_parametric_shared_tangent_fit(&joint_x, joint_y.view(), &x, y, weights, k, d)?;
-        // Rotate the canonical-frame fit back to the caller's output frame.
-        result.coefficients = result.coefficients.dot(&v_rot.t());
-        result.fitted = result.fitted.dot(&v_rot.t());
-        return Ok(result);
-    }
-
-    let offset_zero = Array1::<f64>::zeros(n * d);
-    let joint_weights = Array1::<f64>::ones(n * d);
-    let opts = gam::solver::estimate::FitOptions {
-        latent_cloglog: None,
-        mixture_link: None,
-        optimize_mixture: false,
-        sas_link: None,
-        optimize_sas: false,
-        compute_inference: true,
-        skip_rho_posterior_inference: false,
-        max_iter: 200,
-        tol: 1.0e-9,
-        nullspace_dims: vec![0; s_list.len()],
-        linear_constraints: None,
-        firth_bias_reduction: false,
-        adaptive_regularization: None,
-        penalty_shrinkage_floor: None,
-        rho_prior: Default::default(),
-        persist_warm_start_disk: false,
-        kronecker_penalty_system: None,
-        kronecker_factored: None,
-    };
-    let fit = gam::solver::estimate::fit_gamwith_heuristic_lambdas(
-        joint_x,
-        joint_y.view(),
-        joint_weights.view(),
-        offset_zero.view(),
-        &s_list,
-        None,
-        LikelihoodSpec::new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Identity),
-        ),
-        &opts,
-    )
-    .map_err(|err| err.to_string())?;
-
-    if fit.beta.len() != p_total {
-        return Err(format!(
-            "shared-tangent Gaussian REML produced {} coefficients, expected {p_total}",
-            fit.beta.len()
-        ));
-    }
-
-    // The general REML driver canonicalizes the penalty list before fitting and
-    // SILENTLY DROPS any block whose local matrix has numerical rank 0 (or a
-    // ridge with non-positive scale): see
-    // `construction::canonicalize_penalty_specs`. The surviving penalties are
-    // compacted, so `fit.lambdas` / `inference.edf_by_block` are reported in
-    // canonical-compacted order — NOT in `s_list` order. A rigid `block` stride
-    // would therefore misalign the shared λ/edf whenever a block canonicalizes
-    // away.
-    //
-    // Recover the canonical→`s_list` mapping by replaying the exact same per-spec
-    // canonicalization the solver ran. `s_list` entry `b` is formula smooth `b`
-    // (its shared `Sᵇ ⊗ I_D` block). We record, for each surviving canonical
-    // position, its origin block and the block's penalty rank (`rank(Sᵇ)·D` —
-    // the full rank across all `D` outputs), needed for the residual-df total.
-    let specs: Vec<gam::solver::estimate::PenaltySpec> = s_list
+            .map_err(|err| {
+                SharedTangentFfiError::Spec(format!("failed to build formula design matrix: {err}"))
+            })?;
+    let penalties: Vec<gam::families::response_geometry::SharedTangentPenalty> = design
+        .penalties
         .iter()
-        .map(gam::solver::estimate::PenaltySpec::from_blockwise_ref)
+        .map(|penalty| {
+            gam::families::response_geometry::SharedTangentPenalty::new(
+                penalty.col_range.start,
+                penalty.local.clone(),
+            )
+        })
         .collect();
-    let mut survivor_block: Vec<(usize, f64)> = Vec::with_capacity(s_list.len());
-    for (b, spec) in specs.iter().enumerate() {
-        if let Some(canonical) = gam::terms::construction::canonicalize_penalty_spec(
-            spec,
-            p_total,
-            b,
-            "shared_tangent_gaussian_reml",
-        )
-        .map_err(|err| err.to_string())?
-        {
-            survivor_block.push((b, canonical.rank() as f64));
-        }
-    }
-
-    // Unpack the interleaved coefficients into the `(K, D)` grid: output `o`,
-    // basis column `c` lives at joint index `c*D + o`. Recover the unwhitened
-    // fitted tangent values and the smoothing diagnostics.
-    let mut coefficients = Array2::<f64>::zeros((k, d));
-    for col in 0..k {
-        for output in 0..d {
-            coefficients[[col, output]] = fit.beta[col * d + output];
-        }
-    }
-    let fitted = x.dot(&coefficients);
-    let weight_sum: f64 = weights.iter().copied().sum();
-    let edf_by_block = fit
-        .inference
-        .as_ref()
-        .map(|inf| inf.edf_by_block.clone())
-        .unwrap_or_else(|| vec![0.0; survivor_block.len()]);
-    if fit.lambdas.len() != survivor_block.len() || edf_by_block.len() != survivor_block.len() {
-        return Err(format!(
-            "shared-tangent Gaussian REML smoothing-diagnostic length mismatch: solver reported \
-             {} lambdas and {} edf entries but {} penalty blocks survived canonicalization",
-            fit.lambdas.len(),
-            edf_by_block.len(),
-            survivor_block.len()
-        ));
-    }
-
-    // Scatter the canonical-order shared λ/edf back into the per-smooth vectors
-    // (length `M`). A block dropped during canonicalization (numerical rank 0)
-    // carries no smoothing parameter and contributes zero effective df, so its
-    // cell stays 0 — never NaN-padded by a stride that ran off the end. The
-    // `edf_by_block` value already accounts for all `D` outputs of the shared
-    // Kronecker block, and `rank = rank(Sᵇ)·D` likewise.
-    let mut edf = Array1::<f64>::zeros(m);
-    let mut lambdas = Array1::<f64>::zeros(m);
-    let mut penalized_rank_total = 0.0_f64;
-    let mut penalized_edf_total = 0.0_f64;
-    for (canonical_pos, &(block, rank)) in survivor_block.iter().enumerate() {
-        let edf_value = edf_by_block[canonical_pos];
-        edf[block] = edf_value;
-        lambdas[block] = fit.lambdas[canonical_pos];
-        penalized_rank_total += rank;
-        penalized_edf_total += edf_value;
-    }
-
-    // Pooled, isotropic residual variance. Isotropic tangent noise
-    // (`Cov = σ²·I_D`) is the rotation-invariant noise model; a per-coordinate
-    // scale would itself break frame equivariance. The joint system is a single
-    // Gaussian model with one scale over the `n·D` stacked rows, so we report one
-    // pooled σ̂² with the canonical Gaussian denominator `D·W − edf_total`, where
-    //   edf_total = (K·D − penalized_rank_total) + penalized_edf_total
-    // counts each unpenalized column (intercept, parametric terms, of which there
-    // are `K·D − penalized_rank_total`) once and shrinks the penalized columns to
-    // their bounded effective df — the multi-output analogue of `n − edf` in the
-    // scalar Gaussian scale (`smooth.rs`). Omitting the unpenalized term would
-    // overstate residual df and bias σ² low.
-    let edf_total = (k as f64 * d as f64 - penalized_rank_total) + penalized_edf_total;
-    let denom = (d as f64 * weight_sum - edf_total).max(1.0);
-    let mut ss = 0.0;
-    for row in 0..n {
-        for output in 0..d {
-            let resid = y[[row, output]] - fitted[[row, output]];
-            ss += weights[row] * resid * resid;
-        }
-    }
-    let sigma2 = Array1::<f64>::from_elem(1, ss / denom);
-
-    // Rotate the canonical-frame fit back to the caller's output frame: the
-    // canonical coefficients `B_canon` predict `Y V`, so `B = B_canon Vᵀ` and
-    // `fitted = fitted_canon Vᵀ`. The scale/λ/edf are frame-invariant scalars and
-    // `sigma2` was already accumulated in the (invariant) canonical residuals.
-    let coefficients = coefficients.dot(&v_rot.t());
-    let fitted = fitted.dot(&v_rot.t());
-
+    let request = gam::families::response_geometry::SharedTangentRemlRequest::new(
+        design.design,
+        y.to_owned(),
+        standard.weights.clone(),
+        fisher_rao_w.map(|metric| metric.to_owned()),
+        penalties,
+    );
+    let fit = gam::families::response_geometry::fit_shared_tangent_reml(request)
+        .map_err(SharedTangentFfiError::Engine)?;
     Ok(TangentRemlMultiResult {
-        coefficients,
-        fitted,
-        sigma2,
-        lambdas,
-        edf,
+        sigma2: Array1::from_elem(1, fit.sigma2),
+        coefficients: fit.coefficients,
+        fitted: fit.fitted,
+        lambdas: fit.lambdas,
+        edf: fit.edf_by_penalty,
         reml_score: fit.reml_score,
     })
 }
 
-/// Direct, non-REML shared-tangent fit for a purely parametric RHS (`y ~ 1`,
-/// `y ~ x`): an ordinary (unpenalized) least-squares solve on the joint whitened
-/// tangent design, the path the shared-tangent orchestration promises when the
-/// formula has no smoothing penalty (#2103).
-///
-/// The per-row whitening (observation weights and any Fisher–Rao metric) is
-/// already folded into `joint_x`/`joint_y` by the caller, so the fit is an
-/// ordinary GLS/LSQ on the whitened system: solve the normal equations
-/// `(joint_xᵀ joint_x) β = joint_xᵀ joint_y`. `β` is unpacked into the same
-/// interleaved `(K, D)` grid the REML path uses, and predictions are the tangent
-/// values `X · β` at the base point. For the intercept-only case (`K = 1`, the
-/// constant column) `β` is the weighted tangent mean; at the intrinsic Fréchet
-/// (Karcher) mean base point `Σ_i log_base(Y_i) = 0`, so `β = 0` and
-/// `exp_base(0) = base` is exactly the intrinsic Fréchet mean.
-fn direct_parametric_shared_tangent_fit(
-    joint_x: &Array2<f64>,
-    joint_y: ArrayView1<'_, f64>,
-    x: &Array2<f64>,
-    y: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    k: usize,
-    d: usize,
-) -> Result<TangentRemlMultiResult, String> {
-    use gam::linalg::matrix::FactorizedSystem;
 
-    let p_total = joint_x.ncols();
-    // Whitened normal equations for the unpenalized parametric least squares.
-    let xtx = fast_ata(joint_x);
-    let xty = gam::linalg::faer_ndarray::fast_atv(joint_x, &joint_y);
-    let factor = factorize_symmetricwith_fallback(
-        gam::linalg::faer_ndarray::FaerArrayView::new(&xtx).as_ref(),
-        Side::Lower,
-    )
-    .map_err(|err| {
-        format!(
-            "direct parametric shared-tangent normal-equations factorization failed \
-             (a rank-deficient parametric RHS has no unique unpenalized fit): {err}"
-        )
-    })?;
-    let beta = FactorizedSystem::solve(&factor, &xty)
-        .map_err(|err| format!("direct parametric shared-tangent LSQ solve failed: {err}"))?;
-    if beta.len() != p_total {
-        return Err(format!(
-            "direct parametric shared-tangent LSQ produced {} coefficients, expected {p_total}",
-            beta.len()
-        ));
-    }
 
-    // Unpack the interleaved coefficients into the `(K, D)` grid: output `o`,
-    // basis column `c` lives at joint index `c*D + o` (same layout as the REML
-    // path), then recover the unwhitened fitted tangent values `X · β`.
-    let mut coefficients = Array2::<f64>::zeros((k, d));
-    for col in 0..k {
-        for output in 0..d {
-            coefficients[[col, output]] = beta[col * d + output];
-        }
-    }
-    let fitted = x.dot(&coefficients);
-
-    // Pooled, isotropic residual variance. Every column is unpenalized, so the
-    // effective df is exactly `K·D` and the denominator is the same
-    // `D·W − edf_total` the penalized path uses (the multi-output analogue of the
-    // scalar Gaussian `n − edf`).
-    let weight_sum: f64 = weights.iter().copied().sum();
-    let edf_total = k as f64 * d as f64;
-    let denom = (d as f64 * weight_sum - edf_total).max(1.0);
-    let mut ss = 0.0;
-    for row in 0..y.nrows() {
-        for output in 0..d {
-            let resid = y[[row, output]] - fitted[[row, output]];
-            ss += weights[row] * resid * resid;
-        }
-    }
-    let sigma2_hat = ss / denom;
-
-    // REML criterion of the null-penalty model: the σ-profiled restricted
-    // Gaussian log-likelihood over the `n·D` whitened stacked rows. No smoothing
-    // parameter is selected — this is simply the parametric model's restricted
-    // marginal likelihood, kept finite so the FFI reports `status = "ok"`.
-    let n_rows = joint_x.nrows() as f64;
-    let logdet_xtx = factor.logdet();
-    let reml_score = if sigma2_hat > 0.0 && logdet_xtx.is_finite() {
-        let residual_rows = (n_rows - p_total as f64).max(0.0);
-        -0.5 * residual_rows * ((2.0 * std::f64::consts::PI * sigma2_hat).ln() + 1.0)
-            - 0.5 * logdet_xtx
-    } else {
-        0.0
-    };
-
-    Ok(TangentRemlMultiResult {
-        coefficients,
-        fitted,
-        sigma2: Array1::<f64>::from_elem(1, sigma2_hat),
-        // No smoothing penalty ⇒ no per-smooth λ/edf (length-0 vectors, matching
-        // the empty penalty list `M = 0`).
-        lambdas: Array1::<f64>::zeros(0),
-        edf: Array1::<f64>::zeros(0),
-        reml_score,
-    })
-}
 
 fn gaussian_reml_fit_batched_impl(
     x: ArrayView2<'_, f64>,

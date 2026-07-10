@@ -61,20 +61,15 @@ fn assert_near_separation_converges(n: usize, slope: f64, seed: u64) {
         _ => panic!("expected Standard fit"),
     };
 
+    // The fit existing at all is the convergence proof under the sealed
+    // `FitConvergenceEvidence` contract: a FLAT-VALLEY STALL now surfaces as
+    // a typed error from `fit_from_formula` and trips the `.expect` above.
     let edf = fit.edf_total().unwrap_or(f64::NAN);
     let gnorm = fit.outer_gradient_norm.unwrap_or(f64::NAN);
     eprintln!(
         "#1762 convergence: n={n} slope={slope} elapsed={:.2}s edf={edf:.2} \
-         converged={} |g|={gnorm:.3e}",
+         converged=certified |g|={gnorm:.3e}",
         elapsed.as_secs_f64(),
-        fit.outer_converged
-    );
-
-    assert!(
-        fit.outer_converged,
-        "near-separated binomial-logit fit (n={n}, slope={slope}) reported \
-         NON-CONVERGED (FLAT-VALLEY STALL); the outer ARC optimizer must reach a \
-         certified minimum under PIRLS weight collapse (#1762)"
     );
     // The issue's headline symptom is a projected outer gradient stranded at
     // |g|≈54, far above the ~5.0 stationarity ceiling. A genuinely converged

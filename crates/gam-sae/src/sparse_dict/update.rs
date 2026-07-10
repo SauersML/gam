@@ -640,9 +640,10 @@ pub(super) fn run(
 /// `1e-6`) this kernel is BIT-IDENTICAL to the historical [`run`] — pinned by the
 /// TEMPORARY parity gate `linear_fast_kernel_matches_legacy_run` (design
 /// Increment 2 shim; removed in Increment 6). It is invoked from the unified
-/// engine's inner-solve seam; [`super::fit_sparse_dictionary`] remains a thin
-/// wrapper over [`run`] for now (its two-ridge FFI surface is preserved until
-/// Increment 5 re-points callers to the REML schedule).
+/// engine's inner-solve seam; [`super::fit_sparse_dictionary`] is the
+/// shared-default entry to the REML schedule (Increment 5), and the single
+/// public entry reaches it at ANY `K` through the explicit linear-dictionary
+/// admission (`front_door::admit_linear_dictionary`, Increment 5b).
 pub(crate) fn run_linear_fast_kernel(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,

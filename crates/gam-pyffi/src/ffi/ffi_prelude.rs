@@ -192,12 +192,16 @@ pub(crate) use gam::terms::sae::sparse_dict::{
 pub(crate) use gam::terms::sae::manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     GumbelTemperatureSchedule, MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator,
+    SAE_DEFAULT_TORUS_HARMONICS, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS,
+    SAE_MOBIUS_CIRCLE_HARMONICS, SAE_MOBIUS_WIDTH_DEGREE, SAE_SPHERE_BASIS_SIZE,
     SPHERE_CHART_PENALTY_DIAGONAL,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,
-    SphereChartEvaluator, TorusHarmonicEvaluator, sae_decoder_lsq_init,
-    sae_em_refine_routing_seed, sae_output_energy_cluster_labels,
-    sae_refine_periodic_seed_coords_by_cluster, sae_residual_seed_logits,
-    sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
+    SphereChartEvaluator, TorusHarmonicEvaluator, build_sae_basis_evaluators,
+    sae_decoder_lsq_init, sae_duchon_atom_m, sae_em_refine_routing_seed,
+    sae_euclidean_degree_for_basis_size, sae_output_energy_cluster_labels,
+    sae_periodic_basis_size, sae_refine_periodic_seed_coords_by_cluster,
+    sae_residual_seed_logits, sae_torus_axis_basis_size, sphere_chart_basis_jet,
+    term_from_padded_blocks_with_mode,
 };
 
 pub(crate) use gam::terms::decoders::skip_transcoder::{

@@ -8,8 +8,8 @@ use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use gam_runtime::resource::{
-    Governed, MaterializationPolicy, MatrixMaterializationError, MemoryGovernor, ResourcePolicy,
-    dense_f64_bytes, rows_for_target_bytes,
+    Governed, MaterializationPolicy, MatrixMaterializationError, MemoryGovernor,
+    MemoryReservation, ResourcePolicy, dense_f64_bytes, rows_for_target_bytes,
 };
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
@@ -29,9 +29,14 @@ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 /// well-conditioned solve. Acts as a floor on any caller-supplied `ridge_floor`.
 const SPD_SOLVE_RIDGE_FLOOR: f64 = 1e-15;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
-const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
+/// Cache-retention policy for a sparse design's memoized dense copy: dense
+/// copies at or under this size are kept (with their ledger reservation) for
+/// the design's lifetime; larger ones are rematerialized per use so a single
+/// conversion never pins a large slice of the process budget indefinitely.
+/// Admission itself (may this densification happen at all, and does it fit
+/// jointly with everything else live) is decided by the process-wide
+/// [`MemoryGovernor`], not by this constant.
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 /// Minimum n*p product for the dense-row parallel fold/reduce paths
@@ -818,7 +823,9 @@ fn dense_transpose_weighted_response_view(
 #[derive(Clone)]
 pub struct SparseDesignMatrix {
     matrix: SparseColMat<usize, f64>,
-    dense_cache: Arc<OnceLock<Arc<Array2<f64>>>>,
+    /// Memoized dense copy plus the process-wide ledger reservation that keeps
+    /// its bytes accounted for as long as the cache entry is alive.
+    dense_cache: Arc<OnceLock<(Arc<Array2<f64>>, MemoryReservation)>>,
     csr_cache: Arc<OnceLock<Arc<SparseRowMat<usize, f64>>>>,
 }
 
@@ -861,26 +868,65 @@ impl SparseDesignMatrix {
     }
 
     pub fn try_to_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        if let Some((cached, _)) = self.dense_cache.get() {
+            return Ok(cached.clone());
+        }
         let dense_bytes = self.dense_nbytes()?;
-        if dense_bytes > MAX_SPARSE_TO_DENSE_BYTES {
+        let governor = MemoryGovernor::global();
+        if dense_bytes > governor.single_materialization_cap_bytes() {
             let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
             return Err(MatrixError::DensificationRefused {
                 reason: format!(
-                    "{context}: refusing to densify sparse design {}x{} (~{gib:.2} GiB); use sparse or matrix-free code",
+                    "{context}: refusing to densify sparse design {}x{} (~{gib:.2} GiB, over the process memory budget); use sparse or matrix-free code",
                     self.matrix.nrows(),
                     self.matrix.ncols(),
                 ),
             }
             .into());
         }
-        if dense_bytes <= MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES {
-            Ok(self
+        // Memoization is governed: the cache entry holds its ledger charge for
+        // the design's lifetime, so a reservation refusal (transient joint
+        // pressure) skips caching rather than failing the conversion.
+        if dense_bytes <= MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES
+            && let Ok(reservation) = governor.try_reserve(dense_bytes, context)
+        {
+            return Ok(self
                 .dense_cache
-                .get_or_init(|| self.materialize_dense_arc())
-                .clone())
-        } else {
-            Ok(self.materialize_dense_arc())
+                .get_or_init(|| (self.materialize_dense_arc(), reservation))
+                .0
+                .clone());
         }
+        Ok(self.materialize_dense_arc())
+    }
+
+    /// Densify under the process-wide byte governor, coupling the returned
+    /// dense copy to its RAII reservation. A refusal is typed evidence that
+    /// the dense footprint does not fit the joint ledger right now — callers
+    /// route to a streaming / sparse strategy instead of allocating.
+    pub fn try_to_dense_governed(
+        &self,
+        context: &str,
+    ) -> Result<Governed<Arc<Array2<f64>>>, String> {
+        let governor = MemoryGovernor::global();
+        if let Some((cached, _)) = self.dense_cache.get() {
+            // Cache hit: the bytes are already accounted for by the cache's
+            // own reservation, so this owner charges nothing extra.
+            let reservation = governor
+                .try_reserve(0, context)
+                .expect("zero-byte reservation cannot exceed any budget");
+            return Ok(reservation.bind(cached.clone()));
+        }
+        let dense_bytes = self.dense_nbytes()?;
+        let reservation = governor
+            .try_reserve(dense_bytes, context)
+            .map_err(|err| String::from(MatrixError::DensificationRefused {
+                reason: format!(
+                    "{context}: refusing to densify sparse design {}x{}: {err}",
+                    self.matrix.nrows(),
+                    self.matrix.ncols(),
+                ),
+            }))?;
+        Ok(reservation.bind(self.materialize_dense_arc()))
     }
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
@@ -4145,13 +4191,14 @@ impl LinearOperator for DesignMatrix {
                 let dense_regime = 4 * avg_nnz_row >= p;
                 if dense_regime {
                     let mut xtwx = Array2::<f64>::zeros((p, p));
-                    let dense_bytes =
-                        checked_dense_nbytes(n, p, "DesignMatrix::diag_xtw_x dense sparse route")?;
-                    if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
-                        let xd =
-                            xs.try_to_dense_arc("DesignMatrix::diag_xtw_x dense sparse route")?;
+                    // Reserve-or-stream: the dense BLAS route runs only while
+                    // its full dense footprint is admitted by the process-wide
+                    // governor; a refusal picks the bounded streaming CSC path.
+                    if let Ok(xd) =
+                        xs.try_to_dense_governed("DesignMatrix::diag_xtw_x dense sparse route")
+                    {
                         stream_weighted_crossprod_into(
-                            xd.as_ref(),
+                            &**xd,
                             weights,
                             &mut xtwx,
                             CrossprodStructure::Full,
@@ -5532,16 +5579,15 @@ impl DesignMatrix {
     /// [`Self::try_to_dense_governed`], which additionally holds the
     /// process-wide reservation for the returned matrix's whole lifetime.
     ///
-    /// Sparse designs still honor their own internal
-    /// `MAX_SPARSE_TO_DENSE_BYTES` cap (which is a separate hard limit
-    /// guarding against accidental n×p dense materialization of a sparse
-    /// design that should have stayed sparse).
+    /// Sparse designs refuse to densify past the process memory budget
+    /// (an n×p dense materialization that can never fit is a caller bug —
+    /// the design should have stayed sparse).
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(matrix) => matrix.to_dense(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense")
-                // SAFETY: dense-by-contract accessor; failure means caller broke MAX_SPARSE_TO_DENSE_BYTES contract.
+                // SAFETY: dense-by-contract accessor; failure means the dense footprint exceeds the whole process budget.
                 .unwrap_or_else(|msg| std::panic::panic_any(msg))
                 .as_ref()
                 .clone(),
@@ -5554,7 +5600,7 @@ impl DesignMatrix {
             Self::Dense(matrix) => matrix.to_dense_arc(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense_arc")
-                // SAFETY: dense-by-contract accessor; failure means caller broke MAX_SPARSE_TO_DENSE_BYTES contract.
+                // SAFETY: dense-by-contract accessor; failure means the dense footprint exceeds the whole process budget.
                 .unwrap_or_else(|msg| std::panic::panic_any(msg)),
         }
     }
@@ -5888,13 +5934,14 @@ mod tests {
         ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator, SignedWeightsView,
         SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response,
         fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view,
+        xt_diag_x_symmetric,
     };
     use crate::matrix::LinearOperator;
     use crate::test_support::no_densify_design;
     use crate::types::RidgePolicy;
     use crate::utils::{PcgSolveInfo, StableSolver};
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use gam_runtime::resource::{MatrixMaterializationError, ResourcePolicy};
+    use gam_runtime::resource::{MatrixMaterializationError, MemoryGovernor, ResourcePolicy};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
     use std::ops::Range;
     use std::sync::Arc;
@@ -6047,13 +6094,88 @@ mod tests {
 
     #[test]
     fn huge_sparse_densification_is_rejected_before_allocation() {
-        let sparse = SparseColMat::try_new_from_triplets(500_000, 10_000, &[])
+        // 2^44 × 4 cells → 2^49 dense bytes (512 TiB): over any physical
+        // process budget, so the refusal is machine-independent. The column
+        // count stays small so the sparse symbolic metadata is tiny.
+        let sparse = SparseColMat::try_new_from_triplets(1usize << 44, 4, &[])
             .expect("empty sparse matrix should build");
         let design = SparseDesignMatrix::new(sparse);
         let err = design
             .try_to_dense_arc("matrix test")
             .expect_err("huge sparse densification should be rejected");
         assert!(err.contains("refusing to densify sparse design"));
+    }
+
+    /// The governed sparse densification charges the process ledger for
+    /// exactly the dense footprint while the owner is alive, and a full
+    /// ledger routes the weighted-Gram strategy to the streaming CSC path
+    /// instead of failing or allocating.
+    #[test]
+    fn sparse_densification_reserves_ledger_and_full_ledger_streams() {
+        let triplets = [
+            Triplet::new(0, 0, 1.0),
+            Triplet::new(0, 1, -2.0),
+            Triplet::new(1, 0, 0.5),
+            Triplet::new(1, 1, 3.0),
+            Triplet::new(2, 0, -1.5),
+            Triplet::new(2, 1, 0.25),
+        ];
+        let sparse = SparseColMat::try_new_from_triplets(3, 2, &triplets).expect("sparse");
+        let governor = MemoryGovernor::global();
+
+        let design = SparseDesignMatrix::new(sparse.clone());
+        let before = governor.reserved_bytes();
+        let governed = design
+            .try_to_dense_governed("governed sparse test")
+            .expect("small governed densification succeeds");
+        assert_eq!(
+            governor.reserved_bytes(),
+            before + 3 * 2 * std::mem::size_of::<f64>(),
+            "governed densification must charge its dense footprint"
+        );
+        assert_eq!(governed.dim(), (3, 2));
+        drop(governed);
+        assert_eq!(
+            governor.reserved_bytes(),
+            before,
+            "dropping the governed owner must release its charge"
+        );
+
+        // Exhaust the remaining budget: a fresh (uncached) design must refuse
+        // the governed dense route, while the strategy consumer falls back to
+        // the streaming CSC path and still produces the exact weighted Gram.
+        let filler = governor
+            .try_reserve(governor.remaining_bytes(), "test ledger filler")
+            .expect("filling the remaining budget succeeds");
+        let pressured = SparseDesignMatrix::new(sparse.clone());
+        assert!(
+            pressured
+                .try_to_dense_governed("governed sparse test under pressure")
+                .is_err(),
+            "a full ledger must refuse governed densification"
+        );
+        let weights = array![1.0, -2.0, 0.5];
+        let gram = xt_diag_x_symmetric(&DesignMatrix::from(sparse.clone()), &weights)
+            .expect("streaming fallback under a full ledger");
+        let dense = pressured.to_dense_arc();
+        let mut expected = Array2::<f64>::zeros((2, 2));
+        for row in 0..3 {
+            for a in 0..2 {
+                for b in 0..2 {
+                    expected[[a, b]] += weights[row] * dense[[row, a]] * dense[[row, b]];
+                }
+            }
+        }
+        let got = gram.as_dense().expect("dense symmetric result");
+        for a in 0..2 {
+            for b in 0..2 {
+                assert!(
+                    (got[[a, b]] - expected[[a, b]]).abs() < 1e-12,
+                    "streaming fallback Gram mismatch at ({a}, {b})"
+                );
+            }
+        }
+        drop(filler);
     }
 
     #[test]
