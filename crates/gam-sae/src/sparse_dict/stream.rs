@@ -575,7 +575,7 @@ fn validate_config(config: &SparseDictConfig) -> Result<(), String> {
 #[cfg(test)]
 mod stream_tests {
     use super::{SparseDictConfig, SparseDictStreamState, TileScorer, route_and_code_all};
-    use crate::sparse_dict::run_linear_fast_kernel;
+    use crate::sparse_dict::update::run_linear_fast_kernel;
     use ndarray::{Array2, ArrayView2};
 
     /// Deterministic synthetic corpus: `n` rows, each a scaled planted atom plus a

@@ -906,10 +906,17 @@ use gam::families::multinomial::MultinomialModelEnvelope;
 /// a `headers + rows` table. Returns the bincode-free, serde-JSON model
 /// payload that `gamfit.MultinomialModel` deserialises and stores under
 /// `Model._model_bytes`.
+///
+/// `config_json` is the same canonical fit-config document every formula
+/// family consumes (`gam::config_resolve`). The typed core request honors
+/// `weights` as per-row case weights and rejects fields the softmax family
+/// cannot consume (offsets, noise formulas, manual Firth, ...) instead of
+/// silently dropping them.
 #[pyfunction(signature = (
     headers,
     rows,
     formula,
+    config_json = None,
     init_lambda = 1.0,
     max_iter = 50,
     tol = 1.0e-7,
@@ -919,6 +926,7 @@ fn fit_multinomial_formula_pyfunc<'py>(
     headers: Vec<String>,
     rows: PyRef<'py, PyEncodedTable>,
     formula: String,
+    config_json: Option<String>,
     init_lambda: f64,
     max_iter: usize,
     tol: f64,
@@ -926,15 +934,22 @@ fn fit_multinomial_formula_pyfunc<'py>(
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
+        let fit_config = gam::config_resolve::parse_fit_config_json(config_json.as_deref())
+            .map_err(py_value_error)?
+            .fit_config;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343).
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
-            &dataset,
-            &formula,
-            &gam::families::fit_orchestration::FitConfig::default(),
-            init_lambda,
-            max_iter,
-            tol,
+            &gam::families::multinomial::MultinomialFitRequest {
+                init_lambda,
+                max_iter,
+                tol,
+                ..gam::families::multinomial::MultinomialFitRequest::new(
+                    &dataset,
+                    &formula,
+                    &fit_config,
+                )
+            },
         )
         .map_err(estimation_error_to_pyerr)?;
         MultinomialModelEnvelope::new(saved)
@@ -967,53 +982,40 @@ fn predict_multinomial_formula_pyfunc<'py>(
     Ok(probs.into_pyarray(py).unbind())
 }
 
-/// Predict class probabilities WITH delta-method per-class probability standard
-/// errors and z-scaled confidence bounds for a saved multinomial model (#1101).
-/// Returns a dict with `probs`, `prob_se`, `mean_lower`, `mean_upper` (all
-/// `(N_new, K)` arrays, columns aligned with `class_levels`) plus the `z`
-/// multiplier used. The bounds are the simplex-clamped delta band
-/// `p_c ± z·SE(p_c)`. `prob_se`/bounds are NaN-free only when the saved model
-/// carries covariance (REML-fitted models do); a legacy payload yields
-/// `prob_se = None`.
-#[pyfunction(signature = (model_bytes, headers, rows, z = 1.959963984540054))]
+/// Predict posterior-mean class probabilities WITH integrated per-class
+/// standard errors and simplex-clamped confidence bounds for a saved
+/// multinomial model (#1101). Returns a dict with `probs`, `prob_se`,
+/// `mean_lower`, `mean_upper` (all `(N_new, K)` arrays, columns aligned with
+/// `class_levels`) plus the `level` used. Center and spread both come from the
+/// same deterministic logistic-normal posterior integral (SPEC 3: the estimand
+/// is `E[softmax(η) | data]`, never the plug-in `softmax(E[η])`); a model
+/// without stored posterior covariance is a typed error.
+#[pyfunction(signature = (model_bytes, headers, rows, level = 0.95))]
 fn predict_multinomial_intervals_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
     rows: PyRef<'py, PyEncodedTable>,
-    z: f64,
+    level: f64,
 ) -> PyResult<Py<PyDict>> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    let (probs, prob_se) = detach_pyresult(py, "predict_multinomial_intervals", move || {
+    let intervals = detach_pyresult(py, "predict_multinomial_intervals", move || {
         let envelope =
             MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
-        gam::families::multinomial::predict_multinomial_formula_with_se(&envelope.saved, &dataset)
-            .map_err(estimation_error_to_pyerr)
+        gam::families::multinomial::predict_multinomial_formula_with_intervals(
+            &envelope.saved,
+            &dataset,
+            level,
+        )
+        .map_err(estimation_error_to_pyerr)
     })?;
     let out = PyDict::new(py);
-    out.set_item("z", z)?;
-    out.set_item("probs", probs.clone().into_pyarray(py))?;
-    match prob_se {
-        Some(se) => {
-            // Simplex-clamped delta band p_c ± z·SE(p_c).
-            let mut lower = probs.clone();
-            let mut upper = probs.clone();
-            for ((r, c), &s) in se.indexed_iter() {
-                let p = probs[[r, c]];
-                lower[[r, c]] = (p - z * s).clamp(0.0, 1.0);
-                upper[[r, c]] = (p + z * s).clamp(0.0, 1.0);
-            }
-            out.set_item("prob_se", se.into_pyarray(py))?;
-            out.set_item("mean_lower", lower.into_pyarray(py))?;
-            out.set_item("mean_upper", upper.into_pyarray(py))?;
-        }
-        None => {
-            out.set_item("prob_se", py.None())?;
-            out.set_item("mean_lower", py.None())?;
-            out.set_item("mean_upper", py.None())?;
-        }
-    }
+    out.set_item("level", intervals.level)?;
+    out.set_item("probs", intervals.mean.into_pyarray(py))?;
+    out.set_item("prob_se", intervals.standard_error.into_pyarray(py))?;
+    out.set_item("mean_lower", intervals.mean_lower.into_pyarray(py))?;
+    out.set_item("mean_upper", intervals.mean_upper.into_pyarray(py))?;
     Ok(out.unbind())
 }
 

@@ -82,7 +82,6 @@ pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
-pub(crate) use update::run_linear_fast_kernel;
 pub use update::{
     DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_block_reml_stats,
     linear_shared_rho_fs_step,
