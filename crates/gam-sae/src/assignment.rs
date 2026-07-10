@@ -2259,6 +2259,7 @@ fn ibp_prior_penalty(
     (penalty, rho_view)
 }
 
+#[allow(dead_code)] // staged/test-only IBP prior helpers; production uses the *_weighted variants
 pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
     assignment_prior_value_weighted(assignment, rho, None)
 }
@@ -2339,6 +2340,7 @@ pub(crate) fn assignment_prior_value_weighted(
     }
 }
 
+#[allow(dead_code)] // staged/test-only IBP prior helpers; production uses the *_weighted variants
 pub(crate) fn assignment_prior_log_strength_derivative(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2388,6 +2390,7 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     }
 }
 
+#[allow(dead_code)] // staged/test-only IBP prior helpers; production uses the *_weighted variants
 pub(crate) fn assignment_prior_log_strength_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2499,6 +2502,7 @@ fn mask_fixed_logit_entries(assignment: &SaeAssignment, arr: &mut Array1<f64>) {
     }
 }
 
+#[allow(dead_code)] // staged/test-only IBP prior helpers; production uses the *_weighted variants
 pub(crate) fn assignment_prior_log_strength_target_mixed(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2544,6 +2548,7 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     }
 }
 
+#[allow(dead_code)] // staged/test-only IBP prior helpers; production uses the *_weighted variants
 pub(crate) fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2675,6 +2680,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
 /// `alpha`/`tau`/`learnable_alpha` and the `lambda_sparse` weight convention —
 /// that [`assignment_prior_grad_hdiag`] assembles into `htt`. Returns `None`
 /// for non-IBP assignment modes (no cross-row empirical-π coupling to correct).
+#[allow(dead_code)] // staged/test-only IBP prior helpers; production uses the *_weighted variants
 pub(crate) fn ibp_assignment_third_channels(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
