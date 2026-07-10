@@ -23,6 +23,7 @@
 //! second copy of those gates.
 
 use gam::families::multinomial::MultinomialPredictionIntervals;
+use gam::families::survival::predict::SurvivalPredictResult;
 use gam_predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictUncertaintyResult,
@@ -161,7 +162,7 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             guards: &[1561],
             audited_by: "sbc_location_scale_predictive_coverage",
         },
-        // Survival S(t|x) band.
+        // Survival S(t|x) band (CLI-level mean_lower/mean_upper columns).
         CalibrationTarget {
             name: "survival_probability_band",
             kind: SurfaceKind::CredibleBand {
@@ -170,6 +171,22 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             mode: AuditMode::CoverageSweep,
             guards: &[1869, 1870, 1871],
             audited_by: "sbc_survival_probability_band_coverage",
+        },
+        // `SurvivalPredictResult::survival_se`/`eta_se` (#1891 follow-up): a
+        // SEPARATE code path from `survival_probability_band` above — the
+        // spherical-radial posterior-quadrature pipeline
+        // (`predict_survival_posterior_mean`) that `predict_survival` runs when
+        // `with_uncertainty = true`, not the CLI's band columns. Found
+        // unregistered by a completeness sweep of every public payload struct.
+        CalibrationTarget {
+            name: "survival_posterior_mean_se",
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: false,
+            },
+            mode: AuditMode::CoverageSweep,
+            guards: &[1891],
+            audited_by: "sbc_survival_prediction_se_coverage \
+                         (survival_posterior_mean_se_covers_true_survival_probability_at_nominal)",
         },
         // ---- Coefficient Wald/delta intervals -----------------------------
         CalibrationTarget {
@@ -402,6 +419,59 @@ fn multinomial_payload_field_audits(
     ]
 }
 
+/// Exhaustive classification of every field of [`SurvivalPredictResult`].
+fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAudit> {
+    let SurvivalPredictResult {
+        times,
+        hazard,
+        survival,
+        cumulative_hazard,
+        linear_predictor,
+        likelihood_mode,
+        survival_se,
+        eta_se,
+    } = payload;
+    std::hint::black_box((
+        times,
+        hazard,
+        survival,
+        cumulative_hazard,
+        linear_predictor,
+        likelihood_mode,
+        survival_se,
+        eta_se,
+    ));
+    vec![
+        // Point surfaces: the plug-in/posterior-mean curves themselves carry
+        // no coverage claim on their own (only their SEs do).
+        FieldAudit::point("times"),
+        FieldAudit::point("hazard"),
+        FieldAudit::point("survival"),
+        FieldAudit::point("cumulative_hazard"),
+        FieldAudit::point("linear_predictor"),
+        FieldAudit::point("likelihood_mode"),
+        FieldAudit::audited("survival_se", "survival_posterior_mean_se"),
+        FieldAudit::audited("eta_se", "survival_posterior_mean_se"),
+    ]
+}
+
+/// A minimal well-formed `SurvivalPredictResult` probe.
+fn survival_probe() -> SurvivalPredictResult {
+    use gam::families::survival::construction::SurvivalLikelihoodMode;
+    let one1 = Array1::<f64>::zeros(1);
+    let one2 = ndarray::Array2::<f64>::zeros((1, 1));
+    SurvivalPredictResult {
+        times: vec![1.0],
+        hazard: one2.clone(),
+        survival: one2.clone(),
+        cumulative_hazard: one2.clone(),
+        linear_predictor: one1.clone(),
+        likelihood_mode: SurvivalLikelihoodMode::Weibull,
+        survival_se: Some(one2),
+        eta_se: Some(one1),
+    }
+}
+
 /// A minimal well-formed `MultinomialPredictionIntervals` probe.
 fn multinomial_probe() -> MultinomialPredictionIntervals {
     let one = ndarray::Array2::<f64>::zeros((1, 1));
@@ -492,6 +562,13 @@ fn coefficient_payload_uncertainty_fields_are_all_registered() {
 fn multinomial_payload_uncertainty_fields_are_all_registered() {
     let registry = uq_surface_registry();
     let audits = multinomial_payload_field_audits(&multinomial_probe());
+    assert_registry_covers_fields(&audits, &registry);
+}
+
+#[test]
+fn survival_predict_payload_uncertainty_fields_are_all_registered() {
+    let registry = uq_surface_registry();
+    let audits = survival_payload_field_audits(&survival_probe());
     assert_registry_covers_fields(&audits, &registry);
 }
 
