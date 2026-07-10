@@ -2847,7 +2847,7 @@ impl SaeManifoldTerm {
                 self.row_loss_weights.as_deref(),
             )?
         } else {
-            Vec::new()
+            Array1::zeros(0)
         };
         if softmax.is_none() && hdiag.is_empty() {
             return Ok(0.0);
