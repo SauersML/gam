@@ -896,6 +896,12 @@ pub enum OuterConvergedVia {
         residual_grad_norm: f64,
         certificate_bound: f64,
     },
+    /// Every optimized coordinate carried an explicit analytic fixed-point
+    /// equation and the KKT-projected residual cleared the solver tolerance.
+    FixedPointStationary {
+        projected_residual_inf_norm: f64,
+        certificate_bound: f64,
+    },
     /// Fellner–Schall model-state fixed point (#2235 verdict 2): two
     /// consecutive outer evaluations restored the same banked incumbent, so a
     /// further outer update provably does not change the fitted state. The
@@ -910,6 +916,7 @@ impl OuterConvergedVia {
         match self {
             Self::GradientStationary => "converged_stationary",
             Self::CriterionFlat { .. } => "converged_criterion_flat",
+            Self::FixedPointStationary { .. } => "converged_fixed_point",
             Self::RecurrentIncumbent { .. } => "incumbent_stationary",
         }
     }

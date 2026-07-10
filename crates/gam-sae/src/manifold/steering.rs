@@ -216,6 +216,13 @@ impl SaeManifoldTerm {
     /// fixed strength. Circle closure is
     /// exact up to floating-point wrap: `δ = 0` is an exactly-zero delta and
     /// `δ = period` returns to the start (`|Δ| ≈ 0`).
+    ///
+    /// **Crosscoder footgun.** On a term with a crosscoder layout installed, the
+    /// returned columns are in FIT space: every non-anchor block still carries
+    /// its `√λ_ℓ` relevance scaling. Patching raw `steer_rows`/`steer_decode`
+    /// output into a downstream layer's activations injects `√λ_ℓ`-inflated
+    /// deltas. Use [`Self::steer_layer_delta`] / [`Self::steer_layer_decode`],
+    /// which select one layer's column block and return HONEST activation units.
     pub fn steer_rows(
         &self,
         atom: usize,

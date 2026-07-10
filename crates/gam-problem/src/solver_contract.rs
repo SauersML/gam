@@ -213,6 +213,44 @@ impl EfsEval {
     }
 }
 
+/// One coordinate of an objective-supplied final fixed-point certificate.
+///
+/// `Covered` means the objective has an analytic update equation whose zero is
+/// equivalent to stationarity for this coordinate. `update` is the signed
+/// feasible-descent update in the coordinate's native parameterization and
+/// `scale` makes its residual dimensionless. A guarded zero, an unavailable
+/// trace, or a coordinate with no fixed-point equation must be `Uncovered`;
+/// representing any of those as `Covered { update: 0, .. }` would fabricate a
+/// convergence certificate.
+#[derive(Clone, Debug)]
+pub enum FixedPointCoordinateCertificate {
+    Covered { update: f64, scale: f64 },
+    Uncovered { reason: String },
+}
+
+impl FixedPointCoordinateCertificate {
+    pub fn covered(update: f64, scale: f64) -> Self {
+        Self::Covered { update, scale }
+    }
+
+    pub fn uncovered(reason: impl Into<String>) -> Self {
+        Self::Uncovered {
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Objective-owned proof sample used only for final fixed-point certification.
+///
+/// This is intentionally separate from [`EfsEval`]. The iteration step may be
+/// zero because a guard held or an update is undefined; only this explicit hook
+/// may assert that every coordinate carries a root-equivalent analytic residual.
+#[derive(Clone, Debug)]
+pub struct FixedPointCertificateEval {
+    pub cost: f64,
+    pub coordinates: Vec<FixedPointCoordinateCertificate>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

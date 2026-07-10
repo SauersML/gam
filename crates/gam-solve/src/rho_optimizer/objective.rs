@@ -1,7 +1,9 @@
 use super::*;
 
 // Re-exported here while the shared EFS contract lives in `gam-problem`.
-pub use gam_problem::EfsEval;
+pub use gam_problem::{
+    EfsEval, FixedPointCertificateEval, FixedPointCoordinateCertificate,
+};
 
 /// Outcome of [`OuterObjective::seed_inner_state`].
 ///
@@ -155,6 +157,24 @@ pub trait OuterObjective {
     fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
         Err(EstimationError::RemlOptimizationFailed(format!(
             "EFS evaluation not implemented for this objective at rho_dim={}",
+            rho.len()
+        )))
+    }
+
+    /// Re-evaluate the terminal fixed point and provide an explicit analytic
+    /// residual for every optimized coordinate.
+    ///
+    /// This is a proof surface, not an alias for [`Self::eval_efs`]: iteration
+    /// steps may contain guarded or structurally unsupported zeros. The default
+    /// refuses certification so an EFS-capable objective must deliberately
+    /// describe complete, root-equivalent coordinate coverage before a fixed-
+    /// point result can mint a fit.
+    fn eval_fixed_point_certificate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<FixedPointCertificateEval, EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(format!(
+            "fixed-point certification not implemented for this objective at rho_dim={}",
             rho.len()
         )))
     }

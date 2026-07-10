@@ -580,7 +580,60 @@ mod per_term_edf_tests {
 /// counts as railed against its box bound.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 
-/// Analytic first-order optimality certificate at the returned optimum (#934).
+/// The stationarity equation that certified an outer optimum.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum OuterStationarityCertificate {
+    /// KKT-projected analytic objective gradient.
+    AnalyticGradient {
+        grad_norm: f64,
+        projected_grad_norm: f64,
+        bound: f64,
+    },
+    /// KKT-projected, root-equivalent analytic fixed-point equations.
+    FixedPoint {
+        residual_inf_norm: f64,
+        projected_residual_inf_norm: f64,
+        bound: f64,
+        covered_coordinates: usize,
+    },
+}
+
+impl OuterStationarityCertificate {
+    pub fn raw_norm(&self) -> f64 {
+        match self {
+            Self::AnalyticGradient { grad_norm, .. } => *grad_norm,
+            Self::FixedPoint {
+                residual_inf_norm,
+                ..
+            } => *residual_inf_norm,
+        }
+    }
+
+    pub fn projected_norm(&self) -> f64 {
+        match self {
+            Self::AnalyticGradient {
+                projected_grad_norm,
+                ..
+            } => *projected_grad_norm,
+            Self::FixedPoint {
+                projected_residual_inf_norm,
+                ..
+            } => *projected_residual_inf_norm,
+        }
+    }
+
+    pub fn bound(&self) -> f64 {
+        match self {
+            Self::AnalyticGradient { bound, .. } | Self::FixedPoint { bound, .. } => *bound,
+        }
+    }
+
+    pub fn is_fixed_point(&self) -> bool {
+        matches!(self, Self::FixedPoint { .. })
+    }
+}
+
+/// Analytic optimality certificate at the returned optimum (#934).
 ///
 /// Certifies stationarity from the ANALYTIC objective alone — no
 /// finite-difference probes run in production (SPEC rule 2; derivative
@@ -594,20 +647,7 @@ pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 /// diagnostic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OuterCriterionCertificate {
-    /// ‖∇F(θ̂)‖₂ from the analytic gradient path at the returned point.
-    pub grad_norm: f64,
-    /// KKT-projected gradient norm at θ̂: components pulling INTO an active
-    /// box bound are dropped (the bound multiplier balances them), so this is
-    /// the norm of the feasible-descent gradient — the quantity that must
-    /// vanish at a constrained stationary point.
-    pub projected_grad_norm: f64,
-    /// Stationarity bound the projected gradient was tested against:
-    /// `max(solver absolute gradient floor, flat-valley score-relative
-    /// bound)`. The flat-valley bound is the codebase's operational
-    /// definition of score-relative stationarity (#1690), so the certificate
-    /// is exactly as strict as the acceptance test the outer loop already
-    /// applies to cost-stalled valleys.
-    pub stationarity_bound: f64,
+    pub stationarity: OuterStationarityCertificate,
     /// Whether the final outer Hessian is positive semidefinite (within a
     /// scaled tolerance) at θ̂, when the solver tracked one (`None` when no
     /// final Hessian was available).
@@ -621,7 +661,8 @@ impl OuterCriterionCertificate {
     /// First-order (KKT) stationarity: the projected gradient norm clears the
     /// score-relative stationarity bound.
     pub fn is_stationary(&self) -> bool {
-        self.projected_grad_norm.is_finite() && self.projected_grad_norm <= self.stationarity_bound
+        self.stationarity.projected_norm().is_finite()
+            && self.stationarity.projected_norm() <= self.stationarity.bound()
     }
 
     /// Second-order admissibility: a certified optimum must not sit on
@@ -637,11 +678,11 @@ impl OuterCriterionCertificate {
     /// minimum. This is the load-bearing verdict: a `false` here rejects the
     /// fit with typed non-convergence.
     pub fn certifies(&self) -> bool {
-        self.grad_norm.is_finite()
-            && self.grad_norm >= 0.0
-            && self.projected_grad_norm >= 0.0
-            && self.stationarity_bound.is_finite()
-            && self.stationarity_bound >= 0.0
+        self.stationarity.raw_norm().is_finite()
+            && self.stationarity.raw_norm() >= 0.0
+            && self.stationarity.projected_norm() >= 0.0
+            && self.stationarity.bound().is_finite()
+            && self.stationarity.bound() >= 0.0
             && self.is_stationary()
             && self.curvature_admissible()
     }
@@ -654,11 +695,23 @@ impl OuterCriterionCertificate {
 
     /// One-line human-readable rendering for logs and reports.
     pub fn summary(&self) -> String {
+        let stationarity = match &self.stationarity {
+            OuterStationarityCertificate::AnalyticGradient {
+                grad_norm,
+                projected_grad_norm,
+                bound,
+            } => format!("gradient |g|={grad_norm:.3e} |Pg|={projected_grad_norm:.3e} bound={bound:.3e}"),
+            OuterStationarityCertificate::FixedPoint {
+                residual_inf_norm,
+                projected_residual_inf_norm,
+                bound,
+                covered_coordinates,
+            } => format!(
+                "fixed-point |r|inf={residual_inf_norm:.3e} |Pr|inf={projected_residual_inf_norm:.3e} bound={bound:.3e} covered={covered_coordinates}"
+            ),
+        };
         format!(
-            "|g|={:.3e} |Pg|={:.3e} bound={:.3e} hessian_psd={} railed={:?} → {}",
-            self.grad_norm,
-            self.projected_grad_norm,
-            self.stationarity_bound,
+            "{stationarity} hessian_psd={} railed={:?} → {}",
             match self.hessian_psd {
                 Some(true) => "yes",
                 Some(false) => "NO",

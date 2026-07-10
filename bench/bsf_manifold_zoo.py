@@ -913,10 +913,30 @@ def main() -> int:
                 device=args.device,
             )
         elif which == "ours_rust":
-            fitted = _fit_ours_rust(
-                train_x, test_x, atoms=atoms, top_k=top_k,
-                n_iter=args.rust_iters, seed=args.seed,
-            )
+            try:
+                fitted = _fit_ours_rust(
+                    train_x, test_x, atoms=atoms, top_k=top_k,
+                    n_iter=args.rust_iters, seed=args.seed,
+                )
+            except Exception as error:
+                # A failed/non-converged manifold arm is scientific output, not
+                # an absent row. Persist the typed failure before re-raising so
+                # the process remains fail-loud and the JSONL distinguishes
+                # "ran and refused" from "never started" (#2230/#2134).
+                failure = {
+                    "record": "error",
+                    "featurizer": "ours_rust",
+                    "seed": args.seed,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+                with out_path.open("a") as fh:
+                    fh.write(json.dumps(failure) + "\n")
+                print(
+                    f"[ours_rust] failed: {failure['error_type']}: {failure['error']}",
+                    flush=True,
+                )
+                raise
         elif which == "ours_torch":
             fitted = _fit_ours_torch(
                 train_x, test_x, atoms=atoms, top_k=top_k, steps=args.steps,

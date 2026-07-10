@@ -1480,6 +1480,280 @@ fn seam_equivalence_log_e(
     Some(log_e.clamp(-GLUE_LOG_E_CLAMP, GLUE_LOG_E_CLAMP))
 }
 
+// ===========================================================================
+// #1890 Increment 2 — SPHERE POLE seams (the d=2 register emitter).
+//
+// A sphere pole seam is TWO `SphereChartEvaluator` (lat/lon, `latent_dim = 2`)
+// charts covering ONE ambient sphere with their poles in each other's INTERIOR:
+// neither lat/lon chart alone covers both poles (`cos(lat) → 0` gauge collapse),
+// so the cover is irreducibly an atlas — a single chart cannot represent it.
+// The transition relating two such charts is an ambient rotation `R ∈ SO(3)` on
+// the intrinsic unit vector `u = [x, y, z]`, NOT a 1-D affine map; the 1-D seam
+// fit ([`fit_seam_transition`]) is structurally blind to it (it short-circuits
+// on non-`Periodic`, `latent_dim ≠ 1` atoms). This lane fits that rotation by
+// exact orthogonal Procrustes on the two decoders' linear `[x, y, z]` blocks,
+// classifies pole-vs-regular by whether each chart's pole falls strictly inside
+// the OTHER chart's active latitude span (data-driven, no magic angle), and
+// certifies the overlap with the SAME sample-split equivalence e-value the 1-D
+// lane uses. A pole seam always REGISTERS (keeps both charts as one
+// partition-of-unity atlas atom); a sphere is orientable, so its proper-rotation
+// transition carries `sign = +1` in the cocycle.
+// ===========================================================================
+
+/// The linear `[x, y, z]` decoder block of a `SphereChartEvaluator` atom: rows
+/// `1..4` of the `(7, p)` decoder (`[1, x, y, z, xy, yz, xz]`), returned as the
+/// `3 × p` ambient frame the sphere's unit vector maps through.
+fn sphere_linear_block(atom: &SaeManifoldAtom) -> Option<Array2<f64>> {
+    let decoder = atom.full_width_decoder();
+    if decoder.nrows() != 7 {
+        return None;
+    }
+    Some(decoder.slice(ndarray::s![1..4, ..]).to_owned())
+}
+
+/// Exact inverse of a `3×3` matrix (Cramer). `None` if singular.
+fn inverse_3x3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    if !det.is_finite() || det.abs() < 1e-12 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let mut inv = [[0.0; 3]; 3];
+    inv[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
+    inv[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;
+    inv[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
+    inv[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;
+    inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
+    inv[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det;
+    inv[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
+    inv[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
+    inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
+    Some(inv)
+}
+
+/// Nearest orthogonal matrix to `m` (the orthogonal polar factor `U Vᵀ` of its
+/// SVD) via Higham's polar iteration `Q ← ½(Q + Q⁻ᵀ)`.  This is the orthogonal
+/// Procrustes solution `argmin_{QᵀQ=I} ‖Q − M‖_F`; convergence is quadratic once
+/// near the factor, so a few dozen iterations reach machine precision.  `None`
+/// if any iterate is singular (a degenerate, non-invertible frame product).
+fn nearest_orthogonal_3x3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let mut q = m;
+    for _ in 0..128 {
+        let inv = inverse_3x3(&q)?;
+        let mut next = [[0.0; 3]; 3];
+        let mut diff = 0.0;
+        for i in 0..3 {
+            for j in 0..3 {
+                // inv transpose: (Q⁻ᵀ)[i][j] = inv[j][i].
+                next[i][j] = 0.5 * (q[i][j] + inv[j][i]);
+                diff += (next[i][j] - q[i][j]).abs();
+            }
+        }
+        q = next;
+        if diff < 1e-15 {
+            break;
+        }
+    }
+    if q.iter().flatten().any(|x| !x.is_finite()) {
+        return None;
+    }
+    Some(q)
+}
+
+/// Decode a sphere chart's `(7, p)` decoder at explicit intrinsic unit vectors
+/// `u = [x, y, z]` (on `S²`), evaluating the analytic basis
+/// `[1, x, y, z, xy, yz, xz]` — no sampled-grid nearest-point proxy.
+fn sphere_decoded_points_at_units(
+    decoder: ArrayView2<'_, f64>,
+    units: &[[f64; 3]],
+) -> Option<Array2<f64>> {
+    if decoder.nrows() != 7 {
+        return None;
+    }
+    let p = decoder.ncols();
+    let mut points = Array2::<f64>::zeros((units.len(), p));
+    for (row, &[x, y, z]) in units.iter().enumerate() {
+        let phi = [1.0, x, y, z, x * y, y * z, x * z];
+        for output in 0..p {
+            let mut value = 0.0;
+            for (basis, &phi_b) in phi.iter().enumerate() {
+                value += phi_b * decoder[[basis, output]];
+            }
+            points[[row, output]] = value;
+        }
+    }
+    Some(points)
+}
+
+/// A fitted sphere pole-seam transition: the ambient rotation `R` (`b -> a`, so
+/// `u_a = R u_b`), its pole-vs-regular classification, and the decoded /
+/// rotation-mapped point clouds the shared equivalence e-value scores.
+struct SphereSeamTransition {
+    rotation: [[f64; 3]; 3],
+    seam_kind: AtlasSeamKind,
+    rows_a: Vec<usize>,
+    points_a: Array2<f64>,
+    rows_b: Vec<usize>,
+    points_b: Array2<f64>,
+    /// A decoded at the rotation-mapped unit vectors of B's active rows.
+    mapped_b_to_a: Array2<f64>,
+    /// B decoded at the inverse-rotation-mapped unit vectors of A's active rows.
+    mapped_a_to_b: Array2<f64>,
+}
+
+/// The intrinsic unit vector `[x, y, z]` of a sphere atom's active row, read from
+/// its already-evaluated basis values (`phi = [1, x, y, z, ...]`).
+fn sphere_row_unit(atom: &SaeManifoldAtom, row: usize) -> [f64; 3] {
+    [
+        atom.basis_values[[row, 1]],
+        atom.basis_values[[row, 2]],
+        atom.basis_values[[row, 3]],
+    ]
+}
+
+/// Apply a `3×3` rotation to a unit vector.
+fn rotate_unit(r: &[[f64; 3]; 3], u: [f64; 3]) -> [f64; 3] {
+    [
+        r[0][0] * u[0] + r[0][1] * u[1] + r[0][2] * u[2],
+        r[1][0] * u[0] + r[1][1] * u[1] + r[1][2] * u[2],
+        r[2][0] * u[0] + r[2][1] * u[1] + r[2][2] * u[2],
+    ]
+}
+
+/// Whether two atoms are both `SphereChartEvaluator` local charts.
+fn is_sphere_pair(term: &SaeManifoldTerm, a: usize, b: usize) -> bool {
+    let k = term.k_atoms();
+    if a >= k || b >= k || a == b {
+        return false;
+    }
+    let sa = &term.atoms[a];
+    let sb = &term.atoms[b];
+    sa.latent_dim == 2
+        && sb.latent_dim == 2
+        && matches!(sa.basis_kind, SaeAtomBasisKind::Sphere)
+        && matches!(sb.basis_kind, SaeAtomBasisKind::Sphere)
+}
+
+/// Fit the ambient-rotation seam transition between two sphere charts and
+/// classify pole-vs-regular. `None` unless both atoms are `latent_dim = 2` sphere
+/// charts with a shared ambient dim, non-empty active supports, and an invertible
+/// frame product.
+fn fit_sphere_seam_transition(
+    term: &SaeManifoldTerm,
+    a: usize,
+    b: usize,
+) -> Option<SphereSeamTransition> {
+    if !is_sphere_pair(term, a, b) {
+        return None;
+    }
+    let atom_a = &term.atoms[a];
+    let atom_b = &term.atoms[b];
+    let p = atom_a.decoder_coefficients.ncols();
+    if p == 0 || p != atom_b.decoder_coefficients.ncols() {
+        return None;
+    }
+    let l_a = sphere_linear_block(atom_a)?;
+    let l_b = sphere_linear_block(atom_b)?;
+    // Orthogonal Procrustes: R = argmin ‖L_a − R L_b‖ ⇒ R is the orthogonal
+    // factor of M = L_a L_bᵀ (3×3). Then u_a = R u_b matches the ambient images.
+    let m_prod = l_a.dot(&l_b.t());
+    let mut m = [[0.0_f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i][j] = m_prod[[i, j]];
+        }
+    }
+    let rotation = nearest_orthogonal_3x3(m)?;
+    let rows_a = atom_active_rows(term, a);
+    let rows_b = atom_active_rows(term, b);
+    if rows_a.is_empty() || rows_b.is_empty() {
+        return None;
+    }
+    // Active latitudes (asin z) of each chart, and each chart's pole mapped into
+    // the OTHER chart's coordinate: pole-vs-regular is decided by whether the
+    // mapped pole falls strictly inside the other chart's active latitude span.
+    let lat_of = |u: [f64; 3]| -> f64 { u[2].clamp(-1.0, 1.0).asin() };
+    let (mut a_lat_lo, mut a_lat_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &r in &rows_a {
+        let lat = lat_of(sphere_row_unit(atom_a, r));
+        a_lat_lo = a_lat_lo.min(lat);
+        a_lat_hi = a_lat_hi.max(lat);
+    }
+    let (mut b_lat_lo, mut b_lat_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &r in &rows_b {
+        let lat = lat_of(sphere_row_unit(atom_b, r));
+        b_lat_lo = b_lat_lo.min(lat);
+        b_lat_hi = b_lat_hi.max(lat);
+    }
+    // B's north pole u_b = [0,0,1] into A's coordinate; A's north pole into B's.
+    let b_pole_in_a = lat_of(rotate_unit(&rotation, [0.0, 0.0, 1.0]));
+    let inv_rotation = inverse_3x3(&rotation)?;
+    let a_pole_in_b = lat_of(rotate_unit(&inv_rotation, [0.0, 0.0, 1.0]));
+    let b_pole_interior_to_a = b_pole_in_a > a_lat_lo && b_pole_in_a < a_lat_hi;
+    let a_pole_interior_to_b = a_pole_in_b > b_lat_lo && a_pole_in_b < b_lat_hi;
+    let seam_kind = if b_pole_interior_to_a && a_pole_interior_to_b {
+        AtlasSeamKind::Pole
+    } else {
+        AtlasSeamKind::Regular
+    };
+    // Decoded clouds + rotation-mapped clouds for the equivalence e-value.
+    let units_a: Vec<[f64; 3]> = rows_a.iter().map(|&r| sphere_row_unit(atom_a, r)).collect();
+    let units_b: Vec<[f64; 3]> = rows_b.iter().map(|&r| sphere_row_unit(atom_b, r)).collect();
+    let points_a = sphere_decoded_points_at_units(atom_a.full_width_decoder().view(), &units_a)?;
+    let points_b = sphere_decoded_points_at_units(atom_b.full_width_decoder().view(), &units_b)?;
+    // B's rows carried into A: rotate u_b -> u_a, decode through A.
+    let mapped_b_units: Vec<[f64; 3]> = units_b.iter().map(|&u| rotate_unit(&rotation, u)).collect();
+    let mapped_b_to_a =
+        sphere_decoded_points_at_units(atom_a.full_width_decoder().view(), &mapped_b_units)?;
+    // A's rows carried into B: rotate u_a by R⁻¹ -> u_b, decode through B.
+    let mapped_a_units: Vec<[f64; 3]> =
+        units_a.iter().map(|&u| rotate_unit(&inv_rotation, u)).collect();
+    let mapped_a_to_b =
+        sphere_decoded_points_at_units(atom_b.full_width_decoder().view(), &mapped_a_units)?;
+    Some(SphereSeamTransition {
+        rotation,
+        seam_kind,
+        rows_a,
+        points_a,
+        rows_b,
+        points_b,
+        mapped_b_to_a,
+        mapped_a_to_b,
+    })
+}
+
+/// The sphere pole-seam equivalence certificate (#1890 Increment 2). Returns the
+/// exact ambient-rotation transition (`b -> a`) plus its equivalence log-e-value,
+/// or `None` if the pair is not an identifiable pole seam.  Only genuine POLE
+/// seams (each pole interior to the other chart) are certified for registration;
+/// a regular sphere overlap has no register/fuse outcome wired in this lane and
+/// yields `None`.
+fn sphere_glue_pair_evalue(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+    a: usize,
+    b: usize,
+) -> Option<(SphereChartTransition, f64)> {
+    let seam = fit_sphere_seam_transition(term, a, b)?;
+    if !matches!(seam.seam_kind, AtlasSeamKind::Pole) {
+        return None;
+    }
+    let log_e = seam_equivalence_log_e(
+        residuals,
+        &seam.rows_a,
+        &seam.points_a,
+        &seam.mapped_a_to_b,
+        &seam.rows_b,
+        &seam.points_b,
+        &seam.mapped_b_to_a,
+    )?;
+    let transition =
+        SphereChartTransition::new(b, a, seam.rotation, AtlasSeamKind::Pole).ok()?;
+    Some((transition, log_e))
+}
+
 /// Emit the chart-gluing proposal lane (#1890) into `proposals`, ranked under
 /// `budget`. Returns `(glues_proposed, candidates_screened)`.
 ///
