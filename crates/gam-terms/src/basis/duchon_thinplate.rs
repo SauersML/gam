@@ -213,8 +213,9 @@ fn build_duchon_basis_uncached(
     // predict / κ-trial rebuilds replay the exact fit-time rotated radial basis.
     // A FROZEN `V` (predict / κ-trial / replay) is folded into the constrained
     // kernel transform on EVERY path so the design stays consistent with the
-    // frozen penalty. A FRESH `V` is computed only on the dense cold path; the
-    // lazy/streaming cold path keeps the original constrained basis (`None`).
+    // frozen penalty. A FRESH `V` is computed on every cold path: the dense
+    // builder obtains its realized Gram from the materialized kernel block,
+    // while the lazy builder streams the same Gram through the chunked operator.
     let mut frozen_radial_reparam: Option<Array2<f64>> = None;
     if let Some(v) = spec.radial_reparam.as_ref() {
         if v.nrows() != kernel_transform.ncols() {
@@ -292,9 +293,11 @@ fn build_duchon_basis_uncached(
         let make_kernel = || {
             let coeffs = coeffs.clone();
             let pure_poly_coeff = pure_poly_coeff;
-            let metric_weights = aniso
-                .as_ref()
-                .map(|eta| eta.iter().map(|&value| (2.0 * value).exp()).collect::<Vec<_>>());
+            let metric_weights = aniso.as_ref().map(|eta| {
+                eta.iter()
+                    .map(|&value| (2.0 * value).exp())
+                    .collect::<Vec<_>>()
+            });
             Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
                 let r = if let Some(weights) = metric_weights.as_ref() {
                     let mut squared_radius = 0.0_f64;
@@ -304,9 +307,7 @@ fn build_duchon_basis_uncached(
                     }
                     squared_radius.sqrt()
                 } else {
-                    stable_euclidean_norm(
-                        (0..d).map(|axis| data_row[axis] - center_row[axis]),
-                    )
+                    stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]))
                 };
                 let raw = if let Some(ppc) = pure_poly_coeff {
                     ppc.eval(r)
@@ -345,9 +346,8 @@ fn build_duchon_basis_uncached(
             let ones = Array1::<f64>::ones(raw_op.nrows());
             let raw_gram = raw_op.diag_xtw_x(&ones).map_err(BasisError::InvalidInput)?;
             let kernel_cols = kernel_transform.ncols();
-            let design_gram = symmetrize_penalty(
-                &raw_gram.slice(s![..kernel_cols, ..kernel_cols]).to_owned(),
-            );
+            let design_gram =
+                symmetrize_penalty(&raw_gram.slice(s![..kernel_cols, ..kernel_cols]).to_owned());
             let omega_constrained = duchon_constrained_bending_penalty(
                 centers.view(),
                 spec.length_scale,
@@ -356,8 +356,7 @@ fn build_duchon_basis_uncached(
                 aniso.as_deref(),
                 &kernel_transform,
             )?;
-            let (v, _mu) =
-                thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
+            let (v, _mu) = thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
             if v.ncols() > 0 {
                 kernel_transform = fast_ab(&kernel_transform, &v);
                 frozen_radial_reparam = Some(v);
@@ -374,9 +373,9 @@ fn build_duchon_basis_uncached(
             Some(Arc::new(poly_block)),
         )
         .map_err(BasisError::InvalidInput)?;
-        let base_design = DesignMatrix::Dense(
-            gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(base_op)),
-        );
+        let base_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Arc::new(base_op),
+        ));
         let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
             data,
             &base_design,

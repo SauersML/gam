@@ -459,7 +459,7 @@ pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
     ];
     let second_jets = vec![Array4::<f64>::zeros((1, 1, 1, 1)); 2];
     let prog = term
-        .reconstruction_row_program_for_logdet(&rho, 0, &vars, assignments.view(), &second_jets)
+        .reconstruction_row_program_for_logdet(0, &vars, assignments.view(), &second_jets)
         .expect("row program");
 
     // The program reads the FROZEN logits, not the free ones.
@@ -519,7 +519,7 @@ pub(crate) fn ungated_ibp_row_program_gates_at_unit_with_zero_logit_derivative()
     ];
     let second_jets = vec![Array4::<f64>::zeros((1, 1, 1, 1)); 2];
     let prog = term
-        .reconstruction_row_program_for_logdet(&rho, 0, &vars, assignments.view(), &second_jets)
+        .reconstruction_row_program_for_logdet(0, &vars, assignments.view(), &second_jets)
         .expect("row program");
 
     // Not frozen ⇒ the program reads the FREE logits; only the ungated atom is a

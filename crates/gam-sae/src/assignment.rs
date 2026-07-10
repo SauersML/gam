@@ -225,15 +225,11 @@ pub(crate) fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperat
 pub enum AssignmentMode {
     /// Row-wise simplex assignment with entropy sparsity.
     Softmax { temperature: f64, sparsity: f64 },
-    /// Deterministic concrete relaxation of a truncated IBP active set: each
-    /// atom's gate is the INDEPENDENT prior-shrunk activation
-    /// `σ(logit/temperature) · π_k`, with `π_k = (α/(α+1))^{k+1}` the
-    /// stick-breaking prior mean (see [`ibp_map_row`]). These are per-atom gates,
-    /// NOT mixture/simplex responsibilities: they are computed independently per
-    /// column and do NOT sum to 1 across atoms (there is no row normalization).
-    /// Each `a_k ∈ [0, π_k] ⊂ [0, 1)` is the relaxed "atom k is active in this
-    /// row" indicator of a truncated IBP, not a share of a unit reconstruction
-    /// budget.
+    /// Deterministic concrete posterior means for a truncated IBP active set:
+    /// `a_k = σ(logit_k/temperature)`. These are independent Bernoulli gates,
+    /// not mixture/simplex responsibilities. The ordered stick-breaking mean
+    /// `π_k = (α/(α+1))^{k+1}` is scored once by the IBP prior; it is not
+    /// multiplied into the final reconstructed function.
     IBPMap {
         temperature: f64,
         alpha: f64,
@@ -1259,13 +1255,12 @@ pub(crate) fn ordered_geometric_shrinkage_prior(k_atoms: usize, alpha: f64) -> A
 }
 
 /// Ordered prior-mean *schedule* for the truncated-IBP assignment prior. Both
-/// forms produce a strictly positive, ordered (decreasing) per-atom mass
-/// `μ_k ∈ (0, 1]` consumed by the IBP-MAP gate `a_k = σ(l_k/τ)·μ_k`.
+/// forms produce a strictly positive, ordered (decreasing) prior mean
+/// `μ_k ∈ (0, 1]` consumed by the Beta--Bernoulli penalty.
 ///
 /// * [`Self::Geometric`] — the historical stick-breaking mean
 ///   `μ_k = (α/(α+1))^{k+1}`, which decays GEOMETRICALLY in the atom index and
-///   at the production `α = 1` structurally caps the effective atom count at
-///   ~3 (the #1777 flatten-override exists precisely to fight this).
+///   at `α = 1` assigns overwhelming prior shrinkage to late atoms.
 /// * [`Self::PowerLaw`] — a heavier (near-Zipfian) polynomial tail
 ///   `μ_k = c/(k + k0)^s`, whose sub-exponential decay keeps late atoms
 ///   un-masked at large `K` where the geometric schedule has already collapsed
@@ -1286,9 +1281,8 @@ pub enum OrderedPriorSchedule {
 ///
 /// Both branches accumulate in LOG space and floor the exponentiated weight at
 /// the smallest positive normal so the soft shrinkage prior never becomes a HARD
-/// mask: an atom flushed to exact `0.0` would receive zero assignment AND zero
-/// logit gradient (the gradient is multiplied by `μ_k`) and could never
-/// reactivate. The geometric branch is the historical `π_k = ratio^(k+1)`
+/// mask: exact zero would make the Beta prior undefined. The geometric branch
+/// is the historical `π_k = ratio^(k+1)`
 /// computation, unchanged; the power-law branch additionally clamps `μ_k ≤ 1`
 /// (a raw `c/(k0)^s` can exceed 1 for the first atoms).
 pub fn ordered_prior_means(k_atoms: usize, schedule: OrderedPriorSchedule) -> Array1<f64> {
@@ -1572,10 +1566,8 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
 /// into per-atom activations": the closed-form fitter (via [`softmax_row`] /
 /// [`ibp_map_row`] / [`jumprelu_row`]) and the post-hoc distilled-encoder path
 /// both read it, so a distilled encoder's activation is bit-identical to the
-/// model it distills. Formerly the python `gamfit.distill` module re-derived
-/// this in numpy and had drifted — its IBP prior used `(α/(α+1))^k` instead of
-/// the consistent stick-breaking mean `π_k = (α/(α+1))^{k+1}` this path applies
-/// (issue #2011: python is a thin wrapper, no shadow math).
+/// model it distills. Formerly the Python `gamfit.distill` module re-derived
+/// this math and drifted (issue #2011: Python is a thin wrapper, no shadow math).
 ///
 /// `kind` is the canonical assignment token (`"softmax"`, `"ibp_map"`,
 /// or `"threshold_gate"`). `threshold` is read only for the gate family.

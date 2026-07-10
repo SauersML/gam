@@ -12,7 +12,6 @@
 impl SaeManifoldTerm {
     pub(crate) fn reconstruction_row_program_for_logdet(
         &self,
-        rho: &SaeManifoldRho,
         row: usize,
         vars: &[SaeLocalRowVar],
         assignments: ArrayView1<'_, f64>,
@@ -666,7 +665,6 @@ impl SaeManifoldTerm {
                 // (`assignment_coord_dim() == 0`), so the program simply carries
                 // no gate channels.
                 let program = self.reconstruction_row_program_for_logdet(
-                    rho,
                     row,
                     &vars,
                     assignments,
@@ -745,7 +743,6 @@ mod batch4_oracle_tests {
                     a.as_slice_mut().expect("contiguous assignment scratch"),
                 )?;
                 let prog = self.reconstruction_row_program_for_logdet(
-                    rho,
                     row,
                     &vars,
                     a.view(),

@@ -182,6 +182,8 @@ def _install_exact_protocol(driver):
             if method == "manifold":
                 call = calls[cursor]
                 cursor += 1
+                row["requested_delta_norm"] = call["requested_delta_norm"]
+                row["delta_norm"] = call["effective_delta_norm"]
                 row["predicted_nats"] = call["predicted_nats"]
                 row["measured_kl"] = call["forward_kl"]
                 row["measured_reverse_kl"] = call["reverse_kl"]
@@ -197,11 +199,15 @@ def _install_exact_protocol(driver):
             if method == "linear_norm":
                 pending_linear = calls[cursor]
                 cursor += 1
+                row["requested_delta_norm"] = pending_linear["requested_delta_norm"]
+                row["delta_norm"] = pending_linear["effective_delta_norm"]
                 row["measured_kl"] = pending_linear["forward_kl"]
                 continue
             if method == "linear_fisher":
                 if pending_linear is None:
                     raise RuntimeError("linear Fisher row has no preceding measured move")
+                row["requested_delta_norm"] = pending_linear["requested_delta_norm"]
+                row["delta_norm"] = pending_linear["effective_delta_norm"]
                 row["predicted_nats"] = pending_linear["predicted_nats"]
                 row["measured_kl"] = pending_linear["forward_kl"]
                 pending_linear = None

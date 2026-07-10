@@ -488,19 +488,21 @@ pub fn starting_num_centers(n: usize, d: usize) -> usize {
     d.saturating_add(2).min(n).max(1)
 }
 
-/// Next evidence-backed center count for a saturated spatial basis.
+/// Next evidence-backed center count for a saturated spatial basis, bounded by
+/// the already validated production-default resolution.
 ///
-/// Growth is geometric so the number of certified refits is logarithmic, then
-/// clipped at the observed row support. The cap is information-theoretic rather
-/// than a sample-size heuristic: more selected centers than observations cannot
-/// add a training-data direction. `None` means the row-supported function space
-/// is exhausted, which the workflow reports as typed underresolution when the
-/// fitted EDF is still saturated.
-pub fn expanded_num_centers(current: usize, n: usize) -> Option<usize> {
-    if current >= n {
+/// Growth is geometric so the number of certified refits is logarithmic. The
+/// ceiling is supplied by the owning workflow because it depends on the
+/// spatial family/dimension and resource plan; the standard formula workflow
+/// uses [`default_num_centers`]. Adaptive resolution may therefore avoid work
+/// below the previous default, but can never turn an ordinary fit into an
+/// unvalidated row-rank dense basis. `None` means the validated function-space
+/// ceiling has been reached.
+pub fn expanded_num_centers(current: usize, ceiling: usize) -> Option<usize> {
+    if current >= ceiling {
         return None;
     }
-    let expanded = current.saturating_mul(2).min(n);
+    let expanded = current.saturating_mul(2).min(ceiling);
     (expanded > current).then_some(expanded)
 }
 

@@ -12,19 +12,15 @@ use super::*;
 /// remedy, adapted here to gamfit's REML/LAML engine with a finite truncation
 /// and deterministic concrete relaxation.
 ///
-/// # One model shared with the forward gate
+/// # One posterior-mean model
 ///
-/// This penalty is the negative-log-**posterior** of the SAME generative model
-/// the forward gate (`gam_sae::assignment::ibp_map_row`) implements, so the
-/// fit objective (reconstruction + this penalty) is the neg-log-posterior of a
-/// single model rather than two mismatched priors. The per-atom activation rate
-/// is `π_k ~ Beta(a_k, 1)` whose **prior mean**
-/// `E[π_k] = a_k/(a_k+1) = μ_k = (α/(α+1))^(k+1)` is exactly the ordered
-/// stick-breaking prior mean the forward gate multiplies in
-/// (`z_ik = σ(ℓ_ik/τ)·μ_k`); we take `a_k = μ_k/(1−μ_k)`. The gate applies the
-/// **prior mean** `μ_k`; this penalty scores the relaxed indicators against the
-/// **posterior mean** `π̂_k` of the same `π_k` — the empirical-Bayes / mean-field
-/// structure, one model, prior-vs-posterior mean.
+/// This penalty is the negative-log-**posterior** of the same Bernoulli
+/// indicators returned by the forward gate. The gate is the concrete posterior
+/// mean `z_ik = sigmoid(ell_ik/tau)`. The ordered activation-rate prior is
+/// `pi_k ~ Beta(a_k, 1)`, with
+/// `E[pi_k] = a_k/(a_k+1) = mu_k = (alpha/(alpha+1))^(k+1)` and
+/// `a_k = mu_k/(1-mu_k)`. Crucially, `mu_k` is scored here exactly once; it is
+/// not multiplied into the final reconstructed function as a second prior.
 ///
 /// The target is row-major `(N, K)` logits. We use a deterministic
 /// binary-concrete score `z_ik = sigmoid(logit_ik / tau)`, with optional
@@ -131,12 +127,10 @@ impl IBPAssignmentPenalty {
 
     /// Per-column Beta(`a_k`, 1) shapes and their prior means `μ_k`.
     ///
-    /// `μ_k = (α/(α+1))^(k+1)` is the ordered stick-breaking prior mean the
-    /// forward gate (`ibp_map_row`) multiplies in, and `a_k = μ_k/(1−μ_k)` is the
-    /// Beta shape whose prior mean `a_k/(a_k+1) = μ_k` matches it — so the gate's
-    /// multiplicative π and this penalty's Beta prior are ONE model. Returns
+    /// `μ_k = (α/(α+1))^(k+1)` is the ordered stick-breaking prior mean and
+    /// `a_k = μ_k/(1−μ_k)` is the corresponding Beta shape. Returns
     /// `(a_col, mu)`, each length `K`. `μ_k` is floored at the smallest positive
-    /// normal (mirroring the gate's `ordered_geometric_shrinkage_prior`) so every
+    /// normal so every
     /// atom keeps a live gradient path; the sparsity ordering is preserved.
     fn column_beta_shapes(&self, alpha: f64) -> (Array1<f64>, Array1<f64>) {
         let log_ratio = (alpha / (alpha + 1.0)).ln();
@@ -152,7 +146,7 @@ impl IBPAssignmentPenalty {
 
     /// `∂a_k/∂ρ` with `ρ = logα` and `α = α_base·e^ρ`, for the learnable-α
     /// channels. With `μ_k = (α/(α+1))^(k+1)` we have `∂μ_k/∂ρ = μ_k·(k+1)/(α+1)`
-    /// (the SAME `dπ_k/dρ` the forward gate's α-data derivative uses), and
+    /// and
     /// `a_k = μ_k/(1−μ_k)` gives `∂a_k/∂ρ = (∂μ_k/∂ρ)/(1−μ_k)²`.
     fn column_beta_shape_rho_deriv(&self, alpha: f64, mu: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut da = Array1::<f64>::zeros(self.k_max);
@@ -208,8 +202,8 @@ impl IBPAssignmentPenalty {
     /// zero boundary whenever `a_k < 1` and the fitted mass is sparse, which would
     /// make `∂π̂_k/∂M_k = 0` and drop the IBP cross-row Woodbury curvature for
     /// precisely the active-sparsity regimes this prior is meant to model. The
-    /// prior mean `E[π_k] = a_k/(a_k+1) = μ_k` is the forward gate's multiplier, so
-    /// gate and penalty are one model (prior-vs-posterior mean).
+    /// prior mean `E[π_k] = a_k/(a_k+1) = μ_k` supplies ordered shrinkage solely
+    /// through this prior.
     fn pi_posterior_mean(&self, z: ArrayView1<'_, f64>, a_col: ArrayView1<'_, f64>) -> Array1<f64> {
         let (active_mass, n_eff) = self.weighted_active_mass(z);
         let mut pi = Array1::<f64>::zeros(self.k_max);
@@ -273,8 +267,7 @@ impl IBPAssignmentPenalty {
         majorize: bool,
     ) -> IbpHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
-        // Per-column Beta(a_k, 1) shapes whose prior mean is the forward gate's
-        // ordered stick-breaking μ_k — the single-model reconciliation.
+        // Per-column Beta(a_k, 1) shapes carrying the ordered prior mean μ_k.
         let (a_col, _mu) = self.column_beta_shapes(alpha);
         let tau = self.concrete_temperature();
         let inv_tau = 1.0 / tau;
@@ -479,7 +472,7 @@ impl IBPAssignmentPenalty {
         }
         let alpha = self.resolved_alpha(rho);
         // Per-column Beta shapes a_k and their ρ-derivatives da_k/dρ (single-model
-        // reconciliation: prior mean a_k/(a_k+1) = μ_k = the forward gate's π_k).
+        // prior mean a_k/(a_k+1) = μ_k.
         let (a_col, mu) = self.column_beta_shapes(alpha);
         let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
         let tau = self.concrete_temperature();
@@ -711,7 +704,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.resolved_alpha(rho);
         // Per-column Beta(a_k, 1) shapes; prior mean a_k/(a_k+1) = μ_k = the
-        // forward gate's ordered stick-breaking π_k (one model).
+        // ordered stick-breaking prior mean π_k.
         let (a_col, _mu) = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
         let pi = self.pi_posterior_mean(z.view(), a_col.view());
@@ -972,7 +965,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         }
         let alpha = self.resolved_alpha(rho);
         // Per-column Beta(a_k, 1) shapes a_k = μ_k/(1−μ_k) whose prior mean μ_k is
-        // the forward gate's ordered stick-breaking multiplier, and their ρ
+        // the ordered stick-breaking prior means, and their ρ
         // derivatives da_k/dρ — the single-model reconciliation (#4).
         let (a_col, mu) = self.column_beta_shapes(alpha);
         let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
@@ -983,7 +976,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         // already live inside `mass` and the weighted pi_score).
         let (active_mass, n_f) = self.weighted_active_mass(z.view());
         // ∂F/∂ρ, ρ = logα with α(ρ)=α_base·e^ρ. Each column has its OWN Beta shape
-        // a_k=μ_k/(1−μ_k) (μ_k=(α/(α+1))^(k+1) = the gate's prior mean), so
+        // a_k=μ_k/(1−μ_k) (μ_k=(α/(α+1))^(k+1)), so
         // D_k=N+a_k+1 and da_k/dρ = column_beta_shape_rho_deriv. The plug-in π̂_k =
         // (M_k+a_k)/D_k is the posterior MEAN, NOT the mode, so the implicit-π
         // channel does not vanish and rides alongside the explicit Beta(a_k,1) one:
