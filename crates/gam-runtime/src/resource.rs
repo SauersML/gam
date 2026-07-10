@@ -1070,9 +1070,10 @@ mod resource_policy_tests {
         // After releasing the holder, the same request succeeds: refusal is a
         // routing signal, not a terminal state.
         drop(held);
-        governor
+        let refreshed = governor
             .try_reserve(600, "test-joint")
             .expect("fits after release");
+        assert_eq!(refreshed.bytes(), 600);
     }
 
     #[test]
