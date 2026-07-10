@@ -2104,8 +2104,20 @@ impl SurvivalMarginalSlopeFamily {
         let b_jet = Jet1::primary(b, primary.g, p);
         let du: Vec<Jet1> = (0..p).map(|u| Jet1::primary(0.0, u, p)).collect();
         let (eta, chi, d) = flex_timepoint_inputs_generic(
-            &template, &b_jet, &du, a, d_check, primary.g, primary.infl, q_index, q, z_obs, o_infl,
-            obs_coeff, &obs_fixed, &cells,
+            &template,
+            &b_jet,
+            &du,
+            a,
+            d_check,
+            primary.g,
+            primary.infl,
+            q_index,
+            q,
+            z_obs,
+            o_infl,
+            obs_coeff,
+            &obs_fixed,
+            &cells,
         )?;
 
         let to_g = |j: &Jet1| Array1::from(j.g.clone());
@@ -4296,8 +4308,18 @@ mod moment_engine_tests {
 
         // (1) Parity against the Jet2 production path (single-source).
         let rel = |a: f64, b: f64| (a - b).abs() <= 1e-9 * (1.0 + b.abs());
-        assert!(rel(first.eta, full.eta), "eta {} != {}", first.eta, full.eta);
-        assert!(rel(first.chi, full.chi), "chi {} != {}", first.chi, full.chi);
+        assert!(
+            rel(first.eta, full.eta),
+            "eta {} != {}",
+            first.eta,
+            full.eta
+        );
+        assert!(
+            rel(first.chi, full.chi),
+            "chi {} != {}",
+            first.chi,
+            full.chi
+        );
         assert!(rel(first.d, full.d), "d {} != {}", first.d, full.d);
         for u in 0..p {
             assert!(

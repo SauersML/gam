@@ -43,8 +43,8 @@ mod directional_oracle_tests;
 // only by the `#[cfg(test)]` oracle assemblers, so the module is `cfg(test)` too
 // (in a non-test build it would be dead code under deny-warnings).
 #[cfg(test)]
-mod first_full;
-#[cfg(test)]
 mod first_full_exact_oracle_tests;
+#[cfg(test)]
+mod first_full_tests;
 pub(crate) mod flex_jet;
 mod partition;

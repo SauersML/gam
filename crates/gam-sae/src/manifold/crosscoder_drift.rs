@@ -20,13 +20,17 @@
 //! honest decoders in `ℝ^p`, whose largest angle is the worst-case rotation of the
 //! decoded curve.
 //!
-//! **Chart-gauge invariance.** Every layer of a given atom is decoded through the
-//! SAME `Φ(t)`; a chart reparametrization `t ↦ ψ(t)` changes `Φ` (hence every
-//! `B_k^(ℓ)`) by ONE common change of basis on the shared `M` basis rows. The
-//! principal angles between the row spaces are invariant under that common map, and
-//! the normalized Frobenius drift is invariant under a common orthogonal chart
-//! change — so the statistic is a property of the fitted crosscoder, not of the
-//! chart gauge.
+//! **Chart-gauge invariance — what is and is not invariant.** Every layer of a
+//! given atom is decoded through the SAME `Φ(t)`; a chart reparametrization
+//! `t ↦ ψ(t)` changes `Φ` (hence every `B_k^(ℓ)`) by ONE common change of basis
+//! `W` on the shared `M` basis rows. The principal angles between the row
+//! spaces are invariant under ANY invertible common `W` (row spaces are
+//! `W`-invariant) — they are true gauge invariants. The normalized Frobenius
+//! drift is invariant only under an ORTHOGONAL common `W`: a general
+//! non-orthogonal reparametrization changes `‖W(A−B)‖_F/√(‖WA‖·‖WB‖)`, so the
+//! drift scalar (and the `atom_total_drift` ranking built on it) is
+//! gauge-COVARIANT — meaningful within one fitted crosscoder's own chart, not
+//! across re-gauged refits. Use the angles for cross-gauge comparisons.
 //!
 //! **`λ_ℓ` independence.** The decoders are read in honest units (`B_k^(ℓ)`
 //! divides block `ℓ`'s columns by `√λ_ℓ`), so the per-block REML relevance weight

@@ -455,7 +455,18 @@ fn reconstruction_r2(target: &Array2<f64>, fitted: &Array2<f64>) -> Result<f64, 
             tss += centered * centered;
         }
     }
-    Ok(if tss > 0.0 { 1.0 - rss / tss } else { f64::NAN })
+    // Degenerate constant-column layer (TSS = 0): a zero-residual fit is a
+    // PERFECT reconstruction (R² = 1), not undefined — and a NaN here would
+    // poison the serde-serialized wire report (serde_json writes non-finite
+    // floats as null). A non-zero residual against a constant target has no
+    // variance to explain and stays NaN by design.
+    Ok(if tss > 0.0 {
+        1.0 - rss / tss
+    } else if rss <= f64::EPSILON * (n * p) as f64 {
+        1.0
+    } else {
+        f64::NAN
+    })
 }
 
 /// Build the production circle seed and run the typed crosscoder schedule. This

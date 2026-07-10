@@ -679,6 +679,9 @@ impl ManifoldChartAtlas {
         for transition in &mut self.transitions {
             transition.remap(old_to_new)?;
         }
+        for transition in &mut self.sphere_transitions {
+            transition.remap(old_to_new)?;
+        }
         self.canonicalize_transitions();
         self.validate()
     }
@@ -688,6 +691,10 @@ impl ManifoldChartAtlas {
             *chart += offset;
         }
         for transition in &mut self.transitions {
+            transition.from_chart += offset;
+            transition.to_chart += offset;
+        }
+        for transition in &mut self.sphere_transitions {
             transition.from_chart += offset;
             transition.to_chart += offset;
         }
@@ -772,6 +779,54 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Register an exact sphere pole seam (an ambient rotation between two
+    /// `latent_dim = 2` charts), creating or joining atlas components exactly as
+    /// [`Self::register_chart_transition`] does for the one-dimensional kind.
+    #[must_use = "atlas registration errors must be handled"]
+    pub fn register_sphere_chart_transition(
+        &mut self,
+        transition: SphereChartTransition,
+    ) -> Result<(), String> {
+        let k = self.k_atoms();
+        if transition.from_chart >= k || transition.to_chart >= k {
+            return Err(format!(
+                "sphere chart transition {}->{} is outside dictionary width K={k}",
+                transition.from_chart, transition.to_chart
+            ));
+        }
+        let left = self
+            .chart_atlases
+            .iter()
+            .position(|atlas| atlas.contains_chart(transition.from_chart));
+        let right = self
+            .chart_atlases
+            .iter()
+            .position(|atlas| atlas.contains_chart(transition.to_chart));
+        match (left, right) {
+            (None, None) => self
+                .chart_atlases
+                .push(ManifoldChartAtlas::from_sphere_transition(transition)?),
+            (Some(index), None) | (None, Some(index)) => {
+                self.chart_atlases[index].add_sphere_transition(transition)?;
+            }
+            (Some(left), Some(right)) if left == right => {
+                self.chart_atlases[left].add_sphere_transition(transition)?;
+            }
+            (Some(left), Some(right)) => {
+                let (keep, take) = if left < right {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                let other = self.chart_atlases.remove(take);
+                self.chart_atlases[keep].merge_with_sphere_transition(other, transition)?;
+            }
+        }
+        self.chart_atlases
+            .sort_by_key(|atlas| atlas.charts().first().copied().unwrap_or(usize::MAX));
+        Ok(())
+    }
+
     /// Replace the fitted map on an already-registered directed seam.  Used
     /// after a polish refit so the persisted transition describes the terminal
     /// charts rather than their pre-refit warm start.
@@ -786,6 +841,22 @@ impl SaeManifoldTerm {
         }
         Err(format!(
             "cannot refresh unregistered chart transition {}->{}",
+            transition.from_chart, transition.to_chart
+        ))
+    }
+
+    /// Replace the fitted rotation on an already-registered sphere seam.
+    pub(crate) fn refresh_sphere_chart_transition(
+        &mut self,
+        transition: SphereChartTransition,
+    ) -> Result<(), String> {
+        for atlas in &mut self.chart_atlases {
+            if atlas.replace_directed_sphere_transition(transition)? {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "cannot refresh unregistered sphere chart transition {}->{}",
             transition.from_chart, transition.to_chart
         ))
     }

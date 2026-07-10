@@ -1133,25 +1133,28 @@ impl SaeManifoldOuterObjective {
         Ok(Some(out))
     }
 
-    /// #2231 Inc-B (stage 2) — the analytic block-coordinate gradient
-    /// `∂C/∂log λ_ℓ = ½·R̃_ℓ − n·p_ℓ/2`, one entry per output block, or `None`
-    /// for a plain SAE.
+    /// #2231 Inc-B (stage 2) — the EXPLICIT block-coordinate gradient channels
+    /// `½·R̃_ℓ − n·p_ℓ/2`, one entry per output block, or `None` for a plain
+    /// SAE. NOT the complete `∂C/∂log λ_ℓ` on its own — see below.
     ///
     /// Derivation (UNIT-dispersion `#F1`). Scaling block `ℓ`'s target columns by
-    /// `√λ_ℓ` enters the criterion in exactly two places: the raw half-SSE data
-    /// term (through `R̃_ℓ`) and the change-of-variables Jacobian
-    /// `−(n·p_ℓ/2)·log λ_ℓ` ([`Self::block_jacobian`]). At the inner optimum the
-    /// envelope theorem cancels the implicit `∂θ̂/∂λ_ℓ` response of the penalized
-    /// loss, and the block weight scales the TARGET alone — never the penalty nor
-    /// the joint Hessian `H` — so the Laplace `½log|H|` term (and hence the
-    /// `−½·Γᵀθ̂_ρ` adjoint) carries no `λ_ℓ` dependence. What survives is only the
-    /// explicit data derivative `∂(½‖r̃‖²)/∂log λ_ℓ = ½·R̃_ℓ` (with
-    /// `R̃_ℓ = ‖r̃_ℓ‖² = λ_ℓ·R_ℓ`, so `½·R̃_ℓ = ½·λ_ℓ·R_ℓ` in unscaled form) plus
-    /// the Jacobian `−n·p_ℓ/2`. The coordinate is stationary at
-    /// `R̃_ℓ = n·p_ℓ` (`λ_ℓ = n·p_ℓ/R_ℓ`) and coercive at both ends — the interior
-    /// minimum the Inc-B contract pins. This is the desync-safe (#2087) partner of
-    /// the block Jacobian priced into every value/EFS lane: one consistent
-    /// `(value, gradient)` pair over the SAME `#F1` criterion.
+    /// `√λ_ℓ` enters the criterion in three places: the raw half-SSE data term
+    /// (through `R̃_ℓ`), the change-of-variables Jacobian `−(n·p_ℓ/2)·log λ_ℓ`
+    /// ([`Self::block_jacobian`]), and the Laplace `½log|H|` term through the
+    /// fitted state's response `θ̂(λ_ℓ)`. At the inner optimum the envelope
+    /// theorem cancels the penalized-loss response, and the Gauss–Newton `H` at
+    /// FIXED θ is target-independent, but the `½log|H(θ̂(λ_ℓ))|` chain-rule
+    /// channel survives: it is the same `−½·Γᵀθ̂_ρ` adjoint every other ρ
+    /// coordinate carries, supplied by the components assembler via
+    /// [`SaeManifoldTerm::crosscoder_block_ift_rhs`] (RHS `−½·Jᵀ_M Z̃^{(ℓ)}`
+    /// through the exact-stationarity solve). This function returns only the
+    /// EXPLICIT channels — the data derivative `∂(½‖r̃‖²)/∂log λ_ℓ = ½·R̃_ℓ`
+    /// (with `R̃_ℓ = ‖r̃_ℓ‖² = λ_ℓ·R_ℓ`) plus the Jacobian `−n·p_ℓ/2` — which
+    /// the gradient lane ADDS to the assembler's tail (never overwrites; #2087).
+    /// The explicit channels alone are stationary at `R̃_ℓ = n·p_ℓ`
+    /// (`λ_ℓ = n·p_ℓ/R_ℓ`), the Fellner–Schall proposal root, and coercive at
+    /// both ends; the adjoint shifts the true root by an `O(dim H/(n·p_ℓ))`
+    /// relative correction.
     fn block_log_lambda_gradient(&self, rho: &SaeManifoldRho) -> Result<Option<Vec<f64>>, String> {
         let Some(scaled_rss) = self.block_scaled_rss(rho)? else {
             return Ok(None);

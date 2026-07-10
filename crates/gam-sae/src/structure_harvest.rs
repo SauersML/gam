@@ -1328,12 +1328,55 @@ fn glue_pair_evalue(
     b: usize,
 ) -> Option<ChartTransition> {
     let seam = fit_seam_transition(term, a, b)?;
-    let p = seam.points_a.ncols();
-    if p == 0 || residuals.ncols() != p {
+    let log_e = seam_equivalence_log_e(
+        residuals,
+        &seam.rows_a,
+        &seam.points_a,
+        &seam.mapped_a_to_b,
+        &seam.rows_b,
+        &seam.points_b,
+        &seam.mapped_b_to_a,
+    )?;
+    Some(ChartTransition {
+        sign: seam.sign as i8,
+        offset: seam.offset,
+        log_e_value: log_e,
+    })
+}
+
+/// The sample-split equivalence log-e-value shared by the 1-D
+/// ([`glue_pair_evalue`]) and sphere ([`sphere_glue_pair_evalue`]) seam
+/// certifiers.  `points_*` are the decoded ambient clouds of each chart's active
+/// rows; `mapped_*` are the SAME points carried through the fitted transition to
+/// the other chart's coordinate; `rows_*` index `residuals` for the
+/// reconstruction band.
+///
+/// The reference-null centroid/scatter and the reconstruction band are estimated
+/// on the EVEN-indexed points and the per-point Gaussian likelihood ratio
+/// `N(x; other_chart(transition(t)), σ_band²) / N(x; pooled centroid, σ_pool²)`
+/// is scored ONLY on the ODD-indexed points, so under the isotropic churn-scatter
+/// reference null `E_null[∏ q/p] = 1` — a bona-fide e-value, not a plug-in LR.
+fn seam_equivalence_log_e(
+    residuals: ArrayView2<'_, f64>,
+    rows_a: &[usize],
+    points_a: &Array2<f64>,
+    mapped_a_to_b: &Array2<f64>,
+    rows_b: &[usize],
+    points_b: &Array2<f64>,
+    mapped_b_to_a: &Array2<f64>,
+) -> Option<f64> {
+    let p = points_a.ncols();
+    if p == 0 || residuals.ncols() != p || points_b.ncols() != p {
         return None;
     }
-    let na = seam.points_a.nrows();
-    let nb = seam.points_b.nrows();
+    let na = points_a.nrows();
+    let nb = points_b.nrows();
+    if na != rows_a.len() || nb != rows_b.len() {
+        return None;
+    }
+    if mapped_a_to_b.dim() != (na, p) || mapped_b_to_a.dim() != (nb, p) {
+        return None;
+    }
     // Sample split needs at least one estimation and one evaluation point on
     // each side (even/odd parity), so ≥ 2 active points per atom.
     if na < 2 || nb < 2 {
@@ -1353,12 +1396,12 @@ fn glue_pair_evalue(
     let mut mu = vec![0.0_f64; p];
     for &i in &a_est {
         for c in 0..p {
-            mu[c] += seam.points_a[[i, c]];
+            mu[c] += points_a[[i, c]];
         }
     }
     for &i in &b_est {
         for c in 0..p {
-            mu[c] += seam.points_b[[i, c]];
+            mu[c] += points_b[[i, c]];
         }
     }
     for c in 0..p {
@@ -1368,10 +1411,10 @@ fn glue_pair_evalue(
         |pt: ArrayView1<'_, f64>| -> f64 { (0..p).map(|c| (pt[c] - mu[c]).powi(2)).sum::<f64>() };
     let mut pool_acc = 0.0_f64;
     for &i in &a_est {
-        pool_acc += point_null_sq(seam.points_a.row(i));
+        pool_acc += point_null_sq(points_a.row(i));
     }
     for &i in &b_est {
-        pool_acc += point_null_sq(seam.points_b.row(i));
+        pool_acc += point_null_sq(points_b.row(i));
     }
     let pool_sq = pool_acc / (n_est as f64 * p as f64);
     if !(pool_sq.is_finite() && pool_sq > 0.0) {
@@ -1382,14 +1425,14 @@ fn glue_pair_evalue(
     let mut band_acc = 0.0_f64;
     let mut band_rows = 0usize;
     for &i in &a_est {
-        let r = seam.rows_a[i];
+        let r = rows_a[i];
         for c in 0..p {
             band_acc += residuals[[r, c]].powi(2);
         }
         band_rows += 1;
     }
     for &i in &b_est {
-        let r = seam.rows_b[i];
+        let r = rows_b[i];
         for c in 0..p {
             band_acc += residuals[[r, c]].powi(2);
         }
@@ -1415,16 +1458,16 @@ fn glue_pair_evalue(
     let mut log_e = 0.0_f64;
     for &i in &b_eval {
         let e_glue: f64 = (0..p)
-            .map(|c| (seam.points_b[[i, c]] - seam.mapped_b_to_a[[i, c]]).powi(2))
+            .map(|c| (points_b[[i, c]] - mapped_b_to_a[[i, c]]).powi(2))
             .sum();
-        let e_null = point_null_sq(seam.points_b.row(i));
+        let e_null = point_null_sq(points_b.row(i));
         log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
     }
     for &i in &a_eval {
         let e_glue: f64 = (0..p)
-            .map(|c| (seam.points_a[[i, c]] - seam.mapped_a_to_b[[i, c]]).powi(2))
+            .map(|c| (points_a[[i, c]] - mapped_a_to_b[[i, c]]).powi(2))
             .sum();
-        let e_null = point_null_sq(seam.points_a.row(i));
+        let e_null = point_null_sq(points_a.row(i));
         log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
     }
     if !log_e.is_finite() {
@@ -1434,12 +1477,7 @@ fn glue_pair_evalue(
             GLUE_LOG_E_CLAMP
         };
     }
-    let log_e = log_e.clamp(-GLUE_LOG_E_CLAMP, GLUE_LOG_E_CLAMP);
-    Some(ChartTransition {
-        sign: seam.sign as i8,
-        offset: seam.offset,
-        log_e_value: log_e,
-    })
+    Some(log_e.clamp(-GLUE_LOG_E_CLAMP, GLUE_LOG_E_CLAMP))
 }
 
 /// Emit the chart-gluing proposal lane (#1890) into `proposals`, ranked under

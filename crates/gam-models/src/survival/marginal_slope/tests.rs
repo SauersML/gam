@@ -1,5 +1,6 @@
 //! Tests for the survival marginal-slope family (relocated verbatim).
 
+use super::poly_arith_tests::*;
 use super::*;
 use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 use crate::survival::marginal_slope::flex_oracle_structs_tests::{

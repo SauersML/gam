@@ -8,7 +8,8 @@
 //! (`flex_jet::compute_survival_timepoint_first_order_exact` at `Jet1`); only the
 //! shared `moving_density_boundary_flux` helper stays in `first_full`.
 
-use super::first_full::moving_density_boundary_flux;
+use super::super::poly_arith_tests::*;
+use super::first_full_tests::moving_density_boundary_flux;
 use super::*;
 use crate::survival::marginal_slope::flex_oracle_structs_tests::neg_cell_of;
 

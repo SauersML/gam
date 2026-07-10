@@ -4,6 +4,7 @@
 //! kernels with a single direction `dir` to produce the directional
 //! derivatives (η_uv_dir, χ_uv_dir, D_u_dir, D_uv_dir).
 
+use super::super::poly_arith_tests::*;
 use super::*;
 use crate::marginal_slope_shared::SparsePrimaryCoeffJetView;
 use crate::survival::marginal_slope::flex_oracle_structs_tests::{
