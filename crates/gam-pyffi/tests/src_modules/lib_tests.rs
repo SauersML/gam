@@ -318,7 +318,7 @@ fn symmetric_curvature_solve_preserves_negative_modes() {
 /// drives it (`f"{target} ~ {rhs}"` with the tangent matrix supplied out-of-band).
 /// `r` is a placeholder LHS the materializer needs to parse the formula — the
 /// impl discards the materialized response and uses `y`.
-fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>) {
+fn shared_tangent_formula_dataset() -> (EncodedDataset, Array2<f64>) {
     let n = 80usize;
     let headers = vec![
         "r".to_string(),
@@ -326,7 +326,7 @@ fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>
         "z".to_string(),
         "w".to_string(),
     ];
-    let mut rows = Vec::with_capacity(n);
+    let mut rows = Vec::<csv::StringRecord>::with_capacity(n);
     let mut y = Array2::<f64>::zeros((n, 2));
     for row in 0..n {
         let t = (row as f64 - 39.5) / 20.0;
@@ -340,16 +340,18 @@ fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>
         // `r` is a non-constant placeholder LHS the materializer needs to parse
         // the formula; the impl discards the materialized response and uses `y`.
         // (It must vary — a constant Gaussian response is rejected up front.)
-        rows.push(vec![
+        rows.push(csv::StringRecord::from(vec![
             format!("{y0}"),
             format!("{x}"),
             format!("{z}"),
             format!("{w}"),
-        ]);
+        ]));
         y[[row, 0]] = y0;
         y[[row, 1]] = y1;
     }
-    (headers, rows, y)
+    let dataset = gam::data::encode_recordswith_inferred_schema(headers, rows)
+        .expect("encode shared-tangent formula dataset");
+    (dataset, y)
 }
 
 /// Regression for issue #381 adversarial review (flaw #2), carried into the
@@ -362,10 +364,9 @@ fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>
 /// residual df and biasing σ² low.
 #[test]
 fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
-    let (headers, rows, y) = shared_tangent_formula_table();
-    let fit = gaussian_reml_fit_formula_table_impl(
-        headers,
-        rows,
+    let (dataset, y) = shared_tangent_formula_dataset();
+    let fit = gaussian_reml_fit_formula_dataset_impl(
+        dataset,
         "r ~ x + z + s(w)".to_string(),
         y.view(),
         None,
@@ -423,10 +424,9 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
 /// surviving-block count so a dropped rank-0 block can never silently misalign.
 #[test]
 fn shared_tangent_lambda_edf_are_shared_per_smooth() {
-    let (headers, rows, y) = shared_tangent_formula_table();
-    let fit = gaussian_reml_fit_formula_table_impl(
-        headers,
-        rows,
+    let (dataset, y) = shared_tangent_formula_dataset();
+    let fit = gaussian_reml_fit_formula_dataset_impl(
+        dataset,
         "r ~ x + z + s(w)".to_string(),
         y.view(),
         None,
@@ -460,25 +460,23 @@ fn shared_tangent_lambda_edf_are_shared_per_smooth() {
 /// different angle than the Python end-to-end spherical test.
 #[test]
 fn shared_tangent_fit_is_output_rotation_equivariant() {
-    let (headers, rows, y) = shared_tangent_formula_table(); // D = 2 outputs
+    let (dataset, y) = shared_tangent_formula_dataset(); // D = 2 outputs
     // A genuine 2×2 rotation (orthogonal, det = 1) that mixes the two outputs.
     let theta = 0.6_f64;
     let (c, s) = (theta.cos(), theta.sin());
     let rot = array![[c, -s], [s, c]];
     let y_rot = y.dot(&rot.t());
 
-    let base = gaussian_reml_fit_formula_table_impl(
-        headers.clone(),
-        rows.clone(),
+    let base = gaussian_reml_fit_formula_dataset_impl(
+        dataset.clone(),
         "r ~ x + z + s(w)".to_string(),
         y.view(),
         None,
         None,
     )
     .expect("base shared-tangent fit");
-    let rotated = gaussian_reml_fit_formula_table_impl(
-        headers,
-        rows,
+    let rotated = gaussian_reml_fit_formula_dataset_impl(
+        dataset,
         "r ~ x + z + s(w)".to_string(),
         y_rot.view(),
         None,
@@ -577,13 +575,16 @@ fn response_geometry_parametric_only_rhs_fits_frechet_mean() {
     // matrix (a constant Gaussian LHS would be rejected up front, hence the
     // varying placeholder).
     let headers = vec!["r".to_string()];
-    let rows: Vec<Vec<String>> = (0..n).map(|i| vec![format!("{}", i as f64 + 1.0)]).collect();
+    let rows: Vec<csv::StringRecord> = (0..n)
+        .map(|i| csv::StringRecord::from(vec![format!("{}", i as f64 + 1.0)]))
+        .collect();
+    let dataset = gam::data::encode_recordswith_inferred_schema(headers, rows)
+        .expect("encode parametric shared-tangent formula dataset");
 
     // Before #2103 this returned Err("... requires at least one smoothing
     // penalty ..."); it must now succeed via the direct non-REML LSQ path.
-    let fit = gaussian_reml_fit_formula_table_impl(
-        headers,
-        rows,
+    let fit = gaussian_reml_fit_formula_dataset_impl(
+        dataset,
         "r ~ 1".to_string(),
         tangent.view(),
         None,

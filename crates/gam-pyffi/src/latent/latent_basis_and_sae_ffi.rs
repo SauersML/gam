@@ -4156,7 +4156,7 @@ impl PyInterventionCalibrationPlan {
         let result = self
             .inner
             .finish(&reference_eta, &eval_eta)
-            .map_err(py_value_error)?;
+            .map_err(|err| py_value_error(err.to_string()))?;
         let respeed = PyDict::new(py);
         for (atom, value) in result.respeed {
             respeed.set_item(atom, value)?;
@@ -4231,6 +4231,7 @@ fn intervention_calibration_plan<'py>(
         split_seed,
         floor_quantile,
     };
-    let inner = prepare_intervention_calibration(&shard, spec).map_err(py_value_error)?;
+    let inner = prepare_intervention_calibration(&shard, spec)
+        .map_err(|err| py_value_error(err.to_string()))?;
     Ok(PyInterventionCalibrationPlan { inner })
 }

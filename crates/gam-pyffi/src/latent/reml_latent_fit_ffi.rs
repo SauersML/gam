@@ -1594,6 +1594,7 @@ struct TangentRemlMultiResult {
 /// engine's typed `EstimationError` must reach `estimation_error_to_pyerr`
 /// unflattened so a non-converged outer search keeps its
 /// `RemlConvergenceError` class identity and structured resume evidence.
+#[derive(Debug)]
 enum SharedTangentFfiError {
     Spec(String),
     Engine(EstimationError),
@@ -3703,7 +3704,7 @@ fn model_debiased_functional_dataset_json_impl(
     // offset in THIS layout. The `point`/`contrast` query design must be built
     // against the same full layout, not just the columns named in `x0` (#1621).
     let training_headers = dataset.headers.clone();
-    let (fit_config, _) = parse_fit_config(None)?;
+    let fit_config = parse_fit_config(None)?;
     let materialized = materialize(&formula, &dataset, &fit_config).map_err(|e| format!("{e}"))?;
     let standard = match materialized.request {
         FitRequest::Standard(req) => req,
@@ -4861,7 +4862,7 @@ fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
     let mut rows: Vec<(f64, f64)> = times
         .iter()
         .zip(events.iter())
-        .filter(|(&t, _)| t.is_finite() && t > 0.0)
+        .filter(|&(&t, _)| t.is_finite() && t > 0.0)
         .map(|(&t, &e)| (t, e))
         .collect();
     if rows.is_empty() {
