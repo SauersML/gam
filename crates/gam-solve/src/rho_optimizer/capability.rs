@@ -147,9 +147,9 @@ pub struct OuterCapability {
     ///
     /// # Hybrid EFS strategy (when `psi_dim > 0`)
     ///
-    /// Enabled when `psi_dim > 0`,
-    /// `n_params > SMALL_OUTER_BFGS_MAX_PARAMS`, and
-    /// `fixed_point_available`.
+    /// Enabled when `psi_dim > 0`, `fixed_point_available`, and either the
+    /// analytic gradient is unavailable or the problem is above the small-
+    /// dimensional BFGS crossover.
     /// Combines:
     /// - Standard EFS multiplicative fixed-point updates for ρ coordinates
     /// - Safeguarded preconditioned gradient steps for ψ coordinates:
@@ -222,14 +222,22 @@ impl OuterCapability {
         self.fixed_point_available
             && !self.disable_fixed_point
             && self.all_penalty_like()
-            && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
+            // With an analytic gradient, the small-dimensional crossover is a
+            // performance choice: BFGS is cheaper below the cutoff. Without a
+            // gradient, EFS is the objective's only declared analytic
+            // stationarity mechanism and must remain eligible at every
+            // dimension. Routing a two-coordinate matrix-free problem to BFGS
+            // merely guarantees a capability error before the first step.
+            && (self.gradient == Derivative::Unavailable
+                || self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS)
     }
 
     fn hybrid_efs_plan_eligible(&self) -> bool {
         self.fixed_point_available
             && !self.disable_fixed_point
             && self.has_psi_coords()
-            && self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS
+            && (self.gradient == Derivative::Unavailable
+                || self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS)
     }
 
     fn declared_hessian_for_planning(&self) -> Derivative {
@@ -356,7 +364,9 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             solver: S::Arc,
             hessian_source: H::Analytic,
         },
-        // EFS: all penalty-like coords, no analytic Hessian, many params.
+        // EFS: all penalty-like coords and no analytic Hessian. With an
+        // analytic gradient this is the many-parameter fast path; without one
+        // it is the only declared analytic solver at any dimension.
         // Multiplicative fixed-point needs only traces — no gradient evals.
         // Much cheaper than BFGS for k=10-50 smoothing parameters.
         //

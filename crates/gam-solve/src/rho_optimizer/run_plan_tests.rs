@@ -579,8 +579,28 @@ fn plan_cost_only_many_params_with_fixed_point_still_efs() {
 }
 
 #[test]
+fn plan_cost_only_few_params_with_fixed_point_uses_only_valid_solver() {
+    let cap = OuterCapability {
+        gradient: Derivative::Unavailable,
+        hessian: DeclaredHessianForm::Unavailable,
+        n_params: 2,
+        psi_dim: 0,
+        fixed_point_available: true,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let selected = plan(&cap);
+    assert_eq!(selected.solver, Solver::Efs);
+    assert_eq!(selected.hessian_source, HessianSource::EfsFixedPoint);
+}
+
+#[test]
 fn no_gradient_efs_requires_and_accepts_explicit_full_coverage_certificate() {
-    let n = 9;
+    // Two coordinates is below the analytic-gradient BFGS crossover. With no
+    // gradient, the explicit fixed-point lane is nevertheless the only valid
+    // solver and must be selected rather than rejected on problem size.
+    let n = 2;
     let center = Array1::from_elem(n, 0.25);
     let problem = OuterProblem::new(n)
         .with_gradient(Derivative::Unavailable)
