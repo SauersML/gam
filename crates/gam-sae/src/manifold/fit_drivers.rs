@@ -5398,6 +5398,7 @@ impl SaeManifoldTerm {
             // whose step application or objective evaluation errors is INVALID
             // (`Ok(None)`), halving without consulting the Armijo test.
             let mut first_trial = true;
+            let mut zz2015_prox_used = false;
             let accepted = descent_direction_ok
                 && backtracking_line_search::<_, String>(
                     BacktrackConfig {
@@ -5429,6 +5430,7 @@ impl SaeManifoldTerm {
                 )?
                 .is_some();
             if !accepted {
+                zz2015_prox_used = true;
                 self.restore_mutable_state(&snapshot)?;
                 let correction = ArrowProximalCorrectionOptions {
                     initial_ridge: ridge_ext_coord
@@ -5502,9 +5504,6 @@ impl SaeManifoldTerm {
             if !(canonical_total.is_finite() && canonical_total <= accepted_total) {
                 self.restore_mutable_state(&accepted_snapshot)?;
             }
-            let zz2015_post_gauge = self
-                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                .unwrap_or(f64::INFINITY);
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
             // and answer breaches with a bounded re-seed or a terminal
@@ -5593,9 +5592,6 @@ impl SaeManifoldTerm {
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).
             self.retract_unit_speed_charts_in_loop()?;
-            let zz2015_post_unitspeed = self
-                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                .unwrap_or(f64::INFINITY);
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each
@@ -5614,10 +5610,16 @@ impl SaeManifoldTerm {
             let zz2015_post_frame = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
+            let zz2015_loss = self.loss(target, rho).ok();
+            let (zz2015_df, zz2015_sm) = zz2015_loss
+                .as_ref()
+                .map(|l| (l.data_fit, l.smoothness))
+                .unwrap_or((f64::NAN, f64::NAN));
             eprintln!(
-                "[zz2015] iter={outer_iteration} accepted={accepted_total:.6e} post_gauge={zz2015_post_gauge:.6e} post_unitspeed={zz2015_post_unitspeed:.6e} post_frame={zz2015_post_frame:.6e} frames_active={} ‖g‖={:.4e}",
-                self.frames_active(),
+                "[zz2015] iter={outer_iteration} obj={accepted_total:.6e} post_frame={zz2015_post_frame:.6e} data_fit={zz2015_df:.6e} smooth={zz2015_sm:.6e} ‖g‖={:.4e} ‖Δ‖={:.4e} gᵀΔ={directional_decrease:.4e} prox={zz2015_prox_used} frames={}",
                 grad_norm_sq.sqrt(),
+                step_norm_sq.sqrt(),
+                self.frames_active(),
             );
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
