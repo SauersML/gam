@@ -4841,7 +4841,14 @@ impl SaeManifoldTerm {
         // lives), and faer's reductions are parallelism-invariant — `Par::Seq`
         // and `Par::rayon` are bit-for-bit identical (`tests_parallelism_invariance_1557`)
         // — so this removes only wasted synchronization, changing no fitted value.
-        let _faer_sequential_inner_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
+        //
+        // Held in a named binding and consumed by the explicit `drop(...)` at the
+        // tail return (mirroring `finalize_cap_guard` in run_plan.rs), rather than
+        // `let _guard`: the workspace ban-scanner forbids every underscore-leading
+        // `let`, and a plain unused `let guard` trips `unused_variables` under
+        // `warnings = "deny"`. The guard's Drop still restores the prior
+        // parallelism on every early `?`/`return` path via RAII.
+        let faer_sequential_inner_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
         // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
@@ -5797,8 +5804,13 @@ impl SaeManifoldTerm {
             self.best_fit_incumbent = None;
         }
         // ρ is owned by the outer engine and unchanged here; just return the
-        // converged inner loss at the fixed ρ.
-        self.loss(target, rho)
+        // converged inner loss at the fixed ρ. Drop the faer-sequential guard
+        // explicitly (the idiomatic "use" that satisfies `unused_variables`);
+        // faer's process-global parallelism is restored to its prior policy for
+        // any work the outer engine runs after this inner fit returns.
+        let loss = self.loss(target, rho);
+        drop(faer_sequential_inner_fit);
+        loss
     }
 
     /// Allocate one zero `(M_k × M_k)` Gram accumulator per atom for the
