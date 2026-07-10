@@ -59,6 +59,43 @@ fn pyffi_sources_use_canonical_gam_module_paths() {
 }
 
 #[test]
+fn sae_atom_construction_stays_in_gam_sae_2236() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let binding_fragments = [
+        manifest.join("src/latent/latent_basis_and_sae_ffi.rs"),
+        manifest.join("src/latent/latent_basis_and_sae_ffi_tail.rs"),
+    ];
+    let forbidden_definitions = [
+        "struct SaeAtomBuildPlan",
+        "fn sae_build_atom_plans",
+        "fn sae_build_padded_basis_stacks",
+        "fn sae_build_periodic_atom",
+        "fn sae_build_sphere_atom",
+        "fn sae_build_torus_atom",
+        "fn sae_build_duchon_atom",
+        "fn sae_build_euclidean_atom_with_degree",
+        "fn sae_build_euclidean_atom",
+    ];
+
+    let mut hits = Vec::new();
+    for path in binding_fragments {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        for definition in forbidden_definitions {
+            if source.contains(definition) {
+                hits.push(format!("{} defines {definition}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "SAE atom construction is core orchestration and must remain in gam-sae:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
 fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
     let n = 4usize;
     let k_atoms = 2usize;

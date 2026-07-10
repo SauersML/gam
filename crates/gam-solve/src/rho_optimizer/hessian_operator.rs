@@ -1,7 +1,5 @@
 use super::*;
 
-pub use gam_problem::{DeclaredHessianForm, Derivative};
-
 pub(crate) struct RhoBlockAdditiveHessian {
     pub(crate) base: Arc<dyn HessianOperator>,
     pub(crate) rho_block: Array2<f64>,

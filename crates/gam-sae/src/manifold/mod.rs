@@ -178,6 +178,7 @@ pub use crate::frames::*;
 
 mod amortized_routing;
 mod arrow_solver;
+mod atom_build;
 mod atom;
 mod basin_bundle;
 mod behavior;
@@ -463,6 +464,7 @@ pub fn rank_charge_dof(
 }
 
 pub use crate::inference::atlas_nerve::AtlasCoveringSide;
+pub use atom_build::*;
 pub use coordinate_fidelity::*;
 pub use cross_fit::*;
 pub use crosscoder_drift::*;
