@@ -62,7 +62,18 @@ impl SurvivalSurfaceKind {
                 lower_bound: Some(0.0),
                 upper_bound: None,
             },
-            Self::Hazard | Self::StandardError => SurvivalSurfacePolicy {
+            Self::Hazard => SurvivalSurfacePolicy {
+                // Saved survival surfaces are flat outside their identified
+                // knot support.  The derivative of that continuation is zero,
+                // so an explicitly stored hazard and one derived from the
+                // cumulative-hazard knots must share the same boundary law.
+                left_value: Some(0.0),
+                right_value: Some(0.0),
+                positive_infinity_value: Some(0.0),
+                lower_bound: Some(0.0),
+                upper_bound: None,
+            },
+            Self::StandardError => SurvivalSurfacePolicy {
                 left_value: None,
                 right_value: None,
                 positive_infinity_value: None,
@@ -242,6 +253,60 @@ impl<'a> SurvivalSurface<'a> {
         }
         Ok(output)
     }
+
+    /// Pointwise hazard of a stored piecewise-linear cumulative-hazard
+    /// surface.
+    ///
+    /// The result is the slope of the knot interval containing each query.
+    /// It therefore depends only on the stored curve, never on which other
+    /// query times share the call.  Outside the knot support the stored
+    /// cumulative hazard is flat, so the hazard is zero.  The saved grid may
+    /// be in any order; [`Self::new`] has already established the authoritative
+    /// sorted column order used here and by [`Self::value_at`].
+    pub fn cumulative_hazard_slopes(
+        &self,
+        query: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        if self.kind != SurvivalSurfaceKind::CumulativeHazard {
+            return Err(
+                "cumulative_hazard_slopes requires a cumulative-hazard surface".to_string(),
+            );
+        }
+        let n_rows = self.values.nrows();
+        validate_dense_surface_shape(n_rows, query.len())?;
+        let first = self.order[0];
+        let last = self.order[self.order.len() - 1];
+        let mut output = Array2::<f64>::zeros((n_rows, query.len()));
+        for (query_index, &time) in query.iter().enumerate() {
+            if time.is_nan() {
+                return Err(format!(
+                    "cumulative-hazard slope query time at index {query_index} is NaN"
+                ));
+            }
+            if !(time > self.grid[first] && time <= self.grid[last]) {
+                continue;
+            }
+            let upper_order = self
+                .order
+                .partition_point(|&column| self.grid[column] < time);
+            let lower_column = self.order[upper_order - 1];
+            let upper_column = self.order[upper_order];
+            let width = self.grid[upper_column] - self.grid[lower_column];
+            for row in 0..n_rows {
+                let increment = self.values[[row, upper_column]] - self.values[[row, lower_column]];
+                if increment < 0.0 {
+                    return Err(format!(
+                        "cumulative hazard must be non-decreasing in time; row {row} drops by {} between sorted knots {} and {}",
+                        -increment,
+                        upper_order - 1,
+                        upper_order,
+                    ));
+                }
+                output[[row, query_index]] = increment / width;
+            }
+        }
+        Ok(output)
+    }
 }
 
 /// One half-open tile in a row × time surface.
@@ -282,6 +347,118 @@ pub fn failure_probability_from_survival(
         .collect();
     Array2::from_shape_vec(survival.dim(), values?)
         .map_err(|error| format!("failed to assemble failure surface: {error}"))
+}
+
+/// Convert a survival-probability surface to cumulative hazard via
+/// `H = -ln(S)` without a display-oriented probability floor.
+pub fn cumulative_hazard_from_survival(
+    survival: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    validate_dense_surface_shape(survival.nrows(), survival.ncols())?;
+    let values: Result<Vec<f64>, String> = survival
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.is_nan() {
+                return Ok(f64::NAN);
+            }
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!(
+                    "survival probability at flat index {index} must lie in [0, 1], got {value}"
+                ));
+            }
+            Ok(-value.ln())
+        })
+        .collect();
+    Array2::from_shape_vec(survival.dim(), values?)
+        .map_err(|error| format!("failed to assemble cumulative-hazard surface: {error}"))
+}
+
+/// Validated per-row log-hazard parameters for the exponential survival
+/// fallback used by compact prediction payloads.
+pub struct ExponentialSurvivalParameters<'a> {
+    parameters: ArrayView2<'a, f64>,
+}
+
+impl<'a> ExponentialSurvivalParameters<'a> {
+    pub fn new(parameters: ArrayView2<'a, f64>) -> Result<Self, String> {
+        if parameters.ncols() == 0 {
+            return Err("survival parameter matrix must have at least one column".to_string());
+        }
+        for (row, &log_hazard) in parameters.column(0).iter().enumerate() {
+            if log_hazard.is_nan() {
+                return Err(format!(
+                    "survival log-hazard parameter at row {row} must not be NaN"
+                ));
+            }
+        }
+        Ok(Self { parameters })
+    }
+
+    fn evaluate<F>(&self, times: ArrayView1<'_, f64>, value: F) -> Result<Array2<f64>, String>
+    where
+        F: Fn(f64, f64) -> f64 + Sync,
+    {
+        validate_dense_surface_shape(self.parameters.nrows(), times.len())?;
+        if let Some((index, _)) = times.iter().enumerate().find(|(_, time)| time.is_nan()) {
+            return Err(format!(
+                "survival prediction time at index {index} must not be NaN"
+            ));
+        }
+        let rows: Vec<Vec<f64>> = (0..self.parameters.nrows())
+            .into_par_iter()
+            .map(|row| {
+                let hazard = self.parameters[[row, 0]].exp();
+                times.iter().map(|&time| value(hazard, time)).collect()
+            })
+            .collect();
+        Array2::from_shape_vec(
+            (self.parameters.nrows(), times.len()),
+            rows.into_iter().flatten().collect(),
+        )
+        .map_err(|error| format!("failed to assemble exponential survival surface: {error}"))
+    }
+
+    pub fn survival(&self, times: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        self.evaluate(times, exponential_survival_at)
+    }
+
+    pub fn cumulative_hazard(&self, times: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        self.evaluate(times, exponential_cumulative_hazard_at)
+    }
+
+    pub fn failure_probability(&self, times: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        self.evaluate(times, |hazard, time| {
+            -(-exponential_cumulative_hazard_at(hazard, time)).exp_m1()
+        })
+    }
+
+    pub fn hazard(&self, times: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        self.evaluate(times, |hazard, _time| hazard)
+    }
+}
+
+#[inline]
+fn exponential_survival_at(hazard: f64, time: f64) -> f64 {
+    if time <= 0.0 {
+        return 1.0;
+    }
+    if time == f64::INFINITY {
+        return if hazard > 0.0 { 0.0 } else { 1.0 };
+    }
+    (-hazard * time).exp()
+}
+
+#[inline]
+fn exponential_cumulative_hazard_at(hazard: f64, time: f64) -> f64 {
+    if time <= 0.0 {
+        return 0.0;
+    }
+    if time == f64::INFINITY {
+        return if hazard > 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    hazard * time
 }
 
 impl Default for SurvivalSurfaceChunkPolicy {
@@ -415,6 +592,52 @@ mod tests {
             SurvivalSurface::new(SurvivalSurfaceKind::Hazard, grid.view(), values.view()).unwrap();
         assert_eq!(surface.value_at(0, 0.5).unwrap(), 0.5);
         assert_eq!(surface.value_at(0, 1.5).unwrap(), 1.5);
+    }
+
+    #[test]
+    fn stored_and_derived_hazards_share_zero_extrapolation() {
+        let grid = array![2.0, 1.0];
+        let cumulative_values = array![[3.0, 1.0]];
+        let hazard_values = array![[2.0, 2.0]];
+        let cumulative = SurvivalSurface::new(
+            SurvivalSurfaceKind::CumulativeHazard,
+            grid.view(),
+            cumulative_values.view(),
+        )
+        .unwrap();
+        let stored = SurvivalSurface::new(
+            SurvivalSurfaceKind::Hazard,
+            grid.view(),
+            hazard_values.view(),
+        )
+        .unwrap();
+        let query = array![-1.0, 1.5, 3.0, f64::INFINITY];
+        let derived = cumulative.cumulative_hazard_slopes(query.view()).unwrap();
+        assert_eq!(derived.row(0).to_vec(), vec![0.0, 2.0, 0.0, 0.0]);
+        for &time in &[-1.0, 3.0, f64::INFINITY] {
+            assert_eq!(stored.value_at(0, time).unwrap(), 0.0);
+        }
+    }
+
+    #[test]
+    fn exact_survival_transforms_preserve_tiny_and_large_cumulative_hazard() {
+        let survival = array![[(-100.0_f64).exp(), 0.0, 1.0]];
+        let cumulative = cumulative_hazard_from_survival(survival.view()).unwrap();
+        assert!((cumulative[[0, 0]] - 100.0).abs() < 1e-12);
+        assert_eq!(cumulative[[0, 1]], f64::INFINITY);
+        assert_eq!(cumulative[[0, 2]], 0.0);
+
+        let parameters = array![[0.0]];
+        let exponential = ExponentialSurvivalParameters::new(parameters.view()).unwrap();
+        let times = array![0.0, 1e-20, 1000.0, f64::INFINITY];
+        let cumulative = exponential.cumulative_hazard(times.view()).unwrap();
+        let failure = exponential.failure_probability(times.view()).unwrap();
+        assert_eq!(
+            cumulative.row(0).to_vec(),
+            vec![0.0, 1e-20, 1000.0, f64::INFINITY]
+        );
+        assert!((failure[[0, 1]] - 1e-20).abs() < 1e-32);
+        assert_eq!(failure[[0, 3]], 1.0);
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use gam::families::survival::{
-    SurvivalSurface, SurvivalSurfaceChunkPolicy, SurvivalSurfaceKind,
-    failure_probability_from_survival,
+    ExponentialSurvivalParameters, SurvivalSurface, SurvivalSurfaceChunkPolicy,
+    SurvivalSurfaceKind, cumulative_hazard_from_survival, failure_probability_from_survival,
 };
 use ndarray::{Array1, Array2};
 use numpy::{
@@ -300,130 +300,26 @@ pub(crate) fn hazard_from_cumulative_knots<'py>(
     surface: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    hazard_from_cumulative_knots_impl(grid.as_array(), surface.as_array(), times.as_array())
+    let surface = SurvivalSurface::new(
+        SurvivalSurfaceKind::CumulativeHazard,
+        grid.as_array(),
+        surface.as_array(),
+    )
+    .map_err(py_value_error)?;
+    surface
+        .cumulative_hazard_slopes(times.as_array())
         .map(|out| out.into_pyarray(py))
         .map_err(py_value_error)
 }
 
-/// Pointwise hazard of the STORED piecewise-linear cumulative-hazard surface:
-/// the slope of the knot interval containing each query time.
-///
-/// The hazard at a time is a property of the saved `(grid, H)` interpolant
-/// alone, so the answer for one query cannot depend on which other query
-/// times happen to share the call. The retired approach interpolated `H` at
-/// the queries and then took secants between consecutive *query* points; for
-/// stored knots `(t, H) = (0, 0), (1, 1), (2, 4)` it returned hazard 2 at
-/// `t = 1.5`, and inserting an unrelated query at `t = 1` changed that answer
-/// to 3 (issue #966 follow-up). Here every query is answered from the knot
-/// interval `(grid[k-1], grid[k]]` that contains it — left-continuous at
-/// knots, matching a càdlàg cumulative hazard.
-///
-/// Outside the grid the interpolant is flat (`H = 0` below the first knot and
-/// the #1595 flat clamp past the last), so the hazard there is exactly 0;
-/// `t = +inf` falls in the same flat-clamp region.
-fn hazard_from_cumulative_knots_impl(
-    grid: ndarray::ArrayView1<'_, f64>,
-    surface: ndarray::ArrayView2<'_, f64>,
-    times: ndarray::ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, String> {
-    let (n_rows, n_knots) = surface.dim();
-    if grid.len() != n_knots {
-        return Err(format!(
-            "hazard_from_cumulative_knots: surface has {n_knots} knot columns but the grid \
-             has {} entries",
-            grid.len()
-        ));
-    }
-    if n_knots == 0 {
-        return Err("hazard_from_cumulative_knots: empty knot grid".to_string());
-    }
-    for k in 1..n_knots {
-        if !(grid[k] > grid[k - 1]) {
-            return Err(format!(
-                "hazard_from_cumulative_knots: knot grid must be strictly increasing; \
-                 grid[{k}] = {} does not exceed grid[{}] = {}",
-                grid[k],
-                k - 1,
-                grid[k - 1]
-            ));
-        }
-    }
-    let mut out = Array2::<f64>::zeros((n_rows, times.len()));
-    for (j, &t) in times.iter().enumerate() {
-        if t.is_nan() {
-            return Err(format!(
-                "hazard_from_cumulative_knots: query time at index {j} is NaN"
-            ));
-        }
-        if !(t > grid[0] && t <= grid[n_knots - 1]) {
-            // Flat extrapolation regions of the stored interpolant: slope 0.
-            continue;
-        }
-        // Binary search for the knot interval (grid[lo], grid[hi]] with t
-        // inside; the range check above guarantees 0 <= lo < hi < n_knots.
-        let (mut lo, mut hi) = (0usize, n_knots - 1);
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if grid[mid] < t {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        let width = grid[hi] - grid[lo];
-        for i in 0..n_rows {
-            let delta = surface[[i, hi]] - surface[[i, lo]];
-            if delta < 0.0 {
-                return Err(format!(
-                    "cumulative hazard must be non-decreasing in time; row {i} drops by \
-                     {} between knots {lo} and {hi}",
-                    -delta
-                ));
-            }
-            out[[i, j]] = delta / width;
-        }
-    }
-    Ok(out)
-}
-
-/// Convert a survival probability to a cumulative hazard via `H = -ln S`.
-///
-/// This is exact, not floored: a valid but tiny survival probability (e.g.
-/// `S = e^-100`) maps to the correspondingly large `H = 100`, instead of being
-/// capped at `-ln(1e-12) = 27.63` as an earlier clamp did (issue #964). The
-/// only special cases are the mathematically forced ones:
-///   * `S = 0`   -> `H = +inf`     (`-ln 0 = +inf`, produced naturally),
-///   * `S = NaN` -> `H = NaN`      (propagate undefined input),
-///   * `S` outside `[0, 1]`        -> `Err` (not a survival probability).
-/// Any flooring for display belongs in formatting, never in this S->H math.
-fn cumulative_hazard_from_survival_value(s: f64) -> Result<f64, String> {
-    if s.is_nan() {
-        return Ok(f64::NAN);
-    }
-    if !(0.0..=1.0).contains(&s) {
-        return Err(format!(
-            "survival probability must lie in [0, 1] to convert to cumulative hazard, got {s}"
-        ));
-    }
-    // `-ln S` is exact across the full representable range; `S = 0` yields the
-    // mathematically correct `+inf`, `S = 1` yields `0`.
-    Ok(-s.ln())
-}
-
+/// Convert a survival surface to cumulative hazard through the core's exact
+/// `H = -ln(S)` transform.
 #[pyfunction]
 pub(crate) fn survival_cumulative_from_survival<'py>(
     py: Python<'py>,
     survival: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let view = survival.as_array();
-    let (n_rows, n_cols) = (view.shape()[0], view.shape()[1]);
-    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
-    for i in 0..n_rows {
-        for j in 0..n_cols {
-            out[[i, j]] =
-                cumulative_hazard_from_survival_value(view[[i, j]]).map_err(py_value_error)?;
-        }
-    }
+    let out = cumulative_hazard_from_survival(survival.as_array()).map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -436,70 +332,17 @@ pub(crate) fn survival_failure_from_survival<'py>(
     Ok(failure.into_pyarray(py).unbind())
 }
 
-/// Survival probability of the parametric exponential fallback at one time.
-///
-/// `S(t) = exp(-hazard * t)` for the constant-hazard exponential model, with
-/// `S(0) = 1` enforced exactly. The explicit `t == 0` branch matters because
-/// when `exp(log_hazard)` overflows to `+inf`, the naive `exp(-inf * 0)`
-/// evaluates `(-inf * 0) = NaN`, then `exp(NaN) = NaN`, even though every
-/// survival function satisfies `S(0) = 1` (issue #965).
-fn exponential_survival_at(hazard: f64, t: f64) -> f64 {
-    // `S(t) = P(T > t)` for the constant-hazard exponential fallback is defined
-    // on all of R (issue #965): below the origin everyone is still at risk, so
-    // `S(t <= 0) = 1` exactly (this also avoids the `exp(-hazard * t) > 1`
-    // impossibility for `t < 0` and the `inf * 0 = NaN` case at `t = 0` when
-    // `hazard` overflowed). At `t = +inf`, `S = 0` for any positive hazard.
-    if t <= 0.0 {
-        return 1.0;
-    }
-    if t == f64::INFINITY {
-        // exp(-hazard * inf): 0 for hazard > 0, 1 for a degenerate zero hazard.
-        return if hazard > 0.0 { 0.0 } else { 1.0 };
-    }
-    (-hazard * t).exp()
-}
-
-/// Cumulative hazard of the parametric exponential fallback at one time.
-///
-/// `H(t) = hazard * t` computed DIRECTLY, never reconstructed as
-/// `-ln(exp(-hazard * t))`: that round trip returns 0 instead of ~1e-20 when
-/// `S` rounds to 1 (hazard·t ≈ 1e-20) and `+inf` instead of 1000 when `S`
-/// underflows to 0 (hazard·t ≳ 745), corrupting risk scores and concordance
-/// ordering. Boundary cases mirror `exponential_survival_at`: `H(t <= 0) = 0`
-/// exactly, and `H(+inf) = +inf` for a positive hazard (0 for a degenerate
-/// zero hazard, avoiding `0 * inf = NaN`).
-fn exponential_cumulative_hazard_at(hazard: f64, t: f64) -> f64 {
-    if t <= 0.0 {
-        return 0.0;
-    }
-    if t == f64::INFINITY {
-        return if hazard > 0.0 { f64::INFINITY } else { 0.0 };
-    }
-    hazard * t
-}
-
 #[pyfunction]
 pub(crate) fn survival_block_cumulative_hazard<'py>(
     py: Python<'py>,
     params: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let params = params.as_array();
-    let times_view = times.as_array();
-    let n_rows = params.shape()[0];
-    let n_times = times_view.len();
-    if params.shape()[1] == 0 {
-        return Err(py_value_error(
-            "survival parameter matrix must have at least one column".to_string(),
-        ));
-    }
-    let mut out = Array2::<f64>::zeros((n_rows, n_times));
-    for i in 0..n_rows {
-        let hazard = params[[i, 0]].exp();
-        for j in 0..n_times {
-            out[[i, j]] = exponential_cumulative_hazard_at(hazard, times_view[j]);
-        }
-    }
+    let parameters =
+        ExponentialSurvivalParameters::new(params.as_array()).map_err(py_value_error)?;
+    let out = parameters
+        .cumulative_hazard(times.as_array())
+        .map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }
 
@@ -509,26 +352,11 @@ pub(crate) fn survival_block_failure<'py>(
     params: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    // Failure probability of the parametric exponential fallback,
-    // `F(t) = -expm1(-H(t))` evaluated directly: `1 - exp(-H)` cancels to 0
-    // for `H ≈ 1e-20` where the true failure probability is ~1e-20. The
-    // `H = +inf` endpoint maps to `-expm1(-inf) = 1` exactly.
-    let params = params.as_array();
-    let times_view = times.as_array();
-    let n_rows = params.shape()[0];
-    let n_times = times_view.len();
-    if params.shape()[1] == 0 {
-        return Err(py_value_error(
-            "survival parameter matrix must have at least one column".to_string(),
-        ));
-    }
-    let mut out = Array2::<f64>::zeros((n_rows, n_times));
-    for i in 0..n_rows {
-        let hazard = params[[i, 0]].exp();
-        for j in 0..n_times {
-            out[[i, j]] = -(-exponential_cumulative_hazard_at(hazard, times_view[j])).exp_m1();
-        }
-    }
+    let parameters =
+        ExponentialSurvivalParameters::new(params.as_array()).map_err(py_value_error)?;
+    let out = parameters
+        .failure_probability(times.as_array())
+        .map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }
 
@@ -538,22 +366,11 @@ pub(crate) fn survival_block<'py>(
     params: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let params = params.as_array();
-    let times_view = times.as_array();
-    let n_rows = params.shape()[0];
-    let n_times = times_view.len();
-    if params.shape()[1] == 0 {
-        return Err(py_value_error(
-            "survival parameter matrix must have at least one column".to_string(),
-        ));
-    }
-    let mut out = Array2::<f64>::zeros((n_rows, n_times));
-    for i in 0..n_rows {
-        let hazard = params[[i, 0]].exp();
-        for j in 0..n_times {
-            out[[i, j]] = exponential_survival_at(hazard, times_view[j]);
-        }
-    }
+    let parameters =
+        ExponentialSurvivalParameters::new(params.as_array()).map_err(py_value_error)?;
+    let out = parameters
+        .survival(times.as_array())
+        .map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }
 
@@ -563,30 +380,11 @@ pub(crate) fn survival_block_hazard<'py>(
     params: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    // Hazard of the parametric exponential fallback. For a constant-hazard
-    // exponential model the hazard is `exp(log_hazard)` at every time, so we
-    // return it directly rather than finite-differencing the sampled
-    // cumulative hazard. Differencing query-ordered cumulatives invents zero
-    // hazards at repeated times and negative hazards at unsorted times (issue
-    // #966); the closed-form constant is exact and order-independent.
-    let params = params.as_array();
-    let times_view = times.as_array();
-    let n_rows = params.shape()[0];
-    let n_times = times_view.len();
-    if params.shape()[1] == 0 {
-        return Err(py_value_error(
-            "survival parameter matrix must have at least one column".to_string(),
-        ));
-    }
-    let mut out = Array2::<f64>::zeros((n_rows, n_times));
-    for i in 0..n_rows {
-        let hazard = params[[i, 0]].exp();
-        for j in 0..n_times {
-            // Hazard is constant in `t`; `times_view[j]` selects the column
-            // only. (Times are already validated finite and non-negative.)
-            out[[i, j]] = hazard;
-        }
-    }
+    let parameters =
+        ExponentialSurvivalParameters::new(params.as_array()).map_err(py_value_error)?;
+    let out = parameters
+        .hazard(times.as_array())
+        .map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }
 
@@ -624,6 +422,34 @@ pub(crate) fn survival_ffi_surface<'py>(
 mod tests {
     use super::*;
     use ndarray::array;
+
+    fn cumulative_hazard_from_survival_value(value: f64) -> Result<f64, String> {
+        let input = array![[value]];
+        cumulative_hazard_from_survival(input.view()).map(|output| output[[0, 0]])
+    }
+
+    fn exponential_survival_at(hazard: f64, time: f64) -> f64 {
+        let parameters = array![[hazard.ln()]];
+        ExponentialSurvivalParameters::new(parameters.view())
+            .and_then(|model| model.survival(array![time].view()))
+            .expect("valid exponential survival test input")[[0, 0]]
+    }
+
+    fn exponential_cumulative_hazard_at(hazard: f64, time: f64) -> f64 {
+        let parameters = array![[hazard.ln()]];
+        ExponentialSurvivalParameters::new(parameters.view())
+            .and_then(|model| model.cumulative_hazard(array![time].view()))
+            .expect("valid exponential cumulative-hazard test input")[[0, 0]]
+    }
+
+    fn hazard_from_cumulative_knots_impl(
+        grid: ndarray::ArrayView1<'_, f64>,
+        values: ndarray::ArrayView2<'_, f64>,
+        query: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        SurvivalSurface::new(SurvivalSurfaceKind::CumulativeHazard, grid, values)?
+            .cumulative_hazard_slopes(query)
+    }
 
     // ---- issue #964: S -> H conversion must not floor a valid survival prob ----
 
@@ -760,18 +586,14 @@ mod tests {
     }
 
     #[test]
-    fn hazard_knots_rejects_a_non_increasing_grid_and_decreasing_h() {
-        let surface = array![[1.0, 3.0]];
-        let err = hazard_from_cumulative_knots_impl(
+    fn hazard_knots_accept_unsorted_unique_grid_and_reject_decreasing_h() {
+        let unsorted = hazard_from_cumulative_knots_impl(
             array![2.0, 1.0].view(),
-            surface.view(),
+            array![[3.0, 1.0]].view(),
             array![1.5].view(),
         )
-        .expect_err("decreasing grid must error");
-        assert!(
-            err.contains("strictly increasing"),
-            "unexpected error: {err}"
-        );
+        .expect("unsorted unique grid uses the typed core ordering");
+        assert_eq!(unsorted[[0, 0]], 2.0);
         let err = hazard_from_cumulative_knots_impl(
             array![1.0, 2.0].view(),
             array![[3.0, 1.0]].view(),
