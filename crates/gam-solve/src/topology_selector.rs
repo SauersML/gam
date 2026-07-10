@@ -44,6 +44,7 @@ use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use crate::row_sampling_measure::CoresetCertificate;
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
+use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -429,12 +430,61 @@ pub struct TopologyAutoRankedFit<FitHandle> {
 pub struct TopologyAutoSelectorResult<FitHandle> {
     pub ranked: Vec<TopologyAutoRankedFit<FitHandle>>,
     pub winner_index: usize,
+    /// Every requested candidate that did not produce selectable, finite
+    /// evidence. Failures remain part of the lifecycle result even when another
+    /// candidate wins; callers must never reconstruct them from log strings.
+    pub failed: Vec<TopologyAutoFailedCandidate>,
 }
 
 impl<FitHandle> TopologyAutoSelectorResult<FitHandle> {
     pub fn winner(&self) -> Option<&TopologyAutoRankedFit<FitHandle>> {
         self.ranked.get(self.winner_index)
     }
+}
+
+/// Stage at which a topology candidate became non-selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyAutoFailureStage {
+    Fit,
+    Evidence,
+}
+
+impl TopologyAutoFailureStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fit => "fit",
+            Self::Evidence => "evidence",
+        }
+    }
+}
+
+/// Explicit record for a requested topology candidate that failed.
+///
+/// `evidence_at_failure` is populated when the fit converged but its evidence
+/// metadata was invalid. A failed record is never ranked and is never silently
+/// substituted by a cheaper or previously fitted candidate.
+#[derive(Debug, Clone)]
+pub struct TopologyAutoFailedCandidate {
+    pub candidate: AutoTopologyKind,
+    pub topology_name: String,
+    pub stage: TopologyAutoFailureStage,
+    pub message: String,
+    pub evidence_at_failure: Option<f64>,
+}
+
+fn failed_topology_summary(failed: &[TopologyAutoFailedCandidate]) -> String {
+    failed
+        .iter()
+        .map(|failure| {
+            format!(
+                "{} [{}]: {}",
+                failure.topology_name,
+                failure.stage.as_str(),
+                failure.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Result for one candidate executed by [`run_topology_race_parallel`].
@@ -661,18 +711,33 @@ where
     // discrete stack only adjudicates genuinely non-homotopic topologies.
     let fused = AutoTopologyKind::fuse_constant_curvature_family(&selector.candidates);
     let mut ranked = Vec::with_capacity(fused.len());
-    let mut errors = Vec::new();
+    let mut failed = Vec::new();
     for candidate in &fused {
         match fit_one(*candidate) {
             Ok(evidence) => {
-                let tk_score = tk_normalized_score(
+                let tk_score = match tk_normalized_score(
                     evidence.raw_reml,
                     evidence.null_dim,
                     evidence.null_space_logdet,
                     evidence.effective_dim,
                     evidence.n_obs,
                     selector.score_scale,
-                )?;
+                ) {
+                    Ok(score) => score,
+                    Err(message) => {
+                        failed.push(TopologyAutoFailedCandidate {
+                            candidate: *candidate,
+                            topology_name: evidence.topology_name,
+                            stage: TopologyAutoFailureStage::Evidence,
+                            message,
+                            evidence_at_failure: evidence
+                                .raw_reml
+                                .is_finite()
+                                .then_some(evidence.raw_reml),
+                        });
+                        continue;
+                    }
+                };
                 ranked.push(TopologyAutoRankedFit {
                     topology_name: evidence.topology_name,
                     tk_score,
@@ -682,16 +747,22 @@ where
                     fit_handle: evidence.fit_handle,
                 });
             }
-            Err(err) => errors.push(format!("{}: {}", candidate.as_str(), err.to_string())),
+            Err(err) => failed.push(TopologyAutoFailedCandidate {
+                candidate: *candidate,
+                topology_name: candidate.display_name(),
+                stage: TopologyAutoFailureStage::Fit,
+                message: err.to_string(),
+                evidence_at_failure: None,
+            }),
         }
     }
     if ranked.is_empty() {
         return Err(format!(
             "TopologyAutoSelector found no fittable topology candidates{}",
-            if errors.is_empty() {
+            if failed.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", errors.join("; "))
+                format!(" ({})", failed_topology_summary(&failed))
             }
         ));
     }
@@ -715,6 +786,7 @@ where
     Ok(TopologyAutoSelectorResult {
         ranked,
         winner_index: 0,
+        failed,
     })
 }
 
@@ -749,19 +821,34 @@ where
     })?;
 
     let mut ranked = Vec::with_capacity(race.len());
-    let mut errors = Vec::new();
+    let mut failed = Vec::new();
     for entry in race {
         let (candidate, fit_result) = entry.result;
         match fit_result {
             Ok(evidence) => {
-                let tk_score = tk_normalized_score(
+                let tk_score = match tk_normalized_score(
                     evidence.raw_reml,
                     evidence.null_dim,
                     evidence.null_space_logdet,
                     evidence.effective_dim,
                     evidence.n_obs,
                     selector.score_scale,
-                )?;
+                ) {
+                    Ok(score) => score,
+                    Err(message) => {
+                        failed.push(TopologyAutoFailedCandidate {
+                            candidate,
+                            topology_name: evidence.topology_name,
+                            stage: TopologyAutoFailureStage::Evidence,
+                            message,
+                            evidence_at_failure: evidence
+                                .raw_reml
+                                .is_finite()
+                                .then_some(evidence.raw_reml),
+                        });
+                        continue;
+                    }
+                };
                 ranked.push(TopologyAutoRankedFit {
                     topology_name: evidence.topology_name,
                     tk_score,
@@ -771,16 +858,22 @@ where
                     fit_handle: evidence.fit_handle,
                 });
             }
-            Err(err) => errors.push(format!("{}: {}", candidate.as_str(), err.to_string())),
+            Err(err) => failed.push(TopologyAutoFailedCandidate {
+                candidate,
+                topology_name: candidate.display_name(),
+                stage: TopologyAutoFailureStage::Fit,
+                message: err.to_string(),
+                evidence_at_failure: None,
+            }),
         }
     }
     if ranked.is_empty() {
         return Err(format!(
             "TopologyAutoSelector found no fittable topology candidates{}",
-            if errors.is_empty() {
+            if failed.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", errors.join("; "))
+                format!(" ({})", failed_topology_summary(&failed))
             }
         ));
     }
@@ -803,6 +896,7 @@ where
     Ok(TopologyAutoSelectorResult {
         ranked,
         winner_index: 0,
+        failed,
     })
 }
 
@@ -1122,12 +1216,8 @@ pub fn mixture_density_provider<'a>(
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
             let train_mat = gather_rows(owned.view(), train);
-            let fit = fit_gaussian_mixture(
-                train_mat.view(),
-                k.min(train.len().max(1)),
-                config,
-            )
-            .map_err(|error| error.to_string())?;
+            let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)
+                .map_err(|error| error.to_string())?;
             let eval_mat = gather_rows(owned.view(), eval);
             let dens = fit.per_point_log_density(eval_mat.view())?;
             Ok(dens.to_vec())
@@ -1560,6 +1650,19 @@ pub struct ClosureProfilePoint<FitHandle> {
     pub tk_score: f64,
     pub score_gradient: f64,
     pub score_curvature: f64,
+    /// Explicit structural diagnostic from the converged inner fit. Merely
+    /// attaining `gamma = 0` does not by itself prove support collapse.
+    pub support_collapsed: bool,
+    pub fit_handle: FitHandle,
+}
+
+/// Converged fixed-γ fit returned by the closure profile oracle.
+#[derive(Debug, Clone)]
+pub struct ClosureProfileFit<FitHandle> {
+    pub tk_score: f64,
+    pub score_gradient: f64,
+    pub score_curvature: f64,
+    pub support_collapsed: bool,
     pub fit_handle: FitHandle,
 }
 
@@ -1579,6 +1682,11 @@ pub struct ClosureStationarityCertificate {
     /// of the one-sided KKT condition at a boundary.
     pub projected_gradient: f64,
     pub tolerance: f64,
+    /// Certified bracket for the stationary abscissa (a point at an exact
+    /// endpoint optimum).
+    pub bracket: gam_math::score_opt::ClosedInterval,
+    /// Outward score-derivative and curvature ranges on `bracket`.
+    pub derivative_enclosure: gam_math::score_opt::DerivativeEnclosure,
 }
 
 /// The result of profiling the closure parameter inside the smooth class.
@@ -1601,29 +1709,113 @@ pub struct ClosureSelection<FitHandle> {
     pub route_to_mixture_rung: bool,
 }
 
+fn closure_profile_ci_side<EvaluateScore>(
+    evaluate_score: &EvaluateScore,
+    gamma_hat: f64,
+    target: f64,
+    bound: f64,
+    stationary_abscissae: &[f64],
+    resolution: f64,
+) -> Result<(f64, bool), String>
+where
+    EvaluateScore: Fn(f64) -> Result<f64, String>,
+{
+    let toward_lower = bound < gamma_hat;
+    let mut probes: Vec<f64> = stationary_abscissae
+        .iter()
+        .copied()
+        .filter(|&gamma| {
+            if toward_lower {
+                gamma < gamma_hat && gamma > bound
+            } else {
+                gamma > gamma_hat && gamma < bound
+            }
+        })
+        .collect();
+    probes.sort_by(f64::total_cmp);
+    if toward_lower {
+        probes.reverse();
+    }
+    probes.push(bound);
+
+    let mut inside = gamma_hat;
+    for probe in probes {
+        let value = evaluate_score(probe)?;
+        if !value.is_finite() {
+            return Err(format!(
+                "closure profile CI produced non-finite evidence at γ={probe}"
+            ));
+        }
+        let comparison_roundoff = f64::EPSILON * (1.0 + value.abs() + target.abs());
+        if (value - target).abs() <= comparison_roundoff {
+            return Ok((probe, probe == bound));
+        }
+        if value > target {
+            // `probe` and `inside` are adjacent critical points of the
+            // certified profile partition, so the score is monotone between
+            // them. Bisection therefore isolates the nearest Wilks crossing
+            // without a geometric probe schedule that could jump over an
+            // exit/re-entry pair.
+            let mut outside = probe;
+            while (outside - inside).abs() > resolution {
+                let midpoint = outside + 0.5 * (inside - outside);
+                if midpoint == outside || midpoint == inside {
+                    break;
+                }
+                let midpoint_value = evaluate_score(midpoint)?;
+                if !midpoint_value.is_finite() {
+                    return Err(format!(
+                        "closure profile CI produced non-finite evidence at γ={midpoint}"
+                    ));
+                }
+                if midpoint_value <= target {
+                    inside = midpoint;
+                } else {
+                    outside = midpoint;
+                }
+            }
+            return Ok((outside + 0.5 * (inside - outside), false));
+        }
+        inside = probe;
+    }
+    Ok((bound, true))
+}
+
 /// Profile the closure parameter `γ`, returning the continuously refined
 /// minimiser, its profile-likelihood CI, and the representative fit.
 ///
 /// `fit_at_gamma` performs the converged inner fit at a fixed closure value and
-/// returns `(tk_score, d_score/dγ, d²_score/dγ², fit_handle)`, where
-/// `tk_score` is the profiled
+/// returns a [`ClosureProfileFit`] containing the profiled score jet, an
+/// explicit support-collapse diagnostic, and the fit handle. `tk_score` is the profiled
 /// negative-log evidence on the same scale [`tk_normalized_score`] produces (so
 /// γ and λ_smooth must both be optimised inside the closure, per the issue's
 /// confounding contract). Lower score is better. The analytic score oracle is
-/// searched continuously on `[0, 1]`; exact endpoints compete with every
-/// isolated interior stationary point. The same continuous oracle supplies the
-/// profile-Wilks crossings, so neither the winner nor its interval is selected
-/// or interpolated from a lattice.
-pub fn profile_closure_within_smooth_class<FitHandle, FitAtGamma>(
+/// searched continuously on `[0, 1]`; `enclose_derivatives` supplies outward
+/// ranges containing the score gradient and curvature on every requested
+/// interval. Exact endpoints compete with every certified isolated interior
+/// stationary point. The same continuous oracle supplies the profile-Wilks
+/// crossings, so neither the winner nor its interval is selected or
+/// interpolated from a lattice. An interval whose stationary structure cannot
+/// be certified is an error, never a best sampled point.
+pub fn profile_closure_within_smooth_class<FitHandle, FitAtGamma, EncloseDerivatives>(
     fit_at_gamma: FitAtGamma,
+    enclose_derivatives: EncloseDerivatives,
     level: f64,
 ) -> Result<ClosureSelection<FitHandle>, String>
 where
-    FitAtGamma: Fn(f64) -> Result<(f64, f64, f64, FitHandle), String>,
+    FitAtGamma: Fn(f64) -> Result<ClosureProfileFit<FitHandle>, String>,
+    EncloseDerivatives: Fn(f64, f64) -> Result<gam_math::score_opt::DerivativeEnclosure, String>,
 {
     let gamma_tolerance = f64::EPSILON.sqrt();
     let evaluate = |gamma: f64| -> Result<ClosureProfilePoint<FitHandle>, String> {
-        let (tk_score, score_gradient, score_curvature, fit_handle) = fit_at_gamma(gamma)?;
+        let fit = fit_at_gamma(gamma)?;
+        let ClosureProfileFit {
+            tk_score,
+            score_gradient,
+            score_curvature,
+            support_collapsed,
+            fit_handle,
+        } = fit;
         if !(tk_score.is_finite() && score_gradient.is_finite() && score_curvature.is_finite()) {
             return Err(format!(
                 "closure profile produced a non-finite score jet at γ={gamma}"
@@ -1634,33 +1826,59 @@ where
             tk_score,
             score_gradient,
             score_curvature,
+            support_collapsed,
             fit_handle,
         })
     };
 
     let mut score_oracle = |gamma: f64| {
         let point = evaluate(gamma)?;
-        Ok::<_, String>((-point.tk_score, -point.score_gradient))
+        Ok::<_, String>(gam_math::score_opt::ScoreJet {
+            value: -point.tk_score,
+            derivative: -point.score_gradient,
+            curvature: -point.score_curvature,
+        })
     };
-    let optimum =
-        gam_math::score_opt::maximize_score_1d(0.0, 1.0, gamma_tolerance, &mut score_oracle)?;
-    let representative = evaluate(optimum.x)?;
-    let stationarity_tolerance = f64::EPSILON.sqrt() * (1.0 + representative.tk_score.abs());
-    let (kind, projected_gradient) = if representative.gamma <= gamma_tolerance {
-        (
+    let mut score_enclosure = |lo: f64, hi: f64| {
+        let tk = enclose_derivatives(lo, hi)?;
+        Ok::<_, String>(gam_math::score_opt::DerivativeEnclosure {
+            derivative: gam_math::score_opt::ClosedInterval::outward(
+                -tk.derivative.hi,
+                -tk.derivative.lo,
+            ),
+            curvature: gam_math::score_opt::ClosedInterval::outward(
+                -tk.curvature.hi,
+                -tk.curvature.lo,
+            ),
+        })
+    };
+    let search = gam_math::score_opt::maximize_score_1d(
+        0.0,
+        1.0,
+        gamma_tolerance,
+        &mut score_oracle,
+        &mut score_enclosure,
+    )
+    .map_err(|error| format!("closure profile: {error}"))?;
+    let representative = evaluate(search.optimum.x)?;
+    let gradient_scale = 1.0
+        + search.lower_boundary.derivative.abs()
+        + search.upper_boundary.derivative.abs()
+        + representative.score_curvature.abs();
+    let stationarity_tolerance = f64::EPSILON.sqrt() * gradient_scale;
+    let (kind, projected_gradient) = match search.location {
+        gam_math::score_opt::ScoreOptimumLocation::LowerBoundary => (
             ClosureOptimumKind::IntervalBoundary,
             (-representative.score_gradient).max(0.0),
-        )
-    } else if representative.gamma >= 1.0 - gamma_tolerance {
-        (
+        ),
+        gam_math::score_opt::ScoreOptimumLocation::UpperBoundary => (
             ClosureOptimumKind::CircleBoundary,
             representative.score_gradient.max(0.0),
-        )
-    } else {
-        (
+        ),
+        gam_math::score_opt::ScoreOptimumLocation::Stationary(_) => (
             ClosureOptimumKind::Interior,
             representative.score_gradient.abs(),
-        )
+        ),
     };
     if projected_gradient > stationarity_tolerance
         || (kind == ClosureOptimumKind::Interior && representative.score_curvature <= 0.0)
@@ -1674,28 +1892,73 @@ where
             stationarity_tolerance
         ));
     }
+    let bracket = match search.location {
+        gam_math::score_opt::ScoreOptimumLocation::LowerBoundary
+        | gam_math::score_opt::ScoreOptimumLocation::UpperBoundary => {
+            gam_math::score_opt::ClosedInterval::point(representative.gamma)
+        }
+        gam_math::score_opt::ScoreOptimumLocation::Stationary(index) => {
+            search
+                .stationary_points
+                .get(index)
+                .ok_or_else(|| {
+                    "closure profile optimizer returned an invalid stationary index".to_string()
+                })?
+                .bracket
+        }
+    };
+    let derivative_enclosure = enclose_derivatives(bracket.lo, bracket.hi)?;
     let stationarity = ClosureStationarityCertificate {
         kind,
         projected_gradient,
         tolerance: stationarity_tolerance,
+        bracket,
+        derivative_enclosure,
     };
 
-    let walked = gam_geometry::profile_ci_walk(
-        |gamma| evaluate(gamma).map(|point| point.tk_score),
-        representative.gamma,
-        representative.score_curvature,
-        0.0,
-        1.0,
-        level,
-        gamma_tolerance,
-    )?;
-    let singular_boundary = kind == ClosureOptimumKind::IntervalBoundary;
+    if !(level.is_finite() && level > 0.0 && level < 1.0) {
+        return Err("closure profile CI level must lie in (0, 1)".to_string());
+    }
+    let chi_squared = ChiSquared::new(1.0)
+        .map_err(|error| format!("closure profile CI distribution: {error}"))?;
+    let target = representative.tk_score + 0.5 * chi_squared.inverse_cdf(level);
+    let stationary_abscissae: Vec<f64> = search
+        .stationary_points
+        .iter()
+        .map(|stationary| stationary.sample.x)
+        .collect();
+    let evaluate_score = |gamma| evaluate(gamma).map(|point| point.tk_score);
+    let (ci_lo, lo_at_bound) = if representative.gamma == 0.0 {
+        (0.0, true)
+    } else {
+        closure_profile_ci_side(
+            &evaluate_score,
+            representative.gamma,
+            target,
+            0.0,
+            &stationary_abscissae,
+            gamma_tolerance,
+        )?
+    };
+    let (ci_hi, hi_at_bound) = if representative.gamma == 1.0 {
+        (1.0, true)
+    } else {
+        closure_profile_ci_side(
+            &evaluate_score,
+            representative.gamma,
+            target,
+            1.0,
+            &stationary_abscissae,
+            gamma_tolerance,
+        )?
+    };
+    let singular_boundary = representative.support_collapsed;
     let ci = gam_geometry::ClosureProfileCi {
         gamma_hat: representative.gamma,
-        ci_lo: walked.ci_lo,
-        ci_hi: walked.ci_hi,
-        ci_includes_circle: walked.hi_at_bound,
-        ci_includes_interval: walked.lo_at_bound,
+        ci_lo,
+        ci_hi,
+        ci_includes_circle: hi_at_bound,
+        ci_includes_interval: lo_at_bound,
         singular_boundary,
     };
 
@@ -1966,12 +2229,22 @@ mod tests {
         // the mixture rung (this is a regular interior optimum).
         let selection = profile_closure_within_smooth_class(
             |gamma| {
-                Ok::<_, String>((
-                    100.0 + 80.0 * (gamma - 0.7).powi(2),
-                    160.0 * (gamma - 0.7),
-                    160.0,
-                    gamma,
-                ))
+                Ok::<_, String>(ClosureProfileFit {
+                    tk_score: 100.0 + 80.0 * (gamma - 0.7).powi(2),
+                    score_gradient: 160.0 * (gamma - 0.7),
+                    score_curvature: 160.0,
+                    support_collapsed: false,
+                    fit_handle: gamma,
+                })
+            },
+            |lo, hi| {
+                Ok::<_, String>(gam_math::score_opt::DerivativeEnclosure {
+                    derivative: gam_math::score_opt::ClosedInterval::outward(
+                        160.0 * (lo - 0.7),
+                        160.0 * (hi - 0.7),
+                    ),
+                    curvature: gam_math::score_opt::ClosedInterval::outward(160.0, 160.0),
+                })
             },
             0.95,
         )
@@ -1995,7 +2268,21 @@ mod tests {
         // A profile that keeps improving toward γ=0 (support collapse) pins the
         // minimiser at the floor and must hand off to the mixture/union rung.
         let selection = profile_closure_within_smooth_class(
-            |gamma| Ok::<_, String>((10.0 + 25.0 * gamma, 25.0, 0.0, gamma)),
+            |gamma| {
+                Ok::<_, String>(ClosureProfileFit {
+                    tk_score: 10.0 + 25.0 * gamma,
+                    score_gradient: 25.0,
+                    score_curvature: 0.0,
+                    support_collapsed: gamma == 0.0,
+                    fit_handle: gamma,
+                })
+            },
+            |_lo, _hi| {
+                Ok::<_, String>(gam_math::score_opt::DerivativeEnclosure {
+                    derivative: gam_math::score_opt::ClosedInterval::outward(25.0, 25.0),
+                    curvature: gam_math::score_opt::ClosedInterval::outward(0.0, 0.0),
+                })
+            },
             0.95,
         )
         .expect("closure profile");
@@ -2009,6 +2296,35 @@ mod tests {
     }
 
     #[test]
+    fn closure_profiler_does_not_infer_collapse_from_gamma_zero() {
+        let selection = profile_closure_within_smooth_class(
+            |gamma| {
+                Ok::<_, String>(ClosureProfileFit {
+                    tk_score: 4.0 + gamma,
+                    score_gradient: 1.0,
+                    score_curvature: 0.0,
+                    support_collapsed: false,
+                    fit_handle: gamma,
+                })
+            },
+            |_lo, _hi| {
+                Ok::<_, String>(gam_math::score_opt::DerivativeEnclosure {
+                    derivative: gam_math::score_opt::ClosedInterval::outward(1.0, 1.0),
+                    curvature: gam_math::score_opt::ClosedInterval::outward(0.0, 0.0),
+                })
+            },
+            0.95,
+        )
+        .expect("regular interval-boundary profile");
+        assert_eq!(
+            selection.stationarity.kind,
+            ClosureOptimumKind::IntervalBoundary
+        );
+        assert!(!selection.ci.singular_boundary);
+        assert!(!selection.route_to_mixture_rung);
+    }
+
+    #[test]
     fn closure_profiler_selects_a_non_lattice_optimum_and_continuous_ci() {
         let planted = 0.713_271_828_f64;
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -2016,12 +2332,22 @@ mod tests {
             |gamma| {
                 calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let displacement = gamma - planted;
-                Ok::<_, String>((
-                    7.0 + 32.0 * displacement * displacement,
-                    64.0 * displacement,
-                    64.0,
-                    gamma,
-                ))
+                Ok::<_, String>(ClosureProfileFit {
+                    tk_score: 7.0 + 32.0 * displacement * displacement,
+                    score_gradient: 64.0 * displacement,
+                    score_curvature: 64.0,
+                    support_collapsed: false,
+                    fit_handle: gamma,
+                })
+            },
+            |lo, hi| {
+                Ok::<_, String>(gam_math::score_opt::DerivativeEnclosure {
+                    derivative: gam_math::score_opt::ClosedInterval::outward(
+                        64.0 * (lo - planted),
+                        64.0 * (hi - planted),
+                    ),
+                    curvature: gam_math::score_opt::ClosedInterval::outward(64.0, 64.0),
+                })
             },
             0.95,
         )
@@ -2046,6 +2372,33 @@ mod tests {
         let small = TopologyRaceThreadPlan::for_budget(3, 2);
         assert_eq!(small.concurrent_fits, 1);
         assert!(small.coordinator_threads + small.per_fit_threads <= 2);
+    }
+
+    #[test]
+    fn topology_selector_retains_failed_candidate_records() {
+        let selector = TopologyAutoSelector::new(Some(vec![
+            AutoTopologyKind::Circle,
+            AutoTopologyKind::Torus,
+        ]));
+        let result = select_topology_with_fit(&selector, |kind| match kind {
+            AutoTopologyKind::Circle => Err("inner REML stationarity failed".to_string()),
+            AutoTopologyKind::Torus => Ok(TopologyAutoFitEvidence {
+                topology_name: "torus".to_string(),
+                raw_reml: 3.0,
+                null_dim: 0.0,
+                null_space_logdet: None,
+                effective_dim: 2.0,
+                n_obs: 40,
+                fit_handle: (),
+            }),
+            _ => unreachable!(),
+        })
+        .expect("one converged candidate is selectable");
+        assert_eq!(result.winner().unwrap().topology_name, "torus");
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].topology_name, "circle");
+        assert_eq!(result.failed[0].stage, TopologyAutoFailureStage::Fit);
+        assert!(result.failed[0].message.contains("stationarity"));
     }
 
     // --- #944 stage-4 topology collapse tests --------------------------------
