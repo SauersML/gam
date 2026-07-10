@@ -2865,3 +2865,81 @@ impl SaeManifoldTerm {
         }
     }
 }
+
+// #932 gap-5 contract: the per-atom jet log-det dispatch is a const-generic
+// ladder capped at SAE_MAX_JET_ROW_PRIMARIES; the arity guard must REFUSE a
+// wider per-row Newton block with the typed message (never fall through to
+// the ladder's unsupported arm deep inside streaming assembly), accept a
+// tiny term, and exempt the dynamically-sized softmax hand path.
+#[cfg(test)]
+mod jet_arity_contract_932_tests {
+    use crate::manifold::{
+        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+        SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldTerm,
+    };
+    use gam_terms::latent::LatentManifold;
+    use ndarray::Array2;
+    use std::sync::Arc;
+
+    /// K unfitted circle atoms — per-row Newton arity under a per-atom mode is
+    /// `K logit slots + K latent coords = 2K`, so K=9 exceeds the 16-primary
+    /// ladder while K=1 sits far below it.
+    fn term_with_atoms(k_atoms: usize, mode: AssignmentMode) -> SaeManifoldTerm {
+        let n = 8usize;
+        let p = 4usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let coords = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| r as f64 / n as f64);
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let mut decoder = Array2::<f64>::zeros((3, p));
+        decoder[[1, 0]] = 1.0;
+        decoder[[2, 1]] = 1.0;
+        let atoms: Vec<SaeManifoldAtom> = (0..k_atoms)
+            .map(|a| {
+                SaeManifoldAtom::new(
+                    format!("circle{a}"),
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    phi.clone(),
+                    jet.clone(),
+                    decoder.clone(),
+                    Array2::<f64>::eye(3),
+                )
+                .unwrap()
+            })
+            .collect();
+        let logits = Array2::<f64>::from_elem((n, k_atoms), 1.0);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords; k_atoms],
+            vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
+            mode,
+        )
+        .unwrap();
+        SaeManifoldTerm::new(atoms, assignment).unwrap()
+    }
+
+    #[test]
+    fn jet_row_primary_arity_guard_refuses_wide_accepts_tiny_exempts_softmax_932() {
+        // K=9 IBP-MAP: 18 per-row primaries — must refuse with the typed
+        // message naming the limit and the issue.
+        let wide = term_with_atoms(9, AssignmentMode::ibp_map(0.7, 1.0, false));
+        let err = wide
+            .validate_jet_row_primary_arity(None)
+            .expect_err("18 per-row primaries must refuse the 16-wide jet ladder");
+        assert!(
+            err.contains("16") && err.contains("#932"),
+            "refusal must name the ladder limit and the issue: {err}"
+        );
+
+        // K=1 IBP-MAP: 2 per-row primaries — accepted.
+        let tiny = term_with_atoms(1, AssignmentMode::ibp_map(0.7, 1.0, false));
+        tiny.validate_jet_row_primary_arity(None)
+            .expect("2 per-row primaries fit the ladder");
+
+        // Softmax routes the dynamically-sized hand path — exempt even wide.
+        let softmax_wide = term_with_atoms(9, AssignmentMode::Softmax { temperature: 0.7 });
+        softmax_wide
+            .validate_jet_row_primary_arity(None)
+            .expect("softmax mode is exempt from the per-atom jet ladder cap");
+    }
+}
