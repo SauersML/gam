@@ -2416,7 +2416,7 @@ fn smooth_term_lr_inference_dataset_json_impl(
 }
 
 fn postfit_standard_materialization_config(model: &FittedModel) -> Result<FitConfig, String> {
-    let (mut fit_config, _table_kind) = parse_fit_config(None)?;
+    let mut fit_config = parse_fit_config(None)?;
     fit_config.weight_column = model.weight_column.clone();
     fit_config.offset_column = model.offset_column.clone();
     Ok(fit_config)
