@@ -1,5 +1,5 @@
-use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, cholesky_spd, dot, flatten,
@@ -336,8 +336,8 @@ impl RiemannianManifold for SpdManifold {
 
         // M = S⁻ U S⁻: Ḡ_U = S⁻ Ḡ_M S⁻, Ḡ_{S⁻} = Ḡ_M S⁻ U + U S⁻ Ḡ_M.
         let g_u = fast_ab(&fast_ab(&inv_sqrt_p, &g_m), &inv_sqrt_p);
-        let g_s_inv = &fast_ab(&fast_ab(&g_m, &inv_sqrt_p), &u)
-            + &fast_ab(&fast_ab(&u, &inv_sqrt_p), &g_m);
+        let g_s_inv =
+            &fast_ab(&fast_ab(&g_m, &inv_sqrt_p), &u) + &fast_ab(&fast_ab(&u, &inv_sqrt_p), &g_m);
 
         // S = P^{1/2} and S⁻ = P^{-1/2} pull back through their own
         // divided-difference conjugations on P's eigendecomposition.
@@ -421,19 +421,33 @@ fn inv_sqrt_divided_difference(a: f64, b: f64) -> f64 {
     -((1.0 / hi) / (hi + lo)) / lo
 }
 
-/// Squared metric norm `‖v‖²_P = vᵀ G(P) v = tr(P⁻¹ V P⁻¹ V)` of the (already
-/// symmetric) flat tangent vector `v` at base point `P`, computed without
-/// forming the `n²×n²` Kronecker metric. `pinv = P⁻¹`.
-fn affine_sq_norm(n: usize, pinv: &Array2<f64>, v: ArrayView1<'_, f64>) -> GeometryResult<f64> {
+/// Squared metric norm `‖v‖²_P = vᵀ G(P) v = ‖P⁻¹⁄² V P⁻¹⁄²‖²_F` of
+/// the symmetric flat tangent vector `v`, computed without forming either
+/// `P⁻¹` or the `n²×n²` Kronecker metric. Whitening first turns the
+/// certificate into an explicit sum of squares, avoiding cancellation in
+/// `tr((P⁻¹V)²)` and preserving affine scale invariance for uniformly tiny
+/// SPD inputs. `inv_sqrt_p = P⁻¹⁄²`.
+fn affine_sq_norm(
+    n: usize,
+    inv_sqrt_p: &Array2<f64>,
+    v: ArrayView1<'_, f64>,
+) -> GeometryResult<f64> {
     use gam_linalg::faer_ndarray::fast_ab;
     let vm = sym(&from_flat(v, n, n)?);
-    // tr(P⁻¹ V P⁻¹ V).
-    let a = fast_ab(&fast_ab(pinv, &vm), &fast_ab(pinv, &vm));
-    let mut trace = 0.0_f64;
-    for i in 0..n {
-        trace += a[[i, i]];
+    let whitened = sym(&fast_ab(&fast_ab(inv_sqrt_p, &vm), inv_sqrt_p));
+    let mut squared_norm = 0.0_f64;
+    for &value in &whitened {
+        if !value.is_finite() {
+            return Err(GeometryError::Singular(
+                "SPD affine metric norm is non-finite",
+            ));
+        }
+        squared_norm += value * value;
     }
-    Ok(trace.max(0.0))
+    if !squared_norm.is_finite() {
+        return Err(GeometryError::Singular("SPD affine metric norm overflowed"));
+    }
+    Ok(squared_norm)
 }
 
 /// Weighted Fréchet / Karcher mean of SPD matrices under the affine-invariant
@@ -508,11 +522,11 @@ pub fn spd_frechet_mean(
     // Weighted dispersion V(P) = Σ_i w_i ‖log_P(X_i)‖²_P at flat base `p`.
     let dispersion = |p: ArrayView1<'_, f64>| -> GeometryResult<f64> {
         let pm = spd.matrix(p)?;
-        let pinv = inverse(&pm)?;
+        let inv_sqrt_p = spectral_map_spd(&pm, |x| Ok(1.0 / x.sqrt()))?;
         let mut acc = 0.0_f64;
         for (i, x) in samples.iter().enumerate() {
             let lg = spd.log_map(p, x.view())?;
-            acc += w[i] * affine_sq_norm(n, &pinv, lg.view())?;
+            acc += w[i] * affine_sq_norm(n, &inv_sqrt_p, lg.view())?;
         }
         Ok(acc)
     };
@@ -539,13 +553,13 @@ pub fn spd_frechet_mean(
         // Riemannian descent direction ξ = Σ_i w_i log_P(X_i) (= −½ grad V)
         // and its exact affine-invariant metric norm.
         let pm = spd.matrix(point)?;
-        let pinv = inverse(&pm)?;
+        let inv_sqrt_p = spectral_map_spd(&pm, |x| Ok(1.0 / x.sqrt()))?;
         let mut xi = Array1::<f64>::zeros(ambient);
         for (i, x) in samples.iter().enumerate() {
             let lg = spd.log_map(point, x.view())?;
             xi.scaled_add(w[i], &lg);
         }
-        let residual = affine_sq_norm(n, &pinv, xi.view())?.sqrt();
+        let residual = affine_sq_norm(n, &inv_sqrt_p, xi.view())?.sqrt();
         Ok((xi, residual))
     };
 
@@ -574,8 +588,20 @@ pub fn spd_frechet_mean(
             BacktrackConfig::default(),
             |t| -> GeometryResult<Option<(f64, Array1<f64>)>> {
                 let step = &xi * t;
-                let cand = spd.exp_map(p.view(), step.view())?;
-                let f_cand = dispersion(cand.view())?;
+                let cand = match spd.exp_map(p.view(), step.view()) {
+                    Ok(candidate) => candidate,
+                    Err(GeometryError::InvalidPoint(_) | GeometryError::Singular(_)) => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                let f_cand = match dispersion(cand.view()) {
+                    Ok(value) => value,
+                    Err(GeometryError::InvalidPoint(_) | GeometryError::Singular(_)) => {
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(Some((f_cand, cand)))
             },
             |t, f_cand| f_cand <= f_cur - 2.0 * ARMIJO_C1 * t * pred + f_tol,
@@ -662,16 +688,10 @@ mod exp_map_vjp_tests {
     fn spd_with_eigs(d: [f64; 3], theta: f64, phi: f64) -> Array2<f64> {
         let (c1, s1) = (theta.cos(), theta.sin());
         let (c2, s2) = (phi.cos(), phi.sin());
-        let g1 = Array2::from_shape_vec(
-            (3, 3),
-            vec![c1, -s1, 0.0, s1, c1, 0.0, 0.0, 0.0, 1.0],
-        )
-        .unwrap();
-        let g2 = Array2::from_shape_vec(
-            (3, 3),
-            vec![1.0, 0.0, 0.0, 0.0, c2, -s2, 0.0, s2, c2],
-        )
-        .unwrap();
+        let g1 =
+            Array2::from_shape_vec((3, 3), vec![c1, -s1, 0.0, s1, c1, 0.0, 0.0, 0.0, 1.0]).unwrap();
+        let g2 =
+            Array2::from_shape_vec((3, 3), vec![1.0, 0.0, 0.0, 0.0, c2, -s2, 0.0, s2, c2]).unwrap();
         let r = g1.dot(&g2);
         let mut dm = Array2::<f64>::zeros((3, 3));
         for i in 0..3 {
@@ -702,8 +722,7 @@ mod exp_map_vjp_tests {
                 h[[i, j]] = 1.0;
                 h[[j, i]] = 1.0;
                 let hf = flat(&h);
-                let fd = (scalar(&(&pf + &(&hf * eps)), &tf)
-                    - scalar(&(&pf - &(&hf * eps)), &tf))
+                let fd = (scalar(&(&pf + &(&hf * eps)), &tf) - scalar(&(&pf - &(&hf * eps)), &tf))
                     / (2.0 * eps);
                 let analytic = grad_p.dot(&hf);
                 assert!(
@@ -730,16 +749,12 @@ mod exp_map_vjp_tests {
     #[test]
     fn spd_exp_map_vjp_matches_fd_generic_spectrum() {
         let p = spd_with_eigs([3.0, 1.2, 0.4], 0.7, 1.1);
-        let t = Array2::from_shape_vec(
-            (3, 3),
-            vec![0.3, -0.2, 0.5, 0.1, -0.4, 0.2, -0.3, 0.6, 0.1],
-        )
-        .unwrap();
-        let g = Array2::from_shape_vec(
-            (3, 3),
-            vec![1.0, 0.4, -0.3, 0.2, -0.8, 0.5, 0.7, -0.1, 0.9],
-        )
-        .unwrap();
+        let t =
+            Array2::from_shape_vec((3, 3), vec![0.3, -0.2, 0.5, 0.1, -0.4, 0.2, -0.3, 0.6, 0.1])
+                .unwrap();
+        let g =
+            Array2::from_shape_vec((3, 3), vec![1.0, 0.4, -0.3, 0.2, -0.8, 0.5, 0.7, -0.1, 0.9])
+                .unwrap();
         assert_vjp_matches_fd(&p, &t, &g);
     }
 
@@ -748,16 +763,12 @@ mod exp_map_vjp_tests {
         // Exactly repeated eigenvalues of P: the √/x^{-1/2} divided differences
         // must hit their analytic diagonal limit, not a 0/0 subtraction.
         let p = spd_with_eigs([2.0, 2.0, 0.5], 0.9, 0.3);
-        let t = Array2::from_shape_vec(
-            (3, 3),
-            vec![0.2, 0.1, -0.3, 0.1, -0.1, 0.4, -0.3, 0.4, 0.3],
-        )
-        .unwrap();
-        let g = Array2::from_shape_vec(
-            (3, 3),
-            vec![0.5, -0.6, 0.2, -0.6, 0.3, 0.8, 0.2, 0.8, -0.4],
-        )
-        .unwrap();
+        let t =
+            Array2::from_shape_vec((3, 3), vec![0.2, 0.1, -0.3, 0.1, -0.1, 0.4, -0.3, 0.4, 0.3])
+                .unwrap();
+        let g =
+            Array2::from_shape_vec((3, 3), vec![0.5, -0.6, 0.2, -0.6, 0.3, 0.8, 0.2, 0.8, -0.4])
+                .unwrap();
         assert_vjp_matches_fd(&p, &t, &g);
     }
 
@@ -767,11 +778,9 @@ mod exp_map_vjp_tests {
         // stage coincides, exercising the exp divided-difference limit e^a.
         let p = spd_with_eigs([1.5, 0.8, 2.5], 0.4, 1.3);
         let t = &p * 0.35;
-        let g = Array2::from_shape_vec(
-            (3, 3),
-            vec![0.9, 0.1, -0.2, 0.1, -0.5, 0.3, -0.2, 0.3, 0.6],
-        )
-        .unwrap();
+        let g =
+            Array2::from_shape_vec((3, 3), vec![0.9, 0.1, -0.2, 0.1, -0.5, 0.3, -0.2, 0.3, 0.6])
+                .unwrap();
         assert_vjp_matches_fd(&p, &t, &g);
     }
 
@@ -782,11 +791,8 @@ mod exp_map_vjp_tests {
         // whitened-DK pullback (finite, symmetric).
         let spd = SpdManifold::new(3);
         let p = spd_with_eigs([2.0, 1.0, 0.5], 0.2, 0.8);
-        let g = Array2::from_shape_vec(
-            (3, 3),
-            vec![1.0, 0.3, 0.0, 0.3, -0.7, 0.2, 0.0, 0.2, 0.4],
-        )
-        .unwrap();
+        let g = Array2::from_shape_vec((3, 3), vec![1.0, 0.3, 0.0, 0.3, -0.7, 0.2, 0.0, 0.2, 0.4])
+            .unwrap();
         let zeros = Array1::<f64>::zeros(9);
         let (grad_p, grad_t) = spd
             .exp_map_vjp(flat(&p).view(), zeros.view(), flat(&g).view())
@@ -798,7 +804,12 @@ mod exp_map_vjp_tests {
                 "grad_point at T=0 must be sym(G): {a} vs {b}"
             );
         }
-        assert!(grad_t.iter().all(|x| x.is_finite()));
+        for (a, b) in grad_t.iter().zip(gs.iter()) {
+            assert!(
+                (a - b).abs() <= 1.0e-12,
+                "grad_tangent at T=0 must be sym(G): {a} vs {b}"
+            );
+        }
     }
 
     #[test]
@@ -814,8 +825,8 @@ mod exp_map_vjp_tests {
 
 #[cfg(test)]
 mod frechet_mean_tests {
-    use super::{SpdManifold, spd_frechet_mean};
-    use crate::manifold::{GeometryError, RiemannianManifold};
+    use super::{SpdManifold, affine_sq_norm, spd_frechet_mean};
+    use crate::manifold::{GeometryError, RiemannianManifold, spectral_map_spd};
     use ndarray::{Array1, Array2};
 
     /// Row-major flat `n×n` diagonal matrix from its diagonal.
@@ -848,8 +859,12 @@ mod frechet_mean_tests {
         for (x, &wi) in rows.iter().zip(w) {
             xi.scaled_add(wi, &spd.log_map(p.view(), x.view()).expect("log_map"));
         }
-        let g = spd.metric_tensor(p.view()).expect("metric_tensor");
-        xi.dot(&g.dot(&xi)).max(0.0).sqrt()
+        let pm = spd.matrix(p.view()).expect("SPD mean");
+        let inv_sqrt_p =
+            spectral_map_spd(&pm, |value| Ok(1.0 / value.sqrt())).expect("inverse square root");
+        affine_sq_norm(spd.n, &inv_sqrt_p, xi.view())
+            .expect("affine norm")
+            .sqrt()
     }
 
     /// CLOSED FORM, EXTREME MAGNITUDE. For mutually commuting (here diagonal)
@@ -1022,5 +1037,40 @@ mod frechet_mean_tests {
             }
             other => panic!("expected typed SPD Fréchet exhaustion, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn spd_frechet_mean_is_equivariant_at_uniformly_tiny_scale() {
+        let n = 2;
+        let rows = [
+            diag_flat(&[4.0, 0.25]),
+            Array1::from(vec![1.0, 0.4, 0.4, 2.5]),
+            diag_flat(&[0.6, 3.0]),
+        ];
+        let unit_mean =
+            spd_frechet_mean(n, stack(&rows).view(), None, 1.0e-11, 500).expect("unit-scale mean");
+
+        let scale = 1.0e-16;
+        let tiny_rows: Vec<Array1<f64>> = rows.iter().map(|row| row * scale).collect();
+        let tiny_mean = spd_frechet_mean(n, stack(&tiny_rows).view(), None, 1.0e-11, 500)
+            .expect("uniformly tiny SPD data remain valid");
+        for (&tiny, &unit) in tiny_mean.iter().zip(&unit_mean) {
+            let expected = scale * unit;
+            assert!(
+                (tiny - expected).abs() <= 2.0e-10 * expected.abs().max(scale),
+                "scale equivariance failed: tiny mean {tiny:.6e}, expected {expected:.6e}"
+            );
+        }
+
+        let weights = vec![1.0 / tiny_rows.len() as f64; tiny_rows.len()];
+        let achieved = residual(&SpdManifold::new(n), &tiny_mean, &tiny_rows, &weights);
+        assert!(achieved <= 1.0e-11, "tiny-scale residual {achieved:.3e}");
+    }
+
+    #[test]
+    fn affine_stationarity_norm_rejects_non_finite_tangents() {
+        let inv_sqrt_p = Array2::eye(2);
+        let tangent = Array1::from(vec![f64::NAN, 0.0, 0.0, 1.0]);
+        assert!(affine_sq_norm(2, &inv_sqrt_p, tangent.view()).is_err());
     }
 }

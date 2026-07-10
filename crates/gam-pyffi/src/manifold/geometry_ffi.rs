@@ -1088,6 +1088,7 @@ fn response_geometry_fit_curvature<'py>(
             1.0e-12,
             256,
         )
+        .map_err(|error| error.to_string())
     })?;
     let verdict = match fit.profile_ci.verdict {
         gam::geometry::CurvatureVerdict::Spherical => "spherical",

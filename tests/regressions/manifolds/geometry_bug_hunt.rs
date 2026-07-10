@@ -296,33 +296,36 @@ fn sphere_exp_map_vjp_matches_finite_difference() {
     }
 }
 
-// Curved manifolds without a closed-form backward must REFUSE rather than
-// inherit the silently-wrong flat identity default. Grassmann (for k>1) and
-// SPD route through `GeometryError::Unsupported`. Stiefel has a closed-form
-// canonical VJP (see `stiefel_now_has_analytic_exp_map_vjp` below and the
-// finite-difference suite in `tests/stiefel_exp_map_vjp.rs`), and `Gr(1, n)`
-// is the sphere whose VJP is also closed form, so neither belongs here.
+// Regression guard that the public trait dispatch reaches the analytic
+// Grassmann and SPD pullbacks. Their focused module tests compare every input
+// coordinate against finite differences, including clustered spectra.
 #[test]
-fn closed_form_less_manifolds_refuse_exp_map_vjp() {
-    // Gr(2, 4) is a genuinely curved Grassmann manifold with no sphere
-    // delegation (k > 1) and no analytic VJP wired up.
+fn grassmann_and_spd_have_analytic_exp_map_vjps() {
     let gr = GrassmannManifold::new(2, 4).unwrap();
     let p = array![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let v = array![0.0, 0.1, 0.2, 0.3, 0.0, 0.0, 0.4, 0.5];
     let g = array![0.3, -0.4, 0.5, 0.1, -0.2, 0.6, 0.7, -0.8];
+    let (gr_p, gr_v) = gr
+        .exp_map_vjp(p.view(), v.view(), g.view())
+        .expect("Grassmann analytic VJP");
     assert!(
-        gr.exp_map_vjp(p.view(), v.view(), g.view()).is_err(),
-        "Grassmann exp_map_vjp must refuse instead of returning identity grads"
+        gr_p.iter()
+            .chain(gr_v.iter())
+            .all(|value| value.is_finite())
     );
 
     let spd = SpdManifold::new(2);
     let p_spd = array![1.0, 0.0, 0.0, 1.0];
     let v_spd = array![0.1, 0.05, 0.05, 0.2];
     let g_spd = array![0.3, -0.1, -0.1, 0.4];
+    let (spd_p, spd_v) = spd
+        .exp_map_vjp(p_spd.view(), v_spd.view(), g_spd.view())
+        .expect("SPD analytic VJP");
     assert!(
-        spd.exp_map_vjp(p_spd.view(), v_spd.view(), g_spd.view())
-            .is_err(),
-        "SPD exp_map_vjp must refuse instead of returning identity grads"
+        spd_p
+            .iter()
+            .chain(spd_v.iter())
+            .all(|value| value.is_finite())
     );
 }
 

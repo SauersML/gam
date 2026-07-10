@@ -14,10 +14,9 @@ Backward routes through the canonical Rust analytic vector–Jacobian product
 ``gam_pyffi._rust.manifold_exp_map_vjp`` (dispatching
 ``RiemannianManifold::exp_map_vjp``): exact for flat manifolds (Euclidean /
 Circle / Torus / products thereof, where the VJP collapses to the identity)
-*and* for curved ones (Sphere, products containing a Sphere). No
-straight-through identity is applied to a curved manifold, and no Riemannian
-math is recomputed on the torch side. Manifolds with no closed-form backward
-(Grassmann / Stiefel / SPD) raise from Rust rather than emit wrong gradients.
+*and* for curved ones (Sphere / Grassmann / Stiefel / SPD and products thereof).
+No straight-through identity is applied to a curved manifold, and no Riemannian
+math is recomputed on the torch side.
 """
 
 from __future__ import annotations
@@ -44,10 +43,9 @@ def _exp_map_vjp_rust(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Analytic vector–Jacobian product of ``exp_p(v)``, all math in Rust.
 
-    Returns ``(grad_points, grad_vecs)`` as float64 arrays. Raises whatever
-    the Rust ``RiemannianManifold::exp_map_vjp`` raises for manifolds with no
-    closed-form backward (Grassmann / Stiefel / SPD) — we never substitute a
-    silently-wrong identity gradient on a curved manifold."""
+    Returns ``(grad_points, grad_vecs)`` as float64 arrays. The canonical Rust
+    implementation owns every manifold-specific pullback; Python never
+    substitutes a silently-wrong identity gradient on a curved manifold."""
     grad_p, grad_v = _rust_module().manifold_exp_map_vjp(
         manifold_json, points, vecs, grad_output
     )
@@ -96,11 +94,10 @@ class _ExpMapFn:
     computed entirely in Rust via ``manifold_exp_map_vjp`` (which dispatches
     ``RiemannianManifold::exp_map_vjp``). This is exact for both flat manifolds
     (Euclidean / Circle / Torus / products thereof, where the VJP reduces to
-    the identity) and curved ones (Sphere, and products containing a Sphere,
-    where the Jacobi-field VJP is genuinely non-identity). There is no
-    straight-through approximation and no torch-side recompute of the
-    geometry. Manifolds without a closed-form backward (Grassmann / Stiefel /
-    SPD) raise from Rust rather than return a silently-wrong gradient.
+    the identity) and curved ones (Sphere / Grassmann / Stiefel / SPD and
+    products thereof, where the analytic VJP is genuinely non-identity). There
+    is no straight-through approximation and no torch-side recompute of the
+    geometry.
     """
 
     _impl = None

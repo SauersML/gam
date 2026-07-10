@@ -35,8 +35,9 @@ pub use manifolds::{
 };
 pub use optimizer::{RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion};
 pub use response_geometry::{
-    ResponseCurvatureFit, ResponseManifold, fit_response_curvature, response_curvature_criterion,
-    response_exp_map, response_frechet_mean, response_log_map, response_projection_residual,
+    ResponseCurvatureFit, ResponseGeometryError, ResponseManifold, fit_response_curvature,
+    response_curvature_criterion, response_exp_map, response_frechet_mean, response_log_map,
+    response_projection_residual,
 };
 
 use ndarray::{Array1, ArrayView1};

@@ -497,11 +497,9 @@ mod assembly_convergence_tests {
             hessian_psd: Some(true),
             lambdas_railed: Vec::new(),
         };
-        let error = blockwise_fit_from_parts(
-            parts_with_outer_evidence(1, true, Some(certificate)),
-            &[],
-        )
-        .expect_err("a failed analytic certificate must be rejected");
+        let error =
+            blockwise_fit_from_parts(parts_with_outer_evidence(1, true, Some(certificate)), &[])
+                .expect_err("a failed analytic certificate must be rejected");
         assert!(matches!(
             error,
             CustomFamilyError::Optimization { context, reason }
