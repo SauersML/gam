@@ -689,36 +689,6 @@ fn term_blocks_for_model_impl(
     Ok(blocks)
 }
 
-#[derive(Deserialize)]
-struct DifferenceSmoothRequest {
-    view: String,
-    group: Option<String>,
-    pairs: Option<Vec<(serde_json::Value, serde_json::Value)>>,
-    n: usize,
-    level: Option<f64>,
-    simultaneous: bool,
-    n_sim: Option<usize>,
-    seed: Option<u64>,
-    marginalise_random: bool,
-    group_means: bool,
-    template: Option<BTreeMap<String, serde_json::Value>>,
-}
-
-#[derive(Serialize)]
-struct DifferenceSmoothRequestJson<'a> {
-    view: &'a str,
-    group: Option<String>,
-    pairs: Option<Vec<(String, String)>>,
-    n: usize,
-    level: Option<f64>,
-    simultaneous: bool,
-    n_sim: Option<usize>,
-    seed: Option<u64>,
-    marginalise_random: bool,
-    group_means: bool,
-    template: Option<HashMap<String, String>>,
-}
-
 #[pyfunction]
 fn build_difference_smooth_request_json(
     view: &str,
@@ -733,8 +703,8 @@ fn build_difference_smooth_request_json(
     group_means: bool,
     template: Option<HashMap<String, String>>,
 ) -> PyResult<String> {
-    let payload = DifferenceSmoothRequestJson {
-        view,
+    let payload = gam::inference::difference_smooth::DifferenceSmoothRequest {
+        view: view.to_string(),
         group,
         pairs,
         n,
@@ -744,7 +714,7 @@ fn build_difference_smooth_request_json(
         seed,
         marginalise_random,
         group_means,
-        template,
+        template: template.map(|values| values.into_iter().collect()),
     };
     serde_json::to_string(&payload).map_err(|err| {
         py_value_error(format!(
@@ -930,6 +900,52 @@ fn zero_design_ranges(x: &mut Array2<f64>, ranges: &[(usize, usize)]) {
             x.slice_mut(s![.., start..end]).fill(0.0);
         }
     }
+}
+
+fn difference_smooth_core_json_impl(
+    model_bytes: &[u8],
+    request_json: &str,
+) -> Result<String, String> {
+    let request: gam::inference::difference_smooth::DifferenceSmoothRequest =
+        serde_json::from_str(request_json)
+            .map_err(|err| format!("failed to parse difference_smooth request json: {err}"))?;
+    let model = load_model_impl(model_bytes)?;
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let selected_covariance = gam::inference::effects::select_covariance(
+        &fit,
+        gam::inference::effects::CovarianceSelection::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let payload = model.payload();
+    let schema = payload
+        .data_schema
+        .as_ref()
+        .ok_or_else(|| "difference_smooth requires a saved model schema".to_string())?;
+    let training_feature_ranges = payload
+        .training_feature_ranges
+        .as_deref()
+        .ok_or_else(|| "difference_smooth requires saved training feature ranges".to_string())?;
+    let termspec = payload
+        .resolved_termspec
+        .as_ref()
+        .ok_or_else(|| "difference_smooth requires a saved resolved term specification".to_string())?;
+    let rows = gam::inference::difference_smooth::difference_smooth_report(
+        gam::inference::difference_smooth::DifferenceSmoothInputs {
+            schema,
+            training_feature_ranges,
+            termspec,
+            beta: fit.beta.view(),
+            covariance: selected_covariance.matrix,
+            covariance_source: selected_covariance.source,
+        },
+        request,
+        |headers, rows| {
+            let dataset = dataset_with_model_schema(&model, headers, rows)?;
+            design_matrix_dense(&model, dataset)
+        },
+    )?;
+    serde_json::to_string(&rows)
+        .map_err(|err| format!("failed to serialize difference_smooth rows: {err}"))
 }
 
 fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result<String, String> {

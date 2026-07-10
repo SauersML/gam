@@ -218,11 +218,11 @@ pub fn measure_crosscoder_drift(
     let num_steps = layer_chain.len() - 1;
     let mut steps = Vec::with_capacity(num_atoms * num_steps);
     for k in 0..num_atoms {
-        let decoder = &term.atoms[k].decoder_coefficients;
+        let decoder = term.atoms[k].physical_full_width_decoder();
         // Honest-units decoder at each layer, once per atom (reused across steps).
         let mut honest: Vec<Array2<f64>> = Vec::with_capacity(layer_chain.len());
         for &layer in &layer_chain {
-            honest.push(honest_layer_decoder(decoder, layout, layer)?);
+            honest.push(honest_layer_decoder(&decoder, layout, layer)?);
         }
         for s in 0..num_steps {
             let drift = decoder_drift(&honest[s], &honest[s + 1]);

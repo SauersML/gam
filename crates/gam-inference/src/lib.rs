@@ -18,6 +18,7 @@ pub mod certificates;
 pub use gam_problem::diagnostics;
 pub use gam_problem::dispersion_cov;
 pub use gam_sae::inference::checkpoint_dynamics;
+pub mod difference_smooth;
 pub mod effects;
 pub mod fisher_rao;
 pub mod functionals;

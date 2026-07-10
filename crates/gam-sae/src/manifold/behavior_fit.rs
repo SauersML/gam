@@ -547,9 +547,13 @@ impl SaeManifoldTerm {
             ));
         }
         let inv = 1.0 / layout.sqrt_lambda(l);
-        let scaled = self.atoms[k]
-            .decoder_coefficients
-            .slice(s![.., layout.block_range(l)]);
+        // Materialize both fit-internal decoder gauges before crossing the
+        // layer boundary: an atom may carry a Grassmann frame and the quotient
+        // scale `log_amplitude`.  Persisted/OOS decoders use this same physical
+        // full-width representation, so crosscoder layer access must not expose
+        // the reduced or unit-norm optimization coordinate.
+        let physical = self.atoms[k].physical_full_width_decoder();
+        let scaled = physical.slice(s![.., layout.block_range(l)]);
         Ok(scaled.mapv(|value| inv * value))
     }
 
