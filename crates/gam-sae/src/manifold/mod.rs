@@ -129,11 +129,6 @@ pub(crate) use gam_terms::latent::{LatentCoordValues, LatentIdMode};
 
 pub(crate) use crate::criterion_atoms::SaeCriterion;
 
-#[cfg(test)]
-pub(crate) use crate::certificates::{
-    CoordinateSamples, GradientCriterionCertificate, certificate_from_samples, probe_step_for,
-};
-
 pub(crate) use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerCholeskyFactor, FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb,
     with_nested_parallel,
@@ -167,7 +162,7 @@ pub(crate) use gam_solve::evidence::arrow_log_det_from_cache;
 
 pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
 pub(crate) use gam_solve::rho_optimizer::{
-    OuterCapability, OuterEvalOrder, OuterObjective, SeedOutcome,
+    OuterCapability, OuterConvergedVia, OuterEvalOrder, OuterObjective, SeedOutcome,
 };
 
 pub(crate) use gam_solve::structure_search::{CollapseAction, CollapseEvent};
@@ -202,6 +197,7 @@ mod cross_fit;
 mod crosscoder_drift;
 mod curl;
 mod derivative_oracle;
+mod evaluator_rebuild;
 mod dual;
 mod fit_drivers;
 mod fit_entry;
@@ -472,6 +468,7 @@ pub use cross_fit::*;
 pub use crosscoder_drift::*;
 pub use curl::*;
 pub use derivative_oracle::*;
+pub use evaluator_rebuild::*;
 pub use fit_entry::*;
 pub use gauge::*;
 pub use graph_atom::*;
