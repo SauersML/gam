@@ -873,6 +873,48 @@ pub(crate) enum PlanRunOutcome {
     Exhausted(OuterResult),
 }
 
+/// Which certificate concluded a CONVERGED outer run (#2235/#2241).
+///
+/// `OuterResult.converged == true` bundles genuinely different endings, each
+/// with its own certificate. Distinguishing them is pure evidence for the
+/// caller's termination report — every variant is a converged fit. There is
+/// deliberately no "budget/freeze" variant: exhaustion is a typed error
+/// carrying the resume checkpoint, never a minted fit (SPEC 20; the #2235
+/// forcing-function redesign deleted the freeze lanes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OuterConvergedVia {
+    /// The bound-projected analytic gradient at the returned point cleared the
+    /// solver's absolute/score-scaled stationarity tolerance.
+    GradientStationary,
+    /// Criterion-flat certificate (#2241): the criterion stalled over the
+    /// cost-stall window and the residual projected gradient sits inside the
+    /// flat certificate band — the score-relative stationarity bound
+    /// (`flat_valley_converged_grad_bound`) and/or the probe-noise-floor bound
+    /// measured from the stall window's own value scatter. `certificate_bound`
+    /// is the operative (widened) bound the residual actually cleared.
+    CriterionFlat {
+        residual_grad_norm: f64,
+        certificate_bound: f64,
+    },
+    /// Fellner–Schall model-state fixed point (#2235 verdict 2): two
+    /// consecutive outer evaluations restored the same banked incumbent, so a
+    /// further outer update provably does not change the fitted state. The
+    /// analytic first-order certificate is still taken at the incumbent.
+    RecurrentIncumbent { consecutive_restores: usize },
+}
+
+impl OuterConvergedVia {
+    /// Stable wire name for termination reports; the enum owns the vocabulary
+    /// so bindings marshal instead of mapping.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::GradientStationary => "converged_stationary",
+            Self::CriterionFlat { .. } => "converged_criterion_flat",
+            Self::RecurrentIncumbent { .. } => "incumbent_stationary",
+        }
+    }
+}
+
 /// Result of a completed outer optimization.
 #[derive(Clone, Debug)]
 pub struct OuterResult {
@@ -909,6 +951,19 @@ pub struct OuterResult {
     /// when an audit probe failed to evaluate. Populated once by
     /// [`run_outer`] after the solver ladder returns, outside all hot loops.
     pub criterion_certificate: Option<OuterCriterionCertificate>,
+    /// Which certificate concluded a converged run (#2235/#2241). Stamped by
+    /// [`certify_outer_optimality`] on every certified result (the
+    /// Fellner–Schall lane pre-stamps `RecurrentIncumbent`, which certification
+    /// preserves); `None` exactly on non-converged resume checkpoints.
+    pub converged_via: Option<OuterConvergedVia>,
+    /// Probe-noise-floor gradient bound measured by the cost-stall guard at a
+    /// halted stall (#2241): σ̂/Δ, the criterion's evaluation-noise floor over
+    /// the stall window divided by the radius the accepted steps actually
+    /// probed. Present only on results rebuilt from a cost-stall exit;
+    /// [`certify_outer_optimality`] folds it into the stationarity bound so the
+    /// final re-measured gradient is judged against the same flat certificate
+    /// the guard granted.
+    pub flat_noise_grad_bound: Option<f64>,
     /// Post-fit PSIS diagnostic for whether sampled smoothing-parameter weights
     /// show evidence that plug-in REML/LAML intervals are unreliable. Populated
     /// once by [`run_outer`] when the exact rho Hessian is cheap enough to use.
@@ -935,6 +990,8 @@ impl OuterResult {
             operator_trust_radius: None,
             operator_stop_reason: None,
             criterion_certificate: None,
+            converged_via: None,
+            flat_noise_grad_bound: None,
             rho_uncertainty_diagnostic: None,
         }
     }
@@ -1108,6 +1165,7 @@ pub(crate) fn certify_outer_optimality(
         result.final_gradient = Some(Array1::zeros(0));
         result.final_hessian = None;
         result.converged = true;
+        result.converged_via = Some(OuterConvergedVia::GradientStationary);
         result.criterion_certificate = Some(certificate.clone());
         return Ok(certificate);
     }
@@ -1161,7 +1219,7 @@ pub(crate) fn certify_outer_optimality(
     let projected_grad_norm =
         projected_gradient_norm(&result.rho, &evaluation.gradient, Some(&bounds));
     let solver_bound = outer_gradient_tolerance(config).threshold(evaluation.cost, grad_norm);
-    let stationarity_bound = if matches!(
+    let mut stationarity_bound = if matches!(
         result.operator_stop_reason,
         Some(OperatorTrustRegionStopReason::CostStallFlatValley)
     ) {
@@ -1169,6 +1227,15 @@ pub(crate) fn certify_outer_optimality(
     } else {
         solver_bound
     };
+    // #2241 — a cost-stall exit carries the guard's measured probe-noise-floor
+    // gradient bound σ̂/Δ. The certificate must judge the re-measured final
+    // gradient against the same flat band the guard certified, or the guard's
+    // noise-scale convergence would be granted in the loop and revoked here.
+    if let Some(noise_bound) = result.flat_noise_grad_bound
+        && noise_bound.is_finite()
+    {
+        stationarity_bound = stationarity_bound.max(noise_bound);
+    }
 
     // The cost-only and derivative-bearing interfaces must describe the same
     // objective.  This is an analytic consistency check, not a finite
@@ -1995,6 +2062,11 @@ pub(crate) fn run_fixed_point_outer_solver(
     label: &str,
     failure_prefix: &str,
 ) -> Result<OuterResult, FixedPointOuterRunError> {
+    // Shared publication slot for the recurrent-restored-incumbent stop
+    // (#2235 verdict 2): the bridge is moved into the driver, so the streak
+    // count comes back through this cell and is stamped onto the returned
+    // `OuterResult` below.
+    let recurrent_incumbent_exit = Arc::new(Mutex::new(None));
     let mut objective = OuterFixedPointBridge {
         obj,
         layout,
@@ -2002,6 +2074,7 @@ pub(crate) fn run_fixed_point_outer_solver(
         fixed_point_tolerance: config.tolerance,
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
+        recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
     };
     let seed_sample = match objective.eval_step(seed) {
         Ok(sample) => sample,
@@ -2033,7 +2106,20 @@ pub(crate) fn run_fixed_point_outer_solver(
         .with_tolerance(tol)
         .with_max_iterations(max_iter);
     match optimizer.run() {
-        Ok(sol) => Ok(solution_into_outer_result(sol, true, the_plan)),
+        Ok(sol) => {
+            let mut result = solution_into_outer_result(sol, true, the_plan);
+            // Stamp the model-state fixed-point stop when the bridge published
+            // one; `None` means the walk stopped through the ordinary
+            // step-norm test instead.
+            if let Some(consecutive_restores) =
+                recurrent_incumbent_exit.lock().ok().and_then(|slot| *slot)
+            {
+                result.converged_via = Some(OuterConvergedVia::RecurrentIncumbent {
+                    consecutive_restores,
+                });
+            }
+            Ok(result)
+        }
         Err(FixedPointError::MaxIterationsReached { last_solution }) => {
             log::warn!(
                 "[OUTER warning] {context}: {label} hit max_iter={} at final_value={:.6e} step_norm={:.3e}",

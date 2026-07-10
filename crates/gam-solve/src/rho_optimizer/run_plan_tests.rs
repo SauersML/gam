@@ -1010,6 +1010,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         fixed_point_tolerance: 1e-8,
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
+        recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
     };
 
     let sample = bridge
@@ -1086,6 +1087,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         fixed_point_tolerance: 1.0e-8,
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
+        recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
     };
 
     let first = bridge

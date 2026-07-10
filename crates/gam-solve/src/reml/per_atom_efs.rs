@@ -166,6 +166,8 @@ impl PerAtomEfsResult {
             operator_stop_reason: None,
             criterion_certificate: None,
             rho_uncertainty_diagnostic: None,
+            converged_via: None,
+            flat_noise_grad_bound: None,
         }
     }
 }

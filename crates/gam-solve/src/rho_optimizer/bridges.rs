@@ -2252,6 +2252,14 @@ pub(crate) struct OuterFixedPointBridge<'a> {
     /// outer evaluations; multiple inner-refinement chunks at one rho cannot
     /// terminate the outer walk by themselves.
     pub(crate) last_restored_incumbent_streak: Option<usize>,
+    /// Publication slot for the recurrent-restored-incumbent stop (#2235
+    /// verdict 2). The bridge is moved into the `opt::FixedPoint` driver, so
+    /// when the model-state fixed point fires the streak count is handed back
+    /// to `run_fixed_point_outer_solver` through this shared cell and stamped
+    /// onto the returned [`OuterResult`] as
+    /// [`OuterConvergedVia::RecurrentIncumbent`]. `None` slot after the run
+    /// means the walk stopped through the ordinary step-norm test instead.
+    pub(crate) recurrent_incumbent_exit: Arc<Mutex<Option<usize>>>,
 }
 
 impl OuterFixedPointBridge<'_> {
@@ -2505,6 +2513,9 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             let restores = eval.consecutive_restored_incumbents.unwrap_or_default();
             if psi_indices.is_some() {
                 self.consecutive_psi_zero_iters = 0;
+            }
+            if let Ok(mut slot) = self.recurrent_incumbent_exit.lock() {
+                *slot = Some(restores);
             }
             log::info!(
                 "[OUTER] fixed-point convergence by recurrent restored incumbent: \
