@@ -530,8 +530,13 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
         .ok_or_else(|| "fit_scaling_law: profiled σ² left an undefined log-excess".to_string())?;
     let slope = fit.slope;
 
-    // Standard error of the OLS slope: s² = RSS/(n−2), SE(m) = sqrt(s² / Stt).
-    let dof = (nrung as f64) - 2.0;
+    // Standard error of the OLS slope: s² = RSS/(n−3), SE(m) = sqrt(s² / Stt).
+    // The fitted model is L_k = σ² + c·K^m — THREE parameters, with σ² profiled
+    // out by the golden section over the SAME rungs (variable projection), so
+    // the residual degrees of freedom are n−3, not n−2. With n−2 an nrung=3
+    // exact fit (RSS≈0 by construction) would report a finite ~0 SE and an
+    // unsaturated floor from 3 points fitting 3 parameters.
+    let dof = (nrung as f64) - 3.0;
     let s2 = if dof > 0.0 { fit.rss / dof } else { f64::INFINITY };
     let slope_se = (s2 / stt).sqrt();
 

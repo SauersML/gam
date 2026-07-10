@@ -1,5 +1,5 @@
 use super::*;
-use gam_linalg::faer_ndarray::FaerSvd;
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 
 /// #1610 / Jeffreys — one co-firing connected component of the SAE decoder
 /// Jeffreys prior. The anti-collapse penalty is the Jeffreys prior on the
@@ -37,10 +37,14 @@ use gam_linalg::faer_ndarray::FaerSvd;
 /// therefore exactly
 ///
 /// ```text
-///   P = -1/2 sum_C log det(F_C + eps_C I),
+///   P = -1/2 sum_C sum_i [ln m(lambda_i(F_C)) - ln m(1)],
 /// ```
 ///
-/// with no `N_eff` multiplier.  Occupancy enters only through the precision of
+/// where `lambda_i` are the REAL eigenvalues of the edge-masked `F_C` and
+/// `m(lambda) = eps_C·softplus((lambda + eps_C)/eps_C)` is the smooth spectral
+/// floor (`= lambda + eps_C` on the healthy PSD spectrum, strictly positive on
+/// a frustrated indefinite component — see `barrier_spectral_m`), and with no
+/// `N_eff` multiplier.  Occupancy enters only through the precision of
 /// the estimated coactivation matrix and therefore through the resolution shift
 /// `eps_C` below.  Multiplying `log det F` by `N_eff` would turn a fixed-dimensional
 /// Jeffreys volume term into an artificial O(N) force.
@@ -931,8 +935,48 @@ impl SaeManifoldTerm {
         comps
     }
 
+    /// Smooth spectral floor `m(λ) = ε·softplus((λ + ε)/ε)` for the separation
+    /// barrier. The component matrix `F` keeps only the SURVIVING co-firing
+    /// edges of `Q ∘ O`, and off-diagonally masking a PSD matrix destroys PSD,
+    /// so a frustrated component (e.g. A overlaps B and C while B, C never
+    /// co-fire) has genuinely NEGATIVE eigenvalues. `ln(λ + ε)` is then
+    /// undefined at `λ ≤ −ε`; `m` extends it smoothly: `m(λ) → λ + ε` for
+    /// `λ + ε ≫ ε` (the healthy PSD regime is unchanged to f64 round-off) and
+    /// `m(λ) → ε·e^{(λ+ε)/ε} > 0` below the pole, so the barrier keeps growing
+    /// monotonically with frustration — with the bounded restoring force the
+    /// interior-point design wants — instead of silently reading `|λ|`.
+    fn barrier_spectral_m(lam: f64, eps: f64) -> f64 {
+        let x = (lam + eps) / eps;
+        if x >= 30.0 {
+            lam + eps
+        } else if x <= -30.0 {
+            eps * x.exp()
+        } else {
+            eps * x.exp().ln_1p()
+        }
+    }
+
+    /// `m′(λ) = σ((λ + ε)/ε)` — the exact derivative of
+    /// [`Self::barrier_spectral_m`], shared by the gradient seam so
+    /// `Σ (m′(λᵢ)/m(λᵢ))·vᵢvᵢᵀ` is the EXACT spectral derivative of the value
+    /// `−½·Σ ln m(λᵢ)` (no value/gradient desync anywhere on the spectrum).
+    fn barrier_spectral_m_prime(lam: f64, eps: f64) -> f64 {
+        let x = (lam + eps) / eps;
+        if x >= 30.0 {
+            1.0
+        } else if x <= -30.0 {
+            x.exp()
+        } else {
+            1.0 / (1.0 + (-x).exp())
+        }
+    }
+
     /// SEPARATION barrier value — the SAE decoder Jeffreys prior
-    /// `P_sep = −½ · Σ_components log det(F_C + ε_C·I)`, `F = Q ∘ O`.
+    /// `P_sep = −½ · Σ_components Σ_i [ln m(λ_i(F_C)) − ln m(1)]`, `F = Q ∘ O`
+    /// restricted to surviving co-firing edges, `λ_i` its REAL (signed)
+    /// eigenvalues, and `m` the smooth spectral floor
+    /// [`Self::barrier_spectral_m`] (`m(λ) = λ + ε_C` on the healthy PSD
+    /// spectrum, strictly positive on the frustrated indefinite one).
     /// Exactly `0` on a
     /// mutually-orthogonal co-active set (`F = I`) and `0` for `K < 2` or a fully
     /// disjoint routing. The Jeffreys exponent `½` is fixed — there is no strength
@@ -970,19 +1014,25 @@ impl SaeManifoldTerm {
                 f[[e.jl, e.kl]] = v;
                 f[[e.kl, e.jl]] = v;
             }
-            let sv = match f.svd(false, false) {
-                Ok((_, sv, _)) => sv,
+            // REAL symmetric eigenvalues — NOT singular values: the masked
+            // component `F` can be indefinite, and `|λ|` would silently turn
+            // the barrier's divergence on a frustrated near-collapse into a
+            // small finite value (under-penalizing exactly what it prevents).
+            let (lams, _) = match f.eigh(faer::Side::Lower) {
+                Ok(pair) => pair,
                 Err(_) => continue,
             };
-            // −½·log det(F + ε_C·I), identity-referenced. Shifting (rather than flooring)
-            // keeps the pole bounded while `(F + ε_C·I)⁻¹` is the exact derivative
-            // channel of this value everywhere
-            // — no sub-floor value/gradient mismatch, no Armijo conservatism at
-            // the pole. The per-eigenvalue −ln(1+ε_C) reference keeps a
-            // mutually-orthogonal co-active set (F = I) at exactly 0.
+            // −½·Σ [ln m(λ) − ln m(1)], identity-referenced. The smooth floor
+            // `m` (rather than a hard floor) keeps the restoring force bounded
+            // at the pole while `Σ (m′/m)·vvᵀ` is the exact derivative channel
+            // of this value everywhere on the spectrum — no sub-floor
+            // value/gradient mismatch, no Armijo conservatism at the pole. The
+            // per-eigenvalue −ln m(1) reference keeps a mutually-orthogonal
+            // co-active set (F = I) at exactly 0.
+            let ref_ln_m = Self::barrier_spectral_m(1.0, eps).ln();
             let mut logdet = 0.0_f64;
-            for &lam in sv.iter() {
-                logdet += (lam + eps).ln() - (1.0 + eps).ln();
+            for &lam in lams.iter() {
+                logdet += Self::barrier_spectral_m(lam, eps).ln() - ref_ln_m;
             }
             acc += -0.5 * logdet;
         }
@@ -1156,27 +1206,32 @@ impl SaeManifoldTerm {
                 f[[e.jl, e.kl]] = v;
                 f[[e.kl, e.jl]] = v;
             }
-            let (sv, vt) = match f.svd(false, true) {
-                Ok((_, sv, Some(vt))) => (sv, vt),
+            // REAL symmetric eigendecomposition — the masked component `F` can
+            // be indefinite (see `barrier_spectral_m`), so singular values
+            // `|λ|` would flip the frustrated modes' contribution.
+            let (lams, vecs) = match f.eigh(faer::Side::Lower) {
+                Ok(pair) => pair,
                 _ => continue,
             };
-            // G = (F + εI)⁻¹ = Σ_i vᵢ vᵢᵀ/(λ_i + ε) — the EXACT derivative of the
-            // ε-shifted value −½·Σ ln(λ+ε), sharing one factorization with it.
-            // The shift keeps the interior-point desideratum the old floor bought
-            // (a bounded restoring force ≤ 1/ε at the pole — a collapsed state is
-            // still pushed out of, never flat-lined) with zero value/gradient
-            // mismatch, so the line search's Armijo contract is exact at the pole
-            // too.
+            // G = Σ_i (m′(λ_i)/m(λ_i))·vᵢ vᵢᵀ — the EXACT spectral derivative of
+            // the smooth-floored value −½·Σ ln m(λ), sharing one factorization
+            // with it. On the healthy PSD spectrum this is `(F + εI)⁻¹` to f64
+            // round-off; below the pole it keeps the interior-point desideratum
+            // (a bounded, strictly repulsive restoring force — a collapsed state
+            // is still pushed out of, never flat-lined and never attracted) with
+            // zero value/gradient mismatch, so the line search's Armijo contract
+            // is exact at the pole too.
             let mut g = Array2::<f64>::zeros((s, s));
-            for (i, &lam) in sv.iter().enumerate() {
-                let inv = 1.0 / (lam + eps);
+            for (i, &lam) in lams.iter().enumerate() {
+                let inv =
+                    Self::barrier_spectral_m_prime(lam, eps) / Self::barrier_spectral_m(lam, eps);
                 for a in 0..s {
-                    let va = vt[[i, a]];
+                    let va = vecs[[a, i]];
                     if va == 0.0 {
                         continue;
                     }
                     for b in 0..s {
-                        g[[a, b]] += inv * va * vt[[i, b]];
+                        g[[a, b]] += inv * va * vecs[[b, i]];
                     }
                 }
             }

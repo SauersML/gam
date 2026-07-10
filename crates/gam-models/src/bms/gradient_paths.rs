@@ -80,18 +80,38 @@ pub(crate) fn standardize_latent_z_with_policy(
 
     let normalization = target_norm;
     let z_std = normalization.apply(z, context)?;
+    // Standardized moments of z_std itself. `z_std` has weighted mean 0 and
+    // variance 1 only in `FitWeighted` mode; under `None`/`Frozen` its raw
+    // third/fourth moments are NOT the named statistics (a ×3-scaled Gaussian
+    // would read "excess_kurtosis≈240"), so center and scale by z_std's own
+    // weighted moments before labeling them skewness / excess kurtosis.
+    let std_mean = z_std
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi)
+        .sum::<f64>()
+        / weight_sum;
+    let std_var = (z_std
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - std_mean) * (zi - std_mean))
+        .sum::<f64>()
+        / weight_sum)
+        .max(f64::MIN_POSITIVE);
     let skew = z_std
         .iter()
         .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * zi.powi(3))
+        .map(|(&zi, &wi)| wi * (zi - std_mean).powi(3))
         .sum::<f64>()
-        / weight_sum;
+        / weight_sum
+        / std_var.powf(1.5);
     let kurt = z_std
         .iter()
         .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * zi.powi(4))
+        .map(|(&zi, &wi)| wi * (zi - std_mean).powi(4))
         .sum::<f64>()
         / weight_sum
+        / (std_var * std_var)
         - 3.0;
     if skew.abs() > policy.max_abs_skew || kurt.abs() > policy.max_abs_excess_kurtosis {
         let msg = format!(

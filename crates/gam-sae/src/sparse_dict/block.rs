@@ -1227,6 +1227,7 @@ pub fn fit_block_sparse_dictionary(
 
     // One final γ refresh against the last routing so the returned scalar is the
     // exact least-squares fit to the returned frames + codes.
+    let gamma_prev = gamma;
     gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
     if config.matryoshka_prefix {
         let order = matryoshka_block_order(&codes, g, b);
@@ -1241,6 +1242,23 @@ pub fn fit_block_sparse_dictionary(
             config.minibatch,
             config.block_tile,
         )?;
+    } else if gamma_prev > 0.0 && gamma != gamma_prev {
+        // The signed code is LINEAR in γ (`z_g = γ·w_g`) and the routing order
+        // is γ-invariant, so rescaling the last encode by `γ_new/γ_old` IS the
+        // exact re-encode under the final γ. Without it the packed codes stay
+        // at the pre-refresh scale while `gates`, `gamma`, and the EV below use
+        // the refreshed one — the artifact would violate its own invariants
+        // (`reconstruct()` disagreeing with `explained_variance`, and
+        // `gate ≠ ‖z_g‖₂`).
+        let rescale = gamma / gamma_prev;
+        for code in codes.iter_mut() {
+            for z in code.codes.iter_mut() {
+                *z *= rescale;
+            }
+            for gate in code.gates.iter_mut() {
+                *gate *= rescale;
+            }
+        }
     }
     let final_ev = explained_variance(x, &codes, decoder.view(), gamma, b);
     let (block_utilization, block_stable_rank) = block_reports(&codes, g, b, n);
