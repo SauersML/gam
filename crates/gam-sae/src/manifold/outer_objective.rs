@@ -3297,13 +3297,18 @@ impl SaeManifoldOuterObjective {
         }
 
         // Block weights (trailing L-1 coordinates): the crosscoder block-relevance
-        // Fellner–Schall step (#2231 Inc-B stage 2). The `#F1` criterion is
-        // stationary in `log λ_ℓ` at `R̃_ℓ = n·p_ℓ` (block ½·R̃_ℓ − n·p_ℓ/2 = 0;
-        // see `block_log_lambda_gradient`), and `R̃_ℓ = λ_ℓ·R_ℓ`, so the
+        // Fellner–Schall step (#2231 Inc-B stage 2). The `#F1` criterion's
+        // explicit data + Jacobian channels are stationary in `log λ_ℓ` at
+        // `R̃_ℓ = n·p_ℓ` (block ½·R̃_ℓ − n·p_ℓ/2 = 0; see
+        // `block_log_lambda_gradient`), and `R̃_ℓ = λ_ℓ·R_ℓ`, so the
         // multiplicative fixed point `λ_ℓ_new = n·p_ℓ/R_ℓ = λ_ℓ·n·p_ℓ/R̃_ℓ`
-        // becomes the ADDITIVE log-space step `Δlog λ_ℓ = ln(n·p_ℓ/R̃_ℓ)` — the
-        // same root the analytic gradient vanishes at (the quasi-Newton and
-        // Fellner–Schall lanes agree). Held (step 0) for a block with no residual
+        // becomes the ADDITIVE log-space step `Δlog λ_ℓ = ln(n·p_ℓ/R̃_ℓ)`. This
+        // is a PROPOSAL heuristic (like the λ_smooth/ARD EFS steps above): the
+        // full analytic gradient additionally carries the `−½·Γᵀθ̂_ρ` Laplace
+        // adjoint (`crosscoder_block_ift_rhs`), an `O(dim H / (n·p_ℓ))` relative
+        // correction the quasi-Newton lane prices exactly; EFS proposals are
+        // still accepted only on criterion improvement, so the heuristic root
+        // cannot bias the fitted λ. Held (step 0) for a block with no residual
         // variance (`R̃_ℓ ≤ 0`: perfectly reconstructed / unidentifiable) or a
         // non-finite proposal, matching the λ_smooth/ARD guards above. No-op for a
         // plain SAE.
@@ -3680,21 +3685,23 @@ impl OuterObjective for SaeManifoldOuterObjective {
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?
             .gradient();
-        // #2231 Inc-B (stage 2) — populate the block-relevance tail of the
-        // gradient with the analytic `∂C/∂log λ_ℓ = ½·R̃_ℓ − n·p_ℓ/2`
-        // ([`Self::block_log_lambda_gradient`]). The components assembler leaves
-        // these trailing coordinates at 0 (`outer_rho_gradient_ift_rhs` returns a
-        // zero RHS past the ARD range, and no explicit/logdet/occam channel writes
-        // them), so this OVERWRITE is the block coordinate's sole gradient — the
-        // desync-safe partner of the Jacobian priced into the cost below. No-op for
-        // a plain SAE (`None` ⇒ the tail stays empty and untouched).
+        // #2231 Inc-B (stage 2) — ADD the block-relevance tail's explicit data +
+        // change-of-variables channels `½·R̃_ℓ − n·p_ℓ/2`
+        // ([`Self::block_log_lambda_gradient`]) to the components assembler's
+        // tail, which now carries the block coordinate's `−½·Γᵀθ̂_ρ` Laplace
+        // adjoint (`crosscoder_block_ift_rhs` feeds the exact-stationarity solve
+        // the target-scaling RHS `−½·Jᵀ_M Z̃^{(ℓ)}`). Explicit + adjoint together
+        // are the COMPLETE `∂C/∂log λ_ℓ` of the priced criterion — overwriting
+        // here would re-truncate the gradient to a fictitious fixed-θ̂ criterion
+        // (#2087 desync class). No-op for a plain SAE (`None` ⇒ the tail stays
+        // empty and untouched).
         if let Some(block_grad) = self
             .block_log_lambda_gradient(&rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?
         {
             let tail = gradient.len() - block_grad.len();
             for (l, g_l) in block_grad.into_iter().enumerate() {
-                gradient[tail + l] = g_l;
+                gradient[tail + l] += g_l;
             }
         }
         let beta_hat = self.term.flatten_beta();

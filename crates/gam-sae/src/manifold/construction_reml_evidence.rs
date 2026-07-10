@@ -3324,6 +3324,97 @@ impl SaeManifoldTerm {
         Ok(SaeArrowVector { t, beta })
     }
 
+    /// #2231 — the crosscoder block coordinate's IFT RHS
+    /// `∂g/∂log λ_ℓ = −½·Jᵀ_M Z̃^{(ℓ)}`, where `g` is the inner stationarity
+    /// gradient, `Z̃^{(ℓ)}` is the CURRENTLY-SCALED stacked target masked to
+    /// block `ℓ`'s columns, and `Jᵀ_M` is the same metric-whitened,
+    /// `√w`-weighted data Jacobian the assembly's `gt = J̃ᵀẽ` uses (the target
+    /// enters `g` only through the data residual `r̃ = f − Z̃`, and
+    /// `∂Z̃_ℓ/∂log λ_ℓ = ½·Z̃_ℓ`). Feeding this RHS through
+    /// `solve_exact_stationarity` gives the block coordinate the SAME
+    /// `−½·Γᵀθ̂_ρ` Laplace adjoint every other ρ coordinate carries — without
+    /// it the block gradient differentiates a fictitious criterion in which
+    /// the fitted state is held fixed (#2087 desync class).
+    pub(crate) fn crosscoder_block_ift_rhs(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        target: ArrayView2<'_, f64>,
+        col_range: std::ops::Range<usize>,
+    ) -> Result<SaeArrowVector, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.nrows() != n || target.ncols() != p {
+            return Err(format!(
+                "crosscoder_block_ift_rhs: target shape ({}, {}) != ({n}, {p})",
+                target.nrows(),
+                target.ncols()
+            ));
+        }
+        if col_range.end > p || col_range.start >= col_range.end {
+            return Err(format!(
+                "crosscoder_block_ift_rhs: block columns {col_range:?} outside output dim {p}"
+            ));
+        }
+        let mut t = Array1::<f64>::zeros(cache.delta_t_len());
+        let mut beta = Array1::<f64>::zeros(cache.k);
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let whiten = self.whiten_logdet_row_jets();
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
+        for row in 0..n {
+            let base = cache.row_offsets[row];
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    rho,
+                    jet_window_next,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let mut jets = jet_window
+                .pop_front()
+                .ok_or_else(|| "crosscoder_block_ift_rhs: empty jet window".to_string())?;
+            if whiten {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
+            }
+            // `−½·√w·Z̃` on the block's columns, zero elsewhere; whitened by the
+            // SAME row metric the jets carry so the product reconstructs
+            // `−½·w·Jᵀ M Z̃^{(ℓ)}` (the jets already hold one `√w`/`Uᵀ` factor).
+            let sqrt_w = self
+                .row_loss_weights
+                .as_deref()
+                .map_or(1.0, |w| w[row].sqrt());
+            let mut v: Vec<f64> = (0..p)
+                .map(|col| {
+                    if col_range.contains(&col) {
+                        sqrt_w * target[[row, col]]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            if whiten {
+                let metric = self
+                    .row_metric
+                    .as_ref()
+                    .ok_or_else(|| "crosscoder_block_ift_rhs: whitening metric absent".to_string())?;
+                Self::whiten_logdet_metric_vec(metric, row, p, &mut v)?;
+            }
+            for (var_idx, first) in jets.first.iter().enumerate() {
+                t[base + var_idx] = -0.5 * sae_dot(first, &v);
+            }
+            for (channel_pos, channel) in border.iter().enumerate() {
+                beta[channel.index] += -0.5 * sae_dot(&jets.beta[channel_pos], &v);
+            }
+        }
+        Ok(SaeArrowVector { t, beta })
+    }
+
     fn whiten_logdet_metric_vec(
         metric: &gam_problem::RowMetric,
         row: usize,

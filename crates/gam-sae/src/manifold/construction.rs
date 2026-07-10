@@ -2309,37 +2309,7 @@ impl SaeManifoldTerm {
     pub(crate) fn reclaim_arrow_assembly_workspace(
         &mut self,
         sys: &mut ArrowSchurSystem,
-        accepted_iteration: bool,
     ) {
-        #[cfg(not(test))]
-        let _ = accepted_iteration;
-        #[cfg(test)]
-        if accepted_iteration {
-            let mut numerical_bits = Vec::new();
-            if let Some(row) = sys.rows.first() {
-                numerical_bits.extend(row.htt.iter().map(|value| value.to_bits()));
-                numerical_bits.extend(row.htbeta.iter().map(|value| value.to_bits()));
-                numerical_bits.extend(row.gt.iter().map(|value| value.to_bits()));
-            }
-            numerical_bits.extend(sys.gb.iter().map(|value| value.to_bits()));
-            self.arrow_assembly_workspace
-                .accepted_observations
-                .push(SaeArrowAssemblyObservation {
-                    row_htt_ptr: sys.rows.first().map_or(0, |row| row.htt.as_ptr() as usize),
-                    row_htbeta_ptr: sys
-                        .rows
-                        .first()
-                        .map_or(0, |row| row.htbeta.as_ptr() as usize),
-                    gb_ptr: sys.gb.as_ptr() as usize,
-                    device_frame_ptr: sys
-                        .device_sae_pcg
-                        .as_ref()
-                        .filter(|data| data.frame.is_some())
-                        .map_or(0, |data| Arc::as_ptr(data) as usize),
-                    numerical_bits,
-                });
-        }
-
         self.arrow_assembly_workspace.rows = std::mem::take(&mut sys.rows);
         self.arrow_assembly_workspace.gb = std::mem::replace(&mut sys.gb, Array1::<f64>::zeros(0));
         if let Some(device) = sys.device_sae_pcg.take() {

@@ -1523,9 +1523,10 @@ pub(crate) fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
 }
 
 /// #1017 — accepted nonlinear iterations reuse allocation identity while
-/// rebuilding the actual current-iterate system. This drives the production
-/// joint-fit loop with an automatically framed low-rank decoder, then inspects
-/// observations captured only after accepted steps (not arbitrary assemblies).
+/// rebuilding the actual current-iterate system. Two one-iteration production
+/// driver calls leave their completed system allocations in the ordinary
+/// workspace; the test reads that production state directly, with no test-only
+/// observer embedded in the term.
 #[test]
 pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_fresh_content() {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
@@ -1564,40 +1565,82 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1)]);
 
-    term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 2, 0.05, 1.0e-3, 1.0e-3)
-        .expect("two accepted nonlinear iterations");
-
-    let observations = &term.arrow_assembly_workspace.accepted_observations;
-    assert_eq!(
-        observations.len(),
-        2,
-        "fixture must accept both requested nonlinear iterations"
-    );
-    let first = &observations[0];
-    let second = &observations[1];
-    assert_ne!(first.row_htt_ptr, 0);
-    assert_eq!(first.row_htt_ptr, second.row_htt_ptr);
-    assert_ne!(first.row_htbeta_ptr, 0);
-    assert_eq!(first.row_htbeta_ptr, second.row_htbeta_ptr);
-    assert_ne!(first.gb_ptr, 0);
-    assert_eq!(first.gb_ptr, second.gb_ptr);
+    let decoder_before = term.atoms[0].decoder_coefficients.clone();
+    term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 0.05, 1.0e-3, 1.0e-3)
+        .expect("first accepted nonlinear iteration");
     assert_ne!(
-        first.device_frame_ptr, 0,
+        term.atoms[0].decoder_coefficients, decoder_before,
+        "first production call must accept a state-changing step"
+    );
+    let first_row = term
+        .arrow_assembly_workspace
+        .rows
+        .first()
+        .expect("driver returns row allocations to the workspace");
+    let first_row_htt_ptr = first_row.htt.as_ptr() as usize;
+    let first_row_htbeta_ptr = first_row.htbeta.as_ptr() as usize;
+    let first_gb_ptr = term.arrow_assembly_workspace.gb.as_ptr() as usize;
+    let first_device_frame_ptr = term
+        .arrow_assembly_workspace
+        .device_sae_pcg
+        .as_ref()
+        .filter(|data| data.frame.is_some())
+        .map_or(0, |data| Arc::as_ptr(data) as usize);
+    let first_numerical_bits: Vec<u64> = first_row
+        .htt
+        .iter()
+        .chain(first_row.htbeta.iter())
+        .chain(first_row.gt.iter())
+        .chain(term.arrow_assembly_workspace.gb.iter())
+        .map(|value| value.to_bits())
+        .collect();
+
+    let decoder_after_first = term.atoms[0].decoder_coefficients.clone();
+    term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 0.05, 1.0e-3, 1.0e-3)
+        .expect("second accepted nonlinear iteration");
+    assert_ne!(
+        term.atoms[0].decoder_coefficients, decoder_after_first,
+        "second production call must accept a state-changing step"
+    );
+    let second_row = term
+        .arrow_assembly_workspace
+        .rows
+        .first()
+        .expect("driver returns reused row allocations to the workspace");
+    let second_device_frame_ptr = term
+        .arrow_assembly_workspace
+        .device_sae_pcg
+        .as_ref()
+        .filter(|data| data.frame.is_some())
+        .map_or(0, |data| Arc::as_ptr(data) as usize);
+    let second_numerical_bits: Vec<u64> = second_row
+        .htt
+        .iter()
+        .chain(second_row.htbeta.iter())
+        .chain(second_row.gt.iter())
+        .chain(term.arrow_assembly_workspace.gb.iter())
+        .map(|value| value.to_bits())
+        .collect();
+
+    assert_ne!(first_row_htt_ptr, 0);
+    assert_eq!(first_row_htt_ptr, second_row.htt.as_ptr() as usize);
+    assert_ne!(first_row_htbeta_ptr, 0);
+    assert_eq!(first_row_htbeta_ptr, second_row.htbeta.as_ptr() as usize);
+    assert_ne!(first_gb_ptr, 0);
+    assert_eq!(first_gb_ptr, term.arrow_assembly_workspace.gb.as_ptr() as usize);
+    assert_ne!(
+        first_device_frame_ptr, 0,
         "framed assembly must install DeviceSaePcgData"
     );
-    assert_eq!(first.device_frame_ptr, second.device_frame_ptr);
+    assert_eq!(first_device_frame_ptr, second_device_frame_ptr);
     assert_ne!(
-        first.numerical_bits, second.numerical_bits,
+        first_numerical_bits, second_numerical_bits,
         "accepted state change must refresh Hessian/gradient numerical content"
     );
     eprintln!(
-        "#1017 accepted-iteration residency telemetry: iterations={} row_htt_ptr={} \
+        "#1017 accepted-iteration residency telemetry: iterations=2 row_htt_ptr={} \
          row_htbeta_ptr={} gb_ptr={} device_frame_ptr={} numerical_content_changed=true",
-        observations.len(),
-        first.row_htt_ptr,
-        first.row_htbeta_ptr,
-        first.gb_ptr,
-        first.device_frame_ptr,
+        first_row_htt_ptr, first_row_htbeta_ptr, first_gb_ptr, first_device_frame_ptr,
     );
 }
 

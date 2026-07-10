@@ -158,6 +158,174 @@ impl UnitSpeedChartTransition {
     }
 }
 
+/// Exact ambient isometry between two `latent_dim = 2` sphere charts (#1890
+/// pole seams).
+///
+/// Two lat/lon charts covering ONE ambient sphere with their poles in each
+/// other's interior are related by an ambient rotation `R ∈ O(3)` acting on the
+/// intrinsic unit vector `u = [x, y, z]`: `u_to = R · u_from`.  A sphere pole
+/// seam is *intrinsically* two-dimensional — the transition is a full `3×3`
+/// orthogonal matrix, not the `±1` sign a one-dimensional
+/// [`UnitSpeedChartTransition`] carries — so a pole seam CANNOT be described by
+/// a one-dimensional affine map, and is stored as this distinct kind rather than
+/// a `Pole`-tagged 1-D transition (which would assert a map the overlap does not
+/// have).  Orientability is read from `det R`: `+1` (a proper rotation, the map
+/// relating two charts of an orientable sphere) preserves orientation, `-1` (an
+/// improper rotation / reflection) reverses it — exactly the role `sign` plays
+/// for the 1-D transition, so both feed the same sign cocycle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SphereChartTransition {
+    pub from_chart: usize,
+    pub to_chart: usize,
+    /// Ambient rotation `R ∈ O(3)`, row-major, mapping `from_chart`'s intrinsic
+    /// unit vector to `to_chart`'s: `u_to = R · u_from`.
+    pub rotation: [[f64; 3]; 3],
+    pub seam_kind: AtlasSeamKind,
+}
+
+impl SphereChartTransition {
+    /// Largest tolerated departure from orthonormality (`‖RᵀR − I‖_∞`) and from a
+    /// unit determinant magnitude.  A fitted Procrustes rotation is orthogonal to
+    /// machine precision; this is a loud guard against a mis-supplied matrix, not
+    /// a modelling knob.
+    const ORTHONORMAL_TOL: f64 = 1e-6;
+
+    #[must_use = "transition validation errors must be handled"]
+    pub fn new(
+        from_chart: usize,
+        to_chart: usize,
+        rotation: [[f64; 3]; 3],
+        seam_kind: AtlasSeamKind,
+    ) -> Result<Self, String> {
+        if from_chart == to_chart {
+            return Err("sphere chart transition cannot be a self-edge".to_string());
+        }
+        if rotation.iter().flatten().any(|x| !x.is_finite()) {
+            return Err("sphere chart transition rotation must be finite".to_string());
+        }
+        // `RᵀR = I`: the rows are an orthonormal ambient frame.
+        for i in 0..3 {
+            for j in 0..3 {
+                let dot: f64 = (0..3).map(|k| rotation[k][i] * rotation[k][j]).sum();
+                let target = if i == j { 1.0 } else { 0.0 };
+                if (dot - target).abs() > Self::ORTHONORMAL_TOL {
+                    return Err(format!(
+                        "sphere chart transition rotation is not orthonormal: (RᵀR)[{i},{j}] = {dot}"
+                    ));
+                }
+            }
+        }
+        let det = Self::determinant_of(&rotation);
+        if (det.abs() - 1.0).abs() > Self::ORTHONORMAL_TOL {
+            return Err(format!(
+                "sphere chart transition rotation must have |det| = 1, got det = {det}"
+            ));
+        }
+        Ok(Self {
+            from_chart,
+            to_chart,
+            rotation,
+            seam_kind,
+        })
+    }
+
+    fn determinant_of(r: &[[f64; 3]; 3]) -> f64 {
+        r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
+    }
+
+    /// Signed determinant of the ambient rotation.
+    #[must_use]
+    pub fn determinant(&self) -> f64 {
+        Self::determinant_of(&self.rotation)
+    }
+
+    /// Orientation contribution to the sign cocycle: `+1` for a proper rotation
+    /// (`det R > 0`), `-1` for a reflection.
+    #[must_use]
+    pub fn sign(&self) -> i8 {
+        if self.determinant() >= 0.0 {
+            1
+        } else {
+            -1
+        }
+    }
+
+    /// Apply the exact ambient rotation to a unit vector.
+    #[must_use]
+    pub fn apply(&self, u: [f64; 3]) -> [f64; 3] {
+        let mut out = [0.0; 3];
+        for (i, row) in self.rotation.iter().enumerate() {
+            out[i] = row[0] * u[0] + row[1] * u[1] + row[2] * u[2];
+        }
+        out
+    }
+
+    /// Exact inverse isometry (`R⁻¹ = Rᵀ` for an orthogonal `R`), endpoints
+    /// swapped.
+    #[must_use]
+    pub fn inverse(&self) -> Self {
+        let mut transpose = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                transpose[i][j] = self.rotation[j][i];
+            }
+        }
+        Self {
+            from_chart: self.to_chart,
+            to_chart: self.from_chart,
+            rotation: transpose,
+            seam_kind: self.seam_kind,
+        }
+    }
+
+    /// Compose `self: A -> B` with `next: B -> C` (matrix product `R_next · R_self`).
+    #[must_use = "transition composition errors must be handled"]
+    pub fn compose(&self, next: &Self) -> Result<Self, String> {
+        if self.to_chart != next.from_chart {
+            return Err(format!(
+                "cannot compose sphere chart transitions {}->{} and {}->{}",
+                self.from_chart, self.to_chart, next.from_chart, next.to_chart
+            ));
+        }
+        let mut product = [[0.0; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                product[i][j] = (0..3).map(|k| next.rotation[i][k] * self.rotation[k][j]).sum();
+            }
+        }
+        Self::new(
+            self.from_chart,
+            next.to_chart,
+            product,
+            if matches!(self.seam_kind, AtlasSeamKind::Pole)
+                || matches!(next.seam_kind, AtlasSeamKind::Pole)
+            {
+                AtlasSeamKind::Pole
+            } else {
+                AtlasSeamKind::Regular
+            },
+        )
+    }
+
+    pub(crate) fn remap(&mut self, old_to_new: &[Option<usize>]) -> Result<(), String> {
+        self.from_chart = old_to_new
+            .get(self.from_chart)
+            .and_then(|x| *x)
+            .ok_or_else(|| {
+                "cannot remove an atlas chart while its sphere seam is registered".to_string()
+            })?;
+        self.to_chart = old_to_new
+            .get(self.to_chart)
+            .and_then(|x| *x)
+            .ok_or_else(|| {
+                "cannot remove an atlas chart while its sphere seam is registered".to_string()
+            })?;
+        Ok(())
+    }
+}
+
 /// Orientability of the signed transition cocycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AtlasOrientability {
@@ -170,10 +338,18 @@ pub enum AtlasOrientability {
 }
 
 /// Several local charts representing one manifold atom.
+///
+/// Overlaps come in two exact kinds that share one sign cocycle: the
+/// one-dimensional unit-speed affine [`UnitSpeedChartTransition`] (circles,
+/// Möbius half-twists) and the two-dimensional ambient-rotation
+/// [`SphereChartTransition`] (sphere pole seams).  Both are stored so a single
+/// atlas can mix them; connectivity and orientability read the union of their
+/// signed edges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManifoldChartAtlas {
     charts: Vec<usize>,
     transitions: Vec<UnitSpeedChartTransition>,
+    sphere_transitions: Vec<SphereChartTransition>,
 }
 
 impl ManifoldChartAtlas {
@@ -186,6 +362,22 @@ impl ManifoldChartAtlas {
         let atlas = Self {
             charts,
             transitions: vec![transition],
+            sphere_transitions: Vec::new(),
+        };
+        atlas.validate()?;
+        Ok(atlas)
+    }
+
+    #[must_use = "atlas validation errors must be handled"]
+    pub fn from_sphere_transition(transition: SphereChartTransition) -> Result<Self, String> {
+        let charts = vec![
+            transition.from_chart.min(transition.to_chart),
+            transition.from_chart.max(transition.to_chart),
+        ];
+        let atlas = Self {
+            charts,
+            transitions: Vec::new(),
+            sphere_transitions: vec![transition],
         };
         atlas.validate()?;
         Ok(atlas)
@@ -199,6 +391,30 @@ impl ManifoldChartAtlas {
     #[must_use]
     pub fn transitions(&self) -> &[UnitSpeedChartTransition] {
         &self.transitions
+    }
+
+    /// The registered two-dimensional sphere pole seams, in canonical order.
+    #[must_use]
+    pub fn sphere_transitions(&self) -> &[SphereChartTransition] {
+        &self.sphere_transitions
+    }
+
+    /// Every registered overlap as a signed combinatorial edge
+    /// `(from, to, sign)`, unioning the 1-D and sphere transitions.  This is the
+    /// cocycle connectivity and orientability read from.
+    fn signed_edges(&self) -> impl Iterator<Item = (usize, usize, i8)> + '_ {
+        self.transitions
+            .iter()
+            .map(|t| (t.from_chart, t.to_chart, t.sign))
+            .chain(
+                self.sphere_transitions
+                    .iter()
+                    .map(|t| (t.from_chart, t.to_chart, t.sign())),
+            )
+    }
+
+    fn transition_count(&self) -> usize {
+        self.transitions.len() + self.sphere_transitions.len()
     }
 
     #[must_use]
@@ -215,6 +431,19 @@ impl ManifoldChartAtlas {
         self.charts.sort_unstable();
         self.charts.dedup();
         self.transitions.push(transition);
+        self.canonicalize_transitions();
+        self.validate()
+    }
+
+    pub(crate) fn add_sphere_transition(
+        &mut self,
+        transition: SphereChartTransition,
+    ) -> Result<(), String> {
+        self.charts.push(transition.from_chart);
+        self.charts.push(transition.to_chart);
+        self.charts.sort_unstable();
+        self.charts.dedup();
+        self.sphere_transitions.push(transition);
         self.canonicalize_transitions();
         self.validate()
     }
@@ -236,6 +465,23 @@ impl ManifoldChartAtlas {
         Ok(true)
     }
 
+    pub(crate) fn replace_directed_sphere_transition(
+        &mut self,
+        transition: SphereChartTransition,
+    ) -> Result<bool, String> {
+        let Some(existing) = self.sphere_transitions.iter_mut().find(|existing| {
+            existing.from_chart == transition.from_chart
+                && existing.to_chart == transition.to_chart
+                && existing.seam_kind == transition.seam_kind
+        }) else {
+            return Ok(false);
+        };
+        *existing = transition;
+        self.canonicalize_transitions();
+        self.validate()?;
+        Ok(true)
+    }
+
     pub(crate) fn merge_with_transition(
         &mut self,
         mut other: Self,
@@ -245,11 +491,27 @@ impl ManifoldChartAtlas {
         self.charts.sort_unstable();
         self.charts.dedup();
         self.transitions.append(&mut other.transitions);
+        self.sphere_transitions.append(&mut other.sphere_transitions);
         // The new edge is what connects the formerly separate atlas
         // components. Validate only after it is present; validating the plain
         // union first would (correctly but prematurely) reject it as
         // disconnected and make atlas growth impossible.
         self.transitions.push(transition);
+        self.canonicalize_transitions();
+        self.validate()
+    }
+
+    pub(crate) fn merge_with_sphere_transition(
+        &mut self,
+        mut other: Self,
+        transition: SphereChartTransition,
+    ) -> Result<(), String> {
+        self.charts.append(&mut other.charts);
+        self.charts.sort_unstable();
+        self.charts.dedup();
+        self.transitions.append(&mut other.transitions);
+        self.sphere_transitions.append(&mut other.sphere_transitions);
+        self.sphere_transitions.push(transition);
         self.canonicalize_transitions();
         self.validate()
     }
@@ -263,6 +525,22 @@ impl ManifoldChartAtlas {
                 .then(a.offset.total_cmp(&b.offset))
                 .then((a.seam_kind as u8).cmp(&(b.seam_kind as u8)))
         });
+        self.sphere_transitions.sort_by(|a, b| {
+            a.from_chart
+                .cmp(&b.from_chart)
+                .then(a.to_chart.cmp(&b.to_chart))
+                .then(a.sign().cmp(&b.sign()))
+                .then((a.seam_kind as u8).cmp(&(b.seam_kind as u8)))
+                .then_with(|| {
+                    for (x, y) in a.rotation.iter().flatten().zip(b.rotation.iter().flatten()) {
+                        let ord = x.total_cmp(y);
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                })
+        });
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -272,13 +550,11 @@ impl ManifoldChartAtlas {
         if self.charts.windows(2).any(|w| w[0] >= w[1]) {
             return Err("atlas chart indices must be strictly increasing".to_string());
         }
-        if self.transitions.is_empty() {
+        if self.transition_count() == 0 {
             return Err("a chart atlas requires at least one transition".to_string());
         }
-        for transition in &self.transitions {
-            if !self.contains_chart(transition.from_chart)
-                || !self.contains_chart(transition.to_chart)
-            {
+        for (from, to, _) in self.signed_edges() {
+            if !self.contains_chart(from) || !self.contains_chart(to) {
                 return Err("atlas transition endpoint is not an atlas chart".to_string());
             }
         }
@@ -287,11 +563,11 @@ impl ManifoldChartAtlas {
         let mut reached = BTreeSet::from([self.charts[0]]);
         let mut queue = VecDeque::from([self.charts[0]]);
         while let Some(chart) = queue.pop_front() {
-            for transition in &self.transitions {
-                let next = if transition.from_chart == chart {
-                    Some(transition.to_chart)
-                } else if transition.to_chart == chart {
-                    Some(transition.from_chart)
+            for (from, to, _) in self.signed_edges() {
+                let next = if from == chart {
+                    Some(to)
+                } else if to == chart {
+                    Some(from)
                 } else {
                     None
                 };
@@ -319,11 +595,11 @@ impl ManifoldChartAtlas {
         let mut queue = VecDeque::from([root]);
         while let Some(chart) = queue.pop_front() {
             let here = orientation[&chart];
-            for transition in &self.transitions {
-                let (next, sign) = if transition.from_chart == chart {
-                    (transition.to_chart, transition.sign)
-                } else if transition.to_chart == chart {
-                    (transition.from_chart, transition.sign)
+            for (from, to, edge_sign) in self.signed_edges() {
+                let (next, sign) = if from == chart {
+                    (to, edge_sign)
+                } else if to == chart {
+                    (from, edge_sign)
                 } else {
                     continue;
                 };

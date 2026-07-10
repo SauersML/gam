@@ -10,8 +10,6 @@
 //! outside tests); the `#[cfg(test)]` module verifies each one against finite
 //! differences, which SPEC permits *inside tests only*.
 
-#[cfg(test)]
-use ndarray::Array1;
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
 use super::SaeBasisEvaluator;
@@ -548,7 +546,7 @@ fn ln_gamma(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array3, array};
+    use ndarray::{Array1, Array3, array};
 
     // ---- F1: amplitude-concentration certificate ----------------------------
 

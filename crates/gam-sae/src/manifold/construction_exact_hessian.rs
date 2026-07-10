@@ -642,10 +642,38 @@ impl SaeManifoldTerm {
         // `-1/2 Gamma' theta_hat_rho`.  Dropping this term differentiates a
         // fictitious criterion in which the fitted state is held fixed.  The
         // exact stationarity solve above supplies the required implicit response.
+        // #2231 — the trailing `L−1` flat coordinates are the crosscoder block
+        // relevances `log λ_ℓ` (`SaeManifoldRho::to_flat` appends them last).
+        // Their inner-gradient dependence enters through the λ-scaled target, so
+        // their RHS is `−½·Jᵀ_M Z̃^{(ℓ)}` (`crosscoder_block_ift_rhs`), NOT the
+        // penalty/prior channels `outer_rho_gradient_ift_rhs` owns. The adjoint
+        // contraction below then completes the block gradient with the same
+        // `−½·Γᵀθ̂_ρ` channel every other coordinate carries; the explicit data
+        // + Jacobian parts stay with the eval lane's `block_log_lambda_gradient`.
+        let block_tail_start = n_params - rho.log_lambda_block.len();
         for coord in 0..n_params {
-            let rhs = self
-                .outer_rho_gradient_ift_rhs(rho, coord, cache)
-                .map_err(OuterGradientError::internal)?;
+            let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
+                let &(p_x, ref block_dims) =
+                    self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
+                        OuterGradientError::internal(
+                            "analytic_outer_rho_gradient_components: rho carries block \
+                             coordinates but no crosscoder pricing spans are installed"
+                                .to_string(),
+                        )
+                    })?;
+                let block = coord - block_tail_start;
+                let start = p_x + block_dims[..block].iter().sum::<usize>();
+                self.crosscoder_block_ift_rhs(
+                    rho,
+                    cache,
+                    target,
+                    start..start + block_dims[block],
+                )
+                .map_err(OuterGradientError::internal)?
+            } else {
+                self.outer_rho_gradient_ift_rhs(rho, coord, cache)
+                    .map_err(OuterGradientError::internal)?
+            };
             let solved = self
                 .solve_exact_stationarity(rho, target, cache, solver, &rhs)
                 .map_err(|err| {

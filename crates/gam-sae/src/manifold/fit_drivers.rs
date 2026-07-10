@@ -5237,7 +5237,7 @@ impl SaeManifoldTerm {
             // not a KKT certificate: on K=1 near-isotropic clouds it can be tiny
             // along the chart gauge while the outer residual remains large.
             if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
-                self.reclaim_arrow_assembly_workspace(&mut sys, false);
+                self.reclaim_arrow_assembly_workspace(&mut sys);
                 break;
             }
             let mut step_norm_sq = 0.0;
@@ -5307,7 +5307,7 @@ impl SaeManifoldTerm {
                 // Pre-step state is unperturbed here; restore is a no-op but
                 // keeps the invariant explicit.
                 self.restore_mutable_state(&snapshot)?;
-                self.reclaim_arrow_assembly_workspace(&mut sys, false);
+                self.reclaim_arrow_assembly_workspace(&mut sys);
                 break;
             }
             // #2100/#1117 objective-stagnation gate (see the locals above). The
@@ -5333,7 +5333,7 @@ impl SaeManifoldTerm {
                         // Converged on the quotient — the objective is at its
                         // numerical fixed point. The pre-step state is unperturbed
                         // (the snapshot was taken from it), so no restore is needed.
-                        self.reclaim_arrow_assembly_workspace(&mut sys, false);
+                        self.reclaim_arrow_assembly_workspace(&mut sys);
                         break;
                     }
                 } else {
@@ -5445,7 +5445,7 @@ impl SaeManifoldTerm {
                             grad_norm_sq.sqrt()
                         );
                         self.restore_mutable_state(&snapshot)?;
-                        self.reclaim_arrow_assembly_workspace(&mut sys, false);
+                        self.reclaim_arrow_assembly_workspace(&mut sys);
                         break;
                     }
                 };
@@ -5460,7 +5460,7 @@ impl SaeManifoldTerm {
                         grad_norm_sq.sqrt()
                     );
                     self.restore_mutable_state(&snapshot)?;
-                    self.reclaim_arrow_assembly_workspace(&mut sys, false);
+                    self.reclaim_arrow_assembly_workspace(&mut sys);
                     break;
                 }
             }
@@ -5607,7 +5607,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            self.reclaim_arrow_assembly_workspace(&mut sys, true);
+            self.reclaim_arrow_assembly_workspace(&mut sys);
         }
         // #1117 — the rank-`r_k` oracle is already pinned: each rank-deficient
         // atom was reparametrized onto its data-supported subspace at fit entry

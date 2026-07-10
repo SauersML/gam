@@ -329,8 +329,6 @@ pub(crate) struct SaeArrowAssemblyWorkspace {
     pub(crate) device_sae_pcg: Option<Arc<DeviceSaePcgData>>,
     pub(crate) resident_frame:
         Option<Arc<dyn gam_solve::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>>,
-    #[cfg(test)]
-    pub(crate) accepted_observations: Vec<SaeArrowAssemblyObservation>,
 }
 
 impl std::fmt::Debug for SaeArrowAssemblyWorkspace {
@@ -342,16 +340,6 @@ impl std::fmt::Debug for SaeArrowAssemblyWorkspace {
             .field("resident_frame", &self.resident_frame.is_some())
             .finish()
     }
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct SaeArrowAssemblyObservation {
-    pub(crate) row_htt_ptr: usize,
-    pub(crate) row_htbeta_ptr: usize,
-    pub(crate) gb_ptr: usize,
-    pub(crate) device_frame_ptr: usize,
-    pub(crate) numerical_bits: Vec<u64>,
 }
 
 /// Full SAE-manifold term.
