@@ -716,9 +716,6 @@ where
     }
 
     let p = x.ncols();
-    // Raw design row count, captured before `x` is moved (line ~339); used by the
-    // #1266 null-space shrink-out escape's `n ≥ 2·p` determinacy gate, which must
-    // match `relax_smoothing_rho_prior`'s well-determined gate exactly.
     validate_penalty_specs(&s_list, p, "optimize_external_design")?;
     let (canonical, active_nullspace_dims) = gam_terms::construction::canonicalize_penalty_specs(
         &s_list,
