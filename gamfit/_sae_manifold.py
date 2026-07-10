@@ -14,7 +14,7 @@ from ._penalty_bridge import (
     GumbelTemperatureSchedule,
     validate_gumbel_schedule_fields as _validate_gumbel_schedule_fields,
 )
-from ._sparse_dictionary import sparse_dictionary_fit
+from ._sparse_dictionary import block_sparse_dictionary_fit, sparse_dictionary_fit
 from ._sae_trust import atom_trust_scores
 
 
@@ -2052,6 +2052,49 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"sae_manifold_fit: assignment='topk' requires top_k (the fixed per-row "
             f"active-set size, in [1, K={k_atoms}])"
+        )
+    # EXPLICIT LINEAR-DICTIONARY modeling choice (#2232 Inc 5b, Gap B). A hard
+    # top-k support request whose atoms are ALL the genuinely linear kind
+    # (`atom_topology="linear"`) with one shared dimension b names the linear
+    # sparse-dictionary model, and the sparse-code lane's fixed-support
+    # alternating solve IS that model's fast kernel (Inc 2 plug points 1-3:
+    # the s x s active-set ridge is the degenerate arrow-Schur inner solve for
+    # read-only gates on linear atoms). The Rust front door owns the rule
+    # (`front_door::admit_linear_dictionary`): admitted at ANY K — including
+    # K <= P, where the shape-derived default below would force the dense
+    # engine — because the REQUEST, not the shape, selects the model. b == 1
+    # runs the shared-rho REML atom schedule; b >= 2 is the Grassmann block
+    # lane (framed Euclidean d=b atoms, block-TopK at atom granularity).
+    # Mixed-dimension linear atoms have no block expression and keep the
+    # historical shape-derived routing below.
+    if (
+        kind == "topk"
+        and all(str(b) == "linear" for b in bases)
+        and len(set(dims)) == 1
+    ):
+        rust_module().sae_linear_dictionary_admission(
+            n_obs, int(x.shape[1]), k_atoms, block_size=int(dims[0])
+        )
+        if a_init is not None or t_init is not None:
+            raise ValueError(
+                "sae_manifold_fit linear-dictionary lane does not accept dense "
+                "a_init/t_init warm starts; provide sparse dictionary state instead."
+            )
+        block_b = int(dims[0])
+        if block_b == 1:
+            return sparse_dictionary_fit(
+                np.ascontiguousarray(x, dtype=np.float32),
+                k_atoms,
+                active=int(top_k_arg),
+                max_epochs=max_iter_total,
+                score_mode=str(score_mode),
+            )
+        return block_sparse_dictionary_fit(
+            np.ascontiguousarray(x, dtype=np.float32),
+            k_atoms,
+            block_size=block_b,
+            block_topk=int(top_k_arg),
+            max_epochs=max_iter_total,
         )
     # Front-door lane admission, owned by the Rust front door so the Python
     # public entry and the FFI boundary share one rule:

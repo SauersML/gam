@@ -184,6 +184,61 @@ pub(crate) fn admit_topk_manifold_with_budget(
     ))
 }
 
+/// MODELING-CHOICE admission for an EXPLICIT linear-dictionary request
+/// (design gam#2232, Increment 5b — the Gap-B resolution).
+///
+/// The `K ≤ P → dense / K > P → sparse` rule of [`admit_sae_fit`] is the
+/// DEFAULT admission for penalty-gated MANIFOLD requests: it guards the
+/// no-`N×K` architecture, and for those callers the linear sparse-code lane is
+/// a demotion. But a caller who EXPLICITLY requests a linear dictionary
+/// (every atom the genuinely linear `d`-dimensional Euclidean atom — the
+/// `max_degree = 1` specialization of the one engine, with hard top-k support)
+/// is asking for exactly the model the sparse-code lane's fixed-support
+/// alternating solve IS the fast kernel of (Increment 2, plug points 1–3):
+/// the `s×s` active-set ridge is the degenerate arrow-Schur inner solve for
+/// read-only gates on linear atoms. That model is legitimate at ANY `K` —
+/// including `K ≤ P`, where the historical gate wrongly forced the dense
+/// engine — so this admission returns [`SaeFitLane::SparseCodes`]
+/// unconditionally (shape validation only). `block_size ≥ 2` (uniform
+/// Euclidean `d = b` atoms) is the Grassmann block lane: framed `d = b` atoms
+/// (`B_k = C_k·U_kᵀ`, `U_k ∈ Gr(b, P)`) with block-TopK support at atom
+/// granularity, whose alternating polar/projection solve is the block fast
+/// kernel of the same engine.
+///
+/// This is NOT a silent substitution (the invariant [`admit_topk_manifold`]
+/// protects): substitution is handing a caller a DIFFERENT model than the one
+/// requested. Here the caller named the linear model; the lane is its
+/// specialized solver.
+pub fn admit_linear_dictionary(
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+    block_size: usize,
+) -> Result<SaeFitAdmission, String> {
+    if n_obs == 0 || output_dim == 0 || n_atoms == 0 {
+        return Err(format!(
+            "admit_linear_dictionary requires positive N, P, and K; got N={n_obs}, \
+             P={output_dim}, K={n_atoms}"
+        ));
+    }
+    if block_size == 0 || block_size > output_dim {
+        return Err(format!(
+            "admit_linear_dictionary requires 1 <= block_size <= P={output_dim} (a block's b \
+             orthonormal directions must fit in R^P); got {block_size}"
+        ));
+    }
+    Ok(SaeFitAdmission {
+        lane: SaeFitLane::SparseCodes,
+        n_obs,
+        output_dim,
+        n_atoms,
+        // The linear schedule never materializes a dense assignment; the audit
+        // cells record the shape the DEFAULT rule would have compared.
+        dense_assignment_cells: n_obs.saturating_mul(n_atoms),
+        response_cells: n_obs.saturating_mul(output_dim),
+    })
+}
+
 /// Front-door enforcement for the DENSE manifold engine (#985 / E1): admit the
 /// dense-certification lane, or REFUSE the sparse lane.
 ///
@@ -322,6 +377,27 @@ mod tests {
             .expect_err("over-both-budgets topk must refuse");
         assert!(err.contains("never silently substituted"));
         assert!(!err.contains("admit_topk_curved_lane"));
+    }
+
+    /// #2232 Inc 5b (Gap B) — an EXPLICIT linear-dictionary request takes the
+    /// sparse-code lane at ANY K: the K>P-only sparse gate is the DEFAULT rule
+    /// for manifold requests, relaxed into a modeling choice for callers who
+    /// name the linear model.
+    #[test]
+    fn explicit_linear_dictionary_admits_sparse_codes_at_any_k() {
+        // K ≤ P: the shape the default rule would send to the dense engine.
+        let small = admit_linear_dictionary(640, 24, 16, 1).expect("K<=P linear admission");
+        assert_eq!(small.lane, SaeFitLane::SparseCodes);
+        assert_eq!((small.n_obs, small.output_dim, small.n_atoms), (640, 24, 16));
+        // K > P: identical lane — the request, not the shape, selects it.
+        let large = admit_linear_dictionary(4096, 512, 32_000, 1).expect("K>P linear admission");
+        assert_eq!(large.lane, SaeFitLane::SparseCodes);
+        // Block atoms (uniform Euclidean d=b): same lane, b bounded by P.
+        let block = admit_linear_dictionary(4096, 512, 1024, 4).expect("block linear admission");
+        assert_eq!(block.lane, SaeFitLane::SparseCodes);
+        assert!(admit_linear_dictionary(4096, 512, 1024, 513).is_err());
+        assert!(admit_linear_dictionary(4096, 512, 1024, 0).is_err());
+        assert!(admit_linear_dictionary(0, 512, 1024, 1).is_err());
     }
 
     #[test]

@@ -46,6 +46,35 @@ fn sae_default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Optio
     gam::terms::sae::assignment::default_top_k_for_large_dictionary(n_obs, k_atoms)
 }
 
+/// #2232 Inc 5b (Gap B) — MODELING-CHOICE admission for an EXPLICIT
+/// linear-dictionary request (`atom_topology="linear"` + hard top-k support):
+/// the sparse-code lane at ANY `K`, owned by the Rust front door
+/// (`front_door::admit_linear_dictionary`) so the Python facade routes on the
+/// same rule the crate enforces. Shape validation only; the lane is selected
+/// by the REQUEST, not by the `K` vs `P` comparison.
+#[pyfunction]
+#[pyo3(signature = (n_obs, output_dim, n_atoms, block_size=1))]
+fn sae_linear_dictionary_admission<'py>(
+    py: Python<'py>,
+    n_obs: usize,
+    output_dim: usize,
+    n_atoms: usize,
+    block_size: usize,
+) -> PyResult<Py<PyDict>> {
+    let admission = gam::terms::sae::front_door::admit_linear_dictionary(
+        n_obs, output_dim, n_atoms, block_size,
+    )
+    .map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    out.set_item("lane", "sparse_codes")?;
+    out.set_item("n_obs", admission.n_obs)?;
+    out.set_item("output_dim", admission.output_dim)?;
+    out.set_item("n_atoms", admission.n_atoms)?;
+    out.set_item("dense_assignment_cells", admission.dense_assignment_cells)?;
+    out.set_item("response_cells", admission.response_cells)?;
+    Ok(out.unbind())
+}
+
 #[pyfunction]
 #[pyo3(signature = (n_obs, output_dim, n_atoms, d_max=1, topk_support=None))]
 fn sae_fit_admission<'py>(
@@ -5434,6 +5463,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(linear_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(linear_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sae_fit_admission, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_linear_dictionary_admission, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_transform_ffi, module)?)?;
     module.add_function(wrap_pyfunction!(sparse_dictionary_reconstruct_ffi, module)?)?;
@@ -6857,16 +6887,16 @@ impl SparseDictStream {
         Ok(out.unbind())
     }
 
-    /// Hand back the trained decoder (`K×P`, unit-norm) plus run metadata and
-    /// aggregate score-route telemetry.
+    /// Hand back the converged decoder (`K×P`, unit-norm) plus run metadata and
+    /// aggregate score-route telemetry. Raises if the streaming loop has not
+    /// converged — the handle stays resumable (SPEC 20).
     fn finalize(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let artifact = self.inner.finalize();
+        let artifact = self.inner.finalize().map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("decoder", artifact.decoder.into_pyarray(py))?;
         out.set_item("active", artifact.active)?;
         out.set_item("epochs", artifact.epochs)?;
         out.set_item("explained_variance", artifact.explained_variance)?;
-        out.set_item("converged", artifact.converged)?;
         out.set_item(
             "score_route_stats",
             score_route_stats_dict(py, artifact.score_route_stats)?,
@@ -6986,11 +7016,12 @@ impl BlockSparseDictStream {
         Ok(out.unbind())
     }
 
-    /// Hand back the trained block frames (`K×P`) + γ + per-block report + metadata:
-    /// `{decoder, gamma, block_topk, block_size, block_utilization,
-    /// block_stable_rank, epochs, explained_variance, converged}`.
+    /// Hand back the converged block frames (`K×P`) + γ + per-block report +
+    /// metadata: `{decoder, gamma, block_topk, block_size, block_utilization,
+    /// block_stable_rank, epochs, explained_variance}`. Raises if the streaming
+    /// loop has not converged — the handle stays resumable (SPEC 20).
     fn finalize(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
-        let artifact = self.inner.finalize();
+        let artifact = self.inner.finalize().map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("decoder", artifact.decoder.into_pyarray(py))?;
         out.set_item("gamma", artifact.gamma)?;
@@ -7000,7 +7031,6 @@ impl BlockSparseDictStream {
         out.set_item("block_stable_rank", artifact.block_stable_rank)?;
         out.set_item("epochs", artifact.epochs)?;
         out.set_item("explained_variance", artifact.explained_variance)?;
-        out.set_item("converged", artifact.converged)?;
         Ok(out.unbind())
     }
 
