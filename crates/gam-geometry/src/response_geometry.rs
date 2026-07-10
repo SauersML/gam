@@ -1888,11 +1888,19 @@ mod tests {
             ),
             (
                 "grassmann(k=1)",
-                array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.6, 0.8, 0.0]],
+                array![
+                    [1.0, 0.0, 0.0],
+                    [0.2_f64.cos(), 0.2_f64.sin(), 0.0],
+                    [0.35_f64.cos(), 0.35_f64.sin(), 0.0],
+                ],
             ),
             (
                 "stiefel(k=1)",
-                array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.6, 0.8]],
+                array![
+                    [1.0, 0.0, 0.0],
+                    [0.2_f64.cos(), 0.2_f64.sin(), 0.0],
+                    [0.3_f64.cos(), 0.0, 0.3_f64.sin()],
+                ],
             ),
             ("poincare", array![[0.1, 0.2], [-0.3, 0.1], [0.2, -0.25]]),
         ];
@@ -1934,27 +1942,20 @@ mod tests {
     /// before the fix it hard-passed `None` for the weights, so the chart origin
     /// was the unweighted intrinsic mean even when the tangent regression was
     /// weighted — a biased linearization. Here Stiefel(k=1,n=3) is the sphere S²:
-    /// two clusters of unit vectors 90° apart, with weights concentrated on the
-    /// first cluster, must move the base point toward that cluster.
+    /// two separated clusters, both inside the certified convexity ball, have
+    /// weights concentrated on the first cluster and must move the base toward it.
     #[test]
     fn dispatch_log_map_uses_weighted_frechet_mean() {
-        let a = 0.15_f64;
+        let a = 0.05_f64;
+        let separation = 0.6_f64;
         // Two clusters on the great circle z = 0: cluster A about [1,0,0]
-        // (rows 0,1) and cluster B about [0,1,0] (rows 2,3). Every row is an
-        // exact unit vector (cos²+sin²=1), so Stiefel(k=1) accepts them.
+        // (rows 0,1) and cluster B `separation` radians away (rows 2,3).
+        // Every row is an exact unit vector (cos²+sin²=1).
         let values = array![
             [a.cos(), a.sin(), 0.0],
             [(-a).cos(), (-a).sin(), 0.0],
-            [
-                (std::f64::consts::FRAC_PI_2 - a).cos(),
-                (std::f64::consts::FRAC_PI_2 - a).sin(),
-                0.0
-            ],
-            [
-                (std::f64::consts::FRAC_PI_2 + a).cos(),
-                (std::f64::consts::FRAC_PI_2 + a).sin(),
-                0.0
-            ],
+            [(separation - a).cos(), (separation - a).sin(), 0.0],
+            [(separation + a).cos(), (separation + a).sin(), 0.0],
         ];
         // Heavily weight cluster A: the weighted mean must sit near [1,0,0],
         // whereas the unweighted mean sits near the 45° bisector.
@@ -1973,7 +1974,7 @@ mod tests {
         // Sanity: the two intrinsic means genuinely differ, so this design can
         // distinguish a weighted from an unweighted base point.
         assert!(
-            geodesic(unweighted_ref.view(), weighted_ref.view()) > 0.3,
+            geodesic(unweighted_ref.view(), weighted_ref.view()) > 0.2,
             "test design degenerate: weighted and unweighted means nearly coincide"
         );
 
