@@ -1617,6 +1617,41 @@ mod tests {
     }
 
     #[test]
+    fn matched_spectrum_gaussian_preserves_pc_scales_and_is_seeded_2250() {
+        let rows = 8_192;
+        let mut scores = Array2::<f64>::zeros((rows, 3));
+        for row in 0..rows {
+            let t = row as f64 / rows as f64;
+            scores[[row, 0]] = 2.0 + 3.0 * (2.0 * PI * t).cos();
+            scores[[row, 1]] = -1.0 + 1.5 * (4.0 * PI * t).sin();
+            scores[[row, 2]] = 0.25 + 0.4 * (6.0 * PI * t).cos();
+        }
+        let first = matched_spectrum_gaussian_null(scores.view(), 72).expect("matched null");
+        let repeated = matched_spectrum_gaussian_null(scores.view(), 72).expect("matched null");
+        assert_eq!(first, repeated, "seeded null draws must be reproducible");
+
+        let observed_mean = column_mean(scores.view());
+        let observed_sd = column_sd(scores.view(), observed_mean.view());
+        let null_mean = column_mean(first.view());
+        let null_sd = column_sd(first.view(), null_mean.view());
+        for pc in 0..scores.ncols() {
+            let mean_se = observed_sd[pc] / (rows as f64).sqrt();
+            assert!(
+                (null_mean[pc] - observed_mean[pc]).abs() <= 4.0 * mean_se,
+                "PC {pc} mean mismatch: observed={} null={} se={mean_se}",
+                observed_mean[pc],
+                null_mean[pc]
+            );
+            assert!(
+                (null_sd[pc] / observed_sd[pc] - 1.0).abs() < 0.05,
+                "PC {pc} scale mismatch: observed={} null={}",
+                observed_sd[pc],
+                null_sd[pc]
+            );
+        }
+    }
+
+    #[test]
     fn spike_in_roc_power_rises_monotonically_and_null_stays_quiet() {
         let noise = noise_fixture(128, 12, 1234);
         let mut config = SpikeInRocConfig::circle(vec![0.0, 1.0, 2.0], 16, 91);
