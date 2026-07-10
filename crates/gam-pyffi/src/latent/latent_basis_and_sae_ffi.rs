@@ -1754,21 +1754,13 @@ fn sae_promotion_align_min(factor_rank: usize) -> f64 {
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 2,
     // #2239 magic-by-default: evidence-certified residual structure is promoted
     // to the primary tier by default (the certificate gates the birth; the
     // alternation self-extends its pass budget only while lineages are live).
     promote_from_residual = true,
     run_structure_search = true,
     run_outer_rho_search = true,
-    // #2228/#1095 — the SCALE-gauge is DEFAULT-ON to cure the decoder-penalty↔gate
-    // co-collapse (see SaeManifoldTerm construction). Python callers can pass
-    // `quotient_scale=False` for a historical A/B, but the default engages the fix.
-    quotient_scale = true,
     data_row_reseed = false,
-    // #1893: production Python fits use the realised-rank REML/Laplace
-    // complexity ledger by default; callers can set false for historical A/B.
-    rank_charge_evidence = true,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -1814,15 +1806,10 @@ fn sae_manifold_fit<'py>(
     // term's value; `None` selects the canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
-    // #2021 — count of extra whitened-residual structured-alternation passes
-    // (default 2: production whitens; 0 restores the historical iid-only path).
-    structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,
     run_outer_rho_search: bool,
-    quotient_scale: bool,
     data_row_reseed: bool,
-    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -1875,13 +1862,10 @@ fn sae_manifold_fit<'py>(
         row_w,
         separation_barrier_strength_override,
         ibp_alpha_override,
-        structured_residual_passes,
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
-        quotient_scale,
         data_row_reseed,
-        rank_charge_evidence,
     )
 }
 
@@ -2075,9 +2059,6 @@ fn stagewise_progress_py<'py>(
     // #1939 — appended LAST so the signature stays strictly additive: existing
     // positional/kwarg callers (which never pass this) are byte-for-byte unaffected.
     cone_atom_recovery = false,
-    // #5/(B) — appended LAST (after cone_atom_recovery) so the signature stays
-    // strictly additive: existing positional/kwarg callers are byte-unaffected.
-    rank_charge_evidence = true,
     // Rung 1 (B4) — the harvest-emitted output-Fisher factor stack `(n, p, r)` and
     // its provenance tag. Appended LAST so the signature stays strictly additive.
     // Presence installs the metric on the seed term (carried across every birth /
@@ -2117,7 +2098,6 @@ fn sae_manifold_fit_stagewise<'py>(
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     progress_callback: Option<PyObject>,
     cone_atom_recovery: bool,
-    rank_charge_evidence: bool,
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
@@ -2159,7 +2139,6 @@ fn sae_manifold_fit_stagewise<'py>(
         ridge_ext_coord,
         ridge_beta,
         cone_atom_recovery,
-        rank_charge_evidence,
         structured_whitening,
         fisher_metric,
     })
@@ -2274,9 +2253,6 @@ fn sae_manifold_fit_stagewise<'py>(
     // #1939 — echo the resolved cone-atom RECOVERY opt-in so a harness can VERIFY
     // the kwarg engaged (no silent no-op): the value the fit actually ran with.
     out.set_item("cone_atom_recovery_used", cone_atom_recovery)?;
-    // #5/(B) — echo the resolved rank-charge opt-in so red-tree's A/B harness can
-    // VERIFY the kwarg engaged (no silent no-op).
-    out.set_item("rank_charge_evidence_used", rank_charge_evidence)?;
     out.set_item("births_accepted", report.births_accepted)?;
     out.set_item("births_rejected", report.births_rejected)?;
     out.set_item("stopped_reason", stopped_reason)?;
@@ -2355,18 +2331,10 @@ fn sae_manifold_fit_inner<'py>(
     // canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
-    // #2021 — number of EXTRA whitened-residual refit passes after the iid
-    // pass-0 fit (the structured-residual outer alternation). Default-ON at `2`
-    // ("magic by default": the superposition-aware whitened metric is the
-    // best-known behavior); pass `0` for the legacy iid-only path bit-for-bit.
-    // The value is clamped to `STRUCTURED_RESIDUAL_PASSES_MAX`.
-    structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,
     run_outer_rho_search: bool,
-    quotient_scale: bool,
     data_row_reseed: bool,
-    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -2440,9 +2408,7 @@ fn sae_manifold_fit_inner<'py>(
         native_ard_enabled,
         seed_refine_routing,
         seed_refine_random_state,
-        quotient_scale,
         data_row_reseed,
-        rank_charge_evidence,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
             ibp_alpha_override,
@@ -2479,7 +2445,6 @@ fn sae_manifold_fit_inner<'py>(
         top_k,
         isometry_pin_active,
         metric_provenance,
-        structured_residual_passes,
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
@@ -3553,19 +3518,13 @@ fn sae_manifold_fit_ibp<'py>(
         // entry point: use their canonical data-derived and assignment defaults.
         None,
         None,
-        // No structured-residual alternation on this convenience IBP entry point
-        // (#2021): the iid-only path, matching the default of the other entry points.
-        0,
-        // No #2021 promotion / #2022 scale-quotient / #2023 data-row reseed on this
-        // convenience IBP entry point: all default-off, matching how every other
-        // opt-in above is left inert here (the primary `sae_manifold_fit` /
-        // `sae_manifold_fit_minimal` entry points carry the typed kwargs).
+        // Residual promotion stays disabled for this narrow convenience entry;
+        // canonical structured whitening, scale quotienting, and rank charge are
+        // unconditional in the shared core.
         false,
         true,
         true,
         false,
-        false,
-        true,
     )
 }
 

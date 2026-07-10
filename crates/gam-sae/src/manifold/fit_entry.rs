@@ -54,6 +54,9 @@ use super::{
 /// Hard cap on the number of #2021 whitened-residual refit passes, mirrored from
 /// the binding's historical `STRUCTURED_RESIDUAL_PASSES_MAX`.
 pub const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
+/// Canonical structured-residual alternation budget. The iid-only A/B mode was
+/// removed; every production fit starts with this evidence-refined budget.
+pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 
 /// One #2021 structured-residual outer-alternation pass's diagnostic record. The
 /// binding serializes a `&[StructuredResidualPassDiagnostic]` into the payload;
@@ -328,7 +331,6 @@ pub struct SaeFitRequest {
     pub top_k: Option<usize>,
     pub isometry_pin_active: bool,
     pub metric_provenance: &'static str,
-    pub structured_residual_passes: usize,
     pub promote_from_residual: bool,
     pub run_structure_search: bool,
     pub run_outer_rho_search: bool,
@@ -368,7 +370,6 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
         top_k,
         isometry_pin_active,
         metric_provenance: metric_provenance_initial,
-        structured_residual_passes,
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
@@ -484,7 +485,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
     // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
     // builds a genuine WhitenedStructured blend).
-    let structured_passes = structured_residual_passes.min(STRUCTURED_RESIDUAL_PASSES_MAX);
+    let structured_passes = STRUCTURED_RESIDUAL_PASSES_DEFAULT;
     let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<StructuredResidualModel> = None;

@@ -199,6 +199,11 @@ fn sae_sibling_fit_seeds_delegate_to_gam_sae_2236() {
         .and_then(|(_, body)| body.split_once("fn sae_manifold_fit_inner"))
         .map(|(body, _)| body)
         .expect("stagewise fit body");
+    let ibp = main
+        .split_once("fn sae_manifold_fit_ibp")
+        .and_then(|(_, body)| body.split_once("The full-batch arrow-Schur path"))
+        .map(|(body, _)| body)
+        .expect("IBP convenience fit body");
     let forbidden = [
         "sae_pca_seed_initial_coords(",
         "sae_build_atom_plans(",
@@ -211,6 +216,7 @@ fn sae_sibling_fit_seeds_delegate_to_gam_sae_2236() {
 
     assert!(minimal.contains("build_sae_minimal_seed(SaeMinimalSeedRequest"));
     assert!(stagewise.contains("build_sae_stagewise_seed(SaeStagewiseSeedRequest"));
+    assert!(ibp.contains("sae_manifold_fit("));
     for pattern in forbidden {
         assert!(!minimal.contains(pattern), "minimal binding contains {pattern}");
         assert!(!stagewise.contains(pattern), "stagewise binding contains {pattern}");

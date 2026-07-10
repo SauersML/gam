@@ -27,7 +27,6 @@ pub struct SaeStagewiseSeedRequest<'a> {
     pub ridge_ext_coord: f64,
     pub ridge_beta: f64,
     pub cone_atom_recovery: bool,
-    pub rank_charge_evidence: bool,
     pub structured_whitening: bool,
     pub fisher_metric: Option<SaeFisherRowMetricRequest<'a>>,
 }
@@ -86,9 +85,7 @@ pub fn build_sae_stagewise_seed(
         native_ard_enabled: true,
         seed_refine_routing: false,
         seed_refine_random_state: 0,
-        quotient_scale: true,
         data_row_reseed: false,
-        rank_charge_evidence: request.rank_charge_evidence,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: request.fisher_metric,

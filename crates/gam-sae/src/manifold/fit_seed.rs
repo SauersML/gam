@@ -95,9 +95,7 @@ pub struct SaeFitSeedRequest<'a> {
     pub native_ard_enabled: bool,
     pub seed_refine_routing: bool,
     pub seed_refine_random_state: u64,
-    pub quotient_scale: bool,
     pub data_row_reseed: bool,
-    pub rank_charge_evidence: bool,
     pub fit_config: SaeFitConfig,
     pub temperature_schedule: Option<GumbelTemperatureSchedule>,
     pub fisher_metric: Option<SaeFisherRowMetricRequest<'a>>,
@@ -125,16 +123,9 @@ pub fn admit_sae_fit_shape(
     match assignment_kind {
         SaeFitAssignmentKind::TopK => {
             let support = top_k.ok_or_else(|| {
-                "assignment_kind 'topk' requires top_k (the fixed per-row support size)"
-                    .to_string()
+                "assignment_kind 'topk' requires top_k (the fixed per-row support size)".to_string()
             })?;
-            crate::front_door::admit_topk_manifold(
-                n_obs,
-                p_out,
-                k_atoms,
-                d_max.max(1),
-                support,
-            )
+            crate::front_door::admit_topk_manifold(n_obs, p_out, k_atoms, d_max.max(1), support)
         }
         _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms),
     }
@@ -331,13 +322,11 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_>) -> Result<SaeFitSeedRe
         mode,
         &evaluators,
     )?;
-    base_term.set_quotient_scale(request.quotient_scale);
+    base_term.set_quotient_scale(true);
     base_term.set_data_row_reseed(request.data_row_reseed);
-    base_term.set_rank_charge_evidence(request.rank_charge_evidence);
-    if request.quotient_scale {
-        for atom in base_term.atoms.iter_mut() {
-            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-        }
+    base_term.set_rank_charge_evidence(true);
+    for atom in base_term.atoms.iter_mut() {
+        atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
     }
     base_term.set_fit_config(request.fit_config);
     if let Some(schedule) = request.temperature_schedule {
@@ -474,9 +463,7 @@ mod tests {
             native_ard_enabled: true,
             seed_refine_routing: false,
             seed_refine_random_state: 0,
-            quotient_scale: true,
             data_row_reseed: false,
-            rank_charge_evidence: true,
             fit_config: SaeFitConfig::default(),
             temperature_schedule: None,
             fisher_metric: None,

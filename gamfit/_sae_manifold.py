@@ -1106,7 +1106,7 @@ class ManifoldSAE:
         Post-hoc companion to ``sae_manifold_fit(..., fisher_factors=...)``:
         lets a harvest→attach→steer flow add a WP-D output-Fisher shard to an
         already fitted model without refitting, so :meth:`steer` reports the
-        path-integrated ``predicted_nats`` dose. Accepts the same inputs as the
+        exact applied-delta endpoint ``predicted_nats`` dose. Accepts the same inputs as the
         fit-time hook: a :class:`gamfit.torch.harvest.HarvestShard`, a mapping
         with ``"U"`` ``(n, p, r)`` (plus optional ``"mass_residual"`` /
         ``"provenance"``), or a raw ``(n, p, r)`` array. ``provenance``
@@ -1140,7 +1140,14 @@ class ManifoldSAE:
         self.metric_provenance = "OutputFisher"
         return self
 
-    def steer(self, atom_k: int, t_from: Any, t_to: Any) -> dict[str, Any]:
+    def steer(
+        self,
+        atom_k: int,
+        metric_row: int,
+        amplitude: float,
+        t_from: Any,
+        t_to: Any,
+    ) -> dict[str, Any]:
         """Steering plan with output dosimetry for one atom (#980).
 
         Drives atom ``atom_k``'s latent coordinate from ``t_from`` to ``t_to``
@@ -1153,6 +1160,11 @@ class ManifoldSAE:
         ----------
         atom_k
             Atom index in ``[0, K)``.
+        metric_row
+            Exact fitted row whose output-Fisher block prices the intervention.
+        amplitude
+            Exact positive scalar multiplying the decoder chord in the applied
+            activation-space patch.
         t_from, t_to
             Source / target latent coordinates, each length ``d_k`` (the atom's
             ``atom_dim``), in the atom's raw latent-coordinate units (the same
@@ -1165,14 +1177,15 @@ class ManifoldSAE:
 
             * ``atom`` / ``atom_name`` — the steered atom and its name;
             * ``t_from`` / ``t_to`` — the latent endpoints (lists);
-            * ``amplitude`` — the atom's mean active assignment mass the move was
-              scaled by;
-            * ``measured_row`` — the most-active row whose per-row metric the dose
-              was read through;
+            * ``amplitude`` — the exact caller-supplied amplitude multiplying the
+              applied decoder chord;
+            * ``metric_row`` — the exact fitted row whose output-Fisher block
+              prices the applied move;
             * ``delta`` — ``(p,)`` activation-space move ``a·(g_k(t_to) −
               g_k(t_from))`` to add to a hidden state;
-            * ``predicted_nats`` — path-integrated output-Fisher KL dose in nats,
-              or ``None`` under a Euclidean (no behavioral axis) metric;
+            * ``predicted_nats`` — endpoint output-Fisher KL
+              ``0.5 * delta.T @ F[metric_row] @ delta`` in nats, or ``None``
+              under a Euclidean (no behavioral axis) metric;
             * ``validity_radius`` — latent step length the linearization is
               trusted to, or ``None`` under a Euclidean metric;
             * ``off_manifold_norm`` — ``δ``'s component off the local decoder
@@ -1201,7 +1214,15 @@ class ManifoldSAE:
         k = self._atom_index(atom_k)
         t_from_arr = np.ascontiguousarray(np.asarray(t_from, dtype=np.float64).reshape(-1))
         t_to_arr = np.ascontiguousarray(np.asarray(t_to, dtype=np.float64).reshape(-1))
-        return dict(self._core.steer(int(k), t_from_arr, t_to_arr))
+        return dict(
+            self._core.steer(
+                int(k),
+                int(metric_row),
+                float(amplitude),
+                t_from_arr,
+                t_to_arr,
+            )
+        )
 
     def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
         """Per-token active atom set ``(N, K)`` boolean mask for ``X``.

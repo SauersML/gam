@@ -83,8 +83,7 @@ pub fn build_sae_minimal_seed(
         .iter()
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
-    let seed_coords =
-        sae_pca_seed_initial_coords(request.target, &basis_kinds, &request.atom_dim)?;
+    let seed_coords = sae_pca_seed_initial_coords(request.target, &basis_kinds, &request.atom_dim)?;
     let plans = sae_build_atom_plans(
         request.target,
         &request.atom_basis,
@@ -93,8 +92,7 @@ pub fn build_sae_minimal_seed(
         request.random_state,
         &overrides,
     )?;
-    let effective_atom_dim: Vec<usize> =
-        plans.iter().map(|plan| plan.latent_dim).collect();
+    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
 
     let coords_are_cold = request.initial_coords.is_none();
     let mut start_coords = match request.initial_coords {
@@ -173,10 +171,7 @@ pub fn build_sae_minimal_seed(
         }
         None if k_atoms == 1 && request.assignment_kind == SaeFitAssignmentKind::IbpMap => {
             const IBP_K1_PRESENT_GATE_LOGIT: f64 = 6.0;
-            Array2::<f64>::from_elem(
-                (n_obs, k_atoms),
-                IBP_K1_PRESENT_GATE_LOGIT * request.tau,
-            )
+            Array2::<f64>::from_elem((n_obs, k_atoms), IBP_K1_PRESENT_GATE_LOGIT * request.tau)
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
@@ -222,10 +217,7 @@ pub fn build_sae_minimal_seed(
         request.threshold,
         request.top_k,
     )?;
-    let atom_centers = plans
-        .into_iter()
-        .map(|plan| plan.duchon_centers)
-        .collect();
+    let atom_centers = plans.into_iter().map(|plan| plan.duchon_centers).collect();
 
     Ok(SaeMinimalSeedReport {
         atom_basis: request.atom_basis,

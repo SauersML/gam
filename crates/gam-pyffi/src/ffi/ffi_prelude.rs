@@ -190,23 +190,20 @@ pub(crate) use gam::terms::sae::sparse_dict::{
 };
 
 pub(crate) use gam::terms::sae::manifold::{
-    AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
+    CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     GumbelTemperatureSchedule, MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator,
     SAE_DEFAULT_TORUS_HARMONICS, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS,
     SAE_MOBIUS_CIRCLE_HARMONICS, SAE_MOBIUS_WIDTH_DEGREE, SAE_SPHERE_BASIS_SIZE,
-    SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeAtomBuildPlan, SaeBasisEvaluator,
+    SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeBasisSecondJet, SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitSeedReport,
     SaeFitSeedRequest, SaeManifoldRho, SaeMinimalSeedReport, SaeMinimalSeedRequest,
     SaeStagewiseSeedReport, SaeStagewiseSeedRequest, ScheduleKind, SphereChartEvaluator,
     TorusHarmonicEvaluator, build_sae_basis_evaluators,
     build_sae_fisher_row_metric, build_sae_fit_seed, build_sae_minimal_seed,
     build_sae_stagewise_seed,
-    sae_atom_basis_kind_from_str, sae_atom_basis_kind_name,
-    sae_build_atom_plans, sae_build_padded_basis_stacks, sae_decoder_lsq_init, sae_duchon_atom_m,
-    sae_em_refine_routing_seed, sae_euclidean_degree_for_basis_size,
-    sae_output_energy_cluster_labels, sae_periodic_basis_size, sae_pick_duchon_center_indices,
-    sae_refine_periodic_seed_coords_by_cluster, sae_residual_seed_logits,
-    sae_torus_axis_basis_size, sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
+    sae_atom_basis_kind_from_str, sae_atom_basis_kind_name, sae_duchon_atom_m,
+    sae_euclidean_degree_for_basis_size, sae_periodic_basis_size, sae_pick_duchon_center_indices,
+    sae_torus_axis_basis_size, sphere_chart_basis_jet,
 };
 
 pub(crate) use gam::terms::decoders::skip_transcoder::{

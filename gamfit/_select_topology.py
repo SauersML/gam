@@ -12,6 +12,7 @@ Two public selectors are exposed:
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -665,7 +666,7 @@ def _failed_candidate_outcome(
         "stage": stage,
         "error_type": f"{type(error).__module__}.{type(error).__qualname__}",
         "message": str(error),
-        "evidence_at_failure": evidence_at_failure,
+        "evidence_at_failure": _optional_lifecycle_number(evidence_at_failure),
     }
 
 
@@ -690,15 +691,35 @@ def _fitted_candidate_outcome(
     return {
         "status": "fitted",
         "name": candidate.name,
-        "raw_reml": raw_reml,
-        "laml": _extract_float_field(fit_obj, ("laml",)),
-        "deviance": _extract_float_field(fit_obj, ("deviance",)),
-        "null_dim": _extract_null_dim(fit_obj),
-        "null_space_logdet": _extract_null_hessian_logdet(fit_obj),
-        "effective_dim": _effective_dim(fit_obj),
+        "raw_reml": _lifecycle_number(raw_reml),
+        "laml": _optional_lifecycle_number(_extract_float_field(fit_obj, ("laml",))),
+        "deviance": _optional_lifecycle_number(
+            _extract_float_field(fit_obj, ("deviance",))
+        ),
+        "null_dim": _optional_lifecycle_number(_extract_null_dim(fit_obj)),
+        "null_space_logdet": _optional_lifecycle_number(
+            _extract_null_hessian_logdet(fit_obj)
+        ),
+        "effective_dim": _lifecycle_number(_effective_dim(fit_obj)),
         "basis_size": _basis_size(fit_obj),
         "n_obs": int(n_obs),
     }
+
+
+def _lifecycle_number(value: float) -> float | str:
+    """Encode IEEE non-finite values losslessly across strict JSON."""
+    value = float(value)
+    if math.isnan(value):
+        return "nan"
+    if value == math.inf:
+        return "infinity"
+    if value == -math.inf:
+        return "-infinity"
+    return value
+
+
+def _optional_lifecycle_number(value: float | None) -> float | str | None:
+    return None if value is None else _lifecycle_number(value)
 
 
 def _select_candidate_lifecycle(
@@ -856,20 +877,18 @@ def _infer_candidate_name(topo: Smooth) -> str | None:
 
 
 def _normalize_score_kind(score: str) -> ScoreKind:
-    normalized = str(score).strip().lower()
-    if normalized not in {"reml", "laml", "bic", "tk"}:
+    if score not in {"reml", "laml", "bic", "tk"}:
         raise ValueError("score must be one of: 'reml', 'laml', 'bic', 'tk'")
-    return normalized  # type: ignore[return-value]
+    return score
 
 
 def _normalize_score_scale(score_scale: str) -> ScoreScale:
-    normalized = str(score_scale).strip().lower()
-    if normalized not in {"per_observation", "per_effective_dim", "raw"}:
+    if score_scale not in {"per_observation", "per_effective_dim", "raw"}:
         raise ValueError(
             "score_scale must be one of: 'per_observation', "
             "'per_effective_dim', 'raw'"
         )
-    return normalized  # type: ignore[return-value]
+    return score_scale
 
 
 def _extract_null_dim(fit_obj: Any) -> float | None:

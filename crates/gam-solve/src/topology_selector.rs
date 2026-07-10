@@ -1077,10 +1077,7 @@ fn topology_candidate_raw_score(
         ));
     }
     if evidence.n_obs == 0 {
-        return Err(format!(
-            "candidate {:?} requires n_obs > 0",
-            evidence.name
-        ));
+        return Err(format!("candidate {:?} requires n_obs > 0", evidence.name));
     }
     if !evidence.raw_reml.is_finite() {
         return Err(format!(
@@ -1218,8 +1215,8 @@ pub fn select_topology_candidate_lifecycle(
                     Err(message) => failed.push(TopologyCandidateFailure {
                         name: evidence.name,
                         stage: TopologyCandidateFailureStage::Evidence,
-                        error_type:
-                            "gam_solve::topology_selector::EvidenceValidationError".to_string(),
+                        error_type: "gam_solve::topology_selector::EvidenceValidationError"
+                            .to_string(),
                         message,
                         evidence_at_failure: evidence
                             .raw_reml
@@ -1234,10 +1231,7 @@ pub fn select_topology_candidate_lifecycle(
         .into_iter()
         .map(|candidate| candidate.item)
         .collect();
-    let warnings = topology_score_disagreement_warnings(
-        &evidence_survivors,
-        score_scale,
-    );
+    let warnings = topology_score_disagreement_warnings(&evidence_survivors, score_scale);
     Ok(TopologyCandidateSelectionResult {
         winner_index: (!ranked.is_empty()).then_some(0),
         ranked,
@@ -2749,10 +2743,7 @@ mod tests {
         assert_eq!(result.winner().unwrap().topology_name, "torus");
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].topology_name, "circle");
-        assert_eq!(
-            result.failed[0].stage,
-            TopologyCandidateFailureStage::Fit
-        );
+        assert_eq!(result.failed[0].stage, TopologyCandidateFailureStage::Fit);
         assert!(result.failed[0].message.contains("stationarity"));
     }
 
@@ -2815,8 +2806,14 @@ mod tests {
         assert_eq!(result.ranked.len(), 1);
         assert_eq!(result.ranked[0].name, "winner");
         assert_eq!(result.failed.len(), 2);
-        assert_eq!(result.failed[0].stage, TopologyCandidateFailureStage::Assembly);
-        assert_eq!(result.failed[1].stage, TopologyCandidateFailureStage::Evidence);
+        assert_eq!(
+            result.failed[0].stage,
+            TopologyCandidateFailureStage::Assembly
+        );
+        assert_eq!(
+            result.failed[1].stage,
+            TopologyCandidateFailureStage::Evidence
+        );
         assert!(result.failed[1].message.contains("non-finite REML"));
     }
 

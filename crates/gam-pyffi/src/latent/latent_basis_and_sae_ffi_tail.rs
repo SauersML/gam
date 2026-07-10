@@ -42,22 +42,13 @@
     row_loss_weights = None,
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
-    structured_residual_passes = 2,
     // #2239 magic-by-default: evidence-certified residual structure is promoted
     // to the primary tier by default (the certificate gates the birth; the
     // alternation self-extends its pass budget only while lineages are live).
     promote_from_residual = true,
     run_structure_search = true,
     run_outer_rho_search = true,
-    // #2228/#1095/#2132 — the SCALE-gauge is DEFAULT-ON to cure the decoder-penalty
-    // ↔ gate co-collapse (mirrors the `sae_manifold_fit_inner` default; the d06c1255f
-    // flip missed THIS entry, which is the one the Python `sae_manifold_fit` facade
-    // routes through). Callers can pass `quotient_scale=False` for a historical A/B.
-    quotient_scale = true,
     data_row_reseed = false,
-    // #1893: default Python auto fits to the realised-rank REML/Laplace
-    // complexity ledger; callers can set false for historical A/B.
-    rank_charge_evidence = true,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -99,16 +90,10 @@ fn sae_manifold_fit_minimal<'py>(
     // term's value; `None` selects the canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
     ibp_alpha_override: Option<f64>,
-    // #2021 — count of extra whitened-residual structured-alternation passes.
-    // Default-ON at `2` ("magic by default"); pass `0` for the historical
-    // iid-only path, bit-for-bit.
-    structured_residual_passes: usize,
     promote_from_residual: bool,
     run_structure_search: bool,
     run_outer_rho_search: bool,
-    quotient_scale: bool,
     data_row_reseed: bool,
-    rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
     // Convert borrowed Python arrays into the typed library seed request.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -185,13 +170,10 @@ fn sae_manifold_fit_minimal<'py>(
         row_w,
         separation_barrier_strength_override,
         ibp_alpha_override,
-        structured_residual_passes,
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
-        quotient_scale,
         data_row_reseed,
-        rank_charge_evidence,
     )?;
     // Post-search atom plans are emitted by the shared fit entry from the final
     // variable-K dictionary; the minimal binding never patches the payload.
@@ -912,6 +894,8 @@ fn build_sae_encode_atlas<'py>(
 /// output-Fisher `RowMetric` the dose is measured through.
 fn steer_delta_from_arrays(
     atom_k: usize,
+    metric_row: usize,
+    amplitude: f64,
     t_from: ndarray::ArrayView1<'_, f64>,
     t_to: ndarray::ArrayView1<'_, f64>,
     n_obs: usize,
@@ -1009,6 +993,8 @@ fn steer_delta_from_arrays(
         tau,
         fisher_metric,
         atom_k,
+        metric_row,
+        amplitude,
         t_from: t_from.to_vec(),
         t_to: t_to.to_vec(),
     };
@@ -1028,7 +1014,7 @@ fn steer_plan_to_pydict(
     out.set_item("t_from", plan.t_from)?;
     out.set_item("t_to", plan.t_to)?;
     out.set_item("amplitude", plan.amplitude)?;
-    out.set_item("measured_row", plan.measured_row)?;
+    out.set_item("metric_row", plan.metric_row)?;
     out.set_item("delta", plan.delta.into_pyarray(py))?;
     out.set_item("predicted_nats", plan.predicted_nats)?;
     out.set_item("validity_radius", plan.validity_radius)?;
@@ -1045,6 +1031,8 @@ fn steer_plan_to_pydict(
 /// the shared [`steer_delta_from_arrays`] rebuild (#2091).
 #[pyfunction(signature = (
     atom_k,
+    metric_row,
+    amplitude,
     t_from,
     t_to,
     n_obs,
@@ -1067,6 +1055,8 @@ fn steer_plan_to_pydict(
 fn sae_steer_delta<'py>(
     py: Python<'py>,
     atom_k: usize,
+    metric_row: usize,
+    amplitude: f64,
     t_from: PyReadonlyArray1<'py, f64>,
     t_to: PyReadonlyArray1<'py, f64>,
     n_obs: usize,
@@ -1097,6 +1087,8 @@ fn sae_steer_delta<'py>(
     let fisher_view = fisher_factors.as_ref().map(|f| f.as_array());
     let plan = steer_delta_from_arrays(
         atom_k,
+        metric_row,
+        amplitude,
         t_from.as_array(),
         t_to.as_array(),
         n_obs,

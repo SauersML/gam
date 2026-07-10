@@ -3994,16 +3994,35 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
         Evidence,
     }
     #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum LifecycleFloat {
+        Finite(f64),
+        NonFinite(String),
+    }
+    impl LifecycleFloat {
+        fn decode(self) -> Result<f64, String> {
+            match self {
+                Self::Finite(value) => Ok(value),
+                Self::NonFinite(token) => match token.as_str() {
+                    "nan" => Ok(f64::NAN),
+                    "infinity" => Ok(f64::INFINITY),
+                    "-infinity" => Ok(f64::NEG_INFINITY),
+                    _ => Err(format!("invalid lifecycle float token {token:?}")),
+                },
+            }
+        }
+    }
+    #[derive(Deserialize)]
     #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
     enum CandidateOutcome {
         Fitted {
             name: String,
-            raw_reml: f64,
-            laml: Option<f64>,
-            deviance: Option<f64>,
-            null_dim: Option<f64>,
-            null_space_logdet: Option<f64>,
-            effective_dim: f64,
+            raw_reml: LifecycleFloat,
+            laml: Option<LifecycleFloat>,
+            deviance: Option<LifecycleFloat>,
+            null_dim: Option<LifecycleFloat>,
+            null_space_logdet: Option<LifecycleFloat>,
+            effective_dim: LifecycleFloat,
             basis_size: usize,
             n_obs: usize,
         },
@@ -4012,7 +4031,7 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
             stage: FailureStage,
             error_type: String,
             message: String,
-            evidence_at_failure: Option<f64>,
+            evidence_at_failure: Option<LifecycleFloat>,
         },
     }
     #[derive(Deserialize)]
@@ -4036,14 +4055,10 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
     };
     let score_scale = match request.score_scale {
         ScoreScale::Raw => gam::solver::TopologySelectionScoreScale::Raw,
-        ScoreScale::PerObservation => {
-            gam::solver::TopologySelectionScoreScale::PerObservation
-        }
-        ScoreScale::PerEffectiveDim => {
-            gam::solver::TopologySelectionScoreScale::PerEffectiveDim
-        }
+        ScoreScale::PerObservation => gam::solver::TopologySelectionScoreScale::PerObservation,
+        ScoreScale::PerEffectiveDim => gam::solver::TopologySelectionScoreScale::PerEffectiveDim,
     };
-    let candidates = request
+    let candidates: Result<Vec<_>, String> = request
         .candidates
         .into_iter()
         .map(|candidate| match candidate {
@@ -4057,26 +4072,26 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                 effective_dim,
                 basis_size,
                 n_obs,
-            } => gam::solver::TopologyCandidateOutcome::Fitted(
+            } => Ok(gam::solver::TopologyCandidateOutcome::Fitted(
                 gam::solver::TopologyCandidateEvidence {
                     name,
-                    raw_reml,
-                    laml,
-                    deviance,
-                    null_dim,
-                    null_space_logdet,
-                    effective_dim,
+                    raw_reml: raw_reml.decode()?,
+                    laml: laml.map(LifecycleFloat::decode).transpose()?,
+                    deviance: deviance.map(LifecycleFloat::decode).transpose()?,
+                    null_dim: null_dim.map(LifecycleFloat::decode).transpose()?,
+                    null_space_logdet: null_space_logdet.map(LifecycleFloat::decode).transpose()?,
+                    effective_dim: effective_dim.decode()?,
                     basis_size,
                     n_obs,
                 },
-            ),
+            )),
             CandidateOutcome::Failed {
                 name,
                 stage,
                 error_type,
                 message,
                 evidence_at_failure,
-            } => gam::solver::TopologyCandidateOutcome::Failed(
+            } => Ok(gam::solver::TopologyCandidateOutcome::Failed(
                 gam::solver::TopologyCandidateFailure {
                     name,
                     stage: match stage {
@@ -4090,17 +4105,21 @@ fn select_topology_candidate_lifecycle(request_json: &str) -> PyResult<String> {
                     },
                     error_type,
                     message,
-                    evidence_at_failure,
+                    evidence_at_failure: evidence_at_failure
+                        .map(LifecycleFloat::decode)
+                        .transpose()?,
                 },
-            ),
+            )),
         })
         .collect();
-    let selected = gam::solver::select_topology_candidate_lifecycle(
-        candidates,
-        score_kind,
-        score_scale,
-    )
-    .map_err(|err| py_value_error(format!("select_topology_candidate_lifecycle: {err}")))?;
+    let candidates = candidates.map_err(|err| {
+        py_value_error(format!(
+            "select_topology_candidate_lifecycle: invalid numeric payload: {err}"
+        ))
+    })?;
+    let selected =
+        gam::solver::select_topology_candidate_lifecycle(candidates, score_kind, score_scale)
+            .map_err(|err| py_value_error(format!("select_topology_candidate_lifecycle: {err}")))?;
     let ranked: Vec<serde_json::Value> = selected
         .ranked
         .into_iter()

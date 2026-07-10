@@ -914,6 +914,10 @@ pub struct SaeSteerRequest {
     pub fisher_metric: Option<gam_problem::RowMetric>,
     /// The atom whose coordinate is being steered.
     pub atom_k: usize,
+    /// Exact fitted row whose output-Fisher block prices the applied move.
+    pub metric_row: usize,
+    /// Exact amplitude multiplying the applied decoder chord.
+    pub amplitude: f64,
     /// Source on-manifold coordinate.
     pub t_from: Vec<f64>,
     /// Target on-manifold coordinate.
@@ -934,6 +938,8 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
         tau,
         fisher_metric,
         atom_k,
+        metric_row,
+        amplitude,
         t_from,
         t_to,
     } = request;
@@ -952,6 +958,13 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
             "run_sae_manifold_steer: atom_k={atom_k} out of range for K={k_atoms} atoms"
         ));
     }
+    if metric_row >= logits.nrows() {
+        return Err(format!(
+            "run_sae_manifold_steer: metric_row={metric_row} out of range for {} fitted rows",
+            logits.nrows()
+        ));
+    }
+    finite_positive("amplitude", amplitude)?;
     finite_positive("alpha", alpha)?;
     finite_positive("tau", tau)?;
     let n_obs = logits.nrows();
@@ -1028,7 +1041,15 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     // bit-identical Euclidean metric (geometry-only; dose degrades to None).
     let euclidean = gam_problem::RowMetric::euclidean(n_obs, p_out)?;
     let metric = term.row_metric().unwrap_or(&euclidean);
-    steer_delta(&term, metric, atom_k, &t_from, &t_to)
+    steer_delta(
+        &term,
+        metric,
+        atom_k,
+        metric_row,
+        amplitude,
+        &t_from,
+        &t_to,
+    )
 }
 
 #[cfg(test)]
