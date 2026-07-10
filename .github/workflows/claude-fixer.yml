@@ -132,6 +132,25 @@ jobs:
 
             **2. Pick from the unclaimed set.** Free choice within it.
 
+            **2b. Empty inbox ⇒ bug hunt.** If there are NO open issues
+            (or every open issue is actively claimed per step 1), do not
+            exit idle — switch to bug-hunting to refill the inbox. Hunt
+            for REAL defects with the same standards as a fix run:
+            adversarially read suspicious subsystems, write a failing
+            repro (a test or a minimal script) that demonstrates the
+            wrong behaviour, and verify it actually fails for the reason
+            you claim. Then file one GitHub issue per confirmed defect —
+            title, root-cause hypothesis, exact repro, observed vs
+            expected — via `gh issue create`. Commit any repro tests to
+            `main` marked so they do not break CI (e.g. a
+            `tests_bughunt_*` module referenced from the issue, or the
+            repro inline in the issue body when a committed test would
+            go red). Quality over quantity: one deeply verified issue
+            beats five speculative ones; do NOT file style nits,
+            duplicates of existing closed issues, or unverified
+            suspicions. After filing, you may claim and fix one of your
+            own findings in the same run under the normal lock protocol.
+
             **3. Claim atomically.** Before doing any real work, post a
             comment on the chosen issue whose first line is exactly:
                 `🔒 claim: run ${{ github.run_id }} attempt ${{ github.run_attempt }}`
