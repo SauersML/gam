@@ -4822,6 +4822,26 @@ impl SaeManifoldTerm {
                 "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"
             ));
         }
+        // The inner Newton fit fans the per-row assembly, factorization, and
+        // reduced-Schur reduction across the global Rayon pool (`into_par_iter`
+        // over the `n` rows). Every faer HIGH-LEVEL solver reached from inside
+        // those workers — per-row Cholesky / self-adjoint eigendecomposition, the
+        // border factorization — reads `faer::get_global_parallelism()` directly.
+        // `with_nested_parallel` pins only gam's OWN `matmul` wrapper to
+        // `Par::Seq`; it CANNOT reach those faer solvers (they take no parallelism
+        // argument). Under faer's default `Par::rayon(0)` each per-row solver
+        // therefore re-fans faer's `spindle` barrier pool INTO the already
+        // saturated outer Rayon fan-out. Profiling the real behavior fit
+        // (n=4000, p=256, K=8) on an H100 showed ~34% of all cycles spinning in
+        // `spindle::Barrier::wait_and_clear_while` and a further ~16% in the
+        // futex/spinlock slow path, both pure oversubscription overhead. Pinning
+        // faer's process-global parallelism to `Par::Seq` for the duration of the
+        // inner fit collapses that nested pool: the coarse per-row Rayon
+        // parallelism is untouched (it is where the actual parallel speedup
+        // lives), and faer's reductions are parallelism-invariant — `Par::Seq`
+        // and `Par::rayon` are bit-for-bit identical (`tests_parallelism_invariance_1557`)
+        // — so this removes only wasted synchronization, changing no fitted value.
+        let _faer_sequential_inner_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
         // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
