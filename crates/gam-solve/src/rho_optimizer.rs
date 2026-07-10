@@ -56,7 +56,7 @@ pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::OuterCriterionCertificate;
 pub(crate) use bridges::*;
 pub use capability::*;
-pub use gam_problem::{HessianValue, OuterEval};
+pub use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
 pub(crate) use hessian_operator::*;
 pub use objective::*;
 pub(crate) use run::*;
