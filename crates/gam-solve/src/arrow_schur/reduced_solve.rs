@@ -1982,16 +1982,6 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     Some((plan, eval))
 }
 
-/// Loose CG budget for BUILDING the bottom-tail (inverse-iteration) deflation
-/// basis columns. The two-sided split `tr log(S/c) = term1(Q) + term2(P)` is
-/// EXACT for any orthonormal `Q`, so basis-build solve error can only relax the
-/// variance reduction — it can never bias the value or its gradient. Three
-/// digits steers the subspace iteration onto the small-λ tail (all that is
-/// needed for the Frobenius off-diagonal mass to move into term1) while an
-/// evaluation-grade tolerance on the UNSHIFTED full-κ operator would cost
-/// √κ-scale CG iterations per column for no accuracy in return.
-const DEFLATION_BASIS_CG_REL_TOL: f64 = 1.0e-3;
-
 /// Build the FROZEN #2080 surrogate plan for one outer solve, with the Hutch++
 /// deflation rank DERIVED from a pilot evaluation — the build-once companion to
 /// per-ρ [`RationalLogdetPlan::evaluate`]. Returns just the plan (probes +
@@ -2005,10 +1995,13 @@ const DEFLATION_BASIS_CG_REL_TOL: f64 = 1.0e-3;
 /// `0.1 · STALL_REL_TOL`; `log|S|` is the criterion's dominant term at wide `k`
 /// so `|log|S||+1` is the right objective scale to `O(1)` and the `0.1` margin
 /// absorbs the loss/Occam remainder). The peel rank grows on a doubling schedule
-/// until the Hutchinson error bar clears the target or the `deflation_max_rank`
-/// cap is hit; `deflation_max_rank == 0` (or a pilot already under target) yields
-/// the bare-Hutchinson plan. Deterministic for fixed inputs (`Q` and probes are
-/// seed-derived). The returned plan's `Q` is FROZEN, so
+/// until the Hutchinson error bar clears the target. `deflation_max_rank` is a
+/// resource-admission ceiling, not permission to return an under-certified
+/// estimate: exhausting it before the bar clears returns `None` and the caller
+/// surfaces a typed evidence failure. `deflation_max_rank == 0` explicitly
+/// requests the bare-Hutchinson plan; a pilot already under target also returns
+/// it. Deterministic for fixed inputs (`Q` and probes are seed-derived). The
+/// returned plan's `Q` is FROZEN, so
 /// [`RationalLogdetPlan::directional_derivative`] on its evaluations is the exact
 /// surrogate gradient.
 pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
@@ -2029,7 +2022,10 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     deflation_target_std_err_rel: f64,
 ) -> Option<RationalLogdetPlan> {
     let k = sys.k;
-    if k == 0 {
+    if k == 0
+        || !(cg_rel_tol.is_finite() && cg_rel_tol > 0.0 && cg_rel_tol < 1.0)
+        || !(deflation_target_std_err_rel.is_finite() && deflation_target_std_err_rel >= 0.0)
+    {
         return None;
     }
     let lambda_max = reduced_schur_lambda_max(
@@ -2058,14 +2054,21 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     if deflation_max_rank == 0 {
         return Some(base_plan);
     }
-    let target = deflation_target_std_err_rel.max(0.0) * (pilot.estimate.abs() + 1.0);
+    let target = deflation_target_std_err_rel * (pilot.estimate.abs() + 1.0);
     if pilot.std_err <= target {
         return Some(base_plan);
     }
-    // Grow the peel rank (doubling ⇒ log-many re-solves) until the bar clears or
-    // the cap is hit; keep the LAST plan (its frozen Q is the deepest peel tried).
+    // Grow from the smallest nonzero peel rank (doubling ⇒ log-many re-solves)
+    // until the bar clears. The caller's cap is a resource ceiling; reaching it
+    // with an over-target bar refuses the surrogate rather than silently
+    // weakening the requested statistical-accuracy contract.
     let cap = deflation_max_rank.min(k);
-    let mut rank = 4usize;
+    let mut rank = 1usize;
+    // Basis iteration only steers Q for variance reduction. Derive its looser
+    // true-residual tolerance from the evaluation solve's tolerance instead of
+    // carrying an unrelated fixed knob: √tol is strictly looser while still
+    // converging as the bottom-tail builder now requires.
+    let basis_cg_rel_tol = cg_rel_tol.sqrt();
     loop {
         let r = rank.min(cap);
         // Split the peel budget across BOTH spectral tails at equal total rank:
@@ -2086,11 +2089,14 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             r / 2,
             deflation_subspace_iters,
             seed,
-            (DEFLATION_BASIS_CG_REL_TOL, cg_max_iters),
+            (basis_cg_rel_tol, cg_max_iters),
         )?;
         let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
-        if eval.std_err <= target || r >= cap {
+        if eval.std_err <= target {
             return Some(plan);
+        }
+        if r >= cap {
+            return None;
         }
         rank = rank.saturating_mul(2);
     }

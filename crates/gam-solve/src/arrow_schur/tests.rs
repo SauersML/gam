@@ -125,29 +125,11 @@ pub(crate) fn beta_gauge_quotient_value_inverse_and_gradient_are_orbit_invariant
     let factors = ArrowFactorSlab::from_blocks(Vec::new());
     let backend = CpuBatchedBlockSolver;
     let mf_a = reduced_schur_inverse_apply(
-        &sys_a,
-        &factors,
-        0.0,
-        &backend,
-        None,
-        None,
-        &rhs,
-        None,
-        1e-13,
-        32,
+        &sys_a, &factors, 0.0, &backend, None, None, &rhs, None, 1e-13, 32,
     )
     .expect("matrix-free inverse A");
     let mf_b = reduced_schur_inverse_apply(
-        &sys_b,
-        &factors,
-        0.0,
-        &backend,
-        None,
-        None,
-        &rhs,
-        None,
-        1e-13,
-        32,
+        &sys_b, &factors, 0.0, &backend, None, None, &rhs, None, 1e-13, 32,
     )
     .expect("matrix-free inverse B");
     for i in 0..3 {
@@ -5691,6 +5673,33 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
          (bare={:.3e}, derived={:.3e})",
         bare_eval.std_err,
         derived_eval.std_err
+    );
+
+    // The rank ceiling is resource admission, not a license to consume an
+    // under-certified stochastic criterion. A zero requested bar cannot be met
+    // by one deflated direction with a finite probe block, so the plan must
+    // refuse instead of returning the deepest attempted Q.
+    let under_certified = rational_reduced_schur_plan_derived(
+        &sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+        None,
+        None,
+        32,
+        seed,
+        1e-9,
+        40,
+        1e-11,
+        20_000,
+        1,
+        2,
+        0.0,
+    );
+    assert!(
+        under_certified.is_none(),
+        "derived surrogate must refuse when its rank ceiling is exhausted before \
+         the requested Hutchinson error bar is certified"
     );
 }
 
