@@ -649,8 +649,13 @@ where
     let b = flatten_arrow_parts(b.t.view(), b.beta.view());
     let b_norm = b.dot(&b).sqrt().max(1.0);
     let rel_tol = 1.0e-10;
-    let restart = dim.min(32);
-    let max_iters = dim.clamp(8, 256);
+    // A Krylov space truncated below the system dimension stagnates on small
+    // indefinite systems (restarted GMRES loses superlinear convergence), so
+    // small systems get FULL-memory GMRES — exact termination within `dim`
+    // steps up to round-off — and only genuinely large systems restart. The
+    // iteration budget must exceed `dim` so a restarted cycle can recover.
+    let restart = dim.min(128);
+    let max_iters = (2 * dim).clamp(8, 512);
     let mut iterations = 0usize;
     let mut x = Array1::<f64>::zeros(dim);
 
