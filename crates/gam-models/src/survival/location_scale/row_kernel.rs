@@ -311,6 +311,25 @@ pub(crate) fn split_survival_psi_design(
 /// the index-space derivative tensors are diagonal in `i`.
 pub(crate) const SLS_ROW_K: usize = 9;
 
+/// Highest concrete `KW = SLS_ROW_K + pw` the link-wiggle jet dispatch ladders
+/// (`survival_ls_wiggle_joint_hessian_dense`,
+/// `survival_ls_wiggle_directional_derivative_dense`, and
+/// `survival_ls_wiggle_second_directional_derivative_dense`) monomorphize. The
+/// row kernel tower is const-generic, so `KW` must be a compile-time literal;
+/// the ladders cover `KW ∈ 10..=20`. Widening past this requires a matching
+/// literal arm to be added to each ladder (and a recompile of the new
+/// monomorphization). Keep this in sync with the ladder arms — the
+/// `link_wiggle_width_within_dispatch_ladder` prepare test pins the agreement.
+pub(crate) const SLS_WIGGLE_KW_MAX: usize = 20;
+
+/// Maximum runtime link-wiggle basis width `pw` the const-generic jet ladder
+/// supports (`SLS_WIGGLE_KW_MAX − SLS_ROW_K`). Model preparation validates the
+/// prepared wiggle design against this so a wider otherwise-valid spline is
+/// rejected up front with a precise typed error naming this limit and #932,
+/// instead of hard-erroring deep in the Hessian / directional-derivative
+/// assembly (#932 gap 5).
+pub(crate) const SLS_MAX_LINK_WIGGLE_COLS: usize = SLS_WIGGLE_KW_MAX - SLS_ROW_K;
+
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
 /// [`SurvivalLocationScaleFamily::collect_joint_quantities_rescaled`] and
@@ -1388,19 +1407,21 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // Hessian by the `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
         // oracle (≤ 1e-9).
         //
-        // PERF GUARD (#932 speed audit, measured CPU): this dense `Order2<9>`
-        // v/g/H definition is ORACLE-PINNED but currently GATED OFF in production
-        // — `row_kernel_joint_hessian_supported()` returns `false`, so the joint
-        // Hessian ships the bespoke sparse `assemble_joint_hessian_from_quantities`
-        // instead. It is kept gated off on purpose: the dense jet is ~3.8–5.3×
-        // SLOWER than that bespoke sparse assembler (standalone ns/row + `--emit
-        // asm` op counts), because a dense order-2 tower over 9 channels cannot
-        // recover the 3-functionally-independent-index × ≤5-touched-channel
-        // sparsity the bespoke chain rule hard-codes — this is inherent, not a
-        // tuning gap. DO NOT flip `row_kernel_joint_hessian_supported()` to `true`
-        // (or otherwise route the production joint Hessian through this dense
-        // `Order2<9>` row kernel) without FIRST replacing this with a
-        // sparsity-aware packed jet; doing so as-is is a 3.8–5.3× regression.
+        // MEASURED PERF EXCEPTION (#932 speed audit, measured CPU): this dense
+        // `Order2<9>` v/g/H definition is ORACLE-PINNED (it is the single source
+        // the analytic joint-Hessian and block-gradient oracles compare the live
+        // hand assemblers against) but is NOT the production joint-Hessian path.
+        // The production non-wiggle joint Hessian ships the sparse
+        // `assemble_joint_hessian_from_quantities` because this dense jet is
+        // ~3.8–5.3× SLOWER (standalone ns/row + `--emit asm` op counts): a dense
+        // order-2 tower over 9 channels cannot recover the
+        // 3-functionally-independent-index × ≤5-touched-channel sparsity the
+        // bespoke chain rule hard-codes — inherent, not a tuning gap. DO NOT route
+        // the production joint Hessian through this dense `Order2<9>` row kernel
+        // without FIRST replacing it with a sparsity-aware packed jet; doing so
+        // as-is is a 3.8–5.3× regression. The hand path stays faithful to THIS
+        // single source via the analytic oracles named in
+        // `assemble_joint_hessian_from_quantities`'s doc.
         let (p, kernel) = self.row_nll_inputs(row)?;
         let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
             std::array::from_fn(|a| Order2::variable(p[a], a));
@@ -1719,33 +1740,6 @@ impl SurvivalLocationScaleFamily {
     pub(crate) const BLOCK_LINK_WIGGLE: usize = 3;
     pub(crate) const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
 
-    /// The `RowKernel<K>` engine assumes a fixed linear coefficient-to-primary
-    /// Jacobian for the row. Survival LS satisfies that after choosing the nine
-    /// linear predictors as primary channels, but link-wiggle does not: its
-    /// basis rows are evaluated at q(eta_threshold, eta_log_sigma), so the row
-    /// design itself changes with beta and contributes dJ/dβ terms outside the
-    /// current trait contract.
-    #[inline]
-    pub(crate) fn row_kernel_joint_hessian_supported(&self) -> bool {
-        // Keep the coefficient working-set path on the bespoke exact
-        // assembler. Besides avoiding the oversized `Tower4<9>` cache, the
-        // bespoke path is the derivative path that currently tracks the
-        // survival location-scale likelihood for every supported residual
-        // distribution and time-varying channel layout.
-        //
-        // PERF GUARD (#932 speed audit, measured CPU): returning `false` here is
-        // also a deliberate SPEED decision, not only a coverage one. Routing the
-        // joint Hessian through the dense `Order2<9>` single-source row kernel
-        // (`RowKernel<9>::row_kernel`) is ~3.8–5.3× SLOWER than this bespoke
-        // sparse `assemble_joint_hessian_from_quantities` (standalone ns/row +
-        // `--emit asm` op counts): a dense order-2 tower over 9 channels cannot
-        // recover the 3-functionally-independent-index × ≤5-touched-channel
-        // sparsity the bespoke assembler hard-codes. DO NOT return `true` (or
-        // otherwise enable the dense `Order2<9>` joint-Hessian path) without
-        // FIRST replacing the dense row kernel with a sparsity-aware packed jet;
-        // flipping this as-is is a 3.8–5.3× regression on the live fit hot path.
-        false
-    }
 
     /// First directional derivatives require third qdot map derivatives when
     /// threshold/log-sigma derivative designs are present.

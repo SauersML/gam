@@ -203,37 +203,20 @@ impl SurvivalLocationScaleFamily {
                 }
                 .into());
             }
-            // Source `g = ∇ℓ` from the SAME jet-tower row kernel that produces the
-            // Newton Hessian `H = −∇²ℓ` below, so the step `H δ = g` is solved on a
-            // consistent (objective, gradient, Hessian) triple for EVERY residual
-            // distribution. The legacy `evaluate_log_likelihood_and_block_gradients`
-            // hand-assembly above happens to coincide with the jet tower for the
-            // probit (lognormal) residual but diverges for the logit (log-logistic)
-            // residual, yielding a wrong Newton direction that pinned the `age`
-            // location coefficient to its cold-start 0 (gam#1110). The kernel
-            // gradient has the identical block-concatenated layout (its
-            // `jacobian_transpose_action` writes per channel into the same
-            // `joint_block_offsets` slabs), so it drops in directly; `ll` is still
-            // the scalar log-likelihood from the call above (unchanged).
-            if let Some(kernel_g) = self.exact_newton_joint_loglik_gradient(&states)? {
-                if kernel_g.len() != p_total {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch {
-                        reason: format!(
-                            "direct parametric-AFT MLE: kernel gradient length {} != p_total {}",
-                            kernel_g.len(),
-                            p_total
-                        ),
-                    }
-                    .into());
-                }
-                if !kernel_g.iter().all(|v| v.is_finite()) {
-                    return Err(SurvivalLocationScaleError::NumericalFailure {
-                        reason: "direct parametric-AFT MLE: non-finite kernel gradient".to_string(),
-                    }
-                    .into());
-                }
-                g = kernel_g;
-            }
+            // The step `H δ = g` is solved on a consistent (objective, gradient,
+            // Hessian) triple for EVERY residual distribution: `g = ∇ℓ` above is
+            // the block-gradient hand assembler
+            // (`evaluate_log_likelihood_and_block_gradients`) and `H = −∇²ℓ` below
+            // is `assemble_joint_hessian_from_quantities`, but both are pinned to
+            // the ONE single-sourced `sls_row_nll` jet to ≤1e-9 by the analytic
+            // oracles (`survival_ls_block_gradient_matches_single_sourced_tower_932`
+            // for the gradient across Gaussian/Gumbel/Logistic on the every-channel
+            // time-varying shape;
+            // `survival_ls_time_varying_joint_hessian_matches_single_sourced_tower_932`
+            // for the Hessian). This closes gam#1110, where an earlier hand block
+            // gradient diverged from the jet for the logit (log-logistic) residual
+            // and pinned the `age` location coefficient to its cold-start 0: the
+            // oracle now forbids any dropped cross-channel term from reappearing.
             // Retained for diagnostics only — the stopping test is the Newton
             // decrement computed below, NOT this raw summed-gradient sup-norm
             // (whose attainable floor scales with `n`; see the doc comment /
@@ -1946,54 +1929,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &q, &dynamic, 0.0)?,
             ));
         }
-        if self.row_kernel_joint_hessian_supported() {
-            let dynamic = self.build_dynamic_geometry(block_states)?;
-            let kernel = self.survival_ls_row_kernel(&q, &dynamic);
-            let rows = crate::row_kernel::RowSet::All;
-            let cache = crate::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
-            return Ok(Some(crate::row_kernel::row_kernel_hessian_dense(
-                &kernel, &cache, &rows,
-            )));
-        }
+        // #932 measured perf exception: sparse hand assembler, pinned to the
+        // single-source jet by the analytic oracles (see the method doc).
         self.assemble_joint_hessian_from_quantities(&q, block_states)
-    }
-
-    /// Block-concatenated log-likelihood gradient `g = ∇ℓ(θ)` assembled from the
-    /// SAME per-row jet-tower kernel that [`Self::exact_newton_joint_hessian`]
-    /// uses for `H = −∇²ℓ`. Overrides the `CustomFamily` default (which returns
-    /// `None`), so the damped Newton `H δ = g` in `fit_parametric_aft_direct_mle`
-    /// is solved on a consistent (objective, gradient, Hessian) triple.
-    ///
-    /// If `g` were assembled by one code path
-    /// (`evaluate_log_likelihood_and_block_gradients`) and `H` by another (the
-    /// row-kernel jet tower), any divergence between the two — even a single
-    /// dropped cross-channel term — would yield a Newton direction that is not
-    /// the true ascent step, so a covariate could stall at its cold-start value
-    /// and never move (gam#1110: the log-logistic AFT `age` coefficient pinned to
-    /// exactly 0 while the lognormal/probit path, whose hand-coded and jet-tower
-    /// gradients happen to coincide, recovers it). Sourcing both from
-    /// `row_kernel_*` over one cache makes the objective, its gradient, and its
-    /// Hessian provably consistent for every residual distribution.
-    ///
-    /// `row_kernel_gradient` returns `∇(nll) = −∇ℓ` (the cached per-row jets are
-    /// of the negative log-likelihood, pulled back by `jacobian_transpose_action`
-    /// — exactly the pullback `row_kernel_hessian_dense` consumes), so we negate
-    /// it to return `∇ℓ`. Returns `None` only when the row-kernel joint-Hessian
-    /// path is unavailable (then the caller keeps the legacy gradient).
-    fn exact_newton_joint_loglik_gradient(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<Option<Array1<f64>>, String> {
-        if !self.row_kernel_joint_hessian_supported() {
-            return Ok(None);
-        }
-        let q = self.collect_joint_quantities(block_states)?;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        let kernel = self.survival_ls_row_kernel(&q, &dynamic);
-        let rows = crate::row_kernel::RowSet::All;
-        let cache = crate::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
-        let nll_grad = crate::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
-        Ok(Some(-nll_grad))
     }
 
     fn exact_newton_joint_gradient_evaluation(

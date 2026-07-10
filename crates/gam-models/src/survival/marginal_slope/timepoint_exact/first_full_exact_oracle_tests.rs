@@ -4,8 +4,9 @@
 //! contracted base + directional/bidirectional via the `Jet2`/`Jet3`/`Jet4`
 //! builders). This module pins those against the hand math (the `flex_jet`
 //! `flex_timepoint_inputs_jet{3,4}_*_matches_hand_932` gates + the `tests.rs` FD
-//! witnesses). `compute_survival_timepoint_first_order_exact` (grad-only) +
-//! `FluxVelocity` / `moving_density_boundary_flux` stay production in `first_full`.
+//! witnesses). The grad-only path is likewise jet-sourced
+//! (`flex_jet::compute_survival_timepoint_first_order_exact` at `Jet1`); only the
+//! shared `moving_density_boundary_flux` helper stays in `first_full`.
 
 use super::first_full::moving_density_boundary_flux;
 use super::*;

@@ -34,12 +34,13 @@ mod contracted;
 #[cfg(test)]
 mod directional_oracle_tests;
 mod first_full;
-// #932-2 increment 3: the hand contracted/base θ-derivative producer
-// (`compute_survival_timepoint_exact_from_cached` + its D-path builders) is now a
-// test-only oracle — the production contracted base is jet-sourced
-// (`flex_jet::compute_survival_timepoint_exact_jet_from_cached`). `first_full` keeps
-// the grad-only `compute_survival_timepoint_first_order_exact` + the shared
-// `FluxVelocity` / `moving_density_boundary_flux` helpers in production.
+// #932-2 increment 3 + grad-only cutover: the hand contracted/base θ-derivative
+// producer (`compute_survival_timepoint_exact_from_cached` + its D-path builders)
+// AND the hand grad-only first-order pack are now test-only oracles — BOTH the
+// production grad-only path (`flex_jet::compute_survival_timepoint_first_order_exact`
+// at Jet1) and the value/grad/Hessian + contracted base (Jet2/Jet3/Jet4) are
+// jet-sourced from the one `flex_jet` builder. `first_full` keeps only the shared
+// `moving_density_boundary_flux` helper the oracle assemblers reuse.
 #[cfg(test)]
 mod first_full_exact_oracle_tests;
 pub(crate) mod flex_jet;

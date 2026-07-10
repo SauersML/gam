@@ -793,7 +793,7 @@ fn reparameterize_logslope_design_reduced(
 /// Re-embed the term-collection marginal penalties at the (possibly widened)
 /// block dimension `p_m [+ p₁]`, then append the #461 fixed-ridge absorber:
 ///
-///  (#461, only with influence columns) the fixed-ridge absorber identity on
+///  (#461, only with influence columns) the REML-learned absorber identity on
 ///  the influence columns `p_m..p_m+p₁`.
 ///
 /// The two former gam#754 pinned ridges — the marginal nullspace-shrinkage ridge
@@ -807,18 +807,28 @@ fn reparameterize_logslope_design_reduced(
 ///
 /// The genuine marginal smooth penalties keep their `col_range` (marginal
 /// columns stay in `0..p_m`). Returns `(penalties, nullspace_dims,
-/// initial_log_lambdas)` to install on the marginal block. Fixed ridges remain
-/// in this physical penalty layout and are removed from every REML/outer
-/// coordinate vector by [`PenaltyMatrix::Fixed`].
+/// initial_log_lambdas)` to install on the marginal block. With influence
+/// columns present, `rho_marginal` carries one TRAILING coordinate for the
+/// absorber ridge: its precision is REML-learned like every other penalty
+/// (SPEC: shrinkage is explicit or REML-selected, never a pinned magic
+/// constant), seeded at the ln(n) leakage scale by `joint_setup`.
 pub(crate) fn marginal_penalties_with_influence_ridge(
     design: &TermCollectionDesign,
     rho_marginal: &Array1<f64>,
     influence_columns: Option<&Array2<f64>>,
-    influence_ridge_log_lambda: f64,
 ) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), String> {
     let p_m = design.design.ncols();
     let p1 = influence_columns.map(|z| z.ncols()).unwrap_or(0);
     let total_dim = p_m + p1;
+    let expected_rho = design.penalties.len() + usize::from(p1 > 0);
+    if rho_marginal.len() != expected_rho {
+        return Err(format!(
+            "marginal rho width {} != smooth penalties {} + absorber slot {}",
+            rho_marginal.len(),
+            design.penalties.len(),
+            usize::from(p1 > 0),
+        ));
+    }
     // Re-embed each marginal penalty at the (widened) total dimension (col_range
     // unchanged: marginal columns remain 0..p_m).
     let mut penalties: Vec<PenaltyMatrix> = design
@@ -827,22 +837,20 @@ pub(crate) fn marginal_penalties_with_influence_ridge(
         .map(|bp| bp.to_penalty_matrix(total_dim))
         .collect();
     let mut nullspace_dims = design.nullspace_dims.clone();
-    let mut log_lambdas = rho_marginal.to_vec();
+    let log_lambdas = rho_marginal.to_vec();
 
-    // (#461) fixed-ridge absorber: identity on the influence columns only.
-    // Full rank (nullspace 0); its log λ is pinned out of REML by a degenerate
-    // ρ box.
+    // (#461) absorber ridge: identity on the influence columns only. Full rank
+    // (nullspace 0); its log λ is the trailing `rho_marginal` coordinate, so
+    // the outer REML selects the absorber precision like any other
+    // random-effect variance (large λ recovers the null correction; the
+    // residualized columns carry no marginal-span signal by construction).
     if p1 > 0 {
-        penalties.push(
-            PenaltyMatrix::Blockwise {
-                local: Array2::<f64>::eye(p1),
-                col_range: p_m..total_dim,
-                total_dim,
-            }
-            .with_fixed_log_lambda(influence_ridge_log_lambda),
-        );
+        penalties.push(PenaltyMatrix::Blockwise {
+            local: Array2::<f64>::eye(p1),
+            col_range: p_m..total_dim,
+            total_dim,
+        });
         nullspace_dims.push(0);
-        log_lambdas.push(influence_ridge_log_lambda);
     }
 
     Ok((penalties, nullspace_dims, Array1::from_vec(log_lambdas)))

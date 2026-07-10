@@ -1997,60 +1997,69 @@ impl BernoulliMarginalSlopeFamily {
         let mut packed_neglog = Array1::<f64>::zeros(tile_len);
         let mut packed_grad = Array2::<f64>::zeros((tile_len, r));
         let mut packed_hess = Array2::<f64>::zeros((tile_len, r * r));
-        let chunk_evals: Vec<(f64, Vec<f64>, Vec<f64>)> = rows
-            .clone()
-            .into_par_iter()
-            .map(|row| -> Result<(f64, Vec<f64>, Vec<f64>), String> {
-                let row_ctx = Self::row_ctx(cache, row);
-                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
-                let row_moments = cache
-                    .row_cell_moments
-                    .as_ref()
-                    .and_then(|bundle| bundle.row(row, 9));
-                let neglog = self.compute_row_analytic_flex_into_with_moments(
-                    row,
-                    block_states,
-                    &cache.primary,
-                    row_ctx,
-                    row_moments,
-                    cache.cell_family_forest.as_ref(),
-                    true,
-                    &mut scratch,
-                )?;
-                if log_exact_work(n) {
-                    let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done == n || done % progress_step == 0 {
-                        log::info!(
-                            "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
-                            done,
-                            n,
-                            started.elapsed().as_secs_f64()
+        {
+            // #932 cold-builder allocation fix: one flex scratch per rayon
+            // worker split (`try_for_each_init`), with each row's outputs
+            // written straight into disjoint chunks of the preallocated packed
+            // arrays. The former shape allocated a fresh scratch plus two
+            // output `Vec`s per row and an intermediate per-tile `Vec` of
+            // triples, all repacked serially afterwards. The row kernel's own
+            // `scratch.reset(need_hessian)` makes worker-local reuse exact.
+            use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator};
+            use rayon::slice::ParallelSliceMut;
+            let neglog_out = packed_neglog
+                .as_slice_mut()
+                .expect("packed_neglog is contiguous");
+            let grad_out = packed_grad
+                .as_slice_mut()
+                .expect("packed_grad is contiguous");
+            let hess_out = packed_hess
+                .as_slice_mut()
+                .expect("packed_hess is contiguous");
+            rows.clone()
+                .into_par_iter()
+                .zip(neglog_out.par_iter_mut())
+                .zip(grad_out.par_chunks_mut(r))
+                .zip(hess_out.par_chunks_mut(r * r))
+                .try_for_each_init(
+                    || BernoulliMarginalSlopeFlexRowScratch::new(r),
+                    |scratch, (((row, neglog_slot), grad_slot), hess_slot)| -> Result<(), String> {
+                        let row_ctx = Self::row_ctx(cache, row);
+                        let row_moments = cache
+                            .row_cell_moments
+                            .as_ref()
+                            .and_then(|bundle| bundle.row(row, 9));
+                        let neglog = self.compute_row_analytic_flex_into_with_moments(
+                            row,
+                            block_states,
+                            &cache.primary,
+                            row_ctx,
+                            row_moments,
+                            cache.cell_family_forest.as_ref(),
+                            true,
+                            scratch,
+                        )?;
+                        if log_exact_work(n) {
+                            let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
+                            if done == n || done % progress_step == 0 {
+                                log::info!(
+                                    "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
+                                    done,
+                                    n,
+                                    started.elapsed().as_secs_f64()
+                                );
+                            }
+                        }
+                        *neglog_slot = neglog;
+                        grad_slot.copy_from_slice(
+                            scratch.grad.as_slice().expect("grad is contiguous"),
                         );
-                    }
-                }
-                Ok((
-                    neglog,
-                    scratch.grad.to_vec(),
-                    scratch
-                        .hess
-                        .as_slice()
-                        .expect("hess is contiguous")
-                        .to_vec(),
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        for (offset, (neglog, grad_flat, hess_flat)) in chunk_evals.into_iter().enumerate() {
-            packed_neglog[offset] = neglog;
-            packed_grad
-                .row_mut(offset)
-                .iter_mut()
-                .zip(grad_flat.iter())
-                .for_each(|(d, s)| *d = *s);
-            packed_hess
-                .row_mut(offset)
-                .iter_mut()
-                .zip(hess_flat.iter())
-                .for_each(|(d, s)| *d = *s);
+                        hess_slot.copy_from_slice(
+                            scratch.hess.as_slice().expect("hess is contiguous"),
+                        );
+                        Ok(())
+                    },
+                )?;
         }
         Ok(RowPrimaryEvalPin::new(
             packed_neglog,

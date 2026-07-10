@@ -2068,6 +2068,56 @@ impl SurvivalMarginalSlopeFamily {
             d_uv: to_h(&d)?,
         })
     }
+
+    /// #932 grad-only single-source: the exact timepoint `(eta, chi, d)` VALUE +
+    /// GRADIENT via the SAME single-source `flex_timepoint_inputs_generic` jet
+    /// builder as [`Self::compute_survival_timepoint_exact_jet`], instantiated at
+    /// [`Jet1`] (no second-order channel). This replaces the hand first-order
+    /// cell-moment / IFT `a_u` / moving-flux `d_u` / `ρ`-`τ` `eta_u`/`chi_u`
+    /// assembly that used to live in `first_full`: there is now ONE definition of
+    /// the flex timepoint geometry, and the grad-only path is its order-≤1
+    /// truncation. Because `Jet1` shares `add`/`sub`/`mul`/`scale`/`compose_unary`
+    /// and the `moment_term` gradient line with `Jet2` op-for-op, the returned
+    /// value/gradient are bit-identical to the [`Jet2`] path's base + gradient
+    /// channels; the identity is pinned by
+    /// `flex_timepoint_first_order_matches_jet2_and_fd_932`.
+    pub(crate) fn compute_survival_timepoint_first_order_exact(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
+    ) -> Result<SurvivalFlexTimepointFirstOrderExact, String> {
+        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
+        let p = primary.total;
+        let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
+        let z_obs = self.observed_score_projection(row);
+        let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
+        let cells = cells_from_cached(&cached);
+
+        let template = Jet1::primary(0.0, usize::MAX, p);
+        let b_jet = Jet1::primary(b, primary.g, p);
+        let du: Vec<Jet1> = (0..p).map(|u| Jet1::primary(0.0, u, p)).collect();
+        let (eta, chi, d) = flex_timepoint_inputs_generic(
+            &template, &b_jet, &du, a, d_check, primary.g, primary.infl, q_index, q, z_obs, o_infl,
+            obs_coeff, &obs_fixed, &cells,
+        )?;
+
+        let to_g = |j: &Jet1| Array1::from(j.g.clone());
+        Ok(SurvivalFlexTimepointFirstOrderExact {
+            eta: eta.value(),
+            chi: chi.value(),
+            d: d.value(),
+            eta_u: to_g(&eta),
+            chi_u: to_g(&chi),
+            d_u: to_g(&d),
+        })
+    }
 }
 
 // #932-2 increment 2: the higher-order `MomentTerm` channels (Jet3 directional /

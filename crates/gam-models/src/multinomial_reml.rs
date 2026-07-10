@@ -910,6 +910,18 @@ impl MultinomialFamily {
     /// The per-row arithmetic (`d_η`, `s`, `dp`, `jaa`, `jab`) is byte-identical
     /// to the dense assembly, so a matrix-free contraction against `Ĵ` reproduces
     /// the dense `Fᵀ B_d F` projection up to the associativity of the row sum.
+    ///
+    /// #932 documented performance exception: this hand closed form (and its
+    /// second-directional sibling below) is the third/fourth-order derivative
+    /// tower that the #1082 near-separable Jeffreys/Firth solve runs in its
+    /// per-inner-cycle hot path. It is NOT cut over to the generic gam-math
+    /// `Tower4` jet: the jet would replace only this per-row `M×M` kernel, but the
+    /// hot path fuses it with an X-factored β-space scatter, and materialising a
+    /// full per-row/per-axis dense 4th-order tower regresses the same
+    /// order-of-magnitude the sibling SAE softmax cutover measured (25–57×). The
+    /// jet is instead pinned as a non-ignored oracle against THIS live function,
+    /// with an independent finite-difference witness, in
+    /// `tests::jet_single_source_932::multinomial_live_tower_matches_jet_and_fd`.
     fn directional_fisher_jet_rows(
         &self,
         probs_full: ArrayView2<'_, f64>,
@@ -2076,6 +2088,290 @@ mod tests {
     use super::*;
     use gam_problem::DenseMatrixHyperOperator;
     use ndarray::array;
+
+    /// #932 production single-source parity: the LIVE multinomial hand tower
+    /// (`joint_loglik_and_gradient_from_probs`, `hessian_matvec_into_with_probs`,
+    /// and the third/fourth `directional_fisher_jet_rows` /
+    /// `second_directional_fisher_jet_rows` closed forms that the #1082
+    /// Jeffreys/Firth inner cycle runs) is pinned, by INVOKING PRODUCTION, against
+    /// the universal gam-math jet — and against an independent finite-difference
+    /// witness that never touches the jet.
+    ///
+    /// The live hand tower is deliberately RETAINED (documented performance
+    /// exception at the code sites): the generic per-row `Tower4` cannot replace
+    /// the X-factored β-space scatter the hot path assembles without the same
+    /// order-of-magnitude regression the sibling SAE softmax cutover measured
+    /// (25–57×). This module is the non-ignored oracle that makes the retained
+    /// hand tower non-divergent: any dropped or sign-flipped term in the live
+    /// closed forms is loud here.
+    mod jet_single_source_932 {
+        use super::*;
+        use gam_math::jet_scalar::JetScalar;
+        use gam_math::jet_tower::{
+            RowNllProgramGeneric, generic_fourth_contracted, generic_row_kernel,
+            generic_third_contracted,
+        };
+        use std::sync::Arc;
+
+        /// The multinomial-logit row NLL written ONCE through the jet scalar:
+        /// `ℓ(η) = w·ln(1 + Σ_a e^{η_a}) − w·η_obs`. The active-class log-odds are
+        /// the `M` primaries; the reference class `M` is pinned at `η ≡ 0`.
+        struct MultinomialJetRow<const M: usize> {
+            eta: [f64; M],
+            obs: usize,
+            w: f64,
+        }
+
+        impl<const M: usize> RowNllProgramGeneric<M> for MultinomialJetRow<M> {
+            fn n_rows(&self) -> usize {
+                1
+            }
+            fn primaries(&self, _row: usize) -> Result<[f64; M], String> {
+                Ok(self.eta)
+            }
+            fn row_nll_generic<S: JetScalar<M>>(
+                &self,
+                _row: usize,
+                p: &[S; M],
+            ) -> Result<S, String> {
+                let mut z = S::constant(1.0);
+                for a in 0..M {
+                    z = z.add(&p[a].exp());
+                }
+                let mut ell = z.ln().scale(self.w);
+                if self.obs < M {
+                    ell = ell.sub(&p[self.obs].scale(self.w));
+                }
+                Ok(ell)
+            }
+        }
+
+        /// Build a single-row `K = M + 1` family with the design collapsed to the
+        /// `1×1` identity (`P = 1`, `X = [[1.0]]`), so the coefficient-space
+        /// directions the production kernels consume ARE the η-space directions —
+        /// letting the per-row β-space kernels be compared to the jet's η-space
+        /// contractions with no design projection in the way.
+        fn single_row_family<const M: usize>(eta: &[f64; M], obs: usize, w: f64) -> MultinomialFamily {
+            let k = M + 1;
+            let mut y = Array2::<f64>::zeros((1, k));
+            y[[0, obs]] = 1.0;
+            let design = Arc::new(array![[1.0_f64]]);
+            MultinomialFamily::new(
+                y,
+                array![w],
+                k,
+                design,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+            )
+            .expect("single-row multinomial family")
+        }
+
+        /// Deterministic LCG (NO `rand`, NO clock seeding — #932 rules).
+        struct Lcg(u64);
+        impl Lcg {
+            fn f64(&mut self) -> f64 {
+                self.0 = self
+                    .0
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
+            }
+            fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+                lo + (hi - lo) * self.f64()
+            }
+        }
+
+        const JET_TOL: f64 = 1e-9;
+
+        fn close(a: f64, b: f64, tol: f64, label: &str) {
+            let band = tol + tol * a.abs().max(b.abs());
+            assert!(
+                (a - b).abs() <= band,
+                "{label}: {a:+.15e} vs {b:+.15e} (|Δ|={:.3e} band {band:.3e})",
+                (a - b).abs()
+            );
+        }
+
+        /// Row probabilities over the `M` ACTIVE classes at raw η (reference class
+        /// dropped), via the production softmax pass.
+        fn active_probs<const M: usize>(
+            family: &MultinomialFamily,
+            eta: &[f64; M],
+        ) -> ndarray::Array2<f64> {
+            let eta2 =
+                Array2::<f64>::from_shape_vec((1, M), eta.to_vec()).expect("eta (1,M)");
+            family.row_probabilities(eta2.view())
+        }
+
+        /// Production third `∂_dir H` at η: the per-row `M×M` Fisher jet, evaluated
+        /// by the LIVE `directional_fisher_jet_rows`.
+        fn prod_third<const M: usize>(
+            family: &MultinomialFamily,
+            eta: &[f64; M],
+            dir: &[f64; M],
+        ) -> [[f64; M]; M] {
+            let probs = active_probs(family, eta);
+            let d = Array1::from(dir.to_vec());
+            let j = family.directional_fisher_jet_rows(probs.view(), &d);
+            std::array::from_fn(|a| std::array::from_fn(|b| j[[0, a, b]]))
+        }
+
+        /// Production fourth `∂_u ∂_v H` at η via the LIVE
+        /// `second_directional_fisher_jet_rows`.
+        fn prod_fourth<const M: usize>(
+            family: &MultinomialFamily,
+            eta: &[f64; M],
+            u: &[f64; M],
+            v: &[f64; M],
+        ) -> [[f64; M]; M] {
+            let probs = active_probs(family, eta);
+            let ua = Array1::from(u.to_vec());
+            let va = Array1::from(v.to_vec());
+            let j = family.second_directional_fisher_jet_rows(probs.view(), &ua, &va);
+            std::array::from_fn(|a| std::array::from_fn(|b| j[[0, a, b]]))
+        }
+
+        /// Production Hessian block at η via the LIVE `hessian_matvec_into_with_probs`
+        /// (column extraction against the `M` unit directions).
+        fn prod_hessian<const M: usize>(
+            family: &MultinomialFamily,
+            eta: &[f64; M],
+        ) -> [[f64; M]; M] {
+            let probs = active_probs(family, eta);
+            let mut h = [[0.0_f64; M]; M];
+            for col in 0..M {
+                let mut e = Array1::<f64>::zeros(M);
+                e[col] = 1.0;
+                let mut out = Array1::<f64>::zeros(M);
+                family
+                    .hessian_matvec_into_with_probs(probs.view(), &e, &mut out)
+                    .expect("prod hessian matvec");
+                for row in 0..M {
+                    h[row][col] = out[row];
+                }
+            }
+            h
+        }
+
+        fn run_parity<const M: usize>(seed: u64) {
+            let mut rng = Lcg(seed);
+            for trial in 0..24 {
+                let eta: [f64; M] = std::array::from_fn(|_| rng.uniform(-2.0, 2.0));
+                let obs = trial % (M + 1);
+                let w = rng.uniform(0.25, 2.5);
+                let family = single_row_family(&eta, obs, w);
+                let prog = MultinomialJetRow { eta, obs, w };
+
+                // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
+                let (jet_v, jet_g, jet_h) =
+                    generic_row_kernel(&prog, 0).expect("jet row kernel");
+
+                // Value + gradient from the live log-lik assembler (NLL = −log_lik,
+                // ∇NLL = −∇log_lik).
+                let probs = active_probs(&family, &eta);
+                let (log_lik, grad_ll) =
+                    family.joint_loglik_and_gradient_from_probs(probs.view());
+                close(jet_v, -log_lik, JET_TOL, &format!("M={M} trial {trial} value"));
+                for a in 0..M {
+                    close(
+                        jet_g[a],
+                        -grad_ll[a],
+                        JET_TOL,
+                        &format!("M={M} trial {trial} grad[{a}]"),
+                    );
+                }
+
+                // Hessian block from the live matvec.
+                let prod_h = prod_hessian(&family, &eta);
+                for a in 0..M {
+                    for b in 0..M {
+                        close(
+                            jet_h[a][b],
+                            prod_h[a][b],
+                            JET_TOL,
+                            &format!("M={M} trial {trial} H[{a}][{b}]"),
+                        );
+                    }
+                }
+
+                // Third + fourth directional Fisher jets from the live closed forms.
+                let dir: [f64; M] = std::array::from_fn(|_| rng.uniform(-1.5, 1.5));
+                let u: [f64; M] = std::array::from_fn(|_| rng.uniform(-1.5, 1.5));
+                let jet_third = generic_third_contracted(&prog, 0, &dir).expect("jet third");
+                let prod_t3 = prod_third(&family, &eta, &dir);
+                let jet_fourth = generic_fourth_contracted(&prog, 0, &u, &dir).expect("jet fourth");
+                let prod_t4 = prod_fourth(&family, &eta, &u, &dir);
+                for a in 0..M {
+                    for b in 0..M {
+                        close(
+                            jet_third[a][b],
+                            prod_t3[a][b],
+                            JET_TOL,
+                            &format!("M={M} trial {trial} third[{a}][{b}]"),
+                        );
+                        close(
+                            jet_fourth[a][b],
+                            prod_t4[a][b],
+                            JET_TOL,
+                            &format!("M={M} trial {trial} fourth[{a}][{b}]"),
+                        );
+                    }
+                }
+
+                // ── Independent FINITE-DIFFERENCE witness (NO jet) ─────────────
+                // ∂_dir H via central difference of the live Hessian block.
+                let h_fd = 1e-4;
+                let eta_p: [f64; M] = std::array::from_fn(|a| eta[a] + h_fd * dir[a]);
+                let eta_m: [f64; M] = std::array::from_fn(|a| eta[a] - h_fd * dir[a]);
+                let hp = prod_hessian(&family, &eta_p);
+                let hm = prod_hessian(&family, &eta_m);
+                for a in 0..M {
+                    for b in 0..M {
+                        let fd = (hp[a][b] - hm[a][b]) / (2.0 * h_fd);
+                        close(
+                            prod_t3[a][b],
+                            fd,
+                            1e-6,
+                            &format!("M={M} trial {trial} FD third[{a}][{b}]"),
+                        );
+                    }
+                }
+                // ∂_u of the live third (fixed second direction `dir`) via central
+                // difference reproduces the live fourth.
+                let t3_up = prod_third(&family, &eta_p_along(&eta, &u, h_fd), &dir);
+                let t3_um = prod_third(&family, &eta_m_along(&eta, &u, h_fd), &dir);
+                for a in 0..M {
+                    for b in 0..M {
+                        let fd = (t3_up[a][b] - t3_um[a][b]) / (2.0 * h_fd);
+                        close(
+                            prod_t4[a][b],
+                            fd,
+                            1e-6,
+                            &format!("M={M} trial {trial} FD fourth[{a}][{b}]"),
+                        );
+                    }
+                }
+            }
+        }
+
+        fn eta_p_along<const M: usize>(eta: &[f64; M], u: &[f64; M], h: f64) -> [f64; M] {
+            std::array::from_fn(|a| eta[a] + h * u[a])
+        }
+        fn eta_m_along<const M: usize>(eta: &[f64; M], u: &[f64; M], h: f64) -> [f64; M] {
+            std::array::from_fn(|a| eta[a] - h * u[a])
+        }
+
+        /// The LIVE multinomial value / gradient / Hessian / third / fourth hand
+        /// tower reproduces the universal gam-math jet at ≤1e-9, AND the live
+        /// third/fourth reproduce an independent central-difference of the live
+        /// lower order — for `M = 2` (K=3) and `M = 3` (K=4).
+        #[test]
+        fn multinomial_live_tower_matches_jet_and_fd() {
+            run_parity::<2>(0x9322_2020_0710_face);
+            run_parity::<3>(0x0bad_c0de_0710_2020);
+        }
+    }
 
     impl MultinomialFamily {
         /// Test-only convenience wrapper: assemble the batched first-directional
