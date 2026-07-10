@@ -60,7 +60,7 @@ fn dose_response_reports_fisher_calibration_slope_and_unit_speed_constancy() {
     let report = dose_response_calibration(&obs).unwrap();
     assert!((report.slope_through_origin - 2.0).abs() < f64::EPSILON.sqrt());
     assert!((report.r2_through_origin - 1.0).abs() < f64::EPSILON.sqrt());
-    assert!(report.cv_measured_nats_per_arc < f64::EPSILON.sqrt());
+    assert!(report.cv_measured_nats_per_arc_squared < f64::EPSILON.sqrt());
 }
 
 #[test]

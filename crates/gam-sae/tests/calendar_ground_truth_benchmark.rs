@@ -272,7 +272,7 @@ fn block_fit(fixture: &CalendarFixture) -> BlockSparseFit {
         matryoshka_prefix_losses: Vec::new(),
         explained_variance: 1.0,
         epochs: 0,
-        converged: true,
+        convergence: gam_sae::sparse_dict::BlockSparseConvergence::trivially_converged(),
         block_topk: AXES,
         block_size: BLOCK_SIZE,
     }
@@ -288,7 +288,6 @@ fn chart_config() -> BlockChartComposeConfig {
         min_firings: 64,
         max_blocks: AXES,
         crossfit_folds: 6,
-        alpha: 1.0,
         min_effect: 0.0,
         whitening_ridge: 1.0e-8,
         pair_screen: false,
@@ -310,13 +309,13 @@ fn assert_calendar_circles_promoted(fixture: &CalendarFixture) {
     .unwrap_or_else(|err| panic!("calendar block-chart promotion failed: {err}"));
 
     assert_eq!(
-        result.accepted_blocks.len(),
+        result.selected_chart_blocks.len(),
         AXES,
         "block-chart promotion must accept one circle atom per calendar axis"
     );
     for axis in 0..AXES {
         assert!(
-            result.accepted_blocks.contains(&axis),
+            result.selected_chart_blocks.contains(&axis),
             "missing promoted CIRCLE atom for {} cluster",
             AXIS_NAMES[axis]
         );
@@ -326,7 +325,7 @@ fn assert_calendar_circles_promoted(fixture: &CalendarFixture) {
             .find(|record| record.block0 == axis)
             .unwrap_or_else(|| panic!("missing block-chart record for {}", AXIS_NAMES[axis]));
         assert!(
-            record.evidence.accepted,
+            record.evidence.selected_by_bic,
             "{} cluster was selected but not accepted as a chart atom",
             AXIS_NAMES[axis]
         );
