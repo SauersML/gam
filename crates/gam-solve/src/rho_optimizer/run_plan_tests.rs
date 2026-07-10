@@ -2036,6 +2036,71 @@ fn cost_stall_above_score_relative_band_keeps_descending() {
     );
 }
 
+/// #2241 — the probe-noise-floor certificate: a stalled walk whose residual
+/// projected gradient is BELOW σ̂/Δ (the criterion's measured evaluation-noise
+/// floor over the stall window, divided by the radius the accepted steps
+/// actually probed) is flat relative to its own noise scale and must halt
+/// CONVERGED, even when the residual sits above both the absolute tolerance
+/// and the score-relative band.
+#[test]
+fn cost_stall_certifies_converged_below_probe_noise_floor_2241() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    // Tight absolute threshold and a small score, so neither the absolute nor
+    // the score-relative band (1e-3·(1+10) = 0.011) can certify |g| = 0.5:
+    // only the noise-floor certificate can.
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-9, exit.clone());
+    let residual_grad = 0.5;
+    guard.observe_seed(&array![0.0, 0.0], 10.0, residual_grad);
+    // Three accepted, trusted iterates with O(1e-3) probe steps whose values
+    // scatter by O(1e-3) around the incumbent: no improvement beyond the
+    // relative floor, so the window fills, and the measured noise floor is
+    // σ̂ = median{8e-4, 4e-4, 6e-4} = 6e-4 over a probed radius Δ = 1e-3
+    // ⇒ certified gradient band σ̂/Δ = 0.6 > 0.5 = |g|.
+    guard.observe(&array![1.0e-3, 0.0], 10.0 + 8.0e-4, residual_grad, true);
+    guard.observe(&array![2.0e-3, 0.0], 10.0 + 4.0e-4, residual_grad, true);
+    let verdict = guard.observe(&array![3.0e-3, 0.0], 10.0 + 1.0e-3, residual_grad, true);
+    assert!(
+        matches!(verdict, CostStallVerdict::Converged),
+        "a stall whose residual gradient cannot move the criterion beyond its \
+         own evaluation-noise floor over the probed radius is flat relative to \
+         its noise scale and must certify (#2241). Got {:?}",
+        std::mem::discriminant(&verdict)
+    );
+    let published = exit.lock().unwrap().take().expect("halt published");
+    assert!(published.converged);
+    let noise_bound = published
+        .noise_grad_bound
+        .expect("the halt must carry the measured noise-floor bound");
+    assert!(
+        residual_grad <= noise_bound && noise_bound <= FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP,
+        "the certifying bound must cover the residual and respect the absolute \
+         cap; got {noise_bound}"
+    );
+}
+
+/// #2241 companion — the noise certificate must be un-gameable by collapsed
+/// step sizes: Δ → 0 inflates the raw σ̂/Δ arbitrarily, but the bound is capped
+/// at `FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP`, so a genuinely steep point
+/// (|g| = 2 > cap) can never be certified through the noise route; it keeps
+/// descending exactly as the score-relative escape gate (#509) demands.
+#[test]
+fn probe_noise_floor_capped_never_certifies_steep_point_2241() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-9, exit.clone());
+    let steep_grad = 2.0;
+    guard.observe_seed(&array![0.0, 0.0], 10.0, steep_grad);
+    // Degenerate 1e-9 probe steps with O(1e-3) value scatter: raw σ̂/Δ ≈ 1e6,
+    // which without the cap would "certify" a steep stuck point.
+    guard.observe(&array![1.0e-9, 0.0], 10.0 + 8.0e-4, steep_grad, true);
+    guard.observe(&array![2.0e-9, 0.0], 10.0 + 4.0e-4, steep_grad, true);
+    let verdict = guard.observe(&array![3.0e-9, 0.0], 10.0 + 1.0e-3, steep_grad, true);
+    assert!(
+        !matches!(verdict, CostStallVerdict::Converged),
+        "collapsed probe steps must never manufacture a noise-floor convergence \
+         at a genuinely steep point (#2241 anti-gaming cap)"
+    );
+}
+
 #[test]
 fn lower_bound_outward_axes_mark_separation_stationarity() {
     let lower = array![-10.0, -10.0, -10.0, -10.0];

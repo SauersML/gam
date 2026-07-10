@@ -300,6 +300,13 @@ pub(crate) struct CostStallExit {
     /// residual gradient remains above tolerance — the runner reports the
     /// rebuilt outer result as non-converged in that case.
     pub(crate) converged: bool,
+    /// #2241 — the probe-noise-floor gradient bound σ̂/Δ measured at the stall
+    /// (see [`CostStallGuard::probe_noise_grad_bound`]); `None` when the stall
+    /// window carried too little evidence to measure it. Carried onto
+    /// `OuterResult.flat_noise_grad_bound` so the final analytic certificate
+    /// judges the re-measured gradient against the same flat band the guard
+    /// certified in the loop.
+    pub(crate) noise_grad_bound: Option<f64>,
 }
 
 /// Tracks the monotone best accepted-iterate REML objective and a
@@ -343,6 +350,13 @@ pub(crate) struct CostStallGuard {
     /// once exhausted the guard halts a far-above-tolerance stall as an ordinary
     /// flat-valley floor so the loop still terminates.
     stuck_escapes: usize,
+    /// #2241 — the most recent trusted accepted iterates `(ρ_i, f_i)` (finite
+    /// cost, inner solve converged), newest last, capped at `window + 1`
+    /// entries. This is the raw evidence for the probe-noise-floor flat
+    /// certificate: during a stall the consecutive value differences measure
+    /// the criterion's own evaluation-noise scale, and the consecutive ρ
+    /// distances measure the radius the search actually probed.
+    recent: std::collections::VecDeque<(Array1<f64>, f64)>,
     /// Shared publication slot read by the seed-loop runner after
     /// `optimizer.run()` returns the sentinel error.
     exit: Arc<Mutex<Option<CostStallExit>>>,
@@ -366,8 +380,84 @@ impl CostStallGuard {
             infeasible_streak: 0,
             accepted_iters: 0,
             stuck_escapes: 0,
+            recent: std::collections::VecDeque::new(),
             exit,
         }
+    }
+
+    /// Record one trusted accepted iterate into the #2241 noise-evidence
+    /// buffer, keeping only the latest `window + 1` (⇒ `window` consecutive
+    /// differences).
+    fn record_recent(&mut self, rho: &Array1<f64>, value: f64) {
+        self.recent.push_back((rho.clone(), value));
+        while self.recent.len() > self.window + 1 {
+            self.recent.pop_front();
+        }
+    }
+
+    /// #2241 — probe-noise-floor gradient bound at a halted stall.
+    ///
+    /// Derivation. Over the stalled window the accepted iterates
+    /// `(ρ_i, f_i)` satisfy: (i) the first-order model predicts
+    /// `|f(ρ+d) − f(ρ)| ≤ ‖g‖·‖d‖ + o(‖d‖)` for moves of the size the search
+    /// actually takes, and (ii) because the window is a stall (trend ≈ 0 by
+    /// the `rel_tol` test), the consecutive differences `|f_i − f_{i−1}|` are
+    /// dominated by the criterion's own evaluation noise — inner-solve
+    /// truncation, reassembly order, quadrature — not by descent. So
+    ///   σ̂ = median_i |f_i − f_{i−1}|   (robust noise-floor estimate),
+    ///   Δ  = max_i ‖ρ_i − ρ_{i−1}‖₂    (radius the steps actually probed),
+    /// and if `‖g_best‖ · Δ ≤ σ̂` then NO probe within the radius the line
+    /// search is exploring can change the criterion by more than its own
+    /// measurement noise: the surface is flat relative to its own noise scale
+    /// and the best iterate is stationary at the resolution the criterion can
+    /// be evaluated. Equivalently the gradient is certified below `σ̂/Δ`.
+    ///
+    /// Guards: σ̂ is floored at the roundoff scale `ε·(1+|f_best|)` (a
+    /// byte-identical window cannot license an infinite bound of 0/Δ — it
+    /// licenses exactly the roundoff resolution), and the returned bound is
+    /// capped at [`FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP`] so collapsed step
+    /// sizes (Δ → 0 inflating σ̂/Δ) can never certify a genuinely steep point:
+    /// the #1426 stuck stall (|g| ≈ 11) and the #509 seed-park (|g| ≈ 2) both
+    /// sit above the cap and remain uncertifiable by this route. Returns
+    /// `None` when fewer than three consecutive differences exist or the probe
+    /// radius is degenerate (zero / non-finite).
+    fn probe_noise_grad_bound(&self) -> Option<f64> {
+        if self.recent.len() < 4 {
+            return None;
+        }
+        let mut value_diffs: Vec<f64> = Vec::with_capacity(self.recent.len() - 1);
+        let mut probe_radius = 0.0_f64;
+        for (prev, next) in self.recent.iter().zip(self.recent.iter().skip(1)) {
+            value_diffs.push((next.1 - prev.1).abs());
+            let step = prev
+                .0
+                .iter()
+                .zip(next.0.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+                .sqrt();
+            probe_radius = probe_radius.max(step);
+        }
+        if !probe_radius.is_finite() || probe_radius <= 0.0 {
+            return None;
+        }
+        value_diffs.sort_by(|a, b| a.total_cmp(b));
+        let mid = value_diffs.len() / 2;
+        let median = if value_diffs.len() % 2 == 1 {
+            value_diffs[mid]
+        } else {
+            0.5 * (value_diffs[mid - 1] + value_diffs[mid])
+        };
+        if !median.is_finite() {
+            return None;
+        }
+        let best_scale = if self.best_value.is_finite() {
+            self.best_value.abs()
+        } else {
+            0.0
+        };
+        let noise_floor = median.max(f64::EPSILON * (1.0 + best_scale));
+        Some((noise_floor / probe_radius).min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP))
     }
 
     /// Register a precomputed feasible seed that the optimizer consumes from
@@ -387,6 +477,7 @@ impl CostStallGuard {
         self.no_improve_streak = 0;
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
+        self.record_recent(rho, value);
         // Seed the shared exit cell so the budget-exhaustion path always has a
         // feasible best to fall back to, even if no later step improves (#1371).
         self.publish_best_so_far();
@@ -416,7 +507,7 @@ impl CostStallGuard {
     /// recorded as best and NEVER counted toward a stall: its cost/gradient are
     /// untrustworthy, so the guard treats it as forced descent (streak reset) and
     /// keeps the optimizer moving until an honest, converged iterate lands.
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         rho: &Array1<f64>,
         value: f64,
@@ -450,6 +541,7 @@ impl CostStallGuard {
         // separating-region infeasible run is broken, so clear its streak.
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
+        self.record_recent(rho, value);
         let improvement = self.best_value - value;
         let floor = self.rel_tol * (1.0 + self.best_value.abs());
         if value < self.best_value {
@@ -623,9 +715,17 @@ impl CostStallGuard {
         // separate `FLAT_VALLEY_STALL_GRAD_CEILING`) — is still rejected and routed
         // to `StuckKeepDescending`, so no near-full-basis overfit is ever certified.
         let score_relative_grad_bound = flat_valley_converged_grad_bound(best_value);
+        // #2241 — probe-noise-floor certificate: the stall window's own value
+        // scatter and probed radius bound the gradient at which further probes
+        // become indistinguishable from evaluation noise (derivation on
+        // `probe_noise_grad_bound`). It composes with the score-relative band
+        // as a second sufficient condition; both are capped well below the
+        // stuck-stall regimes so neither can certify a genuinely steep point.
+        let noise_grad_bound = self.probe_noise_grad_bound();
         let converged = best_grad_norm.is_finite()
             && (best_grad_norm <= self.grad_threshold
-                || best_grad_norm <= score_relative_grad_bound);
+                || best_grad_norm <= score_relative_grad_bound
+                || noise_grad_bound.is_some_and(|bound| best_grad_norm <= bound));
         if converged {
             if let Ok(mut slot) = self.exit.lock() {
                 *slot = Some(CostStallExit {
@@ -634,6 +734,7 @@ impl CostStallGuard {
                     grad_norm: best_grad_norm,
                     iterations: self.accepted_iters,
                     converged,
+                    noise_grad_bound,
                 });
             }
             return CostStallVerdict::Converged;
@@ -701,6 +802,7 @@ impl CostStallGuard {
                 grad_norm: best_grad_norm,
                 iterations: self.accepted_iters,
                 converged,
+                noise_grad_bound,
             });
         }
         CostStallVerdict::FlatValleyStall {
@@ -741,6 +843,9 @@ impl CostStallGuard {
                 grad_norm: self.best_grad_norm,
                 iterations: self.accepted_iters,
                 converged,
+                // Not a halted stall: no noise-floor measurement is claimed
+                // for a running best-so-far snapshot (#2241).
+                noise_grad_bound: None,
             });
         }
     }

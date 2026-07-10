@@ -1294,6 +1294,11 @@ pub(crate) fn run_outer_with_plan(
                                         exit.converged,
                                         *the_plan,
                                     );
+                                    // #2241 — carry the guard's measured probe-
+                                    // noise-floor bound so the final analytic
+                                    // certificate honors the same flat band the
+                                    // guard certified in the loop.
+                                    result.flat_noise_grad_bound = exit.noise_grad_bound;
                                     if !exit.converged {
                                         result.operator_stop_reason = Some(
                                             OperatorTrustRegionStopReason::CostStallFlatValley,
@@ -1788,6 +1793,11 @@ pub(crate) fn run_outer_with_plan(
                                         exit.converged,
                                         *the_plan,
                                     );
+                                    // #2241 — carry the guard's measured probe-
+                                    // noise-floor bound so the final analytic
+                                    // certificate honors the same flat band the
+                                    // guard certified in the loop.
+                                    result.flat_noise_grad_bound = exit.noise_grad_bound;
                                     if !exit.converged {
                                         result.operator_stop_reason = Some(
                                             OperatorTrustRegionStopReason::CostStallFlatValley,
