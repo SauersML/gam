@@ -572,8 +572,44 @@ pub fn fit_from_formula_with_notes(
     // activating the structural start without an owner would strand them in an
     // under-resolved function space.
     config.spatial_center_counts = Some(Vec::new());
-    let mut current = fit_from_formula_once_with_notes(formula, data, &config)?;
+    let current = fit_from_formula_once_with_notes(formula, data, &config)?;
+    finish_adaptive_spatial_fit(formula, data, config, current)
+}
 
+/// Fit an already-materialized standard request, then continue through the
+/// canonical saturation-driven spatial-resolution loop.
+///
+/// Front ends that must inspect the request variant for payload dispatch use
+/// this seam so the dispatch materialization is also the first estimator
+/// materialization. Re-entering [`fit_from_formula_with_notes`] after matching a
+/// `Standard` request would build and discard one complete spatial basis before
+/// the real fit (#1689), duplicating construction work and peak memory on the
+/// Python path.
+pub fn fit_materialized_standard_with_notes(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    request: StandardFitRequest<'_>,
+    inference_notes: Vec<String>,
+) -> Result<FormulaFitResult, WorkflowError> {
+    let mut config = config
+        .clone()
+        .resolve()
+        .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+    config.spatial_center_counts = Some(Vec::new());
+    let current = fit_materialized_once_with_notes(MaterializedModel {
+        request: FitRequest::Standard(request),
+        inference_notes,
+    })?;
+    finish_adaptive_spatial_fit(formula, data, config, current)
+}
+
+fn finish_adaptive_spatial_fit(
+    formula: &str,
+    data: &Dataset,
+    mut config: FitConfig,
+    mut current: FormulaFitResult,
+) -> Result<FormulaFitResult, WorkflowError> {
     loop {
         let Some(current_standard) = standard_result(&current) else {
             return Ok(current);
@@ -831,6 +867,12 @@ fn fit_from_formula_once_with_notes(
         });
     }
     let mat = materialize(formula, data, &config)?;
+    fit_materialized_once_with_notes(mat)
+}
+
+fn fit_materialized_once_with_notes(
+    mat: MaterializedModel<'_>,
+) -> Result<FormulaFitResult, WorkflowError> {
     let inference_notes = mat.inference_notes;
     // Exact O(n) spline-scan fast path (#1030): when the materialized request
     // is the single 1-D Gaussian-identity penalized-smooth shape the

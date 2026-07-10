@@ -7311,7 +7311,12 @@ fn fit_dataset_impl(
     // produces the calibrated `z` out-of-fold — no z_column is needed and no
     // Stage-1 pre-fit / synthetic column round-trip is performed here. The recipe
     // rides on fit_config straight into materialize.
-    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    // Standard-fit dispatch must materialize at the adaptive structural start:
+    // this request becomes the first fitted design below. Other estimator
+    // materializers do not consume this standard-only orchestration field.
+    let mut dispatch_config = fit_config.clone();
+    dispatch_config.spatial_center_counts = Some(Vec::new());
+    let materialized = materialize(&formula, &dataset, &dispatch_config)?;
     let request = materialized.request;
     // Advisories produced while materializing (e.g. the mgcv-style "k reduced to
     // the data support" / basis-degradation notes from the cr/cs/sz cap, #1541
@@ -7324,33 +7329,30 @@ fn fit_dataset_impl(
 
     let mut payload = match request {
         FitRequest::Standard(standard_request) => {
-            // The dispatch materialization above only selects this arm. The fit
-            // itself re-enters `fit_from_formula_with_notes` — the same
-            // loop-owning entry point the CLI uses — because that is where the
-            // standard workflow's estimator routing lives: the exact O(n)
-            // spline scan (#1030/#1034), the multiresolution residual cascade
-            // (#1032), the constant-response short circuit, and the #1689
-            // adaptive spatial-resolution loop that starts every auto spatial
-            // smooth at its structural minimum and escalates only on a
-            // certified saturated basis. Fitting the already-materialized
-            // request with `fit_model` here would pin auto spatial smooths at
-            // the fully provisioned basis and strand Python callers off those
-            // estimator routes (#1777-class entry-point drift).
-            let outcome = gam::families::fit_orchestration::fit_from_formula_with_notes(
+            // Fit the request that selected this arm, then hand its converged
+            // result to the same loop owner the CLI uses. Re-entering the
+            // formula entry point here used to materialize the spatial design a
+            // second time; before the adaptive loop landed, the first discarded
+            // design was also the old fully provisioned rank (#1689).
+            let standard_family = standard_request.family.clone();
+            let standard_spec = standard_request.spec.clone();
+            let initial_notes = std::mem::take(&mut inference_notes);
+            let outcome = gam::families::fit_orchestration::fit_materialized_standard_with_notes(
                 &formula,
                 &dataset,
                 &fit_config,
+                standard_request,
+                initial_notes,
             )?;
             inference_notes = outcome.inference_notes;
             match outcome.result {
                 FitResult::Standard(standard_result) => {
-                    let family = standard_request.family.clone();
                     let saved_fit = standard_result.fit.clone();
                     build_standard_payload(
                         formula,
                         &dataset,
                         &fit_config,
-                        family,
+                        standard_family,
                         &saved_fit,
                         &standard_result.design,
                         standard_result.resolvedspec,
@@ -7365,7 +7367,7 @@ fn fit_dataset_impl(
                     // The scan detection is structural on the materialized
                     // shape, so the dispatch request's single smooth is the
                     // same 1-D B-spline the entry point scan-routed.
-                    let feature_col = match &standard_request.spec.smooth_terms[0].basis {
+                    let feature_col = match &standard_spec.smooth_terms[0].basis {
                         gam::terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
                             *feature_col
                         }
@@ -7409,8 +7411,7 @@ fn fit_dataset_impl(
                     // smooth; recover its feature columns from the dispatch
                     // request the same way the CLI does from its parsed
                     // formula.
-                    let feature_cols = standard_request
-                        .spec
+                    let feature_cols = standard_spec
                         .smooth_terms
                         .iter()
                         .find_map(|term| match &term.basis {
