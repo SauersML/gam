@@ -147,11 +147,10 @@ fn gaussian_location_scale_recovers_sinusoidal_mean_and_scale() {
          mu_rmse={rmse_mu:.6} must be < {mu_bar:.6}; \
          log_sigma_pearson={corr_log_sigma:.6} must be > 0.80; \
          log_sigma_rmse={rmse_log_sigma:.6}; \
-         outer_converged={} outer_iterations={}; \
+         outer_converged=certified outer_iterations={}; \
          lambdas={lambdas:?}; log_lambdas={log_lambdas:?}; \
          edf_by_block={edf_by_block:?}; penalty_block_trace={penalty_block_trace:?}; \
          edf_total={edf_total}",
-        fit.fit.fit.outer_converged,
         fit.fit.fit.outer_iterations
     );
 }

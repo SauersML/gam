@@ -644,6 +644,28 @@ impl StructuredResidualModel {
         Self::fit(input)?.row_metric(n)
     }
 
+    /// The model's isotropic (iid-MLE) dispersion: the per-coordinate average of
+    /// its own fitted total residual variance,
+    /// ```text
+    ///   φ̂ = (1/p) · mean_row tr(Σ̂(row)) = mean(c)·‖Λ‖²_F / p + mean(d).
+    /// ```
+    /// This is the honest single-scalar summary of the SAME second moment the
+    /// structured model fits — the scale an iid Gaussian residual model would
+    /// estimate from these residuals. Used as the first-pass damping anchor in
+    /// [`Self::row_metric_damped`] (#2243 cap #2): anchoring at `φ̂·I` instead of
+    /// the unit `I_p` means near-noiseless data is whitened by its MEASURED
+    /// noise, so the downstream unit-dispersion REML criterion prices the
+    /// smoothing penalty against the real dispersion rather than an assumed
+    /// unit one. Floored at `f64::MIN_POSITIVE` so the blend stays SPD.
+    pub fn isotropic_dispersion(&self) -> f64 {
+        let p = self.p.max(1) as f64;
+        let n = self.row_scale.len().max(1) as f64;
+        let mean_c = self.row_scale.iter().copied().sum::<f64>() / n;
+        let lambda_energy: f64 = self.lambda.iter().map(|v| v * v).sum();
+        let mean_d = self.diagonal.iter().copied().sum::<f64>() / p;
+        (mean_c * lambda_energy / p + mean_d).max(f64::MIN_POSITIVE)
+    }
+
     /// Damped per-row metric for the #2021 driver: blend covariances in the
     /// **covariance domain** (before the Woodbury→Cholesky) between this model's
     /// estimate and a previous one,
@@ -652,14 +674,18 @@ impl StructuredResidualModel {
     /// ```
     /// where `Σ̂_t(row) = c_t(z)·ΛΛᵀ + D` is this model's per-row covariance
     /// (built from the hoisted-M0 / occupancy-weighted `c(z)` path), and
-    /// `Σ_prev(row)` is `prev`'s per-row covariance when `Some`, else `I_p`. The
-    /// returned factor `U_n` satisfies `U_n U_nᵀ = Σ_t(row)^{-1}`, packaged as a
-    /// [`RowMetric`](gam_problem::RowMetric).
+    /// `Σ_prev(row)` is `prev`'s per-row covariance when `Some`, else the
+    /// MEASURED iid anchor `φ̂·I_p` ([`Self::isotropic_dispersion`], #2243 cap
+    /// #2: a unit `I_p` anchor silently assumed unit noise, which on
+    /// near-noiseless data pinned the whitened likelihood — and therefore the
+    /// REML smoothing balance — at a noise scale ~1/φ̂ too coarse, i.e. the
+    /// clean-data over-penalization).
     ///
-    /// Endpoints (exact, byte-identical to the undamped producers):
-    /// * `γ = 1.0` ⇒ this model's [`Self::row_metric`] exactly (Woodbury path);
-    /// * `γ = 0.0` ⇒ `prev`'s [`Self::row_metric`] when `Some`, else the
-    ///   Euclidean identity metric.
+    /// Endpoints (exact):
+    /// * `γ = 1.0` ⇒ this model's [`Self::row_metric`] exactly (Woodbury path,
+    ///   byte-identical);
+    /// * `γ = 0.0` ⇒ `prev`'s [`Self::row_metric`] when `Some` (byte-identical),
+    ///   else the measured-scale identity `(φ̂·I)^{-1}` factors.
     ///
     /// `γ` must be finite and in `[0, 1]`; when `prev` is `Some` it must share
     /// this model's `p` and row count.
@@ -700,13 +726,18 @@ impl StructuredResidualModel {
             return self.row_metric(n_rows);
         }
         if gamma == 0.0 {
-            return match prev {
-                Some(pv) => pv.row_metric(n_rows),
-                None => RowMetric::euclidean(n_rows, self.p),
-            };
+            if let Some(pv) = prev {
+                return pv.row_metric(n_rows);
+            }
+            // prev = None falls through to the general path: the blend is then
+            // exactly the measured-scale identity `φ̂·I` (#2243 cap #2), not the
+            // unit Euclidean identity.
         }
 
         let p = self.p;
+        // #2243 cap #2 — the first-pass (prev = None) damping anchor is the
+        // model's own measured isotropic dispersion, hoisted out of the row loop.
+        let iid_anchor = self.isotropic_dispersion();
         // Row-INDEPENDENT outer products ΛΛᵀ (this model and, if present, prev):
         // only the per-row activity scale c(z) multiplies them, so hoist the Gram
         // out of the per-row loop (mirroring the row_metric / penalized_log_evidence
@@ -725,8 +756,16 @@ impl StructuredResidualModel {
             use rayon::prelude::*;
             const PARALLEL_ROW_MIN: usize = 64;
             let build_row = |row: usize, urow: &mut [f64]| -> Option<String> {
-                self.damped_row_factor(row, gamma, prev, &self_gram, prev_gram.as_ref(), urow)
-                    .err()
+                self.damped_row_factor(
+                    row,
+                    gamma,
+                    prev,
+                    iid_anchor,
+                    &self_gram,
+                    prev_gram.as_ref(),
+                    urow,
+                )
+                .err()
             };
             let u_flat = u
                 .as_slice_mut()
@@ -759,12 +798,15 @@ impl StructuredResidualModel {
     /// `Σ_t(row) = γ·(c·ΛΛᵀ + D) + (1−γ)·Σ_prev(row)`, symmetrize, invert, and
     /// write the lower-Cholesky precision factor into `urow` (row-major `p×p`).
     /// Factored out of [`Self::row_metric_damped`] so the serial and parallel
-    /// row drivers share one arithmetic body.
+    /// row drivers share one arithmetic body. `iid_anchor` is the measured
+    /// isotropic dispersion `φ̂` used as `Σ_prev = φ̂·I` when `prev` is `None`
+    /// (#2243 cap #2).
     fn damped_row_factor(
         &self,
         row: usize,
         gamma: f64,
         prev: Option<&StructuredResidualModel>,
+        iid_anchor: f64,
         self_gram: &Array2<f64>,
         prev_gram: Option<&Array2<f64>>,
         urow: &mut [f64],
@@ -792,8 +834,10 @@ impl StructuredResidualModel {
                 }
             }
             None => {
+                // First-pass anchor: the MEASURED iid dispersion φ̂·I, not the
+                // unit identity (#2243 cap #2 — clean-data over-penalization).
                 for a in 0..p {
-                    sigma[[a, a]] += 1.0 - gamma;
+                    sigma[[a, a]] += (1.0 - gamma) * iid_anchor;
                 }
             }
         }
@@ -1965,16 +2009,22 @@ mod tests {
             }
         }
 
-        // γ = 0, prev = None ⇒ Euclidean identity: quad_form = ‖v‖².
+        // γ = 0, prev = None ⇒ the MEASURED-scale identity (#2243 cap #2):
+        // Σ = φ̂·I with φ̂ the model's own isotropic dispersion, so
+        // quad_form = ‖v‖² / φ̂ (a unit-I anchor would silently assume unit
+        // noise and over-penalize clean data).
         let ident = model
             .row_metric_damped(n, 0.0, None)
             .expect("damped γ=0 None");
+        let phi = model.isotropic_dispersion();
+        assert!(phi.is_finite() && phi > 0.0, "φ̂ must be positive");
         let sumsq: f64 = v.iter().map(|x| x * x).sum();
+        let expected = sumsq / phi;
         for row in [0usize, n / 2, n - 1] {
             let q = ident.quad_form(row, v.view());
             assert!(
-                (q - sumsq).abs() <= 1e-12 * (1.0 + sumsq),
-                "γ=0/None must be the identity metric: quad_form {q} vs ‖v‖² {sumsq}"
+                (q - expected).abs() <= 1e-9 * (1.0 + expected),
+                "γ=0/None must be the measured-scale identity: quad_form {q} vs ‖v‖²/φ̂ {expected}"
             );
         }
 

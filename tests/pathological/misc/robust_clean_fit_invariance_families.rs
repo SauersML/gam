@@ -72,7 +72,6 @@ struct CleanFit {
     log_likelihood: f64,
     edf_total: f64,
     log_lambdas: Vec<f64>,
-    outer_converged: bool,
     all_finite: bool,
 }
 
@@ -110,7 +109,6 @@ fn run_standard(
         fit.fit.log_likelihood,
         fit.fit.inference.as_ref().map(|i| i.edf_total),
         fit.fit.log_lambdas.to_vec(),
-        fit.fit.outer_converged,
         family,
     )
 }
@@ -121,14 +119,13 @@ fn summarize(
     log_likelihood: f64,
     edf: Option<f64>,
     log_lambdas: Vec<f64>,
-    outer_converged: bool,
     family: &str,
 ) -> CleanFit {
     let edf_total = edf.unwrap_or(f64::NAN);
     let all_finite = beta.iter().all(|v| v.is_finite()) && eta_train.iter().all(|v| v.is_finite());
     eprintln!(
         "[clean-invariance:{family}] ll={log_likelihood:.6e} edf={edf_total:.6} \
-         conv={outer_converged} max|β|={:.4e} finite={all_finite}",
+         conv=certified max|β|={:.4e} finite={all_finite}",
         beta.iter().fold(0.0_f64, |a, v| a.max(v.abs())),
     );
     CleanFit {
@@ -137,7 +134,6 @@ fn summarize(
         log_likelihood,
         edf_total,
         log_lambdas,
-        outer_converged,
         all_finite,
     }
 }
@@ -151,12 +147,7 @@ fn assert_zero_downside(family: &str, fit: &CleanFit) {
         fit.all_finite,
         "[{family}] non-finite coefficients / predictor on a clean fit",
     );
-    assert!(
-        fit.outer_converged,
-        "[{family}] clean fit failed to converge (conv={}) — the cohort is \
-         well-identified, so the always-on robust path must settle",
-        fit.outer_converged,
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // (1) COEFFICIENTS — the self-limiting Jeffreys penalty leaves a clean,
     //     well-identified fit at a bounded, finite coefficient scale.
@@ -356,7 +347,6 @@ fn clean_fit_invariance_gamlss_location_scale() {
             unified.log_likelihood,
             unified.inference.as_ref().map(|i| i.edf_total),
             unified.log_lambdas.to_vec(),
-            unified.outer_converged,
             "gamlss",
         )
     };
@@ -453,7 +443,6 @@ fn clean_fit_invariance_survival_lognormal() {
             unified.log_likelihood,
             unified.inference.as_ref().map(|i| i.edf_total),
             unified.log_lambdas.to_vec(),
-            unified.outer_converged,
             "survival",
         )
     };

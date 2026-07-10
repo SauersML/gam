@@ -975,6 +975,7 @@ impl SaeManifoldOuterObjective {
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
             termination: OuterTerminationLedger::new(),
+            outer_search_verdict: None,
             checkpoint_fingerprint,
             checkpoint_path,
             crosscoder_blocks: None,
@@ -1418,7 +1419,13 @@ impl SaeManifoldOuterObjective {
     /// engine evaluated, and the inner loss breakdown at that rho.
     pub fn into_fitted(self) -> SaeIntoFittedResult {
         // #2235 — capture the termination ledger before `self` is consumed.
-        let termination_report = self.termination.report();
+        // A search-lane objective carries the converged-via certificate stamped
+        // by `certify_outer_stage`; its absence means no outer search ran here
+        // (the fixed-ρ lane) — that IS the FixedRho verdict, not a fallback.
+        let termination_report = self.termination.report(match self.outer_search_verdict {
+            Some(via) => SaeOuterVerdict::Search(via),
+            None => SaeOuterVerdict::FixedRho,
+        });
         let Self {
             mut term,
             mut baseline_term,

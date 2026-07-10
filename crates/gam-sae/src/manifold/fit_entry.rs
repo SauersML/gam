@@ -292,7 +292,14 @@ pub(crate) fn certify_outer_stage(
     run_result: Result<OuterResult, EstimationError>,
 ) -> Result<SaeManifoldOuterObjective, SaeFitError> {
     match run_result {
-        Ok(result) if result.converged => Ok(objective),
+        Ok(result) if result.converged => {
+            // #2235/#2241 — carry the engine's converged-via certificate
+            // (gradient-stationary / criterion-flat / recurrent-incumbent)
+            // onto the objective so `into_fitted` reports it on the payload.
+            let mut objective = objective;
+            objective.outer_search_verdict = result.converged_via;
+            Ok(objective)
+        }
         Ok(result) => Err(SaeFitError::OuterDidNotConverge {
             stage,
             result: Box::new(result),
@@ -444,7 +451,10 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
     // #2235 — the outer termination verdict + ledger, surfaced on the payload.
-    let outer_termination = fitted_result.termination;
+    // `mut`: each structured-residual pass below re-runs the outer search, and
+    // the payload must report the termination of the fit actually returned
+    // (the final pass), not pass 0's.
+    let mut outer_termination = fitted_result.termination;
     let mut term = fitted_result.term;
     let mut rho = fitted_result.rho;
     let mut loss = fitted_result.loss;
@@ -575,6 +585,8 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
             let fitted_result = objective.into_fitted();
             finalization_invalidated_shape_uncertainty =
                 fitted_result.invalidates_pre_final_shape_uncertainty();
+            // #2235 — the returned fit is this pass's; report its termination.
+            outer_termination = fitted_result.termination;
             term = fitted_result.term;
             rho = fitted_result.rho;
             loss = fitted_result.loss;

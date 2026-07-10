@@ -3294,6 +3294,10 @@ fn sae_manifold_fit_inner<'py>(
     // minted — the forcing-function contract, see SPEC).
     {
         let termination = PyDict::new(py);
+        // #2235/#2241 — which certificate concluded the outer search; the wire
+        // names are owned by the Rust enums (SaeOuterVerdict/OuterConvergedVia
+        // as_str) — the binding marshals, it does not map.
+        termination.set_item("verdict", outer_termination.verdict.as_str())?;
         termination.set_item("evals", outer_termination.evals)?;
         termination.set_item(
             "evals_since_improvement",

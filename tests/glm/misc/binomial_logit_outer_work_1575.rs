@@ -12,7 +12,8 @@
 //!
 //! This test fits a small 3-smooth binomial/logit REML GAM and asserts:
 //!   (a) correctness: the optimizer certifies a genuine REML stationary point —
-//!       `outer_converged` is true AND the final outer gradient clears the
+//!       the fit mints at all (sealed convergence evidence, SPEC 20) AND the
+//!       final outer gradient clears the
 //!       solver's own SCORE-RELATIVE stationarity bound. This fit is weakly
 //!       identified (near-collinear monomial bases), so the REML surface is a
 //!       flat valley and the residual gradient floors at O(0.1) on a score of
@@ -137,8 +138,9 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
     .expect("3-smooth logit REML fit should succeed");
 
     // ── (a) correctness ────────────────────────────────────────────────────
-    // The converged answer must be a genuine REML stationary point: the
-    // optimizer must certify `outer_converged` AND the final outer gradient must
+    // The converged answer must be a genuine REML stationary point: the fit
+    // minting at all is the sealed convergence proof (SPEC 20) AND the final
+    // outer gradient must
     // clear the solver's score-relative stationarity bound (checked below). This
     // is the load-bearing correctness gate — a non-stationary stuck mode (an
     // overfit, or a coarse-inner-solve stall) would fail it.
@@ -163,20 +165,15 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
     );
 
     eprintln!(
-        "RECORD_1575 reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} outer_grad_norm={:?} converged={}",
+        "RECORD_1575 reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} outer_grad_norm={:?} converged=certified",
         fit.reml_score,
         edf,
         fit.outer_cost_evals,
         fit.inner_pirls_solves,
-        fit.outer_gradient_norm,
-        fit.outer_converged
+        fit.outer_gradient_norm
     );
 
-    assert!(
-        fit.outer_converged,
-        "outer REML optimizer must certify convergence (the converged optimum \
-         must be unchanged by the outer-work reduction)"
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     // Stationarity is certified RELATIVE TO THE SCORE SCALE, matching the
     // solver's own outer-convergence contract (the score-relative flat-valley
     // bound in `rho_optimizer::bridges`: a cost-stalled optimum converges when
@@ -304,10 +301,7 @@ fn binomial_logit_reml_firth_on_outer_work_bounded_1575() {
         (4.0..=16.0).contains(&edf),
         "Firth-ON edf {edf} outside structurally valid band [4, 16]"
     );
-    assert!(
-        fit.outer_converged,
-        "Firth-ON outer REML optimizer must certify convergence"
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     if let Some(g) = fit.outer_gradient_norm {
         let bound = (1.0e-3 * (1.0 + fit.reml_score.abs())).min(1.0);
         assert!(
@@ -318,8 +312,8 @@ fn binomial_logit_reml_firth_on_outer_work_bounded_1575() {
     }
 
     eprintln!(
-        "RECORD_1575_FIRTH reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} converged={}",
-        fit.reml_score, edf, fit.outer_cost_evals, fit.inner_pirls_solves, fit.outer_converged
+        "RECORD_1575_FIRTH reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} converged=certified",
+        fit.reml_score, edf, fit.outer_cost_evals, fit.inner_pirls_solves
     );
 
     // Outer-work budget: the Firth path does more per-eval work but the eval/solve

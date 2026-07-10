@@ -73,7 +73,6 @@ fn probe_one(basis: &str, d: usize, ds: &gam::data::EncodedDataset) {
 
     // Contention-robust counts.
     let outer = fit.fit.outer_iterations;
-    let conv = fit.fit.outer_converged;
     let n_pen = fit.fit.lambdas.len();
     let ncoef: usize = fit.fit.blocks.iter().map(|b| b.beta.len()).sum();
     let basis_cols = fit.design.design.ncols();
@@ -94,7 +93,7 @@ fn probe_one(basis: &str, d: usize, ds: &gam::data::EncodedDataset) {
 
     println!(
         "[probe1050] {basis:11} d={d:3} total={total:7.2}s build={build:7.3}s \
-         outer_iters={outer:3} conv={conv} n_pen={n_pen} ncoef={ncoef} basis_cols={basis_cols}"
+         outer_iters={outer:3} conv=certified n_pen={n_pen} ncoef={ncoef} basis_cols={basis_cols}"
     );
 }
 

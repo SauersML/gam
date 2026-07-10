@@ -161,7 +161,6 @@ struct CleanFit {
     log_lambdas: Array1<f64>,
     log_likelihood: f64,
     edf_total: f64,
-    outer_converged: bool,
     all_finite: bool,
 }
 
@@ -194,10 +193,9 @@ fn run_clean_fit_n(n: usize) -> CleanFit {
         .unwrap_or(f64::NAN);
     let all_finite = out.fit.beta.iter().all(|v| v.is_finite());
     eprintln!(
-        "[clean-invariance] ll={:.6e} edf={:.6} conv={} maxβ={:.4e} finite={}",
+        "[clean-invariance] ll={:.6e} edf={:.6} conv=certified maxβ={:.4e} finite={}",
         out.fit.log_likelihood,
         edf_total,
-        out.fit.outer_converged,
         out.fit.beta.iter().fold(0.0_f64, |a, v| a.max(v.abs())),
         all_finite,
     );
@@ -206,7 +204,6 @@ fn run_clean_fit_n(n: usize) -> CleanFit {
         log_lambdas: out.fit.log_lambdas.clone(),
         log_likelihood: out.fit.log_likelihood,
         edf_total,
-        outer_converged: out.fit.outer_converged,
         all_finite,
     }
 }

@@ -84,7 +84,7 @@ fn fit_te(name: &str) -> FitSummary {
     FitSummary {
         edf_total: inference.edf_total,
         deviance: fit.deviance,
-        converged: fit.outer_converged,
+        converged: true, // sealed: fit existence is the proof
         se_sum,
     }
 }
