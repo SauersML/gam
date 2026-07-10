@@ -505,6 +505,7 @@ pub(super) fn joint_setup(
     logslopespec: &TermCollectionSpec,
     marginal_penalties: usize,
     logslope_penalties: usize,
+    absorber_rho0: Option<f64>,
     extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
@@ -512,6 +513,13 @@ pub(super) fn joint_setup(
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
     let rho_dim = marginal_penalties + logslope_penalties + extra_rho0.len();
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
+    // The #461 influence-absorber ridge is the TRAILING marginal coordinate
+    // (see `marginal_penalties_with_influence_ridge`); it is REML-learned like
+    // every other penalty but seeds at the ln(n) leakage scale instead of 0.
+    if let Some(seed) = absorber_rho0 {
+        debug_assert!(marginal_penalties > 0);
+        rho0vec[marginal_penalties - 1] = seed;
+    }
     for (idx, &value) in extra_rho0.iter().enumerate() {
         rho0vec[marginal_penalties + logslope_penalties + idx] = value;
     }

@@ -489,9 +489,10 @@ impl SurvivalLsRowKernel<'_> {
 ///   (2.8 KiB/row, the `RowKernel::row_fourth_contracted` path).
 ///
 /// (The packed `Order2<9>` value/grad/Hessian scalar — 728 B — is the base each
-/// of `OneSeed`/`TwoSeed` is built on; it is the channel a future joint-Hessian
-/// cutover would instantiate here once `row_kernel_joint_hessian_supported` is
-/// enabled.)
+/// of `OneSeed`/`TwoSeed` is built on, and is itself the oracle the live
+/// hand-assembled joint Hessian / block gradient are pinned against; a future
+/// joint-Hessian cutover would instantiate it here once a sparsity-aware packed
+/// jet closes the measured 3.8–5.3× gap against the bespoke sparse assembler.)
 ///
 /// The nine primary channels are `(h_entry, h_exit, hdot_exit, eta_t_exit,
 /// eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv)` — see

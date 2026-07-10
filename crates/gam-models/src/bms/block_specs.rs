@@ -1285,6 +1285,7 @@ mod runaway_tests {
             &empty_terms,
             2,
             3,
+            Some(2.5),
             &[0.4],
             &SpatialLengthScaleOptimizationOptions::default(),
         );
@@ -1292,7 +1293,11 @@ mod runaway_tests {
         assert_eq!(
             setup.rho_dim(),
             6,
-            "BMS spatial setup rho must contain only learned marginal/logslope/auxiliary penalties; fixed physical ridges are carried by PenaltyMatrix::Fixed"
+            "BMS spatial setup rho holds every learned marginal/logslope/auxiliary penalty; the #461 absorber ridge occupies the trailing marginal slot"
+        );
+        assert_eq!(
+            setup.theta0()[1], 2.5,
+            "absorber ridge seeds the trailing marginal rho coordinate at the ln(n) leakage scale"
         );
     }
 
@@ -1629,7 +1634,6 @@ pub(crate) fn build_marginal_blockspec_bms(
     logslope_baseline: f64,
     p_marginal: usize,
     influence_columns: Option<&Array2<f64>>,
-    influence_ridge_log_lambda: f64,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_m = offset + baseline;
     let offset_s = logslope_offset + logslope_baseline;
@@ -1648,12 +1652,8 @@ pub(crate) fn build_marginal_blockspec_bms(
         offset_s,
         p_marginal,
     });
-    let (penalties, nullspace_dims, initial_log_lambdas) = marginal_penalties_with_influence_ridge(
-        design,
-        &rho,
-        influence_columns,
-        influence_ridge_log_lambda,
-    )?;
+    let (penalties, nullspace_dims, initial_log_lambdas) =
+        marginal_penalties_with_influence_ridge(design, &rho, influence_columns)?;
     Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
@@ -2346,13 +2346,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
             }
         };
 
-    let marginal_penalty_count = marginal_design.penalties.len();
+    // With the #461 influence absorber active, the marginal block carries one
+    // extra REML-learned ρ coordinate (the absorber ridge precision), seeded
+    // at the ln(n) leakage scale and clamped into the outer ρ box.
+    let absorber_slots = usize::from(influence_columns.is_some());
+    let absorber_rho0 = influence_columns
+        .as_ref()
+        .map(|_| influence_absorber_log_lambda(spec.z.len()).clamp(-12.0, 12.0));
+    let marginal_penalty_count = marginal_design.penalties.len() + absorber_slots;
     let setup = joint_setup(
         data_view,
         &marginalspec_boot,
         &logslopespec_boot,
         marginal_penalty_count,
         logslope_design.penalties.len(),
+        absorber_rho0,
         &extra_rho0,
         &effective_kappa_options,
     );
@@ -2393,14 +2401,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // blockspec design/β/penalty/jacobian) now agrees at the reduced width.
         let logslope_design_reduced = reduce_logslope_design(logslope_design)?;
         let logslope_design = &logslope_design_reduced;
-        // Fixed #754/#461 ridges are appended inside
-        // `marginal_penalties_with_influence_ridge` as physical penalties and
-        // are excluded from `rho`; only genuine REML-learned smooth penalties
-        // appear in the spatial joint setup.
-        let rho_marginal = rho
-            .slice(s![cursor..cursor + marginal_design.penalties.len()])
-            .to_owned();
-        cursor += marginal_design.penalties.len();
+        // The marginal slice carries the genuine smooth penalties plus, when
+        // the #461 influence absorber is active, one TRAILING coordinate for
+        // the absorber ridge — its precision is REML-learned like every other
+        // penalty (seeded at the ln(n) leakage scale by `joint_setup`).
+        let marginal_rho_len = marginal_design.penalties.len() + absorber_slots;
+        let rho_marginal = rho.slice(s![cursor..cursor + marginal_rho_len]).to_owned();
+        cursor += marginal_rho_len;
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
@@ -2419,7 +2426,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 baseline.1,
                 p_m,
                 influence_columns.as_ref(),
-                influence_absorber_log_lambda(spec.z.len()),
             )?,
             build_logslope_blockspec_bms(
                 logslope_design,

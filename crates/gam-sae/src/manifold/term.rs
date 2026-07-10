@@ -588,22 +588,13 @@ pub struct SaeManifoldTerm {
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
     pub(crate) separation_barrier_strength_override: Option<f64>,
-    /// #2022 — persisted per-fit opt-in for the SCALE-gauge quotient (default
-    /// false ⇒ bit-for-bit historical path). When true, the decoder is confined
-    /// to the unit-Frobenius sphere with its magnitude in the explicit per-atom
-    /// log-amplitude (seed/step/refit peel + sphere retract). Set from the FFI
-    /// via the typed `quotient_scale` kwarg — no env lever. Carried across clones
-    /// like the other per-fit config.
-    pub(crate) quotient_scale: bool,
     /// #1939 — persisted per-fit opt-in for the cone-atom RECOVERY retraction
     /// (default false ⇒ bit-for-bit historical path). When true, at each accepted
     /// OUTER-iterate boundary any atom whose decoder has COLLAPSED relative to its
     /// dictionary peers (`‖B_k‖ < ratio·median`) is retracted onto the unit sphere
     /// and its amplitude re-solved, re-homing a co-vanished born decoder without
-    /// touching healthy atoms. Distinct from `quotient_scale`: this does ONLY the
-    /// stable breach-gated boundary retraction and NEVER the #2022 per-Newton fold
-    /// (fit_drivers.rs:3227), so it cannot detonate a healthy fit. Carried across
-    /// clones like the other per-fit config.
+    /// touching healthy atoms. This does only the stable breach-gated boundary
+    /// retraction. Carried across clones like the other per-fit config.
     pub(crate) cone_atom_recovery: bool,
     /// #5/(B) — persisted per-fit opt-in (default false ⇒ bit-for-bit historical
     /// path) for the RANK-CHARGE evidence criterion. When true, the Laplace
@@ -774,7 +765,6 @@ impl Clone for SaeManifoldTerm {
             // #1777 — persisted per-fit config, carried across clones like the
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            quotient_scale: self.quotient_scale,
             cone_atom_recovery: self.cone_atom_recovery,
             rank_charge_evidence: self.rank_charge_evidence,
             soft_rank_charge: self.soft_rank_charge,
@@ -868,14 +858,10 @@ pub(crate) struct SaeFitIncumbent {
 #[derive(Debug)]
 pub(crate) struct SaeManifoldAtomSnapshot {
     pub(crate) decoder_coefficients: Array2<f64>,
-    /// Explicit log-amplitude `s_k` of the scale quotient (#2022/#1939). The
-    /// physical dictionary is `exp(s_k)·Φ_k·B_k`, so a snapshot that banked only
-    /// the decoder would, on restore, MIX the banked `B_k` with whatever `s_k`
-    /// the fit moved to in the meantime (the boundary amplitude solve
-    /// `pin_scale_gauge` / `optimize_log_amplitudes_closed_form` and the
-    /// affine-gauge transport peel all move `s_k` between snapshot and restore
-    /// under the default-on `quotient_scale`) — a physically different model
-    /// than the one whose objective was banked.
+    /// Explicit physical log-amplitude `s_k`. A snapshot that banked only the
+    /// decoder would mix the banked `B_k` with a different amplitude after a
+    /// boundary recovery solve, producing a physically different model from the
+    /// one whose objective was banked.
     pub(crate) log_amplitude: f64,
     pub(crate) smooth_penalty: Array2<f64>,
     pub(crate) basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,

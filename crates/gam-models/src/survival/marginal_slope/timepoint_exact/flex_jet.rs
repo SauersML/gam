@@ -4251,6 +4251,115 @@ mod moment_engine_tests {
         cmp_mat("d_uv_dir", &dnorm.eps.h, &hand.d_uv_dir);
     }
 
+    /// #932 grad-only cutover: the production grad-only timepoint
+    /// (`compute_survival_timepoint_first_order_exact`, [`Jet1`]) is pinned two ways.
+    /// (1) PARITY: its value + `eta_u`/`chi_u`/`d_u` equal the grad+Hessian
+    /// production path (`compute_survival_timepoint_exact_jet`, [`Jet2`]) base +
+    /// gradient channels to ≤1e-9 relative — the single-source claim (both drive the
+    /// one `flex_timepoint_inputs_generic` builder). (2) INDEPENDENT FD WITNESS: the
+    /// TOTAL derivatives `∂(eta,chi,d)/∂g` and `∂(eta,chi,d)/∂q` — each threading the
+    /// per-row intercept CALIBRATION re-solve `a(g,q)` the audit flagged — match a
+    /// central finite difference of the production-returned VALUE channels.
+    #[test]
+    fn flex_timepoint_first_order_matches_jet2_and_fd_932() {
+        let n = 16usize;
+        let family = make_g_only_flex_family(n);
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let row = 6usize;
+        let g = 0.19_f64;
+        let o_infl = 0.0_f64;
+
+        let m_beta = 0.15_f64;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
+
+        // Base-point intercept solve + both production timepoint packs.
+        let (a1, _d1) = family
+            .solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                None,
+                None,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("intercept solve");
+        let first = family
+            .compute_survival_timepoint_first_order_exact(
+                row, &primary, q1, primary.q1, a1, g, None, None, o_infl,
+            )
+            .expect("grad-only jet1");
+        let full = family
+            .compute_survival_timepoint_exact_jet(
+                row, &primary, q1, primary.q1, a1, g, None, None, o_infl,
+            )
+            .expect("grad+hess jet2");
+
+        // (1) Parity against the Jet2 production path (single-source).
+        let rel = |a: f64, b: f64| (a - b).abs() <= 1e-9 * (1.0 + b.abs());
+        assert!(rel(first.eta, full.eta), "eta {} != {}", first.eta, full.eta);
+        assert!(rel(first.chi, full.chi), "chi {} != {}", first.chi, full.chi);
+        assert!(rel(first.d, full.d), "d {} != {}", first.d, full.d);
+        for u in 0..p {
+            assert!(
+                rel(first.eta_u[u], full.eta_u[u]),
+                "eta_u[{u}] {} != {}",
+                first.eta_u[u],
+                full.eta_u[u]
+            );
+            assert!(
+                rel(first.chi_u[u], full.chi_u[u]),
+                "chi_u[{u}] {} != {}",
+                first.chi_u[u],
+                full.chi_u[u]
+            );
+            assert!(
+                rel(first.d_u[u], full.d_u[u]),
+                "d_u[{u}] {} != {}",
+                first.d_u[u],
+                full.d_u[u]
+            );
+        }
+
+        // (2) Independent central-FD witness of the returned VALUE channels. The
+        // closure re-solves the calibration intercept `a(g,q)` exactly as production
+        // does, so the FD is the genuine TOTAL derivative (intercept chain included).
+        let eval = |gg: f64, qq: f64| -> (f64, f64, f64) {
+            let (aa, _) = family
+                .solve_row_survival_intercept_with_slot(
+                    qq,
+                    gg,
+                    None,
+                    None,
+                    Some((row, SurvivalInterceptSlotKind::Exit)),
+                )
+                .expect("fd intercept solve");
+            let tp = family
+                .compute_survival_timepoint_first_order_exact(
+                    row, &primary, qq, primary.q1, aa, gg, None, None, o_infl,
+                )
+                .expect("fd grad-only");
+            (tp.eta, tp.chi, tp.d)
+        };
+        let h = 1e-6_f64;
+        let (eta_gp, chi_gp, d_gp) = eval(g + h, q1);
+        let (eta_gm, chi_gm, d_gm) = eval(g - h, q1);
+        let (eta_qp, chi_qp, d_qp) = eval(g, q1 + h);
+        let (eta_qm, chi_qm, d_qm) = eval(g, q1 - h);
+        let fd = |plus: f64, minus: f64| (plus - minus) / (2.0 * h);
+        let check = |label: &str, analytic: f64, numeric: f64| {
+            assert!(
+                (analytic - numeric).abs() <= 1e-5 * (1.0 + analytic.abs()),
+                "{label}: analytic {analytic} != fd {numeric}"
+            );
+        };
+        check("d eta/dg", first.eta_u[primary.g], fd(eta_gp, eta_gm));
+        check("d chi/dg", first.chi_u[primary.g], fd(chi_gp, chi_gm));
+        check("d d/dg", first.d_u[primary.g], fd(d_gp, d_gm));
+        check("d eta/dq", first.eta_u[primary.q1], fd(eta_qp, eta_qm));
+        check("d chi/dq", first.chi_u[primary.q1], fd(chi_qp, chi_qm));
+        check("d d/dq", first.d_u[primary.q1], fd(d_qp, d_qm));
+    }
+
     /// #932 item-2 STEP 3c: `flex_timepoint_inputs_generic::<Jet4>` mixed second-
     /// directional channel (`eps_del`) == hand `compute_survival_timepoint_
     /// bidirectional_exact_from_cached` (`block10_pack_bi`) term-for-term (≤1e-6) on a

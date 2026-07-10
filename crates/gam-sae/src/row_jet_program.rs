@@ -209,6 +209,21 @@ pub struct SaeReconstructionRowProgram {
     pub n_primaries: usize,
 }
 
+/// Maximum number of per-row Newton primaries `n_primaries` the const-generic
+/// `Tower4<K>` reconstruction / β-border jet dispatch monomorphizes (issue
+/// #932). The tower is compile-time-sized, so `K` must be a literal drawn from
+/// the `fill_*_from_program_dynamic` ladders (`0..=SAE_MAX_JET_ROW_PRIMARIES`);
+/// a wider per-row block would otherwise route to the ladder's `unsupported`
+/// arm deep inside the streaming arrow log-det assembly. The per-atom
+/// assignment modes (IBP-MAP / ThresholdGate / TopK) route through this ladder,
+/// so their fits validate the finalized per-row arity against this limit up
+/// front (`SaeManifoldTerm::validate_jet_row_primary_arity`). The softmax mode
+/// uses the dynamically-sized hand path and is NOT bound by this cap.
+///
+/// Keep this in sync with the literal list in the `dispatch!` macros of
+/// `construction_row_jet_logdet_channels.rs`.
+pub const SAE_MAX_JET_ROW_PRIMARIES: usize = 16;
+
 impl SaeReconstructionRowProgram {
     /// The gate activation `ζ_k(ℓ)` as a `Tower4<K>` in the gate-logit
     /// primaries. Softmax is the shared composition `exp(ℓ_k·inv_tau) /

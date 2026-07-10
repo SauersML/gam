@@ -137,9 +137,8 @@ pub(crate) use gam_linalg::faer_ndarray::{
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
 pub(crate) use gam_solve::arrow_schur::{
-    ArrowBetaGaugeQuotient, ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum,
-    arrow_factor_max_pivot, arrow_factor_min_pivot, probe_undamped_evidence_row_factors,
-    solve_arrow_newton_step_with_options,
+    ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, arrow_factor_max_pivot,
+    arrow_factor_min_pivot, probe_undamped_evidence_row_factors, solve_arrow_newton_step_with_options,
 };
 
 // #988 memory-matrix-free evidence log-det: the reduced-Schur SLQ entry point

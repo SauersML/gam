@@ -41,7 +41,10 @@ def load_head_tensors(model_dir: str):
     """Load (norm_weight, head_weight, rms_eps) without touching other shards."""
     with open(os.path.join(model_dir, "config.json")) as fh:
         config = json.load(fh)
-    eps = float(config.get("rms_norm_eps", 1e-6))
+    # Multimodal checkpoints nest the text stack under text_config.
+    eps = float(
+        config.get("rms_norm_eps", config.get("text_config", {}).get("rms_norm_eps", 1e-6))
+    )
 
     index_path = os.path.join(model_dir, "model.safetensors.index.json")
     if os.path.exists(index_path):
@@ -57,10 +60,21 @@ def load_head_tensors(model_dir: str):
         with safe_open(shard, framework="numpy") as fh:
             return np.asarray(fh.get_tensor(name), dtype=np.float64)
 
-    norm_w = fetch("model.norm.weight")
-    head_name = (
-        "lm_head.weight" if "lm_head.weight" in weight_map else "model.embed_tokens.weight"
+    def first_present(candidates: list[str]) -> str:
+        for name in candidates:
+            if name in weight_map:
+                return name
+        raise SystemExit(f"none of {candidates} in the checkpoint index")
+
+    norm_name = first_present(["model.norm.weight", "model.language_model.norm.weight"])
+    head_name = first_present(
+        [
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+        ]
     )
+    norm_w = fetch(norm_name)
     head_w = fetch(head_name)
     return norm_w, head_w, eps, head_name
 

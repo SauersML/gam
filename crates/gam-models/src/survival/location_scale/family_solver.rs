@@ -671,6 +671,25 @@ impl SurvivalLocationScaleFamily {
         Ok(blocks)
     }
 
+    /// LIVE production joint Hessian `H = −∇²ℓ` for the non-wiggle survival-LS
+    /// model (the wiggle case is single-sourced through the §13 warp kernel).
+    ///
+    /// #932 MEASURED PERF EXCEPTION: this is a sparse hand assembler, NOT the
+    /// single-source `Order2<9>` jet row kernel. Routing the joint Hessian
+    /// through the dense jet (`RowKernel::<9>::row_kernel` over `sls_row_nll`) is
+    /// ~3.8–5.3× SLOWER (standalone ns/row + `--emit asm` op counts): a dense
+    /// order-2 tower over 9 channels cannot recover the 3-functionally-
+    /// independent-index × ≤5-touched-channel sparsity this assembler hard-codes.
+    /// The exception is kept HONEST, not a divergence risk: this hand assembler
+    /// is pinned bit-for-bit (≤1e-9) to the ONE single-sourced `sls_row_nll` jet
+    /// by non-ignored analytic oracles —
+    /// `survival_ls_row_kernel_matches_bespoke_assembly` (#921, simple shape +
+    /// FD directional witness) and
+    /// `survival_ls_time_varying_joint_hessian_matches_single_sourced_tower_932`
+    /// (every-channel time-varying shape, Gaussian/Gumbel/Logistic). The block
+    /// gradient is likewise pinned by
+    /// `survival_ls_block_gradient_matches_single_sourced_tower_932`. A future
+    /// cutover requires a sparsity-aware packed jet that closes the measured gap.
     pub(crate) fn assemble_joint_hessian_from_quantities(
         &self,
         q: &SurvivalJointQuantities,

@@ -2192,16 +2192,6 @@ impl SaeManifoldTerm {
             }
             start = end;
         }
-        let beta_gauge_quotient = self.beta_scale_gauge_quotient()?;
-        if let Some(quotient) = beta_gauge_quotient.as_ref() {
-            schur_acc = quotient.pin_reduced_schur(schur_acc.view());
-            if let Some(w) = wood_w.as_mut() {
-                for column in 0..w.ncols() {
-                    let projected = quotient.project_complement(w.column(column));
-                    w.column_mut(column).assign(&projected);
-                }
-            }
-        }
         let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
             .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
         let mut total = log_det_tt + log_det_schur;

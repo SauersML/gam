@@ -81,9 +81,6 @@ pub fn term_from_padded_blocks_with_mode(
             Some(evaluator) => atom.with_basis_second_jet(evaluator),
             None => atom,
         };
-        // #2022 — the SCALE-gauge quotient SEED peel is applied in the FFI
-        // (gated by the typed `quotient_scale` kwarg) after the term is built,
-        // not here (this builder has no per-fit flag + must stay env-free).
         atoms.push(atom);
     }
     let manifolds = basis_kinds

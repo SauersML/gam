@@ -427,63 +427,14 @@ impl SaeManifoldTerm {
         }
         let p = self.output_dim();
         let offsets = self.beta_offsets();
-        // #2022 — quotient the SCALE-gauge nullvector out of the applied inner
-        // step. The contribution `exp(s_k)·Φ_k·B_k` is invariant along the exact
-        // joint nullvector `v_k = (vec(B_k), −1)` in `(B_k, s_k)`, and the inner
-        // KKT system solves for `ΔB_k` at frozen `s_k`, so any radial component
-        // `⟨ΔB_k, B_k⟩` it emits is the same physical degree of freedom the
-        // boundary amplitude solve re-homes into `s_k` one iterate later — the
-        // two channels fight (the scale↔amplitude churn this issue names). Apply
-        // the metric projection of `(ΔB_k, 0)` off `v_k`
-        // ([`crate::manifold::gauge::project_scale_gauge_from_joint_step`],
-        // inlined here to stay allocation-free in the per-trial hot path):
-        //   coeff = ⟨ΔB,B⟩_F / (‖B‖_F² + 1),
-        //   ΔB' = ΔB − coeff·B,   δs' = +coeff.
-        // First-order the applied step is IDENTICAL to the raw Newton step on the
-        // data fit (exp(s)Φ(δB' + δs'·B) = exp(s)Φ·δB exactly), so this is a
-        // retraction, not a re-aimed direction — unlike the #2100 mid-solve
-        // ‖B‖≡1 peel it rewrites no parameter and the iterate path is continuous
-        // in `step_size`; the line search evaluates the true objective at every
-        // trial and the (now s-carrying) snapshot restores rejected trials
-        // exactly. The projected step has zero component along `v_k`, so the
-        // scale gauge is unrepresentable in the walk and the accepted iterate
-        // needs no compensating radial peel.
-        let quotient = self.quotient_scale;
         let update_atom = |atom_idx: usize, atom: &mut SaeManifoldAtom| {
             let m = atom.basis_size();
             let offset = offsets[atom_idx];
-            let mut gauge_coeff = 0.0_f64;
-            if quotient {
-                let mut bb = 0.0_f64;
-                let mut db_b = 0.0_f64;
-                for basis_col in 0..m {
-                    for out_col in 0..p {
-                        let b = atom.decoder_coefficients[[basis_col, out_col]];
-                        bb += b * b;
-                        db_b += delta_beta[offset + basis_col * p + out_col] * b;
-                    }
-                }
-                if bb.is_finite() && db_b.is_finite() {
-                    gauge_coeff = db_b / (bb + 1.0);
-                }
-            }
-            if gauge_coeff != 0.0 {
-                for basis_col in 0..m {
-                    for out_col in 0..p {
-                        let flat_idx = offset + basis_col * p + out_col;
-                        let b = atom.decoder_coefficients[[basis_col, out_col]];
-                        atom.decoder_coefficients[[basis_col, out_col]] +=
-                            step_size * (delta_beta[flat_idx] - gauge_coeff * b);
-                    }
-                }
-                atom.log_amplitude += step_size * gauge_coeff;
-            } else {
-                for basis_col in 0..m {
-                    for out_col in 0..p {
-                        let flat_idx = offset + basis_col * p + out_col;
-                        atom.decoder_coefficients[[basis_col, out_col]] +=
-                            step_size * delta_beta[flat_idx];
-                    }
+            for basis_col in 0..m {
+                for out_col in 0..p {
+                    let flat_idx = offset + basis_col * p + out_col;
+                    atom.decoder_coefficients[[basis_col, out_col]] +=
+                        step_size * delta_beta[flat_idx];
                 }
             }
         };
@@ -630,14 +581,6 @@ impl SaeManifoldTerm {
         atom.basis_second_jet = Some(new_evaluator);
         atom.smooth_penalty =
             transport_smooth_penalty_for_decoder(transport.view(), old_smooth_penalty.view())?;
-        // #2022 transport-peel (ADD form, no-refresh). The transported penalty
-        // above is decoder-magnitude-independent (T⁻ᵀ S_old T⁻¹), so under the
-        // quotient normalize the decoder into log_amplitude WITHOUT recomputing
-        // it. `atom`'s borrow ended at its last use above; re-index fresh.
-        if self.quotient_scale {
-            self.atoms[atom_idx]
-                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
-        }
         Ok(())
     }
 
@@ -1099,14 +1042,6 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
-        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
-        // decoder-magnitude-independent; under the quotient normalize the decoder
-        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
-        // re-index self.atoms fresh.
-        if self.quotient_scale {
-            self.atoms[atom_idx]
-                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
-        }
         Ok(true)
     }
 
@@ -1248,14 +1183,6 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
-        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
-        // decoder-magnitude-independent; under the quotient normalize the decoder
-        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
-        // re-index self.atoms fresh.
-        if self.quotient_scale {
-            self.atoms[atom_idx]
-                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
-        }
         Ok(true)
     }
 
@@ -1342,14 +1269,6 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
-        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
-        // decoder-magnitude-independent; under the quotient normalize the decoder
-        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
-        // re-index self.atoms fresh.
-        if self.quotient_scale {
-            self.atoms[atom_idx]
-                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
-        }
         Ok(true)
     }
 
@@ -1436,14 +1355,6 @@ impl SaeManifoldTerm {
             old_smooth_penalty.view(),
         )?;
         atom.chart_canonicalized = true;
-        // #2022 transport-peel (ADD form, no-refresh). Transported penalty is
-        // decoder-magnitude-independent; under the quotient normalize the decoder
-        // into log_amplitude WITHOUT recomputing it. `atom`'s borrow ended above;
-        // re-index self.atoms fresh.
-        if self.quotient_scale {
-            self.atoms[atom_idx]
-                .absorb_decoder_norm_into_log_amplitude_without_refresh(f64::MIN_POSITIVE);
-        }
         Ok(true)
     }
 
@@ -3422,8 +3333,7 @@ impl SaeManifoldTerm {
     /// design is the identical gated `diag(a_·k)·Φ_k` the joint audit and joint refit
     /// use, so on a healthy, well-separated dictionary the deflation reproduces the
     /// joint least-squares fit up to block-coordinate ordering. Deterministic: ties
-    /// resolve to the lower atom index. The `quotient_scale` peel is mirrored from
-    /// the joint refit so the amortized-amplitude bookkeeping stays consistent.
+    /// resolve to the lower atom index.
     pub(crate) fn refit_decoder_sequential_deflation(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -3521,12 +3431,6 @@ impl SaeManifoldTerm {
                 }
             }
             self.atoms[best_atom].refresh_intrinsic_smooth_penalty();
-            // #2022 refit-peel, mirrored from the joint refit (default-off; a no-op
-            // unless the scale-gauge quotient is armed on this term).
-            if self.quotient_scale {
-                self.atoms[best_atom].log_amplitude = 0.0;
-                self.atoms[best_atom].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-            }
             remaining.retain(|&a| a != best_atom);
         }
         Ok(())
@@ -3901,7 +3805,7 @@ impl SaeManifoldTerm {
     /// DISTINCT factor, so its deflation decoder lands on that factor's channels and
     /// the atoms separate. Uses only the production seeding primitive
     /// (`sae_pca_seed_initial_coords`, one atom at a time on the residual) and the
-    /// same gated design / `quotient_scale` peel as the joint refit.
+    /// same gated design as the joint refit.
     pub(crate) fn seed_cold_start_disjoint_charts(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -3923,8 +3827,8 @@ impl SaeManifoldTerm {
         // not variance. Each certified plane already carries its per-row
         // `phases_turns` in the exact `[0, 1)` chart-seed format the Periodic PCA
         // seed emits (see `certify_plane`), so only the chart SOURCE changes; the
-        // decoder LS + `quotient_scale` peel + residual deflation below are
-        // unchanged. When the span carries fewer than K κ-certified circle planes
+        // decoder LS and residual deflation below are unchanged. When the span
+        // carries fewer than K κ-certified circle planes
         // (non-circle atom, or too little independent structure) the remaining
         // atoms fall back to the PCA peel, so peelable/disjoint fixtures are
         // untouched — the κ certificate itself is the gate, never a tuned knob.
@@ -3980,10 +3884,6 @@ impl SaeManifoldTerm {
                 }
             }
             self.atoms[atom].refresh_intrinsic_smooth_penalty();
-            if self.quotient_scale {
-                self.atoms[atom].log_amplitude = 0.0;
-                self.atoms[atom].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-            }
         }
         Ok(())
     }
@@ -4127,10 +4027,6 @@ impl SaeManifoldTerm {
                 }
             }
             self.atoms[atom].refresh_intrinsic_smooth_penalty();
-            if self.quotient_scale {
-                self.atoms[atom].log_amplitude = 0.0;
-                self.atoms[atom].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-            }
         }
         Ok(())
     }
@@ -4388,24 +4284,6 @@ impl SaeManifoldTerm {
         } else {
             self.apply_decoder_step_from_flat(delta_beta, step_size, parallel_atoms)?;
         }
-        // #2100 — the #2022 STEP2 sphere-retract+peel does NOT belong here.
-        // `apply_newton_step_impl` runs on EVERY β-Newton line-search TRIAL, and
-        // folding every atom's ‖B_k‖ into its log-amplitude mid-solve forces
-        // ‖B_k‖≡1 while the β-Newton magnitude step (which assumes scale lives in
-        // B) is still moving: the next step then takes a runaway magnitude
-        // correction that compounds to EV → −1e128 on a HEALTHY dictionary (the
-        // #2100 detonation). The retraction is a settled-iterate representation
-        // move, not a per-trial one, so it lives at the ACCEPTED-iterate
-        // boundary in `run_joint_fit_arrow_schur` (`pin_scale_gauge` /
-        // `retract_collapsed_decoders_in_loop`, where the norms have settled).
-        //
-        // What DOES run per trial (inside `apply_decoder_step_from_flat`, under
-        // `quotient_scale`) is the #2022 JOINT (δB, δs) scale-gauge STEP
-        // projection — a different object: it rewrites no parameter (no forced
-        // ‖B‖≡1), preserves the applied step's first-order image exactly, and
-        // merely re-expresses the step's radial component in the `s_k` channel
-        // that owns it, so the β-Newton walk cannot slide along the exact
-        // nullvector v = (vec B, −1). See the derivation at that projection.
         Ok(())
     }
 
@@ -5684,21 +5562,9 @@ impl SaeManifoldTerm {
             // re-home it — recovering a co-vanished born decoder (the K≥2
             // 0.7255→0.0023 collapse) — while leaving HEALTHY atoms' scale in B.
             //
-            // Shared by two flags, both breach-gated at this settled boundary:
-            //   * `cone_atom_recovery` (#1939) — recover a co-vanished born decoder.
-            //   * `quotient_scale` (#2022 SCALE-gauge) — after #2100 removed the
-            //     detonating per-β-Newton fold at `apply_newton_step_impl` (which
-            //     forced ‖B_k‖≡1 on EVERY atom every TRIAL and blew a healthy K=2
-            //     fit to EV→−1e128), the #2022 unit-Frobenius retraction lives HERE
-            //     instead: at the ACCEPTED iterate where the norms have settled, and
-            //     gated to the COLLAPSED atoms only. On a healthy dictionary nothing
-            //     breaches ⇒ strict no-op ⇒ EV preserved (healthy K=2 back to ~+0.43);
-            //     K<2 is a no-op inside the helper (the K=1 low-amp fit is untouched).
-            // Either flag does ONLY the breach-gated boundary retraction and never a
-            // per-Newton fold, so neither can detonate. K<2 / all-zero-median are
-            // no-ops inside the helper. Run the paired amplitude solve solely when an
-            // atom was actually retracted, so a fit with no collapsed atom is a strict
-            // no-op (bit-for-bit the flag-off path).
+            // Run the paired amplitude solve solely when the recovery retracted an
+            // atom. K<2 and all-zero-median dictionaries are no-ops inside the
+            // helper, and a healthy dictionary never enters the amplitude solve.
             if self.cone_atom_recovery && self.retract_collapsed_decoders_in_loop() > 0 {
                 self.optimize_log_amplitudes_closed_form(target, rho)?;
             }

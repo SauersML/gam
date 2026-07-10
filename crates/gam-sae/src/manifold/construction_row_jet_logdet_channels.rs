@@ -243,7 +243,9 @@ impl SaeManifoldTerm {
                         }
                     )*
                     q => Err(format!(
-                        "SAE row reconstruction Tower4 production path supports at most 16 row primaries, got {q}"
+                        "SAE row reconstruction Tower4 production path supports at most {} row primaries, got {q}; \
+                         widen the const-generic dispatch ladder or reduce the per-row active-atom arity (#932)",
+                        crate::row_jet_program::SAE_MAX_JET_ROW_PRIMARIES,
                     )),
                 }
             };
@@ -315,7 +317,9 @@ impl SaeManifoldTerm {
                         }
                     )*
                     q => Err(format!(
-                        "SAE β border Tower4 production path supports at most 16 row primaries, got {q}"
+                        "SAE β border Tower4 production path supports at most {} row primaries, got {q}; \
+                         widen the const-generic dispatch ladder or reduce the per-row active-atom arity (#932)",
+                        crate::row_jet_program::SAE_MAX_JET_ROW_PRIMARIES,
                     )),
                 }
             };

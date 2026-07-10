@@ -359,7 +359,67 @@ pub struct SaeFitRequest {
 ///   the post-search joint shape recompute).
 /// * `cancel`, when present, is polled by every inner objective; the caller sets
 ///   it on interrupt so the abandoned worker's next outer eval bails.
-pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
+pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
+    // #2023 Increment 5 — Tier-0 shared-mean peel as the ONE entry's NATIVE
+    // preprocessing (the "seed policy" tier of the tiered schedule, folded into the
+    // single fit rather than a separate surface). The shared column mean μ is the
+    // global DC that a raw activation target carries; left in the target it is the
+    // co-collapse-to-mean magnet (a constant "zombie" atom loads it and survives
+    // selection, #2082/#1893). Peeling it once here makes that class EV-invisible by
+    // construction on the primary path — the exact guarantee the C4 tier-0 tests
+    // prove for a hand-built term, now wired into production.
+    //
+    // Mean ownership is exactly one stage (the DOUBLE-SUBTRACTION HAZARD): when the
+    // caller has ALREADY installed a Tier-0 mean on the seed term (already-centered
+    // upstream data-prep, e.g. the COMPOSE `tier0.json` mean), that stage owns μ and
+    // the reconstruction add-back is already wired — run verbatim, do not peel again.
+    // Otherwise compute μ from THIS target and run the WHOLE fit on `Z − μ` (so every
+    // internal decoder LSQ, cold-start, structured-residual pass, and EV sees the
+    // de-meaned target — no stage double-counts μ), then attach μ to the fitted
+    // artifact. Every reconstruction path already adds μ back
+    // (`add_tier0_mean_inplace`), so the returned term is self-contained; the
+    // returned reconstruction arrays are lifted back to raw-target space here.
+    // Reconstruction R² is mean-invariant (both RSS and the centered TSS remove μ),
+    // so it is identical either way.
+    if request.base_term.tier0_mean().is_some() {
+        return run_sae_manifold_fit_on_target(request);
+    }
+    let Some(mu) = request.target.mean_axis(ndarray::Axis(0)) else {
+        // Empty target (N = 0): nothing to peel; the inner entry validates shapes.
+        return run_sae_manifold_fit_on_target(request);
+    };
+    for mut row in request.target.rows_mut() {
+        row -= &mu;
+    }
+    let mut report = run_sae_manifold_fit_on_target(request)?;
+    report
+        .term
+        .set_tier0_mean(mu.clone())
+        .map_err(SaeFitError::Fit)?;
+    // Lift the reported reconstructions back to raw-target space (the fit produced
+    // them against `Z − μ`); assignment masses carry no mean and are untouched.
+    add_tier0_mean_rows(&mut report.fitted, &mu);
+    if let Some(pre_topk) = report.pre_topk_fitted.as_mut() {
+        add_tier0_mean_rows(pre_topk, &mu);
+    }
+    Ok(report)
+}
+
+/// Add the Tier-0 shared mean `mu` (length `p`) to every row of an `N×p`
+/// reconstruction produced against the de-meaned target, lifting it back to
+/// raw-target space. Mirrors [`SaeManifoldTerm::add_tier0_mean_inplace`] for the
+/// report's standalone reconstruction arrays.
+fn add_tier0_mean_rows(recon: &mut Array2<f64>, mu: &Array1<f64>) {
+    for mut row in recon.rows_mut() {
+        row += mu;
+    }
+}
+
+/// The SAE-manifold fit body, run against a target whose Tier-0 shared mean has
+/// already been peeled by [`run_sae_manifold_fit`] (or that the caller centered
+/// and whose mean the seed term already owns). Every reconstruction/EV inside is
+/// therefore in the de-meaned frame; the wrapper owns the μ add-back.
+fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
     let SaeFitRequest {
         base_term,
         target: z,

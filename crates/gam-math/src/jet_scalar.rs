@@ -3,11 +3,9 @@
 //! [`crate::jet_tower::Tower4`] carries the full value/gradient/Hessian/`t3`/`t4`
 //! tensor stack: it answers EVERY channel a [`super::row_kernel::RowKernel`]
 //! consumer can ask for, but at `K = 9` that is a ~50 KiB per-row object whose
-//! by-value copies overflowed the stack and timed out the location-scale fit —
-//! which is exactly why `row_kernel_directional_supported()` /
-//! `row_kernel_joint_hessian_supported()` still `return false`. The cutover does
-//! NOT need the dense `Tower4<9>` per row; it needs, per consumer, only the one
-//! channel that consumer serves:
+//! by-value copies overflowed the stack and timed out the location-scale fit.
+//! The cutover therefore does NOT instantiate the dense `Tower4<9>` per row; it
+//! carries, per consumer, only the one channel that consumer serves:
 //!
 //! | consumer | channel | scalar here | K=9 size |
 //! |---|---|---|---|

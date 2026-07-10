@@ -200,10 +200,6 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
-            // Decoder magnitude belongs to the physical coefficients. Ordered
-            // IBP shrinkage is scored in the assignment prior and no longer caps
-            // the reconstruction gate, so the old scale peel is disabled.
-            quotient_scale: false,
             cone_atom_recovery: false,
             rank_charge_evidence: false,
             soft_rank_charge: false,
@@ -286,7 +282,7 @@ impl SaeManifoldTerm {
     /// Concatenates in (primary, secondary) order: atoms; assignment logits
     /// (column hstack), coords, ungated; rho `log_lambda_smooth` and `log_ard`.
     /// The global sparsity ρ and ALL per-fit config (row_metric, row-loss
-    /// weights, fit-config, quotient_scale, data_row_reseed, temperature, softmax
+    /// weights, fit-config, data-row reseeding, temperature, and softmax
     /// cap, assignment mode) are carried from `primary`; `secondary`'s config is
     /// discarded. This asymmetry is deliberate: in the two-tier fit-order
     /// `primary` is the linear/bulk tier that defines the fit's global regime —
@@ -973,21 +969,9 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// #2022 — set the per-fit SCALE-gauge quotient opt-in (typed kwarg, no env
-    /// lever). Default false ⇒ historical path bit-for-bit.
-    pub fn set_quotient_scale(&mut self, enabled: bool) {
-        self.quotient_scale = enabled;
-    }
-
-    /// #2022 — read the per-fit SCALE-gauge quotient opt-in.
-    pub fn quotient_scale(&self) -> bool {
-        self.quotient_scale
-    }
-
     /// #1939 — set the per-fit cone-atom RECOVERY-retraction opt-in (typed kwarg,
-    /// no env lever). Default false ⇒ historical path bit-for-bit. Distinct from
-    /// `quotient_scale`: this engages ONLY the stable breach-gated boundary
-    /// retraction (never the #2022 per-Newton fold), so it cannot detonate.
+    /// no env lever). Default false. This engages only the stable breach-gated
+    /// boundary retraction.
     pub fn set_cone_atom_recovery(&mut self, enabled: bool) {
         self.cone_atom_recovery = enabled;
     }
@@ -2946,74 +2930,6 @@ impl SaeManifoldTerm {
         out
     }
 
-    /// Per-live-atom radial decoder gauges in the border coordinates the
-    /// evidence Schur actually factors.
-    ///
-    /// The physical atom image is `exp(s_k) Phi_k B_k`.  Its exact scale orbit
-    /// is `(B_k, s_k) -> (c B_k, s_k - log c)`.  The inner walk removes the
-    /// corresponding joint `(delta B, delta s)` nullvector; this carrier gives
-    /// the evidence factor the same quotient in its profiled beta border.  For
-    /// framed atoms the border coordinate is `C_k` with `B_k = C_k U_k^T` and
-    /// orthonormal `U_k`, so the radial direction is simply `vec(C_k)`.
-    pub(crate) fn beta_scale_gauge_quotient(
-        &self,
-    ) -> Result<Option<ArrowBetaGaugeQuotient>, String> {
-        if !self.quotient_scale || self.beta_dim() == 0 {
-            return Ok(None);
-        }
-        let (border, offsets, widths) = if self.frames_active() {
-            let border = self.flatten_factored_border()?;
-            let offsets = self.factored_border_offsets();
-            let widths = self
-                .atoms
-                .iter()
-                .map(|atom| atom.border_coeff_count())
-                .collect::<Vec<_>>();
-            (border, offsets, widths)
-        } else {
-            let border = self.flatten_beta();
-            let offsets = self.beta_offsets();
-            let p = self.output_dim();
-            let widths = self
-                .atoms
-                .iter()
-                .map(|atom| atom.basis_size() * p)
-                .collect::<Vec<_>>();
-            (border, offsets, widths)
-        };
-        let mut directions = Vec::with_capacity(self.atoms.len());
-        for atom_idx in 0..self.atoms.len() {
-            let start = offsets[atom_idx];
-            let end = start + widths[atom_idx];
-            let norm_sq = border
-                .slice(s![start..end])
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>();
-            if norm_sq == 0.0 {
-                // At B_k = 0 the derivative of c B_k is zero: the scale action
-                // has no beta-border tangent and therefore supplies no direction
-                // to quotient. This is geometry, not a collapsed-atom fallback.
-                continue;
-            }
-            if !norm_sq.is_finite() {
-                return Err(format!(
-                    "SaeManifoldTerm::beta_scale_gauge_quotient: atom {atom_idx} decoder norm is non-finite"
-                ));
-            }
-            let mut direction = Array1::<f64>::zeros(border.len());
-            direction
-                .slice_mut(s![start..end])
-                .assign(&border.slice(s![start..end]));
-            directions.push(direction);
-        }
-        if directions.is_empty() {
-            Ok(None)
-        } else {
-            ArrowBetaGaugeQuotient::new(directions).map(Some)
-        }
-    }
-
     pub fn set_flat_beta(&mut self, beta: ArrayView1<'_, f64>) -> Result<(), String> {
         if beta.len() != self.beta_dim() {
             return Err(format!(
@@ -3086,14 +3002,6 @@ impl SaeManifoldTerm {
                 }
             }
             self.atoms[atom_idx].refresh_intrinsic_smooth_penalty();
-            // #2022 refit-peel (RESET form). This LSQ solved the ABSOLUTE decoder
-            // (design = a·φ, exp(s)-unaware), so under the quotient reset s to 0
-            // then peel ⇒ s = ln‖B_abs‖, B unit, reconstruction = a·Φ·B_abs (the
-            // LSQ intent). Gated: default-off keeps the write bit-for-bit.
-            if self.quotient_scale {
-                self.atoms[atom_idx].log_amplitude = 0.0;
-                self.atoms[atom_idx].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-            }
         }
         Ok(())
     }

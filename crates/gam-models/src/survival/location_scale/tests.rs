@@ -2071,8 +2071,8 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
 
 /// #932: the production survival-LS log-likelihood block GRADIENT
 /// (`evaluate_log_likelihood_and_block_gradients` — the LIVE outer-Newton
-/// gradient path, since `row_kernel_joint_hessian_supported()` is `false`) must
-/// equal the single-sourced row-kernel gradient.
+/// gradient path; the sparse hand assembler is the live joint-Hessian path as a
+/// measured perf exception) must equal the single-sourced row-kernel gradient.
 ///
 /// The joint Hessian is now pinned to the tower (the time-varying assembler
 /// oracle above + the #921 simple-shape oracle), and the gradient-vs-FD SAS
@@ -6249,8 +6249,9 @@ fn positive_log_cumulative_hazard_maps_to_baseline_cloglog_survival() {
 /// is pinned against central finite differences of the SAME program's value,
 /// across the three residual distributions. This validates the nonlinear
 /// link-wiggle pullback (the issue's §5/§13 map-inside-the-program) in the
-/// survival row program — the foundation for enabling
-/// `row_kernel_joint_hessian_supported` on link-wiggle rows.
+/// survival row program — the foundation of the single-sourced link-wiggle
+/// joint Hessian (`survival_ls_wiggle_joint_hessian_dense`) shipped in
+/// production.
 #[test]
 fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
     use gam_math::jet_scalar::JetScalar;

@@ -776,16 +776,15 @@ impl SaeManifoldTerm {
             }
         }
         // #1939 wheel diagnostic (opt-in path only — this runs under the
-        // `cone_atom_recovery` or `quotient_scale` (#2100) breach-gated boundary
-        // retraction). Emit the RAW UNROUNDED per-atom norms, the
+        // `cone_atom_recovery` breach-gated boundary retraction). Emit the raw
+        // unrounded per-atom norms, the
         // breach/direction thresholds, and the fired / literal-zero counts, so the
         // near-zero-vs-literal-zero question is answered inside the A/B run: a
         // collapse at `1e-3` is retracted (`retracted>0`), a collapse at `1e-16` is
         // an `unretractable_zero` (Design B correctly no-ops → needs a backfit
         // reseed, not this). Under a healthy dictionary nothing breaches and this is
         // a bit-for-bit no-op with a benign one-line trace. The printed `norms` are
-        // physical contribution scales `exp(s_k)‖B_k‖_F`, so the diagnostic keeps
-        // its meaning under the scale quotient.
+        // physical contribution scales `exp(s_k)‖B_k‖_F`.
         let norms_fmt: Vec<String> = norms.iter().map(|v| format!("{v:.6e}")).collect();
         log::warn!(
             "[#1939 cone-atom] k={k} norms=[{}] median={median:.6e} reference={reference:.6e} \
