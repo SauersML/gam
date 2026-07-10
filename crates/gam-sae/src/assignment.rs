@@ -1539,6 +1539,31 @@ pub fn ibp_map_row_value_grad(
     (value, grad)
 }
 
+/// Batched IBP-MAP value and diagonal logit Jacobian over an `(N, K)` logit
+/// matrix. This shares the exact prior and per-element arithmetic of
+/// [`ibp_map_row_value_grad`] while computing the ordered shrinkage prior only
+/// once for the whole batch.
+#[must_use]
+pub fn ibp_map_batch_value_grad(
+    logits: ArrayView2<'_, f64>,
+    temperature: f64,
+    alpha: f64,
+) -> (Array2<f64>, Array2<f64>) {
+    let (n, k) = logits.dim();
+    let prior = ordered_geometric_shrinkage_prior(k, alpha);
+    let inv_tau = 1.0 / temperature;
+    let mut value = Array2::<f64>::zeros((n, k));
+    let mut grad = Array2::<f64>::zeros((n, k));
+    for i in 0..n {
+        for j in 0..k {
+            let sig = gam_linalg::utils::stable_logistic(logits[[i, j]] * inv_tau);
+            value[[i, j]] = sig * prior[j];
+            grad[[i, j]] = sig * (1.0 - sig) * inv_tau * prior[j];
+        }
+    }
+    (value, grad)
+}
+
 pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
@@ -1805,6 +1830,34 @@ pub fn topk_activation_batch_value_grad(
         }
     }
     (value, grad)
+}
+
+#[cfg(test)]
+mod ibp_map_batch_tests {
+    use super::*;
+
+    #[test]
+    fn ibp_map_batch_matches_row_kernel_bit_for_bit() {
+        let n = 5usize;
+        let k = 7usize;
+        let temperature = 0.41_f64;
+        let alpha = 2.5_f64;
+        let logits = Array2::from_shape_fn((n, k), |(i, j)| {
+            ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
+        });
+
+        let (value, grad) = ibp_map_batch_value_grad(logits.view(), temperature, alpha);
+        assert_eq!(value.dim(), (n, k));
+        assert_eq!(grad.dim(), (n, k));
+
+        for i in 0..n {
+            let (rv, rg) = ibp_map_row_value_grad(logits.row(i), temperature, alpha);
+            for j in 0..k {
+                assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
+                assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

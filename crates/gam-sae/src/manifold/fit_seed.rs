@@ -60,12 +60,9 @@ impl SaeFitAssignmentKind {
             Self::Softmax => Ok(AssignmentMode::softmax(tau)),
             Self::IbpMap => Ok(AssignmentMode::ibp_map(tau, alpha, learnable_alpha)),
             Self::ThresholdGate => Ok(AssignmentMode::threshold_gate(tau, threshold)),
-            Self::TopK => top_k
-                .map(AssignmentMode::top_k_support)
-                .ok_or_else(|| {
-                    "assignment_kind 'topk' requires top_k (the fixed per-row support size)"
-                        .to_string()
-                }),
+            Self::TopK => top_k.map(AssignmentMode::top_k_support).ok_or_else(|| {
+                "assignment_kind 'topk' requires top_k (the fixed per-row support size)".to_string()
+            }),
         }
     }
 }
@@ -364,8 +361,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_>) -> Result<SaeFitSeedRe
         })
         .collect();
     let seed_dispersion = base_term.seed_reconstruction_dispersion(request.target)?;
-    let use_shared_ard =
-        request.native_ard_enabled && k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
+    let use_shared_ard = request.native_ard_enabled && k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
     let initial_rho = if use_shared_ard {
         SaeManifoldRho::new_shared_ard(sparsity_strength.ln(), smoothness.ln(), log_ard)
     } else {
@@ -410,18 +406,25 @@ mod tests {
         let centers = Vec::<Option<Array2<f64>>>::new();
         let basis_sizes = Vec::<usize>::new();
         let registry = AnalyticPenaltyRegistry::new();
+        let target = Array2::<f64>::zeros((0, 0));
+        let basis_values = ndarray::Array3::<f64>::zeros((0, 0, 0));
+        let basis_jacobian = ndarray::Array4::<f64>::zeros((0, 0, 0, 0));
+        let decoder_coefficients = ndarray::Array3::<f64>::zeros((0, 0, 0));
+        let smooth_penalties = ndarray::Array3::<f64>::zeros((0, 0, 0));
+        let initial_logits = Array2::<f64>::zeros((0, 0));
+        let initial_coords = ndarray::Array3::<f64>::zeros((0, 0, 0));
         let request = SaeFitSeedRequest {
-            target: Array2::<f64>::zeros((0, 0)).view(),
+            target: target.view(),
             atom_basis: &atom_basis,
             atom_dim: &atom_dim,
             atom_centers: &centers,
-            basis_values: ndarray::Array3::<f64>::zeros((0, 0, 0)).view(),
-            basis_jacobian: ndarray::Array4::<f64>::zeros((0, 0, 0, 0)).view(),
+            basis_values: basis_values.view(),
+            basis_jacobian: basis_jacobian.view(),
             basis_sizes: &basis_sizes,
-            decoder_coefficients: ndarray::Array3::<f64>::zeros((0, 0, 0)).view(),
-            smooth_penalties: ndarray::Array3::<f64>::zeros((0, 0, 0)).view(),
-            initial_logits: Array2::<f64>::zeros((0, 0)).view(),
-            initial_coords: ndarray::Array3::<f64>::zeros((0, 0, 0)).view(),
+            decoder_coefficients: decoder_coefficients.view(),
+            smooth_penalties: smooth_penalties.view(),
+            initial_logits: initial_logits.view(),
+            initial_coords: initial_coords.view(),
             alpha: 1.0,
             tau: 1.0,
             learnable_alpha: false,
@@ -446,7 +449,9 @@ mod tests {
             row_loss_weights: None,
             registry: &registry,
         };
-        let error = build_sae_fit_seed(request).expect_err("empty target must fail");
+        let error = build_sae_fit_seed(request)
+            .err()
+            .expect("empty target must fail");
         assert!(error.contains("non-empty"));
     }
 }

@@ -2562,9 +2562,9 @@ fn sae_manifold_fit_inner<'py>(
         metric_provenance,
     } = seed;
 
-    // The python boundary owns seed construction and validation; every fit,
-    // structured-residual pass, evidence-guarded structure move, certificate,
-    // diagnostic, and top-k projection after this point belongs to gam-sae's
+    // The typed gam-sae seed entry above owns construction and validation. Every
+    // fit, structured-residual pass, evidence-guarded structure move,
+    // certificate, diagnostic, and top-k projection below belongs to gam-sae's
     // single typed orchestration entry (#2236).
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let request = gam::terms::sae::manifold::SaeFitRequest {
@@ -2714,32 +2714,6 @@ fn sae_manifold_fit_inner<'py>(
         atoms_py.append(atom_dict)?;
     }
 
-    let active_mask: Vec<bool> = (0..k_atoms)
-        .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
-        .collect();
-    let mut means = vec![0.0_f64; p_out];
-    for row in 0..n_obs {
-        for out_col in 0..p_out {
-            means[out_col] += z_view[[row, out_col]];
-        }
-    }
-    if n_obs > 0 {
-        let inv_n = 1.0 / n_obs as f64;
-        for mean in means.iter_mut() {
-            *mean *= inv_n;
-        }
-    }
-    let mut rss = 0.0_f64;
-    let mut tss = 0.0_f64;
-    for row in 0..n_obs {
-        for out_col in 0..p_out {
-            let residual = z_view[[row, out_col]] - fitted[[row, out_col]];
-            let centered = z_view[[row, out_col]] - means[out_col];
-            rss += residual * residual;
-            tss += centered * centered;
-        }
-    }
-    let reconstruction_r2 = if tss > 0.0 { 1.0 - rss / tss } else { 0.0 };
     let out = PyDict::new(py);
     out.set_item("atoms", atoms_py)?;
     out.set_item("assignments_z", assignments.into_pyarray(py))?;
@@ -2800,7 +2774,7 @@ fn sae_manifold_fit_inner<'py>(
     }
     out.set_item("log_alpha", reported_log_alpha)?;
     // Clone, do NOT move the field out: `rho` is still owned and is borrowed
-    // again below for the co-trained amortized-encoder report
+    // again below for the post-fit amortized-encoder diagnostic
     // (`term.amortized_encoder_consistency(.., &rho)`). Moving the non-`Copy`
     // `log_lambda_smooth: Vec<f64>` out here would partially move `rho` and make
     // that later `&rho` borrow a borrow-after-move (E0382), which broke the
@@ -2867,18 +2841,18 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(report) = term.hybrid_split_report() {
         out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
     }
-    // #1154 — the co-trained amortized-encoder report. The outer ρ-cascade ranked
-    // ρ by the co-trained criterion (REML + amortized-encoder consistency), and
-    // the inner solve was warm-started from the amortized encoder built on the
-    // running dictionary (Design A). Here we surface, at the settled dictionary,
-    // how faithfully and certifiably the cheap one-mat-vec encoder inverts it:
+    // #1154 — post-fit amortized-encoder diagnostics. The outer ρ-cascade ranks
+    // the pure REML criterion; encoder consistency is deliberately excluded from
+    // fitting/ranking because it has no matching analytic ρ gradient. Here we
+    // measure, at the settled dictionary, how faithfully the cheap initializer
+    // approximates the exact encode-by-inner-solve map:
     //   * `recon_consistency` — mean per-element squared gap between the amortized
     //     reconstruction and the exact encode-by-inner-solve reconstruction (0 ⇒
     //     the IFT predictor is an exact first-order model of the encode map);
     //   * `unconverged_fraction` — share of shared-residual row solves that did
     //     not meet the first-order stationarity tolerance.
     // Best-effort: a degenerate atlas (no usable charts) yields no report rather
-    // than aborting the fit payload (the co-training fold itself is advisory).
+    // than aborting the fit payload; this diagnostic never changes the fit.
     if let Ok(consistency) = term.amortized_encoder_consistency(z_view.view(), &rho) {
         let cotrain = PyDict::new(py);
         cotrain.set_item("recon_consistency", consistency.recon_consistency)?;
@@ -2923,12 +2897,12 @@ fn sae_manifold_fit_inner<'py>(
     // implements the shared claim+evidence+conservative-verdict contract
     // ([`gam::inference::certificates::Certificate`]); the ledger folds them into
     // a single inspectable block keyed by claim id, with a top-level conservative
-    // `overall` roll-up (the weakest member). This consolidates the scattered
-    // per-feature reads — the bespoke `residual_gauge` / `incoherence_report`
-    // keys above are KEPT working (same values) for back-compat, and the ledger
-    // is the additive, canonical surface. Verdicts cannot read stronger than
-    // their evidence: an absent or below-margin certificate is `unavailable` /
-    // `insufficient`, never a silent pass.
+    // `overall` roll-up (the weakest member). The detailed feature reports above
+    // remain first-class because they carry per-atom coordinates, generators,
+    // and measurements that the generic ledger intentionally does not encode;
+    // the ledger is the canonical cross-certificate verdict surface. Verdicts
+    // cannot read stronger than their evidence: an absent or below-margin
+    // certificate is `unavailable` / `insufficient`, never a silent pass.
     {
         use gam::inference::certificates::CertificateLedger;
         let mut ledger = CertificateLedger::new();
@@ -3190,8 +3164,9 @@ fn certificate_evidence_value<'py>(
 /// `certificates` payload block (task #16): a dict keyed by claim id, each entry
 /// `{claim, verdict, certified, evidence{...}}`, plus a top-level `overall`
 /// conservative roll-up verdict (the weakest member). This is the program's
-/// single inspectable certificate artifact; it replaces reading the scattered
-/// per-feature keys (which are kept working alongside it for back-compat).
+/// single inspectable cross-certificate verdict artifact. Detailed feature
+/// reports remain separate because their rich per-atom payloads are not aliases
+/// of this generic claim/evidence schema.
 fn certificate_ledger_dict<'py>(
     py: Python<'py>,
     ledger: &gam::inference::certificates::CertificateLedger,

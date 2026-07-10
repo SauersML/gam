@@ -129,6 +129,58 @@ fn sae_fisher_metric_construction_stays_in_gam_sae_2236() {
 }
 
 #[test]
+fn sae_fit_seed_construction_stays_in_gam_sae_2236() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest.join("src/latent/latent_basis_and_sae_ffi.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let fit_inner = source
+        .split_once("fn sae_manifold_fit_inner")
+        .map(|(_, body)| body)
+        .expect("sae_manifold_fit_inner source");
+    let forbidden_orchestration = [
+        "term_from_padded_blocks_with_mode(",
+        "build_sae_basis_evaluators(",
+        "seed_reconstruction_dispersion(",
+        "SaeManifoldRho::new_shared_ard(",
+        "base_term.set_fit_config(",
+        "const SAE_SHARED_ARD_K_THRESHOLD",
+    ];
+    let hits = forbidden_orchestration
+        .into_iter()
+        .filter(|pattern| fit_inner.contains(pattern))
+        .collect::<Vec<_>>();
+
+    assert!(
+        fit_inner.contains("build_sae_fit_seed(SaeFitSeedRequest"),
+        "sae_manifold_fit_inner must delegate seed construction to the typed gam-sae entry"
+    );
+    assert!(
+        hits.is_empty(),
+        "SAE seed construction/config/rho policy must remain in gam-sae; binding contains: {}",
+        hits.join(", ")
+    );
+}
+
+#[test]
+fn sae_fit_report_fields_are_marshaled_without_recomputation_2236() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = manifest.join("src/latent/latent_basis_and_sae_ffi.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let fit_inner = source
+        .split_once("fn sae_manifold_fit_inner")
+        .map(|(_, body)| body)
+        .expect("sae_manifold_fit_inner source");
+
+    assert!(!fit_inner.contains("let active_mask: Vec<bool>"));
+    assert!(!fit_inner.contains("let mut rss = 0.0_f64"));
+    assert!(!fit_inner.contains("let mut tss = 0.0_f64"));
+    assert!(fit_inner.contains("atom_active_mask\", active_mask"));
+    assert!(fit_inner.contains("reconstruction_r2\", reconstruction_r2"));
+}
+
+#[test]
 fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
     let n = 4usize;
     let k_atoms = 2usize;

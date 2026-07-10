@@ -1,13 +1,9 @@
-"""Bit-parity contract for the pure-torch IBP-MAP relaxation.
+"""Value/gradient contract for the Rust-backed IBP-MAP relaxation.
 
-The torch IBP-MAP map (``gamfit.torch.penalties.ibp_map``) is a pure-vectorized,
-on-device transcription of the Rust source of truth
-``gam::terms::sae::assignment::ibp_map_row_value_grad`` (crates/gam-sae/src/
-assignment.rs:1033), whose prior is ``ordered_geometric_shrinkage_prior``
-(assignment.rs:966). Rust stays the single source of truth: this test pins the
-torch forward value AND the diagonal logit Jacobian to the Rust kernel
-row-by-row to double-precision tolerance when the compiled extension is
-importable, and always exercises the torch autograd backward via ``gradcheck``.
+The torch IBP-MAP map calls the Rust source of truth
+``gam::terms::sae::assignment::ibp_map_batch_value_grad``. This test pins the
+Torch bridge's forward value and diagonal logit Jacobian to the Rust kernel and
+exercises the cached-Jacobian autograd backward.
 """
 
 from __future__ import annotations
@@ -36,8 +32,8 @@ def _rust_module() -> Any:
 def test_ibp_map_gradcheck() -> None:
     """The torch autograd backward is consistent with its own forward.
 
-    Runs without the compiled extension: it validates the diagonal logit
-    Jacobian against finite differences of the pure-torch forward.
+    Validates the diagonal logit Jacobian against finite differences of the
+    Rust-backed forward.
     """
     torch.manual_seed(0)
     rows, cols = 4, 6

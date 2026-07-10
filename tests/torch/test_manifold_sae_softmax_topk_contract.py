@@ -207,11 +207,18 @@ def test_topk_activation_matches_rust_value_grad() -> None:
 
 
 def test_topk_activation_forward_contains_no_python_numerical_kernel() -> None:
-    """Keep #2011's smooth activation in Rust; Python may only bridge autograd."""
-    source = inspect.getsource(torch_penalties._TopKActivationFn.forward)
-    assert "sae_topk_activation_value_grad" in source
-    assert "softplus(" not in source
-    assert "torch.sigmoid(" not in source
+    """Keep #2011's activation numerics in Rust; Python may only bridge autograd."""
+    ffi_by_bridge = {
+        torch_penalties._JumpReLUSTEFn: "jumprelu_gate_value_grad",
+        torch_penalties._IBPMapFn: "sae_ibp_map_batch_value_grad",
+        torch_penalties._JumpReLUBoundedGateFn: "sae_jumprelu_batch_value_grad",
+        torch_penalties._TopKActivationFn: "sae_topk_activation_value_grad",
+    }
+    forbidden = ("torch.sigmoid(", "torch.softplus(", "torch.where(", "torch.exp(")
+    for bridge, ffi_name in ffi_by_bridge.items():
+        source = inspect.getsource(bridge.forward)
+        assert ffi_name in source
+        assert all(token not in source for token in forbidden)
 
 
 def test_duchon_centers_nd_uses_rust_low_discrepancy_lift() -> None:

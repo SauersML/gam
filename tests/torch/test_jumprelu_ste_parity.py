@@ -1,16 +1,11 @@
-"""Bit-parity contract for the pure-torch JumpReLU activation-gate STE.
+"""Value/gradient contract for the Rust-backed JumpReLU activation-gate STE.
 
 The torch JumpReLU gate (``gamfit.torch.penalties.JumpReLUPenalty.gate`` via
-``_JumpReLUSTEFn``) is a pure-vectorized, on-device transcription of the Rust
-source of truth ``gam::terms::analytic_penalties::jumprelu_gate_value_grad``
-(crates/gam-terms/src/analytic_penalties/sparsity.rs:1196). Rust stays the
-single source of truth: this test pins the torch forward value AND both
-straight-through gradients (logit/``z`` grad, threshold/``τ`` grad) to the Rust
-kernel — exposed over FFI as the matrix ``jumprelu_gate_value_grad`` — to
-double-precision tolerance when the compiled extension is importable, and always
-exercises the torch autograd backward via ``gradcheck`` (which runs without the
-extension). Edge cases: the exact threshold boundary ``z == τ``, all-zero rows,
-and extreme magnitudes that saturate the sigmoid gate.
+``_JumpReLUSTEFn``) calls the Rust source of truth
+``gam::terms::analytic_penalties::jumprelu_gate_value_grad``. This test pins the
+Torch bridge's forward value and both straight-through gradients (logit/``z``
+and threshold/``τ``) to that kernel, including the exact threshold boundary,
+all-zero rows, and extreme magnitudes.
 """
 
 from __future__ import annotations
@@ -44,9 +39,9 @@ def _gate(z: torch.Tensor, tau: torch.Tensor, smoothing_eps: float) -> torch.Ten
 def test_jumprelu_ste_gradcheck() -> None:
     """The torch autograd backward is consistent with its own forward.
 
-    Runs without the compiled extension: it validates the straight-through ``z``
-    gradient and the accumulated threshold gradient against finite differences of
-    the pure-torch forward. ``gradcheck`` perturbs coordinates by ``eps`` so we
+    Validates the straight-through ``z`` gradient and accumulated threshold
+    gradient against finite differences of the Rust-backed forward. ``gradcheck``
+    perturbs coordinates by ``eps`` so we
     keep the samples away from the exact ``z == τ`` jump where the hard gate is
     discontinuous.
     """
@@ -81,8 +76,7 @@ def _assert_matches_rust(
 
     value = _gate(logits, tau, smoothing_eps)
 
-    # Reference: the Rust kernel over the whole (N, F) matrix — the exact routine
-    # the old FFI path called, now replaced by the pure-torch transcription.
+    # Reference: the Rust source of truth over the whole (N, F) matrix.
     rust_value, rust_dphi_dz, rust_dphi_dtau = rust.jumprelu_gate_value_grad(
         np.ascontiguousarray(logits_np),
         np.ascontiguousarray(tau_np),

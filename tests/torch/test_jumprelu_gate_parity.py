@@ -1,12 +1,10 @@
-"""Bit-parity contract for the pure-torch bounded JumpReLU gate.
+"""Value/gradient contract for the Rust-backed bounded JumpReLU gate.
 
 The torch bounded JumpReLU gate (``gamfit.torch.penalties.jumprelu_bounded_gate``)
-is a pure-vectorized, on-device transcription of the Rust source of truth
-``gam_sae::assignment::jumprelu_row_value_grad`` (crates/gam-sae/src/
-assignment.rs:1079). Rust stays the single source of truth: this test pins the
-torch forward value AND both gradients (logit grad, threshold grad) to the Rust
-kernel row-by-row to double-precision tolerance when the compiled extension is
-importable, and always exercises the torch autograd backward via ``gradcheck``.
+calls the Rust source of truth
+``gam_sae::assignment::jumprelu_batch_value_grad``. This test pins the Torch
+bridge's forward value and both gradients (logit and threshold) to the Rust
+kernel and exercises the cached-Jacobian autograd backward.
 """
 
 from __future__ import annotations
@@ -35,9 +33,8 @@ def _rust_module() -> Any:
 def test_jumprelu_gate_gradcheck() -> None:
     """The torch autograd backward is consistent with its own forward.
 
-    Runs without the compiled extension: it validates the straight-through logit
-    gradient and the accumulated threshold gradient against finite differences of
-    the pure-torch forward.
+    Validates the straight-through logit gradient and accumulated threshold
+    gradient against finite differences of the Rust-backed forward.
     """
     torch.manual_seed(0)
     rows, cols = 4, 6

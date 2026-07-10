@@ -123,8 +123,9 @@ fn bench_margslope_flex_large_scale_cycle0(c: &mut Criterion) {
         );
     }
     let problem = build_large_scale_shape_problem(n);
+    let allocation_problem = problem.clone();
     begin_allocation_measurement();
-    let allocation_result = fit_problem(problem.clone(), cycle_capped_options(inner_cycles));
+    let allocation_result = fit_problem(allocation_problem, cycle_capped_options(inner_cycles));
     let allocations = end_allocation_measurement();
     let (allocation_fit, allocation_timing) =
         allocation_result.expect("allocation-probe large-scale margslope fit");

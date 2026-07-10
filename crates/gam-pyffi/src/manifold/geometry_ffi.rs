@@ -5193,6 +5193,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
     module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_ibp_map_batch_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_row_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_jumprelu_batch_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_topk_activation_value_grad, module)?)?;

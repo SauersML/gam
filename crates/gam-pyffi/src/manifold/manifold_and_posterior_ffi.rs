@@ -2714,6 +2714,44 @@ fn sae_ibp_map_value_grad<'py>(
     ))
 }
 
+/// Batched sibling of [`sae_ibp_map_value_grad`] for a complete `(N, K)`
+/// tensor crossing the Python/Rust boundary once per forward pass.
+#[pyfunction(signature = (logits, temperature, alpha))]
+fn sae_ibp_map_batch_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray2<'py, f64>,
+    temperature: f64,
+    alpha: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_ibp_map_batch_value_grad: temperature must be finite and positive; got {temperature}"
+        )));
+    }
+    if !(alpha.is_finite() && alpha > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_ibp_map_batch_value_grad: alpha must be finite and positive; got {alpha}"
+        )));
+    }
+    let logits_view = logits.as_array();
+    for ((row, col), &v) in logits_view.indexed_iter() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_ibp_map_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
+            )));
+        }
+    }
+    let (value, grad) = gam::terms::sae::assignment::ibp_map_batch_value_grad(
+        logits_view.view(),
+        temperature,
+        alpha,
+    );
+    Ok((
+        value.into_pyarray(py).unbind(),
+        grad.into_pyarray(py).unbind(),
+    ))
+}
+
 /// Bounded threshold-gate activations and the straight-through diagonal logit
 /// derivative of their smooth surrogate.
 ///

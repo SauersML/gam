@@ -455,14 +455,16 @@ impl<FitHandle> TopologyAutoSelectorResult<FitHandle> {
 
 /// Stage at which a topology candidate became non-selectable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopologyAutoFailureStage {
+pub enum TopologyCandidateFailureStage {
+    Assembly,
     Fit,
     Evidence,
 }
 
-impl TopologyAutoFailureStage {
+impl TopologyCandidateFailureStage {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Assembly => "assembly",
             Self::Fit => "fit",
             Self::Evidence => "evidence",
         }
@@ -478,9 +480,113 @@ impl TopologyAutoFailureStage {
 pub struct TopologyAutoFailedCandidate {
     pub candidate: AutoTopologyKind,
     pub topology_name: String,
-    pub stage: TopologyAutoFailureStage,
+    pub stage: TopologyCandidateFailureStage,
     pub message: String,
     pub evidence_at_failure: Option<f64>,
+}
+
+/// Evidence family used to adjudicate a completed topology candidate fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologySelectionScoreKind {
+    Reml,
+    Laml,
+    Bic,
+    Tk,
+}
+
+impl TopologySelectionScoreKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reml => "reml",
+            Self::Laml => "laml",
+            Self::Bic => "bic",
+            Self::Tk => "tk",
+        }
+    }
+}
+
+/// Scale applied after the candidate's raw evidence cost is formed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologySelectionScoreScale {
+    Raw,
+    PerObservation,
+    PerEffectiveDim,
+}
+
+impl TopologySelectionScoreScale {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::PerObservation => "per_observation",
+            Self::PerEffectiveDim => "per_effective_dim",
+        }
+    }
+}
+
+/// Typed metadata extracted from one completed candidate fit.
+///
+/// Optional fields are score-specific: LAML requires `laml`, BIC requires
+/// `deviance`, and TK/LAML require `null_dim` (plus `null_space_logdet` when the
+/// null dimension is non-zero). The lifecycle selector validates only the
+/// requested headline score; unavailable secondary scores are omitted from the
+/// disagreement diagnostic instead of changing candidate eligibility.
+#[derive(Debug, Clone)]
+pub struct TopologyCandidateEvidence {
+    pub name: String,
+    pub raw_reml: f64,
+    pub laml: Option<f64>,
+    pub deviance: Option<f64>,
+    pub null_dim: Option<f64>,
+    pub null_space_logdet: Option<f64>,
+    pub effective_dim: f64,
+    pub basis_size: usize,
+    pub n_obs: usize,
+}
+
+/// One failed candidate supplied to, or produced by, the lifecycle selector.
+#[derive(Debug, Clone)]
+pub struct TopologyCandidateFailure {
+    pub name: String,
+    pub stage: TopologyCandidateFailureStage,
+    pub error_type: String,
+    pub message: String,
+    pub evidence_at_failure: Option<f64>,
+}
+
+/// Exactly one terminal outcome for a requested topology candidate.
+#[derive(Debug, Clone)]
+pub enum TopologyCandidateOutcome {
+    Fitted(TopologyCandidateEvidence),
+    Failed(TopologyCandidateFailure),
+}
+
+impl TopologyCandidateOutcome {
+    fn name(&self) -> &str {
+        match self {
+            Self::Fitted(evidence) => &evidence.name,
+            Self::Failed(failure) => &failure.name,
+        }
+    }
+}
+
+/// A selectable candidate after score construction and validation.
+#[derive(Debug, Clone)]
+pub struct TopologyCandidateRanked {
+    pub name: String,
+    pub score: f64,
+    pub raw_reml: f64,
+    pub effective_dim: f64,
+    pub basis_size: usize,
+    pub n_obs: usize,
+}
+
+/// Complete candidate lifecycle: survivors, failures, winner, and diagnostics.
+#[derive(Debug, Clone)]
+pub struct TopologyCandidateSelectionResult {
+    pub ranked: Vec<TopologyCandidateRanked>,
+    pub winner_index: Option<usize>,
+    pub failed: Vec<TopologyCandidateFailure>,
+    pub warnings: Vec<String>,
 }
 
 fn failed_topology_summary(failed: &[TopologyAutoFailedCandidate]) -> String {
@@ -739,7 +845,7 @@ where
                         failed.push(TopologyAutoFailedCandidate {
                             candidate: *candidate,
                             topology_name: evidence.topology_name,
-                            stage: TopologyAutoFailureStage::Evidence,
+                            stage: TopologyCandidateFailureStage::Evidence,
                             message,
                             evidence_at_failure: evidence
                                 .raw_reml
@@ -761,7 +867,7 @@ where
             Err(err) => failed.push(TopologyAutoFailedCandidate {
                 candidate: *candidate,
                 topology_name: candidate.display_name(),
-                stage: TopologyAutoFailureStage::Fit,
+                stage: TopologyCandidateFailureStage::Fit,
                 message: err.to_string(),
                 evidence_at_failure: None,
             }),
@@ -850,7 +956,7 @@ where
                         failed.push(TopologyAutoFailedCandidate {
                             candidate,
                             topology_name: evidence.topology_name,
-                            stage: TopologyAutoFailureStage::Evidence,
+                            stage: TopologyCandidateFailureStage::Evidence,
                             message,
                             evidence_at_failure: evidence
                                 .raw_reml
@@ -872,7 +978,7 @@ where
             Err(err) => failed.push(TopologyAutoFailedCandidate {
                 candidate,
                 topology_name: candidate.display_name(),
-                stage: TopologyAutoFailureStage::Fit,
+                stage: TopologyCandidateFailureStage::Fit,
                 message: err.to_string(),
                 evidence_at_failure: None,
             }),
@@ -919,21 +1025,7 @@ pub fn tk_normalized_score(
     n_obs: usize,
     score_scale: TopologyScoreScale,
 ) -> Result<f64, String> {
-    if !(raw_reml.is_finite() && null_dim.is_finite()) || null_dim < -1.0e-9 {
-        return Err("TopologyAutoSelector received non-finite TK evidence inputs".to_string());
-    }
-    let normalizer = if null_dim.max(0.0) == 0.0 {
-        0.0
-    } else {
-        let logdet = null_space_logdet.ok_or_else(|| {
-            "TopologyAutoSelector TK normalizer requires null-space Hessian logdet".to_string()
-        })?;
-        if !logdet.is_finite() {
-            return Err("TopologyAutoSelector null-space Hessian logdet is not finite".to_string());
-        }
-        -0.5 * null_dim.max(0.0) * TK_LOG_2PI + 0.5 * logdet
-    };
-    let tk = raw_reml + normalizer;
+    let tk = raw_reml + topology_tk_normalizer(Some(null_dim), null_space_logdet)?;
     match score_scale {
         TopologyScoreScale::PerObservation => {
             if n_obs == 0 {
@@ -949,6 +1041,243 @@ pub fn tk_normalized_score(
                 Ok(tk / effective_dim)
             }
         }
+    }
+}
+
+fn topology_tk_normalizer(
+    null_dim: Option<f64>,
+    null_space_logdet: Option<f64>,
+) -> Result<f64, String> {
+    let null_dim = null_dim.ok_or_else(|| {
+        "topology evidence requires null-dimension metadata for TK normalization".to_string()
+    })?;
+    if !null_dim.is_finite() || null_dim < -1.0e-9 {
+        return Err("topology evidence null dimension must be finite and non-negative".to_string());
+    }
+    if null_dim.max(0.0) == 0.0 {
+        return Ok(0.0);
+    }
+    let logdet = null_space_logdet.ok_or_else(|| {
+        "topology evidence TK normalizer requires null-space Hessian logdet".to_string()
+    })?;
+    if !logdet.is_finite() {
+        return Err("topology evidence null-space Hessian logdet must be finite".to_string());
+    }
+    Ok(-0.5 * null_dim.max(0.0) * TK_LOG_2PI + 0.5 * logdet)
+}
+
+fn topology_candidate_raw_score(
+    evidence: &TopologyCandidateEvidence,
+    score_kind: TopologySelectionScoreKind,
+) -> Result<f64, String> {
+    if !evidence.raw_reml.is_finite() {
+        return Err(format!(
+            "candidate {:?} has non-finite REML evidence {:?}",
+            evidence.name, evidence.raw_reml
+        ));
+    }
+    match score_kind {
+        TopologySelectionScoreKind::Reml => Ok(evidence.raw_reml),
+        TopologySelectionScoreKind::Tk => Ok(evidence.raw_reml
+            + topology_tk_normalizer(evidence.null_dim, evidence.null_space_logdet)?),
+        TopologySelectionScoreKind::Laml => {
+            let laml = evidence.laml.ok_or_else(|| {
+                format!(
+                    "candidate {:?} is missing LAML evidence metadata",
+                    evidence.name
+                )
+            })?;
+            if !laml.is_finite() {
+                return Err(format!(
+                    "candidate {:?} has non-finite LAML evidence {laml:?}",
+                    evidence.name
+                ));
+            }
+            Ok(laml + topology_tk_normalizer(evidence.null_dim, evidence.null_space_logdet)?)
+        }
+        TopologySelectionScoreKind::Bic => {
+            let deviance = evidence.deviance.ok_or_else(|| {
+                format!(
+                    "candidate {:?} is missing deviance metadata required for BIC",
+                    evidence.name
+                )
+            })?;
+            bic_score(deviance, evidence.n_obs, evidence.basis_size)
+        }
+    }
+}
+
+fn scale_topology_candidate_score(
+    score: f64,
+    scale: TopologySelectionScoreScale,
+    evidence: &TopologyCandidateEvidence,
+) -> Result<f64, String> {
+    if !score.is_finite() {
+        return Err(format!(
+            "candidate {:?} has non-finite selected evidence {score:?}",
+            evidence.name
+        ));
+    }
+    match scale {
+        TopologySelectionScoreScale::Raw => Ok(score),
+        TopologySelectionScoreScale::PerObservation => {
+            if evidence.n_obs == 0 {
+                Err(format!(
+                    "candidate {:?} requires n_obs > 0 for per-observation scoring",
+                    evidence.name
+                ))
+            } else {
+                Ok(score / evidence.n_obs as f64)
+            }
+        }
+        TopologySelectionScoreScale::PerEffectiveDim => {
+            if !(evidence.effective_dim.is_finite() && evidence.effective_dim > 0.0) {
+                Err(format!(
+                    "candidate {:?} requires finite positive effective_dim for per-effective-dimension scoring; got {:?}",
+                    evidence.name, evidence.effective_dim
+                ))
+            } else {
+                Ok(score / evidence.effective_dim)
+            }
+        }
+    }
+}
+
+fn topology_candidate_score(
+    evidence: &TopologyCandidateEvidence,
+    score_kind: TopologySelectionScoreKind,
+    score_scale: TopologySelectionScoreScale,
+) -> Result<f64, String> {
+    let raw = topology_candidate_raw_score(evidence, score_kind)?;
+    scale_topology_candidate_score(raw, score_scale, evidence)
+}
+
+/// Resolve every declared candidate outcome through one evidence-validation,
+/// failure-policy, deterministic-ranking, and winner-finalization entry.
+///
+/// Callers perform topology-specific assembly and invoke the model fitter, then
+/// submit exactly one terminal outcome per declared name. A malformed lifecycle
+/// (empty request or duplicate name) is rejected. Candidate-local evidence
+/// errors become typed `Evidence` failures so one bad fit cannot erase the
+/// other requested outcomes.
+pub fn select_topology_candidate_lifecycle(
+    outcomes: Vec<TopologyCandidateOutcome>,
+    score_kind: TopologySelectionScoreKind,
+    score_scale: TopologySelectionScoreScale,
+) -> Result<TopologyCandidateSelectionResult, String> {
+    if outcomes.is_empty() {
+        return Err("topology selection requires at least one candidate outcome".to_string());
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for outcome in &outcomes {
+        let name = outcome.name();
+        if name.is_empty() {
+            return Err("topology candidate names cannot be empty".to_string());
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!("duplicate topology candidate {name:?}"));
+        }
+    }
+
+    let mut evidence_survivors = Vec::new();
+    let mut ranked = Vec::new();
+    let mut failed = Vec::new();
+    for (candidate_index, outcome) in outcomes.into_iter().enumerate() {
+        match outcome {
+            TopologyCandidateOutcome::Failed(failure) => failed.push(failure),
+            TopologyCandidateOutcome::Fitted(evidence) => {
+                match topology_candidate_score(&evidence, score_kind, score_scale) {
+                    Ok(score) => {
+                        ranked.push(PriorityCandidate::new(
+                            TopologyCandidateRanked {
+                                name: evidence.name.clone(),
+                                score,
+                                raw_reml: evidence.raw_reml,
+                                effective_dim: evidence.effective_dim,
+                                basis_size: evidence.basis_size,
+                                n_obs: evidence.n_obs,
+                            },
+                            candidate_index,
+                            score,
+                            0,
+                        ));
+                        evidence_survivors.push(evidence);
+                    }
+                    Err(message) => failed.push(TopologyCandidateFailure {
+                        name: evidence.name,
+                        stage: TopologyCandidateFailureStage::Evidence,
+                        error_type:
+                            "gam_solve::topology_selector::EvidenceValidationError".to_string(),
+                        message,
+                        evidence_at_failure: evidence
+                            .raw_reml
+                            .is_finite()
+                            .then_some(evidence.raw_reml),
+                    }),
+                }
+            }
+        }
+    }
+    let ranked: Vec<TopologyCandidateRanked> = rank_priority_candidates(ranked)
+        .into_iter()
+        .map(|candidate| candidate.item)
+        .collect();
+    let warnings = topology_score_disagreement_warnings(
+        &evidence_survivors,
+        score_scale,
+    );
+    Ok(TopologyCandidateSelectionResult {
+        winner_index: (!ranked.is_empty()).then_some(0),
+        ranked,
+        failed,
+        warnings,
+    })
+}
+
+fn topology_score_disagreement_warnings(
+    evidence: &[TopologyCandidateEvidence],
+    score_scale: TopologySelectionScoreScale,
+) -> Vec<String> {
+    let mut orders = Vec::new();
+    for kind in [
+        TopologySelectionScoreKind::Reml,
+        TopologySelectionScoreKind::Laml,
+        TopologySelectionScoreKind::Bic,
+    ] {
+        let scored: Result<Vec<_>, _> = evidence
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                topology_candidate_score(row, kind, score_scale)
+                    .map(|score| PriorityCandidate::new(row.name.clone(), index, score, 0))
+            })
+            .collect();
+        let Ok(scored) = scored else {
+            continue;
+        };
+        let order: Vec<String> = rank_priority_candidates(scored)
+            .into_iter()
+            .map(|row| row.item)
+            .collect();
+        orders.push((kind, order));
+    }
+    if orders.len() < 2 || orders.windows(2).all(|pair| pair[0].1 == pair[1].1) {
+        return Vec::new();
+    }
+    let detail = orders
+        .iter()
+        .map(|(kind, order)| format!("{}: {}", kind.as_str(), order.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if score_scale == TopologySelectionScoreScale::Raw {
+        vec![format!(
+            "Topology score rankings differ across score kinds ({detail}). BIC and REML can disagree when candidate basis sizes differ wildly."
+        )]
+    } else {
+        vec![format!(
+            "Scaled topology score rankings still differ across score kinds under score_scale={:?} ({detail}). Treat BIC as a secondary diagnostic; the Tierney-Kadane Laplace normalizer handles the known cross-basis evidence scale issue.",
+            score_scale.as_str()
+        )]
     }
 }
 
