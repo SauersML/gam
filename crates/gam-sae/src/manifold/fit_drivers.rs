@@ -5068,6 +5068,21 @@ impl SaeManifoldTerm {
         // Bit-identical to the historical per-call reduction (see
         // `TargetCenteredColStats`).
         let target_col_stats = TargetCenteredColStats::compute(target);
+        // #2015 line-search step-length warm start. The Armijo backtracking below
+        // only CONTRACTS from `initial_step`; resetting `initial_step` to the full
+        // `step_size` every iterate re-discovers the same tiny accepted step from
+        // scratch (the wide two-block behavior fit backtracks to ~0.05 each
+        // iterate — the ‖g‖ crawl). Carry the previous iterate's accepted step
+        // forward, warmed by one contraction step (`accepted / contraction`, the
+        // exact inverse of the geometric backtracking rate — NOT an independent
+        // magic constant), and cap at the caller's `step_size`. This lets the
+        // accepted length ratchet UP by one contraction-step per iterate as the
+        // fit linearizes, while still contracting freely when a trial overshoots.
+        // Pure globalization: the KKT convergence criterion and the typed
+        // exhaustion refusal (#2235/#2241) are unchanged — only the trajectory to
+        // the same certified stationary point is affected.
+        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
+        let mut warm_step = step_size;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -5398,10 +5413,10 @@ impl SaeManifoldTerm {
             // whose step application or objective evaluation errors is INVALID
             // (`Ok(None)`), halving without consulting the Armijo test.
             let mut first_trial = true;
-            let accepted = descent_direction_ok
-                && backtracking_line_search::<_, String>(
+            let accepted_step = if descent_direction_ok {
+                backtracking_line_search::<_, String>(
                     BacktrackConfig {
-                        initial_step: step_size,
+                        initial_step: warm_step,
                         max_steps: SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS + 1,
                         ..BacktrackConfig::default()
                     },
@@ -5427,8 +5442,20 @@ impl SaeManifoldTerm {
                         post_step_total.is_finite() && post_step_total <= armijo_bound
                     },
                 )?
-                .is_some();
+            } else {
+                None
+            };
+            let accepted = accepted_step.is_some();
+            if let Some(step) = accepted_step {
+                // Warm the next iterate's line search to one contraction-step above
+                // this accepted length, capped at the caller's `step_size`.
+                warm_step = (step.step * warm_growth).min(step_size);
+            }
             if !accepted {
+                // The proximal LM correction below re-solves with its own ridge
+                // escalation; the next line-search regime is unrelated to this
+                // iterate's accepted length, so reset the warm start.
+                warm_step = step_size;
                 self.restore_mutable_state(&snapshot)?;
                 let correction = ArrowProximalCorrectionOptions {
                     initial_ridge: ridge_ext_coord
