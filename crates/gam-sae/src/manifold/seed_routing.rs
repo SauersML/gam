@@ -956,6 +956,74 @@ pub fn sae_em_refine_routing_seed(
 mod tests {
     use super::*;
 
+    #[test]
+    fn mobius_double_cover_seed_reconstructs_planted_band() {
+        use crate::basis::{MobiusHarmonicEvaluator, SaeBasisEvaluator};
+
+        // Cartesian product of center-circle phase and symmetric width makes
+        // the planted band's radial/transverse half-angle moment exact.
+        let n_phase = 64usize;
+        let n_width = 9usize;
+        let n = n_phase * n_width;
+        let mut target = Array2::<f64>::zeros((n, 3));
+        for phase_idx in 0..n_phase {
+            let phase = std::f64::consts::TAU * phase_idx as f64 / n_phase as f64;
+            for width_idx in 0..n_width {
+                let row = phase_idx * n_width + width_idx;
+                let width = -0.5 + width_idx as f64 / (n_width - 1) as f64;
+                let radius = 1.0 + width * (0.5 * phase).cos();
+                target[[row, 0]] = radius * phase.cos();
+                target[[row, 1]] = radius * phase.sin();
+                target[[row, 2]] = width * (0.5 * phase).sin();
+            }
+        }
+        let rows: Vec<usize> = (0..n).collect();
+        let coords = mobius_double_cover_coords_from_projection(target.view(), &rows)
+            .expect("the planted band has an identifiable double-cover chart");
+        assert!(
+            coords
+                .column(0)
+                .iter()
+                .all(|&value| (0.0..1.0).contains(&value)),
+            "the canonical seed must occupy exactly one fundamental domain"
+        );
+        assert!(
+            coords
+                .column(1)
+                .iter()
+                .all(|&value| (-1.0..=1.0).contains(&value)),
+            "the signed width must respect the fitted interval"
+        );
+
+        let evaluator = MobiusHarmonicEvaluator::new(3, 2).unwrap();
+        let (phi, _) = evaluator.evaluate(coords.view()).unwrap();
+        let mut gram = fast_ata(&phi);
+        let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+        for diagonal in gram.diag_mut().iter_mut() {
+            *diagonal += scale * 64.0 * f64::EPSILON;
+        }
+        let rhs = fast_atb(&phi, &target);
+        let decoder = gram.cholesky(Side::Lower).unwrap().solve_mat(&rhs);
+        let fitted = phi.dot(&decoder);
+        let mean = target.mean_axis(ndarray::Axis(0)).unwrap();
+        let total = target
+            .rows()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .zip(mean.iter())
+                    .map(|(&value, &center)| (value - center).powi(2))
+                    .sum::<f64>()
+            })
+            .sum::<f64>();
+        let residual = (&target - &fitted).mapv(|value| value * value).sum();
+        let r2 = 1.0 - residual / total;
+        assert!(
+            r2 > 0.999_999,
+            "quotient-aware Möbius coordinates and basis should reconstruct the planted band; R²={r2}"
+        );
+    }
+
     /// Regression test for issue #174: the joint LSQ seed for K=2 IBP-MAP
     /// must produce a non-zero decoder and a residual smaller than the
     /// trivial zero-decoder baseline. Without this seed the joint Newton

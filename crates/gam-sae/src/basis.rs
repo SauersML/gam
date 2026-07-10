@@ -2758,6 +2758,31 @@ mod tests {
     use super::*;
     use ndarray::{Array2, Array3};
 
+    #[test]
+    fn mobius_basis_is_invariant_under_deck_transform() {
+        let evaluator = MobiusHarmonicEvaluator::new(3, 2).unwrap();
+        let coords = Array2::from_shape_vec(
+            (5, 2),
+            vec![0.0, -0.8, 0.17, -0.3, 0.51, 0.0, 0.88, 0.4, 1.41, 0.9],
+        )
+        .unwrap();
+        let mut twins = coords.clone();
+        for row in 0..twins.nrows() {
+            twins[[row, 0]] += 1.0;
+            twins[[row, 1]] = -twins[[row, 1]];
+        }
+        let (phi, _) = evaluator.evaluate(coords.view()).unwrap();
+        let (phi_twin, _) = evaluator.evaluate(twins.view()).unwrap();
+        let max_error = (&phi - &phi_twin)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_error <= 32.0 * f64::EPSILON,
+            "every basis column must descend to the Möbius quotient; max deck error {max_error}"
+        );
+    }
+
     /// The in-place `evaluate_into` must reproduce `evaluate` EXACTLY, even when
     /// the target workspace arrives pre-loaded with garbage — the hot Newton loop
     /// reuses one buffer across trials, so any entry the in-place path forgets to
