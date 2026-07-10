@@ -2516,41 +2516,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         solved.fit.inner_cycles,
         solved.fit.outer_converged,
     );
-    // Never-fail outer escalation (#808), mirroring the bernoulli/custom-family
-    // path (`fit_custom_family`, src/families/custom_family.rs): when the outer
-    // smoothing optimizer cannot CERTIFY convergence we do NOT hard-error.
-    // Erroring here turned a (recoverable) outer stall on clustered-PC designs
-    // into a FATAL `IntegrationFailed`, killing the whole fit. The bernoulli
-    // path instead surfaces the non-convergence as a status flag and returns the
-    // best-iterate fit (a usable, posterior-conditional model) so a stalled
-    // landscape degrades gracefully rather than crashing.
-    //
-    // `solved.fit` is the best iterate the outer solve reached: `inner_fit`
-    // produced a full `UnifiedFitResult` (finite β + conditional covariance) at
-    // the terminating ρ. Its `outer_converged == false` propagates downstream to
-    // `PirlsStatus::StalledAtValidMinimum` (src/terms/smooth.rs), the SAME
-    // non-silent diagnostic flag every other family uses — so the caller can see
-    // the fit did not certify convergence (it is NOT reported as a clean
-    // success). This is containment for the underlying time/baseline↔η₁ alias
-    // stall, not a root-cause fix: the returned model is the reached mode, which
-    // on a genuinely stalled solve may be biased; the status flag is the honest
-    // signal of that. Kept MarginalSlope-survival-specific (the AFT
-    // location-scale family lives in survival_location_scale.rs and is
-    // untouched).
-    if !solved.fit.outer_converged {
-        log::warn!(
-            "[robust][smgs] survival marginal-slope outer smoothing did not certify \
-             convergence (iterations={} final_objective={:.6e} |g|_inf={:?}); \
-             AUTO-ESCALATE to graceful degradation: returning the best-iterate fit \
-             with PirlsStatus::StalledAtValidMinimum (outer_converged=false) instead \
-             of erroring. The reached mode may be biased; the status flag is the \
-             honest non-convergence signal (#808).",
-            solved.fit.outer_iterations,
-            solved.fit.reml_score,
-            solved.fit.outer_gradient_norm,
-        );
-    }
-
     // Recompile-after-first-PIRLS-accept refinement (math-agent review).
     //
     // The initial cutover compile used a structural identity row Hessian,
