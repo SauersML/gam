@@ -1061,23 +1061,49 @@ impl SaeManifoldOuterObjective {
         if rho.log_lambda_block.len() != blocks.block_dims.len() {
             return;
         }
+        // Collect the moved blocks' pristine column spans + scales first, then
+        // rewrite in ONE parallel row pass over contiguous row slices. The
+        // former column-by-column walk touched a stride-p̃ element every access
+        // (a cache/TLB miss per element on a row-major target) and made two
+        // passes (assign, then scale); large-width crosscoders paid that on
+        // every outer ρ evaluation. The row-major fused copy is the
+        // memcpy-speed version of the same idempotent pristine→target rewrite.
+        let mut moved: Vec<(usize, usize, f64)> = Vec::new(); // (pristine_off, p_l, √λ)
         let mut pristine_off = 0usize;
         for l in 0..blocks.block_dims.len() {
             let p_l = blocks.block_dims[l];
             let new_ll = rho.log_lambda_block[l];
             if new_ll != blocks.last_log_lambda[l] {
-                let sqrt_lambda = (0.5 * new_ll).exp();
-                let target_off = blocks.p_x + pristine_off;
-                for j in 0..p_l {
-                    let src = blocks.pristine_blocks.column(pristine_off + j);
-                    let mut dst = target.column_mut(target_off + j);
-                    dst.assign(&src);
-                    dst *= sqrt_lambda;
-                }
+                moved.push((pristine_off, p_l, (0.5 * new_ll).exp()));
                 blocks.last_log_lambda[l] = new_ll;
             }
             pristine_off += p_l;
         }
+        if moved.is_empty() {
+            return;
+        }
+        let p_x = blocks.p_x;
+        let pristine = &blocks.pristine_blocks;
+        use rayon::prelude::*;
+        target
+            .axis_iter_mut(ndarray::Axis(0))
+            .into_par_iter()
+            .zip(pristine.axis_iter(ndarray::Axis(0)).into_par_iter())
+            .for_each(|(mut dst_row, src_row)| {
+                let src = src_row
+                    .to_slice()
+                    .expect("pristine block rows are contiguous");
+                let dst = dst_row
+                    .as_slice_mut()
+                    .expect("stacked target rows are contiguous");
+                for &(off, p_l, sqrt_lambda) in &moved {
+                    let dst_span = &mut dst[p_x + off..p_x + off + p_l];
+                    let src_span = &src[off..off + p_l];
+                    for (d, &s) in dst_span.iter_mut().zip(src_span) {
+                        *d = s * sqrt_lambda;
+                    }
+                }
+            });
     }
 
     /// #2231 Inc-B (stage 1) — the block-relevance change-of-variables Jacobian
@@ -2998,6 +3024,18 @@ impl SaeManifoldOuterObjective {
     ///   point exists; it stays cost-driven (the cascade still moves it via
     ///   the cost path when EFS is not the active lane for that coord).
     pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
+        self.efs_step_with_certificate(rho_flat)
+            .map(|(evaluation, _)| evaluation)
+    }
+
+    /// Compute the iteration step and the separate final-proof residuals in one
+    /// factorization. The step surface may hold a coordinate at zero; the proof
+    /// surface marks that coordinate uncovered unless zero is the residual of a
+    /// numerically defined, root-equivalent analytic equation.
+    fn efs_step_with_certificate(
+        &mut self,
+        rho_flat: ArrayView1<'_, f64>,
+    ) -> Result<(EfsEval, Vec<FixedPointCoordinateCertificate>), String> {
         self.fit_verdict = None;
         self.probe_telemetry.criterion_calls += 1;
         // #2080 (a) — this lane commits a new accepted basin below; drop any
@@ -3009,6 +3047,7 @@ impl SaeManifoldOuterObjective {
         // saved envelope basins are keyed to the pre-step accepted basin.
         self.basin_bundle.clear();
         let rho = self.baseline_rho.from_flat(rho_flat);
+        let n_params = rho.to_flat().len();
         // #2231 Inc-B — scale the block columns for this ρ before the EFS inner
         // solve reads `self.target` (idempotent; no-op for a plain SAE).
         self.apply_block_scaling(&rho);
@@ -3084,18 +3123,26 @@ impl SaeManifoldOuterObjective {
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
                 self.probe_telemetry.wall_cost_value_probes += 1;
-                let n_params = rho.to_flat().len();
                 self.current_rho = rho;
-                return Ok(EfsEval {
-                    cost: SAE_FIT_DATA_COLLAPSE_COST,
-                    steps: vec![0.0_f64; n_params],
-                    beta: None,
-                    psi_gradient: None,
-                    psi_indices: None,
-                    inner_hessian_scale: None,
-                    logdet_enclosure_gap: None,
-                    consecutive_restored_incumbents: None,
-                });
+                return Ok((
+                    EfsEval {
+                        cost: SAE_FIT_DATA_COLLAPSE_COST,
+                        steps: vec![0.0_f64; n_params],
+                        beta: None,
+                        psi_gradient: None,
+                        psi_indices: None,
+                        inner_hessian_scale: None,
+                        logdet_enclosure_gap: None,
+                        consecutive_restored_incumbents: None,
+                    },
+                    (0..n_params)
+                        .map(|index| {
+                            FixedPointCoordinateCertificate::uncovered(format!(
+                                "coordinate {index}: fixed-point evidence unavailable at an infeasible rho wall"
+                            ))
+                        })
+                        .collect(),
+                ));
             }
             Err(err) => return Err(err),
         };
@@ -3132,8 +3179,14 @@ impl SaeManifoldOuterObjective {
 
         // Build the flat step vector in `to_flat` layout (#1556):
         // [0]=log_lambda_sparse, [1..1+K]=per-atom log_lambda_smooth, then ARD.
-        let n_params = rho.to_flat().len();
         let mut steps = vec![0.0_f64; n_params];
+        let mut fixed_point_coordinates = (0..n_params)
+            .map(|index| {
+                FixedPointCoordinateCertificate::uncovered(format!(
+                    "coordinate {index}: no root-equivalent fixed-point equation was evaluated"
+                ))
+            })
+            .collect::<Vec<_>>();
 
         // λ_sparse (index 0): the ordered-IBP concentration α is the ONE sparsity
         // prior with a closed-form empirical-Bayes marginal M-step (the
@@ -3144,14 +3197,29 @@ impl SaeManifoldOuterObjective {
         // pinned α) is non-quadratic with no FS fixed point and keeps the
         // historical zero step (`None` ⇒ 0.0). The step reads the fitted gates'
         // occupancy at this ρ and is trust-region bounded inside the helper.
-        steps[0] = self
+        let sparse_step = self
             .term
             .assignment
             .ibp_eb_log_alpha_step(&rho)
             .map_err(|e| {
                 format!("SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}")
-            })?
-            .unwrap_or(0.0);
+            })?;
+        match sparse_step {
+            Some(step) if step.is_finite() => {
+                steps[0] = step;
+                fixed_point_coordinates[0] = FixedPointCoordinateCertificate::covered(step, 1.0);
+            }
+            Some(_) => {
+                fixed_point_coordinates[0] = FixedPointCoordinateCertificate::uncovered(
+                    "IBP empirical-Bayes alpha equation returned a non-finite update",
+                );
+            }
+            None => {
+                fixed_point_coordinates[0] = FixedPointCoordinateCertificate::uncovered(
+                    "assignment sparsity coordinate has no root-equivalent fixed-point equation",
+                );
+            }
+        }
 
         // λ_smooth (indices 1..1+K): per-atom Wood-Fasiolo EFS multiplicative
         // update (#1556). The EFS fixed point is already per-coordinate, so each
@@ -3189,6 +3257,7 @@ impl SaeManifoldOuterObjective {
                 .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?
         };
         for atom_idx in 0..k_smooth {
+            let coordinate = 1 + atom_idx;
             let lambda_k = lambda_smooth_vec[atom_idx];
             let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)
                 * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
@@ -3198,7 +3267,19 @@ impl SaeManifoldOuterObjective {
             // Guard the FS ratio against a vanishing penalty energy or a
             // non-positive numerator (transient far from the optimum) by holding
             // that atom's λ fixed (step 0) — the cost path still moves it then.
-            if quad_k > 0.0 && rank_k - eff_dof_k > 0.0 && lambda_k > 0.0 {
+            if !(quad_k > 0.0) {
+                fixed_point_coordinates[coordinate] = FixedPointCoordinateCertificate::uncovered(
+                    format!("atom {atom_idx} smoothness energy is not positive"),
+                );
+            } else if !(rank_k - eff_dof_k > 0.0) {
+                fixed_point_coordinates[coordinate] = FixedPointCoordinateCertificate::uncovered(
+                    format!("atom {atom_idx} smoothness rank-minus-edf numerator is not positive"),
+                );
+            } else if !(lambda_k > 0.0 && lambda_k.is_finite()) {
+                fixed_point_coordinates[coordinate] = FixedPointCoordinateCertificate::uncovered(
+                    format!("atom {atom_idx} smoothness precision is not finite and positive"),
+                );
+            } else {
                 // #F1 — NO dispersion factor. The outer objective the value/gradient
                 // lanes minimize is the UNIT-dispersion penalized Laplace criterion
                 // `v = ½‖r‖² + ½Σ_k λ_k·B_kᵀS_kB_k + ½log|H| − ½Σ_k rank_k·log λ_k`
@@ -3216,7 +3297,15 @@ impl SaeManifoldOuterObjective {
                 // `decoder_smoothness_value_per_atom`).
                 let lambda_new = (rank_k - eff_dof_k) / quad_k;
                 if lambda_new.is_finite() && lambda_new > 0.0 {
-                    steps[1 + atom_idx] = lambda_new.ln() - rho.log_lambda_smooth[atom_idx];
+                    let step = lambda_new.ln() - rho.log_lambda_smooth[atom_idx];
+                    steps[coordinate] = step;
+                    fixed_point_coordinates[coordinate] =
+                        FixedPointCoordinateCertificate::covered(step, 1.0);
+                } else {
+                    fixed_point_coordinates[coordinate] =
+                        FixedPointCoordinateCertificate::uncovered(format!(
+                            "atom {atom_idx} smoothness equation proposed a non-finite precision"
+                        ));
                 }
             }
         }
@@ -3246,6 +3335,7 @@ impl SaeManifoldOuterObjective {
             ArdSharing::PerAtom => {
                 for (k, axis_logard) in rho.log_ard.iter().enumerate() {
                     for (j, &logard_kj) in axis_logard.iter().enumerate() {
+                        let coordinate = rho.ard_flat_index(k, j);
                         let denom = sumsq[k][j] + traces[k][j];
                         if denom > 0.0 {
                             // #F1 — NO dispersion factor (same unit-dispersion
@@ -3266,8 +3356,21 @@ impl SaeManifoldOuterObjective {
                                 None => alpha_gauss,
                             };
                             if alpha_new.is_finite() && alpha_new > 0.0 {
-                                steps[rho.ard_flat_index(k, j)] = alpha_new.ln() - logard_kj;
+                                let step = alpha_new.ln() - logard_kj;
+                                steps[coordinate] = step;
+                                fixed_point_coordinates[coordinate] =
+                                    FixedPointCoordinateCertificate::covered(step, 1.0);
+                            } else {
+                                fixed_point_coordinates[coordinate] =
+                                    FixedPointCoordinateCertificate::uncovered(format!(
+                                        "atom {k} ARD axis {j} equation proposed a non-finite precision"
+                                    ));
                             }
+                        } else {
+                            fixed_point_coordinates[coordinate] =
+                                FixedPointCoordinateCertificate::uncovered(format!(
+                                    "atom {k} ARD axis {j} posterior second moment is not positive"
+                                ));
                         }
                     }
                 }
@@ -3292,7 +3395,18 @@ impl SaeManifoldOuterObjective {
                             count += 1;
                         }
                     }
-                    if count > 0 && denom > 0.0 {
+                    let coordinate = rho.ard_flat_index(0, axis);
+                    if count == 0 {
+                        fixed_point_coordinates[coordinate] =
+                            FixedPointCoordinateCertificate::uncovered(format!(
+                                "shared ARD axis {axis} has no owning atom"
+                            ));
+                    } else if !(denom > 0.0) {
+                        fixed_point_coordinates[coordinate] =
+                            FixedPointCoordinateCertificate::uncovered(format!(
+                                "shared ARD axis {axis} posterior second moment is not positive"
+                            ));
+                    } else {
                         // #F1 — NO dispersion factor (see the PerAtom branch). The
                         // shared axis pools `count` owners' evidence, so `n_eff` is
                         // lifted by `count`; the φ̂-free form is `α_new =
@@ -3305,7 +3419,15 @@ impl SaeManifoldOuterObjective {
                             None => alpha_gauss,
                         };
                         if alpha_new.is_finite() && alpha_new > 0.0 {
-                            steps[rho.ard_flat_index(0, axis)] = alpha_new.ln() - shared_logard;
+                            let step = alpha_new.ln() - shared_logard;
+                            steps[coordinate] = step;
+                            fixed_point_coordinates[coordinate] =
+                                FixedPointCoordinateCertificate::covered(step, 1.0);
+                        } else {
+                            fixed_point_coordinates[coordinate] =
+                                FixedPointCoordinateCertificate::uncovered(format!(
+                                    "shared ARD axis {axis} equation proposed a non-finite precision"
+                                ));
                         }
                     }
                 }
@@ -3337,11 +3459,26 @@ impl SaeManifoldOuterObjective {
             let tail = n_params - blocks.block_dims.len();
             for (l, (&p_l, &r_tilde)) in blocks.block_dims.iter().zip(scaled_rss.iter()).enumerate()
             {
+                let coordinate = tail + l;
                 if r_tilde > 0.0 {
                     let step = (n * p_l as f64 / r_tilde).ln();
                     if step.is_finite() {
-                        steps[tail + l] = step;
+                        steps[coordinate] = step;
+                        fixed_point_coordinates[coordinate] =
+                            FixedPointCoordinateCertificate::uncovered(format!(
+                                "crosscoder block {l} EFS proposal omits the logdet IFT adjoint and is not a complete stationarity equation"
+                            ));
+                    } else {
+                        fixed_point_coordinates[coordinate] =
+                            FixedPointCoordinateCertificate::uncovered(format!(
+                                "crosscoder block {l} equation proposed a non-finite update"
+                            ));
                     }
+                } else {
+                    fixed_point_coordinates[coordinate] =
+                        FixedPointCoordinateCertificate::uncovered(format!(
+                            "crosscoder block {l} scaled residual energy is not positive"
+                        ));
                 }
             }
         }
@@ -3353,16 +3490,19 @@ impl SaeManifoldOuterObjective {
             .best_fit_incumbent
             .as_ref()
             .map(|incumbent| incumbent.consecutive_inner_restores);
-        Ok(EfsEval {
-            cost,
-            steps,
-            beta: Some(beta_hat),
-            psi_gradient: None,
-            psi_indices: None,
-            inner_hessian_scale: None,
-            logdet_enclosure_gap: None,
-            consecutive_restored_incumbents,
-        })
+        Ok((
+            EfsEval {
+                cost,
+                steps,
+                beta: Some(beta_hat),
+                psi_gradient: None,
+                psi_indices: None,
+                inner_hessian_scale: None,
+                logdet_enclosure_gap: None,
+                consecutive_restored_incumbents,
+            },
+            fixed_point_coordinates,
+        ))
     }
 }
 
@@ -3876,6 +4016,18 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.bank_checkpoint(rho);
         }
         Ok(eval)
+    }
+
+    fn eval_fixed_point_certificate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<FixedPointCertificateEval, EstimationError> {
+        self.check_cancelled()?;
+        let (evaluation, coordinates) = self
+            .efs_step_with_certificate(rho.view())
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let cost = evaluation.cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+        Ok(FixedPointCertificateEval { cost, coordinates })
     }
 
     fn reset(&mut self) {

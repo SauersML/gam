@@ -227,7 +227,7 @@ fn fit_structured_metric(n: usize, p: usize) -> gam_problem::RowMetric {
 /// the dense direct plan (routing the criterion to streaming) while ADMITTING the
 /// matrix-free plan — the exact regime the streaming route was built for.
 #[test]
-fn wide_border_k32_p128_plan_routes_to_streaming() {
+fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
     let (n, p, k, d_max) = (500usize, 128usize, 32usize, 1usize);
     let total_basis = 2 * k; // width-2 euclidean basis per atom.
     let border_dim = total_basis * p;
@@ -259,6 +259,27 @@ fn wide_border_k32_p128_plan_routes_to_streaming() {
         plan.streaming,
         "a non-direct-admitted plan must select streaming"
     );
+    assert_eq!(
+        sae_outer_gradient_capability(plan),
+        Derivative::Unavailable,
+        "matrix-free SAE must not advertise the startup-only zero vector as an analytic gradient"
+    );
+    let dense_plan = sae_streaming_plan_from_budget(
+        n,
+        total_basis,
+        k,
+        d_max,
+        border_dim,
+        usize::MAX,
+        chunk_window,
+        usize::MAX,
+    );
+    assert!(dense_plan.direct_admitted);
+    assert_eq!(
+        sae_outer_gradient_capability(dense_plan),
+        Derivative::Analytic,
+        "dense SAE retains its exact joint-Hessian IFT gradient"
+    );
     // The admission gate must accept the plan (no 'working set exceeds budget'
     // hard error) precisely because the matrix-free lane is admitted.
     plan.admitted_or_error(n, border_dim, k)
@@ -274,7 +295,7 @@ fn wide_border_k32_p128_plan_routes_to_streaming() {
 /// ("infeasible to exercise [at massive K] in a unit test"), we exercise the full
 /// streaming path here at a small, fast, memory-bounded whitened multi-atom fit.
 /// The production K=32/p=128 shape is covered upstream by
-/// `wide_border_k32_p128_plan_routes_to_streaming`, which pins that the memory
+/// `wide_border_routes_to_streaming_without_fake_gradient_certificate`, which pins that the memory
 /// planner refuses the dense direct plan and admits the matrix-free plan at that
 /// shape — the two together establish that a wide-border large-K whitened fit
 /// routes to, and runs through, the streaming lane without hard-erroring.

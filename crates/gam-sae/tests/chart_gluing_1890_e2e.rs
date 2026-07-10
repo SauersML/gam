@@ -25,7 +25,7 @@
 //! future glue variant demotes-without-removing a genuinely covered atom.
 
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
-use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
+use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator, SphereChartEvaluator};
 use gam_sae::manifold::{
     AtlasOrientability, AtlasSeamKind, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm, UnitSpeedChartTransition,
@@ -454,6 +454,278 @@ fn orientation_reversing_pair_registers_atlas_end_to_end() {
         result.term.try_fitted().unwrap(),
         fitted_before,
         "atlas registration must not change the decoded image"
+    );
+    let assignments = result.term.assignment.assignments();
+    for row in 0..n {
+        let (activation, partition) = result
+            .term
+            .atlas_partition_of_unity(0, assignments.row(row))
+            .unwrap();
+        assert!(
+            (partition.sum() - 1.0).abs() < 8.0 * f64::EPSILON,
+            "partition of unity must be normalized on row {row}"
+        );
+        for (slot, &chart) in atlas.charts().iter().enumerate() {
+            assert!(
+                (activation * partition[slot] - assignments[[row, chart]]).abs()
+                    < 8.0 * f64::EPSILON,
+                "activation × partition must reproduce the chart gate on row {row}"
+            );
+        }
+    }
+}
+
+/// Build a TWO-sphere-chart term over `n` rows that cover ONE ambient unit
+/// sphere (in ambient dims `0,1,2`) with mutually-interior poles. Chart A uses
+/// the identity lat/lon frame; chart B is the SAME sphere reparametrized with its
+/// pole along A's `x`-axis (a 90° ambient rotation), so A's pole is a regular
+/// interior point of B and vice versa — the defining sphere pole seam. Rows
+/// `0..n/2` are chart A's disjoint support, `n/2..n` chart B's.
+///
+/// Each physical point `q = [q0, q1, q2]` on the sphere is parametrized in BOTH
+/// charts (`A`: `lat = asin q2, lon = atan2(q1, q0)`; `B`: `u_b = [-q2, q1, q0]`),
+/// and BOTH decoders map their unit vector back to the SAME ambient `q` — so the
+/// two charts are an exact over-tiling whose transition is the ambient rotation
+/// `R = [[0,0,1],[0,1,0],[-1,0,0]]` (`det R = +1`, a proper rotation).
+fn build_sphere_pair_term(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
+    assert!(n % 2 == 0 && n >= 8);
+    let p = 4usize;
+    let evaluator = Arc::new(SphereChartEvaluator);
+    let half = n / 2;
+
+    // Physical points on the unit sphere (ambient dims 0,1,2). Group A near A's
+    // equator (lat = ±0.3 straddling 0); group B near B's equator (lat_B = ±0.3).
+    let mut q = Array2::<f64>::zeros((n, p));
+    for j in 0..half {
+        let lon = -std::f64::consts::PI + std::f64::consts::TAU * (j as f64 + 0.5) / half as f64;
+        let lat = if j % 2 == 0 { 0.3 } else { -0.3 };
+        // A's frame: ambient = [x, y, z].
+        q[[j, 0]] = lat.cos() * lon.cos();
+        q[[j, 1]] = lat.cos() * lon.sin();
+        q[[j, 2]] = lat.sin();
+    }
+    for j in 0..half {
+        let row = half + j;
+        let lon_b = -std::f64::consts::PI + std::f64::consts::TAU * (j as f64 + 0.5) / half as f64;
+        let lat_b = if j % 2 == 0 { 0.3 } else { -0.3 };
+        let xb = lat_b.cos() * lon_b.cos();
+        let yb = lat_b.cos() * lon_b.sin();
+        let zb = lat_b.sin();
+        // B's embedding: ambient = [zb, yb, -xb].
+        q[[row, 0]] = zb;
+        q[[row, 1]] = yb;
+        q[[row, 2]] = -xb;
+    }
+
+    // Per-atom (lat, lon) coordinates of EVERY physical point in each chart.
+    let mut coords_a = Array2::<f64>::zeros((n, 2));
+    let mut coords_b = Array2::<f64>::zeros((n, 2));
+    for r in 0..n {
+        let (q0, q1, q2) = (q[[r, 0]], q[[r, 1]], q[[r, 2]]);
+        coords_a[[r, 0]] = q2.clamp(-1.0, 1.0).asin();
+        coords_a[[r, 1]] = q1.atan2(q0);
+        // B-unit-vector of the same physical point: u_b = [-q2, q1, q0].
+        let (xb, yb, zb) = (-q2, q1, q0);
+        coords_b[[r, 0]] = zb.clamp(-1.0, 1.0).asin();
+        coords_b[[r, 1]] = yb.atan2(xb);
+    }
+
+    let (phi_a, jet_a) = evaluator.evaluate(coords_a.view()).unwrap();
+    let (phi_b, jet_b) = evaluator.evaluate(coords_b.view()).unwrap();
+
+    // Pure linear sphere embeddings (quadratic rows zero). basis = [1,x,y,z,xy,yz,xz].
+    let mut decoder_a = Array2::<f64>::zeros((7, p));
+    decoder_a[[1, 0]] = 1.0; // x -> dim0
+    decoder_a[[2, 1]] = 1.0; // y -> dim1
+    decoder_a[[3, 2]] = 1.0; // z -> dim2
+    let mut decoder_b = Array2::<f64>::zeros((7, p));
+    decoder_b[[3, 0]] = 1.0; // z_b -> dim0
+    decoder_b[[2, 1]] = 1.0; // y_b -> dim1
+    decoder_b[[1, 2]] = -1.0; // x_b -> dim2 (negated)
+
+    let mut penalty = Array2::<f64>::eye(7);
+    penalty *= 1.0e-4;
+    let atom_a = SaeManifoldAtom::new(
+        "sphere_a",
+        SaeAtomBasisKind::Sphere,
+        2,
+        phi_a,
+        jet_a,
+        decoder_a,
+        penalty.clone(),
+    )
+    .unwrap()
+    .with_basis_second_jet(evaluator.clone());
+    let atom_b = SaeManifoldAtom::new(
+        "sphere_b",
+        SaeAtomBasisKind::Sphere,
+        2,
+        phi_b,
+        jet_b,
+        decoder_b,
+        penalty,
+    )
+    .unwrap()
+    .with_basis_second_jet(evaluator.clone());
+
+    // Disjoint supports: A owns the first half, B the second.
+    let mut logits = Array2::<f64>::zeros((n, 2));
+    for r in 0..n {
+        if r < half {
+            logits[[r, 0]] = ON;
+            logits[[r, 1]] = OFF;
+        } else {
+            logits[[r, 0]] = OFF;
+            logits[[r, 1]] = ON;
+        }
+    }
+    let sphere_manifold = || {
+        LatentManifold::Product(vec![
+            LatentManifold::Interval {
+                lo: -std::f64::consts::FRAC_PI_2,
+                hi: std::f64::consts::FRAC_PI_2,
+            },
+            LatentManifold::Circle {
+                period: std::f64::consts::TAU,
+            },
+        ])
+    };
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords_a, coords_b],
+        vec![sphere_manifold(), sphere_manifold()],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom_a, atom_b], assignment).unwrap();
+    (term, q)
+}
+
+fn sphere_rho() -> SaeManifoldRho {
+    // Per-axis ARD: one log-precision per sphere axis (dim = 2).
+    SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(2); 2])
+}
+
+#[test]
+fn sphere_pole_pair_registers_atlas_end_to_end() {
+    // Increment 2 — the d=2 POLE-seam register emitter. Two sphere charts cover
+    // ONE ambient sphere with mutually-interior poles: the transition is an
+    // ambient rotation `R ∈ SO(3)`, not a 1-D affine map, so neither the fusion
+    // lane nor the 1-D glue lane can see it. The sphere pole lane must fit the
+    // rotation, classify the overlap as a POLE seam, certify equivalence, and
+    // REGISTER (keep both charts as one partition-of-unity atlas atom) end-to-end
+    // through the production driver.
+    let n = 48;
+    let (term, q) = build_sphere_pair_term(n);
+    let p = q.ncols();
+    let rho = sphere_rho();
+
+    // Target: the shared sphere image plus a small isometry-band residual.
+    let mut target = term.try_fitted().unwrap();
+    for r in 0..n {
+        for c in 0..p {
+            target[[r, c]] += 0.01 * ((r * 7 + c * 3) as f64).sin();
+        }
+    }
+
+    assert_eq!(active_atom_count(&term), 2, "fixture starts with 2 sphere charts");
+    assert_eq!(term.semantic_atom_count(), 2, "no atlas registered yet");
+
+    let mut ledger = StructureLedger::new();
+    let result = run_production_structure_search(
+        term,
+        rho,
+        target.view(),
+        glue_only_config(),
+        refit_params(),
+        &mut ledger,
+    )
+    .unwrap();
+
+    let glues = accepted_glues(&result);
+    eprintln!(
+        "[1890-e2e-pole] accepted_glues={glues} k_atoms={} semantic_atoms={} atlases={}",
+        result.term.k_atoms(),
+        result.term.semantic_atom_count(),
+        result.term.chart_atlases().len(),
+    );
+
+    // bank -> certify -> apply fired on the pole seam.
+    assert!(
+        glues >= 1,
+        "no Glue certified for the sphere pole pair; the pole-seam register lane \
+         did not fire end-to-end"
+    );
+    assert!(
+        result.structure_changed(),
+        "a glue applied but structure_changed() is false"
+    );
+
+    // REGISTER, not FUSE: both sphere charts survive and keep routing mass — a
+    // pole seam has no destructive fuse outcome (neither lat/lon chart alone
+    // covers both poles).
+    assert_eq!(
+        result.term.k_atoms(),
+        2,
+        "sphere pole registration must keep BOTH local charts"
+    );
+    assert_eq!(
+        active_atom_count(&result.term),
+        2,
+        "both sphere charts stay active under the partition of unity"
+    );
+
+    // The two charts quotient into ONE semantic atom carrying the pole seam.
+    assert_eq!(
+        result.term.semantic_atom_count(),
+        1,
+        "the sphere pole pair must collapse to one semantic atlas atom"
+    );
+    assert_eq!(result.term.chart_atlases().len(), 1, "exactly one atlas");
+    let atlas = &result.term.chart_atlases()[0];
+    assert_eq!(atlas.charts(), &[0, 1], "the atlas covers both sphere charts");
+    // The pole seam is stored as a 2-D ambient-rotation transition, NOT a 1-D
+    // affine one — asserting a 1-D map here would misdescribe the overlap.
+    assert!(
+        atlas.transitions().is_empty(),
+        "a sphere pole seam is not a 1-D unit-speed transition"
+    );
+    assert_eq!(
+        atlas.sphere_transitions().len(),
+        1,
+        "the pole pair registers exactly one ambient-rotation seam"
+    );
+    let sphere_seam = &atlas.sphere_transitions()[0];
+    assert_eq!(sphere_seam.seam_kind, AtlasSeamKind::Pole, "classified as a pole seam");
+    assert_eq!(
+        sphere_seam.sign(),
+        1,
+        "a sphere is orientable: its proper-rotation transition carries sign +1"
+    );
+    assert!(
+        (sphere_seam.determinant() - 1.0).abs() < 1e-9,
+        "the fitted transition must be a proper rotation (det = +1), got {}",
+        sphere_seam.determinant()
+    );
+
+    // A single orientable sphere cover: the sign cocycle is trivially +1.
+    assert_eq!(
+        atlas.orientability(),
+        AtlasOrientability::Orientable,
+        "a sphere pole cover is orientable"
+    );
+
+    // Registration is an image-preserving algebraic quotient of the same gates:
+    // the reconstruction still tracks the shared sphere within the isometry band,
+    // and the chart gates factor exactly into activation × partition of unity.
+    let fitted = result.term.try_fitted().unwrap();
+    let mut max_abs = 0.0_f64;
+    for (a, b) in fitted.iter().zip(target.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    assert!(
+        max_abs < 0.15,
+        "post-register reconstruction diverged from the sphere target by {max_abs:.3e} (> 0.15)"
     );
     let assignments = result.term.assignment.assignments();
     for row in 0..n {

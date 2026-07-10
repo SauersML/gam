@@ -1134,10 +1134,82 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     }
 }
 
+/// Operator-backed design plus its governed dense memo.
+///
+/// Every dense materialization of a lazy design must hold a process-wide
+/// [`MemoryGovernor`] ledger charge for the buffer's lifetime (the #2247 F6
+/// contract: individually-acceptable materializations must not be able to
+/// *jointly* exceed the budget). The memo owns exactly one governed dense
+/// copy shared by every clone of this design — repeated `to_dense_arc`/
+/// `to_dense_cow` calls reuse it instead of re-streaming the operator, and
+/// the ledger charge lives exactly as long as the memo (= the design and all
+/// its clones). Derefs to the inner operator so match arms binding `Lazy(op)`
+/// keep calling trait methods unchanged.
+#[derive(Clone)]
+pub struct LazyDense {
+    op: Arc<dyn DenseDesignOperator>,
+    dense_memo: Arc<OnceLock<Governed<Arc<Array2<f64>>>>>,
+}
+
+impl LazyDense {
+    fn new(op: Arc<dyn DenseDesignOperator>) -> Self {
+        Self {
+            op,
+            dense_memo: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn operator_arc_identity(&self) -> usize {
+        Arc::as_ptr(&self.op) as *const () as usize
+    }
+
+    /// Governed, memoized dense materialization. On a memo hit the bytes are
+    /// already charged by the memo's own reservation; on a miss the footprint
+    /// is admitted against the joint ledger BEFORE streaming the operator. A
+    /// refusal is typed evidence the dense copy does not fit jointly right
+    /// now — fallible callers route to chunked/matrix-free strategies.
+    fn try_governed_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        if let Some(governed) = self.dense_memo.get() {
+            return Ok(Arc::clone(governed.as_ref()));
+        }
+        let reservation = MemoryGovernor::global()
+            .try_reserve_dense_f64(self.op.nrows(), self.op.ncols(), context)
+            .map_err(|err| {
+                format!(
+                    "{context}: refusing to densify {}x{} operator-backed design: {err}",
+                    self.op.nrows(),
+                    self.op.ncols(),
+                )
+            })?;
+        let dense = dense_operator_to_dense_by_chunks(self.op.as_ref()).map_err(|err| {
+            format!(
+                "{context}: failed to materialize {}x{} operator-backed design via row chunks: {err}",
+                self.op.nrows(),
+                self.op.ncols(),
+            )
+        })?;
+        // A concurrent winner's memo (and charge) stands; the loser's copy and
+        // reservation drop together here.
+        Ok(Arc::clone(
+            self.dense_memo
+                .get_or_init(|| reservation.bind(Arc::new(dense)))
+                .as_ref(),
+        ))
+    }
+}
+
+impl std::ops::Deref for LazyDense {
+    type Target = Arc<dyn DenseDesignOperator>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.op
+    }
+}
+
 #[derive(Clone)]
 pub enum DenseDesignMatrix {
     Materialized(Arc<Array2<f64>>),
-    Lazy(Arc<dyn DenseDesignOperator>),
+    Lazy(LazyDense),
 }
 
 impl std::fmt::Debug for DenseDesignMatrix {
@@ -1173,7 +1245,7 @@ where
     T: DenseDesignOperator + 'static,
 {
     fn from(value: Arc<T>) -> Self {
-        Self::Lazy(value)
+        Self::Lazy(LazyDense::new(value))
     }
 }
 
@@ -1189,7 +1261,7 @@ impl DenseDesignMatrix {
     pub fn cache_identity(&self) -> usize {
         match self {
             Self::Materialized(matrix) => Arc::as_ptr(matrix) as *const () as usize,
-            Self::Lazy(op) => Arc::as_ptr(op) as *const () as usize,
+            Self::Lazy(lazy) => lazy.operator_arc_identity(),
         }
     }
 
@@ -1225,21 +1297,39 @@ impl DenseDesignMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Materialized(matrix) => matrix.as_ref().clone(),
-            Self::Lazy(op) => {
+            Self::Lazy(lazy) => {
                 let policy = ResourcePolicy::default_library();
                 panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
                     "DenseDesignMatrix::to_dense",
-                    op.nrows(),
-                    op.ncols(),
+                    lazy.nrows(),
+                    lazy.ncols(),
                     &policy,
                 )
                 .unwrap_or_else(|reason| std::panic::panic_any(reason));
-                dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
+                if let Some(governed) = lazy.dense_memo.get() {
+                    // Already materialized (and ledger-charged) once — reuse
+                    // it instead of re-streaming the operator.
+                    return governed.as_ref().as_ref().clone();
+                }
+                // Owned-return variant: the escaping buffer cannot carry an
+                // RAII charge, so account at least the construction window on
+                // the joint ledger and refuse loudly under joint pressure.
+                // Callers that can hold the charge for the buffer's lifetime
+                // must use `try_to_dense_governed`.
+                let _reservation = MemoryGovernor::global()
+                    .try_reserve_dense_f64(
+                        lazy.nrows(),
+                        lazy.ncols(),
+                        "DenseDesignMatrix::to_dense",
+                    )
+                    // SAFETY: infallible accessor; a joint-ledger refusal here means the caller broke the densification contract.
+                    .unwrap_or_else(|err| std::panic::panic_any(err.to_string()));
+                dense_operator_to_dense_by_chunks(lazy.op.as_ref()).unwrap_or_else(|err| {
                     std::panic::panic_any(format!(
                         "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",
-                        op.nrows(),
-                        op.ncols(),
+                        lazy.nrows(),
+                        lazy.ncols(),
                     ))
                 })
             }
@@ -1249,25 +1339,18 @@ impl DenseDesignMatrix {
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Materialized(matrix) => Arc::clone(matrix),
-            Self::Lazy(op) => {
+            Self::Lazy(lazy) => {
                 let policy = ResourcePolicy::default_library();
                 panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
                     "DenseDesignMatrix::to_dense_arc",
-                    op.nrows(),
-                    op.ncols(),
+                    lazy.nrows(),
+                    lazy.ncols(),
                     &policy,
                 )
                 .unwrap_or_else(|reason| std::panic::panic_any(reason));
-                Arc::new(
-                    dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
-                        std::panic::panic_any(format!(
-                            "DenseDesignMatrix::to_dense_arc: failed to materialize {}x{} \
-                             operator-backed design via row chunks: {err}",
-                            op.nrows(),
-                            op.ncols(),
-                        ))
-                    }),
-                )
+                lazy.try_governed_dense_arc("DenseDesignMatrix::to_dense_arc")
+                    // SAFETY: infallible accessor; refusal here is a caller contract violation, abort with the ledger evidence.
+                    .unwrap_or_else(|msg| std::panic::panic_any(msg))
             }
         }
     }
@@ -1306,18 +1389,14 @@ impl DenseDesignMatrix {
     ) -> Result<Arc<Array2<f64>>, String> {
         match self {
             Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
-            Self::Lazy(op) => {
+            Self::Lazy(lazy) => {
                 panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
                     context,
-                    op.nrows(),
-                    op.ncols(),
+                    lazy.nrows(),
+                    lazy.ncols(),
                     policy,
                 )?;
-                dense_operator_to_dense_by_chunks(op.as_ref())
-                    .map(Arc::new)
-                    .map_err(|err| {
-                        format!("{context}: failed to materialize dense row chunks: {err}")
-                    })
+                lazy.try_governed_dense_arc(context)
             }
         }
     }
