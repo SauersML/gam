@@ -663,7 +663,10 @@ impl IBPAssignmentPenalty {
 pub struct IbpHessianDiagThirdChannels {
     /// Number of columns `K` (atoms) in the row-major logit layout.
     pub k_max: usize,
-    /// `J_ik = z(1−z)/τ`, the per-logit concrete jacobian (row-major `N·K`).
+    /// `u_ik = w_i·J_ik`, the #991 design-weighted per-logit concrete jacobian
+    /// (`J_ik = z(1−z)/τ`; `w_i = 1` without design weights). This is the
+    /// rank-one carrier AND the `∂M_k/∂ℓ_ik` factor of the weighted operator,
+    /// so consumers stay weight-convention-free. Row-major `N·K`.
     pub z_jac: Array1<f64>,
     /// `(∂_z H_ik)·J_ik`: the row-local direct-`z` third derivative of the
     /// assembled diagonal curvature `H_ik` (row-major `N·K`).
@@ -694,10 +697,11 @@ pub struct IbpHessianDiagThirdChannels {
     /// (the fixed-α path scales linearly with `λ`, so `∂H_p/∂ρ = H_p` uses the
     /// value `cross_row_d` instead). Length `K`.
     pub cross_row_d_logalpha: Array1<f64>,
-    /// `logit_curvature[i*K+k] = c_ik = ∂J_ik/∂ℓ_ik = z(1−z)(1−2z)/τ²`: the
-    /// per-logit second derivative of the concrete map (#1416). The
-    /// cross-row rank-one block's `J_ik` factors depend on `ℓ_ik`, so its
-    /// θ-derivative carries `∂J_ik/∂ℓ_wk = δ_iw·c_ik`. Row-major `N·K`.
+    /// `logit_curvature[i*K+k] = w_i·c_ik`, `c_ik = ∂J_ik/∂ℓ_ik =
+    /// z(1−z)(1−2z)/τ²`: the per-logit second derivative of the (#991
+    /// design-weighted) concrete carrier, `∂u_ik/∂ℓ_ik = w_i·c_ik` (#1416). The
+    /// cross-row rank-one block's `u_ik` factors depend on `ℓ_ik`, so its
+    /// θ-derivative carries `∂u_ik/∂ℓ_wk = δ_iw·(w_i·c_ik)`. Row-major `N·K`.
     pub logit_curvature: Array1<f64>,
 }
 
