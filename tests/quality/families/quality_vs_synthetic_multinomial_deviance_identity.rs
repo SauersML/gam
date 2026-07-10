@@ -348,14 +348,13 @@ emit("mgcv_logloss", ll)
     let dev_rel = dev_abs / deviance_recompute.abs().max(1.0);
 
     eprintln!(
-        "[multinomial-quality] n_train={} n_test={} K={} converged={}\n  \
+        "[multinomial-quality] n_train={} n_test={} K={}\n  \
          gam:  acc={gam_acc:.4} logloss={gam_ll:.4}\n  \
          mgcv: acc={mgcv_acc:.4} logloss={mgcv_ll:.4}\n  \
          stored-deviance identity: abs={dev_abs:.3e} rel={dev_rel:.3e}",
         n_train,
         test.len(),
         model.class_levels.len(),
-        model.converged
     );
 
     // ── OBJECTIVE PASS/FAIL ────────────────────────────────────────────────

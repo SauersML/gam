@@ -73,13 +73,15 @@ use crate::fit_orchestration::{
 use crate::model_types::EstimationError;
 use crate::multinomial_reml::MultinomialFamily;
 use crate::penalized_vector_glm::{
-    PenalizedVectorGlmInputs, VectorGlmSolve, fit_penalized_vector_glm,
+    PenalizedVectorGlmInputs, VectorGlmResume, VectorGlmSolve, fit_penalized_vector_glm,
 };
 use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
 use gam_data::ColumnKindTag;
 use gam_data::EncodedDataset;
-use opt::{BacktrackConfig, backtracking_line_search};
-use gam_problem::ResponseColumnKind;
+use gam_problem::{
+    FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage, FixedLambdaStallReason,
+    FixedLambdaStationarityEvidence, ResponseColumnKind,
+};
 use gam_runtime::resource::ProblemHints;
 use gam_terms::inference::formula_dsl::parse_formula;
 use gam_terms::smooth::{
@@ -87,6 +89,7 @@ use gam_terms::smooth::{
 };
 use gam_terms::term_builder::resolve_role_col;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use opt::{BacktrackConfig, backtracking_line_search};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -483,6 +486,12 @@ pub struct MultinomialFitInputs<'a> {
     pub max_iter: usize,
     /// Relative-step convergence tolerance; recommend 1e-7.
     pub tol: f64,
+    /// Optional checkpoint emitted by a prior fixed-λ multinomial stall on
+    /// the same design, response, weights, offsets, penalty, and lambdas. A
+    /// `MultinomialNewton` checkpoint resumes the ordinary softmax objective;
+    /// a `MultinomialFirth` checkpoint resumes the Jeffreys/Firth separation
+    /// objective directly. Any other stage or coefficient shape is rejected.
+    pub resume_from: Option<&'a FixedLambdaCheckpoint>,
 }
 
 /// Outputs of [`fit_penalized_multinomial`].
@@ -616,6 +625,44 @@ impl MultinomialFitOutputs {
     }
 }
 
+#[derive(Clone, Copy)]
+struct FirthResume<'a> {
+    coefficients: ArrayView2<'a, f64>,
+    completed_iterations: usize,
+}
+
+fn fixed_lambda_checkpoint_coefficients(
+    checkpoint: &FixedLambdaCheckpoint,
+    expected_stage: FixedLambdaSolverStage,
+    p: usize,
+    m: usize,
+) -> Result<Array2<f64>, EstimationError> {
+    checkpoint.validate().map_err(|reason| {
+        EstimationError::InvalidInput(format!(
+            "multinomial fixed-λ resume checkpoint is invalid: {reason}"
+        ))
+    })?;
+    if checkpoint.stage() != expected_stage {
+        crate::bail_invalid_estim!(
+            "multinomial fixed-λ resume checkpoint stage is {}, expected {}",
+            checkpoint.stage(),
+            expected_stage,
+        );
+    }
+    if checkpoint.rows() != p || checkpoint.cols() != m {
+        crate::bail_invalid_estim!(
+            "multinomial fixed-λ resume checkpoint shape {}x{} does not match P x (K-1) = {p}x{m}",
+            checkpoint.rows(),
+            checkpoint.cols(),
+        );
+    }
+    Array2::from_shape_vec((p, m), checkpoint.values().to_vec()).map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "multinomial fixed-λ resume checkpoint could not be reshaped: {error}"
+        ))
+    })
+}
+
 /// Fit a penalized multinomial-logit GAM at fixed `λ`.
 ///
 /// See the module docs for the optimization problem and conventions. This
@@ -633,6 +680,7 @@ pub fn fit_penalized_multinomial(
         fisher_w_override,
         max_iter,
         tol,
+        resume_from,
     } = inputs;
 
     // ──────────────────────── family-specific validation ───────────────────
@@ -687,6 +735,46 @@ pub fn fit_penalized_multinomial(
     }
     validate_multinomial_simplex(y_one_hot, "fit_penalized_multinomial")?;
 
+    let p = design.ncols();
+    let resumed_newton_coefficients = match resume_from {
+        Some(checkpoint) if checkpoint.stage() == FixedLambdaSolverStage::MultinomialFirth => {
+            let coefficients = fixed_lambda_checkpoint_coefficients(
+                checkpoint,
+                FixedLambdaSolverStage::MultinomialFirth,
+                p,
+                m,
+            )?;
+            return fit_penalized_multinomial_firth_fallback(
+                design,
+                y_one_hot,
+                penalty,
+                lambdas,
+                row_weights,
+                max_iter,
+                tol,
+                Some(FirthResume {
+                    coefficients: coefficients.view(),
+                    completed_iterations: checkpoint.completed_iterations(),
+                }),
+            );
+        }
+        Some(checkpoint) => Some(fixed_lambda_checkpoint_coefficients(
+            checkpoint,
+            FixedLambdaSolverStage::MultinomialNewton,
+            p,
+            m,
+        )?),
+        None => None,
+    };
+    let vector_resume = resumed_newton_coefficients
+        .as_ref()
+        .map(|coefficients| VectorGlmResume {
+            coefficients: coefficients.view(),
+            completed_iterations: resume_from
+                .map(FixedLambdaCheckpoint::completed_iterations)
+                .unwrap_or(0),
+        });
+
     // ────────────────────────── likelihood construction ───────────────────
     let mut likelihood = MultinomialLogitLikelihood::with_classes(k)?;
     if let Some(w) = row_weights.as_ref() {
@@ -711,7 +799,7 @@ pub fn fit_penalized_multinomial(
             // reference-symmetric Centered metric requires (shared λ). The
             // Centered engine path + its invariance proof land first.
             class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
-            resume_from: None,
+            resume_from: vector_resume,
         },
         &likelihood,
         "fit_penalized_multinomial",
@@ -792,6 +880,10 @@ fn handle_multinomial_fixed_lambda_stall(
                 row_weights,
                 max_iter,
                 tol,
+                Some(FirthResume {
+                    coefficients: stall.coefficients.view(),
+                    completed_iterations: 0,
+                }),
             )
         }));
         match firth {
@@ -821,17 +913,10 @@ fn handle_multinomial_fixed_lambda_stall(
     // A stall WITHOUT the separation fingerprint (|η| below the threshold —
     // e.g. ill-conditioned data exhausting `max_iter`) is a typed error
     // carrying its evidence, never an Ok(outputs) with a flag.
-    Err(EstimationError::FixedLambdaNewtonDidNotConverge {
-        context: format!(
-            "fit_penalized_multinomial (fixed-λ softmax damped Newton): {}; final gradient \
-             norm {:.3e} against stationarity bound {:.3e}",
-            stall.reason.description(),
-            stall.gradient_norm,
-            stall.gradient_bound,
-        ),
-        iterations: stall.iterations,
-        penalized_neg_log_likelihood: stall.penalized_neg_log_likelihood(),
-    })
+    Err(stall.into_nonconvergence_error(
+        FixedLambdaSolverStage::MultinomialNewton,
+        "fit_penalized_multinomial (fixed-λ softmax damped Newton)",
+    )?)
 }
 
 /// Firth/Jeffreys-penalized multinomial refit engaged automatically when the
@@ -900,6 +985,7 @@ fn fit_penalized_multinomial_firth_fallback(
     row_weights: Option<ArrayView1<'_, f64>>,
     max_iter: usize,
     tol: f64,
+    resume_from: Option<FirthResume<'_>>,
 ) -> Result<MultinomialFitOutputs, EstimationError> {
     use faer::Side;
     use gam_linalg::faer_ndarray::{
@@ -921,7 +1007,6 @@ fn fit_penalized_multinomial_firth_fallback(
     }
     let weight = |row: usize| -> f64 { row_weights.as_ref().map_or(1.0, |w| w[row]) };
 
-    let max_iter = max_iter.max(1);
     let tol_eff = if tol.is_finite() && tol > 0.0 {
         tol
     } else {
@@ -1204,10 +1289,27 @@ fn fit_penalized_multinomial_firth_fallback(
     };
 
     // ─────────────────────────── Firth Newton loop ────────────────────────────
-    let mut beta = Array2::<f64>::zeros((p, m));
-    let mut iterations = 0_usize;
+    let (mut beta, completed_iterations) = match resume_from {
+        Some(resume) => {
+            if resume.coefficients.dim() != (p, m) {
+                crate::bail_invalid_estim!(
+                    "multinomial Firth resume coefficient shape {:?} does not match P x (K-1) = {p}x{m}",
+                    resume.coefficients.dim(),
+                );
+            }
+            (resume.coefficients.to_owned(), resume.completed_iterations)
+        }
+        None => (Array2::<f64>::zeros((p, m)), 0),
+    };
+    let mut iterations = completed_iterations;
+    let mut stall_reason = FixedLambdaStallReason::IterationBudgetExhausted;
+    let mut small_step_reached = false;
     for it in 0..max_iter {
-        iterations = it + 1;
+        iterations = completed_iterations.checked_add(it + 1).ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "multinomial Firth resume iteration count overflowed usize".to_string(),
+            )
+        })?;
         let probs = probs_at(&beta);
         let info = assemble_info(&probs);
         let (iinv, logdet_info) = invert_spd(&info, "Fisher information")?;
@@ -1268,6 +1370,7 @@ fn fit_penalized_multinomial_firth_fallback(
             // tiny step. Reaching here therefore means Newton still sees a
             // meaningful ascent direction it cannot realize (boundary / near-
             // singular Fisher information), i.e. a genuine stall → not converged.
+            stall_reason = FixedLambdaStallReason::LineSearchExhausted;
             break;
         };
 
@@ -1276,6 +1379,7 @@ fn fit_penalized_multinomial_firth_fallback(
         let max_step = step * delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         let scale = 1.0 + beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if max_step < tol_eff * scale {
+            small_step_reached = true;
             break;
         }
     }
@@ -1314,20 +1418,41 @@ fn fit_penalized_multinomial_firth_fallback(
     // only this fresh first-order certificate may authorize construction of a
     // fit or its covariance.
     let info = assemble_info(&probs);
-    let (information_inverse, _) = invert_spd(&info, "final Fisher information")?;
+    let (information_inverse, final_logdet_info) = invert_spd(&info, "final Fisher information")?;
     let final_score = firth_score(&probs, &coefficients_active, &information_inverse);
     let hmat = penalized_hessian(&info);
     let final_step = solve_spd(&hmat, &final_score)?;
     let final_decrement = 0.5 * final_score.dot(&final_step).abs();
     if !(final_decrement.is_finite() && final_decrement < tol_eff) {
+        if small_step_reached {
+            stall_reason = FixedLambdaStallReason::StationarityCertificateFailed;
+        }
         // SPEC: a fit object must only ever come from a converged optimization.
         // A Firth refit that exhausted its budget (or stalled its line search at
         // a non-stationary point) is the typed error carrying its evidence — the
         // covariance below is never computed for an uncertified iterate.
+        let checkpoint = FixedLambdaCheckpoint::new(
+            FixedLambdaSolverStage::MultinomialFirth,
+            coefficients_active.iter().copied().collect(),
+            p,
+            m,
+            iterations,
+        )
+        .map_err(|reason| {
+            EstimationError::InvalidInput(format!(
+                "multinomial Firth fallback produced an invalid internal checkpoint: {reason}"
+            ))
+        })?;
         return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
             context: "fit_penalized_multinomial (Firth/Jeffreys separation refit)".to_string(),
-            iterations,
-            penalized_neg_log_likelihood: -log_likelihood + penalty_term,
+            reason: stall_reason,
+            objective_value: -objective(&probs, &coefficients_active, final_logdet_info),
+            stationarity: FixedLambdaStationarityEvidence {
+                kind: FixedLambdaResidualKind::NewtonDecrement,
+                residual: final_decrement,
+                bound: tol_eff,
+            },
+            checkpoint,
         });
     }
 
@@ -1369,6 +1494,7 @@ fn fit_penalized_multinomial_firth_fallback(
 /// fresh data using the *training* basis / penalty structure (no refit on
 /// predict, no re-derivation of class levels).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultinomialSavedModel {
     /// The training formula, verbatim. Stored so Python's `summary()` and
     /// any round-trip persistence path can echo what was fit.
@@ -1417,8 +1543,6 @@ pub struct MultinomialSavedModel {
     pub lambdas_per_block: Vec<usize>,
     /// Newton iterations executed; recorded for the summary report.
     pub iterations: usize,
-    /// `true` if the inner Newton solver hit the relative-step tolerance.
-    pub converged: bool,
     /// Penalized negative log-likelihood at the returned `β̂`.
     pub penalized_neg_log_likelihood: f64,
     /// Unpenalized deviance `−2 log L(β̂)`.
@@ -1789,6 +1913,12 @@ impl MultinomialSavedModel {
 /// as a single constant so every producer / consumer of the envelope agrees on
 /// the tag without a scattered string literal.
 pub const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
+/// Exact multinomial persistence schema. Older payloads carried a public
+/// `converged` flag alongside usable coefficients; accepting one with
+/// `converged=false` violated the convergence-only model contract. Version 1
+/// removes that state entirely: successful deserialization itself means the
+/// payload was minted by the convergence-only constructor.
+pub const MULTINOMIAL_MODEL_FORMAT_VERSION: u32 = 1;
 
 /// Round-trip persistence envelope for a fitted multinomial model. The
 /// `model_class` discriminator lets a loader tell a multinomial payload apart
@@ -1799,8 +1929,10 @@ pub const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
 /// and the `gam` CLI (`gam fit --family multinomial` / `gam predict`), so a
 /// model persisted by one surface loads in the other.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MultinomialModelEnvelope {
     pub model_class: String,
+    pub format_version: u32,
     pub saved: MultinomialSavedModel,
 }
 
@@ -1809,6 +1941,7 @@ impl MultinomialModelEnvelope {
     pub fn new(saved: MultinomialSavedModel) -> Self {
         Self {
             model_class: MULTINOMIAL_MODEL_CLASS.to_string(),
+            format_version: MULTINOMIAL_MODEL_FORMAT_VERSION,
             saved,
         }
     }
@@ -1833,7 +1966,44 @@ impl MultinomialModelEnvelope {
                 envelope.model_class
             )));
         }
+        if envelope.format_version != MULTINOMIAL_MODEL_FORMAT_VERSION {
+            return Err(EstimationError::InvalidInput(format!(
+                "multinomial model: format_version = {}, expected {}",
+                envelope.format_version, MULTINOMIAL_MODEL_FORMAT_VERSION,
+            )));
+        }
         Ok(envelope)
+    }
+}
+
+#[cfg(test)]
+mod multinomial_persistence_contract_tests {
+    use super::*;
+
+    #[test]
+    fn payload_with_nonconverged_model_flag_is_rejected() {
+        let payload = br#"{
+            "model_class": "multinomial",
+            "format_version": 1,
+            "saved": {"converged": false}
+        }"#;
+        let error = MultinomialModelEnvelope::from_json_bytes(payload)
+            .expect_err("a payload carrying an inspectable non-converged model must be rejected");
+        assert!(
+            error.to_string().contains("unknown field `converged`"),
+            "unexpected persistence error: {error}"
+        );
+    }
+
+    #[test]
+    fn unversioned_payload_is_rejected() {
+        let payload = br#"{"model_class":"multinomial","saved":{}}"#;
+        let error = MultinomialModelEnvelope::from_json_bytes(payload)
+            .expect_err("unversioned multinomial persistence must not be guessed");
+        assert!(
+            error.to_string().contains("format_version"),
+            "unexpected persistence error: {error}"
+        );
     }
 }
 
@@ -1969,44 +2139,6 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix, scale: f64) -> Pena
             inner: Box::new(scale_multinomial_formula_penalty(*inner, scale)),
         },
     }
-}
-
-/// Build a warm-started copy of `blocks` whose per-block `initial_log_lambdas`
-/// are seeded from a previously-selected flat `log_lambdas` vector (#1082).
-///
-/// The flat `log_lambdas` returned by [`fit_custom_family_with_rho_prior`]
-/// concatenates each block's penalty log-λ in block order — the same order
-/// `build_block_specs()` emits the blocks and the same per-block penalty order
-/// the spec carries — so it splits back across blocks by each block's penalty
-/// count. Warm-starting the OUTER ρ-search from a prior iterate changes only the
-/// optimizer's starting point, never the penalized objective or its optimum, so
-/// the converged fit is identical; it just resumes near the prior iterate
-/// instead of restarting from the cold `init_lambda` seed.
-///
-/// Returns `None` (caller falls back to the cold blocks) if the flat vector does
-/// not have exactly one entry per penalty across all blocks, or carries a
-/// non-finite value — i.e. anything that would make the seed unsafe.
-fn warm_start_blocks_from_log_lambdas(
-    blocks: &[crate::custom_family::ParameterBlockSpec],
-    log_lambdas: &[f64],
-) -> Option<Vec<crate::custom_family::ParameterBlockSpec>> {
-    let total: usize = blocks.iter().map(|b| b.initial_log_lambdas.len()).sum();
-    if total == 0 || log_lambdas.len() != total {
-        return None;
-    }
-    if log_lambdas.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    let mut warm = blocks.to_vec();
-    let mut offset = 0usize;
-    for block in warm.iter_mut() {
-        let k = block.initial_log_lambdas.len();
-        for slot in 0..k {
-            block.initial_log_lambdas[slot] = log_lambdas[offset + slot];
-        }
-        offset += k;
-    }
-    Some(warm)
 }
 
 /// Top-level formula-driven multinomial fit.
@@ -2422,77 +2554,14 @@ pub fn fit_penalized_multinomial_formula(
     let fit = match probe_attempt {
         Ok(probe_fit) => {
             let separation = multinomial_formula_separation_evidence(&probe_fit.block_states);
-            if probe_fit.outer_converged && separation.is_none() {
-                // Interior, converged, no separation: accept the probe directly.
+            if separation.is_none() {
+                // Fit existence proves both optimization layers certified; no
+                // post-hoc convergence flag is needed.
                 probe_fit
-            } else if let Some(evidence) =
-                multinomial_formula_unresolved_probe_separation_evidence(&probe_fit.block_states)
-            {
-                // Non-converged probe already carrying separation-scale logits:
-                // hand straight to the proper-prior Firth refit (do not spend the
-                // full unbiased budget grinding the λ→0 separable ridge).
-                run_firth_refit(format!(
-                    "unbiased-criterion REML probe did not converge after {} outer iterations; {evidence}",
-                    probe_fit.outer_iterations
-                ))?
-            } else if separation.is_none() {
-                // Interior but the capped probe ran out of iterations without
-                // certifying: re-solve at the caller's full outer budget.
-                //
-                // #1082 wall-clock: the capped probe is a strict prefix of this
-                // solve from the same family/seed, so a COLD restart repeats the
-                // probe's outer iterations. WARM-START the re-solve from the ρ the
-                // probe already reached — seed each block's `initial_log_lambdas`
-                // from the probe's selected `log_lambdas` (same block/penalty
-                // order: the flat vector concatenates per-block penalties in block
-                // order, exactly the order `build_block_specs()` emits them). This
-                // changes only the optimizer's STARTING point, never the objective
-                // or its optimum, but lets the full solve resume near the probe's
-                // last iterate instead of crawling up from `init_lambda` again —
-                // removing the probe-iterations double-pay on the non-separable
-                // (e.g. `vgam_smooth_by_factor`) arm. If the probe's λ vector does
-                // not line up with the block layout (it always should), fall back
-                // to the cold `blocks` seed.
-                let warm_blocks = warm_start_blocks_from_log_lambdas(
-                    &blocks,
-                    probe_fit.log_lambdas.as_slice().unwrap_or(&[]),
-                );
-                let resolve_blocks = warm_blocks.as_deref().unwrap_or(&blocks);
-                match fit_custom_family_with_rho_prior(
-                    &family,
-                    resolve_blocks,
-                    &options,
-                    gam_problem::RhoPrior::Flat,
-                ) {
-                    Ok(full_unbiased_fit) => {
-                        let full_separation = multinomial_formula_separation_evidence(
-                            &full_unbiased_fit.block_states,
-                        );
-                        if full_unbiased_fit.outer_converged && full_separation.is_none() {
-                            full_unbiased_fit
-                        } else {
-                            let evidence = full_separation.unwrap_or_else(|| {
-                                format!(
-                                    "full unbiased-criterion REML solve did not converge after {} outer iterations",
-                                    full_unbiased_fit.outer_iterations
-                                )
-                            });
-                            run_firth_refit(evidence)?
-                        }
-                    }
-                    Err(err) => run_firth_refit(format!(
-                        "full unbiased-criterion REML solve failed: {err}"
-                    ))?,
-                }
             } else {
-                // Probe converged (or capped) but shows interior separation
-                // evidence: Firth refit using the already-computed scan.
-                let evidence = separation.unwrap_or_else(|| {
-                    format!(
-                        "unbiased-criterion REML probe did not converge after {} outer iterations",
-                        probe_fit.outer_iterations
-                    )
-                });
+                // A certified unbiased optimum can still exhibit separation;
+                // use the already-computed evidence to select the Firth target.
+                let evidence = separation.expect("checked as present");
                 run_firth_refit(evidence)?
             }
         }
@@ -2911,7 +2980,6 @@ pub fn fit_penalized_multinomial_formula(
         lambdas: lambdas_flat,
         lambdas_per_block,
         iterations: fit.inner_cycles,
-        converged: fit.outer_converged,
         penalized_neg_log_likelihood: -fit.log_likelihood + 0.5 * fit.stable_penalty_term,
         deviance,
         edf_per_class,
@@ -3056,6 +3124,7 @@ mod fisher_override_tests {
                 fisher_w_override: over,
                 max_iter: 50,
                 tol: 1.0e-9,
+                resume_from: None,
             })
             .expect("fit must succeed")
         };
@@ -3082,16 +3151,84 @@ mod fisher_override_tests {
             fisher_w_override: None,
             max_iter: 0,
             tol: 1.0e-9,
+            resume_from: None,
         })
         .expect_err("a zero-budget Newton solve must not mint a multinomial fit");
         assert!(matches!(
             error,
             EstimationError::FixedLambdaNewtonDidNotConverge {
-                iterations: 0,
-                penalized_neg_log_likelihood,
+                objective_value,
+                checkpoint,
                 ..
-            } if penalized_neg_log_likelihood.is_finite()
+            } if objective_value.is_finite()
+                && checkpoint.stage() == FixedLambdaSolverStage::MultinomialNewton
+                && checkpoint.completed_iterations() == 0
         ));
+    }
+
+    #[test]
+    fn fixed_lambda_checkpoint_resume_matches_uninterrupted_solve() {
+        let (design, y, penalty, lambdas) = toy();
+        let interrupted = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 1,
+            tol: 1.0e-9,
+            resume_from: None,
+        })
+        .expect_err("one Newton step must leave this coupled fit uncertified");
+        let checkpoint = match interrupted {
+            EstimationError::FixedLambdaNewtonDidNotConverge { checkpoint, .. } => checkpoint,
+            other => panic!("unexpected interruption error: {other}"),
+        };
+        assert_eq!(
+            checkpoint.stage(),
+            FixedLambdaSolverStage::MultinomialNewton
+        );
+        assert_eq!(checkpoint.completed_iterations(), 1);
+
+        let resumed = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 49,
+            tol: 1.0e-9,
+            resume_from: Some(&checkpoint),
+        })
+        .expect("resumed multinomial solve must converge");
+        let uninterrupted = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+            resume_from: None,
+        })
+        .expect("uninterrupted multinomial solve must converge");
+
+        assert_eq!(resumed.iterations, uninterrupted.iterations);
+        assert_eq!(
+            resumed.coefficients_active,
+            uninterrupted.coefficients_active
+        );
+        assert_eq!(
+            resumed.penalized_neg_log_likelihood,
+            uninterrupted.penalized_neg_log_likelihood,
+        );
+        assert_eq!(
+            resumed.coefficient_covariance,
+            uninterrupted.coefficient_covariance,
+        );
     }
 
     #[test]
@@ -3109,6 +3246,7 @@ mod fisher_override_tests {
             fisher_w_override: Some(bad.view()),
             max_iter: 50,
             tol: 1.0e-9,
+            resume_from: None,
         })
         .expect_err("wrong active-block shape must error");
         assert!(format!("{err}").contains("fisher_w_override shape"));
@@ -3143,6 +3281,7 @@ mod fisher_override_tests {
             fisher_w_override: None,
             max_iter: 50,
             tol: 1.0e-9,
+            resume_from: None,
         })
         .expect("fit must succeed");
         // (1) Covariance shape, finiteness, symmetry.
@@ -3382,6 +3521,7 @@ mod fisher_override_tests {
             fisher_w_override: None,
             max_iter: 80,
             tol: 1.0e-12,
+            resume_from: None,
         })
         .expect("Firth/Jeffreys prior keeps the separated multinomial fit finite (#1854)");
         // Every coefficient is finite — the whole point of the Firth prior on the
@@ -3601,8 +3741,8 @@ mod fisher_override_tests {
                 }
             }
         }
-        let likelihood = MultinomialLogitLikelihood::with_classes(y.ncols())
-            .expect("test class count is valid");
+        let likelihood =
+            MultinomialLogitLikelihood::with_classes(y.ncols()).expect("test class count is valid");
         let scaled = fit_penalized_vector_glm(
             PenalizedVectorGlmInputs {
                 design: design.view(),
@@ -3698,6 +3838,7 @@ mod separation_firth_tests {
             fisher_w_override: None,
             max_iter: 300,
             tol: 1e-10,
+            resume_from: None,
         })
         .expect("separated multinomial must engage Firth and return a fit, not error");
 
@@ -3752,6 +3893,7 @@ mod separation_firth_tests {
             fisher_w_override: None,
             max_iter: 300,
             tol: 1e-10,
+            resume_from: None,
         })
         .expect("separated multinomial must return a Firth fit");
 
@@ -3796,20 +3938,41 @@ mod separation_firth_tests {
             None,
             1, // one Newton iteration — far from the separated mode
             1e-12,
+            None,
         )
         .expect_err("a one-iteration Firth solve must not mint a fit");
-        assert!(matches!(
-            truncated,
+        let checkpoint = match truncated {
             EstimationError::FixedLambdaNewtonDidNotConverge {
-                iterations: 1,
-                penalized_neg_log_likelihood,
+                objective_value,
+                stationarity,
+                checkpoint,
                 ..
-            } if penalized_neg_log_likelihood.is_finite()
-        ));
+            } => {
+                assert!(objective_value.is_finite());
+                assert_eq!(stationarity.kind, FixedLambdaResidualKind::NewtonDecrement);
+                assert_eq!(checkpoint.stage(), FixedLambdaSolverStage::MultinomialFirth);
+                assert_eq!(checkpoint.completed_iterations(), 1);
+                checkpoint
+            }
+            other => panic!("unexpected Firth interruption error: {other}"),
+        };
+
+        let resumed = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 299,
+            tol: 1e-10,
+            resume_from: Some(&checkpoint),
+        })
+        .expect("Firth checkpoint must resume to the certified mode");
 
         // Contrast: with a full budget the same problem does reach stationarity
         // and returns the convergence-only result type.
-        fit_penalized_multinomial_firth_fallback(
+        let uninterrupted = fit_penalized_multinomial_firth_fallback(
             design.view(),
             y.view(),
             penalty.view(),
@@ -3817,8 +3980,22 @@ mod separation_firth_tests {
             None,
             300,
             1e-10,
+            None,
         )
         .expect("Firth fallback must converge under a full budget");
+        assert_eq!(resumed.iterations, uninterrupted.iterations);
+        assert_eq!(
+            resumed.coefficients_active,
+            uninterrupted.coefficients_active
+        );
+        assert_eq!(
+            resumed.penalized_neg_log_likelihood,
+            uninterrupted.penalized_neg_log_likelihood,
+        );
+        assert_eq!(
+            resumed.coefficient_covariance,
+            uninterrupted.coefficient_covariance,
+        );
     }
 }
 

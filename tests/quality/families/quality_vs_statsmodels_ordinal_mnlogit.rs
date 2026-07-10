@@ -195,6 +195,7 @@ fn gam_multinomial_recovers_true_class_simplex() {
         fisher_w_override: None,
         max_iter: 200,
         tol: 1e-10,
+        resume_from: None,
     })
     .expect("gam multinomial fit converges");
     let gam_probs = out.fitted_probabilities; // (N, J)
@@ -533,6 +534,7 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
         fisher_w_override: None,
         max_iter: 300,
         tol: 1e-10,
+        resume_from: None,
     })
     .expect("gam multinomial fit converges on wine train");
     let beta_active = out.coefficients_active; // (P, RJ-1); reference class ≡ 0

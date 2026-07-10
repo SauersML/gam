@@ -4736,6 +4736,138 @@ mod tests {
         assert_eq!(choices[0].basis_kind, SaeAtomBasisKind::EuclideanPatch);
     }
 
+    /// #2238/#2239 — a genuinely CURVED 2-D primary factor (a 2-sphere) must be
+    /// discovered by the fit-entry evidence race as a d=2 sphere chart, not
+    /// pinned to the 1-D circle default. This is the manifold-zoo plateau and
+    /// its fix in one test: the circle chart is a function of longitude alone,
+    /// so it structurally discards latitude and caps the recovery near the
+    /// observed plateau, while the raced sphere chart reconstructs the planted
+    /// factor almost exactly. The race both SELECTS the curved chart (over the
+    /// circle and the flat patch) and, fitted, strictly BEATS the circle-pinned
+    /// recovery — the two claims the companion issues turn on.
+    #[test]
+    fn auto_primary_topology_selects_curved_sphere_and_beats_circle_2238_2239() {
+        use crate::basis::SphereChartEvaluator;
+        use gam_solve::AutoTopologyKind;
+        use ndarray::Array1;
+
+        // Deterministic (lat, lon) grid on the OPEN sphere (poles excluded so no
+        // chart row is degenerate), embedded as the unit 2-sphere in R³.
+        let (n_lat, n_lon) = (12usize, 14usize);
+        let n = n_lat * n_lon;
+        let mut lat = Vec::with_capacity(n);
+        let mut lon = Vec::with_capacity(n);
+        let mut target = Array2::<f64>::zeros((n, 3));
+        for i in 0..n_lat {
+            let theta = -std::f64::consts::FRAC_PI_2
+                + std::f64::consts::PI * (i as f64 + 1.0) / (n_lat as f64 + 1.0);
+            for j in 0..n_lon {
+                let phi = std::f64::consts::TAU * j as f64 / n_lon as f64;
+                let row = i * n_lon + j;
+                target[[row, 0]] = theta.cos() * phi.cos();
+                target[[row, 1]] = theta.cos() * phi.sin();
+                target[[row, 2]] = theta.sin();
+                lat.push(theta);
+                lon.push(phi);
+            }
+        }
+
+        // The primary-atom race (single cluster) must pick the d=2 sphere chart.
+        let labels = vec![0usize; n];
+        let choices = discover_primary_atom_topologies(target.view(), &labels, 1, &[2])
+            .expect("the supported sphere race must produce a winner");
+        assert_eq!(choices.len(), 1);
+        assert_eq!(
+            choices[0].basis_kind,
+            SaeAtomBasisKind::Sphere,
+            "the curved 2-sphere factor must be discovered as a sphere chart, not a circle/patch"
+        );
+        assert_eq!(choices[0].latent_dim, 2, "a sphere is intrinsically 2-D");
+
+        // Reconstruction proof of "beats the circle-pinned recovery": fit the
+        // circle chart (longitude only) and the sphere chart (lat, lon) to the
+        // SAME planted factor through the same REML candidate fitter the race
+        // uses, and compare the explained variance each achieves.
+        let weights = Array1::<f64>::ones(n);
+        let recon_r2 = |spec: &TopologyCandidateSpec| -> f64 {
+            let fit = fit_topology_candidate(spec, target.view(), weights.view())
+                .expect("candidate fit")
+                .fit_handle;
+            let recon = fit.phi.dot(&fit.decoder);
+            let mut means = [0.0_f64; 3];
+            for col in 0..3 {
+                let mut acc = 0.0;
+                for row in 0..n {
+                    acc += target[[row, col]];
+                }
+                means[col] = acc / n as f64;
+            }
+            let (mut ss_res, mut ss_tot) = (0.0_f64, 0.0_f64);
+            for row in 0..n {
+                for col in 0..3 {
+                    let r = target[[row, col]] - recon[[row, col]];
+                    ss_res += r * r;
+                    let c = target[[row, col]] - means[col];
+                    ss_tot += c * c;
+                }
+            }
+            1.0 - ss_res / ss_tot.max(1e-12)
+        };
+
+        let mut circle_coords = Array2::<f64>::zeros((n, 1));
+        for row in 0..n {
+            circle_coords[[row, 0]] = lon[row] / std::f64::consts::TAU;
+        }
+        let circle_spec = TopologyCandidateSpec {
+            kind: AutoTopologyKind::Circle,
+            basis_kind: SaeAtomBasisKind::Periodic,
+            manifold: LatentManifold::Circle { period: 1.0 },
+            latent_dim: 1,
+            evaluator: Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator")),
+            coords: circle_coords,
+        };
+
+        let mut sphere_coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            sphere_coords[[row, 0]] = lat[row];
+            sphere_coords[[row, 1]] = lon[row];
+        }
+        let sphere_spec = TopologyCandidateSpec {
+            kind: AutoTopologyKind::Sphere,
+            basis_kind: SaeAtomBasisKind::Sphere,
+            manifold: LatentManifold::Product(vec![
+                LatentManifold::Interval {
+                    lo: -std::f64::consts::FRAC_PI_2,
+                    hi: std::f64::consts::FRAC_PI_2,
+                },
+                LatentManifold::Circle {
+                    period: std::f64::consts::TAU,
+                },
+            ]),
+            latent_dim: 2,
+            evaluator: Arc::new(SphereChartEvaluator),
+            coords: sphere_coords,
+        };
+
+        let circle_r2 = recon_r2(&circle_spec);
+        let sphere_r2 = recon_r2(&sphere_spec);
+        eprintln!(
+            "[topology-2238] planted 2-sphere R²: circle-pinned={circle_r2:.4} sphere-chart={sphere_r2:.4}"
+        );
+        assert!(
+            sphere_r2 > 0.9,
+            "the discovered sphere chart must recover the planted 2-sphere (R²={sphere_r2:.4})"
+        );
+        assert!(
+            circle_r2 < 0.75,
+            "the 1-D circle default structurally caps the 2-sphere recovery (R²={circle_r2:.4})"
+        );
+        assert!(
+            sphere_r2 > circle_r2 + 0.2,
+            "discovery must strictly beat the circle-pinned recovery (sphere={sphere_r2:.4} vs circle={circle_r2:.4})"
+        );
+    }
+
     /// Deterministic low-discrepancy sequence on `[0, 1)` (van der Corput, base
     /// 2) for RNG-free synthetic birth targets.
     fn vdc(n: usize) -> Vec<f64> {

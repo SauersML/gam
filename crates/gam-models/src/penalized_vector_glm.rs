@@ -68,15 +68,17 @@
 //! enforced by the adapter before it constructs the override view; the engine
 //! consumes whatever block it is given.
 
-use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
-use crate::vector_response::VectorLikelihood;
 use crate::model_types::EstimationError;
-use gam_solve::pirls::dense_block_xtwx;
+use crate::vector_response::VectorLikelihood;
 use faer::Side;
-use opt::{
-    BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge,
+use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
+use gam_problem::{
+    FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage, FixedLambdaStallReason,
+    FixedLambdaStationarityEvidence,
 };
+use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
 use std::convert::Infallible;
 
 /// Base Levenberg–Marquardt ridge as a fraction of the penalized Hessian's
@@ -246,10 +248,51 @@ pub struct VectorGlmStall {
 }
 
 impl VectorGlmStall {
-    /// Penalized negative log-likelihood `−log L + ½ Σ_a λ_a β_aᵀSβ_a` at the
-    /// abandoned iterate — the evidence the typed non-convergence error carries.
-    pub fn penalized_neg_log_likelihood(&self) -> f64 {
-        -self.log_likelihood + self.penalty_term
+    /// Convert this solver checkpoint into the canonical typed fixed-lambda
+    /// non-convergence error. Family adapters supply only the objective stage
+    /// and a human-readable entry-point name; the evidence and resumable
+    /// coefficient state come from the solver that produced the stall.
+    pub fn into_nonconvergence_error(
+        self,
+        stage: FixedLambdaSolverStage,
+        context: impl Into<String>,
+    ) -> Result<EstimationError, EstimationError> {
+        let rows = self.coefficients.nrows();
+        let cols = self.coefficients.ncols();
+        let checkpoint = FixedLambdaCheckpoint::new(
+            stage,
+            self.coefficients.iter().copied().collect(),
+            rows,
+            cols,
+            self.iterations,
+        )
+        .map_err(|reason| {
+            EstimationError::InvalidInput(format!(
+                "fixed-lambda vector-GLM produced an invalid internal checkpoint: {reason}"
+            ))
+        })?;
+        let reason = match self.reason {
+            VectorGlmStallReason::IterationBudgetExhausted => {
+                FixedLambdaStallReason::IterationBudgetExhausted
+            }
+            VectorGlmStallReason::LineSearchExhausted => {
+                FixedLambdaStallReason::LineSearchExhausted
+            }
+            VectorGlmStallReason::PostStepCertificateFailed => {
+                FixedLambdaStallReason::StationarityCertificateFailed
+            }
+        };
+        Ok(EstimationError::FixedLambdaNewtonDidNotConverge {
+            context: context.into(),
+            reason,
+            objective_value: -self.log_likelihood + self.penalty_term,
+            stationarity: FixedLambdaStationarityEvidence {
+                kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                residual: self.gradient_norm,
+                bound: self.gradient_bound,
+            },
+            checkpoint,
+        })
     }
 }
 
@@ -264,18 +307,6 @@ pub enum VectorGlmStallReason {
     /// The small-step gate passed, but the exact score at the accepted iterate
     /// exceeded its curvature-scaled stationarity bound.
     PostStepCertificateFailed,
-}
-
-impl VectorGlmStallReason {
-    pub fn description(self) -> &'static str {
-        match self {
-            Self::IterationBudgetExhausted => "iteration budget exhausted",
-            Self::LineSearchExhausted => "line search exhausted without an accepted descent step",
-            Self::PostStepCertificateFailed => {
-                "post-step first-order stationarity certificate failed"
-            }
-        }
-    }
 }
 
 /// Two-outcome result of the fixed-λ vector-GLM Newton solve. Hard input /
@@ -663,13 +694,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     };
 
     for iter in 0..max_iter {
-        iterations = completed_iterations
-            .checked_add(iter + 1)
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
-                    "{context}: resume checkpoint iteration count overflowed usize"
-                ))
-            })?;
+        iterations = completed_iterations.checked_add(iter + 1).ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "{context}: resume checkpoint iteration count overflowed usize"
+            ))
+        })?;
 
         recompute_eta(&beta, &mut eta);
 
@@ -1002,12 +1031,15 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         class_penalty_metric,
         &mut grad_flat,
     );
-    let final_grad_norm = grad_flat.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let final_grad_norm = grad_flat
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
     let final_max_diag =
         (0..beta_flat_dim).fold(0.0_f64, |acc, i| acc.max(hessian_final[[i, i]].abs()));
-    let final_grad_optimal =
-        final_grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag);
-    if !final_grad_optimal {
+    let final_grad_optimal = final_grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag);
+    if !(small_step_reached && final_grad_optimal) {
         if small_step_reached {
             stall_reason = VectorGlmStallReason::PostStepCertificateFailed;
         }
@@ -1102,10 +1134,18 @@ mod parity_tests {
                     beta[[i, a]] = bt[o][i] - bt[r][i];
                 }
             }
-            let c =
-                weighted_penalty_sum(&beta, s.view(), lambdas.view(), ClassPenaltyMetric::Centered);
-            let d =
-                weighted_penalty_sum(&beta, s.view(), lambdas.view(), ClassPenaltyMetric::Diagonal);
+            let c = weighted_penalty_sum(
+                &beta,
+                s.view(),
+                lambdas.view(),
+                ClassPenaltyMetric::Centered,
+            );
+            let d = weighted_penalty_sum(
+                &beta,
+                s.view(),
+                lambdas.view(),
+                ClassPenaltyMetric::Diagonal,
+            );
             assert!(
                 (c - 0.5 * symmetric).abs() < 1e-12,
                 "ref {r}: Centered penalty {c} must equal ½·symmetric {}",
@@ -1315,6 +1355,7 @@ mod parity_tests {
             fisher_w_override: None,
             max_iter: 100,
             tol: 1.0e-12,
+            resume_from: None,
         })
         .expect("binomial fit must succeed");
         // First-order optimality: ∇F(β̂) = 0 (engine never used this gradient).
@@ -1503,6 +1544,7 @@ mod parity_tests {
             fisher_w_override: None,
             max_iter: 200,
             tol: 1.0e-10,
+            resume_from: None,
         })
         .expect("rank-deficient multinomial fit must NOT crash (#557): the ridge path recovers it");
 

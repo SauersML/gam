@@ -687,10 +687,10 @@ class Model:
         group: str | None = None,
         pairs: Sequence[tuple[Any, Any]] | None = None,
         n: int = 100,
-        level: float = 0.95,
+        level: float | None = None,
         simultaneous: bool = False,
-        n_sim: int = 10_000,
-        seed: int | None = 12345,
+        n_sim: int | None = None,
+        seed: int | None = None,
         marginalise_random: bool = True,
         group_means: bool = True,
         data: Any | None = None,
@@ -724,9 +724,9 @@ class Model:
                 group_arg,
                 pairs_arg,
                 int(n),
-                float(level),
+                float(level) if level is not None else None,
                 bool(simultaneous),
-                int(n_sim),
+                int(n_sim) if n_sim is not None else None,
                 seed_arg,
                 bool(marginalise_random),
                 bool(group_means),
@@ -1251,10 +1251,6 @@ class MultinomialModel:
         return "multinomial"
 
     @property
-    def converged(self) -> bool:
-        return bool(self._metadata["converged"])
-
-    @property
     def deviance(self) -> float:
         return float(self._metadata["deviance"])
 
@@ -1458,7 +1454,7 @@ class MultinomialModel:
             f"  active classes (K-1): {m}",
             f"  coefficients per class (P): {p}",
             f"  total coefficients: {p * m}",
-            f"  iterations: {int(meta['iterations'])}  converged: {bool(meta['converged'])}",
+            f"  iterations: {int(meta['iterations'])}",
             f"  deviance: {float(meta['deviance']):.6g}",
             f"  penalized -log L: {float(meta['penalized_neg_log_likelihood']):.6g}",
         ]
@@ -1511,7 +1507,7 @@ class MultinomialModel:
     def __repr__(self) -> str:
         return (
             f"MultinomialModel(formula={self.formula!r}, "
-            f"classes={self.classes_!r}, converged={self.converged})"
+            f"classes={self.classes_!r})"
         )
 
     def __str__(self) -> str:

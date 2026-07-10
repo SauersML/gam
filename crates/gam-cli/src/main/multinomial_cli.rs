@@ -71,12 +71,11 @@ fn print_multinomial_fit_summary(saved: &MultinomialSavedModel) {
         .unwrap_or("?");
     cli_out!(
         "multinomial fit | classes={} | reference={} | p_per_class={} | iterations={} | \
-         converged={} | deviance={:.6e}",
+         deviance={:.6e}",
         saved.class_levels.len(),
         reference,
         saved.p_per_class,
         saved.iterations,
-        saved.converged,
         saved.deviance,
     );
     if let Some(edf) = saved.edf_per_class.as_ref() {

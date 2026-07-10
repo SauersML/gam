@@ -415,12 +415,12 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
     let corr2 = pearson(&gam_c2, &true_c2);
 
     eprintln!(
-        "multinomial s(x)+s(x,by=group): N={N} K={K} grid={n_grid} converged={} \
+        "multinomial s(x)+s(x,by=group): N={N} K={K} grid={n_grid} \
          gam_truth_rmse={gam_truth_rmse:.5} vgam_truth_rmse={ref_truth_rmse:.5} \
          rel_l2(gam,vgam)={rel_gam_ref:.4} \
          pearson_vs_truth(c0)={corr0:.5} (c1)={corr1:.5} (c2)={corr2:.5} \
          lambdas={:?}",
-        model.converged, model.lambdas
+        model.lambdas
     );
 
     // The truth-recovery target is scored two ways: reference-relative

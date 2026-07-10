@@ -344,12 +344,12 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     let frob_rel_gam_vs_vgam = relative_l2(&gam_flat, vg_flat);
 
     eprintln!(
-        "multinomial s(x1)+s(x2)+x3: N={N} K={K} converged={} iters={} \
+        "multinomial s(x1)+s(x2)+x3: N={N} K={K} iters={} \
          gam_RMSE_vs_truth={gam_err:.5} mgcv_REML_RMSE_vs_truth={mgcv_err:.5} \
          vgam_fixeddf_RMSE_vs_truth(context)={vg_err:.5} \
          row_sum_err={worst_row_sum_err:.2e} min_p={min_entry:.4} max_p={max_entry:.4} \
          frob_rel_gam_vs_vgam(context)={frob_rel_gam_vs_vgam:.4} lambdas={:?}",
-        model.converged, model.iterations, model.lambdas
+        model.iterations, model.lambdas
     );
 
     // ---- assertions: STRUCTURE then TRUTH RECOVERY then MATCH-OR-BEAT ------
@@ -740,11 +740,11 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
     let mgcv_err = rmse(mgcv_flat, &truth_flat_code);
 
     eprintln!(
-        "hetero multinomial s(x1:df8)+s(x2:df2)+x3: N_HETERO={N_HETERO} K={K} converged={} iters={} \
+        "hetero multinomial s(x1:df8)+s(x2:df2)+x3: N_HETERO={N_HETERO} K={K} iters={} \
          gam_RMSE_vs_truth={gam_err:.5} mgcv_select_RMSE_vs_truth={mgcv_err:.5} \
          vgam_fixeddf_RMSE_vs_truth={vg_err:.5} \
          row_sum_err={worst_row_sum_err:.2e} lambdas={:?}",
-        model.converged, model.iterations, model.lambdas
+        model.iterations, model.lambdas
     );
 
     // gam must recover the heterogeneous surface in absolute terms (the bar is
@@ -996,9 +996,8 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
     let fit_elapsed = fit_started.elapsed();
     assert!(
         fit_elapsed.as_secs_f64() <= 120.0,
-        "gam penguins multinomial fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s converged={} iters={} lambdas={:?} train={} test={}",
+        "gam penguins multinomial fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s iters={} lambdas={:?} train={} test={}",
         fit_elapsed.as_secs_f64(),
-        model.converged,
         model.iterations,
         model.lambdas,
         train_rows.len(),
@@ -1118,11 +1117,11 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
 
     eprintln!(
         "penguins species ~ s(bill)+s(flip)+mass held-out: n_train={n_train} n_test={n_test} K={K} \
-         converged={} iters={} gam_acc={gam_acc:.4} gam_logloss={gam_logloss:.4} \
+         iters={} gam_acc={gam_acc:.4} gam_logloss={gam_logloss:.4} \
          vgam_acc={vg_acc:.4} vgam_logloss={vg_logloss:.4} \
          row_sum_err={worst_row_sum_err:.2e} min_p={min_entry:.4} max_p={max_entry:.4} \
          frob_rel_gam_vs_vgam(context)={frob_rel_gam_vs_vgam:.4} lambdas={:?}",
-        model.converged, model.iterations, model.lambdas
+        model.iterations, model.lambdas
     );
 
     // ---- STRUCTURE: simplex closure ----------------------------------------

@@ -51,11 +51,12 @@
 //! the two are interchangeable at the FFI layer: same input arity, same
 //! convergence semantics, same `(N, K)` fitted-probability output.
 
+use crate::model_types::EstimationError;
 use crate::penalized_vector_glm::{
     PenalizedVectorGlmInputs, VectorGlmSolve, fit_penalized_vector_glm,
 };
 use crate::vector_response::VectorLikelihood;
-use crate::model_types::EstimationError;
+use gam_problem::FixedLambdaSolverStage;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 /// Inputs for [`fit_penalized_binomial_multi`].
@@ -341,17 +342,10 @@ pub fn fit_penalized_binomial_multi(
             // SPEC: a fit object must only ever come from a converged
             // optimization. Exhausting `max_iter` is a typed error carrying
             // evidence from the checkpoint, never an `Ok` with a flag.
-            return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
-                context: format!(
-                    "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton): {}; \
-                     final gradient norm {:.3e} against stationarity bound {:.3e}",
-                    stall.reason.description(),
-                    stall.gradient_norm,
-                    stall.gradient_bound,
-                ),
-                iterations: stall.iterations,
-                penalized_neg_log_likelihood: stall.penalized_neg_log_likelihood(),
-            });
+            return Err(stall.into_nonconvergence_error(
+                FixedLambdaSolverStage::BinomialMultiNewton,
+                "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton)",
+            )?);
         }
     };
 
@@ -439,10 +433,12 @@ mod tests {
         assert!(matches!(
             error,
             EstimationError::FixedLambdaNewtonDidNotConverge {
-                iterations: 0,
-                penalized_neg_log_likelihood,
+                objective_value,
+                checkpoint,
                 ..
-            } if penalized_neg_log_likelihood.is_finite()
+            } if objective_value.is_finite()
+                && checkpoint.stage() == FixedLambdaSolverStage::BinomialMultiNewton
+                && checkpoint.completed_iterations() == 0
         ));
     }
 
@@ -521,13 +517,13 @@ mod tests {
         let likelihood = BinomialMultiLikelihood { row_weights: None };
         let scaled = fit_penalized_vector_glm(
             PenalizedVectorGlmInputs {
-            design: design.view(),
-            y: y.view(),
-            penalty: penalty.view(),
-            lambdas: lambdas.view(),
-            fisher_w_override: Some(over.view()),
-            max_iter: 1,
-            tol: 1.0e-9,
+                design: design.view(),
+                y: y.view(),
+                penalty: penalty.view(),
+                lambdas: lambdas.view(),
+                fisher_w_override: Some(over.view()),
+                max_iter: 1,
+                tol: 1.0e-9,
                 class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
                 resume_from: None,
             },
