@@ -4898,33 +4898,6 @@ impl SaeManifoldTerm {
         // atom (`base`/`step_2300`, `r_k == M_k`) is left untouched, so its
         // design, decoder, and REML criterion are byte-for-byte the historical
         // full-`B` path.
-        {
-            let (n_t, p_t) = target.dim();
-            let mut cmin = f64::INFINITY;
-            let mut cmax = 0.0_f64;
-            let mut first = 0.0_f64;
-            let mut last = 0.0_f64;
-            for c in 0..p_t {
-                let mut s = 0.0_f64;
-                for r in 0..n_t {
-                    s += target[[r, c]] * target[[r, c]];
-                }
-                let cn = (s / (n_t as f64)).sqrt();
-                cmin = cmin.min(cn);
-                cmax = cmax.max(cn);
-                if c == 0 {
-                    first = cn;
-                }
-                if c + 1 == p_t {
-                    last = cn;
-                }
-            }
-            eprintln!(
-                "[zz2015entry] n={n_t} p={p_t} colnorm_first={first:.4e} colnorm_last={last:.4e} colnorm_min={cmin:.4e} colnorm_max={cmax:.4e} ratio={:.4e} k_atoms={}",
-                cmax / cmin.max(1e-300),
-                self.k_atoms(),
-            );
-        }
         self.reduce_atoms_to_data_supported_rank()?;
         // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
         // outer loop, auto-derive and install the low-rank Grassmann frames
@@ -5425,7 +5398,6 @@ impl SaeManifoldTerm {
             // whose step application or objective evaluation errors is INVALID
             // (`Ok(None)`), halving without consulting the Armijo test.
             let mut first_trial = true;
-            let mut zz2015_prox_used = false;
             let accepted = descent_direction_ok
                 && backtracking_line_search::<_, String>(
                     BacktrackConfig {
@@ -5457,7 +5429,6 @@ impl SaeManifoldTerm {
                 )?
                 .is_some();
             if !accepted {
-                zz2015_prox_used = true;
                 self.restore_mutable_state(&snapshot)?;
                 let correction = ArrowProximalCorrectionOptions {
                     initial_ridge: ridge_ext_coord
@@ -5634,20 +5605,6 @@ impl SaeManifoldTerm {
                 self.refresh_active_frames_from_data(target, rho)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
-            let zz2015_post_frame = self
-                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                .unwrap_or(f64::INFINITY);
-            let zz2015_loss = self.loss(target, rho).ok();
-            let (zz2015_df, zz2015_sm) = zz2015_loss
-                .as_ref()
-                .map(|l| (l.data_fit, l.smoothness))
-                .unwrap_or((f64::NAN, f64::NAN));
-            eprintln!(
-                "[zz2015] iter={outer_iteration} obj={accepted_total:.6e} post_frame={zz2015_post_frame:.6e} data_fit={zz2015_df:.6e} smooth={zz2015_sm:.6e} ‖g‖={:.4e} ‖Δ‖={:.4e} gᵀΔ={directional_decrease:.4e} prox={zz2015_prox_used} frames={}",
-                grad_norm_sq.sqrt(),
-                step_norm_sq.sqrt(),
-                self.frames_active(),
-            );
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
                 // (the walk's own referee) and, at (near-)equal objective, on the
@@ -5785,19 +5742,7 @@ impl SaeManifoldTerm {
         // hint would always equal the cold LSQ decoder, never the seed). A freeze
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
-        // #2015 — the polish now runs in the frame-active path too. The wide
-        // two-block crosscoder / behavior fit (p ≫ r) routes onto Grassmann
-        // frames by default, and the joint Newton's line-search-damped step
-        // leaves the decoder SCALE under-converged on the ill-conditioned
-        // two-block target (κ ≈ 1e8 from a ~1e4 output-column-scale spread), so
-        // the inner KKT residual crawls and `reml_criterion` refuses at budget.
-        // The closed-form penalized decoder least-squares homes that scale in
-        // one step. It is legal in the frame-active path because
-        // `project_decoders_onto_active_frames` re-projects the refit back into
-        // each atom's FIXED frame span (`B ← (B U) Uᵀ`) — the frame directions
-        // `U_k` are never moved, so no factored-solve desync arises; only the
-        // in-span decoder coordinate (which carries the scale dof) is updated.
-        if max_iter > 0 {
+        if max_iter > 0 && !self.frames_active() {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if best_objective.is_finite() {
@@ -5809,12 +5754,10 @@ impl SaeManifoldTerm {
                     let snapshot = self.snapshot_mutable_state();
                     let round = self
                         .refit_decoder_least_squares_at_current_state(target, Some(rho))
-                        .and_then(|()| self.project_decoders_onto_active_frames())
                         .and_then(|()| self.seed_coords_by_decoder_projection(target))
                         .and_then(|()| {
                             self.refit_decoder_least_squares_at_current_state(target, Some(rho))
                         })
-                        .and_then(|()| self.project_decoders_onto_active_frames())
                         .and_then(|()| {
                             self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
                         });
