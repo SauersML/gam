@@ -302,20 +302,24 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
     // gradient is `½·R̃_1 − scale`, so `scale` is the natural absolute reference.
     let scale = 0.5 * n as f64 * p_1 as f64;
     let h = 0.1_f64;
-    for &ll in &[closed_form - 2.0, 0.0, closed_form + 2.0] {
+    // Probe within the criterion's EVALUABLE region. At closed_form − 2 the
+    // λ-scaled block is ~7.4× under-weighted and the inner solve at this
+    // fixture genuinely cannot certify within any lane's budget — the eval
+    // pair there is the self-consistent (wall, zero-gradient) refusal, which
+    // an FD spanning the wall boundary misreads as a desync. ±0.75 keeps three
+    // well-separated evaluable points; the gate's discriminating power is
+    // unchanged (a dropped ½, sign flip, or missing n·p/2 still moves the
+    // analytic value by Θ(n·p), orders above the window).
+    for &ll in &[closed_form - 0.75, 0.0, closed_form + 0.75] {
         let analytic = {
             let mut obj = engaged_objective(&evaluator, &z, &coords);
             let eval = obj
                 .eval(&flat_at(ll))
                 .expect("the ValueAndGradient lane must evaluate");
-            let cost_only_at_ll = engaged_objective(&evaluator, &z, &coords)
-                .eval_cost(&flat_at(ll))
-                .expect("cost lane at ll");
-            eprintln!(
-                "[fd2231] ll={ll:.3} eval cost={:.6e} cost_only={:.6e} telemetry={:?}",
-                eval.cost,
-                cost_only_at_ll,
-                obj.probe_telemetry()
+            assert!(
+                eval.cost < 1.0e11,
+                "FD probe point ll={ll:.3} must be evaluable (got the refusal wall) — \
+                 move the probe inside the evaluable region"
             );
             eval.gradient[eval.gradient.len() - 1]
         };

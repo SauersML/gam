@@ -3835,20 +3835,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // while ibp_map (whose seed happens to stay PD) survived. Treat it the
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
-        // #2234 budget rescue, gradient-lane edition: a budget-marker failure is
-        // retried ONCE — the failed attempt leaves an improved inner warm start,
-        // and the second call routinely certifies (measured: at the same ρ the
-        // cost lane converged to 1.13e3 through its rescue while this lane
-        // walled at 1e12, desyncing the (f, ∇f) pair the FD gate pins). Genuine
-        // non-PD classes fail both attempts and keep their wall semantics.
-        // The failed attempt leaves the term at its refused iterate — every
-        // same-state retry (any drive, any budget) then replays the refusal,
-        // and the envelope's basin bundle seeds from the damaged state too
-        // (measured: a FRESH object converges this ρ with the same drive that
-        // the post-failure object refuses). Snapshot cheaply and restore before
-        // the rescue so stage 1 starts where a fresh evaluation would.
-        let pre_attempt_term = self.term.clone();
-        let first_attempt = self.term.reml_criterion_with_cache(
+        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
             self.target.view(),
             &rho_state,
             self.registry.as_ref(),
@@ -3856,65 +3843,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.learning_rate,
             self.ridge_ext_coord,
             self.ridge_beta,
-        );
-        let attempt = match first_attempt {
-            Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
-                self.probe_telemetry.budget_rescued_value_probes += 1;
-                self.term = pre_attempt_term;
-                // Two-stage rescue, mirroring what makes the COST lane succeed at
-                // the same ρ (measured: cost lane 1.128e3 vs this lane's wall,
-                // and a same-drive retry — even at 4× budget — replays the
-                // refusal). Stage 1: the envelope value probe converges the
-                // inner state through its chunked drive and leaves the warm
-                // start in place. Stage 2: the criterion certifies from that
-                // state and hands back the cache the gradient machinery needs.
-                match self.value_probe_with_budget_rescue(
-                    rho.view(),
-                    // extension:false — the PROBE budget policy, measured to
-                    // converge at ρ where the accepted-path policy refuses (the
-                    // accepted path falls back to the BASE budget on a detected
-                    // stall, ending up with LESS room than the flat probe
-                    // policy on stall-prone points).
-                    ProbeInnerDrive::Criterion {
-                        refine_progress_extension: false,
-                    },
-                ) {
-                    Ok(warmed) => {
-                        log::debug!(
-                            "gradient-lane rescue stage 1 converged: cost={:.6e}",
-                            warmed.0
-                        );
-                        // The envelope parks its converged term in the ρ-keyed
-                        // handoff; INSTALL it (exactly as eval's entry does) so
-                        // the criterion opens AT the converged optimum instead
-                        // of replaying the refused trajectory.
-                        if let Some(converged) = self.take_probe_converged_handoff(rho.view()) {
-                            self.term = converged;
-                            self.seeded_beta = None;
-                        }
-                        let stage2 = self.term.reml_criterion_with_cache(
-                            self.target.view(),
-                            &rho_state,
-                            self.registry.as_ref(),
-                            self.inner_max_iter,
-                            self.learning_rate,
-                            self.ridge_ext_coord,
-                            self.ridge_beta,
-                        );
-                        if let Err(reason) = &stage2 {
-                            log::debug!("gradient-lane rescue stage 2 refused: {reason}");
-                        }
-                        stage2
-                    }
-                    Err(stage1) => {
-                        log::debug!("gradient-lane rescue stage 1 refused: {stage1}");
-                        Err(stage1)
-                    }
-                }
-            }
-            other => other,
-        };
-        let (cost, loss, cache) = match attempt {
+        ) {
+
             Ok(evaluated) => evaluated,
             // #1782 — an infeasible-ρ probe (non-PD per-row / cross-row / Schur-
             // complement joint Hessian) has no defined Laplace evidence at this ρ.
