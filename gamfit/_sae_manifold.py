@@ -987,6 +987,43 @@ class ManifoldSAE:
             )
         return dict(self.diagnostics["atoms"][k])
 
+    def trust_scores(self, X: Any = None) -> dict[str, Any]:
+        """Assignment-weighted row and per-atom trust scores.
+
+        With ``X=None`` this uses the fitted assignments. Passing the training
+        activation matrix reuses those assignments; any other matrix is encoded
+        by this model's frozen decoder before the scores are assembled. The
+        returned arrays therefore belong only to this explicit model handle and
+        cannot be affected by another fit in the same process.
+        """
+        atom_trust = atom_trust_scores(self.diagnostics)
+        n_atoms = int(atom_trust.shape[0])
+        if X is None:
+            assignments = np.asarray(self.assignments, dtype=float)
+            n_rows = int(assignments.shape[0])
+        else:
+            x = _as_2d_float(X, "X")
+            n_rows = int(x.shape[0])
+            assignments = np.asarray(
+                self.assignments if self._is_training_data(x) else self.encode(x),
+                dtype=float,
+            )
+        if assignments.shape != (n_rows, n_atoms):
+            raise ValueError(
+                "trust score assignments shape mismatch: "
+                f"expected {(n_rows, n_atoms)}, got {assignments.shape}"
+            )
+        row, per_atom = rust_module().sae_row_trust_scores(
+            np.ascontiguousarray(assignments, dtype=np.float64),
+            np.ascontiguousarray(atom_trust, dtype=np.float64),
+        )
+        return {
+            "row": row,
+            "per_atom": per_atom,
+            "atom": atom_trust,
+            "diagnostics": self.diagnostics,
+        }
+
     def curvature(self) -> list[dict[str, Any]]:
         """Per-atom SAE curvature report (#1099, rescoped under #1115).
 
@@ -3854,59 +3891,12 @@ def _schedule_tau_start(schedule: Any, default: float) -> float:
     return default if payload is None else float(payload["tau_start"])
 
 
-_LAST_RESEARCH_LOOP_MODEL: ManifoldSAE | None = None
-
-
 def _default_research_k(n_obs: int) -> int:
     """Choose a conservative atom count for ``fit(activations)``."""
     return max(1, min(int(n_obs) - 1, 8, max(2, int(np.sqrt(max(1, int(n_obs)))))))
 
 
-def _trust_scores(model: ManifoldSAE, activations: np.ndarray | None = None) -> dict[str, Any]:
-    """Per-row and per-atom trust scores derived from atom diagnostics."""
-    atom_trust = atom_trust_scores(model.diagnostics)
-    n_atoms = int(atom_trust.shape[0])
-    if activations is None:
-        assignments = np.asarray(model.assignments, dtype=float)
-        n_rows = int(assignments.shape[0])
-    else:
-        x = _as_2d_float(activations, "activations")
-        n_rows = int(x.shape[0])
-        if model._is_training_data(x):
-            assignments = np.asarray(model.assignments, dtype=float)
-        else:
-            assignments = np.asarray(model.encode(x), dtype=float)
-    if assignments.shape != (n_rows, n_atoms):
-        raise ValueError(
-            "trust score assignments shape mismatch: "
-            f"expected {(n_rows, n_atoms)}, got {assignments.shape}"
-        )
-    row, per_atom = rust_module().sae_row_trust_scores(
-        np.ascontiguousarray(assignments, dtype=np.float64),
-        np.ascontiguousarray(atom_trust, dtype=np.float64),
-    )
-    return {
-        "row": row,
-        "per_atom": per_atom,
-        "atom": atom_trust,
-        "diagnostics": model.diagnostics,
-    }
-
-
-def _research_fit_dict(model: ManifoldSAE, activations: np.ndarray) -> dict[str, Any]:
-    trust = _trust_scores(model, activations)
-    return {
-        "model": model,
-        "atoms": list(model.atoms),
-        "coordinates": [c.copy() for c in model.coords],
-        "assignments": model.assignments.copy(),
-        "trust": trust,
-        "trust_scores": trust["row"].copy(),
-        "summary": model.summary(),
-    }
-
-
-def fit(activations: Any, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def fit(activations: Any, config: Mapping[str, Any] | None = None) -> ManifoldSAE:
     """Fit the recommended SAE-manifold research objective to activations.
 
     Parameters
@@ -3918,35 +3908,17 @@ def fit(activations: Any, config: Mapping[str, Any] | None = None) -> dict[str, 
 
     Returns
     -------
-    dict
-        ``{"model", "atoms", "coordinates", "assignments", "trust",
-        "trust_scores", "summary"}``. ``atoms`` contains typed
-        :class:`SaeManifoldAtomFit` objects, ``coordinates`` is one
-        ``(N, d_k)`` array per atom, and ``trust`` contains row, atom, and
-        assignment-weighted per-row/per-atom scores derived from the fit
-        diagnostics.
+    ManifoldSAE
+        The fitted model handle. Its atoms, coordinates, assignments, summary,
+        and trust diagnostics are available as attributes or methods. Infer
+        coordinates for new activations with ``model.featurize(X)``; every
+        operation is scoped to this returned model.
     """
-    global _LAST_RESEARCH_LOOP_MODEL
     x = _as_2d_float(activations, "activations")
     cfg = {} if config is None else dict(config)
     if "K" not in cfg:
         cfg["K"] = _default_research_k(x.shape[0])
-    model = sae_manifold_fit(x, **cfg)
-    _LAST_RESEARCH_LOOP_MODEL = model
-    return _research_fit_dict(model, x)
-
-
-def featurize(new_activations: Any) -> list[np.ndarray]:
-    """Infer coordinates for new activations with the most recent SAE fit.
-
-    This promotes the existing frozen-decoder out-of-sample coordinate solve
-    to a first-class research-loop function. It returns one ``(N, d_k)`` array
-    per atom in the most recent :func:`fit` result. For explicit model-scoped
-    use, call ``result["model"].featurize(new_activations)``.
-    """
-    if _LAST_RESEARCH_LOOP_MODEL is None:
-        raise RuntimeError("gamfit.featurize requires a prior gamfit.fit(activations, config=...) call")
-    return _LAST_RESEARCH_LOOP_MODEL.featurize(new_activations)
+    return sae_manifold_fit(x, **cfg)
 
 
 def plot(atom: Any, **kwargs: Any) -> Any:
@@ -3958,4 +3930,4 @@ def plot(atom: Any, **kwargs: Any) -> Any:
 
 __all__ = ["GumbelTemperatureSchedule", "ManifoldSAE", "SaeManifoldAtomFit", "SaeManifoldFitResult",
            "gumbel_geometric_schedule", "gumbel_linear_schedule", "gumbel_reciprocal_iter_schedule",
-           "featurize", "fit", "plot", "sae_manifold_fit"]
+           "fit", "plot", "sae_manifold_fit"]

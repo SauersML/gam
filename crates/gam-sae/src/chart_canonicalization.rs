@@ -1126,8 +1126,8 @@ pub fn chart_arclength_coordinates(
 }
 
 /// State of the flow objective at one `θ`: the defect, the profiled scale,
-/// and the per-row flow Jacobians `A_i = Dφ_θ(t_i)` (row-major
-/// `[a00, a01, a10, a11]`) the Gauss–Newton rows are built from.
+/// and the per-row (possibly reference-whitened) flow Jacobians `A_i`
+/// (row-major `[a00, a01, a10, a11]`) the Gauss--Newton rows are built from.
 struct FlowObjectiveState {
     defect: f64,
     scale: f64,
@@ -1147,9 +1147,8 @@ struct LmTrustStep {
     step_norm_sq: f64,
 }
 
-/// The shared Levenberg–Marquardt damped-accept trust step for both `d = 2`
-/// flow cores (the analytic torus Gauss–Newton and the FD sphere-boost
-/// Gauss–Newton). Given the current normal-equation blocks (`JᵀJ`, `Jᵀr`) it
+/// The shared Levenberg–Marquardt damped-accept trust step for the analytic
+/// `d = 2` flow cores. Given the current normal-equation blocks (`JᵀJ`, `Jᵀr`) it
 /// escalates the damping `λ` until it finds a fold-free strict-descent
 /// candidate or exhausts [`TORUS_FLOW_GN_MAX_REJECTS`] rejections:
 ///
@@ -1231,14 +1230,11 @@ fn lm_damped_accept_sweep(
 /// [`torus_isometry_flow_reparameterization`] for the derivation). Returns
 /// `None` when the profiled scale degenerates (`c ≤ 0` or non-finite).
 ///
-/// `row_base` is the per-row whitened identity `A0_i` (row-major
+/// `row_base` is the per-row base `A0_i` (row-major
 /// `[a00, a01, a10, a11]`) the flow modes are added on top of: the effective
-/// whitened Jacobian is `Ã_i = A0_i + Σ_k θ_k W_{ik}`. The torus/free-patch
-/// families pass `A0_i = I` (the flat reference whitens to the identity); the
-/// sphere passes the reference Cholesky `A0_i = L_i = diag(1, cos lat_i)` and
-/// pre-scales each mode `grad` by `L_i`'s diagonal, so the SAME flat-residual
-/// core measures the round-sphere isometry defect `Ã_iᵀ Ã_i − s·G_i` exactly
-/// (see [`sphere_isometry_flow_reparameterization`] for the whitening proof).
+/// Jacobian is `A_i = A0_i + Σ_k θ_k W_{ik}`. The torus/free-patch families
+/// pass `A0_i = I`. The sphere has moved-point reference whitening and therefore
+/// uses its own exact evaluator/Jacobian below.
 fn evaluate_flow_defect(
     theta: &[f64],
     row_modes: &[Vec<FlowModeSample>],
@@ -2318,36 +2314,29 @@ pub struct SphereIsometryFlowReparameterization {
 /// Dφ_iᵀ g_ref,i Dφ_i = Ã_iᵀ Ã_i ,
 /// ```
 ///
-/// the residual `R_i = Ã_iᵀ Ã_i − s · Ĝ_i` is **exactly the flat-reference
-/// residual** the torus / patch Gauss–Newton core already minimizes — only the
-/// per-row base changes. At the identity flow `Dφ = I`, `Ã_i = L(lat_i) =
-/// diag(1, cos lat_i)`, so the shared core is driven with the per-row base
-/// `A0_i = diag(1, cos lat_i)` (flattened `[1, 0, 0, cos lat_i]`) and the boost
-/// modes pre-scaled by `L`: a boost displacement adding `δ` to coordinate
-/// component `a` contributes `L_i[a]·δ` to row `a` of `Ã`. Both boost
-/// components of each `θ_k` are folded into the base+mode accumulation, so the
-/// sphere assembles its own per-row `A_i` and Gauss–Newton system here (the
-/// three boosts each move BOTH components, unlike the single-component
-/// `FlowModeSample` contract), reusing the residual algebra and the damped,
-/// fold-guarded accept test in spirit; the profiled scale `s` and the analytic
-/// `svec` Gauss–Newton are identical to the torus derivation.
+/// the residual `R_i = Ã_iᵀ Ã_i − s · Ĝ_i` is the same symmetric-metric
+/// residual used by the flat-reference arms. At the identity flow `Dφ = I`,
+/// `Ã_i = L(lat_i) = diag(1, cos lat_i)`. Away from identity, both factors in
+/// `Ã_i = L(φ_θ(t_i))Dφ_θ(t_i)` are evaluated at the current `θ`; the sphere
+/// therefore assembles its own exact residual and analytic Gauss--Newton
+/// Jacobian (the boost modes move both coordinate components, unlike the
+/// single-component `FlowModeSample` contract).
 ///
-/// Whitening by `L(φ(t_i))` (the reference at the MOVED point) rather than
-/// `L(lat_i)` targets the true round-sphere defect of the new chart. Note the
-/// honest limit: `L(φ_θ(t_i))` is itself re-evaluated at the flow-moved latitude,
-/// so the Gauss–Newton residual actually descended equals the true defect only to
-/// FIRST ORDER in the step `θ` — for a non-infinitesimal step the two differ by an
-/// un-audited second-order term (the derivation's `svec` Jacobian treats the base
-/// `A0_i` as fixed, not re-differentiating `L(φ_θ)`). This does NOT make the pass
-/// incorrect, only its per-iterate objective an approximation of the quantity the
-/// derivation above names "exact": the deviation is caught SYMPTOMATICALLY, not
-/// analytically — the post-hoc defect re-measurement on the committed chart
-/// ([`sphere_chart_isometry_defect`], which evaluates `L` at the final moved point
-/// exactly) together with the strict-improvement gate reject any candidate that
-/// did not genuinely lower the true defect, so a committed chart is
-/// improved-or-refused even where the inner objective drifted. A fully exact inner
-/// objective would re-differentiate `L(φ_θ)` through the flow (a second-order
-/// correction), which is deliberately not done here.
+/// For boost `k`, write `V_ik = Dv_k(t_i)`, `u_ik = v_k(t_i)_lat`, moved
+/// latitude `ℓ̃_i = φ_θ(t_i)_lat`, and `D_i = Dφ_θ(t_i)`. The complete chain is
+///
+/// ```text
+/// ∂D_i/∂θ_k = V_ik,
+/// ∂L_i/∂θ_k = diag(0, −sin(ℓ̃_i) u_ik),
+/// ∂Ã_i/∂θ_k = (∂L_i/∂θ_k) D_i + L_i V_ik,
+/// ∂(Ã_iᵀÃ_i)/∂θ_k = (∂Ã_i/∂θ_k)ᵀÃ_i + Ã_iᵀ(∂Ã_i/∂θ_k).
+/// ```
+///
+/// The global scale `s(θ)` is profiled exactly. Its derivative projects each
+/// metric differential off the stacked `Ĝ` direction, so the residual Jacobian
+/// is `J = (I − ĝ ĝᵀ / ‖ĝ‖²) D_θ svec(ÃᵀÃ)`. Consequently the moved-latitude
+/// whitening, metric product, and profiled scale all participate analytically
+/// in the LM system; only the tests use finite differences as an audit oracle.
 ///
 /// # Honest refusals (`Ok(None)`)
 ///
@@ -2418,9 +2407,8 @@ pub fn sphere_isometry_flow_reparameterization(
     }
 
     // ── Damped Gauss–Newton over the 3 boost coefficients ───────────────────
-    let q = 3usize;
     let Some(minimization) =
-        sphere_minimize_boost_defect(&ghat, ghat_norm_sq, row_coords, q, lat_lo, lat_hi)
+        sphere_minimize_boost_defect(&ghat, ghat_norm_sq, row_coords, lat_lo, lat_hi)
     else {
         return Ok(None);
     };
@@ -2491,6 +2479,67 @@ struct SphereFlowMinimization {
     defect_final: f64,
 }
 
+/// Whitened sphere-flow Jacobian `Ã = L(φ_θ(t))Dφ_θ(t)` and its exact
+/// derivatives with respect to the `[Z, X, Y]` boost coefficients.
+///
+/// The derivative includes both the linear flow-Jacobian term and the
+/// moved-latitude whitening term:
+/// `∂Ã_k = L Dv_k + diag(0, -sin(lat̃) v_k,lat) Dφ`.
+fn sphere_whitened_boost_row(
+    theta: &[f64],
+    t: [f64; 2],
+) -> Option<([f64; 4], [[f64; 4]; 3])> {
+    let q = SphereBoostFlowBasis.dim();
+    if theta.len() != q {
+        return None;
+    }
+    let displacements = SphereBoostFlowBasis::mode_displacements(t);
+    let mode_jacobians = SphereBoostFlowBasis::mode_jacobians(t);
+    let mut dphi = [[1.0_f64, 0.0], [0.0, 1.0]];
+    let mut moved_lat = t[0];
+    for k in 0..q {
+        moved_lat += theta[k] * displacements[k][0];
+        let dv = mode_jacobians[k];
+        dphi[0][0] += theta[k] * dv[0][0];
+        dphi[0][1] += theta[k] * dv[0][1];
+        dphi[1][0] += theta[k] * dv[1][0];
+        dphi[1][1] += theta[k] * dv[1][1];
+    }
+
+    let (sin_lat_new, cos_lat_new) = moved_lat.sin_cos();
+    // Mirror the pole floor in `sphere_chart_isometry_defect`: at smaller
+    // `|cos(lat̃)|`, the longitudinal whitening row has no reliable metric
+    // content and the chart is honestly outside this coordinate patch.
+    const SPHERE_EVAL_COS_FLOOR: f64 = 1.0e-6;
+    if !(cos_lat_new.is_finite() && cos_lat_new > SPHERE_EVAL_COS_FLOOR) {
+        return None;
+    }
+
+    let a = [
+        dphi[0][0],
+        dphi[0][1],
+        cos_lat_new * dphi[1][0],
+        cos_lat_new * dphi[1][1],
+    ];
+    let mut da = [[0.0_f64; 4]; 3];
+    for k in 0..q {
+        let dv = mode_jacobians[k];
+        let dcos = -sin_lat_new * displacements[k][0];
+        da[k] = [
+            dv[0][0],
+            dv[0][1],
+            dcos * dphi[1][0] + cos_lat_new * dv[1][0],
+            dcos * dphi[1][1] + cos_lat_new * dv[1][1],
+        ];
+    }
+    if !a.iter().all(|value| value.is_finite())
+        || !da.iter().flatten().all(|value| value.is_finite())
+    {
+        return None;
+    }
+    Some((a, da))
+}
+
 /// Per-row whitened flow Jacobian `Ã_i = L(φ(t_i)) · Dφ_θ(t_i)` (row-major
 /// `[a00, a01, a10, a11]`) and the round-sphere defect at `θ`.
 ///
@@ -2510,34 +2559,7 @@ fn sphere_eval_boost_defect(
     let mut cross = 0.0_f64;
     for row in 0..n {
         let t = [row_coords[[row, 0]], row_coords[[row, 1]]];
-        let jac = SphereBoostFlowBasis::mode_jacobians(t);
-        // Dφ = I + Σ θ_k Dv_k.
-        let mut dphi = [[1.0_f64, 0.0], [0.0, 1.0]];
-        for (k, dv) in jac.iter().enumerate() {
-            dphi[0][0] += theta[k] * dv[0][0];
-            dphi[0][1] += theta[k] * dv[0][1];
-            dphi[1][0] += theta[k] * dv[1][0];
-            dphi[1][1] += theta[k] * dv[1][1];
-        }
-        // Whiten by L(lat̃) at the moved latitude.
-        let mapped = SphereBoostFlowBasis::map_point(theta, t);
-        let cos_lat_new = mapped[0].cos();
-        // Guard against the `1/cos lat` singularity in the lon component of the
-        // whitened Jacobian `Ã = L(lat̃)·Dφ`.  `cos(π/2)` in f64 is ~6.1e-17, not
-        // exactly 0, so a bare `> 0.0` lets a pole-adjacent row through and then
-        // multiplies `dphi[1, .]` by an effectively-zero factor, corrupting `Ã` and
-        // the GN system.  Mirror the floor used in `sphere_chart_isometry_defect`
-        // (`POLE_COS2_FLOOR = 1e-12` on cos²lat ↔ `|cos lat| > 1e-6`).
-        const SPHERE_EVAL_COS_FLOOR: f64 = 1.0e-6;
-        if !(cos_lat_new.is_finite() && cos_lat_new > SPHERE_EVAL_COS_FLOOR) {
-            return None;
-        }
-        let a = [
-            dphi[0][0],
-            dphi[0][1],
-            cos_lat_new * dphi[1][0],
-            cos_lat_new * dphi[1][1],
-        ];
+        let (a, _da) = sphere_whitened_boost_row(theta, t)?;
         a_rows.push(a);
     }
     for (a, g) in a_rows.iter().zip(ghat.iter()) {
@@ -2570,85 +2592,114 @@ fn sphere_eval_boost_defect(
     })
 }
 
-/// Damped Gauss–Newton on the 3 sphere conformal-boost coefficients. The
-/// residual `svec(Ã_iᵀÃ_i − s·Ĝ_i)` and its `θ`-Jacobian are formed by central
-/// finite differences of the whitened per-row `Ã_i` (the whitening composes the
-/// boost Jacobian with the moved-latitude `cos`, so an analytic `∂Ã/∂θ` is a
-/// chain rule the FD evaluates exactly to step order) — the SAME Levenberg
-/// damping + strict-descent + diffeomorphism accept test as the torus / patch
-/// core. Starts at `θ = 0` (`Dφ = I`); only fold-free strict-descent candidates
-/// are accepted. Returns `None` (honest skip) when the identity chart is already
+/// Exact profiled residual and analytic Jacobian for the sphere boost flow.
+///
+/// If `m_i = svec(Ã_iᵀÃ_i)` and `g_i = svec(Ĝ_i)`, the profiled scale is
+/// `s = (Σ g_iᵀm_i) / (Σ g_iᵀg_i)`. Therefore
+///
+/// ```text
+/// ds/dθ_k = Σ_i g_iᵀ dm_i/dθ_k / ‖g‖²,
+/// dr_i/dθ_k = dm_i/dθ_k − (ds/dθ_k) g_i.
+/// ```
+///
+/// The subtraction is load-bearing even though it cancels from `Jᵀr` by the
+/// envelope condition: it changes `JᵀJ`, and hence the LM chart selected by the
+/// profiled objective.
+fn sphere_boost_residual_jacobian(
+    theta: &[f64],
+    row_coords: ArrayView2<'_, f64>,
+    ghat: &[[f64; 3]],
+    ghat_norm_sq: f64,
+    state: &FlowObjectiveState,
+) -> Option<(Array2<f64>, Array2<f64>)> {
+    let n = row_coords.nrows();
+    let q = SphereBoostFlowBasis.dim();
+    if theta.len() != q
+        || row_coords.ncols() != 2
+        || ghat.len() != n
+        || state.a_rows.len() != n
+        || !(ghat_norm_sq.is_finite() && ghat_norm_sq > 0.0 && state.scale.is_finite())
+    {
+        return None;
+    }
+
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let mut residual = Array2::<f64>::zeros((3 * n, 1));
+    let mut jacobian = Array2::<f64>::zeros((3 * n, q));
+    let mut scale_gradient = vec![0.0_f64; q];
+
+    for row in 0..n {
+        let t = [row_coords[[row, 0]], row_coords[[row, 1]]];
+        let (a, da) = sphere_whitened_boost_row(theta, t)?;
+        let g = ghat[row];
+        let m00 = a[0] * a[0] + a[2] * a[2];
+        let m11 = a[1] * a[1] + a[3] * a[3];
+        let m01 = a[0] * a[1] + a[2] * a[3];
+        residual[[3 * row, 0]] = m00 - state.scale * g[0];
+        residual[[3 * row + 1, 0]] = m11 - state.scale * g[1];
+        residual[[3 * row + 2, 0]] = sqrt2 * (m01 - state.scale * g[2]);
+
+        for k in 0..q {
+            let b = da[k];
+            let dm00 = 2.0 * (a[0] * b[0] + a[2] * b[2]);
+            let dm11 = 2.0 * (a[1] * b[1] + a[3] * b[3]);
+            let dm01 = b[0] * a[1] + a[0] * b[1] + b[2] * a[3] + a[2] * b[3];
+            jacobian[[3 * row, k]] = dm00;
+            jacobian[[3 * row + 1, k]] = dm11;
+            jacobian[[3 * row + 2, k]] = sqrt2 * dm01;
+            scale_gradient[k] += dm00 * g[0] + dm11 * g[1] + 2.0 * dm01 * g[2];
+        }
+    }
+
+    for k in 0..q {
+        scale_gradient[k] /= ghat_norm_sq;
+        for row in 0..n {
+            let g = ghat[row];
+            jacobian[[3 * row, k]] -= scale_gradient[k] * g[0];
+            jacobian[[3 * row + 1, k]] -= scale_gradient[k] * g[1];
+            jacobian[[3 * row + 2, k]] -= sqrt2 * scale_gradient[k] * g[2];
+        }
+    }
+
+    if residual.iter().all(|value| value.is_finite())
+        && jacobian.iter().all(|value| value.is_finite())
+    {
+        Some((residual, jacobian))
+    } else {
+        None
+    }
+}
+
+/// Damped Gauss--Newton on the three sphere conformal-boost coefficients. The
+/// residual `svec(Ã_iᵀÃ_i − s·Ĝ_i)` and its `θ`-Jacobian are analytic through
+/// the boost, moved-latitude whitening, metric product, and profiled scale (see
+/// [`sphere_boost_residual_jacobian`]). The Levenberg damping, strict-descent
+/// gate, and diffeomorphism accept test match the torus / patch core. Starts at
+/// `θ = 0` (`Dφ = I`); only fold-free strict-descent candidates are accepted.
+/// Returns `None` (honest skip) when the identity chart is already
 /// round-isometric or no strict improvement is reachable.
 fn sphere_minimize_boost_defect(
     ghat: &[[f64; 3]],
     ghat_norm_sq: f64,
     row_coords: ArrayView2<'_, f64>,
-    q: usize,
     lat_lo: f64,
     lat_hi: f64,
 ) -> Option<SphereFlowMinimization> {
-    let n = row_coords.nrows();
+    let q = SphereBoostFlowBasis.dim();
     let mut theta = vec![0.0_f64; q];
     let mut state = sphere_eval_boost_defect(&theta, row_coords, ghat, ghat_norm_sq)?;
     let defect_initial = state.defect;
     if !(defect_initial > 0.0) {
         return None;
     }
-    let sqrt2 = std::f64::consts::SQRT_2;
-    // FD-OK: FD-audit certificate of the analytic chart-mode Jacobian (central-difference residual Jacobian for the GN flow)
-    let fd_h = 1.0e-6_f64; // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
     let mut lambda = 1.0e-4_f64;
     let mut any_accepted = false;
     for iteration in 0..TORUS_FLOW_GN_MAX_ITERS {
         if iteration + 1 == TORUS_FLOW_GN_MAX_ITERS {
             break;
         }
-        // Residual r(θ) = svec(Ã_iᵀÃ_i − s·Ĝ_i), and its θ-Jacobian by central
-        // FD of the whitened per-row residual (scale s held at its profiled
-        // value — envelope theorem, exactly as the analytic torus core).
-        let mut jmat = Array2::<f64>::zeros((3 * n, q));
-        let mut rcol = Array2::<f64>::zeros((3 * n, 1));
-        let scale = state.scale;
-        for (i, (a, g)) in state.a_rows.iter().zip(ghat.iter()).enumerate() {
-            let m00 = a[0] * a[0] + a[2] * a[2];
-            let m11 = a[1] * a[1] + a[3] * a[3];
-            let m01 = a[0] * a[1] + a[2] * a[3];
-            rcol[[3 * i, 0]] = m00 - scale * g[0];
-            rcol[[3 * i + 1, 0]] = m11 - scale * g[1];
-            rcol[[3 * i + 2, 0]] = sqrt2 * (m01 - scale * g[2]);
-        }
-        for k in 0..q {
-            let mut tp = theta.clone();
-            let mut tm = theta.clone();
-            tp[k] += fd_h; // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
-            tm[k] -= fd_h; // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
-            let sp = sphere_eval_boost_defect(&tp, row_coords, ghat, ghat_norm_sq);
-            let sm = sphere_eval_boost_defect(&tm, row_coords, ghat, ghat_norm_sq);
-            let (Some(sp), Some(sm)) = (sp, sm) else {
-                // A perturbation left the valid band — abandon this GN step.
-                return if any_accepted {
-                    Some(SphereFlowMinimization {
-                        theta,
-                        defect_initial,
-                        defect_final: state.defect,
-                    })
-                } else {
-                    None
-                };
-            };
-            for (i, (ap, am)) in sp.a_rows.iter().zip(sm.a_rows.iter()).enumerate() {
-                let mp00 = ap[0] * ap[0] + ap[2] * ap[2] - scale * ghat[i][0];
-                let mp11 = ap[1] * ap[1] + ap[3] * ap[3] - scale * ghat[i][1];
-                let mp01 = ap[0] * ap[1] + ap[2] * ap[3] - scale * ghat[i][2];
-                let mm00 = am[0] * am[0] + am[2] * am[2] - scale * ghat[i][0];
-                let mm11 = am[1] * am[1] + am[3] * am[3] - scale * ghat[i][1];
-                let mm01 = am[0] * am[1] + am[2] * am[3] - scale * ghat[i][2];
-                jmat[[3 * i, k]] = (mp00 - mm00) / (2.0 * fd_h); // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
-                jmat[[3 * i + 1, k]] = (mp11 - mm11) / (2.0 * fd_h); // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
-                jmat[[3 * i + 2, k]] = sqrt2 * (mp01 - mm01) / (2.0 * fd_h); // fd-ok: FD Jacobian for sphere-boost Gauss-Newton; analytic Jacobian requires per-row product differentials, FD bounded by convergence guard
-            }
-        }
-        // END-FD-OK
+        let (rcol, jmat) =
+            sphere_boost_residual_jacobian(&theta, row_coords, ghat, ghat_norm_sq, &state)?;
         let jtj = fast_ata(&jmat);
         let jtr = fast_atb(&jmat, &rcol);
 

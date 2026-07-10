@@ -2408,133 +2408,6 @@ fn prescan_isotropic_spatial_range_seed(
     Ok(overrides)
 }
 
-/// Fractions of each isotropic term's data-derived ψ window used as joint-solve
-/// restart seeds in the #1688 multistart rescue. They run from the long-range
-/// (stiff) corner at `0.0` through the short-range (flexible) corner at `1.0`,
-/// deliberately spanning BOTH local basins of the multimodal `[ρ, ψ]` REML
-/// surface so a restart lands in the global basin regardless of which side the
-/// auto-seed stranded the primary solve on. Five points keep the rare-trigger
-/// cost bounded while guaranteeing a seed in the long-range half (which the
-/// profiled-REML pre-scan systematically under-ranks for the roughest kernels).
-const JOINT_RESTART_WINDOW_FRACTIONS: [f64; 5] = [0.0, 0.2, 0.45, 0.7, 1.0];
-
-/// #1688 joint-solve multistart from a single ψ-window fraction.
-///
-/// Re-seeds every isotropic spatial term's length scale to `ℓ = exp(−ψ)` at the
-/// requested `fraction` of its data-derived ψ window, then runs the FULL
-/// baseline → freeze → joint `[ρ, ψ]` sequence at that geometry and returns the
-/// realized result with its certified REML score. This is the same machinery the
-/// primary path runs — only the seed differs — so a candidate it returns is a
-/// genuine production fit, never a heuristic stand-in.
-///
-/// Returns `Ok(None)` only when the seed geometry is non-constructible (e.g. a
-/// baseline fit that errors at an extreme range, or no free length scale after
-/// the freeze-time basis promotion); callers treat that as "this restart point
-/// is infeasible, skip it" rather than failing the fit. When the joint refine
-/// itself yields no usable candidate, the seed's frozen baseline geometry is a
-/// valid κ-optimized result (ρ profiled at the fixed seeded κ) and is returned.
-fn joint_solve_from_window_fraction(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    base_spec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-    fraction: f64,
-    family: &LikelihoodSpec,
-    options: &FitOptions,
-    baseline_options: &FitOptions,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<Option<(FittedTermCollectionWithSpec, f64)>, EstimationError> {
-    let mut seed_spec = base_spec.clone();
-    let mut any_set = false;
-    for &term_idx in spatial_terms {
-        if get_spatial_length_scale(&seed_spec, term_idx).is_none() {
-            continue;
-        }
-        let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, &seed_spec, term_idx, kappa_options);
-        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo {
-            continue;
-        }
-        let psi = psi_lo + (psi_hi - psi_lo) * fraction;
-        let ls = (-psi).exp();
-        if !ls.is_finite() || ls <= 0.0 {
-            continue;
-        }
-        if set_spatial_length_scale(&mut seed_spec, term_idx, ls).is_ok() {
-            any_set = true;
-        }
-    }
-    if !any_set {
-        return Ok(None);
-    }
-    // Baseline at the seeded geometry: this both supplies the joint solver's ρ
-    // seed / frozen-baseline fallback AND becomes the returned candidate if the
-    // joint refine is unavailable. A non-constructible seed geometry is skipped.
-    let seed_best = match fit_term_collection_forspec(
-        data,
-        y,
-        weights,
-        offset,
-        &seed_spec,
-        family.clone(),
-        baseline_options,
-    ) {
-        Ok(fit) => fit,
-        Err(_) => return Ok(None),
-    };
-    let seed_spec = freeze_term_collection_from_design(&seed_spec, &seed_best.design)?;
-    // The freeze can promote ThinPlate → pure Duchon (no free length scale);
-    // refresh the eligible-term list exactly as the primary path does.
-    let seed_terms = spatial_length_scale_term_indices(&seed_spec);
-    if seed_terms.is_empty() {
-        let score = fit_score(&seed_best.fit);
-        return Ok(Some((
-            FittedTermCollectionWithSpec {
-                fit: seed_best.fit,
-                design: seed_best.design,
-                resolvedspec: seed_spec,
-                adaptive_diagnostics: seed_best.adaptive_diagnostics,
-                kappa_timing: None,
-            },
-            score,
-        )));
-    }
-    let joint = try_exact_joint_spatial_length_scale_optimization(
-        data,
-        y,
-        weights,
-        offset,
-        &seed_spec,
-        &seed_best,
-        family.clone(),
-        options,
-        kappa_options,
-        &seed_terms,
-    )?;
-    match joint {
-        Some(fit) => {
-            let score = fit_score(&fit.fit);
-            Ok(Some((fit, score)))
-        }
-        // Joint refine unavailable for this seed; its frozen baseline geometry
-        // is itself a valid κ-optimized fit, so return that as the candidate.
-        None => {
-            let score = fit_score(&seed_best.fit);
-            Ok(Some((
-                FittedTermCollectionWithSpec {
-                    fit: seed_best.fit,
-                    design: seed_best.design,
-                    resolvedspec: seed_spec,
-                    adaptive_diagnostics: seed_best.adaptive_diagnostics,
-                    kappa_timing: None,
-                },
-                score,
-            )))
-        }
-    }
-}
-
 fn try_exact_joint_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2893,7 +2766,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     } else {
         SpatialHyperKind::Isotropic
     };
-    let (outcome, kappa_timing) = run_exact_joint_spatial_optimization(
+    let (theta_star, joint_final_value, kappa_timing) = run_exact_joint_spatial_optimization(
         kind,
         data,
         y,
@@ -2914,137 +2787,18 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let baseline_score = fit_score(&best.fit);
 
-    // The joint κ optimizer is a refinement on top of the frozen baseline
-    // geometry, never a precondition for a fit. There are two ways its candidate
-    // is not adopted, and both keep the baseline rather than aborting:
-    //   1. it ran to a finite cost but did not certify a stationary point
-    //      (`NonConverged`) — the formula/FFI path's tight outer tolerance can
-    //      leave the optimizer mid-descent at the iteration cap where the CLI's
-    //      looser tolerance converges (#1126); and
-    //   2. it converged to a candidate whose certified cost worsens the profiled
-    //      score (the gate below).
-    let (theta_star, joint_final_value) = match outcome {
-        SpatialJointOutcome::Optimized {
-            theta_star,
-            final_value,
-        } => (theta_star, final_value),
-        SpatialJointOutcome::NonConverged {
-            iterations,
-            final_value,
-            final_grad_norm,
-        } => {
-            if has_constant_curvature_term {
-                log::info!(
-                    "[#1464-trace] joint solve NONCONVERGED (iters={iterations}, \
-                     final_value={final_value}); returning FROZEN BASELINE geometry \
-                     (κ̂ = spec default, NOT the joint candidate)"
-                );
-            }
-            log::info!(
-                "[spatial-kappa] joint spatial optimization did not converge \
-                 (iterations={}, final_objective={:.6e}, final_grad_norm={}); \
-                 keeping the frozen baseline geometry",
-                iterations,
-                final_value,
-                final_grad_norm.map_or_else(|| "n/a".to_string(), |g| format!("{g:.3e}")),
-            );
-            let baseline = fit_frozen_baseline_geometry(
-                data,
-                y,
-                weights,
-                offset,
-                resolvedspec,
-                best,
-                family.clone(),
-                options,
-                baseline_score,
-                Some(kappa_timing),
-            )?;
-            // #2122: a stalled joint solve must NEVER silently ship a mean-only
-            // surface. The frozen baseline keeps the SPEC-DEFAULT range; when that
-            // range is far longer than this frame's own distance scale the Matérn
-            // kernel columns go nearly collinear with their polynomial nullspace
-            // and REML shrinks the whole smooth onto its intercept — the fit
-            // reports success but predicts the response mean (thinplate/duchon,
-            // which carry no enrolled kernel-range hyperparameter and so never
-            // stall, recover the identical signal on the same frame). Detect that
-            // collapse on the REALIZED baseline (EDF below the null floor) and
-            // only then retreat to a DATA-ADAPTIVE geometry whose kernel range is
-            // re-centered on the data's pairwise-distance scale (the geometric
-            // mean of the admissible kernel-range window — the same data-scaled
-            // length scale a robust GP prior centers on, and the geometry
-            // thinplate effectively uses), refitting λ from scratch there. Adopt
-            // it only when it recovers materially more effective DOF, so a
-            // non-degenerate stalled fit (e.g. the #1126 tight-tolerance stall) is
-            // byte-identical to before.
-            let baseline_edf = baseline.fit.inference.as_ref().map(|inf| inf.edf_total);
-            if let Some(base_edf) = baseline_edf
-                && base_edf < SPATIAL_COLLAPSE_EDF_FLOOR
-                && let Some(adaptive) = fit_data_adaptive_geometry(
-                    data,
-                    y,
-                    weights,
-                    offset,
-                    resolvedspec,
-                    spatial_terms,
-                    &dims_per_term,
-                    &theta0,
-                    &lower,
-                    &upper,
-                    rho_dim,
-                    family,
-                    options,
-                    baseline_score,
-                    Some(kappa_timing),
-                )?
-            {
-                let adaptive_edf = adaptive.fit.inference.as_ref().map(|inf| inf.edf_total);
-                if let Some(adapt_edf) = adaptive_edf
-                    && adapt_edf >= base_edf + SPATIAL_COLLAPSE_EDF_MARGIN
-                {
-                    log::info!(
-                        "[spatial-kappa] #2122 stalled joint solve collapsed the frozen \
-                         baseline (edf={base_edf:.3}); data-adaptive geometry recovers \
-                         edf={adapt_edf:.3} — shipping the data-adaptive fit"
-                    );
-                    return Ok(Some(adaptive));
-                }
-            }
-            return Ok(Some(baseline));
-        }
-    };
-
     // Compare the joint optimizer's certified cost (final_value at theta*)
     // against the baseline. Tolerance ≥ options.tol because both endpoints
     // are outer-BFGS approximations accurate to options.tol; a tighter
     // gate would reject true improvements due to floating-point noise.
     let accept_tol = options.tol.max(1e-8 * baseline_score.abs()).max(1e-12);
     if joint_final_value > baseline_score + accept_tol {
-        if has_constant_curvature_term {
-            log::info!(
-                "[#1464-trace] joint candidate WORSENED score (joint={joint_final_value}, \
-                 baseline={baseline_score}); returning FROZEN BASELINE geometry \
-                 (κ̂ = spec default, NOT the joint candidate)"
-            );
-        }
-        log::info!(
-            "[spatial-kappa] exact joint spatial candidate worsened the profiled score (joint={:.6e}, baseline={:.6e}, tol={:.2e}); keeping the frozen baseline geometry",
-            joint_final_value,
-            baseline_score,
-            accept_tol,
-        );
-        return Ok(Some(fit_frozen_baseline_geometry(
-            data,
-            y,
-            weights,
-            offset,
-            resolvedspec,
-            best,
-            family,
-            options,
-            baseline_score,
-            Some(kappa_timing),
-        )?));
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "exact joint spatial optimization failed its objective-monotonicity certificate: \
+             initial={baseline_score:.6e}, final={joint_final_value:.6e}, \
+             acceptance_tolerance={accept_tol:.3e}, theta_checkpoint={:?}",
+            theta_star.to_vec(),
+        )));
     }
 
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
@@ -3240,99 +2994,6 @@ fn fit_frozen_baseline_geometry(
         adaptive_diagnostics: baseline.adaptive_diagnostics,
         kappa_timing,
     })
-}
-
-/// #2122: data-adaptive retreat geometry for a STALLED joint spatial solve.
-///
-/// This is the safety net that stops a non-converged joint κ/range solve from
-/// silently shipping a mean-only surface. The frozen baseline
-/// (`fit_frozen_baseline_geometry`) keeps the SPEC-DEFAULT length scale; on a
-/// frame whose distance scale is far shorter than that default, the Matérn
-/// kernel columns collapse into their polynomial nullspace and REML shrinks the
-/// smooth onto its intercept (the fit succeeds but predicts the response mean).
-///
-/// This builds a geometry whose every plain spatial length-scale term (Matérn /
-/// hybrid; NOT constant-curvature κ, NOT measure-jet dials) is re-centered at
-/// the MIDPOINT of its data-derived ψ window `[ψ_lo, ψ_hi]` — i.e. the geometric
-/// mean `√(r_min·r_max / (min_frac·max_mult))` of the admissible kernel-range
-/// interval, the same data-scaled length scale a robust GP length-scale prior
-/// centers on and the informative range thinplate/duchon effectively use.
-/// Constant-curvature and measure-jet ψ coordinates carry non-log-scale
-/// semantics (signed κ / geometry dials) and are left at their seed values, so
-/// `apply_tospec` writes them back unchanged. λ is re-derived from scratch at the
-/// new geometry (`best`'s λ belong to the spec-default range and would
-/// mis-warm-start it).
-///
-/// The ψ window bounds are read back from the flat outer-optimizer seed/bound
-/// vectors the joint solve already computed, so no distance pass is repeated.
-/// Returns `Ok(None)` when no term is eligible for a length-scale override, so
-/// the caller keeps the frozen baseline unchanged.
-fn fit_data_adaptive_geometry(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    spatial_terms: &[usize],
-    dims_per_term: &[usize],
-    theta_seed: &Array1<f64>,
-    theta_lower: &Array1<f64>,
-    theta_upper: &Array1<f64>,
-    rho_dim: usize,
-    family: LikelihoodSpec,
-    options: &FitOptions,
-    baseline_score: f64,
-    kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
-) -> Result<Option<FittedTermCollectionWithSpec>, EstimationError> {
-    let dims = dims_per_term.to_vec();
-    let seed = SpatialLogKappaCoords::from_theta_tail_with_dims(theta_seed, rho_dim, dims.clone());
-    let lower = SpatialLogKappaCoords::from_theta_tail_with_dims(theta_lower, rho_dim, dims.clone());
-    let upper = SpatialLogKappaCoords::from_theta_tail_with_dims(theta_upper, rho_dim, dims.clone());
-
-    let mut values = seed.as_array().clone();
-    let mut cursor = 0usize;
-    let mut any_override = false;
-    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-        let d = dims[slot];
-        // Only plain spatial length-scale terms get a data-centered range.
-        // Constant-curvature κ (sign-basin logic) and measure-jet dials carry
-        // non-log-scale ψ coordinates and are left at their seed values.
-        let is_length_scale_term = constant_curvature_term_spec(resolvedspec, term_idx).is_none()
-            && measure_jet_term_spec(resolvedspec, term_idx).is_none();
-        if is_length_scale_term {
-            for off in 0..d {
-                let lo = lower.as_array()[cursor + off];
-                let hi = upper.as_array()[cursor + off];
-                if lo.is_finite() && hi.is_finite() && lo < hi {
-                    values[cursor + off] = 0.5 * (lo + hi);
-                    any_override = true;
-                }
-            }
-        }
-        cursor += d;
-    }
-    if !any_override {
-        return Ok(None);
-    }
-    let coords = SpatialLogKappaCoords::new_with_dims(values, dims);
-    let adaptive_spec = coords.apply_tospec(resolvedspec, spatial_terms)?;
-    let adaptive =
-        fit_term_collection_forspec(data, y, weights, offset, &adaptive_spec, family, options)?;
-    // Stamp the certified baseline REML score, exactly as the frozen-baseline
-    // path does: this fit is the graceful-degradation target chosen because the
-    // joint solve stalled, so the outer `require_successful_spatial_optimization_result`
-    // gate (which compares against `fit_score(&best.fit)` = `baseline_score`) must
-    // not read a same-geometry-class re-derivation drift as "the optimizer made
-    // the score worse" and abort an otherwise-valid recovered fit.
-    let mut fit = adaptive.fit;
-    fit.reml_score = baseline_score;
-    Ok(Some(FittedTermCollectionWithSpec {
-        fit,
-        design: adaptive.design,
-        resolvedspec: adaptive_spec,
-        adaptive_diagnostics: adaptive.adaptive_diagnostics,
-        kappa_timing,
-    }))
 }
 
 /// Coordinate kind for the exact joint spatial hyperparameter optimizer.
@@ -4150,33 +3811,6 @@ impl<'d> SpatialJointContext<'d> {
 /// NOT a gauge direction — it controls the identifiable isotropic scale
 /// κ = exp(ψ̄). The isotropic kind carries one log-κ coordinate per term. In
 /// neither case is a sum-to-zero constraint enforced during optimization.
-/// Outcome of the joint spatial hyperparameter `(ρ, ψ/κ)` optimization.
-///
-/// The joint κ optimizer refines an *already-valid* frozen baseline geometry
-/// (the REML-seeded length scales in `best`); it is therefore best-effort. A run
-/// that does not certify a stationary point must degrade to the baseline rather
-/// than abort the parent fit (#1126), so this enum lets the caller distinguish a
-/// usable iterate from a non-convergence that should fall back to the baseline.
-/// Genuine numerical blowups (a non-finite terminal cost) still surface as
-/// `Err` from [`run_exact_joint_spatial_optimization`] and never reach here.
-enum SpatialJointOutcome {
-    /// The optimizer produced a usable iterate: it either converged to a
-    /// stationary point or its terminal iterate cleared the mgcv-style
-    /// relative-to-cost REML acceptance gate. Carries `(θ*, final_value)`.
-    Optimized {
-        theta_star: Array1<f64>,
-        final_value: f64,
-    },
-    /// The optimizer ran to a finite terminal cost but neither converged nor
-    /// cleared the relative-to-cost gate. The caller keeps the frozen baseline
-    /// geometry; the fields are diagnostics only.
-    NonConverged {
-        iterations: usize,
-        final_value: f64,
-        final_grad_norm: Option<f64>,
-    },
-}
-
 fn kphase_log_norms(theta: &Array1<f64>, rho_dim: usize) -> (f64, f64) {
     let theta_norm = theta.iter().map(|v| v * v).sum::<f64>().sqrt();
     let log_kappa_norm = theta
@@ -4205,7 +3839,14 @@ fn run_exact_joint_spatial_optimization(
     upper: &Array1<f64>,
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<(SpatialJointOutcome, SpatialLengthScaleOptimizationTiming), EstimationError> {
+) -> Result<
+    (
+        Array1<f64>,
+        f64,
+        SpatialLengthScaleOptimizationTiming,
+    ),
+    EstimationError,
+> {
     let label = kind.label();
     // Use bounds and design metadata for validation.
     assert!(
@@ -4519,88 +4160,6 @@ fn run_exact_joint_spatial_optimization(
              attachment so value, gradient, and Hessian remain on the same exact streamed \
              objective"
         );
-    }
-
-    // ── Discriminating outer-gradient FD audit (issue #1040 / #944 merge gate) ──
-    //
-    // At θ₀, central-difference the outer criterion component-by-component and
-    // compare it to the analytic outer gradient that drives this single-block
-    // joint optimizer. This forks the two failure modes of a non-terminating
-    // outer loop — an objective↔gradient DESYNC (analytic ≠ FD) vs weak
-    // identifiability (analytic ≈ FD but a near-singular outer Hessian) — and is
-    // the standing merge gate for any design-moving ψ-coordinate, including the
-    // #944 raw-κ constant-curvature coordinate (labelled `psi_kappa[..]`).
-    //
-    // Gated strictly to diagnostic-sized problems (auto-derived from the
-    // realized (n, θ_dim), no flag) so it never taxes a production fit. The
-    // same gate the n-block driver uses.
-    //
-    // #1688: the audit's whole output is a logged verdict (`log_verdict`,
-    // below) — it never feeds the optimizer — yet it costs `1 + 2·theta_dim`
-    // extra full REML evaluations (one `ValueGradientHessian` plus a central
-    // pair of `ValueOnly` per coordinate). On the common small spatial fit
-    // (n≤4000, the gate ceiling) that is a real fraction of total fit time
-    // spent purely to produce a diagnostic that is suppressed at the default
-    // `Warn` verbosity anyway. So additionally gate on `Info` being enabled:
-    // the gradient-FD-audit regression tests install an `Info` logger and keep
-    // exercising it; an ordinary production fit at the quiet default skips the
-    // extra evals entirely.
-    // FD-OK: FD-audit of the analytic outer gradient (small-problem gate, never feeds the optimizer)
-    const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    let n_total = data.nrows();
-    let outer_fd_audit_eligible = log::log_enabled!(log::Level::Info) // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        && analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        && n_total <= OUTER_FD_AUDIT_MAX_N // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    log::info!(
-        "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} \
-         analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
-         theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
-    );
-    if outer_fd_audit_eligible {
-        // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        let audit = (|| -> Result<gam_solve::rho_optimizer::OuterGradientFdAudit, String> {
-            let mut eval_at = |theta: &Array1<f64>,
-                               mode: gam_solve::estimate::reml::reml_outer_engine::EvalMode|
-             -> Result<
-                (
-                    f64,
-                    Array1<f64>,
-                    gam_problem::HessianValue,
-                ),
-                String,
-            > {
-                use gam_solve::estimate::reml::reml_outer_engine::EvalMode;
-                let order = if matches!(mode, EvalMode::ValueGradientHessian) {
-                    OuterEvalOrder::ValueGradientHessian
-                } else {
-                    OuterEvalOrder::Value
-                };
-                ctx.eval_full(theta, order, analytic_outer_hessian_available)
-                    .map_err(|e| format!("fd-audit eval_full: {e}"))
-            };
-            let rho_dim_audit = rho_dim;
-            let label_fn = move |i: usize| -> String {
-                if i < rho_dim_audit {
-                    format!("rho[{i}]")
-                } else {
-                    format!("psi_kappa[{}]", i - rho_dim_audit)
-                }
-            };
-            gam_solve::rho_optimizer::outer_gradient_fd_audit(
-                // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-                theta0,
-                1e-4,
-                label_fn,
-                &mut eval_at,
-            )
-        })();
-        // END-FD-OK
-        match audit {
-            Ok(audit) => audit.log_verdict("spatial-exact-joint"),
-            Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
-        }
     }
 
     let kphase_prime_order = if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
@@ -4985,51 +4544,20 @@ fn run_exact_joint_spatial_optimization(
                 options.tol,
                 result.final_value.abs(),
             );
-        } else if result.final_value.is_finite() {
-            // The joint κ optimizer is a *refinement* layered on top of an
-            // always-valid frozen baseline geometry (the REML-seeded length
-            // scales in `best`); a run that hits the iteration cap without
-            // certifying a stationary point — and without clearing the
-            // relative-to-cost gate above — must degrade to that baseline, not
-            // abort the parent fit. The `gam` CLI fits this exact data (#1126):
-            // its looser outer tolerance (`tol=1e-6`) lets this same optimizer
-            // converge in ≤80 iters, whereas the formula/FFI path's tightened
-            // `tol=1e-10` (the #893 replication-invariance tolerance) leaves it
-            // mid-descent at the cap. Loosening the tolerance would weaken that
-            // invariant for every fit; instead we report the non-convergence and
-            // let the caller keep the baseline. The terminal cost is finite, so
-            // the iterate is well-defined — this is ordinary slow convergence,
-            // not a numerical blowup.
-            log::warn!(
-                "[{}] {} did not converge after {} iterations \
-                 (final_objective={:.6e}, final_grad_norm={}); keeping the \
-                 frozen baseline geometry instead of aborting the fit.",
-                label,
-                kind.adjective(),
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm_report(),
-            );
-            return Ok((
-                SpatialJointOutcome::NonConverged {
-                    iterations: result.iterations,
-                    final_value: result.final_value,
-                    final_grad_norm: result.final_grad_norm,
-                },
-                timing,
-            ));
         } else {
-            // A non-finite terminal cost is a genuine numerical blowup (NaN/inf
-            // propagating through the gradient/Hessian wiring), not the ordinary
-            // slow convergence handled above — surface it rather than masking a
-            // real defect behind the baseline fallback.
-            crate::bail_invalid_estim!(
-                "{} analytic optimization diverged after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-                kind.adjective(),
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm_report(),
-            );
+            return Err(EstimationError::RemlDidNotConverge {
+                context: label.to_string(),
+                reason: if result.final_value.is_finite() {
+                    "analytic projected-gradient stationarity certificate failed".to_string()
+                } else {
+                    "analytic objective diverged to a non-finite value".to_string()
+                },
+                iterations: result.iterations,
+                final_value: result.final_value,
+                projected_grad_norm: result.final_grad_norm,
+                stationarity_bound: rel_to_cost_threshold,
+                rho_checkpoint: result.rho.to_vec(),
+            });
         }
     }
     log::trace!(
@@ -5043,13 +4571,7 @@ fn run_exact_joint_spatial_optimization(
     // optimization. For the anisotropic kind the decomposition into (ψ̄, η)
     // happens later in apply_tospec.
     let theta_star = result.rho;
-    Ok((
-        SpatialJointOutcome::Optimized {
-            theta_star,
-            final_value: result.final_value,
-        },
-        timing,
-    ))
+    Ok((theta_star, result.final_value, timing))
 }
 
 /// Apply a length scale to a single `SmoothTermSpec` (independent of any

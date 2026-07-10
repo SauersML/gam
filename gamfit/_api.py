@@ -3213,9 +3213,11 @@ def gaussian_reml_optimize_latent(
     basis exactly as in :func:`gaussian_reml_fit_latent`; the spectral seed is
     affinely mapped onto the span of ``centers`` so it lands where ``Φ`` is
     well-conditioned. The result also carries ``"grad_t_norm"``,
-    ``"grad_t_norm_init"``, ``"grad_t_norm_scaled"``, ``"converged"``,
-    ``"objective_value"``, ``"n_restarts"``, and ``"init"`` diagnostics.
-    ``"converged"`` is decided from ``"grad_t_norm_scaled"`` -- the *relative*
+    ``"grad_t_norm_init"``, ``"grad_t_norm_scaled"``, ``"objective_value"``,
+    ``"n_restarts"``, and ``"init"`` diagnostics. A separate convergence flag
+    is unnecessary: returning a fit is itself the convergence certificate.
+
+    Convergence is decided from ``"grad_t_norm_scaled"`` -- the *relative*
     latent-gradient stationarity measure
     ``‖∇ₜ f(t̂)‖ / max(‖∇ₜ f(t₀)‖, 1)`` (``"grad_t_norm"`` divided by
     ``max("grad_t_norm_init", 1)``) -- rather than the raw ``"grad_t_norm"``,
@@ -3226,6 +3228,16 @@ def gaussian_reml_optimize_latent(
     shift ``f → f + C`` of the objective -- unlike the earlier
     ``‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)``, whose ``max(|f|, 1)`` denominator a large
     additive constant could inflate into a false convergence (issue #954).
+
+    A fit is only ever returned from a *converged* optimization (SPEC rule 20).
+    If the relative stationarity measure does not reach ``grad_tol`` within the
+    iteration budget, this raises :class:`gamfit.RemlConvergenceError` instead
+    of returning a degraded payload. The exception carries the evidence as
+    attributes (``grad_t_norm``, ``grad_t_norm_init``, ``grad_t_norm_scaled``,
+    ``grad_tol``, ``latent_t_std``, ``objective_value``, ``max_iter``,
+    ``n_restarts``, ``init``) plus ``checkpoint_t`` -- the best latent found,
+    shape ``(n_obs, latent_dim)`` -- so the caller can resume the same solve
+    via ``t=exc.checkpoint_t, init="caller"`` with a larger ``max_iter``.
     """
     import numpy as np
 

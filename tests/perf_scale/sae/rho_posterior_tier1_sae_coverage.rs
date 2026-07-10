@@ -258,6 +258,27 @@ fn mean_width(var: &Array2<f64>, zcrit: f64) -> f64 {
         / var.len() as f64
 }
 
+/// Test-only curvature oracle for the SAE objective, which deliberately
+/// declares its production Hessian unavailable. Production inference must not
+/// manufacture derivatives numerically; this central difference exists only
+/// to construct the proposal used by this coverage test.
+fn scalar_hessian_from_exact_gradient(
+    objective: &mut dyn OuterObjective,
+    rho_hat: f64,
+) -> Result<f64, EstimationError> {
+    let step = 1.0e-4 * rho_hat.abs().max(1.0);
+    let plus = objective.eval(&Array1::from_vec(vec![rho_hat + step]))?;
+    let minus = objective.eval(&Array1::from_vec(vec![rho_hat - step]))?;
+    if plus.gradient.len() != 1 || minus.gradient.len() != 1 {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "test curvature oracle expected scalar gradients, got {} and {}",
+            plus.gradient.len(),
+            minus.gradient.len(),
+        )));
+    }
+    Ok((plus.gradient[0] - minus.gradient[0]) / (2.0 * step))
+}
+
 #[test]
 fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
     let (theta, z) = planted_data();
@@ -282,12 +303,12 @@ fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
         objective: &mut hessian_objective,
         fixed_rho: rho_hat.clone(),
     };
-    let outer_hessian = gam::inference::rho_posterior::rho_hessian_from_profiled_exact_gradient(
+    let outer_hessian = scalar_hessian_from_exact_gradient(
         &mut smooth_hessian_objective,
-        &rho_hat_smooth,
+        rho_hat_smooth[0],
     )
     .expect("smooth-rho Hessian from exact gradients");
-    let proposal_precision = outer_hessian[[0, 0]].abs().max(100.0);
+    let proposal_precision = outer_hessian.abs().max(100.0);
     let proposal_hessian = Array2::from_shape_vec((1, 1), vec![proposal_precision]).unwrap();
 
     let mut quad_objective = build_objective(&theta, &z);

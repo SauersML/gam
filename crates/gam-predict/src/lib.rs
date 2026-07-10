@@ -1948,8 +1948,9 @@ where
 /// a symmetric band gets the Gamma's width right but its right-skew wrong, so
 /// each tail is badly mis-covered even when total coverage lands near nominal
 /// (#817). The Gaussian identity-link arm widens on the η scale directly with
-/// the residual SD. Returns `(None, None)` for families without a closed-form
-/// conditional response variance (`RoystonParmar`).
+/// the residual SD. The **Royston–Parmar** arm treats the fresh observation as
+/// the discrete horizon indicator `1{T > t}` (Bernoulli with `P(Y=1) = E[S(t)]`),
+/// sharing the Binomial predictive-set arm.
 ///
 /// For a bounded or half-bounded response (a count, a positive value, a
 /// proportion) the symmetric band crosses the support edge for a small/extreme
@@ -1964,9 +1965,9 @@ where
 ///
 /// Per-row conditional response (observation-noise) variance `Var(Y | μ)` on the
 /// response scale, the same per-family definition [`family_observation_band`]
-/// folds into its predictive band. Returns `None` for families without a
-/// closed-form conditional variance (`RoystonParmar`), exactly mirroring the
-/// band's `(None, None)` arm.
+/// folds into its predictive band. Every response family has an arm; `None`
+/// only occurs when a required dispersion hint (`observation_phi` /
+/// `observation_theta`) is unavailable from the fit.
 ///
 /// This is the noise term a *prediction* interval on `Y` must carry in addition
 /// to the epistemic mean SE: the conformal auto-route normalizes its
@@ -2089,13 +2090,17 @@ where
                 |(i, &mu)| ((mu * (1.0 - mu) - v(i)).max(0.0)) / (1.0 + phi),
             )))
         }
-        ResponseFamily::Binomial => Some(Array1::from_iter(mean.iter().enumerate().map(
-            |(i, &mu)| {
+        // Royston–Parmar's response-scale prediction is the survival probability
+        // S(t) = exp(−exp η) at the requested horizon, so a fresh observation is
+        // the Bernoulli indicator 1{T > t} with conditional variance S(1−S) —
+        // the Binomial law of total variance below with μ = S: E[S(1−S)] =
+        // m(1−m) − v, and total predictive variance exactly m(1−m).
+        ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
+            Some(Array1::from_iter(mean.iter().enumerate().map(|(i, &mu)| {
                 let p = mu.clamp(0.0, 1.0);
                 (p * (1.0 - p) - v(i)).max(0.0)
-            },
-        ))),
-        ResponseFamily::RoystonParmar => None,
+            })))
+        }
     }
 }
 
@@ -2335,7 +2340,12 @@ where
                 beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
         }
-        ResponseFamily::Binomial => {
+        ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
+            // Royston–Parmar reports the survival probability S(t) at the
+            // requested horizon, so its fresh observation is the Bernoulli
+            // indicator 1{T > t} with marginal predictive P(Y = 1) = E[S] = m —
+            // the identical discrete predictive set as the Binomial arm.
+            //
             // A new Bernoulli observation is DISCRETE on {0, 1}: a continuous
             // Gaussian band on the probability scale can contain neither
             // support point (p = 0.5, no parameter uncertainty: the 50% band
@@ -2357,7 +2367,6 @@ where
             }
             (Some(lower), Some(upper))
         }
-        ResponseFamily::RoystonParmar => (None, None),
     }
 }
 
@@ -2388,7 +2397,9 @@ where
 /// family's natural units (NB θ, Gamma ν, Beta φ, Tweedie φ — already reciprocated
 /// for Tweedie by the caller). Returns `(None, None)` for the Gaussian/binomial
 /// location-scale families (their band is genuinely symmetric, handled by the
-/// symmetric driver) and for `RoystonParmar`.
+/// symmetric driver); `RoystonParmar` never carries a second dispersion block,
+/// so it cannot reach this two-block driver (its band lives in
+/// [`family_observation_band`]).
 pub(crate) fn family_observation_band_per_row(
     response: &ResponseFamily,
     mean: &Array1<f64>,
@@ -2429,8 +2440,8 @@ pub(crate) fn family_observation_band_per_row(
             })
         }
         // Gaussian/binomial location-scale bands are genuinely symmetric (the
-        // symmetric driver is correct); RoystonParmar has no closed-form
-        // conditional response variance.
+        // symmetric driver is correct); RoystonParmar never has a second
+        // dispersion block, so it cannot reach this two-block driver.
         _ => return (None, None),
     };
 
@@ -2990,10 +3001,12 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     // observation band uses. Normalizing by the mean SE alone (which omits the
     // response-noise term and, for a smooth fit, is far smaller than the noise
     // SD and varies several-fold across x) injects spurious heteroscedasticity
-    // and under-covers `Y` in the data-dense interior (#1054). When the family
-    // exposes no closed-form conditional variance (`RoystonParmar`) we fall back
-    // to the mean SE — the only available scale — which is exactly the prior
-    // behavior for that family.
+    // and under-covers `Y` in the data-dense interior (#1054). For
+    // Royston–Parmar the fresh response is the horizon indicator `1{T > t}`,
+    // so the conditional variance is the Bernoulli `S(t)(1−S(t))` and the
+    // predictive SE is exactly `√(m(1−m))` by the law of total variance —
+    // never the epistemic mean SE, which measures estimation error of `S(t)`,
+    // not outcome spread.
     let cal_scale = predictive_standard_error(
         family,
         &cal_result.mean,
@@ -3017,8 +3030,10 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
 
 /// Predictive (observation-scale) standard error `√(SE(μ̂)² + Var(Y|μ))` per row,
 /// the spread of a fresh response the conformal prediction interval must cover.
-/// Falls back to the epistemic mean SE when the family has no closed-form
-/// conditional response variance ([`family_response_variance`] returns `None`).
+/// Falls back to the epistemic mean SE only when the fit exposes no dispersion
+/// hint for the family ([`family_response_variance`] returns `None`); split
+/// conformal retains its marginal coverage guarantee under any positive scale,
+/// so that degrade costs interval locality, never validity.
 fn predictive_standard_error<S>(
     family: &LikelihoodSpec,
     mean: &Array1<f64>,
@@ -5549,5 +5564,78 @@ mod tests {
         let z1 = multi_point_joint_z(0.95, 1).unwrap();
         let z_baseline = standard_normal_quantile(0.5 + 0.5 * 0.95).unwrap();
         assert!((z1 - z_baseline).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn posterior_mean_backend_mismatch_is_a_typed_error_not_a_plugin_fallback() {
+        // The stored 2x2 covariance cannot serve a 3-dimensional posterior-mean
+        // integral: the mismatch must surface as a typed error naming the
+        // rejected source, never degrade to a plug-in point prediction.
+        let fit = test_fit_with_covariance(array![1.0, 2.0], Array2::eye(2));
+        let err = require_posterior_mean_backend(&fit, None, 3, "test posterior mean")
+            .expect_err("mismatched covariance must be a typed error");
+        let message = err.to_string();
+        assert!(
+            message.contains("rejected") && message.contains("2x2"),
+            "error must carry the rejected source diagnosis, got: {message}"
+        );
+
+        // A matching covariance is accepted.
+        let backend = require_posterior_mean_backend(&fit, None, 2, "test posterior mean")
+            .expect("matching covariance must be accepted");
+        assert_eq!(backend.nrows(), 2);
+    }
+
+    #[test]
+    fn royston_parmar_conformal_scale_is_the_bernoulli_predictive_sd() {
+        // A fresh Royston–Parmar observation at horizon t is the indicator
+        // 1{T > t}; by the law of total variance its predictive variance is
+        // exactly m(1−m) at posterior mean survival m, regardless of how the
+        // total splits between epistemic SE and conditional Bernoulli noise.
+        let fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        let family = LikelihoodSpec::royston_parmar();
+        let mean = array![0.2, 0.5, 0.9];
+        let mean_se = array![0.05, 0.1, 0.02];
+        let scale = predictive_standard_error(&family, &mean, &mean_se, &fit);
+        for i in 0..mean.len() {
+            let expected = (mean[i] * (1.0 - mean[i])).sqrt();
+            assert!(
+                (scale[i] - expected).abs() < 1e-12,
+                "row {i}: conformal scale {} must be the Bernoulli predictive SD {expected}",
+                scale[i]
+            );
+            assert!(
+                scale[i] > mean_se[i],
+                "row {i}: outcome spread must exceed the epistemic mean SE alone"
+            );
+        }
+    }
+
+    #[test]
+    fn royston_parmar_observation_band_is_the_discrete_indicator_set() {
+        // The horizon indicator is supported on {0, 1}; its equal-tailed
+        // predictive set at central 95% is [0, 1] for interior survival
+        // probabilities and collapses to a single support point in the tails.
+        let fit = test_fit_with_covariance(array![0.0], Array2::eye(1));
+        let n = 3;
+        let mean = array![0.5, 0.999, 0.001];
+        let z = standard_normal_quantile(0.975).unwrap();
+        let z_per_row = Array1::from_elem(n, z);
+        let (lower, upper) = family_observation_band(
+            &ResponseFamily::RoystonParmar,
+            &Array1::zeros(n),
+            &Array1::zeros(n),
+            &mean,
+            &Array1::from_elem(n, 0.01),
+            &z_per_row,
+            &z_per_row,
+            &fit,
+            None,
+        );
+        let lower = lower.expect("RoystonParmar must produce an observation band");
+        let upper = upper.expect("RoystonParmar must produce an observation band");
+        assert_eq!((lower[0], upper[0]), (0.0, 1.0), "interior m covers both support points");
+        assert_eq!((lower[1], upper[1]), (1.0, 1.0), "near-certain survival collapses to {{1}}");
+        assert_eq!((lower[2], upper[2]), (0.0, 0.0), "near-certain event collapses to {{0}}");
     }
 }

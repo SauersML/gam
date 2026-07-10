@@ -317,12 +317,21 @@ pub(crate) fn materialize_standard<'a>(
         })
     });
 
+    // Borrow the caller's projected matrix for the ordinary path. Latent
+    // coordinates create an augmented matrix locally, so move that one owned
+    // allocation behind a shared handle instead of cloning it into the
+    // request. Either representation is clone-cheap for iterative estimators.
+    let request_data = match latent_dataset {
+        Some(dataset) => StandardFitData::shared(dataset.values),
+        None => StandardFitData::borrowed(data.values.view()),
+    };
+
     Ok(MaterializedModel {
         request: FitRequest::Standard(StandardFitRequest {
-            data: term_data.values.clone(),
-            y,
-            weights,
-            offset,
+            data: request_data,
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            offset: Arc::new(offset),
             spec,
             family,
             estimate_tweedie_p,
@@ -332,7 +341,6 @@ pub(crate) fn materialize_standard<'a>(
             coefficient_groups: config.coefficient_groups.clone(),
             penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),
             latent_coord,
-            _marker: std::marker::PhantomData,
         }),
         inference_notes,
     })

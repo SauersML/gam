@@ -51,7 +51,7 @@ from ._reml import (
 )
 
 FitMode = Literal["joint", "independent", "auto"]
-ShapeConstrainedSmooth = BSpline | Duchon
+ShapeConstrainedSmooth = BSpline
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +154,35 @@ def _bspline_penalty_np(knots_np: Any, degree: int, order: int, periodic: bool) 
         knots_np, degree=int(degree), order=int(order),
     )
     return penalty_np
+
+
+def _resolve_bspline_knots_for_fit(
+    smooth: BSpline, points_1d: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Resolve the knot vector shared by design, penalty, and shape cone."""
+    knots_spec = smooth.knots
+    if knots_spec is None or isinstance(knots_spec, int):
+        # Auto-knot placement and small-sample degree reduction belong to Rust.
+        # Resolve through that authority so every downstream object uses the
+        # same realized spline chart.
+        from .._api import _resolve_knots
+
+        resolved = _resolve_knots(
+            knots_spec,
+            points_1d.detach().cpu().to(torch.float64).numpy(),
+            label="knots",
+            degree=smooth.degree,
+        )
+        return (
+            torch.as_tensor(
+                resolved.locations, dtype=torch.float64, device=points_1d.device,
+            ),
+            int(resolved.order),
+        )
+    return (
+        _to_tensor(knots_spec, points_1d).reshape(-1).to(torch.float64),
+        int(smooth.degree),
+    )
 
 
 def _marginal_bspline_design_penalty(

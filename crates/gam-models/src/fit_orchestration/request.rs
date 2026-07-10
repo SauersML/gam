@@ -22,11 +22,63 @@ pub struct StandardBinomialWiggleConfig {
     pub refit_options: BlockwiseFitOptions,
 }
 
+/// Clone-cheap training-matrix backing for a standard fit.
+///
+/// Ordinary formula fits borrow the projected [`Dataset`] matrix all the way
+/// through fitting. A latent-coordinate fit has to augment that matrix during
+/// materialization, so it moves the augmented allocation into an [`Arc`]. In
+/// both cases cloning this handle aliases the same storage; outer estimators
+/// such as expectile LAWS can therefore issue repeated fit requests without
+/// copying the complete `n x p` dataset on every iteration.
+#[derive(Clone)]
+pub enum StandardFitData<'a> {
+    Borrowed(ArrayView2<'a, f64>),
+    Shared(Arc<Array2<f64>>),
+}
+
+impl<'a> StandardFitData<'a> {
+    pub fn borrowed(data: ArrayView2<'a, f64>) -> Self {
+        Self::Borrowed(data)
+    }
+
+    pub fn shared(data: Array2<f64>) -> Self {
+        Self::Shared(Arc::new(data))
+    }
+
+    pub fn view(&self) -> ArrayView2<'_, f64> {
+        match self {
+            Self::Borrowed(data) => data.view(),
+            Self::Shared(data) => data.view(),
+        }
+    }
+
+    pub fn nrows(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.nrows(),
+            Self::Shared(data) => data.nrows(),
+        }
+    }
+
+    pub fn ncols(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.ncols(),
+            Self::Shared(data) => data.ncols(),
+        }
+    }
+
+    pub fn column(&self, index: usize) -> ArrayView1<'_, f64> {
+        match self {
+            Self::Borrowed(data) => data.column(index),
+            Self::Shared(data) => data.column(index),
+        }
+    }
+}
+
 pub struct StandardFitRequest<'a> {
-    pub data: Array2<f64>,
-    pub y: Array1<f64>,
-    pub weights: Array1<f64>,
-    pub offset: Array1<f64>,
+    pub data: StandardFitData<'a>,
+    pub y: Arc<Array1<f64>>,
+    pub weights: Arc<Array1<f64>>,
+    pub offset: Arc<Array1<f64>>,
     pub spec: TermCollectionSpec,
     pub family: LikelihoodSpec,
     /// #2026: estimate the Tweedie variance power `p` by profile likelihood
@@ -43,8 +95,6 @@ pub struct StandardFitRequest<'a> {
     pub coefficient_groups: Vec<CoefficientGroupSpec>,
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
     pub latent_coord: Option<StandardLatentCoordConfig>,
-    #[doc(hidden)]
-    pub _marker: std::marker::PhantomData<&'a ()>,
 }
 
 pub struct GaussianLocationScaleFitRequest<'a> {

@@ -1675,6 +1675,21 @@ impl JointTrustRegionDecision {
             Self::RejectFloor => "reject_floor",
         }
     }
+
+    /// Map the shared [`opt::TrustRegionDecision`] onto this crate's
+    /// telemetry enum. The two enums are variant-for-variant identical
+    /// (the shared controller was defined to be a faithful superset), so
+    /// the cycle-log labels are byte-identical to the pre-migration ones.
+    fn from_opt(decision: opt::TrustRegionDecision) -> Self {
+        match decision {
+            opt::TrustRegionDecision::GrowAtBoundary => Self::GrowAtBoundary,
+            opt::TrustRegionDecision::HoldInside => Self::HoldInside,
+            opt::TrustRegionDecision::HoldModerate => Self::HoldModerate,
+            opt::TrustRegionDecision::ShrinkOnMarginalAccept => Self::ShrinkOnMarginalAccept,
+            opt::TrustRegionDecision::ShrinkOnRejection => Self::ShrinkOnRejection,
+            opt::TrustRegionDecision::RejectFloor => Self::RejectFloor,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1692,79 +1707,31 @@ pub(crate) fn update_joint_trust_region_radius(
     predicted_reduction: f64,
     objective_scale: f64,
 ) -> JointTrustRegionUpdate {
-    // Floating-point noise floor relative to the objective magnitude.
-    // When both the model-predicted and the realized reductions are at
-    // this scale, their sign is dominated by round-off in the
-    // log-likelihood evaluation rather than by genuine descent or
-    // ascent; rejecting on that sign would discard a perfectly
-    // converged step. Mirrors the noise-floor handling in
-    // src/solver/pirls.rs (see the analogous `noise_floor` block).
-    let noise_floor = objective_scale.abs().max(1.0) * 1e-14;
-    let predicted_finite_positive =
-        predicted_reduction > noise_floor && predicted_reduction.is_finite();
-    let rho = if actual_reduction.abs() <= noise_floor {
-        // The realized objective change is at the floating-point round-off floor:
-        // the step neither helped nor hurt beyond noise, so it is a numerically
-        // neutral (converged) step. Treat it as `rho = 1` REGARDLESS of whether
-        // `predicted_reduction` happens to sit just above the floor. The previous
-        // form only took this branch when `!predicted_finite_positive`; when a
-        // tiny-but-valid Newton step near a flat-objective optimum produced
-        // `predicted_reduction` marginally above `noise_floor` while
-        // `actual_reduction` was within it, it divided two round-off-level
-        // quantities and got a spurious negative `rho`, rejecting the step and
-        // ratcheting the trust radius to the floor — pinning the solve far below
-        // the (small, valid) Newton step it needed (gam#797 last-mile; same
-        // pinning family observed on clustered bernoulli). Keying neutrality on the
-        // *actual* reduction is the correct round-off guard.
-        1.0
-    } else if predicted_finite_positive {
-        actual_reduction / predicted_reduction
-    } else {
-        f64::NEG_INFINITY
-    };
-    let accepted = rho.is_finite() && rho > 0.0 && actual_reduction >= -noise_floor;
-    let mut radius = old_radius;
-    let decision: JointTrustRegionDecision;
-    if !accepted {
-        radius *= 0.25;
-        if step_norm.is_finite() && step_norm > 0.0 {
-            radius = radius.min(0.5 * step_norm);
-        }
-        decision = JointTrustRegionDecision::ShrinkOnRejection;
-    } else if rho < 0.25 {
-        radius *= 0.25;
-        decision = JointTrustRegionDecision::ShrinkOnMarginalAccept;
-    } else if rho > 0.75 && step_norm >= 0.99 * old_radius {
-        radius *= 2.0;
-        decision = JointTrustRegionDecision::GrowAtBoundary;
-    } else if rho > 0.75 {
-        decision = JointTrustRegionDecision::HoldInside;
-    } else {
-        decision = JointTrustRegionDecision::HoldModerate;
-    }
-    if !radius.is_finite() || radius <= 0.0 {
-        radius = 1.0e-12;
-    }
-    let clamped_radius = radius.clamp(1.0e-12, 1.0e6);
-    // Promote to RejectFloor if we landed at the absolute floor.  The
-    // base classification is preserved up to this final clamp; the
-    // floor classification is just a stronger label that captures the
-    // "no descent direction exists at this radius" signal.
-    let final_decision = if clamped_radius <= 1.0e-12 + f64::EPSILON
-        && matches!(
-            decision,
-            JointTrustRegionDecision::ShrinkOnRejection
-                | JointTrustRegionDecision::ShrinkOnMarginalAccept
-        ) {
-        JointTrustRegionDecision::RejectFloor
-    } else {
-        decision
-    };
+    // Round-off-aware trust-region radius control, delegated to the shared
+    // `opt::TrustRegionPolicy::noise_aware` controller. The
+    // `|objective_scale|·1e-14` floating-point noise floor (which treats a
+    // realized change within round-off as a numerically neutral `rho = 1`
+    // step rather than dividing two round-off-level quantities — the gam#797
+    // last-mile / clustered-bernoulli pinning guard), the `rho > 0` accept
+    // test above that floor, the `×0.25` shrink capped at `0.5·step_norm` on
+    // rejection, the `×2` grow at the boundary (`step_norm ≥ 0.99·old_radius`),
+    // the `[1e-12, 1e6]` clamp, and the `RejectFloor` promotion at the floor
+    // are all reproduced exactly by that controller — this is a behavior-
+    // preserving extraction, not a re-derivation.
+    let hit_boundary = step_norm >= 0.99 * old_radius;
+    let step = opt::TrustRegionPolicy::noise_aware(1.0e-12, 1.0e6, 1.0e-14).update(
+        old_radius,
+        step_norm,
+        hit_boundary,
+        actual_reduction,
+        predicted_reduction,
+        objective_scale,
+    );
     JointTrustRegionUpdate {
-        rho,
-        radius: clamped_radius,
-        accepted,
-        decision: final_decision,
+        rho: step.rho,
+        radius: step.new_radius,
+        accepted: step.accepted,
+        decision: JointTrustRegionDecision::from_opt(step.decision),
     }
 }
 

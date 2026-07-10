@@ -1262,11 +1262,6 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
 
 ## Manifold SAE helpers
 
-::: gamfit.featurize
-    options:
-      show_root_heading: true
-      heading_level: 3
-
 ::: gamfit.sae_fit
     options:
       show_root_heading: true

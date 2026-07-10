@@ -6436,6 +6436,74 @@ pub(crate) fn bug_hunt_block_penalty_logdet_derivs_match_finite_difference_share
     }
 }
 
+/// Overlapping INDEPENDENT prior factors keep per-factor normalizer
+/// multiplicity (audit finding 40).
+///
+/// Two normalized Gaussian factors with precision λ on the SAME scalar
+/// coefficient contribute `λ^{1/2}·λ^{1/2}` to the prior product, i.e. a
+/// doubled logdet `2·log λ`. Coalescing their quadratics into `2λ β²` and
+/// taking one pseudo-logdet yields only `log(2λ)` — losing `½ log λ` from
+/// the outer ρ-posterior. The factor-masked path must return the sum of the
+/// singleton logdets with per-factor rank derivatives and no cross-factor
+/// second-derivative coupling.
+#[test]
+pub(crate) fn prior_factor_mask_preserves_overlap_normalizer_multiplicity() {
+    let s1 = ndarray::arr2(&[[1.0_f64]]);
+    let s2 = ndarray::arr2(&[[1.0_f64]]);
+    let rho = ndarray::arr1(&[0.7_f64, -0.3]);
+    let per_block_rho = vec![rho.clone()];
+    let penalties_block = vec![s1.clone(), s2.clone()];
+    let per_block_penalties: Vec<&[Array2<f64>]> = vec![penalties_block.as_slice()];
+    let masks = vec![vec![true, true]];
+
+    let out = compute_block_penalty_logdet_derivs_with_prior_factors(
+        &per_block_rho,
+        &per_block_penalties,
+        Some(&masks),
+        0.0,
+    )
+    .expect("factor logdet derivs should be finite");
+
+    // Per-factor: Σ_k (rank·ρ_k + log|S_k|₊) = ρ_0 + ρ_1 (rank 1, log|I₁|₊ = 0).
+    let expected = rho[0] + rho[1];
+    assert!(
+        (out.value - expected).abs() < 1e-12,
+        "per-factor normalizer must be ρ₀+ρ₁ = {expected}, got {}",
+        out.value
+    );
+    // The coalesced form would give log(λ₀+λ₁) instead — strictly different here.
+    let coalesced = (rho[0].exp() + rho[1].exp()).ln();
+    assert!(
+        (out.value - coalesced).abs() > 0.3,
+        "test must exercise the overlap regime where the two conventions differ"
+    );
+    // d/dρ_k of Σ rank·ρ = rank = 1 per factor; second derivatives vanish.
+    let second = out.second.as_ref().expect("second derivatives populated");
+    for k in 0..2 {
+        assert!(
+            (out.first[k] - 1.0).abs() < 1e-12,
+            "factor {k} first derivative must equal its rank 1, got {}",
+            out.first[k]
+        );
+        for l in 0..2 {
+            assert!(
+                second[[k, l]].abs() < 1e-12,
+                "factor normalizer is linear in ρ: second[{k},{l}] must vanish, got {}",
+                second[[k, l]]
+            );
+        }
+    }
+
+    // An unmasked (None) call on the same inputs must reproduce the coalesced
+    // convention, unchanged.
+    let plain = compute_block_penalty_logdet_derivs(&per_block_rho, &per_block_penalties, 0.0)
+        .expect("coalesced logdet derivs should be finite");
+    assert!(
+        (plain.value - coalesced).abs() < 1e-12,
+        "unmasked path must keep the coalesced smooth-prior convention"
+    );
+}
+
 // ─── Issue #200 regression: cost and gradient agree under
 // `rho_curvature_scale != 1` when the documented contract is met.
 //

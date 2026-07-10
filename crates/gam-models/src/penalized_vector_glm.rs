@@ -169,7 +169,15 @@ pub struct PenalizedVectorGlmInputs<'a> {
     pub class_penalty_metric: ClassPenaltyMetric,
 }
 
-/// Outputs of [`fit_penalized_vector_glm`].
+/// Outputs of a CONVERGED [`fit_penalized_vector_glm`] solve.
+///
+/// SPEC: a fit object only ever comes from a converged optimization. This
+/// struct is constructed exclusively on the [`VectorGlmSolve::Converged`] arm,
+/// so every consumer holding one holds a certified stationary point; there is
+/// no `converged` flag to check. A budget-exhausted solve surfaces instead as
+/// [`VectorGlmSolve::Stalled`], which carries the abandoned iterate as
+/// checkpoint evidence but deliberately has NO Laplace covariance — posterior
+/// uncertainty evaluated at a non-stationary iterate is not a posterior.
 pub struct PenalizedVectorGlmOutputs {
     /// Coefficient matrix, shape `(P, M)` (column `a` is `β_a`).
     pub coefficients: Array2<f64>,
@@ -179,8 +187,6 @@ pub struct PenalizedVectorGlmOutputs {
     /// Number of Newton iterations executed (including the final step that
     /// satisfied the tolerance).
     pub iterations: usize,
-    /// `true` if the relative-step test was satisfied before `max_iter`.
-    pub converged: bool,
     /// Unpenalized log-likelihood `log L(β̂)`.
     pub log_likelihood: f64,
     /// Penalty term `½ Σ_a λ_a · β̂_aᵀ S β̂_a` at the returned `β̂`.
@@ -193,8 +199,50 @@ pub struct PenalizedVectorGlmOutputs {
     /// factorization used for the Newton step). Block-ordered to match the
     /// stacked coefficient vector `θ[a·P + i] = β̂[i, a]`, i.e.
     /// `β = [β_0; …; β_{M-1}]`. This is the covariance the predict / inference
-    /// surface uses for delta-method standard errors and prediction intervals.
+    /// surface uses for posterior-mean probabilities and prediction intervals.
     pub coefficient_covariance: Array2<f64>,
+}
+
+/// Checkpoint evidence for a budget-exhausted (non-converged) Newton solve.
+///
+/// This is NOT a fit: it exists so family adapters can inspect the abandoned
+/// iterate (e.g. the multinomial separation fingerprint `|η| ≥ 25` that routes
+/// to the Firth/Jeffreys proper-prior refit) and so the typed non-convergence
+/// error can carry honest evidence — the iteration count and the penalized
+/// objective at the last iterate. It carries no covariance and no fitted
+/// probabilities on purpose: nothing downstream may dress it up as a result.
+pub struct VectorGlmStall {
+    /// Coefficient iterate at budget exhaustion, shape `(P, M)`.
+    pub coefficients: Array2<f64>,
+    /// Linear predictor `η = X β` at the abandoned iterate, shape `(N, M)`.
+    pub eta: Array2<f64>,
+    /// Newton iterations executed (== the caller's `max_iter`).
+    pub iterations: usize,
+    /// Unpenalized log-likelihood at the abandoned iterate.
+    pub log_likelihood: f64,
+    /// Penalty term at the abandoned iterate.
+    pub penalty_term: f64,
+}
+
+impl VectorGlmStall {
+    /// Penalized negative log-likelihood `−log L + ½ Σ_a λ_a β_aᵀSβ_a` at the
+    /// abandoned iterate — the evidence the typed non-convergence error carries.
+    pub fn penalized_neg_log_likelihood(&self) -> f64 {
+        -self.log_likelihood + self.penalty_term
+    }
+}
+
+/// Two-outcome result of the fixed-λ vector-GLM Newton solve. Hard input /
+/// linear-algebra failures remain `Err`; exhausting the iteration budget is a
+/// first-class `Stalled` outcome so adapters must decide explicitly (typed
+/// error, or the multinomial separation → Firth escalation) instead of ever
+/// forwarding a non-converged iterate as a fit.
+pub enum VectorGlmSolve {
+    /// Certified stationary point (step-norm AND first-order optimality gates
+    /// passed), with the Laplace covariance computed at the mode.
+    Converged(PenalizedVectorGlmOutputs),
+    /// Iteration budget exhausted before certification.
+    Stalled(VectorGlmStall),
 }
 
 /// Quadratic form `½ β_aᵀ S β_a` accumulated across outputs with per-output
@@ -377,7 +425,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     inputs: PenalizedVectorGlmInputs<'_>,
     likelihood: &L,
     context: &str,
-) -> Result<PenalizedVectorGlmOutputs, EstimationError> {
+) -> Result<VectorGlmSolve, EstimationError> {
     let PenalizedVectorGlmInputs {
         design,
         y,
@@ -785,6 +833,20 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     let log_likelihood = likelihood.log_lik(eta.view(), y);
     let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas, class_penalty_metric);
 
+    if !converged {
+        // Budget exhausted without the stationarity certificate. Hand back the
+        // abandoned iterate as checkpoint evidence — never a covariance, never
+        // fitted probabilities. The adapter decides: typed non-convergence
+        // error, or (multinomial) the separation → Firth/Jeffreys escalation.
+        return Ok(VectorGlmSolve::Stalled(VectorGlmStall {
+            coefficients: beta,
+            eta,
+            iterations,
+            log_likelihood,
+            penalty_term,
+        }));
+    }
+
     // Joint Laplace covariance `H⁻¹` at the converged mode (#1101). Re-assemble
     // the penalized Hessian `H = block(XᵀWX) + penalty` at β̂ — the SAME algebra
     // the Newton loop runs each iteration — and invert it by solving `H·Σ = I`
@@ -840,15 +902,14 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     let coefficient_covariance =
         invert_symmetric_penalized_hessian(&hessian_final, beta_flat_dim, context)?;
 
-    Ok(PenalizedVectorGlmOutputs {
+    Ok(VectorGlmSolve::Converged(PenalizedVectorGlmOutputs {
         coefficients: beta,
         eta,
         iterations,
-        converged,
         log_likelihood,
         penalty_term,
         coefficient_covariance,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -1128,8 +1189,6 @@ mod parity_tests {
             tol: 1.0e-12,
         })
         .expect("binomial fit must succeed");
-        assert!(fit.converged, "binomial fit must converge");
-
         // First-order optimality: ∇F(β̂) = 0 (engine never used this gradient).
         let g = fd_grad(&fit.coefficients, |b| {
             binomial_objective(&design, &y, &penalty, &lambdas, b)
@@ -1225,8 +1284,6 @@ mod parity_tests {
             tol: 1.0e-12,
         })
         .expect("multinomial fit must succeed");
-        assert!(fit.converged, "multinomial fit must converge");
-
         // First-order optimality: ∇F(β̂) = 0.
         let g = fd_grad(&fit.coefficients_active, |b| {
             multinomial_objective(&design, &y, &penalty, &lambdas, b)

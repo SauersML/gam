@@ -1518,6 +1518,7 @@ mod row_weighted_prior_991_tests {
     //! same `w_i` and cannot desync them. These are the CI gate for that
     //! invariant (the fit that consumes it cannot be run here).
     use super::*;
+    use super::AnalyticPenalty;
     use approx::assert_abs_diff_eq;
     use ndarray::{Array1, s};
 

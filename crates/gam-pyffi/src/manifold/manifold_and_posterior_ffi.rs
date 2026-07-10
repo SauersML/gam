@@ -25,15 +25,13 @@ fn posterior_coefficient_names_json_impl(request_json: &str) -> Result<String, S
         .map_err(|err| format!("posterior_coefficient_names_json: serialise names: {err}"))
 }
 
+/// Metadata half of the posterior-summary request. The draw matrix itself
+/// crosses the boundary as a typed numpy buffer (SPEC rule 10: bulk arrays
+/// never travel as JSON); only the O(n_coeffs) descriptive fields ride here.
 #[derive(Deserialize)]
 struct PosteriorSamplesSummaryRequest {
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
     level: f64,
     coefficient_names: Vec<String>,
-    posterior_mean: Vec<f64>,
-    posterior_std: Vec<f64>,
     rhat: f64,
     ess: f64,
     converged: bool,
@@ -52,36 +50,30 @@ fn require_len(actual: usize, expected: usize, label: &str) -> Result<(), String
     Ok(())
 }
 
-fn posterior_samples_summary_json_impl(request_json: &str) -> Result<String, String> {
+fn posterior_samples_summary_json_impl(
+    samples: Array2<f64>,
+    posterior_mean: Array1<f64>,
+    posterior_std: Array1<f64>,
+    request_json: &str,
+) -> Result<String, String> {
     let request: PosteriorSamplesSummaryRequest = serde_json::from_str(request_json)
         .map_err(|err| format!("posterior_samples_summary_json: parse request: {err}"))?;
-    require_len(
-        request.posterior_mean.len(),
-        request.n_coeffs,
-        "posterior_mean",
-    )?;
-    require_len(
-        request.posterior_std.len(),
-        request.n_coeffs,
-        "posterior_std",
-    )?;
-    let ci = posterior_credible_interval_impl(
-        request.samples_flat,
-        request.n_draws,
-        request.n_coeffs,
-        request.level,
-    )?;
-    require_len(ci.len(), request.n_coeffs * 2, "credible interval")?;
-    let names = normalize_coefficient_names_vec(request.coefficient_names, request.n_coeffs);
-    let coefficients: Vec<serde_json::Value> = (0..request.n_coeffs)
+    let (n_draws, n_coeffs) = samples.dim();
+    require_len(posterior_mean.len(), n_coeffs, "posterior_mean")?;
+    require_len(posterior_std.len(), n_coeffs, "posterior_std")?;
+    let ci = posterior_credible_interval_impl(samples, request.level)?;
+    require_len(ci.nrows(), n_coeffs, "credible interval rows")?;
+    require_len(ci.ncols(), 2, "credible interval columns")?;
+    let names = normalize_coefficient_names_vec(request.coefficient_names, n_coeffs);
+    let coefficients: Vec<serde_json::Value> = (0..n_coeffs)
         .map(|j| {
             serde_json::json!({
                 "index": j,
                 "name": names[j],
-                "estimate": request.posterior_mean[j],
-                "std_error": request.posterior_std[j],
-                "ci_lower": ci[j * 2],
-                "ci_upper": ci[j * 2 + 1],
+                "estimate": posterior_mean[j],
+                "std_error": posterior_std[j],
+                "ci_lower": ci[[j, 0]],
+                "ci_upper": ci[[j, 1]],
             })
         })
         .collect();
@@ -90,8 +82,8 @@ fn posterior_samples_summary_json_impl(request_json: &str) -> Result<String, Str
         "method": request.method,
         "model_class": request.model_class,
         "family_kind": request.family_kind,
-        "n_draws": request.n_draws,
-        "n_coeffs": request.n_coeffs,
+        "n_draws": n_draws,
+        "n_coeffs": n_coeffs,
         "rhat": request.rhat,
         "ess": request.ess,
         "converged": request.converged,
@@ -172,13 +164,11 @@ fn posterior_trace_selection_json_impl(request_json: &str) -> Result<String, Str
 }
 
 fn posterior_eta_bands_impl(
-    eta_flat: Vec<f64>,
-    n_draws: usize,
-    n_rows: usize,
+    eta: Array2<f64>,
     family_kind: &str,
     level: f64,
     link_spec: Option<&str>,
-) -> Result<String, String> {
+) -> Result<PosteriorPredictBandsPayload, String> {
     // Prefer the typed link spec when supplied so the parameterized links
     // (`Sas`, `Mixture`, `LatentCLogLog`, `BetaLogistic`) push their per-fit
     // state through to the response-scale bands; otherwise fall back to the
@@ -194,59 +184,56 @@ fn posterior_eta_bands_impl(
         Some(link) => posterior_bands::LinkSelector::Spec(link),
         None => posterior_bands::LinkSelector::Tag(family_kind),
     };
-    let payload =
-        posterior_bands::posterior_eta_bands_link(eta_flat, n_draws, n_rows, selector, level)?;
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize posterior_eta_bands payload: {err}"))
+    let (n_draws, n_rows) = eta.dim();
+    let family_kind = match selector {
+        posterior_bands::LinkSelector::Tag(tag) => tag.to_string(),
+        posterior_bands::LinkSelector::Spec(spec) => spec.link_function().name().to_string(),
+    };
+    let (linear_predictor, linear_predictor_lower, linear_predictor_upper, mean, mean_lower, mean_upper) =
+        posterior_bands::eta_bands_from_matrix_link(eta.view(), selector, level)?;
+    Ok(PosteriorPredictBandsPayload {
+        linear_predictor,
+        linear_predictor_lower,
+        linear_predictor_upper,
+        mean,
+        mean_lower,
+        mean_upper,
+        n_rows,
+        n_draws,
+        model_class: String::new(),
+        family_kind,
+    })
+}
+
+/// Typed result of a posterior-predictive η evaluation. Carried as ndarray /
+/// plain fields between the predict and bands paths and converted to numpy at
+/// the pyfunction edge; the `(n_draws, n_rows)` matrix never rides JSON.
+struct PosteriorPredictResult {
+    eta: Array2<f64>,
+    model_class: String,
+    family_kind: String,
+    /// Serialized parameterized `InverseLink` (JSON) carrying the per-fit state
+    /// the bare `family_kind` tag drops; consumed by `predict_draws` /
+    /// `posterior_predict_bands_table` to route the parameterized links'
+    /// response-scale draws (issue #1133). `None` falls back to the tag.
+    link_spec: Option<String>,
 }
 
 fn posterior_predict_bands_table_impl(
     model_bytes: &[u8],
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
+    samples: Array2<f64>,
     level: f64,
-) -> Result<String, String> {
+) -> Result<PosteriorPredictBandsPayload, String> {
     // Reuse the existing predict pipeline to get an eta matrix, then collapse
     // to per-row bands inside Rust so the predict() path never materializes
     // the (n_draws, n_rows) matrix on the Python side.
-    let raw =
-        posterior_predict_table_impl(model_bytes, headers, rows, samples_flat, n_draws, n_coeffs)?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|err| format!("failed to parse posterior predict payload: {err}"))?;
-    let n_draws_out = parsed
-        .get("n_draws")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "posterior predict payload missing n_draws".to_string())?
-        as usize;
-    let n_rows_out = parsed
-        .get("n_rows")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| "posterior predict payload missing n_rows".to_string())?
-        as usize;
-    let family_kind = parsed
-        .get("family_kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("identity")
-        .to_string();
-    let model_class = parsed
-        .get("model_class")
-        .and_then(|v| v.as_str())
-        .unwrap_or("standard")
-        .to_string();
-    let eta_flat: Vec<f64> = parsed
-        .get("eta_flat")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "posterior predict payload missing eta_flat".to_string())?
-        .iter()
-        .map(|v| v.as_f64().unwrap_or(0.0))
-        .collect();
-    // Prefer the typed link spec carried by the predict payload so the
+    let result = posterior_predict_table_impl(model_bytes, headers, rows, samples)?;
+    // Prefer the typed link spec carried by the predict result so the
     // parameterized links push their per-fit state through to response-scale
     // bands; otherwise fall back to the bare `family_kind` tag (issue #1133).
-    let parsed_link: Option<InverseLink> = match parsed.get("link_spec").and_then(|v| v.as_str()) {
+    let parsed_link: Option<InverseLink> = match result.link_spec.as_deref() {
         Some(spec_json) => Some(
             serde_json::from_str(spec_json)
                 .map_err(|err| format!("failed to parse link_spec for posterior bands: {err}"))?,
@@ -255,26 +242,23 @@ fn posterior_predict_bands_table_impl(
     };
     let selector = match parsed_link.as_ref() {
         Some(link) => posterior_bands::LinkSelector::Spec(link),
-        None => posterior_bands::LinkSelector::Tag(family_kind.as_str()),
+        None => posterior_bands::LinkSelector::Tag(result.family_kind.as_str()),
     };
-    let eta = Array2::<f64>::from_shape_vec((n_draws_out, n_rows_out), eta_flat)
-        .map_err(|err| format!("failed to reshape eta matrix: {err}"))?;
+    let (n_draws, n_rows) = result.eta.dim();
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        posterior_bands::eta_bands_from_matrix_link(eta.view(), selector, level)?;
-    let payload = PosteriorPredictBandsPayload {
+        posterior_bands::eta_bands_from_matrix_link(result.eta.view(), selector, level)?;
+    Ok(PosteriorPredictBandsPayload {
         linear_predictor: eta_mean,
         linear_predictor_lower: eta_lower,
         linear_predictor_upper: eta_upper,
         mean,
         mean_lower,
         mean_upper,
-        n_rows: n_rows_out,
-        n_draws: n_draws_out,
-        model_class,
-        family_kind,
-    };
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize posterior_predict_bands payload: {err}"))
+        n_rows,
+        n_draws,
+        model_class: result.model_class,
+        family_kind: result.family_kind,
+    })
 }
 
 /// Posterior predictive η matrix for a bernoulli marginal-slope model (#1049).
@@ -292,10 +276,12 @@ fn posterior_predict_marginal_slope_eta(
     model: &FittedModel,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
-) -> Result<String, String> {
+    samples: Array2<f64>,
+) -> Result<PosteriorPredictResult, String> {
+    let (n_draws, n_coeffs) = samples.dim();
+    if n_draws == 0 {
+        return Err("posterior_predict requires at least one posterior draw".to_string());
+    }
     let predictor = model.bernoulli_marginal_slope_predictor()?;
     let theta_len = predictor.theta_len();
     if n_coeffs != theta_len {
@@ -322,64 +308,43 @@ fn posterior_predict_marginal_slope_eta(
         &offset_noise,
         false,
     )?;
-    let samples = Array2::<f64>::from_shape_vec((n_draws, n_coeffs), samples_flat)
-        .map_err(|err| format!("failed to reshape samples: {err}"))?;
     // Per-draw final η. Each row of `samples` is one posterior draw of the full
     // coefficient vector; map it through the marginal-slope kernel to its η
     // surface over the prediction rows.
-    let mut eta_rows: Vec<Array1<f64>> = Vec::with_capacity(n_draws);
-    let mut n_rows = 0usize;
+    let mut eta_matrix: Option<Array2<f64>> = None;
     for k in 0..n_draws {
         let theta = samples.row(k).to_owned();
         let eta = predictor
             .final_eta_from_theta(&predict_input, &theta)
             .map_err(|err| format!("marginal-slope posterior predict draw {k}: {err}"))?;
-        if k == 0 {
-            n_rows = eta.len();
-        } else if eta.len() != n_rows {
+        let matrix = eta_matrix.get_or_insert_with(|| Array2::zeros((n_draws, eta.len())));
+        if eta.len() != matrix.ncols() {
             return Err(format!(
                 "marginal-slope posterior predict draw {k} produced {} rows, expected {n_rows}",
-                eta.len()
+                eta.len(),
+                n_rows = matrix.ncols(),
             ));
         }
-        eta_rows.push(eta);
+        matrix.row_mut(k).assign(&eta);
     }
-    let mut eta_flat: Vec<f64> = Vec::with_capacity(n_draws * n_rows);
-    for eta in &eta_rows {
-        eta_flat.extend(eta.iter().copied());
-    }
-    let payload = PosteriorPredictPayload {
-        eta_flat,
-        n_draws,
-        n_rows,
+    let eta = eta_matrix.ok_or_else(|| {
+        "marginal-slope posterior predict produced no posterior draws".to_string()
+    })?;
+    Ok(PosteriorPredictResult {
+        eta,
         model_class: prediction_model_class_label(model),
         family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
         link_spec: model_link_spec_json(model),
-    };
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
+    })
 }
 
 fn posterior_predict_table_impl(
     model_bytes: &[u8],
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
-) -> Result<String, String> {
-    // Validation up front. The Python wrapper is expected to ship samples that
-    // already match the saved coefficient count; we catch shape mismatches
-    // here so the error surface stays consistent with the rest of the FFI
-    // surface instead of failing inside a matmul.
-    if samples_flat.len() != n_draws * n_coeffs {
-        return Err(format!(
-            "posterior_predict samples shape mismatch: got {} floats, expected {} * {}",
-            samples_flat.len(),
-            n_draws,
-            n_coeffs
-        ));
-    }
+    samples: Array2<f64>,
+) -> Result<PosteriorPredictResult, String> {
+    let (_n_draws, n_coeffs) = samples.dim();
     let model = load_model_impl(model_bytes)?;
     // Bernoulli marginal-slope posterior predictive (#1049): η is not X·β —
     // each draw must be mapped through the marginal-slope rigid kernel — so it
@@ -390,14 +355,7 @@ fn posterior_predict_table_impl(
         model.predict_model_class(),
         PredictModelClass::BernoulliMarginalSlope
     ) {
-        return posterior_predict_marginal_slope_eta(
-            &model,
-            headers,
-            rows,
-            samples_flat,
-            n_draws,
-            n_coeffs,
-        );
+        return posterior_predict_marginal_slope_eta(&model, headers, rows, samples);
     }
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
@@ -448,8 +406,6 @@ fn posterior_predict_table_impl(
             dense.ncols()
         ));
     }
-    let samples = Array2::<f64>::from_shape_vec((n_draws, n_coeffs), samples_flat)
-        .map_err(|err| format!("failed to reshape samples: {err}"))?;
     // A GLM fitted with `offset=...` targets the linear predictor η = X·β + offset.
     // The point-predict path (`design.dot(beta) + input.offset`) and the
     // coefficient sampler (#882) both re-apply that offset; the posterior-
@@ -460,17 +416,12 @@ fn posterior_predict_table_impl(
     // eta[k, i] = sum_j samples[k, j] * X[i, j] + offset[i]
     //           = (samples · Xᵀ)[k, i] + offset[i]  (offset broadcasts over draws).
     let eta = samples.dot(&dense.t()) + &offset;
-    let eta_flat: Vec<f64> = eta.iter().copied().collect();
-    let payload = PosteriorPredictPayload {
-        eta_flat,
-        n_draws,
-        n_rows,
+    Ok(PosteriorPredictResult {
+        eta,
         model_class: prediction_model_class_label(&model),
         family_kind: family_link_kind(&model_likelihood_spec(&model)).to_string(),
         link_spec: model_link_spec_json(&model),
-    };
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
+    })
 }
 
 fn sample_table_impl(
@@ -478,7 +429,7 @@ fn sample_table_impl(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     options_json: Option<&str>,
-) -> Result<String, String> {
+) -> Result<SamplePayload, String> {
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
     drop(rows);
@@ -494,7 +445,7 @@ fn sample_table_impl(
         training_headers,
         &cfg,
     )?;
-    serialize_sample_payload(&model, &nuts, &cfg)
+    Ok(build_sample_payload(&model, nuts, &cfg))
 }
 
 /// plain string on the Python side (the Rust `LikelihoodSpec` itself is
@@ -579,29 +530,15 @@ fn nuts_method_label(model: &FittedModel) -> &'static str {
     }
 }
 
-fn serialize_sample_payload(
-    model: &FittedModel,
-    nuts: &NutsResult,
-    cfg: &NutsConfig,
-) -> Result<String, String> {
-    let payload = build_sample_payload(model, nuts, cfg);
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize sample payload: {err}"))
-}
-
-fn build_sample_payload(model: &FittedModel, nuts: &NutsResult, cfg: &NutsConfig) -> SamplePayload {
+fn build_sample_payload(model: &FittedModel, nuts: NutsResult, cfg: &NutsConfig) -> SamplePayload {
     let n_draws = nuts.samples.nrows();
     let n_coeffs = nuts.samples.ncols();
-    // Row-major flatten — ndarray's iter visits row-major already.
-    let samples_flat: Vec<f64> = nuts.samples.iter().copied().collect();
     let coefficient_names: Vec<String> = (0..n_coeffs).map(|j| format!("beta_{j}")).collect();
     SamplePayload {
-        samples_flat,
-        n_draws,
-        n_coeffs,
+        samples: nuts.samples,
         coefficient_names,
-        posterior_mean: nuts.posterior_mean.to_vec(),
-        posterior_std: nuts.posterior_std.to_vec(),
+        posterior_mean: nuts.posterior_mean,
+        posterior_std: nuts.posterior_std,
         rhat: nuts.rhat,
         ess: nuts.ess,
         converged: nuts.converged,

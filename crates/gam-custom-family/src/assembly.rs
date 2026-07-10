@@ -100,21 +100,64 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         let root = penalty_matrix_root(matrix)?;
         penalty_coords.push(PenaltyCoordinate::from_dense_root(root));
     }
+    // Hierarchical coefficient-group penalties are INDEPENDENT Gaussian prior
+    // factors, not additive pieces of one smooth prior: their evidence
+    // normalizer is per-factor `Σ_k(rank Sₖ·ρₖ + log|Sₖ|₊)` rather than the
+    // coalesced `log|Σ λₖSₖ|₊` of a multi-penalty smooth. The two differ
+    // exactly when factors overlap (each shared dimension loses ½·log λ from
+    // the coalesced form), so penalties whose precision label is declared in
+    // `options.independent_prior_factor_labels` are routed to their own
+    // singleton pseudo-logdet block. `None` for every ordinary fit.
+    let prior_factor_masks: Option<Vec<Vec<bool>>> =
+        if options.independent_prior_factor_labels.is_empty() {
+            None
+        } else {
+            Some(
+                specs
+                    .iter()
+                    .map(|spec| {
+                        spec.penalties
+                            .iter()
+                            .map(|penalty| {
+                                penalty.precision_label().is_some_and(|label| {
+                                    options
+                                        .independent_prior_factor_labels
+                                        .iter()
+                                        .any(|factor| factor == label)
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            )
+        };
     let per_block_with_joint: Vec<Array1<f64>>;
+    let masks_with_joint: Option<Vec<Vec<bool>>>;
     let penalty_logdet = if joint_penalty_matrices.is_empty() {
-        compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?
+        compute_block_penalty_logdet_derivs_with_prior_factors(
+            per_block,
+            &per_block_penalties,
+            prior_factor_masks.as_deref(),
+            penalty_logdet_ridge,
+        )?
     } else {
         // Append the joint pseudo-block to the per-block rho list and penalty list
         // so its logdet value / ρ-derivatives slot in after the per-block coords.
+        // Joint penalties are one coupled Gaussian prior — never prior factors.
         per_block_with_joint = per_block
             .iter()
             .cloned()
             .chain(std::iter::once(Array1::from(joint_log_lambdas.clone())))
             .collect();
         per_block_penalties.push(joint_penalty_matrices.as_slice());
-        compute_block_penalty_logdet_derivs(
+        masks_with_joint = prior_factor_masks.map(|mut masks| {
+            masks.push(vec![false; joint_penalty_matrices.len()]);
+            masks
+        });
+        compute_block_penalty_logdet_derivs_with_prior_factors(
             &per_block_with_joint,
             &per_block_penalties,
+            masks_with_joint.as_deref(),
             penalty_logdet_ridge,
         )?
     };

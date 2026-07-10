@@ -572,104 +572,95 @@ mod per_term_edf_tests {
     }
 }
 
-/// Standardized-disagreement gate: the audit flags inconsistency when the
-/// analytic and FD directional derivatives differ by more than this many FD
-/// error bars (and also fail the relative gate).
-pub(crate) const CERTIFICATE_Z_GATE: f64 = 4.0;
-
-/// Relative agreement gate: differences below this fraction of the larger
-/// directional derivative are consistent regardless of the (possibly
-/// underestimated) FD error bar.
-pub(crate) const CERTIFICATE_RELATIVE_GATE: f64 = 1e-3;
-
 /// ρ margin (in log-λ units) within which an outer smoothing coordinate
 /// counts as railed against its box bound.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
 
-/// First-order optimality certificate: gradient-vs-objective FD audit at the
-/// returned optimum (#934).
+/// Analytic first-order optimality certificate at the returned optimum (#934).
 ///
-/// Answers, machine-checkably, the three questions every objective↔gradient
-/// desync postmortem asks: does the analytic gradient match the actual
-/// criterion value HERE ([`Self::first_order_consistent`]); is the outer
-/// curvature positive definite HERE (`hessian_pd`); did any smoothing
-/// coordinate rail to a box bound (`lambdas_railed`).
+/// Certifies stationarity from the ANALYTIC objective alone — no
+/// finite-difference probes run in production (SPEC rule 2; the FD gradient
+/// oracle lives in the test-only `fd_audit` module). The certificate answers,
+/// machine-checkably, the three questions every non-termination postmortem
+/// asks: is the KKT-projected gradient stationary HERE
+/// ([`Self::is_stationary`]); is the outer curvature admissible for a minimum
+/// HERE ([`Self::curvature_admissible`]); did any smoothing coordinate rail
+/// to a box bound (`lambdas_railed`). A failed certificate REJECTS the fit as
+/// typed non-convergence in `run_outer`; it is never a warn-and-continue
+/// diagnostic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OuterCriterionCertificate {
     /// ‖∇F(θ̂)‖₂ from the analytic gradient path at the returned point.
     pub grad_norm: f64,
-    /// Analytic directional derivative ∇F(θ̂)·v along the audit direction.
-    pub analytic_directional: f64,
-    // FD-OK: this certificate STORES a finite-difference oracle of the criterion
-    // value solely to AUDIT the analytic directional derivative against it (the
-    // analytic path is authoritative); the FD never feeds the optimizer.
-    /// Richardson-extrapolated central difference of the criterion VALUE
-    /// path along the same direction: (4·D_h − D_2h)/3 from the h and 2h
-    /// central-difference pairs.
-    pub fd_directional: f64, // fd-ok: FD-audit certificate, not in math path
-    /// Error bar on `fd_directional`: the Richardson residual |D_h − D_2h|
-    /// (which absorbs both truncation and inner-solve value noise) floored
-    /// by the central-difference roundoff bound ε·|F|/h.
-    pub fd_error: f64, // fd-ok: FD-audit certificate, not in math path
-    /// |analytic − fd| / fd_error — standardized disagreement.
-    pub agreement_z: f64,
-    /// Base central-difference step h along the unit direction.
-    pub fd_step: f64, // fd-ok: FD-audit certificate, not in math path
-    // END-FD-OK
-    /// Whether the final outer Hessian is positive definite at θ̂, when the
-    /// solver tracked one (`None` when no final Hessian was available).
-    pub hessian_pd: Option<bool>,
+    /// KKT-projected gradient norm at θ̂: components pulling INTO an active
+    /// box bound are dropped (the bound multiplier balances them), so this is
+    /// the norm of the feasible-descent gradient — the quantity that must
+    /// vanish at a constrained stationary point.
+    pub projected_grad_norm: f64,
+    /// Stationarity bound the projected gradient was tested against:
+    /// `max(solver absolute gradient floor, flat-valley score-relative
+    /// bound)`. The flat-valley bound is the codebase's operational
+    /// definition of score-relative stationarity (#1690), so the certificate
+    /// is exactly as strict as the acceptance test the outer loop already
+    /// applies to cost-stalled valleys.
+    pub stationarity_bound: f64,
+    /// Whether the final outer Hessian is positive semidefinite (within a
+    /// scaled tolerance) at θ̂, when the solver tracked one (`None` when no
+    /// final Hessian was available).
+    pub hessian_psd: Option<bool>,
     /// Leading smoothing coordinates (ρ block) pinned within
     /// [`CERTIFICATE_RAIL_MARGIN`] of either box bound at the optimum.
     pub lambdas_railed: Vec<usize>,
 }
 
 impl OuterCriterionCertificate {
-    /// Whether the analytic directional derivative agrees with the finite
-    /// difference of the actual criterion value at the optimum.
-    pub fn first_order_consistent(&self) -> bool {
-        // FD-OK: audit comparison of the analytic directional derivative against
-        // the stored finite-difference oracle; this is the certificate check, not
-        // a computational FD path.
-        let diff = (self.analytic_directional - self.fd_directional).abs(); // fd-ok: FD-audit certificate, not in math path
-        let scale = self
-            .analytic_directional
-            .abs()
-            .max(self.fd_directional.abs()); // fd-ok: FD-audit certificate, not in math path
-        diff <= (CERTIFICATE_Z_GATE * self.fd_error).max(CERTIFICATE_RELATIVE_GATE * scale) // fd-ok: FD-audit certificate, not in math path
-        // END-FD-OK
+    /// First-order (KKT) stationarity: the projected gradient norm clears the
+    /// score-relative stationarity bound.
+    pub fn is_stationary(&self) -> bool {
+        self.projected_grad_norm.is_finite() && self.projected_grad_norm <= self.stationarity_bound
     }
 
-    /// Whether every audited fact is clean: gradient matches objective, no
-    /// definiteness failure, no railed smoothing coordinate.
+    /// Second-order admissibility: an INTERIOR optimum must not sit on
+    /// genuinely indefinite curvature (a saddle is not a minimum). At an
+    /// active bound the full-space Hessian may legitimately be indefinite
+    /// (curvature along the constrained direction is irrelevant to the KKT
+    /// point), so the check is waived when any coordinate is railed.
+    pub fn curvature_admissible(&self) -> bool {
+        self.hessian_psd != Some(false) || !self.lambdas_railed.is_empty()
+    }
+
+    /// Whether the certificate accepts the returned point as a constrained
+    /// minimum. This is the load-bearing verdict: a `false` here rejects the
+    /// fit with typed non-convergence.
+    pub fn certifies(&self) -> bool {
+        self.is_stationary() && self.curvature_admissible()
+    }
+
+    /// Whether every audited fact is clean (stationary, PSD-or-untracked
+    /// curvature, no railed smoothing coordinate) — the report-level verdict.
     pub fn is_clean(&self) -> bool {
-        self.first_order_consistent()
-            && self.hessian_pd != Some(false)
-            && self.lambdas_railed.is_empty()
+        self.certifies() && self.hessian_psd != Some(false) && self.lambdas_railed.is_empty()
     }
 
     /// One-line human-readable rendering for logs and reports.
     pub fn summary(&self) -> String {
         format!(
-            // FD-OK: human-readable summary of the audit certificate's stored
-            // FD oracle fields; reporting only, no FD computation here.
-            "grad·v={:.6e} fd·v={:.6e}±{:.1e} z={:.2} |g|={:.3e} hessian_pd={} railed={:?} → {}",
-            self.analytic_directional,
-            self.fd_directional, // fd-ok: FD-audit certificate, not in math path
-            self.fd_error,       // fd-ok: FD-audit certificate, not in math path
-            // END-FD-OK
-            self.agreement_z,
+            "|g|={:.3e} |Pg|={:.3e} bound={:.3e} hessian_psd={} railed={:?} → {}",
             self.grad_norm,
-            match self.hessian_pd {
+            self.projected_grad_norm,
+            self.stationarity_bound,
+            match self.hessian_psd {
                 Some(true) => "yes",
                 Some(false) => "NO",
                 None => "n/a",
             },
             self.lambdas_railed,
-            if self.first_order_consistent() {
-                "consistent"
+            if self.certifies() {
+                "stationary"
+            } else if self.is_stationary() {
+                "INDEFINITE CURVATURE AT INTERIOR OPTIMUM"
             } else {
-                "GRADIENT-OBJECTIVE DESYNC"
+                "NOT STATIONARY"
             },
         )
     }

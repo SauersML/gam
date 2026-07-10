@@ -706,12 +706,15 @@ where
     // ML-refreshes θ at the converged η. A *single* freeze→refresh leaves the
     // selected ρ optimal only for `θ_frozen`, not for the refreshed `θ_final`.
     // mgcv `nb()` instead alternates θ-estimation and λ-selection to a joint
-    // fixed point. Wrap the ρ-search + accept-fit in a bounded loop: after each
-    // refit, if the NB θ drifted beyond tolerance, re-freeze the search θ at the
-    // refreshed value, reset the surface caches that depend on it, and re-run the
-    // outer ρ search. The cap bounds the work; for every non-NB / user-fixed-θ
-    // fit the loop runs exactly once (the break condition is met immediately), so
-    // those fits are byte-identical to the pre-#1448 single-pass behaviour.
+    // fixed point. Wrap the ρ-search + accept-fit in a loop: after each refit,
+    // if the NB θ drifted beyond tolerance, re-freeze the search θ (secant-
+    // accelerated on the log-θ fixed point), reset the surface caches that
+    // depend on it, and re-run the outer ρ search. The round budget is a
+    // divergence guard, NOT an answer: if it exhausts while the fixed-point
+    // residual is still out of tolerance, a typed error carrying the best
+    // checkpoint is returned instead of a fit. For every non-NB / user-fixed-θ
+    // fit the loop runs exactly once (the break condition is met immediately),
+    // so those fits are byte-identical to the pre-#1448 single-pass behaviour.
     //
     // 5% relative θ drift is the same band the diagnostic (#1082) flagged as the
     // point beyond which the ρ-optimum for `θ_frozen` and `θ_final` can differ
@@ -727,6 +730,9 @@ where
     let mut outer_result;
     let mut pirls_res;
     let mut negbin_alternation_round: usize = 0;
+    // Secant-acceleration history for the θ fixed point: the previous round's
+    // (log θ_frozen, fixed-point residual log θ_final − log θ_frozen).
+    let mut negbin_secant_prev: Option<(f64, f64)> = None;
     loop {
         (
             final_rho,
@@ -2448,13 +2454,19 @@ where
         // stationary in ρ; the accept-fit above ML-refreshed θ at the converged η.
         // If that refreshed θ_final drifted from the search θ_frozen by more than the
         // joint-stationarity tolerance, the ρ we just selected was optimal for the
-        // OLD θ, not θ_final: re-freeze the search at θ_final, reset the outer seed
-        // state (eval bundle, PIRLS cache, warm-start signals, inner caps — all keyed
+        // OLD θ, not θ_final: re-freeze the search, reset the outer seed state
+        // (eval bundle, PIRLS cache, warm-start signals, inner caps — all keyed
         // to the old θ), and run the ρ search again. Iterate to the (ρ, θ) joint
-        // fixed point or until the round cap, after which we accept the last fit and
-        // log the residual drift. For non-NB / user-fixed-θ fits the criterion below
-        // is never met (θ is not estimated), so the loop breaks on round 0 and the
-        // fit is byte-identical to the pre-#1448 single pass.
+        // fixed point. The joint fixed point is CERTIFIED, never assumed: each
+        // round's ρ search certifies ∂F/∂ρ stationarity at the frozen θ, and the
+        // drift check below is exactly the θ fixed-point residual — when it is
+        // within tolerance both partial stationarities hold simultaneously. If
+        // the round budget exhausts with the residual still out of tolerance, a
+        // typed error carrying the best checkpoint (θ_final, ρ̂) is returned —
+        // a fit object only ever comes from a converged optimization. For
+        // non-NB / user-fixed-θ fits the criterion below is never met (θ is not
+        // estimated), so the loop breaks on round 0 and the fit is
+        // byte-identical to the pre-#1448 single pass.
         let mut should_alternate = false;
         if pirls_res.likelihood.negbin_theta_is_estimated() {
             let frozen_bits = reml_state.frozen_negbin_theta.load(Ordering::Relaxed);
@@ -2468,31 +2480,70 @@ where
                     let drift_pct = rel_drift * 100.0;
                     if rel_drift > NEGBIN_THETA_JOINT_DRIFT_TOL {
                         if negbin_alternation_round + 1 < NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS {
+                            // Fixed-point acceleration: the alternation is a scalar
+                            // fixed-point iteration x ↦ F(x) in x = log θ (freeze x,
+                            // select ρ̂(x), refresh to F(x) = log θ_ML). Plain
+                            // substitution converges only linearly on a slow
+                            // contraction, which is exactly what exhausts the round
+                            // budget. With two residuals in hand, take the secant
+                            // step on g(x) = F(x) − x instead; fall back to
+                            // substitution when the secant is degenerate or when it
+                            // extrapolates an order of magnitude beyond the observed
+                            // residual (a near-zero residual difference makes the
+                            // step direction pure noise).
+                            let x1 = theta_frozen.ln();
+                            let g1 = theta_final.ln() - x1;
+                            let theta_refreeze = match negbin_secant_prev {
+                                Some((x0, g0))
+                                    if (g1 - g0).abs()
+                                        > f64::EPSILON * (g1.abs() + g0.abs()) =>
+                                {
+                                    let x_next = x1 - g1 * (x1 - x0) / (g1 - g0);
+                                    if x_next.is_finite()
+                                        && (x_next - x1).abs() <= 10.0 * g1.abs()
+                                    {
+                                        x_next.exp()
+                                    } else {
+                                        theta_final
+                                    }
+                                }
+                                _ => theta_final,
+                            };
+                            negbin_secant_prev = Some((x1, g1));
                             log::info!(
                                 "[OUTER] negative-binomial θ↔λ alternation round {}: θ drifted \
                              {drift_pct:.1}% (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}); \
-                             re-freezing at θ_final and re-running the ρ search (#1448).",
+                             re-freezing at θ={theta_refreeze:.6e} and re-running the ρ search (#1448).",
                                 negbin_alternation_round + 1
                             );
-                            // Re-freeze the λ-search θ at the refreshed value. The
+                            // Re-freeze the λ-search θ at the accelerated value. The
                             // capture in `solve_for_unified_rho` only writes when the
                             // frozen slot is 0, so a non-zero value here pins every
-                            // subsequent λ-search inner solve to θ_final rather than
+                            // subsequent λ-search inner solve to it rather than
                             // re-deriving it from the seed η.
                             reml_state
                                 .frozen_negbin_theta
-                                .store(theta_final.to_bits(), Ordering::Relaxed);
+                                .store(theta_refreeze.to_bits(), Ordering::Relaxed);
                             // The cached criterion / factor bundle and warm-start
                             // signals were all computed at θ_frozen; drop them so the
-                            // next round's ρ search recomputes `F(ρ) = REML(ρ, θ_final)`.
+                            // next round's ρ search recomputes the criterion at the
+                            // re-frozen θ.
                             reml_state.reset_outer_seed_state();
                             should_alternate = true;
                         } else {
-                            log::warn!(
-                                "[OUTER] negative-binomial θ↔λ alternation hit the round cap \
-                             ({NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS}) with residual θ drift \
-                             {drift_pct:.1}% (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}); \
-                             accepting the last fit (#1448)."
+                            // Round budget exhausted with the joint fixed-point
+                            // residual still out of tolerance: the (θ, ρ) pair is
+                            // NOT jointly stationary, so no fit is minted. The
+                            // typed error carries the best checkpoint for resume.
+                            return Err(
+                                EstimationError::NegativeBinomialAlternationDidNotConverge {
+                                    rounds: NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS,
+                                    theta_frozen,
+                                    theta_final,
+                                    relative_drift_percent: drift_pct,
+                                    tolerance_percent: NEGBIN_THETA_JOINT_DRIFT_TOL * 100.0,
+                                    rho_checkpoint: final_rho.to_vec(),
+                                },
                             );
                         }
                     } else {
@@ -2735,12 +2786,14 @@ where
         // Per-block traces `tr_kk = λ_kk·tr(H⁻¹ S_kk)` are basis-invariant; map
         // each canonical block's penalty root into the original coefficient basis
         // (`root_orig = Qs · root_t`) and contract against the original-basis
-        // inverse. Restricted to small models (where the dense inverse `F` itself
-        // is formed); large models keep the trace-channel value.
+        // inverse. Gated by the SAME resource-policy check as the dense
+        // covariance bundle below, so this reconciliation and the influence
+        // matrix `F` are formed (and share one `posterior_covariance_inverse`)
+        // in exactly the same regime; beyond the policy budget both switch off
+        // together and the trace-channel value stands.
         {
             let p_orig = pirls_res.reparam_result.qs.nrows();
-            const COV_FULL_INVERSE_MAX_P: usize = 10_000;
-            if p_orig <= COV_FULL_INVERSE_MAX_P {
+            if dense_covariance_bundle_allowed(n_design_rows, p_orig) {
                 let h_orig = map_hessian_to_original_basis(&pirls_res)?;
                 // Use the SAME inverse the influence matrix `F = I − H⁻¹S` is
                 // built from (`posterior_covariance_inverse`, below), not the bare
@@ -2981,24 +3034,27 @@ where
         let p_cov = penalized_hessian.nrows();
         let qs = &pirls_res.reparam_result.qs;
 
-        // Auto-select covariance strategy based on model size.
+        // Auto-select covariance strategy from the runtime resource policy.
         //
-        // For small-to-medium models (p ≤ COV_FULL_INVERSE_MAX_P) we can afford
-        // the full p×p inverse: O(p³) compute, O(p²) memory. The full matrix is
-        // needed for the frequentist covariance Ve = H⁻¹ X'WX H⁻¹ φ, the
-        // influence matrix F = H⁻¹ X'WX, and the smoothing-parameter correction.
+        // When the WHOLE simultaneous dense bundle fits the policy's
+        // materialization budget (`dense_covariance_bundle_allowed`) we can
+        // afford the full p×p inverse: O(p³) compute, O(p²) memory. The full
+        // matrix is needed for the frequentist covariance Ve = H⁻¹ X'WX H⁻¹ φ,
+        // the influence matrix F = H⁻¹ X'WX, and the smoothing-parameter
+        // correction.
         //
         // For large models we use solve-on-demand against the Cholesky factor
         // already computed for EDF traces above. We solve H_t Z_t = Qs^T in
-        // column chunks of size COV_SE_CHUNK, then extract the diagonal of
+        // policy-sized column chunks, then extract the diagonal of
         // Qs · Z_t = H_orig⁻¹ to get exact posterior SEs without ever
         // materialising the p×p inverse. Prediction bands continue to work via
         // the factorised-Hessian path in PredictionCovarianceBackend::Factorized.
-        const COV_FULL_INVERSE_MAX_P: usize = 10_000;
-        const COV_SE_CHUNK: usize = 512;
 
-        // Attempt the full inverse when the model is small enough.
-        let beta_covariance_unscaled: Option<Array2<f64>> = if p_cov <= COV_FULL_INVERSE_MAX_P {
+        // Attempt the full inverse when the bundle fits the policy budget.
+        let beta_covariance_unscaled: Option<Array2<f64>> = if dense_covariance_bundle_allowed(
+            n_design_rows,
+            p_cov,
+        ) {
             match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
                 Some(h_inv) => Some(h_inv),
                 None => {
@@ -3138,8 +3194,19 @@ where
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
         // (in transformed basis) to compute exact diagonal of H_orig⁻¹ =
-        // Qs H_t⁻¹ Qs' via chunked solve-on-demand. Memory per chunk:
-        // 2 × p × COV_SE_CHUNK × 8 bytes.
+        // Qs H_t⁻¹ Qs' via chunked solve-on-demand. The chunk width comes
+        // from the runtime resource policy's per-chunk byte target: each
+        // chunk keeps ~2 dense p×chunk workspaces (the RHS slice and the
+        // solved block) live at once.
+        let se_chunk_cols = gam_runtime::resource::rows_for_target_bytes(
+            gam_runtime::resource::ResourcePolicy::for_problem(
+                n_design_rows,
+                p_cov,
+                gam_runtime::resource::ProblemHints::default(),
+            )
+            .row_chunk_target_bytes,
+            2 * p_cov,
+        );
         beta_standard_errors = if let Some(ref h_inv) = beta_covariance_unscaled {
             // Fast path: SE from stored full inverse (already phi-scaled via
             // beta_covariance, but we need the unscaled diagonal here).
@@ -3159,7 +3226,7 @@ where
             let mut diag_inv = Array1::<f64>::zeros(p_cov);
             let mut col_start = 0usize;
             while col_start < p_cov {
-                let col_end = (col_start + COV_SE_CHUNK).min(p_cov);
+                let col_end = (col_start + se_chunk_cols).min(p_cov);
                 let chunk = col_end - col_start;
                 // qs.t() has shape (p_t, p_cov); slice to (p_t, chunk).
                 let rhs = qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned();
@@ -3710,5 +3777,70 @@ mod reported_loglikelihood_normalization_tests {
             LogLikelihoodNormalization::Full,
             "Gaussian reporting field must be tagged fully-normalized"
         );
+    }
+}
+
+#[cfg(test)]
+mod continuous_descent_and_resource_gate_tests {
+    //! Focused coverage for the grid-free KKT-escape line search that replaced
+    //! the banned fixed probe grids (SPEC: no grid search), and for the
+    //! resource-policy gate that replaced the fixed `p <= 10_000` dense
+    //! posterior-covariance cap (SPEC: never run out of memory).
+
+    use super::{continuous_directional_descent, dense_covariance_bundle_allowed};
+
+    #[test]
+    fn descent_converges_to_continuous_interior_minimizer() {
+        // Quadratic basin with a NON-grid-node minimizer: the search must land
+        // on the continuous optimum, not a probe node.
+        let t_star = 7.3_f64;
+        let f = |t: f64| (t - t_star).powi(2) - 5.0;
+        let f0 = f(0.0);
+        let mut eval = |t: f64| Some(f(t));
+        let (t_best, f_best) =
+            continuous_directional_descent(&mut eval, 20.0, f0).expect("strict descent exists");
+        assert!(
+            (t_best - t_star).abs() < 1e-3,
+            "refined minimizer {t_best} should match the continuous optimum {t_star}"
+        );
+        assert!(f_best <= f(t_star) + 1e-6);
+    }
+
+    #[test]
+    fn descent_reaches_basins_beyond_the_last_doubling_probe() {
+        // Minimum between the last doubling probe (16) and the clamped segment
+        // end (29): the expansion must include t_max itself and the refinement
+        // must recover the interior optimum.
+        let t_star = 25.0_f64;
+        let f = |t: f64| (t - t_star).powi(2);
+        let f0 = f(0.0);
+        let mut eval = |t: f64| Some(f(t));
+        let (t_best, _) =
+            continuous_directional_descent(&mut eval, 29.0, f0).expect("strict descent exists");
+        assert!((t_best - t_star).abs() < 1e-3, "found {t_best}, want {t_star}");
+    }
+
+    #[test]
+    fn descent_is_a_noop_without_strict_improvement() {
+        // Monotone ascent: no probe beats the incumbent.
+        let mut ascent = |t: f64| Some(100.0 + t);
+        assert!(continuous_directional_descent(&mut ascent, 10.0, 100.0).is_none());
+        // Sub-tolerance improvement is rejected too (matches the escapes'
+        // shared strict-improvement gate).
+        let mut flat = |_t: f64| Some(100.0 - 1e-9);
+        assert!(continuous_directional_descent(&mut flat, 10.0, 100.0).is_none());
+        // Degenerate segment.
+        let mut any = |t: f64| Some(-t);
+        assert!(continuous_directional_descent(&mut any, 0.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn dense_covariance_gate_admits_small_and_rejects_800mb_scale() {
+        // Ordinary small-model inference keeps the dense bundle.
+        assert!(dense_covariance_bundle_allowed(500, 200));
+        // The old fixed cap admitted p = 10_000 — seven simultaneous ~800 MB
+        // matrices. The policy gate must reject that regime so the fit takes
+        // the factorized solve-on-demand path instead.
+        assert!(!dense_covariance_bundle_allowed(500, 10_000));
     }
 }

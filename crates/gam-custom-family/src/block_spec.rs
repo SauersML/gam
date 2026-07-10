@@ -95,6 +95,15 @@ pub struct RealizedCoefficientGroupSpecs {
     /// Per-coordinate priors in `outer_labels` order.
     pub rho_prior: gam_problem::RhoPrior,
     pub outer_labels: Vec<String>,
+    /// The group labels, i.e. the precision labels whose penalty pieces are
+    /// INDEPENDENT Gaussian prior factors rather than additive pieces of one
+    /// smooth prior. A fit consuming these specs must copy this into
+    /// `BlockwiseFitOptions::independent_prior_factor_labels`, so the outer
+    /// evidence uses the per-factor normalizer `Σ_k ½(rank Sₖ·log λₖ +
+    /// log|Sₖ|₊)` for them instead of the coalesced `½ log|Σ λₖSₖ|₊` — the
+    /// two differ exactly when hierarchical groups overlap, where coalescing
+    /// loses `½ log λ` per shared dimension.
+    pub independent_prior_factor_labels: Vec<String>,
 }
 
 pub(crate) fn custom_family_block_role(

@@ -359,6 +359,7 @@ def test_oos_payload_threads_trained_basis_sizes(monkeypatch):
 
 def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
     assert gamfit.sae_fit is sae.fit
+    assert not hasattr(gamfit, "featurize")
     assert gamfit.plot is sae.plot
     assert callable(gamfit.sae_trust_diagnostics)
     assert callable(gamfit.atom_trust_scores)
@@ -448,7 +449,7 @@ def test_research_trust_scores_are_assignment_weighted():
     )
     fit.diagnostics = _diagnostics(2, trust=[0.2, 0.8])
 
-    trust = sae._trust_scores(fit)
+    trust = fit.trust_scores()
     np.testing.assert_allclose(trust["atom"], [0.2, 0.8])
     np.testing.assert_allclose(trust["row"], [0.2, 0.8, 0.5])
     assert trust["per_atom"].shape == (3, 2)

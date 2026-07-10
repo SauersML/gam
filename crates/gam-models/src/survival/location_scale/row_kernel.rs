@@ -2336,44 +2336,16 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), String> {
         let n = self.n;
-        // Defensive degraded-fit path: a custom-family `fit_custom_family` whose
-        // outer ARC stalled into the "deterministic-replay" branch can land in
-        // `blockwise_fit_from_parts` with the final inner refit's `block_states`
-        // cleared (the path at `custom_family.rs` post-degraded-plan rebuilds
-        // `BlockwiseFitResultParts` without re-populating per-block state).
-        // Surfaces here as `block_states.len() == 0` when the value-closure
-        // cache (`last_geometry` in `fit_survival_location_scale_terms`) is
-        // unset and the fallback refit runs through this method.
-        // `build_dynamic_geometry` would then fail with the cryptic
-        // `SurvivalLocationScaleFamily expects 3 blocks, got 0` — which
-        // propagates all the way to the Python wrapper.
-        //
-        // Returning zero residuals + zero curvatures here lets the outer
-        // baseline BFGS treat this candidate as a stationary point (no
-        // gradient contribution from these rows) instead of crashing the
-        // whole fit. The next BFGS step gets `‖g‖ = 0`, so the optimizer
-        // terminates at the current θ rather than wandering into NaN
-        // territory. Production loss is at most a slightly suboptimal
-        // baseline θ at this BMA parent set — far preferable to a hard
-        // exception from PyPI.
         if block_states.is_empty() {
-            log::warn!(
+            // Missing fitted state means the row likelihood geometry is
+            // undefined. Returning zeros would assert a false stationary
+            // point to the outer baseline optimizer and manufacture a
+            // convergence certificate, so propagate the invariant failure.
+            return Err(format!(
                 "SurvivalLocationScaleFamily::offset_channel_geometry: \
-                 block_states is empty (degraded fit, likely ARC \
-                 deterministic-replay stall); returning zero residuals + \
-                 curvatures (n={n})"
-            );
-            return Ok((
-                OffsetChannelResiduals {
-                    exit: Array1::<f64>::zeros(n),
-                    entry: Array1::<f64>::zeros(n),
-                    derivative: Array1::<f64>::zeros(n),
-                    // Location-scale has no interval upper-bound channel.
-                    right: Array1::<f64>::zeros(n),
-                },
-                OffsetChannelCurvatures {
-                    rows: vec![[[0.0_f64; 3]; 3]; n],
-                },
+                 block_states is empty (the fitted per-block state was not \
+                 propagated to the baseline-θ geometry path; n={n}); offset \
+                 residuals and curvatures are undefined without it"
             ));
         }
         let dynamic = self.build_dynamic_geometry(block_states)?;

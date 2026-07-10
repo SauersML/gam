@@ -946,87 +946,43 @@ impl OuterResult {
 // ─── First-order optimality certificate (#934) ────────────────────────
 //
 // The objective↔gradient desync bug genus (#748, #752, #808, #901, …) has a
-// universal signature: at the returned "optimum" the analytic gradient says
-// converged while a finite difference of the ACTUAL criterion value says
-// otherwise (or the optimizer stalls and rails λ). Every such bug was
-// diagnosed by a human running exactly that FD comparison by hand. The
-// certificate makes the engine run it on itself, once, at θ̂, on every fit:
-// two central-difference pairs of the VALUE path along one deterministic
-// random direction, compared against ∇F(θ̂)·v from the analytic path, plus
-// the two ancillary facts every desync postmortem asks for (is the outer
-// curvature PD here; did any λ rail to a bound). It is the runtime
-// enforcement layer for the criterion-atom architecture (#931): atoms make
-// desync structurally hard, the certificate makes any residue observable.
+// universal signature: at the returned "optimum" the optimizer claims
+// convergence while the criterion is not actually stationary there (or the
+// optimizer stalls and rails λ). The certificate makes the engine check
+// itself, once, at θ̂, on every generic outer fit — purely from the ANALYTIC
+// objective, per SPEC rule 2 (finite differences never run outside tests;
+// the FD gradient oracle now lives in the test-only `fd_audit` module): the
+// KKT-projected analytic gradient norm against the same score-relative
+// stationarity bound the outer loop already uses to accept flat-valley
+// stalls (#1690), a scaled PSD probe of the tracked outer Hessian, and the
+// λ-rail facts every desync postmortem asks for. It is the runtime
+// enforcement layer for the criterion-atom architecture (#931).
 //
-// Cost discipline: at most four value-path evaluations at the single final
-// point, outside every hot loop. The value path is evaluated through
-// `eval_cost` at θ̂±hv — points the gradient path never visited, so the
-// existing ρ-keyed caches naturally miss and the true value code runs.
-// Disagreement does not fail the fit: it names the broken criterion loudly
-// in the result, the log, and the report.
+// A failed certificate REJECTS the fit as typed non-convergence — never a
+// warn-and-continue diagnostic — so a nonstationary point can never be
+// minted into a fit (SPEC rule 20).
 
-/// Deterministic unit direction on the θ sphere for the certificate audit.
+/// Cholesky positive-SEMIdefiniteness probe for the (small, outer-dim) final
+/// Hessian, with a roundoff-scale diagonal shift. Returns `None` when the
+/// matrix is empty, non-square, or non-finite; `Some(false)` when the shifted
+/// matrix has a non-positive pivot — i.e. the curvature is genuinely
+/// indefinite, not merely semidefinite-within-noise.
 ///
-/// Seeded from the problem fingerprint (context string + θ̂ bits) via FNV-1a
-/// and expanded with SplitMix64 + Box–Muller — no clock, no global RNG, so
-/// the audit direction is reproducible across runs of the same fit.
-pub(crate) fn certificate_audit_direction(theta: &Array1<f64>, context: &str) -> Array1<f64> {
-    let mut seed: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut fnv = |byte: u8| {
-        seed ^= u64::from(byte);
-        seed = seed.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    for byte in context.bytes() {
-        fnv(byte);
-    }
-    for &x in theta.iter() {
-        for byte in x.to_bits().to_le_bytes() {
-            fnv(byte);
-        }
-    }
-    let mut state = seed;
-    let mut next_unit = move || {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        // Uniform in (0, 1): 53 mantissa bits, nudged off zero for the log.
-        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    };
-    let mut direction = Array1::<f64>::zeros(theta.len());
-    let mut i = 0;
-    while i < direction.len() {
-        let (u1, u2) = (next_unit(), next_unit());
-        let radius = (-2.0 * u1.ln()).sqrt();
-        let angle = 2.0 * std::f64::consts::PI * u2;
-        direction[i] = radius * angle.cos();
-        if i + 1 < direction.len() {
-            direction[i + 1] = radius * angle.sin();
-        }
-        i += 2;
-    }
-    let norm = direction.dot(&direction).sqrt();
-    if norm.is_finite() && norm > f64::EPSILON {
-        direction.mapv_inplace(|v| v / norm);
-        direction
-    } else {
-        // Degenerate draw (probability ~0): fall back to the first axis.
-        let mut fallback = Array1::<f64>::zeros(theta.len());
-        fallback[0] = 1.0;
-        fallback
-    }
-}
-
-/// Plain Cholesky positive-definiteness probe for the (small, outer-dim)
-/// final Hessian. Returns `None` when the matrix is empty, non-square, or
-/// non-finite; `Some(false)` on any non-positive pivot.
-pub(crate) fn certificate_hessian_is_pd(hessian: &Array2<f64>) -> Option<bool> {
+/// The shift is `√ε · max(1, max|H_ii|)`: eigenvalues assembled through
+/// O(‖H‖)-scaled arithmetic carry O(ε·‖H‖) roundoff, so a `√ε`-relative
+/// margin cleanly separates a true negative direction from accumulated
+/// floating-point noise on a flat (near-semidefinite) valley.
+pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> {
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
         return None;
     }
+    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+    let shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
     let mut chol = hessian.clone();
+    for j in 0..n {
+        chol[[j, j]] += shift;
+    }
     for j in 0..n {
         for k in 0..j {
             let l_jk = chol[[j, k]];

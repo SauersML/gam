@@ -150,33 +150,18 @@ impl StandardPredictor {
         let eta_base = input.design.dot(&self.beta) + &input.offset;
         let warp_index = self.wiggle_warp_index(&eta_base, input, runtime)?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
-        let Some(backend) = posterior_mean_backend_or_warn(
+        // The posterior mean requires a coefficient covariance at the full warp
+        // width p_main + p_w. The identifiable frozen-basis learnable-link fit
+        // (#1596) keeps its covariance in a reduced coordinate that does not
+        // match the widened standard-basis warp the predict layer reconstructs;
+        // that mismatch is a typed error here — silently substituting the
+        // plug-in mean g⁻¹(q̂) would change the estimand of this pass.
+        let backend = require_posterior_mean_backend(
             fit,
             self.covariance.as_ref(),
             self.beta.len() + runtime.beta.len(),
             "standard link-wiggle posterior mean",
-        ) else {
-            // No usable coefficient covariance at the full warp width. The
-            // identifiable frozen-basis learnable-link fit (#1596) keeps its
-            // covariance in a reduced coordinate that does not match the
-            // widened standard-basis warp the predict layer reconstructs, so the
-            // posterior-mean uncertainty integral is unavailable. Degrade
-            // gracefully to the finite plug-in mean `g⁻¹(q̂)` (the reported
-            // linear predictor) rather than failing the whole prediction;
-            // `eta_se`/`mean_se` are then `None`.
-            let mean = plugin
-                .eta
-                .iter()
-                .map(|&e| strategy.inverse_link(e))
-                .collect::<Result<Array1<f64>, _>>()?;
-            return Ok(LinearState {
-                eta: plugin.eta,
-                mean,
-                eta_se: None,
-                mean_se: None,
-                covariance_corrected_used: false,
-            });
-        };
+        )?;
         let p_main = self.beta.len();
         let p_w = runtime.beta.len();
         let p_total = p_main + p_w;
@@ -199,18 +184,14 @@ impl StandardPredictor {
             .iter()
             .zip(eta_se.iter())
             .map(|(&e, &se)| {
-                // #1515: guard the wiggle posterior-mean path like the non-wiggle
-                // one (predict_gam_posterior_mean_from_backendwith_bc). A degenerate
-                // fit — near-singular Hessian, se in the thousands — overflows the
-                // response integral E[g⁻¹(η)] to +inf, which serializes as a None
-                // mean and crashes the Python shaper. Fall back to the finite plug-in
-                // mean g⁻¹(η̂), consistent with the reported linear predictor.
-                let pm = strategy.posterior_mean(&quadctx, e, se)?;
-                if pm.is_finite() {
-                    Ok(pm)
-                } else {
-                    strategy.inverse_link(e)
-                }
+                // The posterior-integrated mean E[g⁻¹(η)] can genuinely overflow
+                // f64 on a degenerate fit (near-singular Hessian, se in the
+                // thousands); +inf IS the correctly rounded value of that
+                // integral. Report it honestly, exactly like the non-wiggle
+                // engine (predict_gam_posterior_mean_from_backendwith_bc) —
+                // substituting the finite plug-in g⁻¹(η̂) silently reported an
+                // unbounded posterior mean as an innocuous finite number.
+                strategy.posterior_mean(&quadctx, e, se)
             })
             .collect::<Result<Array1<f64>, _>>()?;
         // Response-scale delta-method SE at the plug-in η: SE(μ) = |dμ/dη|·SE(η).
@@ -439,18 +420,12 @@ impl PredictableModel for StandardPredictor {
             // always built from the conditional covariance — never the
             // smoothing-widened one. `covariance_mode` only shapes the
             // uncertainty attached below.
-            let backend = posterior_mean_backend_or_warn(
+            let backend = require_posterior_mean_backend(
                 fit,
                 self.covariance.as_ref(),
                 self.beta.len(),
                 "standard posterior mean",
-            )
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "posterior-mean prediction requires beta covariance or penalized Hessian"
-                        .to_string(),
-                )
-            })?;
+            )?;
             let family = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
             let strategy = strategy_from_fit(&family, fit)?;
             // #1602: report the UNCORRECTED linear predictor η̂ = Xβ̂ here. The

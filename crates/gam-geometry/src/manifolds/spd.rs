@@ -3,7 +3,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, cholesky_spd, dot, flatten,
-    from_flat, inverse, spectral_map_spd, spectral_map_symmetric, sym,
+    from_flat, inverse, jacobi_symmetric, spectral_map_spd, spectral_map_symmetric, sym,
     tangent_basis_metric_orthonormal,
 };
 
@@ -261,23 +261,163 @@ impl RiemannianManifold for SpdManifold {
         Ok(flatten(&sym(&grad)))
     }
 
+    /// Analytic vector–Jacobian product of the affine-invariant exponential
+    /// [`exp_map`](RiemannianManifold::exp_map), hand-derived via the
+    /// Daleckii–Krein theorem.
+    ///
+    /// The forward map is the composition
+    ///
+    /// ```text
+    ///   U = sym(T),  S = P^{1/2},  S⁻ = P^{-1/2},
+    ///   M = S⁻ U S⁻,  E = exp(M),  Y = S E S,
+    /// ```
+    ///
+    /// and every non-linear stage is a primary matrix function of a symmetric
+    /// argument, whose Fréchet derivative at `A = Q Λ Qᵀ` is the Daleckii–Krein
+    /// divided-difference form `Df(A)[H] = Q (Φ_f ∘ (Qᵀ H Q)) Qᵀ` with
+    /// `Φ_f[i,j] = f[λ_i, λ_j]` (first divided difference; `f'(λ_i)` on the
+    /// diagonal and for clustered eigenvalues). That map is self-adjoint under
+    /// the Frobenius pairing, so each cotangent pulls back through the SAME
+    /// divided-difference conjugation, and the product-rule terms of
+    /// `Y = S E S`, `M = S⁻ U S⁻` transpose in closed form. The three divided
+    /// differences involved are evaluated in cancellation-free closed forms:
+    ///
+    /// * `exp`: `e^max(a,b)·[-expm1(-|a−b|)]/|a−b|` (`= e^a` at
+    ///   equality);
+    /// * `√x`: `1/(√a + √b)`;
+    /// * `x^{-1/2}`: `−1/(√a·√b·(√a + √b))`;
+    ///
+    /// so repeated/clustered eigenvalues need no branch beyond the exact
+    /// `h → 0` limit of `sinh(h)/h`. The returned pair is
+    /// `(∂⟨G, Y⟩/∂point, ∂⟨G, Y⟩/∂tangent)` for the raw flattened inputs; the
+    /// `sym` projections of the forward map are their own adjoints and are
+    /// applied to both outputs.
     fn exp_map_vjp(
         &self,
         point: ArrayView1<'_, f64>,
         tangent_vec: ArrayView1<'_, f64>,
         grad_output: ArrayView1<'_, f64>,
     ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        use gam_linalg::faer_ndarray::fast_ab;
         let m = self.ambient_dim();
         check_len("SPD exp_map_vjp point", point.len(), m)?;
         check_len("SPD exp_map_vjp tangent", tangent_vec.len(), m)?;
         check_len("SPD exp_map_vjp grad", grad_output.len(), m)?;
-        // The affine-invariant SPD exponential VJP requires differentiating
-        // the symmetric matrix exponential / Fréchet derivative; no closed
-        // form is wired up. Refuse rather than inherit the identity default.
-        Err(GeometryError::Unsupported(
-            "SPD exp_map_vjp: no analytic backward implemented",
-        ))
+
+        // Forward quantities, recomputed from the eigendecompositions the
+        // divided-difference pullbacks need anyway.
+        let p = self.matrix(point)?;
+        let u = sym(&from_flat(tangent_vec, self.n, self.n)?);
+        let (p_evals, p_vecs) = jacobi_symmetric(&p)?;
+        for &lam in p_evals.iter() {
+            if !(lam.is_finite() && lam > 0.0) {
+                return Err(GeometryError::InvalidPoint(
+                    "SPD eigenvalue is not positive",
+                ));
+            }
+        }
+        let sqrt_p = spectral_reconstruct(&p_vecs, &p_evals, f64::sqrt);
+        let inv_sqrt_p = spectral_reconstruct(&p_vecs, &p_evals, |x| 1.0 / x.sqrt());
+        let middle = sym(&fast_ab(&fast_ab(&inv_sqrt_p, &u), &inv_sqrt_p));
+        let (m_evals, m_vecs) = jacobi_symmetric(&middle)?;
+        let exp_middle = spectral_reconstruct(&m_vecs, &m_evals, f64::exp);
+
+        // Adjoint of the trailing `flatten(sym(·))`.
+        let g_y = sym(&from_flat(grad_output, self.n, self.n)?);
+
+        // Y = S E S: Ḡ_E = S Ḡ_Y S, Ḡ_S = Ḡ_Y S E + E S Ḡ_Y.
+        let g_e = fast_ab(&fast_ab(&sqrt_p, &g_y), &sqrt_p);
+        let g_s = &fast_ab(&fast_ab(&g_y, &sqrt_p), &exp_middle)
+            + &fast_ab(&fast_ab(&exp_middle, &sqrt_p), &g_y);
+
+        // E = exp(M): the Daleckii–Krein map is self-adjoint, so
+        // Ḡ_M = Q (Φ_exp ∘ (Qᵀ Ḡ_E Q)) Qᵀ.
+        let g_m = daleckii_krein_pullback(&m_vecs, &m_evals, exp_divided_difference, &sym(&g_e));
+
+        // M = S⁻ U S⁻: Ḡ_U = S⁻ Ḡ_M S⁻, Ḡ_{S⁻} = Ḡ_M S⁻ U + U S⁻ Ḡ_M.
+        let g_u = fast_ab(&fast_ab(&inv_sqrt_p, &g_m), &inv_sqrt_p);
+        let g_s_inv = &fast_ab(&fast_ab(&g_m, &inv_sqrt_p), &u)
+            + &fast_ab(&fast_ab(&u, &inv_sqrt_p), &g_m);
+
+        // S = P^{1/2} and S⁻ = P^{-1/2} pull back through their own
+        // divided-difference conjugations on P's eigendecomposition.
+        let g_p = &daleckii_krein_pullback(&p_vecs, &p_evals, sqrt_divided_difference, &sym(&g_s))
+            + &daleckii_krein_pullback(
+                &p_vecs,
+                &p_evals,
+                inv_sqrt_divided_difference,
+                &sym(&g_s_inv),
+            );
+
+        // Adjoints of the leading `sym` projections of point and tangent.
+        Ok((flatten(&sym(&g_p)), flatten(&sym(&g_u))))
     }
+}
+
+/// `V · diag(f(λ)) · Vᵀ` from an eigendecomposition already in hand (the VJP
+/// needs the factors themselves, so it cannot use `spectral_map_spd`, which
+/// re-decomposes internally and discards them).
+fn spectral_reconstruct(
+    vecs: &Array2<f64>,
+    evals: &Array1<f64>,
+    f: impl Fn(f64) -> f64,
+) -> Array2<f64> {
+    use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
+    let n = evals.len();
+    let mut diag = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        diag[[i, i]] = f(evals[i]);
+    }
+    fast_abt(&fast_ab(vecs, &diag), vecs)
+}
+
+/// Pull a symmetric cotangent `c` back through the Fréchet derivative of a
+/// primary matrix function at `A = Q Λ Qᵀ`: the Daleckii–Krein map
+/// `H ↦ Q (Φ ∘ (Qᵀ H Q)) Qᵀ` is self-adjoint under the Frobenius pairing
+/// (`Φ` is symmetric), so the pullback applies the same conjugation to `c`.
+fn daleckii_krein_pullback(
+    vecs: &Array2<f64>,
+    evals: &Array1<f64>,
+    divided_difference: impl Fn(f64, f64) -> f64,
+    c: &Array2<f64>,
+) -> Array2<f64> {
+    use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+    let n = evals.len();
+    let mut inner = fast_ab(&fast_atb(vecs, c), vecs);
+    for i in 0..n {
+        for j in 0..n {
+            inner[[i, j]] *= divided_difference(evals[i], evals[j]);
+        }
+    }
+    fast_abt(&fast_ab(vecs, &inner), vecs)
+}
+
+/// First divided difference of `exp`: `(e^a − e^b)/(a − b)`. Factoring
+/// out the larger exponential gives the cancellation-free form
+/// `e^hi·[-expm1(-gap)]/gap`, where `gap = |a−b|`. Besides resolving the
+/// clustered limit analytically, this avoids the indeterminate `0·∞` produced
+/// by the equivalent midpoint/sinh identity when both eigenvalues are very
+/// negative but far apart.
+fn exp_divided_difference(a: f64, b: f64) -> f64 {
+    if a == b {
+        return a.exp();
+    }
+    let hi = a.max(b);
+    let gap = (a - b).abs();
+    hi.exp() * (-(-gap).exp_m1() / gap)
+}
+
+/// First divided difference of `√x` on the positive axis: the subtraction-free
+/// closed form `1/(√a + √b)` (`= 1/(2√a)`, the derivative, at `a = b`).
+fn sqrt_divided_difference(a: f64, b: f64) -> f64 {
+    1.0 / (a.sqrt() + b.sqrt())
+}
+
+/// First divided difference of `x^{-1/2}` on the positive axis:
+/// `−1/(√a·√b·(√a + √b))` (`= −1/(2a^{3/2})` at `a = b`), also subtraction-free.
+fn inv_sqrt_divided_difference(a: f64, b: f64) -> f64 {
+    let (sa, sb) = (a.sqrt(), b.sqrt());
+    -1.0 / (sa * sb * (sa + sb))
 }
 
 /// Squared metric norm `‖v‖²_P = vᵀ G(P) v = tr(P⁻¹ V P⁻¹ V)` of the (already
@@ -525,6 +665,172 @@ mod tangent_basis_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod exp_map_vjp_tests {
+    use super::{SpdManifold, exp_divided_difference};
+    use crate::manifold::RiemannianManifold;
+    use ndarray::{Array1, Array2};
+
+    /// Row-major flatten matching `flatten`/`from_flat`.
+    fn flat(m: &Array2<f64>) -> Array1<f64> {
+        Array1::from_iter(m.iter().copied())
+    }
+
+    /// `R diag(d) Rᵀ` with `R` a Givens-style 3-D rotation, giving an SPD
+    /// matrix with EXACTLY the prescribed eigenvalues (repeated ones included).
+    fn spd_with_eigs(d: [f64; 3], theta: f64, phi: f64) -> Array2<f64> {
+        let (c1, s1) = (theta.cos(), theta.sin());
+        let (c2, s2) = (phi.cos(), phi.sin());
+        let g1 = Array2::from_shape_vec(
+            (3, 3),
+            vec![c1, -s1, 0.0, s1, c1, 0.0, 0.0, 0.0, 1.0],
+        )
+        .unwrap();
+        let g2 = Array2::from_shape_vec(
+            (3, 3),
+            vec![1.0, 0.0, 0.0, 0.0, c2, -s2, 0.0, s2, c2],
+        )
+        .unwrap();
+        let r = g1.dot(&g2);
+        let mut dm = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            dm[[i, i]] = d[i];
+        }
+        r.dot(&dm).dot(&r.t())
+    }
+
+    /// Central finite-difference oracle (TEST-ONLY, per SPEC 2) for the scalar
+    /// `f(P, T) = ⟨G, exp_P(T)⟩`: checks the analytic VJP pair against the FD
+    /// directional derivative along every symmetric coordinate direction of `P`
+    /// and every raw coordinate direction of `T`.
+    fn assert_vjp_matches_fd(p: &Array2<f64>, t: &Array2<f64>, g: &Array2<f64>) {
+        let spd = SpdManifold::new(3);
+        let (pf, tf, gf) = (flat(p), flat(t), flat(g));
+        let (grad_p, grad_t) = spd
+            .exp_map_vjp(pf.view(), tf.view(), gf.view())
+            .expect("SPD exp_map_vjp");
+        let scalar = |pv: &Array1<f64>, tv: &Array1<f64>| -> f64 {
+            let y = spd.exp_map(pv.view(), tv.view()).expect("exp_map");
+            y.dot(&gf)
+        };
+        let eps = 1.0e-6;
+        // Point directions: symmetric (the SPD chart rejects asymmetric points).
+        for i in 0..3 {
+            for j in i..3 {
+                let mut h = Array2::<f64>::zeros((3, 3));
+                h[[i, j]] = 1.0;
+                h[[j, i]] = 1.0;
+                let hf = flat(&h);
+                let fd = (scalar(&(&pf + &(&hf * eps)), &tf)
+                    - scalar(&(&pf - &(&hf * eps)), &tf))
+                    / (2.0 * eps);
+                let analytic = grad_p.dot(&hf);
+                assert!(
+                    (fd - analytic).abs() <= 1.0e-5 * (1.0 + fd.abs()),
+                    "grad_point mismatch along sym e({i},{j}): fd {fd:.9e} vs vjp {analytic:.9e}"
+                );
+            }
+        }
+        // Tangent directions: raw (the forward symmetrizes internally; the VJP
+        // must carry that projection's adjoint).
+        for idx in 0..9 {
+            let mut hf = Array1::<f64>::zeros(9);
+            hf[idx] = 1.0;
+            let fd = (scalar(&pf, &(&tf + &(&hf * eps))) - scalar(&pf, &(&tf - &(&hf * eps))))
+                / (2.0 * eps);
+            let analytic = grad_t.dot(&hf);
+            assert!(
+                (fd - analytic).abs() <= 1.0e-5 * (1.0 + fd.abs()),
+                "grad_tangent mismatch along e{idx}: fd {fd:.9e} vs vjp {analytic:.9e}"
+            );
+        }
+    }
+
+    #[test]
+    fn spd_exp_map_vjp_matches_fd_generic_spectrum() {
+        let p = spd_with_eigs([3.0, 1.2, 0.4], 0.7, 1.1);
+        let t = Array2::from_shape_vec(
+            (3, 3),
+            vec![0.3, -0.2, 0.5, 0.1, -0.4, 0.2, -0.3, 0.6, 0.1],
+        )
+        .unwrap();
+        let g = Array2::from_shape_vec(
+            (3, 3),
+            vec![1.0, 0.4, -0.3, 0.2, -0.8, 0.5, 0.7, -0.1, 0.9],
+        )
+        .unwrap();
+        assert_vjp_matches_fd(&p, &t, &g);
+    }
+
+    #[test]
+    fn spd_exp_map_vjp_matches_fd_clustered_point_spectrum() {
+        // Exactly repeated eigenvalues of P: the √/x^{-1/2} divided differences
+        // must hit their analytic diagonal limit, not a 0/0 subtraction.
+        let p = spd_with_eigs([2.0, 2.0, 0.5], 0.9, 0.3);
+        let t = Array2::from_shape_vec(
+            (3, 3),
+            vec![0.2, 0.1, -0.3, 0.1, -0.1, 0.4, -0.3, 0.4, 0.3],
+        )
+        .unwrap();
+        let g = Array2::from_shape_vec(
+            (3, 3),
+            vec![0.5, -0.6, 0.2, -0.6, 0.3, 0.8, 0.2, 0.8, -0.4],
+        )
+        .unwrap();
+        assert_vjp_matches_fd(&p, &t, &g);
+    }
+
+    #[test]
+    fn spd_exp_map_vjp_matches_fd_degenerate_exp_spectrum() {
+        // T ∝ P makes the whitened middle M = c·I: EVERY eigenvalue of the exp
+        // stage coincides, exercising the exp divided-difference limit e^a.
+        let p = spd_with_eigs([1.5, 0.8, 2.5], 0.4, 1.3);
+        let t = &p * 0.35;
+        let g = Array2::from_shape_vec(
+            (3, 3),
+            vec![0.9, 0.1, -0.2, 0.1, -0.5, 0.3, -0.2, 0.3, 0.6],
+        )
+        .unwrap();
+        assert_vjp_matches_fd(&p, &t, &g);
+    }
+
+    #[test]
+    fn spd_exp_map_vjp_zero_tangent_reduces_to_identity_pullback() {
+        // At T = 0 the exponential is exp_P(0) = P, so grad_point must be the
+        // symmetrized cotangent exactly and grad_tangent must equal the
+        // whitened-DK pullback (finite, symmetric).
+        let spd = SpdManifold::new(3);
+        let p = spd_with_eigs([2.0, 1.0, 0.5], 0.2, 0.8);
+        let g = Array2::from_shape_vec(
+            (3, 3),
+            vec![1.0, 0.3, 0.0, 0.3, -0.7, 0.2, 0.0, 0.2, 0.4],
+        )
+        .unwrap();
+        let zeros = Array1::<f64>::zeros(9);
+        let (grad_p, grad_t) = spd
+            .exp_map_vjp(flat(&p).view(), zeros.view(), flat(&g).view())
+            .expect("VJP at zero tangent");
+        let gs = crate::manifold::sym(&g);
+        for (a, b) in grad_p.iter().zip(gs.iter()) {
+            assert!(
+                (a - b).abs() <= 1.0e-12,
+                "grad_point at T=0 must be sym(G): {a} vs {b}"
+            );
+        }
+        assert!(grad_t.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn exp_divided_difference_stays_finite_across_underflow_range() {
+        // The midpoint/sinh identity is mathematically equivalent but evaluates
+        // this case as `exp(-750.5) * sinh(749.5) = 0 * inf = NaN`.
+        let got = exp_divided_difference(-1.0, -1500.0);
+        let expected = (-1.0_f64).exp() / 1499.0;
+        assert!(got.is_finite());
+        assert!((got - expected).abs() <= f64::EPSILON * expected);
     }
 }
 

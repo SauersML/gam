@@ -6,6 +6,30 @@
 // `construction.rs`, so these methods share that module's scope exactly as
 // before (same `impl SaeManifoldTerm`, same `use super::*` imports).
 
+/// Dimensionless curvature-fraction floor for the exact-stationarity IFT solve
+/// (#2080 defect 4). The majorizer construction guarantees `B ⪰ A`, so the
+/// pencil `(A, B)` has generalized spectrum `μ ∈ (0, 1]`: `μ` is the fraction
+/// of its own majorizer curvature a direction retains in the EXACT Hessian. A
+/// direction with `μ` below this floor (a saturated IBP gate logit has data
+/// curvature `∝ σ'(ℓ)² → 0`) is numerically curvature-free — the inner
+/// optimizer cannot resolve the iterate's position along it, so the IFT
+/// response `θ̂_ρ = −A⁻¹g_ρ` there is an unidentifiable `1/μ` amplification,
+/// not a real derivative. That amplification is what flipped the analytic
+/// λ-gradient's sign against the criterion it differentiates (the #931
+/// objective↔gradient desync; the FD safeguard in `outer_objective.rs` exists
+/// only to catch it). Deflating those directions keeps the envelope term
+/// value-consistent by construction.
+const SAE_IFT_MIN_CURVATURE_FRACTION: f64 = 1.0e-8;
+
+/// Inverse-power refinement sweeps for a suspected near-null `(A, B)`
+/// direction. The corrupted solve is itself dominated by that direction, so
+/// one or two sweeps of `v ← A⁻¹(B v)` sharpen it to working accuracy.
+const SAE_IFT_DEFLATION_POWER_ITERS: usize = 2;
+
+/// Maximum near-null directions deflated per IFT solve (a backstop; the
+/// observed defect class is rank one or two — saturated gate logits).
+const SAE_IFT_DEFLATION_MAX_DIRECTIONS: usize = 8;
+
 impl SaeManifoldTerm {
     /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
     /// to a joint `(t, β)` vector, matrix-free and per row.

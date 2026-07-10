@@ -20,6 +20,7 @@ pub mod lognormal_kernel;
 pub mod marginal_slope;
 pub mod predict;
 pub mod royston_parmar;
+pub mod surface;
 pub(crate) mod time_constraints;
 
 pub use base::*;
@@ -30,3 +31,4 @@ pub use lognormal_kernel::*;
 pub use marginal_slope::*;
 pub use predict::*;
 pub use royston_parmar::*;
+pub use surface::*;

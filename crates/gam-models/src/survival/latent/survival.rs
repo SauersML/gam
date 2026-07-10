@@ -583,6 +583,9 @@ pub fn fit_latent_survival_terms(
         // Right-censored-at-L ignores the interval upper bound `R`, so the
         // (unused) `q_right` channel cannot drift the fit; leaving the right
         // design/mass in place is harmless (no interval row remains to read it).
+        // Fixed-λ surrogate: no outer smoothing loop runs here, and the inner
+        // solve is convergence-gated inside `fit_custom_family_fixed_log_lambdas`,
+        // so the assembled surrogate fit is (vacuously) outer-converged.
         let warm_fit_result = fit_custom_family_fixed_log_lambdas(
             &warm_family,
             &blocks,
@@ -590,7 +593,7 @@ pub fn fit_latent_survival_terms(
             None,
             0,
             None,
-            false,
+            true,
         );
         let warm_fit = match warm_fit_result {
             Ok(fit) => fit,
@@ -630,7 +633,7 @@ pub fn fit_latent_survival_terms(
                     None,
                     0,
                     None,
-                    false,
+                    true,
                 )
                 .map_err(|event_error| {
                     format!(
@@ -2383,20 +2386,16 @@ impl LatentSurvivalFamily {
     ) -> Result<crate::survival::OffsetChannelResiduals, String> {
         let n = self.event_target.len();
         if block_states.is_empty() {
-            // Degraded-fit fallback mirroring the location-scale family: an
-            // empty block-state slate (ARC deterministic-replay stall) yields
-            // zero residuals so the outer baseline-θ BFGS sees ‖g‖ = 0 and
-            // terminates cleanly at the current θ̂ rather than panicking.
-            log::warn!(
+            // SPEC 20: missing per-block geometry is a typed error, never a
+            // fabricated zero derivative — a zero residual vector here would
+            // hand the outer baseline-θ optimizer a false ‖g‖ = 0 and let it
+            // manufacture convergence at an arbitrary θ.
+            return Err(format!(
                 "LatentSurvivalFamily::offset_channel_residuals: block_states is empty \
-                 (degraded fit); returning zero offset residuals (n={n})"
-            );
-            return Ok(crate::survival::OffsetChannelResiduals {
-                exit: Array1::<f64>::zeros(n),
-                entry: Array1::<f64>::zeros(n),
-                derivative: Array1::<f64>::zeros(n),
-                right: Array1::<f64>::zeros(n),
-            });
+                 (the fitted per-block state was not propagated to the baseline-θ \
+                 gradient path; n={n}); the baseline offset residuals are undefined \
+                 without it"
+            ));
         }
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
@@ -3559,16 +3558,16 @@ impl LatentBinaryFamily {
     ) -> Result<crate::survival::OffsetChannelResiduals, String> {
         let n = self.event_target.len();
         if block_states.is_empty() {
-            log::warn!(
+            // SPEC 20: missing per-block geometry is a typed error, never a
+            // fabricated zero derivative — a zero residual vector here would
+            // hand the outer baseline-θ optimizer a false ‖g‖ = 0 and let it
+            // manufacture convergence at an arbitrary θ.
+            return Err(format!(
                 "LatentBinaryFamily::offset_channel_residuals: block_states is empty \
-                 (degraded fit); returning zero offset residuals (n={n})"
-            );
-            return Ok(crate::survival::OffsetChannelResiduals {
-                exit: Array1::<f64>::zeros(n),
-                entry: Array1::<f64>::zeros(n),
-                derivative: Array1::<f64>::zeros(n),
-                right: Array1::<f64>::zeros(n),
-            });
+                 (the fitted per-block state was not propagated to the baseline-θ \
+                 gradient path; n={n}); the baseline offset residuals are undefined \
+                 without it"
+            ));
         }
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let mut entry = Array1::<f64>::zeros(n);

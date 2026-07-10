@@ -49,10 +49,10 @@ def test_sae_fit_avg_active_atoms_is_consistent_with_reconstruction() -> None:
     X = rng.uniform(1.0, 3.0, size=N)[:, None] * dirs[labels]
 
     res = gamfit.sae_fit(X)
-    s = res["summary"]
+    s = res.summary()
     r2 = float(s["reconstruction_r2"])
     avg_active = float(s["avg_active_atoms"])
-    assignments = np.asarray(res["assignments"], dtype=float)
+    assignments = np.asarray(res.assignments, dtype=float)
 
     # The fit genuinely reconstructs the data, so atoms ARE active.
     assert r2 > 0.5, f"sanity: SAE should reconstruct this structured data, got R²={r2:.3f}"

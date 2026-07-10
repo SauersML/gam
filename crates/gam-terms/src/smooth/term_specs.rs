@@ -11,9 +11,8 @@ use input_standardization::{
 };
 
 use shape_constraints::{
-    build_shape_constraint_design_1d, build_shape_linear_constraints_1d,
-    merge_linear_constraints_global, shape_lower_bounds_local, shape_order_and_sign,
-    shape_supports_basis, shape_uses_box_reparameterization,
+    shape_lower_bounds_local, shape_order_and_sign, shape_supports_basis,
+    shape_uses_box_reparameterization,
 };
 
 pub fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -7304,7 +7303,6 @@ pub fn build_single_local_smooth_term(
         return build_by_smooth_local(data, term, smooth, by_kind, workspace);
     }
 
-    let mut shape_axis_col: Option<usize> = None;
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::FactorSumToZero {
             inner,
@@ -7608,7 +7606,6 @@ pub fn build_single_local_smooth_term(
                         feature_cols.len()
                     );
                 }
-                shape_axis_col = Some(feature_cols[0]);
             }
             let mut x = select_columns(data, feature_cols)?;
             // Auto-standardize multivariate inputs: use stored scales (prediction)
@@ -7789,7 +7786,6 @@ pub fn build_single_local_smooth_term(
                         feature_cols.len()
                     );
                 }
-                shape_axis_col = Some(feature_cols[0]);
             }
             let mut x = select_columns(data, feature_cols)?;
             // Auto-standardization (per-axis division by σ_a) reinterprets
@@ -7847,7 +7843,6 @@ pub fn build_single_local_smooth_term(
                         feature_cols.len()
                     );
                 }
-                shape_axis_col = Some(feature_cols[0]);
             }
             let mut x = select_columns(data, feature_cols)?;
             // Hybrid Duchon (length_scale=Some) is governed by the same
@@ -8229,25 +8224,6 @@ pub fn build_single_local_smooth_term(
         .collect::<Result<Vec<_>, _>>()?;
     let (penalties_t, nullspaces_t, penaltyinfo_t, null_eigenvectors_t, ops_t) =
         crate::basis::filter_active_penalty_candidates_with_ops(penalty_candidates)?;
-    let shape_linear_constraints = if term.shape != ShapeConstraint::None && !use_box_reparam {
-        let axis = shape_axis_col.ok_or_else(|| {
-            BasisError::InvalidInput(format!(
-                "internal shape-constraint axis missing for term '{}'",
-                term.name
-            ))
-        })?;
-        let (x_shape_eval, design_shape_eval) =
-            build_shape_constraint_design_1d(data, term, &metadata, axis)?;
-        build_shape_linear_constraints_1d(
-            x_shape_eval.view(),
-            design_shape_eval.view(),
-            term.shape,
-        )?
-    } else {
-        None
-    };
-    let linear_constraints_local = merge_linear_constraints_global(shape_linear_constraints, None);
-
     // Joint-null absorption rotation. Fresh fit specs compute Q from the final
     // per-smooth penalty set (after all in-smooth reparameterizations have
     // already been applied). Frozen specs already carry the complete realized
@@ -8284,7 +8260,7 @@ pub fn build_single_local_smooth_term(
         penaltyinfo: penaltyinfo_t,
         pre_dropped_penaltyinfo: pre_dropped_penaltyinfo_t,
         metadata,
-        linear_constraints: linear_constraints_local,
+        linear_constraints: None,
         box_reparam: use_box_reparam,
         kronecker_factored: kron_factored,
     })

@@ -1,6 +1,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use std::fmt;
 
 const DEFAULT_MAX_ITER: usize = 30;
 const DEFAULT_TOP_K: usize = 1;
@@ -34,6 +35,65 @@ impl LinearDictionaryAssignment {
         }
     }
 }
+
+/// Typed failure from [`fit_linear_dictionary`].
+///
+/// In particular, [`LinearDictionaryError::NonConvergence`] preserves the
+/// numerical certificate that prevented the final iterate from becoming a
+/// [`LinearDictionaryFit`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinearDictionaryError {
+    InvalidInput {
+        reason: String,
+    },
+    NumericalFailure {
+        reason: String,
+    },
+    NonConvergence {
+        iterations: usize,
+        explained_variance: f64,
+        last_improvement: f64,
+        tolerance: f64,
+    },
+}
+
+impl LinearDictionaryError {
+    fn invalid_input(reason: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<String> for LinearDictionaryError {
+    fn from(reason: String) -> Self {
+        Self::NumericalFailure { reason }
+    }
+}
+
+impl fmt::Display for LinearDictionaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput { reason } | Self::NumericalFailure { reason } => {
+                f.write_str(reason)
+            }
+            Self::NonConvergence {
+                iterations,
+                explained_variance,
+                last_improvement,
+                tolerance,
+            } => write!(
+                f,
+                "linear_dictionary_fit did not converge: {iterations} coordinate-descent sweeps \
+                 ended at EV {explained_variance:.6} with last improvement \
+                 {last_improvement:.3e} still above tolerance {tolerance:.3e}; a non-converged \
+                 iterate is not a model"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LinearDictionaryError {}
 
 #[derive(Clone, Debug)]
 pub struct LinearDictionaryConfig {
@@ -81,6 +141,12 @@ impl Default for LinearDictionaryConfig {
     }
 }
 
+/// A converged linear-dictionary model. This struct exists ONLY for a certified
+/// fit (SPEC 20): the coordinate-descent solver returns it exclusively when the
+/// EV-plateau convergence test fired, and non-convergence is an error carrying
+/// its evidence (sweeps run, last EV, last improvement, tolerance) — never a
+/// degraded/best-effort fit. The closed-form K=1 lanes are converged by
+/// construction (a single exact eigensolve).
 #[derive(Clone, Debug)]
 pub struct LinearDictionaryFit {
     pub atoms: Array2<f64>,
@@ -90,7 +156,6 @@ pub struct LinearDictionaryFit {
     pub reml_scores: Array1<f64>,
     pub explained_variance: f64,
     pub iterations: usize,
-    pub converged: bool,
     pub assignment: LinearDictionaryAssignment,
     pub top_k: usize,
 }
@@ -114,7 +179,7 @@ pub struct LinearDictionaryFit {
 pub fn fit_linear_dictionary(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
-) -> Result<LinearDictionaryFit, String> {
+) -> Result<LinearDictionaryFit, LinearDictionaryError> {
     validate_inputs(x, config)?;
     if config.n_atoms == 1 {
         return fit_rank_one_pca_lane(x, config);
@@ -138,7 +203,7 @@ struct MultiAtomDictionaryFit {
 fn fit_multi_atom_dictionary(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
-) -> Result<MultiAtomDictionaryFit, String> {
+) -> Result<MultiAtomDictionaryFit, LinearDictionaryError> {
     let top_k = config.top_k.min(config.n_atoms).max(1);
     let mut atoms = initialize_atoms(x, config.n_atoms);
     let mut assignments = Array2::<f64>::zeros((x.nrows(), config.n_atoms));
@@ -148,6 +213,8 @@ fn fit_multi_atom_dictionary(
     let mut previous_ev = f64::NEG_INFINITY;
     let mut converged = false;
     let mut completed_iterations = 0usize;
+    let mut last_ev = f64::NEG_INFINITY;
+    let mut last_improvement = f64::INFINITY;
 
     for iter in 0..config.max_iter {
         assignments = reroute_against_atoms(x, atoms.view(), top_k, config)?;
@@ -169,14 +236,29 @@ fn fit_multi_atom_dictionary(
 
         completed_iterations = iter + 1;
         let ev = explained_variance(x, fitted.view());
+        last_ev = ev;
+        last_improvement = ev - previous_ev;
         // #1500: never declare convergence on an iteration that re-seeded a dead
         // atom — its revived direction carries no code yet, so EV is momentarily
         // flat; one more sweep lets the assignment step route rows to it.
-        if !any_reseeded && (ev - previous_ev).abs() <= config.tolerance.max(0.0) {
+        if !any_reseeded && last_improvement.abs() <= config.tolerance.max(0.0) {
             converged = true;
             break;
         }
         previous_ev = ev;
+    }
+
+    // SPEC 20: a fit object only ever comes from a converged optimization. An
+    // iterate that exhausted `max_iter` without an EV plateau is work state, not
+    // a model — refuse it with the convergence evidence instead of minting a
+    // best-effort fit whose coefficients/EV are known-unsettled.
+    if !converged {
+        return Err(LinearDictionaryError::NonConvergence {
+            iterations: completed_iterations,
+            explained_variance: last_ev,
+            last_improvement,
+            tolerance: config.tolerance.max(0.0),
+        });
     }
 
     // FINAL REROUTE: the loop's last assignment step routed rows against the atoms
@@ -203,7 +285,6 @@ fn fit_multi_atom_dictionary(
             reml_scores,
             explained_variance: final_ev,
             iterations: completed_iterations,
-            converged,
             assignment: config.assignment,
             top_k,
         },
@@ -230,39 +311,52 @@ fn reroute_against_atoms(
     }
 }
 
-fn validate_inputs(x: ArrayView2<'_, f64>, config: &LinearDictionaryConfig) -> Result<(), String> {
+fn validate_inputs(
+    x: ArrayView2<'_, f64>,
+    config: &LinearDictionaryConfig,
+) -> Result<(), LinearDictionaryError> {
     if x.nrows() == 0 || x.ncols() == 0 {
-        return Err("linear_dictionary_fit requires a non-empty 2-D matrix".to_string());
+        return Err(LinearDictionaryError::invalid_input(
+            "linear_dictionary_fit requires a non-empty 2-D matrix",
+        ));
     }
     if !x.iter().all(|value| value.is_finite()) {
-        return Err("linear_dictionary_fit input must be finite".to_string());
+        return Err(LinearDictionaryError::invalid_input(
+            "linear_dictionary_fit input must be finite",
+        ));
     }
     if config.n_atoms == 0 {
-        return Err("linear_dictionary_fit requires K >= 1".to_string());
+        return Err(LinearDictionaryError::invalid_input(
+            "linear_dictionary_fit requires K >= 1",
+        ));
     }
     if config.max_iter == 0 {
-        return Err("linear_dictionary_fit requires max_iter >= 1".to_string());
+        return Err(LinearDictionaryError::invalid_input(
+            "linear_dictionary_fit requires max_iter >= 1",
+        ));
     }
     if config.top_k == 0 || config.top_k > config.n_atoms {
-        return Err(format!(
+        return Err(LinearDictionaryError::invalid_input(format!(
             "linear_dictionary_fit top_k must be in [1, K={}]; got {}",
             config.n_atoms, config.top_k
-        ));
+        )));
     }
     if !(config.temperature.is_finite() && config.temperature > 0.0) {
-        return Err(format!(
+        return Err(LinearDictionaryError::invalid_input(format!(
             "linear_dictionary_fit temperature must be finite and positive; got {}",
             config.temperature
-        ));
+        )));
     }
     if !(config.code_ridge.is_finite() && config.code_ridge > 0.0) {
-        return Err(format!(
+        return Err(LinearDictionaryError::invalid_input(format!(
             "linear_dictionary_fit code_ridge must be finite and positive; got {}",
             config.code_ridge
-        ));
+        )));
     }
     if !config.tolerance.is_finite() {
-        return Err("linear_dictionary_fit tolerance must be finite".to_string());
+        return Err(LinearDictionaryError::invalid_input(
+            "linear_dictionary_fit tolerance must be finite",
+        ));
     }
     Ok(())
 }
@@ -285,7 +379,7 @@ fn validate_inputs(x: ArrayView2<'_, f64>, config: &LinearDictionaryConfig) -> R
 fn fit_rank_one_pca_lane(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
-) -> Result<LinearDictionaryFit, String> {
+) -> Result<LinearDictionaryFit, LinearDictionaryError> {
     if config.center_rank_one {
         return fit_rank_one_centered_lane(x, config);
     }
@@ -312,7 +406,6 @@ fn fit_rank_one_pca_lane(
         reml_scores: Array1::from_elem(1, score),
         explained_variance: explained_variance(x, fitted.view()),
         iterations: 1.min(config.max_iter),
-        converged: true,
         assignment: config.assignment,
         top_k: 1,
     })
@@ -328,7 +421,7 @@ fn fit_rank_one_pca_lane(
 fn fit_rank_one_centered_lane(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
-) -> Result<LinearDictionaryFit, String> {
+) -> Result<LinearDictionaryFit, LinearDictionaryError> {
     let CenteredRankOne {
         atom,
         codes,
@@ -346,7 +439,6 @@ fn fit_rank_one_centered_lane(
         reml_scores: Array1::from_elem(1, score),
         explained_variance: ev,
         iterations: 1.min(config.max_iter),
-        converged: true,
         assignment: config.assignment,
         top_k: 1,
     })
@@ -1074,6 +1166,43 @@ mod tests {
             explained_variance(x.view(), centered.fitted.view()),
             epsilon = 1.0e-10
         );
+    }
+
+    #[test]
+    fn nonconverged_multi_atom_fit_is_an_error_not_a_model() {
+        // SPEC 20: the EV-plateau certificate compares two consecutive sweeps, so
+        // max_iter = 1 can never certify convergence — the solver must refuse to
+        // mint a model and return the convergence evidence instead.
+        let mut x = Array2::<f64>::zeros((24, 3));
+        for row in 0..24 {
+            x[[row, row % 3]] = 1.0 + 0.01 * row as f64;
+        }
+        let config = LinearDictionaryConfig {
+            n_atoms: 2,
+            max_iter: 1,
+            top_k: 1,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: DEFAULT_TOLERANCE,
+            center_rank_one: false,
+        };
+        let err = fit_linear_dictionary(x.view(), &config)
+            .expect_err("one sweep cannot certify an EV plateau");
+        match err {
+            LinearDictionaryError::NonConvergence {
+                iterations,
+                explained_variance,
+                last_improvement,
+                tolerance,
+            } => {
+                assert_eq!(iterations, 1);
+                assert!(explained_variance.is_finite());
+                assert!(last_improvement.abs() > tolerance);
+                assert_eq!(tolerance, DEFAULT_TOLERANCE);
+            }
+            other => panic!("expected typed non-convergence evidence, got: {other}"),
+        }
     }
 
     #[test]

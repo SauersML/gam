@@ -227,45 +227,6 @@ fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Option<Ar
     Some(l_inv)
 }
 
-/// Estimate the local outer Hessian by central differencing the profiled-exact
-/// `OuterObjective::eval` gradient.
-///
-/// This is for objectives such as the SAE REML surface that expose exact
-/// gradients but not a dense Hessian. The criterion values are never
-/// finite-differenced; only the exact profiled gradient is sampled.
-pub fn rho_hessian_from_profiled_exact_gradient(
-    objective: &mut dyn OuterObjective,
-    rho_hat: &Array1<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    let k = rho_hat.len();
-    let mut hessian = Array2::<f64>::zeros((k, k));
-    if k == 0 {
-        return Ok(hessian);
-    }
-    let base_step = 1.0e-4;
-    for j in 0..k {
-        let step = base_step * rho_hat[j].abs().max(1.0);
-        let mut plus = rho_hat.clone();
-        let mut minus = rho_hat.clone();
-        plus[j] += step;
-        minus[j] -= step;
-        let gp = objective.eval(&plus)?.gradient;
-        let gm = objective.eval(&minus)?.gradient;
-        if gp.len() != k || gm.len() != k {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "rho_hessian_from_profiled_exact_gradient: gradient length mismatch: expected {k}, got {} and {}",
-                gp.len(),
-                gm.len()
-            )));
-        }
-        for i in 0..k {
-            hessian[[i, j]] = (gp[i] - gm[i]) / (2.0 * step);
-        }
-    }
-    gam_linalg::matrix::symmetrize_in_place(&mut hessian);
-    Ok(hessian)
-}
-
 /// Gauss-Hermite rules for the STANDARD NORMAL weight (probabilists'
 /// convention: nodes are `√2·x_i`, weights `w_i/√π` of the physicists' rule, so
 /// the weights sum to 1 and the rule integrates polynomials of degree

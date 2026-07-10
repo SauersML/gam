@@ -283,7 +283,50 @@ fn gaussian_reml_optimize_latent<'py>(
     // test. Anchoring to `‖∇ₜ f(t₀)‖` is both shift-invariant (the gradient does
     // not depend on `C`) and scale-invariant.
     let grad_t_norm_scaled = latent_relative_stationarity(grad_t_norm, grad0_norm);
-    let converged = grad_t_norm_scaled <= grad_tol;
+    if !(grad_t_norm_scaled.is_finite() && grad_t_norm_scaled <= grad_tol) {
+        // SPEC 20 — a fit object must only ever come from a converged
+        // optimization. The chosen latent failed the shift-invariant relative
+        // stationarity test, so no fit is rebuilt or returned: the caller gets
+        // a typed `RemlConvergenceError` carrying the full numerical evidence
+        // plus the best latent as a resume checkpoint (`checkpoint_t`, shape
+        // `(n_obs, latent_dim)`), which round-trips straight back through
+        // `t=..., init="caller"` for a warm-started continuation.
+        let t_matrix = best_t
+            .into_shape_with_order((n_obs, latent_dim))
+            .map_err(shape_error_to_pyerr)?;
+        let err = RemlConvergenceError::new_err(format!(
+            "gaussian_reml_optimize_latent did not reach latent stationarity: relative \
+             gradient {grad_t_norm_scaled:.6e} did not satisfy grad_tol {grad_tol:.6e} with a \
+             budget of {max_iter} iteration(s) x {n_restarts} restart(s) (projected gradient {grad_t_norm:.6e}, \
+             seed gradient {grad0_norm:.6e}, objective {best_value:.9e}, latent spread \
+             {latent_t_std:.6e}). No fit is minted from a non-converged optimization; \
+             resume from the exception's `checkpoint_t` attribute via \
+             `t=err.checkpoint_t, init=\"caller\"` with a larger max_iter, or loosen \
+             grad_tol if this stationarity precision is not required."
+        ));
+        // Attach the structured evidence + checkpoint as instance attributes
+        // (same best-effort pattern as `ColumnNotFoundError` in ffi_errors.rs):
+        // the typed class + message remain the primary contract if a setattr
+        // ever fails.
+        let bound = err.value(py);
+        let attach_result: PyResult<()> = (|| {
+            bound.setattr("grad_t_norm", grad_t_norm)?;
+            bound.setattr("grad_t_norm_init", grad0_norm)?;
+            bound.setattr("grad_t_norm_scaled", grad_t_norm_scaled)?;
+            bound.setattr("grad_tol", grad_tol)?;
+            bound.setattr("latent_t_std", latent_t_std)?;
+            bound.setattr("objective_value", best_value)?;
+            bound.setattr("max_iter", max_iter)?;
+            bound.setattr("n_restarts", n_restarts)?;
+            bound.setattr("init", init.as_str())?;
+            bound.setattr("checkpoint_t", t_matrix.into_pyarray(py))?;
+            Ok(())
+        })();
+        if let Err(attach_err) = attach_result {
+            attach_err.write_unraisable(py, Some(&bound));
+        }
+        return Err(err);
+    }
 
     // Rebuild the full fit dictionary at the converged latent so callers get the
     // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
@@ -383,7 +426,6 @@ fn gaussian_reml_optimize_latent<'py>(
     out.set_item("grad_t_norm", grad_t_norm)?;
     out.set_item("grad_t_norm_init", grad0_norm)?;
     out.set_item("grad_t_norm_scaled", grad_t_norm_scaled)?;
-    out.set_item("converged", converged)?;
     out.set_item("latent_t_std", latent_t_std)?;
     out.set_item("response_r2", response_r2)?;
     out.set_item("response_residual_norm", response_residual_norm)?;

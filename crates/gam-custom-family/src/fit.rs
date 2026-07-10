@@ -243,61 +243,6 @@ pub(crate) fn wire_output_channels<F: CustomFamily + ?Sized>(
     Ok(Some(wired))
 }
 
-/// True iff an outer-smoothing `Err` is a POST-AUDIT NUMERICAL pathology that
-/// the never-fail posterior-sampling rung can recover from (gam#860), rather
-/// than an ill-posed input that must keep raising.
-///
-/// All structural guards (the #531-class identifiability audit, the #789B
-/// zero-events guard, the #859 cross-fit alignment check) raise BEFORE the outer
-/// solver runs, so by the time the outer optimizer reports "no candidate seeds
-/// passed outer startup validation" (every seed rejected during exact-eval
-/// validation, e.g. the #787 kappa-driven penalty-topology dim-mismatch that
-/// surfaces as a non-finite cost) the design is structurally well-posed and a
-/// posterior mode exists to sample about. Those two signatures are the
-/// escalatable ones. Any other `Err` (a genuine solver contract violation,
-/// dimension error, etc.) keeps the hard raise.
-pub(crate) fn outer_startup_failure_is_escalatable(err: &EstimationError) -> bool {
-    match err {
-        EstimationError::RemlOptimizationFailed(message) => {
-            message.contains("no candidate seeds passed outer startup validation")
-                || message.contains("objective returned a non-finite cost")
-                // Data-driven inner non-convergence on a structurally-audited design:
-                // the coupled exact-joint Newton path could not drive a weakly-identified
-                // block's penalized stationarity residual below tol at every screened seed
-                // (the #787 weak marginal/logslope-coupling KKT-flooring regime). This
-                // surfaces as a hard `Err` from the inner solve (rather than the
-                // `Ok(!inner_converged)` retreat sentinel), so when it rejects every seed
-                // BEFORE the outer optimizer starts it would otherwise dead-end short of
-                // the post-run escalation rung. It is a post-audit NUMERICAL pathology, not
-                // an ill-posed input — the best inner mode reached during screening is a
-                // usable posterior mode — so route it into the same never-fail escalation
-                // (gam#860).
-                //
-                // Both coupled-exact-joint non-convergence signatures qualify: the
-                // pre-budget "exited the joint Newton path before convergence" exit and
-                // the "exhausted the joint Newton budget without KKT convergence" exit are
-                // the same #787-class weak-identification floor reached two ways.
-                //
-                // The SAME prefixes are also emitted for GENUINELY STRUCTURAL cert
-                // refusals (the diagnosis is carried in the trailing `; diagnosis: <label>`
-                // slot of the bubbled error). Those — a rank-deficient joint design, an
-                // unresolved active set, or a cross-block alias surfaced at fit time — are
-                // NOT recoverable by sampling about the mode (the mode itself is
-                // degenerate), so they must keep hard-raising. We therefore escalate the
-                // coupled-joint failure only when it carries no structural diagnosis label.
-                || ((message
-                    .contains("coupled exact-joint inner solve exited the joint Newton path")
-                    || message.contains(
-                        "coupled exact-joint inner solve exhausted the joint Newton budget",
-                    ))
-                    && !message.contains("diagnosis: rank_deficient_H_pen")
-                    && !message.contains("diagnosis: active_set_incomplete")
-                    && !message.contains("diagnosis: aliasing_detected_at_fit"))
-        }
-        _ => false,
-    }
-}
-
 /// Minimum effective degrees of freedom a penalized term must retain in the
 /// outer λ-selection. One effective dimension is the smallest non-arbitrary
 /// floor: it asserts the penalized component must explain at least ONE effective
@@ -879,6 +824,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             options,
             persistent_warm_start.as_ref(),
         )?;
+        let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
+        store_persistent_custom_family_warm_start(
+            persistent_warm_start_key.as_deref(),
+            specs,
+            &warm_start,
+        );
+        if !inner.converged {
+            return Err(CustomFamilyError::Optimization {
+                context: "fit_custom_family no-smoothing inner solve",
+                reason: format!(
+                    "coefficient optimization did not converge after {} cycles; no fit was \
+                     assembled",
+                    inner.cycles
+                ),
+            });
+        }
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
         let covariance_conditional = compute_joint_covariance_required(
             family,
@@ -908,12 +869,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             context: "fit_custom_family no-smoothing penalized objective",
             reason,
         })?;
-        let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
-        store_persistent_custom_family_warm_start(
-            persistent_warm_start_key.as_deref(),
-            specs,
-            &warm_start,
-        );
         // Cross-fit FitArtifact capture (Phase 0/1): persist the converged
         // raw-β + ρ under the descriptor-indexed keyspace so a later fold
         // can warm-start its ρ. Best-effort; never affects this fit. Gated on
@@ -927,10 +882,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 &warm_start.rho,
                 &label_layout.physical_to_outer,
                 penalized_objective,
-                inner.converged,
+                true,
             );
         }
-        let inner_converged = inner.converged;
         return assemble_custom_family_fit_result(
             inner,
             BlockwiseFitAssembly {
@@ -943,7 +897,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 outer_iterations: 0,
                 outer_gradient_norm: None,
                 criterion_certificate: None,
-                outer_converged: inner_converged,
+                outer_converged: true,
                 joint_log_lambdas: None,
                 context: "fit_custom_family no-smoothing result assembly",
             },
@@ -953,50 +907,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // Exact Hessians are primary whenever the assembled family can supply them.
     // If a particular outer step is ill-conditioned, strategy fallback handles
     // the downgrade; we do not suppress second-order capability preemptively
-    // based on the presence of a wiggle block.
-    if options.inner_max_cycles <= 1 && options.outer_max_iter <= 1 {
-        log::info!(
-            "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
-        );
-        let per_block = split_labeled_log_lambdas(&rho0, &label_layout)?;
-        let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
-        refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|reason| {
-            CustomFamilyError::Optimization {
-                context: "fit_custom_family one-cycle eta refresh",
-                reason,
-            }
-        })?;
-        let penalized_objective = inner_penalized_objective(
-            &inner,
-            include_exact_newton_logdet_h(family, options),
-            include_exact_newton_logdet_s(family, options),
-            "custom-family explicit one-cycle inner probe",
-        )
-        .map_err(|reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family one-cycle penalized objective",
-            reason,
-        })?;
-        let physical_rho0 = expand_labeled_log_lambdas(&rho0, &label_layout)?;
-        let inner_converged = inner.converged;
-        return assemble_custom_family_fit_result(
-            inner,
-            BlockwiseFitAssembly {
-                rho_physical: physical_rho0,
-                covariance_conditional: None,
-                geometry: None,
-                canonical: Some(&canonical),
-                result_specs: raw_specs,
-                penalized_objective,
-                outer_iterations: 0,
-                outer_gradient_norm: Some(0.0),
-                criterion_certificate: None,
-                outer_converged: inner_converged,
-                joint_log_lambdas: None,
-                context: "fit_custom_family one-cycle result assembly",
-            },
-        );
-    }
-
+    // based on the presence of a wiggle block. Small iteration budgets still
+    // run through this same outer solver and must earn its convergence
+    // certificate; they are not a production shortcut to an unoptimized fit.
     use gam_problem::OuterEval;
     use gam_solve::model_types::EstimationError;
     use gam_solve::rho_optimizer::{FallbackPolicy, OuterEvalOrder, OuterProblem};
@@ -1195,11 +1108,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         problem
     };
 
-    // Robustness is unconditional, so escalation is always armed: the inner-non-
-    // convergence branch inside `eval_outer` marks a trial rho *infeasible*
-    // (recoverable) rather than hard-erroring, letting the outer optimizer retreat
-    // and the run reach the terminal HMC sampling rung instead of dead-ending
-    // before it (the gap `verify` located at this site).
+    // An inner failure at one trial rho makes that trial infeasible, not the
+    // entire smoothing problem. Let the outer optimizer retreat and try its
+    // remaining certified strategies. If none reaches stationarity, the outer
+    // result below is returned as nonconvergence with checkpoint evidence;
+    // no fit or posterior approximation is assembled from the trial state.
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
@@ -1276,11 +1189,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             Ok(eval) if !eval.inner_converged => {
                 outer.warm_cache = Some(eval.warm_start.clone());
                 outer.last_error = Some("custom-family inner solve did not converge".to_string());
-                // Recoverable: this trial rho is infeasible (inner solve did not
-                // converge), so the outer optimizer retreats rather than the whole
-                // run hard-erroring. When the search ultimately reports
-                // `converged == false`, the post-run rung samples the proper
-                // posterior (never-fail).
+                // Recoverable at the trial level: the outer optimizer may
+                // retreat to another rho, but this state can never certify the
+                // outer solve or reach result assembly.
                 return Ok(OuterEval::infeasible(rho.len()));
             }
             Ok(eval)
@@ -1324,17 +1235,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 // Recoverable (data-driven): the objective/derivatives became
                 // non-finite at this trial rho (e.g. separation / near-singular
                 // information), so the outer optimizer retreats from this infeasible
-                // point rather than the whole run hard-erroring. When the search
-                // ultimately reports `converged == false`, the post-run rung samples
-                // the proper posterior (never-fail).
+                // point rather than the whole run hard-erroring. Exhausting
+                // those alternatives becomes a terminal nonconvergence error.
                 return Ok(OuterEval::infeasible(rho.len()));
             }
             Err(e) => {
-                // Genuine eval-error (internal computation failure: linalg error,
-                // etc.) — NOT data-driven. Leave as a hard Err even when escalation
-                // is armed: a real bug must surface, not be silently sampled over.
-                // Only the "did not converge" / "non-finite objective" data-driven
-                // paths above convert to infeasible-when-armed.
+                // Genuine evaluator failure (for example, invalid linear
+                // algebra) is not a trial-level infeasibility. Surface it as a
+                // hard error instead of letting strategy fallback obscure it.
                 outer.last_error = Some(e.clone());
                 return Err(EstimationError::RemlOptimizationFailed(e));
             }
@@ -1405,16 +1313,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     // line-search cost the outer optimizer calls most often. A
                     // non-converged inner solve / non-finite objective at this trial
                     // rho means the point is infeasible — return an infinite cost so
-                    // the line search retreats, rather than hard-erroring out of
-                    // `problem.run` and bypassing the post-run escalation (sampling)
-                    // rung. When the search reports `converged == false` the never-fail
-                    // rung samples the proper posterior.
+                    // the line search retreats. If every candidate remains
+                    // infeasible, `problem.run` returns a terminal error and no
+                    // fit is assembled.
                     Ok(f64::INFINITY)
                 }
                 Err(e) => {
-                    // Genuine eval-error (internal computation failure) — NOT
-                    // data-driven. Leave as a hard Err even when escalation is armed
-                    // so a real bug surfaces instead of being silently sampled over.
+                    // Genuine evaluator failure is not data-driven trial
+                    // infeasibility, so it remains a hard error.
                     outer.last_error = Some(e.clone());
                     Err(EstimationError::RemlOptimizationFailed(e))
                 }
@@ -1463,21 +1369,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     outer.warm_cache = Some(warm);
                     outer.last_error =
                         Some("custom-family EFS inner solve did not converge".to_string());
-                    // Intentionally LEFT as a hard Err even when escalation is armed.
-                    // Unlike the BFGS/value-only paths above, an EFS error does NOT
-                    // dead-end the run: it surfaces as a recoverable objective-eval
-                    // error at the fixed-point bridge (rho_optimizer.rs:2409-2410
-                    // `into_objective_error` -> `ObjectiveEvalError::recoverable`),
-                    // so the EFS seed is rejected / the FixedPoint run returns Err,
-                    // and `run_outer`'s fallback cascade (rho_optimizer.rs:5297) routes
-                    // to the fixed-point-disabled analytic-gradient BFGS attempt. That
-                    // attempt is always present here because custom-family declares an
-                    // analytic outer gradient (custom_family.rs:11826), so
-                    // `automatic_fallback_attempts` (rho_optimizer.rs:1502) adds it.
-                    // BFGS then evaluates via `eval_outer` / the value-only cost
-                    // closure, both of which now retreat-when-armed, so the run reaches
-                    // `Ok(converged == false)` and the post-run sampling rung. No
-                    // analogous infeasible sentinel is needed at this site.
+                    // EFS cannot form a valid fixed-point update away from an
+                    // inner mode. Returning an error lets the outer strategy
+                    // runner try an analytically valid alternative; exhaustion
+                    // remains a terminal nonconvergence error.
                     Err(EstimationError::RemlOptimizationFailed(
                         "custom-family EFS inner solve did not converge".to_string(),
                     ))
@@ -1528,73 +1423,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
 
     let outer_result = problem.run(&mut obj, "custom family");
 
-    // ── Discriminating outer-gradient FD audit (issue #1040) ──
-    //
-    // The custom-family outer ρ-REML loop is driven by `problem.run` above, with
-    // `outerobjectivegradienthessian_labeled` as the θ↦(V,∇V,H) evaluator. When
-    // the loop FAILS to certify convergence, central-difference the outer
-    // criterion component-by-component against the analytic gradient and report
-    // the outer-Hessian spectrum — the single diagnostic that forks a
-    // non-terminating outer loop into objective↔gradient DESYNC (analytic ≠ FD ⇒
-    // the trust region chases a phantom descent forever) vs weak IDENTIFIABILITY
-    // (analytic ≈ FD but a ~0 outer-Hessian eigenvalue ⇒ a flat valley).
-    //
-    // This audit costs 2·n_rho + 1 extra full outer evals (each a coupled inner
-    // solve over all n rows), so it must run ONLY on the pathology it diagnoses,
-    // never on a healthy fit: gating it by size alone (the original #1040 gate)
-    // taxed EVERY production custom-family fit — for `bernoulli-marginal-slope`
-    // at n=1500, n_rho=6 it was ~39% of the wall clock (13 phantom evals) on a
-    // fit that converged cleanly with nothing to diagnose (gam#979). A
-    // certified-converged outer result has, by definition, no desync to find, so
-    // the audit only fires when `problem.run` returned `Err` or a non-converged
-    // result — exactly when the #1040 verdict is actionable.
-    let outer_needs_audit = match &outer_result {
-        Ok(result) => !result.converged,
-        Err(_) => true,
-    };
-    if outer_needs_audit {
-        // FD-OK: FD-audit of the analytic custom-family outer gradient (small-problem gate, never feeds the optimizer)
-        const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
-        if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
-            // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-            log::warn!(
-                "[OUTER-FD-AUDIT/custom-family] outer did not certify convergence; running desync/identifiability audit n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
-            );
-            let mut eval_at =
-                |rho: &Array1<f64>,
-                 mode: EvalMode|
-                 -> Result<(f64, Array1<f64>, gam_problem::HessianValue), String> {
-                    let e = outerobjectivegradienthessian_labeled(
-                        family,
-                        specs,
-                        &outer_options,
-                        &label_layout,
-                        rho,
-                        None,
-                        &rho_prior,
-                        mode,
-                    )?;
-                    if !e.inner_converged {
-                        return Err("inner solve did not converge at audit rho".to_string());
-                    }
-                    Ok((e.objective, e.gradient, e.outer_hessian))
-                };
-            match gam_solve::rho_optimizer::outer_gradient_fd_audit(
-                // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-                &rho0,
-                1e-4,
-                |i| format!("rho[{i}]"),
-                &mut eval_at,
-            ) {
-                Ok(audit) => audit.log_verdict("custom-family"),
-                Err(e) => log::warn!("[OUTER-FD-AUDIT/custom-family] skipped: {e}"),
-            }
-        }
-        // END-FD-OK
-    }
-
     let last_error_detail = obj
         .state
         .last_error
@@ -1607,72 +1435,62 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         })
         .unwrap_or_default();
 
-    // Startup-validation escalation net (gam#860). When the outer optimizer
-    // returns `Err` because no candidate seed passed startup validation, the
-    // raise is a POST-AUDIT NUMERICAL pathology, not an ill-posed input: by the
-    // time we reach the outer solve the structural audits have already passed
-    // (the #531-class identifiability audit, the #789B zero-events guard, and
-    // the #859 cross-fit alignment all raise BEFORE the solver). So an
-    // all-seeds-rejected / non-finite-cost failure HERE is a solver numerical
-    // defect (e.g. the #787 kappa-driven penalty-topology dim-mismatch) on a
-    // structurally-well-posed design — exactly the regime the never-fail
-    // posterior-sampling rung exists for. Route it into the SAME AUTO-ESCALATE
-    // the non-convergence path below uses, seeding the sampler at the initial ρ
-    // (`rho0`, the bootstrap seed), instead of hard-raising. The carve-out is
-    // strict: this only catches the post-audit startup-validation failure, never
-    // the structural guards above (they keep raising with their own messages),
-    // and the degraded refit below STILL raises if even `rho0` produces a
-    // non-finite mode (sampling about NaN would manufacture meaningless
-    // infinite-width intervals that masquerade as a fit — see the finite-mode
-    // check after the refit). The result carries the existing escalation's
-    // degraded / sampled-not-certified flagging so confidence is honest.
-    let (rho_star, outer_grad_norm, outer_iters, nonconvergence_escalation, outer_certificate) =
-        match outer_result {
-            Ok(outer_result) => {
-                // Geometry-driven terminal escalation. When the outer smoothing
-                // optimizer cannot certify convergence, the objective is always
-                // *proper* (Jeffreys/PC term unconditionally armed), so a
-                // non-convergence here is a geometry signal (indefinite / non-smooth
-                // LAML landscape that stalled Strong-Wolfe) — not a reason to fail.
-                // Instead we AUTO-ESCALATE to sampling the proper posterior about the
-                // best mode the inner solve reached (the never-fail bottom rung; see
-                // `hmc::sample_gaussian_mode_posterior`). The fast Arc/EFS path is
-                // untouched: this branch is only reached after the optimizer reports
-                // non-convergence, so nice landscapes never pay any sampling cost.
-                let nonconvergence_escalation = !outer_result.converged;
-                if nonconvergence_escalation {
-                    log::info!(
-                        "[robust] outer smoothing did not certify convergence (plan={} iters={} |g|={}); \
-                     AUTO-ESCALATE to never-fail posterior sampling about the best mode",
-                        outer_result.plan_used,
-                        outer_result.iterations,
-                        outer_result.final_grad_norm_report(),
-                    );
-                }
-                (
-                    outer_result.rho,
-                    outer_result.final_grad_norm,
-                    outer_result.iterations,
-                    nonconvergence_escalation,
-                    outer_result.criterion_certificate,
-                )
-            }
-            Err(e) if outer_startup_failure_is_escalatable(&e) => {
-                log::warn!(
-                    "[robust] outer smoothing raised at startup validation on a structurally-audited \
-                 design (post-audit numerical pathology, gam#860): {e}.{last_error_detail} \
-                 AUTO-ESCALATE to never-fail posterior sampling about the initial ρ seed; the \
-                 degraded refit below still raises if even the seed produces a non-finite mode.",
+    // SPEC 20: a fit object only ever comes from a certified-converged outer
+    // optimization. A non-converged outer result is a typed nonconvergence
+    // error carrying its evidence (plan, iterations, gradient norm, and rho
+    // checkpoint). A keyed coefficient warm start is persisted when the family
+    // supplies the response fingerprint required for safe reuse. Work survives
+    // through checkpoint/resume, never by minting a degraded fit. A
+    // Laplace/Gaussian approximation centered at a
+    // non-mode is not posterior inference, so there is no sampling rung to
+    // "escalate" to here: sampling is only ever legitimate about a certified
+    // mode, and a certified mode has no nonconvergence to recover from.
+    let (rho_star, outer_grad_norm, outer_iters, outer_certificate) = match outer_result {
+        Ok(outer_result) if outer_result.converged => (
+            outer_result.rho,
+            outer_result.final_grad_norm,
+            outer_result.iterations,
+            outer_result.criterion_certificate,
+        ),
+        Ok(outer_result) => {
+            if let Some(warm) = obj.state.warm_cache.as_ref() {
+                store_persistent_custom_family_warm_start(
+                    persistent_warm_start_key.as_deref(),
+                    specs,
+                    warm,
                 );
-                (rho0.clone(), None, 0, true, None)
             }
-            Err(e) => {
-                return Err(format!(
-                "outer smoothing optimization failed after exhausting strategy fallbacks: {e}.{last_error_detail}"
-            )
-            .into());
+            return Err(CustomFamilyError::Optimization {
+                context: "fit_custom_family outer smoothing",
+                reason: format!(
+                    "outer smoothing optimization did not certify convergence \
+                     (plan={}, iterations={}, |grad|={}, rho_checkpoint={:?}); no fit was \
+                     assembled.{}",
+                    outer_result.plan_used,
+                    outer_result.iterations,
+                    outer_result.final_grad_norm_report(),
+                    outer_result.rho.as_slice().unwrap_or(&[]),
+                    last_error_detail
+                ),
+            });
+        }
+        Err(e) => {
+            if let Some(warm) = obj.state.warm_cache.as_ref() {
+                store_persistent_custom_family_warm_start(
+                    persistent_warm_start_key.as_deref(),
+                    specs,
+                    warm,
+                );
             }
-        };
+            return Err(CustomFamilyError::Optimization {
+                context: "fit_custom_family outer smoothing",
+                reason: format!(
+                    "outer smoothing optimization failed after exhausting strategy fallbacks: \
+                     {e}.{last_error_detail}"
+                ),
+            });
+        }
+    };
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
@@ -1734,46 +1552,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                      {e}.{last_error_detail}"
         )
     })?;
-    if !inner.converged && !nonconvergence_escalation {
+    if !inner.converged {
+        // Preserve the refit's rho/coefficients in the response-keyed cache
+        // when this family supports persistent warm starts, then reject the
+        // non-mode. The rho checkpoint is carried in the typed error regardless.
+        store_persistent_custom_family_warm_start(
+            persistent_warm_start_key.as_deref(),
+            specs,
+            &constrained_warm_start_from_inner(&rho_star, &inner),
+        );
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family final inner refit",
             reason: format!(
-                "outer smoothing optimization final inner refit did not converge after {} cycles.{}",
-                inner.cycles, last_error_detail
-            ),
-        });
-    }
-    if !inner.converged && nonconvergence_escalation {
-        // The mode the inner solve reached is still the seed for the proper
-        // posterior; a marginal inner non-convergence only widens the sampled
-        // intervals (honest, not wrong). Proceed to assemble + sample.
-        log::info!(
-            "[robust] final inner refit did not fully converge ({} cycles) under escalation; \
-             sampling the proper posterior about the reached mode",
-            inner.cycles,
-        );
-    }
-    // Finite-mode carve-out for the escalation net (gam#860). The never-fail
-    // rung samples a Gaussian posterior ABOUT the reached mode; that is honest
-    // only when the mode is finite (a non-converged-but-finite mode just widens
-    // the sampled intervals). If the refit produced a NON-FINITE β — e.g. the
-    // degraded startup-validation fallback (`rho0`) still lands on garbage —
-    // sampling about NaN would manufacture meaningless infinite-width intervals
-    // that masquerade as a fit, so KEEP the hard raise with a clear message
-    // rather than escalate. (On the certified path β is finite by construction,
-    // so this guard only ever fires on a genuinely broken escalation seed.)
-    if nonconvergence_escalation
-        && inner
-            .block_states
-            .iter()
-            .any(|state| state.beta.iter().any(|value| !value.is_finite()))
-    {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family escalation finite-mode check",
-            reason: format!(
-                "outer smoothing escalation cannot sample a posterior: the refit mode is \
-                 non-finite (β contains NaN/inf), so there is no valid mode to sample about; \
-                 this is an ill-posed problem, not a recoverable numerical non-convergence.{}",
+                "outer smoothing optimization final inner refit did not converge after {} cycles; \
+                 rho_checkpoint={:?}; no fit was assembled.{}",
+                inner.cycles,
+                rho_star.as_slice().unwrap_or(&[]),
                 last_error_detail
             ),
         });
@@ -1793,7 +1587,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // gam#1587: pass `final_options` (carrying the joint penalty bundle) so the
     // posterior precision `H = H_lik + S_λ` includes the full-width centered
     // penalty, matching the inner-converged mode.
-    let mut covariance_conditional = compute_joint_covariance_required(
+    let covariance_conditional = compute_joint_covariance_required(
         family,
         specs,
         &inner.block_states,
@@ -1839,166 +1633,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &final_warm_start.rho,
             &label_layout.physical_to_outer,
             penalized_objective,
-            !nonconvergence_escalation,
+            true,
         );
     }
-    // Never-fail terminal rung. Under escalation, sample the proper posterior
-    // `N(β̂, H⁻¹)` whose precision `H` is the SAME penalized (Jeffreys-augmented)
-    // joint Hessian the inner solve produced at the reached mode `β̂`, and report
-    // its honest covariance in place of the optimizer-conditional one. Both `H`
-    // and `β̂` are in the reduced (canonical) coordinate space here; the joint
-    // lift below (`lift_fit_geometry_to_raw`) carries the sampled covariance back
-    // to raw space exactly like the conditional covariance it replaces.
-    //
-    // Sampling a multivariate normal cannot dead-end: `sample_gaussian_mode_posterior`
-    // jitters and Cholesky-factors `H`, so a marginally indefinite boundary
-    // Hessian only widens the intervals. If that structural factorization is
-    // genuinely impossible (e.g. a non-PSD precision after symmetrization) the
-    // sampler returns `Err`; rather than re-introducing the dead-end we then keep
-    // the optimizer-conditional covariance (a finite point with its existing SEs)
-    // and still return a fit — never an `Err` for non-convergence.
-    if nonconvergence_escalation {
-        if let Some(geom) = geometry.as_ref() {
-            let joint_mode: Array1<f64> = {
-                let mut mode = Vec::new();
-                for state in &inner.block_states {
-                    mode.extend(state.beta.iter().copied());
-                }
-                Array1::from(mode)
-            };
-            let precision = geom.penalized_hessian.as_array();
-            if joint_mode.len() == precision.nrows()
-                && precision.nrows() == precision.ncols()
-                && joint_mode.iter().all(|v| v.is_finite())
-            {
-                // #1521 trait-inversion: the never-fail Gaussian mode-posterior
-                // sampler (NUTS config auto-derived from the dimension) lives UP
-                // in the gam-inference `hmc_io` tier; gam-solve calls it through
-                // the neutral `gam_problem` sampler contract instead of a
-                // back-edge into the inference SCC. When the sampler tier is not
-                // linked / registered, retain the optimizer-conditional
-                // covariance (the existing never-fail fallback) — still no
-                // dead-end.
-                let posterior_result =
-                    gam_problem::laplace_sampler_contract::gaussian_mode_posterior_sampler().map(
-                        |sampler| {
-                            sampler
-                                .sample_gaussian_mode_posterior(joint_mode.view(), precision.view())
-                        },
-                    );
-                match posterior_result {
-                    None => {
-                        log::info!(
-                            "[robust] never-fail posterior sampling unavailable (sampler tier not \
-                             linked); retaining optimizer-conditional covariance (still no \
-                             dead-end)",
-                        );
-                    }
-                    Some(Ok(posterior)) => {
-                        let dim = joint_mode.len();
-                        let n = posterior.samples.nrows();
-                        if n > 1 {
-                            // Sample posterior covariance about the posterior mean
-                            // (honest intervals; not the Laplace inverse-Hessian).
-                            let mean = &posterior.posterior_mean;
-                            let mut cov = Array2::<f64>::zeros((dim, dim));
-                            for row in posterior.samples.rows() {
-                                let centered = &row.to_owned() - mean;
-                                for a in 0..dim {
-                                    for b in 0..dim {
-                                        cov[[a, b]] += centered[a] * centered[b];
-                                    }
-                                }
-                            }
-                            cov.mapv_inplace(|v| v / (n as f64 - 1.0));
-                            // DIAGNOSTIC GUARD (no false-confident intervals).
-                            // The sampler NEVER fails, so without checking its
-                            // mixing diagnostics a divergent (R̂ ≫ 1) / near-zero-
-                            // ESS draw would be reported as an "honest" covariance.
-                            // That is especially dangerous here: the seed `H` is
-                            // the Jeffreys-AUGMENTED precision evaluated at β̂, which
-                            // may be NON-converged on a flat (unidentified) joint
-                            // direction — so a poorly-mixed chain can report a
-                            // FINITE, NARROW interval around an arbitrary point on
-                            // that flat direction (the prior's interval), masquer-
-                            // ading as data-driven. We therefore only accept the
-                            // sampled covariance as honest when the chain actually
-                            // mixed; otherwise we INFLATE it to reflect the non-
-                            // convergence and flag it low-confidence rather than
-                            // silently reporting a Jeffreys-narrowed interval.
-                            //
-                            // R̂ ≤ 1.05 is the standard "mixed" gate (stricter than
-                            // the 1.1 used for a coarse converged/not flag, because
-                            // this covariance is reported as honest uncertainty).
-                            // The ESS floor scales with dimension (≥ 10 effective
-                            // draws per parameter, absolute floor 50) so a chain
-                            // that produced essentially no independent information
-                            // about the posterior is caught independent of model
-                            // size.
-                            const RHAT_MIXED_MAX: f64 = 1.05;
-                            let ess_floor = (10.0 * dim as f64).max(50.0);
-                            let rhat = posterior.rhat;
-                            let ess = posterior.ess;
-                            let diagnostics_ok = rhat.is_finite()
-                                && ess.is_finite()
-                                && rhat <= RHAT_MIXED_MAX
-                                && ess >= ess_floor;
-                            if diagnostics_ok {
-                                log::info!(
-                                    "[robust] never-fail posterior sampling mixed: dim={dim} \
-                                     draws={n} rhat={rhat:.3} ess={ess:.0}; reporting sampled \
-                                     covariance as honest intervals",
-                                );
-                                covariance_conditional = Some(cov);
-                            } else {
-                                // Non-converged: do NOT report the narrow sampled
-                                // covariance as data-driven. Inflate it so the
-                                // reported uncertainty reflects the failure to
-                                // resolve the posterior — widen by the R̂ excess (a
-                                // divergent chain widens hard) and an ESS-deficit
-                                // factor (too few independent draws ⇒ the sample
-                                // covariance is itself unreliable / too narrow). The
-                                // result is a clearly-flagged LOW-CONFIDENCE summary,
-                                // never an artificially tight interval, and we still
-                                // return a fit (the never-fail guarantee stands).
-                                let rhat_factor = if rhat.is_finite() {
-                                    rhat.max(1.0)
-                                } else {
-                                    // R̂ unestimable (too few chains/samples) ⇒
-                                    // treat as maximally unresolved.
-                                    RHAT_MIXED_MAX
-                                };
-                                let ess_factor = if ess.is_finite() && ess > 0.0 {
-                                    (ess_floor / ess).sqrt().max(1.0)
-                                } else {
-                                    ess_floor.sqrt()
-                                };
-                                let inflation = (rhat_factor * rhat_factor) * ess_factor;
-                                cov.mapv_inplace(|v| v * inflation);
-                                log::warn!(
-                                    "[robust] never-fail posterior sampling DID NOT MIX: dim={dim} \
-                                     draws={n} rhat={rhat:.3} (>{RHAT_MIXED_MAX}) ess={ess:.0} \
-                                     (<{ess_floor:.0}); reporting LOW-CONFIDENCE inflated covariance \
-                                     (x{inflation:.2}) instead of a possibly false-confident \
-                                     Jeffreys-narrowed interval (intervals are prior-dominated on \
-                                     any unidentified joint direction, NOT data-driven)",
-                                );
-                                covariance_conditional = Some(cov);
-                            }
-                        }
-                    }
-                    Some(Err(reason)) => {
-                        log::warn!(
-                            "[robust] never-fail posterior sampling could not factor the precision \
-                             ({reason}); retaining optimizer-conditional covariance (still no dead-end)",
-                        );
-                    }
-                }
-            }
-        }
-    }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
-    let outer_converged = !nonconvergence_escalation;
     // gam#1587/#561: a family whose smoothing rides on the full-width JOINT
     // penalty (the multinomial centered `Σ_t λ_t (M ⊗ S_t)` metric) leaves its
     // per-block penalty lists — and hence the physical `rho_physical`/`lambdas`
@@ -2020,7 +1658,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer_iterations: outer_iters,
             outer_gradient_norm: outer_grad_norm,
             criterion_certificate: outer_certificate,
-            outer_converged,
+            outer_converged: true,
             joint_log_lambdas,
             context: "fit_custom_family result assembly",
         },
@@ -2036,6 +1674,14 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
     outer_gradient_norm: Option<f64>,
     outer_converged: bool,
 ) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
+    if !outer_converged {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas",
+            reason: "the enclosing outer optimization did not certify convergence; refusing \
+                     to run inference or assemble a fixed-lambda fit from its checkpoint"
+                .to_string(),
+        });
+    }
     let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;

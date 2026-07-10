@@ -55,26 +55,15 @@ pub fn build_spherical_spline_basis(
     )?;
     let raw_design =
         build_wahba_decomposed_design(raw_kernel_design.view(), data, spec.radians, &decomposition);
-    let mut raw_penalty = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
-    let kernel_rank = decomposition.kernel_basis.ncols();
-    let diag_scale = if kernel_rank > 0 {
-        (0..kernel_rank)
-            .map(|i| raw_penalty[[i, i]].abs())
-            .sum::<f64>()
-            / kernel_rank as f64
-    } else {
-        0.0
-    };
-    if diag_scale.is_finite() && diag_scale > 0.0 {
-        // The raw finite-center chart is intentionally not coefficient-gauged.
-        // Tie a small coefficient ridge to the primary RKHS penalty so REML
-        // cannot disable all raw-chart stabilization by driving the separate
-        // double-penalty block to zero. This damps sparse polar center leverage
-        // without adding another smoothing parameter.
-        for i in 0..kernel_rank {
-            raw_penalty[[i, i]] += 10.0 * diag_scale;
-        }
-    }
+    // The primary penalty is exactly the Wahba RKHS seminorm `c'Kc` of the
+    // fitted function — no coefficient ridge is fused into it. Raw-chart
+    // shrinkage (sparse polar center leverage) is statistically a prior on
+    // the low-degree/null directions, so it lives ONLY in the separate
+    // REML-selected double-penalty candidate below; if the evidence drives
+    // that block to zero, zero shrinkage is the correct estimate. Numerical
+    // conditioning of near-singular kernel blocks is the solver's job, not
+    // the objective's.
+    let raw_penalty = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
     let raw_width = raw_design.ncols();
     // Realized-design transform. The Wahba kernels are built without the l=0
     // spherical-harmonic mode, so an additional finite-center coefficient
@@ -118,9 +107,9 @@ pub fn build_spherical_spline_basis(
         // genuinely-unpenalized low-degree harmonics free — the wrong subspace (a
         // standalone numeric check gives ‖ridge·primary‖/(‖ridge‖‖primary‖) ≈ 0.41
         // instead of 0). Build the ridge from the actual null space of the primary
-        // (`raw_penalty`, whose kernel block is full-rank after the diagonal
-        // stabilizer above and whose low-degree block is identically zero, so its
-        // null space is exactly the low-degree block), matching the corrected
+        // (`raw_penalty`, whose low-degree block is identically zero while the
+        // kernel block carries the RKHS Gram, so its structural null space is
+        // the low-degree block), matching the corrected
         // thin-plate / Matérn / 1-D B-spline pattern. The local `gauge` is the
         // identity for the fresh-fit `CenterSumToZero` chart (and the frozen
         // transform otherwise), so restricting `Z_null Z_nullᵀ` here keeps the
@@ -3592,6 +3581,67 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     // removal, since centering only subtracts a common mean from every axis.
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod wahba_penalty_invariants_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn wahba_primary_is_exact_function_seminorm_without_coefficient_ridge() {
+        let data = array![
+            [-1.1, 0.1],
+            [-0.7, 1.0],
+            [-0.2, 2.0],
+            [0.3, 2.8],
+            [0.8, -2.5],
+            [1.1, -1.4],
+            [0.5, -0.4],
+            [-0.4, -1.8],
+        ];
+        let spec = SphericalSplineBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            penalty_order: 2,
+            double_penalty: false,
+            radians: true,
+            method: SphereMethod::Wahba,
+            max_degree: None,
+            wahba_kernel: SphereWahbaKernel::Sobolev,
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        };
+        let built = build_spherical_spline_basis(data.view(), &spec).expect("Wahba basis");
+        assert_eq!(built.penalties.len(), 1);
+        let BasisMetadata::Sphere { centers, .. } = &built.metadata else {
+            panic!("Wahba builder must return spherical metadata");
+        };
+
+        let center_kernel = spherical_wahba_kernel_matrix_with_kind(
+            centers.view(),
+            centers.view(),
+            spec.penalty_order,
+            spec.radians,
+            spec.wahba_kernel,
+        )
+        .expect("center kernel");
+        let decomposition =
+            wahba_low_degree_decomposition(centers.view(), spec.radians, center_kernel.view())
+                .expect("low-degree decomposition");
+        let exact_raw = build_wahba_decomposed_penalty(center_kernel.view(), &decomposition);
+        let (expected, _) = normalize_penalty(&exact_raw);
+
+        let observed = &built.penalties[0];
+        assert_eq!(observed.dim(), expected.dim());
+        let error = observed
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            error <= 1.0e-12,
+            "primary Wahba penalty must be exactly the normalized RKHS seminorm; max error={error:.3e}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -14,8 +14,7 @@ pub const DEFAULT_DICTIONARY_SCORE_MIN_ELEMS: usize = 1 << 20;
 /// matching the library row-chunk target and keeping peak score memory bounded
 /// independent of dictionary width.
 pub const DEFAULT_DICTIONARY_SCORE_TILE_ELEMS: usize =
-    gam_runtime::resource::ResourcePolicy::default_library().row_chunk_target_bytes
-        / std::mem::size_of::<f32>();
+    gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES / std::mem::size_of::<f32>();
 
 /// Device admission and tile geometry for one minibatch-by-dictionary score
 /// route.

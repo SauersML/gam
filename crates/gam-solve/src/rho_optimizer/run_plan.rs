@@ -1021,6 +1021,39 @@ pub(crate) fn run_outer_with_plan(
                             result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
+                        // opt 0.5.13 native cost-stall exits: `CostStallConverged`
+                        // means the cost flatlined AND the bound-projected
+                        // gradient at the best iterate cleared the outer
+                        // tolerance — a KKT-stationary success, same verdict as
+                        // `Converged`. `CostStallFloor` is the flat-valley floor
+                        // with residual non-stationarity: halt is correct but
+                        // NOT a success; map it to `CostStallFlatValley` so the
+                        // retry orchestrator (run.rs) skips the wasted replay
+                        // and the shipped-β gradient reconciliation
+                        // (estimate/optimizer.rs) can still upgrade a
+                        // score-relative near-stationary floor.
+                        OptimizationStatus::CostStallConverged => {
+                            let mut result =
+                                solution_into_outer_result(report.solution, true, *the_plan);
+                            result.operator_stop_reason =
+                                Some(OperatorTrustRegionStopReason::Converged);
+                            result.operator_trust_radius = final_radius;
+                            Ok(result)
+                        }
+                        OptimizationStatus::CostStallFloor => {
+                            log::warn!(
+                                "[OUTER warning] {context}: matrix-free TR stopped on a cost stall \
+                                 with non-stationary projected gradient at final_value={:.6e} |g|={:.3e}",
+                                report.solution.final_value,
+                                report.solution.final_gradient_norm.unwrap_or(f64::NAN),
+                            );
+                            let mut result =
+                                solution_into_outer_result(report.solution, false, *the_plan);
+                            result.operator_stop_reason =
+                                Some(OperatorTrustRegionStopReason::CostStallFlatValley);
+                            result.operator_trust_radius = final_radius;
+                            Ok(result)
+                        }
                         OptimizationStatus::ObjectiveFailed
                         | OptimizationStatus::NumericalFailure
                         | OptimizationStatus::LineSearchFailed => {

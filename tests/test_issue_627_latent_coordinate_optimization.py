@@ -18,6 +18,13 @@ parabola — a 1-D curve in 2-D whose intrinsic coordinate is the arc position):
 * the recovered coordinate is actually returned (``t`` / ``latent`` / ``t_flat``);
 * ``init="caller"`` is a pure local solve (no seed), so a bad ``t`` stays bad and
   a good ``t`` stays good — proving the seed is what does the work.
+
+``gaussian_reml_optimize_latent`` only ever returns a *converged* fit (SPEC
+rule 20): non-stationarity raises ``gamfit.RemlConvergenceError`` carrying a
+``checkpoint_t`` resume checkpoint. The helper below implements the sanctioned
+checkpoint/resume loop — continue from the checkpoint (``init="caller"``) with
+a doubled iteration budget until stationarity is certified — so these quality
+assertions always run on an honestly converged fit.
 """
 
 from __future__ import annotations
@@ -29,6 +36,30 @@ import gamfit
 
 M = 14
 N = 180
+
+
+def _optimize_to_convergence(*args, max_iter, max_rounds=6, **kwargs):
+    """Resume-loop wrapper for the SPEC-20 convergence contract.
+
+    Returns ``(payload, first_init)`` where ``first_init`` is the init mode the
+    FIRST attempt reported (resumes are always ``init="caller"`` from the
+    checkpoint, so the payload's own ``init`` reflects the last round).
+    """
+    budget = int(max_iter)
+    first_init = None
+    for _ in range(max_rounds):
+        try:
+            out = gamfit.gaussian_reml_optimize_latent(*args, max_iter=budget, **kwargs)
+            return out, (out["init"] if first_init is None else first_init)
+        except gamfit.RemlConvergenceError as exc:
+            if first_init is None:
+                first_init = str(exc.init)
+            kwargs["t"] = np.asarray(exc.checkpoint_t, dtype=float).reshape(-1)
+            kwargs["init"] = "caller"
+            budget *= 2
+    # Last round propagates the typed error as an honest failure.
+    out = gamfit.gaussian_reml_optimize_latent(*args, max_iter=budget, **kwargs)
+    return out, first_init
 
 
 def _abs_spearman(a, b):
@@ -71,14 +102,14 @@ def test_optimizer_recovers_coordinate_from_random_init():
     centers, penalty = _centers_and_penalty()
     rng = np.random.default_rng(123)
 
-    out = gamfit.gaussian_reml_optimize_latent(
+    out, first_init = _optimize_to_convergence(
         y, N, 1, centers, penalty,
         t=rng.random(N), m=2, max_iter=120,
     )
 
     assert _r2(y, out["fitted"]) >= 0.99
     assert _abs_spearman(out["t"], true_t) >= 0.95
-    assert out["init"] == "spectral"
+    assert first_init == "spectral"
 
 
 def test_recovery_is_initialization_independent():

@@ -580,7 +580,6 @@ fn fit_expectile_laws(
         coefficient_groups,
         penalty_block_gamma_priors,
         latent_coord,
-        _marker,
     } = base_request;
     // The materializer already resolved the inner family to Gaussian-identity
     // from `gaussian_config`; assert it so a future materializer change that
@@ -605,19 +604,28 @@ fn fit_expectile_laws(
 
     let n = y.len();
     let gaussian_family = LikelihoodSpec::gaussian_identity();
-    // Cold start: τ = 0.5 (symmetric) weights ⇒ the first inner fit is the OLS
+    // Cold start: unweighted base weights ⇒ the first inner fit is the OLS
     // mean GAM, the natural warm start for any τ.
     let mut weights = base_weights.clone();
+    // Every sign pattern visited so far. The LAWS map is deterministic given a
+    // sign pattern (weights are a pure function of the pattern, and the inner
+    // penalized WLS + REML solve is deterministic), so revisiting a pattern
+    // without a KKT certificate proves the iteration is in a cycle and will
+    // never certify — a typed nonconvergence, not something to iterate past.
+    let mut seen_signs: std::collections::HashSet<Vec<bool>> = std::collections::HashSet::new();
     let mut last_sign: Option<Vec<bool>> = None;
-    let mut last_result: Option<StandardFitResult> = None;
+    // Evidence for the typed exhaustion error: (kkt residual, kkt scale) of the
+    // final uncertified iterate.
+    let mut last_kkt = (f64::NAN, f64::NAN);
 
     // The sign pattern has 2ⁿ values but LAWS visits a monotone-descent subset;
-    // empirically a handful of iterations suffice. The cap is a safety guard:
-    // on the rare oscillation between two equal-objective sign patterns (only
-    // possible when rows sit exactly on the fitted surface) the last fit is a
-    // valid τ-expectile of the perturbation-stable problem, so returning it is
-    // correct rather than an error.
+    // empirically a handful of iterations suffice. The cap is a pure safety
+    // guard: hitting it without a certificate below is typed nonconvergence
+    // carrying the fixed-point evidence — the cap never selects the estimator
+    // (SPEC rule 20).
     const MAX_LAWS_ITERS: usize = 50;
+
+    let inf_norm = |v: &Array1<f64>| v.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
 
     for _iter in 0..MAX_LAWS_ITERS {
         let request = StandardFitRequest {
@@ -636,7 +644,6 @@ fn fit_expectile_laws(
             coefficient_groups: coefficient_groups.clone(),
             penalty_block_gamma_priors: penalty_block_gamma_priors.clone(),
             latent_coord: None,
-            _marker,
         };
         let result = fit_standard_model(request)
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
@@ -658,19 +665,72 @@ fn fit_expectile_laws(
         mu_off += &offset;
 
         let sign: Vec<bool> = (0..n).map(|i| y[i] > mu_off[i]).collect();
-        let converged = last_sign.as_ref().is_some_and(|prev| prev == &sign);
-        weights = expectile_row_weights(y.view(), mu_off.view(), base_weights.view(), tau);
-        last_sign = Some(sign);
-        last_result = Some(result);
-        if converged {
-            break;
+        let next_weights =
+            expectile_row_weights(y.view(), mu_off.view(), base_weights.view(), tau);
+
+        // KKT certificate for the CONVEX penalized asymmetric-least-squares
+        // problem at the fit's own selected λ. The asymmetric loss
+        // ρ_τ(r) = |τ − 1[r<0]|·r² is convex and continuously differentiable
+        // (its derivative vanishes at r = 0 from both sides), so the true
+        // penalized objective J(β) = Σ wᵢ(τ)·rᵢ² + βᵀS_λβ has a checkable
+        // gradient at the returned β. The inner solve certifies stationarity
+        // of the FROZEN-weight problem, Xᵀ(w_used ∘ r) = S_λ β, hence
+        //   ∇J(β)/2 = Xᵀ((w_used − w_new) ∘ r),
+        // supported exactly on rows whose residual sign disagrees with the
+        // pattern the weights were frozen at. Scaling by the stationarity
+        // balance ‖Xᵀ(w ∘ r)‖∞ makes the residual dimensionless: it is 0 at
+        // the exact LAWS fixed point and below tolerance precisely when the
+        // only unstabilized rows sit (numerically) on the fitted surface —
+        // the equal-objective tie oscillation, now certified instead of
+        // assumed benign.
+        let residual = y.as_ref() - &mu_off;
+        let mismatch = (&weights - &next_weights) * &residual;
+        let kkt = inf_norm(&result.design.design.apply_transpose(&mismatch));
+        let scale = inf_norm(
+            &result
+                .design
+                .design
+                .apply_transpose(&(&weights * &residual)),
+        )
+        .max(inf_norm(
+            &result
+                .design
+                .design
+                .apply_transpose(&(&next_weights * &residual)),
+        ));
+        let exact_fixed_point = last_sign.as_ref().is_some_and(|prev| prev == &sign);
+        if exact_fixed_point || kkt <= options.tol * scale {
+            return Ok(result);
         }
+        last_kkt = (kkt, scale);
+        if !seen_signs.insert(sign.clone()) {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "expectile LAWS entered a deterministic sign-pattern cycle without \
+                     reaching the KKT fixed point of the convex asymmetric least-squares \
+                     problem (tau={tau}, iterations={}, KKT residual={:.3e} vs scaled \
+                     tolerance {:.3e}); non-convergence is a typed error, never a \
+                     best-effort fit",
+                    seen_signs.len(),
+                    kkt,
+                    options.tol * scale,
+                ),
+            });
+        }
+        last_sign = Some(sign);
+        weights = next_weights;
     }
 
-    let result = last_result.ok_or_else(|| WorkflowError::IntegrationFailed {
-        reason: "expectile LAWS produced no fit".to_string(),
-    })?;
-    Ok(result)
+    Err(WorkflowError::IntegrationFailed {
+        reason: format!(
+            "expectile LAWS exhausted its {MAX_LAWS_ITERS}-iteration safety cap without a \
+             KKT certificate for the convex asymmetric least-squares problem (tau={tau}, \
+             final KKT residual={:.3e} vs scaled tolerance {:.3e}); the iteration cap \
+             never selects the estimator — non-convergence is a typed error",
+            last_kkt.0,
+            options.tol * last_kkt.1,
+        ),
+    })
 }
 /// Detection seam for the exact O(n) cubic-smoothing-spline fast path.
 ///

@@ -5300,7 +5300,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(conditional_prior_ivae, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_aux_richness, module)?)?;
     module.add_function(wrap_pyfunction!(diagnostics_jacobian_sparsity, module)?)?;
-    module.add_function(wrap_pyfunction!(diagnostics_anchor_consistency, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        diagnostics_anchor_consistency_report,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(diagnostics_concat_decoder_blocks, module)?)?;
     module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
     module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
@@ -5521,31 +5524,48 @@ fn diagnostics_jacobian_sparsity<'py>(
     Ok(dict.unbind())
 }
 
-/// Anchor-consistency metrics for a manifold-SAE assignment matrix.
+/// Full anchor-consistency identifiability verdict for an assignment matrix.
 ///
-/// `assignments` has shape `(N, K)`. Returns a dict with keys:
-/// `n_rows`, `n_atoms`, `n_anchors`, `anchors_per_atom` (list[int] length K).
-#[pyfunction(signature = (assignments, anchor_dominance))]
-fn diagnostics_anchor_consistency<'py>(
+/// Marshals `gam::identifiability::kernel::anchor_consistency_report` — the
+/// single core implementation of the pass/fail logic — into a dict with keys
+/// `preconditions` (dict[str, bool]), `violations` (list[str]),
+/// `recommendations` (list[str]), `anchor_dominance`, and `details`
+/// (`n_samples`, `K`, `n_anchors`, `anchor_fraction`, `anchors_per_atom`,
+/// `uncovered_atoms`).
+#[pyfunction(signature = (assignments, anchor_dominance=None))]
+fn diagnostics_anchor_consistency_report<'py>(
     py: Python<'py>,
     assignments: PyReadonlyArray2<'py, f64>,
-    anchor_dominance: f64,
+    anchor_dominance: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
-    if !(anchor_dominance > 0.0 && anchor_dominance <= 1.0) {
-        return Err(py_value_error(format!(
-            "diagnostics_anchor_consistency: anchor_dominance must be in (0, 1]; got {}",
-            anchor_dominance
-        )));
-    }
-    let m = gam::identifiability::kernel::anchor_consistency_metrics(
+    let report = gam::identifiability::kernel::anchor_consistency_report(
         assignments.as_array(),
         anchor_dominance,
-    );
+    )
+    .map_err(py_value_error)?;
+    let preconditions = PyDict::new(py);
+    preconditions.set_item(
+        "enough_anchors_total",
+        report.preconditions.enough_anchors_total,
+    )?;
+    preconditions.set_item(
+        "anchors_cover_all_atoms",
+        report.preconditions.anchors_cover_all_atoms,
+    )?;
+    let details = PyDict::new(py);
+    details.set_item("n_samples", report.metrics.n_rows)?;
+    details.set_item("K", report.metrics.n_atoms)?;
+    details.set_item("n_anchors", report.metrics.n_anchors)?;
+    details.set_item("anchor_fraction", report.anchor_fraction)?;
+    details.set_item("anchors_per_atom", report.metrics.anchors_per_atom.clone())?;
+    details.set_item("uncovered_atoms", report.uncovered_atoms.clone())?;
+    details.set_item("anchor_dominance", report.anchor_dominance)?;
     let dict = PyDict::new(py);
-    dict.set_item("n_rows", m.n_rows)?;
-    dict.set_item("n_atoms", m.n_atoms)?;
-    dict.set_item("n_anchors", m.n_anchors)?;
-    dict.set_item("anchors_per_atom", m.anchors_per_atom)?;
+    dict.set_item("preconditions", preconditions)?;
+    dict.set_item("violations", report.violations.clone())?;
+    dict.set_item("recommendations", report.recommendations.clone())?;
+    dict.set_item("anchor_dominance", report.anchor_dominance)?;
+    dict.set_item("details", details)?;
     Ok(dict.unbind())
 }
 
@@ -5763,7 +5783,7 @@ fn linear_dictionary_fit<'py>(
         center_rank_one,
     };
     let fit = detach_py_result(py, "linear_dictionary_fit", move || {
-        fit_linear_dictionary(x_values.view(), &config)
+        fit_linear_dictionary(x_values.view(), &config).map_err(|error| error.to_string())
     })?;
     let out = PyDict::new(py);
     out.set_item("atoms", fit.atoms.into_pyarray(py))?;
@@ -5773,7 +5793,6 @@ fn linear_dictionary_fit<'py>(
     out.set_item("reml_scores", fit.reml_scores.into_pyarray(py))?;
     out.set_item("explained_variance", fit.explained_variance)?;
     out.set_item("iterations", fit.iterations)?;
-    out.set_item("converged", fit.converged)?;
     out.set_item("assignment", fit.assignment.as_str())?;
     out.set_item("top_k", fit.top_k)?;
     Ok(out.unbind())
@@ -9358,28 +9377,18 @@ fn design_matrix_dense(
     .map_err(|err| err.to_string())
 }
 
-#[derive(Serialize)]
-struct PosteriorPredictPayload {
-    eta_flat: Vec<f64>,
-    n_draws: usize,
-    n_rows: usize,
-    model_class: String,
-    family_kind: String,
-    /// Serialized parameterized `InverseLink` (JSON) carrying the per-fit state
-    /// the bare `family_kind` tag drops; consumed by `predict_draws` /
-    /// `posterior_predict_bands_table` to route the parameterized links'
-    /// response-scale draws (issue #1133). `None` falls back to the tag.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    link_spec: Option<String>,
-}
-
 fn posterior_credible_interval_impl(
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
+    samples: Array2<f64>,
     level: f64,
-) -> Result<Vec<f64>, String> {
-    gam::inference::posterior::credible_interval(&samples_flat, n_draws, n_coeffs, level)
+) -> Result<Array2<f64>, String> {
+    let (n_draws, n_coeffs) = samples.dim();
+    let contiguous = samples
+        .as_slice()
+        .ok_or_else(|| "posterior samples must use contiguous row-major storage".to_string())?;
+    let intervals =
+        gam::inference::posterior::credible_interval(contiguous, n_draws, n_coeffs, level)?;
+    Array2::from_shape_vec((n_coeffs, 2), intervals)
+        .map_err(|err| format!("failed to shape posterior credible intervals: {err}"))
 }
 
 #[derive(Deserialize)]

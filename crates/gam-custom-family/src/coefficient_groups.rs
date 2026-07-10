@@ -287,11 +287,23 @@ pub fn realize_coefficient_groups_for_custom_family(
         }
     }
 
+    // Every group is a separate Gaussian factor in the prior product (the
+    // hierarchical-Gamma identity above), so its label must be carried into
+    // `BlockwiseFitOptions::independent_prior_factor_labels`: the evidence
+    // normalizer for these pieces is per-factor `½(rank Sₖ·log λₖ +
+    // log|Sₖ|₊)`, and coalescing them into one block pseudo-logdet would
+    // lose `½ log λ` for every dimension shared by overlapping groups.
+    let independent_prior_factor_labels = realized_groups
+        .iter()
+        .map(|group| group.label.clone())
+        .collect();
+
     Ok(RealizedCoefficientGroupSpecs {
         specs: realized_specs,
         groups: realized_groups,
         penalty_labels,
         rho_prior: gam_problem::RhoPrior::Independent(priors),
         outer_labels,
+        independent_prior_factor_labels,
     })
 }

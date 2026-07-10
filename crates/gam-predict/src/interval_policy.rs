@@ -589,8 +589,8 @@ pub trait PredictionTransform {
 
     /// The response distribution family. Used by the generic posterior-mean
     /// driver to build the per-family observation (prediction) interval via
-    /// [`family_observation_band`]; families without a closed-form conditional
-    /// response variance (`RoystonParmar`) simply yield no observation columns.
+    /// [`family_observation_band`]; `RoystonParmar` yields the discrete
+    /// Bernoulli predictive set for the horizon indicator `1{T > t}`.
     fn response_family(&self) -> ResponseFamily;
 
     /// Optional response-scale observation-noise σ for the requested batch.

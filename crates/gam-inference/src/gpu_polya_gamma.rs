@@ -53,8 +53,11 @@
 //! the same `(seed, row)`.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use std::{convert::Infallible, sync::OnceLock};
 
 use gam_linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
+
+use crate::polya_gamma::PolyaGamma;
 
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuError;
@@ -221,38 +224,48 @@ impl XorwowState {
     }
 }
 
+/// Expose XORWOW's random bits through the workspace `rand` interface so the
+/// CPU fallback can use the same upstream sampler adapter as every other host
+/// caller. The CUDA kernel keeps its own device-side transforms; this bridge is
+/// only for the host distribution oracle.
+impl rand::TryRng for XorwowState {
+    type Error = Infallible;
+
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(XorwowState::next_u32(self))
+    }
+
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let low = u64::from(XorwowState::next_u32(self));
+        let high = u64::from(XorwowState::next_u32(self));
+        Ok((high << 32) | low)
+    }
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        rand::rand_core::utils::fill_bytes_via_next_word(dest, || {
+            Ok(XorwowState::next_u32(self))
+        })
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
-// CPU host reference — Devroye PG(1, c) via the shared sampler core
+// CPU host reference — PG(1, c) via the upstream sampler adapter
 // ────────────────────────────────────────────────────────────────────────
 //
-// The CPU oracle for parity tests has to *use the same RNG bytes as the
-// device kernel*, so it drives the shared Devroye core
-// (`crate::polya_gamma_core`) through the bit-exact `XorwowState`
-// rather than through the production `rand::Rng` adapter. The math (Devroye
-// 1986; PSW 2013) is the single shared implementation — there is no second
-// copy of the tail mass / series / inverse-Gaussian helpers to drift.
+// The host fallback deliberately routes through `crate::polya_gamma`, which
+// owns the rand-version bridge and delegates all CPU sampling mathematics to
+// `polya-gamma`. XORWOW still supplies deterministic per-row random bits, while
+// the CUDA kernel remains an independent device implementation validated in
+// distribution against this host path.
 
-use crate::polya_gamma_core::{PgRng, draw_pg1};
-use std::f64::consts::{FRAC_PI_2, PI};
+use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
 
-/// `XorwowState` is the randomness source for the bit-exact GPU oracle. Wiring
-/// it through [`PgRng`] lets the shared Devroye core run against the same RNG
-/// byte stream the device kernel consumes.
-impl PgRng for XorwowState {
-    #[inline]
-    fn next_unit(&mut self) -> f64 {
-        XorwowState::next_unit(self)
-    }
-
-    #[inline]
-    fn next_exp(&mut self) -> f64 {
-        XorwowState::next_exp(self)
-    }
-
-    #[inline]
-    fn next_norm(&mut self) -> f64 {
-        XorwowState::next_norm(self)
-    }
+fn upstream_pg1() -> &'static PolyaGamma {
+    static SAMPLER: OnceLock<PolyaGamma> = OnceLock::new();
+    SAMPLER.get_or_init(PolyaGamma::new)
 }
 
 /// CPU oracle for one PG(1, c) draw using a `XorwowState` directly. The
@@ -260,7 +273,7 @@ impl PgRng for XorwowState {
 /// rounding of transcendentals, which agree to <1 ULP for the inputs we
 /// touch).
 pub fn pg1_draw_cpu_oracle(state: &mut XorwowState, tilt: f64) -> f64 {
-    draw_pg1(state, tilt)
+    upstream_pg1().draw(state, tilt)
 }
 
 /// Higher-shape draw on host via convolution: PG(b, c) =_d Σ_{j=1..b} PG(1, c).

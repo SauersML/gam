@@ -5654,6 +5654,108 @@ pub struct LinkWiggleSplineArtifacts {
     pub degree: usize,
 }
 
+/// Per-family likelihood parameters for the link-wiggle joint target.
+///
+/// The historical single `scale: f64` slot was ambiguous: for Tweedie the
+/// caller supplied the fitted *dispersion* φ while the target consumed the
+/// same scalar as the variance *power* p, and the quasi-likelihood dropped
+/// its 1/φ factor entirely — a different posterior, not an approximation
+/// (finding 15, #2245). Each family now names exactly the parameters its
+/// log-likelihood needs, so a mis-wiring is a type error.
+#[derive(Clone, Copy, Debug)]
+pub enum LinkWiggleFamilyParams {
+    /// Profiled Gaussian with residual standard deviation σ.
+    Gaussian { sigma: f64 },
+    BinomialLogit,
+    BinomialProbit,
+    BinomialCLogLog,
+    PoissonLog,
+    /// Tweedie quasi-likelihood: variance power `p ∈ (1, 2)` and dispersion
+    /// `φ > 0` (the 1/φ factor scales both the log-likelihood and score,
+    /// matching the flat NUTS path's `data.dispersion` handling).
+    TweedieLog { power: f64, phi: f64 },
+    /// Negative binomial with overdispersion θ > 0.
+    NegativeBinomialLog { theta: f64 },
+    /// Gamma with shape k = 1/φ.
+    GammaLog { shape: f64 },
+}
+
+impl LinkWiggleFamilyParams {
+    /// The response-family tag this parameter set belongs to.
+    fn nuts_family(self) -> NutsFamily {
+        match self {
+            Self::Gaussian { .. } => NutsFamily::Gaussian,
+            Self::BinomialLogit => NutsFamily::BinomialLogit,
+            Self::BinomialProbit => NutsFamily::BinomialProbit,
+            Self::BinomialCLogLog => NutsFamily::BinomialCLogLog,
+            Self::PoissonLog => NutsFamily::PoissonLog,
+            Self::TweedieLog { .. } => NutsFamily::TweedieLog,
+            Self::NegativeBinomialLog { .. } => NutsFamily::NegativeBinomialLog,
+            Self::GammaLog { .. } => NutsFamily::GammaLog,
+        }
+    }
+
+    /// Coefficient-covariance scale `cov_scale` (#679/#680 invariant): `σ²`
+    /// for profiled Gaussian, `1.0` for every family whose working weight
+    /// already carries the dispersion (Gamma/Tweedie/NB) and for the
+    /// unit-scale families.
+    fn cov_scale(self) -> f64 {
+        match self {
+            Self::Gaussian { sigma } => sigma * sigma,
+            _ => 1.0,
+        }
+    }
+
+    /// Validate the family parameters once at construction so an invalid
+    /// payload is a hard error rather than a silent `-inf` target.
+    fn validate(self) -> Result<(), HmcError> {
+        match self {
+            Self::TweedieLog { power, phi } => {
+                if !is_valid_tweedie_power(power) {
+                    return Err(HmcError::InvalidConfig {
+                        reason: format!(
+                            "Tweedie variance power must be finite and strictly between 1 and 2; got {power}"
+                        ),
+                    });
+                }
+                if !(phi.is_finite() && phi > 0.0) {
+                    return Err(HmcError::InvalidConfig {
+                        reason: format!(
+                            "Tweedie dispersion phi must be finite and positive; got {phi}"
+                        ),
+                    });
+                }
+            }
+            Self::NegativeBinomialLog { theta } => {
+                if !(theta.is_finite() && theta > 0.0) {
+                    return Err(HmcError::InvalidConfig {
+                        reason: format!(
+                            "negative-binomial theta must be finite and positive; got {theta}"
+                        ),
+                    });
+                }
+            }
+            Self::Gaussian { sigma } => {
+                if !(sigma.is_finite() && sigma > 0.0) {
+                    return Err(HmcError::InvalidConfig {
+                        reason: format!("Gaussian sigma must be finite and positive; got {sigma}"),
+                    });
+                }
+            }
+            Self::GammaLog { shape } => {
+                if !(shape.is_finite() && shape > 0.0) {
+                    return Err(HmcError::InvalidConfig {
+                        reason: format!("Gamma shape must be finite and positive; got {shape}"),
+                    });
+                }
+            }
+            Self::BinomialLogit | Self::BinomialProbit | Self::BinomialCLogLog
+            | Self::PoissonLog => {}
+        }
+        Ok(())
+    }
+}
+
 /// Whitened log-posterior target for joint (β_eta, β_wiggle) with analytical gradients.
 #[derive(Clone)]
 pub struct LinkWigglePosterior {
@@ -5661,6 +5763,9 @@ pub struct LinkWigglePosterior {
     x: Arc<Array2<f64>>,
     y: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
+    /// Fixed fit-time additive offset on the base linear predictor
+    /// (q₀ = Xβ + offset), or `None` for an offset-free fit.
+    offset: Option<Arc<Array1<f64>>>,
     /// Penalty for main coefficients (p_main × p_main)
     penalty_base: Arc<Array2<f64>>,
     /// Penalty for wiggle coefficients (p_wiggle × p_wiggle)
@@ -5675,9 +5780,8 @@ pub struct LinkWigglePosterior {
     p_base: usize,
     p_link: usize,
     n_samples: usize,
-    nuts_family: NutsFamily,
-    /// Family-specific noise parameter: Gaussian sigma or Gamma shape.
-    scale: f64,
+    /// Typed per-family likelihood parameters (see [`LinkWiggleFamilyParams`]).
+    family: LinkWiggleFamilyParams,
     /// Coefficient-covariance scale `cov_scale` (#679/#680 invariant): the
     /// `Vb = cov_scale·H⁻¹` multiplier driving both the whitening
     /// (`L Lᵀ = cov_scale·H⁻¹`) and the target penalty weight
@@ -5698,18 +5802,19 @@ impl LinkWigglePosterior {
     }
 
     /// Creates a new link-wiggle posterior target.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
         weights: ArrayView1<f64>,
+        offset: Option<ArrayView1<f64>>,
         penalty_base: ArrayView2<f64>,
         penalty_link: ArrayView2<f64>,
         mode_beta: ArrayView1<f64>,
         mode_theta: ArrayView1<f64>,
         hessian: ArrayView2<f64>,
         spline: LinkWiggleSplineArtifacts,
-        nuts_family: NutsFamily,
-        scale: f64,
+        family: LinkWiggleFamilyParams,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
         let p_base = x.ncols();
@@ -5727,6 +5832,26 @@ impl LinkWigglePosterior {
             }
             .into());
         }
+        family.validate().map_err(String::from)?;
+        if let Some(offset) = offset.as_ref() {
+            if offset.len() != n_samples {
+                return Err(HmcError::DimensionMismatch {
+                    reason: format!(
+                        "link-wiggle NUTS offset length {} does not match {} observations",
+                        offset.len(),
+                        n_samples
+                    ),
+                }
+                .into());
+            }
+            if !offset.iter().all(|v| v.is_finite()) {
+                return Err(HmcError::NonFiniteState {
+                    reason: "link-wiggle NUTS offset contains NaN or Inf values".to_string(),
+                }
+                .into());
+            }
+        }
+        let nuts_family = family.nuts_family();
         if nuts_family.likelihood_spec().is_binomial() {
             validate_binary_responses("binomial link-wiggle NUTS", &y, &weights)
                 .map_err(String::from)?;
@@ -5736,17 +5861,12 @@ impl LinkWigglePosterior {
                 .map_err(String::from)?;
         }
         // Whitening metric `L Lᵀ = cov_scale · H⁻¹` (#679/#680 invariant), so
-        // scale `L` by `√cov_scale`. For the link-wiggle joint target `scale`
-        // is σ (Gaussian), so the profiled-Gaussian covariance scale is
-        // `cov_scale = σ²`. Every other family folds its dispersion into the
-        // working weight / the `shape`/`theta` already inside its
-        // log-likelihood, so `cov_scale = 1` and this is a no-op. The previous
-        // Gamma branch scaled `L` by `1/√shape = √φ`, mis-preconditioning the
-        // sampler against `φ·H⁻¹` instead of the correct `H⁻¹` (#680).
-        let cov_scale = match nuts_family {
-            NutsFamily::Gaussian => scale * scale,
-            _ => 1.0,
-        };
+        // scale `L` by `√cov_scale`: `σ²` for the profiled Gaussian, `1.0`
+        // for every family that folds its dispersion into the working weight
+        // / the `shape`/`theta` already inside its log-likelihood. The
+        // pre-#680 Gamma branch scaled `L` by `1/√shape = √φ`,
+        // mis-preconditioning the sampler against `φ·H⁻¹` instead of `H⁻¹`.
+        let cov_scale = family.cov_scale();
         let whitening = hessian_whitening_transform(
             hessian,
             dim,
@@ -5759,6 +5879,7 @@ impl LinkWigglePosterior {
             x: Arc::new(x.to_owned()),
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
+            offset: offset.map(|o| Arc::new(o.to_owned())),
             penalty_base: Arc::new(penalty_base.to_owned()),
             penalty_link: Arc::new(penalty_link.to_owned()),
             mode_beta: Arc::new(mode_beta.to_owned()),
@@ -5769,8 +5890,7 @@ impl LinkWigglePosterior {
             p_base,
             p_link,
             n_samples,
-            nuts_family,
-            scale,
+            family,
             cov_scale,
         })
     }
@@ -5868,16 +5988,19 @@ impl LinkWigglePosterior {
         let beta = q.slice(ndarray::s![0..self.p_base]).to_owned();
         let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
 
-        // Compute η = q₀ + B(q₀)·θ where q₀ = X·β
-        let u = gam_linalg::faer_ndarray::fast_av(self.x.as_ref(), &beta);
+        // Compute η = q₀ + B(q₀)·θ where q₀ = X·β (+ fixed fit-time offset)
+        let mut u = gam_linalg::faer_ndarray::fast_av(self.x.as_ref(), &beta);
+        if let Some(offset) = self.offset.as_ref() {
+            u += offset.as_ref();
+        }
         let (bwiggle, eta) = self.evaluate_link(&u, &theta);
 
         // Log-likelihood and residuals via family dispatch
         let ll;
         let mut residual = Array1::<f64>::zeros(self.n_samples);
-        match self.nuts_family {
-            NutsFamily::Gaussian => {
-                let inv_scale_sq = 1.0 / (self.scale * self.scale).max(1e-10);
+        match self.family {
+            LinkWiggleFamilyParams::Gaussian { sigma } => {
+                let inv_scale_sq = 1.0 / (sigma * sigma).max(1e-10);
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let r = self.y[i] - eta[i];
@@ -5887,7 +6010,7 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
-            NutsFamily::BinomialLogit => {
+            LinkWiggleFamilyParams::BinomialLogit => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
@@ -5898,7 +6021,7 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
-            NutsFamily::BinomialProbit => {
+            LinkWiggleFamilyParams::BinomialProbit => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
@@ -5913,7 +6036,7 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
-            NutsFamily::BinomialCLogLog => {
+            LinkWiggleFamilyParams::BinomialCLogLog => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
@@ -5934,7 +6057,7 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
-            NutsFamily::PoissonLog => {
+            LinkWiggleFamilyParams::PoissonLog => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
@@ -5954,15 +6077,14 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
-            NutsFamily::TweedieLog => {
+            LinkWiggleFamilyParams::TweedieLog { power: p, phi } => {
+                // Tweedie quasi-log-likelihood on the log link, per-row
+                // ℓᵢ = (wᵢ/φ)·(yᵢ·μ^{1−p}/(1−p) − μ^{2−p}/(2−p)); the 1/φ
+                // factor scales both the value and the score exactly as the
+                // flat NUTS path's `data.dispersion` does. `p` and `φ` are
+                // validated at construction (finding 15, #2245).
+                let inv_phi = 1.0 / phi;
                 let mut ll_acc = 0.0;
-                // Family mapping: Tweedie scale carries payload p; phi is not stored here.
-                // Invalid p makes the link-wiggle target invalid instead of defaulting.
-                if !is_valid_tweedie_power(self.scale) {
-                    grad.fill(0.0);
-                    return f64::NEG_INFINITY;
-                }
-                let p = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !eta_i.is_finite() {
@@ -5971,21 +6093,15 @@ impl LinkWigglePosterior {
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp().max(1e-300);
-                    ll_acc +=
-                        w_i * (y_i * mu.powf(1.0 - p) / (1.0 - p) - mu.powf(2.0 - p) / (2.0 - p));
-                    residual[i] = w_i * (y_i - mu) * mu.powf(1.0 - p);
+                    ll_acc += w_i
+                        * inv_phi
+                        * (y_i * mu.powf(1.0 - p) / (1.0 - p) - mu.powf(2.0 - p) / (2.0 - p));
+                    residual[i] = w_i * inv_phi * (y_i - mu) * mu.powf(1.0 - p);
                 }
                 ll = ll_acc;
             }
-            NutsFamily::NegativeBinomialLog => {
+            LinkWiggleFamilyParams::NegativeBinomialLog { theta } => {
                 let mut ll_acc = 0.0;
-                // Family mapping: NegativeBinomial scale carries payload theta.
-                // Invalid theta makes the link-wiggle target invalid instead of clamping.
-                if !(self.scale.is_finite() && self.scale > 0.0) {
-                    grad.fill(0.0);
-                    return f64::NEG_INFINITY;
-                }
-                let theta = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !eta_i.is_finite() {
@@ -6010,9 +6126,8 @@ impl LinkWigglePosterior {
                 }
                 ll = ll_acc;
             }
-            NutsFamily::GammaLog => {
+            LinkWiggleFamilyParams::GammaLog { shape } => {
                 let mut ll_acc = 0.0;
-                let shape = self.scale.max(1e-10);
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !eta_i.is_finite() {

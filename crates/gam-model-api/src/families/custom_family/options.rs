@@ -596,6 +596,26 @@ pub struct BlockwiseFitOptions {
     /// `ParameterBlockSpec.penalties`. The per-block path is unchanged.
     /// `None` preserves legacy behaviour for every existing caller.
     pub joint_penalties: Option<Arc<crate::JointPenaltyBundle>>,
+    /// Precision labels whose per-block penalty components are INDEPENDENT
+    /// Gaussian prior factors (the hierarchical coefficient-group priors from
+    /// `realize_coefficient_groups_for_custom_family`; copy its
+    /// `independent_prior_factor_labels` here), as opposed to additive pieces
+    /// of one Gaussian smooth prior.
+    ///
+    /// The distinction matters only for the evidence normalizer. A
+    /// multi-penalty smooth is ONE Gaussian with precision `Σ_k λ_k S_k`, so
+    /// its normalizer is the coalesced `½ log|Σ_k λ_k S_k|₊`. A product of
+    /// independent group factors `∏_k N(0, (λ_k S_k)⁻¹)` instead contributes
+    /// `Σ_k ½ (rank S_k · log λ_k + log|S_k|₊)` — and the two disagree
+    /// exactly when factors overlap (two factors with precision λ on one
+    /// scalar coefficient carry `λ^{1/2}·λ^{1/2} = λ`, but the coalesced form
+    /// `½ log(2λ)` loses `½ log λ` up to constants), which biases the outer
+    /// ρ-posterior and the hierarchical Gamma precision exponent. Labels
+    /// listed here get the per-factor normalizer in the outer objective.
+    ///
+    /// **Default empty** — every penalty coalesces per block, the correct
+    /// convention for ordinary (tensor/multi-penalty) smooths.
+    pub independent_prior_factor_labels: Vec<String>,
     /// Whether the outer smoothing optimizer screens the explicit
     /// `initial_rho` seed through the seed-screening cascade before the
     /// solver starts.
@@ -689,6 +709,7 @@ impl Default for BlockwiseFitOptions {
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
+            independent_prior_factor_labels: Vec::new(),
             screen_initial_rho: true,
         }
     }

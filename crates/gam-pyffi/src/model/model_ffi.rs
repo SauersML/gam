@@ -326,22 +326,16 @@ struct PredictionPayload {
     interval_method: Option<String>,
 }
 
-/// JSON wire format for NUTS posterior draws.
+/// Typed wire payload for NUTS posterior draws.
 ///
-/// `samples_flat` is a row-major flattening of an `(n_draws, n_coeffs)`
-/// matrix.  The Python side rebuilds the numpy array via
-/// `np.asarray(samples_flat).reshape(n_draws, n_coeffs)` — flat lists round
-/// trip through `serde_json` faster than nested ones at the sizes typical
-/// for large-scale work (millions of doubles), and they sidestep the
-/// per-row Python list construction cost.
-#[derive(Serialize)]
+/// Bulk numeric fields stay as ndarrays until the PyO3 edge, where they become
+/// NumPy arrays. Only names and scalar diagnostics become ordinary Python
+/// objects; no draw-sized JSON or Python list is materialized.
 struct SamplePayload {
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
+    samples: Array2<f64>,
     coefficient_names: Vec<String>,
-    posterior_mean: Vec<f64>,
-    posterior_std: Vec<f64>,
+    posterior_mean: Array1<f64>,
+    posterior_std: Array1<f64>,
     rhat: f64,
     ess: f64,
     converged: bool,
@@ -361,7 +355,6 @@ struct SamplePayload {
     /// so this carries the full link spec back into the response-scale
     /// transforms. `None` when serialization is unavailable; the wrapper then
     /// falls back to the string tag (issue #1133).
-    #[serde(skip_serializing_if = "Option::is_none")]
     link_spec: Option<String>,
     /// Whether the draws came from exact NUTS or the Laplace-Gaussian
     /// fallback. Currently only "nuts" or "laplace"; callers can use
@@ -1729,10 +1722,33 @@ fn sample_table(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     options_json: Option<String>,
-) -> PyResult<String> {
-    detach_py_result(py, "sample_table", move || {
+) -> PyResult<Py<PyDict>> {
+    let payload = detach_py_result(py, "sample_table", move || {
         sample_table_impl(&model_bytes, headers, rows, options_json.as_deref())
-    })
+    })?;
+    let (n_draws, n_coeffs) = payload.samples.dim();
+    let config = PyDict::new(py);
+    config.set_item("n_samples", payload.config.n_samples)?;
+    config.set_item("n_warmup", payload.config.n_warmup)?;
+    config.set_item("n_chains", payload.config.n_chains)?;
+    config.set_item("target_accept", payload.config.target_accept)?;
+    config.set_item("seed", payload.config.seed)?;
+    let out = PyDict::new(py);
+    out.set_item("samples", payload.samples.into_pyarray(py))?;
+    out.set_item("n_draws", n_draws)?;
+    out.set_item("n_coeffs", n_coeffs)?;
+    out.set_item("coefficient_names", payload.coefficient_names)?;
+    out.set_item("posterior_mean", payload.posterior_mean.into_pyarray(py))?;
+    out.set_item("posterior_std", payload.posterior_std.into_pyarray(py))?;
+    out.set_item("rhat", payload.rhat)?;
+    out.set_item("ess", payload.ess)?;
+    out.set_item("converged", payload.converged)?;
+    out.set_item("config", config)?;
+    out.set_item("model_class", payload.model_class)?;
+    out.set_item("family_kind", payload.family_kind)?;
+    out.set_item("link_spec", payload.link_spec)?;
+    out.set_item("method", payload.method)?;
+    Ok(out.unbind())
 }
 
 // paired_sample_table and paired_cumulative_incidence_table pyffi wrappers

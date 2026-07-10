@@ -45,6 +45,15 @@ const RHO_UPPER: f64 = 30.0;
 const EIGEN_REL_TOL: f64 = 1.0e-10;
 const GRAD_TOL: f64 = 1.0e-12;
 const MIN_DEVIANCE: f64 = 1.0e-300;
+/// Relative first-order convergence certificate for the block-orthogonal
+/// alternation: the largest per-block |dV/drho|, normalized by the score's
+/// natural magnitude `d * max(1, rank)`, must fall below this before a fit is
+/// minted. See `gaussian_reml_blocks_orthogonal_shared_scale`.
+const BLOCK_ORTHOGONAL_SCORE_TOL: f64 = 1.0e-7;
+/// Exhaustion-escalation bound on outer alternation passes. It never selects
+/// the estimator: reaching it without the score certificate is a typed
+/// `BlockOrthogonalRemlDidNotConverge` error carrying the rho checkpoint.
+const BLOCK_ORTHOGONAL_MAX_OUTER_PASSES: usize = 200;
 
 /// Canonicalize a penalty matrix to its symmetric average.
 ///
@@ -853,6 +862,12 @@ fn block_orthogonal_scale_objective(
     BlockOrthogonalScaleDerivs { value, grad, hess }
 }
 
+/// One warm-started 1-D Newton polish of a single block's rho at fixed scale
+/// precisions. `max_iter` is a per-pass WORK bound, not a convergence
+/// selector: the caller (`gaussian_reml_blocks_orthogonal_shared_scale`)
+/// re-enters this solve every outer pass and certifies the joint fit by the
+/// analytic score residual, erroring typed if the certificate is never met —
+/// so an iterate returned at this cap never silently becomes the estimator.
 fn solve_block_orthogonal_rho(
     gram: &Array2<f64>,
     rhs: &Array2<f64>,
@@ -1012,7 +1027,29 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
     };
     let mut scale_precision = ywy.mapv(|value| nu / value.max(MIN_DEVIANCE));
     let mut evals = Vec::new();
-    for _ in 0..40 {
+    // Convergence is certified by the analytic score of the joint REML
+    // objective, never by the iteration cap (SPEC rule 20). Each outer pass
+    // (a) solves every block's 1-D rho Newton at the current scale precisions
+    // and (b) applies the EXACT conditional-optimum scale update
+    // `scale_o = nu / q_o`, so at the post-update point the scale block of the
+    // joint score vanishes identically and — by the envelope theorem — the
+    // profiled objective's total rho-derivative equals the partial
+    // rho-gradient there. That gradient is available exactly from the cached
+    // block evaluations because `block_orthogonal_eval` depends only on rho,
+    // not on the scale precisions. The certificate is therefore
+    // `max_b |dV/drho_b| / (d * max(1, rank_b)) <= BLOCK_ORTHOGONAL_SCORE_TOL`
+    // (the normalizer is the score's natural magnitude: every gradient term is
+    // a sum of `d * rank`-order quantities, making the test relative).
+    // Exhausting the pass budget without the certificate is a typed error
+    // carrying the rho checkpoint, resumable through `init_rhos`.
+    let mut converged = false;
+    let mut cycle_detected = false;
+    let mut outer_passes = 0usize;
+    let mut last_score_residual = f64::INFINITY;
+    let mut last_scale_step = f64::INFINITY;
+    let mut recent_states: [Option<(Array1<f64>, Array1<f64>)>; 2] = [None, None];
+    while outer_passes < BLOCK_ORTHOGONAL_MAX_OUTER_PASSES {
+        outer_passes += 1;
         evals.clear();
         for block in 0..designs.len() {
             let (rho, eval) = solve_block_orthogonal_rho(
@@ -1038,29 +1075,55 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
             });
         }
         let next_scale = q.mapv(|value| nu / value);
-        let scale_step = next_scale
+        last_scale_step = next_scale
             .iter()
             .zip(scale_precision.iter())
             .map(|(next, old)| (next.ln() - old.ln()).abs())
             .fold(0.0_f64, f64::max);
         scale_precision = next_scale;
-        if scale_step < 1.0e-7 {
+        last_score_residual = evals
+            .iter()
+            .enumerate()
+            .map(|(block, eval)| {
+                let derivs = block_orthogonal_scale_objective(
+                    eval,
+                    rhos[block],
+                    scale_precision.view(),
+                    ranks[block],
+                );
+                derivs.grad.abs() / ((d as f64) * (ranks[block].max(1) as f64))
+            })
+            .fold(0.0_f64, f64::max);
+        if last_score_residual <= BLOCK_ORTHOGONAL_SCORE_TOL {
+            converged = true;
             break;
         }
+        // Cycle guard: one outer pass is a pure function of the state
+        // `(rhos, scale_precision)`. Revisiting a state from one or two passes
+        // ago (bitwise) means the alternation is in a floating-point limit
+        // cycle that can never certify, so stop escalating immediately instead
+        // of burning the remaining budget on the same orbit.
+        let state = (rhos.clone(), scale_precision.clone());
+        if recent_states
+            .iter()
+            .flatten()
+            .any(|prev| prev.0 == state.0 && prev.1 == state.1)
+        {
+            cycle_detected = true;
+            break;
+        }
+        recent_states[1] = recent_states[0].take();
+        recent_states[0] = Some(state);
     }
-    evals.clear();
-    for block in 0..designs.len() {
-        let (rho, eval) = solve_block_orthogonal_rho(
-            &grams[block],
-            &rhs_blocks[block],
-            &penalties_owned[block],
-            rhos[block],
-            scale_precision.view(),
-            ranks[block],
-            16,
-        )?;
-        rhos[block] = rho;
-        evals.push(eval);
+    if !converged {
+        return Err(EstimationError::BlockOrthogonalRemlDidNotConverge {
+            iterations: outer_passes,
+            max_score_residual: last_score_residual,
+            score_tol: BLOCK_ORTHOGONAL_SCORE_TOL,
+            last_scale_step,
+            cycle_detected,
+            rho_checkpoint: rhos.to_vec(),
+        });
     }
 
     let coefficients = evals
@@ -3673,6 +3736,70 @@ mod tests {
 
         assert!(result.edf >= result.cache.nullity as f64);
         assert!(result.edf <= x.ncols() as f64 + 1.0e-10);
+    }
+
+    #[test]
+    fn block_orthogonal_shared_scale_fit_carries_a_score_certificate() {
+        // Two mutually orthogonal ±1 blocks (Hadamard columns) with full-rank
+        // penalties. A minted fit must satisfy the joint first-order REML
+        // score certificate at its own returned iterate — re-derived here from
+        // the same production primitives the solver certifies with, so a
+        // regression that lets an iteration cap select the estimator fails.
+        let c0 = [1.0_f64; 8];
+        let c1 = [1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0];
+        let c2 = [1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0];
+        let c3 = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        let mut d1 = Array2::<f64>::zeros((8, 2));
+        let mut d2 = Array2::<f64>::zeros((8, 2));
+        for i in 0..8 {
+            d1[[i, 0]] = c0[i];
+            d1[[i, 1]] = c1[i];
+            d2[[i, 0]] = c2[i];
+            d2[[i, 1]] = c3[i];
+        }
+        let penalties = vec![Array2::<f64>::eye(2), Array2::<f64>::eye(2)];
+        let bumps = [0.03, -0.05, 0.02, 0.01, -0.02, 0.04, -0.01, -0.02];
+        let mut y = Array2::<f64>::zeros((8, 1));
+        for i in 0..8 {
+            y[[i, 0]] = c0[i] + 0.5 * c1[i] + 0.25 * c2[i] + bumps[i];
+        }
+
+        let result = gaussian_reml_blocks_orthogonal_shared_scale(
+            &[d1.clone(), d2.clone()],
+            &penalties,
+            y.view(),
+            None,
+            None,
+        )
+        .expect("well-posed orthogonal-block fit must certify and mint");
+
+        let weight = Array1::<f64>::ones(8);
+        let ywy = (0..8).map(|i| y[[i, 0]] * y[[i, 0]]).sum::<f64>();
+        // Full-rank penalties: zero total nullity, so nu = n.
+        let nu = 8.0_f64;
+        let mut evals = Vec::new();
+        for (block, design) in [&d1, &d2].into_iter().enumerate() {
+            let gram = canonicalize_penalty(dense_xt_diag_x(design.view(), weight.view()).view());
+            let rhs = dense_xt_diag_y(design.view(), weight.view(), y.view());
+            let pen = canonicalize_penalty(penalties[block].view());
+            evals.push(
+                block_orthogonal_eval(&gram, &rhs, &pen, result.log_lambdas[block])
+                    .expect("block eval at the minted rho"),
+            );
+        }
+        let explained: f64 = evals.iter().map(|eval| eval.fitted_energy[0]).sum();
+        let q = ywy - explained;
+        assert!(q > 0.0);
+        let scale = Array1::from_vec(vec![nu / q]);
+        for (block, eval) in evals.iter().enumerate() {
+            let derivs =
+                block_orthogonal_scale_objective(eval, result.log_lambdas[block], scale.view(), 2);
+            let residual = derivs.grad.abs() / 2.0;
+            assert!(
+                residual <= BLOCK_ORTHOGONAL_SCORE_TOL,
+                "block {block} score residual {residual:.3e} exceeds the certificate tolerance"
+            );
+        }
     }
 
     #[test]

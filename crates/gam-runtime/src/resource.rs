@@ -1,3 +1,8 @@
+/// The library-default streamed row-chunk target (8 MiB), shared as a `const`
+/// so compile-time consumers (e.g. device tile geometry) stay in lockstep with
+/// [`ResourcePolicy::default_library`] without a runtime policy query.
+pub const LIBRARY_ROW_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct ResourcePolicy {
     pub max_single_materialization_bytes: usize,
@@ -8,18 +13,243 @@ pub struct ResourcePolicy {
     pub derivative_storage_mode: DerivativeStorageMode,
 }
 
-pub const SPATIAL_DISTANCE_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
-pub const SPATIAL_DISTANCE_CACHE_SINGLE_ENTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 pub const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
 
-/// Auto-strict triggers for [`ResourcePolicy::for_problem`].
+// ─────────────────────────────────────────────────────────────────────────────
+// Process-wide memory governor
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fraction of the *detected available* memory the governor is allowed to hand
+/// out as reservations: 3/4.
 ///
-/// Tuned for large-scale problems where dense materialization of any
-/// design factor would itself be tens of GiB. Below these thresholds we
-/// stay on `default_library` so small-data and ad-hoc fits keep working
-/// without operator implementations.
-pub const STRICT_POLICY_NROWS_THRESHOLD: usize = 100_000;
-pub const STRICT_POLICY_P_THRESHOLD: usize = 5_000;
+/// The ledger only accounts for the large, planned allocations that route
+/// through [`MemoryGovernor::try_reserve`] (dense design materializations,
+/// covariance blocks, sampler design assemblies). Everything else — allocator
+/// slack, thread stacks, code, and small per-iteration temporaries, plus
+/// whatever the rest of the machine does concurrently — lives in the remaining
+/// quarter. The base quantity is *available* (not total) memory, so memory
+/// already committed by other processes is excluded before the fraction is
+/// applied.
+const GOVERNOR_BUDGET_NUMERATOR: u128 = 3;
+const GOVERNOR_BUDGET_DENOMINATOR: u128 = 4;
+
+/// Divisor turning the governor budget into the cap on a *single* dense
+/// materialization: 4.
+///
+/// A dense matrix is never the end of the story — its consumer needs
+/// comparable workspace (a Gram product, a factorization, a transposed copy),
+/// and several independent blocks are commonly live at once during a fit. A
+/// single object may therefore claim at most a quarter of the joint budget;
+/// anything larger must stay operator-backed / chunked. Joint exhaustion
+/// across *multiple* under-cap objects is what the reservation ledger itself
+/// enforces.
+const SINGLE_MATERIALIZATION_BUDGET_DIVISOR: usize = 4;
+
+/// Fallback budget when memory detection reports nothing at all (exotic
+/// platform with neither system nor cgroup memory info). SPEC rule 10 defines
+/// the target as "reasonably-resourced computers"; 2 GiB is the floor of that
+/// class, and undershooting on an undetectable platform only routes more work
+/// to the chunked/matrix-free paths — it never aborts anything.
+const UNDETECTABLE_MEMORY_FALLBACK_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+fn detect_governor_budget_bytes() -> usize {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let mut available = sys.available_memory();
+    // Containers: the cgroup allowance is the real ceiling regardless of what
+    // the host machine has available.
+    if let Some(cgroup) = sys.cgroup_limits()
+        && cgroup.free_memory > 0
+    {
+        available = available.min(cgroup.free_memory);
+    }
+    if available == 0 {
+        // `available_memory` unsupported: fall back to half of total, the
+        // conservative stand-in for "available" on a machine we know nothing
+        // else about.
+        available = sys.total_memory() / 2;
+    }
+    let budget =
+        (available as u128 * GOVERNOR_BUDGET_NUMERATOR / GOVERNOR_BUDGET_DENOMINATOR) as usize;
+    if budget == 0 {
+        UNDETECTABLE_MEMORY_FALLBACK_BUDGET_BYTES
+    } else {
+        budget
+    }
+}
+
+/// Typed refusal from [`MemoryGovernor::try_reserve`].
+///
+/// Carries the full ledger evidence so callers can route to a chunked or
+/// matrix-free strategy (and so error messages explain *why* dense was
+/// refused). This is a routing signal, never an abort: the process still has
+/// its unreserved headroom, the requested allocation just does not fit the
+/// joint budget.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide"
+)]
+pub struct MemoryBudgetExceeded {
+    pub context: &'static str,
+    pub requested_bytes: usize,
+    pub reserved_bytes: usize,
+    pub budget_bytes: usize,
+}
+
+#[derive(Debug)]
+struct GovernorLedger {
+    budget_bytes: usize,
+    reserved_bytes: std::sync::atomic::AtomicUsize,
+}
+
+/// Process-wide byte-accounting governor for large allocations.
+///
+/// Every large planned allocation (dense design materialization, covariance
+/// block, sampler design assembly) reserves its byte footprint against one
+/// shared ledger via [`try_reserve`](Self::try_reserve) and holds the returned
+/// RAII [`MemoryReservation`] for as long as the allocation is live. Because
+/// the ledger is shared, allocations that are each individually acceptable can
+/// no longer *jointly* exceed memory: whichever request would tip the ledger
+/// past the budget gets a typed [`MemoryBudgetExceeded`] and routes to a
+/// chunked or matrix-free strategy instead. Strategy selection is thereby a
+/// continuous function of predicted live bytes vs remaining budget, not of
+/// row/column thresholds.
+///
+/// The global budget is sized once from actually-available memory (host
+/// `available_memory`, clamped by cgroup limits inside containers) — see
+/// [`GOVERNOR_BUDGET_NUMERATOR`] for the headroom rationale.
+#[derive(Debug, Clone)]
+pub struct MemoryGovernor {
+    ledger: Arc<GovernorLedger>,
+}
+
+impl MemoryGovernor {
+    /// The process-wide governor. Budget detection runs once, on first use.
+    pub fn global() -> &'static MemoryGovernor {
+        static GLOBAL: OnceLock<MemoryGovernor> = OnceLock::new();
+        GLOBAL.get_or_init(|| MemoryGovernor::with_budget(detect_governor_budget_bytes()))
+    }
+
+    /// Governor over an explicit byte budget. Production code uses
+    /// [`global`](Self::global); this constructor exists for tests and for
+    /// embedders that partition memory themselves.
+    pub fn with_budget(budget_bytes: usize) -> Self {
+        Self {
+            ledger: Arc::new(GovernorLedger {
+                budget_bytes,
+                reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.ledger.budget_bytes
+    }
+
+    pub fn reserved_bytes(&self) -> usize {
+        self.ledger
+            .reserved_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn remaining_bytes(&self) -> usize {
+        self.ledger
+            .budget_bytes
+            .saturating_sub(self.reserved_bytes())
+    }
+
+    /// Cap on any *single* materialization, derived from the joint budget —
+    /// see [`SINGLE_MATERIALIZATION_BUDGET_DIVISOR`] for the rationale.
+    pub fn single_materialization_cap_bytes(&self) -> usize {
+        self.ledger.budget_bytes / SINGLE_MATERIALIZATION_BUDGET_DIVISOR
+    }
+
+    /// Reserve `bytes` against the joint ledger.
+    ///
+    /// On success the returned [`MemoryReservation`] must be held for as long
+    /// as the allocation it accounts for is live; dropping it releases the
+    /// bytes. On failure the caller receives the ledger evidence and is
+    /// expected to fall back to a chunked or matrix-free strategy.
+    pub fn try_reserve(
+        &self,
+        bytes: usize,
+        context: &'static str,
+    ) -> Result<MemoryReservation, MemoryBudgetExceeded> {
+        use std::sync::atomic::Ordering;
+        let mut current = self.ledger.reserved_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = match current.checked_add(bytes) {
+                Some(next) if next <= self.ledger.budget_bytes => next,
+                _ => {
+                    return Err(MemoryBudgetExceeded {
+                        context,
+                        requested_bytes: bytes,
+                        reserved_bytes: current,
+                        budget_bytes: self.ledger.budget_bytes,
+                    });
+                }
+            };
+            match self.ledger.reserved_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(MemoryReservation {
+                        ledger: Arc::clone(&self.ledger),
+                        bytes,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Reserve the footprint of a dense `nrows × ncols` `f64` matrix.
+    /// Dimension-product overflow is reported as a budget refusal (an
+    /// allocation whose size cannot even be computed certainly does not fit).
+    pub fn try_reserve_dense_f64(
+        &self,
+        nrows: usize,
+        ncols: usize,
+        context: &'static str,
+    ) -> Result<MemoryReservation, MemoryBudgetExceeded> {
+        let bytes = dense_f64_bytes(nrows, ncols).unwrap_or(usize::MAX);
+        self.try_reserve(bytes, context)
+    }
+}
+
+/// Checked byte footprint of a dense `nrows × ncols` `f64` matrix.
+pub const fn dense_f64_bytes(nrows: usize, ncols: usize) -> Option<usize> {
+    match nrows.checked_mul(ncols) {
+        Some(cells) => cells.checked_mul(std::mem::size_of::<f64>()),
+        None => None,
+    }
+}
+
+/// RAII guard for bytes reserved on a [`MemoryGovernor`] ledger; dropping it
+/// releases the reservation. Hold it exactly as long as the accounted
+/// allocation is live.
+#[derive(Debug)]
+pub struct MemoryReservation {
+    ledger: Arc<GovernorLedger>,
+    bytes: usize,
+}
+
+impl MemoryReservation {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        self.ledger
+            .reserved_bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// Hints that flip strict mode on regardless of n/p — used when a code path
 /// is structurally operator-only and any dense fallback would be a bug.
@@ -74,6 +304,12 @@ pub enum MatrixMaterializationError {
         context: &'static str,
         mode: DerivativeStorageMode,
     },
+
+    /// The process-wide [`MemoryGovernor`] ledger could not reserve the dense
+    /// footprint: proceeding would jointly exceed real memory. Callers route
+    /// to a chunked or matrix-free strategy.
+    #[error(transparent)]
+    BudgetExceeded(#[from] MemoryBudgetExceeded),
 }
 
 pub trait ResidentBytes {
@@ -83,80 +319,90 @@ pub trait ResidentBytes {
 impl ResourcePolicy {
     /// Conservative default suitable for general-purpose use.
     ///
-    /// Uses `MaterializeIfSmall`: dense materialization is allowed only when the
-    /// matrix fits under `max_single_materialization_bytes`. This lets small-data
-    /// families that lack an implicit operator work out of the box, while
-    /// pathologically large problems still error out and force the analytic-operator
-    /// path. Set `derivative_storage_mode = AnalyticOperatorRequired` explicitly to
+    /// Uses `MaterializeIfSmall`: dense materialization is allowed only when
+    /// the matrix fits under `max_single_materialization_bytes`. This lets
+    /// small-data families that lack an implicit operator work out of the box,
+    /// while problems whose dense footprint does not fit real memory get a
+    /// typed refusal that forces the analytic-operator path. Set
+    /// `derivative_storage_mode = AnalyticOperatorRequired` explicitly to
     /// reject all dense fallback.
     ///
-    /// The 1 GiB single-materialization budget matches the established
-    /// large-scale densification ceiling used elsewhere in the codebase
-    /// (e.g. `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`). Real
-    /// large-scale GAMLSS spatial designs (320k rows × ~130 cols ≈ 0.32 GiB)
-    /// must be materializable under this default because their families
-    /// (e.g. `BinomialLocationScale`) eagerly densify in
-    /// `build_location_scale_block` and have no operator-only fallback. A
-    /// tighter cap silently classified those as "too big" even though the
-    /// only available code path is the dense one.
-    pub const fn default_library() -> Self {
+    /// Every byte budget is a fixed fraction of the [`MemoryGovernor`] budget
+    /// (itself sized from actually-available memory), not an absolute
+    /// constant: the single-materialization cap is the governor's
+    /// [`single_materialization_cap_bytes`](MemoryGovernor::single_materialization_cap_bytes)
+    /// (budget/4 — its consumer needs comparable workspace), the operator
+    /// cache matches it, and the spatial-distance / owned-data caches take
+    /// half of that. On a laptop these come out near the historical 1 GiB /
+    /// 512 MiB values; on a large node they scale up, and in a tight
+    /// container they scale down instead of jointly overcommitting.
+    pub fn default_library() -> Self {
+        let governor = MemoryGovernor::global();
+        let single_cap = governor.single_materialization_cap_bytes();
         Self {
-            max_single_materialization_bytes: 1024 * 1024 * 1024, // 1 GiB
-            max_operator_cache_bytes: 1024 * 1024 * 1024,         // 1 GiB
-            max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
-            max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MiB
-            row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MiB per chunk
+            max_single_materialization_bytes: single_cap,
+            max_operator_cache_bytes: single_cap,
+            max_spatial_distance_cache_bytes: single_cap / 2,
+            max_owned_data_cache_bytes: single_cap / 2,
+            row_chunk_target_bytes: LIBRARY_ROW_CHUNK_TARGET_BYTES,
             derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
         }
     }
 
     /// Strict mode that rejects every dense fallback. Use when you intend to
     /// run only on operator-backed bases (large-scale Duchon/TPS, exact
-    /// GAMLSS marginal slope, CTN, etc.).
-    pub const fn analytic_operator_required() -> Self {
+    /// GAMLSS marginal slope, CTN, etc.). The byte caps only govern the
+    /// residual diagnostic surfaces (materialization itself is forbidden by
+    /// the mode), and keep the historical 1:4 tightening relative to
+    /// [`default_library`](Self::default_library).
+    pub fn analytic_operator_required() -> Self {
+        let base = Self::default_library();
         Self {
-            max_single_materialization_bytes: 256 * 1024 * 1024,
-            max_operator_cache_bytes: 1024 * 1024 * 1024,
-            max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
-            max_owned_data_cache_bytes: 512 * 1024 * 1024,
-            row_chunk_target_bytes: 8 * 1024 * 1024,
+            max_single_materialization_bytes: base.max_single_materialization_bytes / 4,
             derivative_storage_mode: DerivativeStorageMode::AnalyticOperatorRequired,
+            ..base
         }
     }
 
     /// Auto-derive the resource policy from the shape of the problem rather
-    /// than from an explicit CLI flag. The library refuses to silently
-    /// densify operator-backed designs once the problem is large enough that
-    /// a hidden dense fallback would blow real-world memory budgets, but
-    /// keeps the permissive default for ordinary small-data fits so that
-    /// non-operator bases still work out of the box.
+    /// than from an explicit CLI flag.
     ///
-    /// Strict mode (`AnalyticOperatorRequired`) is selected when ANY of:
-    ///   * `n_rows >= STRICT_POLICY_NROWS_THRESHOLD` (large scale by row count)
-    ///   * `p_estimate >= STRICT_POLICY_P_THRESHOLD` (large scale by coefficient count)
-    ///   * `hints.marginal_slope_large_scale_active` (the GAMLSS marginal-slope
-    ///     large-scale path is in play; the corresponding operators MUST stay
-    ///     matrix-free regardless of n)
-    pub const fn for_problem(n_rows: usize, p_estimate: usize, hints: ProblemHints) -> Self {
-        let strict = n_rows >= STRICT_POLICY_NROWS_THRESHOLD
-            || p_estimate >= STRICT_POLICY_P_THRESHOLD
-            || hints.marginal_slope_large_scale_active;
-        if strict {
-            Self::analytic_operator_required()
-        } else {
-            Self::default_library()
+    /// The decision is byte-denominated and continuous, not an n/p cliff: the
+    /// predicted dense footprint `n_rows × p_estimate × 8` is compared against
+    /// the governor-derived single-materialization cap. Problems whose full
+    /// design provably cannot be densified within real memory start out in
+    /// strict `AnalyticOperatorRequired` mode (operators refuse dense fallback
+    /// up front instead of failing mid-fit); everything else keeps the
+    /// permissive default, where each individual materialization still has to
+    /// reserve its actual bytes on the [`MemoryGovernor`] ledger at the moment
+    /// it happens. `p_estimate == 0` means "unknown width" and defers entirely
+    /// to per-materialization reservation.
+    ///
+    /// `hints.marginal_slope_large_scale_active` forces strict mode regardless
+    /// of shape: that path is structurally operator-only and any dense
+    /// fallback would be a bug, not a memory question.
+    pub fn for_problem(n_rows: usize, p_estimate: usize, hints: ProblemHints) -> Self {
+        if hints.marginal_slope_large_scale_active {
+            return Self::analytic_operator_required();
+        }
+        let policy = Self::default_library();
+        match dense_f64_bytes(n_rows, p_estimate) {
+            Some(bytes) if bytes <= policy.max_single_materialization_bytes => policy,
+            _ => Self::analytic_operator_required(),
         }
     }
 
-    /// Permissive mode for small-data usage and tests.
-    pub const fn permissive_small_data() -> Self {
+    /// Permissive mode for small-data usage and tests: doubles the
+    /// single-materialization and cache allowances relative to
+    /// [`default_library`](Self::default_library) and streams in larger
+    /// chunks.
+    pub fn permissive_small_data() -> Self {
+        let base = Self::default_library();
         Self {
-            max_single_materialization_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
-            max_operator_cache_bytes: 2 * 1024 * 1024 * 1024,
-            max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
-            max_owned_data_cache_bytes: 512 * 1024 * 1024,
+            max_single_materialization_bytes: base.max_single_materialization_bytes * 2,
+            max_operator_cache_bytes: base.max_operator_cache_bytes * 2,
             row_chunk_target_bytes: 64 * 1024 * 1024,
-            derivative_storage_mode: DerivativeStorageMode::MaterializeIfSmall,
+            ..base
         }
     }
 
@@ -222,7 +468,7 @@ pub fn prediction_chunk_rows(
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Byte-limited LRU cache with an optional entry cap.
 ///
@@ -673,24 +919,46 @@ mod resource_policy_tests {
     }
 
     #[test]
-    fn for_problem_large_nrows_is_strict() {
-        let p = ResourcePolicy::for_problem(
-            STRICT_POLICY_NROWS_THRESHOLD,
-            100,
-            ProblemHints::default(),
-        );
+    fn for_problem_is_byte_denominated_not_a_row_cliff() {
+        // Tall-and-skinny: 4M rows × 10 cols ≈ 0.32 GiB dense. Under the old
+        // n >= 100_000 cliff this was forced strict even though the dense
+        // footprint is modest; the byte-denominated rule keeps it permissive
+        // (the per-materialization ledger still guards the actual allocation).
+        let policy = ResourcePolicy::for_problem(4_194_304, 10, ProblemHints::default());
+        let cap = policy.max_single_materialization_bytes;
+        let footprint = dense_f64_bytes(4_194_304, 10).unwrap();
+        if footprint <= cap {
+            assert_eq!(
+                policy.derivative_storage_mode,
+                DerivativeStorageMode::MaterializeIfSmall
+            );
+        } else {
+            // On a machine so tight that even 0.32 GiB exceeds the cap, strict
+            // is exactly right.
+            assert_eq!(
+                policy.derivative_storage_mode,
+                DerivativeStorageMode::AnalyticOperatorRequired
+            );
+        }
+    }
+
+    #[test]
+    fn for_problem_huge_dense_footprint_is_strict() {
+        // 2^31 rows × 2^13 cols × 8 bytes = 2^47 bytes = 128 TiB: no
+        // reasonably-resourced computer's quarter-budget admits this, so the
+        // problem must start in strict operator-only mode on every machine.
+        let policy = ResourcePolicy::for_problem(1 << 31, 1 << 13, ProblemHints::default());
         assert_eq!(
-            p.derivative_storage_mode,
+            policy.derivative_storage_mode,
             DerivativeStorageMode::AnalyticOperatorRequired
         );
     }
 
     #[test]
-    fn for_problem_large_p_is_strict() {
-        let p =
-            ResourcePolicy::for_problem(100, STRICT_POLICY_P_THRESHOLD, ProblemHints::default());
+    fn for_problem_dimension_overflow_is_strict() {
+        let policy = ResourcePolicy::for_problem(usize::MAX, usize::MAX, ProblemHints::default());
         assert_eq!(
-            p.derivative_storage_mode,
+            policy.derivative_storage_mode,
             DerivativeStorageMode::AnalyticOperatorRequired
         );
     }
@@ -736,5 +1004,101 @@ mod resource_policy_tests {
         );
         assert_eq!(mp.max_cached_dense_bytes, policy.max_operator_cache_bytes);
         assert_eq!(mp.row_chunk_target_bytes, policy.row_chunk_target_bytes);
+    }
+
+    // ── MemoryGovernor ledger ────────────────────────────────────────────────
+
+    #[test]
+    fn reservations_account_and_release_on_drop() {
+        let governor = MemoryGovernor::with_budget(1_000);
+        assert_eq!(governor.remaining_bytes(), 1_000);
+        let first = governor.try_reserve(600, "test-first").expect("fits");
+        assert_eq!(governor.reserved_bytes(), 600);
+        assert_eq!(governor.remaining_bytes(), 400);
+        assert_eq!(first.bytes(), 600);
+        drop(first);
+        assert_eq!(governor.reserved_bytes(), 0);
+        assert_eq!(governor.remaining_bytes(), 1_000);
+    }
+
+    #[test]
+    fn jointly_excessive_reservations_are_refused_with_evidence() {
+        // Two allocations that each fit alone must not be jointly grantable —
+        // this is exactly the independent-budgets failure the ledger exists
+        // to prevent.
+        let governor = MemoryGovernor::with_budget(1_000);
+        let _held = governor.try_reserve(600, "test-held").expect("fits alone");
+        let refusal = governor
+            .try_reserve(600, "test-joint")
+            .expect_err("600 + 600 exceeds the 1000-byte budget");
+        assert_eq!(refusal.context, "test-joint");
+        assert_eq!(refusal.requested_bytes, 600);
+        assert_eq!(refusal.reserved_bytes, 600);
+        assert_eq!(refusal.budget_bytes, 1_000);
+        // After releasing the holder, the same request succeeds: refusal is a
+        // routing signal, not a terminal state.
+        drop(_held);
+        governor
+            .try_reserve(600, "test-joint")
+            .expect("fits after release");
+    }
+
+    #[test]
+    fn dense_reservation_uses_checked_footprint() {
+        let governor = MemoryGovernor::with_budget(1 << 20);
+        let ok = governor
+            .try_reserve_dense_f64(1024, 64, "test-dense")
+            .expect("512 KiB fits in 1 MiB");
+        assert_eq!(ok.bytes(), 1024 * 64 * 8);
+        drop(ok);
+        // Dimension-product overflow must refuse, never wrap into a tiny
+        // spurious reservation.
+        governor
+            .try_reserve_dense_f64(usize::MAX, 2, "test-overflow")
+            .expect_err("overflowing footprint cannot be reserved");
+    }
+
+    #[test]
+    fn concurrent_reservations_never_oversubscribe() {
+        let governor = std::sync::Arc::new(MemoryGovernor::with_budget(1_000));
+        let granted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let governor = std::sync::Arc::clone(&governor);
+                let granted = std::sync::Arc::clone(&granted);
+                scope.spawn(move || {
+                    let mut held = Vec::new();
+                    for _ in 0..100 {
+                        if let Ok(reservation) = governor.try_reserve(7, "test-race") {
+                            granted
+                                .fetch_add(reservation.bytes(), std::sync::atomic::Ordering::SeqCst);
+                            held.push(reservation);
+                        }
+                    }
+                    // Peak accounting during the race must respect the budget.
+                    assert!(governor.reserved_bytes() <= governor.budget_bytes());
+                });
+            }
+        });
+        // All guards dropped at scope end: the ledger returns to empty.
+        assert_eq!(governor.reserved_bytes(), 0);
+        assert!(granted.load(std::sync::atomic::Ordering::SeqCst) <= 1_000);
+    }
+
+    #[test]
+    fn global_governor_budget_is_positive_and_caps_scale() {
+        let governor = MemoryGovernor::global();
+        assert!(governor.budget_bytes() > 0);
+        assert!(governor.single_materialization_cap_bytes() <= governor.budget_bytes());
+        let policy = ResourcePolicy::default_library();
+        assert_eq!(
+            policy.max_single_materialization_bytes,
+            governor.single_materialization_cap_bytes()
+        );
+        let strict = ResourcePolicy::analytic_operator_required();
+        assert_eq!(
+            strict.max_single_materialization_bytes,
+            policy.max_single_materialization_bytes / 4
+        );
     }
 }

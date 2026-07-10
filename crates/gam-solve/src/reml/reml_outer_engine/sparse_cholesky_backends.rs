@@ -1382,6 +1382,42 @@ pub fn compute_block_penalty_logdet_derivs(
     per_block_penalties: &[&[Array2<f64>]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
+    compute_block_penalty_logdet_derivs_with_prior_factors(
+        per_block_rho,
+        per_block_penalties,
+        None,
+        ridge,
+    )
+}
+
+/// [`compute_block_penalty_logdet_derivs`] with per-penalty prior-factor
+/// structure.
+///
+/// `prior_factor_mask[b][k] == true` declares block `b`'s penalty `k` an
+/// INDEPENDENT Gaussian prior factor rather than an additive piece of one
+/// smooth prior. The evidence normalizer of one Gaussian with precision
+/// `Σ_k λ_k S_k` is the coalesced `log|Σ_k λ_k S_k|₊` (the default, and the
+/// correct convention for multi-penalty smooths), but a PRODUCT of
+/// independent factors `∏_k N(0, (λ_k S_k)⁻¹)` contributes
+///
+/// ```text
+/// Σ_k log|λ_k S_k|₊ = Σ_k ( rank(S_k)·ρ_k + log|S_k|₊ ),
+/// ```
+///
+/// which differs from the coalesced form exactly when factors overlap: two
+/// factors with precision λ on one scalar coefficient carry
+/// `λ^{1/2}·λ^{1/2} = λ`, while coalescing their quadratics into `2λβ²` and
+/// taking one normalizer yields `(2λ)^{1/2}` — losing `½ log λ` from the
+/// outer ρ-posterior (hierarchical coefficient groups, audit finding 40).
+/// Each masked penalty therefore becomes its own singleton pseudo-logdet
+/// block; unmasked penalties within the block coalesce as before. `None`
+/// masks (or an all-false mask) reproduce the coalesced behaviour exactly.
+pub fn compute_block_penalty_logdet_derivs_with_prior_factors(
+    per_block_rho: &[Array1<f64>],
+    per_block_penalties: &[&[Array2<f64>]],
+    prior_factor_mask: Option<&[Vec<bool>]>,
+    ridge: f64,
+) -> Result<PenaltyLogdetDerivs, String> {
     use super::super::penalty_logdet::PenaltyPseudologdet;
 
     let total_k: usize = per_block_rho.iter().map(|r| r.len()).sum();
@@ -1413,17 +1449,74 @@ pub fn compute_block_penalty_logdet_derivs(
             });
         }
         let lambdas: Vec<f64> = block_rho.iter().map(|&r| r.exp()).collect();
+        let mask = prior_factor_mask.map(|m| m[b].as_slice());
+        let factor_indices: Vec<usize> = (0..kb)
+            .filter(|&k| mask.is_some_and(|m| m.get(k).copied().unwrap_or(false)))
+            .collect();
 
-        // Single eigendecomposition via canonical PenaltyPseudologdet.
-        //
-        // No metadata-based structural-nullity hint: the classifier derives
-        // the positive eigenspace from the assembled spectrum alone (issues
-        // #192/#318).
-        let pld = PenaltyPseudologdet::from_components(penalties, &lambdas, ridge)
-            .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
+        if factor_indices.is_empty() {
+            // Single eigendecomposition via canonical PenaltyPseudologdet.
+            //
+            // No metadata-based structural-nullity hint: the classifier derives
+            // the positive eigenspace from the assembled spectrum alone (issues
+            // #192/#318).
+            let pld = PenaltyPseudologdet::from_components(penalties, &lambdas, ridge)
+                .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
 
-        let value = pld.value();
-        let (first, second) = pld.rho_derivatives(penalties, &lambdas);
+            let value = pld.value();
+            let (first, second) = pld.rho_derivatives(penalties, &lambdas);
+            return Ok(BlockPenaltyLogdetResult {
+                offset: block_offsets[b],
+                value,
+                first,
+                second,
+            });
+        }
+
+        // Independent-factor structure: the normalizer factorizes over the
+        // coalesced smooth part and each factor's own singleton logdet, so
+        // value/first/second are assembled block-diagonally in ρ-coordinate
+        // space (no cross terms between factors, exactly as the product
+        // prior dictates).
+        let mut value = 0.0;
+        let mut first = Array1::<f64>::zeros(kb);
+        let mut second = Array2::<f64>::zeros((kb, kb));
+
+        let coalesced_indices: Vec<usize> = (0..kb)
+            .filter(|k| !factor_indices.contains(k))
+            .collect();
+        if !coalesced_indices.is_empty() {
+            let sub_pens: Vec<Array2<f64>> = coalesced_indices
+                .iter()
+                .map(|&k| penalties[k].clone())
+                .collect();
+            let sub_lambdas: Vec<f64> = coalesced_indices.iter().map(|&k| lambdas[k]).collect();
+            let pld = PenaltyPseudologdet::from_components(&sub_pens, &sub_lambdas, ridge)
+                .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
+            value += pld.value();
+            let (sub_first, sub_second) = pld.rho_derivatives(&sub_pens, &sub_lambdas);
+            for (i, &k) in coalesced_indices.iter().enumerate() {
+                first[k] = sub_first[i];
+                for (j, &l) in coalesced_indices.iter().enumerate() {
+                    second[[k, l]] = sub_second[[i, j]];
+                }
+            }
+        }
+        for &k in &factor_indices {
+            let factor_pen = std::slice::from_ref(&penalties[k]);
+            let factor_lambda = [lambdas[k]];
+            let pld = PenaltyPseudologdet::from_components(factor_pen, &factor_lambda, ridge)
+                .map_err(|e| {
+                    format!("penalty logdet failed for block {b} prior factor {k}: {e}")
+                })?;
+            // log|λ_k S_k|₊ = rank·ρ_k + log|S_k|₊: first derivative is the
+            // factor rank, second derivative vanishes — both come out of the
+            // same exact singleton kernel, no special-casing.
+            value += pld.value();
+            let (sub_first, sub_second) = pld.rho_derivatives(factor_pen, &factor_lambda);
+            first[k] = sub_first[0];
+            second[[k, k]] = sub_second[[0, 0]];
+        }
         Ok(BlockPenaltyLogdetResult {
             offset: block_offsets[b],
             value,

@@ -4,6 +4,7 @@ pub mod jet_partitions;
 pub mod jet_scalar;
 pub mod jet_tower;
 pub mod probability;
+pub mod score_opt;
 pub mod special;
 
 #[cfg(test)]

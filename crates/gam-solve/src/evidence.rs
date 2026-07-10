@@ -178,26 +178,36 @@ pub enum TopologyScoreScale {
 /// Convergence controls for stacking retained topology predictive densities.
 #[derive(Debug, Clone, Copy)]
 pub struct StackingConfig {
+    /// Exhaustion-escalation bound on solver iterations. It never selects the
+    /// weights: exhausting it without the KKT certificate is an error, so an
+    /// uncertified iterate can never feed model selection.
     pub max_iter: usize,
-    pub weight_tol: f64,
+    /// Simplex-KKT residual the solution must certify before it is returned.
+    /// The residual is scale-free: the KKT multiplier of the stacking problem
+    /// is exactly 1, so `g_k − 1` is already a relative stationarity measure.
+    pub kkt_tol: f64,
 }
 
 impl Default for StackingConfig {
     fn default() -> Self {
         Self {
-            max_iter: 1000,
-            weight_tol: 1e-10,
+            max_iter: 10_000,
+            kkt_tol: 1e-8,
         }
     }
 }
 
 /// Simplex weights for retained topology candidates plus the achieved held-out
-/// mean log-score.
+/// mean log-score and the verified KKT certificate residual.
 #[derive(Debug, Clone)]
 pub struct StackingWeights {
     pub weights: Array1<f64>,
     pub mean_log_score: f64,
     pub iterations: usize,
+    /// Verified simplex-KKT residual at the returned weights (always at or
+    /// below the configured `kkt_tol`; a solve that cannot certify errors
+    /// instead of returning weights).
+    pub kkt_residual: f64,
 }
 
 /// Solve the stacking-of-predictive-distributions weight problem from a
@@ -206,6 +216,21 @@ pub struct StackingWeights {
 /// This belongs on the evidence surface rather than in a separate solver: it is
 /// the topology/evidence consumer that replaces winner-take-all only when the
 /// caller has retained candidate fits and per-point held-out densities.
+///
+/// ## Optimality certificate
+///
+/// The objective `f(w) = mean_i log Σ_k w_k p_ik` is concave on the simplex,
+/// so first-order KKT conditions are necessary AND sufficient for the global
+/// optimum. With `g_k = ∂f/∂w_k = mean_i p_ik / mix_i`, the simplex multiplier
+/// is exactly `Σ_k w_k g_k = 1`, so the KKT system is `g_k ≤ 1` for every
+/// candidate with `w_k · (1 − g_k) = 0` (complementary slackness). Iterates
+/// come from the exponentiated-gradient / EM multiplicative step
+/// `w_k ← w_k · g_k` (a monotone MM ascent whose fixed points are exactly the
+/// KKT points), but the step never certifies itself: the solve returns only
+/// when the residual `max_k max((g_k − 1)⁺, w_k · |g_k − 1|)` is verified
+/// below `config.kkt_tol`, and exhausting `config.max_iter` without that
+/// certificate is a typed error — uncertified weights never reach model
+/// selection.
 pub fn solve_stacking_weights(
     log_density: ArrayView2<'_, f64>,
     config: StackingConfig,
@@ -234,11 +259,18 @@ pub fn solve_stacking_weights(
 
     let kept = kept_cols.len();
     let mut weights = Array1::<f64>::from_elem(kept, 1.0 / kept as f64);
-    let mut next = Array1::<f64>::zeros(kept);
+    let mut gain = vec![0.0_f64; kept];
     let mut iterations = 0usize;
-    for _ in 0..config.max_iter {
+    let mut kkt_residual = f64::INFINITY;
+    let mut certified = false;
+    while iterations < config.max_iter {
         iterations += 1;
-        next.fill(0.0);
+        // Gradient of the mean held-out log-score at the current weights:
+        // g_k = mean over active rows of p_ik / mix_i, in log space. The
+        // gradient is accumulated for EVERY kept candidate — including any
+        // whose weight has reached the boundary — because the boundary KKT
+        // condition `g_k ≤ 1` must be checked there too.
+        gain.fill(0.0);
         let mut active_rows = 0usize;
         for &row in &rows {
             let mut row_max = f64::NEG_INFINITY;
@@ -265,27 +297,55 @@ pub fn solve_stacking_weights(
             let log_mix = row_max + denom.ln();
             for (local_col, &source_col) in kept_cols.iter().enumerate() {
                 let log_p = log_density[[row, source_col]];
-                if log_p.is_finite() && weights[local_col] > 0.0 {
-                    next[local_col] += (weights[local_col].ln() + log_p - log_mix).exp();
+                if log_p.is_finite() {
+                    gain[local_col] += (log_p - log_mix).exp();
                 }
             }
         }
         if active_rows == 0 {
-            break;
+            return Err(
+                "stacking lost every active held-out row (all mixture densities degenerated); \
+                 the weight problem has no certifiable optimum"
+                    .to_string(),
+            );
         }
-        next.mapv_inplace(|value| value / active_rows as f64);
-        let total = next.sum();
-        if total > 0.0 {
-            next.mapv_inplace(|value| value / total);
+        for g in gain.iter_mut() {
+            *g /= active_rows as f64;
         }
-        let delta = next
+        // Verified simplex-KKT residual (multiplier ≡ 1): stationarity excess
+        // (g_k − 1)⁺ for every candidate, complementary slackness
+        // w_k·|g_k − 1| for candidates carrying weight.
+        kkt_residual = weights
             .iter()
-            .zip(weights.iter())
-            .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()));
-        weights.assign(&next);
-        if delta <= config.weight_tol {
+            .zip(gain.iter())
+            .map(|(&w, &g)| (g - 1.0).max(0.0).max(w * (g - 1.0).abs()))
+            .fold(0.0_f64, f64::max);
+        if kkt_residual <= config.kkt_tol {
+            certified = true;
             break;
         }
+        // Exponentiated-gradient / EM multiplicative ascent step. Σ_k w_k g_k
+        // = 1 over the active rows, so the renormalization only removes
+        // floating-point drift.
+        for (w, &g) in weights.iter_mut().zip(gain.iter()) {
+            *w *= g;
+        }
+        let total = weights.sum();
+        if !(total.is_finite() && total > 0.0) {
+            return Err(format!(
+                "stacking weight update degenerated (weight mass {total:.3e}); \
+                 the multiplicative ascent cannot continue"
+            ));
+        }
+        weights.mapv_inplace(|value| value / total);
+    }
+    if !certified {
+        return Err(format!(
+            "stacking weights did not certify within {iterations} iterations: simplex-KKT \
+             residual {kkt_residual:.6e} exceeds tolerance {:.3e}; uncertified weights must \
+             not feed model selection",
+            config.kkt_tol
+        ));
     }
 
     let mean_log_score = stacking_mean_log_score(log_density, &rows, &kept_cols, weights.view());
@@ -297,6 +357,7 @@ pub fn solve_stacking_weights(
         weights: full,
         mean_log_score,
         iterations,
+        kkt_residual,
     })
 }
 
@@ -391,7 +452,10 @@ pub fn stacked_predictive_mean(
 /// mixture a pure function of the data and `k`.
 #[derive(Debug, Clone, Copy)]
 pub struct GaussianMixtureConfig {
-    /// Maximum EM iterations.
+    /// Exhaustion-escalation bound on EM iterations. It never selects the
+    /// estimator: exhausting it without the convergence certificate
+    /// (monotone ascent + relative objective step below `loglik_tol`) is an
+    /// error, so an uncertified mixture never enters evidence comparison.
     pub max_iter: usize,
     /// Relative mean-log-likelihood improvement tolerance for EM stopping.
     pub loglik_tol: f64,
@@ -405,7 +469,7 @@ pub struct GaussianMixtureConfig {
 impl Default for GaussianMixtureConfig {
     fn default() -> Self {
         Self {
-            max_iter: 200,
+            max_iter: 1000,
             loglik_tol: 1e-7,
             covariance_floor: 1e-6,
             kmeans_max_iter: 25,
@@ -487,6 +551,13 @@ impl GaussianMixtureFit {
     /// by calling [`laplace_evidence`] with `residual_objective = −loglik`,
     /// `penalty_log_det = 0`, `penalty_rank = 0`, `effective_dim = P`, and
     /// `log|H|` the observed empirical-Fisher information at the optimum.
+    ///
+    /// The Laplace expansion is only meaningful at a stationary point:
+    /// [`fit_gaussian_mixture`] enforces this by returning a typed error
+    /// whenever EM exhausts its budget without the monotone-ascent +
+    /// objective-residual certificate, so every `GaussianMixtureFit` that can
+    /// reach this method is a certified EM optimum and its evidence is
+    /// comparable across candidates.
     pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
         let p = self.num_free_parameters();
         let information = self.empirical_fisher_information(data)?;
@@ -799,6 +870,19 @@ pub fn fit_gaussian_mixture(
     let mut prev_mean_ll = f64::NEG_INFINITY;
     let mut total_loglik = f64::NEG_INFINITY;
     let mut iterations = 0usize;
+    // EM convergence certificate (both parts must hold before the fit is
+    // minted; SPEC rule 20):
+    //   1. Monotonicity — EM is an ascent algorithm, so a mean log-likelihood
+    //      DROP beyond the stopping tolerance means the numerics broke and the
+    //      iterate is not a certified EM fixed point.
+    //   2. Objective residual — the relative mean log-likelihood step must
+    //      fall below `config.loglik_tol`.
+    // Exhausting `config.max_iter` without the certificate is an error: an
+    // uncertified mixture is not a stationary Laplace expansion point, so its
+    // "evidence" would not be comparable to other candidates' and must never
+    // enter ranking or stacking.
+    let mut converged = false;
+    let mut last_rel_step = f64::INFINITY;
 
     for iter in 0..config.max_iter.max(1) {
         iterations = iter + 1;
@@ -835,7 +919,18 @@ pub fn fit_gaussian_mixture(
         let mean_ll = total_loglik / n as f64;
         if iter > 0 {
             let denom = prev_mean_ll.abs().max(1.0);
-            if (mean_ll - prev_mean_ll).abs() / denom <= config.loglik_tol {
+            let step = mean_ll - prev_mean_ll;
+            if step < -config.loglik_tol * denom {
+                return Err(format!(
+                    "gaussian mixture EM (k={k}) violated ascent monotonicity at iteration \
+                     {iterations}: mean log-likelihood fell from {prev_mean_ll:.12e} to \
+                     {mean_ll:.12e}; the EM certificate is broken, so this fit cannot be \
+                     scored as evidence"
+                ));
+            }
+            last_rel_step = step.abs() / denom;
+            if last_rel_step <= config.loglik_tol {
+                converged = true;
                 break;
             }
         }
@@ -887,6 +982,15 @@ pub fn fit_gaussian_mixture(
             }
             covariances[j] = cov;
         }
+    }
+
+    if !converged {
+        return Err(format!(
+            "gaussian mixture EM (k={k}) did not converge within {iterations} iterations: \
+             last relative mean log-likelihood step {last_rel_step:.6e} exceeds tolerance \
+             {:.3e}; an uncertified mixture must not enter evidence comparison or stacking",
+            config.loglik_tol
+        ));
     }
 
     Ok(GaussianMixtureFit {
@@ -3629,29 +3733,55 @@ mod tests {
     }
 
     #[test]
-    fn stacking_mean_log_score_is_monotone_under_more_iterations() {
-        // The EM ascent is monotone in the held-out mean log-score, so allowing
-        // more iterations never lowers it.
+    fn stacking_solution_satisfies_the_simplex_kkt_certificate() {
+        // Recompute the KKT residual from scratch at the returned weights:
+        // g_k = mean_i p_ik / mix_i must satisfy g_k <= 1 (+tol) everywhere
+        // and w_k * |g_k - 1| <= tol. The objective is concave, so this
+        // certifies the GLOBAL optimum, not merely a stationary iterate.
         let log_density =
             Array2::from_shape_vec((4, 2), vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5])
                 .unwrap();
-        let mut prev = f64::NEG_INFINITY;
-        for max_iter in [1usize, 2, 4, 8, 32] {
-            let out = solve_stacking_weights(
-                log_density.view(),
-                StackingConfig {
-                    max_iter,
-                    weight_tol: 0.0,
-                },
-            )
-            .unwrap();
+        let config = StackingConfig::default();
+        let out = solve_stacking_weights(log_density.view(), config).unwrap();
+        assert!(out.kkt_residual <= config.kkt_tol);
+        let n = log_density.nrows();
+        for k in 0..2 {
+            let mut g = 0.0_f64;
+            for i in 0..n {
+                let mix: f64 = (0..2)
+                    .map(|c| out.weights[c] * log_density[[i, c]].exp())
+                    .sum();
+                g += log_density[[i, k]].exp() / mix;
+            }
+            g /= n as f64;
             assert!(
-                out.mean_log_score >= prev - 1e-12,
-                "log-score decreased at max_iter={max_iter}: {prev} -> {}",
-                out.mean_log_score
+                g <= 1.0 + config.kkt_tol,
+                "stationarity violated for candidate {k}: g = {g}"
             );
-            prev = out.mean_log_score;
+            assert!(
+                out.weights[k] * (g - 1.0).abs() <= config.kkt_tol * (1.0 + 1e-6),
+                "complementary slackness violated for candidate {k}: w = {}, g = {g}",
+                out.weights[k]
+            );
         }
+    }
+
+    #[test]
+    fn stacking_exhaustion_without_certificate_is_an_error_not_weights() {
+        // A one-iteration budget cannot certify a nontrivial table; the solve
+        // must refuse to mint weights rather than return the capped iterate.
+        let log_density =
+            Array2::from_shape_vec((4, 2), vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5])
+                .unwrap();
+        let err = solve_stacking_weights(
+            log_density.view(),
+            StackingConfig {
+                max_iter: 1,
+                kkt_tol: 0.0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("KKT"), "error must carry the evidence: {err}");
     }
 
     #[test]

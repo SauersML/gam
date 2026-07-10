@@ -4,15 +4,16 @@
 //! #780): a cohesive group of `#[pyfunction]`s that interpolate survival
 //! surfaces along a time grid, reshape/validate survival parameter matrices,
 //! convert between survival / cumulative-hazard / hazard representations, and
-//! stream interpolated surfaces to CSV. They share the same nearest-endpoint
-//! linear-interpolation kernel (`survival_csv_interpolate`) and asymptotic
-//! extrapolation policy, and depend on nothing in the rest of the module
-//! except the boundary error helper `py_value_error`.
+//! stream interpolated surfaces to CSV. Surface math and resource policy live
+//! in `gam-models`; this module only converts numpy buffers and performs the
+//! external CSV I/O.
 
-use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
+use gam::families::survival::{
+    SurvivalSurface, SurvivalSurfaceChunkPolicy, SurvivalSurfaceKind,
+};
 use ndarray::{Array1, Array2};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
@@ -20,201 +21,21 @@ use numpy::{
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
-use rayon::prelude::*;
 
 use crate::py_value_error;
 
 #[pyfunction]
-pub(crate) fn interpolate_survival_surface<'py>(
-    py: Python<'py>,
-    grid: PyReadonlyArray1<'py, f64>,
-    surface: PyReadonlyArray2<'py, f64>,
-    query: PyReadonlyArray1<'py, f64>,
-    clip_lo: Option<f64>,
-    clip_hi: Option<f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let grid_view = grid.as_array();
-    let surface_view = surface.as_array();
-    let query_values: Vec<f64> = query.as_array().iter().copied().collect();
-    let n_grid = grid_view.len();
-    let (n_rows, n_cols) = surface_view.dim();
-    if n_grid == 0 || n_cols != n_grid {
-        return Err(py_value_error(
-            "survival interpolation requires a non-empty grid".to_string(),
-        ));
-    }
-
-    let mut order: Vec<(f64, usize)> = grid_view
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, value)| (value, index))
-        .collect();
-    order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
-    let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
-    let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
-    let n_query = query_values.len();
-    let mut values = vec![0.0_f64; n_rows * n_query];
-
-    values
-        .par_chunks_mut(n_query.max(1))
-        .enumerate()
-        .for_each(|(row_idx, out_row)| {
-            if n_query == 0 {
-                return;
-            }
-            let surface_row = surface_view.row(row_idx);
-            for (query_idx, query_value) in query_values.iter().copied().enumerate() {
-                let mut interpolated = if query_value.is_nan() {
-                    f64::NAN
-                } else if query_value <= sorted_grid[0] {
-                    surface_row[sorted_indices[0]]
-                } else if query_value >= sorted_grid[n_grid - 1] {
-                    surface_row[sorted_indices[n_grid - 1]]
-                } else {
-                    let upper =
-                        sorted_grid.partition_point(|grid_value| *grid_value <= query_value);
-                    let lower = upper - 1;
-                    let x0 = sorted_grid[lower];
-                    let x1 = sorted_grid[upper];
-                    let y0 = surface_row[sorted_indices[lower]];
-                    let y1 = surface_row[sorted_indices[upper]];
-                    if x1 == x0 {
-                        y1
-                    } else {
-                        y0 + (query_value - x0) * (y1 - y0) / (x1 - x0)
-                    }
-                };
-                if let Some(lo) = clip_lo {
-                    if interpolated < lo {
-                        interpolated = lo;
-                    }
-                }
-                if let Some(hi) = clip_hi {
-                    if interpolated > hi {
-                        interpolated = hi;
-                    }
-                }
-                out_row[query_idx] = interpolated;
-            }
-        });
-
-    let out = Array2::from_shape_vec((n_rows, n_query), values).map_err(|err| {
-        py_value_error(format!(
-            "failed to assemble survival interpolation result: {err}"
-        ))
-    })?;
-    Ok(out.into_pyarray(py).unbind())
-}
-
-#[pyfunction]
-#[pyo3(signature = (grid, surface, query, clip_lo, clip_hi, left_value = None, right_value = None, inf_value = None))]
 pub(crate) fn interpolate_rows<'py>(
     py: Python<'py>,
     grid: PyReadonlyArray1<'py, f64>,
     surface: PyReadonlyArray2<'py, f64>,
     query: PyReadonlyArray1<'py, f64>,
-    clip_lo: Option<f64>,
-    clip_hi: Option<f64>,
-    left_value: Option<f64>,
-    right_value: Option<f64>,
-    inf_value: Option<f64>,
+    kind: &str,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let grid_view = grid.as_array();
-    let surface_view = surface.as_array();
-    let query_values: Vec<f64> = query.as_array().iter().copied().collect();
-    let n_grid = grid_view.len();
-    let (n_rows, n_cols) = surface_view.dim();
-    if n_grid == 0 || n_cols != n_grid {
-        return Err(py_value_error(
-            "survival interpolation requires a non-empty grid".to_string(),
-        ));
-    }
-
-    let mut order: Vec<(f64, usize)> = grid_view
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, value)| (value, index))
-        .collect();
-    order.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
-    let sorted_grid: Vec<f64> = order.iter().map(|(value, _index)| *value).collect();
-    let sorted_indices: Vec<usize> = order.iter().map(|(_value, index)| *index).collect();
-    let n_query = query_values.len();
-    let mut values = vec![0.0_f64; n_rows * n_query];
-
-    values
-        .par_chunks_mut(n_query.max(1))
-        .enumerate()
-        .for_each(|(row_idx, out_row)| {
-            if n_query == 0 {
-                return;
-            }
-            let surface_row = surface_view.row(row_idx);
-            for (query_idx, query_value) in query_values.iter().copied().enumerate() {
-                let mut interpolated = if query_value.is_nan() {
-                    f64::NAN
-                } else if query_value == f64::INFINITY {
-                    // `t -> +inf` asymptote, distinct from the finite past-grid
-                    // flat-clamp (#1595): survival surfaces continue to
-                    // `S(+inf) = 0`, cumulative hazard to `H(+inf) = +inf`.
-                    // Surfaces with no canonical asymptote (`hazard`,
-                    // `survival_se`) pass `None` and fall back to the
-                    // nearest-endpoint value (issue #965).
-                    inf_value.unwrap_or(surface_row[sorted_indices[n_grid - 1]])
-                } else if query_value <= sorted_grid[0] {
-                    // Below-grid extrapolation: callers (e.g. survival surfaces)
-                    // can supply an explicit asymptotic `left_value` so that
-                    // extrapolating before the modeled support returns the
-                    // theoretically correct boundary (S(t)=1 for t<=0). The
-                    // exact-equality case still uses the grid value to remain
-                    // continuous at the boundary; only strict left extrapolation
-                    // honors the override.
-                    if query_value < sorted_grid[0] {
-                        left_value.unwrap_or(surface_row[sorted_indices[0]])
-                    } else {
-                        surface_row[sorted_indices[0]]
-                    }
-                } else if query_value >= sorted_grid[n_grid - 1] {
-                    // Above-grid extrapolation: same idea, with `right_value`
-                    // expressing the asymptote (S(inf)=0 for survival). Use
-                    // strict inequality so the grid endpoint itself remains
-                    // continuous.
-                    if query_value > sorted_grid[n_grid - 1] {
-                        right_value.unwrap_or(surface_row[sorted_indices[n_grid - 1]])
-                    } else {
-                        surface_row[sorted_indices[n_grid - 1]]
-                    }
-                } else {
-                    let upper =
-                        sorted_grid.partition_point(|grid_value| *grid_value <= query_value);
-                    let lower = upper - 1;
-                    let x0 = sorted_grid[lower];
-                    let x1 = sorted_grid[upper];
-                    let y0 = surface_row[sorted_indices[lower]];
-                    let y1 = surface_row[sorted_indices[upper]];
-                    if x1 == x0 {
-                        y1
-                    } else {
-                        y0 + (query_value - x0) * (y1 - y0) / (x1 - x0)
-                    }
-                };
-                if let Some(lo) = clip_lo {
-                    if interpolated < lo {
-                        interpolated = lo;
-                    }
-                }
-                if let Some(hi) = clip_hi {
-                    if interpolated > hi {
-                        interpolated = hi;
-                    }
-                }
-                out_row[query_idx] = interpolated;
-            }
-        });
-
-    let out = Array2::from_shape_vec((n_rows, n_query), values)
-        .map_err(|err| py_value_error(format!("failed to assemble interpolation result: {err}")))?;
+    let kind = SurvivalSurfaceKind::parse(kind).map_err(py_value_error)?;
+    let surface = SurvivalSurface::new(kind, grid.as_array(), surface.as_array())
+        .map_err(py_value_error)?;
+    let out = surface.interpolate(query.as_array()).map_err(py_value_error)?;
     Ok(out.into_pyarray(py))
 }
 
@@ -300,6 +121,105 @@ fn clip_survival_surface_value(mut value: f64, clip_lo: Option<f64>, clip_hi: Op
     value
 }
 
+/// Boundary + clip policy for one survival-surface kind.
+///
+/// This is the SINGLE authoritative extrapolation/clip law for every query
+/// path in every frontend — the in-memory interpolation, the auto-chunked
+/// dense path (`survival_chunk_iter_collect`), and the streaming CSV writer
+/// (`write_survival_csv`) all resolve it from [`survival_surface_policy_for`];
+/// Python reads it through the `survival_surface_policy` pyfunction and holds
+/// no table of its own (issues #965 / #1595 / #2154).
+///
+/// The law itself:
+///   * left edge (`t < t_min`): survival and cumulative hazard have the
+///     unambiguous, mutually consistent boundary `S = 1`, `H = 0`
+///     (`exp(-0) = 1` — the identity `S = exp(-H)` holds exactly).
+///   * right edge (finite `t > t_max`): flat-clamp BOTH surfaces to the last
+///     grid value (`right_value = None` = nearest-endpoint). The fitted grid
+///     only spans the training time support, so past its top node there is no
+///     information to pick a parametric tail; forcing `S -> 0` while `H`
+///     stayed finite broke `S = exp(-H)` and injected a jump discontinuity at
+///     the grid edge (#1595). Flat-clamping both preserves the identity for
+///     every finite `t` past the grid.
+///   * `t == +inf`: the genuine asymptote, distinct from the finite
+///     flat-clamp: `S(+inf) = 0`, `H(+inf) = +inf` (#965).
+///   * hazard / SE surfaces have no canonical asymptote: nearest-endpoint on
+///     every edge.
+///   * clips assert the codomain (`S` in `[0, 1]`; `H`, hazard, SE in
+///     `[0, +inf)`) against interpolation round-off.
+pub(crate) struct SurvivalSurfacePolicy {
+    pub(crate) left_value: Option<f64>,
+    pub(crate) right_value: Option<f64>,
+    pub(crate) inf_value: Option<f64>,
+    pub(crate) clip_lo: Option<f64>,
+    pub(crate) clip_hi: Option<f64>,
+}
+
+pub(crate) fn survival_surface_policy_for(kind: &str) -> Result<SurvivalSurfacePolicy, String> {
+    match kind {
+        "survival" => Ok(SurvivalSurfacePolicy {
+            left_value: Some(1.0),
+            right_value: None,
+            inf_value: Some(0.0),
+            clip_lo: Some(0.0),
+            clip_hi: Some(1.0),
+        }),
+        "cumulative_hazard" => Ok(SurvivalSurfacePolicy {
+            left_value: Some(0.0),
+            right_value: None,
+            inf_value: Some(f64::INFINITY),
+            clip_lo: Some(0.0),
+            clip_hi: None,
+        }),
+        "hazard" | "survival_se" => Ok(SurvivalSurfacePolicy {
+            left_value: None,
+            right_value: None,
+            inf_value: None,
+            clip_lo: Some(0.0),
+            clip_hi: None,
+        }),
+        other => Err(format!("unknown survival surface kind '{other}'")),
+    }
+}
+
+/// Expose the per-kind boundary/clip policy to Python as
+/// `(left_value, right_value, inf_value, clip_lo, clip_hi)` so the wrapper
+/// consumes the core law instead of carrying a copy.
+#[pyfunction]
+pub(crate) fn survival_surface_policy(
+    kind: &str,
+) -> PyResult<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>)> {
+    let policy = survival_surface_policy_for(kind).map_err(py_value_error)?;
+    Ok((
+        policy.left_value,
+        policy.right_value,
+        policy.inf_value,
+        policy.clip_lo,
+        policy.clip_hi,
+    ))
+}
+
+/// Default rows-per-tile when chunking dense survival-surface evaluation.
+/// One `50_000 x 64` f64 tile is ~25.6 MB — small enough to stream on the
+/// 8 GB floor this project targets, large enough to amortize dispatch.
+pub(crate) const SURVIVAL_PEOPLE_CHUNK_DEFAULT: usize = 50_000;
+/// Default query-times-per-tile companion of [`SURVIVAL_PEOPLE_CHUNK_DEFAULT`].
+pub(crate) const SURVIVAL_TIME_GRID_CHUNK_DEFAULT: usize = 64;
+/// Dense `(rows x times)` cell count above which the accessors switch from a
+/// single dense evaluation to streaming tiles (8 MB of f64 output).
+pub(crate) const SURVIVAL_DENSE_AUTO_CHUNK_CELLS: usize = 1_000_000;
+
+/// Expose the core chunking policy to Python as
+/// `(people_chunk, time_grid_chunk, dense_auto_chunk_cells)`.
+#[pyfunction]
+pub(crate) fn survival_chunk_defaults() -> (usize, usize, usize) {
+    (
+        SURVIVAL_PEOPLE_CHUNK_DEFAULT,
+        SURVIVAL_TIME_GRID_CHUNK_DEFAULT,
+        SURVIVAL_DENSE_AUTO_CHUNK_CELLS,
+    )
+}
+
 #[pyfunction]
 pub(crate) fn survival_chunk_iter_collect<'py>(
     py: Python<'py>,
@@ -307,39 +227,10 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
     surface: PyReadonlyArray2<'py, f64>,
     times: PyReadonlyArray1<'py, f64>,
     kind: &str,
-    clip_lo: Option<f64>,
-    clip_hi: Option<f64>,
     people_chunk: usize,
     time_grid_chunk: usize,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    // Mirror the asymptotic-extrapolation policy in
-    // `gamfit._survival._SURVIVAL_EXTRAPOLATION` EXACTLY so the dense
-    // auto-chunked path and the small non-chunked path agree past the grid
-    // (issue #965 / completing #1595):
-    //   * left edge (`t <= t_min`): `S = 1`, `H = 0` -- unambiguous boundary.
-    //   * right edge (finite `t > t_max`): flat-clamp to the last grid value
-    //     (`right_value = None`). Forcing `S -> 0` here (the old hardcoded
-    //     `Some(0.0)`) contradicted the non-chunked path and broke the
-    //     `S(t) = exp(-H(t))` identity past the grid (#1595): it made `S` jump
-    //     to 0 while `H` stayed finite.
-    //   * `t == +inf`: the genuine asymptote `S = 0`, `H = +inf` (carried by
-    //     `kind_inf_value`, separate from the finite flat-clamp).
-    // Hazards and standard errors have no canonical asymptote, so they keep
-    // nearest-endpoint behavior on every edge (`None`).
-    let (kind_left_value, kind_right_value, kind_inf_value): (
-        Option<f64>,
-        Option<f64>,
-        Option<f64>,
-    ) = match kind {
-        "survival" => (Some(1.0), None, Some(0.0)),
-        "cumulative_hazard" => (Some(0.0), None, Some(f64::INFINITY)),
-        "hazard" | "survival_se" => (None, None, None),
-        other => {
-            return Err(py_value_error(format!(
-                "unknown survival surface kind '{other}'"
-            )));
-        }
-    };
+    let policy = survival_surface_policy_for(kind).map_err(py_value_error)?;
     if people_chunk == 0 {
         return Err(py_value_error("people_chunk must be positive".to_string()));
     }
@@ -392,12 +283,15 @@ pub(crate) fn survival_chunk_iter_collect<'py>(
                             &sorted_indices,
                             row_idx,
                             times_values[time_idx],
-                            kind_left_value,
-                            kind_right_value,
-                            kind_inf_value,
+                            policy.left_value,
+                            policy.right_value,
+                            policy.inf_value,
                         );
-                        values[out_row_start + time_idx] =
-                            clip_survival_surface_value(interpolated, clip_lo, clip_hi);
+                        values[out_row_start + time_idx] = clip_survival_surface_value(
+                            interpolated,
+                            policy.clip_lo,
+                            policy.clip_hi,
+                        );
                     }
                 }
             }

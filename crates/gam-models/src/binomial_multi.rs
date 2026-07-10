@@ -51,7 +51,9 @@
 //! the two are interchangeable at the FFI layer: same input arity, same
 //! convergence semantics, same `(N, K)` fitted-probability output.
 
-use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
+use crate::penalized_vector_glm::{
+    PenalizedVectorGlmInputs, VectorGlmSolve, fit_penalized_vector_glm,
+};
 use crate::vector_response::VectorLikelihood;
 use crate::model_types::EstimationError;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
@@ -102,12 +104,6 @@ pub struct BinomialMultiFitOutputs {
     /// block-diagonal penalized Hessian, so there is one iteration count for
     /// the whole solve.
     pub iterations: usize,
-    /// Always `true` for values returned by [`fit_penalized_binomial_multi`]:
-    /// non-convergence is surfaced as the typed
-    /// [`EstimationError::FixedLambdaNewtonDidNotConverge`] rather than an
-    /// `Ok` with a flag (SPEC: a fit only ever comes from a converged
-    /// optimization).
-    pub converged: bool,
     /// Penalized negative log-likelihood at the returned `β̂`:
     /// `−log L(β̂) + ½ Σ_a λ_a · β̂_aᵀ S β̂_a`.
     pub penalized_neg_log_likelihood: f64,
@@ -320,7 +316,7 @@ pub fn fit_penalized_binomial_multi(
     let likelihood = BinomialMultiLikelihood {
         row_weights: row_weights.map(|w| w.to_owned()),
     };
-    let fit = fit_penalized_vector_glm(
+    let solve = fit_penalized_vector_glm(
         PenalizedVectorGlmInputs {
             design,
             y,
@@ -338,17 +334,20 @@ pub fn fit_penalized_binomial_multi(
         "fit_penalized_binomial_multi",
     )?;
 
-    if !fit.converged {
-        // SPEC: a fit object must only ever come from a converged optimization.
-        // Exhausting `max_iter` is a typed error carrying its evidence, never
-        // an Ok(outputs) with `converged: false`.
-        return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
-            context: "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton)"
-                .to_string(),
-            iterations: fit.iterations,
-            penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
-        });
-    }
+    let fit = match solve {
+        VectorGlmSolve::Converged(fit) => fit,
+        VectorGlmSolve::Stalled(stall) => {
+            // SPEC: a fit object must only ever come from a converged
+            // optimization. Exhausting `max_iter` is a typed error carrying
+            // evidence from the checkpoint, never an `Ok` with a flag.
+            return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
+                context: "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton)"
+                    .to_string(),
+                iterations: stall.iterations,
+                penalized_neg_log_likelihood: stall.penalized_neg_log_likelihood(),
+            });
+        }
+    };
 
     // η → μ = σ(η) is the binomial inverse link applied column-wise.
     let fitted = fit.eta.mapv(sigmoid_stable);
@@ -357,7 +356,6 @@ pub fn fit_penalized_binomial_multi(
         coefficients: fit.coefficients,
         fitted_probabilities: fitted,
         iterations: fit.iterations,
-        converged: fit.converged,
         penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
         deviance: -2.0 * fit.log_likelihood,
     })
@@ -490,32 +488,46 @@ mod tests {
                 over[[row, a, a]] = 0.25 * 4.0; // 4× the analytic curvature
             }
         }
-        let scaled = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+        let likelihood = BinomialMultiLikelihood { row_weights: None };
+        let scaled = fit_penalized_vector_glm(
+            PenalizedVectorGlmInputs {
             design: design.view(),
             y: y.view(),
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            row_weights: None,
             fisher_w_override: Some(over.view()),
             max_iter: 1,
             tol: 1.0e-9,
-        })
-        .expect("override fit must succeed");
-        let analytic = fit_penalized_binomial_multi(BinomialMultiFitInputs {
-            design: design.view(),
-            y: y.view(),
-            penalty: penalty.view(),
-            lambdas: lambdas.view(),
-            row_weights: None,
-            fisher_w_override: None,
-            max_iter: 1,
-            tol: 1.0e-9,
-        })
-        .expect("analytic fit must succeed");
+                class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+            },
+            &likelihood,
+            "binomial scaled-curvature first-step test",
+        )
+        .expect("scaled-curvature engine step must be finite");
+        let analytic = fit_penalized_vector_glm(
+            PenalizedVectorGlmInputs {
+                design: design.view(),
+                y: y.view(),
+                penalty: penalty.view(),
+                lambdas: lambdas.view(),
+                fisher_w_override: None,
+                max_iter: 1,
+                tol: 1.0e-9,
+                class_penalty_metric: crate::penalized_vector_glm::ClassPenaltyMetric::Diagonal,
+            },
+            &likelihood,
+            "binomial analytic-curvature first-step test",
+        )
+        .expect("analytic-curvature engine step must be finite");
+        let checkpoint_coefficients = |solve| match solve {
+            VectorGlmSolve::Converged(fit) => fit.coefficients,
+            VectorGlmSolve::Stalled(stall) => stall.coefficients,
+        };
+        let scaled = checkpoint_coefficients(scaled);
+        let analytic = checkpoint_coefficients(analytic);
         let differs = scaled
-            .coefficients
             .iter()
-            .zip(analytic.coefficients.iter())
+            .zip(analytic.iter())
             .any(|(a, b)| (a - b).abs() > 1.0e-6);
         assert!(differs, "scaled curvature override must change the step");
     }

@@ -171,8 +171,8 @@ pub struct BlockwiseFitResultParts {
     /// is the authoritative convergence signal.
     pub outer_gradient_norm: Option<f64>,
     /// First-order optimality certificate from the outer smoothing solve
-    /// (#934); `None` when no outer ran (fixed-λ, one-cycle probe) or the
-    /// audit could not evaluate.
+    /// (#934); `None` when no outer ran (for example, a fixed-λ fit) or the
+    /// certificate could not be evaluated.
     pub criterion_certificate: Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
@@ -184,9 +184,9 @@ pub struct BlockwiseFitResultParts {
     /// space and reporting it on the raw fit is exact — and it avoids the
     /// `tr((H_raw + εI)⁻¹ S_raw)` blow-up that a rank-deficient raw-lifted
     /// Hessian (zero rows/cols on canonicalization-dropped directions) would
-    /// otherwise inject. `None` when the caller has no reduced geometry (e.g.
-    /// the one-cycle inner probe), in which case `blockwise_fit_from_parts`
-    /// falls back to computing edf from whatever geometry it was handed.
+    /// otherwise inject. `None` when the caller has no reduced geometry, in
+    /// which case `blockwise_fit_from_parts` falls back to computing edf from
+    /// whatever geometry it was handed.
     /// Tuple layout: `(edf_total, edf_by_penalty, block_edf, penalty_trace)`,
     /// where `penalty_trace[k] = λ_k·tr(H⁻¹S_k)` feeds the per-term EDF
     /// decomposition `|coeff_range| − Σ tr_k` (issue #1219).
@@ -452,6 +452,21 @@ pub fn blockwise_fit_from_parts(
         }
         .into());
     }
+    // SPEC 20: a fit object only ever comes from a converged optimization.
+    // Assembling a `UnifiedFitResult` from a non-converged outer state would
+    // mint a degraded fit (previously surfaced as `StalledAtValidMinimum`);
+    // non-convergence must instead be raised as a typed error at the solver,
+    // with a checkpoint, before ever reaching this assembler.
+    if !outer_converged {
+        return Err(CustomFamilyError::Optimization {
+            context: "blockwise_fit_from_parts",
+            reason: "refusing to assemble a fit from a non-converged outer optimization; \
+                     non-convergence is a typed error with a resume checkpoint, never an \
+                     assembled fit"
+                .to_string(),
+        }
+        .into());
+    }
     ensure_finite_scalar_estimation("blockwise_fit.log_likelihood", log_likelihood)
         .map_err(|e| e.to_string())?;
     validate_all_finite_estimation("blockwise_fit.log_lambdas", log_lambdas.iter().copied())
@@ -678,18 +693,9 @@ pub fn blockwise_fit_from_parts(
         fitted_link: FittedLinkState::Standard(None),
         geometry,
         block_states,
-        // Report the inner status honestly from the threaded `outer_converged`
-        // flag rather than hardcoding `Converged`. When the outer optimization
-        // did not converge (e.g. it escalated to posterior sampling), surface
-        // `StalledAtValidMinimum` — the same non-converged-but-usable bucket the
-        // smooth-term path maps to — so downstream consumers
-        // (`pirls_status.is_converged()`, `outer_converged` derivation) do not
-        // report a non-converged fit as converged.
-        pirls_status: if outer_converged {
-            gam_solve::pirls::PirlsStatus::Converged
-        } else {
-            gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-        },
+        // `outer_converged == true` is guaranteed by the SPEC-20 gate at the
+        // top of this assembler, so the assembled status is always honest.
+        pirls_status: gam_solve::pirls::PirlsStatus::Converged,
         max_abs_eta: 0.0,
         constraint_kkt: None,
         artifacts: gam_solve::model_types::FitArtifacts {

@@ -363,6 +363,27 @@ pub enum CenterStrategy {
     },
 }
 
+impl CenterStrategy {
+    /// The number of centers this strategy will select, computed from the
+    /// strategy alone (no data pass). `d` is the smooth's covariate
+    /// dimensionality, needed only by `UniformGrid` whose count is
+    /// `points_per_dim^d`. This is what resource planning consults to estimate
+    /// a spatial term's column contribution before any basis is built.
+    pub fn planned_num_centers(&self, d: usize) -> usize {
+        match self {
+            Self::Auto(inner) => inner.planned_num_centers(d),
+            Self::UserProvided(centers) => centers.nrows(),
+            Self::EqualMass { num_centers }
+            | Self::EqualMassCovarRepresentative { num_centers }
+            | Self::FarthestPoint { num_centers }
+            | Self::KMeans { num_centers, .. } => *num_centers,
+            Self::UniformGrid { points_per_dim } => {
+                points_per_dim.saturating_pow(d.clamp(1, u32::MAX as usize) as u32)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CenterStrategyKind {
     UserProvided,

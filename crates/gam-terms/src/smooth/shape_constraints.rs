@@ -1,23 +1,16 @@
-//! Shape-constraint (monotone / convex / concave) machinery for the 1-D smooth
-//! arm.
+//! Exact shape-constraint (monotone / convex / concave) machinery.
 //!
-//! Pure relocation from `smooth.rs` (issue #780 decomposition): the
-//! shape-constraint order/sign lookup, per-coefficient lower-bound vector,
-//! basis-support gate, box-reparameterization gate, the 1-D grid + design
-//! reconstruction used to assemble the inequality rows, and the
-//! `LinearInequalityConstraints` assembly/merge helpers. No behavior change —
-//! bodies are byte-identical and the entry points are re-imported by the parent
-//! so every call site is unchanged.
+//! Shape constraints are admitted only for open, untransformed B-spline
+//! control coefficients.  In that chart, non-negative first control-point
+//! differences certify monotonicity on every knot span, while non-decreasing
+//! Greville-scaled control-polygon slopes certify convexity.  The smooth
+//! builder realizes those cones with an invertible coefficient transform and
+//! coordinate lower bounds; no sampled evaluation grid is involved.
 
 use super::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
-use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
-    BasisError, BasisMetadata, DuchonBasisSpec, MaternBasisSpec, MaternIdentifiability,
-    SpatialIdentifiability, ThinPlateBasisSpec, build_bspline_basis_1d, build_duchon_basis,
-    build_matern_basis, build_thin_plate_basis,
-};
+use crate::basis::{BSplineKnotSpec, OneDimensionalBoundary};
 use gam_problem::LinearInequalityConstraints;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, s};
 
 pub(super) fn shape_order_and_sign(shape: ShapeConstraint) -> Option<(usize, f64)> {
     match shape {
@@ -39,330 +32,28 @@ pub fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Ar
 }
 
 pub(super) fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
+    let SmoothBasisSpec::BSpline1D { spec, .. } = &term.basis else {
+        return false;
+    };
+
+    // A cyclic spline cannot be globally monotone unless it is constant, and
+    // the periodic coefficient chart requires a wrap-around constraint that
+    // the open cumulative transform does not encode.  Natural cubic regression
+    // coefficients are knot values rather than raw B-spline control points, so
+    // coefficient differences do not certify against cubic overshoot.  Endpoint
+    // boundary conditions likewise introduce a raw-basis nullspace transform.
+    // Reject all three instead of pretending their transformed coordinates have
+    // the control-polygon geometry used by the exact cone below.
     !matches!(
-        term.basis,
-        SmoothBasisSpec::TensorBSpline { .. } | SmoothBasisSpec::Pca { .. }
-    )
+        &spec.knotspec,
+        BSplineKnotSpec::PeriodicUniform { .. }
+            | BSplineKnotSpec::NaturalCubicRegression { .. }
+    ) && matches!(&spec.boundary, OneDimensionalBoundary::Open)
+        && spec.boundary_conditions.is_free()
 }
 
 pub(super) fn shape_uses_box_reparameterization(basis: &SmoothBasisSpec) -> bool {
     matches!(basis, SmoothBasisSpec::BSpline1D { .. })
-}
-
-pub(super) fn build_shape_constraint_grid_1d(
-    x: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, BasisError> {
-    if x.is_empty() {
-        crate::bail_invalid_basis!("shape-constrained smooth requires non-empty covariate values");
-    }
-    if x.iter().any(|v| !v.is_finite()) {
-        crate::bail_invalid_basis!("shape-constrained smooth requires finite covariate values");
-    }
-
-    let mut x_sorted: Vec<f64> = x.iter().copied().collect();
-    x_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    // Tie tolerance on the covariate SPAN, not the absolute coordinates:
-    // monotonicity/convexity are translation invariant, so a unit-spaced grid
-    // must dedup identically whether it sits near 0 or near 1e13.
-    let tie_tol = 1e-12 * (x_sorted[x_sorted.len() - 1] - x_sorted[0]);
-    let mut x_unique: Vec<f64> = Vec::with_capacity(x_sorted.len());
-    let mut last: Option<f64> = None;
-    for v in x_sorted {
-        let take = match last {
-            None => true,
-            Some(prev) => (v - prev).abs() > tie_tol,
-        };
-        if take {
-            x_unique.push(v);
-            last = Some(v);
-        }
-    }
-    if x_unique.len() < 2 {
-        crate::bail_invalid_basis!(
-            "shape-constrained smooth requires at least two unique covariate values"
-        );
-    }
-
-    let min_x = x_unique[0];
-    let max_x = *x_unique
-        .last()
-        .expect("x_unique has at least two elements by construction");
-    if (max_x - min_x).abs() <= 1e-12 {
-        crate::bail_invalid_basis!(
-            "shape-constrained smooth requires non-degenerate covariate range"
-        );
-    }
-
-    let target_points = x_unique.len().clamp(96, 320);
-    let mut grid = Array1::<f64>::zeros(target_points);
-    let denom = (target_points - 1) as f64;
-    for i in 0..target_points {
-        let t = i as f64 / denom;
-        grid[i] = min_x + t * (max_x - min_x);
-    }
-    Ok(grid)
-}
-
-pub(super) fn build_shape_constraint_design_1d(
-    data: ArrayView2<'_, f64>,
-    term: &SmoothTermSpec,
-    metadata: &BasisMetadata,
-    axis_col: usize,
-) -> Result<(Array1<f64>, Array2<f64>), BasisError> {
-    let x_grid = build_shape_constraint_grid_1d(data.column(axis_col))?;
-    let grid_2d = x_grid
-        .clone()
-        .into_shape_with_order((x_grid.len(), 1))
-        .map_err(|e| {
-            BasisError::InvalidInput(format!(
-                "failed to construct 1D shape grid matrix for term '{}': {e}",
-                term.name
-            ))
-        })?;
-
-    let design = match (&term.basis, metadata) {
-        (
-            SmoothBasisSpec::BSpline1D { spec, .. },
-            BasisMetadata::BSpline1D {
-                knots,
-                identifiability_transform,
-                periodic,
-                degree: meta_degree,
-                ..
-            },
-        ) => {
-            // Issue #340: predict against the metadata-recorded effective
-            // degree so fit-time auto-shrink (cubic → linear for small n) is
-            // honoured at prediction time too.
-            let effective_degree = meta_degree.unwrap_or(spec.degree);
-            let evalspec = BSplineBasisSpec {
-                degree: effective_degree,
-                penalty_order: spec.penalty_order,
-                knotspec: periodic
-                    .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                            data_range: (domain_start, domain_start + period),
-                            num_basis,
-                        },
-                    )
-                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone())),
-                double_penalty: false,
-                identifiability: identifiability_transform
-                    .as_ref()
-                    .map(|z| BSplineIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    })
-                    .unwrap_or(BSplineIdentifiability::None),
-                boundary: spec.boundary.clone(),
-                boundary_conditions: BSplineBoundaryConditions::default(),
-            };
-            build_bspline_basis_1d(x_grid.view(), &evalspec)?
-                .design
-                .to_dense()
-        }
-        (
-            SmoothBasisSpec::ThinPlate { .. },
-            BasisMetadata::ThinPlate {
-                centers,
-                length_scale,
-                identifiability_transform,
-                radial_reparam,
-                ..
-            },
-        ) => {
-            let evalspec = ThinPlateBasisSpec {
-                periodic: None,
-                center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
-                length_scale: *length_scale,
-                double_penalty: false,
-                identifiability: identifiability_transform
-                    .as_ref()
-                    .map(|z| SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    })
-                    .unwrap_or(SpatialIdentifiability::None),
-                radial_reparam: radial_reparam.clone(),
-            };
-            build_thin_plate_basis(grid_2d.view(), &evalspec)?
-                .design
-                .to_dense()
-        }
-        (
-            SmoothBasisSpec::Matern { .. },
-            BasisMetadata::Matern {
-                centers,
-                length_scale,
-                nu,
-                include_intercept,
-                identifiability_transform,
-                aniso_log_scales,
-                ..
-            },
-        ) => {
-            let ident = identifiability_transform
-                .as_ref()
-                .map(|z| MaternIdentifiability::FrozenTransform {
-                    transform: z.clone(),
-                    // Predict-time design rebuild: penalties are not assembled
-                    // here (`double_penalty: false` below), so the frozen
-                    // shrinkage decision is irrelevant on this path.
-                    nullspace_shrinkage_survived: None,
-                })
-                .unwrap_or(MaternIdentifiability::None);
-            let evalspec = MaternBasisSpec {
-                periodic: None,
-                center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
-                length_scale: *length_scale,
-                nu: *nu,
-                include_intercept: *include_intercept,
-                double_penalty: false,
-                identifiability: ident,
-                aniso_log_scales: aniso_log_scales.clone(),
-                nullspace_shrinkage_survived: None,
-            };
-            build_matern_basis(grid_2d.view(), &evalspec)?
-                .design
-                .to_dense()
-        }
-        (
-            SmoothBasisSpec::Duchon { spec, .. },
-            BasisMetadata::Duchon {
-                centers,
-                length_scale,
-                power,
-                nullspace_order,
-                identifiability_transform,
-                aniso_log_scales,
-                radial_reparam,
-                ..
-            },
-        ) => {
-            let evalspec = DuchonBasisSpec {
-                periodic: None,
-                center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
-                length_scale: *length_scale,
-                power: *power,
-                nullspace_order: *nullspace_order,
-                identifiability: identifiability_transform
-                    .as_ref()
-                    .map(|z| SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    })
-                    .unwrap_or_else(|| spec.identifiability.clone()),
-                aniso_log_scales: aniso_log_scales.clone(),
-                operator_penalties: spec.operator_penalties.clone(),
-                boundary: spec.boundary.clone(),
-                radial_reparam: radial_reparam.clone(),
-            };
-            build_duchon_basis(grid_2d.view(), &evalspec)?
-                .design
-                .to_dense()
-        }
-        _ => {
-            crate::bail_invalid_basis!(
-                "shape-constraint grid reconstruction metadata mismatch for term '{}'",
-                term.name
-            );
-        }
-    };
-
-    Ok((x_grid, design))
-}
-
-pub(super) fn build_shape_linear_constraints_1d(
-    x: ArrayView1<'_, f64>,
-    design_local: ArrayView2<'_, f64>,
-    shape: ShapeConstraint,
-) -> Result<Option<LinearInequalityConstraints>, BasisError> {
-    let Some((order, sign)) = shape_order_and_sign(shape) else {
-        return Ok(None);
-    };
-    let n = x.len();
-    let p = design_local.ncols();
-    if n == 0 || p == 0 {
-        return Ok(None);
-    }
-    if x.iter().any(|v| !v.is_finite()) {
-        crate::bail_invalid_basis!("shape-constrained smooth requires finite covariate values");
-    }
-
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&i, &j| x[i].partial_cmp(&x[j]).unwrap_or(std::cmp::Ordering::Equal));
-
-    // Tie tolerance on the covariate SPAN (translation invariant): an absolute
-    // |x|-based scale inflates the tolerance for a grid merely translated far
-    // from the origin and collapses genuinely distinct unit-spaced locations.
-    let x_span = x[idx[n - 1]] - x[idx[0]];
-    let x_tol = 1e-12 * x_span;
-    let mut collapsedrows: Vec<Array1<f64>> = Vec::new();
-    let mut group_sum = Array1::<f64>::zeros(p);
-    let mut group_count = 0usize;
-    let mut last_x: Option<f64> = None;
-    for &r in &idx {
-        let xr = x[r];
-        let start_new = match last_x {
-            None => false,
-            Some(prev) => (xr - prev).abs() > x_tol,
-        };
-        if start_new {
-            if group_count > 0 {
-                collapsedrows.push(group_sum.mapv(|v| v / group_count as f64));
-            }
-            group_sum.fill(0.0);
-            group_count = 0;
-        }
-        group_sum.scaled_add(1.0, &design_local.row(r));
-        group_count += 1;
-        last_x = Some(xr);
-    }
-    if group_count > 0 {
-        collapsedrows.push(group_sum.mapv(|v| v / group_count as f64));
-    }
-
-    let m = collapsedrows.len();
-    if m <= order {
-        crate::bail_invalid_basis!(
-            "shape-constrained smooth requires at least {} unique covariate locations; found {}",
-            order + 1,
-            m
-        );
-    }
-
-    let q_raw = m - order;
-    let mut candidates: Vec<(Array1<f64>, f64)> = Vec::with_capacity(q_raw);
-    let mut max_norm = 0.0_f64;
-    for i in 0..q_raw {
-        let row = if order == 1 {
-            &collapsedrows[i + 1] - &collapsedrows[i]
-        } else {
-            &collapsedrows[i + 2] - &collapsedrows[i + 1].mapv(|v| 2.0 * v) + &collapsedrows[i]
-        };
-        let mut row_signed = row;
-        if sign < 0.0 {
-            row_signed.mapv_inplace(|v| -v);
-        }
-        let norm = row_signed.dot(&row_signed).sqrt();
-        max_norm = max_norm.max(norm);
-        candidates.push((row_signed, norm));
-    }
-    // Drop numerically-null difference rows RELATIVE to the largest row: an
-    // absolute 1e-12 cutoff silently deletes every constraint of a design that
-    // is merely expressed in small units, which is not a geometric property.
-    let arows: Vec<Array1<f64>> = candidates
-        .into_iter()
-        .filter(|(_, norm)| *norm > 1e-12 * max_norm)
-        .map(|(row, _)| row)
-        .collect();
-    if arows.is_empty() {
-        return Ok(None);
-    }
-
-    let mut a = Array2::<f64>::zeros((arows.len(), p));
-    for (i, row) in arows.iter().enumerate() {
-        a.row_mut(i).assign(row);
-    }
-    let b = Array1::<f64>::zeros(a.nrows());
-    Ok(Some(LinearInequalityConstraints { a, b }))
 }
 
 pub fn linear_constraints_from_lower_bounds_global(

@@ -23,7 +23,8 @@ gam-sae = { path = "../gam-sae", version = "=0.3.149" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
 rand = "0.10.1"
-rand_distr = "0.6.0"
+rand_core_06 = { package = "rand_core", version = "0.6.4" }
+polya-gamma = { version = "0.5.3", default-features = false }
 faer = "0.24.0"
 statrs = "0.18.0"
 libm = "0.2.16"

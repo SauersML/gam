@@ -2974,6 +2974,33 @@ pub fn discover_primary_atom_topologies(
                         coords,
                     });
                 }
+                if n_pcs >= 3 {
+                    // Möbius band (#2240): double-cover angle from the leading
+                    // principal pair (s = 2·phase ∈ [0, 2)) and a bounded width
+                    // from the standardized third component. The deck-invariant
+                    // basis makes width-odd structure carry half-period angular
+                    // factors — the non-orientable signature no other candidate
+                    // can express.
+                    let sd2 = cluster_sd(2);
+                    let mut coords = Array2::<f64>::zeros((n_obs, 2));
+                    for row in 0..n_obs {
+                        coords[[row, 0]] = 2.0 * phase(proj[[row, 0]], proj[[row, 1]]);
+                        coords[[row, 1]] = (proj[[row, 2]] / (2.0 * sd2)).clamp(-1.0, 1.0);
+                    }
+                    if let Ok(evaluator) = MobiusHarmonicEvaluator::new(3, 2) {
+                        specs.push(TopologyCandidateSpec {
+                            kind: AutoTopologyKind::Mobius,
+                            basis_kind: SaeAtomBasisKind::Mobius,
+                            manifold: LatentManifold::Product(vec![
+                                LatentManifold::Circle { period: 2.0 },
+                                LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+                            ]),
+                            latent_dim: 2,
+                            evaluator: Arc::new(evaluator),
+                            coords,
+                        });
+                    }
+                }
                 if n_pcs >= 4 {
                     // Torus: independent phases of the two leading principal
                     // pairs (fraction-of-period convention on both axes).
@@ -3069,6 +3096,10 @@ pub fn resolve_auto_primary_atoms(
             }
             SaeAtomBasisKind::Sphere => {
                 atom_basis[atom_idx] = "sphere".to_string();
+                atom_dim[atom_idx] = choice.latent_dim;
+            }
+            SaeAtomBasisKind::Mobius => {
+                atom_basis[atom_idx] = "mobius".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
             }
             SaeAtomBasisKind::EuclideanPatch => {

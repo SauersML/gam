@@ -392,10 +392,9 @@ impl AmortizedWarmStartTelemetry {
 ///
 /// The SAE's outer coordinates ρ are all penalty-like / τ (precisions and
 /// log-smoothing-strengths), so `psi_dim = 0`: there are no design-moving
-/// (ψ) coordinates. No analytic outer gradient/Hessian is exposed yet
-/// (task v2 wires the selected-inverse block-trace ρ-gradient), so this
-/// is a cost-only objective and the engine routes it to a derivative-free /
-/// central-difference outer strategy per the planner.
+/// (ψ) coordinates. Dense-admitted fits expose the exact implicit outer
+/// gradient through the rank-revealing joint-Hessian solve; matrix-free fits
+/// use the analytic Fellner--Schall trace fixed point.
 
 /// #2080 — probe telemetry for the outer REML ρ-search. Counts how the outer
 /// objective spends its criterion evaluations so the wide-`p` acceptance test can
@@ -414,13 +413,8 @@ impl AmortizedWarmStartTelemetry {
 pub struct OuterProbeTelemetry {
     /// Full REML criterion evaluations requested through the generic outer
     /// lanes. Accepted gradient/EFS lanes commit their solved basin; value-only
-    /// comparison probes restore the incumbent state before returning. The
-    /// lighter FD-safeguard probes are counted under `fd_probe_calls`.
+    /// comparison probes restore the incumbent state before returning.
     pub criterion_calls: usize,
-    /// Finite-difference / directional value probes issued by the
-    /// value-consistent-gradient safeguard. Each runs on a clone of `self.term`
-    /// (pure — never mutates the accepted basin).
-    pub fd_probe_calls: usize,
     /// Infeasible probes by refusal kind (non-PD Laplace log-det at that ρ).
     pub infeasible_non_pd_per_row: usize,
     pub infeasible_cross_row: usize,
@@ -430,14 +424,6 @@ pub struct OuterProbeTelemetry {
     /// Value probes that resolved to the finite collapse/refusal wall
     /// (`cost ≥ SAE_FIT_DATA_COLLAPSE_COST`) rather than a real REML value.
     pub wall_cost_value_probes: usize,
-    /// #2080 defect 3 — FD/line-search value probes issued by the
-    /// value-consistent-gradient safeguard that mutated the accepted `self.term`
-    /// basin. The fix routes every such probe through a THROWAWAY clone
-    /// (`probe_outer_criterion_value`), so this stays 0: a rejected line-search /
-    /// FD probe can no longer drag the per-row routing off the decisive seed basin
-    /// (the stateful-objective corruption of #629/#630/#2080). A nonzero count is a
-    /// regression — a probe lane that mutates the committed state.
-    pub mutating_value_probes: usize,
     /// Eisenstat–Walker inexact-probe engagement: line-search value probes
     /// (`eval_with_order(Value)`) whose inner `(t, β)` solve was ACCEPTED at the
     /// loosened forcing gate `max(η_j·‖g_inner,entry‖, τ_full)` while the inner
@@ -604,12 +590,11 @@ struct ProbeConvergedHandoff {
 //
 // WHAT STAYS FULL-TOLERANCE, unconditionally: gradient evaluations at accepted
 // iterates (`eval` / `ValueAndGradient` / `ValueGradientHessian`), the
-// cross-seed ranking / EFS value lane (`eval_cost`), the FD-safeguard and
-// certificate probes (`probe_outer_criterion_value`, `optimality_certificate`),
-// the finalize re-evaluation, and the returned fit (`into_fitted` /
-// `fit_at_fixed_rho`). Only the Armijo/Wolfe comparison probes inside the line
-// search are ever loosened, so the outer KKT test and the FD gates are
-// untouched.
+// cross-seed ranking / EFS value lane (`eval_cost`), the post-convergence
+// certificate probes (`optimality_certificate`), the finalize re-evaluation,
+// and the returned fit (`into_fitted` / `fit_at_fixed_rho`). Only the
+// Armijo/Wolfe comparison probes inside the line search are ever loosened, so
+// the outer KKT test is untouched.
 
 /// EW96 Choice-2 multiplier γ (see the module block above for the citation).
 const EW_FORCING_GAMMA: f64 = 0.9;
@@ -2194,208 +2179,12 @@ impl SaeManifoldOuterObjective {
         }
     }
 
-    /// Exact REML criterion value at `rho` on a THROWAWAY clone of the current
-    /// (converged) inner state — the same quantity `eval` returns as `cost`
-    /// (`reml_criterion_with_cache`, floored to the finite collapse wall when the
-    /// Laplace normaliser is non-finite). Used ONLY by
-    /// [`Self::value_consistent_outer_gradient`] to central-difference the outer
-    /// criterion; the clone means the production converged state is untouched and
-    /// the probe re-solves warm from it. Returns the same finite collapse wall
-    /// used by the production value / gradient / EFS lanes for a recoverable
-    /// infeasible ρ probe (non-PD joint Hessian), so the consistency safeguard
-    /// differentiates the objective shape the line search actually sees instead
-    /// of reintroducing an `+∞` lane for the #1782 refusal class.
-    fn probe_outer_criterion_value(&mut self, rho: &SaeManifoldRho) -> Result<f64, String> {
-        self.probe_telemetry.fd_probe_calls += 1;
-        // #2080 — a PURE line-search / FD probe: run on a THROWAWAY clone so the
-        // accepted warm-start basin in `self.term` is never mutated (defect 3),
-        // and on the PROBE refine budget (`refine_progress_extension = false`) so
-        // an infeasible ρ (non-PD Laplace log-det) returns the typed refusal after
-        // a single diagnostic pass instead of grinding the accepted 16×/64× inner
-        // refinement budget (defect 2). The value it returns is the same quantity
-        // `eval` reports as `cost` (floored to the finite collapse wall when the
-        // Laplace normaliser is non-finite, and to the recoverable refusal wall for
-        // an infeasible ρ), so the outer central-difference differentiates the
-        // objective shape the line search actually sees.
-        let mut probe = self.term.clone();
-        let reml = match probe.reml_criterion_with_cache_refine_policy(
-            self.target.view(),
-            rho,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-            false,
-        ) {
-            Ok(evaluated) => evaluated.0,
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                self.probe_telemetry.record_refusal_kind(&err);
-                self.probe_telemetry.wall_cost_value_probes += 1;
-                return Ok(Self::recoverable_refusal_wall_cost());
-            }
-            Err(err) => return Err(err),
-        };
-        Ok(if reml.is_finite() {
-            reml
-        } else {
-            SAE_FIT_DATA_COLLAPSE_COST
-        })
-    }
-
     /// #2080 — whether a probe value resolved to the finite collapse/refusal wall
     /// (an infeasible ρ or a data-collapsed fit) rather than a real REML value.
-    /// Differencing the objective across such a wall is meaningless, so the
-    /// value-consistent-gradient safeguard treats it exactly like a non-finite
-    /// probe and keeps the analytic gradient.
+    /// A wall-valued probe's converged state is a degenerate basin, so the
+    /// handoff / basin-bundle lanes never admit it.
     fn probe_value_is_wall(value: f64) -> bool {
         !value.is_finite() || value >= SAE_FIT_DATA_COLLAPSE_COST
-    }
-
-    /// Value-consistent outer-ρ gradient safeguard for the small (BFGS) regime.
-    ///
-    /// The analytic outer gradient's implicit-state envelope correction (the
-    /// #1006/#1418 third-order `Γ·θ̂_ρ` term) is assembled by inverting the exact
-    /// inner stationarity Jacobian `A = ∇²_θθ L`. When an inner coordinate is
-    /// near-flat — e.g. a SATURATED IBP gate logit at K=1, whose data curvature
-    /// `∝ σ'(ℓ)² ≈ 0` — `A` is near-singular in that direction and the CG
-    /// stationarity solve amplifies it into a spurious envelope term, so the
-    /// returned λ-gradient can disagree in SIGN with the criterion it
-    /// differentiates. Paired with the line search's value probes this is the
-    /// objective↔gradient desync class (#931): the BFGS line search rejects every
-    /// step and STALLS at the seed (planted-circle IBP K=1: railed at the ρ = 1
-    /// GeneralizedLinear anchor seed, held-out EV ≈ 0.87 instead of > 0.95, while
-    /// the true criterion slope points at a lower, better-reconstructing λ).
-    ///
-    /// This is a SAFEGUARD, not a replacement. Only in the small (≤ BFGS-cap)
-    /// outer regime that consumes this gradient — large-K fits descend on the EFS
-    /// fixed point (traces only, no gradient) and never reach here — it
-    /// central-differences the SAME exact REML criterion `eval` returns, on a
-    /// throwaway clone, and adopts the finite-difference gradient ONLY when the
-    /// analytic direction is not descent-consistent with it (the cosine of the
-    /// analytic and FD gradients drops below ½, i.e. they point > 60° apart). A
-    /// well-conditioned fit's analytic gradient matches the FD to inner-solve
-    /// tolerance, so the cosine stays ≈ 1 and the analytic gradient is returned
-    /// byte-for-byte — softmax and every well-conditioned IBP fixture are
-    /// untouched. The FD differentiates the production value path, so the adopted
-    /// direction is exactly consistent with what the line search minimises (a
-    /// real gradient of the real criterion, used only as a descent direction).
-    fn value_consistent_outer_gradient(
-        &mut self,
-        rho_state: &SaeManifoldRho,
-        cost: f64,
-        analytic: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        // Only the small BFGS outer regime consumes the analytic gradient; keep it
-        // aligned with the planner's `SMALL_OUTER_BFGS_MAX_PARAMS` gate so large-K
-        // fits (EFS lane) never pay the 2·n probe cost.
-        const SAFEGUARD_MAX_PARAMS: usize = 8;
-        let flat = rho_state.to_flat();
-        let n = flat.len();
-        if n == 0 || n > SAFEGUARD_MAX_PARAMS || !cost.is_finite() {
-            return Ok(analytic);
-        }
-        let na = analytic.dot(&analytic).sqrt();
-        // A vanishing analytic gradient IS a stationary-point claim; let BFGS
-        // terminate on its own convergence test rather than probe around it.
-        if na <= 1.0e-8 {
-            return Ok(analytic);
-        }
-        // Stage 1 — CHEAP directional consistency check (2 probes). Central-
-        // difference the criterion along the analytic gradient's own unit
-        // direction `d̂`. The analytic directional derivative there is exactly
-        // `‖g‖` (`g·d̂`), so a value-consistent gradient reproduces
-        // `fd_dir ≈ ‖g‖`. A near-flat inner direction that flipped the envelope
-        // term makes `d̂` a NON-descent direction of the true criterion, so
-        // `fd_dir` collapses (or goes negative). Escalate to the full FD gradient
-        // only then; well-conditioned fits exit here having paid two evaluations.
-        let inv_na = 1.0 / na;
-        // The FD step must be LARGE enough that the criterion change `‖g‖·2·step`
-        // exceeds the inner-solve convergence noise (the criterion is evaluated at
-        // a re-solved inner optimum, whose residual KKT slack perturbs the value at
-        // the ~1e-4..1e-6 level). A tiny `1e-4` step buries the true slope in that
-        // noise and yields a spurious ~0 gradient that STALLS the descent; `1e-2`
-        // resolves the slope cleanly while the O(h²) central-difference truncation
-        // stays negligible for a descent direction.
-        let step = 1.0e-2 * (1.0 + flat.iter().fold(0.0_f64, |m, &v| m.max(v.abs())));
-        let mut dir_plus = flat.clone();
-        let mut dir_minus = flat.clone();
-        for i in 0..n {
-            let d = analytic[i] * inv_na;
-            dir_plus[i] += step * d;
-            dir_minus[i] -= step * d;
-        }
-        let rho_plus = self.baseline_rho.from_flat(dir_plus.view());
-        let rho_minus = self.baseline_rho.from_flat(dir_minus.view());
-        let vp_dir = self.probe_outer_criterion_value(&rho_plus)?;
-        let vm_dir = self.probe_outer_criterion_value(&rho_minus)?;
-        if Self::probe_value_is_wall(vp_dir) || Self::probe_value_is_wall(vm_dir) {
-            // #2080 — a probe hit an infeasible (non-PD Laplace) or collapse wall
-            // adjacent to this ρ; the finite wall cost is astronomically larger
-            // than any real REML value, so differencing across it produces a
-            // spurious huge slope. Keep the analytic gradient, exactly as for a
-            // non-finite probe.
-            return Ok(analytic);
-        }
-        let fd_dir = (vp_dir - vm_dir) / (2.0 * step);
-        if fd_dir >= 0.5 * na {
-            // Analytic gradient is descent-consistent along its own direction.
-            return Ok(analytic);
-        }
-        // #2080 (defect 4) — the desync is only SUSPECTED here (the cheap 2-probe
-        // directional check tripped). Confirming it needs the FULL 2·d_ρ
-        // central-difference gradient, each probe a fresh dense inner solve. Gate
-        // that escalation on the inner-criterion cost, not on d_ρ alone: when the
-        // dense evidence factor is WIDE (the aggregate factor work of the 2·d_ρ
-        // escalation probes exceeds the in-core budget's worth of factor slabs),
-        // the escalation is disproportionately expensive relative to the safeguard
-        // it provides, so keep the analytic gradient rather than pay it. The
-        // gate is derived from the streaming plan's in-core budget machinery, not a
-        // bare magic threshold. Narrow (small-`p`) fits — every current fixture —
-        // fall through and run the full escalation exactly as before.
-        let plan = self.term.streaming_plan();
-        let escalation_probe_factor_work = plan
-            .estimated_dense_schur_bytes
-            .saturating_mul(2usize.saturating_mul(n));
-        if escalation_probe_factor_work > plan.in_core_budget_bytes {
-            log::info!(
-                "[SAE/#2080] value-consistent outer-gradient safeguard: skipping the \
-                 2·d_ρ full-FD escalation at a wide criterion (dense factor slab \
-                 {schur} B × {probes} probes exceeds in-core budget {budget} B); \
-                 descending with the analytic outer gradient",
-                schur = plan.estimated_dense_schur_bytes,
-                probes = 2 * n,
-                budget = plan.in_core_budget_bytes,
-            );
-            return Ok(analytic);
-        }
-        // Stage 2 — desync suspected: assemble the FULL central-difference gradient
-        // of the exact criterion (2·n probes) and adopt it when it points away
-        // from the analytic gradient (cosine < ½, i.e. > 60° apart).
-        let mut fd = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            // Same inner-solve-noise floor as the Stage-1 step: a `1e-2` FD step
-            // keeps the per-coordinate slope well above the re-solve KKT slack.
-            let h = 1.0e-2 * (1.0 + flat[i].abs());
-            let mut plus = flat.clone();
-            let mut minus = flat.clone();
-            plus[i] += h;
-            minus[i] -= h;
-            let rho_plus = self.baseline_rho.from_flat(plus.view());
-            let rho_minus = self.baseline_rho.from_flat(minus.view());
-            let vp = self.probe_outer_criterion_value(&rho_plus)?;
-            let vm = self.probe_outer_criterion_value(&rho_minus)?;
-            if Self::probe_value_is_wall(vp) || Self::probe_value_is_wall(vm) {
-                return Ok(analytic);
-            }
-            fd[i] = (vp - vm) / (2.0 * h);
-        }
-        let nf = fd.dot(&fd).sqrt();
-        if nf <= 1.0e-8 {
-            return Ok(analytic);
-        }
-        let cosine = analytic.dot(&fd) / (na * nf);
-        if cosine < 0.5 { Ok(fd) } else { Ok(analytic) }
     }
 
     /// #1782 — the finite outer-cost a recoverable infeasible-ρ REFUSAL presents
@@ -2535,14 +2324,12 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
         refine_progress_extension: bool,
-        fold_cotrain: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         self.evaluate_with_inner_drive(
             rho_flat,
             ProbeInnerDrive::Criterion {
                 refine_progress_extension,
             },
-            fold_cotrain,
             false,
         )
     }
@@ -2552,14 +2339,13 @@ impl SaeManifoldOuterObjective {
     /// or the Eisenstat–Walker forced line-search probe lane
     /// ([`Self::forced_probe_criterion`]). Everything around the inner drive —
     /// the probe handoff install, seeded-β warm start, amortized latent warm
-    /// start, the co-training fold, and the collapse wall — is shared, so the
-    /// two drives evaluate the SAME criterion and differ only in how far the
-    /// inner solve is converged before pricing it.
+    /// start, and the collapse wall — is shared, so the two drives evaluate the
+    /// SAME criterion and differ only in how far the inner solve is converged
+    /// before pricing it.
     fn evaluate_with_inner_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
         drive: ProbeInnerDrive,
-        fold_cotrain: bool,
         basin_installed: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
@@ -2631,33 +2417,20 @@ impl SaeManifoldOuterObjective {
             }
         };
         let beta_hat = self.term.flatten_beta();
-        // #1154 — co-train the amortized encoder with the dictionary + λ: rank ρ
-        // by the REML criterion PLUS the amortized-encoder consistency penalty,
-        // so the derivative-free outer cascade settles on a dictionary the cheap
-        // one-mat-vec encoder can faithfully and certifiably invert. The inner
-        // solve already converged to stationarity above, so the consistency fold
-        // is evaluated at the exact fitted dictionary and the REML λ-gradient is
-        // untouched (Design A).
-        //
-        // #1224 — the fold `c(ρ)` has NO analytic gradient, so it may only be
-        // carried where the cost is never compared against the REML gradient
-        // `∇f`. `fold_cotrain == true` is the CROSS-SEED RANKING / EFS lane
-        // (`eval_cost`): a value-only screen across independent seeds and final
-        // selection, where no `∇f` is in play, so `f+c` is the right ranking
-        // criterion. `fold_cotrain == false` is the BFGS / ARC LINE-SEARCH lane
-        // (`eval_with_order(Value)`): those probes accept/reject steps whose
-        // search DIRECTION came from `eval`'s `∇f`, so a sufficient-decrease test
-        // on `f+c` paired with `∇f` mixes two functions and can stall or wander
-        // (the objective↔gradient desync class, #931/#1206). The line search must
-        // see the SAME pure REML `f` the gradient lane (`eval`) reports. Either
-        // way the discrete collapse barrier stays on both lanes (BFGS rejects
-        // steps into it — the intended infeasibility wall, not a smooth fold).
-        let cost = if fold_cotrain {
-            self.fold_cotrain_consistency(reml_cost, &rho)?
-        } else {
-            reml_cost
-        };
-        let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
+        // ONE criterion everywhere. Every outer lane — BFGS/ARC descent, the
+        // line-search value probes, cross-seed ranking, EFS backtracking, and
+        // final selection — prices the SAME pure REML criterion `f(ρ)` whose
+        // exact implicit gradient `∇f` the gradient lane returns. The former
+        // #1154 amortized-encoder consistency fold `c(ρ)` ranked seeds/EFS
+        // states by `f+c` while optimization descended `f` alone (c had no
+        // gradient), so the selected fit was not stationary for the criterion
+        // that selected it — the objective↔gradient desync class (#931/#1206)
+        // moved from the line search into selection. The fold is removed from
+        // every fitting/ranking lane; encoder consistency remains available as
+        // a pure diagnostic (`reml_criterion_cotrained`). The discrete collapse
+        // barrier stays on all lanes (an infeasibility wall the search rejects
+        // steps into, not a smooth fold).
+        let cost = self.add_fit_data_collapse_penalty(reml_cost, &rho)?;
         self.current_rho = rho;
         self.last_loss = Some(loss);
         Ok((cost, beta_hat))
@@ -2892,7 +2665,7 @@ impl SaeManifoldOuterObjective {
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
-        self.evaluate_with_refine_policy(rho_flat, true, false)
+        self.evaluate_with_refine_policy(rho_flat, true)
             .map(|_| ())
     }
 
@@ -2906,14 +2679,13 @@ impl SaeManifoldOuterObjective {
     fn evaluate_value_probe_with_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
-        fold_cotrain: bool,
         drive: ProbeInnerDrive,
     ) -> Result<(f64, Array1<f64>), String> {
         let saved_term = self.term.clone();
         let saved_rho = self.current_rho.clone();
         let saved_loss = self.last_loss.clone();
         let saved_seeded_beta = self.seeded_beta.clone();
-        let result = self.evaluate_with_inner_drive(rho_flat, drive, fold_cotrain, false);
+        let result = self.evaluate_with_inner_drive(rho_flat, drive, false);
         // #2080 (a) — instead of discarding the probe's converged inner state,
         // hand it off (a move: swapped against the restored `saved_term`, no
         // extra clone) to the next evaluation at this exact ρ — the line-search
@@ -2978,14 +2750,13 @@ impl SaeManifoldOuterObjective {
     fn evaluate_envelope_value_probe(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
-        fold_cotrain: bool,
         drive: ProbeInnerDrive,
     ) -> Result<(f64, Array1<f64>), String> {
         // (1) Bypass: streaming/matrix-free (no dense per-basin factor to
         // re-converge) or the freeze contract (verbatim reuse). Byte-for-byte
         // historical single trajectory.
         if self.inner_max_iter == 0 || !self.term.streaming_plan().direct_logdet_admitted() {
-            return self.evaluate_value_probe_with_drive(rho_flat, fold_cotrain, drive);
+            return self.evaluate_value_probe_with_drive(rho_flat, drive);
         }
 
         // (2) Seed the bundle with the accepted entry basin on first use. The
@@ -2998,7 +2769,7 @@ impl SaeManifoldOuterObjective {
 
         // (3) Discovery trajectory — the historical single warm-start probe. Sets
         // the probe handoff (if non-wall) to its converged term at this exact ρ.
-        let discovery = self.evaluate_value_probe_with_drive(rho_flat, fold_cotrain, drive);
+        let discovery = self.evaluate_value_probe_with_drive(rho_flat, drive);
         let discovery_cost = match &discovery {
             Ok((cost, _)) if !Self::probe_value_is_wall(*cost) => Some(*cost),
             _ => None,
@@ -3017,7 +2788,7 @@ impl SaeManifoldOuterObjective {
         );
         let member_eval = bundle.evaluate(|state: &SaeManifoldTerm| {
             let (res, converged) =
-                self.converge_member_criterion(rho_flat, state, drive, fold_cotrain);
+                self.converge_member_criterion(rho_flat, state, drive);
             res.map(|value| (converged, value))
         });
 
@@ -3093,7 +2864,6 @@ impl SaeManifoldOuterObjective {
         rho_flat: ArrayView1<'_, f64>,
         member: &SaeManifoldTerm,
         drive: ProbeInnerDrive,
-        fold_cotrain: bool,
     ) -> (Result<f64, String>, SaeManifoldTerm) {
         let saved_term = std::mem::replace(&mut self.term, member.clone());
         let saved_rho = self.current_rho.clone();
@@ -3101,7 +2871,7 @@ impl SaeManifoldOuterObjective {
         // Members must not touch the pending seed — take it out for the duration.
         let saved_seeded_beta = self.seeded_beta.take();
         let res = self
-            .evaluate_with_inner_drive(rho_flat, drive, fold_cotrain, true)
+            .evaluate_with_inner_drive(rho_flat, drive, true)
             .map(|(cost, _beta)| cost);
         let converged = std::mem::replace(&mut self.term, saved_term);
         self.current_rho = saved_rho;
@@ -3146,40 +2916,6 @@ impl SaeManifoldOuterObjective {
             diff_sq += d * d;
         }
         (diff_sq / ss_tot) < SAE_FINAL_EV_DEGRADATION_TOL
-    }
-
-    /// #1154 — add the amortized-encoder consistency fold to an already-computed
-    /// REML criterion at the converged dictionary for `rho`. The fold has NO
-    /// analytic gradient: under Design A the inner solve converges to the same
-    /// stationary point, so the exact outer derivative is the REML λ-gradient
-    /// `∇f` (the implicit-function `dβ̂/dλ` path) and nothing else.
-    ///
-    /// #1206 — for that reason the fold is carried ONLY by the DERIVATIVE-FREE
-    /// value-probe lane (`evaluate_with_refine_policy` → `eval_cost`), where the
-    /// cost is never paired with a gradient (seed screening, cross-seed final
-    /// ranking, EFS backtracking). It is NOT folded into the gradient lane
-    /// (`eval`/`OuterEvalOrder::ValueAndGradient`), whose `(cost, gradient)` pair
-    /// must be self-consistent for the BFGS Armijo line search — folding `c` into
-    /// the cost there while returning `∇f` is exactly the objective↔gradient
-    /// desync bug class (#931). The consistency term thus steers the value-only
-    /// ranking the cascade does between certified candidates, never the smooth
-    /// descent direction.
-    fn fold_cotrain_consistency(
-        &self,
-        reml_cost: f64,
-        rho: &SaeManifoldRho,
-    ) -> Result<f64, String> {
-        let consistency = self
-            .term
-            .amortized_encoder_consistency(self.target.view(), rho)?;
-        // Route through the SINGLE source of the fold arithmetic on
-        // `SaeManifoldTerm` so the cascade-ranked cost and the public
-        // `reml_criterion_cotrained` value can never drift (the objective↔gradient
-        // desync bug class).
-        Ok(SaeManifoldTerm::fold_cotrain_consistency(
-            reml_cost,
-            &consistency,
-        ))
     }
 
     /// Fellner-Schall / Mackay multiplicative fixed-point step on ρ at
@@ -3608,20 +3344,16 @@ fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         OuterCapability {
-            // The outer-ρ gradient is ALWAYS available, so the planner always has
-            // a usable descent lane. Two regimes:
+            // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
             //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
             //    every assignment mode incl. IBP-MAP (#1006).
             //  * Matrix-free (dense evidence factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): no dense cache exists for the
-            //    analytic path, so `eval` descends ρ with a CENTRAL finite-
-            //    difference of the cheap, deterministic streaming REML cost over
-            //    the low-dim ρ vector. Declaring `Unavailable` here instead routed
-            //    the planner to a BFGS runner that hard-errors on a missing
-            //    gradient ("no non-analytic fallback") — the K≥256 duchon /
-            //    large-K matrix-free hang. `eval` branches on the same admission
-            //    flag and supplies whichever gradient is valid.
+            //    IFT solve, so the fixed-point lane updates every ρ coordinate from
+            //    analytic inverse traces in one pass. The zero-gradient `eval`
+            //    result in that regime is startup-validation plumbing only; the
+            //    planner never uses it as a descent direction.
             gradient: Derivative::Analytic,
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
@@ -3653,18 +3385,18 @@ impl OuterObjective for SaeManifoldOuterObjective {
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         self.check_cancelled()?;
-        // Value-only comparison path (EFS backtracking, seed validation, FD
-        // certificate probes): no gradient/Hessian is ever
+        // Value-only comparison path (EFS backtracking and seed validation): no
+        // gradient/Hessian is ever
         // consumed at this iterate, so it takes the cheap probe refine budget
         // (#1029). Accepted points are always re-polished through
         // `eval`/`eval_with_order(ValueAndGradient|ValueGradientHessian)`
         // before any derivative consumption, and a probe value — when one is
         // returned at all — is converged to the same KKT/step tolerance as
         // the full-budget path, so all ranked comparisons stay in one measure.
-        // #1224 — `eval_cost` is the value-only CROSS-SEED RANKING / EFS lane
-        // (seed screening, cross-seed final selection, EFS backtracking). No `∇f`
-        // is ever paired with this cost, so it is the correct place to carry the
-        // derivative-free co-training fold `f+c` (`fold_cotrain = true`).
+        // `eval_cost` is the value-only CROSS-SEED RANKING / EFS lane (seed
+        // screening, cross-seed final selection, EFS backtracking). It prices
+        // the SAME pure REML criterion `f(ρ)` the gradient lane descends, so
+        // the fit selection is stationary for the criterion that selected it.
         self.probe_telemetry.criterion_calls += 1;
         // #2230/#2087 — descend the basin lower envelope V*(ρ)=min_b V_b(ρ) here
         // instead of the single hysteretic warm-start trajectory. Same value-probe
@@ -3677,7 +3409,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         }
         match self.evaluate_envelope_value_probe(
             rho.view(),
-            true,
             ProbeInnerDrive::Criterion {
                 refine_progress_extension: false,
             },
@@ -3727,7 +3458,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
         // are byte-for-byte unchanged.
         if !self.term.streaming_plan().direct_logdet_admitted() {
-            let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false, false)
+            let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false)
             {
                 Ok(evaluated) => evaluated,
                 // #1782 — recoverable infeasible-ρ refusal → finite collapse
@@ -3855,35 +3586,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
             }
             Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
         };
-        // #1273 — the analytic outer gradient is built from the undamped joint
-        // Hessian via `outer_gradient_arrow_solver`, whose Faddeev-Popov gauge
-        // deflation recovers near-null directions that lie in the closed-form
-        // chart gauge orbit or the penalised decoder β-null. On a circle/torus
-        // topology whose data is intrinsically lower-dimensional than the latent
-        // (`atom_topology="circle"` with `d_atom=2`: a 1-D ring embedded in a 2-D
-        // torus basis), the joint Hessian carries a genuine near-singular-but-
-        // valid direction OUTSIDE both deflation sets — its min pivot is tiny but
-        // strictly positive (≈1.2e-10) while the max is ≈2.3e5, so the analytic
-        // gradient's pivot-ratio gate (`outer_gradient_conditioning_error`)
-        // legitimately reports "joint Hessian numerically singular" and the solver
-        // refuses. Before the fix this `?`-propagated as `RemlOptimizationFailed`,
-        // aborting the WHOLE outer optimisation: every BFGS gradient point was
-        // refused, the line search stalled into consecutive infeasible probes, and
-        // the seed cascade rejected every seed → `RemlConvergenceError`.
-        //
-        // The cost at this ρ is still the EXACT REML criterion (it factorised
-        // fine; only the gradient's pivot ratio tripped the gate), so the point is
-        // feasible, not infeasible. Recover by descending it with a CENTRAL
-        // central-difference outer gradient of the same value path — the identical
-        // FD instrument the optimality certificate already uses to audit the
-        // analytic gradient (`certificates::probe_*`), here used as a descent
-        // direction only when the analytic path is numerically undefined. This is
-        // exact-REML-policy clean: the FD does not produce the cost (the returned
-        // cost is the analytic REML value), it only supplies a usable direction so
-        // BFGS can cross the flat valley instead of aborting. The well-conditioned
-        // path is byte-for-byte unchanged: the analytic solver succeeds there and
-        // this fallback is never reached.
-        let analytic = self
+        // Exact implicit derivative through the converged inner state. The arrow
+        // solver first applies a rank-revealing projection of the closed-form
+        // chart gauge and penalty-aware decoder nulls, then solves the resulting
+        // implicit-function system. A system that remains singular or unreliable
+        // is a typed `OuterGradientError`: it is not a usable derivative and must
+        // terminate this evaluation instead of being hidden behind a plain inverse
+        // or a differenced value path.
+        let gradient = self
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
@@ -3894,81 +3604,32 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     &cache,
                     &solver,
                 )
-            });
-        let gradient = match analytic {
-            Ok(components) => components.gradient(),
-            Err(analytic_err) => {
-                if !analytic_err.admits_plain_solver_fallback(cost) {
-                    // #1436: propagate non-recoverable errors (InternalInvariant)
-                    // and non-finite-cost points as hard failures instead of
-                    // masking them with a degraded descent direction. Only
-                    // IllConditioned / NonIdentifiable at a finite-cost ρ route to
-                    // the analytic plain-solver fallback below.
-                    return Err(EstimationError::RemlOptimizationFailed(
-                        analytic_err.to_string(),
-                    ));
-                }
-                // #1440: the gauge deflation declined (a genuinely non-identifiable
-                // point with NO deflatable gauge / decoder-null candidate at all —
-                // the near-singular Rayleigh-band deflation now always succeeds when
-                // ANY candidate exists, see `outer_gradient_arrow_solver`). The
-                // joint factor is still finite (conditioning tripped on the pivot
-                // RATIO, not a factor failure), so the PLAIN (undeflated) analytic
-                // solver still yields a finite, cost-consistent gradient of the same
-                // Laplace value — its components orthogonal to the flat subspace are
-                // exact and the flat-subspace component is bounded by the factor.
-                // This replaces the former central-difference descent of the value
-                // path (#1273): the direction stays fully analytic, never differenced.
-                log::info!(
-                    "[SAE/#1440] gauge-deflated analytic outer gradient declined at a \
-                     finite-cost ρ ({analytic_err}); descending with the plain analytic \
-                     outer gradient (undeflated joint factor) so the near-singular flat \
-                     valley is crossed without a finite-difference fallback"
-                );
-                let plain = DeflatedArrowSolver::plain(&cache);
-                let components = self
-                    .term
-                    .analytic_outer_rho_gradient_components(
-                        self.target.view(),
-                        &rho_state,
-                        &loss,
-                        &cache,
-                        &plain,
-                    )
-                    .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
-                components.gradient()
-            }
-        };
+            })
+            .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?
+            .gradient();
         let beta_hat = self.term.flatten_beta();
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
-        // is the gradient we return. The amortized-encoder consistency fold `c(ρ)`
-        // (#1154) has NO analytic gradient — under Design A the inner solve
-        // converges to the same stationary point and the exact REML λ-gradient is
-        // `∇f` only. Folding `c` into the cost here while returning `∇f` would hand
-        // BFGS the value of `f+c` paired with `∇f`, so its sufficient-decrease test
-        // `f(ρ+αd)+c(ρ+αd) ≤ f(ρ)+c(ρ) + c₁α·∇f·d` mixes two functions and can
-        // stall or wander (the objective↔gradient desync bug class, #931). So the
-        // gradient lane reports the consistent pair `(f, ∇f)`; the consistency fold
-        // `c` is a DERIVATIVE-FREE ranking regularizer carried ONLY by the
-        // value-probe lane (`eval_cost`/`evaluate_with_refine_policy`), where no
-        // gradient is ever paired with the cost (seed screening, cross-seed final
-        // ranking, EFS backtracking). The collapse penalty is a discrete
-        // infeasibility wall (a huge constant on a degenerate fit), not a smooth
-        // regularizer — BFGS simply rejects steps into it, which is the intended
-        // barrier behaviour, so it stays on both lanes.
+        // is the gradient we return: the consistent pair `(f, ∇f)` for the pure
+        // REML criterion — the SAME criterion every value/ranking/EFS lane prices
+        // (one coherent objective; see `evaluate_with_inner_drive`). The collapse
+        // penalty is a discrete infeasibility wall (a huge constant on a
+        // degenerate fit), not a smooth regularizer — BFGS simply rejects steps
+        // into it, which is the intended barrier behaviour, so it stays on all
+        // lanes.
         let cost = self
             .add_fit_data_collapse_penalty(cost, &rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
-        // Guard the assembled analytic gradient against an implicit-state envelope
-        // desync (a near-flat inner direction — e.g. a saturated IBP K=1 gate
-        // logit — corrupting the #1006/#1418 `Γ·θ̂_ρ` correction into a
-        // wrong-signed λ-gradient that stalls the BFGS line search). Byte-for-byte
-        // unchanged for well-conditioned fits; see
-        // `value_consistent_outer_gradient`.
-        let gradient = self
-            .value_consistent_outer_gradient(&rho_state, cost, gradient)
-            .map_err(EstimationError::RemlOptimizationFailed)?;
+        // The gradient is the EXACT implicit derivative: `outer_gradient_arrow_
+        // solver` solves the implicit-function system through the rank-revealing
+        // gauge/decoder-null deflation (Rayleigh-band + Faddeev–Popov stiffness),
+        // and a genuinely singular system surfaced above as a typed
+        // `OuterGradientError` instead of a degraded direction. No secondary
+        // finite-difference safeguard is layered on top (SPEC: FD never leaves
+        // tests) — a near-flat inner direction that corrupts the `Γ·θ̂_ρ`
+        // envelope term is a deflation-candidate gap to fix in
+        // `outer_gradient_arrow_solver`, not something to paper over with a
+        // differenced value path.
         // Eisenstat–Walker forcing update: this gradient lane runs only at
         // accepted iterates (plus the seed and the finalize re-installation,
         // which the bitwise same-ρ check inside filters out), so its ‖g‖ is
@@ -4010,14 +3671,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
         }
         match order {
             OuterEvalOrder::Value => {
-                // #1224 — the `Value` order is the BFGS / ARC LINE-SEARCH cost
-                // probe (see `solver/rho_optimizer/bridges.rs`). Its cost is
-                // compared against steps whose direction came from `eval`'s pure
-                // REML `∇f`, so it must NOT fold in the gradient-free co-training
-                // consistency penalty (`fold_cotrain = false`) — otherwise the
-                // Armijo/Wolfe sufficient-decrease test mixes `f+c` with `∇f` and
-                // can stall or wander. The fold is carried only by the value-only
-                // cross-seed ranking lane (`eval_cost`).
+                // The `Value` order is the BFGS / ARC LINE-SEARCH cost probe
+                // (see `solver/rho_optimizer/bridges.rs`). Its cost is compared
+                // against steps whose direction came from `eval`'s pure REML
+                // `∇f` — the same single criterion every lane prices.
                 // Eisenstat–Walker forced-probe drive (see the block comment
                 // above `EW_FORCING_GAMMA`): this lane — and ONLY this lane —
                 // is the Armijo/Wolfe line-search comparison probe, whose
@@ -4031,7 +3688,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     eta: self.forcing.line_search_eta(),
                 };
                 let (cost, _beta_hat) =
-                    match self.evaluate_envelope_value_probe(rho.view(), false, drive) {
+                    match self.evaluate_envelope_value_probe(rho.view(), drive) {
                         Ok(evaluated) => evaluated,
                         // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
                         // log-det) presents to the line search as the SAME finite

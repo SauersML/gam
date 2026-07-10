@@ -244,12 +244,19 @@ pub fn dimension_spectrometer(
     if cfg.k_min == 0 {
         return Err("dimension_spectrometer requires k_min >= 1".to_string());
     }
-    // Need at least three rungs: two regression parameters (slope, intercept) plus
-    // one residual degree of freedom for the slope's standard error.
-    if cfg.n_doublings < 2 {
+    // Need at least four rungs: the scaling law L(K) = σ² + c·K^m has THREE fitted
+    // parameters (the profiled-out noise floor σ², plus the log-log slope and
+    // intercept), so a residual degree of freedom for the slope's standard error
+    // needs `nrung − 3 ≥ 1`. With only three rungs the three parameters interpolate
+    // the data exactly (RSS ≈ 0) and the slope SE is undefined; the fit would report
+    // a spurious near-zero uncertainty. `fit_scaling_law` still accepts three rungs
+    // (returning an infinite SE / floor-saturated verdict) so the drop-last probe and
+    // the stable-window fallback stay well-posed, but the primary entry demands four.
+    if cfg.n_doublings < 3 {
         return Err(
-            "dimension_spectrometer requires n_doublings >= 2 (>= 3 rungs) to estimate a slope \
-             and its standard error"
+            "dimension_spectrometer requires n_doublings >= 3 (>= 4 rungs): the scaling law has \
+             three parameters (σ², slope, intercept), so a slope standard error needs at least \
+             one residual degree of freedom (nrung − 3 >= 1)"
                 .to_string(),
         );
     }

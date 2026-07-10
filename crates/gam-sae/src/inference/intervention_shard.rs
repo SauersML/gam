@@ -7,7 +7,11 @@
 //! behavior decoder when a y-block exists) and the *measured* realized KL. The
 //! `.npz` I/O lives at the Python boundary (mirroring the harvest-shard
 //! discipline of `gamfit/torch/harvest.py` / `gamfit/torch/interventions.py`);
-//! this type owns validation and the **G2 eval-forever split**.
+//! this type owns validation and the **G2 eval-forever split**.  The typed
+//! calibration plan in this module also owns every policy that turns those
+//! records into a Rung-3 fit and turns fitted predictions into chart
+//! re-speeds; language bindings only marshal the plan into their fitting
+//! surface.
 //!
 //! # The G2 split is part of the contract
 //!
@@ -18,9 +22,11 @@
 //! [`InterventionShard::eval_forever_split`] therefore hashes each group id
 //! through SplitMix64 with the caller's seed and assigns by parity: adding new
 //! groups later can never move an existing group across the fence. The Python
-//! calibration driver implements the *same* function
-//! (`gamfit/intervention_calibration.py::_splitmix64_parity`) so the two sides
-//! agree on the manifest without shipping one.
+//! calibration driver consumes the plan produced here, so there is no second
+//! implementation of the split or any other calibration policy.
+
+use std::collections::BTreeMap;
+use std::fmt;
 
 /// One shard of executed interventions. All per-record vectors share length
 /// `m`; `dose` is row-major `(m, d_dose)`.
@@ -61,6 +67,148 @@ pub struct EvalForeverSplit {
     pub eval_groups: Vec<i64>,
 }
 
+/// The one production calibration model.  Keeping the model description next
+/// to the design builder makes the Rust library, CLI, and Python binding
+/// consume one contract instead of spelling model policy in each front-end.
+pub const CHART_CALIBRATION_FORMULA: &str = "log_nu ~ s(log_nu_hat) + re(atom)";
+pub const CHART_CALIBRATION_SMOOTH_TERM: &str = "s(log_nu_hat)";
+pub const CHART_CALIBRATION_SMOOTH_CONSTRAINT: &str = "monotone_increasing";
+
+/// Which typed predicted-nats channel the Rung-3 calibration consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictedNats {
+    Rung1,
+    Rung2,
+}
+
+/// Caller decisions needed to build a Rung-3 chart calibration design from a
+/// validated [`InterventionShard`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InterventionCalibrationSpec {
+    pub prediction: PredictedNats,
+    pub split_seed: u64,
+    /// Caller-selected one-sided evidence quantile for the G3 control floor.
+    pub floor_quantile: f64,
+}
+
+/// Fully prepared calibration design.  Numeric transforms, selectors, and
+/// reference/evaluation rows have already been decided by the Rust core.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterventionCalibrationPlan {
+    /// Response for the calibration fit, `log(max(nu_measured, floor))`.
+    pub train_log_nu: Vec<f64>,
+    /// Predictor for the calibration fit, `log(nu_hat)`.
+    pub train_log_nu_hat: Vec<f64>,
+    pub train_atom: Vec<i64>,
+    /// One reference predictor row per measurable atom, used to isolate the
+    /// centered random intercept and hence the chart re-speed.
+    pub reference_log_nu_hat: f64,
+    pub measurable_atoms: Vec<i64>,
+    /// Held-out response and predictors.  These groups never enter the fit.
+    pub eval_log_nu: Vec<f64>,
+    pub eval_log_nu_hat: Vec<f64>,
+    pub eval_atom: Vec<i64>,
+    pub below_measurement_floor_atoms: Vec<i64>,
+    pub no_training_intervention_atoms: Vec<i64>,
+    pub floor_nats: f64,
+}
+
+/// Final chart-safe calibration output.  It deliberately contains only
+/// coordinate re-speeds and diagnostics (guard G1), never a value that can
+/// enter a fit criterion.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterventionCalibrationResult {
+    pub respeed: Vec<(i64, f64)>,
+    pub below_measurement_floor: Vec<i64>,
+    pub no_training_intervention: Vec<i64>,
+    pub floor_nats: f64,
+    pub heldout_rmse_lognats: Option<f64>,
+    pub n_train: usize,
+    pub n_eval: usize,
+}
+
+/// Typed failures from calibration design construction or fitted-prediction
+/// reduction.  Front-ends may map this to their native error hierarchy without
+/// having to parse strings or repeat validation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InterventionCalibrationError {
+    InvalidShard(String),
+    Rung2Unavailable,
+    InvalidFloorQuantile(f64),
+    NoTrainingControls,
+    NonPositiveControlFloor(f64),
+    NoUsableTrainingRecords,
+    PredictionLengthMismatch {
+        phase: &'static str,
+        expected: usize,
+        got: usize,
+    },
+    NonFinitePrediction {
+        phase: &'static str,
+        index: usize,
+        value: f64,
+    },
+    NonRepresentableRespeed {
+        atom: i64,
+        centered_log_speed: f64,
+    },
+}
+
+impl fmt::Display for InterventionCalibrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidShard(message) => {
+                write!(f, "intervention calibration: invalid shard: {message}")
+            }
+            Self::Rung2Unavailable => write!(
+                f,
+                "intervention calibration: Rung-2 predicted nats were requested but the shard has no Rung-2 channel"
+            ),
+            Self::InvalidFloorQuantile(q) => write!(
+                f,
+                "intervention calibration: floor_quantile must be finite and in (0, 1); got {q}"
+            ),
+            Self::NoTrainingControls => write!(
+                f,
+                "intervention calibration: no control records occur in the train split; the G3 floor must be estimated from controls"
+            ),
+            Self::NonPositiveControlFloor(value) => write!(
+                f,
+                "intervention calibration: the train-control quantile is {value}; log-scale calibration requires a strictly positive measured resolution"
+            ),
+            Self::NoUsableTrainingRecords => write!(
+                f,
+                "intervention calibration: no measurable, positive-prediction intervention records remain in the train split"
+            ),
+            Self::PredictionLengthMismatch {
+                phase,
+                expected,
+                got,
+            } => write!(
+                f,
+                "intervention calibration: {phase} predictions have length {got}; expected {expected}"
+            ),
+            Self::NonFinitePrediction {
+                phase,
+                index,
+                value,
+            } => write!(
+                f,
+                "intervention calibration: {phase} prediction {index} is not finite ({value})"
+            ),
+            Self::NonRepresentableRespeed {
+                atom,
+                centered_log_speed,
+            } => write!(
+                f,
+                "intervention calibration: atom {atom} re-speed is not representable from centered log speed {centered_log_speed}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InterventionCalibrationError {}
+
 /// SplitMix64 — the split's hash. A fixed, well-known mixing function so the
 /// group→side assignment is reproducible across languages and releases.
 #[inline]
@@ -92,6 +240,225 @@ pub fn eval_forever_mask(group: &[i64], seed: u64) -> Vec<bool> {
         .iter()
         .map(|&g| group_is_eval_forever(g, seed_mix))
         .collect()
+}
+
+/// NumPy-compatible inclusive linear-interpolation quantile over a non-empty,
+/// finite sample.  Callers validate the preconditions before entering this
+/// small common kernel.
+fn inclusive_quantile(mut values: Vec<f64>, q: f64) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let h = q * (values.len() as f64 - 1.0);
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    let frac = h - lo as f64;
+    values[lo] * (1.0 - frac) + values[hi] * frac
+}
+
+/// Build the single-source Rung-3 calibration design.
+///
+/// This function owns guards G2/G3 and every numerical transform used by the
+/// calibration fit: the permanent split, train-control floor, measurable-atom
+/// screen, log/floor transform, fit selector, reference predictor, and held-out
+/// rows.  A front-end only has to fit [`CHART_CALIBRATION_FORMULA`] to the three
+/// `train_*` vectors and request predictions at the prepared reference/eval
+/// rows.
+pub fn prepare_intervention_calibration(
+    shard: &InterventionShard,
+    spec: InterventionCalibrationSpec,
+) -> Result<InterventionCalibrationPlan, InterventionCalibrationError> {
+    shard
+        .validate()
+        .map_err(InterventionCalibrationError::InvalidShard)?;
+    let nu_hat = match spec.prediction {
+        PredictedNats::Rung1 => shard.nu_hat_1.as_slice(),
+        PredictedNats::Rung2 => shard
+            .nu_hat_2
+            .as_deref()
+            .ok_or(InterventionCalibrationError::Rung2Unavailable)?,
+    };
+    let n = shard.n_records();
+    if !(spec.floor_quantile.is_finite()
+        && spec.floor_quantile > 0.0
+        && spec.floor_quantile < 1.0)
+    {
+        return Err(InterventionCalibrationError::InvalidFloorQuantile(
+            spec.floor_quantile,
+        ));
+    }
+
+    let eval = eval_forever_mask(&shard.group, spec.split_seed);
+    let train_controls: Vec<f64> = (0..n)
+        .filter(|&i| !eval[i] && shard.is_control[i])
+        .map(|i| shard.nu_measured[i])
+        .collect();
+    if train_controls.is_empty() {
+        return Err(InterventionCalibrationError::NoTrainingControls);
+    }
+    let floor_nats = inclusive_quantile(train_controls, spec.floor_quantile);
+    if !(floor_nats.is_finite() && floor_nats > 0.0) {
+        return Err(InterventionCalibrationError::NonPositiveControlFloor(
+            floor_nats,
+        ));
+    }
+
+    // Sorted map makes both the Rust API and every binding deterministic.
+    // Every atom with at least one train intervention is classified exactly
+    // once; controls and eval-forever rows cannot influence measurability.
+    let mut atom_is_measurable: BTreeMap<i64, Option<bool>> = shard
+        .atom
+        .iter()
+        .copied()
+        .map(|atom| (atom, None))
+        .collect();
+    for i in 0..n {
+        if !eval[i] && !shard.is_control[i] {
+            let measurable = shard.nu_measured[i] > floor_nats;
+            atom_is_measurable
+                .entry(shard.atom[i])
+                .and_modify(|seen| *seen = Some(seen.unwrap_or(false) || measurable))
+                .or_insert(Some(measurable));
+        }
+    }
+    let measurable_atoms: Vec<i64> = atom_is_measurable
+        .iter()
+        .filter_map(|(&atom, &measurable)| (measurable == Some(true)).then_some(atom))
+        .collect();
+    let below_measurement_floor_atoms: Vec<i64> = atom_is_measurable
+        .iter()
+        .filter_map(|(&atom, &measurable)| (measurable == Some(false)).then_some(atom))
+        .collect();
+    let no_training_intervention_atoms: Vec<i64> = atom_is_measurable
+        .iter()
+        .filter_map(|(&atom, &measurable)| measurable.is_none().then_some(atom))
+        .collect();
+
+    let mut train_log_nu = Vec::new();
+    let mut train_log_nu_hat = Vec::new();
+    let mut train_atom = Vec::new();
+    let mut eval_log_nu = Vec::new();
+    let mut eval_log_nu_hat = Vec::new();
+    let mut eval_atom = Vec::new();
+    for i in 0..n {
+        if shard.is_control[i]
+            || nu_hat[i] <= 0.0
+            || !matches!(atom_is_measurable.get(&shard.atom[i]), Some(Some(true)))
+        {
+            continue;
+        }
+        let log_nu = shard.nu_measured[i].max(floor_nats).ln();
+        let log_nu_hat = nu_hat[i].ln();
+        if eval[i] {
+            eval_log_nu.push(log_nu);
+            eval_log_nu_hat.push(log_nu_hat);
+            eval_atom.push(shard.atom[i]);
+        } else {
+            train_log_nu.push(log_nu);
+            train_log_nu_hat.push(log_nu_hat);
+            train_atom.push(shard.atom[i]);
+        }
+    }
+    if train_log_nu.is_empty() {
+        return Err(InterventionCalibrationError::NoUsableTrainingRecords);
+    }
+    let reference_log_nu_hat = inclusive_quantile(train_log_nu_hat.clone(), 0.5);
+
+    Ok(InterventionCalibrationPlan {
+        train_log_nu,
+        train_log_nu_hat,
+        train_atom,
+        reference_log_nu_hat,
+        measurable_atoms,
+        eval_log_nu,
+        eval_log_nu_hat,
+        eval_atom,
+        below_measurement_floor_atoms,
+        no_training_intervention_atoms,
+        floor_nats,
+    })
+}
+
+impl InterventionCalibrationPlan {
+    /// Convert predictions from the fitted calibration model into the only
+    /// chart mutation calibration may emit (G1) and its held-out diagnostic.
+    pub fn finish(
+        &self,
+        reference_eta: &[f64],
+        eval_eta: &[f64],
+    ) -> Result<InterventionCalibrationResult, InterventionCalibrationError> {
+        if reference_eta.len() != self.measurable_atoms.len() {
+            return Err(
+                InterventionCalibrationError::PredictionLengthMismatch {
+                    phase: "reference",
+                    expected: self.measurable_atoms.len(),
+                    got: reference_eta.len(),
+                },
+            );
+        }
+        if eval_eta.len() != self.eval_log_nu.len() {
+            return Err(
+                InterventionCalibrationError::PredictionLengthMismatch {
+                    phase: "held-out",
+                    expected: self.eval_log_nu.len(),
+                    got: eval_eta.len(),
+                },
+            );
+        }
+        for (phase, values) in [("reference", reference_eta), ("held-out", eval_eta)] {
+            for (index, &value) in values.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(InterventionCalibrationError::NonFinitePrediction {
+                        phase,
+                        index,
+                        value,
+                    });
+                }
+            }
+        }
+
+        // Online mean avoids overflow from summing many individually finite
+        // linear predictors.  A non-representable center is a typed refusal,
+        // never a silently saturated chart update.
+        let mut mean_eta = 0.0_f64;
+        for (i, &eta) in reference_eta.iter().enumerate() {
+            mean_eta += (eta - mean_eta) / (i + 1) as f64;
+        }
+        let mut respeed = Vec::with_capacity(reference_eta.len());
+        for (&atom, &eta) in self.measurable_atoms.iter().zip(reference_eta) {
+            let centered_log_speed = eta - mean_eta;
+            let value = (0.5 * centered_log_speed).exp();
+            if !(value.is_finite() && value > 0.0) {
+                return Err(InterventionCalibrationError::NonRepresentableRespeed {
+                    atom,
+                    centered_log_speed,
+                });
+            }
+            respeed.push((atom, value));
+        }
+
+        let heldout_rmse_lognats = if eval_eta.is_empty() {
+            None
+        } else {
+            // Hypot accumulation computes the Euclidean norm without squaring
+            // overflow, then division by sqrt(n) gives RMSE.
+            let residual_norm = eval_eta
+                .iter()
+                .zip(&self.eval_log_nu)
+                .fold(0.0_f64, |norm, (&predicted, &observed)| {
+                    norm.hypot(predicted - observed)
+                });
+            Some(residual_norm / (eval_eta.len() as f64).sqrt())
+        };
+
+        Ok(InterventionCalibrationResult {
+            respeed,
+            below_measurement_floor: self.below_measurement_floor_atoms.clone(),
+            no_training_intervention: self.no_training_intervention_atoms.clone(),
+            floor_nats: self.floor_nats,
+            heldout_rmse_lognats,
+            n_train: self.train_log_nu.len(),
+            n_eval: self.eval_log_nu.len(),
+        })
+    }
 }
 
 impl InterventionShard {
@@ -218,7 +585,7 @@ impl InterventionShard {
                 "control_floor_nats: quantile must be in (0, 1); got {q}"
             ));
         }
-        let mut nulls: Vec<f64> = self
+        let nulls: Vec<f64> = self
             .nu_measured
             .iter()
             .zip(self.is_control.iter())
@@ -231,14 +598,15 @@ impl InterventionShard {
                     .to_string(),
             );
         }
-        nulls.sort_by(|a, b| a.partial_cmp(b).expect("validated finite"));
+        if nulls.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "control_floor_nats: control measurements must be finite before taking a quantile"
+                    .to_string(),
+            );
+        }
         // Inclusive linear-interpolation quantile (the same convention as
         // numpy's default), on the validated finite sample.
-        let h = q * (nulls.len() as f64 - 1.0);
-        let lo = h.floor() as usize;
-        let hi = h.ceil() as usize;
-        let frac = h - lo as f64;
-        Ok(nulls[lo] * (1.0 - frac) + nulls[hi] * frac)
+        Ok(inclusive_quantile(nulls, q))
     }
 }
 
@@ -347,10 +715,94 @@ mod tests {
 
     #[test]
     fn splitmix_reference_values_pin_the_cross_language_contract() {
-        // The Python driver mirrors these exact values
-        // (gamfit/intervention_calibration.py); a change here is a contract
-        // break, not a refactor.
+        // A change here moves permanent train/eval membership and is a
+        // calibration-contract break, not a refactor.
         assert_eq!(splitmix64(0), 0xE220_A839_7B1D_CDAF);
         assert_eq!(splitmix64(1), 0x910A_2DEC_8902_5CC1);
+    }
+
+    fn group_on_side(seed: u64, eval: bool) -> i64 {
+        (0_i64..)
+            .find(|&group| eval_forever_mask(&[group], seed)[0] == eval)
+            .expect("an infinite sequence contains a group on each hash parity")
+    }
+
+    fn calibration_input() -> InterventionCalibrationInput {
+        let seed = 19;
+        let train_group = group_on_side(seed, false);
+        let eval_group = group_on_side(seed, true);
+        InterventionCalibrationInput {
+            // Two train controls establish floor=2.  Atom 10 is measurable;
+            // atom 20 never clears the floor and is reported, not fitted.
+            nu_hat: vec![0.0, 0.0, 1.0, 4.0, 2.0, 3.0],
+            nu_measured: vec![1.0, 3.0, 4.0, 1.0, 2.0, 8.0],
+            atom: vec![10, 10, 10, 20, 10, 10],
+            group: vec![
+                train_group,
+                train_group,
+                train_group,
+                train_group,
+                train_group,
+                eval_group,
+            ],
+            is_control: vec![true, true, false, false, false, false],
+            split_seed: seed,
+            floor_quantile: 0.5,
+        }
+    }
+
+    #[test]
+    fn calibration_plan_owns_split_floor_screen_and_log_transforms() {
+        let plan = prepare_intervention_calibration(calibration_input()).unwrap();
+        assert_eq!(plan.floor_nats, 2.0);
+        assert_eq!(plan.measurable_atoms, vec![10]);
+        assert_eq!(plan.unmeasurable_atoms, vec![20]);
+        assert_eq!(plan.train_atom, vec![10, 10]);
+        assert_eq!(plan.train_log_nu, vec![4.0_f64.ln(), 2.0_f64.ln()]);
+        assert_eq!(plan.train_log_nu_hat, vec![0.0, 2.0_f64.ln()]);
+        assert_eq!(plan.reference_log_nu_hat, 2.0_f64.ln() / 2.0);
+        assert_eq!(plan.eval_atom, vec![10]);
+        assert_eq!(plan.eval_log_nu, vec![8.0_f64.ln()]);
+        assert_eq!(plan.eval_log_nu_hat, vec![3.0_f64.ln()]);
+    }
+
+    #[test]
+    fn calibration_finish_computes_only_respeeds_and_heldout_diagnostic() {
+        let mut input = calibration_input();
+        // Make atom 20 measurable so centering of two reference predictions is
+        // observable in the chart updates.
+        input.nu_measured[3] = 5.0;
+        let plan = prepare_intervention_calibration(input).unwrap();
+        let result = plan.finish(&[1.0, 3.0], &[8.0_f64.ln() + 0.25]).unwrap();
+        assert_eq!(result.unmeasurable, Vec::<i64>::new());
+        assert_eq!(result.n_train, 3);
+        assert_eq!(result.n_eval, 1);
+        assert!((result.respeed[0].1 - (-0.5_f64).exp()).abs() < 1.0e-12);
+        assert!((result.respeed[1].1 - 0.5_f64.exp()).abs() < 1.0e-12);
+        assert_eq!(result.heldout_rmse_lognats, Some(0.25));
+    }
+
+    #[test]
+    fn calibration_requires_positive_control_resolution_for_log_model() {
+        let mut input = calibration_input();
+        input.nu_measured[0] = 0.0;
+        input.nu_measured[1] = 0.0;
+        assert_eq!(
+            prepare_intervention_calibration(input).unwrap_err(),
+            InterventionCalibrationError::NonPositiveControlFloor(0.0)
+        );
+    }
+
+    #[test]
+    fn calibration_finish_rejects_prediction_shape_drift() {
+        let plan = prepare_intervention_calibration(calibration_input()).unwrap();
+        assert!(matches!(
+            plan.finish(&[], &[]),
+            Err(InterventionCalibrationError::PredictionLengthMismatch {
+                phase: "reference",
+                expected: 1,
+                got: 0,
+            })
+        ));
     }
 }

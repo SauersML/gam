@@ -379,9 +379,10 @@ impl PredictionTransform for SurvivalPredictor {
     }
 
     fn response_family(&self) -> ResponseFamily {
-        // Survival reports the survival probability `S(t)`; its observation noise
-        // is handled by the survival-specific interval path, so the GLM-style
-        // observation band is intentionally absent (`RoystonParmar` ⇒ no band).
+        // Survival reports the survival probability `S(t)`; a fresh observation
+        // at that horizon is the Bernoulli indicator `1{T > t}`, so the generic
+        // drivers build the discrete `RoystonParmar` predictive set from
+        // `family_observation_band` (marginal `P(Y = 1) = E[S]`).
         ResponseFamily::RoystonParmar
     }
 }

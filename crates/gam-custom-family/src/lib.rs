@@ -47,9 +47,9 @@ pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     BlockCoupledOperator, CompositeHyperOperator, DenseSpectralOperator, DispersionHandling,
     ExactJeffreysTerm, HessianDerivativeProvider, HessianFactorization, MatrixFreeSpdOperator,
     OuterHessianDerivativeKernel, PenaltySubspaceTrace, StochasticTraceState,
-    compute_block_penalty_logdet_derivs, compute_efs_update, compute_hybrid_efs_update,
-    exact_pseudo_logdet, hessian_factorization_geometric_scale, positive_eigenvalue_threshold,
-    spectral_epsilon, spectral_regularize,
+    compute_block_penalty_logdet_derivs_with_prior_factors, compute_efs_update,
+    compute_hybrid_efs_update, exact_pseudo_logdet, hessian_factorization_geometric_scale,
+    positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
 // `ActiveLinearConstraintBlock`, `FitGeometry`, and `ProjectedKktResidual` are
 // the model-estimation contract types that still live in the (not-yet-carved)

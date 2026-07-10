@@ -347,7 +347,6 @@ from ._sae_manifold import (
     SaeManifoldFitResult,
     StagewiseAtom,
     StagewiseSAE,
-    featurize,
     fit as sae_fit,
     flat_block_assignment,
     gumbel_geometric_schedule,

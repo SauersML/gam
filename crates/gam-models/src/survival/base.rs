@@ -1,21 +1,19 @@
-use gam_linalg::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
 use crate::custom_family::{
     BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
     projected_linear_constraint_stationarity_vector,
 };
-use gam_linalg::matrix::SymmetricMatrix;
 use crate::model_types::EstimationError;
+use gam_linalg::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
+use gam_linalg::matrix::SymmetricMatrix;
+use gam_problem::{Coefficients, LinearPredictor};
 use gam_solve::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
-use gam_problem::{Coefficients, LinearPredictor};
-use opt::{
-    BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge,
-};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
-use std::convert::Infallible;
+use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, constants, escalate_ridge};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::ops::Range;
 use std::sync::LazyLock;
 use thiserror::Error;
@@ -452,10 +450,7 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         Some((0..specs.len()).collect())
     }
 
-    fn coefficient_hessian_cost(
-        &self,
-        specs: &[crate::custom_family::ParameterBlockSpec],
-    ) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
         crate::custom_family::default_coefficient_hessian_cost(specs)
     }
 
@@ -1696,8 +1691,7 @@ impl WorkingModelSurvival {
     /// vector, sets the smoothing blocks' `λ_k` here, and re-runs the inner
     /// constrained PIRLS, so the monotone I-spline baseline can adapt its
     /// wiggliness instead of being pinned at a fixed seed. `lambdas` must have
-    /// one entry per penalty block. The fixed stabilization ridge keeps its
-    /// caller-set value (the optimizer never proposes a new one for it).
+    /// one entry per penalty block.
     pub fn set_penalty_lambdas(&mut self, lambdas: &[f64]) -> Result<(), EstimationError> {
         if lambdas.len() != self.penalties.blocks.len() {
             crate::bail_invalid_estim!(
@@ -1983,8 +1977,8 @@ impl WorkingModelSurvival {
         h += &self.derivative_xt_diag_x(w_event_outer);
 
         // Norm of the unpenalized score, captured before adding the penalty
-        // and ridge contributions, for the scale-invariant convergence
-        // certificate (||score||_2 + ||S*beta||_2 (+ ridge*||beta||_2)).
+        // contribution, for the scale-invariant convergence certificate
+        // (||score||_2 + ||S*beta||_2).
         let score_norm = array1_l2_norm(&grad);
 
         let penaltygrad = self.penalties.gradient(beta);
@@ -1995,29 +1989,12 @@ impl WorkingModelSurvival {
         totalgrad += &penaltygrad;
 
         self.penalties.addhessian_inplace(&mut h);
-        // SURVIVAL_STABILIZATION_RIDGE is an `ExplicitPrior`-kind
-        // stabilization in the canonical ledger taxonomy
-        // (`gam_problem::StabilizationKind::ExplicitPrior`): δ enters the
-        // gradient (`grad += δ β`), the Hessian (`H += δ I`), the scalar
-        // penalty term added to the objective (`0.5 δ ‖β‖²`), and is
-        // serialized through `WorkingState::ridge_used` so downstream
-        // covariance and survival_ridge_lambda accounting remain
-        // consistent. The canonical ledger record is
-        //   StabilizationLedger::explicit_prior(δ, RidgeMatrixForm::ScaledIdentity)
-        // chosen_by = FixedConstant. Coordinated with main.rs
-        // `survival_ridge_lambda` field.
-        const SURVIVAL_STABILIZATION_RIDGE: f64 = 1e-8;
-        let ridge_used = SURVIVAL_STABILIZATION_RIDGE;
-        for d in 0..p {
-            h[[d, d]] += ridge_used;
-        }
-        totalgrad += &beta.mapv(|v| ridge_used * v);
-        // Keep scalar objective term consistent with:
-        //   grad += ridge * beta,  Hess += ridge * I
-        // which correspond to 0.5 * ridge * ||beta||^2.
-        let ridge_penalty = 0.5 * ridge_used * beta.dot(beta);
-        let ridge_grad_norm = ridge_used * array1_l2_norm(beta);
-
+        // No coefficient ridge is fused into this objective. Indefinite or
+        // rank-deficient curvature along the Newton path is the SOLVER's
+        // problem: the working-model driver applies Levenberg–Marquardt
+        // damping (H + λD²)δ = −g that vanishes at convergence, so the
+        // converged estimator is a stationary point of the exact penalized
+        // likelihood and is invariant under coefficient rescaling.
         let log_likelihood = -nll;
         let deviance = 2.0 * nll;
 
@@ -2027,11 +2004,11 @@ impl WorkingModelSurvival {
             hessian: gam_linalg::matrix::SymmetricMatrix::Dense(h),
             log_likelihood,
             deviance,
-            penalty_term: penalty_dev + ridge_penalty,
+            penalty_term: penalty_dev,
             firth: gam_solve::pirls::FirthDiagnostics::Inactive,
-            ridge_used,
+            ridge_used: 0.0,
             hessian_curvature: gam_solve::pirls::HessianCurvatureKind::Observed,
-            gradient_natural_scale: score_norm + penaltygrad_norm + ridge_grad_norm,
+            gradient_natural_scale: score_norm + penaltygrad_norm,
         })
     }
 
@@ -2309,6 +2286,7 @@ impl WorkingModelSurvival {
         state: &WorkingState,
         rho: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
+        use gam_problem::{EvalMode, PseudoLogdetMode};
         use gam_solve::estimate::reml::assembly::{
             InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
         };
@@ -2316,7 +2294,6 @@ impl WorkingModelSurvival {
             DenseSpectralOperator, DispersionHandling, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs,
         };
-        use gam_problem::{EvalMode, PseudoLogdetMode};
 
         let p = beta.len();
         let active_penalty_blocks: Vec<&PenaltyBlock> = self
@@ -2626,9 +2603,10 @@ impl WorkingModelSurvival {
             const BACKTRACK: f64 = constants::BACKTRACK_CONTRACTION;
             const MAX_BACKTRACK: usize = 80;
             let p = beta.len();
-            // Penalized inner objective f(β) = −ℓ(β) + ½β'Sβ + ½ridge‖β‖² whose
-            // gradient is exactly `state.gradient` and whose Hessian is exactly
-            // `state.hessian`. `update_state` exposes the pieces directly.
+            // Penalized inner objective f(β) = −ℓ(β) + ½β'Sβ whose gradient is
+            // exactly `state.gradient` and whose UNDAMPED Hessian is exactly
+            // `state.hessian`. `update_state` exposes the pieces directly; the
+            // Levenberg–Marquardt shift below exists only while solving a step.
             let penalized_objective =
                 |st: &WorkingState| -> f64 { -st.log_likelihood + st.penalty_term };
             for _ in 0..POLISH_MAX_ITERS {
@@ -2681,11 +2659,9 @@ impl WorkingModelSurvival {
                     for d in 0..p {
                         h_reg[[d, d]] += lambda_lm;
                     }
-                    let factor = gam_linalg::faer_ndarray::FaerCholesky::cholesky(
-                        &h_reg,
-                        faer::Side::Lower,
-                    )
-                    .ok()?;
+                    let factor =
+                        gam_linalg::faer_ndarray::FaerCholesky::cholesky(&h_reg, faer::Side::Lower)
+                            .ok()?;
                     let candidate_step = factor.solvevec(&r);
                     if candidate_step.iter().any(|v| !v.is_finite()) {
                         return None;
@@ -2736,8 +2712,7 @@ impl WorkingModelSurvival {
                         };
                         let ft = penalized_objective(&ts);
                         let tn = ts.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-                        let armijo_ok =
-                            ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv;
+                        let armijo_ok = ft.is_finite() && ft <= f0 + ARMIJO_C * alpha * dir_deriv;
                         let residual_ok = tn.is_finite() && tn < r_norm;
                         Ok((armijo_ok || residual_ok).then_some((ft, trial)))
                     },
@@ -2776,7 +2751,9 @@ impl SurvivalDerivProvider {
     }
 }
 
-impl gam_solve::estimate::reml::reml_outer_engine::HessianDerivativeProvider for SurvivalDerivProvider {
+impl gam_solve::estimate::reml::reml_outer_engine::HessianDerivativeProvider
+    for SurvivalDerivProvider
+{
     fn hessian_derivative_correction(
         &self,
         v_k: &Array1<f64>,
@@ -3944,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn survivalridge_penalty_scalar_matchesgradienthessian_scaling() {
+    fn survival_working_state_is_ridge_free() {
         let age_entry = array![1.0_f64, 2.0_f64];
         let age_exit = array![2.0_f64, 3.5_f64];
         let event_target = array![1u8, 0u8];
@@ -3980,7 +3957,11 @@ mod tests {
         .expect("construct survival model");
 
         let state = model.update_state(&beta).expect("survival state");
-        let expected_penalty = penalties.deviance(&beta) + 0.5 * state.ridge_used * beta.dot(&beta);
+        assert_eq!(
+            state.ridge_used, 0.0,
+            "survival objective must not fuse a coefficient ridge"
+        );
+        let expected_penalty = penalties.deviance(&beta);
         assert!(
             (state.penalty_term - expected_penalty).abs() < 1e-12,
             "penalty_term mismatch: state={} expected={}",
@@ -4064,7 +4045,7 @@ mod tests {
     }
 
     #[test]
-    fn survivalgradient_matchesobjectivefdwithridge_scaling() {
+    fn survivalgradient_matches_ridge_free_objective_fd() {
         let age_entry = array![1.0_f64, 2.0_f64, 3.0_f64];
         let age_exit = array![2.0_f64, 3.5_f64, 4.0_f64];
         let event_target = array![1u8, 0u8, 1u8];
@@ -4204,8 +4185,8 @@ mod tests {
     }
 
     fn laml_test_logdet_h(state: &WorkingState) -> f64 {
-        use gam_solve::estimate::reml::reml_outer_engine::{spectral_epsilon, spectral_regularize};
         use gam_linalg::faer_ndarray::FaerEigh;
+        use gam_solve::estimate::reml::reml_outer_engine::{spectral_epsilon, spectral_regularize};
 
         let h_dense = state.hessian.to_dense();
         let (evals, _) = h_dense.eigh(faer::Side::Lower).expect("eigh");
@@ -4214,6 +4195,29 @@ mod tests {
             .iter()
             .map(|&sigma| spectral_regularize(sigma, eps).ln())
             .sum()
+    }
+
+    #[test]
+    fn survival_solver_damping_converges_undamped_objective() {
+        let rho = -0.35_f64;
+        let model = laml_fd_test_model(rho.exp());
+        let beta0 = array![-2.5_f64, 1.0];
+        let (converged_model, beta) = model
+            .reconverge_survival_inner_mode(&[rho], &beta0)
+            .expect("converge survival mode with solver-only damping");
+        let state = converged_model
+            .update_state(&beta)
+            .expect("evaluate undamped objective at converged mode");
+
+        assert_eq!(
+            state.ridge_used, 0.0,
+            "solver damping must not enter the converged statistical objective"
+        );
+        let undamped_stationarity = array1_l2_norm(&state.gradient);
+        assert!(
+            undamped_stationarity <= 1.0e-9,
+            "solver must converge the undamped objective; ||gradient||={undamped_stationarity:.3e}"
+        );
     }
 
     #[test]

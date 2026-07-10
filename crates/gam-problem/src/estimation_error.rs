@@ -93,6 +93,31 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Negative-binomial θ↔λ alternation did not reach its joint fixed point within {rounds} \
+         rounds: the ML-refreshed θ still drifts {relative_drift_percent:.2}% from the λ-search θ \
+         (θ_frozen = {theta_frozen:.6e} → θ_final = {theta_final:.6e}; joint-stationarity \
+         tolerance {tolerance_percent:.2}%). A fit is only minted from a certified joint (θ, ρ) \
+         optimum; resume from the carried checkpoint (θ_final and rho_checkpoint) rather than \
+         accepting a degraded fit."
+    )]
+    NegativeBinomialAlternationDidNotConverge {
+        /// Alternation rounds executed before the budget was exhausted.
+        rounds: usize,
+        /// θ the exhausted round's λ-search was frozen at.
+        theta_frozen: f64,
+        /// ML-refreshed θ at the exhausted round's converged η (the best
+        /// checkpoint θ for a resumed fit).
+        theta_final: f64,
+        /// Fixed-point residual |θ_final − θ_frozen| / θ_frozen, in percent.
+        relative_drift_percent: f64,
+        /// Joint-stationarity tolerance the residual failed to meet, in percent.
+        tolerance_percent: f64,
+        /// The last accepted log-smoothing parameters ρ̂ (the best checkpoint
+        /// for warm-starting a resumed λ search via `init_rhos`).
+        rho_checkpoint: Vec<f64>,
+    },
+
+    #[error(
         "Perfect or quasi-perfect separation detected during model fitting at iteration {iteration}. \
         The model cannot converge because a predictor perfectly separates the binary outcomes. \
         (Diagnostic: max|eta| = {max_abs_eta:.2e})."
@@ -174,6 +199,38 @@ pub enum EstimationError {
 
     #[error("REML smoothing optimization failed to converge: {0}")]
     RemlOptimizationFailed(String),
+
+    #[error(
+        "Outer smoothing-parameter optimization did not certify a stationary optimum \
+         ({context}): {reason} after {iterations} outer iteration(s); final objective \
+         {final_value:.6e}, projected gradient norm {} against stationarity bound \
+         {stationarity_bound:.3e}. A fit is only minted from a converged optimization; \
+         the best iterate is carried as a checkpoint — resume by seeding the outer \
+         search at rho_checkpoint = {rho_checkpoint:?}.",
+        .projected_grad_norm.map_or_else(|| "unmeasured".to_string(), |g| format!("{g:.3e}"))
+    )]
+    RemlDidNotConverge {
+        /// Fit context label (the same string the outer runner logs under).
+        context: String,
+        /// Which certificate failed: budget exhaustion, line-search collapse,
+        /// non-stationary cost stall, or a failed post-solve stationarity
+        /// certificate.
+        reason: String,
+        /// Outer iterations executed across all solver restarts.
+        iterations: usize,
+        /// Objective value at the abandoned best iterate.
+        final_value: f64,
+        /// KKT-projected gradient norm at the best iterate, when the solver
+        /// measured a gradient there (`None` for gradient-free exits).
+        projected_grad_norm: Option<f64>,
+        /// Bound the projected gradient had to clear for the stationarity
+        /// certificate.
+        stationarity_bound: f64,
+        /// Best (lowest-objective feasible) outer iterate at exhaustion. This
+        /// is work-preservation evidence for resume — it is NOT a fit and no
+        /// fitted-model API is reachable from it.
+        rho_checkpoint: Vec<f64>,
+    },
 
     #[error("{context}: unified evaluator returned no gradient in {mode} mode")]
     GradientUnavailable {
