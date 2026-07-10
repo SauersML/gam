@@ -119,7 +119,11 @@ def _selftest_softmax_topk_k1_converges_to_one_active() -> None:
         atom_manifold="product",
         atom_basis="duchon",
         sparsity=SparsityConfig(
-            kind="softmax_topk", target_k=1, tau_start=4.0, tau_min=1.0, tau_steps=tau_steps
+            kind="softmax_topk",
+            target_k=1,
+            tau_start=4.0,
+            tau_min=1.0,
+            tau_steps=tau_steps,
         ),
         dtype=torch.float64,
     )
@@ -149,7 +153,9 @@ def _selftest_softmax_topk_k1_converges_to_one_active() -> None:
     mean_active = float((out.z != 0).sum(dim=1).to(torch.float64).mean().item())
     tau_now = float(model.sparsity.tau.item())
 
-    assert torch.isfinite(out.x_hat).all(), "k=1 reconstruction produced non-finite values"
+    assert torch.isfinite(out.x_hat).all(), (
+        "k=1 reconstruction produced non-finite values"
+    )
     assert abs(tau_now - cfg.sparsity.tau_min) < 1e-9, (
         f"schedule did not reach tau_min (tau={tau_now}); the honest k=1 bar is annealed"
     )
@@ -238,9 +244,7 @@ def test_softmax_topk_numeric_helpers_remain_rust_routed() -> None:
         torch_manifold_sae._SparsityLayer._matching_pursuit_commit: (
             "sae_matching_pursuit_commit"
         ),
-        torch_manifold_sae._SparsityLayer._update_assign_ema: (
-            "sae_assign_ema_update"
-        ),
+        torch_manifold_sae._SparsityLayer._update_assign_ema: ("sae_assign_ema_update"),
         torch_manifold_sae._SparsityLayer._sinkhorn_balance: (
             "sae_sinkhorn_balance_bias"
         ),
