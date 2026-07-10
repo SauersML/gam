@@ -114,6 +114,15 @@ mod linux {
                 return Ok(existing);
             }
             let ptx = compile_ptx_with_opts(source, nvrtc_compile_options())
+                .map_err(|err| {
+                    // The historical silent-CPU class: an NVRTC failure here is
+                    // swallowed by callers' `.ok()?`; count it so telemetry can
+                    // distinguish "device engaged" from "silently declined".
+                    crate::profile::telemetry_record_cpu_fallback(format!(
+                        "{label} NVRTC compile failed: {err}"
+                    ));
+                    err
+                })
                 .gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))?;
             let module = ctx
                 .load_module(ptx)

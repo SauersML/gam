@@ -622,7 +622,14 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     // check) at the default log level, so production pays nothing.
     macro_rules! trace_decline {
         ($($arg:tt)*) => {
-            log::debug!("arrow-schur device SAE Direct PCG declined: {}", format!($($arg)*));
+            let reason = format!($($arg)*);
+            log::debug!("arrow-schur device SAE Direct PCG declined: {}", reason);
+            // #1017/#2231 observability: the decline ALSO lands in the GPU
+            // telemetry counter so a fit report can say why the device path was
+            // skipped without a RUST_LOG debug rerun.
+            gam_gpu::profile::telemetry_record_cpu_fallback(format!(
+                "sae-direct-pcg decline: {reason}"
+            ));
         };
     }
     if options.mode != ArrowSolverMode::Direct {
