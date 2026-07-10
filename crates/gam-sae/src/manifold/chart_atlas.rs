@@ -125,20 +125,24 @@ impl UnitSpeedChartTransition {
         }
         let sign = self.sign * next.sign;
         let offset = (next.sign as f64 * self.offset + next.offset).rem_euclid(self.period);
-        Self::new(
-            self.from_chart,
-            next.to_chart,
+        // Composition is a closed algebraic operation on isometries: composing a
+        // transition with its inverse yields the IDENTITY self-map (`from == to`),
+        // which `new` rejects as a registration self-edge.  Build the result
+        // directly so `compose` stays total on validated inputs.
+        Ok(Self {
+            from_chart: self.from_chart,
+            to_chart: next.to_chart,
             sign,
             offset,
-            self.period,
-            if matches!(self.seam_kind, AtlasSeamKind::Pole)
+            period: self.period,
+            seam_kind: if matches!(self.seam_kind, AtlasSeamKind::Pole)
                 || matches!(next.seam_kind, AtlasSeamKind::Pole)
             {
                 AtlasSeamKind::Pole
             } else {
                 AtlasSeamKind::Regular
             },
-        )
+        })
     }
 
     pub(crate) fn remap(&mut self, old_to_new: &[Option<usize>]) -> Result<(), String> {
@@ -293,18 +297,21 @@ impl SphereChartTransition {
                     .sum();
             }
         }
-        Self::new(
-            self.from_chart,
-            next.to_chart,
-            product,
-            if matches!(self.seam_kind, AtlasSeamKind::Pole)
+        // As with the 1-D transition, composing with the inverse yields the
+        // identity self-map; build directly so `compose` stays total (the
+        // self-edge check only guards registration).
+        Ok(Self {
+            from_chart: self.from_chart,
+            to_chart: next.to_chart,
+            rotation: product,
+            seam_kind: if matches!(self.seam_kind, AtlasSeamKind::Pole)
                 || matches!(next.seam_kind, AtlasSeamKind::Pole)
             {
                 AtlasSeamKind::Pole
             } else {
                 AtlasSeamKind::Regular
             },
-        )
+        })
     }
 
     pub(crate) fn remap(&mut self, old_to_new: &[Option<usize>]) -> Result<(), String> {
