@@ -1694,8 +1694,8 @@ pub fn fit_block_sparse_dictionary(
     let mut ev_residual = f64::INFINITY;
     let mut gamma_residual = f64::INFINITY;
     let mut frame_residual = f64::INFINITY;
-    let mut routing_residual = f64::INFINITY;
-    let mut reconstruction_residual = f64::INFINITY;
+    let routing_residual: f64;
+    let reconstruction_residual: f64;
     let mut accepted_births = 0usize;
     let mut polar_failures = 0usize;
 
