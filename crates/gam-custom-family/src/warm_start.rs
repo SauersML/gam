@@ -171,8 +171,9 @@ pub struct BlockwiseFitResultParts {
     /// is the authoritative convergence signal.
     pub outer_gradient_norm: Option<f64>,
     /// First-order optimality certificate from the outer smoothing solve
-    /// (#934); `None` when no outer ran (for example, a fixed-λ fit) or the
-    /// certificate could not be evaluated.
+    /// (#934). `None` is valid only when no outer iteration ran (for example,
+    /// a fixed-λ fit); an outer run that cannot produce a certificate is
+    /// non-converged and is rejected before result assembly.
     pub criterion_certificate: Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
@@ -439,11 +440,74 @@ fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), Cus
 mod assembly_convergence_tests {
     use super::*;
 
+    fn parts_with_outer_evidence(
+        outer_iterations: usize,
+        outer_converged: bool,
+        criterion_certificate: Option<gam_solve::rho_optimizer::OuterCriterionCertificate>,
+    ) -> BlockwiseFitResultParts {
+        BlockwiseFitResultParts {
+            block_states: Vec::new(),
+            log_likelihood: 0.0,
+            log_lambdas: Array1::zeros(0),
+            lambdas: Array1::zeros(0),
+            covariance_conditional: None,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            outer_iterations,
+            outer_gradient_norm: None,
+            criterion_certificate,
+            inner_cycles: 0,
+            outer_converged,
+            geometry: None,
+            precomputed_edf: None,
+            joint_log_lambdas: None,
+        }
+    }
+
     #[test]
     fn nonconverged_outer_state_cannot_reach_fit_assembly() {
-        let error = require_converged_outer_for_assembly(false)
+        let error = blockwise_fit_from_parts(parts_with_outer_evidence(1, false, None), &[])
             .expect_err("nonconverged outer state must be rejected");
-        assert!(matches!(error, CustomFamilyError::Optimization { .. }));
+        assert!(matches!(
+            error,
+            CustomFamilyError::Optimization { context, reason }
+                if context == "blockwise_fit_from_parts"
+                    && reason.contains("non-converged outer optimization")
+        ));
+    }
+
+    #[test]
+    fn outer_run_without_certificate_cannot_reach_fit_assembly() {
+        let error = blockwise_fit_from_parts(parts_with_outer_evidence(1, true, None), &[])
+            .expect_err("an outer run without a certificate must be rejected");
+        assert!(matches!(
+            error,
+            CustomFamilyError::Optimization { context, reason }
+                if context == "blockwise_fit_from_parts"
+                    && reason.contains("without its analytic convergence certificate")
+        ));
+    }
+
+    #[test]
+    fn failed_outer_certificate_cannot_reach_fit_assembly() {
+        let certificate = gam_solve::rho_optimizer::OuterCriterionCertificate {
+            grad_norm: 1.0,
+            projected_grad_norm: 1.0,
+            stationarity_bound: 0.1,
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+        };
+        let error = blockwise_fit_from_parts(
+            parts_with_outer_evidence(1, true, Some(certificate)),
+            &[],
+        )
+        .expect_err("a failed analytic certificate must be rejected");
+        assert!(matches!(
+            error,
+            CustomFamilyError::Optimization { context, reason }
+                if context == "blockwise_fit_from_parts"
+                    && reason.contains("analytic outer certificate failed")
+        ));
     }
 }
 
@@ -486,6 +550,15 @@ pub fn blockwise_fit_from_parts(
                      no fit was assembled",
                     certificate.summary()
                 ),
+            }
+            .into());
+        }
+        None if outer_iterations > 0 => {
+            return Err(CustomFamilyError::Optimization {
+                context: "blockwise_fit_from_parts",
+                reason: "refusing to assemble a fit after an outer optimization without its \
+                         analytic convergence certificate"
+                    .to_string(),
             }
             .into());
         }

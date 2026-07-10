@@ -1492,6 +1492,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             });
         }
         Err(e) => {
+            let rho_checkpoint = obj
+                .state
+                .warm_cache
+                .as_ref()
+                .map(|warm| warm.rho.to_vec())
+                .unwrap_or_else(|| rho0.to_vec());
             if let Some(warm) = obj.state.warm_cache.as_ref() {
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_key.as_deref(),
@@ -1503,7 +1509,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 context: "fit_custom_family outer smoothing",
                 reason: format!(
                     "outer smoothing optimization failed after exhausting strategy fallbacks: \
-                     {e}.{last_error_detail}"
+                     {e}; rho_checkpoint={rho_checkpoint:?}; no fit was assembled.\
+                     {last_error_detail}"
                 ),
             });
         }
