@@ -176,8 +176,6 @@ fn reserve_dense_covariance_bundle(
         + IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE;
 
     let policy = gam_runtime::resource::ResourcePolicy::for_problem(
-        n_design_rows,
-        p,
         gam_runtime::resource::ProblemHints::default(),
     );
     if !policy.material_policy().allow_operator_materialization {
@@ -209,8 +207,6 @@ fn reserve_factorized_inference_state(
 ) -> Option<gam_runtime::resource::MemoryReservation> {
     const RETAINED_FACTOR_AND_PRECISION_MATRICES: usize = 7;
     let policy = gam_runtime::resource::ResourcePolicy::for_problem(
-        n_design_rows,
-        p,
         gam_runtime::resource::ProblemHints::default(),
     );
     if !policy.material_policy().allow_operator_materialization {
@@ -2641,8 +2637,6 @@ where
         // chunk keeps ~2 dense p×chunk workspaces (the RHS slice and the
         // solved block) live at once.
         let resource_policy = gam_runtime::resource::ResourcePolicy::for_problem(
-            n_design_rows,
-            p_cov,
             gam_runtime::resource::ProblemHints::default(),
         );
         let governor = gam_runtime::resource::MemoryGovernor::global();

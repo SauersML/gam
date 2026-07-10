@@ -523,7 +523,6 @@ fn build_stagewise_manifold_sae_payload(
     sparsity_strength, smoothness, learning_rate, max_iter, random_state,
     jumprelu_threshold, reconstruction_r2
 ))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sae_manifold_core_from_stagewise<'py>(
     py: Python<'py>,
     atom_topologies: Vec<String>,

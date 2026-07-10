@@ -3133,8 +3133,6 @@ impl CoefficientTransformOperator {
                 // outer shape says we're in strict territory. Falls
                 // through to streaming row_chunk_into / apply paths.
                 let auto_policy = ResourcePolicy::for_problem(
-                    self.n,
-                    self.p_out,
                     gam_runtime::resource::ProblemHints::default(),
                 );
                 let cache_policy = ResourcePolicy {
@@ -3330,8 +3328,6 @@ impl ResidualisedDesignOperator {
         let computed = match bytes {
             Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
                 let auto_policy = ResourcePolicy::for_problem(
-                    self.n,
-                    self.p_out,
                     gam_runtime::resource::ProblemHints::default(),
                 );
                 let cache_policy = ResourcePolicy {

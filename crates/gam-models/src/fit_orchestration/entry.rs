@@ -151,7 +151,7 @@ pub(crate) fn resolved_resource_policy(
     if let Some(p) = config.resource_policy.clone() {
         return p;
     }
-    gam_runtime::resource::ResourcePolicy::for_problem(data.values.nrows(), 0, hints)
+    gam_runtime::resource::ResourcePolicy::for_problem(hints)
 }
 
 pub(crate) fn marginal_slope_hints(config: &FitConfig) -> gam_runtime::resource::ProblemHints {

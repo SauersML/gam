@@ -434,7 +434,7 @@ impl ResourcePolicy {
     /// `hints.marginal_slope_large_scale_active` forces strict mode regardless
     /// of shape: that path is structurally operator-only and any dense
     /// fallback would be a bug, not a memory question.
-    pub fn for_problem(_n_rows: usize, _p_estimate: usize, hints: ProblemHints) -> Self {
+    pub fn for_problem(hints: ProblemHints) -> Self {
         if hints.marginal_slope_large_scale_active {
             return Self::analytic_operator_required();
         }
@@ -964,7 +964,7 @@ mod resource_policy_tests {
 
     #[test]
     fn for_problem_small_data_uses_materialize_if_small() {
-        let p = ResourcePolicy::for_problem(1000, 100, ProblemHints::default());
+        let p = ResourcePolicy::for_problem(ProblemHints::default());
         assert_eq!(
             p.derivative_storage_mode,
             DerivativeStorageMode::MaterializeIfSmall
@@ -973,8 +973,8 @@ mod resource_policy_tests {
 
     #[test]
     fn for_problem_has_no_row_or_column_cliff() {
-        let narrow = ResourcePolicy::for_problem(4_194_304, 10, ProblemHints::default());
-        let wide = ResourcePolicy::for_problem(128, usize::MAX, ProblemHints::default());
+        let narrow = ResourcePolicy::for_problem(ProblemHints::default());
+        let wide = ResourcePolicy::for_problem(ProblemHints::default());
         assert_eq!(
             narrow.derivative_storage_mode,
             DerivativeStorageMode::MaterializeIfSmall
@@ -987,7 +987,7 @@ mod resource_policy_tests {
 
     #[test]
     fn for_problem_dimension_overflow_defers_to_typed_reservation() {
-        let policy = ResourcePolicy::for_problem(usize::MAX, usize::MAX, ProblemHints::default());
+        let policy = ResourcePolicy::for_problem(ProblemHints::default());
         assert_eq!(
             policy.derivative_storage_mode,
             DerivativeStorageMode::MaterializeIfSmall
@@ -996,13 +996,9 @@ mod resource_policy_tests {
 
     #[test]
     fn for_problem_marginal_slope_hint_is_strict() {
-        let p = ResourcePolicy::for_problem(
-            100,
-            100,
-            ProblemHints {
-                marginal_slope_large_scale_active: true,
-            },
-        );
+        let p = ResourcePolicy::for_problem(ProblemHints {
+            marginal_slope_large_scale_active: true,
+        });
         assert_eq!(
             p.derivative_storage_mode,
             DerivativeStorageMode::AnalyticOperatorRequired

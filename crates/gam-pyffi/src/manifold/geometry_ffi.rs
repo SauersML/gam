@@ -385,7 +385,6 @@ fn format_g(x: f64) -> String {
     test_x, recon, gate, code_dims, dictionary_params, atom_contribution,
     r2_targets = None, native_bits_per_token = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn sae_eq4_description_length<'py>(
     py: Python<'py>,
     test_x: PyReadonlyArray2<'py, f64>,

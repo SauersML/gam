@@ -731,8 +731,7 @@ struct QuadratureWorkspace<'a, 'b> {
 }
 
 impl<'a, 'b> QuadratureWorkspace<'a, 'b> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
+        fn new(
         active_mean: &'a [f64],
         projected: &'a ProjectedGaussian,
         rules: &'a [GaussHermiteRule],
@@ -948,7 +947,6 @@ fn softmax_with_reference_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn moments_from_raw(
     raw_moments: Vec<f64>,
     k: usize,

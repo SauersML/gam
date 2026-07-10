@@ -4844,7 +4844,6 @@ impl PyInterventionCalibrationPlan {
 /// Rung-3 calibration design.  `prediction` is deliberately a closed choice;
 /// requesting Rung 2 without a Rung-2 channel is a typed core error.
 #[pyfunction]
-#[allow(clippy::too_many_arguments)]
 fn intervention_calibration_plan<'py>(
     row_id: PyReadonlyArray1<'py, i64>,
     atom: PyReadonlyArray1<'py, i64>,
