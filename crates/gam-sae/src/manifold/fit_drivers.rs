@@ -4512,7 +4512,7 @@ impl SaeManifoldTerm {
         // before a later unsupported chart reports that complete stationary
         // enumeration is unavailable.
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let needs_multivariate_enumerator = match atom.basis_kind {
+            let needs_multivariate_enumerator = match &atom.basis_kind {
                 SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => atom.latent_dim != 1,
                 SaeAtomBasisKind::Sphere
                 | SaeAtomBasisKind::Cylinder
@@ -4527,7 +4527,7 @@ impl SaeManifoldTerm {
             if needs_multivariate_enumerator {
                 return Err(format!(
                     "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} ({:?}, latent_dim {}) requires complete multivariate stationary-point enumeration; fixed-lattice resolution {resolution} is forbidden",
-                    atom.basis_kind, atom.latent_dim
+                    &atom.basis_kind, atom.latent_dim
                 ));
             }
         }
@@ -4546,7 +4546,7 @@ impl SaeManifoldTerm {
         for atom_idx in 0..self.k_atoms() {
             let d = self.atoms[atom_idx].latent_dim;
             if matches!(
-                self.atoms[atom_idx].basis_kind,
+                &self.atoms[atom_idx].basis_kind,
                 SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus
             ) && d == 1
             {
