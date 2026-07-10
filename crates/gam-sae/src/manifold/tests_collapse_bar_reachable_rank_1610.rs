@@ -166,3 +166,24 @@ pub(crate) fn collapse_bar_uses_reachable_dictionary_rank_not_nominal_count_1610
         "reachable-rank degeneracy floor must be a finite EV fraction, got {bar_reachable}"
     );
 }
+
+/// 2026-07-10 regression — a SATURATED floor is NO VERDICT, not certain collapse.
+/// With reachable rank `q >= n` the signal-free least squares reproduces the
+/// target exactly (`colspan(Φ) = R^n`), so the null floor carries zero evidence:
+/// every possible EV sits at or below it, and returning `1.0` branded EV≈0.999
+/// fits on small-n/basis-rich fixtures as co-collapsed. The floor must return
+/// NaN (the established n==0 no-verdict convention; both caller arms compare
+/// `<= floor`, which is false on NaN, standing the absolute arm down).
+#[test]
+fn saturated_degeneracy_floor_is_no_verdict() {
+    let target = ndarray::Array2::<f64>::from_shape_fn((4, 8), |(i, j)| (i * 8 + j) as f64);
+    // q == n and q > n: both saturate — no verdict.
+    assert!(absolute_degeneracy_ev_floor(target.view(), 4).is_nan());
+    assert!(absolute_degeneracy_ev_floor(target.view(), 9).is_nan());
+    // q < n: the classical null-R² q/n, unchanged.
+    let floor = absolute_degeneracy_ev_floor(target.view(), 3);
+    assert!((floor - 0.75).abs() < 1e-15, "expected 3/4, got {floor}");
+    // The no-verdict NaN stands the caller arms down: `ev <= floor` is false.
+    let ev = 0.999_f64;
+    assert!(!(ev <= absolute_degeneracy_ev_floor(target.view(), 4)));
+}
