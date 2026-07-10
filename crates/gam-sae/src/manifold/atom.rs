@@ -231,7 +231,7 @@ impl SaeAtomBasisKind {
     /// Dense candidate coordinates spanning compact latents for fixed-decoder
     /// out-of-sample projection. Unbounded/basis-linear latents return `None`
     /// because their PCA seed already lies in the convex training hull.
-    pub(crate) fn projection_seed_grid(
+    pub fn projection_seed_grid(
         &self,
         latent_dim: usize,
         resolution: usize,
@@ -267,7 +267,7 @@ impl SaeAtomBasisKind {
     }
 }
 
-pub(crate) fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+pub fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     use std::f64::consts::PI;
     let r = resolution.max(2);
     let mut grid = Array2::<f64>::zeros((r * r, 2));
@@ -282,7 +282,7 @@ pub(crate) fn sphere_projection_seed_grid(resolution: usize) -> Option<Array2<f6
     Some(grid)
 }
 
-pub(crate) fn mobius_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+pub fn mobius_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     let r = resolution.max(2);
     let mut grid = Array2::<f64>::zeros((r * r, 2));
     for i in 0..r {
@@ -296,7 +296,7 @@ pub(crate) fn mobius_projection_seed_grid(resolution: usize) -> Option<Array2<f6
     Some(grid)
 }
 
-pub(crate) fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
+pub fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<f64>> {
     // Sweep the periodic (circle) axis over one period in fraction-of-period
     // coordinates `[0, 1)`; hold the unbounded line axis at the hull-centered
     // seed `0`. The Newton retraction recovers any line offset from there.
@@ -309,7 +309,7 @@ pub(crate) fn cylinder_projection_seed_grid(resolution: usize) -> Option<Array2<
     Some(grid)
 }
 
-pub(crate) fn torus_projection_seed_grid(
+pub fn torus_projection_seed_grid(
     latent_dim: usize,
     resolution: usize,
 ) -> Option<Array2<f64>> {

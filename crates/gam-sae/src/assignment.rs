@@ -2259,7 +2259,7 @@ fn ibp_prior_penalty(
     (penalty, rho_view)
 }
 
-pub(crate) fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
+pub fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
     assignment_prior_value_weighted(assignment, rho, None)
 }
 
@@ -2339,7 +2339,7 @@ pub(crate) fn assignment_prior_value_weighted(
     }
 }
 
-pub(crate) fn assignment_prior_log_strength_derivative(
+pub fn assignment_prior_log_strength_derivative(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> f64 {
@@ -2388,7 +2388,7 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     }
 }
 
-pub(crate) fn assignment_prior_log_strength_hdiag(
+pub fn assignment_prior_log_strength_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<Array1<f64>, String> {
@@ -2499,7 +2499,7 @@ fn mask_fixed_logit_entries(assignment: &SaeAssignment, arr: &mut Array1<f64>) {
     }
 }
 
-pub(crate) fn assignment_prior_log_strength_target_mixed(
+pub fn assignment_prior_log_strength_target_mixed(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<Array1<f64>, String> {
@@ -2544,7 +2544,7 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     }
 }
 
-pub(crate) fn assignment_prior_grad_hdiag(
+pub fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
@@ -2675,7 +2675,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
 /// `alpha`/`tau`/`learnable_alpha` and the `lambda_sparse` weight convention —
 /// that [`assignment_prior_grad_hdiag`] assembles into `htt`. Returns `None`
 /// for non-IBP assignment modes (no cross-row empirical-π coupling to correct).
-pub(crate) fn ibp_assignment_third_channels(
+pub fn ibp_assignment_third_channels(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
     majorize: bool,
