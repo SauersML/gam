@@ -204,13 +204,7 @@ pub(crate) fn run_predict_multinomial(args: &PredictArgs) -> Result<(), String> 
     let (probs, prob_se) = if args.uncertainty {
         let (probs, prob_se) = predict_multinomial_formula_with_se(&saved, &ds)
             .map_err(|e| format!("multinomial predict failed: {e}"))?;
-        if prob_se.is_none() {
-            cli_err!(
-                "note: --uncertainty requested but this multinomial model carries no coefficient \
-                 covariance; writing probabilities only"
-            );
-        }
-        (probs, prob_se)
+        (probs, Some(prob_se))
     } else {
         let probs = predict_multinomial_formula(&saved, &ds)
             .map_err(|e| format!("multinomial predict failed: {e}"))?;
