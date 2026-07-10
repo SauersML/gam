@@ -1355,7 +1355,6 @@ mod parity_tests {
             fisher_w_override: None,
             max_iter: 100,
             tol: 1.0e-12,
-            resume_from: None,
         })
         .expect("binomial fit must succeed");
         // First-order optimality: ∇F(β̂) = 0 (engine never used this gradient).
@@ -1451,6 +1450,7 @@ mod parity_tests {
             fisher_w_override: None,
             max_iter: 100,
             tol: 1.0e-12,
+            resume_from: None,
         })
         .expect("multinomial fit must succeed");
         // First-order optimality: ∇F(β̂) = 0.

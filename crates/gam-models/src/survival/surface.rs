@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn survival_and_cumulative_hazard_share_consistent_boundaries() {
         let grid = array![1.0, 2.0];
-        let survival_values = array![[0.8, 0.5]];
+        let survival_values = array![[0.8_f64, 0.5]];
         let cumulative_values = survival_values.mapv(|value| -value.ln());
         let survival = SurvivalSurface::new(
             SurvivalSurfaceKind::Survival,

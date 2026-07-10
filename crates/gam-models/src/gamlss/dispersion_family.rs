@@ -2154,7 +2154,7 @@ mod tests {
     /// ν(1 − y/μ) = −3`; the Fisher weights are `ν = 3` and `0`.
     #[test]
     pub(crate) fn observed_eta_hessian_matches_gamma_closed_form() {
-        let (yi, mu, nu) = (4.0, 2.0, 3.0);
+        let (yi, mu, nu): (f64, f64, f64) = (4.0, 2.0, 3.0);
         let (h_mm, h_md, h_dd) = dispersion_row_observed_hessian_weights(
             DispersionFamilyKind::Gamma,
             yi,
