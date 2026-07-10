@@ -1020,36 +1020,6 @@ pub(crate) fn run_outer_with_plan(
                             result.operator_trust_radius = final_radius;
                             Ok(result)
                         }
-                        // opt 0.5.12 — the optimizer's own cost-stall guard
-                        // certified the halt: CostStallConverged is a genuine
-                        // stationary optimum on a flat score surface (same
-                        // verdict semantics as the gam-side guard's Converged),
-                        // CostStallFloor is a weakly-identified valley floor
-                        // whose residual gradient stayed above tolerance — an
-                        // honest NON-converged halt, mirrored on the
-                        // RejectFloor stop reason so the retry orchestrator
-                        // treats it as a floor, not a budget.
-                        OptimizationStatus::CostStallConverged => {
-                            let mut result =
-                                solution_into_outer_result(report.solution, true, *the_plan);
-                            result.operator_stop_reason =
-                                Some(OperatorTrustRegionStopReason::Converged);
-                            result.operator_trust_radius = final_radius;
-                            Ok(result)
-                        }
-                        OptimizationStatus::CostStallFloor => {
-                            log::warn!(
-                                "[OUTER warning] {context}: matrix-free TR halted on a cost-stall                                  FLOOR (non-stationary flat valley) at final_value={:.6e} |g|={:.3e}",
-                                report.solution.final_value,
-                                report.solution.final_gradient_norm.unwrap_or(f64::NAN),
-                            );
-                            let mut result =
-                                solution_into_outer_result(report.solution, false, *the_plan);
-                            result.operator_stop_reason =
-                                Some(OperatorTrustRegionStopReason::RejectFloor);
-                            result.operator_trust_radius = final_radius;
-                            Ok(result)
-                        }
                         OptimizationStatus::ObjectiveFailed
                         | OptimizationStatus::NumericalFailure
                         | OptimizationStatus::LineSearchFailed => {
