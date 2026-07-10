@@ -5785,7 +5785,19 @@ impl SaeManifoldTerm {
         // hint would always equal the cold LSQ decoder, never the seed). A freeze
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
-        if max_iter > 0 && !self.frames_active() {
+        // #2015 — the polish now runs in the frame-active path too. The wide
+        // two-block crosscoder / behavior fit (p ≫ r) routes onto Grassmann
+        // frames by default, and the joint Newton's line-search-damped step
+        // leaves the decoder SCALE under-converged on the ill-conditioned
+        // two-block target (κ ≈ 1e8 from a ~1e4 output-column-scale spread), so
+        // the inner KKT residual crawls and `reml_criterion` refuses at budget.
+        // The closed-form penalized decoder least-squares homes that scale in
+        // one step. It is legal in the frame-active path because
+        // `project_decoders_onto_active_frames` re-projects the refit back into
+        // each atom's FIXED frame span (`B ← (B U) Uᵀ`) — the frame directions
+        // `U_k` are never moved, so no factored-solve desync arises; only the
+        // in-span decoder coordinate (which carries the scale dof) is updated.
+        if max_iter > 0 {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if best_objective.is_finite() {
@@ -5797,10 +5809,12 @@ impl SaeManifoldTerm {
                     let snapshot = self.snapshot_mutable_state();
                     let round = self
                         .refit_decoder_least_squares_at_current_state(target, Some(rho))
+                        .and_then(|()| self.project_decoders_onto_active_frames())
                         .and_then(|()| self.seed_coords_by_decoder_projection(target))
                         .and_then(|()| {
                             self.refit_decoder_least_squares_at_current_state(target, Some(rho))
                         })
+                        .and_then(|()| self.project_decoders_onto_active_frames())
                         .and_then(|()| {
                             self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
                         });

@@ -3035,6 +3035,30 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Re-project every ACTIVE decoder frame's authoritative `B_k` back onto its
+    /// (fixed) frame span, `B_k ← (B_k U_k) U_kᵀ` (#2015). The closed-form
+    /// decoder least-squares refit
+    /// ([`Self::refit_decoder_least_squares_at_current_state`]) writes the
+    /// unconstrained full-width `B_k`, which can carry an off-frame component the
+    /// factored border solve cannot represent. Projecting it back into
+    /// `range(U_k)` — the same `B ← (B U) Uᵀ` no-op-in-span the frame activation
+    /// applies — keeps `decoder_coefficients` and the profiled frame consistent
+    /// so the polish can run in the frame-active path WITHOUT desyncing `U_k`
+    /// (the frame directions are held FIXED; only the in-span coordinate scale is
+    /// updated, which is exactly the decoder degree of freedom the joint Newton's
+    /// line-search-damped step leaves under-converged on wide two-block targets).
+    /// A no-op for every un-framed atom (full-`B` path).
+    pub(crate) fn project_decoders_onto_active_frames(&mut self) -> Result<(), String> {
+        for atom in self.atoms.iter_mut() {
+            let Some(coords) = atom.factored_coordinates()? else {
+                continue;
+            };
+            atom.set_factored_coordinates(coords.view())?;
+            atom.refresh_intrinsic_smooth_penalty();
+        }
+        Ok(())
+    }
+
     pub fn fitted(&self) -> Array2<f64> {
         self.try_fitted().expect("assignment logits must be finite")
     }
