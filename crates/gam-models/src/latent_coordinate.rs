@@ -967,9 +967,10 @@ mod tests {
 
         fn hessian_vector_product(
             &mut self,
-            _coordinates: ArrayView1<'_, f64>,
+            coordinates: ArrayView1<'_, f64>,
             tangent: ArrayView1<'_, f64>,
         ) -> Result<Option<Array1<f64>>, Self::Error> {
+            assert_eq!(coordinates.len(), tangent.len());
             Ok(Some(tangent.to_owned()))
         }
     }
@@ -1068,8 +1069,9 @@ mod tests {
 
         fn value_and_gradient(
             &mut self,
-            _coordinates: ArrayView1<'_, f64>,
+            coordinates: ArrayView1<'_, f64>,
         ) -> Result<LatentCoordinateEvaluation, Self::Error> {
+            assert!(coordinates.iter().all(|value| value.is_finite()));
             Err(TestObjectiveError::InnerSolve)
         }
     }

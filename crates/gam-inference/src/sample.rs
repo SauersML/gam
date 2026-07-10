@@ -1537,7 +1537,14 @@ mod tests {
             self.values.t().dot(vector)
         }
 
-        fn diag_xtw_x(&self, _weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+            if weights.len() != self.nrows() {
+                return Err(format!(
+                    "weight vector has {} entries for {} design rows",
+                    weights.len(),
+                    self.nrows()
+                ));
+            }
             Ok(Array2::zeros((self.ncols(), self.ncols())))
         }
     }

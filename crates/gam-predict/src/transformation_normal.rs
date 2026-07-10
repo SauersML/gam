@@ -116,26 +116,42 @@ impl PredictableModel for TransformationNormalPredictor {
 
     fn predict_full_uncertainty(
         &self,
-        _input: &PredictInput,
-        _fit: &UnifiedFitResult,
-        _options: &PredictUncertaintyOptions,
+        input: &PredictInput,
+        fit: &UnifiedFitResult,
+        options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        Err(EstimationError::InvalidInput(
-            "transformation-normal models cannot report coefficient-uncertainty intervals: \
-             propagating the coefficient covariance through the inverse transform h⁻¹ requires \
-             the I-spline basis Jacobian, which is not part of the persisted quantile grid. \
-             Use predict_posterior_mean for the point E[Y|x] and its response-scale \
-             observation (predictive) interval."
-                .to_string(),
-        ))
+        if !fit.log_likelihood.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "transformation-normal predict received a fit with a non-finite log-likelihood"
+                    .to_string(),
+            ));
+        }
+        Err(EstimationError::InvalidInput(format!(
+            "transformation-normal models cannot report coefficient-uncertainty intervals \
+             (level {} requested for {} rows): propagating the coefficient covariance through \
+             the inverse transform h⁻¹ requires the I-spline basis Jacobian, which is not part \
+             of the persisted quantile grid. Use predict_posterior_mean for the point E[Y|x] \
+             and its response-scale observation (predictive) interval.",
+            options.confidence_level,
+            input.offset.len(),
+        )))
     }
 
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
-        _fit: &UnifiedFitResult,
+        fit: &UnifiedFitResult,
         options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
+        // The posterior mean is read entirely off the persisted quantile
+        // ladder; the fit contributes no coefficient state here, but a
+        // non-finite fitted log-likelihood marks a corrupted payload.
+        if !fit.log_likelihood.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "transformation-normal predict received a fit with a non-finite log-likelihood"
+                    .to_string(),
+            ));
+        }
         let h = input.offset.clone();
         let n = h.len();
         let mut result = PredictPosteriorMeanResult {

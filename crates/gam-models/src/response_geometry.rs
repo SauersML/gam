@@ -602,7 +602,14 @@ impl OuterObjective for SharedTangentObjective<'_> {
 
     fn reset(&mut self) {}
 
-    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        // No warm-start slot to fill, but a non-finite seed is a caller error
+        // worth surfacing rather than silently discarding.
+        if beta.iter().any(|value| !value.is_finite()) {
+            return Err(invalid(
+                "seed_inner_state received a non-finite β warm-start vector",
+            ));
+        }
         Ok(SeedOutcome::NoSlot)
     }
 }
