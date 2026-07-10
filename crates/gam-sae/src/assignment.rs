@@ -960,11 +960,28 @@ impl SaeAssignment {
         Ok(Some(step))
     }
 
+    /// Post-#1033 the row gates are ρ-invariant (frozen/predicted or free
+    /// routing logits never read ρ), so ρ enters this API purely as a wiring
+    /// contract: reject a ρ minted for a different dictionary before producing
+    /// gates instead of silently pairing mismatched objects.
+    fn check_rho_dictionary(&self, rho: &SaeManifoldRho) -> Result<(), String> {
+        if rho.log_lambda_smooth.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeAssignment: rho carries {} per-atom smoothness coordinates \
+                 but the dictionary has {} atoms",
+                rho.log_lambda_smooth.len(),
+                self.k_atoms()
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_assignments_row_for_rho(
         &self,
         row: usize,
-        _rho: &SaeManifoldRho,
+        rho: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
+        self.check_rho_dictionary(rho)?;
         self.try_assignments_row_inner(row)
     }
 
@@ -1019,9 +1036,10 @@ impl SaeAssignment {
     pub(crate) fn try_assignments_row_for_rho_into(
         &self,
         row: usize,
-        _rho: &SaeManifoldRho,
+        rho: &SaeManifoldRho,
         out: &mut [f64],
     ) -> Result<(), String> {
+        self.check_rho_dictionary(rho)?;
         self.try_assignments_row_into(row, out)
     }
 

@@ -517,7 +517,10 @@ pub(super) fn joint_setup(
     // (see `marginal_penalties_with_influence_ridge`); it is REML-learned like
     // every other penalty but seeds at the ln(n) leakage scale instead of 0.
     if let Some(seed) = absorber_rho0 {
-        debug_assert!(marginal_penalties > 0);
+        assert!(
+            marginal_penalties > 0,
+            "an absorber rho0 seed requires at least one marginal penalty to land in"
+        );
         rho0vec[marginal_penalties - 1] = seed;
     }
     for (idx, &value) in extra_rho0.iter().enumerate() {

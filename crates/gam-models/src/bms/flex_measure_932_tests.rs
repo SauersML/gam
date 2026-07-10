@@ -59,12 +59,18 @@ thread_local! {
 /// a measured region. `try_with` (not `with`) so allocations during TLS
 /// teardown at thread exit can never panic inside the allocator.
 fn note_allocation(size: usize) {
-    let _ = TRACK_THIS_THREAD.try_with(|track| {
-        if track.get() {
-            let _ = THREAD_ALLOCATION_CALLS.try_with(|c| c.set(c.get() + 1));
-            let _ = THREAD_ALLOCATED_BYTES.try_with(|b| b.set(b.get() + size as u64));
-        }
-    });
+    // A failed `try_with` means this thread's TLS is already torn down: there
+    // is no measured region left to credit, so "not tracking" is the correct
+    // (and panic-free) reading inside the allocator.
+    if !TRACK_THIS_THREAD.try_with(Cell::get).unwrap_or(false) {
+        return;
+    }
+    THREAD_ALLOCATION_CALLS
+        .try_with(|c| c.set(c.get() + 1))
+        .unwrap_or(());
+    THREAD_ALLOCATED_BYTES
+        .try_with(|b| b.set(b.get() + size as u64))
+        .unwrap_or(());
 }
 
 // SAFETY: `ThreadCountingAllocator` delegates every allocation operation to

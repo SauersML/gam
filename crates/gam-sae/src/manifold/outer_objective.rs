@@ -1388,11 +1388,13 @@ impl SaeManifoldOuterObjective {
         } = self;
         let mut fitted_rho = current_rho;
         let mut fitted = term;
-        let _certified_loss = last_loss.ok_or_else(|| {
-            "SaeManifoldOuterObjective::into_fitted: no converged evaluation is installed; \
-             run the fixed-rho solve or certify the outer search before minting a fit"
-                .to_string()
-        })?;
+        if last_loss.is_none() {
+            return Err(
+                "SaeManifoldOuterObjective::into_fitted: no converged evaluation is installed; \
+                 run the fixed-rho solve or certify the outer search before minting a fit"
+                    .to_string(),
+            );
+        }
 
         // Do not arbitrate the certified terminal state against historical
         // reconstruction-EV incumbents or construction seeds here. Those states
@@ -2745,10 +2747,7 @@ impl SaeManifoldOuterObjective {
         // (4) Re-converge every saved member from its own state (cheap, pure). The
         // bundle is moved out of `self` so the closure can borrow `&mut self` for
         // the per-member inner drive; restored immediately after.
-        let mut bundle = std::mem::replace(
-            &mut self.basin_bundle,
-            BasinBundle::new(1),
-        );
+        let mut bundle = std::mem::replace(&mut self.basin_bundle, BasinBundle::new(1));
         let member_eval = bundle.evaluate(|state: &SaeManifoldTerm| {
             let (res, converged) = self.converge_member_criterion(rho_flat, state, drive);
             res.map(|value| (converged, value))

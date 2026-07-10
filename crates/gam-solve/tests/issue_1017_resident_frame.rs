@@ -19,10 +19,19 @@ impl SaeResidentFrame for RecordingFrame {
         sys: &ArrowSchurSystem,
         ridge_t: f64,
         ridge_beta: f64,
-        _rhs_beta: &Array1<f64>,
-        _max_iterations: usize,
-        _relative_tolerance: f64,
+        rhs_beta: &Array1<f64>,
+        max_iterations: usize,
+        relative_tolerance: f64,
     ) -> Result<(Array1<f64>, ArrowPcgDiagnostics), ArrowSchurGpuFailure> {
+        assert_eq!(
+            rhs_beta.len(),
+            sys.k,
+            "resident resolve must receive the beta-block RHS"
+        );
+        assert!(
+            max_iterations > 0 && relative_tolerance > 0.0,
+            "resident resolve must receive a live PCG budget"
+        );
         let mut calls = self.calls.lock().expect("record resident resolves");
         calls.push((ridge_t, ridge_beta));
         if calls.len() == 1 {

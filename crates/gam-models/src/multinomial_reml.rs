@@ -2126,14 +2126,24 @@ mod tests {
             fn n_rows(&self) -> usize {
                 1
             }
-            fn primaries(&self, _row: usize) -> Result<[f64; M], String> {
+            fn primaries(&self, row: usize) -> Result<[f64; M], String> {
+                if row != 0 {
+                    return Err(format!(
+                        "MultinomialJetRow holds exactly one row; got row {row}"
+                    ));
+                }
                 Ok(self.eta)
             }
             fn row_nll_generic<S: JetScalar<M>>(
                 &self,
-                _row: usize,
+                row: usize,
                 p: &[S; M],
             ) -> Result<S, String> {
+                if row != 0 {
+                    return Err(format!(
+                        "MultinomialJetRow holds exactly one row; got row {row}"
+                    ));
+                }
                 let mut z = S::constant(1.0);
                 for a in 0..M {
                     z = z.add(&p[a].exp());
