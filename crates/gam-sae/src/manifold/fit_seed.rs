@@ -476,4 +476,14 @@ mod tests {
             .expect("empty target must fail");
         assert!(error.contains("non-empty"));
     }
+
+    #[test]
+    fn python_free_example_drives_the_core_fit_entry() {
+        let example = include_str!("../../examples/sae_fit.rs");
+        assert!(example.contains("build_sae_minimal_seed(SaeMinimalSeedRequest"));
+        assert!(example.contains("build_sae_fit_seed(SaeFitSeedRequest"));
+        assert!(example.contains("run_sae_manifold_fit(SaeFitRequest"));
+        assert!(!example.contains("pyo3"));
+        assert!(!example.contains("Python<"));
+    }
 }
