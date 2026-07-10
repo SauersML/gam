@@ -128,7 +128,7 @@ pub fn admit_sae_fit_shape(
             crate::front_door::admit_topk_manifold(n_obs, p_out, k_atoms, d_max.max(1), support)
                 .map(|_| ())
         }
-        _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms),
+        _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms).map(|_| ()),
     }
 }
 
