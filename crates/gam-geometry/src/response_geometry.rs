@@ -1236,7 +1236,6 @@ struct CurvatureCriterionJet {
     score: f64,
     curvature: f64,
     base: Array1<f64>,
-    dispersion: f64,
 }
 
 /// Hand-derived value, score, and Hessian of the profiled criterion. Every
@@ -1343,7 +1342,6 @@ fn response_curvature_criterion_jet(
         score,
         curvature,
         base,
-        dispersion,
     })
 }
 
