@@ -130,9 +130,25 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let tiles = if assembly_work < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
         None
     } else {
-        gam_gpu::device_runtime::GpuRuntime::global()
-            .map(|rt| gam_gpu::pool::balanced_partition(rt, n))
-            .filter(|tiles| tiles.len() > 1)
+        gam_gpu::device_runtime::GpuRuntime::global().and_then(|rt| {
+            let tiles = gam_gpu::pool::balanced_partition(rt, n);
+            // Engage the device stacked-GEMM reduction when a MULTI-GPU pool can
+            // overlap tiles, OR — the single-GPU gap this closes — when the one
+            // stacked `(total_d×k)ᵀ(total_d×k)` GEMM clears the runtime's own
+            // `gemm_min_flops`, so `try_fast_atb_on_ordinal` will actually offload
+            // it instead of declining back to CPU. This reduction is the dense
+            // build's O(n·d·k²) cost (measured on an H100 as ~28% of the fit in
+            // `block_gemm_subtract`), and on a single GPU it previously always ran
+            // on the CPU because the tile path required `len() > 1` — the device
+            // sat idle. `assembly_work` IS the stacked GEMM's flop count (2·k²·Σd),
+            // so this is exactly `try_fast_atb`'s own offload predicate; below the
+            // GEMM floor the launch/staging tax loses to the CPU, so we keep the
+            // deterministic CPU rayon fold there. Small K (e.g. K=8) never clears
+            // the floor and stays on the CPU — magic-by-default crossover, no flag.
+            let engage =
+                tiles.len() > 1 || assembly_work >= rt.policy().gemm_min_flops as u128;
+            (engage && !tiles.is_empty()).then_some(tiles)
+        })
     };
 
     let Some(tiles) = tiles else {
