@@ -712,6 +712,10 @@ pub fn survival_fit_from_parts(
             rho_posterior_escalation: None,
             rho_covariance: None,
             joint_log_lambdas: None,
+            // Survival location-scale fits optimize the plain penalized
+            // likelihood; the Firth/Jeffreys adjustment is a binary-separation
+            // remedy and is never engaged here.
+            firth_bias_reduction: false,
         },
         inner_cycles: 0,
     })
