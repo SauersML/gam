@@ -2023,10 +2023,6 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
     use gam_custom_family::evaluate_custom_family_joint_hyper;
     use gam_problem::EvalMode;
-    // Trait-in-scope for `apply_into` method resolution; `as _` keeps this
-    // compiling when the operator enum's payload trait churns between having
-    // the method inherently vs via this trait.
-    use gam_problem::HessianOperator as _;
     use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
     use gam_terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
