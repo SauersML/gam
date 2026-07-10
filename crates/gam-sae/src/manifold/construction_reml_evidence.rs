@@ -2821,8 +2821,41 @@ impl SaeManifoldTerm {
             }
         }
 
+        let k_atoms = self.k_atoms();
+        let softmax = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                Some((
+                    temperature,
+                    rho.lambda_sparse() * sparsity * inv_tau * inv_tau,
+                    gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms,
+                        temperature,
+                    ),
+                ))
+            }
+            AssignmentMode::Softmax { .. } => return Ok(0.0),
+            _ => None,
+        };
+        let hdiag = if softmax.is_none() {
+            crate::assignment::assignment_prior_log_strength_hdiag_weighted(
+                &self.assignment,
+                rho,
+                self.row_loss_weights.as_deref(),
+            )?
+        } else {
+            Vec::new()
+        };
+        if softmax.is_none() && hdiag.is_empty() {
+            return Ok(0.0);
+        }
+        let assignment_dim = self.assignment.assignment_coord_dim();
+        let row_loss_weights = self.row_loss_weights.as_deref();
         let inv_m = 1.0 / m as f64;
-        let mut row_inverse_diagonals = Vec::with_capacity(self.n_obs());
+        let mut trace = 0.0_f64;
         for row in 0..self.n_obs() {
             if cache
                 .deflated_row_directions
@@ -2845,8 +2878,6 @@ impl SaeManifoldTerm {
                 inverse_diagonal[slot] = cholesky_solve_vector(factor, unit.view())[slot];
             }
 
-            let mut probe_rows = Vec::with_capacity(m);
-            let mut solve_rows = Vec::with_capacity(m);
             let mut cross = Array1::<f64>::zeros(q);
             for j in 0..m {
                 cross.fill(0.0);
@@ -2856,7 +2887,7 @@ impl SaeManifoldTerm {
                          probe apply failed"
                     ));
                 }
-                probe_rows.push(cholesky_solve_vector(factor, cross.view()));
+                let probe_row = cholesky_solve_vector(factor, cross.view());
                 cross.fill(0.0);
                 if !cache.apply_htbeta_row(row, sinv_probes[j].view(), &mut cross) {
                     return Err(format!(
@@ -2864,42 +2895,19 @@ impl SaeManifoldTerm {
                          solve apply failed"
                     ));
                 }
-                solve_rows.push(cholesky_solve_vector(factor, cross.view()));
+                let solve_row = cholesky_solve_vector(factor, cross.view());
+                for slot in 0..q {
+                    inverse_diagonal[slot] += inv_m * probe_row[slot] * solve_row[slot];
+                }
             }
-            for slot in 0..q {
-                let border = (0..m)
-                    .map(|j| probe_rows[j][slot] * solve_rows[j][slot])
-                    .sum::<f64>();
-                inverse_diagonal[slot] += inv_m * border;
-            }
-            row_inverse_diagonals.push(inverse_diagonal);
-        }
 
-        let k_atoms = self.k_atoms();
-        if let AssignmentMode::Softmax {
-            temperature,
-            sparsity,
-        } = self.assignment.mode
-        {
-            if k_atoms <= 1 {
-                return Ok(0.0);
-            }
-            let inv_tau = 1.0 / temperature;
-            let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
-            let penalty = gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                k_atoms,
-                temperature,
-            );
-            let assignment_dim = self.assignment.assignment_coord_dim();
-            let row_loss_weights = self.row_loss_weights.as_deref();
-            let mut trace = 0.0_f64;
-            for (row, inverse_diagonal) in row_inverse_diagonals.iter().enumerate() {
+            if let Some((temperature, scale, penalty)) = softmax.as_ref() {
                 let row_weight = row_loss_weights.map_or(1.0, |weights| weights[row]);
                 match self.last_row_layout {
                     Some(ref layout) => {
                         let assignments = crate::assignment::softmax_row(
                             self.assignment.logits.row(row),
-                            temperature,
+                            *temperature,
                         );
                         let assignments = assignments
                             .as_slice()
@@ -2910,7 +2918,7 @@ impl SaeManifoldTerm {
                                 assignments,
                                 atom,
                                 mean,
-                                scale,
+                                *scale,
                             );
                             trace += inverse_diagonal[slot] * row_weight * curvature;
                         }
@@ -2919,38 +2927,25 @@ impl SaeManifoldTerm {
                         let row_logits = (0..k_atoms)
                             .map(|atom| self.assignment.logits[[row, atom]])
                             .collect::<Vec<_>>();
-                        let curvature = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
+                        let curvature = penalty.psd_majorizer_abs_row_sums(&row_logits, *scale);
                         let logit_dim = assignment_dim.min(inverse_diagonal.len());
                         for atom in 0..logit_dim {
                             trace += inverse_diagonal[atom] * row_weight * curvature[atom];
                         }
                     }
                 }
-            }
-            return Ok(0.5 * trace);
-        }
-
-        let hdiag = crate::assignment::assignment_prior_log_strength_hdiag_weighted(
-            &self.assignment,
-            rho,
-            self.row_loss_weights.as_deref(),
-        )?;
-        if hdiag.is_empty() {
-            return Ok(0.0);
-        }
-        let assignment_dim = self.assignment.assignment_coord_dim();
-        let mut trace = 0.0_f64;
-        for (row, inverse_diagonal) in row_inverse_diagonals.iter().enumerate() {
-            let assignment_base = row * k_atoms;
-            match self.last_row_layout {
-                Some(ref layout) => {
-                    for (slot, &atom) in layout.active_atoms[row].iter().enumerate() {
-                        trace += inverse_diagonal[slot] * hdiag[assignment_base + atom];
+            } else {
+                let assignment_base = row * k_atoms;
+                match self.last_row_layout {
+                    Some(ref layout) => {
+                        for (slot, &atom) in layout.active_atoms[row].iter().enumerate() {
+                            trace += inverse_diagonal[slot] * hdiag[assignment_base + atom];
+                        }
                     }
-                }
-                None => {
-                    for slot in 0..assignment_dim.min(inverse_diagonal.len()) {
-                        trace += inverse_diagonal[slot] * hdiag[assignment_base + slot];
+                    None => {
+                        for slot in 0..assignment_dim.min(inverse_diagonal.len()) {
+                            trace += inverse_diagonal[slot] * hdiag[assignment_base + slot];
+                        }
                     }
                 }
             }
@@ -3586,10 +3581,9 @@ impl SaeManifoldTerm {
                 })
                 .collect();
             if whiten {
-                let metric = self
-                    .row_metric
-                    .as_ref()
-                    .ok_or_else(|| "crosscoder_block_ift_rhs: whitening metric absent".to_string())?;
+                let metric = self.row_metric.as_ref().ok_or_else(|| {
+                    "crosscoder_block_ift_rhs: whitening metric absent".to_string()
+                })?;
                 Self::whiten_logdet_metric_vec(metric, row, p, &mut v)?;
             }
             for (var_idx, first) in jets.first.iter().enumerate() {
