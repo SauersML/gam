@@ -3739,29 +3739,6 @@ fn dataset_with_model_schema(
     encode_recordswith_schema(headers, records, schema, policy)
 }
 
-/// [`dataset_with_model_schema`] with the missing-required-column case lifted
-/// into a typed [`PredictError::SchemaMismatch`] so the predict FFI can raise
-/// the documented `SchemaMismatchError` (issue #343) instead of flattening the
-/// rejection to a generic `GamError`. The header/required-column diff is the
-/// same set difference `dataset_with_model_schema` performs internally; every
-/// other failure (encoding, schema load) stays `PredictError::Other`.
-pub(crate) fn dataset_with_model_schema_typed(
-    model: &FittedModel,
-    headers: &[String],
-    rows: &[Vec<String>],
-) -> Result<EncodedDataset, PredictError> {
-    let expected_names = required_prediction_columns(model).map_err(PredictError::Other)?;
-    let present_names = headers.iter().cloned().collect::<BTreeSet<_>>();
-    let missing = expected_names
-        .difference(&present_names)
-        .map(|name| format!("missing required column '{name}'"))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        return Err(PredictError::SchemaMismatch(missing.join(" ")));
-    }
-    dataset_with_model_schema(model, headers, rows).map_err(PredictError::Other)
-}
-
 fn dataset_from_xy_arrays(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,

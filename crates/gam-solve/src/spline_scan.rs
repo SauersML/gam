@@ -797,17 +797,6 @@ fn concentrated_criterion_enclosure(
     })
 }
 
-/// Value-only diagnostic surface retained for the derivative oracle tests.
-#[cfg(test)]
-fn concentrated_criterion(
-    nodes: &[PooledNode],
-    ssr_within: f64,
-    n_obs: usize,
-    log_lambda: f64,
-    order: usize,
-) -> Result<f64, String> {
-    Ok(concentrated_criterion_jet(nodes, ssr_within, n_obs, log_lambda, order)?.0)
-}
 
 /// Exact diffuse smoother for the `order−1` partially-diffuse leading nodes
 /// (#1044 — the multi-node generalization of the `m = 2` reverse-Markov
@@ -1554,6 +1543,16 @@ impl SplineScanFit {
 
 #[cfg(test)]
 mod tests {
+    /// Value-only diagnostic surface retained for the derivative oracle tests.
+    fn concentrated_criterion(
+        nodes: &[PooledNode],
+        ssr_within: f64,
+        n_obs: usize,
+        log_lambda: f64,
+        order: usize,
+    ) -> Result<f64, String> {
+        Ok(concentrated_criterion_jet(nodes, ssr_within, n_obs, log_lambda, order)?.0)
+    }
     use super::*;
 
     #[test]
