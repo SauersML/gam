@@ -210,7 +210,16 @@ def main() -> None:
     feature("oos_encode", oos_encode)
 
     def steer_smoke():
-        s = model.steer(atom=0, delta=0.1)
+        t_from = np.asarray(model.coords[0][0], dtype=np.float64).reshape(-1)
+        t_to = t_from.copy()
+        t_to[0] += 0.1
+        s = model.steer(
+            0,
+            0,
+            float(model.assignments[0, 0]),
+            t_from,
+            t_to,
+        )
         keys = s.keys() if hasattr(s, "keys") else dir(s)
         return {"has_predicted_nats": "predicted_nats" in list(keys)}
     feature("steer_smoke", steer_smoke)

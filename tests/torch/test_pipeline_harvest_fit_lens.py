@@ -321,7 +321,7 @@ def _analytic_softmax_kl(W: np.ndarray, x_from: np.ndarray, x_to: np.ndarray) ->
     The synthetic ``_LinearHead`` makes the output distribution at an activation
     ``x`` exactly ``softmax(W x)``. For a steering move that drives the hidden
     state from ``x_from`` to ``x_to``, the *true* behavioral effect is this KL —
-    the analytic ground truth the path-integrated output-Fisher dose
+    the analytic ground truth the endpoint output-Fisher dose
     (``SteerPlan.predicted_nats``) should match to second order for a small move.
     """
     def _softmax(z: np.ndarray) -> np.ndarray:
@@ -336,7 +336,7 @@ def _analytic_softmax_kl(W: np.ndarray, x_from: np.ndarray, x_to: np.ndarray) ->
 def test_steer_dosimetry_against_analytic_kl(
     fit_with_shard: ManifoldSAE, harvest_shard: HarvestShard
 ) -> None:
-    """Path-integrated output-Fisher dose ≈ analytic KL for a small steer move.
+    """Endpoint output-Fisher dose ≈ analytic KL for a small steer move.
 
     The steering FFI (``ManifoldSAE.steer`` → ``gam-pyffi::sae_steer_delta`` →
     ``gam::inference::steering::steer_delta``) drives the planted atom a small
@@ -349,7 +349,7 @@ def test_steer_dosimetry_against_analytic_kl(
        ``δ = a·(x_to − x_from)`` (amplitude ``a = 1`` for this single-atom
        softmax fit, where the only atom carries unit assignment mass on every
        row).
-    3. The SteerPlan's ``predicted_nats`` (output-Fisher path integral) must
+    3. The SteerPlan's ``predicted_nats`` (endpoint Fisher quadratic) must
        match the analytic KL of the synthetic head between those two activations
        to second order: small move ⇒ ``predicted_nats ≈ KL`` within a relative
        tolerance; ``off_manifold_norm ≈ 0``; ``validity_radius`` ≥ the move
@@ -374,7 +374,15 @@ def test_steer_dosimetry_against_analytic_kl(
     order = np.argsort(coords[:, 0])
     t_from = coords[order[0]]
     t_to = coords[order[1]]
-    plan = steer(atom_k, t_from=t_from, t_to=t_to)
+    metric_row = int(order[0])
+    amplitude = float(fit_with_shard.assignments[metric_row, atom_k])
+    plan = steer(
+        atom_k,
+        metric_row=metric_row,
+        amplitude=amplitude,
+        t_from=t_from,
+        t_to=t_to,
+    )
     # Geometry self-checks: the move stays on the learned surface, the dose is
     # measured through OutputFisher, and the linearization is trusted past the
     # move length.
@@ -409,13 +417,13 @@ def test_steer_dosimetry_against_analytic_kl(
         np.asarray(plan["delta"], dtype=float), x_to - x_from, rtol=0.0, atol=1e-8
     )
     kl = _analytic_softmax_kl(W, x_from, x_to)
-    # Second-order agreement for the small step. The path-integrated output-Fisher
+    # Second-order agreement for the small step. The endpoint output-Fisher
     # dose is the quadratic (Fisher) model of the KL; for a genuinely small move it
     # matches the exact KL to a loose relative tolerance. Two gaps keep this from
     # being exact: (i) the softmax KL has third-order curvature beyond the Fisher
     # quadratic, and (ii) the dose reads the harvested per-row Fisher at the atom's
-    # most-active row (`measured_row`), whose base activation differs slightly from
-    # the decoded `x_from`; both are O(move) on this well-recovered circle.
+    # explicitly selected source row (`metric_row`), whose base activation differs
+    # slightly from the decoded `x_from`; both are O(move) on this well-recovered circle.
     assert plan["predicted_nats"] == pytest.approx(kl, rel=0.3, abs=1e-9)
 
 

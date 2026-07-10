@@ -68,8 +68,8 @@ def test_steer_bitwise_equivalence_circle_with_fisher() -> None:
 
     t_from = np.array([0.0], dtype=np.float64)
     t_to = np.array([0.75], dtype=np.float64)
-    plan_dc = fit.steer(0, t_from, t_to)
-    plan_core = core.steer(0, t_from, t_to)
+    plan_dc = fit.steer(0, 0, 1.0, t_from, t_to)
+    plan_core = core.steer(0, 0, 1.0, t_from, t_to)
     # The dose must actually be present (this is the fisher path, not geometry).
     assert plan_dc["predicted_nats"] is not None
     _assert_plans_bitwise_equal(plan_dc, plan_core)
@@ -198,6 +198,6 @@ def test_steer_bitwise_equivalence_euclidean_duchon_centers() -> None:
 
     t_from = np.array([0.0, 0.0], dtype=np.float64)
     t_to = np.array([0.5, -0.25], dtype=np.float64)
-    plan_dc = fit.steer(0, t_from, t_to)
-    plan_core = core.steer(0, t_from, t_to)
+    plan_dc = fit.steer(0, 0, 1.0, t_from, t_to)
+    plan_core = core.steer(0, 0, 1.0, t_from, t_to)
     _assert_plans_bitwise_equal(plan_dc, plan_core)

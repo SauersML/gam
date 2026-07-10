@@ -169,7 +169,7 @@ fn run(
     for row in 0..n {
         let from = raw_t[row];
         let to = (from + step).rem_euclid(1.0);
-        let plan = steer_delta(&term, &metric, 0, &[from], &[to])?;
+        let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[from], &[to])?;
         steer_off_norm_sum += plan.off_manifold_norm;
         for col in 0..p_x {
             deltas[[row, col]] = plan.delta[col];

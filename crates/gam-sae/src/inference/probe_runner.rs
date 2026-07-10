@@ -276,23 +276,31 @@ impl<'a> ProbeRunner<'a> {
     /// atom's fitted representative (most-active-row) coordinate. Each move is
     /// realized through [`steer_delta`] so the planner sees its true dose.
     fn candidate_steers(&self, atom_k: usize) -> Result<Vec<SteerPlan>, String> {
-        let t0 = self.representative_coordinate(atom_k);
+        let (metric_row, amplitude, t0) = self.representative_anchor(atom_k)?;
         let d = t0.len();
         let mut out = Vec::with_capacity(2 * d);
         for axis in 0..d {
             for &sign in &[1.0_f64, -1.0_f64] {
                 let mut t_to = t0.clone();
                 t_to[axis] += sign * PROBE_LATENT_STEP;
-                out.push(steer_delta(self.term, self.metric, atom_k, &t0, &t_to)?);
+                out.push(steer_delta(
+                    self.term,
+                    self.metric,
+                    atom_k,
+                    metric_row,
+                    amplitude,
+                    &t0,
+                    &t_to,
+                )?);
             }
         }
         Ok(out)
     }
 
     /// Atom `atom_k`'s fitted latent coordinate at its most-active row — the
-    /// representative operating point a probe perturbs away from. Falls back to
-    /// the origin when the atom is active on no row.
-    fn representative_coordinate(&self, atom_k: usize) -> Vec<f64> {
+    /// representative operating point a probe perturbs away from, together with
+    /// that exact row and its applied assignment amplitude.
+    fn representative_anchor(&self, atom_k: usize) -> Result<(usize, f64, Vec<f64>), String> {
         let assignments = self.term.assignment.assignments();
         let n = self.term.n_obs();
         let mut best_row = 0usize;
@@ -304,7 +312,16 @@ impl<'a> ProbeRunner<'a> {
                 best_row = row;
             }
         }
-        self.term.assignment.coords[atom_k].row(best_row).to_vec()
+        if !(best_mass.is_finite() && best_mass > 0.0) {
+            return Err(format!(
+                "probe_runner: atom {atom_k} has no positive fitted assignment amplitude"
+            ));
+        }
+        Ok((
+            best_row,
+            best_mass,
+            self.term.assignment.coords[atom_k].row(best_row).to_vec(),
+        ))
     }
 }
 

@@ -7647,11 +7647,13 @@ impl ManifoldSaeCore {
     /// (acceptance bullet 2) and the returned plan is bitwise-identical to the
     /// dataclass path. Mirrors the Python steer's exact `n_harmonics` gate
     /// (`periodic`/`torus` only) so the rebuilt basis matches the trained design.
-    #[pyo3(signature = (atom_k, t_from, t_to))]
+    #[pyo3(signature = (atom_k, metric_row, amplitude, t_from, t_to))]
     fn steer<'py>(
         &self,
         py: Python<'py>,
         atom_k: usize,
+        metric_row: usize,
+        amplitude: f64,
         t_from: PyReadonlyArray1<'py, f64>,
         t_to: PyReadonlyArray1<'py, f64>,
     ) -> PyResult<Py<PyDict>> {
@@ -7704,6 +7706,8 @@ impl ManifoldSaeCore {
         let fisher_view = fisher_owned.as_ref().map(|a| a.view());
         let plan = steer_delta_from_arrays(
             atom_k,
+            metric_row,
+            amplitude,
             t_from.as_array(),
             t_to.as_array(),
             n_obs,

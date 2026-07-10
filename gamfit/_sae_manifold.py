@@ -1454,7 +1454,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
                      ibp_alpha: float | None = None,
-                     structured_residual_passes: int = 2,
                      promote_from_residual: bool = True,
                      score_mode: str = "auto",
                      _run_structure_search: bool = True,
@@ -1575,20 +1574,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         masking every atom past the first few (which underfit an equal-K linear
         dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
         overrides it.
-    structured_residual_passes
-        Number of structured-residual whitening passes run after the primary
-        joint fit. Defaults to ``2`` (#2021 — ON by default; "magic by default":
-        the superposition-aware whitened metric is the best-known behavior, not
-        an opt-in). Each pass fits the current reconstruction residual's
-        structured covariance and installs the Σ-damped per-row metric under the
-        annealed schedule ``γ_p = (p+1)/(N+1)``, so with the default ``N = 2``
-        the final pass installs a majority-structured metric (``γ = 2/3``); ``2``
-        is also the ``PROMOTION_NURSERY_MIN_PASSES`` dwell, so the default budget
-        is coherent with the (default-on) residual-atom promotion. Pass ``0`` to
-        force the legacy iid fit (bit-identical to the pre-#2021 behavior). Must
-        be a non-negative int; the native core clamps the effective count to
-        ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``), so larger values
-        behave like ``4``.
     promote_from_residual
         When ``True`` (the default, #2239 magic-by-default), factor directions
         discovered in the structured residual passes that clear the full
@@ -1755,17 +1740,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     ):
         raise ValueError(
             f"ibp_alpha must be finite and > 0 or None; got {ibp_alpha}"
-        )
-    # Structured-residual sculpting is an explicit, typed opt-in. The count must
-    # be a non-negative int (it is clamped natively to
-    # `STRUCTURED_RESIDUAL_PASSES_MAX`); `promote_from_residual` is coerced to a
-    # plain bool for the pyfunction kwarg.
-    structured_residual_passes = int(structured_residual_passes)
-    if structured_residual_passes < 0:
-        raise ValueError(
-            "structured_residual_passes must be a non-negative int (it is "
-            "clamped natively to STRUCTURED_RESIDUAL_PASSES_MAX); "
-            f"got {structured_residual_passes}"
         )
     promote_from_residual = bool(promote_from_residual)
     if scad_mcp_gamma is None:
@@ -2187,7 +2161,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             None if separation_barrier_strength is None else float(separation_barrier_strength)
         ),
         ibp_alpha_override=None if ibp_alpha is None else float(ibp_alpha),
-        structured_residual_passes=int(structured_residual_passes),
         promote_from_residual=bool(promote_from_residual),
         run_structure_search=bool(_run_structure_search),
         run_outer_rho_search=bool(_run_outer_rho_search),
@@ -2307,7 +2280,6 @@ class StagewiseSAE:
     cone_atom_recovery_used: bool = False
     #: #5/(B) — echoed rank-charge opt-in (the value the fit ran with), so red-tree's
     #: A/B harness can verify the flag engaged; default false keeps older payloads valid.
-    rank_charge_evidence_used: bool = False
 
     @property
     def k(self) -> int:
@@ -2538,7 +2510,6 @@ def sae_manifold_fit_stagewise(
     structured_whitening: bool | None = None,
     fisher_factors: Any = None,
     cone_atom_recovery: bool = False,
-    rank_charge_evidence: bool = False,
     min_effect_ev: float = 0.0,
     max_births: int = 24,
     max_backfit_sweeps: int = 4,
@@ -2799,7 +2770,6 @@ def sae_manifold_fit_stagewise(
         max_factor_rank=int(max_factor_rank),
         structured_whitening=bool(structured_whitening_eff),
         cone_atom_recovery=bool(cone_atom_recovery),
-        rank_charge_evidence=bool(rank_charge_evidence),
         row_loss_weights=weights_arr,
         progress_callback=progress_callback,
         fisher_factors=(
@@ -2892,7 +2862,6 @@ def _stagewise_from_payload(
         # harness can verify the flag engaged; older payloads without the key default
         # to False.
         cone_atom_recovery_used=bool(payload.get("cone_atom_recovery_used", False)),
-        rank_charge_evidence_used=bool(payload.get("rank_charge_evidence_used", False)),
     )
 
 

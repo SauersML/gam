@@ -23,11 +23,10 @@
 //! ⇒ KL_analytic(Δ) = R² (1 − cos(2π Δ))            ← the closed-form oracle
 //! ```
 //!
-//! The dosimetry path-energy `½ ∫₀¹ ‖dg/dτ‖²_F dτ` equals this chord quad-form
-//! to first order (a straight output move), so for a SMALL latent step the
-//! reported `predicted_nats` must match `KL_analytic` tightly. For a LARGE step
-//! the circle has curved away from its chord and the two diverge predictably —
-//! and the reported `validity_radius` must flag exactly that crossover.
+//! The canonical dosimetry is the endpoint quadratic form itself, so the
+//! reported `predicted_nats` must match `KL_analytic` for both small and large
+//! moves. The separate `validity_radius` still flags where the local
+//! initial-tangent approximation stops matching that exact chord dose.
 //!
 //! Off-manifold component: `δ` is a chord of the decoder circle, so it lies in
 //! the local tangent line at `t_from` up to curvature; the reported
@@ -122,7 +121,7 @@ fn predicted_nats_match_analytic_kl_within_validity_radius() {
     // A SMALL latent step: the chord and the arc agree, so the path-energy dose
     // must match the closed-form KL tightly.
     let delta = 0.01_f64;
-    let plan = steer_delta(&term, &metric, 0, &[t0], &[t0 + delta]).expect("plan");
+    let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
 
     assert_eq!(plan.atom, 0);
     assert_eq!(plan.atom_name, "circle");
@@ -169,33 +168,26 @@ fn predicted_nats_match_analytic_kl_within_validity_radius() {
 }
 
 #[test]
-fn predicted_nats_degrade_beyond_validity_radius() {
+fn predicted_nats_remain_endpoint_kl_beyond_validity_radius() {
     let t0 = 0.0;
     let (term, metric) = planted_circle(t0);
 
     // A LARGE latent step (a quarter turn): the arc has curved far from the
-    // chord, so the path-energy dose OVER-counts relative to the chord KL, and
-    // the validity radius must fall strictly inside the requested move.
+    // initial tangent, but the canonical prediction still prices the exact
+    // applied endpoint chord. The validity radius must fall strictly inside the
+    // requested move.
     let delta = 0.25_f64; // quarter circle
-    let plan = steer_delta(&term, &metric, 0, &[t0], &[t0 + delta]).expect("plan");
+    let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
 
     let nats = plan.predicted_nats.expect("dose");
     let kl = analytic_kl(delta); // R²(1 − cos(π/2)) = R²
     println!("large step: predicted_nats={nats:.6} analytic_kl={kl:.6}");
 
-    // Path-energy of a quarter circle = ½ R² (2π·Δ)² ... = 2 π² R² Δ²; with
-    // Δ = 0.25 this is ½ R² (π/2)² = R² π²/8 ≈ 1.2337 R². The chord KL is R².
-    // The dose must be meaningfully larger than the chord KL (the surface curved
-    // away) — a predictable, NON-matching degradation.
-    let expected_path = 0.5 * R * R * (TWO_PI * delta).powi(2);
-    println!("expected_path_energy={expected_path:.6}");
+    // The prediction is exactly the endpoint Fisher quadratic form, hence it
+    // agrees with the patched-forward quadratic oracle at any chord length.
     assert!(
-        (nats - expected_path).abs() / expected_path < 1e-3,
-        "path-energy dose {nats:.6} must match the closed-form arc energy {expected_path:.6}"
-    );
-    assert!(
-        nats > kl * 1.1,
-        "beyond validity radius the path dose {nats:.6} must over-count vs chord KL {kl:.6}"
+        (nats - kl).abs() / kl < 1e-12,
+        "endpoint dose {nats:.6} must match the closed-form chord KL {kl:.6}"
     );
 
     // The validity radius must flag the breakdown: strictly inside the full move.
@@ -219,7 +211,7 @@ fn euclidean_metric_yields_geometry_but_no_dose() {
     let euclid = RowMetric::euclidean(term.n_obs(), p).expect("euclidean");
 
     let delta = 0.05;
-    let plan = steer_delta(&term, &euclid, 0, &[t0], &[t0 + delta]).expect("plan");
+    let plan = steer_delta(&term, &euclid, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
 
     assert_eq!(plan.metric_provenance, MetricProvenance::Euclidean);
     assert!(
@@ -251,7 +243,7 @@ fn delta_is_the_activation_space_chord() {
     let t0 = 0.0;
     let (term, metric) = planted_circle(t0);
     let delta = 0.05;
-    let plan = steer_delta(&term, &metric, 0, &[t0], &[t0 + delta]).expect("plan");
+    let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
 
     // g(t) = R·[cos(2πt), sin(2πt)]; chord at amplitude 1.
     let g_from = [R * (TWO_PI * t0).cos(), R * (TWO_PI * t0).sin()];

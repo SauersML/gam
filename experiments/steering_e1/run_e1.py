@@ -267,7 +267,8 @@ def select_flat_direction(flat_fit, X, day_indices):
 
 
 # --------------------------------------------------------------------------- #
-def steer_records(model, tokenizer, layer, atom, base_examples, base_coords,
+def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_coords,
+                  base_amplitudes,
                   candidate_ids, flat_dir, ks):
     """Run manifold + flat steering across base examples × rotation counts k.
 
@@ -275,7 +276,9 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_coords,
     ``base_examples[i]`` on the weekday atom.
     """
     records: list[dict[str, Any]] = []
-    for base, t0_in in zip(base_examples, base_coords):
+    for base, metric_row, t0_in, amplitude in zip(
+        base_examples, base_rows, base_coords, base_amplitudes
+    ):
         b = base.day_index
         base_probs = restricted_probs(base.logits, candidate_ids)
         t0 = np.atleast_1d(np.asarray(t0_in, dtype=np.float64)).reshape(-1)
@@ -283,7 +286,7 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_coords,
             dcoord = k * TAU / 7.0
             t_to = t0.copy()
             t_to[0] = t0[0] + dcoord  # circle retract wraps mod period Rust-side
-            plan = model.steer(int(atom), t0, t_to)
+            plan = model.steer(int(atom), int(metric_row), float(amplitude), t0, t_to)
             delta = np.asarray(plan["delta"], dtype=np.float64)
             import torch
 
@@ -459,11 +462,14 @@ def main() -> int:
     # rows are the last len(base_examples) rows of X (all_examples order).
     base_row0 = len(fit_examples)
     coord_atom = np.asarray(model.coords[atom], dtype=float)
-    base_coords = [coord_atom[base_row0 + i] for i in range(len(base_examples))]
+    base_rows = [base_row0 + i for i in range(len(base_examples))]
+    base_coords = [coord_atom[row] for row in base_rows]
+    base_amplitudes = [float(model.assignments[row, atom]) for row in base_rows]
 
     ks = list(range(1, args.max_k + 1))
     log(f"steering {len(base_examples)} base contexts × k∈{ks} (manifold + flat)")
-    records = steer_records(model, tok, layer, atom, base_examples, base_coords,
+    records = steer_records(model, tok, layer, atom, base_examples, base_rows, base_coords,
+                            base_amplitudes,
                             candidate_ids, flat_dir, ks)
     summary = summarize(records, ks)
 
