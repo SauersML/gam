@@ -52,7 +52,7 @@ pub(crate) fn materialize_location_scale<'a>(
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
     let policy =
-        resolved_resource_policy(config, data, gam_runtime::resource::ProblemHints::default());
+        resolved_resource_policy(config, gam_runtime::resource::ProblemHints::default());
     let meanspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,

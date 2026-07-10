@@ -126,7 +126,6 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     // flip the hint regardless of n to keep dense fallbacks blocked.
     let policy = resolved_resource_policy(
         config,
-        data,
         gam_runtime::resource::ProblemHints {
             marginal_slope_large_scale_active: true,
         },

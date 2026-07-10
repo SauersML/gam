@@ -558,9 +558,11 @@ fn fit_stratum(
         "flat_ev_residual": flat.convergence.ev_residual,
         "curved_ev_residual": curved.convergence.ev_residual,
         "selected_blocks": composed.selected_blocks,
-        "accepted_blocks": composed.accepted_blocks,
+        // The honest discovery list is the FDR-controlled e-BH selection
+        // (#2246); the BIC gate stays available as selected_chart_blocks.
+        "accepted_blocks": composed.fdr_selected_chart_blocks,
         "n_chart_records": records.len(),
-        "n_accepted_charts": composed.accepted_blocks.len(),
+        "n_accepted_charts": composed.fdr_selected_chart_blocks.len(),
         "chart_records": records
     }))
 }

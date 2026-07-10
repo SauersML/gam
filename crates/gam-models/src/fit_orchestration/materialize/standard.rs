@@ -76,7 +76,6 @@ pub(crate) fn materialize_standard<'a>(
 
     let policy = resolved_resource_policy(
         config,
-        term_data,
         gam_runtime::resource::ProblemHints::default(),
     );
     let mut spec = build_termspec_with_geometry_and_overrides(

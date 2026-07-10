@@ -2032,7 +2032,7 @@ fn build_formula_design_for_multinomial(
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")
         .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;
     let y_kind = crate::fit_orchestration::response_column_kind(data, y_col);
-    let policy = resolved_resource_policy(config, data, ProblemHints::default());
+    let policy = resolved_resource_policy(config, ProblemHints::default());
     let mut inference_notes: Vec<String> = Vec::new();
     let spec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,

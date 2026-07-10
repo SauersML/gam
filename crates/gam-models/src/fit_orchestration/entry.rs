@@ -145,7 +145,6 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
 /// `ProblemHints` remains the structural signal for operator-only estimators.
 pub(crate) fn resolved_resource_policy(
     config: &FitConfig,
-    data: &Dataset,
     hints: gam_runtime::resource::ProblemHints,
 ) -> gam_runtime::resource::ResourcePolicy {
     if let Some(p) = config.resource_policy.clone() {

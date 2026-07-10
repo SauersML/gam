@@ -361,7 +361,6 @@ pub(crate) fn materialize_survival<'a>(
 
     let policy = resolved_resource_policy(
         config,
-        data,
         gam_runtime::resource::ProblemHints {
             // Survival marginal-slope shares the operator-only invariant with
             // the Bernoulli path; flag it as such so strict mode is selected
