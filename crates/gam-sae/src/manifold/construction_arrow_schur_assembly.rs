@@ -1573,10 +1573,24 @@ impl SaeManifoldTerm {
                                 } else {
                                     None
                                 };
+                                let jac_rows: ArrayView2<'_, f64> = match &ljr_white {
+                                    Some(w_jac) => w_jac.view(),
+                                    None => local_jac_row.view(),
+                                };
                                 for &atom_idx in row_active {
                                     let atom = &self.atoms[atom_idx];
                                     let m = atom.basis_size();
                                     let a_k = assignments[atom_idx];
+                                    // The frame projection of the Jacobian rows is
+                                    // basis-column independent: hoist it to ONE
+                                    // `q×p · p×r` GEMM per (row, atom) and reduce the
+                                    // basis scan to rank-length axpys, instead of
+                                    // re-deriving it through m·q·p scalar
+                                    // `accumulate_output_project` calls (a top-two
+                                    // profile cost of the joint fit).
+                                    let projected =
+                                        frame_projection.project_jacobian_rows(atom_idx, jac_rows);
+                                    let rank = frame_projection.ranks[atom_idx];
                                     for basis_col in 0..m {
                                         let phi = atom.basis_values[[row, basis_col]];
                                         let w = a_k * phi * sqrt_row_w;
@@ -1584,21 +1598,32 @@ impl SaeManifoldTerm {
                                             continue;
                                         }
                                         let c_base = frame_projection.border_offsets[atom_idx]
-                                            + basis_col * frame_projection.ranks[atom_idx];
+                                            + basis_col * rank;
                                         for c in 0..q_row {
                                             let mut hrow = block.htbeta.row_mut(c);
                                             let hrow_slice = hrow
                                                 .as_slice_mut()
                                                 .expect("htbeta row is contiguous");
-                                            for out_col in 0..p {
-                                                let ljr = match &ljr_white {
-                                                    Some(w_jac) => w_jac[[c, out_col]],
-                                                    None => local_jac_row[[c, out_col]],
-                                                };
-                                                let value = ljr * w;
-                                                frame_projection.accumulate_output_project(
-                                                    atom_idx, c_base, out_col, value, hrow_slice,
-                                                );
+                                            match &projected {
+                                                Some(proj) => {
+                                                    let dst =
+                                                        &mut hrow_slice[c_base..c_base + rank];
+                                                    for (slot, &value) in
+                                                        dst.iter_mut().zip(proj.row(c).iter())
+                                                    {
+                                                        *slot += w * value;
+                                                    }
+                                                }
+                                                // Unframed atom: identity frame, the
+                                                // border block IS the raw output row.
+                                                None => {
+                                                    let dst = &mut hrow_slice[c_base..c_base + p];
+                                                    for (slot, &value) in
+                                                        dst.iter_mut().zip(jac_rows.row(c).iter())
+                                                    {
+                                                        *slot += w * value;
+                                                    }
+                                                }
                                             }
                                         }
                                     }

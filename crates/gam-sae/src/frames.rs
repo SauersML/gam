@@ -288,6 +288,20 @@ impl FrameProjection {
         }
     }
 
+    /// Project a `(q × p)` block of t-row Jacobian rows through atom `atom`'s
+    /// frame in ONE GEMM (`J·U_k`, `q × rank`), or `None` for an unframed atom
+    /// (identity frame — callers use the raw rows directly). The projection is
+    /// basis-column independent, so hot assembly loops hoist this out of their
+    /// per-basis-column scans instead of re-deriving it one scalar
+    /// [`Self::accumulate_output_project`] call at a time.
+    pub(crate) fn project_jacobian_rows(
+        &self,
+        atom: usize,
+        jac: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        self.frames[atom].as_ref().map(|uk| fast_ab(&jac, uk))
+    }
+
     pub(crate) fn output_variance(
         &self,
         atom: usize,
