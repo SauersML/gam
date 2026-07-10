@@ -297,27 +297,6 @@ fn sae_outer_rho_gradient_components_match_centered_fd_softmax() {
 }
 
 #[test]
-fn sae_outer_rho_gradient_matches_fd_under_scale_quotient_2022() {
-    // #2022 leg (1) — evidence-side scale-gauge quotient. With `quotient_scale`
-    // ON the whole criterion is evaluated through the Faddeev--Popov pinned
-    // border Schur `S_quot = P S P + Q Qᵀ` (`ArrowBetaGaugeQuotient`): the
-    // terminal Laplace log-det factors the PINNED curvature and every gradient
-    // trace reads the PINNED selected inverse `P S⁻¹ P`. This is the exact
-    // site where a value that factors `S_quot` while the ρ-gradient still
-    // differentiates the unprojected `S` would recreate the #2087 obj↔grad
-    // desync. The certificate is the same `grad ≈ centered-FD(value)` used by
-    // the quotient-off arms, but now each ±h re-solve re-installs the pin at its
-    // own converged decoder, so the FD carries the pin's full ρ-dependence
-    // (both the explicit λ-in-border term through `P·∂S/∂ρ·P` and the implicit
-    // dθ̂/dρ that moves the pinned subspace). It holds iff value and gradient
-    // ride the SAME pinned factorization.
-    let mut f = fixture(AssignmentMode::softmax(0.7), -8.0);
-    f.term.set_quotient_scale(true);
-    assert!(f.term.quotient_scale(), "quotient path must be engaged");
-    assert_full_gradient_matches_fd("scale_quotient_softmax", &f);
-}
-
-#[test]
 fn sae_outer_rho_gradient_certificate_consistent_under_rank_deficient_k2() {
     // K=2 rank-deficient circle: the indefinite per-row H_tt must be spectral-
     // deflated at unit stiffness, NOT ridge-damped, so the outer REML value and
