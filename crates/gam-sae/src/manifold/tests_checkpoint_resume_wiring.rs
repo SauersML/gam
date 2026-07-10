@@ -7,7 +7,7 @@
 //! the objective-level plumbing those left uncovered.
 
 use super::*;
-use gam_solve::rho_optimizer::OuterObjective;
+use gam_solve::rho_optimizer::{HessianSource, OuterObjective, OuterPlan, OuterResult, Solver};
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -139,4 +139,114 @@ fn checkpoint_never_resumes_across_different_data() {
          problem's checkpoint"
     );
     a.remove_checkpoint();
+}
+
+/// Primary and structured residual phases solve different objectives even on
+/// the same target/K. Their checkpoints must be independently addressed, and a
+/// structured phase must resume only the matching pass schedule.
+#[test]
+fn checkpoint_paths_are_phase_scoped_and_structured_phase_resumes() {
+    let salt = std::process::id() as u64 ^ 0x57A6_E001;
+    let (mut primary, flat) = tiny_objective(salt);
+    scope_outer_checkpoint_to_stage(&mut primary, SaeFitStage::Primary);
+    primary.remove_checkpoint();
+    primary.bank_checkpoint(&flat);
+    let primary_path = primary.checkpoint_path.clone();
+    assert!(primary_path.exists());
+
+    let structured_stage = SaeFitStage::StructuredResidual {
+        pass: 1,
+        total_passes: 2,
+    };
+    let (mut structured, _) = tiny_objective(salt);
+    scope_outer_checkpoint_to_stage(&mut structured, structured_stage);
+    structured.remove_checkpoint();
+    structured.bank_checkpoint(&flat);
+    let structured_path = structured.checkpoint_path.clone();
+    assert!(structured_path.exists());
+    assert_ne!(primary_path, structured_path);
+
+    let (mut different_schedule, _) = tiny_objective(salt);
+    scope_outer_checkpoint_to_stage(
+        &mut different_schedule,
+        SaeFitStage::StructuredResidual {
+            pass: 1,
+            total_passes: 4,
+        },
+    );
+    assert_ne!(structured_path, different_schedule.checkpoint_path);
+
+    primary.remove_checkpoint();
+    assert!(!primary_path.exists());
+    assert!(
+        structured_path.exists(),
+        "removing the primary phase must preserve structured work"
+    );
+
+    let (mut resumed, _) = tiny_objective(salt);
+    scope_outer_checkpoint_to_stage(&mut resumed, structured_stage);
+    assert!(
+        resumed.try_resume_from_checkpoint(flat.len()).is_some(),
+        "a fresh matching structured phase must resume its own checkpoint"
+    );
+    resumed.remove_checkpoint();
+}
+
+/// The fit driver can only regain ownership of an outer objective after a
+/// converged verdict. Nonconvergence retains all `OuterResult` evidence and
+/// dropping the rejected objective leaves its wall-survival checkpoint intact.
+#[test]
+fn convergence_ownership_gate_preserves_typed_evidence_and_checkpoint() {
+    let salt = std::process::id() as u64 ^ 0xCE47_1F1E;
+    let stage = SaeFitStage::StructuredResidual {
+        pass: 2,
+        total_passes: 3,
+    };
+    let plan = OuterPlan {
+        solver: Solver::Efs,
+        hessian_source: HessianSource::EfsFixedPoint,
+    };
+    let (mut objective, flat) = tiny_objective(salt);
+    scope_outer_checkpoint_to_stage(&mut objective, stage);
+    objective.remove_checkpoint();
+    objective.bank_checkpoint(&flat);
+    let checkpoint_path = objective.checkpoint_path.clone();
+
+    let mut result = OuterResult::new(flat.clone(), 12.5, 7, false, plan);
+    result.final_grad_norm = Some(0.25);
+    let error = match certify_outer_stage(objective, stage, Ok(result)) {
+        Ok(_) => panic!("a non-converged result must not return a fit-producing objective"),
+        Err(error) => error,
+    };
+    match error {
+        SaeFitError::OuterDidNotConverge {
+            stage: error_stage,
+            result,
+        } => {
+            assert_eq!(error_stage, stage);
+            assert_eq!(result.rho, flat);
+            assert_eq!(result.final_value, 12.5);
+            assert_eq!(result.iterations, 7);
+            assert_eq!(result.final_grad_norm, Some(0.25));
+            assert_eq!(result.plan_used, plan);
+        }
+        other => panic!("expected typed nonconvergence evidence, got {other}"),
+    }
+    assert!(
+        checkpoint_path.exists(),
+        "rejecting a non-converged objective must preserve its checkpoint"
+    );
+
+    let (mut cleanup, _) = tiny_objective(salt);
+    scope_outer_checkpoint_to_stage(&mut cleanup, stage);
+    cleanup.remove_checkpoint();
+
+    let (mut converged_objective, converged_flat) = tiny_objective(salt ^ 0xC0A);
+    scope_outer_checkpoint_to_stage(&mut converged_objective, stage);
+    let converged = OuterResult::new(converged_flat, 8.0, 3, true, plan);
+    let certified = certify_outer_stage(converged_objective, stage, Ok(converged));
+    assert!(
+        certified.is_ok(),
+        "a converged result returns the objective"
+    );
 }

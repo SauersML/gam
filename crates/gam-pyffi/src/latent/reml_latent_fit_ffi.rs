@@ -21,6 +21,7 @@
     sigma_eff_mode = "profiled".to_string(),
     max_iter = 200,
     grad_tol = 1.0e-8,
+    stationarity_reference = None,
     trust_radius = 1.0,
     max_radius = 1.0e6,
     n_restarts = 1,
@@ -53,6 +54,7 @@ fn gaussian_reml_optimize_latent<'py>(
     sigma_eff_mode: String,
     max_iter: usize,
     grad_tol: f64,
+    stationarity_reference: Option<f64>,
     trust_radius: f64,
     max_radius: f64,
     n_restarts: usize,
@@ -76,6 +78,33 @@ fn gaussian_reml_optimize_latent<'py>(
     let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
     if n_restarts == 0 {
         return Err(py_value_error("n_restarts must be at least 1".to_string()));
+    }
+    if !(grad_tol.is_finite() && grad_tol > 0.0) {
+        return Err(py_value_error(format!(
+            "grad_tol must be finite and positive; got {grad_tol}"
+        )));
+    }
+    if let Some(reference) = stationarity_reference {
+        if !(reference.is_finite() && reference >= 0.0) {
+            return Err(py_value_error(format!(
+                "stationarity_reference must be finite and non-negative; got {reference}"
+            )));
+        }
+    }
+    if !(trust_radius.is_finite() && trust_radius > 0.0) {
+        return Err(py_value_error(format!(
+            "trust_radius must be finite and positive; got {trust_radius}"
+        )));
+    }
+    if !(max_radius.is_finite() && max_radius >= trust_radius) {
+        return Err(py_value_error(format!(
+            "max_radius must be finite and at least trust_radius ({trust_radius}); got {max_radius}"
+        )));
+    }
+    if !(restart_scale.is_finite() && restart_scale > 0.0) {
+        return Err(py_value_error(format!(
+            "restart_scale must be finite and positive; got {restart_scale}"
+        )));
     }
     let expected = n_obs
         .checked_mul(latent_dim)
@@ -162,13 +191,13 @@ fn gaussian_reml_optimize_latent<'py>(
     // Restart 0 starts from `base_start` (the spectral seed, or the caller's `t`
     // when `init="caller"`); further restarts perturb it in the tangent space and
     // retract back onto the manifold, then we keep the lowest-score latent.
-    let (best_t, best_value) = py
-        .detach(|| -> Result<(Array1<f64>, f64), String> {
+    let (best_t, best_value, best_start_grad_norm, best_restart) = py
+        .detach(|| -> Result<(Array1<f64>, f64, f64, usize), String> {
             let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
-            let normal = rand_distr::Normal::new(0.0, restart_scale.abs().max(f64::MIN_POSITIVE))
-                .map_err(|err| err.to_string())?;
+            let normal =
+                rand_distr::Normal::new(0.0, restart_scale).map_err(|err| err.to_string())?;
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            let mut best: Option<(Array1<f64>, f64)> = None;
+            let mut best: Option<(Array1<f64>, f64, f64, usize)> = None;
             for restart in 0..n_restarts {
                 let start = if restart == 0 {
                     base_start.clone()
@@ -182,14 +211,35 @@ fn gaussian_reml_optimize_latent<'py>(
                         .retract(base_start.view(), tangent.view())
                         .map_err(|err| err.to_string())?
                 };
+                // Every manifold accepted by `build_latent_outer_manifold`
+                // carries the induced ambient metric. Its Riemannian gradient
+                // is therefore the tangent projection and its norm is the
+                // Euclidean norm in ambient coordinates. Record the scale at
+                // THIS restart's initial point: the winning restart must be
+                // certified against the same reference its optimizer used.
+                let (_, start_gradient) = problem.value_and_grad(start.view(), true);
+                let start_gradient = start_gradient.ok_or_else(|| {
+                    format!("restart {restart} did not produce an initial latent gradient")
+                })?;
+                let start_projected = manifold_ref
+                    .riemannian_gradient(start.view(), start_gradient.view())
+                    .map_err(|err| err.to_string())?;
+                let start_grad_norm = start_projected
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt();
                 let mut objective = LatentOuterObjective { problem: &problem };
                 let optimized = trust_region
                     .minimize(manifold_ref, &mut objective, start.view())
                     .map_err(|err| err.to_string())?;
                 let (value, _) = problem.value_and_grad(optimized.view(), false);
-                let improved = best.as_ref().map(|(_, b)| value < *b).unwrap_or(true);
+                let improved = best
+                    .as_ref()
+                    .map(|(_, incumbent, _, _)| value < *incumbent)
+                    .unwrap_or(true);
                 if improved {
-                    best = Some((optimized, value));
+                    best = Some((optimized, value, start_grad_norm, restart));
                 }
             }
             best.ok_or_else(|| "no restart produced a latent".to_string())
@@ -206,37 +256,20 @@ fn gaussian_reml_optimize_latent<'py>(
     // identity, so this leaves that path byte-identical.
     let (_, final_grad) = problem.value_and_grad(best_t.view(), true);
     let grad_t_norm = match final_grad.as_ref() {
-        Some(g) => {
-            let projected = manifold_box
+        Some(gradient) => {
+            let riemannian = manifold_box
                 .as_ref()
-                .project_tangent(best_t.view(), g.view())
-                .unwrap_or_else(|_| g.clone());
-            projected.iter().map(|v| v * v).sum::<f64>().sqrt()
+                .riemannian_gradient(best_t.view(), gradient.view())
+                .map_err(|err| py_value_error(err.to_string()))?;
+            riemannian.iter().map(|value| value * value).sum::<f64>().sqrt()
         }
         None => f64::INFINITY,
     };
-    // Gradient norm at the INITIAL iterate (`base_start`: the spectral seed, or
-    // the caller's `t` under `init="caller"`), measured in the SAME projected
-    // (Riemannian) metric as `grad_t_norm`. This is the scale anchor of the
-    // shift-invariant relative-stationarity test below — the FFI analogue of the
-    // optimizer's own `grad0_norm` (`relative_stationarity` in optimizer.rs),
-    // which records the gradient norm at the first iterate of each `minimize`.
-    // The restarts all perturb `base_start` in its tangent space, so its
-    // gradient norm is the representative initial scale for the chosen latent.
-    // A non-finite (degenerate) initial gradient maps to `0`, which the `max(·,
-    // 1)` floor below turns into the bare absolute test — matching the optimizer
-    // adapter, which sanitises a degenerate point to a zero gradient.
-    let (_, init_grad) = problem.value_and_grad(base_start.view(), true);
-    let grad0_norm = match init_grad.as_ref() {
-        Some(g) => {
-            let projected = manifold_box
-                .as_ref()
-                .project_tangent(base_start.view(), g.view())
-                .unwrap_or_else(|_| g.clone());
-            projected.iter().map(|v| v * v).sum::<f64>().sqrt()
-        }
-        None => 0.0,
-    };
+    // The winning restart carries its own initial-gradient scale. A resumed
+    // solve may supply the original scale explicitly so the convergence test
+    // remains the same test across process/wall boundaries instead of silently
+    // renormalizing at the checkpoint.
+    let grad0_norm = stationarity_reference.unwrap_or(best_start_grad_norm);
     // Latent spread: a genuine collapse (all rows retract to one latent
     // coordinate, the issue #876 failure mode) leaves `latent_t_std ≈ 0`, which
     // distinguishes it from a healthy fit whose latent gradient merely failed to
@@ -287,21 +320,17 @@ fn gaussian_reml_optimize_latent<'py>(
         // SPEC 20 — a fit object must only ever come from a converged
         // optimization. The chosen latent failed the shift-invariant relative
         // stationarity test, so no fit is rebuilt or returned: the caller gets
-        // a typed `RemlConvergenceError` carrying the full numerical evidence
-        // plus the best latent as a resume checkpoint (`checkpoint_t`, shape
-        // `(n_obs, latent_dim)`), which round-trips straight back through
-        // `t=..., init="caller"` for a warm-started continuation.
-        let t_matrix = best_t
-            .into_shape_with_order((n_obs, latent_dim))
-            .map_err(shape_error_to_pyerr)?;
+        // a typed `RemlConvergenceError` carrying the available numerical
+        // evidence plus the best latent as a one-dimensional resume checkpoint,
+        // exactly matching the public API's `t` input.
         let err = RemlConvergenceError::new_err(format!(
             "gaussian_reml_optimize_latent did not reach latent stationarity: relative \
              gradient {grad_t_norm_scaled:.6e} did not satisfy grad_tol {grad_tol:.6e} with a \
              budget of {max_iter} iteration(s) x {n_restarts} restart(s) (projected gradient {grad_t_norm:.6e}, \
              seed gradient {grad0_norm:.6e}, objective {best_value:.9e}, latent spread \
              {latent_t_std:.6e}). No fit is minted from a non-converged optimization; \
-             resume from the exception's `checkpoint_t` attribute via \
-             `t=err.checkpoint_t, init=\"caller\"` with a larger max_iter, or loosen \
+             resume from the exception's `checkpoint_t` and \
+             `checkpoint_stationarity_reference` attributes with `init=\"caller\"`, or loosen \
              grad_tol if this stationarity precision is not required."
         ));
         // Attach the structured evidence + checkpoint as instance attributes
@@ -318,8 +347,11 @@ fn gaussian_reml_optimize_latent<'py>(
             bound.setattr("objective_value", best_value)?;
             bound.setattr("max_iter", max_iter)?;
             bound.setattr("n_restarts", n_restarts)?;
+            bound.setattr("restart_index", best_restart)?;
             bound.setattr("init", init.as_str())?;
-            bound.setattr("checkpoint_t", t_matrix.into_pyarray(py))?;
+            bound.setattr("checkpoint_t", best_t.into_pyarray(py))?;
+            bound.setattr("checkpoint_shape", (n_obs, latent_dim))?;
+            bound.setattr("checkpoint_stationarity_reference", grad0_norm)?;
             Ok(())
         })();
         if let Err(attach_err) = attach_result {
@@ -3658,19 +3690,60 @@ fn ungate_design_gradient(
     }
 }
 
+fn owned_row_major_f64(values: ArrayView2<'_, f64>) -> Array2<f64> {
+    Array2::from_shape_fn(values.dim(), |index| values[index])
+}
+
+fn posterior_bands_payload_to_py(
+    py: Python<'_>,
+    payload: PosteriorPredictBandsPayload,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item(
+        "linear_predictor",
+        payload.linear_predictor.into_pyarray(py),
+    )?;
+    out.set_item(
+        "linear_predictor_lower",
+        payload.linear_predictor_lower.into_pyarray(py),
+    )?;
+    out.set_item(
+        "linear_predictor_upper",
+        payload.linear_predictor_upper.into_pyarray(py),
+    )?;
+    out.set_item("mean", payload.mean.into_pyarray(py))?;
+    out.set_item("mean_lower", payload.mean_lower.into_pyarray(py))?;
+    out.set_item("mean_upper", payload.mean_upper.into_pyarray(py))?;
+    out.set_item("model_class", payload.model_class)?;
+    out.set_item("family_kind", payload.family_kind)?;
+    Ok(out.unbind())
+}
+
+fn posterior_predict_result_to_py(
+    py: Python<'_>,
+    result: PosteriorPredictResult,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("eta", result.eta.into_pyarray(py))?;
+    out.set_item("model_class", result.model_class)?;
+    out.set_item("family_kind", result.family_kind)?;
+    out.set_item("link_spec", result.link_spec)?;
+    Ok(out.unbind())
+}
+
 #[pyfunction]
 fn posterior_predict_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
-) -> PyResult<String> {
-    detach_py_result(py, "posterior_predict_table", move || {
-        posterior_predict_table_impl(&model_bytes, headers, rows, samples_flat, n_draws, n_coeffs)
-    })
+    samples: PyReadonlyArray2<'_, f64>,
+) -> PyResult<Py<PyDict>> {
+    let samples = owned_row_major_f64(samples.as_array());
+    let result = detach_py_result(py, "posterior_predict_table", move || {
+        posterior_predict_table_impl(&model_bytes, headers, rows, samples)
+    })?;
+    posterior_predict_result_to_py(py, result)
 }
 
 #[pyfunction]
@@ -3679,58 +3752,49 @@ fn posterior_predict_bands_table(
     model_bytes: Vec<u8>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
+    samples: PyReadonlyArray2<'_, f64>,
     level: f64,
-) -> PyResult<String> {
-    detach_py_result(py, "posterior_predict_bands_table", move || {
+) -> PyResult<Py<PyDict>> {
+    let samples = owned_row_major_f64(samples.as_array());
+    let payload = detach_py_result(py, "posterior_predict_bands_table", move || {
         posterior_predict_bands_table_impl(
             &model_bytes,
             headers,
             rows,
-            samples_flat,
-            n_draws,
-            n_coeffs,
+            samples,
             level,
         )
-    })
+    })?;
+    posterior_bands_payload_to_py(py, payload)
 }
 
 #[pyfunction]
-#[pyo3(signature = (eta_flat, n_draws, n_rows, family_kind, level, link_spec=None))]
+#[pyo3(signature = (eta, family_kind, level, link_spec=None))]
 fn posterior_eta_bands(
     py: Python<'_>,
-    eta_flat: Vec<f64>,
-    n_draws: usize,
-    n_rows: usize,
+    eta: PyReadonlyArray2<'_, f64>,
     family_kind: String,
     level: f64,
     link_spec: Option<String>,
-) -> PyResult<String> {
-    detach_py_result(py, "posterior_eta_bands", move || {
-        posterior_eta_bands_impl(
-            eta_flat,
-            n_draws,
-            n_rows,
-            &family_kind,
-            level,
-            link_spec.as_deref(),
-        )
-    })
+) -> PyResult<Py<PyDict>> {
+    let eta = owned_row_major_f64(eta.as_array());
+    let payload = detach_py_result(py, "posterior_eta_bands", move || {
+        posterior_eta_bands_impl(eta, &family_kind, level, link_spec.as_deref())
+    })?;
+    posterior_bands_payload_to_py(py, payload)
 }
 
 #[pyfunction]
 fn posterior_credible_interval(
     py: Python<'_>,
-    samples_flat: Vec<f64>,
-    n_draws: usize,
-    n_coeffs: usize,
+    samples: PyReadonlyArray2<'_, f64>,
     level: f64,
-) -> PyResult<Vec<f64>> {
-    detach_py_result(py, "posterior_credible_interval", move || {
-        posterior_credible_interval_impl(samples_flat, n_draws, n_coeffs, level)
-    })
+) -> PyResult<Py<PyArray2<f64>>> {
+    let samples = owned_row_major_f64(samples.as_array());
+    let intervals = detach_py_result(py, "posterior_credible_interval", move || {
+        posterior_credible_interval_impl(samples, level)
+    })?;
+    Ok(intervals.into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -3739,9 +3803,23 @@ fn posterior_coefficient_names_json(request_json: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
-fn posterior_samples_summary_json(py: Python<'_>, request_json: String) -> PyResult<String> {
+fn posterior_samples_summary_json(
+    py: Python<'_>,
+    samples: PyReadonlyArray2<'_, f64>,
+    posterior_mean: PyReadonlyArray1<'_, f64>,
+    posterior_std: PyReadonlyArray1<'_, f64>,
+    request_json: String,
+) -> PyResult<String> {
+    let samples = owned_row_major_f64(samples.as_array());
+    let posterior_mean = posterior_mean.as_array().to_owned();
+    let posterior_std = posterior_std.as_array().to_owned();
     detach_py_result(py, "posterior_samples_summary_json", move || {
-        posterior_samples_summary_json_impl(&request_json)
+        posterior_samples_summary_json_impl(
+            samples,
+            posterior_mean,
+            posterior_std,
+            &request_json,
+        )
     })
 }
 
@@ -3754,13 +3832,19 @@ fn posterior_trace_selection_json(request_json: &str) -> PyResult<String> {
 #[pyo3(signature = (eta, family_kind, link_spec=None))]
 fn apply_inverse_link_array(
     py: Python<'_>,
-    eta: Vec<f64>,
+    eta: PyReadonlyArray2<'_, f64>,
     family_kind: String,
     link_spec: Option<String>,
-) -> PyResult<Vec<f64>> {
-    detach_py_result(py, "apply_inverse_link_array", move || {
-        apply_inverse_link_with_optional_spec(&eta, &family_kind, link_spec.as_deref())
-    })
+) -> PyResult<Py<PyArray2<f64>>> {
+    let eta = owned_row_major_f64(eta.as_array());
+    let shape = eta.dim();
+    let values = eta.into_raw_vec_and_offset().0;
+    let transformed = detach_py_result(py, "apply_inverse_link_array", move || {
+        apply_inverse_link_with_optional_spec(&values, &family_kind, link_spec.as_deref())
+    })?;
+    let result = Array2::from_shape_vec(shape, transformed)
+        .map_err(|err| py_value_error(format!("failed to shape inverse-link result: {err}")))?;
+    Ok(result.into_pyarray(py).unbind())
 }
 
 /// Apply the inverse link to `eta`, preferring the typed `link_spec` (a

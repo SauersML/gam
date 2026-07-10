@@ -100,224 +100,6 @@ fn resolved_wiggle_inverse_link(
     Ok(resolved)
 }
 
-/// #1788: neutralize a self-contradictory penalized-EDF report on a stalled
-/// standard fit, reusing the `untrusted_edf_collapse` guard the smooth-term LR
-/// path already applies (`drivers::spatial_optimization::
-/// smooth_term_lr_inference_forspec`).
-///
-/// When the outer REML optimizer STALLS at its iteration cap it can rail every
-/// smooth block's `λ` to its ceiling (~1e5–1e13) and return an INCONSISTENT
-/// state: the coefficients (from the inner P-IRLS solve) stay wiggly and predict
-/// the response with dozens of active columns, yet the influence / trace-channel
-/// EDF assembled at that divergent outer iterate collapses —
-/// `Σ_k λ_k·tr(H⁻¹S_k) → Σ block_cols`, so each smooth term's `tr(F) → 0` and
-/// `edf_total → p − Σ block_cols = mp`, the intercept-only floor (~1.0). A genuine
-/// penalized least-squares solution cannot pair large `β` with `tr(F) ≈ 0`, so
-/// that reported EDF is untrustworthy; shipping it verbatim reports
-/// `edf_total ≈ 1.0` with every per-term smooth EDF `= 0` for a well-fitting
-/// model, silently violating EDF additivity and hiding the non-convergence on the
-/// EDF channel (#1788).
-///
-/// The trigger is the SAME NARROW `untrusted_edf_collapse` fingerprint that guard
-/// uses: NON-convergence AND a per-term influence EDF collapsed BELOW the term's
-/// guaranteed joint unpenalized (null-space) floor `wald_unpenalized_dim` — the
-/// direction no penalty can shrink, so a present term cannot honestly read below
-/// it. On a matching term the trustworthy substitute is the dimension floor (the
-/// term's full basis rank — the maximally-honest EDF for an untrusted term that
-/// may occupy up to all its columns), exactly as the LR path floors its reference
-/// d.f. The corrected per-term EDF is written to the additive `edf_by_block` /
-/// `penalty_block_trace` channel, `edf_total` is re-derived additively, and the
-/// now-untrustworthy influence matrix is dropped so `per_term_edf` reports the
-/// SAME corrected additive value (rather than re-reading the collapsed `F`). A
-/// HEALTHY non-converged fit (the null-space double-penalty λ routinely rails on
-/// good `te`/multi-term fits) keeps its trustworthy EDF untouched, because its
-/// per-term EDF never falls below the floor. The underlying flat-valley REML
-/// stall itself is #1762 (out of scope); this only keeps the REPORTED EDF from
-/// contradicting the fitted coefficients and surfaces the non-convergence rather
-/// than leaving the collapse silent.
-fn guard_untrusted_edf_collapse(
-    fit: &mut UnifiedFitResult,
-    design: &TermCollectionDesign,
-    n_obs: usize,
-) {
-    if fit.outer_converged {
-        return;
-    }
-    // Dispersion rescale factor to apply after the `inference` borrow ends: the
-    // corrected effective d.f. changes `σ̂² = RSS/(n − edf_total)`, and every
-    // dispersion-linked covariance block (top-level AND inference) must scale by
-    // it together. We compute it while holding the `inference` borrow (it needs
-    // the old/new EDF) but apply it through the single invariant-preserving
-    // `UnifiedFitResult::rescale_estimated_dispersion` afterwards, so the two
-    // redundant covariance representations can never drift apart (#1789).
-    let mut pending_var_ratio = 1.0_f64;
-    // Reporting state hoisted out of the `inference` borrow so the single
-    // non-convergence warning can be emitted AFTER the dispersion rescale below
-    // and thus quote the σ̂ ratio that rescale actually applied.
-    let mut corrected_any = false;
-    let mut correction_note = String::new();
-    let edf_total_before;
-    let mut corrected_total = 0.0_f64;
-    {
-        let Some(inference) = fit.inference.as_mut() else {
-            return;
-        };
-        edf_total_before = inference.edf_total;
-        // Penalty-block cursor walks the recorded global block order: any leading
-        // linear ridge and penalized random-effect ridge blocks first, then smooth
-        // terms (mirrors `smooth_term_lr_inference_forspec` and the
-        // `build_model_summary` per-term EDF walk).
-        let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
-        // Running change to `Σ edf_by_block`. `edf_total` carries an additional
-        // `mp = p − Σ rank_k` offset for the UNPENALIZED columns (e.g. the intercept),
-        // so it is NOT `Σ edf_by_block`; applying the same delta preserves that offset.
-        let mut edf_delta = 0.0_f64;
-        for design_term in design.smooth.terms.iter() {
-            let k = design_term.penalties_local.len();
-            let block_start = penalty_cursor;
-            penalty_cursor += k;
-            // Shape-constrained smooths use a cone-projected EDF; leave them alone
-            // (the LR path skips them for the same reason).
-            if design_term.shape != gam_terms::smooth::ShapeConstraint::None {
-                continue;
-            }
-            let coeff_range = design_term.coeff_range.clone();
-            if coeff_range.start >= coeff_range.end {
-                continue;
-            }
-            let block_cols = coeff_range.len();
-            // Influence-matrix per-term EDF `tr(F)` over the term's block — the same
-            // authoritative quantity the summary per-term-EDF path reads.
-            let edf = fit_inference_per_term_edf(inference, &coeff_range, block_start, k);
-            // The term's joint unpenalized null-space dimension `dim(∩_k null(S_k))`:
-            // the coefficient directions no active penalty can shrink. A term that is
-            // present cannot honestly read an EDF below this floor.
-            let edf_floor = design_term.wald_unpenalized_dim().max(1) as f64;
-            if edf < edf_floor {
-                // Substitute the dimension floor via the ADDITIVE channel: the term's
-                // first block carries the full basis rank; any trailing blocks of the
-                // same coefficient range carry 0 (matching `per_term_edf`'s
-                // single-range accounting) and their traces go to 0.
-                let mut old_block_sum = 0.0_f64;
-                if let Some(slot) = inference.edf_by_block.get_mut(block_start) {
-                    old_block_sum += *slot;
-                    *slot = block_cols as f64;
-                }
-                if let Some(slot) = inference.penalty_block_trace.get_mut(block_start) {
-                    *slot = 0.0;
-                }
-                for extra in (block_start + 1)..(block_start + k) {
-                    if let Some(slot) = inference.edf_by_block.get_mut(extra) {
-                        old_block_sum += *slot;
-                        *slot = 0.0;
-                    }
-                    if let Some(slot) = inference.penalty_block_trace.get_mut(extra) {
-                        *slot = 0.0;
-                    }
-                }
-                edf_delta += block_cols as f64 - old_block_sum;
-                corrected_any = true;
-                correction_note.push_str(&format!(
-                    " term[{}..{}] edf {edf:.3}->{block_cols}",
-                    coeff_range.start, coeff_range.end
-                ));
-            }
-        }
-        if corrected_any {
-            // Apply the per-block correction delta to the total (preserving its `mp`
-            // unpenalized-column offset), then drop the untrustworthy influence matrix
-            // so `per_term_edf` reports the SAME corrected additive value (its
-            // resolution prefers `F` when present).
-            inference.edf_total += edf_delta;
-            corrected_total = inference.edf_total;
-            inference.coefficient_influence = None;
-
-            // Keep the estimated dispersion consistent with the corrected effective
-            // d.f.: for an estimated-scale fit the reported scale is `σ̂² =
-            // RSS/(n − edf_total)` and the coefficient covariance is `Vb = H⁻¹·σ̂²`
-            // (with SEs `sqrt(diag Vb)`). The collapsed `edf_total ≈ mp` inflated
-            // `n − edf_total`, biasing `σ̂²` LOW; leaving it stale after raising
-            // `edf_total` would re-introduce a contradiction (`σ̂² ≠
-            // RSS/(n − edf_total)`). Because `RSS` is invariant under this EDF
-            // correction, `σ̂²_new = σ̂²_old·(n − edf_old)/(n − edf_new)` is an EXACT
-            // scalar rescale, and `Vb`/`Vp`/SEs scale by the same ratio (they are
-            // linear in `σ̂²` / `σ̂`). We only record the ratio here (the actual
-            // covariance rescale, gated on an estimated scale, happens below via the
-            // single method that touches BOTH covariance representations at once —
-            // see `pending_var_ratio`).
-            let denom_old = (n_obs as f64 - edf_total_before).max(1.0);
-            let denom_new = (n_obs as f64 - corrected_total).max(1.0);
-            pending_var_ratio = denom_old / denom_new;
-        }
-    }
-    if !corrected_any {
-        return;
-    }
-    // Apply the dispersion rescale outside the `inference` borrow, through the
-    // single invariant-preserving method: it scales `σ̂`, both top-level
-    // covariance blocks, and the paired inference-block covariances/SEs by the
-    // same factor (and is a no-op for a fixed/`Known` scale). This is what keeps
-    // `covariance_conditional == inference.beta_covariance` after the correction
-    // so the returned model still passes `validate()` on predict/summary/load
-    // (#1789); the previous inline rescale updated only the inference block and
-    // produced an unusable model.
-    //
-    // The method returns the σ̂ ratio it applied: `√pending_var_ratio` for an
-    // estimated-scale fit whose SEs/covariance genuinely moved, or exactly `1.0`
-    // for a fixed-scale family (`φ ≡ 1`) whose covariance does not embed σ̂² and
-    // so must not move under an EDF change. Reporting that factor makes the
-    // downstream consequence of the correction — that the returned standard
-    // errors were rescaled, and by how much — explicit in the non-convergence
-    // warning instead of leaving it silent.
-    let sigma_ratio = fit.rescale_estimated_dispersion(pending_var_ratio);
-    log::warn!(
-        "[edf#1788] outer REML did not converge (railed smoothing parameters); the \
-         influence EDF collapsed to the intercept-only floor while the fitted \
-         coefficients remain wiggly. Substituted the per-term dimension floor so the \
-         reported EDF is not self-contradictory (edf_total {edf_total_before:.3}->\
-         {corrected_total:.3}).{correction_note} Standard errors and covariance rescaled \
-         by ×{sigma_ratio:.4} to keep σ̂² = RSS/(n − edf_total) consistent with the \
-         corrected effective d.f. The fit is NON-CONVERGED (see #1762); treat its \
-         inference accordingly."
-    );
-}
-
-/// Read-only per-term EDF over `coeff_range` from a [`FitInference`], mirroring
-/// [`UnifiedFitResult::per_term_edf`] but operating on the inference block alone
-/// (so the #1788 guard can consult it while holding a `&mut` borrow of the same
-/// inference): influence-matrix trace when available, else the additive
-/// `|coeff_range| − Σ tr_kk` trace channel.
-fn fit_inference_per_term_edf(
-    inference: &gam_solve::estimate::FitInference,
-    coeff_range: &std::ops::Range<usize>,
-    penalty_cursor: usize,
-    k: usize,
-) -> f64 {
-    let dim = coeff_range.len() as f64;
-    if let Some(f) = inference.coefficient_influence.as_ref()
-        && coeff_range.end <= f.nrows()
-        && coeff_range.end <= f.ncols()
-    {
-        let tr = coeff_range.clone().map(|j| f[[j, j]]).sum::<f64>();
-        return tr.clamp(0.0, dim);
-    }
-    if k == 0 {
-        return dim;
-    }
-    if let Some(block) = inference
-        .penalty_block_trace
-        .get(penalty_cursor..penalty_cursor + k)
-    {
-        let sum_trace = block.iter().sum::<f64>();
-        return (dim - sum_trace).clamp(0.0, dim);
-    }
-    inference
-        .edf_by_block
-        .get(penalty_cursor..penalty_cursor + k)
-        .map(|block| block.iter().sum::<f64>().clamp(0.0, dim))
-        .unwrap_or(0.0)
-}
-
 /// Run the base standard fit (the three-way latent / coefficient-group /
 /// spatial dispatch) at an explicit [`FitOptions`], leaving the caller's
 /// `request.options` untouched. Split out of [`fit_standard_model`] so the
@@ -327,11 +109,18 @@ fn fit_standard_base(
     request: &StandardFitRequest<'_>,
     family: &LikelihoodSpec,
     options: &FitOptions,
-) -> Result<crate::fit_orchestration::drivers::FittedTermCollectionWithSpec, String> {
+) -> Result<
+    crate::fit_orchestration::drivers::FittedTermCollectionWithSpec,
+    gam_solve::estimate::EstimationError,
+> {
     if let Some(latent_coord) = request.latent_coord.as_ref() {
         if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
         {
-            return Err("latent-coordinate standard fits do not support coefficient_groups or penalty_block_gamma_priors in the same request".to_string());
+            return Err(gam_solve::estimate::EstimationError::InvalidInput(
+                "latent-coordinate standard fits do not support coefficient_groups or \
+                 penalty_block_gamma_priors in the same request"
+                    .to_string(),
+            ));
         }
         fit_term_collectionwith_latent_coord_optimization(
             request.data.view(),
@@ -343,7 +132,6 @@ fn fit_standard_base(
             family.clone(),
             options,
         )
-        .map_err(|e| e.to_string())
     } else if !request.coefficient_groups.is_empty()
         || !request.penalty_block_gamma_priors.is_empty()
     {
@@ -357,13 +145,11 @@ fn fit_standard_base(
             &request.penalty_block_gamma_priors,
             family.clone(),
             options,
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         let resolvedspec = crate::fit_orchestration::drivers::freeze_term_collection_from_design(
             &request.spec,
             &fitted.design,
-        )
-        .map_err(|e| e.to_string())?;
+        )?;
         Ok(
             crate::fit_orchestration::drivers::FittedTermCollectionWithSpec {
                 fit: fitted.fit,
@@ -384,7 +170,6 @@ fn fit_standard_base(
             options,
             &request.kappa_options,
         )
-        .map_err(|e| e.to_string())
     }
 }
 
@@ -1516,7 +1301,6 @@ fn optimize_survival_transformation_smoothing(
             coefficient_lower_bounds: structural_lower_bounds.cloned(),
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
         let summary = gam_solve::pirls::runworking_model_pirls(
@@ -2591,7 +2375,6 @@ pub(crate) fn fit_survival_transformation_model(
                     coefficient_lower_bounds: structural_lower_bounds,
                     linear_constraints: None,
                     initial_lm_lambda: None,
-                    geodesic_acceleration: false,
                     arrow_schur: None,
                 };
                 let summary = gam_solve::pirls::runworking_model_pirls(
@@ -2694,7 +2477,6 @@ pub(crate) fn fit_survival_transformation_model(
         coefficient_lower_bounds: structural_lower_bounds,
         linear_constraints: None,
         initial_lm_lambda: None,
-        geodesic_acceleration: false,
         arrow_schur: None,
     };
     let rho_for_cache = survival_transformation_log_lambdas(&penalty_blocks);

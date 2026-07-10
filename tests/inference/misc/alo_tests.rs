@@ -61,7 +61,6 @@ fn fit_unpenalized(
         convergence_tolerance: 1e-10,
         firth_bias_reduction: matches!(link, LinkFunction::Logit),
         initial_lm_lambda: None,
-        geodesic_acceleration: false,
         arrow_schur: None,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
@@ -125,7 +124,6 @@ fn fit_identity_penalized(
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,
         initial_lm_lambda: None,
-        geodesic_acceleration: false,
         arrow_schur: None,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(

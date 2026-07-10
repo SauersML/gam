@@ -76,9 +76,9 @@ impl<'a> StandardFitData<'a> {
 
 pub struct StandardFitRequest<'a> {
     pub data: StandardFitData<'a>,
-    pub y: Arc<Array1<f64>>,
-    pub weights: Arc<Array1<f64>>,
-    pub offset: Arc<Array1<f64>>,
+    pub y: Array1<f64>,
+    pub weights: Array1<f64>,
+    pub offset: Array1<f64>,
     pub spec: TermCollectionSpec,
     pub family: LikelihoodSpec,
     /// #2026: estimate the Tweedie variance power `p` by profile likelihood
@@ -556,14 +556,14 @@ pub struct FitConfig {
     /// explicit array-valued `centers=` differs, routing through
     /// `CenterStrategy::UserProvided` instead of `FarthestPoint`/`EqualMass`.
     pub smooth_overrides: Option<JsonValue>,
-    /// Engage the cross-process ON-DISK persistent warm-start layer (#1082).
+    /// Engage the cross-process ON-DISK persistent checkpoint layer (#1082).
     ///
-    /// Default `false`: only the always-on in-memory warm start runs, so a
-    /// single fit and throwaway/replicate/CI-coverage loops pay zero disk I/O
-    /// (no `WarmStartStore` dir/eviction scan, no record load/store). Set
-    /// `true` to engage cross-process / repeat-fit resume: the flag threads
+    /// Default `true`: formula fits survive process and wall interruptions.
+    /// The flag threads
     /// `FitConfig → FitOptions → ExternalOptimOptions` down to the standard
     /// `RemlState`, which then calls `enable_persistent_warm_start_disk()`.
+    /// Low-level embedding code may disable it explicitly when it owns a
+    /// stronger external checkpoint transaction.
     pub persist_warm_start_disk: bool,
     /// Saturation-escalation level for 2-D+ spatial smooths (#1689). In-process
     /// plumbing ONLY — never a user flag/env var: the `fit_from_formula` refit
@@ -625,7 +625,7 @@ impl Default for FitConfig {
             analytic_penalties: None,
             topology_auto_selector: None,
             smooth_overrides: None,
-            persist_warm_start_disk: false,
+            persist_warm_start_disk: true,
             spatial_escalation_level: 0,
         }
     }
@@ -660,4 +660,27 @@ pub struct ResidualCascadeInputs {
     /// Sobolev smoothness order `s` of the multilevel Wendland-(3,1) prior,
     /// clamped into the native-space window `(d/2, (d+3)/2]` (issue caveat 1).
     pub sobolev_s: f64,
+}
+
+#[cfg(test)]
+mod checkpoint_policy_tests {
+    use super::*;
+
+    #[test]
+    fn formula_fits_checkpoint_durably_by_default() {
+        let config = FitConfig::default();
+        assert!(config.persist_warm_start_disk);
+        let options = canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
+        assert!(options.persist_warm_start_disk);
+    }
+
+    #[test]
+    fn explicit_external_checkpoint_owner_can_disable_disk_layer() {
+        let config = FitConfig {
+            persist_warm_start_disk: false,
+            ..FitConfig::default()
+        };
+        let options = canonical_standard_fit_options(&config, StandardFitOptionsInputs::default());
+        assert!(!options.persist_warm_start_disk);
+    }
 }

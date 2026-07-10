@@ -21,10 +21,11 @@ use sklearn_metadata::sklearn_fit_metadata;
 use summary_render::{summary_html_escape, summary_render_coefficients_html, summary_render_value};
 
 use survival_surface_io::{
-    hazard_from_cumulative_knots, interpolate_rows, interpolate_survival_surface, survival_block,
+    hazard_from_cumulative_knots, interpolate_rows, survival_block,
     survival_block_cumulative_hazard, survival_block_failure, survival_block_hazard,
-    survival_chunk_iter_collect, survival_coerce_times, survival_collect_chunks,
-    survival_cumulative_from_survival, survival_ffi_surface, survival_parameters_matrix,
+    survival_chunk_defaults, survival_chunk_iter_collect, survival_chunk_ranges,
+    survival_coerce_times, survival_cumulative_from_survival, survival_should_chunk,
+    survival_failure_from_survival, survival_ffi_surface, survival_parameters_matrix,
     write_survival_csv,
 };
 
@@ -481,7 +482,10 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "predict_array",
             "predict_conformal",
             "build_predict_payload_json",
-            "interpolate_survival_surface",
+            "interpolate_rows",
+            "survival_chunk_defaults",
+            "survival_chunk_ranges",
+            "survival_should_chunk",
             "survival_chunk_iter_collect",
             "write_survival_csv",
             "default_survival_time_grid",
@@ -1726,7 +1730,6 @@ fn sample_table(
     let payload = detach_py_result(py, "sample_table", move || {
         sample_table_impl(&model_bytes, headers, rows, options_json.as_deref())
     })?;
-    let (n_draws, n_coeffs) = payload.samples.dim();
     let config = PyDict::new(py);
     config.set_item("n_samples", payload.config.n_samples)?;
     config.set_item("n_warmup", payload.config.n_warmup)?;
@@ -1735,8 +1738,6 @@ fn sample_table(
     config.set_item("seed", payload.config.seed)?;
     let out = PyDict::new(py);
     out.set_item("samples", payload.samples.into_pyarray(py))?;
-    out.set_item("n_draws", n_draws)?;
-    out.set_item("n_coeffs", n_coeffs)?;
     out.set_item("coefficient_names", payload.coefficient_names)?;
     out.set_item("posterior_mean", payload.posterior_mean.into_pyarray(py))?;
     out.set_item("posterior_std", payload.posterior_std.into_pyarray(py))?;

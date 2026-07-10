@@ -2561,7 +2561,6 @@ impl WorkingModelSurvival {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
         let summary = gam_solve::pirls::runworking_model_pirls(

@@ -2823,10 +2823,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
             }
         }
     }
-    // Keep a handle on the baseline geometry spec before shadowing `resolvedspec`
-    // with the κ-optimized spec, so the #1357 degenerate-corner guard below can
-    // fall back to the frozen baseline.
-    let baseline_spec = resolvedspec;
     let optimized_spec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
     let optimized = fit_term_collection_forspecwith_heuristic_lambdas(
         data,
@@ -2838,49 +2834,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
         family.clone(),
         options,
     )?;
-
-    // #1357 degenerate-corner guard. In the flat (ρ, κ) valley the joint
-    // optimizer can certify a κ at which the kernel block goes nearly flat and
-    // REML then shrinks the whole smooth onto its intercept (EDF → the null
-    // floor, prediction returns a constant surface). Such a corner can carry a
-    // *better* profiled REML cost than the informative baseline — the
-    // smoothing-correction trace flips between the near-boundary cubature and
-    // first-order branches across draws, so the `joint_final_value` ≤
-    // `baseline_score` gate above does not catch it. The frozen baseline
-    // geometry (the data-derived default length scale with its own REML-seeded
-    // λ) keeps the kernel informative, so when the joint optimum has collapsed
-    // to the null while the baseline has materially more effective DOF, reject
-    // the optimum and keep the baseline. This never blocks a genuine refinement:
-    // the baseline is only preferred when the joint candidate is degenerate.
-    let optimized_edf = optimized.fit.inference.as_ref().map(|inf| inf.edf_total);
-    if let Some(opt_edf) = optimized_edf
-        && opt_edf < SPATIAL_COLLAPSE_EDF_FLOOR
-    {
-        let baseline = fit_frozen_baseline_geometry(
-            data,
-            y,
-            weights,
-            offset,
-            baseline_spec,
-            best,
-            family.clone(),
-            options,
-            baseline_score,
-            Some(kappa_timing),
-        )?;
-        let baseline_edf = baseline.fit.inference.as_ref().map(|inf| inf.edf_total);
-        if let Some(base_edf) = baseline_edf
-            && base_edf >= opt_edf + SPATIAL_COLLAPSE_EDF_MARGIN
-        {
-            log::info!(
-                "[spatial-kappa] joint candidate collapsed to the null (edf={opt_edf:.3}); \
-                 baseline geometry retains edf={base_edf:.3} — keeping the frozen baseline",
-            );
-            return Ok(Some(baseline));
-        }
-        // Baseline is no better (both genuinely near-null, or baseline lacks
-        // inference): keep the optimized candidate via the normal path below.
-    }
 
     // Stamp reml_score with joint_final_value so downstream consumers see a
     // score consistent with the gate decision; the refit serves as a
@@ -2896,104 +2849,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
     };
 
     Ok(Some(optimized_result))
-}
-
-/// EDF below this is treated as an intercept-only / null collapse of the spatial
-/// smooth (#1357): the model has shed essentially all effective degrees of
-/// freedom beyond a handful of unpenalized coordinates.
-const SPATIAL_COLLAPSE_EDF_FLOOR: f64 = 2.5;
-
-/// A non-degenerate baseline must carry at least this much more effective DOF
-/// than the collapsed joint candidate before the baseline is preferred (#1357),
-/// so genuinely-near-null surfaces (where both fits agree there is no signal)
-/// are left untouched.
-const SPATIAL_COLLAPSE_EDF_MARGIN: f64 = 1.0;
-
-/// Re-fit at the frozen baseline geometry — the REML-seeded length scales and
-/// heuristic λ already certified in `best` — and stamp the certified baseline
-/// REML score onto the result.
-///
-/// This is the graceful-degradation target for the joint spatial-κ optimizer. It
-/// is reached whenever the joint refinement is not adopted: when the optimizer
-/// converges to a candidate that worsens the profiled score, *and* when it fails
-/// to converge at all (#1126). The geometry is the same baseline the parent fit
-/// started from, so it is always valid — the joint step can only ever improve on
-/// it, never block it.
-///
-/// The refit is a β/inference harvester at the frozen baseline `resolvedspec`;
-/// the score that geometry was certified at is
-/// `baseline_score = fit_score(&best.fit)`. We stamp that certified value rather
-/// than the harvest's own re-derived `reml_score`, which drifts because the
-/// harvest runs the full-inference option set (and re-runs the adaptive spatial
-/// overlay) instead of the superseded baseline path that produced `best`. The
-/// spatial-κ result gate (`require_successful_spatial_optimization_result`)
-/// compares the returned fit's `fit_score` against `fit_score(&best.fit)`;
-/// without this stamp a downward drift of a few REML units on the *same*
-/// geometry spuriously reads as "the optimizer made the score worse" and aborts
-/// an otherwise-valid fit. Stamping keeps the returned score consistent with the
-/// gate decision that selected this geometry, identical to the optimized branch.
-///
-/// #1357: the harvest warm-starts REML from `best.fit.lambdas` (reproducing the
-/// certified baseline cheaply), but on the flat (ρ, κ) Matérn valley that warm
-/// start can slide the ρ search into a degenerate basin that collapses the smooth
-/// onto its intercept (EDF → 1) even though `best` at the same geometry is
-/// healthy — the double-penalty nullspace-shrinkage block of `best`'s λ sits near
-/// the shrink-out corner, and the relaxed log-λ cap then lets it run away. When
-/// the warm-started harvest collapses far below `best`'s certified EDF, refit the
-/// same geometry from scratch (no λ seed, exactly how `best` was produced); the
-/// scratch fit recovers the healthy baseline. This retry only fires on the
-/// collapse pathology, so warm-starting's speed/uniformity is preserved for every
-/// non-degenerate fallback.
-fn fit_frozen_baseline_geometry(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    best: &FittedTermCollection,
-    family: LikelihoodSpec,
-    options: &FitOptions,
-    baseline_score: f64,
-    kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
-) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    let baseline = fit_term_collection_forspecwith_heuristic_lambdas(
-        data,
-        y,
-        weights,
-        offset,
-        resolvedspec,
-        best.fit.lambdas.as_slice(),
-        family.clone(),
-        options,
-    )?;
-    // #1357 collapse retry: if the warm-started harvest shed essentially all of
-    // `best`'s certified effective DOF (a flat-valley collapse onto the
-    // intercept), re-derive λ from scratch — `best` itself was fit from scratch
-    // and is healthy, so the scratch harvest reproduces it.
-    let best_edf = best.fit.inference.as_ref().map(|inf| inf.edf_total);
-    let baseline_edf = baseline.fit.inference.as_ref().map(|inf| inf.edf_total);
-    let baseline = match (best_edf, baseline_edf) {
-        (Some(best_edf), Some(base_edf))
-            if base_edf < SPATIAL_COLLAPSE_EDF_FLOOR
-                && best_edf >= base_edf + SPATIAL_COLLAPSE_EDF_MARGIN =>
-        {
-            log::info!(
-                "[spatial-kappa] warm-started frozen baseline collapsed (edf={base_edf:.3}) \
-                 below the certified baseline (edf={best_edf:.3}); refitting from scratch",
-            );
-            fit_term_collection_forspec(data, y, weights, offset, resolvedspec, family, options)?
-        }
-        _ => baseline,
-    };
-    let mut fit = baseline.fit;
-    fit.reml_score = baseline_score;
-    Ok(FittedTermCollectionWithSpec {
-        fit,
-        design: baseline.design,
-        resolvedspec: resolvedspec.clone(),
-        adaptive_diagnostics: baseline.adaptive_diagnostics,
-        kappa_timing,
-    })
 }
 
 /// Coordinate kind for the exact joint spatial hyperparameter optimizer.
@@ -6799,8 +6654,8 @@ where
 
     let log_kappa_dim = joint_setup.log_kappa_dim();
 
-    log::warn!(
-        "[OUTER-FD-AUDIT/spatial-exact-joint] driver entry: aux_dim={} log_kappa_dim={} kappa_enabled={} rho_dim={} theta0_len={}",
+    log::trace!(
+        "[spatial-exact-joint] driver entry: aux_dim={} log_kappa_dim={} kappa_enabled={} rho_dim={} theta0_len={}",
         joint_setup.auxiliary_dim(),
         log_kappa_dim,
         kappa_options.enabled,
@@ -6812,8 +6667,8 @@ where
     // Fast path: kappa disabled or no spatial terms — build designs once.
     // -----------------------------------------------------------------------
     if joint_setup.auxiliary_dim() == 0 && (!kappa_options.enabled || log_kappa_dim == 0) {
-        log::warn!(
-            "[OUTER-FD-AUDIT/spatial-exact-joint] taking FAST path (no outer theta optimization in this driver)"
+        log::trace!(
+            "[spatial-exact-joint] taking fast path (no outer theta optimization in this driver)"
         );
         let (designs, resolved_specs) = build_term_collection_designs_and_freeze_joint(
             data, block_specs,
@@ -8107,7 +7962,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // scale in the globally best-scoring basin before the joint solve refines it.
     // Strict-improvement-only, so a fit the midpoint already solved well is left
     // byte-identical. Isotropic/non-CC only (gated inside the helper).
-    let mut prescan_improved = false;
     if !spatial_terms.is_empty() {
         let baseline_score = fit_score(&best.fit);
         let range_overrides = prescan_isotropic_spatial_range_seed(
@@ -8123,7 +7977,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             &spatial_terms,
         )?;
         if !range_overrides.is_empty() {
-            prescan_improved = true;
             for (term_idx, length_scale) in range_overrides {
                 set_spatial_length_scale(&mut resolvedspec, term_idx, length_scale)?;
             }
@@ -8167,19 +8020,11 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     }
     let initial_score = fit_score(&best.fit);
     if !initial_score.is_finite() {
-        log::debug!("[spatial-kappa] initial profiled score is non-finite");
+        crate::bail_invalid_estim!(
+            "spatial kappa optimization received a non-finite initial profiled score"
+        );
     }
-    // #1688: snapshot the per-term seed length scales the joint solve starts
-    // from. If the joint solve neither improves the score NOR moves the geometry
-    // off these values, it stalled and kept the frozen baseline — the precise
-    // signature that triggers the ψ-window multistart rescue below. (A joint
-    // solve that genuinely converged to its seed basin still moves ψ off the
-    // exact seed, so this distinguishes a stall from a healthy local optimum.)
-    let seed_length_scales: Vec<(usize, f64)> = spatial_terms
-        .iter()
-        .filter_map(|&t| get_spatial_length_scale(&resolvedspec, t).map(|ls| (t, ls)))
-        .collect();
-    let joint_result = try_exact_joint_spatial_length_scale_optimization(
+    let exact_joint = try_exact_joint_spatial_length_scale_optimization(
         data,
         y.view(),
         weights.view(),
@@ -8190,154 +8035,18 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         options,
         kappa_options,
         &spatial_terms,
-    )
-    .map(|opt| {
-        opt.map(|fit| {
-            let score = fit_score(&fit.fit);
-            (fit, score)
-        })
-    });
-    // #1074 / #2162: when the fixed-κ profiled seed is in a good, finite basin,
-    // a HARD joint-solve failure caused only by inference-matrix finiteness (for
-    // example a NaN frequentist covariance from κ railing into the
-    // kernel-collapse corner during local polish) must not sink the whole fit.
-    // The trial-evaluation path already classifies that exact condition as a
-    // recoverable infeasible κ point and retreats; apply the same semantics to
-    // the terminal polish by returning the finite frozen/pre-scan geometry with
-    // ρ profiled at fixed κ. Keep unrelated errors fatal, and keep the older
-    // pre-scan-improved rescue for cases where the multi-start scan found a
-    // strictly better fixed-κ basin but the final polish produced no candidate.
-    let terminal_joint_recoverable = matches!(
-        &joint_result,
-        Err(err) if is_recoverable_trial_point_error(err)
-    );
-    let exact_joint = if (prescan_improved && !matches!(joint_result, Ok(Some(_))))
-        || terminal_joint_recoverable
-    {
-        let reason = match &joint_result {
-            Err(e) => format!("error: {e}"),
-            _ => "unavailable".to_string(),
-        };
-        log::info!(
-            "[spatial-kappa] #1074/#2162 joint polish yielded no usable candidate \
-             ({reason}); returning the fixed-κ profiled geometry (REML {initial_score:.5})"
-        );
-        FittedTermCollectionWithSpec {
-            fit: best.fit,
-            design: best.design,
-            resolvedspec,
-            adaptive_diagnostics: best.adaptive_diagnostics,
-            kappa_timing: None,
-        }
-    } else {
-        require_successful_spatial_optimization_result(initial_score, joint_result)?
-    };
-
-    // #1688: conditional joint-solve MULTISTART rescue.
-    //
-    // The joint [ρ, ψ] REML surface of an isotropic radial GP smooth is genuinely
-    // multimodal in the kernel range, and the local ARC/BFGS solver descends into
-    // whichever basin holds its seed. When the auto-seed (`max_range/√n`, the
-    // wiggly side since #1629) lands in a flat valley between the two basins, the
-    // local solver STALLS — it returns NonConverged at a large gradient and keeps
-    // the frozen baseline geometry, so the realized score never improves on the
-    // seed's profiled REML (the observed ν=3/2 boundary over-smoothing: edge RMSE
-    // 4× the interior, REML ~7 nats worse than the reachable global basin).
-    //
-    // The #1074 pre-scan does not rescue this case: it ranks restart seeds by
-    // FIXED-κ profiled REML (ρ-opt at fixed ψ), which is a poor predictor of the
-    // JOINT outcome reachable from a seed — the global-basin seeds score WORSE on
-    // the profiled proxy than the stalled auto-seed basin, so the strict-
-    // improvement gate adopts none of them. The only honest ranking is the
-    // realized joint REML itself.
-    //
-    // So: only when the primary joint solve produced NO REML improvement over its
-    // baseline (the exact stall signature) do we re-run the full baseline → joint
-    // sequence from a handful of seeds spanning the data-derived ψ window (long-
-    // range corner through short-range corner) and keep the best REALIZED joint
-    // score. This fires on a vanishing fraction of fits — a healthy joint solve
-    // that moves ψ off the seed improves the score and skips the rescue entirely,
-    // so the matern/GP fast path #1688 is about keeps its speed. Isotropic/non-CC
-    // only: anisotropic and constant-curvature terms carry their own seeding.
-    let exact_joint = {
-        let primary_score = fit_score(&exact_joint.fit);
-        let improved = primary_score.is_finite()
-            && initial_score.is_finite()
-            && primary_score < initial_score - 1e-7 * initial_score.abs().max(1.0);
-        // Base the eligibility checks and the restart seeds on the realized
-        // (frozen, κ-optimized) spec the primary path produced: it carries the
-        // same term structure with resolved centers, and the parent `resolvedspec`
-        // has already been moved into `exact_joint` on the pre-scan fallback path.
-        let base_spec = exact_joint.resolvedspec.clone();
-        // Did the joint solve keep the frozen baseline geometry (no length scale
-        // moved off its seed)? That, combined with no score gain, is the stall.
-        let geometry_unchanged = !seed_length_scales.is_empty()
-            && seed_length_scales.iter().all(|&(t, seed_ls)| {
-                get_spatial_length_scale(&base_spec, t)
-                    .is_some_and(|ls| (ls - seed_ls).abs() <= 1e-6 * seed_ls.abs().max(1.0))
-            });
-        let eligible = !improved
-            && geometry_unchanged
-            && !has_aniso_terms(&base_spec, &spatial_terms)
-            && constant_curvature_term_indices(&base_spec).is_empty()
-            && spatial_terms
-                .iter()
-                .any(|&t| get_spatial_length_scale(&base_spec, t).is_some());
-        if eligible {
-            log::info!(
-                "[spatial-kappa] #1688 joint solve stalled at REML {primary_score:.5} \
-                 (no improvement over baseline {initial_score:.5}); running ψ-window \
-                 multistart rescue across {} seeds",
-                JOINT_RESTART_WINDOW_FRACTIONS.len(),
-            );
-            let mut best_fit = exact_joint;
-            // Lower REML is better; the incumbent is the primary stalled result.
-            let mut best_score = primary_score;
-            for &fraction in JOINT_RESTART_WINDOW_FRACTIONS.iter() {
-                match joint_solve_from_window_fraction(
-                    data,
-                    y.view(),
-                    weights.view(),
-                    offset.view(),
-                    &base_spec,
-                    &spatial_terms,
-                    fraction,
-                    &family,
-                    options,
-                    &baseline_options,
-                    kappa_options,
-                ) {
-                    Ok(Some((candidate, score))) => {
-                        if score.is_finite()
-                            && (!best_score.is_finite()
-                                || score < best_score - 1e-7 * best_score.abs().max(1.0))
-                        {
-                            log::info!(
-                                "[spatial-kappa] #1688 multistart seed (ψ-window {fraction:.2}) \
-                                 reached REML {score:.5}, improving on {best_score:.5}",
-                            );
-                            best_score = score;
-                            best_fit = candidate;
-                        }
-                    }
-                    // Infeasible seed geometry — skip this restart point.
-                    Ok(None) => {}
-                    // A restart's full re-fit can hit a genuine fatal error; the
-                    // incumbent (the primary result) is already valid, so log and
-                    // keep going rather than sinking the whole fit on one seed.
-                    Err(e) => {
-                        log::info!(
-                            "[spatial-kappa] #1688 multistart seed (ψ-window {fraction:.2}) \
-                             failed ({e}); skipping"
-                        );
-                    }
-                }
-            }
-            best_fit
-        } else {
-            exact_joint
-        }
-    };
+    )?
+    .ok_or_else(|| {
+        EstimationError::RemlOptimizationFailed(
+            "spatial kappa optimization is unavailable for one or more eligible spatial terms"
+                .to_string(),
+        )
+    })?;
+    let exact_score = fit_score(&exact_joint.fit);
+    let exact_joint = require_successful_spatial_optimization_result(
+        initial_score,
+        Ok(Some((exact_joint, exact_score))),
+    )?;
 
     log_spatial_aniso_scales(&exact_joint.resolvedspec);
     Ok(exact_joint)

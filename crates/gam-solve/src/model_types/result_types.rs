@@ -620,13 +620,13 @@ impl OuterCriterionCertificate {
         self.projected_grad_norm.is_finite() && self.projected_grad_norm <= self.stationarity_bound
     }
 
-    /// Second-order admissibility: an INTERIOR optimum must not sit on
-    /// genuinely indefinite curvature (a saddle is not a minimum). At an
-    /// active bound the full-space Hessian may legitimately be indefinite
-    /// (curvature along the constrained direction is irrelevant to the KKT
-    /// point), so the check is waived when any coordinate is railed.
+    /// Second-order admissibility: a certified optimum must not sit on
+    /// genuinely indefinite analytic curvature. A nearby box rail is only a
+    /// diagnostic; it cannot waive negative curvature in unrelated free
+    /// directions. If a future certificate projects onto the exact critical
+    /// cone, that projected result can be recorded here instead.
     pub fn curvature_admissible(&self) -> bool {
-        self.hessian_psd != Some(false) || !self.lambdas_railed.is_empty()
+        self.hessian_psd != Some(false)
     }
 
     /// Whether the certificate accepts the returned point as a constrained

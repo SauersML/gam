@@ -92,6 +92,7 @@ pub struct SurvivalSurface<'a> {
     kind: SurvivalSurfaceKind,
     grid: ArrayView1<'a, f64>,
     values: ArrayView2<'a, f64>,
+    order: Vec<usize>,
 }
 
 impl<'a> SurvivalSurface<'a> {
@@ -113,15 +114,23 @@ impl<'a> SurvivalSurface<'a> {
                     "survival surface grid[{index}] must be finite, got {time}"
                 ));
             }
-            if index > 0 && time <= grid[index - 1] {
+        }
+        let mut order: Vec<usize> = (0..grid.len()).collect();
+        order.sort_by(|&left, &right| grid[left].total_cmp(&grid[right]));
+        for pair in order.windows(2) {
+            if grid[pair[1]] <= grid[pair[0]] {
                 return Err(format!(
-                    "survival surface grid must be strictly increasing; grid[{index}]={time} does not exceed grid[{}]={}",
-                    index - 1,
-                    grid[index - 1]
+                    "survival surface grid values must be unique; grid[{}]={} duplicates grid[{}]={}",
+                    pair[1], grid[pair[1]], pair[0], grid[pair[0]]
                 ));
             }
         }
-        Ok(Self { kind, grid, values })
+        Ok(Self {
+            kind,
+            grid,
+            values,
+            order,
+        })
     }
 
     pub fn nrows(&self) -> usize {
@@ -141,25 +150,35 @@ impl<'a> SurvivalSurface<'a> {
         }
         let policy = self.kind.policy();
         let last = self.grid.len() - 1;
+        let first_column = self.order[0];
+        let last_column = self.order[last];
         let value = if query == f64::INFINITY {
             policy
                 .positive_infinity_value
-                .unwrap_or(self.values[[row, last]])
-        } else if query < self.grid[0] {
-            policy.left_value.unwrap_or(self.values[[row, 0]])
-        } else if query == self.grid[0] {
-            self.values[[row, 0]]
-        } else if query > self.grid[last] {
-            policy.right_value.unwrap_or(self.values[[row, last]])
-        } else if query == self.grid[last] {
-            self.values[[row, last]]
+                .unwrap_or(self.values[[row, last_column]])
+        } else if query < self.grid[first_column] {
+            policy
+                .left_value
+                .unwrap_or(self.values[[row, first_column]])
+        } else if query == self.grid[first_column] {
+            self.values[[row, first_column]]
+        } else if query > self.grid[last_column] {
+            policy
+                .right_value
+                .unwrap_or(self.values[[row, last_column]])
+        } else if query == self.grid[last_column] {
+            self.values[[row, last_column]]
         } else {
-            let upper = self.grid.partition_point(|grid_value| *grid_value <= query);
+            let upper = self
+                .order
+                .partition_point(|&column| self.grid[column] <= query);
             let lower = upper - 1;
-            let x0 = self.grid[lower];
-            let x1 = self.grid[upper];
-            let y0 = self.values[[row, lower]];
-            let y1 = self.values[[row, upper]];
+            let lower_column = self.order[lower];
+            let upper_column = self.order[upper];
+            let x0 = self.grid[lower_column];
+            let x1 = self.grid[upper_column];
+            let y0 = self.values[[row, lower_column]];
+            let y1 = self.values[[row, upper_column]];
             y0 + (query - x0) * (y1 - y0) / (x1 - x0)
         };
         Ok(policy.clamp(value))
@@ -191,12 +210,8 @@ impl<'a> SurvivalSurface<'a> {
         people_chunk: Option<usize>,
         time_chunk: Option<usize>,
     ) -> Result<Array2<f64>, String> {
-        let chunks = chunk_policy.chunks(
-            self.values.nrows(),
-            query.len(),
-            people_chunk,
-            time_chunk,
-        )?;
+        let chunks =
+            chunk_policy.chunks(self.values.nrows(), query.len(), people_chunk, time_chunk)?;
         let mut output = Array2::<f64>::zeros((self.values.nrows(), query.len()));
         for chunk in chunks {
             for row in chunk.row_start..chunk.row_end {
@@ -224,10 +239,34 @@ pub struct SurvivalSurfaceChunkPolicy {
     target_cells: usize,
 }
 
+/// Convert a survival-probability matrix to failure probabilities.
+pub fn failure_probability_from_survival(
+    survival: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let values: Result<Vec<f64>, String> = survival
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.is_nan() {
+                return Ok(f64::NAN);
+            }
+            if !(0.0..=1.0).contains(&value) {
+                return Err(format!(
+                    "survival probability at flat index {index} must lie in [0, 1], got {value}"
+                ));
+            }
+            Ok(1.0 - value)
+        })
+        .collect();
+    Array2::from_shape_vec(survival.dim(), values?)
+        .map_err(|error| format!("failed to assemble failure surface: {error}"))
+}
+
 impl Default for SurvivalSurfaceChunkPolicy {
     fn default() -> Self {
-        let target_bytes = gam_runtime::resource::ResourcePolicy::default_library()
-            .row_chunk_target_bytes;
+        let target_bytes =
+            gam_runtime::resource::ResourcePolicy::default_library().row_chunk_target_bytes;
         Self {
             target_cells: (target_bytes / std::mem::size_of::<f64>()).max(1),
         }

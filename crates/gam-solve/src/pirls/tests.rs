@@ -909,7 +909,6 @@ mod tests {
             convergence_tolerance: 1e-12,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
         let problem = PirlsProblem {
@@ -1502,7 +1501,6 @@ mod tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -2115,7 +2113,6 @@ mod tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -2195,7 +2192,6 @@ mod tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3026,7 +3022,6 @@ mod root_cause_tests {
                 b: array![0.0],
             }),
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3280,7 +3275,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3342,7 +3336,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3385,7 +3378,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3441,7 +3433,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3494,7 +3485,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3533,7 +3523,6 @@ mod root_cause_tests {
                 b: array![-100.0],
             }),
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3569,7 +3558,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3665,7 +3653,6 @@ mod root_cause_tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3751,7 +3738,6 @@ mod root_cause_tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
 
@@ -3857,7 +3843,6 @@ mod root_cause_tests {
                 convergence_tolerance: 1e-8,
                 firth_bias_reduction: false,
                 initial_lm_lambda: None,
-                geodesic_acceleration: false,
                 arrow_schur: None,
             };
 
@@ -4064,7 +4049,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
         let summary =
@@ -4125,7 +4109,6 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
-            geodesic_acceleration: false,
             arrow_schur: None,
         };
         let summary =

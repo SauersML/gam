@@ -2383,20 +2383,12 @@ impl LatentSurvivalFamily {
     pub fn offset_channel_residuals(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<crate::survival::OffsetChannelResiduals, String> {
+    ) -> Result<crate::survival::OffsetChannelResiduals, LatentSurvivalError> {
         let n = self.event_target.len();
-        if block_states.is_empty() {
-            // SPEC 20: missing per-block geometry is a typed error, never a
-            // fabricated zero derivative — a zero residual vector here would
-            // hand the outer baseline-θ optimizer a false ‖g‖ = 0 and let it
-            // manufacture convergence at an arbitrary θ.
-            return Err(format!(
-                "LatentSurvivalFamily::offset_channel_residuals: block_states is empty \
-                 (the fitted per-block state was not propagated to the baseline-θ \
-                 gradient path; n={n}); the baseline offset residuals are undefined \
-                 without it"
-            ));
-        }
+        // `split_time_eta` validates the complete block slate before indexing
+        // it and returns `LatentSurvivalError::BlockMismatch` when fitted state
+        // is missing. There is deliberately no zero-residual fallback: zeros
+        // would manufacture a stationary outer baseline gradient.
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
@@ -2427,7 +2419,8 @@ impl LatentSurvivalFamily {
                 mu[row_idx],
                 sigma,
                 include_log_sigma,
-            )?;
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
             // ∂NLL/∂o_ch = −w · ∂(log-likelihood)/∂q_ch.
             entry[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
             exit[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
@@ -3555,20 +3548,11 @@ impl LatentBinaryFamily {
     pub fn offset_channel_residuals(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<crate::survival::OffsetChannelResiduals, String> {
+    ) -> Result<crate::survival::OffsetChannelResiduals, LatentSurvivalError> {
         let n = self.event_target.len();
-        if block_states.is_empty() {
-            // SPEC 20: missing per-block geometry is a typed error, never a
-            // fabricated zero derivative — a zero residual vector here would
-            // hand the outer baseline-θ optimizer a false ‖g‖ = 0 and let it
-            // manufacture convergence at an arbitrary θ.
-            return Err(format!(
-                "LatentBinaryFamily::offset_channel_residuals: block_states is empty \
-                 (the fitted per-block state was not propagated to the baseline-θ \
-                 gradient path; n={n}); the baseline offset residuals are undefined \
-                 without it"
-            ));
-        }
+        // `split_time_eta` returns a typed block-count error before indexing.
+        // Missing state is never translated into zero residuals, because that
+        // would falsely certify the enclosing baseline optimization.
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let mut entry = Array1::<f64>::zeros(n);
         let mut exit = Array1::<f64>::zeros(n);
@@ -3590,7 +3574,8 @@ impl LatentBinaryFamily {
                     mu[row_idx],
                     self.latent_sd,
                     false,
-                )?;
+                )
+                .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
             let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
             // ∂NLL/∂o_ch = −w · grad_scale · ∂(log S)/∂q_ch.
             entry[row_idx] =
@@ -4775,6 +4760,32 @@ mod tests {
             x_mean: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0, -0.3], [0.2, 0.9]])),
             time_linear_constraints: None,
             quadctx: Arc::new(QuadratureContext::new()),
+        }
+    }
+
+    #[test]
+    fn latent_survival_offset_residuals_reject_missing_block_state() {
+        let error = learnable_sigma_test_family()
+            .offset_channel_residuals(&[])
+            .expect_err("missing fitted blocks must not become zero residuals");
+        match error {
+            LatentSurvivalError::BlockMismatch { reason } => {
+                assert!(reason.contains("got 0"), "unexpected mismatch: {reason}");
+            }
+            other => panic!("missing fitted blocks must be a block mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn latent_binary_offset_residuals_reject_missing_block_state() {
+        let error = fixed_sigma_binary_test_family()
+            .offset_channel_residuals(&[])
+            .expect_err("missing fitted blocks must not become zero residuals");
+        match error {
+            LatentSurvivalError::BlockMismatch { reason } => {
+                assert!(reason.contains("got 0"), "unexpected mismatch: {reason}");
+            }
+            other => panic!("missing fitted blocks must be a block mismatch, got {other:?}"),
         }
     }
 

@@ -43,6 +43,7 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use std::hash::{Hash, Hasher};
 
 use crate::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
@@ -191,23 +192,225 @@ pub struct StackingConfig {
 impl Default for StackingConfig {
     fn default() -> Self {
         Self {
-            max_iter: 10_000,
-            kkt_tol: 1e-8,
+            max_iter: 256,
+            kkt_tol: f64::EPSILON.sqrt(),
         }
     }
 }
 
-/// Simplex weights for retained topology candidates plus the achieved held-out
-/// mean log-score and the verified KKT certificate residual.
+/// Auditable global-optimality certificate for a stacking solution.
+#[derive(Debug, Clone, Copy)]
+pub struct StackingCertificate {
+    /// Achieved held-out mean log predictive density.
+    pub mean_log_score: f64,
+    /// Frank-Wolfe/KKT duality gap `max_k g_k - w·g`. Concavity makes this
+    /// an upper bound on objective suboptimality.
+    pub duality_gap: f64,
+    /// Absolute simplex mass residual `|Σw - 1|`.
+    pub simplex_residual: f64,
+    /// Error in the analytic multiplier identity `w·g = 1`.
+    pub multiplier_residual: f64,
+    /// Largest complementary-slackness residual `w_k |g_k - w·g|`.
+    pub complementarity_residual: f64,
+}
+
+impl StackingCertificate {
+    pub fn residual(&self) -> f64 {
+        self.duality_gap
+            .max(self.simplex_residual)
+            .max(self.multiplier_residual)
+            .max(self.complementarity_residual)
+    }
+}
+
+/// Serializable work state carried by a stacking exhaustion error and accepted
+/// by [`resume_stacking_weights`]. Weights stay aligned to the original input
+/// columns; no candidate is silently dropped.
+#[derive(Debug, Clone)]
+pub struct StackingCheckpoint {
+    pub weights: Array1<f64>,
+    pub completed_iterations: usize,
+}
+
+/// Typed stacking failure. In particular, exhaustion carries both its
+/// certificate evidence and an exact checkpoint rather than returning weights.
+#[derive(Debug, Clone)]
+pub enum StackingError {
+    InvalidInput { message: String },
+    NumericalFailure {
+        message: String,
+        certificate: Option<StackingCertificate>,
+        checkpoint: Option<StackingCheckpoint>,
+    },
+    DidNotConverge {
+        max_iterations: usize,
+        tolerance: f64,
+        certificate: StackingCertificate,
+        checkpoint: StackingCheckpoint,
+    },
+}
+
+impl std::fmt::Display for StackingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput { message } => write!(f, "invalid stacking problem: {message}"),
+            Self::NumericalFailure {
+                message,
+                certificate,
+                checkpoint,
+            } => write!(
+                f,
+                "stacking numerical failure: {message} (certificate residual {}, checkpoint iterations {})",
+                certificate.map_or(f64::NAN, |value| value.residual()),
+                checkpoint.as_ref().map_or(0, |value| value.completed_iterations)
+            ),
+            Self::DidNotConverge {
+                max_iterations,
+                tolerance,
+                certificate,
+                checkpoint,
+            } => write!(
+                f,
+                "stacking did not certify after {max_iterations} additional iterations (total {}): KKT residual {:.6e} exceeds tolerance {:.3e}; resume from the carried weights checkpoint",
+                checkpoint.completed_iterations,
+                certificate.residual(),
+                tolerance
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StackingError {}
+
+/// Simplex weights for retained topology candidates plus their verified global
+/// optimum certificate.
 #[derive(Debug, Clone)]
 pub struct StackingWeights {
     pub weights: Array1<f64>,
-    pub mean_log_score: f64,
     pub iterations: usize,
-    /// Verified simplex-KKT residual at the returned weights (always at or
-    /// below the configured `kkt_tol`; a solve that cannot certify errors
-    /// instead of returning weights).
-    pub kkt_residual: f64,
+    pub certificate: StackingCertificate,
+}
+
+struct StackingProblem {
+    scaled_density: Array2<f64>,
+    row_log_scale: Array1<f64>,
+}
+
+impl StackingProblem {
+    fn from_log_density(log_density: ArrayView2<'_, f64>) -> Result<Self, StackingError> {
+        let n_obs = log_density.nrows();
+        let n_cand = log_density.ncols();
+        if n_cand == 0 || n_obs == 0 {
+            return Err(StackingError::InvalidInput {
+                message: "at least one candidate and one held-out row are required".to_string(),
+            });
+        }
+        if let Some(((row, col), value)) = log_density
+            .indexed_iter()
+            .find(|(_, value)| value.is_nan() || **value == f64::INFINITY)
+        {
+            return Err(StackingError::InvalidInput {
+                message: format!(
+                    "log density at row {row}, candidate {col} is {value}; NaN and +infinity are not predictive densities"
+                ),
+            });
+        }
+        let mut scaled_density = Array2::<f64>::zeros((n_obs, n_cand));
+        let mut row_log_scale = Array1::<f64>::zeros(n_obs);
+        for row in 0..n_obs {
+            let row_max = (0..n_cand)
+                .map(|col| log_density[[row, col]])
+                .fold(f64::NEG_INFINITY, f64::max);
+            if !row_max.is_finite() {
+                return Err(StackingError::InvalidInput {
+                    message: format!(
+                        "held-out row {row} has zero density under every candidate; deleting it would change the stacking target"
+                    ),
+                });
+            }
+            row_log_scale[row] = row_max;
+            for col in 0..n_cand {
+                let value = log_density[[row, col]];
+                if value.is_finite() {
+                    scaled_density[[row, col]] = (value - row_max).exp();
+                }
+            }
+        }
+        Ok(Self {
+            scaled_density,
+            row_log_scale,
+        })
+    }
+
+    fn evaluate(
+        &self,
+        weights: ArrayView1<'_, f64>,
+    ) -> Result<(Array1<f64>, StackingCertificate, f64), String> {
+        let n = self.scaled_density.nrows();
+        let k = self.scaled_density.ncols();
+        let mass = weights.sum();
+        if weights.len() != k
+            || weights.iter().any(|value| !value.is_finite() || *value < 0.0)
+            || !(mass.is_finite() && mass > 0.0)
+        {
+            return Err("checkpoint weights are not a finite nonnegative simplex vector".to_string());
+        }
+        let mut gradient = Array1::<f64>::zeros(k);
+        let mut centered_objective = 0.0_f64;
+        let mut mean_log_score = 0.0_f64;
+        for row in 0..n {
+            let mut mixture = 0.0_f64;
+            for col in 0..k {
+                mixture += weights[col] * self.scaled_density[[row, col]];
+            }
+            if !(mixture.is_finite() && mixture > 0.0) {
+                return Err(format!(
+                    "candidate mixture lost held-out row {row} (scaled density {mixture})"
+                ));
+            }
+            let log_mixture = mixture.ln();
+            centered_objective += log_mixture / n as f64;
+            let log_score = self.row_log_scale[row] + log_mixture;
+            let count = (row + 1) as f64;
+            mean_log_score = mean_log_score * ((count - 1.0) / count) + log_score / count;
+            for col in 0..k {
+                gradient[col] += self.scaled_density[[row, col]] / mixture / n as f64;
+            }
+        }
+        if !centered_objective.is_finite()
+            || !mean_log_score.is_finite()
+            || gradient.iter().any(|value| !value.is_finite())
+        {
+            return Err("objective or analytic gradient became non-finite".to_string());
+        }
+        let multiplier = weights.dot(&gradient);
+        let max_gradient = gradient.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let certificate = StackingCertificate {
+            mean_log_score,
+            duality_gap: (max_gradient - multiplier).max(0.0),
+            simplex_residual: (mass - 1.0).abs(),
+            multiplier_residual: (multiplier - 1.0).abs(),
+            complementarity_residual: weights
+                .iter()
+                .zip(gradient.iter())
+                .map(|(&weight, &gain)| weight * (gain - multiplier).abs())
+                .fold(0.0_f64, f64::max),
+        };
+        Ok((gradient, certificate, centered_objective))
+    }
+
+    fn centered_objective(&self, weights: ArrayView1<'_, f64>) -> Option<f64> {
+        let n = self.scaled_density.nrows();
+        let mut objective = 0.0_f64;
+        for row in 0..n {
+            let mixture = self.scaled_density.row(row).dot(&weights);
+            if !(mixture.is_finite() && mixture > 0.0) {
+                return None;
+            }
+            objective += mixture.ln() / n as f64;
+        }
+        objective.is_finite().then_some(objective)
+    }
 }
 
 /// Solve the stacking-of-predictive-distributions weight problem from a
@@ -224,178 +427,290 @@ pub struct StackingWeights {
 /// optimum. With `g_k = ∂f/∂w_k = mean_i p_ik / mix_i`, the simplex multiplier
 /// is exactly `Σ_k w_k g_k = 1`, so the KKT system is `g_k ≤ 1` for every
 /// candidate with `w_k · (1 − g_k) = 0` (complementary slackness). Iterates
-/// come from the exponentiated-gradient / EM multiplicative step
-/// `w_k ← w_k · g_k` (a monotone MM ascent whose fixed points are exactly the
-/// KKT points), but the step never certifies itself: the solve returns only
-/// when the residual `max_k max((g_k − 1)⁺, w_k · |g_k − 1|)` is verified
-/// below `config.kkt_tol`, and exhausting `config.max_iter` without that
-/// certificate is a typed error — uncertified weights never reach model
-/// selection.
+/// use an analytic reduced-space Newton step on the current simplex face; an
+/// exact concave line solve toward the most violated vertex activates a
+/// candidate or globalizes a singular Newton system. The solve returns only
+/// after the Frank-Wolfe duality gap and all primal/KKT residuals are verified
+/// below `config.kkt_tol`. Exhaustion carries the full certificate and a
+/// resumable weights checkpoint; uncertified weights never reach selection.
 pub fn solve_stacking_weights(
     log_density: ArrayView2<'_, f64>,
     config: StackingConfig,
-) -> Result<StackingWeights, String> {
-    let n_obs = log_density.nrows();
-    let n_cand = log_density.ncols();
-    if n_cand == 0 {
-        return Err("stacking requires at least one candidate column".to_string());
-    }
-    if n_obs == 0 {
-        return Err("stacking requires at least one held-out observation row".to_string());
-    }
-
-    let kept_cols: Vec<usize> = (0..n_cand)
-        .filter(|&k| (0..n_obs).any(|i| log_density[[i, k]].is_finite()))
-        .collect();
-    if kept_cols.is_empty() {
-        return Err("stacking found no candidate with any finite held-out density".to_string());
-    }
-    let rows: Vec<usize> = (0..n_obs)
-        .filter(|&i| kept_cols.iter().any(|&k| log_density[[i, k]].is_finite()))
-        .collect();
-    if rows.is_empty() {
-        return Err("stacking found no held-out row with a finite density".to_string());
-    }
-
-    let kept = kept_cols.len();
-    let mut weights = Array1::<f64>::from_elem(kept, 1.0 / kept as f64);
-    let mut gain = vec![0.0_f64; kept];
-    let mut iterations = 0usize;
-    let mut kkt_residual = f64::INFINITY;
-    let mut certified = false;
-    while iterations < config.max_iter {
-        iterations += 1;
-        // Gradient of the mean held-out log-score at the current weights:
-        // g_k = mean over active rows of p_ik / mix_i, in log space. The
-        // gradient is accumulated for EVERY kept candidate — including any
-        // whose weight has reached the boundary — because the boundary KKT
-        // condition `g_k ≤ 1` must be checked there too.
-        gain.fill(0.0);
-        let mut active_rows = 0usize;
-        for &row in &rows {
-            let mut row_max = f64::NEG_INFINITY;
-            for (local_col, &source_col) in kept_cols.iter().enumerate() {
-                let log_p = log_density[[row, source_col]];
-                if log_p.is_finite() && weights[local_col] > 0.0 {
-                    row_max = row_max.max(weights[local_col].ln() + log_p);
-                }
-            }
-            if !row_max.is_finite() {
-                continue;
-            }
-            let mut denom = 0.0_f64;
-            for (local_col, &source_col) in kept_cols.iter().enumerate() {
-                let log_p = log_density[[row, source_col]];
-                if log_p.is_finite() && weights[local_col] > 0.0 {
-                    denom += (weights[local_col].ln() + log_p - row_max).exp();
-                }
-            }
-            if denom <= 0.0 {
-                continue;
-            }
-            active_rows += 1;
-            let log_mix = row_max + denom.ln();
-            for (local_col, &source_col) in kept_cols.iter().enumerate() {
-                let log_p = log_density[[row, source_col]];
-                if log_p.is_finite() {
-                    gain[local_col] += (log_p - log_mix).exp();
-                }
-            }
-        }
-        if active_rows == 0 {
-            return Err(
-                "stacking lost every active held-out row (all mixture densities degenerated); \
-                 the weight problem has no certifiable optimum"
-                    .to_string(),
-            );
-        }
-        for g in gain.iter_mut() {
-            *g /= active_rows as f64;
-        }
-        // Verified simplex-KKT residual (multiplier ≡ 1): stationarity excess
-        // (g_k − 1)⁺ for every candidate, complementary slackness
-        // w_k·|g_k − 1| for candidates carrying weight.
-        kkt_residual = weights
-            .iter()
-            .zip(gain.iter())
-            .map(|(&w, &g)| (g - 1.0).max(0.0).max(w * (g - 1.0).abs()))
-            .fold(0.0_f64, f64::max);
-        if kkt_residual <= config.kkt_tol {
-            certified = true;
-            break;
-        }
-        // Exponentiated-gradient / EM multiplicative ascent step. Σ_k w_k g_k
-        // = 1 over the active rows, so the renormalization only removes
-        // floating-point drift.
-        for (w, &g) in weights.iter_mut().zip(gain.iter()) {
-            *w *= g;
-        }
-        let total = weights.sum();
-        if !(total.is_finite() && total > 0.0) {
-            return Err(format!(
-                "stacking weight update degenerated (weight mass {total:.3e}); \
-                 the multiplicative ascent cannot continue"
-            ));
-        }
-        weights.mapv_inplace(|value| value / total);
-    }
-    if !certified {
-        return Err(format!(
-            "stacking weights did not certify within {iterations} iterations: simplex-KKT \
-             residual {kkt_residual:.6e} exceeds tolerance {:.3e}; uncertified weights must \
-             not feed model selection",
-            config.kkt_tol
-        ));
-    }
-
-    let mean_log_score = stacking_mean_log_score(log_density, &rows, &kept_cols, weights.view());
-    let mut full = Array1::<f64>::zeros(n_cand);
-    for (local_col, &source_col) in kept_cols.iter().enumerate() {
-        full[source_col] = weights[local_col];
-    }
-    Ok(StackingWeights {
-        weights: full,
-        mean_log_score,
-        iterations,
-        kkt_residual,
-    })
+) -> Result<StackingWeights, StackingError> {
+    solve_stacking_weights_impl(log_density, config, None)
 }
 
-fn stacking_mean_log_score(
+/// Resume a previously exhausted stacking solve without redoing its accepted
+/// Newton/active-set work.
+pub fn resume_stacking_weights(
     log_density: ArrayView2<'_, f64>,
-    rows: &[usize],
-    kept_cols: &[usize],
+    config: StackingConfig,
+    checkpoint: &StackingCheckpoint,
+) -> Result<StackingWeights, StackingError> {
+    solve_stacking_weights_impl(log_density, config, Some(checkpoint))
+}
+
+fn solve_stacking_weights_impl(
+    log_density: ArrayView2<'_, f64>,
+    config: StackingConfig,
+    checkpoint: Option<&StackingCheckpoint>,
+) -> Result<StackingWeights, StackingError> {
+    if config.max_iter == 0 {
+        return Err(StackingError::InvalidInput {
+            message: "max_iter must be positive".to_string(),
+        });
+    }
+    let numerical_floor = f64::EPSILON.sqrt();
+    if !config.kkt_tol.is_finite() || config.kkt_tol < numerical_floor {
+        return Err(StackingError::InvalidInput {
+            message: format!(
+                "kkt_tol must be finite and at least the floating-point resolution floor {numerical_floor:.3e}"
+            ),
+        });
+    }
+    let problem = StackingProblem::from_log_density(log_density)?;
+    let k = problem.scaled_density.ncols();
+    let (mut weights, completed_before) = if let Some(checkpoint) = checkpoint {
+        if checkpoint.weights.len() != k {
+            return Err(StackingError::InvalidInput {
+                message: format!(
+                    "checkpoint has {} weights but the density table has {k} candidates",
+                    checkpoint.weights.len()
+                ),
+            });
+        }
+        let mut weights = checkpoint.weights.clone();
+        let mass = weights.sum();
+        if weights.iter().any(|value| !value.is_finite() || *value < 0.0)
+            || !(mass.is_finite() && mass > 0.0)
+        {
+            return Err(StackingError::InvalidInput {
+                message: "checkpoint weights must be finite, nonnegative, and have positive mass"
+                    .to_string(),
+            });
+        }
+        weights.mapv_inplace(|value| value / mass);
+        (weights, checkpoint.completed_iterations)
+    } else {
+        (Array1::<f64>::from_elem(k, 1.0 / k as f64), 0)
+    };
+
+    for additional_iterations in 0..=config.max_iter {
+        let completed_iterations = completed_before + additional_iterations;
+        let checkpoint = StackingCheckpoint {
+            weights: weights.clone(),
+            completed_iterations,
+        };
+        let (gradient, certificate, objective) = problem.evaluate(weights.view()).map_err(|message| {
+            StackingError::NumericalFailure {
+                message,
+                certificate: None,
+                checkpoint: Some(checkpoint.clone()),
+            }
+        })?;
+        if certificate.residual() <= config.kkt_tol {
+            return Ok(StackingWeights {
+                weights,
+                iterations: completed_iterations,
+                certificate,
+            });
+        }
+        if additional_iterations == config.max_iter {
+            return Err(StackingError::DidNotConverge {
+                max_iterations: config.max_iter,
+                tolerance: config.kkt_tol,
+                certificate,
+                checkpoint,
+            });
+        }
+
+        let max_gradient_col = gradient
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index)
+            .expect("stacking has at least one candidate");
+        let candidate = stacking_newton_step(&problem, weights.view(), gradient.view(), objective)
+            .or_else(|| {
+                stacking_vertex_step(&problem, weights.view(), max_gradient_col, objective)
+            })
+            .ok_or_else(|| StackingError::NumericalFailure {
+                message: "positive KKT gap remained but neither the analytic Newton direction nor the exact vertex line solve produced a representable ascent step".to_string(),
+                certificate: Some(certificate),
+                checkpoint: Some(checkpoint),
+            })?;
+        weights = candidate;
+    }
+    unreachable!("inclusive iteration loop always returns")
+}
+
+fn stacking_newton_step(
+    problem: &StackingProblem,
     weights: ArrayView1<'_, f64>,
-) -> f64 {
-    let mut score_sum = 0.0_f64;
-    let mut counted = 0usize;
-    for &row in rows {
-        let mut row_max = f64::NEG_INFINITY;
-        for (local_col, &source_col) in kept_cols.iter().enumerate() {
-            let log_p = log_density[[row, source_col]];
-            if log_p.is_finite() && weights[local_col] > 0.0 {
-                row_max = row_max.max(weights[local_col].ln() + log_p);
+    gradient: ArrayView1<'_, f64>,
+    objective: f64,
+) -> Option<Array1<f64>> {
+    let active: Vec<usize> = weights
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &weight)| (weight > 0.0).then_some(index))
+        .collect();
+    if active.len() < 2 {
+        return None;
+    }
+    let reference_position = active
+        .iter()
+        .enumerate()
+        .max_by(|left, right| weights[*left.1].total_cmp(&weights[*right.1]))
+        .map(|(position, _)| position)?;
+    let reference = active[reference_position];
+    let free: Vec<usize> = active
+        .iter()
+        .copied()
+        .filter(|&index| index != reference)
+        .collect();
+    let dimension = free.len();
+    let n = problem.scaled_density.nrows();
+    let mut information = Array2::<f64>::zeros((dimension, dimension));
+    for row in 0..n {
+        let mixture = problem.scaled_density.row(row).dot(&weights);
+        if !(mixture.is_finite() && mixture > 0.0) {
+            return None;
+        }
+        let reference_density = problem.scaled_density[[row, reference]];
+        let contrasts: Vec<f64> = free
+            .iter()
+            .map(|&col| (problem.scaled_density[[row, col]] - reference_density) / mixture)
+            .collect();
+        for left in 0..dimension {
+            for right in 0..=left {
+                information[[left, right]] += contrasts[left] * contrasts[right] / n as f64;
+                information[[right, left]] = information[[left, right]];
             }
-        }
-        if !row_max.is_finite() {
-            continue;
-        }
-        let mut denom = 0.0_f64;
-        for (local_col, &source_col) in kept_cols.iter().enumerate() {
-            let log_p = log_density[[row, source_col]];
-            if log_p.is_finite() && weights[local_col] > 0.0 {
-                denom += (weights[local_col].ln() + log_p - row_max).exp();
-            }
-        }
-        if denom > 0.0 {
-            score_sum += row_max + denom.ln();
-            counted += 1;
         }
     }
-    if counted == 0 {
-        f64::NEG_INFINITY
+    let reduced_gradient = Array1::from_iter(
+        free.iter()
+            .map(|&col| gradient[col] - gradient[reference]),
+    );
+    let (eigenvalues, eigenvectors) = information.eigh(Side::Lower).ok()?;
+    let spectral_scale = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+    if !(spectral_scale.is_finite() && spectral_scale > 0.0) {
+        return None;
+    }
+    let rank_tolerance =
+        f64::EPSILON * (dimension as f64) * spectral_scale.max(f64::MIN_POSITIVE);
+    let projected = eigenvectors.t().dot(&reduced_gradient);
+    let mut spectral_step = Array1::<f64>::zeros(dimension);
+    for index in 0..dimension {
+        if eigenvalues[index] > rank_tolerance {
+            spectral_step[index] = projected[index] / eigenvalues[index];
+        }
+    }
+    let reduced_step = eigenvectors.dot(&spectral_step);
+    let ascent = reduced_gradient.dot(&reduced_step);
+    if !(ascent.is_finite() && ascent > 0.0) {
+        return None;
+    }
+    let mut direction = Array1::<f64>::zeros(weights.len());
+    for (position, &col) in free.iter().enumerate() {
+        direction[col] = reduced_step[position];
+    }
+    direction[reference] = -reduced_step.sum();
+    let mut step = 1.0_f64;
+    let mut boundary = None;
+    for col in 0..weights.len() {
+        if direction[col] < 0.0 {
+            let candidate = -weights[col] / direction[col];
+            if candidate < step {
+                step = candidate;
+                boundary = Some(col);
+            }
+        }
+    }
+    loop {
+        let mut candidate = &weights + &(direction.mapv(|value| step * value));
+        if let Some(col) = boundary {
+            if step == -weights[col] / direction[col] {
+                candidate[col] = 0.0;
+            }
+        }
+        for value in candidate.iter_mut() {
+            if *value < 0.0 && *value >= -f64::EPSILON {
+                *value = 0.0;
+            }
+        }
+        let mass = candidate.sum();
+        if mass.is_finite() && mass > 0.0 {
+            candidate.mapv_inplace(|value| value / mass);
+            if problem
+                .centered_objective(candidate.view())
+                .is_some_and(|value| value > objective)
+            {
+                return Some(candidate);
+            }
+        }
+        let next_step = 0.5 * step;
+        if next_step == step || next_step == 0.0 {
+            return None;
+        }
+        step = next_step;
+        boundary = None;
+    }
+}
+
+fn stacking_vertex_step(
+    problem: &StackingProblem,
+    weights: ArrayView1<'_, f64>,
+    vertex: usize,
+    objective: f64,
+) -> Option<Array1<f64>> {
+    let derivative = |step: f64| -> f64 {
+        let mut value = 0.0_f64;
+        let n = problem.scaled_density.nrows();
+        for row in 0..n {
+            let current = problem.scaled_density.row(row).dot(&weights);
+            let target = problem.scaled_density[[row, vertex]];
+            let mixture = (1.0 - step) * current + step * target;
+            if mixture <= 0.0 {
+                return f64::NEG_INFINITY;
+            }
+            value += (target - current) / mixture / n as f64;
+        }
+        value
+    };
+    if derivative(0.0) <= 0.0 {
+        return None;
+    }
+    let mut step = if derivative(1.0) >= 0.0 {
+        1.0
     } else {
-        score_sum / counted as f64
+        let mut lower = 0.0_f64;
+        let mut upper = 1.0_f64;
+        while upper - lower > f64::EPSILON.sqrt() {
+            let middle = 0.5 * (lower + upper);
+            if derivative(middle) > 0.0 {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        0.5 * (lower + upper)
+    };
+    loop {
+        let mut candidate = weights.mapv(|weight| (1.0 - step) * weight);
+        candidate[vertex] += step;
+        if problem
+            .centered_objective(candidate.view())
+            .is_some_and(|value| value > objective)
+        {
+            return Some(candidate);
+        }
+        let next_step = 0.5 * step;
+        if next_step == step || next_step == 0.0 {
+            return None;
+        }
+        step = next_step;
     }
 }
 
@@ -459,8 +774,11 @@ pub struct GaussianMixtureConfig {
     pub max_iter: usize,
     /// Relative mean-log-likelihood improvement tolerance for EM stopping.
     pub loglik_tol: f64,
-    /// Ridge added to each component covariance for numerical SPD safety
-    /// (variance floor). A small fixed value, not a tuned knob.
+    /// Relative max-norm tolerance for the full EM parameter-map residual.
+    pub parameter_tol: f64,
+    /// Lower eigenvalue constraint for every component covariance. The M-step
+    /// solves this constrained likelihood problem exactly by spectral clipping;
+    /// it is not an additive ridge or an unmodelled prior.
     pub covariance_floor: f64,
     /// Maximum iterations for the deterministic k-means seeding pass.
     pub kmeans_max_iter: usize,
@@ -470,35 +788,142 @@ impl Default for GaussianMixtureConfig {
     fn default() -> Self {
         Self {
             max_iter: 1000,
-            loglik_tol: 1e-7,
+            loglik_tol: f64::EPSILON.sqrt(),
+            parameter_tol: f64::EPSILON.sqrt(),
             covariance_floor: 1e-6,
             kmeans_max_iter: 25,
         }
     }
 }
 
+/// Residual evidence proving that the returned mixture is a fixed point of its
+/// likelihood EM map rather than merely the iterate present at a work cap.
+#[derive(Debug, Clone, Copy)]
+pub struct GaussianMixtureCertificate {
+    pub mean_log_likelihood: f64,
+    pub objective_residual: f64,
+    pub objective_tolerance: f64,
+    pub parameter_residual: f64,
+    pub parameter_tolerance: f64,
+}
+
+/// Exact parameter state carried across an EM exhaustion boundary.
+#[derive(Debug, Clone)]
+pub struct GaussianMixtureCheckpoint {
+    pub weights: Array1<f64>,
+    pub means: Array2<f64>,
+    pub covariances: Vec<Array2<f64>>,
+    pub mean_log_likelihood: f64,
+    pub completed_iterations: usize,
+}
+
+/// Typed Gaussian-mixture optimization failure. Exhaustion and a broken EM
+/// monotonicity invariant both carry the last internally consistent state.
+#[derive(Debug, Clone)]
+pub enum GaussianMixtureError {
+    InvalidInput { message: String },
+    NumericalFailure {
+        message: String,
+        checkpoint: Option<GaussianMixtureCheckpoint>,
+    },
+    MonotonicityViolation {
+        previous_mean_log_likelihood: f64,
+        next_mean_log_likelihood: f64,
+        allowed_decrease: f64,
+        checkpoint: GaussianMixtureCheckpoint,
+    },
+    DidNotConverge {
+        max_iterations: usize,
+        certificate: GaussianMixtureCertificate,
+        checkpoint: GaussianMixtureCheckpoint,
+    },
+}
+
+impl std::fmt::Display for GaussianMixtureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput { message } => write!(f, "invalid Gaussian mixture: {message}"),
+            Self::NumericalFailure {
+                message,
+                checkpoint,
+            } => write!(
+                f,
+                "Gaussian-mixture numerical failure: {message} (checkpoint iterations {})",
+                checkpoint.as_ref().map_or(0, |value| value.completed_iterations)
+            ),
+            Self::MonotonicityViolation {
+                previous_mean_log_likelihood,
+                next_mean_log_likelihood,
+                allowed_decrease,
+                checkpoint,
+            } => write!(
+                f,
+                "Gaussian-mixture EM violated monotone ascent at iteration {}: mean log likelihood {previous_mean_log_likelihood:.12e} -> {next_mean_log_likelihood:.12e} (allowed numerical decrease {allowed_decrease:.3e}); resume from the carried checkpoint only after diagnosing the numerical failure",
+                checkpoint.completed_iterations
+            ),
+            Self::DidNotConverge {
+                max_iterations,
+                certificate,
+                checkpoint,
+            } => write!(
+                f,
+                "Gaussian-mixture EM did not certify after {max_iterations} additional iterations (total {}): objective residual {:.6e}/{:.3e}, parameter-map residual {:.6e}/{:.3e}; resume from the carried checkpoint, which is not comparable evidence",
+                checkpoint.completed_iterations,
+                certificate.objective_residual,
+                certificate.objective_tolerance,
+                certificate.parameter_residual,
+                certificate.parameter_tolerance
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GaussianMixtureError {}
+
 /// A fitted `k`-component full-covariance Gaussian mixture.
 #[derive(Debug, Clone)]
 pub struct GaussianMixtureFit {
     /// Mixing weights, length `k`, on the simplex.
-    pub weights: Array1<f64>,
+    weights: Array1<f64>,
     /// Component means, `k × d`.
-    pub means: Array2<f64>,
+    means: Array2<f64>,
     /// Component covariances, `k` matrices of shape `d × d` (SPD).
-    pub covariances: Vec<Array2<f64>>,
+    covariances: Vec<Array2<f64>>,
     /// Number of mixture components.
-    pub k: usize,
+    k: usize,
     /// Data dimension.
-    pub d: usize,
+    d: usize,
     /// Number of rows used to fit.
-    pub n_obs: usize,
+    n_obs: usize,
     /// Maximised total log-likelihood `Σ_i log Σ_j w_j N(y_i; μ_j, Σ_j)`.
-    pub loglik: f64,
+    loglik: f64,
     /// EM iterations taken.
-    pub iterations: usize,
+    iterations: usize,
+    certificate: GaussianMixtureCertificate,
+    data_fingerprint: u64,
 }
 
 impl GaussianMixtureFit {
+    pub fn weights(&self) -> ArrayView1<'_, f64> {
+        self.weights.view()
+    }
+
+    pub fn means(&self) -> ArrayView2<'_, f64> {
+        self.means.view()
+    }
+
+    pub fn covariances(&self) -> &[Array2<f64>] {
+        &self.covariances
+    }
+
+    pub fn iterations(&self) -> usize {
+        self.iterations
+    }
+
+    pub fn certificate(&self) -> GaussianMixtureCertificate {
+        self.certificate
+    }
+
     /// Free-parameter count `P` of a `k`-component full-covariance mixture in
     /// `d` dimensions: `(k − 1)` mixing weights on the simplex, `k·d` mean
     /// coordinates, and `k · d(d+1)/2` covariance entries. This is the exact
@@ -559,6 +984,15 @@ impl GaussianMixtureFit {
     /// reach this method is a certified EM optimum and its evidence is
     /// comparable across candidates.
     pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if data.nrows() != self.n_obs
+            || data.ncols() != self.d
+            || mixture_data_fingerprint(data) != self.data_fingerprint
+        {
+            return Err(
+                "mixture Laplace evidence must be evaluated on the exact data whose certified EM fixed point is stored in this fit"
+                    .to_string(),
+            );
+        }
         let p = self.num_free_parameters();
         let information = self.empirical_fisher_information(data)?;
         if information.nrows() != p {
@@ -697,20 +1131,17 @@ impl GaussianMixtureFit {
                 }
             }
         }
-        // Symmetrize and add a unit-precision ridge `I`. This is the Hessian
-        // contribution of a standard-normal prior on the (natural) parameters,
-        // making the object a proper MAP observed-information `H = I_prior +
-        // Σ_i s_i s_iᵀ`. It guarantees SPD (well-defined `log|H|`) for any `n`
-        // and is a fixed prior, not a tuned knob — the same unit-information
-        // prior the rank-aware normalizer assumes when it credits each free
-        // parameter one `log(2π)` of integration volume.
+        // Symmetrize the empirical Fisher. No ridge or prior may be added here:
+        // the certified mode optimizes the pure mixture likelihood, so its
+        // objective and Hessian must describe that same Laplace integral.
+        // Rank-deficient information is therefore an evidence error, not an
+        // excuse to manufacture comparability with an unmodelled prior.
         for r in 0..p {
             for c in (r + 1)..p {
                 let avg = 0.5 * (info[[r, c]] + info[[c, r]]);
                 info[[r, c]] = avg;
                 info[[c, r]] = avg;
             }
-            info[[r, r]] += 1.0;
         }
         Ok(info)
     }
@@ -814,6 +1245,16 @@ fn log_sum_exp(terms: &[f64], max_term: f64) -> f64 {
         acc += (t - max_term).exp();
     }
     max_term + acc.ln()
+}
+
+fn mixture_data_fingerprint(data: ArrayView2<'_, f64>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.nrows().hash(&mut hasher);
+    data.ncols().hash(&mut hasher);
+    for value in data {
+        value.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Fit a `k`-component full-covariance Gaussian mixture by deterministic

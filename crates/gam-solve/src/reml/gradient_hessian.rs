@@ -444,7 +444,7 @@ impl<'a> RemlState<'a> {
         // curvature to BFGS instead of spending minutes on one Hessian probe
         // (#1575).
         if reml_robust_jeffreys_link(&self.config).is_some()
-            && self.tk_correction_is_canonical_logit()
+            && self.tk_exact_hessian_is_canonical_logit()
             && !Self::firth_tk_exact_hessian_scale_allows(n_obs, p_dim)
         {
             log::info!(
@@ -454,15 +454,14 @@ impl<'a> RemlState<'a> {
             );
             return false;
         }
-        // The analytic outer Hessian for a Firth fit folds in the Tierney-Kadane
-        // curvature, whose c/d/e/f derivative arrays are implemented only for the
-        // canonical Binomial Logit jet. #758 widened Firth to other Binomial
-        // inverse links (Probit, CLogLog, SAS, …); those fits have no analytic TK
-        // Hessian, so decline the analytic path and let BFGS drive the outer loop
-        // off the (link-general) plain-Laplace gradient. Non-Firth fits are
-        // unaffected — they never use the TK correction.
+        // The corrected objective and its exact analytic gradient are
+        // link-general, but an exact TK outer Hessian additionally needs the
+        // fourth eta derivative of the observed-information surface. That
+        // carrier is currently available only for canonical Binomial Logit.
+        // Other Firth links therefore optimize the same TK-corrected objective
+        // with BFGS curvature rather than silently dropping the correction.
         if reml_robust_jeffreys_link(&self.config).is_some()
-            && !self.tk_correction_is_canonical_logit()
+            && !self.tk_exact_hessian_is_canonical_logit()
         {
             return false;
         }
@@ -479,17 +478,16 @@ impl<'a> RemlState<'a> {
             <= FIRTH_TK_EXACT_HESSIAN_MAX_ROW_PAIR_WORK
     }
 
-    /// Whether the Tierney-Kadane outer correction (its value, ρ-gradient, and
-    /// ρ-Hessian) applies to this fit. It is implemented only for canonical
-    /// Binomial Logit Firth fits because its c/d/e/f derivative arrays consume
-    /// the logit 5th-derivative jet (`logit_inverse_link_jet5`). Non-logit Firth
-    /// fits skip the TK refinement and use plain Laplace REML, which is
-    /// link-general; logit fits keep the full higher-order correction.
-    pub(crate) fn tk_correction_is_canonical_logit(&self) -> bool {
+    /// Whether the exact analytic outer Hessian of the Tierney-Kadane
+    /// correction is available. TK value and gradient are link-general; only
+    /// this optimizer-curvature capability remains canonical-logit-specific.
+    pub(crate) fn tk_exact_hessian_is_canonical_logit(&self) -> bool {
         let spec = reml_spec(&self.config.likelihood);
         matches!(spec.response, ResponseFamily::Binomial)
-            && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
-            && self.runtime_mixture_link_state.is_none()
+            && matches!(
+                self.runtime_inverse_link(),
+                InverseLink::Standard(StandardLink::Logit)
+            )
     }
 
     pub(crate) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -2099,24 +2097,6 @@ impl<'a> RemlState<'a> {
                 },
             ));
         }
-        // The TK correction's c/d/e/f derivative arrays use the logit
-        // 5th-derivative jet and are implemented only for canonical Binomial
-        // Logit Firth fits. #758 widened Firth to other Binomial inverse links;
-        // those fits skip the higher-order TK refinement (zero correction) and
-        // fall back to plain Laplace REML rather than erroring inside
-        // `hessian_cdef_arrays`. The Firth/Jeffreys bias reduction itself lives in
-        // the inner PIRLS solve, so it is fully retained — only the outer
-        // marginal-likelihood refinement is dropped for non-logit links.
-        if !self.tk_correction_is_canonical_logit() {
-            return Ok(super::atoms::TierneyKadaneAtom::from_terms(
-                TkCorrectionTerms {
-                    value: 0.0,
-                    gradient: None,
-                    hessian: None,
-                },
-            ));
-        }
-
         let compute_gradient = compute_gradient_for_tk(mode);
         let zero_correction = || {
             super::atoms::TierneyKadaneAtom::from_terms(TkCorrectionTerms {
@@ -2162,7 +2142,17 @@ impl<'a> RemlState<'a> {
         }
 
         let pirls_result = bundle.pirls_result.as_ref();
-        let (c_array, d_array, e_array, f_array) = self.hessian_cdef_arrays(pirls_result)?;
+        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
+        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian. The exact
+        // non-canonical observed-information carrier needs a sixth inverse-link
+        // derivative, which is not exposed by the current jet tower, so those
+        // links are deliberately routed to BFGS above. Value and gradient use
+        // only c/d/e and remain exact for every supported Firth link.
+        let f_array = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
+            self.hessian_cdef_arrays(pirls_result)?.3
+        } else {
+            Array1::zeros(e_array.len())
+        };
         if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane correction received non-finite c derivative at row {idx}: {}",
@@ -2196,7 +2186,8 @@ impl<'a> RemlState<'a> {
             };
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
-            let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
+            let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
+                let jeffreys_link = self.runtime_inverse_link();
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
                 } else {
@@ -2353,7 +2344,8 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
-        let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
+        let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
+            let jeffreys_link = self.runtime_inverse_link();
             Some(std::sync::Arc::new(
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
@@ -2459,10 +2451,7 @@ impl<'a> RemlState<'a> {
                 InverseLink::Sas(state)
             }
         } else {
-            InverseLink::Standard(
-                StandardLink::try_from(link_function)
-                    .expect("state-bearing link without runtime state in runtime_inverse_link"),
-            )
+            self.config.link_kind.clone()
         }
     }
 

@@ -387,7 +387,7 @@ pub struct AnchorConsistencyMetrics {
 /// Compute anchor counts from an assignment matrix.
 ///
 /// `assignments` is `(N, K)`. A row is an anchor when its maximum-magnitude
-/// entry contributes at least `anchor_dominance ∈ (0, 1]` of the row's L1
+/// entry contributes at least `anchor_dominance ∈ (1/2, 1]` of the row's L1
 /// mass. Zero-mass rows are *not* anchors.
 fn anchor_consistency_metrics(
     assignments: ArrayView2<f64>,

@@ -107,8 +107,7 @@ mod tests {
         let pg = PolyaGamma::new();
         let sample_count = 1_000_000usize;
         for &c in &[0.0_f64, 0.1, 1.0, 3.0, 10.0, 30.0] {
-            let mut rng =
-                StdRng::seed_from_u64(0xC0FFEE ^ (c.to_bits().wrapping_mul(7)));
+            let mut rng = StdRng::seed_from_u64(0xC0FFEE ^ (c.to_bits().wrapping_mul(7)));
             let mut sum = 0.0_f64;
             let mut sum_sq = 0.0_f64;
             for _ in 0..sample_count {
@@ -120,8 +119,7 @@ mod tests {
             let variance = sum_sq / sample_count as f64 - mean * mean;
             let expected_mean = theoretical_mean(c);
             let expected_variance = theoretical_variance(c);
-            let mean_relative_error =
-                (mean - expected_mean).abs() / expected_mean.max(1e-12);
+            let mean_relative_error = (mean - expected_mean).abs() / expected_mean.max(1e-12);
             let variance_relative_error =
                 (variance - expected_variance).abs() / expected_variance.max(1e-12);
             assert!(

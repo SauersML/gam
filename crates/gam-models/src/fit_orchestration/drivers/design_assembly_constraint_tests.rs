@@ -4076,15 +4076,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
             rho_dim,
             &kappa_options,
         )
-        .map(|(outcome, _timing)| match outcome {
-            SpatialJointOutcome::Optimized {
-                theta_star,
-                final_value,
-            } => (theta_star, final_value),
-            SpatialJointOutcome::NonConverged { final_value, .. } => panic!(
-                "exact joint spatial optimization did not converge (final_value={final_value})"
-            ),
-        })
+        .map(|(theta_star, final_value, _timing)| (theta_star, final_value))
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact joint spatial optimization", e))
     };
 

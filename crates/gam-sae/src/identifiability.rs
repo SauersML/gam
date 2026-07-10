@@ -89,6 +89,7 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
+use gam_math::score_opt::maximize_score_1d;
 use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
@@ -578,15 +579,15 @@ impl RidgeRemlWeight {
 /// g  = nq·S₁/S + qL₁,             g′ = nq·(S₂S − S₁²)/S² + qL₂
 /// ```
 ///
-/// via safeguarded (bisection-bracketed) Newton. `g → −(#{γ_r>0}) < 0` as
-/// ρ → −∞, and `λ·g → c∞ = nq·Σm_r/‖aux‖² − qΣγ_r` as ρ → +∞, so when
-/// `c∞ > 0` a sign change brackets an interior stationary minimum; the exact
-/// λ → ∞ boundary candidate is always compared against any interior optimum
-/// and wins ties. Directions with `γ_r = 0` are exact null directions of
+/// The analytic score/gradient oracle is searched over the complete
+/// representable log-λ domain by adaptive stationary-interval isolation and
+/// safeguarded derivative-root refinement. Every certified interior minimum
+/// competes with the exact λ → ∞ boundary, which wins ties. Directions with
+/// `γ_r = 0` are exact null directions of
 /// `G` (`‖T v_r‖² = 0` forces `m_r = (T v_r)ᵀaux = 0` in exact arithmetic)
 /// and drop from every sum.
 ///
-/// Non-convergence of the Newton iteration is a typed error, never a
+/// Non-convergence or failure to certify stationarity is a typed error, never a
 /// degraded answer.
 pub fn ridge_reml_select_weight(
     eigvals: &[f64],
@@ -625,11 +626,15 @@ pub fn ridge_reml_select_weight(
     let gamma_max = eigvals.iter().cloned().fold(0.0_f64, f64::max);
     // Exact-arithmetic null directions of G carry zero signal energy; keep
     // only numerically nonzero eigen-directions.
+    let rank_resolution = f64::EPSILON * eigvals.len().max(1) as f64;
     let pairs: Vec<(f64, f64)> = eigvals
         .iter()
         .zip(signal_energy)
-        .filter(|(&g, _)| g > gamma_max * f64::EPSILON)
-        .map(|(&g, &m)| (g, m))
+        .filter(|(&g, _)| g > gamma_max * rank_resolution)
+        // Work in u = λ/γ_max so every retained spectral abscissa lies in
+        // (0, 1].  This keeps the score and its derivatives finite across the
+        // complete representable log-domain even for ill-scaled Gram matrices.
+        .map(|(&g, &m)| (g / gamma_max, m / gamma_max))
         .collect();
     let boundary_score = scalar_observations * (aux_norm_sq / scalar_observations).ln();
     if pairs.is_empty() {
@@ -639,10 +644,11 @@ pub fn ridge_reml_select_weight(
         });
     }
 
-    // score, gradient (d/dρ), and curvature (d²/dρ²); Err = S ≤ 0, i.e. the
-    // ridge interpolates aux and the Gaussian profile evidence degenerates.
+    // Score, gradient (d/dρ), and curvature (d²/dρ²) in
+    // ρ = log(λ/γ_max). Err = S ≤ 0, i.e. the ridge interpolates aux and
+    // the Gaussian profile evidence degenerates.
     let eval = |rho: f64| -> Result<(f64, f64, f64), String> {
-        let lam = rho.exp();
+        let scaled_lambda = rho.exp();
         let mut s = aux_norm_sq;
         let mut s1 = 0.0_f64;
         let mut s2_tail = 0.0_f64;
@@ -650,20 +656,22 @@ pub fn ridge_reml_select_weight(
         let mut l1 = 0.0_f64;
         let mut l2 = 0.0_f64;
         for &(g, m) in &pairs {
-            let d = g + lam;
+            let d = g + scaled_lambda;
             s -= m / d;
             s1 += m / (d * d);
             s2_tail += m / (d * d * d);
-            l += (1.0 + g / lam).ln();
+            // log(1 + g/u) = log(g + u) - log(u), without forming g/u.
+            l += d.ln() - rho;
             l1 -= g / d;
             l2 += g / (d * d);
         }
-        s1 *= lam;
-        let s2 = s1 - 2.0 * lam * lam * s2_tail;
-        l2 *= lam;
+        s1 *= scaled_lambda;
+        let s2 = s1 - 2.0 * scaled_lambda * scaled_lambda * s2_tail;
+        l2 *= scaled_lambda;
         if !(s.is_finite() && s > 0.0) {
+            let lambda = gamma_max * scaled_lambda;
             return Err(format!(
-                "ridge_reml_select_weight: profile RSS S(λ)={s} degenerates at λ={lam} \
+                "ridge_reml_select_weight: profile RSS S(λ)={s} degenerates at λ={lambda} \
                  (ridge map interpolates aux; Gaussian evidence is unbounded)"
             ));
         }
@@ -674,105 +682,48 @@ pub fn ridge_reml_select_weight(
         Ok((score, grad, hess))
     };
 
-    let sum_gamma: f64 = pairs.iter().map(|p| p.0).sum();
-    let sum_m: f64 = pairs.iter().map(|p| p.1).sum();
-    let c_inf = scalar_observations * sum_m / aux_norm_sq - response_multiplicity * sum_gamma;
-    let grad_tol =
+    // Search the entire representable positive-λ domain adaptively from the
+    // analytic score and gradient.  `maximize_score_1d` isolates stationary
+    // intervals; it does not choose among lattice nodes.  The λ=∞ null is
+    // evaluated analytically below rather than approximated by the upper end.
+    let rho_lo = f64::MIN_POSITIVE.ln();
+    let rho_hi = (f64::MAX / 2.0).ln();
+    let rho_tol = f64::EPSILON.sqrt();
+    let mut objective = |rho: f64| {
+        let (score, gradient, _) = eval(rho)?;
+        Ok::<_, String>((-score, -gradient))
+    };
+    let optimum = maximize_score_1d(rho_lo, rho_hi, rho_tol, &mut objective)?;
+    let (score, gradient, curvature) = eval(optimum.x)?;
+    let gradient_tolerance =
         f64::EPSILON.sqrt() * (scalar_observations + response_multiplicity * pairs.len() as f64);
-    let mean_gamma = sum_gamma / pairs.len() as f64;
-    let rho0 = mean_gamma.ln();
+    let score_roundoff = f64::EPSILON * (1.0 + score.abs() + boundary_score.abs());
 
-    // Bracket a − → + sign change of g when the λ → ∞ asymptote guarantees
-    // one; otherwise attempt damped Newton from the natural scale and fall
-    // back to the exact boundary optimum.
-    let expand = |start: f64, step: f64, want_positive: bool| -> Result<Option<f64>, String> {
-        let mut rho = start;
-        for _ in 0..400 {
-            let (_, g, _) = eval(rho)?;
-            if (g > 0.0) == want_positive {
-                return Ok(Some(rho));
-            }
-            rho += step;
-        }
-        Ok(None)
-    };
-    let rho_lo = expand(rho0, -(4.0_f64.ln()), false)?.ok_or_else(|| {
-        "ridge_reml_select_weight: could not bracket g < 0 toward λ → 0 (this is a bug: \
-         g → −#{γ_r>0} in that limit)"
-            .to_string()
-    })?;
-
-    let interior = if c_inf > 0.0 {
-        let rho_hi = expand(rho_lo.max(rho0), 4.0_f64.ln(), true)?.ok_or_else(|| {
-            format!(
-                "ridge_reml_select_weight: failed to bracket the interior REML stationary \
-                 point despite positive asymptotic slope c∞={c_inf}"
-            )
-        })?;
-        // Safeguarded Newton on g within the sign-change bracket.
-        let (mut lo, mut hi) = (rho_lo, rho_hi);
-        let mut rho = 0.5 * (lo + hi);
-        let mut converged: Option<(f64, f64)> = None;
-        for _ in 0..200 {
-            let (score, g, h) = eval(rho)?;
-            if g.abs() <= grad_tol {
-                converged = Some((rho, score));
-                break;
-            }
-            if g < 0.0 {
-                lo = rho;
-            } else {
-                hi = rho;
-            }
-            let newton = if h > 0.0 { rho - g / h } else { f64::NAN };
-            rho = if newton.is_finite() && newton > lo && newton < hi {
-                newton
-            } else {
-                0.5 * (lo + hi)
-            };
-            if hi - lo < 1.0e-13 * (1.0 + rho.abs()) {
-                let (score, _, _) = eval(rho)?;
-                converged = Some((rho, score));
-                break;
-            }
-        }
-        let (rho_star, score_star) = converged.ok_or_else(|| {
-            "ridge_reml_select_weight: safeguarded Newton did not converge within 200 \
-             iterations"
-                .to_string()
-        })?;
-        Some((rho_star.exp(), score_star))
-    } else {
-        // Downhill toward full shrinkage at ∞; accept an interior optimum
-        // only if damped Newton lands on a certified local minimum that
-        // beats the boundary.
-        let mut rho = rho0;
-        let mut found: Option<(f64, f64)> = None;
-        for _ in 0..200 {
-            let (score, g, h) = eval(rho)?;
-            if g.abs() <= grad_tol {
-                if h > 0.0 && score < boundary_score {
-                    found = Some((rho.exp(), score));
-                }
-                break;
-            }
-            if h <= 0.0 {
-                break;
-            }
-            let step = (-g / h).clamp(-2.0, 2.0);
-            rho += step;
-        }
-        found
-    };
-
-    match interior {
-        Some((lambda, score)) if score < boundary_score => {
-            Ok(RidgeRemlWeight::Interior { lambda, score })
-        }
-        _ => Ok(RidgeRemlWeight::FullShrinkage {
+    if score + score_roundoff >= boundary_score {
+        return Ok(RidgeRemlWeight::FullShrinkage {
             score: boundary_score,
-        }),
+        });
     }
+    if optimum.x <= rho_lo + rho_tol {
+        return Err(
+            "ridge_reml_select_weight: REML is unbounded at the λ → 0 interpolation \
+             boundary; no converged Gaussian evidence fit exists"
+                .to_string(),
+        );
+    }
+    if gradient.abs() > gradient_tolerance || curvature <= 0.0 {
+        return Err(format!(
+            "ridge_reml_select_weight: continuous REML search did not certify an interior \
+             minimum (d/dlogλ={gradient}, curvature={curvature}, tolerance={gradient_tolerance})"
+        ));
+    }
+    let lambda = gamma_max * optimum.x.exp();
+    if !lambda.is_finite() {
+        return Ok(RidgeRemlWeight::FullShrinkage {
+            score: boundary_score,
+        });
+    }
+    Ok(RidgeRemlWeight::Interior { lambda, score })
 }
 
 /// Column-centred thin-SVD scores: returns the leading `k` columns of

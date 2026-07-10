@@ -608,7 +608,7 @@ class Model:
             options_json = ffi.build_sample_payload_json(
                 samples, warmup, chains, target_accept, seed
             )
-            raw = ffi.sample_table(
+            payload = ffi.sample_table(
                 self._model_bytes,
                 headers,
                 rows,
@@ -616,7 +616,7 @@ class Model:
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        return PosteriorSamples.from_ffi_json(raw, model_bytes=self._model_bytes)
+        return PosteriorSamples.from_ffi_payload(payload, model_bytes=self._model_bytes)
 
     def sample_replicates(
         self,

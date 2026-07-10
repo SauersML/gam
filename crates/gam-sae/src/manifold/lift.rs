@@ -36,6 +36,7 @@ use faer::Side;
 use faer::prelude::*;
 use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2};
+use opt::{LmConfig, LmOutcome, LmState, lm_step};
 use std::f64::consts::TAU;
 
 // ============================================================================
@@ -693,7 +694,12 @@ where
 
     let mut state = init;
     let (mut r, mut res_norm, mut cache) = eval(&state)?;
-    let mut mu = opts.initial_damping;
+    // Levenberg–Marquardt damping carried across outer iterations through the
+    // shared `opt::lm_step` driver: halve (floored at 1e-12) on an accepted
+    // step, quadruple on a rejected one, give up after 24 rejections within
+    // one outer iteration — the exact pre-migration μ schedule.
+    let lm_cfg = LmConfig::quartic(opts.initial_damping, 1e-12, 24);
+    let mut lm = LmState::new(&lm_cfg);
     let mut converged = false;
     let mut iterations = 0;
 
@@ -715,59 +721,62 @@ where
             }
         }
 
-        // Damped step with backtracking on μ. Solve the stacked least-squares
-        // problem [J; √μ I] δ = [r; 0].
-        let mut stepped = false;
-        for _ in 0..24 {
-            let sqrt_mu = mu.sqrt();
-            let aug = Mat::<f64>::from_fn(big_d + n_params, n_params, |row, col| {
-                if row < big_d {
-                    jdata[row * n_params + col]
-                } else if row - big_d == col {
-                    sqrt_mu
-                } else {
-                    0.0
-                }
-            });
-            let rhs =
-                Mat::<f64>::from_fn(
+        // Damped step with backtracking on μ via the shared LM driver. Each
+        // trial solves the stacked least-squares problem [J; √μ I] δ = [r; 0].
+        let outcome = lm_step(
+            &mut lm,
+            &lm_cfg,
+            |mu: f64| {
+                let sqrt_mu = mu.sqrt();
+                let aug = Mat::<f64>::from_fn(big_d + n_params, n_params, |row, col| {
+                    if row < big_d {
+                        jdata[row * n_params + col]
+                    } else if row - big_d == col {
+                        sqrt_mu
+                    } else {
+                        0.0
+                    }
+                });
+                let rhs = Mat::<f64>::from_fn(
                     big_d + n_params,
                     1,
                     |row, _| {
                         if row < big_d { r[row] } else { 0.0 }
                     },
                 );
-            let delta = aug.qr().solve_lstsq(&rhs);
+                let delta = aug.qr().solve_lstsq(&rhs);
 
-            let mut trial = state.clone();
-            for j in 0..m {
-                let base = j * (d + 1);
-                trial.amplitudes[j] += delta[(base, 0)];
-                for c in 0..d {
-                    trial.coords[j][c] += delta[(base + 1 + c, 0)];
+                let mut trial = state.clone();
+                for j in 0..m {
+                    let base = j * (d + 1);
+                    trial.amplitudes[j] += delta[(base, 0)];
+                    for c in 0..d {
+                        trial.coords[j][c] += delta[(base + 1 + c, 0)];
+                    }
                 }
-            }
-            let (r_new, res_new, cache_new) = eval(&trial)?;
-            if res_new < res_norm {
+                let (r_new, res_new, cache_new) = eval(&trial)?;
+                Ok(Some((trial, r_new, res_new, cache_new)))
+            },
+            |&(_, _, res_new, _): &_| res_new < res_norm,
+        )?;
+
+        match outcome {
+            LmOutcome::Accepted { candidate, .. } => {
+                let (trial, r_new, res_new, cache_new) = candidate;
                 let improvement = res_norm - res_new;
                 state = trial;
                 r = r_new;
                 cache = cache_new;
                 res_norm = res_new;
-                mu = (mu * 0.5).max(1e-12);
-                stepped = true;
                 if improvement < opts.residual_tol {
                     converged = true;
                 }
-                break;
             }
-            mu *= 4.0;
-        }
-
-        if !stepped {
-            // No damped step improved the residual: a local optimum to working
-            // precision.
-            converged = true;
+            LmOutcome::Exhausted { .. } => {
+                // No damped step improved the residual: a local optimum to
+                // working precision.
+                converged = true;
+            }
         }
         if converged {
             break;

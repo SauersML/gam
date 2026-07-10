@@ -35,13 +35,13 @@
 //! exist only during the race; it is not retained for the saved-model
 //! prediction path. That OOS-retention package is out of scope here.
 
-use crate::row_sampling_measure::CoresetCertificate;
 use crate::evidence::{
     GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
     UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,
     fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
+use crate::row_sampling_measure::CoresetCertificate;
 use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
 use std::sync::Mutex;
@@ -637,9 +637,8 @@ fn run_one_topology_race_candidate<Candidate, FitResult, FitOne>(
     // spawns a nested barrier pool; the per-candidate parallelism is the race
     // itself, and faer reductions are parallelism-invariant so the result is
     // bit-identical to the sequential path.
-    let result = pool.install(|| {
-        gam_linalg::faer_ndarray::with_faer_sequential(|| fit_one(candidate))
-    });
+    let result =
+        pool.install(|| gam_linalg::faer_ndarray::with_faer_sequential(|| fit_one(candidate)));
     let wall_time = started.elapsed();
     *slot.lock().expect("topology race result mutex poisoned") =
         Some(TopologyRaceParallelCandidate {
@@ -1545,24 +1544,35 @@ pub fn adjudicate_cross_class_race(
 // Closure-parameter smooth class (#1015): circle ⇄ interval as one estimand
 // ===========================================================================
 
-/// The deterministic closure-parameter grid the smooth-class profiler sweeps.
-///
-/// `γ = 1` is the closed circle, `γ = 0` the interval limit; the grid is dense
-/// near both boundaries (where the Wilks crossing for the one-sided CI lives)
-/// and is a fixed function of nothing but this constant, so the profile — and
-/// thus the reported CI — is reproducible with no data-dependent node placement.
-pub const CLOSURE_GAMMA_GRID: &[f64] = &[
-    0.0, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.98, 1.0,
-];
-
 /// One profiled point of the closure family: the closure value `γ`, the
-/// profiled (θ and λ_smooth optimised) negative-log evidence at that γ, and the
-/// fit handle the caller wants carried for the winner.
+/// profiled (θ and λ_smooth optimised) negative-log evidence and its exact
+/// first two profile derivatives at that γ, and the fit handle the caller wants
+/// carried for the winner.
 #[derive(Debug, Clone)]
 pub struct ClosureProfilePoint<FitHandle> {
     pub gamma: f64,
     pub tk_score: f64,
+    pub score_gradient: f64,
+    pub score_curvature: f64,
     pub fit_handle: FitHandle,
+}
+
+/// KKT location of the continuously selected closure optimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureOptimumKind {
+    Interior,
+    IntervalBoundary,
+    CircleBoundary,
+}
+
+/// First-order certificate for the selected closure parameter.
+#[derive(Debug, Clone, Copy)]
+pub struct ClosureStationarityCertificate {
+    pub kind: ClosureOptimumKind,
+    /// Absolute gradient in the interior, or the violated outward component
+    /// of the one-sided KKT condition at a boundary.
+    pub projected_gradient: f64,
+    pub tolerance: f64,
 }
 
 /// The result of profiling the closure parameter inside the smooth class.
@@ -1578,6 +1588,7 @@ pub struct ClosureProfilePoint<FitHandle> {
 pub struct ClosureSelection<FitHandle> {
     pub ci: gam_geometry::ClosureProfileCi,
     pub representative: ClosureProfilePoint<FitHandle>,
+    pub stationarity: ClosureStationarityCertificate,
     /// True when the profile pinned γ at the singular cluster boundary — the
     /// "not a regular smooth 1-D topology" signal that must be routed to the
     /// #907 mixture/union rung rather than reported as a regular closure.
@@ -1587,118 +1598,106 @@ pub struct ClosureSelection<FitHandle> {
 /// Profile the closure parameter `γ`, returning the continuously refined
 /// minimiser, its profile-likelihood CI, and the representative fit.
 ///
-/// `fit_at_gamma` performs the inner fit at a fixed closure value and returns
-/// `(tk_score, fit_handle)`, where `tk_score` is the profiled
+/// `fit_at_gamma` performs the converged inner fit at a fixed closure value and
+/// returns `(tk_score, d_score/dγ, d²_score/dγ², fit_handle)`, where
+/// `tk_score` is the profiled
 /// negative-log evidence on the same scale [`tk_normalized_score`] produces (so
 /// γ and λ_smooth must both be optimised inside the closure, per the issue's
-/// confounding contract). Lower score is better. [`CLOSURE_GAMMA_GRID`] is
-/// swept in parallel via [`run_topology_race_parallel`] to build the
-/// reproducible profile curve for the Wilks CI; γ̂ itself is then refined by
-/// golden-section minimization inside the bracketing interval, so the selected
-/// closure is a continuous optimum, not a grid node.
+/// confounding contract). Lower score is better. The analytic score oracle is
+/// searched continuously on `[0, 1]`; exact endpoints compete with every
+/// isolated interior stationary point. The same continuous oracle supplies the
+/// profile-Wilks crossings, so neither the winner nor its interval is selected
+/// or interpolated from a lattice.
 pub fn profile_closure_within_smooth_class<FitHandle, FitAtGamma>(
     fit_at_gamma: FitAtGamma,
     level: f64,
 ) -> Result<ClosureSelection<FitHandle>, String>
 where
-    FitHandle: Send,
-    FitAtGamma: Fn(f64) -> Result<(f64, FitHandle), String> + Sync,
+    FitAtGamma: Fn(f64) -> Result<(f64, f64, f64, FitHandle), String>,
 {
-    let gammas: Vec<f64> = CLOSURE_GAMMA_GRID.to_vec();
-    let results = run_topology_race_parallel(gammas.clone(), |gamma| {
-        fit_at_gamma(gamma).map(|(score, handle)| (gamma, score, handle))
-    })?;
-
-    let mut points: Vec<ClosureProfilePoint<FitHandle>> = Vec::with_capacity(results.len());
-    for entry in results {
-        let (gamma, tk_score, fit_handle) = entry.result?;
-        if !tk_score.is_finite() {
+    let gamma_tolerance = f64::EPSILON.sqrt();
+    let evaluate = |gamma: f64| -> Result<ClosureProfilePoint<FitHandle>, String> {
+        let (tk_score, score_gradient, score_curvature, fit_handle) = fit_at_gamma(gamma)?;
+        if !(tk_score.is_finite() && score_gradient.is_finite() && score_curvature.is_finite()) {
             return Err(format!(
-                "closure profile produced non-finite score at γ={gamma}"
+                "closure profile produced a non-finite score jet at γ={gamma}"
             ));
         }
-        points.push(ClosureProfilePoint {
+        Ok(ClosureProfilePoint {
             gamma,
             tk_score,
+            score_gradient,
+            score_curvature,
             fit_handle,
-        });
-    }
-    if points.len() < 2 {
-        return Err("closure profile needs at least two evaluable γ grid points".into());
-    }
-    points.sort_by(|a, b| a.gamma.partial_cmp(&b.gamma).expect("finite γ"));
+        })
+    };
 
-    let grid: Vec<(f64, f64)> = points.iter().map(|p| (p.gamma, p.tk_score)).collect();
-    let mut ci = gam_geometry::profile_ci_from_grid(&grid, level)?;
-
-    // Pull the curve minimiser out of the points.
-    let hat_index = points
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| a.tk_score.partial_cmp(&b.tk_score).expect("finite score"))
-        .map(|(i, _)| i)
-        .expect("non-empty points");
-    let mut representative = points.swap_remove(hat_index);
-
-    // Continuous γ̂ refinement (SPEC: grid search is never allowed). The fixed
-    // grid supplies only the reproducible profile CURVE behind the Wilks CI;
-    // the headline γ̂ is then refined by deterministic golden-section
-    // minimization on the interval bracketing the curve minimum — the same
-    // coarse-curve + golden-section pattern `fit_spline_scan` uses for log λ.
-    // The best profiled evidence among the grid minimiser and the refinement
-    // iterates wins, so refinement can only improve γ̂, and a boundary-pinned
-    // minimiser (γ̂ ∈ {0, 1}) survives unless the interior genuinely beats it.
-    const CLOSURE_GAMMA_TOL: f64 = 1e-3;
-    const INV_PHI: f64 = 0.618_033_988_749_894_9;
-    let mut lo = grid[hat_index.saturating_sub(1)].0;
-    let mut hi = grid[(hat_index + 1).min(grid.len() - 1)].0;
-    if hi - lo > CLOSURE_GAMMA_TOL {
-        let eval_at = |gamma: f64| -> Result<ClosureProfilePoint<FitHandle>, String> {
-            let (tk_score, fit_handle) = fit_at_gamma(gamma)?;
-            if !tk_score.is_finite() {
-                return Err(format!(
-                    "closure profile produced non-finite score at γ={gamma}"
-                ));
-            }
-            Ok(ClosureProfilePoint {
-                gamma,
-                tk_score,
-                fit_handle,
-            })
-        };
-        let mut x1 = hi - INV_PHI * (hi - lo);
-        let mut x2 = lo + INV_PHI * (hi - lo);
-        let mut p1 = eval_at(x1)?;
-        let mut p2 = eval_at(x2)?;
-        while hi - lo > CLOSURE_GAMMA_TOL {
-            if p1.tk_score > p2.tk_score {
-                lo = x1;
-                x1 = x2;
-                p1 = p2;
-                x2 = lo + INV_PHI * (hi - lo);
-                p2 = eval_at(x2)?;
-            } else {
-                hi = x2;
-                x2 = x1;
-                p2 = p1;
-                x1 = hi - INV_PHI * (hi - lo);
-                p1 = eval_at(x1)?;
-            }
-        }
-        for cand in [p1, p2] {
-            if cand.tk_score < representative.tk_score {
-                representative = cand;
-            }
-        }
-        // Keep γ̂ and the representative fit coherent: the reported minimiser
-        // is the refined one whenever refinement improved on the curve node.
-        ci.gamma_hat = representative.gamma;
+    let mut score_oracle = |gamma: f64| {
+        let point = evaluate(gamma)?;
+        Ok::<_, String>((-point.tk_score, -point.score_gradient))
+    };
+    let optimum =
+        gam_math::score_opt::maximize_score_1d(0.0, 1.0, gamma_tolerance, &mut score_oracle)?;
+    let representative = evaluate(optimum.x)?;
+    let stationarity_tolerance = f64::EPSILON.sqrt() * (1.0 + representative.tk_score.abs());
+    let (kind, projected_gradient) = if representative.gamma <= gamma_tolerance {
+        (
+            ClosureOptimumKind::IntervalBoundary,
+            (-representative.score_gradient).max(0.0),
+        )
+    } else if representative.gamma >= 1.0 - gamma_tolerance {
+        (
+            ClosureOptimumKind::CircleBoundary,
+            representative.score_gradient.max(0.0),
+        )
+    } else {
+        (
+            ClosureOptimumKind::Interior,
+            representative.score_gradient.abs(),
+        )
+    };
+    if projected_gradient > stationarity_tolerance
+        || (kind == ClosureOptimumKind::Interior && representative.score_curvature <= 0.0)
+    {
+        return Err(format!(
+            "closure profile did not certify its continuous optimum: γ={}, projected \
+             gradient={}, curvature={}, tolerance={}",
+            representative.gamma,
+            projected_gradient,
+            representative.score_curvature,
+            stationarity_tolerance
+        ));
     }
+    let stationarity = ClosureStationarityCertificate {
+        kind,
+        projected_gradient,
+        tolerance: stationarity_tolerance,
+    };
+
+    let walked = gam_geometry::profile_ci_walk(
+        |gamma| evaluate(gamma).map(|point| point.tk_score),
+        representative.gamma,
+        representative.score_curvature,
+        0.0,
+        1.0,
+        level,
+        gamma_tolerance,
+    )?;
+    let singular_boundary = kind == ClosureOptimumKind::IntervalBoundary;
+    let ci = gam_geometry::ClosureProfileCi {
+        gamma_hat: representative.gamma,
+        ci_lo: walked.ci_lo,
+        ci_hi: walked.ci_hi,
+        ci_includes_circle: walked.hi_at_bound,
+        ci_includes_interval: walked.lo_at_bound,
+        singular_boundary,
+    };
 
     Ok(ClosureSelection {
         ci,
         representative,
-        route_to_mixture_rung: ci.singular_boundary,
+        stationarity,
+        route_to_mixture_rung: singular_boundary,
     })
 }
 
@@ -1960,7 +1959,14 @@ mod tests {
         // circle (γ=1) and the interval (γ=0) boundaries, and must NOT route to
         // the mixture rung (this is a regular interior optimum).
         let selection = profile_closure_within_smooth_class(
-            |gamma| Ok::<_, String>((100.0 + 80.0 * (gamma - 0.7).powi(2), gamma)),
+            |gamma| {
+                Ok::<_, String>((
+                    100.0 + 80.0 * (gamma - 0.7).powi(2),
+                    160.0 * (gamma - 0.7),
+                    160.0,
+                    gamma,
+                ))
+            },
             0.95,
         )
         .expect("closure profile");
@@ -1972,6 +1978,8 @@ mod tests {
         assert!(!selection.ci.ci_includes_circle);
         assert!(!selection.ci.ci_includes_interval);
         assert!(!selection.route_to_mixture_rung);
+        assert_eq!(selection.stationarity.kind, ClosureOptimumKind::Interior);
+        assert!(selection.stationarity.projected_gradient <= selection.stationarity.tolerance);
         // The representative fit handle is the γ̂ point.
         assert!((selection.representative.gamma - selection.ci.gamma_hat).abs() < 1e-12);
     }
@@ -1981,13 +1989,43 @@ mod tests {
         // A profile that keeps improving toward γ=0 (support collapse) pins the
         // minimiser at the floor and must hand off to the mixture/union rung.
         let selection = profile_closure_within_smooth_class(
-            |gamma| Ok::<_, String>((10.0 + 25.0 * gamma, gamma)),
+            |gamma| Ok::<_, String>((10.0 + 25.0 * gamma, 25.0, 0.0, gamma)),
             0.95,
         )
         .expect("closure profile");
         assert!(selection.ci.gamma_hat.abs() < 1e-9);
         assert!(selection.route_to_mixture_rung);
         assert!(selection.ci.ci_includes_interval);
+        assert_eq!(
+            selection.stationarity.kind,
+            ClosureOptimumKind::IntervalBoundary
+        );
+    }
+
+    #[test]
+    fn closure_profiler_selects_a_non_lattice_optimum_and_continuous_ci() {
+        let planted = 0.713_271_828_f64;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let selection = profile_closure_within_smooth_class(
+            |gamma| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let displacement = gamma - planted;
+                Ok::<_, String>((
+                    7.0 + 32.0 * displacement * displacement,
+                    64.0 * displacement,
+                    64.0,
+                    gamma,
+                ))
+            },
+            0.95,
+        )
+        .expect("continuous closure profile");
+        assert!((selection.representative.gamma - planted).abs() < 1.0e-7);
+        assert!(selection.ci.ci_lo < planted && selection.ci.ci_hi > planted);
+        // Adaptive optimization and two root walks are expected to revisit the
+        // oracle; this assertion guards specifically against resurrection of
+        // the old exactly-17 complete-fit lattice sweep.
+        assert_ne!(calls.load(std::sync::atomic::Ordering::Relaxed), 17);
     }
 
     #[test]

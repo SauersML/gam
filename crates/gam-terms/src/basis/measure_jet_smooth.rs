@@ -117,7 +117,9 @@ use serde::{Deserialize, Serialize};
 
 use faer::Side;
 
-use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::faer_ndarray::{
+    FaerEigh, default_rrqr_rank_alpha, rrqr_nullspace_basis,
+};
 
 use super::{
     AnisoBasisPsiDerivatives, AnisoPenaltyCrossProvider, BasisBuildResult, BasisError,
@@ -167,16 +169,6 @@ pub(crate) const MEASURE_JET_MAX_AUTO_SCALES: usize = 8;
 /// for hundreds of seconds (the #1116 timeout). One spacing-width kernel fixes
 /// both at the root without touching the energy penalty or the dials.
 pub(crate) const MEASURE_JET_AUTO_LENGTH_SCALE_FACTOR: f64 = 1.0;
-
-/// Single-scale fused-mode weight of the affine-preserving nullspace ridge,
-/// as a fraction of the primary energy penalty's Frobenius scale (#1116). The
-/// ridge's role is identifiability — flooring the fused energy's near-nullspace
-/// — not smoothing selection, so it is fused at a small FIXED fraction rather
-/// than carrying its own REML λ (which would double the single-scale outer
-/// search). 1e-2 lifts the unpenalized directions ~two orders below the
-/// dominant penalized modes: a definite identifiability floor that leaves the
-/// genuine spectrum (and the single primary λ) in control of the fit.
-pub(crate) const MEASURE_JET_FUSED_RIDGE_FRACTION: f64 = 1e-2;
 
 /// Memory budget (in f64 entries) above which the multi-form assembly stops
 /// parallelizing over scales: parallel scale partials cost
@@ -410,72 +402,118 @@ pub(crate) fn symmetric_pseudoinverse(
     Ok(scaled.dot(&evecs.t()))
 }
 
-/// Affine-preserving shrinkage ridge `I − P_pseudoaffine` in the constrained
-/// Gaussian-coefficient space, where `P_pseudoaffine` projects onto the
-/// coefficient directions `b̂` that — pushed through the representer `K·z` — best
-/// reproduce the affine center functions `[1, c₁…c_d]` under the mass-weighted
-/// normal equations. The double penalty thus shrinks the wiggle space while
-/// preserving the (pseudo-)affine component, the measure-jet analogue of leaving
-/// a smooth's null space lightly damped.
-pub(crate) fn affine_preserving_coefficient_ridge(
-    kz: &Array2<f64>,
+/// Rank-adapted center values of the measure-jet energy's affine null space.
+///
+/// The first column is the constant. The remaining columns are the supported
+/// ambient-linear directions returned by [`measure_jet_affine_head_transform`].
+/// Using that transform makes the basis full-column-rank even when the centers
+/// lie on a lower-dimensional affine stratum of the ambient coordinates.
+fn measure_jet_affine_value_basis(
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Array2<f64> {
+    let m = centers.nrows();
+    let head_transform = measure_jet_affine_head_transform(centers, masses);
+    let head_rank = head_transform.ncols();
+    let mut affine = Array2::<f64>::ones((m, head_rank + 1));
+    if head_rank > 0 {
+        affine
+            .slice_mut(ndarray::s![.., 1..])
+            .assign(&centers.dot(&head_transform));
+    }
+    affine
+}
+
+/// Mass-metric quadratic form selecting the affine/null component of center
+/// function values:
+///
+/// `H₀ = W A (Aᵀ W A)⁺ Aᵀ W`.
+///
+/// This is a function-space object: `vᵀH₀v` is the squared mass norm of the
+/// affine projection of the center values `v`. No coefficient metric enters.
+fn affine_function_nullspace_form(
     centers: ArrayView2<'_, f64>,
     masses: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
     let m = centers.nrows();
-    let d = centers.ncols();
-    let p = kz.ncols();
-    if kz.nrows() != m || masses.len() != m {
+    if masses.len() != m {
         crate::bail_dim_basis!(
-            "measure-jet affine-preserving ridge shape mismatch: kz {:?}, centers {:?}, masses {}",
-            kz.dim(),
+            "measure-jet affine function-space form shape mismatch: centers {:?}, masses {}",
             centers.dim(),
             masses.len()
         );
     }
-    if p == 0 {
-        return Ok(Array2::<f64>::zeros((0, 0)));
-    }
-    let mut weighted_kz = kz.clone();
-    for (i, mut row) in weighted_kz.outer_iter_mut().enumerate() {
-        row.mapv_inplace(|v| v * masses[i]);
-    }
-    let normal = kz.t().dot(&weighted_kz);
-    let normal_pinv = symmetric_pseudoinverse(&normal, "affine ridge normal")?;
-    let mut affine = Array2::<f64>::ones((m, d + 1));
-    for i in 0..m {
-        for k in 0..d {
-            affine[(i, k + 1)] = centers[(i, k)];
-        }
-    }
+    let affine = measure_jet_affine_value_basis(centers, masses);
     let mut weighted_affine = affine.clone();
     for (i, mut row) in weighted_affine.outer_iter_mut().enumerate() {
         row.mapv_inplace(|v| v * masses[i]);
     }
-    let rhs = kz.t().dot(&weighted_affine);
-    let beta = normal_pinv.dot(&rhs);
-    let beta_gram = beta.t().dot(&beta);
-    let (evals, evecs) = beta_gram.eigh(Side::Lower).map_err(|e| {
-        BasisError::InvalidInput(format!(
-            "measure-jet affine ridge subspace eigendecomposition failed: {e}"
-        ))
-    })?;
-    let lam_max = evals.iter().fold(0.0_f64, |acc, v| acc.max((*v).max(0.0)));
-    let rank_tol = MEASURE_JET_PSEUDOINVERSE_RTOL * ((d + 1).max(1) as f64) * lam_max;
-    let mut ridge = Array2::<f64>::eye(p);
-    for k in 0..(d + 1) {
-        let lam = evals[k].max(0.0);
-        if lam <= rank_tol {
-            continue;
-        }
-        let dir = beta.dot(&evecs.column(k).to_owned()) / lam.sqrt();
-        for r in 0..p {
-            for c in 0..p {
-                ridge[(r, c)] -= dir[r] * dir[c];
-            }
-        }
+    let affine_gram = affine.t().dot(&weighted_affine);
+    let affine_gram_pinv =
+        symmetric_pseudoinverse(&affine_gram, "affine function-space Gram")?;
+    let form = weighted_affine
+        .dot(&affine_gram_pinv)
+        .dot(&weighted_affine.t());
+    Ok((&form + &form.t()) * 0.5)
+}
+
+/// Pull a center-value quadratic form back through an evaluation map.
+fn pullback_center_form(evaluation: &Array2<f64>, form: &Array2<f64>) -> Array2<f64> {
+    let pulled = evaluation.t().dot(form).dot(evaluation);
+    (&pulled + &pulled.t()) * 0.5
+}
+
+/// First and diagonal-second `u = ln ℓ` derivatives of `E(u)ᵀ H E(u)` for a
+/// `u`-invariant center-value form `H`.
+fn pullback_center_form_log_length_jets(
+    evaluation: &Array2<f64>,
+    evaluation_first: &Array2<f64>,
+    evaluation_second: &Array2<f64>,
+    form: &Array2<f64>,
+) -> (Array2<f64>, Array2<f64>) {
+    let h_e = form.dot(evaluation);
+    let h_e_first = form.dot(evaluation_first);
+    let h_e_second = form.dot(evaluation_second);
+    let first_raw = evaluation_first.t().dot(&h_e) + evaluation.t().dot(&h_e_first);
+    let second_raw = evaluation_second.t().dot(&h_e)
+        + evaluation.t().dot(&h_e_second)
+        + evaluation_first.t().dot(&h_e_first) * 2.0;
+    (
+        (&first_raw + &first_raw.t()) * 0.5,
+        (&second_raw + &second_raw.t()) * 0.5,
+    )
+}
+
+/// Mixed derivative `∂²(EᵀH(ψ)E)/(∂lnℓ ∂ψ)` when only `E` depends on `ℓ`.
+fn pullback_center_form_log_length_cross(
+    evaluation: &Array2<f64>,
+    evaluation_first: &Array2<f64>,
+    form_first: &Array2<f64>,
+) -> Array2<f64> {
+    let h_e = form_first.dot(evaluation);
+    let h_e_first = form_first.dot(evaluation_first);
+    let cross_raw = evaluation_first.t().dot(&h_e) + evaluation.t().dot(&h_e_first);
+    (&cross_raw + &cross_raw.t()) * 0.5
+}
+
+/// Function-space affine/null-component penalty in the current coefficient
+/// chart. Under a coefficient reparameterization `E -> E R`, this matrix
+/// transforms covariantly as `S₀ -> Rᵀ S₀ R`; the statistical functional is
+/// therefore independent of coefficient scaling.
+pub(crate) fn affine_function_nullspace_penalty(
+    evaluation: &Array2<f64>,
+    centers: ArrayView2<'_, f64>,
+    masses: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, BasisError> {
+    if evaluation.nrows() != centers.nrows() {
+        crate::bail_dim_basis!(
+            "measure-jet affine function-space penalty shape mismatch: evaluation {:?}, centers {:?}",
+            evaluation.dim(),
+            centers.dim()
+        );
     }
-    Ok((&ridge + &ridge.t()) * 0.5)
+    let form = affine_function_nullspace_form(centers, masses)?;
+    Ok(pullback_center_form(evaluation, &form))
 }
 
 /// Pairwise squared distances `‖a_i − b_j‖²` via the GEMM identity
@@ -1233,6 +1271,31 @@ pub fn measure_jet_design_matrix(
     Ok(out)
 }
 
+/// Exact first and diagonal-second derivatives of the Gaussian representer
+/// design with respect to `u = ln ℓ`.
+fn measure_jet_design_log_length_jets(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+    let kernel = measure_jet_design_matrix(data, centers, length_scale)?;
+    let squared_distances = pairwise_sq_dists(data, centers);
+    let inv_l2 = 1.0 / (length_scale * length_scale);
+    let mut first = kernel.clone();
+    let mut second = kernel;
+    for ((first_value, second_value), &distance_squared) in first
+        .iter_mut()
+        .zip(second.iter_mut())
+        .zip(squared_distances.iter())
+    {
+        let a = distance_squared * inv_l2;
+        let kernel_value = *first_value;
+        *first_value = kernel_value * a;
+        *second_value = kernel_value * (a * a - 2.0 * a);
+    }
+    Ok((first, second))
+}
+
 /// Rank-revealing ambient-linear head lift `T` (d × head_rank) for the
 /// extrapolation null space (#1845).
 ///
@@ -1446,12 +1509,22 @@ pub(crate) fn realize_measure_jet_geometry(
     };
     let head_rank = head_transform.ncols();
     let m_aug = m + head_rank;
-    // Realized-design constraint transform: block sum-to-zero on the
-    // representer coefficients composed with an identity pass-through on the
-    // head at fit time; the frozen composed `z · z_parametric` at predict time
-    // (#532 pattern — see MeasureJetIdentifiability). The head rides the SAME
-    // global parametric orthogonalization, so its constant component cannot
-    // collide with the intercept.
+    let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
+    let head_cc = centers.dot(&head_transform);
+    // Realized-design constraint transform. In single-scale mode the explicit
+    // affine head and Gaussian representers can otherwise carry the same affine
+    // CENTER values in two different ways. That is a genuine gauge redundancy,
+    // not a reason to ridge either coefficient block. At fit time remove it
+    // exactly by restricting the RBF center values to the mass-orthogonal
+    // complement of the supported affine space:
+    //
+    //   C = A^T W K_cc,       Z_rbf = null(C).
+    //
+    // The head then passes through as an identity block. The frozen composed
+    // `z · z_parametric` is replayed verbatim at prediction/ψ trials (#532), so
+    // the rank-revealed section never changes after fit-time realization. In
+    // multiscale mode there is no explicit head, hence no affine duplication;
+    // retain the existing representer sum-to-zero section there.
     let (z, coefficient_gauge) = match &spec.identifiability {
         MeasureJetIdentifiability::FrozenTransform { transform } => {
             if transform.nrows() != m_aug {
@@ -1468,15 +1541,30 @@ pub(crate) fn realize_measure_jet_geometry(
             )
         }
         MeasureJetIdentifiability::CenterSumToZero => {
-            // Householder sum-to-zero on the representers, block-composed with
-            // the identity on the head columns. The active projection is owned
-            // by Gauge; the dense z is persisted for frozen replay metadata.
-            let u = householder_sum_to_zero_u(m);
-            let z_rbf = householder_sum_to_zero_z(&u);
-            let mut z_block = Array2::<f64>::zeros((m_aug, (m - 1) + head_rank));
-            z_block.slice_mut(ndarray::s![..m, ..m - 1]).assign(&z_rbf);
+            let z_rbf = if head_rank > 0 {
+                let affine = measure_jet_affine_value_basis(centers.view(), masses.view());
+                let mut weighted_affine = affine.clone();
+                for (i, mut row) in weighted_affine.outer_iter_mut().enumerate() {
+                    row.mapv_inplace(|v| v * masses[i]);
+                }
+                // `rrqr_nullspace_basis(B)` returns null(B^T). Here
+                // `B = K_cc^T W A = C^T`, hence the returned columns span
+                // null(C), exactly the required RBF coefficient section.
+                let constraint_cross = k_cc.t().dot(&weighted_affine);
+                rrqr_nullspace_basis(&constraint_cross, default_rrqr_rank_alpha())
+                    .map_err(BasisError::LinalgError)?
+                    .0
+            } else {
+                let u = householder_sum_to_zero_u(m);
+                householder_sum_to_zero_z(&u)
+            };
+            let rbf_rank = z_rbf.ncols();
+            let mut z_block = Array2::<f64>::zeros((m_aug, rbf_rank + head_rank));
+            z_block
+                .slice_mut(ndarray::s![..m, ..rbf_rank])
+                .assign(&z_rbf);
             for r in 0..head_rank {
-                z_block[(m + r, (m - 1) + r)] = 1.0;
+                z_block[(m + r, rbf_rank + r)] = 1.0;
             }
             (
                 z_block.clone(),
@@ -1488,11 +1576,9 @@ pub(crate) fn realize_measure_jet_geometry(
     // restricted `kz` maps constrained coefficients to center nodal values for
     // BOTH the representers and the head; the energy annihilates the head block
     // (affine) to machine precision, so it stays the unpenalized null space.
-    let k_cc = measure_jet_design_matrix(centers.view(), centers.view(), length_scale)?;
     let mut k_aug = Array2::<f64>::zeros((m, m_aug));
     k_aug.slice_mut(ndarray::s![.., ..m]).assign(&k_cc);
     if head_rank > 0 {
-        let head_cc = centers.dot(&head_transform);
         k_aug.slice_mut(ndarray::s![.., m..]).assign(&head_cc);
     }
     let kz = coefficient_gauge.restrict_design(&k_aug);
@@ -1734,61 +1820,11 @@ pub fn build_measure_jet_basis(
             spec.alpha,
             spec.tau0,
         )?;
-        let mut penalty = kz.t().dot(&q_form).dot(&kz);
-        penalty = (&penalty + &penalty.t()) * 0.5;
-        // Single-scale nullspace stabilization, FUSED (not a second REML λ).
-        //
-        // The fused jet-residual energy penalizes only the LOCAL jet residual,
-        // so it has a large near-nullspace of
-        // globally-smooth-but-not-locally-affine modes; on low-effective-rank
-        // data those weakly-penalized directions are unidentified and the inner
-        // solve / outer REML cycle (MEASURED #1116: with NO stabilizer the
-        // bms-accuracy fit was 3s→59s and less accurate). The
-        // affine-preserving ridge `I − P_affine` stabilizes exactly those
-        // directions. But its job is IDENTIFIABILITY, not smoothing selection —
-        // it does not need its own learned λ. As a separate candidate it
-        // doubled the single-scale outer-REML search into 2-D (the #1116
-        // perf-parity 2.8× vs Duchon's 1-λ fit). Instead fold it into the
-        // primary at a small FIXED fraction of the primary's Frobenius scale:
-        // the near-nullspace gets a definite floor (κ ≈ 1/ε_ridge bounded), the
-        // smoothing strength stays owned by the single primary λ, and the outer
-        // footprint is one λ — Duchon/Matérn parity. Multiscale mode keeps the
-        // ridge as a genuine learned candidate (its per-scale spectrum IS the
-        // estimand).
-        if spec.double_penalty {
-            // With the ambient-linear head carrying the affine null space
-            // explicitly (#1845), the representer's own affine-reproducing
-            // directions become redundant with the (unpenalized) head: leaving
-            // them unpenalized would split the flank trend arbitrarily between a
-            // decaying representer combination and the head, and only the head
-            // survives across the gap. A plain identity floor on the representer
-            // coefficients (`blockdiag(I_m, 0_head)` restricted through the same
-            // gauge) breaks that tie deterministically toward the free head —
-            // any affine mass placed on the representer now pays a strictly
-            // positive toll, so the penalized-least-squares optimum drives it
-            // into the head — while still flooring the energy's smooth
-            // near-nullspace exactly as the affine-preserving ridge did. Without
-            // a head the geometry keeps the original affine-preserving ridge.
-            let ridge = if head_rank > 0 {
-                let mut r_raw = Array2::<f64>::zeros((m_aug, m_aug));
-                for i in 0..m {
-                    r_raw[(i, i)] = 1.0;
-                }
-                coefficient_gauge.restrict_penalty(&r_raw)
-            } else {
-                affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?
-            };
-            let primary_fro = trace_of_product(&penalty, &penalty).sqrt();
-            let ridge_fro = trace_of_product(&ridge, &ridge).sqrt();
-            if primary_fro.is_finite()
-                && primary_fro > 0.0
-                && ridge_fro.is_finite()
-                && ridge_fro > 0.0
-            {
-                let w = MEASURE_JET_FUSED_RIDGE_FRACTION * primary_fro / ridge_fro;
-                penalty = &penalty + &(&ridge * w);
-            }
-        }
+        // The Primary is exactly the jet-energy functional pulled back through
+        // the center evaluation map. It is independent of `double_penalty`:
+        // statistical selection is a distinct REML component below, never a
+        // fixed coefficient toll fused into this estimand.
+        let penalty = pullback_center_form(&kz, &q_form);
         let (penalty_norm, c_primary) = normalize_penalty(&penalty);
         fused_penalty_normalization_scale = Some(c_primary);
         candidates.push(PenaltyCandidate {
@@ -1800,18 +1836,20 @@ pub fn build_measure_jet_basis(
             op: None,
         });
     }
-    // Multiscale mode: the affine-preserving ridge is a genuine learned
-    // candidate (the per-scale split leaves its own spectrum to estimate). In
-    // single-scale mode it is fused into the primary above (a fixed
-    // identifiability floor, not a second λ) — see that block.
-    if spec.double_penalty && per_level {
-        let ridge = affine_preserving_coefficient_ridge(&kz, centers.view(), masses.view())?;
-        let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
+    // Explicit null recovery is a genuine statistical component: penalize the
+    // affine/null FUNCTION projection under the empirical-measure mass metric,
+    // and let REML select its strength independently in both modes. This is the
+    // standard double-penalty decomposition (roughness + null component); no
+    // coefficient identity and no hard-coded mixture changes the Primary.
+    if spec.double_penalty {
+        let null_penalty =
+            affine_function_nullspace_penalty(&kz, centers.view(), masses.view())?;
+        let (null_penalty_norm, c_null) = normalize_penalty(&null_penalty);
         candidates.push(PenaltyCandidate {
-            matrix: ridge_norm,
+            matrix: null_penalty_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
-            normalization_scale: c_ridge,
+            normalization_scale: c_null,
             kronecker_factors: None,
             op: None,
         });
@@ -1895,25 +1933,105 @@ pub fn build_measure_jet_basis_psi_derivatives(
         log_step: geom.log_step,
     };
     let n = data.nrows();
-    let p = geom.kz.ncols(); // design width: constrained Gaussian-coefficient space
-    let kz = &geom.kz;
-    let sandwich = |j: &Array2<f64>| {
-        let s = kz.t().dot(j).dot(kz);
-        (&s + &s.t()) * 0.5
+    let p = geom.kz.ncols();
+    let m = geom.centers.nrows();
+    let m_aug = m + geom.head_transform.ncols();
+
+    struct LengthScaleJets {
+        evaluation_first: Array2<f64>,
+        evaluation_second: Array2<f64>,
+        design_first: Array2<f64>,
+        design_second: Array2<f64>,
+    }
+
+    // The Gaussian representer range moves both the FIT design and the center
+    // evaluation map `E = [K_cc | A_head] Z`. The affine head is ℓ-invariant,
+    // so its raw derivative columns are exactly zero before applying the frozen
+    // Gauge section. Keeping `Z` frozen is the replay contract: rank/gauge
+    // realization happens once at fit time, then every ψ trial differentiates
+    // the same coefficient chart.
+    let length_scale_jets = if spec.learn_length_scale {
+        let (dk_data, d2k_data) = measure_jet_design_log_length_jets(
+            data,
+            geom.centers.view(),
+            geom.length_scale,
+        )?;
+        let mut dk_data_aug = Array2::<f64>::zeros((n, m_aug));
+        let mut d2k_data_aug = Array2::<f64>::zeros((n, m_aug));
+        dk_data_aug
+            .slice_mut(ndarray::s![.., ..m])
+            .assign(&dk_data);
+        d2k_data_aug
+            .slice_mut(ndarray::s![.., ..m])
+            .assign(&d2k_data);
+
+        let (dk_centers, d2k_centers) = measure_jet_design_log_length_jets(
+            geom.centers.view(),
+            geom.centers.view(),
+            geom.length_scale,
+        )?;
+        let mut dk_centers_aug = Array2::<f64>::zeros((m, m_aug));
+        let mut d2k_centers_aug = Array2::<f64>::zeros((m, m_aug));
+        dk_centers_aug
+            .slice_mut(ndarray::s![.., ..m])
+            .assign(&dk_centers);
+        d2k_centers_aug
+            .slice_mut(ndarray::s![.., ..m])
+            .assign(&d2k_centers);
+
+        Some(LengthScaleJets {
+            evaluation_first: geom.coefficient_gauge.restrict_design(&dk_centers_aug),
+            evaluation_second: geom.coefficient_gauge.restrict_design(&d2k_centers_aug),
+            design_first: geom.coefficient_gauge.restrict_design(&dk_data_aug),
+            design_second: geom.coefficient_gauge.restrict_design(&d2k_data_aug),
+        })
+    } else {
+        None
     };
-    // Raw (pre-normalization) value + jet stacks per ORIGINAL candidate, in
-    // coordinate order. `raw[cand] = (S, firsts, seconds, crosses)` with
-    // crosses keyed by coordinate pairs in `pairs` order.
-    let (n_coords, pairs, raw): (
-        usize,
-        Vec<(usize, usize)>,
-        Vec<(
-            Array2<f64>,
-            Vec<Array2<f64>>,
-            Vec<Array2<f64>>,
-            Vec<Array2<f64>>,
-        )>,
-    ) = if geom.per_level {
+
+    let coord_offset = usize::from(length_scale_jets.is_some());
+    let n_coords = coord_offset + if geom.per_level { 2 } else { 0 };
+    let pairs: Vec<(usize, usize)> = (0..n_coords)
+        .flat_map(|a| ((a + 1)..n_coords).map(move |b| (a, b)))
+        .collect();
+    let zero_p = || Array2::<f64>::zeros((p, p));
+
+    struct RawPenaltyJets {
+        value: Array2<f64>,
+        first: Vec<Array2<f64>>,
+        second_diag: Vec<Array2<f64>>,
+        cross: Vec<Array2<f64>>,
+    }
+
+    let sandwich = |form: &Array2<f64>| pullback_center_form(&geom.kz, form);
+    let length_diag = |form: &Array2<f64>| {
+        let jets = length_scale_jets
+            .as_ref()
+            .expect("length-scale form jets require an enrolled length coordinate");
+        pullback_center_form_log_length_jets(
+            &geom.kz,
+            &jets.evaluation_first,
+            &jets.evaluation_second,
+            form,
+        )
+    };
+    let length_cross = |form_first: &Array2<f64>| {
+        let jets = length_scale_jets
+            .as_ref()
+            .expect("length-scale cross jets require an enrolled length coordinate");
+        pullback_center_form_log_length_cross(
+            &geom.kz,
+            &jets.evaluation_first,
+            form_first,
+        )
+    };
+
+    // Raw (pre-normalization) value + exact jet stacks per ORIGINAL candidate.
+    // Coordinate order is `[lnℓ?, α, lnτ]` in multiscale mode and `[lnℓ?]`
+    // in single-scale mode. Candidate order exactly mirrors the value builder:
+    // scale candidates or Primary first, then the optional null-component
+    // candidate. Active filtering aligns through `PenaltyInfo::original_index`.
+    let mut raw: Vec<RawPenaltyJets> = if geom.per_level {
         let l_count = band.eps.len();
         // Six forms per scale: value, ∂α, ∂α², and zero τ slots — same
         // blocks, one walk (single-source rule).
@@ -1941,84 +2059,93 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 out[k0 + 5] = [0.0, 0.0, 0.0];
             },
         )?;
-        let mut raw = Vec::with_capacity(l_count);
+        let alpha_coord = coord_offset;
+        let tau_coord = coord_offset + 1;
+        let mut raw = Vec::with_capacity(l_count + usize::from(spec.double_penalty));
         for level in 0..l_count {
             let chunk = &forms[6 * level..6 * level + 6];
-            raw.push((
-                sandwich(&chunk[0]),
-                vec![sandwich(&chunk[1]), sandwich(&chunk[3])],
-                vec![sandwich(&chunk[2]), sandwich(&chunk[4])],
-                vec![sandwich(&chunk[5])],
-            ));
+            let mut first: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
+            let mut second_diag: Vec<Array2<f64>> =
+                (0..n_coords).map(|_| zero_p()).collect();
+            first[alpha_coord] = sandwich(&chunk[1]);
+            first[tau_coord] = sandwich(&chunk[3]);
+            second_diag[alpha_coord] = sandwich(&chunk[2]);
+            second_diag[tau_coord] = sandwich(&chunk[4]);
+            if coord_offset == 1 {
+                let (ell_first, ell_second) = length_diag(&chunk[0]);
+                first[0] = ell_first;
+                second_diag[0] = ell_second;
+            }
+            let mut cross: Vec<Array2<f64>> = (0..pairs.len()).map(|_| zero_p()).collect();
+            for (pair_idx, &(a, b)) in pairs.iter().enumerate() {
+                cross[pair_idx] = if coord_offset == 1 && a == 0 && b == alpha_coord {
+                    length_cross(&chunk[1])
+                } else if coord_offset == 1 && a == 0 && b == tau_coord {
+                    length_cross(&chunk[3])
+                } else if a == alpha_coord && b == tau_coord {
+                    sandwich(&chunk[5])
+                } else {
+                    zero_p()
+                };
+            }
+            raw.push(RawPenaltyJets {
+                value: sandwich(&chunk[0]),
+                first,
+                second_diag,
+                cross,
+            });
         }
-        (2usize, vec![(0usize, 1usize)], raw)
+        raw
     } else {
-        // Single-scale mode (the default): the penalty dials (s, α, lnτ) are NOT
-        // enrolled — the fused penalty is fixed and only the design-moving ℓ
-        // coordinate (added below) varies. So there are ZERO penalty-derivative
-        // COORDINATES (n_coords = 0), but the term still has ONE fitted penalty
-        // candidate (the fused primary), so we emit one `raw` entry with EMPTY
-        // per-coordinate derivative vecs. That keeps the candidate COUNT
-        // (n_active = 1) aligned with the build's penalty list while contributing
-        // no penalty ψ-derivative (the penalty is ℓ-independent). MUST match
-        // `measure_jet_penalty_psi_dim` (= 0 coords) and the build's 1 candidate.
-        let q_value = sandwich(&measure_jet_energy_form(
+        // Single-scale mode enrolls no `(s, α, lnτ)` penalty dials. It still
+        // emits the pure Primary and, when requested, a separate REML null
+        // component; an opt-in `lnℓ` coordinate differentiates both pullbacks.
+        let q_form = measure_jet_energy_form(
             geom.centers.view(),
             geom.masses.view(),
             &band,
             geom.order_s_eval,
             spec.alpha,
             spec.tau0,
-        )?);
-        let raw = vec![(q_value, Vec::new(), Vec::new(), Vec::new())];
-        (0usize, Vec::new(), raw)
-    };
-    // Design-moving ℓ coordinate (#1116). The Gaussian representer design
-    // `X = K(data, centers; ℓ)·z` is the ONLY ℓ-dependent object (the jet-energy
-    // penalty uses the ε-band, not ℓ; the constraint transform `z` acts in
-    // center-coefficient space). With `u = lnℓ` and `a = r²/ℓ²`:
-    //   ∂K/∂u = K ⊙ a,     ∂²K/∂u² = K ⊙ (a² − 2a),
-    // and `∂X/∂u = (∂K/∂u)·z`, `∂²X/∂u² = (∂²K/∂u²)·z`. Cross terms with the
-    // (s, α, lnτ) penalty dials vanish: those carry zero design drift and the
-    // penalty carries zero ℓ drift. FD-gated by `psi_producer_matches_fd_length_scale`.
-    let length_scale_design = if spec.learn_length_scale {
-        let ell = geom.length_scale;
-        let k = measure_jet_design_matrix(data, geom.centers.view(), ell)?;
-        let r2 = pairwise_sq_dists(data, geom.centers.view());
-        let inv_l2 = 1.0 / (ell * ell);
-        let mut dk = k.clone();
-        let mut d2k = k.clone();
-        for ((dk_v, d2k_v), &r2_v) in dk.iter_mut().zip(d2k.iter_mut()).zip(r2.iter()) {
-            let a = r2_v * inv_l2;
-            let kij = *dk_v;
-            *dk_v = kij * a;
-            *d2k_v = kij * (a * a - 2.0 * a);
+        )?;
+        let mut first: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
+        let mut second_diag: Vec<Array2<f64>> =
+            (0..n_coords).map(|_| zero_p()).collect();
+        if coord_offset == 1 {
+            let (ell_first, ell_second) = length_diag(&q_form);
+            first[0] = ell_first;
+            second_diag[0] = ell_second;
         }
-        // The ambient-linear head (#1845) is ℓ-independent, so its derivative
-        // columns are exactly zero: pad the representer derivatives to the
-        // augmented raw width before restricting through the SAME Gauge-owned
-        // coefficient section the design uses.
-        let m = geom.centers.nrows();
-        let m_aug = m + geom.head_transform.ncols();
-        let mut dk_aug = Array2::<f64>::zeros((data.nrows(), m_aug));
-        let mut d2k_aug = Array2::<f64>::zeros((data.nrows(), m_aug));
-        dk_aug.slice_mut(ndarray::s![.., ..m]).assign(&dk);
-        d2k_aug.slice_mut(ndarray::s![.., ..m]).assign(&d2k);
-        let dx_du = geom.coefficient_gauge.restrict_design(&dk_aug);
-        let d2x_du2 = geom.coefficient_gauge.restrict_design(&d2k_aug);
-        Some((dx_du, d2x_du2))
-    } else {
-        None
+        vec![RawPenaltyJets {
+            value: sandwich(&q_form),
+            first,
+            second_diag,
+            cross: Vec::new(),
+        }]
     };
-    let n_active = raw.len();
-    // Mirror the build-path gate (`build_measure_jet_basis`): the
-    // affine-preserving ridge is a SEPARATE candidate only in multiscale mode.
-    // In single-scale mode it is FUSED into the primary value above (#1116), so
-    // no separate candidate — the ψ-derivative penalty count must match the
-    // build path, count desync = the gam#860 trap class.
-    let ridge = spec.double_penalty && geom.per_level;
-    let n_cands = n_active + usize::from(ridge);
-    let zero_p = || Array2::<f64>::zeros((p, p));
+
+    if spec.double_penalty {
+        let null_form =
+            affine_function_nullspace_form(geom.centers.view(), geom.masses.view())?;
+        let mut first: Vec<Array2<f64>> = (0..n_coords).map(|_| zero_p()).collect();
+        let mut second_diag: Vec<Array2<f64>> =
+            (0..n_coords).map(|_| zero_p()).collect();
+        if coord_offset == 1 {
+            let (ell_first, ell_second) = length_diag(&null_form);
+            first[0] = ell_first;
+            second_diag[0] = ell_second;
+        }
+        raw.push(RawPenaltyJets {
+            value: sandwich(&null_form),
+            first,
+            second_diag,
+            // H₀ is independent of α and τ; its only moving object is E(ℓ),
+            // so every mixed coordinate derivative is zero.
+            cross: (0..pairs.len()).map(|_| zero_p()).collect(),
+        });
+    }
+
+    let n_cands = raw.len();
     let mut penalties_first: Vec<Vec<Array2<f64>>> =
         (0..n_coords).map(|_| Vec::with_capacity(n_cands)).collect();
     let mut penalties_second_diag: Vec<Vec<Array2<f64>>> =
@@ -2027,7 +2154,8 @@ pub fn build_measure_jet_basis_psi_derivatives(
     // candidate count is the band length, not the data size) and served
     // through the on-demand provider.
     let mut crosses: Vec<Vec<Array2<f64>>> = (0..pairs.len()).map(|_| Vec::new()).collect();
-    for (s_raw, firsts, seconds, cross_raw) in &raw {
+    for candidate in &raw {
+        let s_raw = &candidate.value;
         // ONE Frobenius scale per candidate, fixed up front from `s_raw`
         // alone: c anchors the value and every derivative of this candidate.
         // `normalize_penaltywith_psi_derivatives` recomputes the identical c
@@ -2043,64 +2171,31 @@ pub fn build_measure_jet_basis_psi_derivatives(
             1.0
         };
         for coord in 0..n_coords {
-            let (_, s_first, s_second, _) =
-                normalize_penaltywith_psi_derivatives(s_raw, &firsts[coord], &seconds[coord]);
+            let (_, s_first, s_second, _) = normalize_penaltywith_psi_derivatives(
+                s_raw,
+                &candidate.first[coord],
+                &candidate.second_diag[coord],
+            );
             penalties_first[coord].push(s_first);
             penalties_second_diag[coord].push(s_second);
         }
         for (pair_idx, &(a, b)) in pairs.iter().enumerate() {
             let cross_raw_mat = normalize_penalty_cross_psi_derivative(
                 s_raw,
-                &firsts[a],
-                &firsts[b],
-                &cross_raw[pair_idx],
+                &candidate.first[a],
+                &candidate.first[b],
+                &candidate.cross[pair_idx],
                 c,
             );
             crosses[pair_idx].push(cross_raw_mat);
         }
     }
-    if ridge {
-        for coord in 0..n_coords {
-            penalties_first[coord].push(zero_p());
-            penalties_second_diag[coord].push(zero_p());
-        }
-        for pair_crosses in crosses.iter_mut() {
-            pair_crosses.push(zero_p());
-        }
-    }
-    // Prepend the design-moving ℓ coordinate at index 0 when enrolled. ℓ
-    // carries the nonzero `design_first/second`, ZERO penalty derivatives (the
-    // penalty is ℓ-independent), and no cross terms with the penalty dials
-    // (those carry zero design drift). Every penalty-dial coordinate and cross
-    // pair therefore shifts up by one.
-    let coord_offset = usize::from(length_scale_design.is_some());
-    if coord_offset == 1 {
-        penalties_first.insert(0, (0..n_cands).map(|_| zero_p()).collect());
-        penalties_second_diag.insert(0, (0..n_cands).map(|_| zero_p()).collect());
-    }
-    let n_coords_total = n_coords + coord_offset;
-    // Penalty-dial cross pairs, shifted past the ℓ coordinate.
-    let mut all_pairs: Vec<(usize, usize)> = pairs
-        .iter()
-        .map(|&(a, b)| (a + coord_offset, b + coord_offset))
-        .collect();
-    let mut all_crosses: Vec<Vec<Array2<f64>>> = crosses;
-    // ℓ (coord 0) × every penalty coordinate: the penalty is ℓ-independent and
-    // the penalty dials carry zero design drift, so each cross block is zero —
-    // but the pair MUST be registered (the consumer queries every coordinate
-    // pair `(a, b)`), else the provider errors on an unregistered ℓ pair.
-    if coord_offset == 1 {
-        for c in 1..n_coords_total {
-            all_pairs.push((0, c));
-            all_crosses.push((0..n_cands).map(|_| zero_p()).collect());
-        }
-    }
-    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> = all_pairs
+
+    let pair_index: Vec<((usize, usize), Vec<Array2<f64>>)> = pairs
         .iter()
         .copied()
-        .zip(all_crosses.into_iter())
+        .zip(crosses.into_iter())
         .collect();
-    let shifted_pairs = all_pairs;
     let provider = AnisoPenaltyCrossProvider::new(move |a, b| {
         pair_index
             .iter()
@@ -2112,15 +2207,15 @@ pub fn build_measure_jet_basis_psi_derivatives(
                 ))
             })
     });
-    let mut design_first: Vec<Array2<f64>> = (0..n_coords_total)
+    let mut design_first: Vec<Array2<f64>> = (0..n_coords)
         .map(|_| Array2::<f64>::zeros((n, p)))
         .collect();
-    let mut design_second_diag: Vec<Array2<f64>> = (0..n_coords_total)
+    let mut design_second_diag: Vec<Array2<f64>> = (0..n_coords)
         .map(|_| Array2::<f64>::zeros((n, p)))
         .collect();
-    if let Some((dx_du, d2x_du2)) = length_scale_design {
-        design_first[0] = dx_du;
-        design_second_diag[0] = d2x_du2;
+    if let Some(jets) = length_scale_jets {
+        design_first[0] = jets.design_first;
+        design_second_diag[0] = jets.design_second;
     }
     Ok(AnisoBasisPsiDerivatives {
         design_first,
@@ -2129,7 +2224,7 @@ pub fn build_measure_jet_basis_psi_derivatives(
         design_second_cross_pairs: Vec::new(),
         penalties_first,
         penalties_second_diag,
-        penalties_cross_pairs: shifted_pairs,
+        penalties_cross_pairs: pairs,
         penalties_cross_provider: Some(provider),
         implicit_operator: None,
     })

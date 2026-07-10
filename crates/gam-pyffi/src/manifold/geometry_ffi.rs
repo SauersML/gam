@@ -12,6 +12,27 @@ fn poincare_distance<'py>(
     })
 }
 
+#[pyfunction]
+fn poincare_distance_batch<'py>(
+    py: Python<'py>,
+    left: PyReadonlyArray2<'py, f64>,
+    right: PyReadonlyArray2<'py, f64>,
+    dimension: usize,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let left_owned = left.as_array().to_owned();
+    let right_owned = right.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_distance_batch", move || {
+        poincare_distance_batch_impl(
+            left_owned.view(),
+            right_owned.view(),
+            dimension,
+            curvature,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
 /// K-aware default IBP concentration `α` (#1784) from the Rust source of truth
 /// `assignment::default_ibp_concentration_for_k_atoms`. Exposed so the Python
 /// facade calls the core formula (`α = max(1, 1/(exp(1/K) − 1))`) instead of
@@ -504,6 +525,76 @@ fn poincare_log_map<'py>(
     let q_owned = q.as_array().to_owned();
     let out = detach_geometry_result(py, "poincare_log_map", move || {
         poincare_log_map_impl(p_owned.view(), q_owned.view(), curvature)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_exp_map_batch<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    tangents: PyReadonlyArray2<'py, f64>,
+    dimension: usize,
+    curvature: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let points_owned = points.as_array().to_owned();
+    let tangents_owned = tangents.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_exp_map_batch", move || {
+        poincare_exp_map_batch_impl(
+            points_owned.view(),
+            tangents_owned.view(),
+            dimension,
+            curvature,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_log_map_batch<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    targets: PyReadonlyArray2<'py, f64>,
+    dimension: usize,
+    curvature: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let points_owned = points.as_array().to_owned();
+    let targets_owned = targets.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_log_map_batch", move || {
+        poincare_log_map_batch_impl(
+            points_owned.view(),
+            targets_owned.view(),
+            dimension,
+            curvature,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_project_into_ball_batch<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    dimension: usize,
+    curvature: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let points_owned = points.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_project_into_ball_batch", move || {
+        poincare_project_into_ball_batch_impl(points_owned.view(), dimension, curvature)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_metric_tensor_batch<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    dimension: usize,
+    curvature: f64,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let points_owned = points.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_metric_tensor_batch", move || {
+        poincare_metric_tensor_batch_impl(points_owned.view(), dimension, curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -4850,15 +4941,17 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(fidelity_distortion_floor_r2, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
     module.add_function(wrap_pyfunction!(set_log_level, module)?)?;
-    module.add_function(wrap_pyfunction!(interpolate_survival_surface, module)?)?;
     module.add_function(wrap_pyfunction!(interpolate_rows, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_chunk_defaults, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_chunk_ranges, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_should_chunk, module)?)?;
     module.add_function(wrap_pyfunction!(survival_chunk_iter_collect, module)?)?;
     module.add_function(wrap_pyfunction!(write_survival_csv, module)?)?;
     module.add_function(wrap_pyfunction!(survival_coerce_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_parameters_matrix, module)?)?;
-    module.add_function(wrap_pyfunction!(survival_collect_chunks, module)?)?;
     module.add_function(wrap_pyfunction!(hazard_from_cumulative_knots, module)?)?;
     module.add_function(wrap_pyfunction!(survival_cumulative_from_survival, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_failure_from_survival, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block_hazard, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block_cumulative_hazard, module)?)?;
@@ -4942,6 +5035,34 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(decoder_cov_from_channel_factors, module)?)?;
     module.add_function(wrap_pyfunction!(sae_canonical_n_harmonics, module)?)?;
     module.add_function(wrap_pyfunction!(sae_atom_topologies, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_canonical_assignment_kind,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_canonical_basis_kind,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_basis_kind_for_topology,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_topology_for_basis,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_canonical_topology,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_flat_block_assignment,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_activation_matrix_from_logits,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
@@ -5073,12 +5194,17 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(poincare_mobius_add, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_distance, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_distance_batch, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_project_into_ball, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_log_origin, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_exp_origin, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_conformal_factor, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_log_map, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_exp_map_batch, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_log_map_batch, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_project_into_ball_batch, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_metric_tensor_batch, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_to_lorentz, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_from_lorentz, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_lorentz_log_origin, module)?)?;
@@ -5181,7 +5307,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(chart_transfer_operator, module)?)?;
     module.add_function(wrap_pyfunction!(certify_chart_transfer, module)?)?;
     module.add_function(wrap_pyfunction!(sae_checkpoint_dynamics, module)?)?;
-    module.add_function(wrap_pyfunction!(intervention_eval_forever_mask, module)?)?;
+    module.add_class::<PyInterventionCalibrationPlan>()?;
+    module.add_function(wrap_pyfunction!(intervention_calibration_plan, module)?)?;
     inference_instruments::register(module)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;

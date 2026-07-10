@@ -727,16 +727,20 @@ mod tests {
             .expect("an infinite sequence contains a group on each hash parity")
     }
 
-    fn calibration_input() -> InterventionCalibrationInput {
+    fn calibration_shard_and_spec() -> (InterventionShard, InterventionCalibrationSpec) {
         let seed = 19;
         let train_group = group_on_side(seed, false);
         let eval_group = group_on_side(seed, true);
-        InterventionCalibrationInput {
+        let shard = InterventionShard {
             // Two train controls establish floor=2.  Atom 10 is measurable;
             // atom 20 never clears the floor and is reported, not fitted.
-            nu_hat: vec![0.0, 0.0, 1.0, 4.0, 2.0, 3.0],
-            nu_measured: vec![1.0, 3.0, 4.0, 1.0, 2.0, 8.0],
+            row_id: (0..6).collect(),
             atom: vec![10, 10, 10, 20, 10, 10],
+            dose: vec![0.0, 0.0, 1.0, 1.0, 2.0, 3.0],
+            d_dose: 1,
+            nu_hat_1: vec![0.0, 0.0, 1.0, 4.0, 2.0, 3.0],
+            nu_hat_2: None,
+            nu_measured: vec![1.0, 3.0, 4.0, 1.0, 2.0, 8.0],
             group: vec![
                 train_group,
                 train_group,
@@ -746,17 +750,25 @@ mod tests {
                 eval_group,
             ],
             is_control: vec![true, true, false, false, false, false],
+            layer: 4,
+            seed: 7,
+        };
+        let spec = InterventionCalibrationSpec {
+            prediction: PredictedNats::Rung1,
             split_seed: seed,
             floor_quantile: 0.5,
-        }
+        };
+        (shard, spec)
     }
 
     #[test]
     fn calibration_plan_owns_split_floor_screen_and_log_transforms() {
-        let plan = prepare_intervention_calibration(calibration_input()).unwrap();
+        let (shard, spec) = calibration_shard_and_spec();
+        let plan = prepare_intervention_calibration(&shard, spec).unwrap();
         assert_eq!(plan.floor_nats, 2.0);
         assert_eq!(plan.measurable_atoms, vec![10]);
-        assert_eq!(plan.unmeasurable_atoms, vec![20]);
+        assert_eq!(plan.below_measurement_floor_atoms, vec![20]);
+        assert_eq!(plan.no_training_intervention_atoms, Vec::<i64>::new());
         assert_eq!(plan.train_atom, vec![10, 10]);
         assert_eq!(plan.train_log_nu, vec![4.0_f64.ln(), 2.0_f64.ln()]);
         assert_eq!(plan.train_log_nu_hat, vec![0.0, 2.0_f64.ln()]);
@@ -768,13 +780,14 @@ mod tests {
 
     #[test]
     fn calibration_finish_computes_only_respeeds_and_heldout_diagnostic() {
-        let mut input = calibration_input();
+        let (mut shard, spec) = calibration_shard_and_spec();
         // Make atom 20 measurable so centering of two reference predictions is
         // observable in the chart updates.
-        input.nu_measured[3] = 5.0;
-        let plan = prepare_intervention_calibration(input).unwrap();
+        shard.nu_measured[3] = 5.0;
+        let plan = prepare_intervention_calibration(&shard, spec).unwrap();
         let result = plan.finish(&[1.0, 3.0], &[8.0_f64.ln() + 0.25]).unwrap();
-        assert_eq!(result.unmeasurable, Vec::<i64>::new());
+        assert_eq!(result.below_measurement_floor, Vec::<i64>::new());
+        assert_eq!(result.no_training_intervention, Vec::<i64>::new());
         assert_eq!(result.n_train, 3);
         assert_eq!(result.n_eval, 1);
         assert!((result.respeed[0].1 - (-0.5_f64).exp()).abs() < 1.0e-12);
@@ -784,18 +797,19 @@ mod tests {
 
     #[test]
     fn calibration_requires_positive_control_resolution_for_log_model() {
-        let mut input = calibration_input();
-        input.nu_measured[0] = 0.0;
-        input.nu_measured[1] = 0.0;
+        let (mut shard, spec) = calibration_shard_and_spec();
+        shard.nu_measured[0] = 0.0;
+        shard.nu_measured[1] = 0.0;
         assert_eq!(
-            prepare_intervention_calibration(input).unwrap_err(),
+            prepare_intervention_calibration(&shard, spec).unwrap_err(),
             InterventionCalibrationError::NonPositiveControlFloor(0.0)
         );
     }
 
     #[test]
     fn calibration_finish_rejects_prediction_shape_drift() {
-        let plan = prepare_intervention_calibration(calibration_input()).unwrap();
+        let (shard, spec) = calibration_shard_and_spec();
+        let plan = prepare_intervention_calibration(&shard, spec).unwrap();
         assert!(matches!(
             plan.finish(&[], &[]),
             Err(InterventionCalibrationError::PredictionLengthMismatch {
@@ -804,5 +818,18 @@ mod tests {
                 got: 0,
             })
         ));
+    }
+
+    #[test]
+    fn calibration_prediction_channel_is_typed() {
+        let (mut shard, mut spec) = calibration_shard_and_spec();
+        spec.prediction = PredictedNats::Rung2;
+        assert_eq!(
+            prepare_intervention_calibration(&shard, spec).unwrap_err(),
+            InterventionCalibrationError::Rung2Unavailable
+        );
+        shard.nu_hat_2 = Some(shard.nu_hat_1.iter().map(|value| value * 2.0).collect());
+        let plan = prepare_intervention_calibration(&shard, spec).unwrap();
+        assert_eq!(plan.train_log_nu_hat[0], 2.0_f64.ln());
     }
 }

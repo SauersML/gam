@@ -811,17 +811,136 @@ mod tests {
         );
     }
 
+    /// Test-only central-difference oracle for the exact ambient VJP. Point
+    /// perturbations deliberately range over raw ambient coordinates: the
+    /// public backward contract differentiates the concrete Rust map, including
+    /// its horizontal projection, rather than silently projecting cotangents
+    /// after the fact.
+    fn assert_exp_vjp_matches_fd(y: &Array2<f64>, z: &Array2<f64>, g: &Array2<f64>) {
+        let (n, k) = y.dim();
+        let gr = GrassmannManifold::new(k, n).unwrap();
+        let (yf, zf, gf) = (flat(y), flat(z), flat(g));
+        let (grad_y, grad_z) = gr
+            .exp_map_vjp(yf.view(), zf.view(), gf.view())
+            .expect("analytic Grassmann VJP");
+        let loss = |point: &Array1<f64>, tangent: &Array1<f64>| {
+            gr.exp_map(point.view(), tangent.view())
+                .expect("Grassmann exp")
+                .dot(&gf)
+        };
+        let eps = 1.0e-6;
+        for idx in 0..n * k {
+            let mut direction = Array1::<f64>::zeros(n * k);
+            direction[idx] = 1.0;
+            let fd_y = (loss(&(&yf + &(&direction * eps)), &zf)
+                - loss(&(&yf - &(&direction * eps)), &zf))
+                / (2.0 * eps);
+            let fd_z = (loss(&yf, &(&zf + &(&direction * eps)))
+                - loss(&yf, &(&zf - &(&direction * eps))))
+                / (2.0 * eps);
+            let scale_y = 1.0 + fd_y.abs();
+            let scale_z = 1.0 + fd_z.abs();
+            assert!(
+                (grad_y[idx] - fd_y).abs() <= 2.0e-5 * scale_y,
+                "point VJP[{idx}]={} != FD {fd_y}",
+                grad_y[idx]
+            );
+            assert!(
+                (grad_z[idx] - fd_z).abs() <= 2.0e-5 * scale_z,
+                "tangent VJP[{idx}]={} != FD {fd_z}",
+                grad_z[idx]
+            );
+        }
+    }
+
     #[test]
-    fn exp_map_vjp_k_gt_1_is_unsupported() {
-        let gr = GrassmannManifold::new(2, 4).unwrap();
-        let y =
-            flat(&Array2::from_shape_vec((4, 2), vec![1., 0., 0., 1., 0., 0., 0., 0.]).unwrap());
-        let delta =
-            flat(&Array2::from_shape_vec((4, 2), vec![0., 0., 0., 0., 1., 0., 0., 0.]).unwrap());
-        let g_out = y.clone();
-        match gr.exp_map_vjp(y.view(), delta.view(), g_out.view()) {
-            Err(GeometryError::Unsupported(_)) => {}
-            other => panic!("expected Unsupported for k>1, got {other:?}"),
+    fn exp_map_vjp_matches_fd_for_distinct_principal_angles() {
+        let (y, _) = frames_with_angles(6, 2, &[0.0, 0.0]);
+        let z = Array2::from_shape_vec(
+            (6, 2),
+            vec![0.2, -0.1, 0.05, 0.3, 0.7, -0.2, 0.1, 1.1, -0.4, 0.3, 0.2, 0.5],
+        )
+        .unwrap();
+        let g = Array2::from_shape_vec(
+            (6, 2),
+            vec![0.3, -0.8, 0.6, 0.1, -0.2, 0.5, 0.9, -0.4, 0.7, 0.2, -0.1, 0.4],
+        )
+        .unwrap();
+        assert_exp_vjp_matches_fd(&y, &z, &g);
+    }
+
+    #[test]
+    fn exp_map_vjp_matches_fd_for_repeated_principal_angles() {
+        let (y, _) = frames_with_angles(6, 2, &[0.0, 0.0]);
+        let theta = 0.7;
+        let mut z = Array2::<f64>::zeros((6, 2));
+        // ΔᵀΔ = θ²I: the Gram eigenbasis is arbitrary, so this pins the
+        // analytic repeated-eigenvalue limit rather than an SVD-vector gauge.
+        z[[2, 0]] = theta;
+        z[[3, 1]] = theta;
+        let g = Array2::from_shape_vec(
+            (6, 2),
+            vec![0.5, 0.1, -0.3, 0.7, 0.8, -0.2, 0.4, 0.9, -0.6, 0.2, 0.3, -0.5],
+        )
+        .unwrap();
+        assert_exp_vjp_matches_fd(&y, &z, &g);
+    }
+
+    #[test]
+    fn exp_map_vjp_matches_fd_at_zero_principal_angle() {
+        let (y, _) = frames_with_angles(6, 2, &[0.0, 0.0]);
+        let mut z = Array2::<f64>::zeros((6, 2));
+        z[[2, 0]] = 0.9;
+        // Second singular value is exactly zero, exercising c'(0)=-1/2 and
+        // s'(0)=-1/6 without an eigen-gap branch.
+        let g = Array2::from_shape_vec(
+            (6, 2),
+            vec![0.2, -0.4, 0.8, 0.3, -0.7, 0.5, 0.1, 0.6, -0.2, 0.9, 0.4, -0.1],
+        )
+        .unwrap();
+        assert_exp_vjp_matches_fd(&y, &z, &g);
+    }
+
+    #[test]
+    fn principal_angle_divided_differences_use_exact_zero_limits() {
+        assert_eq!(cos_sqrt_divided_difference(0.0, 0.0), -0.5);
+        assert_eq!(sinc_sqrt_divided_difference(0.0, 0.0), -1.0 / 6.0);
+    }
+
+    #[test]
+    fn exp_map_vjp_matches_fd_for_nearly_repeated_large_angles() {
+        let (y, _) = frames_with_angles(6, 2, &[0.0, 0.0]);
+        let mut z = Array2::<f64>::zeros((6, 2));
+        let theta = 1.2;
+        z[[2, 0]] = theta;
+        z[[3, 1]] = theta * (1.0 + 1.0e-10);
+        let g = Array2::from_shape_vec(
+            (6, 2),
+            vec![0.7, -0.2, 0.1, 0.8, -0.5, 0.4, 0.9, -0.3, 0.2, 0.6, -0.8, 0.5],
+        )
+        .unwrap();
+        assert_exp_vjp_matches_fd(&y, &z, &g);
+    }
+
+    #[test]
+    fn exp_map_vjp_zero_tangent_has_closed_form_pullback() {
+        let gr = GrassmannManifold::new(2, 5).unwrap();
+        let (y, _) = frames_with_angles(5, 2, &[0.0, 0.0]);
+        let z = Array2::<f64>::zeros((5, 2));
+        let g = Array2::from_shape_vec(
+            (5, 2),
+            vec![0.4, -0.2, 0.7, 0.3, -0.5, 0.9, 0.1, -0.6, 0.8, 0.2],
+        )
+        .unwrap();
+        let (grad_y, grad_z) = gr
+            .exp_map_vjp(flat(&y).view(), flat(&z).view(), flat(&g).view())
+            .unwrap();
+        let projected_g = gr
+            .project_tangent(flat(&y).view(), flat(&g).view())
+            .unwrap();
+        for idx in 0..grad_y.len() {
+            assert!((grad_y[idx] - flat(&g)[idx]).abs() <= 2.0 * f64::EPSILON);
+            assert!((grad_z[idx] - projected_g[idx]).abs() <= 2.0 * f64::EPSILON);
         }
     }
 }

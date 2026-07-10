@@ -61,8 +61,8 @@ def test_penalty_specs_sampling_survival_and_diagnostics_regressions():
     from gamfit._tables import normalize_table
 
     headers, table_rows, _ = normalize_table(rows)
-    raw = ffi.sample_table(model._model_bytes, headers, table_rows, options_json)
-    direct_draws = PosteriorSamples.from_ffi_json(raw, model_bytes=model._model_bytes)
+    payload = ffi.sample_table(model._model_bytes, headers, table_rows, options_json)
+    direct_draws = PosteriorSamples.from_ffi_payload(payload, model_bytes=model._model_bytes)
     assert np.array_equal(py_draws.samples, direct_draws.samples), "Python Model.sample and direct Rust sample_table should return identical NUTS draws for the same seed."
 
     surv = SurvivalPrediction(

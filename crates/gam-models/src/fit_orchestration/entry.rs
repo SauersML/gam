@@ -29,7 +29,6 @@ pub struct StandardFitOptionsInputs {
     /// `Some` only when a caller (the forced-Firth CLI branch) overrides the
     /// canonical default. `None` keeps the single-source default `Some(1e-6)`.
     pub penalty_shrinkage_floor_override: Option<Option<f64>>,
-    pub persist_warm_start_disk: bool,
 }
 
 /// The single source of truth for standard-fit `FitOptions` *policy*.
@@ -82,16 +81,14 @@ pub fn canonical_standard_fit_options(
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
-        persist_warm_start_disk: inputs.persist_warm_start_disk,
+        // A formula fit is recoverable across process/wall interruptions by
+        // default. The model/data fingerprinting and checkpoint cadence live
+        // in gam-solve; this canonical seam only owns the high-level policy.
+        persist_warm_start_disk: config.persist_warm_start_disk,
     }
 }
 
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
-    // Disk warm-start persistence is opt-in. The always-on in-memory warm start
-    // remains inside the fit engines, but the workflow dispatcher must not open
-    // the shared WarmStartStore for ordinary formula fits: refit-heavy quality
-    // tests get no cross-process reuse and previously paid cache lookup,
-    // checkpoint, and eviction scans on every replicate (#1082/#1114).
     let request = request;
     // Each `fit_*_model` helper still returns `Result<_, String>` internally;
     // the boundary conversion happens here so the public API returns
@@ -239,6 +236,93 @@ fn expectile_row_weights(
         let asym = if y[i] > mu[i] { tau } else { 1.0 - tau };
         base[i] * asym
     })
+}
+
+/// Constant-history cycle detector for the deterministic LAWS sign map.
+///
+/// Brent's power-of-two schedule detects a cycle of any length while retaining
+/// one `Vec<bool>` checkpoint, rather than one sign vector per iteration.  That
+/// keeps cycle detection O(n) in the number of observations even when a caller
+/// grants a large iteration budget.
+#[derive(Debug, Default)]
+struct ExpectileSignCycle {
+    anchor: Option<Vec<bool>>,
+    power: usize,
+    span: usize,
+}
+
+impl ExpectileSignCycle {
+    /// Observe the next sign state. Returns the detected cycle length once the
+    /// current state revisits Brent's anchor.
+    fn observe(&mut self, sign: &[bool]) -> Option<usize> {
+        let Some(anchor) = self.anchor.as_deref() else {
+            self.anchor = Some(sign.to_vec());
+            self.power = 1;
+            return None;
+        };
+
+        self.span += 1;
+        if anchor == sign {
+            return Some(self.span);
+        }
+        if self.span == self.power {
+            self.anchor = Some(sign.to_vec());
+            self.power = self.power.saturating_mul(2);
+            self.span = 0;
+        }
+        None
+    }
+}
+
+fn expectile_kkt_certified(residual: f64, bound: f64) -> bool {
+    residual.is_finite()
+        && bound.is_finite()
+        && residual >= 0.0
+        && bound >= 0.0
+        && residual <= bound
+}
+
+#[cfg(test)]
+mod expectile_convergence_tests {
+    use super::{ExpectileSignCycle, expectile_kkt_certified};
+
+    #[test]
+    fn brent_detector_finds_fixed_sign_state() {
+        let mut detector = ExpectileSignCycle::default();
+        let sign = vec![true, false, true, true];
+        assert_eq!(detector.observe(&sign), None);
+        assert_eq!(detector.observe(&sign), Some(1));
+    }
+
+    #[test]
+    fn brent_detector_finds_longer_cycle_without_storing_history() {
+        let mut detector = ExpectileSignCycle::default();
+        let cycle = [
+            vec![true, false, false],
+            vec![false, true, false],
+            vec![false, false, true],
+        ];
+        let mut detected = None;
+        for sign in cycle.iter().cycle().take(9) {
+            detected = detector.observe(sign);
+            if detected.is_some() {
+                break;
+            }
+        }
+        assert_eq!(detected, Some(3));
+        assert_eq!(detector.anchor.as_ref().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn kkt_gate_never_certifies_non_finite_or_over_bound_residual() {
+        assert!(expectile_kkt_certified(0.0, 0.0));
+        assert!(expectile_kkt_certified(1.0e-9, 1.0e-8));
+        assert!(!expectile_kkt_certified(1.0e-7, 1.0e-8));
+        assert!(!expectile_kkt_certified(-1.0, 1.0));
+        assert!(!expectile_kkt_certified(0.0, -1.0));
+        assert!(!expectile_kkt_certified(f64::NAN, 1.0));
+        assert!(!expectile_kkt_certified(0.0, f64::NAN));
+    }
 }
 
 fn constant_gaussian_standard_fit(
@@ -510,15 +594,13 @@ pub fn fit_expectile_if_requested(
 /// Least Asymmetrically Weighted Squares (LAWS) driver for expectile GAMs.
 ///
 /// The τ-expectile surface minimizes `Σ wᵢ(τ)·(yᵢ − μᵢ)²` with the residual-
-/// sign asymmetric weight `wᵢ(τ)`. Because that weight is piecewise-constant in
-/// `sign(yᵢ − μᵢ)`, the objective is the supremum of a finite family of
-/// weighted least-squares problems and its minimizer is the unique fixed point
-/// of: *solve the penalized WLS with weights frozen at the current sign
-/// pattern, then recompute the sign pattern from the new fit*. The asymmetric
-/// loss is strictly convex (weights bounded in `[min(τ,1−τ), max(τ,1−τ)] > 0`),
-/// so this monotone-descent iteration converges, and since the sign pattern
-/// takes finitely many values it stabilizes in finitely many steps (Schnabel &
-/// Eilers 2009; the same Newton/IRLS-for-expectiles `expectreg` runs).
+/// sign asymmetric weight `wᵢ(τ)`. The asymmetric loss is convex and
+/// continuously differentiable: each side of zero is a positive quadratic and
+/// both one-sided derivatives agree at zero. LAWS solves the penalized WLS
+/// problem with weights frozen at the current sign pattern, then recomputes the
+/// pattern. A returned estimator must satisfy the KKT residual of the original
+/// asymmetric objective; a repeated sign state or an iteration cap is only
+/// termination evidence, never an estimator-selection rule.
 ///
 /// Each inner solve is the FULL standard Gaussian-identity GAM: any basis,
 /// tensor, spatial smooth, by-variable, random effect, plus REML λ-selection on
@@ -607,27 +689,32 @@ fn fit_expectile_laws(
     // Cold start: unweighted base weights ⇒ the first inner fit is the OLS
     // mean GAM, the natural warm start for any τ.
     let mut weights = base_weights.clone();
-    // Every sign pattern visited so far. The LAWS map is deterministic given a
-    // sign pattern (weights are a pure function of the pattern, and the inner
-    // penalized WLS + REML solve is deterministic), so revisiting a pattern
-    // without a KKT certificate proves the iteration is in a cycle and will
-    // never certify — a typed nonconvergence, not something to iterate past.
-    let mut seen_signs: std::collections::HashSet<Vec<bool>> = std::collections::HashSet::new();
-    let mut last_sign: Option<Vec<bool>> = None;
+    // The LAWS map is deterministic given a sign pattern. Brent detection
+    // proves recurrence using one O(n) sign checkpoint; no iteration-count
+    // multiple of the training data is retained.
+    let mut sign_cycle = ExpectileSignCycle::default();
     // Evidence for the typed exhaustion error: (kkt residual, kkt scale) of the
     // final uncertified iterate.
     let mut last_kkt = (f64::NAN, f64::NAN);
+    let mut last_rho_checkpoint = Vec::new();
 
-    // The sign pattern has 2ⁿ values but LAWS visits a monotone-descent subset;
-    // empirically a handful of iterations suffice. The cap is a pure safety
-    // guard: hitting it without a certificate below is typed nonconvergence
-    // carrying the fixed-point evidence — the cap never selects the estimator
-    // (SPEC rule 20).
-    const MAX_LAWS_ITERS: usize = 50;
+    // Reuse the request's explicit outer-work budget; LAWS does not introduce a
+    // second hidden iteration knob. The budget is a safety guard only: hitting
+    // it without the certificate below is typed nonconvergence (SPEC rule 20).
+    let max_laws_iters = options.max_iter;
+    if max_laws_iters == 0 || !(options.tol.is_finite() && options.tol > 0.0) {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "expectile LAWS requires a positive iteration budget and finite positive KKT \
+                 tolerance; got max_iter={max_laws_iters}, tol={}",
+                options.tol,
+            ),
+        });
+    }
 
     let inf_norm = |v: &Array1<f64>| v.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
 
-    for _iter in 0..MAX_LAWS_ITERS {
+    for iteration in 1..=max_laws_iters {
         let request = StandardFitRequest {
             data: design_data.clone(),
             y: y.clone(),
@@ -647,6 +734,26 @@ fn fit_expectile_laws(
         };
         let result = fit_standard_model(request)
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
+        let inner_certified = result.fit.outer_converged
+            && matches!(
+                result.fit.pirls_status,
+                gam_solve::pirls::PirlsStatus::Converged
+                    | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
+            );
+        if !inner_certified {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "expectile LAWS inner Gaussian fit did not carry a convergence certificate \
+                     (iteration={iteration}, outer_converged={}, PIRLS status={:?}, \
+                     outer_gradient_norm={:?}, rho_checkpoint={:?}); the iterate is retained \
+                     only as non-convergence evidence",
+                    result.fit.outer_converged,
+                    result.fit.pirls_status,
+                    result.fit.outer_gradient_norm,
+                    result.fit.log_lambdas.to_vec(),
+                ),
+            });
+        }
 
         // Training-scale fitted mean μ = X·β (identity link, zero-checked
         // offset folded by the design path). The design columns match the
@@ -665,8 +772,7 @@ fn fit_expectile_laws(
         mu_off += &offset;
 
         let sign: Vec<bool> = (0..n).map(|i| y[i] > mu_off[i]).collect();
-        let next_weights =
-            expectile_row_weights(y.view(), mu_off.view(), base_weights.view(), tau);
+        let next_weights = expectile_row_weights(y.view(), mu_off.view(), base_weights.view(), tau);
 
         // KKT certificate for the CONVEX penalized asymmetric-least-squares
         // problem at the fit's own selected λ. The asymmetric loss
@@ -683,49 +789,70 @@ fn fit_expectile_laws(
         // only unstabilized rows sit (numerically) on the fitted surface —
         // the equal-objective tie oscillation, now certified instead of
         // assumed benign.
-        let residual = y.as_ref() - &mu_off;
-        let mismatch = (&weights - &next_weights) * &residual;
-        let kkt = inf_norm(&result.design.design.apply_transpose(&mismatch));
-        let scale = inf_norm(
-            &result
-                .design
-                .design
-                .apply_transpose(&(&weights * &residual)),
-        )
-        .max(inf_norm(
-            &result
-                .design
-                .design
-                .apply_transpose(&(&next_weights * &residual)),
-        ));
-        let exact_fixed_point = last_sign.as_ref().is_some_and(|prev| prev == &sign);
-        if exact_fixed_point || kkt <= options.tol * scale {
+        let residual = &y - &mu_off;
+        let frozen_score = result
+            .design
+            .design
+            .apply_transpose(&(&weights * &residual));
+        let expectile_score = result
+            .design
+            .design
+            .apply_transpose(&(&next_weights * &residual));
+        if frozen_score
+            .iter()
+            .chain(expectile_score.iter())
+            .any(|v| !v.is_finite())
+        {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "expectile LAWS KKT audit produced a non-finite score \
+                     (iteration={iteration}, rho_checkpoint={:?})",
+                    result.fit.log_lambdas.to_vec(),
+                ),
+            });
+        }
+        let kkt = inf_norm(&(&frozen_score - &expectile_score));
+        let scale = inf_norm(&frozen_score).max(inf_norm(&expectile_score));
+        let kkt_bound = options.tol * scale;
+        if !(kkt.is_finite() && kkt_bound.is_finite()) {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "expectile LAWS KKT audit produced non-finite evidence \
+                     (iteration={iteration}, residual={kkt:?}, bound={kkt_bound:?}, \
+                     rho_checkpoint={:?})",
+                    result.fit.log_lambdas.to_vec(),
+                ),
+            });
+        }
+        if expectile_kkt_certified(kkt, kkt_bound) {
             return Ok(result);
         }
         last_kkt = (kkt, scale);
-        if !seen_signs.insert(sign.clone()) {
+        last_rho_checkpoint = result.fit.log_lambdas.to_vec();
+        if let Some(cycle_length) = sign_cycle.observe(&sign) {
             return Err(WorkflowError::IntegrationFailed {
                 reason: format!(
                     "expectile LAWS entered a deterministic sign-pattern cycle without \
                      reaching the KKT fixed point of the convex asymmetric least-squares \
-                     problem (tau={tau}, iterations={}, KKT residual={:.3e} vs scaled \
-                     tolerance {:.3e}); non-convergence is a typed error, never a \
+                     problem (tau={tau}, iterations={iteration}, cycle_length={cycle_length}, \
+                     KKT residual={:.3e} vs scaled tolerance {:.3e}, \
+                     rho_checkpoint={:?}); non-convergence is a typed error, never a \
                      best-effort fit",
-                    seen_signs.len(),
                     kkt,
-                    options.tol * scale,
+                    kkt_bound,
+                    result.fit.log_lambdas.to_vec(),
                 ),
             });
         }
-        last_sign = Some(sign);
         weights = next_weights;
     }
 
     Err(WorkflowError::IntegrationFailed {
         reason: format!(
-            "expectile LAWS exhausted its {MAX_LAWS_ITERS}-iteration safety cap without a \
+            "expectile LAWS exhausted its {max_laws_iters}-iteration safety cap without a \
              KKT certificate for the convex asymmetric least-squares problem (tau={tau}, \
-             final KKT residual={:.3e} vs scaled tolerance {:.3e}); the iteration cap \
+             final KKT residual={:.3e} vs scaled tolerance {:.3e}, \
+             rho_checkpoint={last_rho_checkpoint:?}); the iteration cap \
              never selects the estimator — non-convergence is a typed error",
             last_kkt.0,
             options.tol * last_kkt.1,

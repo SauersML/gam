@@ -21,8 +21,6 @@ pub(crate) struct RemlConfig {
     pub(crate) max_iterations: usize,
     pub(crate) reml_convergence_tolerance: f64,
     pub(crate) firth_bias_reduction: bool,
-    /// Forwarded to `pirls::PirlsConfig::geodesic_acceleration`. Off by default.
-    pub(crate) geodesic_acceleration: bool,
 }
 
 impl RemlConfig {
@@ -47,7 +45,6 @@ impl RemlConfig {
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
-            geodesic_acceleration: false,
         }
         .with_max_iterations(300)
     }
@@ -72,7 +69,6 @@ impl RemlConfig {
             // each `execute_pirls_if_needed` call from the cached final
             // λ of the previous successful PIRLS solve.
             initial_lm_lambda: None,
-            geodesic_acceleration: self.geodesic_acceleration,
             // Arrow-Schur structured-inner-solve descriptor. Not used by
             // the standard REML→PIRLS path (β-only); set by the latent
             // driver (`crate::latent_inner::LatentInnerSolver`)

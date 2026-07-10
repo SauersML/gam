@@ -2392,30 +2392,8 @@ def gaussian_reml_fit(
     init_lambda: float | None = None,
     by: Any | None = None,
     by_start_col: int = 0,
-    geodesic_acceleration: bool = False,
 ) -> dict[str, Any]:
-    """Fit a closed-form Gaussian REML problem from NumPy-compatible arrays.
-
-    Parameters
-    ----------
-    geodesic_acceleration:
-        Enable the Transtrum-Sethna geodesic-acceleration second-order
-        correction in the inner Newton / Levenberg-Marquardt solver
-        (Transtrum & Sethna, 2011, "Improvements to the Levenberg-Marquardt
-        algorithm for nonlinear least-squares minimization"). The standard
-        LM step ``δp = −(H + λ_lm·diag(H))⁻¹ g`` is augmented with a
-        second-order correction ``δp₂ = −(H + λ_lm·diag(H))⁻¹ K`` where
-        ``K`` is a central-difference estimate of the directional second
-        derivative of the gradient along ``δp``; the correction is
-        accepted only when ``‖δp₂‖ ≤ 0.75 · ‖δp‖``. Most useful for fits
-        with near-singular Hessians (latent-coordinate fits, near-collinear
-        bases). Default ``False`` until validated. *Note:* the closed-form
-        Gaussian-identity path used by this function does not run an inner
-        Newton loop, so this flag is accepted for API parity with the
-        PIRLS-based fits and is a no-op here; it is honored by the
-        formula-based ``gamfit.fit(...)`` entrypoint and any GLM-family
-        fits that drive the inner Newton solver.
-    """
+    """Fit a closed-form Gaussian REML problem from NumPy-compatible arrays."""
     import numpy as np
 
     try:
@@ -3178,6 +3156,7 @@ def gaussian_reml_optimize_latent(
     sigma_eff_mode: str = "profiled",
     max_iter: int = 200,
     grad_tol: float = 1.0e-8,
+    stationarity_reference: float | None = None,
     trust_radius: float = 1.0,
     max_radius: float = 1.0e6,
     n_restarts: int = 1,
@@ -3235,9 +3214,12 @@ def gaussian_reml_optimize_latent(
     of returning a degraded payload. The exception carries the evidence as
     attributes (``grad_t_norm``, ``grad_t_norm_init``, ``grad_t_norm_scaled``,
     ``grad_tol``, ``latent_t_std``, ``objective_value``, ``max_iter``,
-    ``n_restarts``, ``init``) plus ``checkpoint_t`` -- the best latent found,
-    shape ``(n_obs, latent_dim)`` -- so the caller can resume the same solve
-    via ``t=exc.checkpoint_t, init="caller"`` with a larger ``max_iter``.
+    ``n_restarts``, ``restart_index``, ``init``) plus the one-dimensional
+    ``checkpoint_t`` and its ``checkpoint_shape``. Resume with
+    ``t=exc.checkpoint_t``, ``init="caller"``, and
+    ``stationarity_reference=exc.checkpoint_stationarity_reference``: carrying
+    that reference preserves the original relative-stationarity criterion
+    instead of silently renormalizing it at the checkpoint.
     """
     import numpy as np
 
@@ -3276,6 +3258,7 @@ def gaussian_reml_optimize_latent(
             str(sigma_eff_mode),
             int(max_iter),
             float(grad_tol),
+            None if stationarity_reference is None else float(stationarity_reference),
             float(trust_radius),
             float(max_radius),
             int(n_restarts),

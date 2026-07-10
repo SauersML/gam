@@ -5283,6 +5283,8 @@ pub fn build_tensor_bspline_basis(
     let mut marginal_degrees = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    let mut marginal_function_grams =
+        Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     // Per-margin effective period: either user-set via `spec.periods` or
     // implied by a `PeriodicUniform` marginal knotspec (which the 1D B-spline
@@ -5320,9 +5322,38 @@ pub fn build_tensor_bspline_basis(
         // metadata whose `knots` are the k value-knots; a B-spline margin emits
         // `BSpline1D` with the clamped knot vector. Capture either so the
         // tensor freeze can rebuild the exact same marginal knotspec (#1074).
-        let (knots, marginal_is_cr) = match built.metadata {
-            BasisMetadata::BSpline1D { knots, .. } => (knots, false),
-            BasisMetadata::CubicRegression1D { knots, .. } => (knots, true),
+        let (knots, marginal_is_cr, effective_degree, function_gram) = match built.metadata {
+            BasisMetadata::BSpline1D {
+                knots,
+                periodic,
+                degree,
+                ..
+            } => {
+                let effective_degree = degree.unwrap_or(marginal_unconstrained.degree);
+                let gram = if spec.double_penalty {
+                    Some(match periodic {
+                        Some((start, period, num_basis)) => {
+                        crate::basis::periodic_bspline_function_gram(
+                            start,
+                            start + period,
+                            effective_degree,
+                            num_basis,
+                        )?
+                        }
+                        None => crate::basis::bspline_function_gram(&knots, effective_degree)?,
+                    })
+                } else {
+                    None
+                };
+                (knots, false, effective_degree, gram)
+            }
+            BasisMetadata::CubicRegression1D { knots, .. } => {
+                let gram = spec
+                    .double_penalty
+                    .then(|| crate::basis::cubic_regression_function_gram(&knots))
+                    .transpose()?;
+                (knots, true, marginalspec.degree, gram)
+            }
             _ => {
                 crate::bail_invalid_basis!(
                     "internal TensorBSpline error at dim {dim}: expected BSpline1D or CubicRegression1D metadata"
@@ -5336,9 +5367,19 @@ pub fn build_tensor_bspline_basis(
             } => Array1::linspace(data_range.0, data_range.1, num_basis),
             _ => knots,
         };
+        if let Some(function_gram) = function_gram {
+            if function_gram.dim() != (built.design.ncols(), built.design.ncols()) {
+                crate::bail_dim_basis!(
+                    "internal TensorBSpline error at dim {dim}: function Gram is {:?}, basis has {} columns",
+                    function_gram.dim(),
+                    built.design.ncols()
+                );
+            }
+            marginal_function_grams.push(function_gram);
+        }
         marginal_knots.push(metadata_knots);
         marginal_is_cr_flags.push(marginal_is_cr);
-        marginal_degrees.push(marginalspec.degree);
+        marginal_degrees.push(effective_degree);
         marginalnum_basis.push(built.design.ncols());
         // Capture the sparse representation of this marginal (when the
         // 1D builder produced one) before densifying for the dense
@@ -5413,6 +5454,44 @@ pub fn build_tensor_bspline_basis(
         .iter()
         .map(normalize_penalty_in_constrained_space)
         .collect();
+    let tensor_function_gram = if spec.double_penalty {
+        if marginal_function_grams.len() != marginalnum_basis.len() {
+            crate::bail_dim_basis!(
+                "TensorBSpline double penalty requires one function Gram per margin; got {} for {} margins",
+                marginal_function_grams.len(),
+                marginalnum_basis.len()
+            );
+        }
+        let mut gram = Array2::<f64>::eye(1);
+        for marginal_gram in &marginal_function_grams {
+            gram = kronecker_product(&gram, marginal_gram);
+        }
+        Some(gram)
+    } else {
+        None
+    };
+    // A single PSD sum has exactly the joint null space shared by every
+    // marginal roughness block. It is used only to define the global
+    // null-component penalty; the ordinary tensor candidates below retain
+    // their one-coordinate-per-margin decomposition.
+    let joint_wiggliness = if spec.double_penalty {
+        let mut sum = Array2::<f64>::zeros((total_cols, total_cols));
+        for dim in 0..normalized_marginal_penalties.len() {
+            let mut embedded = Array2::<f64>::eye(1);
+            for (margin, &width) in marginalnum_basis.iter().enumerate() {
+                let factor = if margin == dim {
+                    normalized_marginal_penalties[margin].0.clone()
+                } else {
+                    Array2::<f64>::eye(width)
+                };
+                embedded = kronecker_product(&embedded, &factor);
+            }
+            sum += &embedded;
+        }
+        Some(sum)
+    } else {
+        None
+    };
     let mut kronecker_marginal_penalties =
         Vec::<Array2<f64>>::with_capacity(normalized_marginal_penalties.len());
 
@@ -5423,8 +5502,6 @@ pub fn build_tensor_bspline_basis(
             // of all marginal penalties — the tensor of marginal polynomial
             // null spaces. The tensor double penalty (below) shrinks only this
             // joint null, never the already-penalized interaction range.
-            let mut marginal_kron_sum = Array2::<f64>::zeros((total_cols, total_cols));
-
             for dim in 0..normalized_marginal_penalties.len() {
                 let mut s_dim = Array2::<f64>::eye(1);
                 let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
@@ -5440,8 +5517,6 @@ pub fn build_tensor_bspline_basis(
                 if dim == kronecker_marginal_penalties.len() {
                     kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
                 }
-                marginal_kron_sum += &s_dim;
-
                 candidates.push(PenaltyCandidate {
                     matrix: s_dim,
                     nullspace_dim_hint: 0,
@@ -5452,12 +5527,13 @@ pub fn build_tensor_bspline_basis(
                 });
             }
 
-            if spec.double_penalty
+            if let (Some(primary), Some(gram)) =
+                (joint_wiggliness.as_ref(), tensor_function_gram.as_ref())
                 && let Some(shrink) =
-                    crate::basis::build_nullspace_shrinkage_penalty(&marginal_kron_sum)?
+                    crate::basis::function_space_nullspace_shrinkage(primary, gram)?
             {
                 let (matrix, normalization_scale) =
-                    normalize_penalty_in_constrained_space(&shrink.sym_penalty);
+                    normalize_penalty_in_constrained_space(&shrink);
                 candidates.push(PenaltyCandidate {
                     matrix,
                     nullspace_dim_hint: 0,
@@ -5503,20 +5579,18 @@ pub fn build_tensor_bspline_basis(
                 });
             }
 
-            if spec.double_penalty {
-                let mut matrix = Array2::<f64>::eye(1);
-                let mut factors = Vec::<Array2<f64>>::with_capacity(projectors.len());
-                for projector in &projectors {
-                    matrix = kronecker_product(&matrix, &projector.null);
-                    factors.push(projector.null.clone());
-                }
+            if let (Some(primary), Some(gram)) =
+                (joint_wiggliness.as_ref(), tensor_function_gram.as_ref())
+                && let Some(matrix) =
+                    crate::basis::function_space_nullspace_shrinkage(primary, gram)?
+            {
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
                 candidates.push(PenaltyCandidate {
                     matrix,
                     nullspace_dim_hint: 0,
                     source: PenaltySource::TensorGlobalRidge,
                     normalization_scale,
-                    kronecker_factors: Some(factors),
+                    kronecker_factors: None,
                     op: None,
                 });
             }
@@ -5619,6 +5693,45 @@ pub fn build_tensor_bspline_basis(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        if candidates
+            .iter()
+            .any(|candidate| matches!(candidate.source, PenaltySource::TensorGlobalRidge))
+        {
+            let width = candidates[0].matrix.nrows();
+            let mut joint_primary = Array2::<f64>::zeros((width, width));
+            for candidate in &candidates {
+                if !matches!(candidate.source, PenaltySource::TensorGlobalRidge) {
+                    joint_primary += &candidate
+                        .matrix
+                        .mapv(|value| value * candidate.normalization_scale);
+                }
+            }
+            for candidate in &mut candidates {
+                if !matches!(candidate.source, PenaltySource::TensorGlobalRidge) {
+                    continue;
+                }
+                let physical_ridge = candidate
+                    .matrix
+                    .mapv(|value| value * candidate.normalization_scale);
+                match crate::basis::rebuild_metric_consistent_ridge(
+                    &joint_primary,
+                    &physical_ridge,
+                )? {
+                    Some(rebuilt) => {
+                        let (matrix, scale) = normalize_penalty_in_constrained_space(&rebuilt);
+                        candidate.matrix = matrix;
+                        candidate.normalization_scale = scale;
+                    }
+                    None => {
+                        candidate.matrix = Array2::<f64>::zeros((width, width));
+                        candidate.normalization_scale = 1.0;
+                    }
+                }
+                candidate.kronecker_factors = None;
+                candidate.op = None;
+            }
+        }
     }
 
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
@@ -6435,6 +6548,70 @@ pub fn pca_center_mean(x: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError
     Ok(mean)
 }
 
+/// Build the empirical final-function mass penalty from the raw score Gram.
+///
+/// For the realized PCA score design `Z`, the quadratic form is
+///
+/// `beta^T S beta = smooth_penalty * mean_i((Z beta)_i^2)`.
+///
+/// Thus `smooth_penalty` chooses the reference-measure scale only; the existing
+/// REML smoothing coordinate multiplying this penalty learns the shrinkage
+/// strength.  In particular, this is not an identity ridge on whichever
+/// coefficient chart happened to encode the score columns.
+fn pca_function_mass_penalty(
+    mut raw_score_gram: Array2<f64>,
+    n_rows: usize,
+    smooth_penalty: f64,
+) -> Result<Array2<f64>, BasisError> {
+    let k = raw_score_gram.ncols();
+    if raw_score_gram.nrows() != k {
+        crate::bail_dim_basis!(
+            "Pca score Gram must be square, got {}x{}",
+            raw_score_gram.nrows(),
+            k
+        );
+    }
+    if n_rows == 0 {
+        crate::bail_invalid_basis!("Pca basis requires at least one score row");
+    }
+    if k == 0 {
+        crate::bail_invalid_basis!("Pca basis requires at least one score column");
+    }
+    if k > n_rows {
+        crate::bail_invalid_basis!(
+            "Pca score design is rank deficient: {} score columns cannot have full column rank with only {} rows; remove redundant components",
+            k,
+            n_rows
+        );
+    }
+    if raw_score_gram.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_basis!("Pca score design produced a non-finite function Gram");
+    }
+
+    // Use the same design-rank convention as the global identifiability audit.
+    // `rrqr_from_gram_with_permutation` recovers the column-pivoted QR verdict
+    // from Z^T Z while retaining the tall design's row-count-aware tolerance.
+    let rrqr = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
+        &raw_score_gram,
+        n_rows,
+        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+    )
+    .map_err(BasisError::LinalgError)?;
+    if rrqr.rank != k {
+        let redundant_columns = &rrqr.column_permutation[rrqr.rank..];
+        crate::bail_invalid_basis!(
+            "Pca score design is rank deficient under canonical RRQR: rank {} < {} (tolerance {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
+            rrqr.rank,
+            k,
+            rrqr.rank_tol,
+            redundant_columns
+        );
+    }
+
+    raw_score_gram.mapv_inplace(|value| value * smooth_penalty / n_rows as f64);
+    Ok(raw_score_gram)
+}
+
 pub fn build_pca_smooth_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -6445,6 +6622,16 @@ pub fn build_pca_smooth_basis(
     pca_basis_path: Option<&PathBuf>,
     chunk_size: usize,
 ) -> Result<BasisBuildResult, BasisError> {
+    if !smooth_penalty.is_finite() || smooth_penalty < 0.0 {
+        crate::bail_invalid_basis!(
+            "Pca smooth_penalty must be finite and non-negative, got {}",
+            smooth_penalty
+        );
+    }
+    if data.nrows() == 0 {
+        crate::bail_invalid_basis!("Pca basis requires at least one data row");
+    }
+
     if let Some(path) = pca_basis_path {
         let op = PcaScoresMemmapDesignOperator::open(path.clone(), chunk_size)?;
         if op.nrows != data.nrows() {
@@ -6454,14 +6641,21 @@ pub fn build_pca_smooth_basis(
                 data.nrows()
             );
         }
-        let k = op.ncols;
-        let mut penalty = Array2::<f64>::eye(k);
-        penalty.mapv_inplace(|v| v * smooth_penalty);
+        // The out-of-core scores are already the realized final-function
+        // design. Stream Z^T Z without materializing its n-by-k rows.
+        let raw_score_gram = op
+            .diag_xtw_x(&Array1::<f64>::ones(op.nrows))
+            .map_err(|err| {
+                BasisError::InvalidInput(format!(
+                    "lazy Pca function-mass Gram construction failed: {err}"
+                ))
+            })?;
+        let penalty = pca_function_mass_penalty(raw_score_gram, op.nrows, smooth_penalty)?;
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
                 matrix: penalty,
                 nullspace_dim_hint: 0,
-                source: PenaltySource::Other("PcaRidge".to_string()),
+                source: PenaltySource::OperatorMass,
                 normalization_scale: 1.0,
                 kronecker_factors: None,
                 op: None,
@@ -6508,14 +6702,13 @@ pub fn build_pca_smooth_basis(
         }
     }
     let design = fast_ab(&x, basis_matrix);
-    let k = basis_matrix.ncols();
-    let mut penalty = Array2::<f64>::eye(k);
-    penalty.mapv_inplace(|v| v * smooth_penalty);
+    let raw_score_gram = gam_linalg::faer_ndarray::fast_ata(&design);
+    let penalty = pca_function_mass_penalty(raw_score_gram, design.nrows(), smooth_penalty)?;
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
             matrix: penalty,
             nullspace_dim_hint: 0,
-            source: PenaltySource::Other("PcaRidge".to_string()),
+            source: PenaltySource::OperatorMass,
             normalization_scale: 1.0,
             kronecker_factors: None,
             op: None,
@@ -6539,6 +6732,196 @@ pub fn build_pca_smooth_basis(
         },
         kronecker_factored: None,
     })
+}
+
+#[cfg(test)]
+mod pca_function_mass_tests {
+    use super::{PenaltySource, build_pca_smooth_basis};
+    use ndarray::{Array1, Array2, array};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn quadratic_form(matrix: &Array2<f64>, coefficients: &Array1<f64>) -> f64 {
+        coefficients.dot(&matrix.dot(coefficients))
+    }
+
+    fn assert_close(left: f64, right: f64) {
+        let scale = left.abs().max(right.abs()).max(1.0);
+        assert!(
+            (left - right).abs() <= 1e-11 * scale,
+            "values differ: left={left:.16e}, right={right:.16e}"
+        );
+    }
+
+    fn write_f64_npy(scores: &Array2<f64>) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "gam_terms_pca_function_mass_{}.npy",
+            std::process::id()
+        ));
+        let mut header = format!(
+            "{{'descr': '<f8', 'fortran_order': False, 'shape': ({}, {}), }}",
+            scores.nrows(),
+            scores.ncols()
+        );
+        while (10 + header.len() + 1) % 16 != 0 {
+            header.push(' ');
+        }
+        header.push('\n');
+        let header_len = u16::try_from(header.len()).expect("test .npy header fits u16");
+
+        let mut file = std::fs::File::create(&path).expect("create test .npy");
+        file.write_all(b"\x93NUMPY").expect("write .npy magic");
+        file.write_all(&[1, 0]).expect("write .npy version");
+        file.write_all(&header_len.to_le_bytes())
+            .expect("write .npy header length");
+        file.write_all(header.as_bytes())
+            .expect("write .npy header");
+        for &value in scores {
+            file.write_all(&value.to_le_bytes())
+                .expect("write .npy score");
+        }
+        path
+    }
+
+    #[test]
+    fn pca_penalty_quadratic_equals_empirical_fitted_function_norm() {
+        let data = array![[1.0, 2.0], [-1.0, 0.5], [2.0, -0.5], [0.25, -1.5]];
+        let basis = array![[1.0, 0.5], [-0.25, 2.0]];
+        let smooth_penalty = 2.5;
+        let built = build_pca_smooth_basis(
+            data.view(),
+            &[0, 1],
+            &basis,
+            false,
+            smooth_penalty,
+            None,
+            None,
+            2,
+        )
+        .expect("full-rank PCA basis");
+        let coefficients = array![0.7, -1.2];
+        let design = built.design.to_dense();
+        let fitted = design.dot(&coefficients);
+        let expected = smooth_penalty * fitted.dot(&fitted) / fitted.len() as f64;
+        let actual = quadratic_form(&built.penalties[0], &coefficients);
+
+        assert_close(actual, expected);
+        assert_eq!(built.nullspace_dims, vec![0]);
+        assert_eq!(built.penaltyinfo[0].source, PenaltySource::OperatorMass);
+    }
+
+    #[test]
+    fn pca_function_mass_is_invariant_to_nonorthogonal_score_reparameterization() {
+        let scores = array![[1.0, 2.0], [-1.0, 0.5], [2.0, -0.5], [0.25, -1.5]];
+        let identity = Array2::<f64>::eye(2);
+        // An invertible scale-plus-shear, deliberately not orthogonal.
+        let transform = array![[2.0, 0.5], [0.0, 0.25]];
+        let base_coefficients = array![0.8, -1.1];
+        // transform * transformed_coefficients == base_coefficients.
+        let transformed_coefficients = array![1.5, -4.4];
+        let smooth_penalty = 1.7;
+
+        let base = build_pca_smooth_basis(
+            scores.view(),
+            &[0, 1],
+            &identity,
+            false,
+            smooth_penalty,
+            None,
+            None,
+            2,
+        )
+        .expect("base PCA chart");
+        let transformed = build_pca_smooth_basis(
+            scores.view(),
+            &[0, 1],
+            &transform,
+            false,
+            smooth_penalty,
+            None,
+            None,
+            2,
+        )
+        .expect("reparameterized PCA chart");
+
+        let fitted_base = base.design.to_dense().dot(&base_coefficients);
+        let fitted_transformed = transformed.design.to_dense().dot(&transformed_coefficients);
+        for (&left, &right) in fitted_base.iter().zip(fitted_transformed.iter()) {
+            assert_close(left, right);
+        }
+        assert_close(
+            quadratic_form(&base.penalties[0], &base_coefficients),
+            quadratic_form(&transformed.penalties[0], &transformed_coefficients),
+        );
+    }
+
+    #[test]
+    fn rank_deficient_pca_score_design_is_rejected() {
+        let scores = array![[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]];
+        let result = build_pca_smooth_basis(
+            scores.view(),
+            &[0, 1],
+            &Array2::<f64>::eye(2),
+            false,
+            1.0,
+            None,
+            None,
+            2,
+        );
+        let err = result.err().expect("zero score column must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("rank deficient"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("rank 1 < 2"),
+            "missing RRQR evidence: {message}"
+        );
+    }
+
+    #[test]
+    fn lazy_and_dense_pca_function_mass_penalties_match() {
+        let scores = array![[1.0, 2.0], [-1.0, 0.5], [2.0, -0.5], [0.25, -1.5]];
+        let smooth_penalty = 2.25;
+        let path = write_f64_npy(&scores);
+        let dense = build_pca_smooth_basis(
+            scores.view(),
+            &[0, 1],
+            &Array2::<f64>::eye(2),
+            false,
+            smooth_penalty,
+            None,
+            None,
+            2,
+        )
+        .expect("dense PCA basis");
+        let lazy_data = Array2::<f64>::zeros((scores.nrows(), 0));
+        let lazy = build_pca_smooth_basis(
+            lazy_data.view(),
+            &[],
+            &Array2::<f64>::zeros((0, scores.ncols())),
+            false,
+            smooth_penalty,
+            None,
+            Some(&path),
+            2,
+        )
+        .expect("lazy PCA basis");
+        std::fs::remove_file(&path).expect("remove test .npy");
+
+        for (&left, &right) in dense.penalties[0].iter().zip(lazy.penalties[0].iter()) {
+            assert_close(left, right);
+        }
+        for (&left, &right) in dense
+            .design
+            .to_dense()
+            .iter()
+            .zip(lazy.design.to_dense().iter())
+        {
+            assert_close(left, right);
+        }
+    }
 }
 
 /// A factor-level `by=` wrapper owns the model-space centering of its inner
@@ -8035,9 +8418,8 @@ pub fn build_single_local_smooth_term(
         // uniform and the geometrically-correct cone is the second *divided*
         // difference. Build the Greville-scaled transform so γ_{≥2} ≥ 0
         // certifies convexity of the function, not of the raw coefficient
-        // index. Periodic B-splines use uniform interior knots (uniform
-        // abscissae), where the divided differences coincide with the integer
-        // differences up to scale, so the plain path stays exact there.
+        // index. Periodic splines are rejected by the exact-support gate: their
+        // cyclic coefficient chart cannot use this open divided-difference cone.
         let t = if order == 2 {
             let bspline_meta = match &metadata {
                 BasisMetadata::BSpline1D {
@@ -8087,85 +8469,16 @@ pub fn build_single_local_smooth_term(
                 active_penaltyinfo_t.len()
             );
         }
-        // Wiggliness penalties undergo the exact congruence `S → TᵀST` (PSD
-        // preserving). The double-penalty *nullspace shrinkage* ridge must NOT:
-        // it is a unit-eigenvalue projector `ZZᵀ` onto null(S_wiggle) in the
-        // β (B-spline coefficient) coordinates, and the congruence
-        // `Tᵀ(ZZᵀ)T = (TᵀZ)(TᵀZ)ᵀ` is no longer a projector — its eigenvalues
-        // blow up by the conditioning of the cumulative-sum `T` (cond(T) grows
-        // with the basis dim), concentrating an enormous penalty on the leading
-        // γ₀ "level" coordinate. REML then drives the shared λ to its ceiling
-        // and the smooth collapses to a flat constant (#509, the over-smoothing
-        // face). The principled fix keeps mgcv's double-penalty semantics in the
-        // *reparametrized* space: rebuild the ridge as the unit-eigenvalue
-        // nullspace projector of the transformed wiggliness penalty `TᵀST`, so
-        // the double penalty shrinks exactly the unpenalized polynomial
-        // directions of the γ-space smooth with eigenvalue 1, identical in
-        // conditioning to the unconstrained fit.
-        let transformed_wiggliness = penalties_t
-            .iter()
-            .zip(active_penaltyinfo_t.iter())
-            .find(|(_, info)| !matches!(info.source, PenaltySource::DoublePenaltyNullspace))
-            .map(|(s_local, _)| {
-                let tt_s = fast_atb(&t, s_local);
-                fast_ab(&tt_s, &t)
-            });
+        // `β = Tγ` is an invertible change of coefficient chart. Every
+        // physical quadratic functional, including the function-space
+        // null-component penalty, therefore transforms by the same congruence
+        // `S_γ = Tᵀ S_β T`. Rebuilding `ZZᵀ` in the γ Euclidean metric
+        // would change the represented functional under this harmless chart
+        // change and violate SPEC 5.
         let mut rebuilt = Vec::with_capacity(penalties_t.len());
-        for (s_local, info) in penalties_t.iter().zip(active_penaltyinfo_t.iter()) {
-            if matches!(info.source, PenaltySource::DoublePenaltyNullspace) {
-                // #1654: the double-penalty nullspace ridge under the box
-                // reparameterization.
-                //
-                // For the CURVATURE constraints (order == 2, convex/concave) the
-                // box transform `T` is the Greville-scaled second *divided*
-                // difference map (`convex_divided_difference_transform_matrix`).
-                // Rebuilding the ridge from scratch as the orthonormal null-space
-                // projector of `TᵀST` (the #509-era monotone fix below) yields a
-                // γ-space ridge `Z_γ Z_γᵀ` whose null subspace is the affine
-                // (level γ₀ + slope γ₁) face — the SAME subspace targeted in
-                // β-space, but measured in the γ inner product rather than the
-                // β one. A reparameterization `β = Tγ` must leave the penalized
-                // REML fit invariant, which requires every penalty block to
-                // transform by the SAME congruence `S ↦ TᵀST`; the from-scratch
-                // projector rebuild is NOT that congruence, so it silently
-                // re-weights the level/slope shrinkage relative to the wiggliness
-                // penalty (each block is independently Frobenius-normalized just
-                // below, decoupling their scales). The distorted REML λ landscape
-                // then drives the convex/concave smooth into the flat linear
-                // corner (curvature pinned ≈ 0, EDF ≈ 1.5) for a
-                // seed/basis-dimension–specific subset of fits, even though an
-                // unconstrained `s(x)` on the same data recovers the convex truth
-                // at EDF ≈ 4. Restoring the exact congruence `Tᵀ R_β T` for the
-                // ridge keeps the box reparameterization a true invertible
-                // change of coordinates, so the curvature-constrained fit tracks
-                // the unconstrained smoothing instead of over-smoothing
-                // (verified: seed-7/k-20 truth-RMSE 0.31 → 0.045).
-                //
-                // For MONOTONE (order == 1) `T` is the cumulative-sum transform
-                // whose conditioning grows fast with the basis dimension; there
-                // the congruence concentrates an enormous penalty on the leading
-                // γ₀ level coordinate and over-smooths to a flat constant (#509),
-                // which the from-scratch unit-eigenvalue projector rebuild was
-                // introduced to cure. Keep that path for monotone.
-                if order == 2 {
-                    let tt_s = fast_atb(&t, s_local);
-                    rebuilt.push(fast_ab(&tt_s, &t));
-                } else {
-                    let s_wiggle_t = transformed_wiggliness.as_ref().ok_or_else(|| {
-                        BasisError::InvalidInput(format!(
-                            "box-reparam term '{}' has a double-penalty ridge but no primary wiggliness penalty to derive its nullspace from",
-                            term.name
-                        ))
-                    })?;
-                    let ridge = crate::basis::build_nullspace_shrinkage_penalty(s_wiggle_t)?
-                        .map(|shrink| shrink.sym_penalty)
-                        .unwrap_or_else(|| Array2::<f64>::zeros((p_local, p_local)));
-                    rebuilt.push(ridge);
-                }
-            } else {
+        for s_local in &penalties_t {
                 let tt_s = fast_atb(&t, s_local);
                 rebuilt.push(fast_ab(&tt_s, &t));
-            }
         }
         penalties_t = rebuilt;
         // T^T S T (and the rebuilt γ-space ridge) invalidate op-form

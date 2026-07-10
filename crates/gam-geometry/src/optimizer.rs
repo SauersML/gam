@@ -1,4 +1,4 @@
-use opt::{BacktrackConfig, backtracking_line_search, constants};
+use opt::{BacktrackConfig, ExpandConfig, bidirectional_line_search, constants};
 use ndarray::{Array1, ArrayView1};
 
 use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
@@ -523,78 +523,66 @@ impl RiemannianLBFGS {
             };
             let old_x = x.clone();
             let old_grad = grad.clone();
-            // --- Armijo line search with bidirectional adaptation. ---
-            let mut alpha = initial_step;
-            let mut best_alpha = 0.0;
-            let mut best_f = f_curr;
-            let mut best_x = x.clone();
-            let mut best_grad = grad.clone();
-            // First try to expand: while Armijo holds and the objective keeps
-            // improving, double the step.
-            loop {
-                let step = &direction * alpha;
-                let trial_x = manifold.retract(x.view(), step.view())?;
-                let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
-                let armijo_rhs = f_curr + armijo_c * alpha * slope;
-                let accepted = f_trial.is_finite() && f_trial <= armijo_rhs;
-                if accepted && f_trial < best_f {
-                    best_alpha = alpha;
-                    best_f = f_trial;
-                    best_x = trial_x;
-                    // Riemannian (metric-raised) gradient at the trial point —
-                    // the object the secant pair (s, y) is formed from (#955).
-                    best_grad = manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
-                    if alpha >= alpha_max {
-                        break;
-                    }
-                    alpha *= 2.0;
-                } else {
-                    break;
+            // --- Armijo line search with bidirectional adaptation, via the
+            // shared expand-then-backtrack primitive: doubles while Armijo
+            // holds and the objective keeps strictly improving (capped at
+            // `alpha_max`), otherwise contracts by the shared halving
+            // schedule. The trial payload carries the retracted point and its
+            // ambient differential so the accepted step's Riemannian gradient
+            // is raised exactly once, after the search.
+            // The pre-migration loops doubled to `alpha_max` and halved to
+            // `alpha_min`; both trial counts are derived by the same
+            // recurrences (exact, unlike a log).
+            let max_expansions = {
+                let mut n = 1_usize;
+                let mut a = initial_step;
+                while a < alpha_max {
+                    n += 1;
+                    a *= 2.0;
                 }
-            }
-            // If no expansion succeeded, contract from the initial trial.
-            if best_alpha == 0.0 {
-                // The pre-migration loop halved while `alpha > alpha_min`;
-                // `initial_step` is caller-supplied, so the trial count is
-                // derived by the same halving recurrence (exact, unlike a log).
-                let max_steps = {
-                    let mut n = 0_usize;
-                    let mut a = initial_step;
-                    while a > alpha_min {
-                        n += 1;
-                        a *= 0.5;
-                    }
-                    n
-                };
-                if let Some(accepted) = backtracking_line_search(
-                    BacktrackConfig {
-                        initial_step,
-                        max_steps,
-                        ..BacktrackConfig::default()
-                    },
-                    |alpha| {
-                        let step = &direction * alpha;
-                        let trial_x = manifold.retract(x.view(), step.view())?;
-                        let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
-                        Ok(Some((f_trial, (trial_x, g_trial_e))))
-                    },
-                    |alpha, f_trial| {
-                        f_trial.is_finite() && f_trial <= f_curr + armijo_c * alpha * slope
-                    },
-                )? {
-                    best_alpha = accepted.step;
-                    best_f = accepted.value;
-                    let (trial_x, g_trial_e) = accepted.payload;
-                    // Riemannian (metric-raised) gradient at the trial point.
-                    best_grad =
-                        manifold.riemannian_gradient(trial_x.view(), g_trial_e.view())?;
-                    best_x = trial_x;
+                n
+            };
+            let max_steps = {
+                let mut n = 0_usize;
+                let mut a = initial_step;
+                while a > alpha_min {
+                    n += 1;
+                    a *= 0.5;
                 }
-            }
-            if best_alpha == 0.0 {
+                n
+            };
+            let accepted = bidirectional_line_search(
+                f_curr,
+                ExpandConfig {
+                    expand_factor: 2.0,
+                    max_expansions,
+                    max_step: alpha_max,
+                },
+                BacktrackConfig {
+                    initial_step,
+                    max_steps,
+                    ..BacktrackConfig::default()
+                },
+                |alpha| {
+                    let step = &direction * alpha;
+                    let trial_x = manifold.retract(x.view(), step.view())?;
+                    let (f_trial, g_trial_e) = objective.value_gradient(trial_x.view())?;
+                    Ok(Some((f_trial, (trial_x, g_trial_e))))
+                },
+                |alpha, f_trial| {
+                    f_trial.is_finite() && f_trial <= f_curr + armijo_c * alpha * slope
+                },
+            )?;
+            let Some(accepted) = accepted else {
                 // No admissible step found — terminate at the current point.
                 break;
-            }
+            };
+            let best_alpha = accepted.step;
+            let best_f = accepted.value;
+            let (best_x, g_trial_e) = accepted.payload;
+            // Riemannian (metric-raised) gradient at the accepted point — the
+            // object the secant pair (s, y) is formed from (#955).
+            let best_grad = manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
             // The accepted tangent step at `old_x` (the actual move taken).
             let eta = &direction * best_alpha;
             x = best_x;

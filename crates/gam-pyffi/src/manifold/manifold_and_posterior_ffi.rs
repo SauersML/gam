@@ -396,7 +396,6 @@ fn posterior_predict_table_impl(
         training_headers,
         base_dense,
     )?;
-    let n_rows = dense.nrows();
     if dense.ncols() != n_coeffs {
         return Err(format!(
             "posterior_predict coefficient count mismatch: samples have {} coefficients \
@@ -531,7 +530,6 @@ fn nuts_method_label(model: &FittedModel) -> &'static str {
 }
 
 fn build_sample_payload(model: &FittedModel, nuts: NutsResult, cfg: &NutsConfig) -> SamplePayload {
-    let n_draws = nuts.samples.nrows();
     let n_coeffs = nuts.samples.ncols();
     let coefficient_names: Vec<String> = (0..n_coeffs).map(|j| format!("beta_{j}")).collect();
     SamplePayload {

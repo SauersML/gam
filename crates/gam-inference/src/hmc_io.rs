@@ -771,8 +771,11 @@ impl NutsPosterior {
 
         let mut firth_logdet = 0.0;
         if self.firth_enabled {
-            match firth_jeffreys_logp_and_grad(&self.nuts_family.likelihood_spec(), &self.data, &eta)
-            {
+            match firth_jeffreys_logp_and_grad(
+                &self.nuts_family.likelihood_spec(),
+                &self.data,
+                &eta,
+            ) {
                 Ok((value, grad_beta_firth)) => {
                     firth_logdet = value;
                     grad_ll_beta += &grad_beta_firth;
@@ -2024,14 +2027,14 @@ mod tests {
             x.view(),
             y.view(),
             weights.view(),
+            None,
             penalty_base.view(),
             penalty_link.view(),
             mode_beta.view(),
             mode_theta.view(),
             hessian.view(),
             spline,
-            NutsFamily::BinomialLogit,
-            1.0,
+            LinkWiggleFamilyParams::BinomialLogit,
         )
         .expect("link-wiggle posterior should accept explicit SPD joint Hessian");
 
@@ -2070,14 +2073,14 @@ mod tests {
             x.view(),
             y.view(),
             weights.view(),
+            None,
             penalty_base.view(),
             penalty_link.view(),
             mode_beta.view(),
             mode_theta.view(),
             hessian.view(),
             spline,
-            NutsFamily::BinomialCLogLog,
-            1.0,
+            LinkWiggleFamilyParams::BinomialCLogLog,
         )
         .expect("cloglog link-wiggle posterior");
 
@@ -2365,12 +2368,9 @@ mod tests {
             dim: x.ncols(),
         };
 
-        let (value, grad) = firth_jeffreys_logp_and_grad(
-            &NutsFamily::BinomialLogit.likelihood_spec(),
-            &data,
-            &eta,
-        )
-        .expect("firth");
+        let (value, grad) =
+            firth_jeffreys_logp_and_grad(&NutsFamily::BinomialLogit.likelihood_spec(), &data, &eta)
+                .expect("firth");
 
         assert!(value.is_finite());
         assert_eq!(grad.len(), x.ncols());
@@ -5665,7 +5665,9 @@ pub struct LinkWiggleSplineArtifacts {
 #[derive(Clone, Copy, Debug)]
 pub enum LinkWiggleFamilyParams {
     /// Profiled Gaussian with residual standard deviation σ.
-    Gaussian { sigma: f64 },
+    Gaussian {
+        sigma: f64,
+    },
     BinomialLogit,
     BinomialProbit,
     BinomialCLogLog,
@@ -5673,11 +5675,18 @@ pub enum LinkWiggleFamilyParams {
     /// Tweedie quasi-likelihood: variance power `p ∈ (1, 2)` and dispersion
     /// `φ > 0` (the 1/φ factor scales both the log-likelihood and score,
     /// matching the flat NUTS path's `data.dispersion` handling).
-    TweedieLog { power: f64, phi: f64 },
+    TweedieLog {
+        power: f64,
+        phi: f64,
+    },
     /// Negative binomial with overdispersion θ > 0.
-    NegativeBinomialLog { theta: f64 },
+    NegativeBinomialLog {
+        theta: f64,
+    },
     /// Gamma with shape k = 1/φ.
-    GammaLog { shape: f64 },
+    GammaLog {
+        shape: f64,
+    },
 }
 
 impl LinkWiggleFamilyParams {
@@ -5749,7 +5758,9 @@ impl LinkWiggleFamilyParams {
                     });
                 }
             }
-            Self::BinomialLogit | Self::BinomialProbit | Self::BinomialCLogLog
+            Self::BinomialLogit
+            | Self::BinomialProbit
+            | Self::BinomialCLogLog
             | Self::PoissonLog => {}
         }
         Ok(())
@@ -6220,18 +6231,19 @@ impl HamiltonianTarget<Array1<f64>> for LinkWigglePosterior {
 }
 
 /// Runs NUTS sampling for joint (β_eta, β_wiggle) in a link-wiggle model.
+#[allow(clippy::too_many_arguments)]
 pub fn run_link_wiggle_nuts_sampling(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
     weights: ArrayView1<f64>,
+    offset: Option<ArrayView1<f64>>,
     penalty_base: ArrayView2<f64>,
     penalty_link: ArrayView2<f64>,
     mode_beta: ArrayView1<f64>,
     mode_theta: ArrayView1<f64>,
     hessian: ArrayView2<f64>,
     spline: LinkWiggleSplineArtifacts,
-    nuts_family: NutsFamily,
-    scale: f64,
+    family: LinkWiggleFamilyParams,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     validate_nuts_config(config).map_err(String::from)?;
@@ -6240,14 +6252,14 @@ pub fn run_link_wiggle_nuts_sampling(
         x,
         y,
         weights,
+        offset,
         penalty_base,
         penalty_link,
         mode_beta,
         mode_theta,
         hessian,
         spline,
-        nuts_family,
-        scale,
+        family,
     )?;
     let chol = target.chol().clone();
     let mode_arr = target.mode_joint();

@@ -52,9 +52,11 @@
 //! assembled penalized Hessian `H + I_{K-1} ⊗ (λ_a S)` is factored via faer's
 //! symmetric-PD-with-fallback path, the full Newton step `δ = −H^{-1} ∇F` is
 //! computed, and accepted with step halving if the objective fails to decrease
-//! (up to a small backtracking budget). The convergence test is the relative
-//! coefficient step norm `‖δ‖ / (1 + ‖β‖) ≤ tol`, matching the existing pyffi
-//! reference path. This module is the softmax adapter over that engine: it
+//! (up to a small backtracking budget). Convergence requires both a relative
+//! coefficient step `‖δ‖ / (1 + ‖β‖) ≤ tol` and a fresh first-order score
+//! certificate at the accepted final iterate; failure produces checkpoint
+//! evidence, never coefficients/covariance behind a false flag. This module is
+//! the softmax adapter over that engine: it
 //! supplies the dense `(K-1)×(K-1)` Fisher block, the residual, and the
 //! log-likelihood through [`MultinomialLogitLikelihood`], and owns the
 //! class-count / simplex preconditions. The independent-binomial sibling
@@ -819,7 +821,13 @@ fn handle_multinomial_fixed_lambda_stall(
     // e.g. ill-conditioned data exhausting `max_iter`) is a typed error
     // carrying its evidence, never an Ok(outputs) with a flag.
     Err(EstimationError::FixedLambdaNewtonDidNotConverge {
-        context: "fit_penalized_multinomial (fixed-λ softmax damped Newton)".to_string(),
+        context: format!(
+            "fit_penalized_multinomial (fixed-λ softmax damped Newton): {}; final gradient \
+             norm {:.3e} against stationarity bound {:.3e}",
+            stall.reason.description(),
+            stall.gradient_norm,
+            stall.gradient_bound,
+        ),
         iterations: stall.iterations,
         penalized_neg_log_likelihood: stall.penalized_neg_log_likelihood(),
     })
@@ -1196,7 +1204,6 @@ fn fit_penalized_multinomial_firth_fallback(
 
     // ─────────────────────────── Firth Newton loop ────────────────────────────
     let mut beta = Array2::<f64>::zeros((p, m));
-    let mut converged = false;
     let mut iterations = 0_usize;
     for it in 0..max_iter {
         iterations = it + 1;
@@ -1210,7 +1217,6 @@ fn fit_penalized_multinomial_firth_fallback(
         // Newton decrement ½ U*ᵀ H⁻¹ U* = ½ U*ᵀ Δ (≥ 0, scale-aware stop).
         let decrement = u.dot(&step_vec);
         if 0.5 * decrement.abs() < tol_eff {
-            converged = true;
             break;
         }
 
@@ -1261,7 +1267,6 @@ fn fit_penalized_multinomial_firth_fallback(
             // tiny step. Reaching here therefore means Newton still sees a
             // meaningful ascent direction it cannot realize (boundary / near-
             // singular Fisher information), i.e. a genuine stall → not converged.
-            converged = 0.5 * decrement.abs() < tol_eff;
             break;
         };
 
@@ -1270,7 +1275,6 @@ fn fit_penalized_multinomial_firth_fallback(
         let max_step = step * delta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         let scale = 1.0 + beta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         if max_step < tol_eff * scale {
-            converged = true;
             break;
         }
     }
@@ -1304,7 +1308,17 @@ fn fit_penalized_multinomial_firth_fallback(
         penalty_term += 0.5 * lambdas[a] * beta_col.dot(&sbeta);
     }
 
-    if !converged {
+    // Recompute the Firth score and Newton decrement AT the final accepted
+    // iterate. A tiny backtracked coefficient step is not itself stationarity:
+    // only this fresh first-order certificate may authorize construction of a
+    // fit or its covariance.
+    let info = assemble_info(&probs);
+    let (information_inverse, _) = invert_spd(&info, "final Fisher information")?;
+    let final_score = firth_score(&probs, &coefficients_active, &information_inverse);
+    let hmat = penalized_hessian(&info);
+    let final_step = solve_spd(&hmat, &final_score)?;
+    let final_decrement = 0.5 * final_score.dot(&final_step).abs();
+    if !(final_decrement.is_finite() && final_decrement < tol_eff) {
         // SPEC: a fit object must only ever come from a converged optimization.
         // A Firth refit that exhausted its budget (or stalled its line search at
         // a non-stationary point) is the typed error carrying its evidence — the
@@ -1319,8 +1333,6 @@ fn fit_penalized_multinomial_firth_fallback(
     // Laplace covariance H⁻¹ at the converged mode (block-ordered θ[a·P+i]).
     // A covariance that cannot be factored at a certified mode is a hard error,
     // never a silent zero matrix (a zero covariance is a false certainty claim).
-    let info = assemble_info(&probs);
-    let hmat = penalized_hessian(&info);
     let (coefficient_covariance, _) = invert_spd(&hmat, "penalized Hessian covariance")?;
 
     Ok(MultinomialFitOutputs {
@@ -3055,6 +3067,30 @@ mod fisher_override_tests {
         {
             assert_eq!(x, z);
         }
+    }
+
+    #[test]
+    fn exhausted_fixed_lambda_budget_is_typed_error_not_fit() {
+        let (design, y, penalty, lambdas) = toy();
+        let error = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 0,
+            tol: 1.0e-9,
+        })
+        .expect_err("a zero-budget Newton solve must not mint a multinomial fit");
+        assert!(matches!(
+            error,
+            EstimationError::FixedLambdaNewtonDidNotConverge {
+                iterations: 0,
+                penalized_neg_log_likelihood,
+                ..
+            } if penalized_neg_log_likelihood.is_finite()
+        ));
     }
 
     #[test]

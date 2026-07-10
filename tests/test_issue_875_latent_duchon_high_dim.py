@@ -1,6 +1,6 @@
 """Regression test for issue #875: N-D Duchon latent basis at latent_dim >= 4.
 
-`gamfit.gaussian_reml_optimize_latent(..., basis_kind="duchon")` worked for
+The latent Duchon design used by ``gaussian_reml_fit_latent`` worked for
 ``latent_dim`` 1-3 but raised for ``latent_dim >= 4``::
 
     GamError: failed to evaluate N-D Duchon basis for LatentCoord:
@@ -66,19 +66,18 @@ def test_latent_duchon_constructs_for_high_dim(k: int) -> None:
     coeffs = rng.randn(k, 6)
     y = t_true @ coeffs + 0.01 * rng.randn(n, 6)
 
-    res = gamfit.gaussian_reml_optimize_latent(
-        y=y,
-        n_obs=n,
-        latent_dim=k,
-        centers=centers,
-        penalty=penalty,
-        t=t_true.reshape(-1),
+    # This is a basis-construction regression, so hold the latent coordinate
+    # fixed instead of coupling it to the separate latent-optimizer convergence
+    # contract.
+    res = gamfit.gaussian_reml_fit_latent(
+        t_true.reshape(-1),
+        y,
+        n,
+        k,
+        centers,
+        penalty,
         m=2,
-        manifold="euclidean",
         basis_kind="duchon",
-        init="caller",  # pure local solve from the true coordinate
-        max_iter=40,
-        seed=0,
     )
 
     # Construction succeeded (no GamError) and produced a usable decoder.

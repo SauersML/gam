@@ -54,6 +54,27 @@ const BLOCK_ORTHOGONAL_SCORE_TOL: f64 = 1.0e-7;
 /// the estimator: reaching it without the score certificate is a typed
 /// `BlockOrthogonalRemlDidNotConverge` error carrying the rho checkpoint.
 const BLOCK_ORTHOGONAL_MAX_OUTER_PASSES: usize = 200;
+/// Work allocated to each one-dimensional block polish within an outer pass.
+/// This is not a convergence criterion: the joint analytic score below is the
+/// only condition that can mint a fit.
+const BLOCK_ORTHOGONAL_BLOCK_UPDATES_PER_PASS: usize = 32;
+
+#[derive(Clone, Copy)]
+struct BlockOrthogonalControls {
+    score_tol: f64,
+    max_outer_passes: usize,
+    block_updates_per_pass: usize,
+}
+
+impl Default for BlockOrthogonalControls {
+    fn default() -> Self {
+        Self {
+            score_tol: BLOCK_ORTHOGONAL_SCORE_TOL,
+            max_outer_passes: BLOCK_ORTHOGONAL_MAX_OUTER_PASSES,
+            block_updates_per_pass: BLOCK_ORTHOGONAL_BLOCK_UPDATES_PER_PASS,
+        }
+    }
+}
 
 /// Canonicalize a penalty matrix to its symmetric average.
 ///
@@ -890,58 +911,75 @@ fn solve_block_orthogonal_rho(
                 condition_number: f64::INFINITY,
             });
         }
-        // Newton step where the curvature is reliably positive; a unit
-        // gradient-descent direction where it is not (non-convex / near-flat
-        // region) so we never step ALONG negative curvature (which ascends).
-        // There is deliberately NO magic step clamp: the line search below
-        // globalizes and SKIPS any candidate ρ that is infeasible (e.g. λ =
-        // exp(ρ) overflows `validate_initial_lambda`), so an over-long Newton
-        // step is simply rejected rather than bounded by an arbitrary constant
-        // or crashing the solve. This is the root fix the old `.clamp(-2,2)`
-        // was masking: the clamp existed only to keep an over-long step from
-        // reaching `block_orthogonal_eval`, which errors on a non-finite λ.
-        let descent = grad.signum();
-        let step = if hess > 1.0e-10 { grad / hess } else { descent };
-        let mut best_rho = rho;
-        let mut best_eval = current;
-        let mut best_phi =
-            block_orthogonal_scale_objective(&best_eval, best_rho, scale_precision, rank).value;
-        for candidate_rho in [
-            rho - step,
-            rho - 0.5 * step,
-            rho - 0.25 * step,
-            rho - descent,
-            rho - 0.25 * descent,
-        ] {
-            // Skip infeasible candidates (λ overflow / ill-conditioned Gram)
-            // instead of failing the whole solve — the bounded gradient
-            // candidates (`rho - descent`, `rho - 0.25·descent`) remain valid,
-            // so a too-long Newton step degrades to gradient descent.
-            let Ok(candidate_eval) = block_orthogonal_eval(gram, rhs, penalty, candidate_rho)
-            else {
-                continue;
-            };
-            let candidate_phi = block_orthogonal_scale_objective(
-                &candidate_eval,
-                candidate_rho,
-                scale_precision,
-                rank,
-            )
-            .value;
-            if candidate_phi < best_phi {
-                best_rho = candidate_rho;
-                best_eval = candidate_eval;
-                best_phi = candidate_phi;
-            }
-        }
-        let delta = (best_rho - rho).abs();
-        rho = best_rho;
-        current = best_eval;
-        if delta < 1.0e-12 || step.abs() < 1.0e-7 {
+        if grad == 0.0 {
             break;
         }
+        // Positive curvature gives the Newton direction. Else use the exact
+        // negative-gradient direction, which is descending regardless of the
+        // local curvature. A representability-terminated backtracking search
+        // globalizes either direction; it has no arbitrary finite trial list,
+        // step clamp, or line-search iteration budget.
+        let direction = if hess > 0.0 { -grad / hess } else { -grad };
+        if !direction.is_finite() || grad * direction >= 0.0 {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        let current_value = derivs.value;
+        let mut step_scale = 1.0_f64;
+        let accepted = loop {
+            let candidate_rho = rho + step_scale * direction;
+            if candidate_rho == rho {
+                break None;
+            }
+            if let Ok(candidate_eval) = block_orthogonal_eval(gram, rhs, penalty, candidate_rho) {
+                let candidate_value = block_orthogonal_scale_objective(
+                    &candidate_eval,
+                    candidate_rho,
+                    scale_precision,
+                    rank,
+                )
+                .value;
+                if candidate_value.is_finite() && candidate_value < current_value {
+                    break Some((candidate_rho, candidate_eval));
+                }
+            }
+            // Bisection is intrinsic to backtracking, not a tuned step-size
+            // schedule. Floating-point representability above is the stopping
+            // rule, so every feasible improving step remains reachable.
+            step_scale *= 0.5;
+        };
+        let Some((next_rho, next_eval)) = accepted else {
+            break;
+        };
+        rho = next_rho;
+        current = next_eval;
     }
     Ok((rho, current))
+}
+
+fn block_orthogonal_conditional_scale(
+    evals: &[BlockOrthogonalEval],
+    ywy: ArrayView1<'_, f64>,
+    nu: f64,
+) -> Result<Array1<f64>, EstimationError> {
+    let mut explained = Array1::<f64>::zeros(ywy.len());
+    for eval in evals {
+        explained += &eval.fitted_energy;
+    }
+    let q = &ywy - &explained;
+    if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    let scale = q.mapv(|value| nu / value);
+    if scale.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    Ok(scale)
 }
 
 pub fn gaussian_reml_blocks_orthogonal_shared_scale(
@@ -950,6 +988,24 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
     y: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_rhos: Option<&[f64]>,
+) -> Result<GaussianRemlBlockOrthogonalResult, EstimationError> {
+    gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
+        designs,
+        penalties,
+        y,
+        weights,
+        init_rhos,
+        BlockOrthogonalControls::default(),
+    )
+}
+
+fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    y: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rhos: Option<&[f64]>,
+    controls: BlockOrthogonalControls,
 ) -> Result<GaussianRemlBlockOrthogonalResult, EstimationError> {
     if designs.is_empty() {
         crate::bail_invalid_estim!("block-orthogonal Gaussian REML requires at least one block");
@@ -1025,8 +1081,22 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
         Some(values) => Array1::from_vec(values.to_vec()),
         None => Array1::zeros(designs.len()),
     };
-    let mut scale_precision = ywy.mapv(|value| nu / value.max(MIN_DEVIANCE));
-    let mut evals = Vec::new();
+    // A rho checkpoint is sufficient to resume exactly because scale is a
+    // closed-form conditional block. Reconstruct that block from the supplied
+    // rhos before any new rho update instead of discarding it and restarting
+    // from the response-only scale.
+    let mut evals = (0..designs.len())
+        .map(|block| {
+            block_orthogonal_eval(
+                &grams[block],
+                &rhs_blocks[block],
+                &penalties_owned[block],
+                rhos[block],
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut scale_precision =
+        block_orthogonal_conditional_scale(&evals, ywy.view(), nu)?;
     // Convergence is certified by the analytic score of the joint REML
     // objective, never by the iteration cap (SPEC rule 20). Each outer pass
     // (a) solves every block's 1-D rho Newton at the current scale precisions
@@ -1048,7 +1118,7 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
     let mut last_score_residual = f64::INFINITY;
     let mut last_scale_step = f64::INFINITY;
     let mut recent_states: [Option<(Array1<f64>, Array1<f64>)>; 2] = [None, None];
-    while outer_passes < BLOCK_ORTHOGONAL_MAX_OUTER_PASSES {
+    while outer_passes < controls.max_outer_passes {
         outer_passes += 1;
         evals.clear();
         for block in 0..designs.len() {
@@ -1059,42 +1129,36 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
                 rhos[block],
                 scale_precision.view(),
                 ranks[block],
-                32,
+                controls.block_updates_per_pass,
             )?;
             rhos[block] = rho;
             evals.push(eval);
         }
-        let mut explained = Array1::<f64>::zeros(d);
-        for eval in evals.iter() {
-            explained += &eval.fitted_energy;
-        }
-        let q = &ywy - &explained;
-        if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        let next_scale = q.mapv(|value| nu / value);
+        let next_scale = block_orthogonal_conditional_scale(&evals, ywy.view(), nu)?;
         last_scale_step = next_scale
             .iter()
             .zip(scale_precision.iter())
             .map(|(next, old)| (next.ln() - old.ln()).abs())
             .fold(0.0_f64, f64::max);
         scale_precision = next_scale;
-        last_score_residual = evals
-            .iter()
-            .enumerate()
-            .map(|(block, eval)| {
-                let derivs = block_orthogonal_scale_objective(
-                    eval,
-                    rhos[block],
-                    scale_precision.view(),
-                    ranks[block],
-                );
-                derivs.grad.abs() / ((d as f64) * (ranks[block].max(1) as f64))
-            })
-            .fold(0.0_f64, f64::max);
-        if last_score_residual <= BLOCK_ORTHOGONAL_SCORE_TOL {
+        last_score_residual = 0.0;
+        for (block, eval) in evals.iter().enumerate() {
+            let derivs = block_orthogonal_scale_objective(
+                eval,
+                rhos[block],
+                scale_precision.view(),
+                ranks[block],
+            );
+            let residual =
+                derivs.grad.abs() / ((d as f64) * (ranks[block].max(1) as f64));
+            if !residual.is_finite() {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+            last_score_residual = last_score_residual.max(residual);
+        }
+        if last_score_residual <= controls.score_tol {
             converged = true;
             break;
         }
@@ -1119,7 +1183,7 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
         return Err(EstimationError::BlockOrthogonalRemlDidNotConverge {
             iterations: outer_passes,
             max_score_residual: last_score_residual,
-            score_tol: BLOCK_ORTHOGONAL_SCORE_TOL,
+            score_tol: controls.score_tol,
             last_scale_step,
             cycle_detected,
             rho_checkpoint: rhos.to_vec(),
@@ -3739,6 +3803,28 @@ mod tests {
     }
 
     #[test]
+    fn block_orthogonal_score_matches_the_objective_derivative() {
+        let gram = array![[3.0, 0.4], [0.4, 2.0]];
+        let rhs = array![[1.2, -0.3], [0.6, 0.9]];
+        let penalty = array![[1.0, 0.2], [0.2, 0.8]];
+        let scale = array![1.3, 0.8];
+        let rho = 0.37;
+        let step = 1.0e-6;
+        let eval = block_orthogonal_eval(&gram, &rhs, &penalty, rho).unwrap();
+        let analytic = block_orthogonal_scale_objective(&eval, rho, scale.view(), 2).grad;
+        let value_at = |candidate_rho: f64| {
+            let candidate =
+                block_orthogonal_eval(&gram, &rhs, &penalty, candidate_rho).unwrap();
+            block_orthogonal_scale_objective(&candidate, candidate_rho, scale.view(), 2).value
+        };
+        let numerical = (value_at(rho + step) - value_at(rho - step)) / (2.0 * step);
+        assert!(
+            (analytic - numerical).abs() <= 1.0e-7 * analytic.abs().max(1.0),
+            "analytic score {analytic:.12e} != objective derivative {numerical:.12e}"
+        );
+    }
+
+    #[test]
     fn block_orthogonal_shared_scale_fit_carries_a_score_certificate() {
         // Two mutually orthogonal ±1 blocks (Hadamard columns) with full-rank
         // penalties. A minted fit must satisfy the joint first-order REML
@@ -3799,6 +3885,32 @@ mod tests {
                 residual <= BLOCK_ORTHOGONAL_SCORE_TOL,
                 "block {block} score residual {residual:.3e} exceeds the certificate tolerance"
             );
+        }
+
+        let err = gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
+            &[d1, d2],
+            &penalties,
+            y.view(),
+            None,
+            None,
+            BlockOrthogonalControls {
+                max_outer_passes: 0,
+                ..BlockOrthogonalControls::default()
+            },
+        )
+        .unwrap_err();
+        match err {
+            EstimationError::BlockOrthogonalRemlDidNotConverge {
+                iterations,
+                max_score_residual,
+                rho_checkpoint,
+                ..
+            } => {
+                assert_eq!(iterations, 0);
+                assert!(max_score_residual.is_infinite());
+                assert_eq!(rho_checkpoint, vec![0.0, 0.0]);
+            }
+            other => panic!("expected typed block-orthogonal exhaustion, got {other}"),
         }
     }
 

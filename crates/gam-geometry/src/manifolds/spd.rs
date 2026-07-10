@@ -417,7 +417,8 @@ fn sqrt_divided_difference(a: f64, b: f64) -> f64 {
 /// `−1/(√a·√b·(√a + √b))` (`= −1/(2a^{3/2})` at `a = b`), also subtraction-free.
 fn inv_sqrt_divided_difference(a: f64, b: f64) -> f64 {
     let (sa, sb) = (a.sqrt(), b.sqrt());
-    -1.0 / (sa * sb * (sa + sb))
+    let (lo, hi) = if sa <= sb { (sa, sb) } else { (sb, sa) };
+    -((1.0 / hi) / (hi + lo)) / lo
 }
 
 /// Squared metric norm `‖v‖²_P = vᵀ G(P) v = tr(P⁻¹ V P⁻¹ V)` of the (already
@@ -452,8 +453,8 @@ fn affine_sq_norm(n: usize, pinv: &Array2<f64>, v: ArrayView1<'_, f64>) -> Geome
 /// the step-½ gradient move `t = 1` would *diverge*. The backtracking restores
 /// monotone descent there.
 ///
-/// Two numerical subtleties make a naive Armijo-on-`V` line search stall above
-/// the requested tolerance, and both are handled here:
+/// A numerical subtlety makes a naive Armijo-on-`V` line search stall above the
+/// requested tolerance and is handled here:
 ///
 ///  * **Round-off floor of `V`.** Near the minimizer `V` is flat to machine
 ///    precision: the true decrease per step is `O(‖ξ‖²)`, which underflows the
@@ -464,21 +465,11 @@ fn affine_sq_norm(n: usize, pinv: &Array2<f64>, v: ArrayView1<'_, f64>) -> Geome
 ///    ordinary sufficient decrease (Zoutendijk convergence) and near the
 ///    optimum it merely forbids an *increase* beyond round-off — letting the
 ///    convergent unit step drive `‖ξ‖_P` well below `√ε`.
-///  * **Round-off floor of `ξ`.** `ξ` is a cancelling sum of `O(1)` log-maps,
-///    so its own evaluation floor is `O(ε)`; for some data the smallest
-///    attainable `‖ξ‖_P` sits just above a very tight `tol`. No gradient method
-///    can push the residual below the round-off of its own gradient, so once
-///    the residual stops improving by more than `STALL_REL` for `STALL_PATIENCE`
-///    consecutive steps we accept the best iterate as stationary to the
-///    achievable precision rather than spuriously erroring.
 ///
-/// Returns `Ok` with the least-residual iterate once the residual reaches
-/// `tol` or stalls (no further `STALL_REL`-relative progress for
-/// `STALL_PATIENCE` steps / no step decreases `V` within round-off). The
-/// stall exit is the correct terminal state of a gradient method: the returned
-/// point minimizes the dispersion to the achievable precision. `Err` is
-/// reserved for a genuine budget shortfall — `max_iter` exhausted while the
-/// residual is still making real first-order progress.
+/// A point is returned only after the closed-form Karcher stationarity
+/// certificate `‖ξ(P)‖_P ≤ tol` passes. A line-search stall or iteration-budget
+/// exhaustion above that threshold returns [`GeometryError::NonConvergence`]
+/// carrying the achieved residual; it never mints an approximate chart origin.
 ///
 /// Caveat (first-order rate): convergence is linear with a rate set by the
 /// conditioning of `Hess V`. For well- to moderately-conditioned inputs the
@@ -536,17 +527,6 @@ pub fn spd_frechet_mean(
 
     let mut f_cur = dispersion(p.view())?;
 
-    // Best (smallest-residual) iterate seen, returned if the residual stalls at
-    // its numerical floor below the reach of `tol`.
-    let mut best_p = p.clone();
-    let mut best_grad = f64::INFINITY;
-    // Consecutive steps that failed to improve the residual by a meaningful
-    // relative margin. `STALL_REL` must sit above the residual's round-off
-    // oscillation at the floor (empirically `< 1e-3`) yet well below any
-    // genuine linear-convergence rate, so a real descent never trips it.
-    const STALL_REL: f64 = 5.0e-3;
-    const STALL_PATIENCE: usize = 10;
-    let mut stall = 0_usize;
     // Armijo sufficient-decrease parameter c₁ (`1e-4`), the backtracking-halving
     // cap (`t = 1` unit Karcher step down to `t = 2⁻⁶⁰ ≈ 1e-18`), and the
     // round-off cushion `8·ε·(1+|f|)` all live in `opt` now — this loop
@@ -555,40 +535,27 @@ pub fn spd_frechet_mean(
     // and the shared `armijo_roundoff_cushion` helper.
     const ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
-    for _ in 0..max_iter {
-        // Riemannian descent direction ξ = Σ_i w_i log_P(X_i) (= −½ grad V).
-        let pm = spd.matrix(p.view())?;
+    let stationarity = |point: ArrayView1<'_, f64>| -> GeometryResult<(Array1<f64>, f64)> {
+        // Riemannian descent direction ξ = Σ_i w_i log_P(X_i) (= −½ grad V)
+        // and its exact affine-invariant metric norm.
+        let pm = spd.matrix(point)?;
         let pinv = inverse(&pm)?;
         let mut xi = Array1::<f64>::zeros(ambient);
         for (i, x) in samples.iter().enumerate() {
-            let lg = spd.log_map(p.view(), x.view())?;
+            let lg = spd.log_map(point, x.view())?;
             xi.scaled_add(w[i], &lg);
         }
-        // Stationarity residual ‖ξ‖_P: half the Riemannian gradient norm.
-        let grad_norm = affine_sq_norm(n, &pinv, xi.view())?.sqrt();
+        let residual = affine_sq_norm(n, &pinv, xi.view())?.sqrt();
+        Ok((xi, residual))
+    };
+
+    for iteration in 0..max_iter {
+        // Evaluate the analytic first-order certificate before every step.
+        let (xi, grad_norm) = stationarity(p.view())?;
 
         // Reached the requested first-order optimality tolerance.
         if grad_norm <= tol {
             return Ok(p);
-        }
-
-        // Track the best iterate and detect a stalled residual. A step counts
-        // as progress only if it improves the best residual by more than
-        // `STALL_REL` (relative); pure round-off wobble at the floor does not.
-        let improved = grad_norm < best_grad * (1.0 - STALL_REL);
-        if grad_norm < best_grad {
-            best_grad = grad_norm;
-            best_p.assign(&p);
-        }
-        if improved {
-            stall = 0;
-        } else {
-            stall += 1;
-            if stall >= STALL_PATIENCE {
-                // The residual cannot be driven below the round-off of its own
-                // evaluation: `best_p` is stationary to the achievable precision.
-                return Ok(best_p);
-            }
         }
 
         // Geodesic step P ← exp_P(t·ξ) with backtracking. The acceptance test
@@ -619,19 +586,30 @@ pub fn spd_frechet_mean(
                 p = step.payload;
             }
             None => {
-                // No positive step decreases V even within round-off: the
-                // iterate is stationary to machine precision. Return the best.
-                return Ok(best_p);
+                // No admissible positive step exists, but the analytic
+                // stationarity certificate above did not pass.
+                return Err(GeometryError::NonConvergence {
+                    context: "SPD Fréchet mean",
+                    iterations: iteration + 1,
+                    residual: grad_norm,
+                    tolerance: tol,
+                });
             }
         }
     }
-    // Budget exhausted while still descending: keep the best (least-residual)
-    // iterate rather than discarding it. Consistent with the two other
-    // non-`tol` exits above (stall, rejected step) and with the generic
-    // `response_frechet_mean` driver (#2140) — `best_p` is a valid SPD point and
-    // a usable approximate Fréchet mean; erroring would needlessly abort a fit
-    // over a mere iteration-budget shortfall on the geodesically convex cone.
-    Ok(best_p)
+    // The last allowed update may itself have crossed the threshold, so certify
+    // the final iterate once before reporting typed exhaustion.
+    let (_, residual) = stationarity(p.view())?;
+    if residual <= tol {
+        Ok(p)
+    } else {
+        Err(GeometryError::NonConvergence {
+            context: "SPD Fréchet mean",
+            iterations: max_iter,
+            residual,
+            tolerance: tol,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -837,7 +815,7 @@ mod exp_map_vjp_tests {
 #[cfg(test)]
 mod frechet_mean_tests {
     use super::{SpdManifold, spd_frechet_mean};
-    use crate::manifold::RiemannianManifold;
+    use crate::manifold::{GeometryError, RiemannianManifold};
     use ndarray::{Array1, Array2};
 
     /// Row-major flat `n×n` diagonal matrix from its diagonal.
@@ -989,18 +967,16 @@ mod frechet_mean_tests {
         }
         let m = rows.len();
 
-        // Request a tolerance below the achievable floor so success can only
-        // come from the stagnation path, not from `tol` being loose.
-        let p = spd_frechet_mean(n, stack(&rows).view(), None, 1e-14, 1000)
-            .expect("spread non-commuting frechet mean converges via safeguard");
+        let tol = 1e-9;
+        let p = spd_frechet_mean(n, stack(&rows).view(), None, tol, 1000)
+            .expect("spread non-commuting frechet mean reaches its certificate");
 
         let spd = SpdManifold::new(n);
         let w = vec![1.0 / m as f64; m];
         let r = residual(&spd, &p, &rows, &w);
         assert!(
-            r < 1e-9,
-            "spread non-commuting residual {r:.3e} did not descend below √ε \
-             (regression of #693: line search stalled at the V round-off floor)"
+            r <= tol,
+            "spread non-commuting residual {r:.3e} exceeds requested tolerance {tol:.3e}"
         );
 
         // It must also be the dispersion minimizer: V(P) below V at any sample.
@@ -1023,32 +999,28 @@ mod frechet_mean_tests {
     }
 
     #[test]
-    fn spd_frechet_mean_budget_shortfall_returns_best_iterate_not_error() {
-        // Consistency with the generic response_frechet_mean driver (#2140): a
-        // `max_iter` too small to reach the requested `tol` must STILL return
-        // the best (least-residual) SPD iterate, matching the stall and
-        // rejected-step exits — never a "did not reach stationarity within
-        // max_iter" error over a mere budget shortfall on the convex cone.
+    fn spd_frechet_mean_budget_shortfall_is_typed_non_convergence() {
+        // A `max_iter` too small to reach stationarity must carry its analytic
+        // residual as typed evidence, never mint an approximate chart origin.
         let n = 2;
         let rows = [
             diag_flat(&[4.0, 0.25]),
             Array1::from(vec![1.0, 0.5, 0.5, 3.0]),
             diag_flat(&[0.3, 6.0]),
         ];
-        let m = rows.len();
-        let p = spd_frechet_mean(n, stack(&rows).view(), None, 1e-14, 1)
-            .expect("budget=1 must return the best iterate, not an error");
-
-        // The returned point is a genuine SPD matrix (a valid mean / chart
-        // origin): symmetric with strictly positive eigenvalues.
-        assert_eq!(p.len(), n * n);
-        assert!(p.iter().all(|c| c.is_finite()));
-        assert!((p[1] - p[2]).abs() < 1e-12, "SPD mean must be symmetric");
-        let spd = SpdManifold::new(n);
-        // `log_map` is only defined at an SPD base point, so its success is a
-        // positive-definiteness certificate for the returned iterate.
-        let w = vec![1.0 / m as f64; m];
-        let r = residual(&spd, &p, &rows, &w);
-        assert!(r.is_finite(), "residual at the returned mean must be finite");
+        match spd_frechet_mean(n, stack(&rows).view(), None, 1e-14, 1) {
+            Err(GeometryError::NonConvergence {
+                context,
+                iterations,
+                residual,
+                tolerance,
+            }) => {
+                assert_eq!(context, "SPD Fréchet mean");
+                assert_eq!(iterations, 1);
+                assert!(residual.is_finite() && residual > tolerance);
+                assert_eq!(tolerance, 1e-14);
+            }
+            other => panic!("expected typed SPD Fréchet exhaustion, got {other:?}"),
+        }
     }
 }

@@ -9,8 +9,8 @@
 //! shared penalty `S ∈ ℝ^{P×P}` replicated per output, differing **only** in
 //! the per-row Fisher-block algebra and the likelihood/residual. Everything
 //! else — input validation, penalized objective / gradient / Hessian assembly,
-//! damped Newton with backtracking, the relative-step convergence test, and the
-//! final penalized-objective / deviance tally — is written once here.
+//! damped Newton with backtracking, convergence certification, and the final
+//! penalized-objective / deviance tally — is written once here.
 //!
 //! # Fit problem
 //!
@@ -51,8 +51,10 @@
 //! step is then accepted by a backtracking line search on `F` (full step first,
 //! halve up to 8 times). Because the line search validates against the
 //! *unridged* objective `F`, the ridge never biases the converged β̂ (at the
-//! optimum the gradient vanishes and δ → 0 for any τ). Convergence is the
-//! relative coefficient step `‖δ‖ / (1 + ‖β‖) ≤ tol`.
+//! optimum the gradient vanishes and δ → 0 for any τ). Convergence requires
+//! both the relative coefficient step `‖δ‖ / (1 + ‖β‖) ≤ tol` and an exact
+//! curvature-scaled first-order score certificate recomputed at the accepted
+//! final iterate.
 //!
 //! # Fisher-block override
 //!
@@ -203,7 +205,7 @@ pub struct PenalizedVectorGlmOutputs {
     pub coefficient_covariance: Array2<f64>,
 }
 
-/// Checkpoint evidence for a budget-exhausted (non-converged) Newton solve.
+/// Checkpoint evidence for a Newton solve that stopped without certification.
 ///
 /// This is NOT a fit: it exists so family adapters can inspect the abandoned
 /// iterate (e.g. the multinomial separation fingerprint `|η| ≥ 25` that routes
@@ -212,16 +214,22 @@ pub struct PenalizedVectorGlmOutputs {
 /// objective at the last iterate. It carries no covariance and no fitted
 /// probabilities on purpose: nothing downstream may dress it up as a result.
 pub struct VectorGlmStall {
-    /// Coefficient iterate at budget exhaustion, shape `(P, M)`.
+    /// Why the convergence certificate was not reached.
+    pub reason: VectorGlmStallReason,
+    /// Coefficient checkpoint at the last accepted iterate, shape `(P, M)`.
     pub coefficients: Array2<f64>,
     /// Linear predictor `η = X β` at the abandoned iterate, shape `(N, M)`.
     pub eta: Array2<f64>,
-    /// Newton iterations executed (== the caller's `max_iter`).
+    /// Newton iterations executed before the stall was diagnosed.
     pub iterations: usize,
     /// Unpenalized log-likelihood at the abandoned iterate.
     pub log_likelihood: f64,
     /// Penalty term at the abandoned iterate.
     pub penalty_term: f64,
+    /// Norm of the exact penalized score at the checkpoint.
+    pub gradient_norm: f64,
+    /// Curvature-scaled score bound required by the stationarity certificate.
+    pub gradient_bound: f64,
 }
 
 impl VectorGlmStall {
@@ -232,16 +240,41 @@ impl VectorGlmStall {
     }
 }
 
+/// Exhaustive reason a fixed-λ vector solve produced checkpoint evidence
+/// instead of a converged result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorGlmStallReason {
+    /// The caller's iteration budget ended before both certificates passed.
+    IterationBudgetExhausted,
+    /// No backtracked candidate satisfied the objective-descent certificate.
+    LineSearchExhausted,
+    /// The small-step gate passed, but the exact score at the accepted iterate
+    /// exceeded its curvature-scaled stationarity bound.
+    PostStepCertificateFailed,
+}
+
+impl VectorGlmStallReason {
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::IterationBudgetExhausted => "iteration budget exhausted",
+            Self::LineSearchExhausted => "line search exhausted without an accepted descent step",
+            Self::PostStepCertificateFailed => {
+                "post-step first-order stationarity certificate failed"
+            }
+        }
+    }
+}
+
 /// Two-outcome result of the fixed-λ vector-GLM Newton solve. Hard input /
-/// linear-algebra failures remain `Err`; exhausting the iteration budget is a
-/// first-class `Stalled` outcome so adapters must decide explicitly (typed
-/// error, or the multinomial separation → Firth escalation) instead of ever
-/// forwarding a non-converged iterate as a fit.
+/// linear-algebra failures remain `Err`; any terminal state without a
+/// stationarity certificate is a first-class `Stalled` outcome so adapters must
+/// decide explicitly (typed error, or the multinomial separation → Firth
+/// escalation) instead of ever forwarding a non-converged iterate as a fit.
 pub enum VectorGlmSolve {
     /// Certified stationary point (step-norm AND first-order optimality gates
     /// passed), with the Laplace covariance computed at the mode.
     Converged(PenalizedVectorGlmOutputs),
-    /// Iteration budget exhausted before certification.
+    /// Solver stopped without a convergence certificate.
     Stalled(VectorGlmStall),
 }
 
@@ -318,6 +351,76 @@ fn weighted_penalty_sum(
             }
             0.5 * lam * (sum_quad - g_quad / k)
         }
+    }
+}
+
+/// Fill the gradient of the penalized negative log-likelihood in the engine's
+/// class-major coefficient order. `residual = -∂ log L / ∂η`; the penalty
+/// contribution uses the same class-space metric as the objective and Hessian.
+/// Keeping this algebra in one production helper lets the loop and the final
+/// convergence certificate evaluate exactly the same score at different
+/// iterates.
+fn fill_penalized_gradient(
+    design: ArrayView2<'_, f64>,
+    residual: ArrayView2<'_, f64>,
+    beta: &Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambdas: ArrayView1<'_, f64>,
+    metric: ClassPenaltyMetric,
+    out: &mut Array1<f64>,
+) {
+    let (p, m) = beta.dim();
+    for a in 0..m {
+        for i in 0..p {
+            let mut acc = 0.0_f64;
+            for row in 0..design.nrows() {
+                acc += design[[row, i]] * residual[[row, a]];
+            }
+            out[a * p + i] = acc;
+        }
+    }
+    match metric {
+        ClassPenaltyMetric::Diagonal => {
+            for a in 0..m {
+                let la = lambdas[a];
+                if la == 0.0 {
+                    continue;
+                }
+                let beta_col = beta.column(a);
+                for i in 0..p {
+                    let mut s_beta_i = 0.0_f64;
+                    for j in 0..p {
+                        s_beta_i += penalty[[i, j]] * beta_col[j];
+                    }
+                    out[a * p + i] += la * s_beta_i;
+                }
+            }
+        }
+        ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
+            let lam = lambdas[0];
+            let inv_k = 1.0 / ((m + 1) as f64);
+            let mut beta_bar = vec![0.0_f64; p];
+            for a in 0..m {
+                let col = beta.column(a);
+                for i in 0..p {
+                    beta_bar[i] += col[i];
+                }
+            }
+            for value in &mut beta_bar {
+                *value *= inv_k;
+            }
+            for a in 0..m {
+                let beta_col = beta.column(a);
+                for i in 0..p {
+                    let mut s_centered_i = 0.0_f64;
+                    for j in 0..p {
+                        s_centered_i += penalty[[i, j]] * (beta_col[j] - beta_bar[j]);
+                    }
+                    out[a * p + i] += lam * s_centered_i;
+                }
+            }
+        }
+        ClassPenaltyMetric::Centered => {}
     }
 }
 
@@ -495,6 +598,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
 
     let mut iterations = 0usize;
     let mut converged = false;
+    let mut stall_reason = VectorGlmStallReason::IterationBudgetExhausted;
     let mut last_objective = f64::INFINITY;
 
     // η = X · β for the current β, reused by the analytic Fisher / gradient.
@@ -591,65 +695,15 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             ClassPenaltyMetric::Centered => {}
         }
 
-        // Penalized gradient: g_a = Xᵀ r_{·,a} + (penalty gradient). For the
-        // Diagonal metric that is `λ_a S β_a`; for Centered it is the
-        // reference-symmetric `λ S (β_a − β̄)`, β̄ = (1/K) Σ_b β_b (#1587).
-        // Written into the reused `grad_flat` buffer; the loop below assigns
-        // every entry (`=`) before the penalty `+=`, so no re-zeroing is needed.
-        for a in 0..m {
-            for i in 0..p {
-                let mut acc = 0.0_f64;
-                for row in 0..n_obs {
-                    acc += design[[row, i]] * residual[[row, a]];
-                }
-                grad_flat[a * p + i] = acc;
-            }
-        }
-        match class_penalty_metric {
-            ClassPenaltyMetric::Diagonal => {
-                for a in 0..m {
-                    let la = lambdas[a];
-                    if la == 0.0 {
-                        continue;
-                    }
-                    let beta_col = beta.column(a);
-                    for i in 0..p {
-                        let mut s_beta_i = 0.0_f64;
-                        for j in 0..p {
-                            s_beta_i += penalty[[i, j]] * beta_col[j];
-                        }
-                        grad_flat[a * p + i] += la * s_beta_i;
-                    }
-                }
-            }
-            ClassPenaltyMetric::Centered if m > 0 && lambdas[0] != 0.0 => {
-                let lam = lambdas[0];
-                let inv_k = 1.0 / ((m + 1) as f64);
-                // β̄ = (1/K) Σ_b β_b.
-                let mut bbar = vec![0.0_f64; p];
-                for b in 0..m {
-                    let col = beta.column(b);
-                    for i in 0..p {
-                        bbar[i] += col[i];
-                    }
-                }
-                for v in bbar.iter_mut() {
-                    *v *= inv_k;
-                }
-                for a in 0..m {
-                    let beta_col = beta.column(a);
-                    for i in 0..p {
-                        // (S (β_a − β̄))_i.
-                        let mut s_centered_i = 0.0_f64;
-                        for j in 0..p {
-                            s_centered_i += penalty[[i, j]] * (beta_col[j] - bbar[j]);
-                        }
-                        grad_flat[a * p + i] += lam * s_centered_i;
-                    }
-                }
-            }
-            ClassPenaltyMetric::Centered => {}
-        }
+        fill_penalized_gradient(
+            design,
+            residual.view(),
+            &beta,
+            penalty,
+            lambdas,
+            class_penalty_metric,
+            &mut grad_flat,
+        );
 
         // δ = − H^{-1} · grad, solved through an adaptive Levenberg–Marquardt
         // ridge. The penalized Hessian `H = block(XᵀWX) + diag_a(λ_a S)` can be
@@ -766,28 +820,32 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 crate::bail_invalid_estim!("{context}: non-finite objective at β = 0");
             }
         }
-        // The trial closure writes each candidate into `accepted_beta`/
-        // `new_objective` directly: on acceptance they hold the accepted trial,
-        // and on exhaustion they hold the LAST (rejected) trial — this site has
-        // always proceeded with that final halved step rather than falling back.
-        let mut accepted_beta = Array2::<f64>::zeros(beta.raw_dim());
-        let mut new_objective = f64::NAN;
-        match backtracking_line_search::<_, Infallible>(
+        let accepted = match backtracking_line_search::<_, Infallible>(
             BacktrackConfig {
                 contraction: LINE_SEARCH_SHRINK,
                 max_steps: MAX_BACKTRACKS + 1,
                 ..BacktrackConfig::default()
             },
             |alpha| {
-                accepted_beta = proposed_beta(alpha);
-                new_objective = evaluate_objective(&accepted_beta, &mut eta_objective_scratch);
-                Ok(Some((new_objective, ())))
+                let candidate = proposed_beta(alpha);
+                let objective = evaluate_objective(&candidate, &mut eta_objective_scratch);
+                Ok(Some((objective, candidate)))
             },
             |_alpha, f| f.is_finite() && f <= last_objective + OBJECTIVE_DECREASE_SLACK,
         ) {
-            Ok(_) => {}
+            Ok(accepted) => accepted,
             Err(never) => match never {},
-        }
+        };
+        let Some(accepted) = accepted else {
+            // Every candidate failed the descent certificate. Keep the last
+            // ACCEPTED iterate as checkpoint evidence; a rejected trial can
+            // never become a result merely because the line-search budget was
+            // exhausted.
+            stall_reason = VectorGlmStallReason::LineSearchExhausted;
+            break;
+        };
+        let accepted_beta = accepted.payload;
+        let new_objective = accepted.value;
 
         let mut step_norm_sq = 0.0_f64;
         let mut beta_norm_sq = 0.0_f64;
@@ -833,20 +891,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     let log_likelihood = likelihood.log_lik(eta.view(), y);
     let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas, class_penalty_metric);
 
-    if !converged {
-        // Budget exhausted without the stationarity certificate. Hand back the
-        // abandoned iterate as checkpoint evidence — never a covariance, never
-        // fitted probabilities. The adapter decides: typed non-convergence
-        // error, or (multinomial) the separation → Firth/Jeffreys escalation.
-        return Ok(VectorGlmSolve::Stalled(VectorGlmStall {
-            coefficients: beta,
-            eta,
-            iterations,
-            log_likelihood,
-            penalty_term,
-        }));
-    }
-
+    // Re-assemble the final penalized Hessian before certification. This is not
+    // posterior work: its diagonal supplies the same curvature scale used by
+    // the loop's first-order gate. Covariance inversion remains below the gate
+    // and is therefore impossible for an uncertified iterate.
+    //
     // Joint Laplace covariance `H⁻¹` at the converged mode (#1101). Re-assemble
     // the penalized Hessian `H = block(XᵀWX) + penalty` at β̂ — the SAME algebra
     // the Newton loop runs each iteration — and invert it by solving `H·Σ = I`
@@ -899,6 +948,47 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         }
         ClassPenaltyMetric::Centered => {}
     }
+
+    // Re-evaluate the exact penalized score AT the accepted final iterate. The
+    // loop's inexpensive gate uses the pre-step score (valid to first order
+    // when the accepted step is tiny); this second evaluation closes the only
+    // gap through which heavy backtracking could otherwise certify a point
+    // whose post-step score is still material.
+    let final_residual = likelihood.grad_eta(eta.view(), y).mapv(|value| -value);
+    fill_penalized_gradient(
+        design,
+        final_residual.view(),
+        &beta,
+        penalty,
+        lambdas,
+        class_penalty_metric,
+        &mut grad_flat,
+    );
+    let final_grad_norm = grad_flat.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let final_max_diag =
+        (0..beta_flat_dim).fold(0.0_f64, |acc, i| acc.max(hessian_final[[i, i]].abs()));
+    let final_grad_optimal =
+        final_grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag);
+    if !(converged && final_grad_optimal) {
+        if converged {
+            stall_reason = VectorGlmStallReason::PostStepCertificateFailed;
+        }
+        // Budget exhausted (or the post-step score failed certification). Hand
+        // back checkpoint evidence — never a covariance or fitted probabilities.
+        // The adapter decides between a typed non-convergence error and the
+        // multinomial separation → Firth/Jeffreys escalation.
+        return Ok(VectorGlmSolve::Stalled(VectorGlmStall {
+            reason: stall_reason,
+            coefficients: beta,
+            eta,
+            iterations,
+            log_likelihood,
+            penalty_term,
+            gradient_norm: final_grad_norm,
+            gradient_bound: OPTIMALITY_GRAD_FRACTION * (1.0 + final_max_diag),
+        }));
+    }
+
     let coefficient_covariance =
         invert_symmetric_penalized_hessian(&hessian_final, beta_flat_dim, context)?;
 

@@ -64,7 +64,8 @@ pub struct PeriodicBSplineBasisSpec {
     pub period: f64,
     /// Parameter value identified with zero phase.
     pub origin: f64,
-    /// Cyclic finite-difference order used by curve fitting penalties.
+    /// Derivative order in the periodic function roughness
+    /// `∮(f^(penalty_order))²` used by curve fitting.
     pub penalty_order: usize,
 }
 
@@ -172,6 +173,13 @@ pub(crate) fn validate_periodic_bspline_spec(
         return Err(BasisError::InvalidPenaltyOrder {
             order: spec.penalty_order,
             num_basis: spec.num_basis,
+        });
+    }
+    if spec.penalty_order > spec.degree {
+        return Err(BasisError::InsufficientDegreeForDerivative {
+            degree: spec.degree,
+            derivative_order: spec.penalty_order,
+            minimum_degree: spec.penalty_order,
         });
     }
     Ok(())
@@ -446,7 +454,12 @@ pub fn fit_periodic_bspline_curve(
     let basis = build_periodic_bspline_basis_1d(u, spec)?;
     let mut lhs = basis.t().dot(&basis);
     if smoothing_lambda > 0.0 {
-        let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
+        let penalty = cyclic_bspline_derivative_penalty_matrix(
+            spec.degree,
+            spec.num_basis,
+            spec.period,
+            spec.penalty_order,
+        )?;
         lhs = lhs + smoothing_lambda * penalty;
     }
     let rhs = basis.t().dot(&y);

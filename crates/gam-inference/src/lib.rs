@@ -36,7 +36,6 @@ pub mod model_comparison;
 pub use gam_solve::inference::{pg_gate_evidence, pg_moments};
 pub mod gpu_polya_gamma;
 pub mod polya_gamma;
-pub mod polya_gamma_core;
 pub mod posterior;
 pub use gam_models::inference::{
     full_conformal, generative, model, model_payload_builders, predict_io,

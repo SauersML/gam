@@ -56,8 +56,9 @@
 //! penalty on interval domains — constructed directly, not via the string DSL.
 
 use crate::chart_canonicalization::CanonicalChartTopology;
-use faer::Side;
-use gam_linalg::faer_ndarray::FaerEigh;
+use gam_solve::gaussian_reml::{
+    gaussian_reml_closed_form_with_nullspace_dim, gaussian_reml_stationary_set,
+};
 use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d,
     create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
@@ -89,10 +90,6 @@ const DEGREE_CANDIDATES: [i32; 5] = [-2, -1, 0, 1, 2];
 const FOLD_CHECK_GRID: usize = 512;
 /// Default evaluation grid for the composition-law defect.
 pub const DEFAULT_COMPOSITION_GRID: usize = 256;
-/// REML λ-profile: log-spaced grid points then golden-section refinement.
-const REML_LAMBDA_GRID_POINTS: usize = 41;
-const REML_GOLDEN_ITERATIONS: usize = 40;
-const REML_LAMBDA_SPAN_DECADES: f64 = 8.0;
 
 /// Topology of a one-dimensional concept chart.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -408,9 +405,10 @@ struct Penalized1dFit {
 ///
 /// Profile σ² out of Wood's REML,
 /// `V(λ) = (n − M₀)·log PRSS(λ) + log|XᵀWX + λS| − rank(S)·log λ`, with
-/// `M₀ = dim ker S` and `PRSS = yᵀWy − β̂ᵀXᵀWy`. λ is selected on a deterministic log grid spanning
-/// ±[`REML_LAMBDA_SPAN_DECADES`] decades around the design's trace scale and
-/// refined by golden section — no RNG, no caller knobs.
+/// `M₀ = dim ker S` and `PRSS = yᵀWy − β̂ᵀXᵀWy`. Selection delegates to
+/// the engine's analytic Gaussian-REML stationary-point enumerator, so this
+/// transport path shares the same grid-free objective, derivatives, boundary
+/// comparison, and convergence certificate as every other Gaussian smooth.
 fn fit_penalized_1d(
     design: &Array2<f64>,
     penalty: &Array2<f64>,
@@ -428,7 +426,12 @@ fn fit_penalized_1d(
             penalty.ncols()
         ));
     }
-    if let Some(w) = weights {
+    if penalty_rank > m {
+        return Err(format!(
+            "penalized 1-D fit penalty rank {penalty_rank} exceeds coefficient dimension {m}"
+        ));
+    }
+    if let Some(w) = weights.as_ref() {
         if w.len() != n {
             return Err(format!(
                 "penalized 1-D fit weight length {} does not match n = {n}",
@@ -440,145 +443,94 @@ fn fit_penalized_1d(
         }
     }
 
-    let mut xtwx = Array2::<f64>::zeros((m, m));
-    let mut xtwy = Array1::<f64>::zeros(m);
-    let mut ytwy = 0.0_f64;
-    let mut sum_w = 0.0_f64;
-    for r in 0..n {
-        let w = weights.map_or(1.0, |wv| wv[r]);
-        let y = response[r];
-        ytwy += w * y * y;
-        sum_w += w;
-        for j in 0..m {
-            let xj = design[[r, j]];
-            if xj == 0.0 {
-                continue;
-            }
-            xtwy[j] += w * xj * y;
-            for k in j..m {
-                xtwx[[j, k]] += w * xj * design[[r, k]];
-            }
-        }
+    let nullspace_dim = m - penalty_rank;
+    let weight_view = || weights.as_ref().map(|w| w.view());
+    let stationary = gaussian_reml_stationary_set(
+        design.view(),
+        response.view(),
+        penalty.view(),
+        Some(nullspace_dim),
+        weight_view(),
+        None,
+    )
+    .map_err(|error| format!("penalized 1-D REML stationary enumeration failed: {error}"))?;
+    if stationary.hit_resolution_floor {
+        return Err(format!(
+            "penalized 1-D REML is underresolved: the stationary-point enclosure reached its \
+             resolution floor ({} isolated roots, selected log-lambda {}, endpoint costs {:?})",
+            stationary.roots.len(),
+            stationary.selected_rho,
+            stationary.endpoint_costs,
+        ));
     }
-    for j in 0..m {
-        for k in 0..j {
-            xtwx[[j, k]] = xtwx[[k, j]];
-        }
+    let reml = gaussian_reml_closed_form_with_nullspace_dim(
+        design.view(),
+        response.view(),
+        penalty.view(),
+        Some(nullspace_dim),
+        weight_view(),
+        None,
+    )
+    .map_err(|error| format!("penalized 1-D Gaussian REML failed: {error}"))?;
+    if reml.rho.to_bits() != stationary.selected_rho.to_bits() {
+        return Err(format!(
+            "penalized 1-D REML selection drifted between its certificate ({}) and fit ({})",
+            stationary.selected_rho, reml.rho,
+        ));
     }
 
-    let trace_scale = (0..m).map(|i| xtwx[[i, i]]).sum::<f64>() / m as f64;
-    let anchor = trace_scale.max(f64::MIN_POSITIVE);
-    let nullspace_dim = m.saturating_sub(penalty_rank);
-    let dof = ((n as f64) - nullspace_dim as f64).max(1.0);
-    let rank_f = penalty_rank as f64;
-
-    let solve_at = |lambda: f64| -> Result<(Array1<f64>, Array1<f64>, Array2<f64>), String> {
-        let mut a = xtwx.clone();
-        for j in 0..m {
-            for k in 0..m {
-                a[[j, k]] += lambda * penalty[[j, k]];
-            }
-        }
-        // Representative-selecting micro-ridge for exactly aliased designs.
-        let diag_scale = (0..m).map(|i| a[[i, i]].abs()).fold(1.0_f64, f64::max);
-        for i in 0..m {
-            a[[i, i]] += 1e-12 * diag_scale;
-        }
-        let (evals, evecs) = a
-            .eigh(Side::Lower)
-            .map_err(|e| format!("penalized 1-D fit eigendecomposition failed: {e:?}"))?;
-        Ok((evals, evecs.t().dot(&xtwy), evecs))
-    };
-
-    let criterion = |lambda: f64| -> f64 {
-        let Ok(parts) = solve_at(lambda) else {
-            return f64::INFINITY;
-        };
-        let (evals, rotated) = (&parts.0, &parts.1);
-        let floor = evals.iter().copied().fold(0.0_f64, f64::max) * 1e-14;
-        let mut prss = ytwy;
-        let mut logdet = 0.0_f64;
-        for i in 0..m {
-            let d = evals[i].max(floor).max(f64::MIN_POSITIVE);
-            prss -= rotated[i] * rotated[i] / d;
-            logdet += d.ln();
-        }
-        let prss = prss.max(f64::MIN_POSITIVE);
-        let fit_term = dof * prss.ln();
-        fit_term + logdet - rank_f * lambda.ln()
-    };
-
-    let lo = anchor * 10f64.powf(-REML_LAMBDA_SPAN_DECADES);
-    let hi = anchor * 10f64.powf(REML_LAMBDA_SPAN_DECADES);
-    let grid: Vec<f64> = (0..REML_LAMBDA_GRID_POINTS)
-        .map(|i| {
-            let t = i as f64 / (REML_LAMBDA_GRID_POINTS - 1) as f64;
-            lo * (hi / lo).powf(t)
-        })
-        .collect();
-    let mut best_idx = 0usize;
-    let mut best_val = f64::INFINITY;
-    for (i, &lam) in grid.iter().enumerate() {
-        let v = criterion(lam);
-        if v < best_val {
-            best_val = v;
-            best_idx = i;
-        }
+    // If C = L⁻ᵀU is the cache's coefficient basis and δᵢ are the
+    // eigenvalues of L⁻¹SL⁻ᵀ, then the exact penalized inverse is
+    //     (XᵀWX + λS)⁻¹ = C diag((1 + λδᵢ)⁻¹) Cᵀ.
+    // Reconstruct that same inverse directly: no eigenvalue flooring and no
+    // representative-selecting ridge that would change the REML objective.
+    let lambda = reml.lambda;
+    let coefficient_basis = &reml.cache.coefficient_basis;
+    let penalty_eigenvalues = &reml.cache.penalty_eigenvalues;
+    if coefficient_basis.dim() != (m, m) || penalty_eigenvalues.len() != m {
+        return Err(format!(
+            "penalized 1-D REML cache shape drift: basis is {}x{}, spectrum has {}, expected {m}",
+            coefficient_basis.nrows(),
+            coefficient_basis.ncols(),
+            penalty_eigenvalues.len(),
+        ));
     }
-    let mut a_log = grid[best_idx.saturating_sub(1)].ln();
-    let mut c_log = grid[(best_idx + 1).min(REML_LAMBDA_GRID_POINTS - 1)].ln();
-    let golden = (5.0_f64.sqrt() - 1.0) / 2.0;
-    let mut x1 = c_log - golden * (c_log - a_log);
-    let mut x2 = a_log + golden * (c_log - a_log);
-    let mut f1 = criterion(x1.exp());
-    let mut f2 = criterion(x2.exp());
-    for _ in 0..REML_GOLDEN_ITERATIONS {
-        if f1 <= f2 {
-            c_log = x2;
-            x2 = x1;
-            f2 = f1;
-            x1 = c_log - golden * (c_log - a_log);
-            f1 = criterion(x1.exp());
-        } else {
-            a_log = x1;
-            x1 = x2;
-            f1 = f2;
-            x2 = a_log + golden * (c_log - a_log);
-            f2 = criterion(x2.exp());
-        }
-    }
-    let lambda = (0.5 * (a_log + c_log)).exp();
-
-    let (evals, rotated, evecs) = solve_at(lambda)?;
-    let floor = evals.iter().copied().fold(0.0_f64, f64::max) * 1e-14;
     let mut a_inv = Array2::<f64>::zeros((m, m));
-    let mut beta = Array1::<f64>::zeros(m);
     for i in 0..m {
-        let d = evals[i].max(floor).max(f64::MIN_POSITIVE);
-        let coeff = rotated[i] / d;
+        let delta = penalty_eigenvalues[i];
+        let denominator = 1.0 + lambda * delta;
+        if !(delta.is_finite() && delta >= 0.0 && denominator.is_finite() && denominator > 0.0) {
+            return Err(format!(
+                "penalized 1-D REML cache has invalid mode {i}: delta={delta}, denominator={denominator}"
+            ));
+        }
+        let inverse_denominator = denominator.recip();
         for j in 0..m {
-            beta[j] += evecs[[j, i]] * coeff;
+            let scaled_basis = coefficient_basis[[j, i]] * inverse_denominator;
             for k in 0..m {
-                a_inv[[j, k]] += evecs[[j, i]] * evecs[[k, i]] / d;
+                a_inv[[j, k]] += scaled_basis * coefficient_basis[[k, i]];
             }
         }
     }
-    let influence = a_inv.dot(&xtwx);
-    let edf = (0..m).map(|i| influence[[i, i]]).sum::<f64>();
 
-    let fitted = design.dot(&beta);
+    let beta = reml.coefficients;
+    let fitted = reml.fitted;
+    let edf = reml.edf;
+    let sigma2 = reml.sigma2;
     let mut rss = 0.0_f64;
     for r in 0..n {
-        let w = weights.map_or(1.0, |wv| wv[r]);
+        let w = weights.as_ref().map_or(1.0, |wv| wv[r]);
         let e = response[r] - fitted[r];
         rss += w * e * e;
     }
-    let sigma2 = (rss / ((n as f64) - edf).max(1.0)).max(f64::MIN_POSITIVE);
     let covariance = a_inv.mapv(|v| v * sigma2);
+    let sum_w = weights
+        .as_ref()
+        .map_or(n as f64, |wv| wv.iter().copied().sum());
     let residual_rms = (rss / sum_w.max(f64::MIN_POSITIVE)).sqrt();
     let mut coefficient_score_influence = Array2::<f64>::zeros((m, n));
     for row in 0..n {
-        let w = weights.map_or(1.0, |wv| wv[row]);
+        let w = weights.as_ref().map_or(1.0, |wv| wv[row]);
         let residual = response[row] - fitted[row];
         for j in 0..m {
             let mut sensitivity = 0.0_f64;
@@ -589,8 +541,10 @@ fn fit_penalized_1d(
         }
     }
 
-    if beta.iter().any(|v| !v.is_finite()) {
-        return Err("penalized 1-D fit produced non-finite coefficients".to_string());
+    if beta.iter().chain(a_inv.iter()).any(|v| !v.is_finite())
+        || !(sigma2.is_finite() && sigma2 > 0.0)
+    {
+        return Err("penalized 1-D REML produced non-finite posterior moments".to_string());
     }
     Ok(Penalized1dFit {
         beta,
@@ -1605,6 +1559,8 @@ pub fn transport_ladder(
 #[cfg(test)]
 mod invert_tests {
     use super::*;
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::Array1;
 
     fn interval(lo: f64, hi: f64) -> ChartTopology {

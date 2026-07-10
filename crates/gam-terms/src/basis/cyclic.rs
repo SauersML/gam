@@ -220,9 +220,10 @@ pub(crate) fn create_cyclic_bspline_basis_dense(
             num_basis,
             period,
             origin: anchor,
-            // The value evaluator does not use the penalty order; pass the
-            // standard cyclic smooth order so spec validation remains shared.
-            penalty_order: 2.min(num_basis - 1),
+            // The value evaluator does not use the penalty order. Supply a
+            // valid derivative order so shared spec validation still enforces
+            // the same Sobolev contract as fitted periodic splines.
+            penalty_order: degree.min(2),
         },
     )?;
     Ok((cyclic, knots))

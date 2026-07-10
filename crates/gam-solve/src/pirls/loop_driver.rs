@@ -1690,7 +1690,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         coefficient_lower_bounds: None,
         linear_constraints: linear_constraints.clone(),
         initial_lm_lambda: config.initial_lm_lambda,
-        geodesic_acceleration: config.geodesic_acceleration,
         arrow_schur: config.arrow_schur.clone(),
     };
 
@@ -2227,12 +2226,6 @@ pub struct PirlsConfig {
     /// internal options. See the field doc on `WorkingModelPirlsOptions`
     /// for the seeding semantics.
     pub initial_lm_lambda: Option<f64>,
-    /// Enable the Transtrum-Sethna geodesic-acceleration second-order
-    /// correction on each accepted LM step. Forwarded to
-    /// `WorkingModelPirlsOptions::geodesic_acceleration`; see that
-    /// field's doc for the full semantics and cost model. Default
-    /// `false`; opt-in until validated.
-    pub geodesic_acceleration: bool,
     /// Optional arrow-Schur structured-inner-solve descriptor. When
     /// `Some`, forwarded to `WorkingModelPirlsOptions::arrow_schur` so
     /// each accepted LM step is solved by the per-observation

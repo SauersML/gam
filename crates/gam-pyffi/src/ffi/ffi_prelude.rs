@@ -55,15 +55,18 @@ pub(crate) use gam::solver::gaussian_reml::{
 pub(crate) use gam::geometry::manifold::GeometryError as EngineGeometryError;
 
 pub(crate) use gam::geometry::poincare::{
-    conformal_factor as poincare_conformal_factor_impl, exp_map as poincare_exp_map_impl,
+    conformal_factor as poincare_conformal_factor_impl, distance_batch as poincare_distance_batch_impl,
+    exp_map as poincare_exp_map_impl, exp_map_batch as poincare_exp_map_batch_impl,
     exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
-    log_map as poincare_log_map_impl, log_origin as poincare_log_origin_impl,
+    log_map as poincare_log_map_impl, log_map_batch as poincare_log_map_batch_impl,
+    log_origin as poincare_log_origin_impl,
     lorentz_decode_backward as poincare_lorentz_decode_backward_impl,
     lorentz_decode_forward as poincare_lorentz_decode_forward_impl,
     lorentz_exp_origin as poincare_lorentz_exp_origin_impl,
     lorentz_log_origin as poincare_lorentz_log_origin_impl, mobius_add as poincare_mobius_add_impl,
-    poincare_distance as poincare_distance_impl,
-    project_into_ball as poincare_project_into_ball_impl,
+    metric_tensor_batch as poincare_metric_tensor_batch_impl,
+    poincare_distance as poincare_distance_impl, project_into_ball as poincare_project_into_ball_impl,
+    project_into_ball_batch as poincare_project_into_ball_batch_impl,
     tangent_decode_backward as poincare_tangent_decode_backward_impl,
     tangent_decode_forward as poincare_tangent_decode_forward_impl,
     to_lorentz as poincare_to_lorentz_impl,
@@ -185,7 +188,8 @@ pub(crate) use gam::terms::sae::sparse_dict::{
 
 pub(crate) use gam::terms::sae::manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL,
+    GumbelTemperatureSchedule, MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator,
+    SPHERE_CHART_PENALTY_DIAGONAL,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,
     SphereChartEvaluator, TorusHarmonicEvaluator, sphere_chart_basis_jet,
     term_from_padded_blocks_with_mode,

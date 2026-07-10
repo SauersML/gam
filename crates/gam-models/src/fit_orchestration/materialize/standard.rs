@@ -274,7 +274,6 @@ pub(crate) fn materialize_standard<'a>(
             optimize_sas,
             firth_bias_reduction: config.firth,
             adaptive_regularization: standard_adaptive_regularization_options(config),
-            persist_warm_start_disk: config.persist_warm_start_disk,
             ..Default::default()
         },
     );
@@ -329,9 +328,9 @@ pub(crate) fn materialize_standard<'a>(
     Ok(MaterializedModel {
         request: FitRequest::Standard(StandardFitRequest {
             data: request_data,
-            y: Arc::new(y),
-            weights: Arc::new(weights),
-            offset: Arc::new(offset),
+            y,
+            weights,
+            offset,
             spec,
             family,
             estimate_tweedie_p,

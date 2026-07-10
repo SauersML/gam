@@ -16,19 +16,16 @@
 //! file* exemption on the `SANCTIONED_FD_FILES` allowlist. That meant a fresh
 //! finite difference could hide behind a per-line `// fd-ok:` marker in ANY file
 //! — the allowlist's "single, tracked source of truth" promise was false. Two
-//! real production finite differences (the geodesic-acceleration curvature probe
-//! in `pirls/reweight.rs` and the survival pilot W-metric chain factor in
-//! `survival/marginal_slope/row_math.rs`), plus the SAE sphere-boost chart
-//! Jacobian, were exempted this way while the allowlist claimed to be EMPTY.
+//! real production finite differences were once exempted this way while the
+//! allowlist claimed to be EMPTY.
 //!
 //! ## The fix
 //!
 //! The scanner now confines `fd-ok` markers to the allowlist
 //! (`fd_ok_markers_are_confined_to_the_allowlist`): a non-test file that uses an
 //! `fd-ok` marker but is not allowlisted is itself a violation. The allowlist is
-//! populated with every sanctioned FD (audit oracle/certificate machinery, the
-//! genuinely-irreducible geodesic probe and SAE chart Jacobian, and the tracked
-//! reducible survival-pilot FD debt), each with a written justification.
+//! populated with every sanctioned FD (audit oracle/certificate machinery and
+//! the tracked SAE chart Jacobian), each with a written justification.
 //!
 //! ## What this test guards
 //!
@@ -81,14 +78,13 @@ fn scanner_keeps_a_tracked_allowlist_constant() {
     );
 }
 
-/// The genuinely-irreducible production finite differences and the FD-audit
-/// oracle must remain enumerated in the allowlist. If FD is removed from one of
+/// The remaining production finite difference and the FD-audit oracle must
+/// remain enumerated in the allowlist. If FD is removed from one of
 /// these files, drop the entry here too (and from the scanner) — that is a
 /// deliberate, reviewed change, not a silent weakening.
 #[test]
 fn known_sanctioned_fd_sites_stay_enumerated() {
     for site in [
-        "crates/gam-solve/src/pirls/reweight.rs", // geodesic-acceleration curvature probe
         "crates/gam-sae/src/chart_canonicalization.rs", // SAE sphere-boost GN chart Jacobian
         "crates/gam-solve/src/rho_optimizer/fd_audit.rs", // FD-audit oracle (diagnostic only)
     ] {

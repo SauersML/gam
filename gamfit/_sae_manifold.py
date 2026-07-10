@@ -177,45 +177,6 @@ _LOW_LEVEL_LAZY_FIELDS = {"fitted", "assignments", "coords"}
 _MODEL_LAZY_FIELDS = {"fitted", "assignments", "coords", "training_data", "low_level_logits"}
 
 
-# #1777 — the hard-sigmoid gate family's primary token is ``"threshold_gate"``
-# (the renamed Rust ``AssignmentMode::ThresholdGate``); the legacy ``"jumprelu"``
-# spelling is retained as a deprecated alias that canonicalizes to it. The FFI
-# accepts both tokens and emits ``"threshold_gate"``.
-_ASSIGNMENT_KINDS: dict[str, str] = {
-    "ibp_map": "ibp_map",
-    "softmax": "softmax",
-    "threshold_gate": "threshold_gate",
-    "jumprelu": "threshold_gate",
-    "topk": "topk",
-}
-
-_PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
-    "ibp_map": "ibp_map",
-    "softmax": "softmax",
-    "threshold_gate": "threshold_gate",
-    "jumprelu": "threshold_gate",
-    "topk": "topk",
-}
-
-# Public assignment alias table (#159). Both the ``assignment=`` and the
-# ``assignment_prior=`` kwargs normalize through this single map so they can
-# never validate differently. ``ibp``/``ibp-map``/``ibp_map`` all canonicalize
-# to ``ibp_map``; ``threshold_gate`` (primary) and the deprecated aliases
-# ``gated``/``jump_relu``/``jumprelu`` all canonicalize to ``threshold_gate`` (#1777).
-_PUBLIC_ASSIGNMENT_ALIASES: dict[str, str] = {
-    "ibp": "ibp_map",
-    "ibp-map": "ibp_map",
-    "ibp_map": "ibp_map",
-    "softmax": "softmax",
-    "threshold_gate": "threshold_gate",
-    "gated": "threshold_gate",
-    "jump_relu": "threshold_gate",
-    "jumprelu": "threshold_gate",
-    "topk": "topk",
-    "top_k": "topk",
-}
-
-
 def _penalized_loss_score(payload: Mapping[str, Any]) -> float | None:
     """Read the SAE fit's penalized-loss score honestly (#1231).
 
@@ -354,14 +315,12 @@ def _jsonable_value(value: Any) -> Any:
 
 
 def _canonical_assignment(value: str, label: str) -> str:
-    name = str(value).strip().lower()
-    canon = _ASSIGNMENT_KINDS.get(name)
-    if canon is None:
+    try:
+        return str(rust_module().sae_canonical_assignment_kind(str(value)))
+    except ValueError as exc:
         raise ValueError(
-            f"{label}={value!r} is not a recognized assignment kind; "
-            f"expected one of {sorted(set(_ASSIGNMENT_KINDS))}"
-        )
-    return canon
+            f"{label}={value!r} is not a recognized assignment kind: {exc}"
+        ) from None
 
 
 def _coerce_atom_inference(raw: Any) -> list[dict[str, Any]] | None:
@@ -429,17 +388,6 @@ def _coerce_cotrain_report(raw: Any) -> dict[str, Any] | None:
     }
 
 
-def _canonical_public_assignment(value: str) -> str:
-    name = str(value).strip().lower()
-    canon = _PUBLIC_ASSIGNMENT_ALIASES.get(name)
-    if canon is None:
-        raise ValueError(
-            f"assignment={value!r} is not a recognized assignment kind; "
-            f"expected one of {sorted(_PUBLIC_ASSIGNMENT_ALIASES)}"
-        )
-    return canon
-
-
 # Sentinel so ``assignment_prior`` can tell "not supplied" apart from any
 # explicit value.
 _ASSIGNMENT_PRIOR_UNSET = object()
@@ -481,16 +429,16 @@ def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
 def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
     """Normalize the ``assignment`` / ``assignment_prior`` aliases (#159).
 
-    Both kwargs route through the single :func:`_canonical_public_assignment`
+    Both kwargs route through the Rust-owned :func:`_canonical_assignment`
     validator, so they can never accept different alias sets. If both are
     supplied and resolve to DIFFERENT canonical kinds, raise an eager
     ``ValueError`` naming both BEFORE any Rust call. Unknown values raise a
     ``ValueError`` listing the accepted alias set.
     """
-    canon_assignment = _canonical_public_assignment(assignment)
+    canon_assignment = _canonical_assignment(assignment, "assignment")
     if assignment_prior is _ASSIGNMENT_PRIOR_UNSET:
         return canon_assignment
-    canon_prior = _canonical_public_assignment(assignment_prior)
+    canon_prior = _canonical_assignment(assignment_prior, "assignment_prior")
     if canon_prior != canon_assignment:
         raise ValueError(
             f"assignment={assignment!r} (resolves to {canon_assignment!r}) and "
@@ -2762,7 +2710,7 @@ class StagewiseSAE:
             )
         )
         atom_basis = [
-            _TOPOLOGY_TO_BASIS.get(_canon_name(atom.topology), _canon_name(atom.topology))
+            _canonical_basis_kind(atom.topology)
             for atom in self.atoms
         ]
         atom_dims = [int(atom.latent_dim) for atom in self.atoms]
@@ -2809,7 +2757,7 @@ class StagewiseSAE:
         training = np.ascontiguousarray(np.asarray(self.training_data, dtype=np.float64))
         fitted = np.ascontiguousarray(self._in_sample_reconstruction())
         basis_kinds = [
-            _TOPOLOGY_TO_BASIS.get(_canon_name(a.topology), _canon_name(a.topology))
+            _canonical_basis_kind(a.topology)
             for a in self.atoms
         ]
         decoder_blocks = [
@@ -3100,7 +3048,7 @@ def sae_manifold_fit_stagewise(
         raise ValueError(
             "max_births / max_backfit_sweeps must be >= 0 and max_factor_rank >= 1"
         )
-    kind = _canonical_public_assignment(assignment)
+    kind = _canonical_assignment(assignment, "assignment")
     seed_iter = int(n_iter if seed_n_iter is None else seed_n_iter)
     effective_lr = (0.05 if kind == "threshold_gate" else 1.0) if learning_rate is None else float(learning_rate)
 
@@ -3626,84 +3574,19 @@ def _dims(k_atoms: int, d_atom: Any) -> list[int]:
     return out
 
 
-def _canon_name(name: Any) -> str:
-    """Case-insensitive, ``-``/``_``-interchangeable name normalizer (O).
-
-    String matching for topology / basis names is documented as
-    case-insensitive and treating ``-`` and ``_`` interchangeably.
-    """
-    return str(name).strip().lower().replace("-", "_")
+def _canonical_basis_kind(name: Any) -> str:
+    """Canonical basis token from the Rust-owned SAE semantic schema."""
+    return str(rust_module().sae_canonical_basis_kind(str(name)))
 
 
-# Documented topology / basis ALIAS -> canonical basis kind. Mirrors the alias
-# set in docs/manifold-sae.md (and the names the Rust ``SaeAtomBasisKind``
-# accepts). Centralizing all aliases here keeps the resolution single-source.
-_TOPOLOGY_TO_BASIS = {
-    "circle": "periodic", "periodic": "periodic", "periodic_spline": "periodic",
-    "sphere": "sphere", "torus": "torus",
-    "linear": "linear", "linear_rank1": "linear", "affine": "linear",
-    # BSF block AS a manifold-SAE atom (γ_g(t)=t·D_g, orthonormal frame + block
-    # gating): kept as its OWN basis-kind string so the "linear_block" label
-    # survives round-trip; the Rust `sae_atom_basis_kind_from_str` maps it to the
-    # `Linear` kind for construction/evidence (see the FFI doc-comment). This is
-    # the honest encoding of "BSF ⊂ ManifoldSAE" as config, not a new atom type.
-    "linear_block": "linear_block", "flat_block": "linear_block",
-    "euclidean": "euclidean", "euclidean_patch": "euclidean",
-    "euclidean_quadratic_patch": "euclidean",
-    "duchon": "duchon",
-    "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
-    "cylinder": "cylinder",
-    # Per-atom evidence-raced topology discovery at fit entry (#2238): the
-    # Rust driver rewrites each "auto" atom to the concrete race winner.
-    "auto": "auto",
-}
-# Canonical / aliased basis kind -> canonical topology label.
-_BASIS_TO_TOPOLOGY = {
-    "periodic": "circle", "periodic_spline": "circle", "circle": "circle",
-    "sphere": "sphere", "torus": "torus",
-    "linear": "linear", "linear_rank1": "linear", "affine": "linear",
-    # linear_block reports its own topology label (it is a flat block, not a plain
-    # linear atom); the distinction is the orthonormal decoder frame + block gating.
-    "linear_block": "linear_block", "flat_block": "linear_block",
-    "duchon": "euclidean", "euclidean": "euclidean", "euclidean_patch": "euclidean",
-    "euclidean_quadratic_patch": "euclidean",
-    "poincare": "poincare", "hyperbolic": "poincare", "poincare_patch": "poincare",
-    "cylinder": "cylinder",
-    "auto": "auto",
-}
-
-
-def _basis_to_topology(basis: str) -> str:
-    """Canonical topology label for a (possibly aliased) basis kind."""
-    return _BASIS_TO_TOPOLOGY.get(_canon_name(basis), str(basis))
+def _basis_to_topology(basis: Any) -> str:
+    """Canonical topology label from the Rust-owned SAE semantic schema."""
+    return str(rust_module().sae_topology_for_basis(str(basis)))
 
 
 def _canonical_topology(name: str) -> str:
-    """Canonical topology label for a (possibly aliased) topology/basis string.
-
-    Resolves through the alias map to the basis kind, then to the canonical
-    topology, so e.g. ``"periodic"`` and ``"circle"`` both canonicalize to
-    ``"circle"``. Unknown (precomputed / caller-supplied) names pass through.
-    """
-    canon = _canon_name(name)
-    basis = _TOPOLOGY_TO_BASIS.get(canon, canon)
-    return _basis_to_topology(basis)
-
-
-#: The two block-gating modes for ``atom_topology="linear_block"`` (BSF-as-atom).
-#: ``norm_selection`` mirrors the BSF paper exactly — a block fires by its group ℓ2
-#: coordinate norm (amplitude-driven selection), mapped to the ``ibp_map``
-#: assignment. ``separate_gate`` is our reading — presence is a SEPARATE gate from
-#: amplitude — mapped to the ``threshold_gate`` (hard-sigmoid) assignment. Both are
-#: existing manifold-SAE assignment modes, so a linear_block atom races vs a curved
-#: atom under one framework with no new solver path. No coordinate shrinkage is
-#: applied beyond ARD (the flat block keeps its signed coordinates).
-_FLAT_BLOCK_GATING_TO_ASSIGNMENT = {
-    "norm_selection": "ibp_map",
-    "norm": "ibp_map",
-    "separate_gate": "threshold_gate",
-    "separate": "threshold_gate",
-}
+    """Canonical topology token from the Rust-owned SAE semantic schema."""
+    return str(rust_module().sae_canonical_topology(str(name)))
 
 
 def flat_block_assignment(gating: str) -> str:
@@ -3717,13 +3600,7 @@ def flat_block_assignment(gating: str) -> str:
     assignment=flat_block_assignment("norm_selection"))`` so the flat block and a
     curved atom race under ONE fit. Raises on an unknown mode.
     """
-    key = _canon_name(gating)
-    if key not in _FLAT_BLOCK_GATING_TO_ASSIGNMENT:
-        raise ValueError(
-            f"flat_block gating must be one of {sorted(set(_FLAT_BLOCK_GATING_TO_ASSIGNMENT))}; "
-            f"got {gating!r}"
-        )
-    return _FLAT_BLOCK_GATING_TO_ASSIGNMENT[key]
+    return str(rust_module().sae_flat_block_assignment(str(gating)))
 
 
 def _stagewise_to_manifold_sae_dict(
@@ -3835,7 +3712,7 @@ def _stagewise_to_manifold_sae_dict(
 
 def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     if atom_basis is None:
-        atom_basis = _TOPOLOGY_TO_BASIS.get(_canon_name(atom_topology), atom_topology)
+        atom_basis = rust_module().sae_basis_kind_for_topology(str(atom_topology))
     raw = [atom_basis] * k_atoms if isinstance(atom_basis, str) else list(atom_basis)
     if len(raw) != k_atoms:
         raise ValueError("atom_basis must provide one basis per atom")
@@ -3843,20 +3720,17 @@ def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
 
 
 def _topologies_for_bases(bases: list[str]) -> list[str]:
-    """Per-atom topology labels for a resolved bases list (``basis_specs`` order)."""
-    return [_basis_to_topology(b) for b in bases]
+    """Per-atom topology labels from the Rust-owned semantic schema."""
+    _scalar, per_atom = rust_module().sae_atom_topologies([str(b) for b in bases])
+    return [str(value) for value in per_atom]
 
 
 def _topology_for_bases(bases: list[str]) -> str:
-    """Collapse a resolved bases list to a single topology label for metadata.
-
-    When all atoms share one topology that common label is returned; when the
-    atoms span more than one topology the honest scalar is ``"mixed"`` and the
-    per-atom truth is exposed via ``atom_topologies`` (``basis_specs`` remains
-    the per-atom source of truth)."""
-    per_atom = _topologies_for_bases(bases)
-    first = per_atom[0]
-    return first if all(t == first for t in per_atom) else "mixed"
+    """Collapse resolved bases through the Rust-owned semantic schema."""
+    scalar, _per_atom = rust_module().sae_atom_topologies([str(b) for b in bases])
+    if scalar is None:
+        raise ValueError("a fitted SAE dictionary must contain at least one basis")
+    return str(scalar)
 
 
 def _schedule_payload(schedule: Any) -> dict[str, Any] | None:

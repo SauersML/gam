@@ -54,7 +54,7 @@
 //!   arXiv:1805.09112.
 //! * Hyperbolic-Mamba, arXiv:2505.18973 (2025).
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 
 use crate::manifold::{GeometryError, GeometryResult};
 
@@ -303,7 +303,8 @@ pub fn exp_origin(v: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
 /// The metric is the closed-form diagonal `g_p = lambda_p^2 I`; this is the
 /// single source of truth for that factor across all front-ends.
 pub fn conformal_factor(p: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<f64> {
-    require_negative_curvature(curvature)?;
+    let sqrt_negc = require_negative_curvature(curvature)?;
+    require_in_ball(p, sqrt_negc)?;
     let sq = p.iter().map(|x| x * x).sum::<f64>();
     Ok(2.0 / (1.0 + curvature * sq))
 }
@@ -509,6 +510,147 @@ pub fn log_map(
     let shifted = mobius_add(neg_p.view(), q, curvature)?;
     let log0 = log_origin(shifted.view(), curvature)?;
     Ok(log0.mapv(|x| (2.0 / lam) * x))
+}
+
+fn require_batch_width(
+    values: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    context: &'static str,
+) -> GeometryResult<()> {
+    if expected_dim == 0 {
+        return Err(GeometryError::InvalidPoint(
+            "Poincaré batch dimension must be at least one",
+        ));
+    }
+    if values.ncols() != expected_dim {
+        return Err(GeometryError::DimensionMismatch {
+            context,
+            expected: expected_dim,
+            got: values.ncols(),
+        });
+    }
+    Ok(())
+}
+
+fn require_same_batch_shape(
+    left: ArrayView2<'_, f64>,
+    right: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    context: &'static str,
+) -> GeometryResult<()> {
+    require_batch_width(left, expected_dim, context)?;
+    require_batch_width(right, expected_dim, context)?;
+    if left.nrows() != right.nrows() {
+        return Err(GeometryError::DimensionMismatch {
+            context,
+            expected: left.nrows(),
+            got: right.nrows(),
+        });
+    }
+    Ok(())
+}
+
+/// Batched Poincaré exponential map.  Each output row is exactly
+/// `exp_map(points.row(i), tangents.row(i), curvature)`, with descriptor width
+/// and row alignment validated once at the core boundary.
+pub fn exp_map_batch(
+    points: ArrayView2<'_, f64>,
+    tangents: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    curvature: f64,
+) -> GeometryResult<Array2<f64>> {
+    require_same_batch_shape(
+        points,
+        tangents,
+        expected_dim,
+        "Poincaré batched exponential",
+    )?;
+    let mut out = Array2::zeros(points.raw_dim());
+    for row in 0..points.nrows() {
+        let value = exp_map(points.row(row), tangents.row(row), curvature)?;
+        out.row_mut(row).assign(&value);
+    }
+    Ok(out)
+}
+
+/// Batched Poincaré logarithm map, paired row-for-row.
+pub fn log_map_batch(
+    points: ArrayView2<'_, f64>,
+    targets: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    curvature: f64,
+) -> GeometryResult<Array2<f64>> {
+    require_same_batch_shape(
+        points,
+        targets,
+        expected_dim,
+        "Poincaré batched logarithm",
+    )?;
+    let mut out = Array2::zeros(points.raw_dim());
+    for row in 0..points.nrows() {
+        let value = log_map(points.row(row), targets.row(row), curvature)?;
+        out.row_mut(row).assign(&value);
+    }
+    Ok(out)
+}
+
+/// Batched paired geodesic distances, one scalar per aligned row.
+pub fn distance_batch(
+    left: ArrayView2<'_, f64>,
+    right: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    curvature: f64,
+) -> GeometryResult<Array1<f64>> {
+    require_same_batch_shape(
+        left,
+        right,
+        expected_dim,
+        "Poincaré batched distance",
+    )?;
+    let mut out = Array1::zeros(left.nrows());
+    for row in 0..left.nrows() {
+        out[row] = poincare_distance(left.row(row), right.row(row), curvature)?;
+    }
+    Ok(out)
+}
+
+/// Project every row into the open Poincaré ball in one core call.
+pub fn project_into_ball_batch(
+    points: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    curvature: f64,
+) -> GeometryResult<Array2<f64>> {
+    require_batch_width(
+        points,
+        expected_dim,
+        "Poincaré batched ball projection",
+    )?;
+    let mut out = Array2::zeros(points.raw_dim());
+    for row in 0..points.nrows() {
+        let value = project_into_ball(points.row(row), curvature)?;
+        out.row_mut(row).assign(&value);
+    }
+    Ok(out)
+}
+
+/// Batched conformal metric tensors, shape `(n, dim, dim)`.  Metric assembly
+/// lives here with the validated conformal factor; front-ends never reconstruct
+/// `lambda² I` themselves.
+pub fn metric_tensor_batch(
+    points: ArrayView2<'_, f64>,
+    expected_dim: usize,
+    curvature: f64,
+) -> GeometryResult<Array3<f64>> {
+    require_batch_width(points, expected_dim, "Poincaré batched metric")?;
+    let mut out = Array3::zeros((points.nrows(), expected_dim, expected_dim));
+    for row in 0..points.nrows() {
+        let lambda = conformal_factor(points.row(row), curvature)?;
+        let diagonal = lambda * lambda;
+        for axis in 0..expected_dim {
+            out[[row, axis, axis]] = diagonal;
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1626,6 +1768,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn batched_primitives_match_scalar_core_row_for_row() {
+        let points = array![[0.0, 0.0], [0.1, -0.2], [-0.15, 0.05]];
+        let tangents = array![[0.2, 0.1], [-0.05, 0.08], [0.03, -0.07]];
+        let curvature = -1.0;
+        let exp = exp_map_batch(points.view(), tangents.view(), 2, curvature).unwrap();
+        let log = log_map_batch(points.view(), exp.view(), 2, curvature).unwrap();
+        let distance = distance_batch(points.view(), exp.view(), 2, curvature).unwrap();
+        let projected = project_into_ball_batch(points.view(), 2, curvature).unwrap();
+        let metric = metric_tensor_batch(points.view(), 2, curvature).unwrap();
+
+        for row in 0..points.nrows() {
+            let scalar_exp = exp_map(points.row(row), tangents.row(row), curvature).unwrap();
+            let scalar_log = log_map(points.row(row), exp.row(row), curvature).unwrap();
+            let scalar_distance =
+                poincare_distance(points.row(row), exp.row(row), curvature).unwrap();
+            let scalar_project = project_into_ball(points.row(row), curvature).unwrap();
+            let lambda = conformal_factor(points.row(row), curvature).unwrap();
+            assert_eq!(exp.row(row), scalar_exp.view());
+            assert_eq!(log.row(row), scalar_log.view());
+            assert_eq!(distance[row], scalar_distance);
+            assert_eq!(projected.row(row), scalar_project.view());
+            for i in 0..2 {
+                for j in 0..2 {
+                    assert_eq!(metric[[row, i, j]], if i == j { lambda * lambda } else { 0.0 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_primitives_enforce_descriptor_width_and_row_alignment() {
+        let two_rows = array![[0.0, 0.0], [0.1, 0.2]];
+        let one_row = array![[0.0, 0.0]];
+        assert!(exp_map_batch(two_rows.view(), one_row.view(), 2, -1.0).is_err());
+        assert!(distance_batch(two_rows.view(), two_rows.view(), 3, -1.0).is_err());
+        assert!(metric_tensor_batch(two_rows.view(), 0, -1.0).is_err());
+    }
+
+    #[test]
+    fn conformal_factor_rejects_nonfinite_and_out_of_ball_points() {
+        assert!(conformal_factor(array![f64::NAN, 0.0].view(), -1.0).is_err());
+        assert!(conformal_factor(array![1.0, 0.0].view(), -1.0).is_err());
+        assert!(conformal_factor(array![2.0, 0.0].view(), -1.0).is_err());
     }
 
     #[test]

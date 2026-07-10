@@ -2485,10 +2485,7 @@ struct SphereFlowMinimization {
 /// The derivative includes both the linear flow-Jacobian term and the
 /// moved-latitude whitening term:
 /// `∂Ã_k = L Dv_k + diag(0, -sin(lat̃) v_k,lat) Dφ`.
-fn sphere_whitened_boost_row(
-    theta: &[f64],
-    t: [f64; 2],
-) -> Option<([f64; 4], [[f64; 4]; 3])> {
+fn sphere_whitened_boost_row(theta: &[f64], t: [f64; 2]) -> Option<([f64; 4], [[f64; 4]; 3])> {
     let q = SphereBoostFlowBasis.dim();
     if theta.len() != q {
         return None;
@@ -3452,6 +3449,91 @@ mod sphere_defect_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Test-only finite-difference oracle for the complete production Jacobian:
+    /// boost flow, moved-latitude whitening, `AᵀA`, and the profiled-scale
+    /// projection. The perturbed residual uses each perturbation's own profiled
+    /// scale, so this catches the former fixed-scale Jacobian as well as a missing
+    /// whitening chain-rule term.
+    #[test]
+    fn sphere_profiled_residual_jacobian_matches_finite_difference_oracle() {
+        let row_coords = Array2::from_shape_vec(
+            (5, 2),
+            vec![-0.72, -1.1, -0.31, 0.8, 0.04, -0.2, 0.43, 1.7, 0.77, -2.0],
+        )
+        .expect("five sphere rows");
+        // Positive-definite, non-diagonal fitted metrics exercise all three
+        // symmetric entries and make the scale projection observable.
+        let ghat = vec![
+            [1.20, 0.82, 0.11],
+            [0.91, 1.31, -0.14],
+            [1.43, 0.73, 0.19],
+            [0.79, 1.18, 0.08],
+            [1.08, 0.96, -0.17],
+        ];
+        let ghat_norm_sq = ghat
+            .iter()
+            .map(|g| g[0] * g[0] + g[1] * g[1] + 2.0 * g[2] * g[2])
+            .sum::<f64>();
+        let theta = vec![0.07, -0.05, 0.04];
+        let state = sphere_eval_boost_defect(&theta, row_coords.view(), &ghat, ghat_norm_sq)
+            .expect("interior boost state");
+        let (residual, jacobian) =
+            sphere_boost_residual_jacobian(&theta, row_coords.view(), &ghat, ghat_norm_sq, &state)
+                .expect("analytic profiled residual Jacobian");
+
+        let profiled_residual = |trial: &[f64]| {
+            let trial_state =
+                sphere_eval_boost_defect(trial, row_coords.view(), &ghat, ghat_norm_sq)
+                    .expect("test perturbation remains in the sphere chart");
+            let mut out = Array2::<f64>::zeros((3 * ghat.len(), 1));
+            for (row, (a, g)) in trial_state.a_rows.iter().zip(ghat.iter()).enumerate() {
+                let m00 = a[0] * a[0] + a[2] * a[2];
+                let m11 = a[1] * a[1] + a[3] * a[3];
+                let m01 = a[0] * a[1] + a[2] * a[3];
+                out[[3 * row, 0]] = m00 - trial_state.scale * g[0];
+                out[[3 * row + 1, 0]] = m11 - trial_state.scale * g[1];
+                out[[3 * row + 2, 0]] = std::f64::consts::SQRT_2 * (m01 - trial_state.scale * g[2]);
+            }
+            out
+        };
+        let direct_residual = profiled_residual(&theta);
+        for row in 0..residual.nrows() {
+            assert_eq!(residual[[row, 0]], direct_residual[[row, 0]]);
+        }
+
+        let eps = 1.0e-6;
+        for k in 0..theta.len() {
+            let mut plus = theta.clone();
+            let mut minus = theta.clone();
+            plus[k] += eps;
+            minus[k] -= eps;
+            let r_plus = profiled_residual(&plus);
+            let r_minus = profiled_residual(&minus);
+            for row in 0..jacobian.nrows() {
+                let fd = (r_plus[[row, 0]] - r_minus[[row, 0]]) / (2.0 * eps);
+                let exact = jacobian[[row, k]];
+                let tolerance = 2.0e-7 * (1.0 + exact.abs());
+                assert!(
+                    (fd - exact).abs() <= tolerance,
+                    "profiled sphere residual row {row}, boost {k}: FD {fd:.12e}, analytic {exact:.12e}"
+                );
+            }
+
+            // Variable projection makes every residual-Jacobian column
+            // orthogonal to the stacked profiled metric direction.
+            let mut projection = 0.0_f64;
+            for (row, g) in ghat.iter().enumerate() {
+                projection += g[0] * jacobian[[3 * row, k]]
+                    + g[1] * jacobian[[3 * row + 1, k]]
+                    + std::f64::consts::SQRT_2 * g[2] * jacobian[[3 * row + 2, k]];
+            }
+            assert!(
+                projection.abs() <= 1.0e-10,
+                "profile projection failed for boost {k}: gᵀJ={projection:.12e}"
+            );
         }
     }
 

@@ -182,21 +182,6 @@ pub struct WorkingModelPirlsOptions {
     /// have to rediscover problem-specific damping at every accepted
     /// outer iterate.
     pub initial_lm_lambda: Option<f64>,
-    /// Enable the Transtrum-Sethna geodesic-acceleration second-order
-    /// correction on each accepted Levenberg-Marquardt step. When true,
-    /// after the standard LM direction `δp = −(H + λ_lm·diag(H))⁻¹ g`
-    /// is computed and accepted by the LM gain test, the solver computes
-    /// a finite-difference estimate of the directional second derivative
-    /// of the gradient along `δp`, solves a *second* linear system with
-    /// the same (already-factored) Hessian, and adds the correction
-    /// `δp₂` to the step only if `‖δp₂‖ ≤ α‖δp‖` (the Transtrum-Sethna
-    /// 2011 acceptance criterion, α = 0.75 here). The correction costs
-    /// two extra full `WorkingModel::update` calls per accepted step
-    /// (for the FD evaluations); it is most useful for fits whose
-    /// penalized Hessian is near-singular (latent-coordinate fits,
-    /// near-collinear bases). Default `false`; opt-in until validated
-    /// across the broader family of likelihoods and penalties.
-    pub geodesic_acceleration: bool,
     /// Optional arrow-Schur structured-inner-solve descriptor.
     ///
     /// When `Some`, every accepted LM Newton step inside the inner loop

@@ -33,9 +33,9 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use gam_problem::MetricProvenance;
+use gam_problem::{EstimationError, MetricProvenance};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
-use gam_solve::rho_optimizer::OuterProblem;
+use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
 use gam_solve::seeding::SeedConfig;
 use gam_solve::structure_search::{MoveBudget, StructureMove};
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
@@ -167,6 +167,137 @@ pub struct SaeFitReport {
     pub reported_log_alpha: f64,
 }
 
+/// Optimization phase that owns an SAE wall-survival checkpoint and convergence
+/// verdict. Structured phases include the configured pass count because their
+/// residual-metric damping `γ = pass / (total_passes + 1)` depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaeFitStage {
+    Primary,
+    StructuredResidual {
+        /// One-based pass number.
+        pass: usize,
+        total_passes: usize,
+    },
+}
+
+impl SaeFitStage {
+    fn checkpoint_tag(self) -> String {
+        match self {
+            Self::Primary => "primary".to_string(),
+            Self::StructuredResidual { pass, total_passes } => {
+                format!("structured-residual-{pass}-of-{total_passes}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SaeFitStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => f.write_str("primary"),
+            Self::StructuredResidual { pass, total_passes } => {
+                write!(f, "structured-residual pass {pass}/{total_passes}")
+            }
+        }
+    }
+}
+
+/// Typed failure from [`run_sae_manifold_fit`]. A non-converged outer run keeps
+/// the complete [`OuterResult`] as machine-readable evidence; it is never
+/// flattened into a message or converted into a fit.
+#[derive(Debug)]
+pub enum SaeFitError {
+    Fit(String),
+    OuterRun {
+        stage: SaeFitStage,
+        source: EstimationError,
+    },
+    OuterDidNotConverge {
+        stage: SaeFitStage,
+        result: Box<OuterResult>,
+    },
+}
+
+impl From<String> for SaeFitError {
+    fn from(message: String) -> Self {
+        Self::Fit(message)
+    }
+}
+
+impl std::fmt::Display for SaeFitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fit(message) => f.write_str(message),
+            Self::OuterRun { stage, source } => {
+                write!(f, "SAE manifold {stage} outer search failed: {source}")
+            }
+            Self::OuterDidNotConverge { stage, result } => {
+                let grad = result
+                    .final_grad_norm
+                    .map(|value| format!("{value:.6e}"))
+                    .unwrap_or_else(|| "unmeasured".to_string());
+                write!(
+                    f,
+                    "SAE manifold {stage} outer search stopped without a stationarity \
+                     certificate (iterations={}, final_value={:.6e}, final_grad_norm={}, \
+                     plan={}, stop_reason={:?}, rho_checkpoint={:?}); refusing to mint a fit",
+                    result.iterations,
+                    result.final_value,
+                    grad,
+                    result.plan_used,
+                    result.operator_stop_reason,
+                    result.rho,
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SaeFitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OuterRun { source, .. } => Some(source),
+            Self::Fit(_) | Self::OuterDidNotConverge { .. } => None,
+        }
+    }
+}
+
+/// Give each fit phase its own checkpoint address. The target/K fingerprint
+/// still verifies the payload; the phase tag prevents a structured-metric state
+/// from being installed into the primary Euclidean objective, and includes the
+/// total pass count because it determines the structured damping schedule.
+pub(crate) fn scope_outer_checkpoint_to_stage(
+    objective: &mut SaeManifoldOuterObjective,
+    stage: SaeFitStage,
+) {
+    let mut path =
+        super::checkpoint::SaeFitCheckpoint::default_store_path(&objective.checkpoint_fingerprint);
+    path.set_file_name(format!(
+        "{}.{}.json",
+        objective.checkpoint_fingerprint.content_hash,
+        stage.checkpoint_tag(),
+    ));
+    objective.checkpoint_path = path;
+}
+
+/// Ownership gate for fit-producing outer phases. The objective is returned
+/// only with a converged [`OuterResult`]; otherwise it is dropped without
+/// checkpoint cleanup and the complete verdict is retained in a typed error.
+pub(crate) fn certify_outer_stage(
+    objective: SaeManifoldOuterObjective,
+    stage: SaeFitStage,
+    run_result: Result<OuterResult, EstimationError>,
+) -> Result<SaeManifoldOuterObjective, SaeFitError> {
+    match run_result {
+        Ok(result) if result.converged => Ok(objective),
+        Ok(result) => Err(SaeFitError::OuterDidNotConverge {
+            stage,
+            result: Box::new(result),
+        }),
+        Err(source) => Err(SaeFitError::OuterRun { stage, source }),
+    }
+}
+
 /// Fully typed request for the single SAE-manifold fit entry.
 ///
 /// Seed construction is deliberately outside this type: callers build and
@@ -212,7 +343,7 @@ pub struct SaeFitRequest {
 ///   default-off `promote_from_residual` path.
 /// * `cancel`, when present, is polled by every inner objective; the caller sets
 ///   it on interrupt so the abandoned worker's next outer eval bails.
-pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, String> {
+pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
     let SaeFitRequest {
         base_term,
         target: z,
@@ -262,11 +393,12 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
         ridge_ext_coord,
         ridge_beta,
     );
+    scope_outer_checkpoint_to_stage(&mut objective, SaeFitStage::Primary);
     // #1026 — "normal SAE" entry: a single seed (the PCA decoder-projection
     // seed already installed on the term) with NO ρ-multistart. seed_budget=1 +
     // max_seeds=1 collapses the cascade to the single initial ρ.
     objective.set_cancel_flag(Arc::clone(&cancel_flag));
-    let run_result: Result<(), String> = if run_outer_rho_search {
+    let mut objective = if run_outer_rho_search {
         // #2241 — do not tune convergence to a workload's observed criterion
         // creep and do not return merely because an iteration budget expired.
         // SAE's Fellner–Schall lane carries a typed recurrent-incumbent
@@ -289,19 +421,12 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
                 seed_budget: 1,
                 ..Default::default()
             });
-        match problem.run(&mut objective, "SAE manifold") {
-            Ok(result) if result.converged => Ok(()),
-            Ok(result) => Err(format!(
-                "SAE manifold outer search exhausted its solver without a stationarity \
-                 certificate (iterations={}, final_value={:.6e}); refusing to mint a fit",
-                result.iterations, result.final_value,
-            )),
-            Err(err) => Err(err.to_string()),
-        }
+        let run_result = problem.run(&mut objective, "SAE manifold");
+        certify_outer_stage(objective, SaeFitStage::Primary, run_result)?
     } else {
-        objective.fit_at_fixed_rho(init_rho_flat.view())
+        objective.fit_at_fixed_rho(init_rho_flat.view())?;
+        objective
     };
-    run_result?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
@@ -399,11 +524,23 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
                 ridge_ext_coord,
                 ridge_beta,
             );
+            let stage = SaeFitStage::StructuredResidual {
+                pass: pass + 1,
+                total_passes: structured_passes,
+            };
+            scope_outer_checkpoint_to_stage(&mut objective, stage);
             // #2021 — a promotion (below) grows K, enlarging ρ; size the outer
             // problem from the CURRENT warm vector, not the pass-0 `n_params`
             // (identical to `n_params` when no birth has occurred).
-            let problem = OuterProblem::new(warm_flat.len())
-                .with_initial_rho(warm_flat)
+            // Resume only the checkpoint for this exact structured phase. Earlier
+            // phases have already been deterministically rebuilt on this run;
+            // their distinct files cannot leak a differently-whitened state here.
+            let search_init_rho = match objective.try_resume_from_checkpoint(warm_flat.len()) {
+                Some(banked) => ndarray::Array1::from(banked),
+                None => warm_flat,
+            };
+            let problem = OuterProblem::new(search_init_rho.len())
+                .with_initial_rho(search_init_rho)
                 .with_seed_config(SeedConfig {
                     max_seeds: 1,
                     seed_budget: 1,
@@ -411,25 +548,12 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, Stri
                 });
             // #2138 — same shared cancel flag; each pass's objective polls it.
             objective.set_cancel_flag(Arc::clone(&cancel_flag));
-            // SPEC 20 — same discipline as the primary path above: a fit is
-            // minted only from a CONVERGED outer run. Non-convergence is a
-            // typed error and the wall-survival checkpoint is left in place
-            // for resume (`remove_checkpoint` below is only reached on the
-            // converged path).
-            match problem.run(&mut objective, "SAE manifold (structured)") {
-                Ok(result) if result.converged => {}
-                Ok(result) => {
-                    return Err(format!(
-                        "SAE manifold structured-residual pass {} exhausted its solver \
-                         without a stationarity certificate (iterations={}, \
-                         final_value={:.6e}); refusing to mint a fit",
-                        pass + 1,
-                        result.iterations,
-                        result.final_value,
-                    ));
-                }
-                Err(err) => return Err(err.to_string()),
-            }
+            // SPEC 20 — possession of the objective below is itself the
+            // convergence certificate: `certify_outer_stage` returns it only for
+            // `OuterResult.converged`, and drops it without removing its
+            // phase-scoped checkpoint for every typed failure.
+            let run_result = problem.run(&mut objective, "SAE manifold (structured)");
+            let mut objective = certify_outer_stage(objective, stage, run_result)?;
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;

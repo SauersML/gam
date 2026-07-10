@@ -154,6 +154,27 @@ fn sae_build_atom_plans(
                     basis_size,
                 });
             }
+            SaeAtomBasisKind::Mobius => {
+                // Möbius band (#2240) is a first-class SEEDABLE kind: the
+                // deck-invariant double-cover layout is fixed by the production
+                // convention, so the plan needs no centers — just the width.
+                if d != 2 {
+                    return Err(format!(
+                        "sae_build_atom_plans: atom {atom_idx} basis 'mobius' requires atom_dim == 2, got {d}"
+                    ));
+                }
+                let evaluator = MobiusHarmonicEvaluator::new(
+                    SAE_MOBIUS_CIRCLE_HARMONICS,
+                    SAE_MOBIUS_WIDTH_DEGREE,
+                )?;
+                plans.push(SaeAtomBuildPlan {
+                    kind: SaeAtomBasisKind::Mobius,
+                    latent_dim: 2,
+                    n_harmonics: SAE_MOBIUS_CIRCLE_HARMONICS,
+                    duchon_centers: None,
+                    basis_size: evaluator.basis_size(),
+                });
+            }
             SaeAtomBasisKind::Cylinder => {
                 // A cylinder atom is not SEEDED through `sae_manifold_fit_minimal`:
                 // it arises only by EVIDENCE, when the #977 birth topology race

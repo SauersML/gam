@@ -17,6 +17,16 @@ pub enum GeometryError {
     /// not silently fall back to a wrong default (e.g. a curved-manifold VJP
     /// for which no closed form is wired up yet).
     Unsupported(&'static str),
+    /// An iterative geometry primitive exhausted or stalled without satisfying
+    /// its analytic first-order certificate. The evidence is carried in the
+    /// error so callers can distinguish non-convergence from invalid geometry
+    /// and inspect the achieved residual rather than receiving a partial point.
+    NonConvergence {
+        context: &'static str,
+        iterations: usize,
+        residual: f64,
+        tolerance: f64,
+    },
 }
 
 impl fmt::Display for GeometryError {
@@ -30,6 +40,16 @@ impl fmt::Display for GeometryError {
             Self::InvalidPoint(message) => write!(f, "invalid manifold point: {message}"),
             Self::Singular(message) => write!(f, "singular geometry operation: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported geometry operation: {message}"),
+            Self::NonConvergence {
+                context,
+                iterations,
+                residual,
+                tolerance,
+            } => write!(
+                f,
+                "{context} did not converge after {iterations} iterations: \
+                 stationarity residual {residual:.6e} exceeds tolerance {tolerance:.6e}"
+            ),
         }
     }
 }

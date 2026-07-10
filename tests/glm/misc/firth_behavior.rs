@@ -86,7 +86,6 @@ fn fit_beta_norm(
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
         initial_lm_lambda: None,
-        geodesic_acceleration: false,
         arrow_schur: None,
     };
     let offset = Array1::<f64>::zeros(y.len());
@@ -389,7 +388,6 @@ fn fit_deviance(
         convergence_tolerance: 1e-10,
         firth_bias_reduction: firth,
         initial_lm_lambda: None,
-        geodesic_acceleration: false,
         arrow_schur: None,
     };
     let offset = Array1::<f64>::zeros(y.len());

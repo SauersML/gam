@@ -371,8 +371,15 @@ struct FilterPass {
     steps: Vec<FilterStep>,
     /// Σ over proper steps of `log F̃_t` (innovation variances at σ²=1).
     sum_log_f: f64,
+    /// First and second analytic derivatives of `sum_log_f` with respect to
+    /// `rho = log lambda` (`q = exp(-rho)`).
+    sum_log_f_d1: f64,
+    sum_log_f_d2: f64,
     /// Σ over proper steps of `v_t² / F̃_t`.
     sum_v2_over_f: f64,
+    /// First and second analytic `rho` derivatives of `sum_v2_over_f`.
+    sum_v2_over_f_d1: f64,
+    sum_v2_over_f_d2: f64,
     /// Number of proper (non-diffuse) innovations.
     n_proper: usize,
 }
@@ -385,26 +392,43 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
     // diffuse rank starts at `order`, consumed by the first `order` distinct
     // abscissae.
     let mut a: Vec2 = [0.0; MAX_ORDER];
+    let mut a_d1: Vec2 = [0.0; MAX_ORDER];
+    let mut a_d2: Vec2 = [0.0; MAX_ORDER];
     let mut p_star: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
+    let mut p_star_d1: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
+    let mut p_star_d2: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
     let mut p_inf: Mat2 = [[0.0; MAX_ORDER]; MAX_ORDER];
     for i in 0..order {
         p_inf[i][i] = 1.0;
     }
     let mut diffuse_rank = order;
     let mut sum_log_f = 0.0;
+    let mut sum_log_f_d1 = 0.0;
+    let mut sum_log_f_d2 = 0.0;
     let mut sum_v2_over_f = 0.0;
+    let mut sum_v2_over_f_d1 = 0.0;
+    let mut sum_v2_over_f_d2 = 0.0;
     let mut n_proper = 0usize;
     for t in 0..n {
         let a_pred = a;
         let p_pred = p_star;
         let r = 1.0 / nodes[t].w;
         let v = nodes[t].y - a[0];
+        let v_d1 = -a_d1[0];
+        let v_d2 = -a_d2[0];
         // H = [1 0 … 0] ⇒ M = P·H' is the first column, F = M[0] (+ r).
         let mut m_star: Vec2 = [0.0; MAX_ORDER];
+        let mut m_star_d1: Vec2 = [0.0; MAX_ORDER];
+        let mut m_star_d2: Vec2 = [0.0; MAX_ORDER];
         for i in 0..order {
             m_star[i] = p_star[i][0];
+            m_star_d1[i] = p_star_d1[i][0];
+            m_star_d2[i] = p_star_d2[i][0];
         }
         let f_star = m_star[0] + r;
+        let f_star_d1 = m_star_d1[0];
+        let f_star_d2 = m_star_d2[0];
+        let mut proper_update = diffuse_rank == 0;
         if diffuse_rank > 0 {
             let mut m_inf: Vec2 = [0.0; MAX_ORDER];
             for i in 0..order {
@@ -416,17 +440,32 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                 // standard update; the diffuse step contributes −½·log F_∞ to
                 // the restricted likelihood and consumes one diffuse dimension.
                 for i in 0..order {
-                    a[i] += (m_inf[i] / f_inf) * v;
+                    let k_inf = m_inf[i] / f_inf;
+                    a[i] += k_inf * v;
+                    a_d1[i] += k_inf * v_d1;
+                    a_d2[i] += k_inf * v_d2;
                 }
                 let mut p_new = p_star;
+                let mut p_new_d1 = p_star_d1;
+                let mut p_new_d2 = p_star_d2;
                 for i in 0..order {
                     for j in 0..order {
                         p_new[i][j] += -m_inf[i] * m_star[j] / f_inf - m_star[i] * m_inf[j] / f_inf
                             + m_inf[i] * m_inf[j] * f_star / (f_inf * f_inf);
+                        p_new_d1[i][j] += -m_inf[i] * m_star_d1[j] / f_inf
+                            - m_star_d1[i] * m_inf[j] / f_inf
+                            + m_inf[i] * m_inf[j] * f_star_d1 / (f_inf * f_inf);
+                        p_new_d2[i][j] += -m_inf[i] * m_star_d2[j] / f_inf
+                            - m_star_d2[i] * m_inf[j] / f_inf
+                            + m_inf[i] * m_inf[j] * f_star_d2 / (f_inf * f_inf);
                     }
                 }
                 p_star = p_new;
+                p_star_d1 = p_new_d1;
+                p_star_d2 = p_new_d2;
                 symmetrize(&mut p_star, order);
+                symmetrize(&mut p_star_d1, order);
+                symmetrize(&mut p_star_d2, order);
                 for i in 0..order {
                     for j in 0..order {
                         p_inf[i][j] -= m_inf[i] * m_inf[j] / f_inf;
@@ -438,39 +477,76 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
                     p_inf = [[0.0; MAX_ORDER]; MAX_ORDER];
                 }
             } else {
-                // Diffuse direction orthogonal to H at this node: ordinary
-                // proper update with P* (F_∞ = 0 ⇒ standard Kalman step).
-                if f_star <= INNOVATION_VAR_FLOOR {
-                    return Err("spline scan: non-positive innovation variance".to_string());
-                }
-                for i in 0..order {
-                    a[i] += (m_star[i] / f_star) * v;
-                }
-                for i in 0..order {
-                    for j in 0..order {
-                        p_star[i][j] -= m_star[i] * m_star[j] / f_star;
-                    }
-                }
-                symmetrize(&mut p_star, order);
-                sum_log_f += f_star.ln();
-                sum_v2_over_f += v * v / f_star;
-                n_proper += 1;
+                // Diffuse direction orthogonal to H: this observation is an
+                // ordinary proper update of P* even though diffuse rank remains.
+                proper_update = true;
             }
-        } else {
+        }
+        if proper_update {
             if f_star <= INNOVATION_VAR_FLOOR {
                 return Err("spline scan: non-positive innovation variance".to_string());
             }
+            let inv_f = 1.0 / f_star;
+            let inv_f2 = inv_f * inv_f;
+            let inv_f3 = inv_f2 * inv_f;
+            let mut gain = [0.0; MAX_ORDER];
+            let mut gain_d1 = [0.0; MAX_ORDER];
+            let mut gain_d2 = [0.0; MAX_ORDER];
             for i in 0..order {
-                a[i] += (m_star[i] / f_star) * v;
+                gain[i] = m_star[i] * inv_f;
+                gain_d1[i] = m_star_d1[i] * inv_f - m_star[i] * f_star_d1 * inv_f2;
+                gain_d2[i] = m_star_d2[i] * inv_f
+                    - 2.0 * m_star_d1[i] * f_star_d1 * inv_f2
+                    - m_star[i] * f_star_d2 * inv_f2
+                    + 2.0 * m_star[i] * f_star_d1 * f_star_d1 * inv_f3;
             }
+            let a_old_d1 = a_d1;
+            let a_old_d2 = a_d2;
+            for i in 0..order {
+                a[i] += gain[i] * v;
+                a_d1[i] = a_old_d1[i] + gain_d1[i] * v + gain[i] * v_d1;
+                a_d2[i] = a_old_d2[i]
+                    + gain_d2[i] * v
+                    + 2.0 * gain_d1[i] * v_d1
+                    + gain[i] * v_d2;
+            }
+            let mut p_new = p_star;
+            let mut p_new_d1 = p_star_d1;
+            let mut p_new_d2 = p_star_d2;
             for i in 0..order {
                 for j in 0..order {
-                    p_star[i][j] -= m_star[i] * m_star[j] / f_star;
+                    let mm = m_star[i] * m_star[j];
+                    let mm_d1 = m_star_d1[i] * m_star[j] + m_star[i] * m_star_d1[j];
+                    let mm_d2 = m_star_d2[i] * m_star[j]
+                        + 2.0 * m_star_d1[i] * m_star_d1[j]
+                        + m_star[i] * m_star_d2[j];
+                    p_new[i][j] -= mm * inv_f;
+                    p_new_d1[i][j] -= mm_d1 * inv_f - mm * f_star_d1 * inv_f2;
+                    p_new_d2[i][j] -= mm_d2 * inv_f
+                        - 2.0 * mm_d1 * f_star_d1 * inv_f2
+                        - mm * f_star_d2 * inv_f2
+                        + 2.0 * mm * f_star_d1 * f_star_d1 * inv_f3;
                 }
             }
+            p_star = p_new;
+            p_star_d1 = p_new_d1;
+            p_star_d2 = p_new_d2;
             symmetrize(&mut p_star, order);
+            symmetrize(&mut p_star_d1, order);
+            symmetrize(&mut p_star_d2, order);
+
+            let vv = v * v;
+            let vv_d1 = 2.0 * v * v_d1;
+            let vv_d2 = 2.0 * (v_d1 * v_d1 + v * v_d2);
             sum_log_f += f_star.ln();
-            sum_v2_over_f += v * v / f_star;
+            sum_log_f_d1 += f_star_d1 * inv_f;
+            sum_log_f_d2 += f_star_d2 * inv_f - f_star_d1 * f_star_d1 * inv_f2;
+            sum_v2_over_f += vv * inv_f;
+            sum_v2_over_f_d1 += vv_d1 * inv_f - vv * f_star_d1 * inv_f2;
+            sum_v2_over_f_d2 += vv_d2 * inv_f
+                - 2.0 * vv_d1 * f_star_d1 * inv_f2
+                - vv * f_star_d2 * inv_f2
+                + 2.0 * vv * f_star_d1 * f_star_d1 * inv_f3;
             n_proper += 1;
         }
         steps.push(FilterStep {
@@ -484,13 +560,31 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
             let delta = nodes[t + 1].x - nodes[t].x;
             let f_t = transition(delta, order);
             a = mat_vec(&f_t, &a, order);
+            a_d1 = mat_vec(&f_t, &a_d1, order);
+            a_d2 = mat_vec(&f_t, &a_d2, order);
+            let f_t_t = mat_t(&f_t, order);
+            let q_noise = process_noise(delta, q, order);
             let mut p_next = mat_add(
-                &mat_mul(&mat_mul(&f_t, &p_star, order), &mat_t(&f_t, order), order),
-                &process_noise(delta, q, order),
+                &mat_mul(&mat_mul(&f_t, &p_star, order), &f_t_t, order),
+                &q_noise,
+                order,
+            );
+            let mut p_next_d1 = mat_sub(
+                &mat_mul(&mat_mul(&f_t, &p_star_d1, order), &f_t_t, order),
+                &q_noise,
+                order,
+            );
+            let mut p_next_d2 = mat_add(
+                &mat_mul(&mat_mul(&f_t, &p_star_d2, order), &f_t_t, order),
+                &q_noise,
                 order,
             );
             symmetrize(&mut p_next, order);
+            symmetrize(&mut p_next_d1, order);
+            symmetrize(&mut p_next_d2, order);
             p_star = p_next;
+            p_star_d1 = p_next_d1;
+            p_star_d2 = p_next_d2;
             if diffuse_rank > 0 {
                 let mut pi_next =
                     mat_mul(&mat_mul(&f_t, &p_inf, order), &mat_t(&f_t, order), order);
@@ -502,7 +596,11 @@ fn run_filter(nodes: &[PooledNode], q: f64, order: usize) -> Result<FilterPass, 
     Ok(FilterPass {
         steps,
         sum_log_f,
+        sum_log_f_d1,
+        sum_log_f_d2,
         sum_v2_over_f,
+        sum_v2_over_f_d1,
+        sum_v2_over_f_d2,
         n_proper,
     })
 }
@@ -616,14 +714,17 @@ fn pool_nodes(
     Ok((nodes, ssr_within, n))
 }
 
-/// Concentrated diffuse restricted log-likelihood at `log λ` (σ² profiled).
-fn concentrated_criterion(
+/// Concentrated diffuse restricted log-likelihood and its exact first two
+/// derivatives with respect to `log λ` (σ² profiled). The derivatives are
+/// propagated through the same diffuse Kalman recursion as the value; no
+/// finite differencing or surrogate objective is involved.
+fn concentrated_criterion_jet(
     nodes: &[PooledNode],
     ssr_within: f64,
     n_obs: usize,
     log_lambda: f64,
     order: usize,
-) -> Result<f64, String> {
+) -> Result<(f64, f64, f64), String> {
     let pass = run_filter(nodes, (-log_lambda).exp(), order)?;
     // Profiled σ̂² over the proper innovations plus within-tie residuals;
     // the restricted degrees of freedom subtract the diffuse dimension `order`.
@@ -640,7 +741,26 @@ fn concentrated_criterion(
             pass.n_proper
         ));
     }
-    Ok(-0.5 * (pass.sum_log_f + dof * sigma2.ln()))
+    let rss_d1 = pass.sum_v2_over_f_d1;
+    let rss_d2 = pass.sum_v2_over_f_d2;
+    let rss_log_d1 = rss_d1 / rss;
+    let rss_log_d2 = rss_d2 / rss - rss_log_d1 * rss_log_d1;
+    Ok((
+        -0.5 * (pass.sum_log_f + dof * sigma2.ln()),
+        -0.5 * (pass.sum_log_f_d1 + dof * rss_log_d1),
+        -0.5 * (pass.sum_log_f_d2 + dof * rss_log_d2),
+    ))
+}
+
+/// Value-only diagnostic surface retained for fixed-λ callers and tests.
+fn concentrated_criterion(
+    nodes: &[PooledNode],
+    ssr_within: f64,
+    n_obs: usize,
+    log_lambda: f64,
+    order: usize,
+) -> Result<f64, String> {
+    Ok(concentrated_criterion_jet(nodes, ssr_within, n_obs, log_lambda, order)?.0)
 }
 
 /// Exact diffuse smoother for the `order−1` partially-diffuse leading nodes
@@ -1398,6 +1518,40 @@ impl SplineScanFit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concentrated_score_jet_matches_test_only_differences() {
+        let x = [0.0, 0.07, 0.19, 0.41, 0.41, 0.68, 1.0, 1.37];
+        let y = [0.2, -0.4, 0.8, 0.1, 0.35, -0.2, 0.7, 0.15];
+        let w = [1.0, 2.0, 0.7, 1.4, 0.9, 3.0, 1.2, 0.8];
+        for order in 1..=MAX_ORDER {
+            let (nodes, within, n_obs) = pool_nodes(&x, &y, &w, order).expect("pooled data");
+            for &rho in &[-4.0, -0.3, 2.5] {
+                let (value, d1, d2) =
+                    concentrated_criterion_jet(&nodes, within, n_obs, rho, order)
+                        .expect("analytic score jet");
+                // Finite differences are deliberately confined to this oracle
+                // test; production selection uses the analytic sensitivities.
+                let h = 2.0e-4;
+                let fm = concentrated_criterion(&nodes, within, n_obs, rho - h, order)
+                    .expect("left score");
+                let fp = concentrated_criterion(&nodes, within, n_obs, rho + h, order)
+                    .expect("right score");
+                let d1_fd = (fp - fm) / (2.0 * h);
+                let d2_fd = (fp - 2.0 * value + fm) / (h * h);
+                let d1_scale = 1.0 + d1.abs().max(d1_fd.abs());
+                let d2_scale = 1.0 + d2.abs().max(d2_fd.abs());
+                assert!(
+                    (d1 - d1_fd).abs() <= 2.0e-6 * d1_scale,
+                    "order={order} rho={rho}: analytic d1={d1}, FD={d1_fd}"
+                );
+                assert!(
+                    (d2 - d2_fd).abs() <= 2.0e-4 * d2_scale,
+                    "order={order} rho={rho}: analytic d2={d2}, FD={d2_fd}"
+                );
+            }
+        }
+    }
 
     /// #1034 persistence seam: snapshot → JSON → restore must replay the
     /// Gaussian bridge bit-for-bit — knot posteriors, off-knot bridge,

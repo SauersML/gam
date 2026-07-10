@@ -135,7 +135,6 @@ fn fit_at_rho(
         convergence_tolerance: 1e-12,
         firth_bias_reduction: false,
         initial_lm_lambda: None,
-        geodesic_acceleration: false,
         arrow_schur: None,
     };
     let (result, _working) = fit_model_for_fixed_rho(

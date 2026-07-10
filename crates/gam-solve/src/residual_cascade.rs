@@ -409,9 +409,63 @@ pub struct RefinementCertificate {
     pub next_level_gain_bound: f64,
     /// The absolute tolerance it was compared against (`REFINE_TOL·rss_pen`).
     pub tolerance: f64,
-    /// True when refinement stopped because the net produced no new centers
-    /// or a cap was reached rather than because the bound passed.
-    pub exhausted: bool,
+}
+
+/// A structural limit that prevented the cascade from assessing or adding the
+/// next resolution level. These are never convergence certificates: if the
+/// requested gain tolerance has not passed, they produce
+/// [`ResidualCascadeError::Underresolved`] instead of a fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefinementObstruction {
+    /// The representation reached its supported maximum number of levels.
+    LevelCapacity {
+        levels: usize,
+        maximum_levels: usize,
+    },
+    /// Extending the nested net would exceed its supported center capacity.
+    CenterCapacity {
+        centers: usize,
+        maximum_centers: usize,
+    },
+}
+
+impl std::fmt::Display for RefinementObstruction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::LevelCapacity {
+                levels,
+                maximum_levels,
+            } => write!(
+                f,
+                "level capacity reached ({levels} of {maximum_levels} levels)"
+            ),
+            Self::CenterCapacity {
+                centers,
+                maximum_centers,
+            } => write!(
+                f,
+                "center capacity exceeded ({centers} centers for capacity {maximum_centers})"
+            ),
+        }
+    }
+}
+
+/// Result of assessing the candidate level immediately finer than a fitted
+/// design. Empty-net exhaustion is distinct from representation capacity:
+/// only the former proves that the remaining gain is exactly zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NextLevelAssessment {
+    /// The nested net produced no new centers, so the next-level gain is zero.
+    EmptyNet,
+    /// The complete candidate level was assessed and has this gain bound.
+    GainBound(f64),
+    /// A representation limit was reached. `gain_bound` is the computed bound
+    /// when the candidate could be assessed (level capacity), and positive
+    /// infinity when center capacity prevented a complete assessment.
+    CapacityExceeded {
+        obstruction: RefinementObstruction,
+        gain_bound: f64,
+    },
 }
 
 /// Multiresolution residual-cascade design: nested nets, sparse design,
@@ -445,6 +499,103 @@ pub struct ResidualCascadeFit {
     /// Present when the fit came from the refinement loop.
     pub refinement: Option<RefinementCertificate>,
 }
+
+/// Opaque work checkpoint carried by an underresolved cascade result.
+///
+/// The current finite-resolution iterate is deliberately private: callers can
+/// inspect its numerical evidence, but cannot turn an uncertified iterate into
+/// a [`ResidualCascadeFit`]. The retained design and coefficients allow a
+/// future refinement backend to resume the work without minting a partial fit.
+pub struct ResidualCascadeCheckpoint {
+    iterate: ResidualCascadeFit,
+}
+
+impl ResidualCascadeCheckpoint {
+    fn new(iterate: ResidualCascadeFit) -> Self {
+        Self { iterate }
+    }
+
+    /// Number of levels already fitted in this checkpoint.
+    pub fn num_levels(&self) -> usize {
+        self.iterate.num_levels()
+    }
+
+    /// Number of centers already fitted in this checkpoint.
+    pub fn num_centers(&self) -> usize {
+        self.iterate.num_centers()
+    }
+
+    /// REML-selected log smoothing parameter of the retained iterate.
+    pub fn log_lambda(&self) -> f64 {
+        self.iterate.log_lambda
+    }
+
+    /// Penalized residual used to scale the requested refinement tolerance.
+    pub fn rss_pen(&self) -> f64 {
+        self.iterate.rss_pen
+    }
+
+    /// Linear-solve evidence attached to the retained iterate.
+    pub fn certificate(&self) -> CascadeCertificate {
+        self.iterate.certificate
+    }
+}
+
+impl std::fmt::Debug for ResidualCascadeCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResidualCascadeCheckpoint")
+            .field("num_levels", &self.num_levels())
+            .field("num_centers", &self.num_centers())
+            .field("log_lambda", &self.log_lambda())
+            .field("rss_pen", &self.rss_pen())
+            .field("certificate", &self.certificate())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Typed failure of the magic-default cascade fit.
+#[derive(Debug)]
+pub enum ResidualCascadeError {
+    /// Invalid input or a numerical failure in design construction/optimization.
+    Computation(String),
+    /// Refinement could not meet its requested tolerance before a structural
+    /// capacity was reached. The checkpoint preserves all completed work while
+    /// remaining unusable as a public fit.
+    Underresolved {
+        checkpoint: ResidualCascadeCheckpoint,
+        gain_bound: f64,
+        requested_tolerance: f64,
+        obstruction: RefinementObstruction,
+    },
+}
+
+impl From<String> for ResidualCascadeError {
+    fn from(reason: String) -> Self {
+        Self::Computation(reason)
+    }
+}
+
+impl std::fmt::Display for ResidualCascadeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Computation(reason) => f.write_str(reason),
+            Self::Underresolved {
+                checkpoint,
+                gain_bound,
+                requested_tolerance,
+                obstruction,
+            } => write!(
+                f,
+                "residual cascade underresolved after {} levels: next-level gain bound \
+                 {gain_bound:.6e} exceeds requested tolerance {requested_tolerance:.6e}; \
+                 {obstruction}",
+                checkpoint.num_levels()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResidualCascadeError {}
 
 /// One resolution level's geometry in a persisted snapshot: the data needed to
 /// rebuild a [`Level`] (its lookup grid, bumps, and column block) without the
@@ -1205,8 +1356,8 @@ fn extend_net(
     // level `l`. At fine levels below the data spacing that is an explosion
     // (every sub-data-spacing cell of the whole domain becomes a synthetic
     // center), which is unbounded work the caller never needs: once the net
-    // crosses `MAX_CENTERS` the build path errors and the auto-route
-    // refinement (`next_level_gain_bound`) treats it as "stop refining". So
+    // crosses `MAX_CENTERS` the build path errors and the auto-route's typed
+    // next-level assessment reports center-capacity underresolution. So
     // cap the fill IN the loop — stop planting synthetic centers the moment
     // the net exceeds the cap rather than materializing the entire fine-level
     // box first. Coarse levels (few cells, never near the cap) keep the full
@@ -1753,25 +1904,39 @@ impl ResidualCascadeDesign {
         self.fit_at_with_warm(0.5 * (lo + hi), None, Some(warm))
     }
 
-    /// Exact upper bound on the penalized-objective decrease available from
-    /// appending the candidate level L+1 at this fit's λ:
-    /// `‖X₂'W r̂‖² / (λ·d_{L+1})` (see the module header for the Schur-
-    /// complement argument). Returns `None` when the net is exhausted (no new
-    /// centers — every data point is already a center).
-    pub fn next_level_gain_bound(&self, fit: &ResidualCascadeFit) -> Result<Option<f64>, String> {
+    /// Assess the candidate level L+1 at this fit's λ. A complete candidate
+    /// reports the exact upper bound `‖X₂'W r̂‖² / (λ·d_{L+1})` on its
+    /// penalized-objective decrease (see the module header for the Schur-
+    /// complement argument). Empty-net exhaustion and representation capacity
+    /// are different typed outcomes because only an empty net certifies zero
+    /// remaining gain.
+    pub fn assess_next_level(
+        &self,
+        fit: &ResidualCascadeFit,
+    ) -> Result<NextLevelAssessment, String> {
         let core = &self.core;
         if !Arc::ptr_eq(core, &fit.core) {
             return Err("residual cascade: fit does not belong to this design".into());
         }
         let next_l = core.levels.len();
-        if next_l >= MAX_LEVELS {
-            return Ok(None);
-        }
         let h = core.levels[next_l - 1].h * 0.5;
         let mut net = core.net.clone();
         let candidates = extend_net(&mut net, &core.z, core.dim, h, &core.z_range);
-        if candidates.is_empty() || net.len() > MAX_CENTERS {
-            return Ok(None);
+        if candidates.is_empty() {
+            return Ok(NextLevelAssessment::EmptyNet);
+        }
+        if net.len() > MAX_CENTERS {
+            return Ok(NextLevelAssessment::CapacityExceeded {
+                obstruction: RefinementObstruction::CenterCapacity {
+                    centers: net.len(),
+                    maximum_centers: MAX_CENTERS,
+                },
+                // The cap stopped candidate construction before every column
+                // could contribute to ‖X₂'Wr̂‖². Infinity is the honest
+                // conservative upper bound; a finite partial sum would not
+                // certify the omitted columns.
+                gain_bound: f64::INFINITY,
+            });
         }
         let delta = OVERLAP * h;
         let mut grid = HashGrid::new(delta, core.dim);
@@ -1789,7 +1954,18 @@ impl ResidualCascadeDesign {
         }
         let g2: f64 = g.iter().map(|v| v * v).sum();
         let d_next = level_weight(next_l, core.sobolev_s, core.dim);
-        Ok(Some(g2 / (fit.log_lambda.exp() * d_next)))
+        let gain_bound = g2 / (fit.log_lambda.exp() * d_next);
+        if next_l >= MAX_LEVELS {
+            Ok(NextLevelAssessment::CapacityExceeded {
+                obstruction: RefinementObstruction::LevelCapacity {
+                    levels: next_l,
+                    maximum_levels: MAX_LEVELS,
+                },
+                gain_bound,
+            })
+        } else {
+            Ok(NextLevelAssessment::GainBound(gain_bound))
+        }
     }
 }
 
@@ -2163,34 +2339,63 @@ impl ResidualCascadeFit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RefinementDecision {
+    Converged {
+        gain_bound: f64,
+    },
+    Refine,
+    Underresolved {
+        gain_bound: f64,
+        obstruction: RefinementObstruction,
+    },
+}
+
+/// Turn the typed next-level assessment into the only three legal refinement
+/// transitions. In particular, a capacity limit can yield a fit only when its
+/// already-computed gain bound independently passes the requested tolerance.
+fn decide_refinement(
+    assessment: NextLevelAssessment,
+    requested_tolerance: f64,
+) -> RefinementDecision {
+    match assessment {
+        NextLevelAssessment::EmptyNet => RefinementDecision::Converged { gain_bound: 0.0 },
+        NextLevelAssessment::GainBound(gain_bound) if gain_bound <= requested_tolerance => {
+            RefinementDecision::Converged { gain_bound }
+        }
+        NextLevelAssessment::GainBound(_) => RefinementDecision::Refine,
+        NextLevelAssessment::CapacityExceeded {
+            gain_bound,
+            obstruction: _,
+        } if gain_bound <= requested_tolerance => RefinementDecision::Converged { gain_bound },
+        NextLevelAssessment::CapacityExceeded {
+            gain_bound,
+            obstruction,
+        } => RefinementDecision::Underresolved {
+            gain_bound,
+            obstruction,
+        },
+    }
+}
+
 /// Fit the full magic-default cascade: start at [`INITIAL_LEVELS`], REML-fit,
 /// and refine (add a level, refit, re-select λ) until the exact next-level
 /// gain bound certifies that one more level cannot move the penalized
-/// objective by more than [`REFINE_TOL`] of the penalized residual — or the
-/// net/cap is exhausted. Returns the certified fit.
+/// objective by more than [`REFINE_TOL`] of the penalized residual. A genuinely
+/// empty next-level net certifies zero remaining gain; a level/center capacity
+/// reached before the tolerance passes is a typed
+/// [`ResidualCascadeError::Underresolved`] carrying the retained work and its
+/// evidence, never a fit.
 pub fn fit_residual_cascade(
     xs: &[&[f64]],
     y: &[f64],
     w: &[f64],
     metric: &[f64],
     sobolev_s: f64,
-) -> Result<ResidualCascadeFit, String> {
+) -> Result<ResidualCascadeFit, ResidualCascadeError> {
     let mut levels = INITIAL_LEVELS;
-    let mut capped_fit: Option<ResidualCascadeFit> = None;
     loop {
-        let design = match ResidualCascadeDesign::build(xs, y, w, metric, sobolev_s, levels) {
-            Ok(design) => design,
-            Err(err)
-                if levels > INITIAL_LEVELS
-                    && err.contains(&format!("center cap {MAX_CENTERS} exceeded")) =>
-            {
-                if let Some(fit) = capped_fit {
-                    return Ok(fit);
-                }
-                return Err(err);
-            }
-            Err(err) => return Err(err),
-        };
+        let design = ResidualCascadeDesign::build(xs, y, w, metric, sobolev_s, levels)?;
         // Quasi-uniformity guard (issue #1032, caveat 2): if the metric has
         // collapsed the cloud onto a near-degenerate sheet in scaled
         // coordinates, the BPX iteration bound no longer holds. Refuse the
@@ -2206,7 +2411,8 @@ pub fn fit_residual_cascade(
                  iteration bound is not trustworthy on this (near-degenerate) metric — \
                  fall back to the dense kernel path",
                 design.metric_scaled_aspect_ratio()
-            ));
+            )
+            .into());
         }
         let mut fit = design.fit_reml()?;
         // The realized CG iteration count at this cascade depth is the runtime
@@ -2219,36 +2425,109 @@ pub fn fit_residual_cascade(
         // caller that wants to watch the bound reads them off the returned fit
         // instead of scraping log lines. (A library solve never writes to
         // stderr.)
-        let gain = design.next_level_gain_bound(&fit)?;
-        let tolerance = REFINE_TOL * fit.rss_pen;
-        match gain {
-            None => {
+        let assessment = design.assess_next_level(&fit)?;
+        let requested_tolerance = REFINE_TOL * fit.rss_pen;
+        match decide_refinement(assessment, requested_tolerance) {
+            RefinementDecision::Converged { gain_bound } => {
                 fit.refinement = Some(RefinementCertificate {
-                    next_level_gain_bound: 0.0,
-                    tolerance,
-                    exhausted: true,
+                    next_level_gain_bound: gain_bound,
+                    tolerance: requested_tolerance,
                 });
                 return Ok(fit);
             }
-            Some(bound) if bound <= tolerance || levels >= MAX_LEVELS => {
-                fit.refinement = Some(RefinementCertificate {
-                    next_level_gain_bound: bound,
-                    tolerance,
-                    exhausted: bound > tolerance,
-                });
-                return Ok(fit);
-            }
-            Some(bound) => {
-                capped_fit = Some({
-                    fit.refinement = Some(RefinementCertificate {
-                        next_level_gain_bound: bound,
-                        tolerance,
-                        exhausted: true,
-                    });
-                    fit
-                });
+            RefinementDecision::Refine => {
                 levels += 1;
             }
+            RefinementDecision::Underresolved {
+                gain_bound,
+                obstruction,
+            } => {
+                return Err(ResidualCascadeError::Underresolved {
+                    checkpoint: ResidualCascadeCheckpoint::new(fit),
+                    gain_bound,
+                    requested_tolerance,
+                    obstruction,
+                });
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod refinement_decision_tests {
+    use super::*;
+
+    const TOLERANCE: f64 = 0.25;
+
+    #[test]
+    fn only_empty_or_passing_bound_converges() {
+        assert_eq!(
+            decide_refinement(NextLevelAssessment::EmptyNet, TOLERANCE),
+            RefinementDecision::Converged { gain_bound: 0.0 }
+        );
+        assert_eq!(
+            decide_refinement(NextLevelAssessment::GainBound(0.2), TOLERANCE),
+            RefinementDecision::Converged { gain_bound: 0.2 }
+        );
+        assert_eq!(
+            decide_refinement(NextLevelAssessment::GainBound(0.3), TOLERANCE),
+            RefinementDecision::Refine
+        );
+    }
+
+    #[test]
+    fn capacity_above_tolerance_is_underresolved() {
+        let obstruction = RefinementObstruction::LevelCapacity {
+            levels: MAX_LEVELS,
+            maximum_levels: MAX_LEVELS,
+        };
+        assert_eq!(
+            decide_refinement(
+                NextLevelAssessment::CapacityExceeded {
+                    obstruction,
+                    gain_bound: 0.3,
+                },
+                TOLERANCE,
+            ),
+            RefinementDecision::Underresolved {
+                gain_bound: 0.3,
+                obstruction,
+            }
+        );
+
+        let center_obstruction = RefinementObstruction::CenterCapacity {
+            centers: MAX_CENTERS + 1,
+            maximum_centers: MAX_CENTERS,
+        };
+        assert_eq!(
+            decide_refinement(
+                NextLevelAssessment::CapacityExceeded {
+                    obstruction: center_obstruction,
+                    gain_bound: f64::INFINITY,
+                },
+                TOLERANCE,
+            ),
+            RefinementDecision::Underresolved {
+                gain_bound: f64::INFINITY,
+                obstruction: center_obstruction,
+            }
+        );
+    }
+
+    #[test]
+    fn capacity_does_not_block_an_independently_passing_bound() {
+        assert_eq!(
+            decide_refinement(
+                NextLevelAssessment::CapacityExceeded {
+                    obstruction: RefinementObstruction::LevelCapacity {
+                        levels: MAX_LEVELS,
+                        maximum_levels: MAX_LEVELS,
+                    },
+                    gain_bound: 0.2,
+                },
+                TOLERANCE,
+            ),
+            RefinementDecision::Converged { gain_bound: 0.2 }
+        );
     }
 }

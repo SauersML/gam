@@ -2334,19 +2334,21 @@ impl SurvivalLocationScaleFamily {
     pub(crate) fn offset_channel_geometry(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), String> {
+    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), SurvivalLocationScaleError> {
         let n = self.n;
         if block_states.is_empty() {
             // Missing fitted state means the row likelihood geometry is
             // undefined. Returning zeros would assert a false stationary
             // point to the outer baseline optimizer and manufacture a
             // convergence certificate, so propagate the invariant failure.
-            return Err(format!(
-                "SurvivalLocationScaleFamily::offset_channel_geometry: \
-                 block_states is empty (the fitted per-block state was not \
-                 propagated to the baseline-θ geometry path; n={n}); offset \
-                 residuals and curvatures are undefined without it"
-            ));
+            return Err(SurvivalLocationScaleError::InternalInvariant {
+                reason: format!(
+                    "SurvivalLocationScaleFamily::offset_channel_geometry: \
+                     block_states is empty (the fitted per-block state was not \
+                     propagated to the baseline-θ geometry path; n={n}); offset \
+                     residuals and curvatures are undefined without it"
+                ),
+            });
         }
         let dynamic = self.build_dynamic_geometry(block_states)?;
 

@@ -113,9 +113,9 @@ def test_missing_x_raises():
 # ---------------------------------------------------------------------------
 # #607 — assignment summary thresholds are mode-specific on the canonical kind.
 # ---------------------------------------------------------------------------
-def test_ibp_alias_is_rejected():
-    with pytest.raises(ValueError, match="not a recognized assignment kind"):
-        sae._canonical_assignment("ibp", "assignment")
+def test_assignment_aliases_use_the_public_rust_schema():
+    assert sae._canonical_assignment("ibp", "assignment") == "ibp_map"
+    assert sae._canonical_assignment("top-k", "assignment") == "topk"
 
 
 def test_jumprelu_assignment_is_canonical():

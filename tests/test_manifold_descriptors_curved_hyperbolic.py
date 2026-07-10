@@ -180,6 +180,24 @@ def test_poincare_batch_exp_log_roundtrip():
     assert q.shape == (2, 2)
     v_back = m.log(p, q)
     assert np.allclose(v_back, v, atol=1e-7)
+    d = np.asarray(m.distance(p, q))
+    assert d.shape == (2,)
+    metrics = np.asarray(m.metric(p))
+    assert metrics.shape == (2, 2, 2)
+    projected = np.asarray(m.project(p))
+    assert projected.shape == (2, 2)
+
+
+def test_poincare_batch_core_enforces_descriptor_dimension_and_chart_domain():
+    m = manifolds.Poincare(dim=2, curvature=-1.0)
+    with pytest.raises(ValueError, match="expected 2"):
+        m.exp(np.zeros((2, 3)), np.zeros((2, 3)))
+    with pytest.raises(ValueError, match="expected 2"):
+        m.distance(np.zeros((2, 2)), np.zeros((2, 3)))
+    with pytest.raises(ValueError, match="outside the open ball"):
+        m.metric(np.array([1.0, 0.0]))
+    with pytest.raises(ValueError, match="NaN or infinity"):
+        m.metric(np.array([np.nan, 0.0]))
 
 
 def test_poincare_project_keeps_interior_point_and_clamps_exterior():

@@ -499,14 +499,6 @@ pub(crate) fn ensure_positive_definitewithridge(
     })
 }
 
-pub(super) fn solve_newton_direction_dense(
-    hessian: &Array2<f64>,
-    gradient: &Array1<f64>,
-    direction_out: &mut Array1<f64>,
-) -> Result<(), EstimationError> {
-    solve_newton_direction_dense_with_factor(hessian, gradient, direction_out).map(|_| ())
-}
-
 pub(super) fn solve_direction_with_dense_factor(
     factor: &FaerSymmetricFactor,
     gradient: &Array1<f64>,
@@ -521,14 +513,11 @@ pub(super) fn solve_direction_with_dense_factor(
     direction_out.mapv_inplace(|v| -v);
 }
 
-/// Fixes the audit-revised geodesic-acceleration note: expose the dense
-/// factor so the optional second-order correction can reuse it instead of
-/// refactorizing the same Hessian.
-pub(super) fn solve_newton_direction_dense_with_factor(
+pub(super) fn solve_newton_direction_dense(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     direction_out: &mut Array1<f64>,
-) -> Result<Option<FaerSymmetricFactor>, EstimationError> {
+) -> Result<(), EstimationError> {
     let dense_solve_start = std::time::Instant::now();
     let p = hessian.nrows();
     if direction_out.len() != gradient.len() {
@@ -556,7 +545,7 @@ pub(super) fn solve_newton_direction_dense_with_factor(
                 (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
                 dense_solve_start.elapsed().as_secs_f64(),
             );
-            return Ok(None);
+            return Ok(());
         }
     }
 
@@ -602,7 +591,7 @@ pub(super) fn solve_newton_direction_dense_with_factor(
                 cpu_route,
                 rel,
             );
-            return Ok(Some(factor));
+            return Ok(());
         }
     }
     if array_is_finite(direction_out) {
@@ -613,7 +602,7 @@ pub(super) fn solve_newton_direction_dense_with_factor(
             dense_solve_start.elapsed().as_secs_f64(),
             cpu_route,
         );
-        return Ok(Some(factor));
+        return Ok(());
     }
     Err(EstimationError::LinearSystemSolveFailed(
         FaerLinalgError::FactorizationFailed {

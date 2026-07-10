@@ -28,17 +28,22 @@
 //!     score_f(t) = ⟨y, m_f(t)⟩² / ‖m_f(t)‖² .
 //! ```
 //!
-//! The solver returns `argmax_t score_f(t)` over a uniform grid of
-//! `8 · K` points on `[0, 1)` (resolution derived from the basis width, not a
-//! knob). A first sweep uses `y = x` (the row); an optional second sweep uses
-//! the leave-one-out residual target
+//! The solver returns the global `argmax_t score_f(t)` by forming its analytic
+//! trigonometric stationarity polynomial, enumerating every unit-circle root
+//! through a companion-matrix eigenproblem, and comparing the score at all of
+//! them. A first sweep uses `y = x` (the row); an optional second sweep uses the
+//! leave-one-out residual target
 //! `y_f = x − Σ_{g≠f} gate_g · m_g(t_g)` built from the previous sweep's
 //! positions and gate weights, so co-active atoms carve complementary charts.
 
-use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
-use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
+mod stationary_roots;
 
-/// Basis family the coordinate solver evaluates on the grid. Periodic
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
+use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
+
+pub(crate) use stationary_roots::PeriodicCurveExtrema;
+
+/// Basis family the coordinate solver evaluates analytically. Periodic
 /// (`n_harmonics`-harmonic Fourier) covers `atom_manifold="circle"` /
 /// `atom_basis="fourier"` — the intrinsic-rank-1 default of the torch lane.
 #[derive(Debug, Clone, Copy)]
@@ -52,14 +57,14 @@ pub enum ChartBasisKind {
 impl ChartBasisKind {
     /// Number of basis columns `K` this kind produces (must match the decoder
     /// block's `K` dimension).
-    fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         match self {
             ChartBasisKind::Periodic { n_harmonics } => 2 * n_harmonics + 1,
         }
     }
 
     /// Evaluate the basis row `φ(t)` into `out` (length `K`).
-    fn eval_into(&self, t: f64, out: &mut [f64]) {
+    pub(crate) fn eval_into(&self, t: f64, out: &mut [f64]) {
         match self {
             ChartBasisKind::Periodic { n_harmonics } => {
                 let two_pi = 2.0 * std::f64::consts::PI;
@@ -118,54 +123,30 @@ pub fn solve_chart_coordinates(
         return Ok(Array2::<f64>::zeros((n, f)));
     }
 
-    // Grid resolution is DERIVED from the basis width (8 samples per basis
-    // column), never a caller knob.
-    let grid_res = 8 * k;
-
-    // Precompute grid basis rows φ(t_g).
-    let mut grid_t = Vec::with_capacity(grid_res);
-    let mut grid_phi = Array2::<f64>::zeros((grid_res, k));
-    {
-        let mut row = vec![0.0_f64; k];
-        for g in 0..grid_res {
-            let t = (g as f64) / (grid_res as f64);
-            grid_t.push(t);
-            basis.eval_into(t, &mut row);
-            grid_phi.row_mut(g).assign(&Array1::from(row.clone()));
-        }
-    }
-    // COEFFICIENT-SPACE restructure. The naive sweep scores every
-    // `(row, atom, grid)` triple with an ambient-space dot (`O(N·F·G·D)` —
-    // measured 100 s/step at N=4096, F=512, D=2048 on the torch circle lane).
-    // But `⟨y, m_f(t)⟩ = φ(t)ᵀ (D_f y)`: projecting each target ONCE into every
-    // atom's K-dim coefficient space (one GEMM, `N·D·F·K`) collapses the grid
-    // scan to `K` mults per point, and `‖m_f(t)‖² = φ(t)ᵀ (D_f D_fᵀ) φ(t)` needs
-    // only the K×K per-atom Gram. Identical scores, GEMM-shaped work.
+    // COEFFICIENT-SPACE restructure.  Since
+    // `⟨y, m_f(t)⟩ = φ(t)ᵀ (D_f y)`, projecting each target once into every
+    // atom's K-dimensional coefficient space (one GEMM, `N·D·F·K`) leaves the
+    // exact stationary solve independent of ambient dimension.  Likewise,
+    // `‖m_f(t)‖² = φ(t)ᵀ (D_f D_fᵀ) φ(t)` needs only the K×K per-atom Gram.
     //
     // dec_flat: (F·K, D) — atom-major flattening of the decoder blocks.
     let dec_flat = decoders
         .to_shape((f * k, d))
         .map_err(|e| format!("solve_chart_coordinates: decoder reshape failed: {e}"))?
         .to_owned();
-    // Per-atom Grams G_f = D_f D_fᵀ (K, K), and grid norms ‖m_{f,g}‖² = φ_gᵀ G_f φ_g.
+    // Per-atom Grams G_f = D_f D_fᵀ (K, K), and their reusable Fourier
+    // quadratic forms.  Only the linear Fourier term changes by row.
     let mut grams = Array3::<f64>::zeros((f, k, k));
-    let mut grid_nrm2 = Array2::<f64>::zeros((f, grid_res));
+    let mut extrema = Vec::with_capacity(f);
     for fi in 0..f {
         let block = decoders.index_axis(ndarray::Axis(0), fi); // (K, D)
         let gram = fast_abt(&block, &block);
+        extrema.push(
+            PeriodicCurveExtrema::from_gram(gram.view()).map_err(|error| {
+                format!("solve_chart_coordinates: atom {fi} periodic Gram: {error}")
+            })?,
+        );
         grams.index_axis_mut(ndarray::Axis(0), fi).assign(&gram);
-        for g in 0..grid_res {
-            let phi = grid_phi.row(g);
-            let mut nrm2 = 0.0_f64;
-            for a in 0..k {
-                let mut row_acc = 0.0_f64;
-                for b in 0..k {
-                    row_acc += gram[[a, b]] * phi[b];
-                }
-                nrm2 += phi[a] * row_acc;
-            }
-            grid_nrm2[[fi, g]] = nrm2;
-        }
     }
     // Plain-sweep projections P[row, f·K + k] = ⟨x_row, D_f[k, :]⟩ — one GEMM.
     let proj_x = fast_abt(&x, &dec_flat); // (N, F·K)
@@ -224,10 +205,11 @@ pub fn solve_chart_coordinates(
         proj_x
     };
 
-    // Score the grid in coefficient space: `K` mults per (row, atom, grid).
-    let solve_rows = |start: usize, end: usize, out: &mut Array2<f64>| {
+    // Enumerate and score every analytic stationary point in coefficient space.
+    let solve_rows = |start: usize, end: usize, out: &mut Array2<f64>| -> Result<(), String> {
         let mut phi_prev = vec![0.0_f64; k];
         let mut gram_phi = vec![0.0_f64; k];
+        let mut linear = vec![0.0_f64; k];
         for row in start..end {
             let out_row = row - start;
             for fi in 0..f {
@@ -249,53 +231,43 @@ pub fn solve_chart_coordinates(
                         }
                     }
                 }
-                let mut best_score = f64::NEG_INFINITY;
-                let mut best_t = 0.0_f64;
-                for g in 0..grid_res {
-                    let nrm2 = grid_nrm2[[fi, g]];
-                    if nrm2 <= 1e-30 {
-                        continue;
-                    }
-                    let phi = grid_phi.row(g);
-                    let mut dot = 0.0_f64;
-                    for kk in 0..k {
-                        dot += phi[kk] * proj_target[[row, fi * k + kk]];
-                    }
-                    if has_addback {
-                        for kk in 0..k {
-                            dot += phi[kk] * gram_phi[kk];
-                        }
-                    }
-                    let score = dot * dot / nrm2;
-                    if score > best_score {
-                        best_score = score;
-                        best_t = grid_t[g];
-                    }
+                for kk in 0..k {
+                    linear[kk] = proj_target[[row, fi * k + kk]]
+                        + if has_addback { gram_phi[kk] } else { 0.0 };
                 }
-                out[[out_row, fi]] = best_t;
+                let solution = extrema[fi]
+                    .maximize_profiled_score(&linear)
+                    .map_err(|error| {
+                        format!(
+                            "solve_chart_coordinates: row {row}, atom {fi} stationary solve: {error}"
+                        )
+                    })?;
+                out[[out_row, fi]] = solution.coordinate;
             }
         }
+        Ok(())
     };
 
     let mut solved = Array2::<f64>::zeros((n, f));
     if n >= PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
         use rayon::prelude::*;
         let n_chunks = n.div_ceil(ROW_CHUNK);
-        let blocks: Vec<(usize, usize, Array2<f64>)> = (0..n_chunks)
+        let blocks: Vec<Result<(usize, usize, Array2<f64>), String>> = (0..n_chunks)
             .into_par_iter()
             .map(|c| {
                 let start = c * ROW_CHUNK;
                 let end = (start + ROW_CHUNK).min(n);
                 let mut local = Array2::<f64>::zeros((end - start, f));
-                solve_rows(start, end, &mut local);
-                (start, end, local)
+                solve_rows(start, end, &mut local)?;
+                Ok((start, end, local))
             })
             .collect();
-        for (start, end, slice) in blocks {
+        for block in blocks {
+            let (start, end, slice) = block?;
             solved.slice_mut(ndarray::s![start..end, ..]).assign(&slice);
         }
     } else {
-        solve_rows(0, n, &mut solved);
+        solve_rows(0, n, &mut solved)?;
     }
 
     Ok(solved)
@@ -460,16 +432,15 @@ mod chart_coordinate_solve_tests {
     }
 
     #[test]
-    fn exactness_target_on_grid_point_returns_that_grid_point() {
+    fn exactness_target_at_off_lattice_phase_returns_that_phase() {
         let n_harmonics = 3;
         let k = 2 * n_harmonics + 1;
         let d = 16;
         let basis = ChartBasisKind::Periodic { n_harmonics };
-        let grid_res = 8 * k;
 
         // A GENERIC decoder (DC + all harmonics, distinct ambient axes per row)
-        // breaks the pure-circle antipodal degeneracy, so the grid argmax at a
-        // target sitting exactly on the curve is unique. Deterministic entries.
+        // breaks the pure-circle antipodal degeneracy, so the global score
+        // maximum at a target sitting exactly on the curve is unique.
         let mut dec = Array3::<f64>::zeros((1, k, d));
         for kk in 0..k {
             for col in 0..d {
@@ -478,10 +449,9 @@ mod chart_coordinate_solve_tests {
             }
         }
 
-        // Pick a grid point t_g and place the target EXACTLY on the decoded
-        // curve at that point, scaled by an arbitrary amplitude.
-        let g = 17usize;
-        let tg = (g as f64) / (grid_res as f64);
+        // Pick a deliberately off-lattice phase and place the target exactly on
+        // the decoded curve there, scaled by an arbitrary amplitude.
+        let tg = 0.173_205_080_756_887_73;
         let amp = 2.3_f64;
         let m = eval_curve(&dec, basis, tg);
         let mut target = Array2::<f64>::zeros((1, d));
@@ -489,11 +459,10 @@ mod chart_coordinate_solve_tests {
             target[[0, col]] = amp * m[col];
         }
 
-        let solved =
-            solve_chart_coordinates(target.view(), dec.view(), basis, None, None).unwrap();
+        let solved = solve_chart_coordinates(target.view(), dec.view(), basis, None, None).unwrap();
         assert!(
-            (solved[[0, 0]] - tg).abs() < 1e-12,
-            "solver returned {} but the target sits exactly on grid point t_g = {tg}",
+            (solved[[0, 0]] - tg).abs() < 1e-9,
+            "solver returned {} but the target sits exactly at t = {tg}",
             solved[[0, 0]]
         );
     }
@@ -513,7 +482,9 @@ mod chart_coordinate_solve_tests {
         // Deterministic pseudo-random draws (LCG) — no external rng dependency.
         let mut state = 0x1234_5678_9abc_def0u64;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 11) as f64) / ((1u64 << 53) as f64)
         };
 
@@ -533,8 +504,7 @@ mod chart_coordinate_solve_tests {
             }
         }
 
-        let solved =
-            solve_chart_coordinates(x.view(), dec.view(), basis, None, None).unwrap();
+        let solved = solve_chart_coordinates(x.view(), dec.view(), basis, None, None).unwrap();
 
         // Reconstruction error at a set of coordinates, amplitude profiled per
         // row (the honest E-step reconstruction: best amplitude at the coord).

@@ -341,8 +341,13 @@ pub fn fit_penalized_binomial_multi(
             // optimization. Exhausting `max_iter` is a typed error carrying
             // evidence from the checkpoint, never an `Ok` with a flag.
             return Err(EstimationError::FixedLambdaNewtonDidNotConverge {
-                context: "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton)"
-                    .to_string(),
+                context: format!(
+                    "fit_penalized_binomial_multi (fixed-λ vector-GLM damped Newton): {}; \
+                     final gradient norm {:.3e} against stationarity bound {:.3e}",
+                    stall.reason.description(),
+                    stall.gradient_norm,
+                    stall.gradient_bound,
+                ),
                 iterations: stall.iterations,
                 penalized_neg_log_likelihood: stall.penalized_neg_log_likelihood(),
             });
@@ -414,6 +419,30 @@ mod tests {
         for (a, b) in base.coefficients.iter().zip(again.coefficients.iter()) {
             assert_eq!(a, b, "None override must be deterministic");
         }
+    }
+
+    #[test]
+    fn exhausted_fixed_lambda_budget_is_typed_error_not_fit() {
+        let (design, y, penalty, lambdas) = toy_inputs();
+        let error = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 0,
+            tol: 1.0e-9,
+        })
+        .expect_err("a zero-budget Newton solve must not mint a binomial fit");
+        assert!(matches!(
+            error,
+            EstimationError::FixedLambdaNewtonDidNotConverge {
+                iterations: 0,
+                penalized_neg_log_likelihood,
+                ..
+            } if penalized_neg_log_likelihood.is_finite()
+        ));
     }
 
     #[test]

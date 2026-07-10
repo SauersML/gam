@@ -308,9 +308,82 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
-        solve_b_preconditioned_gmres(solver, rhs, |v| {
+        let mut x = solve_b_preconditioned_gmres(solver, rhs, |v| {
             self.apply_exact_hessian(rho, target, cache, v)
-        })
+        })?;
+        // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
+        //
+        // `B ⪰ A` (majorizer construction), so the generalized Rayleigh
+        // quotient `μ(x) = xᵀAx / xᵀBx ∈ (0, 1]` of the SOLUTION is a
+        // detector: expanding `x = Σ (vᵢᵀrhs/μᵢ) vᵢ` in the B-orthonormal
+        // `(A, B)`-eigenbasis, any near-null component present in `rhs` enters
+        // `x` with weight `1/μᵢ`, so `μ(x)` collapses to `≈ μ_min` exactly
+        // when the solve was amplified. A healthy solve (`rhs` B-orthogonal to
+        // the flat directions, or no flat directions) leaves `μ(x)` above the
+        // floor and pays only one extra `A`/`B` apply.
+        //
+        // Deflation is EXACT in that eigenbasis with no re-solve: the
+        // amplified term of `x` along a B-normalized eigendirection `v` is
+        // `v·(vᵀBx)` (since `vᵀBx = vᵀrhs/μ_v`), so subtracting the
+        // B-projection removes precisely the unidentifiable component while
+        // leaving every resolved direction untouched.
+        for _ in 0..SAE_IFT_DEFLATION_MAX_DIRECTIONS {
+            let ax = self.apply_exact_hessian(rho, target, cache, &x)?;
+            let bx = apply_cached_arrow_hessian(cache, x.t.view(), x.beta.view())?;
+            let x_b_norm_sq = sae_inner(&x, &bx);
+            if !(x_b_norm_sq.is_finite() && x_b_norm_sq > 0.0) {
+                break;
+            }
+            let mu = sae_inner(&x, &ax) / x_b_norm_sq;
+            if !mu.is_finite() || mu >= SAE_IFT_MIN_CURVATURE_FRACTION {
+                break;
+            }
+            // Sharpen the offending direction by inverse power iteration on
+            // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
+            // already dominated by it, so it is the natural seed. A refinement
+            // solve that fails keeps the unrefined seed — still a valid
+            // deflation direction, just first-order.
+            let mut v = x.clone();
+            for _ in 0..SAE_IFT_DEFLATION_POWER_ITERS {
+                let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+                match solve_b_preconditioned_gmres(solver, &bv, |w| {
+                    self.apply_exact_hessian(rho, target, cache, w)
+                }) {
+                    Ok(refined) => v = refined,
+                    Err(_) => break,
+                }
+                let bvv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+                let norm_sq = sae_inner(&v, &bvv);
+                if !(norm_sq.is_finite() && norm_sq > 0.0) {
+                    break;
+                }
+                let inv_norm = 1.0 / norm_sq.sqrt();
+                v.t.mapv_inplace(|val| val * inv_norm);
+                v.beta.mapv_inplace(|val| val * inv_norm);
+            }
+            // B-normalize the final direction, then remove its B-projection.
+            let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+            let v_b_norm_sq = sae_inner(&v, &bv);
+            if !(v_b_norm_sq.is_finite() && v_b_norm_sq > 0.0) {
+                break;
+            }
+            let inv_norm = 1.0 / v_b_norm_sq.sqrt();
+            v.t.mapv_inplace(|val| val * inv_norm);
+            v.beta.mapv_inplace(|val| val * inv_norm);
+            let bx = apply_cached_arrow_hessian(cache, x.t.view(), x.beta.view())?;
+            let proj = sae_inner(&v, &bx);
+            if proj == 0.0 || !proj.is_finite() {
+                break;
+            }
+            x.t.scaled_add(-proj, &v.t);
+            x.beta.scaled_add(-proj, &v.beta);
+            log::debug!(
+                "[SAE/#2080-d4] IFT solve deflated a near-null pencil direction \
+                 (μ={mu:.3e} < {SAE_IFT_MIN_CURVATURE_FRACTION:.1e}, |proj|={:.3e})",
+                proj.abs(),
+            );
+        }
+        Ok(x)
     }
 
     /// Analytic SAE REML outer-ρ gradient components at the already converged

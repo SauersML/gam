@@ -9,10 +9,8 @@ set.
 both with DIFFERENT values raises an eager ``ValueError``; equal values pass
 through.
 
-These checks are PURE PYTHON and run BEFORE any Rust call, so they exercise the
-normalizer/validators directly (no compiled extension required for the helper
-tests) and the public ``sae_manifold_fit`` eager validators (which raise before
-reaching the Rust solver).
+The alias schema lives in Rust and both public kwargs consume that one parser;
+the public ``sae_manifold_fit`` validators still reject conflicts before fitting.
 """
 from __future__ import annotations
 
@@ -23,7 +21,7 @@ gamfit = pytest.importorskip("gamfit")
 
 from gamfit._sae_manifold import (  # noqa: E402
     _ASSIGNMENT_PRIOR_UNSET,
-    _canonical_public_assignment,
+    _canonical_assignment,
     _resolve_public_assignment,
 )
 
@@ -40,13 +38,14 @@ from gamfit._sae_manifold import (  # noqa: E402
         ("IBP", "ibp_map"),
         ("softmax", "softmax"),
         ("SoftMax", "softmax"),
-        ("gated", "jumprelu"),
-        ("jump_relu", "jumprelu"),
-        ("jumprelu", "jumprelu"),
+        ("gated", "threshold_gate"),
+        ("jump_relu", "threshold_gate"),
+        ("jumprelu", "threshold_gate"),
+        ("top-k", "topk"),
     ],
 )
 def test_assignment_alias_normalizes(value, expected):
-    assert _canonical_public_assignment(value) == expected
+    assert _canonical_assignment(value, "assignment") == expected
 
 
 def test_assignment_prior_alias_accepts_ibp():
@@ -87,7 +86,7 @@ def test_assignment_conflict_raises_naming_both():
 
 def test_assignment_unknown_value_lists_accepted_aliases():
     with pytest.raises(ValueError) as exc:
-        _canonical_public_assignment("not_a_kind")
+        _canonical_assignment("not_a_kind", "assignment")
     msg = str(exc.value)
     # The accepted alias set is listed.
     for alias in ("ibp", "ibp_map", "softmax", "jumprelu", "gated"):

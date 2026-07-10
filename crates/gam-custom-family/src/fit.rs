@@ -823,7 +823,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &per_block,
             options,
             persistent_warm_start.as_ref(),
-        )?;
+        )
+        .map_err(|error| CustomFamilyError::Optimization {
+            context: "fit_custom_family no-smoothing inner solve",
+            reason: format!("{error}; no fit was assembled"),
+        })?;
         let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
         store_persistent_custom_family_warm_start(
             persistent_warm_start_key.as_deref(),
@@ -847,7 +851,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &inner.block_states,
             &per_block,
             options,
-        )?;
+        )
+        .map_err(|error| CustomFamilyError::Optimization {
+            context: "fit_custom_family no-smoothing covariance factorization",
+            reason: format!("{error}; no fit was assembled"),
+        })?;
         let reml_term = if options.use_remlobjective {
             0.5 * (inner.block_logdet_h - inner.block_logdet_s)
         } else {
@@ -1446,12 +1454,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // "escalate" to here: sampling is only ever legitimate about a certified
     // mode, and a certified mode has no nonconvergence to recover from.
     let (rho_star, outer_grad_norm, outer_iters, outer_certificate) = match outer_result {
-        Ok(outer_result) if outer_result.converged => (
-            outer_result.rho,
-            outer_result.final_grad_norm,
-            outer_result.iterations,
-            outer_result.criterion_certificate,
-        ),
+        Ok(outer_result)
+            if outer_result.converged
+                && outer_result
+                    .criterion_certificate
+                    .as_ref()
+                    .is_some_and(|certificate| certificate.certifies()) =>
+        {
+            (
+                outer_result.rho,
+                outer_result.final_grad_norm,
+                outer_result.iterations,
+                outer_result.criterion_certificate,
+            )
+        }
         Ok(outer_result) => {
             if let Some(warm) = obj.state.warm_cache.as_ref() {
                 store_persistent_custom_family_warm_start(
@@ -1460,15 +1476,20 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     warm,
                 );
             }
+            let certificate = outer_result
+                .criterion_certificate
+                .as_ref()
+                .map_or_else(|| "missing".to_string(), |value| value.summary());
             return Err(CustomFamilyError::Optimization {
                 context: "fit_custom_family outer smoothing",
                 reason: format!(
                     "outer smoothing optimization did not certify convergence \
-                     (plan={}, iterations={}, |grad|={}, rho_checkpoint={:?}); no fit was \
-                     assembled.{}",
+                     (plan={}, iterations={}, |grad|={}, certificate={}, \
+                     rho_checkpoint={:?}); no fit was assembled.{}",
                     outer_result.plan_used,
                     outer_result.iterations,
                     outer_result.final_grad_norm_report(),
+                    certificate,
                     outer_result.rho.as_slice().unwrap_or(&[]),
                     last_error_detail
                 ),
@@ -1546,11 +1567,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &final_options,
         final_seed.as_ref(),
     )
-    .map_err(|e| {
-        format!(
-            "outer smoothing optimization failed during final inner refit: \
-                     {e}.{last_error_detail}"
-        )
+    .map_err(|error| CustomFamilyError::Optimization {
+        context: "fit_custom_family final inner refit",
+        reason: format!(
+            "{error}; rho_checkpoint={:?}; no fit was assembled.{}",
+            rho_star.as_slice().unwrap_or(&[]),
+            last_error_detail
+        ),
     })?;
     if !inner.converged {
         // Preserve the refit's rho/coefficients in the response-keyed cache
@@ -1593,7 +1616,14 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &inner.block_states,
         &per_block,
         &final_options,
-    )?;
+    )
+    .map_err(|error| CustomFamilyError::Optimization {
+        context: "fit_custom_family final covariance factorization",
+        reason: format!(
+            "{error}; rho_checkpoint={:?}; no fit was assembled",
+            rho_star.as_slice().unwrap_or(&[])
+        ),
+    })?;
 
     // gam#1587/#561: pass `final_options` (carrying the joint penalty bundle at
     // the selected ρ*) so the exported geometry's penalized Hessian — and the
@@ -1688,19 +1718,35 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
     let rho = flatten_log_lambdas(specs);
     let per_block = split_log_lambdas(&rho, &penalty_counts)?;
     let reduced_warm_start = fixed_lambda_warm_start_for_reduced_specs(warm_start, &canonical);
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, reduced_warm_start)?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, reduced_warm_start)
+        .map_err(|error| CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas inner solve",
+            reason: format!(
+                "{error}; rho_checkpoint={:?}; no fit was assembled",
+                rho.as_slice().unwrap_or(&[])
+            ),
+        })?;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family_fixed_log_lambdas inner solve",
             reason: format!(
-                "fixed-log-lambda inner solve did not converge after {} cycles",
-                inner.cycles
+                "fixed-log-lambda inner solve did not converge after {} cycles; \
+                 rho_checkpoint={:?}; no fit was assembled",
+                inner.cycles,
+                rho.as_slice().unwrap_or(&[])
             ),
         });
     }
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
-        compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
+        compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)
+            .map_err(|error| CustomFamilyError::Optimization {
+                context: "fit_custom_family_fixed_log_lambdas covariance factorization",
+                reason: format!(
+                    "{error}; rho_checkpoint={:?}; no fit was assembled",
+                    rho.as_slice().unwrap_or(&[])
+                ),
+            })?;
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block, options)
         .map_err(|reason| CustomFamilyError::Optimization {
             context: "fit_custom_family_fixed_log_lambdas joint geometry",
@@ -1728,7 +1774,7 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
             outer_iterations,
             outer_gradient_norm,
             criterion_certificate: None,
-            outer_converged,
+            outer_converged: true,
             joint_log_lambdas: None,
             context: "fit_custom_family_fixed_log_lambdas result assembly",
         },

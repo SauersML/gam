@@ -58,6 +58,89 @@ pub fn selection_bits(g_dict: i64, k_active: i64) -> f64 {
     bits
 }
 
+/// Joint reverse-water-filling of weighted Gaussian spectra to a positive
+/// total-distortion budget.  A component weight scales both its distortion and
+/// its rate (for Eq. 4 this is an atom's firing probability; the residual has
+/// weight one).  Returns one rate in bits per component.
+///
+/// The water level is solved exactly, without iterative tolerances.  After
+/// sorting the variance breakpoints, distortion is affine between adjacent
+/// breakpoints:
+/// `D(theta) = sum_{v<=theta} w*v + theta*sum_{v>theta} w`.
+/// The unique segment containing the requested budget therefore gives `theta`
+/// in closed form.
+pub fn weighted_reverse_water_filling(
+    components: &[(f64, Vec<f64>)],
+    total_distortion: f64,
+) -> Result<Vec<f64>, String> {
+    if !total_distortion.is_finite() || total_distortion <= 0.0 {
+        return Err(format!(
+            "total distortion must be finite and positive, got {total_distortion}"
+        ));
+    }
+
+    let mut breakpoints: Vec<(f64, f64)> = Vec::new();
+    let mut spectra: Vec<(f64, Vec<f64>)> = Vec::with_capacity(components.len());
+    let mut total_variance = 0.0_f64;
+    for (weight, spectrum) in components {
+        if !weight.is_finite() || *weight < 0.0 {
+            return Err(format!(
+                "component weight must be finite and nonnegative, got {weight}"
+            ));
+        }
+        let mut variances = Vec::with_capacity(spectrum.len());
+        for &value in spectrum {
+            if !value.is_finite() {
+                return Err("component spectrum must contain only finite values".to_string());
+            }
+            let variance = value.max(0.0);
+            variances.push(variance);
+            total_variance += *weight * variance;
+            if *weight > 0.0 {
+                breakpoints.push((variance, *weight));
+            }
+        }
+        spectra.push((*weight, variances));
+    }
+    if total_distortion >= total_variance || breakpoints.is_empty() {
+        return Ok(vec![0.0; spectra.len()]);
+    }
+
+    breakpoints.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    let mut saturated_distortion = 0.0_f64;
+    let mut active_weight: f64 = breakpoints.iter().map(|(_, weight)| weight).sum();
+    let mut index = 0usize;
+    let water_level = loop {
+        let next_breakpoint = breakpoints[index].0;
+        let candidate = (total_distortion - saturated_distortion) / active_weight;
+        if candidate <= next_breakpoint {
+            break candidate;
+        }
+        while index < breakpoints.len() && breakpoints[index].0 == next_breakpoint {
+            let (variance, weight) = breakpoints[index];
+            saturated_distortion += weight * variance;
+            active_weight -= weight;
+            index += 1;
+        }
+        if index == breakpoints.len() {
+            // `total_distortion < total_variance` guarantees an earlier segment;
+            // this protects against a last-bit rounding inversion only.
+            break next_breakpoint;
+        }
+    };
+
+    Ok(spectra
+        .iter()
+        .map(|(weight, variances)| {
+            *weight
+                * variances
+                    .iter()
+                    .map(|&variance| scalar_rate_bits(variance, water_level))
+                    .sum::<f64>()
+        })
+        .collect())
+}
+
 /// Rate (bits/sample) of the optimal linear (reverse-water-filling) code of a
 /// Gaussian source with covariance eigenvalues `eigs`, coded to total MSE
 /// `delta2`. Returns `(total_rate_bits, per_coordinate_bits)`. This is the
@@ -79,23 +162,36 @@ pub fn reverse_water_filling(eigs: &[f64], delta2: f64) -> (f64, Vec<f64>) {
     if delta2 >= total_variance {
         return (0.0, vec![0.0; variances.len()]);
     }
-    let max_e = variances.iter().cloned().fold(0.0_f64, f64::max);
-    let (mut lo, mut hi) = (0.0f64, max_e);
-    for _ in 0..200 {
-        let theta = 0.5 * (lo + hi);
-        let dist: f64 = variances.iter().map(|&e| e.min(theta)).sum();
-        if dist > delta2 {
-            hi = theta;
-        } else {
-            lo = theta;
+    // The validated one-component specialization of the shared exact solver.
+    let component_rates = weighted_reverse_water_filling(&[(1.0, variances.clone())], delta2)
+        .expect("positive finite one-component water-fill inputs are valid");
+    // Recover the exact water level from the rate allocation segment so the
+    // longstanding per-coordinate reporting surface remains available.
+    let mut sorted = variances.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mut saturated = 0.0_f64;
+    let mut active = sorted.len() as f64;
+    let mut index = 0usize;
+    let theta = loop {
+        let next = sorted[index];
+        let candidate = (delta2 - saturated) / active;
+        if candidate <= next {
+            break candidate;
         }
-    }
-    let theta = 0.5 * (lo + hi);
+        while index < sorted.len() && sorted[index] == next {
+            saturated += sorted[index];
+            active -= 1.0;
+            index += 1;
+        }
+        if index == sorted.len() {
+            break next;
+        }
+    };
     let per: Vec<f64> = variances
         .iter()
         .map(|&e| scalar_rate_bits(e, theta))
         .collect();
-    (per.iter().sum(), per)
+    (component_rates[0], per)
 }
 
 /// The spectra-only inputs to the #2233 closed-form curved-birth MDL pre-screen.

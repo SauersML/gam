@@ -1,20 +1,19 @@
 //! Rust-owned coercion helpers for the `ManifoldSAE.from_payload` -> flat
-//! `to_dict` schema derivation (#2091 phase-2, design (A)). These reproduce the
-//! Python `_sae_manifold.py` derivations bit-for-bit so the fit path can return
+//! `to_dict` schema derivation (#2091 phase-2, design (A)). These own the
+//! derivations so the fit path can return
 //! a Rust-owned `ManifoldSaeCore` built directly from the raw
 //! `sae_manifold_fit_minimal` payload, with no Python dataclass in the middle.
 //!
-//! This module owns the topology-naming derivation (basis-kind -> canonical
-//! topology label, scalar + per-atom) and the periodic shape-band reorder,
+//! This module owns assignment and topology aliases, topology naming, distilled
+//! assignment activation dispatch, and the periodic shape-band reorder,
 //! exposed to Python as `sae_atom_topologies` / `sae_periodic_shape_band_reorder`
 //! — the same Rust-owner pattern as `sae_canonical_n_harmonics`. The full
-//! `RawFitPayload -> ManifoldSaePayload` assembly that also consumes these lands
-//! in a later increment. Each helper mirrors an exact Python function — the
-//! doc-comments name the counterpart so a future schema drift is traceable to
-//! one side.
+//! `RawFitPayload -> ManifoldSaePayload` assembly below consumes those same
+//! helpers; Python only marshals typed inputs to this owner.
 
 use crate::manifold::manifold_sae_payload::{AtomPayload, ManifoldSaePayload, SCHEMA_TAG};
 use ndarray::{Array2, Array3, ArrayView2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
@@ -166,19 +165,66 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
-/// Case-insensitive, `-`/`_`-interchangeable name normalizer. Mirrors
-/// `_sae_manifold.py::_canon_name`: `str(name).strip().lower().replace("-", "_")`.
+/// Case-insensitive, `-`/`_`-interchangeable SAE name normalizer.
 pub(crate) fn canon_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-/// Canonical topology label for a (possibly aliased) basis kind. Mirrors
-/// `_basis_to_topology`: look the CANON-normalized basis up in the
-/// `_BASIS_TO_TOPOLOGY` alias map, falling back to the ORIGINAL (un-canon'd)
-/// basis string when unknown — exactly as the Python `dict.get(canon, str(basis))`
-/// does (the default is the raw argument, not its canon form).
+/// Canonical assignment-family token for every documented public spelling.
+///
+/// This is the only assignment alias table at the Python boundary. The fit,
+/// stagewise, payload, and distilled-encoder paths all call this parser before
+/// dispatching to the core [`gam::terms::sae::assignment::AssignmentMode`]
+/// implementation, so accepted spellings and emitted tokens cannot drift.
+pub(crate) fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
+    match canon_name(kind).as_str() {
+        "softmax" => Ok("softmax"),
+        "ibp" | "ibp_map" => Ok("ibp_map"),
+        "threshold_gate" | "gated" | "jump_relu" | "jumprelu" => Ok("threshold_gate"),
+        "topk" | "top_k" => Ok("topk"),
+        _ => Err(format!(
+            "assignment={kind:?} is not a recognized assignment kind; expected one of \
+             ['gated', 'ibp', 'ibp_map', 'jump_relu', 'jumprelu', 'softmax', \
+              'threshold_gate', 'top_k', 'topk']"
+        )),
+    }
+}
+
+fn basis_alias_to_kind(normalized: &str) -> Option<&'static str> {
+    match normalized {
+        "circle" | "periodic" | "periodic_spline" => Some("periodic"),
+        "sphere" => Some("sphere"),
+        "torus" => Some("torus"),
+        "linear" | "linear_rank1" | "affine" => Some("linear"),
+        "linear_block" | "flat_block" => Some("linear_block"),
+        "euclidean" | "euclidean_patch" | "euclidean_quadratic_patch" => Some("euclidean"),
+        "duchon" => Some("duchon"),
+        "poincare" | "hyperbolic" | "poincare_patch" => Some("poincare"),
+        "cylinder" => Some("cylinder"),
+        "mobius" | "mobius_band" => Some("mobius"),
+        "auto" => Some("auto"),
+        _ => None,
+    }
+}
+
+/// Canonical basis kind for a documented topology/basis spelling. Unknown
+/// precomputed kinds are normalized (trim/lower/dash-to-underscore), matching
+/// the fit parser's established treatment of an explicit basis string.
+pub(crate) fn canonical_basis_kind(name: &str) -> String {
+    let normalized = canon_name(name);
+    basis_alias_to_kind(&normalized).map_or(normalized, str::to_string)
+}
+
+/// Resolve a topology spelling to its basis kind while preserving an unknown
+/// caller-supplied precomputed name verbatim.
+pub(crate) fn basis_kind_for_topology(name: &str) -> String {
+    let normalized = canon_name(name);
+    basis_alias_to_kind(&normalized).map_or_else(|| name.to_string(), str::to_string)
+}
+
+/// Canonical topology label for a (possibly aliased) basis kind, falling back
+/// to the original (un-normalized) basis string for an unknown precomputed kind.
 pub(crate) fn basis_to_topology(basis: &str) -> String {
-    // _BASIS_TO_TOPOLOGY (canonical / aliased basis kind -> canonical topology).
     match canon_name(basis).as_str() {
         "periodic" | "periodic_spline" | "circle" => "circle".to_string(),
         "sphere" => "sphere".to_string(),
@@ -190,9 +236,106 @@ pub(crate) fn basis_to_topology(basis: &str) -> String {
         }
         "poincare" | "hyperbolic" | "poincare_patch" => "poincare".to_string(),
         "cylinder" => "cylinder".to_string(),
-        // Unknown -> the ORIGINAL basis string verbatim (Python `str(basis)`).
+        "mobius" | "mobius_band" => "mobius".to_string(),
+        "auto" => "auto".to_string(),
+        // Unknown -> the original basis string verbatim.
         _ => basis.to_string(),
     }
+}
+
+/// Canonical topology for a topology or basis spelling. Unknown precomputed
+/// names are normalized because this is a canonicalizer, not a round-trip
+/// label conversion.
+pub(crate) fn canonical_topology(name: &str) -> String {
+    basis_to_topology(&canonical_basis_kind(name))
+}
+
+/// Assignment family implied by the public flat-block gating vocabulary.
+pub(crate) fn flat_block_assignment(gating: &str) -> Result<&'static str, String> {
+    match canon_name(gating).as_str() {
+        "norm_selection" | "norm" => Ok("ibp_map"),
+        "separate_gate" | "separate" => Ok("threshold_gate"),
+        _ => Err(format!(
+            "flat_block gating={gating:?} is not recognized; expected one of \
+             ['norm', 'norm_selection', 'separate', 'separate_gate']"
+        )),
+    }
+}
+
+/// Python bridge for [`canonical_assignment_kind`].
+#[pyfunction]
+pub(crate) fn sae_canonical_assignment_kind(kind: &str) -> PyResult<String> {
+    canonical_assignment_kind(kind)
+        .map(str::to_string)
+        .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// Python bridge for [`canonical_basis_kind`].
+#[pyfunction]
+pub(crate) fn sae_canonical_basis_kind(name: &str) -> String {
+    canonical_basis_kind(name)
+}
+
+/// Python bridge for [`basis_kind_for_topology`].
+#[pyfunction]
+pub(crate) fn sae_basis_kind_for_topology(name: &str) -> String {
+    basis_kind_for_topology(name)
+}
+
+/// Python bridge for [`basis_to_topology`].
+#[pyfunction]
+pub(crate) fn sae_topology_for_basis(name: &str) -> String {
+    basis_to_topology(name)
+}
+
+/// Python bridge for [`canonical_topology`].
+#[pyfunction]
+pub(crate) fn sae_canonical_topology(name: &str) -> String {
+    canonical_topology(name)
+}
+
+/// Python bridge for [`flat_block_assignment`].
+#[pyfunction]
+pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {
+    flat_block_assignment(gating)
+        .map(str::to_string)
+        .map_err(pyo3::exceptions::PyValueError::new_err)
+}
+
+/// Convert a fitted encoder's `(N, K)` routing logits into assignment values
+/// with the exact production kernel used by the Rust fit. This deletes the
+/// former NumPy reimplementation (including its independently-maintained IBP
+/// exponent) from `gamfit.distill`.
+#[pyfunction(signature = (logits, assignment, temperature, alpha, threshold))]
+pub(crate) fn sae_activation_matrix_from_logits<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray2<'py, f64>,
+    assignment: &str,
+    temperature: f64,
+    alpha: f64,
+    threshold: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let kind = canonical_assignment_kind(assignment)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    if kind == "ibp_map" && !(alpha.is_finite() && alpha > 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "alpha must be finite and positive; got {alpha}"
+        )));
+    }
+    if kind == "threshold_gate" && !threshold.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "threshold must be finite; got {threshold}"
+        )));
+    }
+    gam::terms::sae::assignment::activation_matrix_from_logits(
+        logits.as_array(),
+        kind,
+        temperature,
+        alpha,
+        threshold,
+    )
+    .map(|values| values.into_pyarray(py).unbind())
+    .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Per-atom topology labels for a resolved bases list (`basis_specs` order).
@@ -701,6 +844,56 @@ mod manifold_sae_coercion_tests {
     }
 
     #[test]
+    fn assignment_aliases_have_one_canonical_parser() {
+        for (alias, canonical) in [
+            ("softmax", "softmax"),
+            (" SoftMax ", "softmax"),
+            ("ibp", "ibp_map"),
+            ("ibp-map", "ibp_map"),
+            ("ibp_map", "ibp_map"),
+            ("threshold_gate", "threshold_gate"),
+            ("gated", "threshold_gate"),
+            ("jump-relu", "threshold_gate"),
+            ("jumprelu", "threshold_gate"),
+            ("topk", "topk"),
+            ("top-k", "topk"),
+        ] {
+            assert_eq!(canonical_assignment_kind(alias), Ok(canonical), "alias {alias}");
+        }
+        let err = canonical_assignment_kind("unknown").expect_err("unknown kind");
+        assert!(err.contains("not a recognized assignment kind"));
+        assert!(err.contains("ibp_map") && err.contains("threshold_gate"));
+    }
+
+    #[test]
+    fn topology_and_basis_aliases_share_one_directional_table() {
+        for (alias, canonical) in [
+            ("circle", "periodic"),
+            ("Periodic-Spline", "periodic"),
+            ("affine", "linear"),
+            ("flat-block", "linear_block"),
+            ("euclidean_quadratic_patch", "euclidean"),
+            ("hyperbolic", "poincare"),
+            ("mobius-band", "mobius"),
+            (" AUTO ", "auto"),
+        ] {
+            assert_eq!(canonical_basis_kind(alias), canonical, "alias {alias}");
+            assert_eq!(basis_kind_for_topology(alias), canonical, "alias {alias}");
+        }
+        assert_eq!(canonical_basis_kind(" Weird-Kind "), "weird_kind");
+        assert_eq!(basis_kind_for_topology(" Weird-Kind "), " Weird-Kind ");
+        assert_eq!(canonical_topology(" AUTO "), "auto");
+        assert_eq!(canonical_topology("mobius-band"), "mobius");
+    }
+
+    #[test]
+    fn flat_block_gating_uses_rust_owned_assignment_tokens() {
+        assert_eq!(flat_block_assignment("norm-selection"), Ok("ibp_map"));
+        assert_eq!(flat_block_assignment(" Separate-Gate "), Ok("threshold_gate"));
+        assert!(flat_block_assignment("unknown").is_err());
+    }
+
+    #[test]
     fn basis_to_topology_matches_python_alias_map() {
         // Every documented alias -> canonical topology, plus alias/casing forms.
         for (basis, topo) in [
@@ -722,6 +915,8 @@ mod manifold_sae_coercion_tests {
             ("hyperbolic", "poincare"),
             ("poincare_patch", "poincare"),
             ("cylinder", "cylinder"),
+            ("mobius-band", "mobius"),
+            (" AUTO ", "auto"),
         ] {
             assert_eq!(basis_to_topology(basis), topo, "basis {basis}");
         }
@@ -729,8 +924,7 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn basis_to_topology_unknown_passes_through_original_string() {
-        // Python `dict.get(_canon_name(basis), str(basis))` returns the RAW arg
-        // (not its canon form) on a miss.
+        // The round-trip label conversion returns the raw argument on a miss.
         assert_eq!(basis_to_topology("Weird-Kind"), "Weird-Kind");
     }
 

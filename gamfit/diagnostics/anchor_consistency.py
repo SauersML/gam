@@ -1,7 +1,7 @@
 """Anchor-consistency diagnostic for manifold-SAE atom identifiability.
 
 Reference: the project's own atom-anchor convention (see
-``gamfit._sae_manifold`` / ``gam::identifiability::kernel::anchor_consistency_metrics``).
+``gamfit._sae_manifold`` / ``gam::identifiability::kernel::anchor_consistency_report``).
 A manifold-SAE with ``K`` atoms is identified up to permutation of atoms
 only when the assignment matrix ``A in R^{N x K}`` contains a sufficient
 number of *anchor* rows — rows where one atom dominates

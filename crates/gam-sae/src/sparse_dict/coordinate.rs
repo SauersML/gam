@@ -108,12 +108,13 @@
 //!
 //! `f` is a real trigonometric polynomial of degree `H`; `f'` is likewise degree
 //! `H` and has at most `2H` zeros per period, so `f` has at most `2H` critical
-//! points and at most `H` local maxima. Evaluating `f` on the `4H`-point
-//! equispaced grid (grid spacing `1/(4H)`, four times the degree) places a grid
-//! node inside the global maximum's basin — a **degree-determined** localisation,
-//! not a tuned grid — and a Newton polish on `f'(t) = 0` from the best node
-//! converges to the maximiser. The polish reverts to the grid node if it fails to
-//! increase `f`, so the reported phase is never worse than the grid argmax.
+//! points and at most `H` local maxima. We enumerate all of those stationary
+//! points without a lattice. Writing `x = cos(2πt)`, the sine and cosine parts
+//! of `f'` give a degree-`2H` Chebyshev polynomial whose real roots in `[-1,1]`
+//! contain every stationary point. Recursive derivative-root isolation finds
+//! both sign-changing and repeated roots; both circle lifts of every root are
+//! checked against the original analytic derivative. The global phase is then
+//! the best value over the complete stationary set.
 //!
 //! The SE is the M-estimator (sandwich) delta method for the root `f'(t̂) = 0`.
 //! `f'(t) = Σ_h ω_h(−ρ_{h,1} sin ω_h t + ρ_{h,2} cos ω_h t)` is linear in `ρ`
@@ -371,20 +372,19 @@ fn separated_from_all(t: f64, accepted: &[MeasureSpikeCoordinate], min_sep: f64)
 }
 
 fn count_separated_positive_modes(z: &[f64], min_sep: f64) -> usize {
-    let h_count = z.len() / 2;
-    let grid = 4 * h_count.max(1);
+    let stationary = harmonic_stationary_points(z);
+    let derivative_scale = harmonic_derivative_scale(z);
+    let sign_tol = f64::EPSILON.sqrt() * derivative_scale;
     let mut candidates = Vec::new();
-    for idx in 0..grid {
-        let prev = (idx + grid - 1) % grid;
-        let next = (idx + 1) % grid;
-        let t = idx as f64 / grid as f64;
+    for (idx, &t) in stationary.iter().enumerate() {
+        let previous = stationary[(idx + stationary.len() - 1) % stationary.len()];
+        let next = stationary[(idx + 1) % stationary.len()];
+        let left_span = (t - previous).rem_euclid(1.0);
+        let right_span = (next - t).rem_euclid(1.0);
+        let left = (t - 0.5 * left_span).rem_euclid(1.0);
+        let right = (t + 0.5 * right_span).rem_euclid(1.0);
         let val = harmonic_f(z, t);
-        if val <= 0.0 {
-            continue;
-        }
-        if val >= harmonic_f(z, prev as f64 / grid as f64)
-            && val >= harmonic_f(z, next as f64 / grid as f64)
-        {
+        if val > 0.0 && harmonic_fp(z, left) > sign_tol && harmonic_fp(z, right) < -sign_tol {
             candidates.push((t, val));
         }
     }
@@ -567,57 +567,247 @@ fn harmonic_fpp(rho: &[f64], t: f64) -> f64 {
     acc
 }
 
-/// Locate the global maximiser of `f` on `[0,1)`: `4H`-point equispaced grid
-/// scan (degree-determined localisation), then a Newton polish on `f'(t) = 0`
-/// from the best node. Returns `(t̂, f''(t̂))`. The polish reverts to the grid
-/// node if it fails to increase `f`, so `t̂` is never worse than the grid argmax.
-fn harmonic_argmax(rho: &[f64]) -> (f64, f64) {
+fn harmonic_derivative_scale(rho: &[f64]) -> f64 {
+    rho.chunks_exact(2)
+        .enumerate()
+        .map(|(h, pair)| TAU * (h + 1) as f64 * (pair[0].abs() + pair[1].abs()))
+        .sum()
+}
+
+/// Chebyshev coefficients of the degree-`2H` stationary-point eliminant.
+///
+/// With `θ = 2πt`, split `f'(t)/(2π)` into
+/// `B(θ) - S(θ)`, where `B = Σ h b_h cos(hθ)` and
+/// `S = Σ h a_h sin(hθ)`. At `x = cos θ`, every stationary point therefore
+/// projects to a root of `R(x) = B(θ)^2 - S(θ)^2`. The product identities
+/// `cos h cos k = (T_{h+k}+T_|h-k|)/2` and
+/// `sin h sin k = (T_|h-k|-T_{h+k})/2` assemble `R` directly in the stable
+/// Chebyshev basis. Both lifts `±acos(x)` are checked later, so squaring cannot
+/// introduce a false stationary phase.
+fn stationary_eliminant(rho: &[f64]) -> Vec<f64> {
     let h_count = rho.len() / 2;
-    let grid = 4 * h_count.max(1);
-    let mut best_t = 0.0;
-    let mut best_f = f64::NEG_INFINITY;
-    for m in 0..grid {
-        let t = m as f64 / grid as f64;
-        let val = harmonic_f(rho, t);
-        if val > best_f {
-            best_f = val;
-            best_t = t;
+    let rho_scale = rho
+        .iter()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if h_count == 0 || rho_scale == 0.0 || !rho_scale.is_finite() {
+        return vec![0.0];
+    }
+    let mut alpha = vec![0.0; h_count + 1];
+    let mut beta = vec![0.0; h_count + 1];
+    for h in 1..=h_count {
+        alpha[h] = h as f64 * (rho[2 * (h - 1)] / rho_scale);
+        beta[h] = h as f64 * (rho[2 * (h - 1) + 1] / rho_scale);
+    }
+    let mut coefficients = vec![0.0; 2 * h_count + 1];
+    for h in 1..=h_count {
+        for k in 1..=h_count {
+            let aa = alpha[h] * alpha[k];
+            let bb = beta[h] * beta[k];
+            coefficients[h + k] += 0.5 * (bb + aa);
+            coefficients[h.abs_diff(k)] += 0.5 * (bb - aa);
+        }
+    }
+    coefficients
+}
+
+fn normalize_chebyshev(mut coefficients: Vec<f64>) -> Vec<f64> {
+    let scale = coefficients
+        .iter()
+        .fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    if scale == 0.0 || !scale.is_finite() {
+        return vec![0.0];
+    }
+    let rounding_floor = f64::EPSILON * (coefficients.len() * coefficients.len()) as f64 * scale;
+    while coefficients.len() > 1
+        && coefficients
+            .last()
+            .is_some_and(|value| value.abs() <= rounding_floor)
+    {
+        coefficients.pop();
+    }
+    for value in &mut coefficients {
+        *value /= scale;
+    }
+    coefficients
+}
+
+fn evaluate_chebyshev(coefficients: &[f64], x: f64) -> f64 {
+    let mut next = 0.0;
+    let mut next_next = 0.0;
+    for &coefficient in coefficients.iter().skip(1).rev() {
+        let current = coefficient + 2.0 * x * next - next_next;
+        next_next = next;
+        next = current;
+    }
+    coefficients[0] + x * next - next_next
+}
+
+fn differentiate_chebyshev(coefficients: &[f64]) -> Vec<f64> {
+    let degree = coefficients.len().saturating_sub(1);
+    if degree == 0 {
+        return vec![0.0];
+    }
+    let mut derivative = vec![0.0; degree];
+    derivative[degree - 1] = 2.0 * degree as f64 * coefficients[degree];
+    if degree >= 2 {
+        derivative[degree - 2] = 2.0 * (degree - 1) as f64 * coefficients[degree - 1];
+        for k in (0..degree - 2).rev() {
+            derivative[k] = derivative[k + 2] + 2.0 * (k + 1) as f64 * coefficients[k + 1];
+        }
+    }
+    derivative[0] *= 0.5;
+    normalize_chebyshev(derivative)
+}
+
+fn chebyshev_zero_tolerance(coefficients: &[f64]) -> f64 {
+    f64::EPSILON.sqrt() * coefficients.iter().map(|value| value.abs()).sum::<f64>()
+}
+
+fn push_distinct_root(roots: &mut Vec<f64>, root: f64) {
+    let merge_tol = f64::EPSILON.sqrt();
+    if !roots
+        .iter()
+        .any(|existing| (existing - root).abs() <= merge_tol)
+    {
+        roots.push(root.clamp(-1.0, 1.0));
+    }
+}
+
+fn bisect_chebyshev_root(coefficients: &[f64], mut left: f64, mut right: f64) -> f64 {
+    let mut left_value = evaluate_chebyshev(coefficients, left);
+    loop {
+        let middle = left + 0.5 * (right - left);
+        if middle == left || middle == right {
+            break;
+        }
+        let middle_value = evaluate_chebyshev(coefficients, middle);
+        if middle_value == 0.0 {
+            return middle;
+        }
+        if left_value.is_sign_negative() != middle_value.is_sign_negative() {
+            right = middle;
+        } else {
+            left = middle;
+            left_value = middle_value;
+        }
+    }
+    if evaluate_chebyshev(coefficients, left).abs() <= evaluate_chebyshev(coefficients, right).abs()
+    {
+        left
+    } else {
+        right
+    }
+}
+
+/// Isolate every real root of a Chebyshev polynomial on `[-1,1]`.
+///
+/// Roots of the derivative partition the interval into monotone pieces, so each
+/// sign-changing piece contains exactly one simple root and bisection is fully
+/// safeguarded. Testing the derivative roots themselves retains even-multiplicity
+/// (tangential) roots that a sign-change scan would miss.
+fn chebyshev_roots_unit_interval(coefficients: Vec<f64>) -> Vec<f64> {
+    let coefficients = normalize_chebyshev(coefficients);
+    let degree = coefficients.len() - 1;
+    if degree == 0 {
+        return Vec::new();
+    }
+    if degree == 1 {
+        let root = -coefficients[0] / coefficients[1];
+        return if (-1.0..=1.0).contains(&root) {
+            vec![root]
+        } else {
+            Vec::new()
+        };
+    }
+
+    let critical = chebyshev_roots_unit_interval(differentiate_chebyshev(&coefficients));
+    let tolerance = chebyshev_zero_tolerance(&coefficients);
+    let mut roots = Vec::new();
+    for &candidate in critical.iter().chain([-1.0, 1.0].iter()) {
+        if evaluate_chebyshev(&coefficients, candidate).abs() <= tolerance {
+            push_distinct_root(&mut roots, candidate);
         }
     }
 
-    // Newton polish on f'(t) = 0 from the best grid node. The step tolerance is
-    // derived from f64 machine epsilon (Newton doubles correct digits each step,
-    // so √eps reaches full precision); the iteration cap is a non-convergence
-    // safety bound (a genuine peak converges in a handful of steps), not a tuned
-    // budget — a flat/failed polish falls back to the grid node below.
-    let tol = f64::EPSILON.sqrt();
-    let iter_cap = 64;
-    let mut t = best_t;
-    let mut converged = false;
-    for _ in 0..iter_cap {
-        let fpp = harmonic_fpp(rho, t);
-        if fpp.abs() <= f64::MIN_POSITIVE {
-            break;
-        }
-        let step = harmonic_fp(rho, t) / fpp;
-        t -= step;
-        if step.abs() <= tol * (1.0 + t.abs()) {
-            converged = true;
-            break;
+    let mut boundaries = Vec::with_capacity(critical.len() + 2);
+    boundaries.push(-1.0);
+    boundaries.extend(critical.iter().copied());
+    boundaries.push(1.0);
+    boundaries.sort_by(f64::total_cmp);
+    for interval in boundaries.windows(2) {
+        let left = interval[0];
+        let right = interval[1];
+        let left_value = evaluate_chebyshev(&coefficients, left);
+        let right_value = evaluate_chebyshev(&coefficients, right);
+        if left_value.abs() > tolerance
+            && right_value.abs() > tolerance
+            && left_value.is_sign_negative() != right_value.is_sign_negative()
+        {
+            push_distinct_root(
+                &mut roots,
+                bisect_chebyshev_root(&coefficients, left, right),
+            );
         }
     }
-    let t_polished = t.rem_euclid(1.0);
-    let (t_hat, fpp) = if converged && harmonic_f(rho, t_polished) >= best_f {
-        (t_polished, harmonic_fpp(rho, t_polished))
-    } else {
-        (best_t, harmonic_fpp(rho, best_t))
+    roots.sort_by(f64::total_cmp);
+    roots
+}
+
+fn push_distinct_phase(phases: &mut Vec<f64>, phase: f64) {
+    let phase = phase.rem_euclid(1.0);
+    let merge_tol = f64::EPSILON.sqrt();
+    if !phases
+        .iter()
+        .any(|existing| circle_dist(*existing, phase) <= merge_tol)
+    {
+        phases.push(phase);
+    }
+}
+
+fn harmonic_stationary_points(rho: &[f64]) -> Vec<f64> {
+    let derivative_scale = harmonic_derivative_scale(rho);
+    if derivative_scale == 0.0 || !derivative_scale.is_finite() {
+        return Vec::new();
+    }
+    let residual_tol = f64::EPSILON.sqrt() * derivative_scale;
+    let projected = chebyshev_roots_unit_interval(stationary_eliminant(rho));
+    let mut phases = Vec::with_capacity(2 * projected.len());
+    for x in projected {
+        let theta = x.clamp(-1.0, 1.0).acos();
+        for lifted in [theta / TAU, (-theta) / TAU] {
+            let phase = lifted.rem_euclid(1.0);
+            if harmonic_fp(rho, phase).abs() <= residual_tol {
+                push_distinct_phase(&mut phases, phase);
+            }
+        }
+    }
+    phases.sort_by(f64::total_cmp);
+    phases
+}
+
+/// Locate the global maximiser of `f` on `[0,1)` by evaluating the complete
+/// stationary set of its degree-`H` trigonometric polynomial. Returns
+/// `(t̂, f''(t̂))`; ties choose the smallest phase deterministically.
+fn harmonic_argmax(rho: &[f64]) -> (f64, f64) {
+    let stationary = harmonic_stationary_points(rho);
+    let Some(&first) = stationary.first() else {
+        return (0.0, harmonic_fpp(rho, 0.0));
     };
-    (t_hat, fpp)
+    let mut best_t = first;
+    let mut best_value = harmonic_f(rho, first);
+    for &candidate in stationary.iter().skip(1) {
+        let value = harmonic_f(rho, candidate);
+        if value > best_value || (value == best_value && candidate < best_t) {
+            best_t = candidate;
+            best_value = value;
+        }
+    }
+    (best_t, harmonic_fpp(rho, best_t))
 }
 
 /// Per-firing coordinate readout for a harmonic block (`b = 2H`, `H ≥ 1`): the
-/// phase `t̂` maximising the trig matched filter `Σ_h ρ_h·u_h(t)` via a
-/// `4H`-grid scan plus Newton polish, with the delta-method SE
+/// phase `t̂` maximising the trig matched filter `Σ_h ρ_h·u_h(t)` over all
+/// analytically isolated stationary roots, with the delta-method SE
 /// `√(σ̂² Σ_h ω_h²)/|f''(t̂)|`. Amplitude is `‖z‖` with SE `≈ σ̂`. See the module
 /// doc for the derivation; `H = 1` reproduces [`block_firing_coordinates`].
 pub fn harmonic_firing_coordinates(
@@ -890,6 +1080,73 @@ mod tests {
     fn circ_err(a: f64, b: f64) -> f64 {
         let d = (a - b).rem_euclid(1.0);
         d.min(1.0 - d)
+    }
+
+    #[test]
+    fn stationary_root_argmax_beats_the_old_lattice_basin() {
+        // This degree-two profile's best 4H lattice node lies in the WRONG
+        // local maximum's basin. Complete stationary-root enumeration must find
+        // the true global phase near 0.07078, not the old answer near 0.47780.
+        let rho = [
+            -0.2203432413122001,
+            1.7750647300698044,
+            1.4778082357960907,
+            0.4751086996188798,
+        ];
+        let expected = 0.07077957313295;
+        let (phase, curvature) = harmonic_argmax(&rho);
+        assert!(
+            circ_err(phase, expected) <= f64::EPSILON.sqrt(),
+            "stationary-root global phase {phase} missed {expected}"
+        );
+        assert!(curvature < 0.0);
+        assert!(
+            harmonic_f(&rho, phase) > 1.86,
+            "selected local rather than global maximum"
+        );
+    }
+
+    #[test]
+    fn stationary_roots_include_tangencies_and_circle_seam() {
+        // f'(t)/(2π) = cos(2πt) - cos(4πt): t=0 is a repeated stationary root,
+        // invisible to derivative-sign bracketing alone.
+        let tangent = [0.0, 1.0, 0.0, -0.5];
+        let roots = harmonic_stationary_points(&tangent);
+        for expected in [0.0, 1.0 / 3.0, 2.0 / 3.0] {
+            assert!(
+                roots
+                    .iter()
+                    .any(|&root| circ_err(root, expected) <= f64::EPSILON.sqrt()),
+                "missing stationary root {expected}; got {roots:?}"
+            );
+        }
+
+        // The maximum of -cos(2πt) is exactly opposite the t=0 seam.
+        let seam = [-1.0, 0.0];
+        let (phase, curvature) = harmonic_argmax(&seam);
+        assert!(circ_err(phase, 0.5) <= f64::EPSILON.sqrt());
+        assert!(curvature < 0.0);
+
+        let zero = [0.0, 0.0, 0.0, 0.0];
+        assert_eq!(harmonic_argmax(&zero), (0.0, 0.0));
+    }
+
+    #[test]
+    fn exact_mode_positions_prevent_grid_snapping_separation_error() {
+        // The two positive maxima are 0.453 apart, below the production
+        // separation limit 2/H = 0.5. The former 4H lattice snapped them to
+        // 0.25 and 0.75 (exactly 0.5 apart) and falsely counted two modes.
+        let rho = [
+            -0.19136859058260647,
+            0.5744053053825253,
+            -0.8795719735057727,
+            -0.16915833401458946,
+            0.1636929927729193,
+            -0.03509594833820036,
+            0.05717764914618254,
+            -0.1065206988264421,
+        ];
+        assert_eq!(count_separated_positive_modes(&rho, separation_limit(4)), 1);
     }
 
     /// Wrap planted `(row, code)` firings on a single block into a minimal

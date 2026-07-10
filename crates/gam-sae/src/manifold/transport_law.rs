@@ -18,12 +18,14 @@
 //! so the atom image at layer `ℓ` (`C^(ℓ) = {Φ_k(t) B^(ℓ)_k}`) and at layer `ℓ+1`
 //! (`C^(ℓ+1) = {Φ_k(t) B^(ℓ+1)_k}`) are two curves in one `ℝ^p`. The network's
 //! transport carries a layer-`ℓ` feature to layer `ℓ+1`; with no network in hand
-//! we approximate that correspondence by NEAREST POINT: for each chart grid point
-//! `t_g` decode the SOURCE (layer `ℓ`) image `x_g = Φ_k(t_g) B^(ℓ)_k`, then
-//! PROJECT `x_g` onto the TARGET (layer `ℓ+1`) atom image to read off the chart
-//! coordinate that best reproduces it,
+//! we approximate that correspondence by NEAREST POINT: for each reported source
+//! sample `t_g`, decode the SOURCE (layer `ℓ`) image
+//! `x_g = Φ_k(t_g) B^(ℓ)_k`, then PROJECT `x_g` onto the CONTINUOUS TARGET
+//! (layer `ℓ+1`) atom image to read off the chart coordinate that best reproduces it,
 //! `t'_g = argmin_{t'} ‖x_g − Φ_k(t') B^(ℓ+1)_k‖²`. The empirical transport map is
-//! `t_g ↦ t'_g`.
+//! `t_g ↦ t'_g`.  The target projection enumerates every stationary point of
+//! this trigonometric polynomial through its companion-matrix roots, so `t'_g`
+//! is not quantized by the source-report sampling density.
 //!
 //! (The mission brief phrased the grid step as "decode at layer ℓ+1 … project
 //! back onto the layer-(ℓ+1) atom image", which is the identity map; the
@@ -63,6 +65,7 @@
 //! decoders in `ℝ^p`).
 
 use super::*;
+use crate::chart_coordinate_solve::{ChartBasisKind, PeriodicCurveExtrema};
 
 /// A reference to one column block of a crosscoder target: the implicit anchor
 /// layer `[0, p_x)`, or an explicit output block `ℓ`.
@@ -86,7 +89,8 @@ pub struct AtomTransportReport {
     pub source: CrosscoderLayer,
     /// The target layer (its image is the projection target).
     pub target: CrosscoderLayer,
-    /// Chart-grid resolution used (number of grid points over `[0, 1)`).
+    /// Number of source chart samples reported over `[0, 1)`.  Target
+    /// coordinates are solved continuously and do not inherit this resolution.
     pub grid_resolution: usize,
     /// The atom's harmonic order `H = (M − 1)/2`, which sets the smooth-map
     /// alternative's Fourier order.
@@ -150,9 +154,9 @@ impl AtomTransportReport {
 /// `term` must hold the fitted atom (with an installed periodic basis evaluator);
 /// `layout` supplies the anchor width, the block column ranges, and the per-block
 /// `√λ_ℓ` unscaling (pass the layout the fit installed, or one built with
-/// [`CrosscoderLayout::from_blocks`]). `grid_resolution` is the number of chart
-/// grid points over `[0, 1)` — the caller's resolution choice, not an
-/// answer-changing knob. Requires `layout.num_blocks() ≥ 1`.
+/// [`CrosscoderLayout::from_blocks`]). `grid_resolution` is the number of source
+/// samples reported over `[0, 1)`; it controls diagnostic sampling, not the
+/// continuous target-coordinate solve. Requires `layout.num_blocks() ≥ 1`.
 pub fn measure_atom_transport(
     term: &SaeManifoldTerm,
     layout: &CrosscoderLayout,
@@ -202,10 +206,23 @@ pub fn measure_atom_transport_between(
             atom_ref.latent_dim
         ));
     }
+    if atom_ref.basis_kind != SaeAtomBasisKind::Periodic {
+        return Err(format!(
+            "measure_atom_transport: atom {atom} must use the standard periodic harmonic basis, got {:?}",
+            atom_ref.basis_kind
+        ));
+    }
+    if atom_ref.homotopy_eta != 1.0 {
+        return Err(format!(
+            "measure_atom_transport: atom {atom} is at homotopy eta {}, not the fitted eta = 1 endpoint",
+            atom_ref.homotopy_eta
+        ));
+    }
 
     // Honest-units source and target decoders, both `M × p` in the SAME ambient.
-    let b_src = honest_layer_decoder(&atom_ref.decoder_coefficients, layout, source)?;
-    let b_tgt = honest_layer_decoder(&atom_ref.decoder_coefficients, layout, target)?;
+    let physical_decoder = atom_ref.physical_full_width_decoder();
+    let b_src = honest_layer_decoder(&physical_decoder, layout, source)?;
+    let b_tgt = honest_layer_decoder(&physical_decoder, layout, target)?;
     if b_src.ncols() != b_tgt.ncols() {
         return Err(format!(
             "measure_atom_transport: source ambient width {} != target ambient width {} — the \
@@ -216,7 +233,7 @@ pub fn measure_atom_transport_between(
         ));
     }
 
-    let m = atom_ref.decoder_coefficients.nrows();
+    let m = physical_decoder.nrows();
     let n_harmonics = m.saturating_sub(1) / 2;
     // The smooth alternative fits `K = 2H + 1` Fourier coefficients; it needs at
     // least `K + 1` grid points to be determined (and the phase test needs a
@@ -230,49 +247,47 @@ pub fn measure_atom_transport_between(
         ));
     }
 
-    let evaluator = atom_ref.basis_evaluator.as_ref().ok_or_else(|| {
-        format!("measure_atom_transport: atom {atom} has no basis evaluator installed")
-    })?;
-
-    // Evaluate the shared chart basis `Φ` on the uniform grid `t_g = g / G` once;
-    // both layer images are read off it.
+    // Evaluate the standard full-width harmonic basis at the requested SOURCE
+    // report samples.  These samples do not serve as target candidates.
+    let basis = ChartBasisKind::Periodic { n_harmonics };
     let grid = Array2::<f64>::from_shape_fn((grid_resolution, 1), |(g, _)| {
         g as f64 / grid_resolution as f64
     });
-    let (phi_grid, _jet) = evaluator.evaluate(grid.view())?;
-    if phi_grid.ncols() != m {
+    if basis.width() != m {
         return Err(format!(
-            "measure_atom_transport: evaluator returned Φ width {} but the decoder has {m} basis \
-             rows",
-            phi_grid.ncols()
+            "measure_atom_transport: periodic basis width {} != physical decoder width {m}",
+            basis.width()
         ));
     }
+    let mut phi_grid = Array2::<f64>::zeros((grid_resolution, m));
+    let mut phi = vec![0.0; m];
+    for g in 0..grid_resolution {
+        basis.eval_into(grid[[g, 0]], &mut phi);
+        for column in 0..m {
+            phi_grid[[g, column]] = phi[column];
+        }
+    }
     let source_image = phi_grid.dot(&b_src); // G × p, decoded source points
-    let target_image = phi_grid.dot(&b_tgt); // G × p, target-image candidates
+    let target_gram = b_tgt.dot(&b_tgt.t());
+    let target_extrema = PeriodicCurveExtrema::from_gram(target_gram.view())?;
 
-    // Empirical transport: project each source point onto the target image by a
-    // grid argmin over `t'` (resolution `1/G`, the caller's grid choice).
+    // Empirical transport: project each source point onto the continuous target
+    // image by comparing every companion-enumerated stationary point.
     let mut transport_grid = Vec::with_capacity(grid_resolution);
     let mut t_arr = Vec::with_capacity(grid_resolution);
     let mut tprime = Vec::with_capacity(grid_resolution);
     for g in 0..grid_resolution {
         let x = source_image.row(g);
-        let mut best_gp = 0usize;
-        let mut best_d2 = f64::INFINITY;
-        for gp in 0..grid_resolution {
-            let y = target_image.row(gp);
-            let mut d2 = 0.0_f64;
-            for j in 0..x.len() {
-                let d = x[j] - y[j];
-                d2 += d * d;
-            }
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best_gp = gp;
-            }
-        }
+        let linear = b_tgt.dot(&x);
+        let projection = target_extrema
+            .minimize_squared_distance(linear.as_slice().ok_or_else(|| {
+                "measure_atom_transport: target linear coefficients are not contiguous".to_string()
+            })?)
+            .map_err(|error| {
+                format!("measure_atom_transport: source sample {g} target projection: {error}")
+            })?;
         let t = g as f64 / grid_resolution as f64;
-        let tp = best_gp as f64 / grid_resolution as f64;
+        let tp = projection.coordinate;
         t_arr.push(t);
         tprime.push(tp);
         transport_grid.push((t, tp));

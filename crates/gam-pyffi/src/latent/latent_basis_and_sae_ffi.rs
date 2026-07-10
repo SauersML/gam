@@ -707,7 +707,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
     let mut coefficients = Array2::<f64>::zeros((p, n_outputs));
     let fitted: Array2<f64>;
     let iterations: usize;
-    let converged: bool;
     let penalized_neg_log_likelihood: f64;
 
     if multinomial {
@@ -733,7 +732,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
         }
         fitted = outputs.fitted_probabilities;
         iterations = outputs.iterations;
-        converged = outputs.converged;
         penalized_neg_log_likelihood = outputs.penalized_neg_log_likelihood;
     } else {
         let outputs = gam::families::binomial_multi::fit_penalized_binomial_multi(
@@ -752,7 +750,6 @@ fn latent_multi_output_fit_to_pydict<'py>(
         coefficients = outputs.coefficients;
         fitted = outputs.fitted_probabilities;
         iterations = outputs.iterations;
-        converged = outputs.converged;
         penalized_neg_log_likelihood = outputs.penalized_neg_log_likelihood;
     }
 
@@ -765,7 +762,9 @@ fn latent_multi_output_fit_to_pydict<'py>(
     let reml_score = penalized_neg_log_likelihood + latent_prior_score;
 
     let out = PyDict::new(py);
-    out.set_item("status", if converged { "ok" } else { "not_converged" })?;
+    // Both core adapters are convergence-only result boundaries: a stalled
+    // vector solve is a typed error above and can never reach this dictionary.
+    out.set_item("status", "ok")?;
     out.set_item("lambda", lambda)?;
     out.set_item("rho", lambda.ln())?;
     out.set_item("reml_score", reml_score)?;
@@ -1581,9 +1580,10 @@ fn gaussian_reml_fit_latent<'py>(
 }
 
 fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
-    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+    let canonical = crate::manifold::manifold_sae_coercion::canonical_basis_kind(value);
+    match canonical.as_str() {
         "duchon" => SaeAtomBasisKind::Duchon,
-        "periodic" | "periodic_spline" | "circle" => SaeAtomBasisKind::Periodic,
+        "periodic" => SaeAtomBasisKind::Periodic,
         "sphere" => SaeAtomBasisKind::Sphere,
         "torus" => SaeAtomBasisKind::Torus,
         // #1221 — the genuinely-linear (affine) atom: `γ(t) = b₀ + Σ t_a·b_a`,
@@ -1591,7 +1591,7 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         // distinct from `"euclidean"` / `"euclidean_patch"`, which is the degree-2
         // QUADRATIC patch `{1, t, t²}`. `"euclidean_quadratic_patch"` is accepted
         // as an explicit synonym so callers can name the quadratic patch honestly.
-        "linear" | "linear_rank1" | "affine" => SaeAtomBasisKind::Linear,
+        "linear" => SaeAtomBasisKind::Linear,
         // #BSF — `"linear_block"` is a BSF block expressed AS a manifold-SAE atom:
         // γ_g(t) = t·D_g with an orthonormal decoder frame D_g and block-level
         // (norm-selection or separate-gate) gating. Mathematically it IS the
@@ -1605,12 +1605,11 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         // then-unverifiable, collision-prone change) for a type-level distinction
         // the frame+gating config already carries. Do NOT "simplify" this alias
         // away — it is load-bearing for the executable BSF-subset claim.
-        "linear_block" | "flat_block" => SaeAtomBasisKind::Linear,
-        "euclidean" | "euclidean_patch" | "euclidean_quadratic_patch" => {
-            SaeAtomBasisKind::EuclideanPatch
-        }
-        "poincare" | "poincare_patch" | "hyperbolic" => SaeAtomBasisKind::Poincare,
+        "linear_block" => SaeAtomBasisKind::Linear,
+        "euclidean" => SaeAtomBasisKind::EuclideanPatch,
+        "poincare" => SaeAtomBasisKind::Poincare,
         "cylinder" => SaeAtomBasisKind::Cylinder,
+        "mobius" => SaeAtomBasisKind::Mobius,
         other => SaeAtomBasisKind::Precomputed(other.to_string()),
     }
 }
@@ -1637,6 +1636,7 @@ fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
+        SaeAtomBasisKind::Mobius => "mobius".to_string(),
         // The finite-set (discrete-anchor) candidate is inert scaffolding that is
         // not enrolled in the topology race by default, so a discovered dictionary
         // never actually carries it (see
@@ -1648,30 +1648,10 @@ fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
     }
 }
 
-/// #1777 — canonicalize the Python-facing assignment-kind token. The hard-sigmoid
-/// gate family formerly spelled `"jumprelu"` is now the accurately-named
-/// `"threshold_gate"` (the renamed [`AssignmentMode::ThresholdGate`]); BOTH
-/// spellings are accepted and map to the same mode, and the canonical (emitted)
-/// token is `"threshold_gate"`. `"softmax"` / `"ibp_map"` pass through unchanged.
-/// Any other token is a caller error. Every FFI entry point that receives an
-/// `assignment_kind` string from Python normalizes through this so the legacy
-/// `"jumprelu"` alias keeps working while the primary spelling is `"threshold_gate"`.
+/// Canonicalize every Python-facing assignment token through the Rust-owned
+/// schema shared with the public facade and distilled encoder.
 fn canonicalize_assignment_kind(kind: &str) -> Result<String, String> {
-    match kind {
-        "softmax" => Ok("softmax".to_string()),
-        "ibp_map" => Ok("ibp_map".to_string()),
-        // Primary spelling and the retained legacy alias both collapse to the
-        // renamed variant's canonical token.
-        "threshold_gate" | "jumprelu" => Ok("threshold_gate".to_string()),
-        // Sparsity by construction: hard top-k support, no sparsity penalty, no
-        // gate coordinates in the inner system. The support size is the fit's
-        // `top_k` argument (required for this mode).
-        "topk" => Ok("topk".to_string()),
-        other => Err(format!(
-            "assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', \
-             or 'topk' (legacy alias 'jumprelu' also accepted); got {other:?}"
-        )),
-    }
+    crate::manifold::manifold_sae_coercion::canonical_assignment_kind(kind).map(str::to_string)
 }
 
 /// Default per-axis harmonic order for a torus atom (Φ has `(2H+1)^d`
@@ -1761,6 +1741,13 @@ const SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE: usize = 3;
 /// Mirrors the Euclidean-patch degree so the cylinder's flat factor matches the
 /// patch candidate it races against; `Ml = SAE_CYLINDER_LINE_DEGREE + 1`.
 const SAE_CYLINDER_LINE_DEGREE: usize = 2;
+
+/// Möbius production convention (#2240): circle harmonics on the DOUBLE-COVER
+/// angle and the width monomial degree of the deck-invariant basis. Must match
+/// the seed builder and the topology-race candidate (`MobiusHarmonicEvaluator::
+/// new(3, 2)`, deck-invariant width 10).
+const SAE_MOBIUS_CIRCLE_HARMONICS: usize = 3;
+const SAE_MOBIUS_WIDTH_DEGREE: usize = 2;
 
 /// Recover the cylinder evaluator's `(circle_harmonics H, line_degree D)` from
 /// its fitted product basis width `m = (2H + 1)·(D + 1)` and the production
@@ -1955,6 +1942,29 @@ fn build_sae_basis_evaluators(
                     d,
                     sae_euclidean_degree_for_basis_size(d, m)?,
                 )?)
+            }
+            SaeAtomBasisKind::Mobius if d == 2 => {
+                // Möbius production convention: H = 3 double-cover circle
+                // harmonics, width degree 2 (deck-invariant width 10, see
+                // `MobiusHarmonicEvaluator`). Verify the fitted width instead
+                // of guessing an alternative layout.
+                let evaluator = MobiusHarmonicEvaluator::new(
+                    SAE_MOBIUS_CIRCLE_HARMONICS,
+                    SAE_MOBIUS_WIDTH_DEGREE,
+                )?;
+                if evaluator.basis_size() != m {
+                    return Err(format!(
+                        "build_sae_basis_evaluators: Mobius atom {k} width {m} does not match \
+                         the production deck-invariant layout ({} columns)",
+                        evaluator.basis_size()
+                    ));
+                }
+                Arc::new(evaluator)
+            }
+            SaeAtomBasisKind::Mobius => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Mobius atom {k} requires latent_dim == 2; got dim={d}, m={m}"
+                ));
             }
             SaeAtomBasisKind::Cylinder => {
                 return Err(format!(
@@ -2268,6 +2278,7 @@ fn stagewise_basis_kind_tag(kind: &SaeAtomBasisKind) -> &'static str {
         SaeAtomBasisKind::Sphere => "sphere",
         SaeAtomBasisKind::Torus => "torus",
         SaeAtomBasisKind::Cylinder => "cylinder",
+        SaeAtomBasisKind::Mobius => "mobius",
         SaeAtomBasisKind::Linear => "linear",
         SaeAtomBasisKind::EuclideanPatch => "euclidean_patch",
         SaeAtomBasisKind::Poincare => "poincare",
@@ -3382,7 +3393,7 @@ fn sae_manifold_fit_inner<'py>(
     let report = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
         gam::terms::sae::manifold::run_sae_manifold_fit(request)
     })?
-    .map_err(py_value_error)?;
+    .map_err(|err| py_value_error(err.to_string()))?;
     let gam::terms::sae::manifold::SaeFitReport {
         term,
         rho,
@@ -5075,15 +5086,155 @@ fn sae_checkpoint_dynamics(
     Ok(out.unbind())
 }
 
-/// Guard G2's eval-forever split, per record: `mask[i]` is true iff `group[i]`
-/// is an eval-forever group under `seed`. A thin wrapper over the single source
-/// of truth `gam_sae::inference::intervention_shard::eval_forever_mask`, so the
-/// SplitMix64 split stays bit-identical across the language boundary and the
-/// Python assembly layer never re-derives the hash (SPEC rules 8-9). Group ids
-/// are reinterpreted to `u64` two's-complement exactly as the Rust split does.
-#[pyfunction(signature = (group, seed))]
-fn intervention_eval_forever_mask(group: Vec<i64>, seed: u64) -> Vec<bool> {
-    gam::sae::inference::intervention_shard::eval_forever_mask(&group, seed)
+/// Rust-owned Rung-3 calibration design.  Python receives prepared fit and
+/// prediction frames from this object and returns only the fitted linear
+/// predictors; split/floor/screening/log/gauge/diagnostic math never crosses
+/// the FFI boundary.
+#[pyclass(module = "gamfit._rust", name = "_InterventionCalibrationPlan")]
+struct PyInterventionCalibrationPlan {
+    inner: gam::sae::inference::intervention_shard::InterventionCalibrationPlan,
+}
+
+fn intervention_atom_labels(atoms: &[i64]) -> Vec<String> {
+    atoms.iter().map(i64::to_string).collect()
+}
+
+#[pymethods]
+impl PyInterventionCalibrationPlan {
+    #[getter]
+    fn formula(&self) -> &'static str {
+        gam::sae::inference::intervention_shard::CHART_CALIBRATION_FORMULA
+    }
+
+    fn constraints(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let out = PyDict::new(py);
+        out.set_item(
+            gam::sae::inference::intervention_shard::CHART_CALIBRATION_SMOOTH_TERM,
+            gam::sae::inference::intervention_shard::CHART_CALIBRATION_SMOOTH_CONSTRAINT,
+        )?;
+        Ok(out.unbind())
+    }
+
+    fn fit_frame(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let out = PyDict::new(py);
+        out.set_item("log_nu", self.inner.train_log_nu.clone())?;
+        out.set_item("log_nu_hat", self.inner.train_log_nu_hat.clone())?;
+        out.set_item("atom", intervention_atom_labels(&self.inner.train_atom))?;
+        Ok(out.unbind())
+    }
+
+    fn reference_frame(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let out = PyDict::new(py);
+        out.set_item(
+            "log_nu_hat",
+            vec![self.inner.reference_log_nu_hat; self.inner.measurable_atoms.len()],
+        )?;
+        out.set_item(
+            "atom",
+            intervention_atom_labels(&self.inner.measurable_atoms),
+        )?;
+        Ok(out.unbind())
+    }
+
+    fn eval_frame(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let out = PyDict::new(py);
+        out.set_item("log_nu_hat", self.inner.eval_log_nu_hat.clone())?;
+        out.set_item("atom", intervention_atom_labels(&self.inner.eval_atom))?;
+        Ok(out.unbind())
+    }
+
+    #[getter]
+    fn n_eval(&self) -> usize {
+        self.inner.eval_log_nu.len()
+    }
+
+    fn finish(
+        &self,
+        py: Python<'_>,
+        reference_eta: Vec<f64>,
+        eval_eta: Vec<f64>,
+    ) -> PyResult<Py<PyDict>> {
+        let result = self
+            .inner
+            .finish(&reference_eta, &eval_eta)
+            .map_err(py_value_error)?;
+        let respeed = PyDict::new(py);
+        for (atom, value) in result.respeed {
+            respeed.set_item(atom, value)?;
+        }
+        let out = PyDict::new(py);
+        out.set_item("respeed", respeed)?;
+        out.set_item(
+            "below_measurement_floor",
+            result.below_measurement_floor,
+        )?;
+        out.set_item(
+            "no_training_intervention",
+            result.no_training_intervention,
+        )?;
+        out.set_item("floor_nats", result.floor_nats)?;
+        out.set_item("heldout_rmse_lognats", result.heldout_rmse_lognats)?;
+        out.set_item("n_train", result.n_train)?;
+        out.set_item("n_eval", result.n_eval)?;
+        Ok(out.unbind())
+    }
+}
+
+/// Validate a complete intervention shard and prepare the single Rust-owned
+/// Rung-3 calibration design.  `prediction` is deliberately a closed choice;
+/// requesting Rung 2 without a Rung-2 channel is a typed core error.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn intervention_calibration_plan<'py>(
+    row_id: PyReadonlyArray1<'py, i64>,
+    atom: PyReadonlyArray1<'py, i64>,
+    dose: PyReadonlyArray2<'py, f64>,
+    nu_hat_1: PyReadonlyArray1<'py, f64>,
+    nu_hat_2: Option<PyReadonlyArray1<'py, f64>>,
+    nu_measured: PyReadonlyArray1<'py, f64>,
+    group: PyReadonlyArray1<'py, i64>,
+    is_control: PyReadonlyArray1<'py, bool>,
+    layer: i64,
+    seed: u64,
+    prediction: &str,
+    split_seed: u64,
+    floor_quantile: f64,
+) -> PyResult<PyInterventionCalibrationPlan> {
+    use gam::sae::inference::intervention_shard::{
+        InterventionCalibrationSpec, InterventionShard, PredictedNats,
+        prepare_intervention_calibration,
+    };
+
+    let prediction = match prediction {
+        "rung1" => PredictedNats::Rung1,
+        "rung2" => PredictedNats::Rung2,
+        other => {
+            return Err(py_value_error(format!(
+                "intervention calibration prediction must be 'rung1' or 'rung2'; got {other:?}"
+            )));
+        }
+    };
+    let dose_view = dose.as_array();
+    let shard = InterventionShard {
+        row_id: row_id.as_array().iter().copied().collect(),
+        atom: atom.as_array().iter().copied().collect(),
+        dose: dose_view.iter().copied().collect(),
+        d_dose: dose_view.ncols(),
+        nu_hat_1: nu_hat_1.as_array().iter().copied().collect(),
+        nu_hat_2: nu_hat_2.map(|values| values.as_array().iter().copied().collect()),
+        nu_measured: nu_measured.as_array().iter().copied().collect(),
+        group: group.as_array().iter().copied().collect(),
+        is_control: is_control.as_array().iter().copied().collect(),
+        layer,
+        seed,
+    };
+    let spec = InterventionCalibrationSpec {
+        prediction,
+        split_seed,
+        floor_quantile,
+    };
+    let inner = prepare_intervention_calibration(&shard, spec).map_err(py_value_error)?;
+    Ok(PyInterventionCalibrationPlan { inner })
 }
 
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
@@ -6267,6 +6418,34 @@ fn sae_build_padded_basis_stacks(
                     return Err(format!(
                         "sae_build_padded_basis_stacks: atom {atom_idx} Duchon penalty shape {:?} disagrees with M={m}",
                         penalty.dim()
+                    ));
+                }
+                phi_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m])
+                    .assign(&phi);
+                let jet_d = jet.shape()[2].min(d_max);
+                jet_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..jet_d])
+                    .assign(&jet.slice(s![.., .., 0..jet_d]));
+                penalty_stack
+                    .slice_mut(s![atom_idx, 0..m, 0..m])
+                    .assign(&penalty);
+            }
+            SaeAtomBasisKind::Mobius => {
+                // Möbius band (#2240): the deck-invariant double-cover basis is
+                // fully analytic, so the stack is built straight off the
+                // evaluator (design + jet) with its closed-form roughness Gram.
+                let evaluator = MobiusHarmonicEvaluator::new(
+                    SAE_MOBIUS_CIRCLE_HARMONICS,
+                    SAE_MOBIUS_WIDTH_DEGREE,
+                )?;
+                let (phi, jet) = evaluator.evaluate(coords.view())?;
+                let penalty = evaluator.roughness_gram();
+                let m = phi.ncols();
+                if m != basis_sizes[atom_idx] {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: atom {atom_idx} Mobius basis size {m} disagrees with declared M={}",
+                        basis_sizes[atom_idx]
                     ));
                 }
                 phi_stack

@@ -81,9 +81,10 @@ pub use scoring_gpu::{
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 pub use update::{
-    DecoderSolveStats, LinearBlockRemlStats, linear_block_reml_stats, linear_shared_rho_fs_step,
-    run_linear_fast_kernel, run_linear_reml_schedule,
+    DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_block_reml_stats,
+    linear_shared_rho_fs_step,
 };
+pub(crate) use update::run_linear_fast_kernel;
 
 use ndarray::{Array2, ArrayView2};
 
@@ -169,14 +170,37 @@ pub struct SparseDictFit {
     pub explained_variance: f64,
     /// Number of epochs actually run.
     pub epochs: usize,
-    /// Whether the EV-improvement tolerance was reached.
-    pub converged: bool,
+    /// Inner-alternation and outer-REML fixed-point certificate. A
+    /// [`SparseDictFit`] is constructed only when every residual below is at or
+    /// below its matching tolerance.
+    pub convergence: SparseDictConvergence,
     /// Active budget `s` actually used (`min(active, K)`).
     pub active: usize,
     /// Aggregate CPU/GPU scoring counters over every route pass in the fit.
     pub score_route_stats: ScoreRouteStats,
     /// Decoder refresh percolation/CG certificate from the final MOD update.
     pub decoder_solve_stats: DecoderSolveStats,
+}
+
+/// Checkable convergence evidence attached to every [`SparseDictFit`].
+#[derive(Clone, Copy, Debug)]
+pub struct SparseDictConvergence {
+    /// Absolute held-in EV change over the final inner alternation.
+    pub inner_ev_residual: f64,
+    /// Configured inner EV tolerance.
+    pub inner_tolerance: f64,
+    /// Largest relative normal-equation residual in the final decoder refresh.
+    pub decoder_residual: f64,
+    /// Solver-derived decoder residual threshold.
+    pub decoder_tolerance: f64,
+    /// REML fixed-point residual `|ρ_new - ρ| / ρ`.
+    pub outer_rho_residual: f64,
+    /// Estimator-derived REML fixed-point tolerance.
+    pub outer_tolerance: f64,
+    /// Evidence-selected shared ridge.
+    pub selected_rho: f64,
+    /// Full inner fits evaluated by the outer REML schedule.
+    pub outer_iterations: usize,
 }
 
 impl SparseDictFit {
@@ -314,25 +338,13 @@ pub fn sparse_dictionary_transform_with_mode(
 /// dense `N×K` object: scoring is tiled, routing is fixed-width sparse, and the
 /// decoder is refreshed from accumulated sparse normal equations.
 ///
-/// At the **shared default** (`code_ridge == decoder_ridge == 1e-6`, the
-/// documented defaults) the two historical magic ridges collapse into ONE shared
-/// ρ that the linear block's REML evidence loop SELECTS
-/// ([`update::run_linear_reml_schedule`], design gam#2232 Increment 2 plug 4):
-/// the default ridge becomes only the warm start, killing the no-REML lane. Any
-/// **explicit** ridge choice (the two differ, or either departs from the default)
-/// keeps the legacy fixed-ridge alternation ([`update::run`]) verbatim, so the
-/// two-ridge FFI surface is preserved unchanged until Increment 5 re-points
-/// callers.
+/// The two ridge fields must name one shared starting value. That value is only
+/// the warm start for the evidence-selected shared `ρ`; every public fit runs the
+/// outer REML fixed-point schedule and returns only after both inner and outer
+/// certificates are satisfied.
 pub fn fit_sparse_dictionary(
     x: ArrayView2<'_, f32>,
     config: &SparseDictConfig,
-) -> Result<SparseDictFit, String> {
-    let default_ridge = SparseDictConfig::default();
-    let shared_default = config.code_ridge == default_ridge.code_ridge
-        && config.decoder_ridge == default_ridge.decoder_ridge;
-    if shared_default {
-        update::run_linear_reml_schedule(x, config)
-    } else {
-        update::run(x, config)
-    }
+) -> Result<SparseDictFit, SparseDictionaryError> {
+    update::run_linear_reml_schedule(x, config)
 }

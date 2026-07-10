@@ -7,6 +7,8 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from ._binding import rust_module
+
 
 def _torch() -> Any:
     try:
@@ -182,33 +184,14 @@ def _activation_from_logits(
     alpha: float,
     jumprelu_threshold: float,
 ) -> np.ndarray:
-    tau = float(tau)
-    if tau <= 0.0 or not np.isfinite(tau):
-        raise ValueError(f"tau must be finite and positive; got {tau}")
-    name = str(assignment)
-    z = np.asarray(logits, dtype=np.float64)
-    if name == "softmax":
-        shifted = (z - np.max(z, axis=1, keepdims=True)) / tau
-        exp = np.exp(shifted)
-        return exp / np.sum(exp, axis=1, keepdims=True)
-    if name == "ibp_map":
-        if not np.isfinite(alpha) or alpha <= 0.0:
-            raise ValueError(f"alpha must be finite and positive; got {alpha}")
-        k_atoms = z.shape[1]
-        ratio = float(alpha) / (float(alpha) + 1.0)
-        prior = np.exp(
-            np.arange(1, k_atoms + 1, dtype=np.float64) * np.log(ratio)
-        )
-        prior = np.maximum(prior, np.finfo(np.float64).tiny)
-        sig = 1.0 / (1.0 + np.exp(-np.clip(z / tau, -709.0, 709.0)))
-        return sig * prior.reshape(1, -1)
-    # #1777 — the hard-sigmoid gate's primary token is "threshold_gate"; the
-    # legacy "jumprelu" spelling is still accepted as a deprecated alias.
-    if name in ("threshold_gate", "jumprelu"):
-        shifted = (z - float(jumprelu_threshold)) / tau
-        sig = 1.0 / (1.0 + np.exp(-np.clip(shifted, -709.0, 709.0)))
-        return np.where(z > float(jumprelu_threshold), sig, 0.0)
-    raise ValueError(f"unsupported assignment kind {assignment!r}")
+    values = rust_module().sae_activation_matrix_from_logits(
+        np.ascontiguousarray(np.asarray(logits, dtype=np.float64)),
+        str(assignment),
+        float(tau),
+        float(alpha),
+        float(jumprelu_threshold),
+    )
+    return np.ascontiguousarray(np.asarray(values, dtype=np.float64))
 
 
 @dataclass(slots=True)

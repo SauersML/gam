@@ -423,6 +423,30 @@ pub(crate) fn reduced_blockwise_edf(
     }
 }
 
+fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), CustomFamilyError> {
+    if outer_converged {
+        return Ok(());
+    }
+    Err(CustomFamilyError::Optimization {
+        context: "blockwise_fit_from_parts",
+        reason: "refusing to assemble a fit from a non-converged outer optimization; \
+                 the solver must return its checkpoint as nonconvergence evidence instead"
+            .to_string(),
+    })
+}
+
+#[cfg(test)]
+mod assembly_convergence_tests {
+    use super::*;
+
+    #[test]
+    fn nonconverged_outer_state_cannot_reach_fit_assembly() {
+        let error = require_converged_outer_for_assembly(false)
+            .expect_err("nonconverged outer state must be rejected");
+        assert!(matches!(error, CustomFamilyError::Optimization { .. }));
+    }
+}
+
 /// Build a `UnifiedFitResult` from blockwise-specific fields.
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
@@ -446,24 +470,39 @@ pub fn blockwise_fit_from_parts(
         joint_log_lambdas,
     } = parts;
 
-    if block_states.is_empty() {
-        return Err(CustomFamilyError::UnsupportedConfiguration {
-            reason: "blockwise fit requires at least one block state".to_string(),
-        }
-        .into());
-    }
     // SPEC 20: a fit object only ever comes from a converged optimization.
     // Assembling a `UnifiedFitResult` from a non-converged outer state would
     // mint a degraded fit (previously surfaced as `StalledAtValidMinimum`);
     // non-convergence must instead be raised as a typed error at the solver,
-    // with a checkpoint, before ever reaching this assembler.
-    if !outer_converged {
-        return Err(CustomFamilyError::Optimization {
-            context: "blockwise_fit_from_parts",
-            reason: "refusing to assemble a fit from a non-converged outer optimization; \
-                     non-convergence is a typed error with a resume checkpoint, never an \
-                     assembled fit"
-                .to_string(),
+    // with a checkpoint, before ever reaching this assembler. This defensive
+    // gate prevents direct assembly callers from bypassing that contract.
+    require_converged_outer_for_assembly(outer_converged).map_err(String::from)?;
+    match criterion_certificate.as_ref() {
+        Some(certificate) if !certificate.certifies() => {
+            return Err(CustomFamilyError::Optimization {
+                context: "blockwise_fit_from_parts",
+                reason: format!(
+                    "refusing to assemble a fit whose analytic outer certificate failed: {}; \
+                     no fit was assembled",
+                    certificate.summary()
+                ),
+            }
+            .into());
+        }
+        None if outer_iterations > 0 => {
+            return Err(CustomFamilyError::Optimization {
+                context: "blockwise_fit_from_parts",
+                reason: "refusing to assemble a fit after an outer optimization without its \
+                         analytic convergence certificate"
+                    .to_string(),
+            }
+            .into());
+        }
+        _ => {}
+    }
+    if block_states.is_empty() {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "blockwise fit requires at least one block state".to_string(),
         }
         .into());
     }
