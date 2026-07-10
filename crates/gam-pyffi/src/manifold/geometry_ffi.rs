@@ -5513,10 +5513,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(rank_charge_dof, module)?)?;
     module.add_class::<SparseDictStream>()?;
     module.add_class::<BlockSparseDictStream>()?;
-    module.add_function(wrap_pyfunction!(
-        identifiable_factor_log_evidence,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(identifiable_factor_log_evidence, module)?)?;
     module.add_class::<IsometryPenalty>()?;
     module.add_class::<SparsityPenalty>()?;
     module.add_class::<PyTopKActivationPenalty>()?;
@@ -9202,9 +9199,8 @@ fn generative_replicates(
 ) -> PyResult<PyObject> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
-    let result = py.detach(|| {
-        generative_replicates_encoded_impl(&model_bytes, dataset, n_draws, seed)
-    });
+    let result =
+        py.detach(|| generative_replicates_encoded_impl(&model_bytes, dataset, n_draws, seed));
     match result {
         Ok((flat, n_rows)) => {
             let arr = ndarray::Array2::<f64>::from_shape_vec((n_draws, n_rows), flat)

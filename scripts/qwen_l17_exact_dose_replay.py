@@ -101,8 +101,15 @@ def _install_exact_protocol(driver):
                 handle.remove()
             activation = captured["activation"]
             flat = activation.reshape(-1, activation.shape[-1])
-            x0 = flat[-1].float().detach().requires_grad_(True)
-            delta_work = delta64.to(device=x0.device, dtype=x0.dtype)
+            x0_native = flat[-1].detach()
+            requested_delta = delta64.to(device=x0_native.device, dtype=x0_native.dtype)
+            # The patched forward adds in the hook tensor's native dtype.  On
+            # this model that is bf16, so the actual edit is the rounded target
+            # minus the already-rounded base activation—not the f64 chart delta.
+            # Price precisely that effective move.
+            target_native = x0_native + requested_delta
+            x0 = x0_native.float().detach().requires_grad_(True)
+            delta_work = target_native.float() - x0_native.float()
 
             def logits_from_x(x):
                 def _splice(_module, _inputs, output):
@@ -141,7 +148,7 @@ def _install_exact_protocol(driver):
                 )
 
             with torch.no_grad():
-                logits1 = logits_from_x((x0 + delta_work).detach()).double()
+                logits1 = logits_from_x(target_native).double()
             log_probs0 = torch.log_softmax(logits0.detach().double(), dim=-1)
             log_probs1 = torch.log_softmax(logits1, dim=-1)
             probs0 = log_probs0.exp()
@@ -150,7 +157,8 @@ def _install_exact_protocol(driver):
             reverse_kl = float(torch.sum(probs1 * (log_probs1 - log_probs0)))
             self.exact_calls.append(
                 {
-                    "delta_norm": float(torch.linalg.vector_norm(delta64)),
+                    "requested_delta_norm": float(torch.linalg.vector_norm(delta64)),
+                    "effective_delta_norm": float(torch.linalg.vector_norm(delta_work)),
                     "predicted_nats": predicted,
                     "forward_kl": forward_kl,
                     "reverse_kl": reverse_kl,

@@ -285,16 +285,29 @@ fn build_duchon_basis_uncached(
             coeffs.as_ref(),
             pure_poly_coeff.as_ref(),
         );
-        let base_design = if let Some(eta) = aniso.as_ref() {
-            let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
+        // Build the same kernel evaluator for the raw-Gram pass and the final
+        // operator.  The evaluator owns its anisotropic metric weights, so the
+        // two streamed passes share the exact function without sharing mutable
+        // state or materialising the n×p design.
+        let make_kernel = || {
             let coeffs = coeffs.clone();
-            let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                let mut q = 0.0f64;
-                for axis in 0..data_row.len() {
-                    let delta = data_row[axis] - center_row[axis];
-                    q += metric_weights[axis] * delta * delta;
-                }
-                let r = q.sqrt();
+            let pure_poly_coeff = pure_poly_coeff;
+            let metric_weights = aniso
+                .as_ref()
+                .map(|eta| eta.iter().map(|&value| (2.0 * value).exp()).collect::<Vec<_>>());
+            Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
+                let r = if let Some(weights) = metric_weights.as_ref() {
+                    let mut squared_radius = 0.0_f64;
+                    for axis in 0..data_row.len() {
+                        let delta = data_row[axis] - center_row[axis];
+                        squared_radius += weights[axis] * delta * delta;
+                    }
+                    squared_radius.sqrt()
+                } else {
+                    stable_euclidean_norm(
+                        (0..d).map(|axis| data_row[axis] - center_row[axis]),
+                    )
+                };
                 let raw = if let Some(ppc) = pure_poly_coeff {
                     ppc.eval(r)
                 } else {
@@ -309,103 +322,61 @@ fn build_duchon_basis_uncached(
                     .expect("validated Duchon inputs should not fail")
                 };
                 raw * kernel_amp
-            };
-            let kernel_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
+            }) as Arc<dyn crate::chunked_kernel_design::SpatialKernelEvaluator>
+        };
+        // The data-metric radial chart is a property of the represented kernel
+        // function, not of the isotropic special case.  Stream the raw
+        // constrained Gram for every cold lazy build, including anisotropic and
+        // operator-penalty configurations, then solve the same generalized
+        // eigenproblem as the dense path.  This keeps VᵀG_cV=I and
+        // VᵀΩ_cV=diag(μ) without ever allocating n×p.
+        if frozen_radial_reparam.is_none() {
+            let raw_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
                 kernel_transform.clone(),
             ]));
-            let base_op = ChunkedKernelDesignOperator::new(
+            let raw_op = ChunkedKernelDesignOperator::new(
                 shared_data.clone(),
                 Arc::new(centers.clone()),
-                kernel,
-                Some(kernel_gauge),
+                make_kernel(),
+                Some(raw_gauge),
                 Some(Arc::new(poly_block.clone())),
             )
             .map_err(BasisError::InvalidInput)?;
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-                base_op,
-            )))
-        } else {
-            let coeffs = coeffs.clone();
-            let make_kernel = || {
-                let coeffs = coeffs.clone();
-                let pure_poly_coeff = pure_poly_coeff;
-                Arc::new(move |data_row: &[f64], center_row: &[f64]| -> f64 {
-                    let r =
-                        stable_euclidean_norm((0..d).map(|axis| data_row[axis] - center_row[axis]));
-                    let raw = if let Some(ppc) = pure_poly_coeff {
-                        ppc.eval(r)
-                    } else {
-                        duchon_matern_kernel_general_from_distance(
-                            r,
-                            length_scale,
-                            p_order,
-                            s_order_int.expect("hybrid Duchon requires integer power"),
-                            d,
-                            coeffs.as_ref(),
-                        )
-                        .expect("validated Duchon inputs should not fail")
-                    };
-                    raw * kernel_amp
-                }) as Arc<dyn crate::chunked_kernel_design::SpatialKernelEvaluator>
-            };
-            let operators_active = matches!(
-                spec.operator_penalties.mass,
-                OperatorPenaltySpec::Active { .. }
-            ) || matches!(
-                spec.operator_penalties.tension,
-                OperatorPenaltySpec::Active { .. }
-            ) || matches!(
-                spec.operator_penalties.stiffness,
-                OperatorPenaltySpec::Active { .. }
+            let ones = Array1::<f64>::ones(raw_op.nrows());
+            let raw_gram = raw_op.diag_xtw_x(&ones).map_err(BasisError::InvalidInput)?;
+            let kernel_cols = kernel_transform.ncols();
+            let design_gram = symmetrize_penalty(
+                &raw_gram.slice(s![..kernel_cols, ..kernel_cols]).to_owned(),
             );
-            if frozen_radial_reparam.is_none() && !operators_active {
-                let raw_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
-                    kernel_transform.clone(),
-                ]));
-                let raw_op = ChunkedKernelDesignOperator::new(
-                    shared_data.clone(),
-                    Arc::new(centers.clone()),
-                    make_kernel(),
-                    Some(raw_gauge),
-                    Some(Arc::new(poly_block.clone())),
-                )
-                .map_err(BasisError::InvalidInput)?;
-                let ones = Array1::<f64>::ones(raw_op.nrows());
-                let raw_gram = raw_op.diag_xtw_x(&ones).map_err(BasisError::InvalidInput)?;
-                let kernel_cols = kernel_transform.ncols();
-                let design_gram = symmetrize_penalty(
-                    &raw_gram.slice(s![..kernel_cols, ..kernel_cols]).to_owned(),
-                );
-                let omega_constrained = duchon_constrained_bending_penalty(
-                    centers.view(),
-                    spec.length_scale,
-                    spec.power,
-                    effective_nullspace_order,
-                    aniso.as_deref(),
-                    &kernel_transform,
-                )?;
-                let (v, _mu) =
-                    thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
-                if v.ncols() > 0 {
-                    kernel_transform = fast_ab(&kernel_transform, &v);
-                    frozen_radial_reparam = Some(v);
-                }
+            let omega_constrained = duchon_constrained_bending_penalty(
+                centers.view(),
+                spec.length_scale,
+                spec.power,
+                effective_nullspace_order,
+                aniso.as_deref(),
+                &kernel_transform,
+            )?;
+            let (v, _mu) =
+                thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
+            if v.ncols() > 0 {
+                kernel_transform = fast_ab(&kernel_transform, &v);
+                frozen_radial_reparam = Some(v);
             }
-            let kernel_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
-                kernel_transform.clone(),
-            ]));
-            let base_op = ChunkedKernelDesignOperator::new(
-                shared_data,
-                Arc::new(centers.clone()),
-                make_kernel(),
-                Some(kernel_gauge),
-                Some(Arc::new(poly_block)),
-            )
-            .map_err(BasisError::InvalidInput)?;
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-                base_op,
-            )))
-        };
+        }
+        let kernel_gauge = Arc::new(gam_problem::Gauge::from_block_transforms(&[
+            kernel_transform.clone(),
+        ]));
+        let base_op = ChunkedKernelDesignOperator::new(
+            shared_data,
+            Arc::new(centers.clone()),
+            make_kernel(),
+            Some(kernel_gauge),
+            Some(Arc::new(poly_block)),
+        )
+        .map_err(BasisError::InvalidInput)?;
+        let base_design = DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(base_op)),
+        );
         let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
             data,
             &base_design,

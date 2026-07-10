@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,6 +19,15 @@ assert SPEC is not None and SPEC.loader is not None
 probe = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = probe
 SPEC.loader.exec_module(probe)
+
+CANDIDATE_SCRIPT = SCRIPT.with_name("build_fixed_budget_candidate_2251.py")
+CANDIDATE_SPEC = importlib.util.spec_from_file_location(
+    "build_fixed_budget_candidate_2251", CANDIDATE_SCRIPT
+)
+assert CANDIDATE_SPEC is not None and CANDIDATE_SPEC.loader is not None
+candidate_builder = importlib.util.module_from_spec(CANDIDATE_SPEC)
+sys.modules[CANDIDATE_SPEC.name] = candidate_builder
+CANDIDATE_SPEC.loader.exec_module(candidate_builder)
 
 
 def fixture_archive(path: Path, *, active: int = 64) -> None:
@@ -99,3 +108,14 @@ def test_archive_refuses_budget_rounding(tmp_path: Path) -> None:
     fixture_archive(archive, active=63)
     with pytest.raises(ValueError, match="requires exactly 64"):
         probe.load_arms(archive)
+
+
+def test_sparse_block_pooling_preserves_signed_coordinates() -> None:
+    blocks = np.asarray([[0], [1], [0]], dtype=np.uint32)
+    codes = np.asarray([[[2.0, -1.0]], [[3.0, 4.0]], [[-2.0, 1.0]]], dtype=np.float32)
+    offsets = np.asarray([0, 2, 3], dtype=np.int64)
+    pooled = candidate_builder.mean_pool_sparse_block_route(
+        blocks, codes, offsets, n_atoms=4, block_size=2
+    )
+    np.testing.assert_allclose(pooled[0], [1.0, -0.5, 1.5, 2.0])
+    np.testing.assert_allclose(pooled[1], [-2.0, 1.0, 0.0, 0.0])

@@ -1151,10 +1151,11 @@ fn periodic_decoder_under_transition(
 }
 
 /// Closed-form registration of two periodic harmonic decoders.  The first
-/// harmonic identifies the phase analytically for each of the only two
-/// unit-speed slopes (`+1`, `-1`); the complete coefficient block then chooses
-/// the sign by exact represented-function residual.  There is no coordinate
-/// scan, optimizer, finite difference, or sampled nearest-point proxy.
+/// non-zero harmonic identifies a finite set of phase roots analytically for
+/// each of the only two unit-speed slopes (`+1`, `-1`); the complete coefficient
+/// block then chooses the root/sign by exact represented-function residual.
+/// There is no coordinate scan, optimizer, finite difference, or sampled
+/// nearest-point proxy.
 fn fit_periodic_transition_from_decoders(
     decoder_a: ArrayView2<'_, f64>,
     decoder_b: ArrayView2<'_, f64>,
@@ -1167,20 +1168,38 @@ fn fit_periodic_transition_from_decoders(
             .map(|output| decoder_b[[left_row, output]] * decoder_a[[right_row, output]])
             .sum()
     };
-    let plus_cos = dot(1, 1) + dot(2, 2);
-    let plus_sin = -dot(1, 2) + dot(2, 1);
-    let minus_cos = -dot(1, 1) + dot(2, 2);
-    let minus_sin = dot(1, 2) + dot(2, 1);
-    let candidates = [
-        (
-            1_i8,
-            plus_sin.atan2(plus_cos).rem_euclid(std::f64::consts::TAU),
-        ),
-        (
-            -1_i8,
-            minus_sin.atan2(minus_cos).rem_euclid(std::f64::consts::TAU),
-        ),
-    ];
+    let harmonics = (decoder_a.nrows() - 1) / 2;
+    let mut candidates = Vec::new();
+    for sign in [1_i8, -1_i8] {
+        for harmonic in 1..=harmonics {
+            let sin_row = 2 * harmonic - 1;
+            let cos_row = 2 * harmonic;
+            let (cos_score, sin_score) = if sign == 1 {
+                (
+                    dot(sin_row, sin_row) + dot(cos_row, cos_row),
+                    -dot(sin_row, cos_row) + dot(cos_row, sin_row),
+                )
+            } else {
+                (
+                    -dot(sin_row, sin_row) + dot(cos_row, cos_row),
+                    dot(sin_row, cos_row) + dot(cos_row, sin_row),
+                )
+            };
+            if cos_score.hypot(sin_score) > 0.0 {
+                let harmonic_phase = sin_score
+                    .atan2(cos_score)
+                    .rem_euclid(std::f64::consts::TAU);
+                // `h*delta = harmonic_phase (mod 2π)` has exactly h roots.
+                for branch in 0..harmonic {
+                    let phase = (harmonic_phase
+                        + std::f64::consts::TAU * branch as f64)
+                        / harmonic as f64;
+                    candidates.push((sign, phase));
+                }
+                break;
+            }
+        }
+    }
 
     candidates
         .into_iter()
@@ -6146,6 +6165,23 @@ mod tests {
                     p.trigger
                 );
             }
+        }
+    }
+
+    #[test]
+    fn closed_form_transition_uses_first_nonzero_harmonic_without_scanning() {
+        let mut decoder_a = Array2::<f64>::zeros((5, 3));
+        decoder_a[[3, 0]] = 2.0;
+        decoder_a[[4, 1]] = 1.0;
+        decoder_a[[0, 2]] = 0.25;
+        let decoder_b = periodic_decoder_under_transition(decoder_a.view(), -1, 0.125).unwrap();
+        let (sign, offset) =
+            fit_periodic_transition_from_decoders(decoder_a.view(), decoder_b.view()).unwrap();
+        assert_eq!(sign, -1);
+        let recovered =
+            periodic_decoder_under_transition(decoder_a.view(), sign, offset).unwrap();
+        for (actual, expected) in recovered.iter().zip(decoder_b.iter()) {
+            assert!((actual - expected).abs() < 32.0 * f64::EPSILON);
         }
     }
 
