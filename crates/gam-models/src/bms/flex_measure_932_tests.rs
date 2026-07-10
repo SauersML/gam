@@ -384,17 +384,23 @@ fn measure_branch(is_score_warp: bool) {
 
     // ---- The asserted gate --------------------------------------------
     // d1a7a0bc6 deleted the four per-row coefficient `Vec`s (4 calls,
-    // 128·r bytes per row). The surviving warmed per-row heap traffic is the
-    // `denested_partition_cells` Vec (+ its cell probes). Pin a bound BELOW
-    // the pre-d1a7a0bc6 level so this file, dropped verbatim into the parent
-    // revision on the same machine, FAILS here and prints the parent's
-    // measured numbers above — that pair of runs is the A/B evidence.
+    // 128·r bytes per row). MEASURED floors on this fixture (Lambda A10,
+    // 2026-07-10, dev and release identical — counts are code-path
+    // deterministic): post-fix warmed = 5 allocs/row score-warp, 7 link-dev;
+    // parent-of-d1a7a0bc6 = 9 and 11 (+4 calls, +128·r bytes/row — the exact
+    // predicted delta). The surviving traffic is the denested cell partition
+    // + per-cell probe allocations. Pin the gate AT the measured post-fix
+    // floor, strictly below parent, so this file dropped verbatim into the
+    // parent revision FAILS here and prints the parent's numbers above —
+    // that pair of runs is the A/B evidence.
+    let floor = if is_score_warp { 5.0 } else { 7.0 };
     assert!(
-        calls_per_row <= 3.0,
+        calls_per_row <= floor,
         "{label}: warmed empirical-flex row op regressed to {calls_per_row:.3} \
-         allocation calls/row ({bytes_per_row:.1} bytes/row) — the per-row \
-         coefficient buffers deleted by d1a7a0bc6 (4 calls, 128·r bytes/row) \
-         or new per-row heap traffic came back"
+         allocation calls/row ({bytes_per_row:.1} bytes/row) above the measured \
+         post-d1a7a0bc6 floor of {floor} — the per-row coefficient buffers \
+         deleted by d1a7a0bc6 (4 calls, 128·r bytes/row) or new per-row heap \
+         traffic came back"
     );
 }
 
