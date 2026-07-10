@@ -485,7 +485,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         None
     };
-    let sas_linkspec = if let Some(choice) = link_choice.as_ref() {
+    let _sas_linkspec = if let Some(choice) = link_choice.as_ref() {
         if choice.mixture_components.is_none() && choice.link == LinkFunction::Sas {
             if effective_beta_logistic_init.is_some() {
                 return Err(

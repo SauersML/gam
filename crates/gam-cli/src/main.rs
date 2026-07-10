@@ -9,21 +9,16 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 
 pub(crate) use csv::WriterBuilder;
 
-pub(crate) use faer::Mat as FaerMat;
-
-pub(crate) use faer::Side;
-
 pub(crate) use gam::alo::compute_alo_diagnostics_from_fit;
 
 pub(crate) use gam::estimate::{
-    BlockRole, ContinuousSmoothnessOrderStatus, ExternalOptimResult, FitOptions, FittedLinkState,
-    ModelSummary, ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
-    compute_continuous_smoothness_order, fit_gam, optimize_external_design,
+    BlockRole, ContinuousSmoothnessOrderStatus, FitOptions, FittedLinkState, ModelSummary,
+    ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
+    compute_continuous_smoothness_order, fit_gam,
 };
 
 pub(crate) use gam::families::bms::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentMeasureKind,
-    LatentZPolicy,
+    BernoulliMarginalSlopeTermSpec, DeviationRuntime, LatentMeasureKind, LatentZPolicy,
 };
 
 pub(crate) use gam::families::survival::latent::{
@@ -60,8 +55,8 @@ pub(crate) use gam::inference::formula_dsl::{
 };
 
 pub(crate) use gam::inference::model::{
-    FittedFamily, FittedModel as SavedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    PredictModelClass, SavedLatentZNormalization, load_survival_time_basis_config_from_model,
+    FittedFamily, FittedModel as SavedModel, FittedModelPayload, PredictModelClass,
+    SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
 pub(crate) use gam_data::{ColumnKindTag, DataSchema};
 
@@ -112,10 +107,7 @@ pub(crate) use gam::terms::smooth::build_term_collection_design;
 
 pub(crate) use gam::smooth_test::SmoothTestScale;
 
-pub(crate) use gam::families::survival::{
-    PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
-    survival_event_code_from_value,
-};
+pub(crate) use gam::families::survival::{SurvivalSpec, survival_event_code_from_value};
 
 pub(crate) use gam::families::survival::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
@@ -123,7 +115,7 @@ pub(crate) use gam::families::survival::{
     baseline_chain_rule_gradient, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    fitted_weibull_baseline_from_linear_time_beta, initial_survival_baseline_config_for_fit,
+    initial_survival_baseline_config_for_fit,
     location_scale_uses_probit_survival_baseline, marginal_slope_baseline_chain_rule_gradient,
     marginal_slope_baseline_chain_rule_hessian, normalize_survival_time_pair,
     optimize_survival_baseline_config_with_gradient,
@@ -131,8 +123,8 @@ pub(crate) use gam::families::survival::{
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
     resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
-    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
-    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
+    resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
+    survival_likelihood_modename,
 };
 
 pub(crate) use gam::families::survival::location_scale::{
@@ -160,7 +152,6 @@ pub(crate) use gam::transformation_normal::TransformationNormalConfig;
 pub(crate) use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
     MixtureLinkSpec, ResponseColumnKind, ResponseFamily, SasLinkSpec, StandardLink,
-    WigglePenaltyConfig,
 };
 
 pub(crate) use gam::families::fit_orchestration::{

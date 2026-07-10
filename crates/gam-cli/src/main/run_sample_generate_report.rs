@@ -1078,7 +1078,7 @@ fn report_family_residuals(
     leverage: Option<&[f64]>,
     edf_total: f64,
 ) -> Result<FamilyResiduals, String> {
-    use rand::Rng;
+    use rand::RngExt;
     use statrs::distribution::{Beta, Discrete, DiscreteCDF, Gamma, NegativeBinomial, Poisson};
 
     let n = y.len().min(mu.len());
