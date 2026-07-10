@@ -411,6 +411,9 @@ mod tests_behavior_qwen_real;
 mod tests_crosscoder_olmo;
 
 #[cfg(test)]
+mod tests_stall_diagnostic_2234;
+
+#[cfg(test)]
 mod tests_crosscoder_rho_2231;
 
 #[cfg(test)]
