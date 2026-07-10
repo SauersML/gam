@@ -791,3 +791,187 @@ fn birth_prescreen_matches_hand_computed_crossover() {
 
     assert!((scalar_rate_bits(3.0, 1.0) - scalar_rate).abs() < 1e-12);
 }
+
+/// A planted `s = d+1` kind (circle `d=1`, sphere `d=2`): `s` orthogonal
+/// equal-energy signal columns (distinct-frequency cosines are discretely
+/// orthogonal on evenly spaced angles, so each carries variance `r²/2` and the
+/// curved atom's contribution SVD yields exactly `s` equal singular values),
+/// plus deterministic isotropic noise on every ambient channel. `recon` is the
+/// denoised signal, shared by the flat and curved featurizers, so their Eq-4
+/// residual and code terms are identical by construction and the verdict is
+/// driven purely by support (flat spends `s` active slots, curved spends 1) vs
+/// the dictionary surcharge (`m·P` vs `s·P`) — exactly the `s=d+1` support-only
+/// crossover the pre-screen prices.
+fn planted_sd1_signal(n: usize, p: usize, d: usize, radius: f64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let s = d + 1;
+    let mut signal = vec![vec![0.0_f64; p]; n];
+    let mut noisy = vec![vec![0.0_f64; p]; n];
+    let noise_sd = 0.1_f64;
+    for (i, (sig_row, noisy_row)) in signal.iter_mut().zip(noisy.iter_mut()).enumerate() {
+        for (j, sig) in sig_row.iter_mut().enumerate().take(s) {
+            let freq = (j + 1) as f64;
+            *sig = radius * (std::f64::consts::TAU * freq * i as f64 / n as f64).cos();
+        }
+        for (j, noisy_val) in noisy_row.iter_mut().enumerate() {
+            // Deterministic, channel- and row-varying noise (incommensurate with
+            // the signal frequencies) so the residual has full-rank isotropic mass.
+            let noise = noise_sd * (0.7 * i as f64 + 1.9 * j as f64 + 0.3).sin();
+            *noisy_val = sig_row[j] + noise;
+        }
+    }
+    (noisy, signal)
+}
+
+/// The signed per-token Eq-4 bits advantage of the CURVED single-atom featurizer
+/// over the FLAT `s`-latent alternative on a planted `s=d+1` kind (positive ⇒
+/// curved is cheaper ⇒ the birth wins), computed through the production
+/// [`crate::eq4_description_length::eq4_fixed_distortion_description_length`]
+/// path — and the closed-form pre-screen's prediction on the SAME planted
+/// quantities. Both should carry the same sign: that agreement is the pre-screen's
+/// contract.
+fn eq4_curved_advantage_and_prescreen(
+    d: usize,
+    n: usize,
+    p: usize,
+    g_dict: usize,
+    basis_m: usize,
+) -> (f64, f64) {
+    use crate::eq4_description_length::eq4_fixed_distortion_description_length;
+    use ndarray::Array2;
+
+    let s = d + 1;
+    let radius = 2.0_f64;
+    let target = 0.9_f64;
+    let (noisy, signal) = planted_sd1_signal(n, p, d, radius);
+    let test_x = Array2::from_shape_fn((n, p), |(i, j)| noisy[i][j]);
+    // Both featurizers reconstruct the same denoised signal: circle/sphere sit in
+    // their linear span, so the curved atom and the flat latents recover it
+    // identically, isolating the support-vs-dictionary crossover.
+    let recon = Array2::from_shape_fn((n, p), |(i, j)| signal[i][j]);
+    let signal_mat = Array2::from_shape_fn((n, p), |(i, j)| signal[i][j]);
+
+    // FLAT: s atoms (columns 0..s), each firing every row, one coded coordinate.
+    let mut flat_gate = Array2::zeros((n, g_dict));
+    let mut flat_dims = vec![0_i64; g_dict];
+    for atom in 0..s {
+        for row in 0..n {
+            flat_gate[[row, atom]] = 1.0;
+        }
+        flat_dims[atom] = 1;
+    }
+    let flat = {
+        let signal_mat = signal_mat.clone();
+        eq4_fixed_distortion_description_length(
+            test_x.view(),
+            recon.view(),
+            flat_gate.view(),
+            &flat_dims,
+            (s * p) as i64,
+            &[target],
+            None,
+            move |atom, take| {
+                // Flat atom `atom` reconstructs only its own signal channel.
+                let mut out = Array2::zeros((take.len(), p));
+                for (out_row, &src) in take.iter().enumerate() {
+                    out[[out_row, atom]] = signal_mat[[src, atom]];
+                }
+                Ok(out)
+            },
+        )
+        .expect("flat Eq-4 scoring succeeds")
+    };
+
+    // CURVED: one atom (column 0), firing every row, d+1 coded coordinates.
+    let mut curved_gate = Array2::zeros((n, g_dict));
+    for row in 0..n {
+        curved_gate[[row, 0]] = 1.0;
+    }
+    let mut curved_dims = vec![0_i64; g_dict];
+    curved_dims[0] = s as i64;
+    let curved = {
+        let signal_mat = signal_mat.clone();
+        eq4_fixed_distortion_description_length(
+            test_x.view(),
+            recon.view(),
+            curved_gate.view(),
+            &curved_dims,
+            (basis_m * p) as i64,
+            &[target],
+            None,
+            move |_atom, take| {
+                // The curved atom reconstructs the whole s-dimensional signal.
+                let mut out = Array2::zeros((take.len(), p));
+                for (out_row, &src) in take.iter().enumerate() {
+                    for col in 0..s {
+                        out[[out_row, col]] = signal_mat[[src, col]];
+                    }
+                }
+                Ok(out)
+            },
+        )
+        .expect("curved Eq-4 scoring succeeds")
+    };
+
+    let eq4_advantage = flat.per_target[0].bits - curved.per_target[0].bits;
+
+    let predicted = predicted_birth_dl_bits(&BirthMdlPrescreen {
+        rho: 1.0,
+        span: s as f64,
+        intrinsic_dim: d,
+        basis_size: basis_m,
+        signal_var: radius * radius / 2.0,
+        noise_floor: 0.01,
+        n_tokens: n as f64,
+        p_out: p,
+        g_dict,
+        l0: s as f64,
+    });
+
+    (eq4_advantage, predicted)
+}
+
+/// #2233 agreement contract: the closed-form birth pre-screen's win/lose VERDICT
+/// (the sign of its predicted ΔMDL) must match the full Eq-4 fixed-distortion
+/// bits computation run through the production scorer on the same planted
+/// `s=d+1` data — for a circle (`d=1`) and a sphere (`d=2`), on BOTH sides of the
+/// crossover (a lean basis where the curved birth pays, and a rich basis where
+/// its dictionary surcharge sinks it).
+#[test]
+fn birth_prescreen_verdict_agrees_with_full_eq4_bits() {
+    // Grid of (d, N, P, G): circle and sphere at a 2048-atom overcomplete
+    // dictionary, enough rows for stable covariance/SVD spectra.
+    for &(d, n, p, g_dict) in &[(1usize, 300usize, 6usize, 2048usize), (2, 320, 8, 2048)] {
+        // WIN side: a lean basis (few harmonics) → the support saving from
+        // collapsing s active slots to one dwarfs the small dictionary surcharge.
+        let lean_m = 2 * d + 1;
+        let (eq4_win, pred_win) = eq4_curved_advantage_and_prescreen(d, n, p, g_dict, lean_m);
+        assert!(
+            eq4_win > 0.0 && pred_win > 0.0,
+            "d={d}: lean curved birth must win on BOTH scoreboards, \
+             got Eq-4 advantage {eq4_win} and pre-screen {pred_win}"
+        );
+
+        // LOSE side: a rich basis (large m) → the (m−s)·P·½log₂N dictionary
+        // surcharge overwhelms the support saving on both scoreboards.
+        let rich_m = 400;
+        let (eq4_lose, pred_lose) = eq4_curved_advantage_and_prescreen(d, n, p, g_dict, rich_m);
+        assert!(
+            eq4_lose < 0.0 && pred_lose < 0.0,
+            "d={d}: rich curved birth must lose on BOTH scoreboards, \
+             got Eq-4 advantage {eq4_lose} and pre-screen {pred_lose}"
+        );
+
+        // The pre-screen never claims a win the full scorer denies (its raison
+        // d'être: it may only DEFER, never spuriously accept).
+        assert_eq!(
+            eq4_win.signum(),
+            pred_win.signum(),
+            "d={d}: win-side verdict sign must agree"
+        );
+        assert_eq!(
+            eq4_lose.signum(),
+            pred_lose.signum(),
+            "d={d}: lose-side verdict sign must agree"
+        );
+    }
+}
