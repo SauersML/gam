@@ -122,8 +122,6 @@ fn two_circle_k2_term(n: usize, p: usize, m: usize) -> (SaeManifoldTerm, Array2<
     .unwrap();
     (term, target)
 }
-    .unwrap()
-}
 
 /// The K=2 whitened two-circle fit must recover a materially positive
 /// reconstruction EV — NOT co-collapse to the signal-free null floor. Two disjoint

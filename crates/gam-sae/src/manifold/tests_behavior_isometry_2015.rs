@@ -366,3 +366,6 @@ fn reml_selected_coupling_then_isometry_defect_separates() {
     assert!(
         defect_broken > 2.0 * defect_iso,
         "defect must separate on the REML-coupled fit: isometric {defect_iso} vs broken \
+         {defect_broken}"
+    );
+}
