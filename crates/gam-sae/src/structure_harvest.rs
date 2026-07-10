@@ -2787,6 +2787,13 @@ fn race_spec_set(
 pub struct PrimaryTopologyChoice {
     pub basis_kind: SaeAtomBasisKind,
     pub latent_dim: usize,
+    /// Evidence-selected harmonic resolution for a periodic (circle) winner
+    /// (#2243): the number of Fourier harmonics the seed circle carries, chosen
+    /// by REML marginal likelihood rather than the historical fixed budget.
+    /// `None` for every non-periodic kind, whose chart resolution is not a
+    /// harmonic count (sphere/torus/möbius carry fixed charts; flat winners
+    /// carry data-scaled Duchon centers).
+    pub n_harmonics: Option<usize>,
 }
 
 /// Per-atom topology discovery for the PRIMARY seed dictionary (#2238/#2239).
@@ -2906,8 +2913,11 @@ pub fn discover_primary_atom_topologies(
             };
             let mut specs: Vec<TopologyCandidateSpec> = Vec::with_capacity(4);
             // Circle: phase of the leading principal pair (unit-period
-            // convention, matching the periodic seed refinement).
-            {
+            // convention, matching the periodic seed refinement). The phase
+            // coordinate is retained so that, if the circle wins the topology
+            // race, its harmonic RESOLUTION can be selected by evidence (#2243)
+            // on the same coordinate the topology race discriminated on.
+            let circle_coords = {
                 let mut coords = Array2::<f64>::zeros((n_obs, 1));
                 for row in 0..n_obs {
                     coords[[row, 0]] = phase(proj[[row, 0]], proj[[row, 1]]);
@@ -2924,9 +2934,10 @@ pub fn discover_primary_atom_topologies(
                     manifold: LatentManifold::Circle { period: 1.0 },
                     latent_dim: 1,
                     evaluator: Arc::new(evaluator),
-                    coords,
+                    coords: coords.clone(),
                 });
-            }
+                coords
+            };
             if max_dims[atom_idx] >= 2 {
                 // Flat 2-D patch: standardized leading principal projections.
                 let (sd0, sd1) = (cluster_sd(0), cluster_sd(1));
@@ -3046,12 +3057,141 @@ pub fn discover_primary_atom_topologies(
                     "discover_primary_atom_topologies: evidence race returned no winner for auto atom {atom_idx}"
                 )
             })?;
+            // #2243 — for a circle winner, GROW the harmonic resolution by the
+            // same REML evidence: the topology race ran the circle at a fixed low
+            // budget only to discriminate topology, but a genuinely 1-D factor's
+            // fidelity is capped by that budget. Every other kind carries a chart
+            // whose resolution is not a harmonic count, so it selects none.
+            let n_harmonics = if fit.basis_kind == SaeAtomBasisKind::Periodic {
+                Some(select_periodic_resolution(
+                    circle_coords.view(),
+                    target,
+                    weights.view(),
+                    rows.len(),
+                )?)
+            } else {
+                None
+            };
             Ok(PrimaryTopologyChoice {
                 basis_kind: fit.basis_kind,
                 latent_dim: fit.latent_dim,
+                n_harmonics,
             })
         })
         .collect()
+}
+
+/// Evidence-driven harmonic resolution for a periodic (circle) primary atom
+/// (#2243). The historical seed budget (`2·d_atom + 1` harmonics, i.e. 2
+/// harmonics at the default `d_atom = 2`) under-resolves genuinely 1-D factors
+/// with real high-frequency content, capping reconstruction below the fidelity
+/// the data supports even once the topology is right. This selects the harmonic
+/// count by the SAME proper closed-form REML marginal likelihood the topology
+/// race scores with (`fit_topology_candidate` → `raw_reml`, already complexity-
+/// priced through `log|H| − log|λS|₊` + profiled dispersion, so lower is better):
+/// it takes the GLOBAL evidence minimum over the candidate resolutions rather
+/// than stopping at the first non-improving rung, because the angular spectrum
+/// can have gaps (a fundamental plus a higher harmonic with nothing between), so
+/// the evidence is not guaranteed unimodal in resolution.
+///
+/// Two hard, data-derived bounds keep the search finite and free of any tuned
+/// resolution constant:
+///
+/// * the identifiability limit `2H + 1 < n_cluster` — the weighted REML cannot
+///   be identified with more basis columns than the cluster has observations;
+/// * a spectral bandwidth — the largest harmonic whose weighted periodogram
+///   energy exceeds a machine-precision fraction (`1e-12`) of the peak
+///   single-harmonic energy. Harmonics above the bandwidth carry no
+///   reconstructible signal, only basis columns the complexity term would
+///   charge for, so they can never be the evidence optimum. The `1e-12` is a
+///   numerical-zero guard (a harmonic that small is indistinguishable from
+///   absent), NOT a smoothing/energy threshold.
+///
+/// The REML argmin then chooses the complexity-optimal resolution within the
+/// band. `n_cluster` too small for even a single harmonic, or a target with no
+/// angular energy, returns an error (the caller surfaces it as a discovery
+/// failure rather than silently pinning a resolution).
+fn select_periodic_resolution(
+    circle_coords: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    n_cluster: usize,
+) -> Result<usize, String> {
+    let n_obs = target.nrows();
+    let p_out = target.ncols();
+    // 2H + 1 basis columns must stay strictly below the cluster sample count for
+    // the weighted REML to be identifiable.
+    let ident_ceiling = (n_cluster.saturating_sub(2) / 2).max(1);
+    // Weighted angular periodogram energy per harmonic, over the cluster rows the
+    // weights select. Harmonics beyond the highest with non-numerical-zero energy
+    // are pruned from the (potentially expensive) REML ladder below.
+    let mut peak_energy = 0.0_f64;
+    let mut energies = Vec::with_capacity(ident_ceiling);
+    for h in 1..=ident_ceiling {
+        let mut energy = 0.0_f64;
+        for col in 0..p_out {
+            let (mut re, mut im) = (0.0_f64, 0.0_f64);
+            for row in 0..n_obs {
+                let w = weights[row];
+                if w == 0.0 {
+                    continue;
+                }
+                let angle = std::f64::consts::TAU * h as f64 * circle_coords[[row, 0]];
+                re += w * target[[row, col]] * angle.cos();
+                im += w * target[[row, col]] * angle.sin();
+            }
+            energy += re * re + im * im;
+        }
+        peak_energy = peak_energy.max(energy);
+        energies.push(energy);
+    }
+    if !(peak_energy > 0.0) {
+        return Err(
+            "select_periodic_resolution: the circle winner carries no angular energy".to_string(),
+        );
+    }
+    let energy_floor = peak_energy * 1e-12;
+    let bandwidth = energies
+        .iter()
+        .rposition(|&energy| energy > energy_floor)
+        .map(|idx| idx + 1)
+        .unwrap_or(1);
+    let ceiling = bandwidth.min(ident_ceiling).max(1);
+    let mut best_h = 0usize;
+    let mut best_score = f64::INFINITY;
+    for h in 1..=ceiling {
+        let evaluator = match PeriodicHarmonicEvaluator::new(h) {
+            Ok(evaluator) => evaluator,
+            Err(_) => continue,
+        };
+        let spec = TopologyCandidateSpec {
+            kind: AutoTopologyKind::Circle,
+            basis_kind: SaeAtomBasisKind::Periodic,
+            manifold: LatentManifold::Circle { period: 1.0 },
+            latent_dim: 1,
+            evaluator: Arc::new(evaluator),
+            coords: circle_coords.to_owned(),
+        };
+        // `raw_reml` is the proper REML evidence (lower is better); with a common
+        // `n_obs` and no null-space term it is monotone in the per-observation
+        // `tk_normalized_score` the topology race ranks on, so comparing it
+        // directly selects the same resolution the race machinery would.
+        let score = match fit_topology_candidate(&spec, target, weights) {
+            Ok(evidence) => evidence.raw_reml,
+            Err(_) => continue,
+        };
+        if score.is_finite() && score < best_score {
+            best_score = score;
+            best_h = h;
+        }
+    }
+    if best_h == 0 {
+        return Err(
+            "select_periodic_resolution: no fittable harmonic resolution for the circle winner"
+                .to_string(),
+        );
+    }
+    Ok(best_h)
 }
 
 /// Resolve every `"auto"` entry of a primary seed dictionary to the concrete
@@ -3063,7 +3203,10 @@ pub fn discover_primary_atom_topologies(
 /// * a flat 2-D winner builds the expressive thin-plate (`duchon`) chart
 ///   rather than the degree-2 patch the race scored with — same topology,
 ///   strictly richer basis for the seeded atom;
-/// * a circle winner keeps the caller's harmonic budget;
+/// * a circle winner carries the harmonic resolution the fit-entry evidence
+///   race selected (#2243), installed as the periodic atom's `d_atom` (the seed
+///   builder's harmonic-count knob) so discovery grows resolution rather than
+///   pinning the caller's default budget;
 /// * any discovery failure is returned. Auto mode never silently substitutes
 ///   the old periodic default; callers that require a fixed topology must name
 ///   that topology explicitly.
@@ -3108,6 +3251,16 @@ pub fn resolve_auto_primary_atoms(
             }
             SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
+                // #2243 — install the evidence-selected harmonic resolution as
+                // the periodic atom's `d_atom` (the seed builder routes `d_atom`
+                // into the Fourier harmonic count for a periodic basis), so the
+                // seeded circle carries the resolution REML picked rather than
+                // the caller's default budget. `None` cannot occur for a
+                // periodic winner (discovery always selects a resolution), but a
+                // missing value conservatively leaves the caller's budget.
+                if let Some(n_harmonics) = choice.n_harmonics {
+                    atom_dim[atom_idx] = n_harmonics;
+                }
             }
             ref unexpected => {
                 return Err(format!(
@@ -4865,6 +5018,89 @@ mod tests {
         assert!(
             sphere_r2 > circle_r2 + 0.2,
             "discovery must strictly beat the circle-pinned recovery (sphere={sphere_r2:.4} vs circle={circle_r2:.4})"
+        );
+    }
+
+    /// #2243 — a circle winner's harmonic RESOLUTION is grown by evidence, not
+    /// pinned to the historical fixed budget (2 harmonics at the default
+    /// `d_atom = 2`). The planted 1-D factor carries energy at the fundamental
+    /// AND the 4th harmonic with a GAP between (harmonics 2, 3 are absent), which
+    /// (a) the 2-harmonic default structurally cannot represent — half the energy
+    /// lives at 4f — and (b) defeats a naive "stop at the first non-improving
+    /// resolution" rule, exercising the global-argmin robustness of the selector.
+    #[test]
+    fn select_periodic_resolution_grows_past_default_over_harmonic_gap_2243() {
+        use gam_solve::AutoTopologyKind;
+        use ndarray::Array1;
+
+        // Angular signal in R⁴: fundamental in (col0, col1), 4th harmonic in
+        // (col2, col3), nothing at harmonics 2 or 3.
+        let n = 240usize;
+        let mut coords = Array2::<f64>::zeros((n, 1));
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for row in 0..n {
+            let t = row as f64 / n as f64;
+            let angle = std::f64::consts::TAU * t;
+            coords[[row, 0]] = t;
+            target[[row, 0]] = angle.cos();
+            target[[row, 1]] = angle.sin();
+            target[[row, 2]] = (4.0 * angle).cos();
+            target[[row, 3]] = (4.0 * angle).sin();
+        }
+        let weights = Array1::<f64>::ones(n);
+
+        let selected =
+            select_periodic_resolution(coords.view(), target.view(), weights.view(), n)
+                .expect("resolution selection must succeed on a supported periodic signal");
+        assert!(
+            selected >= 4,
+            "the 4th-harmonic content (past a gap) requires at least 4 harmonics; the fixed \
+             2-harmonic default under-resolves it (selected={selected})"
+        );
+
+        // Reconstruction: the selected resolution recovers the whole signal while
+        // the historical 2-harmonic default cannot touch the 4f half of the energy.
+        let circle_r2 = |h: usize| -> f64 {
+            let spec = TopologyCandidateSpec {
+                kind: AutoTopologyKind::Circle,
+                basis_kind: SaeAtomBasisKind::Periodic,
+                manifold: LatentManifold::Circle { period: 1.0 },
+                latent_dim: 1,
+                evaluator: Arc::new(PeriodicHarmonicEvaluator::new(h).expect("periodic evaluator")),
+                coords: coords.clone(),
+            };
+            let fit = fit_topology_candidate(&spec, target.view(), weights.view())
+                .expect("candidate fit")
+                .fit_handle;
+            let recon = fit.phi.dot(&fit.decoder);
+            let (mut ss_res, mut ss_tot) = (0.0_f64, 0.0_f64);
+            for col in 0..4 {
+                let mut mean = 0.0;
+                for row in 0..n {
+                    mean += target[[row, col]];
+                }
+                mean /= n as f64;
+                for row in 0..n {
+                    let r = target[[row, col]] - recon[[row, col]];
+                    ss_res += r * r;
+                    let c = target[[row, col]] - mean;
+                    ss_tot += c * c;
+                }
+            }
+            1.0 - ss_res / ss_tot.max(1e-12)
+        };
+        let default_r2 = circle_r2(2);
+        let selected_r2 = circle_r2(selected);
+        eprintln!(
+            "[resolution-2243] circle R²: default(2 harmonics)={default_r2:.4} selected({selected})={selected_r2:.4}"
+        );
+        assert!(
+            selected_r2 > 0.99,
+            "the evidence-selected resolution must recover the signal (R²={selected_r2:.4})"
+        );
+        assert!(
+            default_r2 < 0.75,
+            "the 2-harmonic default cannot represent the 4th-harmonic half of the energy (R²={default_r2:.4})"
         );
     }
 
