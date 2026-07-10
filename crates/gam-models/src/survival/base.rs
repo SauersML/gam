@@ -606,6 +606,17 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
     }
 }
 
+/// The LIVE third-order tower `∂_dir H` for the cause-specific NLL: the
+/// per-predictor directional weights (`w_exit`, `w_entry`, `w_derivative`)
+/// scattered through the exit / entry / derivative designs.
+///
+/// #932 documented performance exception: this diagonal-in-(η1,η0,s) closed form
+/// (and its fourth-order sibling `cause_specific_hessian_second_directional_derivative`)
+/// STAYS in the production Newton path; it is not cut over to the generic gam-math
+/// `Tower4` jet, which would materialise a full per-row dense 4th-order tensor on
+/// this inner-solve path. It is instead pinned as a non-ignored jet oracle at
+/// ≤1e-9, with an independent central-difference witness, in
+/// `tests::jet_cause_specific_production_parity::cause_specific_live_tower_matches_jet_and_fd`.
 fn cause_specific_hessian_directional_derivative(
     block: &CauseSpecificRoystonParmarBlock,
     beta: &Array1<f64>,
@@ -3134,6 +3145,202 @@ impl PirlsWorkingModel for WorkingModelSurvival {
 mod tests {
     use super::*;
     use ndarray::{Array1, Array2, Array3, array, s};
+
+    /// #932 production single-source parity for the cause-specific Royston-Parmar
+    /// derivative tower. The earlier cutover added only a gam-math oracle that
+    /// replicated the production `w_exit`/`w_entry`/`w_derivative` weight formulas
+    /// verbatim; this module INVOKES production
+    /// (`evaluate_cause_specific_block`, `cause_specific_hessian_directional_derivative`,
+    /// `cause_specific_hessian_second_directional_derivative`) and pins each
+    /// channel against the universal gam-math jet at ≤1e-9, plus an independent
+    /// central-difference witness of the live third/fourth against the live lower
+    /// order. The live hand tower is retained (documented performance exception at
+    /// the code site).
+    mod jet_cause_specific_production_parity {
+        use super::*;
+        use gam_math::jet_scalar::JetScalar;
+        use gam_math::jet_tower::{
+            RowNllProgramGeneric, generic_fourth_contracted, generic_row_kernel,
+            generic_third_contracted,
+        };
+
+        /// The cause-specific row NLL written ONCE through the jet scalar:
+        /// `ℓ = w·[e^{η1} − 1{entry}·e^{η0} − δ·(η1 + ln s)]`, additively separable
+        /// over the three predictors (primary 0 = exit index `η1`, primary 1 =
+        /// entry index `η0`, primary 2 = spline derivative `s > 0`). The entry gate
+        /// `1{entry}` and event gate `δ` enter as per-row constants.
+        struct CauseSpecificJetRow {
+            has_entry: bool,
+            event: bool,
+            w: f64,
+            base: [f64; 3],
+        }
+
+        impl RowNllProgramGeneric<3> for CauseSpecificJetRow {
+            fn n_rows(&self) -> usize {
+                1
+            }
+            fn primaries(&self, _row: usize) -> Result<[f64; 3], String> {
+                Ok(self.base)
+            }
+            fn row_nll_generic<S: JetScalar<3>>(
+                &self,
+                _row: usize,
+                p: &[S; 3],
+            ) -> Result<S, String> {
+                let mut ell = p[0].exp();
+                if self.has_entry {
+                    ell = ell.sub(&p[1].exp());
+                }
+                if self.event {
+                    ell = ell.sub(&p[0].add(&p[2].ln()));
+                }
+                Ok(ell.scale(self.w))
+            }
+        }
+
+        /// A single-row cause-specific block with the design collapsed to the 3×3
+        /// identity (`x_exit = e0`, `x_entry = e1`, `x_derivative = e2`, zero
+        /// offsets), so β directly parameterises `(η1, η0, s)` and a coefficient
+        /// direction IS the predictor-space direction — pinning the per-row
+        /// β-space kernels against the jet's predictor-space contractions with no
+        /// design projection in the way.
+        fn identity_block(w: f64, has_entry: bool, event: bool) -> CauseSpecificRoystonParmarBlock {
+            let age_entry = if has_entry { 1.0 } else { 0.0 };
+            CauseSpecificRoystonParmarBlock {
+                age_entry: array![age_entry],
+                age_exit: array![2.0],
+                event_target: array![if event { 1u8 } else { 0u8 }],
+                sampleweight: array![w],
+                x_entry: array![[0.0, 1.0, 0.0]],
+                x_exit: array![[1.0, 0.0, 0.0]],
+                x_derivative: array![[0.0, 0.0, 1.0]],
+                offset_eta_entry: array![0.0],
+                offset_eta_exit: array![0.0],
+                offset_derivative_exit: array![0.0],
+                derivative_floor: 0.0,
+            }
+        }
+
+        fn close(hand: f64, jet: f64, tol: f64, label: &str) {
+            let band = tol + tol * hand.abs().max(jet.abs());
+            assert!(
+                (hand - jet).abs() <= band,
+                "{label}: hand {hand:+.15e} vs jet {jet:+.15e} (|Δ|={:.3e} band {band:.3e})",
+                (hand - jet).abs()
+            );
+        }
+
+        const JET_TOL: f64 = 1e-9;
+
+        fn run_corner(has_entry: bool, event: bool) {
+            // β = (η1, η0, s); s > 0 for the event ln-derivative term.
+            let beta = array![0.4_f64, -0.3_f64, 1.3_f64];
+            let d_beta = array![0.7_f64, -0.5_f64, 0.6_f64];
+            let v_beta = array![-0.2_f64, 0.8_f64, -0.4_f64];
+            let w = 1.4_f64;
+            let block = identity_block(w, has_entry, event);
+            let prog = CauseSpecificJetRow {
+                has_entry,
+                event,
+                w,
+                base: [beta[0], beta[1], beta[2]],
+            };
+            let label = format!("entry={has_entry} event={event}");
+
+            // ── Value / gradient / Hessian: LIVE evaluate vs jet ──────────────
+            let (ll, grad, hess) =
+                evaluate_cause_specific_block(&block, &beta).expect("evaluate block");
+            let (jet_v, jet_g, jet_h) = generic_row_kernel(&prog, 0).expect("jet kernel");
+            close(jet_v, -ll, JET_TOL, &format!("{label} value"));
+            for a in 0..3 {
+                close(jet_g[a], -grad[a], JET_TOL, &format!("{label} grad[{a}]"));
+                for b in 0..3 {
+                    close(jet_h[a][b], hess[[a, b]], JET_TOL, &format!("{label} H[{a}][{b}]"));
+                }
+            }
+
+            // ── Third: LIVE directional derivative vs jet ─────────────────────
+            let dh = cause_specific_hessian_directional_derivative(&block, &beta, &d_beta)
+                .expect("live third");
+            let dir = [d_beta[0], d_beta[1], d_beta[2]];
+            let jet_t3 = generic_third_contracted(&prog, 0, &dir).expect("jet third");
+            for a in 0..3 {
+                for b in 0..3 {
+                    close(
+                        jet_t3[a][b],
+                        dh[[a, b]],
+                        JET_TOL,
+                        &format!("{label} third[{a}][{b}]"),
+                    );
+                }
+            }
+
+            // ── Fourth: LIVE second directional derivative vs jet ─────────────
+            let d2h =
+                cause_specific_hessian_second_directional_derivative(&block, &beta, &d_beta, &v_beta)
+                    .expect("live fourth");
+            let uu = [d_beta[0], d_beta[1], d_beta[2]];
+            let vv = [v_beta[0], v_beta[1], v_beta[2]];
+            let jet_t4 = generic_fourth_contracted(&prog, 0, &uu, &vv).expect("jet fourth");
+            for a in 0..3 {
+                for b in 0..3 {
+                    close(
+                        jet_t4[a][b],
+                        d2h[[a, b]],
+                        JET_TOL,
+                        &format!("{label} fourth[{a}][{b}]"),
+                    );
+                }
+            }
+
+            // ── Independent FD witness (NO jet) ───────────────────────────────
+            // ∂_d_beta H via central difference of the LIVE evaluate Hessian.
+            let h_fd = 1e-5;
+            let bp = &beta + &(&d_beta * h_fd);
+            let bm = &beta - &(&d_beta * h_fd);
+            let (_, _, hp) = evaluate_cause_specific_block(&block, &bp).expect("evaluate +");
+            let (_, _, hm) = evaluate_cause_specific_block(&block, &bm).expect("evaluate -");
+            for a in 0..3 {
+                for b in 0..3 {
+                    let fd = (hp[[a, b]] - hm[[a, b]]) / (2.0 * h_fd);
+                    close(dh[[a, b]], fd, 1e-5, &format!("{label} FD third[{a}][{b}]"));
+                }
+            }
+            // ∂_v of the LIVE third (fixed direction d_beta) vs the LIVE fourth.
+            let dhp = cause_specific_hessian_directional_derivative(&block, &bp_along(&beta, &v_beta, h_fd), &d_beta)
+                .expect("live third +");
+            let dhm = cause_specific_hessian_directional_derivative(&block, &bm_along(&beta, &v_beta, h_fd), &d_beta)
+                .expect("live third -");
+            for a in 0..3 {
+                for b in 0..3 {
+                    let fd = (dhp[[a, b]] - dhm[[a, b]]) / (2.0 * h_fd);
+                    close(d2h[[a, b]], fd, 1e-5, &format!("{label} FD fourth[{a}][{b}]"));
+                }
+            }
+        }
+
+        fn bp_along(beta: &Array1<f64>, v: &Array1<f64>, h: f64) -> Array1<f64> {
+            beta + &(v * h)
+        }
+        fn bm_along(beta: &Array1<f64>, v: &Array1<f64>, h: f64) -> Array1<f64> {
+            beta - &(v * h)
+        }
+
+        /// The LIVE cause-specific value / gradient / Hessian / third / fourth hand
+        /// tower reproduces the universal gam-math jet at ≤1e-9, and the live
+        /// third/fourth reproduce an independent central-difference of the live
+        /// lower order — across all four (event × entry) corners that gate the
+        /// entry and event predictor channels on and off.
+        #[test]
+        fn cause_specific_live_tower_matches_jet_and_fd() {
+            for &has_entry in &[false, true] {
+                for &event in &[false, true] {
+                    run_corner(has_entry, event);
+                }
+            }
+        }
+    }
 
     #[test]
     fn competing_risks_cif_constant_hazard_matches_closed_form() {
