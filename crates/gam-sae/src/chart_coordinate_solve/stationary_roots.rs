@@ -378,6 +378,21 @@ fn global_extremum(
     kind: ExtremumKind,
     mut evaluate: impl FnMut(f64) -> Result<f64, String>,
 ) -> Result<PeriodicExtremum, String> {
+    if stationarity.is_numerically_zero() {
+        let value = evaluate(0.0)?;
+        if !value.is_finite() {
+            return Err("periodic extremum: constant objective is not finite".to_string());
+        }
+        return Ok(PeriodicExtremum {
+            coordinate: 0.0,
+            value,
+        });
+    }
+    // Root locations are invariant to a scalar multiple.  Normalizing here
+    // also protects the distance objective (not only the profiled objective)
+    // from coefficient-norm overflow during degree trimming and residual
+    // verification.
+    let (stationarity, _) = stationarity.normalized()?;
     if stationarity.numerical_degree() == 0 {
         let value = evaluate(0.0)?;
         if !value.is_finite() {
@@ -388,7 +403,7 @@ fn global_extremum(
             value,
         });
     }
-    let candidates = stationary_coordinates(stationarity)?;
+    let candidates = stationary_coordinates(&stationarity)?;
     if candidates.is_empty() {
         return Err(
             "periodic extremum: companion solve found no verified stationary point".to_string(),
