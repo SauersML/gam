@@ -334,10 +334,7 @@ mod standard_convergence_gate_tests {
     #[test]
     fn standard_gate_requires_outer_and_inner_certificates() {
         assert!(standard_status_is_certified(true, PirlsStatus::Converged));
-        assert!(!standard_status_is_certified(
-            false,
-            PirlsStatus::Converged
-        ));
+        assert!(!standard_status_is_certified(false, PirlsStatus::Converged));
         for status in [
             PirlsStatus::StalledAtValidMinimum,
             PirlsStatus::MaxIterationsReached,
@@ -1665,7 +1662,9 @@ fn optimize_survival_transformation_smoothing(
     // `EstimationError::RemlDidNotConverge`, whose rho checkpoint is preserved
     // in the error; a seed or best-so-far smoothing value is never promoted to
     // an estimator merely because a fixed-lambda inner solve was finite.
-    let result = problem.run(&mut obj, &context).map_err(|error| error.to_string())?;
+    let result = problem
+        .run(&mut obj, &context)
+        .map_err(|error| error.to_string())?;
     let selected_rho = result.rho;
     if selected_rho.len() != num_smoothing {
         return Err(format!(
@@ -2322,14 +2321,14 @@ fn store_survival_transformation_persistent_warm_start(
         .final_accept_rho
         .filter(|value| value.is_finite() && *value >= 0.0);
     match gam_solve::persistent_warm_start::store_record(&record) {
-        Ok(()) => gam_solve::persistent_warm_start::load_record(&record.key).is_some_and(
-            |stored| {
+        Ok(()) => {
+            gam_solve::persistent_warm_start::load_record(&record.key).is_some_and(|stored| {
                 stored.rho == record.rho
                     && stored.beta == record.beta
                     && stored.last_inner_iters == record.last_inner_iters
                     && stored.last_inner_converged == record.last_inner_converged
-            },
-        ),
+            })
+        }
         Err(err) => {
             log::warn!(
                 "[warm-start-cache] failed to persist survival transformation warm start: {err}"
