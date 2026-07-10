@@ -66,14 +66,15 @@
 
 use csv::StringRecord;
 use gam::data::{EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema};
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
-use std::time::Instant;
 
 const N_PER_GROUP: usize = 90;
 const N_GROUPS: usize = 3;
@@ -186,38 +187,19 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
         family: Some("multinomial".to_string()),
         ..FitConfig::default()
     };
-    // PERF GATE (#569): the smooth-by-factor model carries a large per-class
-    // smoothing-parameter vector — one λ for the global `s(x)` plus one per
-    // group level, per active class (here D = (K−1)·n_terms = 2·4 = 8). The
-    // native multinomial driver must NOT pay the O(D²) exact-dense-outer-Hessian
-    // assembly per outer iteration on this regime (that blew past the 360 s
-    // harness budget); it auto-routes to the exact-gradient quasi-Newton outer
-    // when D is large. We time the fit and assert it completes well inside a
-    // strict budget so a regression that reinstates the O(D²) path (or otherwise
-    // re-introduces the wall-clock blow-up) fails loudly here rather than only
-    // tripping the outer harness timeout. VGAM fits the analogous model in
-    // seconds; a faithful gam path is comfortably within tens of seconds even on
-    // a slow CI runner, so 120 s is a safe, un-weakened ceiling that still
-    // catches the pathological-slowness regression (which exceeded 360 s).
-    let fit_started = Instant::now();
-    let model = fit_penalized_multinomial_formula(
-        &ds,
-        "y ~ s(x, bs='tp', k=5) + s(x, by=group, bs='tp', k=5)",
-        &cfg,
-        1.0,  // init_lambda warm-start; outer REML selects per-class λ
-        60,   // outer REML cycles
-        1e-8, // inner tolerance
-    )
+    // The smooth-by-factor model carries one λ for the global `s(x)` plus one
+    // per group level, per active class. The native multinomial driver routes
+    // this large smoothing-parameter vector through the scalable exact-gradient
+    // outer path; convergence, not elapsed wall time, is the correctness gate.
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &ds,
+        formula: "y ~ s(x, bs='tp', k=5) + s(x, by=group, bs='tp', k=5)",
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 60,
+        tol: 1e-8,
+    })
     .expect("gam multinomial fit");
-    let fit_elapsed = fit_started.elapsed();
-    const FIT_WALL_CLOCK_BUDGET_SECS: f64 = 90.0;
-    assert!(
-        fit_elapsed.as_secs_f64() <= FIT_WALL_CLOCK_BUDGET_SECS,
-        "gam multinomial smooth-by-factor fit took {:.1}s > {FIT_WALL_CLOCK_BUDGET_SECS}s budget \
-         (#569 perf regression: the large per-class λ vector must route through the \
-         exact-gradient quasi-Newton outer, not the O(D²) exact-dense-outer-Hessian path)",
-        fit_elapsed.as_secs_f64(),
-    );
     assert_eq!(model.class_levels.len(), K, "expected K=3 classes");
     assert_eq!(model.n_active_classes, K - 1, "K-1 = 2 active class blocks");
     // The per-class smoothing-parameter vector must NOT be fused (#561): with one

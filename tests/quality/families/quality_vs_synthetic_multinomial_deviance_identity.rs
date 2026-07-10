@@ -45,7 +45,9 @@
 //! replicated across `K-1 = 2` softmax linear predictors.
 
 use gam::data::EncodedDataset;
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::test_support::reference::{Column, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
@@ -186,8 +188,15 @@ fn multinomial_recovers_decision_boundary_on_held_out_split() {
     // per active class, replicated over K-1 = 2 softmax predictors.
     let formula = "y ~ s(x1, bs='cc', k=8) + s(x2, bs='tp', k=5) + te(x1, x2, bs=c('cc','tp'))";
     let cfg = FitConfig::default();
-    let model = fit_penalized_multinomial_formula(&ds_train, formula, &cfg, 1.0, 50, 1e-7)
-        .expect("multinomial formula fit");
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &ds_train,
+        formula,
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 50,
+        tol: 1e-7,
+    })
+    .expect("multinomial formula fit");
 
     assert_eq!(
         model.class_levels.len(),

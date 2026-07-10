@@ -360,7 +360,7 @@ fn mixture_nle_for_k(
     k: usize,
     cfg: GaussianMixtureConfig,
 ) -> Result<f64, String> {
-    let fit = fit_gaussian_mixture(data, k, cfg)?;
+    let fit = fit_gaussian_mixture(data, k, cfg).map_err(|error| error.to_string())?;
     fit.laplace_negative_log_evidence(data)
 }
 

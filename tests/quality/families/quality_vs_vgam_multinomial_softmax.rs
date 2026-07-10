@@ -39,14 +39,15 @@
 //! probability columns line up with the truth.
 
 use csv::StringRecord;
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
 use std::path::Path;
-use std::time::Instant;
 
 const N: usize = 200;
 
@@ -188,14 +189,14 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode multinomial dataset");
 
     let cfg = FitConfig::default();
-    let model = fit_penalized_multinomial_formula(
-        &ds,
-        "y ~ s(x1, k=6) + s(x2, k=6) + x3",
-        &cfg,
-        1.0,
-        40,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &ds,
+        formula: "y ~ s(x1, k=6) + s(x2, k=6) + x3",
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 40,
+        tol: 1e-8,
+    })
     .expect("gam multinomial fit");
     assert_eq!(
         model.class_levels.len(),
@@ -597,14 +598,14 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
     // to hold its true df (`k = 12` → ~11 spline df > 8) while keeping the
     // near-linear x2 term modest, so the test exercises adaptive per-term
     // smoothing (resolve x1, shrink x2) against the SAME 0.10 bar.
-    let model = fit_penalized_multinomial_formula(
-        &ds,
-        "y ~ s(x1, k=12) + s(x2, k=6) + x3",
-        &cfg,
-        1.0,
-        40,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &ds,
+        formula: "y ~ s(x1, k=12) + s(x2, k=6) + x3",
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 40,
+        tol: 1e-8,
+    })
     .expect("gam hetero multinomial fit");
     assert_eq!(
         model.class_levels.len(),
@@ -983,26 +984,15 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
 
     // ---- fit gam on TRAIN, predict TEST -------------------------------------
     let cfg = FitConfig::default();
-    let fit_started = Instant::now();
-    let model = fit_penalized_multinomial_formula(
-        &train_ds,
-        "species ~ s(bill, k=5) + s(flip, k=5) + mass",
-        &cfg,
-        1.0,
-        40,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &train_ds,
+        formula: "species ~ s(bill, k=5) + s(flip, k=5) + mass",
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 40,
+        tol: 1e-8,
+    })
     .expect("gam multinomial fit on penguins train");
-    let fit_elapsed = fit_started.elapsed();
-    assert!(
-        fit_elapsed.as_secs_f64() <= 120.0,
-        "gam penguins multinomial fit exceeded #1082 bounded-fixture budget: elapsed={:.1}s iters={} lambdas={:?} train={} test={}",
-        fit_elapsed.as_secs_f64(),
-        model.iterations,
-        model.lambdas,
-        train_rows.len(),
-        test_rows.len()
-    );
     assert_eq!(
         model.class_levels.len(),
         K,

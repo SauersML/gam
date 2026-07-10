@@ -50,7 +50,9 @@
 //! surfaces; matching nnet's noisy linear fit would prove nothing about quality.
 
 use csv::StringRecord;
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use std::fs::File;
@@ -282,14 +284,14 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet_on_real_d
         .expect("encode penguin test dataset");
 
     let cfg = FitConfig::default();
-    let model = fit_penalized_multinomial_formula(
-        &train_ds,
-        "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
-        &cfg,
-        1.0,
-        100,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &train_ds,
+        formula: "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 100,
+        tol: 1e-8,
+    })
     .expect("gam penguin multinomial fit (real-data arm)");
     assert_eq!(
         model.class_levels.len(),
@@ -521,14 +523,14 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet() {
     // Keep the original k=10 fixture: reducing basis dimension makes each cycle
     // cheaper but does not prove the production convergence bug is fixed.
     let cfg = FitConfig::default();
-    let model = fit_penalized_multinomial_formula(
-        &train_ds,
-        "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
-        &cfg,
-        1.0,
-        100,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        data: &train_ds,
+        formula: "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
+        config: &cfg,
+        init_lambda: 1.0,
+        max_iter: 100,
+        tol: 1e-8,
+    })
     .expect("gam penguin multinomial fit");
     assert_eq!(
         model.class_levels.len(),

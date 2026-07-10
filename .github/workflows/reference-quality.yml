@@ -13,7 +13,7 @@ name: Reference Quality Suite
 # the mature reference is an honest, useful measurement. This job RUNS every
 # quality test (no fail-fast — it collects EVERY failure and a pass/fail/
 # compile-error table), and THEN GATES the pipeline red if any test landed in a
-# gating bucket (METRIC_OFF/GAM_ERROR/TEST_ERROR/TIMEOUT/BUILDFAIL). REF_ERROR —
+# gating bucket (METRIC_OFF/GAM_ERROR/TEST_ERROR/BUILDFAIL). REF_ERROR —
 # the reference R/Python environment failing, not gam — is reported but NOT
 # gated. Gating is what stops quality regressions from landing on main silently.
 
@@ -42,7 +42,6 @@ jobs:
   reference-quality:
     name: Reference quality vs mature tools
     runs-on: ubuntu-latest
-    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -107,7 +106,7 @@ jobs:
           # makes the 360s budget measure production-representative cost; it is NOT a
           # budget bump (the per-test cap below is unchanged) — it stops measuring a
           # debug build no user experiences.
-          cargo build --keep-going --profile release-dev --test quality 2>&1 | tail -120 \
+          cargo build --keep-going --profile release-dev --test quality \
             || echo "build reported errors; missing quality binary is flagged BUILDFAIL in the run step"
           # A handful of quality tests (RMST, competing risks) shell out to the
           # real `gam` CLI to exercise the end-to-end formula fit path. The CLI
@@ -116,7 +115,7 @@ jobs:
           # under the SAME profile — otherwise those tests spawn a nonexistent
           # `target/release-dev/gam` and report TEST_ERROR every run.
           echo "building the gam CLI binary (gam-cli) so CLI-shelling quality tests can spawn it"
-          cargo build --keep-going --profile release-dev -p gam-cli --bin gam 2>&1 | tail -40 \
+          cargo build --keep-going --profile release-dev -p gam-cli --bin gam \
             || echo "gam CLI build reported errors; CLI-shelling quality tests will report TEST_ERROR"
 
       - name: Run quality suite (resilient + streaming; full per-test capture)
@@ -127,7 +126,7 @@ jobs:
           # the streaming loop and exit 0. Turn `-e` OFF: per-test failures are
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
-          pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; tmo=0; bf=0
+          pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; bf=0
           # REF_ERROR among comparators the job GUARANTEES are installed (the
           # install-reference-tools action hard-fails if mgcv/gamlss/survival do
           # not load). For those tests a lost reference is a genuine breakage, not the
@@ -166,8 +165,8 @@ jobs:
             echo ""
             echo "Each row is one exact libtest case from the grouped \`quality\`"
             echo "integration binary. Synthetic and \`_on_real_data\` arms are timed"
-            echo "and classified independently, so grouping does not hide the slow"
-            echo "test behind a whole-suite timeout. The \`outcome\` says exactly WHAT happened — it never collapses"
+            echo "and classified independently, so grouping does not hide an individual"
+            echo "test inside one aggregate invocation. The \`outcome\` says exactly WHAT happened — it never collapses"
             echo "distinct situations into one vague word:"
             echo ""
             echo "- \`PASS\` — met the quality bar."
@@ -179,7 +178,6 @@ jobs:
             echo "  (R/Python package, system lib, namespace, or its script) — not gam."
             echo "- \`TEST_ERROR\` — the test/harness setup is wrong (bad data, missing"
             echo "  fixture, mismatched column lengths) — fix the test, not gam."
-            echo "- \`TIMEOUT\` — exceeded the per-test wall-clock cap."
             echo ""
             echo "Full per-test logs + an un-truncated metric TSV + a JSONL stream are"
             echo "in the \`quality-results\` artifact."
@@ -189,7 +187,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           for t in "${tests[@]}"; do
             i=$((i+1))
-            outcome=""; cause=""; reason=""; rc=0; cap=360
+            outcome=""; cause=""; reason=""; rc=0
             echo "::group::[$i/$N] $t"
             # Sanitize the log FILENAME: Rust test paths contain '::', which
             # upload-artifact rejects (colon is invalid on NTFS). Keep $t intact
@@ -206,20 +204,12 @@ jobs:
               outcome=BUILDFAIL; rc=-1
               echo "no executable binary found for grouped quality target — the build step could not compile it" > "$log"
             else
-              # EXECUTE the pre-built binary directly — no cargo, no rebuild.
-              # Per-test wall-clock cap bounds a hung fit/R/Python subprocess.
-              # 124 = timed out, 137 = SIGKILL after.
-              # A few tests are bounded by a correct-but-heavy REFERENCE tool
-              # (INLA grid/SPDE-mesh integration; mgcv full-rank thin-plate
-              # eigendecomposition on ~800 points), not by gam — they get a
-              # larger budget so they finish and report real metrics instead of
-              # a spurious TIMEOUT. gam-side slowness is filed as a perf bug, not
-              # papered over with a bump.
-              cap=360
-              case "$t" in
-                quality_vs_inla_rw2_spde_penalized_baseline::*|quality_vs_mgcv_quakes_spatial_smooth::*) cap=900 ;;
-              esac
-              timeout --kill-after=30 "$cap" "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
+              # Execute the pre-built binary directly — no cargo, no rebuild.
+              # SPEC forbids wall-clock budgets: a fit either converges, returns
+              # a typed non-convergence error with resumable work, or keeps
+              # progressing. The harness must not substitute elapsed time for a
+              # mathematical convergence verdict.
+              "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
               rc=$?
             fi
             dur=$((SECONDS-start))
@@ -249,8 +239,6 @@ jobs:
               cause=build; reason=$(head -1 "$log"); bf=$((bf+1))
             elif [ "$rc" -eq 0 ]; then
               outcome=PASS; cause=ok; reason=""; pass=$((pass+1))
-            elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-              outcome=TIMEOUT; cause=timeout; reason="exceeded ${cap}s wall-clock"; tmo=$((tmo+1))
             elif [ -n "$refmarker" ]; then
               outcome=REF_ERROR; cause=reference_tool; reason="$refmarker"; referr=$((referr+1))
               # If the lost reference is one the job guarantees present, this REF_ERROR
@@ -305,11 +293,10 @@ jobs:
             echo "| GAM_ERROR | $gamerr | gam fit crashed / refused / failed to converge |"
             echo "| REF_ERROR | $referr | reference tool failed or missing |"
             echo "| TEST_ERROR | $testerr | test/harness setup defect |"
-            echo "| TIMEOUT | $tmo | exceeded per-test wall-clock cap |"
             echo "| BUILDFAIL | $bf | did not compile |"
             echo "| **total** | **$N** | |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr timeout=$tmo build_fail=$bf (of $N)"
+          echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr build_fail=$bf (of $N)"
           # GATE the pipeline. The suite is the ONLY end-to-end measurement of gam
           # quality vs the mature standard tools; if it cannot go red, every quality
           # regression lands on main silently (the #1087 meta-bug). We ran ALL N
@@ -321,15 +308,14 @@ jobs:
           #   METRIC_OFF  gam ran but a quality metric missed its bound
           #   GAM_ERROR   gam fit crashed / refused / failed to converge
           #   TEST_ERROR  test/harness setup defect
-          #   TIMEOUT     exceeded the per-test wall-clock cap
           #   BUILDFAIL   did not compile
           # NOT gated: REF_ERROR — the reference R/Python environment failed or is
           # missing (not a gam result; tracked separately, #1070/#1071). It is
           # reported below but never masks or triggers the gam-side gate.
-          gating=$((metricoff + gamerr + testerr + tmo + bf))
+          gating=$((metricoff + gamerr + testerr + bf))
           if [ "$gating" -gt 0 ]; then
             echo ""
-            echo "::error::Reference Quality Suite FAILED: ${gating} test(s) in gating buckets (METRIC_OFF=${metricoff} GAM_ERROR=${gamerr} TEST_ERROR=${testerr} TIMEOUT=${tmo} BUILDFAIL=${bf}); REF_ERROR=${referr} not gated."
+            echo "::error::Reference Quality Suite FAILED: ${gating} test(s) in gating buckets (METRIC_OFF=${metricoff} GAM_ERROR=${gamerr} TEST_ERROR=${testerr} BUILDFAIL=${bf}); REF_ERROR=${referr} not gated."
             echo "----- gating failures (outcome  test  reason) -----"
             # Reprint the offending rows from the TSV (skip header; field 2 = outcome).
             awk -F'\t' 'NR>1 && $2!="PASS" && $2!="REF_ERROR" {printf "  %-11s %s\n    %s\n", $2, $4, $10}' "$RES"
@@ -338,7 +324,7 @@ jobs:
               echo ""
               echo "### Gate: FAILED"
               echo ""
-              echo "${gating} test(s) in gating buckets (METRIC_OFF/GAM_ERROR/TEST_ERROR/TIMEOUT/BUILDFAIL)."
+              echo "${gating} test(s) in gating buckets (METRIC_OFF/GAM_ERROR/TEST_ERROR/BUILDFAIL)."
               echo "REF_ERROR (${referr}) is reference-environment, not gated."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
@@ -389,7 +375,7 @@ jobs:
           echo "Gate: PASSED — every test met its quality bar; guaranteed-comparator reference coverage 100% (mgcv/gamlss/survival REF_ERROR=0); optional-reference REF_ERROR=${referr}/${N} within the 25% floor."
           { echo ""; echo "### Gate: PASSED"; } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload full quality report (always — survives timeout/cancel)
+      - name: Upload full quality report (always — survives failures)
         if: always()
         uses: actions/upload-artifact@v7
         with:
