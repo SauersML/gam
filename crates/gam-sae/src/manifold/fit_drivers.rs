@@ -5068,6 +5068,17 @@ impl SaeManifoldTerm {
         // Bit-identical to the historical per-call reduction (see
         // `TargetCenteredColStats`).
         let target_col_stats = TargetCenteredColStats::compute(target);
+        // #2015 line-search step-length warm start (the ‖g‖ crawl mitigation).
+        // The Armijo backtracking only CONTRACTS from `initial_step`; carry the
+        // previous accepted step forward so the search does not re-discover the
+        // same tiny step from `step_size` each iterate. A CLEAN acceptance resets
+        // to the full `step_size` (no overshoot evidence), so a hard early iterate
+        // never throttles later easy iterates; only a BACKTRACKED acceptance warms
+        // forward by one contraction step (`accepted / contraction`). Pure
+        // globalization — KKT convergence and typed exhaustion (#2235/#2241)
+        // unchanged.
+        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
+        let mut warm_step = step_size;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
