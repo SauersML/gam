@@ -1246,12 +1246,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                         survival_block_diagonal_logslope_map,
                                         survival_reduced_logslope_transform_effective,
                                     };
+                                    use crate::bms::block_specs::ReducedLogslopeOutcome;
                                     match survival_reduced_logslope_transform_effective(
                                         m_dq.view(),
                                         g_dg.view(),
                                         &row_hess,
                                     ) {
-                                        Ok(Some(t_log)) => {
+                                        Ok(ReducedLogslopeOutcome::Reduced(t_log)) => {
                                             let wl = t_log.ncols();
                                             let bd_map = survival_block_diagonal_logslope_map(
                                                 p_time, p_marg, &t_log,
@@ -1268,11 +1269,26 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                                             );
                                             return Ok(Some((bd_map, (p_time, p_marg, wl), true)));
                                         }
-                                        Ok(None) => {
-                                            // r == p_log (no effective confound to
-                                            // remove) or r == 0 (whole logslope image
-                                            // in the marginal span). Fall through to
-                                            // the measured-phantom gate below.
+                                        Ok(ReducedLogslopeOutcome::FullRank) => {
+                                            // No effective confound to remove; fall
+                                            // through to the measured-phantom gate.
+                                        }
+                                        Ok(ReducedLogslopeOutcome::FullyConfounded) => {
+                                            // The ENTIRE effective logslope image is
+                                            // W-explained by the marginal span — the
+                                            // block is unidentified (#2245 finding 45
+                                            // sibling). Deleting the whole channel is
+                                            // the deliberate handling here: the gate
+                                            // below performs exactly that projection,
+                                            // now reached explicitly rather than via a
+                                            // signal shared with the full-rank case.
+                                            log::info!(
+                                                "[smgs phase-4b compiled-map] #979: the effective \
+                                                 Schur Gram keeps 0/{p_log} logslope directions — \
+                                                 the block is fully confounded with the marginal \
+                                                 surface; deferring to the measured-phantom gate \
+                                                 to delete the unidentified channel",
+                                            );
                                         }
                                         Err(reason) => {
                                             log::warn!(

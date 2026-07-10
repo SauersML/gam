@@ -1037,12 +1037,12 @@ pub fn compiled_map_from_per_term(
 /// Precondition: `marginal_dq`'s derivative-into-qd1 contribution is zero (the
 /// `#808` fallback constructs `m_dqd1` as an all-zero matrix), so marginal
 /// touches only `(q0, q1)` and the scalar collapse above is exact.
-pub fn survival_reduced_logslope_transform_effective(
+pub(crate) fn survival_reduced_logslope_transform_effective(
     marginal_dq: ndarray::ArrayView2<'_, f64>,
     logslope_dg: ndarray::ArrayView2<'_, f64>,
     row_hess: &SurvivalRowHessian,
-) -> Result<Option<Array2<f64>>, String> {
-    use crate::bms::block_specs::LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL;
+) -> Result<crate::bms::block_specs::ReducedLogslopeOutcome, String> {
+    use crate::bms::block_specs::{LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL, ReducedLogslopeOutcome};
     use gam_linalg::faer_ndarray::{
         FaerArrayView, factorize_symmetricwith_fallback, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
     };
@@ -1051,7 +1051,7 @@ pub fn survival_reduced_logslope_transform_effective(
     let p_m = marginal_dq.ncols();
     let p_log = logslope_dg.ncols();
     if p_m == 0 || p_log == 0 {
-        return Ok(None);
+        return Ok(ReducedLogslopeOutcome::FullRank);
     }
     if logslope_dg.nrows() != n || row_hess.h.shape()[0] != n {
         return Err(format!(
@@ -1082,8 +1082,15 @@ pub fn survival_reduced_logslope_transform_effective(
     // sets the energy scale for the relative kept-direction tolerance.
     let c_gram = fast_xt_diag_x(&log, &w_gg);
     let energy_scale = (0..p_log).map(|i| c_gram[[i, i]]).fold(0.0_f64, f64::max);
-    if !energy_scale.is_finite() || energy_scale <= 0.0 {
-        return Ok(None);
+    if !energy_scale.is_finite() {
+        return Err(
+            "survival reduced logslope: non-finite effective logslope energy scale".to_string(),
+        );
+    }
+    if energy_scale <= 0.0 {
+        // Zero effective logslope energy: the block carries no curvature at
+        // all — every direction is unidentified (#2245 finding 45 sibling).
+        return Ok(ReducedLogslopeOutcome::FullyConfounded);
     }
 
     // A = M_effᵀ W M_eff + εI (ridge relative to the marginal effective energy
@@ -1129,10 +1136,17 @@ pub fn survival_reduced_logslope_transform_effective(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let r = kept.len();
-    // r == p_log: no confounded direction to remove. r == 0: the whole effective
-    // logslope image is in the marginal span. In both cases keep the raw design.
-    if r == p_log || r == 0 {
-        return Ok(None);
+    // r == p_log: no confounded direction to remove — keep the raw design.
+    // r == 0: the whole effective logslope image is W-explained by the
+    // marginal span — the block is unidentified. These are OPPOSITE cases and
+    // must not share a signal (#2245 finding 45 sibling): keeping the raw
+    // columns for a fully confounded block lets the penalty pick an arbitrary
+    // decomposition and report it as an estimate.
+    if r == p_log {
+        return Ok(ReducedLogslopeOutcome::FullRank);
+    }
+    if r == 0 {
+        return Ok(ReducedLogslopeOutcome::FullyConfounded);
     }
     let mut transform = Array2::<f64>::zeros((p_log, r));
     for (out_col, &src) in kept.iter().enumerate() {
@@ -1143,7 +1157,7 @@ pub fn survival_reduced_logslope_transform_effective(
             "survival reduced logslope: reduced transform produced non-finite entries".to_string(),
         );
     }
-    Ok(Some(transform))
+    Ok(ReducedLogslopeOutcome::Reduced(transform))
 }
 
 /// Assemble a block-diagonal 3-block [`CompiledMap`] that passes the time and
@@ -2549,9 +2563,16 @@ mod tests {
         let log =
             Array2::from_shape_vec((n, 2), vec![1.0, 10.0, 1.0, -10.0, 1.0, 10.0, 1.0, -10.0])
                 .unwrap();
-        let t = survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
-            .expect("contraction must succeed")
-            .expect("a partial confound must yield a reduced transform");
+        let t = match survival_reduced_logslope_transform_effective(
+            marg.view(),
+            log.view(),
+            &row_hess,
+        )
+        .expect("contraction must succeed")
+        {
+            crate::bms::block_specs::ReducedLogslopeOutcome::Reduced(t) => t,
+            other => panic!("a partial confound must yield a reduced transform, got {other:?}"),
+        };
         assert_eq!(t.dim(), (2, 1), "exactly one logslope direction survives");
         // The kept eigenvector is the free column ≈ e2 (up to sign); the
         // confounded e1 component is dropped.
@@ -2568,12 +2589,13 @@ mod tests {
     }
 
     #[test]
-    fn survival_reduced_logslope_fully_confounded_returns_none_979() {
+    fn survival_reduced_logslope_fully_confounded_is_distinct_signal_979() {
         // A single logslope column equal to the marginal column under the exact
         // rank-1 (q0,g) confound: the whole effective logslope image lies in the
         // marginal span. The conservative ridge floors the residual eigenvalue at
-        // energy_scale·TOL/(1+TOL) < tol, so r == 0 → Ok(None) (keep the raw
-        // design, defer to the measured-phantom gate).
+        // energy_scale·TOL/(1+TOL) < tol, so r == 0 → FullyConfounded — a
+        // DISTINCT signal from the full-rank case, so the caller can delete the
+        // unidentified channel deliberately (#2245 finding 45 sibling).
         let n = 4;
         let row_hess = const_row_hess_q0g(n, 2.0, 2.0, 2.0);
         let marg = Array2::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap();
@@ -2581,16 +2603,19 @@ mod tests {
         let out = survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
             .expect("contraction must succeed");
         assert!(
-            out.is_none(),
-            "a fully marginal-explained logslope column reduces to nothing → keep raw"
+            matches!(
+                out,
+                crate::bms::block_specs::ReducedLogslopeOutcome::FullyConfounded
+            ),
+            "a fully marginal-explained logslope block must report FullyConfounded"
         );
     }
 
     #[test]
-    fn survival_reduced_logslope_no_confound_returns_none_979() {
+    fn survival_reduced_logslope_no_confound_is_full_rank_979() {
         // No marginal↔logslope cross weight (h03 = 0): the channels are
         // W-orthogonal, so every logslope direction is free (r == p_log) and
-        // there is nothing to remove → Ok(None).
+        // there is nothing to remove → FullRank (keep the raw design).
         let n = 4;
         let row_hess = const_row_hess_q0g(n, 2.0, 0.0, 2.0);
         let marg = Array2::from_shape_vec((n, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap();
@@ -2600,7 +2625,10 @@ mod tests {
         let out = survival_reduced_logslope_transform_effective(marg.view(), log.view(), &row_hess)
             .expect("contraction must succeed");
         assert!(
-            out.is_none(),
+            matches!(
+                out,
+                crate::bms::block_specs::ReducedLogslopeOutcome::FullRank
+            ),
             "W-orthogonal channels need no reduction → keep raw"
         );
     }

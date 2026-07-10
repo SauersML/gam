@@ -556,6 +556,7 @@ fn build_reduced_logslope_reparam(
 /// the latter the data identify only a combination of the marginal and
 /// score-slope surfaces, and silently retaining the raw columns would let the
 /// penalty pick an arbitrary decomposition and report it as an estimate.
+#[derive(Debug)]
 pub(crate) enum ReducedLogslopeOutcome {
     /// Every effective logslope direction carries its own curvature; keep the
     /// raw design.
