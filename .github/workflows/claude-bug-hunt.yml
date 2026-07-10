@@ -18,49 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install gam CLI
-        run: |
-          set -euxo pipefail
-          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Try to build gamfit from source (non-fatal)
-        continue-on-error: true
-        run: |
-          set -uxo pipefail
-          python -m pip install --upgrade pip maturin
-          python -m pip install numpy pandas scipy scikit-learn pyarrow requests
-          python -m pip install . && \
-            (cd /tmp && python -c "import gamfit; print('gamfit ok')") || \
-            echo "::warning::gamfit source build failed — agent can still use the gam CLI from install.sh"
-
-      - name: Run Claude bug-hunt agent
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
-          # Suppress the raw stream-json dump; a readable transcript of just
-          # Claude's messages is rendered from execution_file after the run.
-          show_full_output: false
-          claude_args: >-
-            --model claude-opus-4-8
-            --dangerously-skip-permissions
-            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
-          additional_permissions: |
-            actions: read
-          prompt: |
+    env:
+      # Single-sourced Claude prompt: BOTH the ALT primary and the ORIG
+      # fallback step reference this, so they can never drift apart.
+      CLAUDE_HUNT_PROMPT: |
             Hi Claude. You have the run of this repo and an Ubuntu runner.
 
             `gam` is a Rust generalized additive model crate. `gamfit` is
@@ -139,7 +100,68 @@ jobs:
             Look in CI jobs for failures and inaccuracies. Get creative.
 
             Have fun with it.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gam CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Try to build gamfit from source (non-fatal)
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          python -m pip install --upgrade pip maturin
+          python -m pip install numpy pandas scipy scikit-learn pyarrow requests
+          python -m pip install . && \
+            (cd /tmp && python -c "import gamfit; print('gamfit ok')") || \
+            echo "::warning::gamfit source build failed — agent can still use the gam CLI from install.sh"
+
+      - name: Run Claude bug-hunt agent (primary — ALT token)
+        id: claude_primary
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
+          # Suppress the raw stream-json dump; a readable transcript of just
+          # Claude's messages is rendered from execution_file after the run.
+          show_full_output: false
+          claude_args: >-
+            --model claude-opus-4-8
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: ${{ env.CLAUDE_HUNT_PROMPT }}
+
+      - name: Run Claude bug-hunt agent (fallback — original token)
+        id: claude_fallback
+        if: steps.claude_primary.outcome == 'failure'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Suppress the raw stream-json dump; a readable transcript of just
+          # Claude's messages is rendered from execution_file after the run.
+          show_full_output: false
+          claude_args: >-
+            --model claude-opus-4-8
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: ${{ env.CLAUDE_HUNT_PROMPT }}
 
       - name: Print Claude transcript
         if: always()
-        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude.outputs.execution_file }}'
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude_fallback.outputs.execution_file || steps.claude_primary.outputs.execution_file }}'

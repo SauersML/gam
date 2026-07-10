@@ -26,28 +26,31 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Run Claude Code
-        id: claude
+      # Token failover: try CLAUDE_CODE_ALT_OAUTH_TOKEN first; if that run is
+      # rate-limited the action exits non-zero, and the fallback step below
+      # re-runs with CLAUDE_CODE_OAUTH_TOKEN. Both are valid tokens on
+      # different accounts whose rate limits reset at different times.
+      - name: Run Claude Code (primary — ALT token)
+        id: claude_primary
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
-          # Suppress the raw stream-json dump; a readable transcript of just
-          # Claude's messages is rendered from execution_file after the run.
           show_full_output: false
-
-          # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
             actions: read
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
-
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+      - name: Run Claude Code (fallback — original token)
+        id: claude_fallback
+        if: steps.claude_primary.outcome == 'failure'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: false
+          additional_permissions: |
+            actions: read
 
       - name: Print Claude transcript
         if: always()
-        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude.outputs.execution_file }}'
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude_fallback.outputs.execution_file || steps.claude_primary.outputs.execution_file }}'
 

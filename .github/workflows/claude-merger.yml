@@ -49,48 +49,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install publishing tools
-        run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install build twine maturin
-
-      - name: Install gam CLI
-        run: |
-          set -euxo pipefail
-          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Run Claude merger agent
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
-          # Suppress the raw stream-json dump; a readable transcript of just
-          # Claude's messages is rendered from execution_file after the run.
-          show_full_output: false
-          claude_args: >-
-            --model claude-opus-4-8
-            --dangerously-skip-permissions
-            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
-          additional_permissions: |
-            actions: read
-          prompt: |
+    env:
+      # Single-sourced Claude prompt: BOTH the ALT primary and the ORIG
+      # fallback step reference this, so they can never drift apart.
+      CLAUDE_MERGER_PROMPT: |
             Hi Claude. You have the run of this repo, an Ubuntu runner, no
             turn budget, and as long as you need.
 
@@ -219,7 +181,70 @@ jobs:
             it ships. Removing publish blockers is part of the job.
 
             Have fun. Take your time. Get it perfect.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install publishing tools
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build twine maturin
+
+      - name: Install gam CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Claude merger agent (primary — ALT token)
+        id: claude_primary
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
+          # Suppress the raw stream-json dump; a readable transcript of just
+          # Claude's messages is rendered from execution_file after the run.
+          show_full_output: false
+          claude_args: >-
+            --model claude-opus-4-8
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: ${{ env.CLAUDE_MERGER_PROMPT }}
+
+      - name: Run Claude merger agent (fallback — original token)
+        id: claude_fallback
+        if: steps.claude_primary.outcome == 'failure'
+        uses: anthropics/claude-code-action@v1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Suppress the raw stream-json dump; a readable transcript of just
+          # Claude's messages is rendered from execution_file after the run.
+          show_full_output: false
+          claude_args: >-
+            --model claude-opus-4-8
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: ${{ env.CLAUDE_MERGER_PROMPT }}
 
       - name: Print Claude transcript
         if: always()
-        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude.outputs.execution_file }}'
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude_fallback.outputs.execution_file || steps.claude_primary.outputs.execution_file }}'
