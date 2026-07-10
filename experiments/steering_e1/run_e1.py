@@ -500,7 +500,7 @@ def main() -> int:
     log(f"steering {len(base_examples)} base contexts × k∈{ks} (manifold + flat)")
     records = steer_records(model, tok, layer, atom, base_examples, base_rows, base_coords,
                             base_amplitudes,
-                            candidate_ids, flat_dir, ks)
+                            candidate_ids, flat_dir, ks, lift=lift)
     summary = summarize(records, ks)
 
     meta = {
