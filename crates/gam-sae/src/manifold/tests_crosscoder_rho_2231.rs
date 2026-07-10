@@ -236,3 +236,137 @@ fn block_relevance_has_interior_stationary_minimum_2231() {
          are mis-balanced"
     );
 }
+
+/// Fresh engaged objective on the planted two-layer target: one block
+/// (`p_x = 4`, `p_1 = 4`), a K=1 always-on circle term, and a clean-ish inner
+/// budget (60 Newton steps) so the fitted residual — and thus `R̃_1` — is
+/// converged enough for a meaningful gradient/FD comparison. The term is consumed
+/// by `new`, so each call rebuilds it (the fits are independent).
+fn engaged_objective(
+    evaluator: &Arc<PeriodicHarmonicEvaluator>,
+    z: &Array2<f64>,
+    coords: &Array2<f64>,
+) -> SaeManifoldOuterObjective {
+    let p_tot = z.ncols();
+    let term = build_k1_circle(evaluator, coords, p_tot);
+    let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .with_log_lambda_block(vec![0.0]);
+    SaeManifoldOuterObjective::new(term, z.clone(), None, rho_template, 60, 0.04, 1.0e-6, 1.0e-6)
+        .with_crosscoder_blocks(4, vec![4])
+        .expect("crosscoder block pricing must install (p_x + Σ block_dims == p̃)")
+}
+
+/// #2231 Inc-B (stage 2) — the analytic block gradient the ValueAndGradient lane
+/// returns in its `log_lambda_block` tail slot MUST be the finite-difference
+/// derivative of the value lane's own cost: the consistent `(value, gradient)`
+/// pair the #2087 objective↔gradient desync class demands. `eval`'s block-tail
+/// entry is `½·R̃_1 − n·p_1/2`; the central difference of `eval_cost` (which
+/// re-runs the inner solve at each perturbed `log λ_1`) is compared against it at
+/// three points spanning the planted optimum.
+///
+/// Tolerance note: unlike the pure-math sibling gate
+/// (`tests_crosscoder_block_fd_2231`, `h = 1e-6`, `1e-5` rel), this FD runs the
+/// full re-fitting engine, so it carries the inner solve's finite-budget noise
+/// AND the central difference's `O(h²)` truncation on a strongly-curved
+/// criterion. The gate is a DESYNC / wrong-form discriminator (a dropped `½`, a
+/// sign flip, or a missing `n·p/2` moves the analytic value by `Θ(n·p)` — orders
+/// above this window), not a precision gate.
+#[test]
+fn block_gradient_matches_central_difference_of_cost_2231() {
+    let (z, coords, _p_x, p_1, closed_form) = planted_two_layer();
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+    let n = z.nrows();
+    let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .with_log_lambda_block(vec![0.0]);
+    let flat_at = |log_lambda: f64| -> Array1<f64> {
+        let mut flat = rho_template.to_flat();
+        let last = flat.len() - 1;
+        flat[last] = log_lambda;
+        flat
+    };
+
+    // Stationarity scale n·p_1/2 (the Jacobian half-count): the analytic block
+    // gradient is `½·R̃_1 − scale`, so `scale` is the natural absolute reference.
+    let scale = 0.5 * n as f64 * p_1 as f64;
+    let h = 0.1_f64;
+    for &ll in &[closed_form - 2.0, 0.0, closed_form + 2.0] {
+        let analytic = {
+            let mut obj = engaged_objective(&evaluator, &z, &coords);
+            let grad = obj
+                .eval(&flat_at(ll))
+                .expect("the ValueAndGradient lane must evaluate")
+                .gradient;
+            grad[grad.len() - 1]
+        };
+        let c_plus = engaged_objective(&evaluator, &z, &coords)
+            .eval_cost(&flat_at(ll + h))
+            .expect("cost at log λ_1 + h must evaluate");
+        let c_minus = engaged_objective(&evaluator, &z, &coords)
+            .eval_cost(&flat_at(ll - h))
+            .expect("cost at log λ_1 − h must evaluate");
+        let fd = (c_plus - c_minus) / (2.0 * h);
+        let tol = 0.1 * scale + 0.1 * analytic.abs();
+        assert!(
+            (analytic - fd).abs() < tol,
+            "block gradient desync at log λ_1 = {ll:.3}: analytic ½·R̃_1 − n·p_1/2 = \
+             {analytic:.4} vs central-difference of eval_cost = {fd:.4} (|Δ| = {:.4}, \
+             tol = {tol:.4}) — the #2087 objective↔gradient pair is inconsistent",
+            (analytic - fd).abs()
+        );
+    }
+}
+
+/// #2231 Inc-B (stage 2) — the block Fellner–Schall coordinate and the analytic
+/// block gradient share ONE root. Iterating the EFS log-λ step
+/// `Δlog λ_1 = ln(n·p_1/R̃_1)` from `log λ_1 = 0` to convergence must arrive at a
+/// point where the ValueAndGradient lane's block gradient `½·R̃_1 − n·p_1/2`
+/// vanishes — the quasi-Newton lane and the fixed-point lane agree (the coherence
+/// the whole Inc-B contract is built on). Red until both lanes are wired.
+#[test]
+fn block_efs_step_reaches_gradient_root_2231() {
+    let (z, coords, _p_x, p_1, _closed_form) = planted_two_layer();
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+    let n = z.nrows();
+    let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .with_log_lambda_block(vec![0.0]);
+    let mut objective = engaged_objective(&evaluator, &z, &coords);
+
+    // Fellner–Schall fixed-point iteration on the block coordinate ONLY (every
+    // other ρ coordinate held at its template value), from log λ_1 = 0.
+    let mut flat = rho_template.to_flat();
+    let last = flat.len() - 1;
+    let mut converged = false;
+    for _ in 0..150 {
+        let efs = objective
+            .efs_step(flat.view())
+            .expect("the EFS lane must evaluate");
+        let step = efs.steps[last];
+        flat[last] += step;
+        if step.abs() < 1.0e-3 {
+            converged = true;
+            break;
+        }
+    }
+    assert!(
+        converged,
+        "the block Fellner–Schall iteration did not converge from log λ_1 = 0 \
+         (last log λ_1 = {:.4})",
+        flat[last]
+    );
+
+    // At the arrived point the analytic block gradient must vanish: the EFS root
+    // `R̃_1 = n·p_1` IS the gradient's stationary point `½·R̃_1 − n·p_1/2 = 0`.
+    let grad = objective
+        .eval(&flat)
+        .expect("the ValueAndGradient lane must evaluate at the arrived point")
+        .gradient;
+    let scale = 0.5 * n as f64 * p_1 as f64;
+    assert!(
+        grad[last].abs() <= 1.0e-2 * scale,
+        "the EFS fixed point is not the gradient root: |½·R̃_1 − n·p_1/2| = {:.4} exceeds \
+         {:.4} (= 1e-2·n·p_1/2) at the arrived log λ_1 = {:.4}",
+        grad[last].abs(),
+        1.0e-2 * scale,
+        flat[last]
+    );
+}

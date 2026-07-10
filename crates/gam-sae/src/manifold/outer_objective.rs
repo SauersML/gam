@@ -1095,6 +1095,78 @@ impl SaeManifoldOuterObjective {
             .sum()
     }
 
+    /// #2231 Inc-B (stage 2) — the per-output-block SCALED residual sum of
+    /// squares `R̃_ℓ = ‖r̃_ℓ‖²` at the current fitted state, over each block's
+    /// stacked-column span `[p_x + Σ_{m<ℓ} p_m, …)`.
+    ///
+    /// `r̃ = fitted − self.target` is the residual against the ALREADY block-scaled
+    /// target (every eval lane calls `apply_block_scaling` before the inner solve),
+    /// so `R̃_ℓ` is the scaled-block residual the `#F1` unit-dispersion data term
+    /// `½‖r̃‖² = ½(R_x + Σ_ℓ R̃_ℓ)` already carries. In UNSCALED form
+    /// `R̃_ℓ = λ_ℓ·R_ℓ` where `R_ℓ = ‖r̃_ℓ‖²/λ_ℓ` is the block's honest-units
+    /// residual (the quantity `run_multiblock_reml_fit`'s `augmented_block_rss`
+    /// reports); the two coincide at `λ_ℓ = 1`. Returns `None` when crosscoder
+    /// pricing is off (plain SAE). The reconstruction is read from the CONVERGED
+    /// fitted state, so callers must invoke this only after the lane's inner solve.
+    fn block_scaled_rss(&self, rho: &SaeManifoldRho) -> Result<Option<Vec<f64>>, String> {
+        let Some(blocks) = self.crosscoder_blocks.as_ref() else {
+            return Ok(None);
+        };
+        let residual = self.term.reconstruction_residual(self.target.view(), rho)?;
+        let mut out = Vec::with_capacity(blocks.block_dims.len());
+        let mut off = blocks.p_x;
+        for &p_l in &blocks.block_dims {
+            let mut rss = 0.0_f64;
+            for row in residual.rows() {
+                for j in off..off + p_l {
+                    let r = row[j];
+                    rss += r * r;
+                }
+            }
+            out.push(rss);
+            off += p_l;
+        }
+        Ok(Some(out))
+    }
+
+    /// #2231 Inc-B (stage 2) — the analytic block-coordinate gradient
+    /// `∂C/∂log λ_ℓ = ½·R̃_ℓ − n·p_ℓ/2`, one entry per output block, or `None`
+    /// for a plain SAE.
+    ///
+    /// Derivation (UNIT-dispersion `#F1`). Scaling block `ℓ`'s target columns by
+    /// `√λ_ℓ` enters the criterion in exactly two places: the raw half-SSE data
+    /// term (through `R̃_ℓ`) and the change-of-variables Jacobian
+    /// `−(n·p_ℓ/2)·log λ_ℓ` ([`Self::block_jacobian`]). At the inner optimum the
+    /// envelope theorem cancels the implicit `∂θ̂/∂λ_ℓ` response of the penalized
+    /// loss, and the block weight scales the TARGET alone — never the penalty nor
+    /// the joint Hessian `H` — so the Laplace `½log|H|` term (and hence the
+    /// `−½·Γᵀθ̂_ρ` adjoint) carries no `λ_ℓ` dependence. What survives is only the
+    /// explicit data derivative `∂(½‖r̃‖²)/∂log λ_ℓ = ½·R̃_ℓ` (with
+    /// `R̃_ℓ = ‖r̃_ℓ‖² = λ_ℓ·R_ℓ`, so `½·R̃_ℓ = ½·λ_ℓ·R_ℓ` in unscaled form) plus
+    /// the Jacobian `−n·p_ℓ/2`. The coordinate is stationary at
+    /// `R̃_ℓ = n·p_ℓ` (`λ_ℓ = n·p_ℓ/R_ℓ`) and coercive at both ends — the interior
+    /// minimum the Inc-B contract pins. This is the desync-safe (#2087) partner of
+    /// the block Jacobian priced into every value/EFS lane: one consistent
+    /// `(value, gradient)` pair over the SAME `#F1` criterion.
+    fn block_log_lambda_gradient(&self, rho: &SaeManifoldRho) -> Result<Option<Vec<f64>>, String> {
+        let Some(scaled_rss) = self.block_scaled_rss(rho)? else {
+            return Ok(None);
+        };
+        let blocks = self
+            .crosscoder_blocks
+            .as_ref()
+            .expect("block_scaled_rss returned Some ⇒ crosscoder pricing is installed");
+        let n = self.target.nrows() as f64;
+        Ok(Some(
+            blocks
+                .block_dims
+                .iter()
+                .zip(scaled_rss.iter())
+                .map(|(&p_l, &r_tilde)| 0.5 * r_tilde - 0.5 * n * p_l as f64)
+                .collect(),
+        ))
+    }
+
     /// SPEC wall-survival: bank a resumable checkpoint at a MATERIAL improvement
     /// of the outer best cost. Best-effort — a checkpoint write must never abort
     /// a fit (the error is logged, not raised).
@@ -3339,6 +3411,36 @@ impl SaeManifoldOuterObjective {
             }
         }
 
+        // Block weights (trailing L-1 coordinates): the crosscoder block-relevance
+        // Fellner–Schall step (#2231 Inc-B stage 2). The `#F1` criterion is
+        // stationary in `log λ_ℓ` at `R̃_ℓ = n·p_ℓ` (block ½·R̃_ℓ − n·p_ℓ/2 = 0;
+        // see `block_log_lambda_gradient`), and `R̃_ℓ = λ_ℓ·R_ℓ`, so the
+        // multiplicative fixed point `λ_ℓ_new = n·p_ℓ/R_ℓ = λ_ℓ·n·p_ℓ/R̃_ℓ`
+        // becomes the ADDITIVE log-space step `Δlog λ_ℓ = ln(n·p_ℓ/R̃_ℓ)` — the
+        // same root the analytic gradient vanishes at (the quasi-Newton and
+        // Fellner–Schall lanes agree). Held (step 0) for a block with no residual
+        // variance (`R̃_ℓ ≤ 0`: perfectly reconstructed / unidentifiable) or a
+        // non-finite proposal, matching the λ_smooth/ARD guards above. No-op for a
+        // plain SAE.
+        if let Some(scaled_rss) = self.block_scaled_rss(&rho)? {
+            let n = self.term.n_obs() as f64;
+            let blocks = self
+                .crosscoder_blocks
+                .as_ref()
+                .expect("block_scaled_rss returned Some ⇒ crosscoder pricing is installed");
+            let tail = n_params - blocks.block_dims.len();
+            for (l, (&p_l, &r_tilde)) in
+                blocks.block_dims.iter().zip(scaled_rss.iter()).enumerate()
+            {
+                if r_tilde > 0.0 {
+                    let step = (n * p_l as f64 / r_tilde).ln();
+                    if step.is_finite() {
+                        steps[tail + l] = step;
+                    }
+                }
+            }
+        }
+
         let beta_hat = self.term.flatten_beta();
         let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         let consecutive_restored_incumbents = self
@@ -3690,7 +3792,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is a typed `OuterGradientError`: it is not a usable derivative and must
         // terminate this evaluation instead of being hidden behind a plain inverse
         // or a differenced value path.
-        let gradient = self
+        let mut gradient = self
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
@@ -3704,6 +3806,23 @@ impl OuterObjective for SaeManifoldOuterObjective {
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?
             .gradient();
+        // #2231 Inc-B (stage 2) — populate the block-relevance tail of the
+        // gradient with the analytic `∂C/∂log λ_ℓ = ½·R̃_ℓ − n·p_ℓ/2`
+        // ([`Self::block_log_lambda_gradient`]). The components assembler leaves
+        // these trailing coordinates at 0 (`outer_rho_gradient_ift_rhs` returns a
+        // zero RHS past the ARD range, and no explicit/logdet/occam channel writes
+        // them), so this OVERWRITE is the block coordinate's sole gradient — the
+        // desync-safe partner of the Jacobian priced into the cost below. No-op for
+        // a plain SAE (`None` ⇒ the tail stays empty and untouched).
+        if let Some(block_grad) = self
+            .block_log_lambda_gradient(&rho_state)
+            .map_err(EstimationError::RemlOptimizationFailed)?
+        {
+            let tail = gradient.len() - block_grad.len();
+            for (l, g_l) in block_grad.into_iter().enumerate() {
+                gradient[tail + l] = g_l;
+            }
+        }
         let beta_hat = self.term.flatten_beta();
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
@@ -3719,10 +3838,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .map_err(EstimationError::RemlOptimizationFailed)?;
         // #2231 Inc-B — price the block Jacobian into the gradient lane's cost so
         // the value it records matches the value/ranking/EFS lanes (0 for a plain
-        // SAE). STAGE 1 is pricing only: the analytic block-coordinate gradient
-        // is deferred to stage 2, so `gradient`'s appended entries are not yet the
-        // exact `∂C/∂log λ_ℓ` — the block coordinate is driven by the value/EFS
-        // lanes until then.
+        // SAE). This Jacobian and the block-tail gradient populated above
+        // (`½·R̃_ℓ − n·p_ℓ/2`) are the desync-safe (#2087) `(value, gradient)` pair:
+        // the cost carries `−(n·p_ℓ/2)·log λ_ℓ`, whose derivative is the `−n·p_ℓ/2`
+        // half of that gradient entry, and the scaled-block residual carries the
+        // `½·R̃_ℓ` half through the data term.
         let cost = cost + self.block_jacobian(&rho_state);
         // The gradient is the EXACT implicit derivative: `outer_gradient_arrow_
         // solver` solves the implicit-function system through the rank-revealing
@@ -3861,9 +3981,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .efs_step(rho.view())
             .map_err(EstimationError::RemlOptimizationFailed)?;
         // #2231 Inc-B — price the block Jacobian into the EFS cost (0 for a plain
-        // SAE) so the value recorded and returned matches the value/gradient
-        // lanes. STAGE 1: the EFS fixed-point coordinate for `log λ_ℓ` is stage 2;
-        // here the block λ is carried by the outer descent, not moved by EFS.
+        // SAE) so the value recorded and returned matches the value/gradient lanes.
+        // `efs_step` already populated the block-tail Fellner–Schall step
+        // `Δlog λ_ℓ = ln(n·p_ℓ/R̃_ℓ)`, so the EFS descent moves the block λ toward
+        // the same root the gradient lane vanishes at.
         eval.cost += self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
         if self.termination.record(eval.cost) {
             self.bank_checkpoint(rho);
