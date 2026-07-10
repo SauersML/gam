@@ -720,6 +720,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
                 fisher_w_override: multinomial_fisher_active.as_ref().map(|a| a.view()),
                 max_iter,
                 tol,
+                resume_from: None,
             },
         )
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -851,6 +852,7 @@ fn fit_penalized_multinomial_pyfunc<'py>(
             fisher_w_override: None,
             max_iter,
             tol,
+            resume_from: None,
         },
     )
     .map_err(|err| py_value_error(err.to_string()))?;
@@ -1112,7 +1114,6 @@ fn multinomial_model_metadata_pyfunc<'py>(
     // label here component-for-component instead of assuming one λ per term.
     out.set_item("lambda_labels", envelope.saved.lambda_labels.clone())?;
     out.set_item("iterations", envelope.saved.iterations)?;
-    out.set_item("converged", envelope.saved.converged)?;
     out.set_item(
         "penalized_neg_log_likelihood",
         envelope.saved.penalized_neg_log_likelihood,

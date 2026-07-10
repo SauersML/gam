@@ -3623,10 +3623,9 @@ fn manifold_exp_map<'py>(
 /// ``(grad_points, grad_vecs)`` — the analytic pullbacks w.r.t. ``points`` and
 /// ``vecs``. This is the backward used by the Python ``torch.autograd.Function``
 /// wrapping ``manifold_exp_map``; it routes through the canonical Rust
-/// ``RiemannianManifold::exp_map_vjp`` so curved manifolds (Sphere, products
-/// containing a Sphere) get their true analytic Jacobi-field gradients instead
-/// of a silent straight-through identity. Manifolds with no closed-form
-/// backward (Grassmann, Stiefel, SPD) raise rather than return wrong grads.
+/// ``RiemannianManifold::exp_map_vjp`` so Sphere, Grassmann, Stiefel, SPD, and
+/// products of supported components get their true analytic pullbacks instead
+/// of a silent straight-through identity.
 #[pyfunction(signature = (manifold_json, points, vecs, grad_output))]
 fn manifold_exp_map_vjp<'py>(
     py: Python<'py>,
