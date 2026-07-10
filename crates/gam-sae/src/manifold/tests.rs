@@ -510,17 +510,6 @@ pub(crate) fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius(
     assert_abs_diff_eq!(report.peak_activity_floor, 1.0, epsilon = 1.0e-12);
 }
 
-#[test]
-pub(crate) fn search_strategy_exposes_fixed_and_sweep_values() {
-    assert!(SearchStrategy::Fixed.is_fixed());
-
-    let strategy = SearchStrategy::ExponentialSweep {
-        values: vec![0.1, 1.0, 10.0],
-    };
-    assert!(!strategy.is_fixed());
-    assert_eq!(strategy.sweep_values(), Some([0.1, 1.0, 10.0].as_slice()));
-}
-
 /// `try_assignments_row` may only pin the K==1 assignment to `1.0` for
 /// Softmax, whose single simplex coordinate is genuinely fixed. For the
 /// independent gate modes (IBP-MAP, JumpReLU) the lone logit must drive the
@@ -529,13 +518,8 @@ pub(crate) fn search_strategy_exposes_fixed_and_sweep_values() {
 /// audit's K==1 special-case bug.
 #[test]
 pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
-    // IBP-MAP, K=1: σ(0/τ)·π_0. Since #614 the stick-breaking prior shrinks
-    // EVERY atom by one Beta(α,1) stick mean — including the first — so the
-    // truncated mean is `π_0 = α/(α+1)`, NOT the old unshrunk `π_0 = 1` (that
-    // left atom 0 unshrunk and broke α's role as a concentration). With α=1,
-    // τ=1, l=0 the gate is therefore `σ(0)·(1/2) = 0.5·0.5 = 0.25`. The point
-    // of this case is unchanged: the K=1 gate is NOT pinned to 1.0 (the
-    // Softmax-only collapse), it is the genuine sigmoid×prior product.
+    // IBP, K=1: the posterior-mean Bernoulli gate is σ(0/τ)=0.5. The ordered
+    // prior is scored separately and never caps the final function.
     let ibp = SaeAssignment::from_blocks_with_mode(
         array![[0.0]],
         vec![array![[0.0]]],
@@ -543,7 +527,7 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
     )
     .unwrap();
     let ibp_gate = ibp.try_assignments_row(0).unwrap()[0];
-    assert_abs_diff_eq!(ibp_gate, 0.25, epsilon = 1e-9);
+    assert_abs_diff_eq!(ibp_gate, 0.5, epsilon = 1e-9);
     assert!(
         (ibp_gate - 1.0).abs() > 1e-6,
         "K=1 IBP-MAP must not pin the gate to 1.0"

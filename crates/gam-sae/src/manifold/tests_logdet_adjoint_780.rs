@@ -698,49 +698,6 @@ fn install_low_rank_ibp_metric_2156(term: &mut SaeManifoldTerm) {
     );
 }
 
-fn whiten_vec_for_metric_2156(term: &SaeManifoldTerm, row: usize, values: &mut Vec<f64>) {
-    let metric = term.row_metric().expect("row metric");
-    let p = term.output_dim();
-    assert_eq!(values.len(), p, "metric vector width");
-    let rank = metric.metric_rank();
-    let mut whitened = vec![0.0_f64; rank];
-    for rank_col in 0..rank {
-        let mut acc = 0.0_f64;
-        for out_col in 0..p {
-            acc += metric.factor_entry(row, out_col, rank_col) * values[out_col];
-        }
-        whitened[rank_col] = acc;
-    }
-    *values = whitened;
-}
-
-fn whiten_row_jets_for_low_rank_metric_2156(
-    term: &SaeManifoldTerm,
-    row: usize,
-    jets: &mut SaeRowJets,
-) {
-    for first in jets.first.iter_mut() {
-        whiten_vec_for_metric_2156(term, row, first);
-    }
-    for second_row in jets.second.iter_mut() {
-        for second in second_row.iter_mut() {
-            whiten_vec_for_metric_2156(term, row, second);
-        }
-    }
-    for beta in jets.beta.iter_mut() {
-        whiten_vec_for_metric_2156(term, row, beta);
-    }
-    for beta_deriv_row in jets.beta_deriv.iter_mut() {
-        for beta_deriv in beta_deriv_row.iter_mut() {
-            whiten_vec_for_metric_2156(term, row, beta_deriv);
-        }
-    }
-    for beta_l_deriv_row in jets.beta_l_deriv.iter_mut() {
-        for beta_l_deriv in beta_l_deriv_row.iter_mut() {
-            whiten_vec_for_metric_2156(term, row, beta_l_deriv);
-        }
-    }
-}
 
 fn ibp_majorized_hdiag_2156(
     channels: &IbpHessianDiagThirdChannels,
@@ -755,7 +712,6 @@ fn ibp_majorized_hdiag_2156(
     let diag_score_c = raw_hdiag - self_term;
     d.max(0.0) * j * j + diag_score_c.max(0.0)
 }
-
 
 fn dense_trace_hinv_dh_2156(h: &Array2<f64>, dh: &Array2<f64>) -> f64 {
     assert_eq!(h.raw_dim(), dh.raw_dim(), "trace shape");
@@ -1979,7 +1935,6 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
          analytic={analytic:.8e}"
     );
 }
-
 
 /// #1625 (scope expansion) — the LEARNABLE-α IBP-MAP logit θ-adjoint. This is
 /// the cross-row Woodbury logit channel of `Γ = tr(H⁻¹ ∂H/∂ℓ)` under

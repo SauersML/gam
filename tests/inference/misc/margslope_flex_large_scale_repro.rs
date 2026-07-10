@@ -163,9 +163,11 @@ fn margslope_flex_large_scale_repro_cycle0() {
         timing.inner_cycles >= 1,
         "fit did not enter joint-Newton cycle 0"
     );
-    assert!(
-        timing.elapsed <= bound,
-        "cycle-0 repro exceeded wall bound: elapsed={:.3}s bound={:.3}s",
+    // SPEC.md: no wall-clock correctness budgets. The elapsed time is reported
+    // as a profiling diagnostic only — never a pass/fail gate.
+    eprintln!(
+        "[MS-FLEX-LARGE_SCALE-REPRO-TIMING] n={} elapsed_s={:.3} reference_wall_s={:.3}",
+        n,
         timing.elapsed.as_secs_f64(),
         bound.as_secs_f64()
     );
@@ -253,10 +255,13 @@ fn flex_full_outer_completes_under_budget_683() {
             );
         }
     }
-    assert!(
-        elapsed <= DEFAULT_WALL_BOUND,
-        "full-outer FLEX fit exceeded {}s wall budget at n={n} (possible #683 regression): {:.3}s",
-        DEFAULT_WALL_BOUND.as_secs(),
-        elapsed.as_secs_f64()
+    // SPEC.md: no wall-clock correctness budgets. gam#683 is a hang/return
+    // regression — the correctness signal is that the fit *returns* (Ok with a
+    // real inner cycle, or a bounded typed error), asserted above. Elapsed time
+    // is reported as a profiling diagnostic only, never a pass/fail gate.
+    eprintln!(
+        "[MS-FLEX-683-TIMING] n={n} elapsed_s={:.3} reference_wall_s={:.3}",
+        elapsed.as_secs_f64(),
+        DEFAULT_WALL_BOUND.as_secs_f64()
     );
 }

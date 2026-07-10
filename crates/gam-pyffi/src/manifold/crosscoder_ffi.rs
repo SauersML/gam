@@ -145,3 +145,87 @@ fn sae_crosscoder_fit<'py>(
         },
     )
 }
+
+/// Rust-owned behavior-anchored fit (#2015). The wire report is materialized by
+/// `gam-sae`; this class only re-serializes it.
+#[pyclass(module = "gamfit._rust", name = "ManifoldBehaviorCore")]
+struct ManifoldBehaviorCore {
+    wire: gam::terms::sae::manifold::SaeBehaviorWireReport,
+}
+
+impl ManifoldBehaviorCore {
+    fn wire_value(&self) -> PyResult<serde_json::Value> {
+        serde_json::to_value(&self.wire).map_err(|error| py_value_error(error.to_string()))
+    }
+}
+
+#[pymethods]
+impl ManifoldBehaviorCore {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+        json_value_to_py(py, self.wire_value()?)
+    }
+
+    fn to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.wire_value()?)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+}
+
+#[pyfunction(signature = (
+    activation,
+    probabilities,
+    n_atoms,
+    n_harmonics,
+    sparsity_strength = None,
+    smoothness = None,
+    max_iter = None,
+    learning_rate = None,
+    ridge_ext_coord = None,
+    ridge_beta = None,
+    random_state = None,
+    run_outer_rho_search = None,
+))]
+fn sae_behavior_fit<'py>(
+    py: Python<'py>,
+    activation: PyReadonlyArray2<'py, f64>,
+    probabilities: PyReadonlyArray2<'py, f64>,
+    n_atoms: usize,
+    n_harmonics: usize,
+    sparsity_strength: Option<f64>,
+    smoothness: Option<f64>,
+    max_iter: Option<usize>,
+    learning_rate: Option<f64>,
+    ridge_ext_coord: Option<f64>,
+    ridge_beta: Option<f64>,
+    random_state: Option<u64>,
+    run_outer_rho_search: Option<bool>,
+) -> PyResult<Py<ManifoldBehaviorCore>> {
+    use gam::terms::sae::manifold::{
+        SaeBehaviorAutoFitRequest, SaeCrosscoderAutoFitOverrides, run_auto_sae_behavior_fit,
+    };
+
+    let config = SaeCrosscoderAutoFitOverrides {
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        random_state,
+        run_outer_rho_search,
+    }
+    .resolve(n_atoms, n_harmonics);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let request = SaeBehaviorAutoFitRequest {
+        activation: activation.as_array().to_owned(),
+        probabilities: probabilities.as_array().to_owned(),
+        config,
+        cancel: Some(std::sync::Arc::clone(&cancel)),
+    };
+    let inner = run_sae_fit_interruptible(py, "gam-sae-behavior-fit", &cancel, move || {
+        run_auto_sae_behavior_fit(request)
+    })?
+    .map_err(|error| sae_fit_error_to_pyerr(py, error))?;
+    let wire = inner.wire_report().map_err(py_value_error)?;
+    Py::new(py, ManifoldBehaviorCore { wire })
+}

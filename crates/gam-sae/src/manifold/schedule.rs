@@ -1,1 +1,1 @@
-pub use gam_problem::{GumbelTemperatureSchedule, ScheduleKind, SearchStrategy};
+pub use gam_problem::{GumbelTemperatureSchedule, ScheduleKind};

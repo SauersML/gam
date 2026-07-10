@@ -2673,8 +2673,7 @@ impl SaeManifoldTerm {
                 canonicalize_softmax_logits(&mut self.assignment.logits);
             }
             AssignmentMode::IBPMap { .. } => {
-                // σ(0/τ) = ½ — the gate's neutral point; the IBP prior π_k
-                // still applies its geometric damping, as it should.
+                // σ(0/τ) = ½ — the Bernoulli posterior mean's neutral point.
                 for row in 0..n {
                     self.assignment.logits[[row, atom]] = 0.0;
                 }
@@ -5700,30 +5699,8 @@ impl SaeManifoldTerm {
             // no-ops inside the helper. Run the paired amplitude solve solely when an
             // atom was actually retracted, so a fit with no collapsed atom is a strict
             // no-op (bit-for-bit the flag-off path).
-            if (self.cone_atom_recovery || self.quotient_scale)
-                && self.retract_collapsed_decoders_in_loop() > 0
-            {
+            if self.cone_atom_recovery && self.retract_collapsed_decoders_in_loop() > 0 {
                 self.optimize_log_amplitudes_closed_form(target, rho)?;
-            } else if self.quotient_scale {
-                // #2228/#1095/#2134 SCALE-gauge pin (any active support). The
-                // collapse-relative retraction above MISSES the co-collapse whenever
-                // the whole active support shrinks TOGETHER: its `k<2` early-out kills
-                // K=1, and its MEDIAN-keyed breach never fires when every active atom
-                // is over-shrunk in lockstep (no atom is small RELATIVE to its peers).
-                // But that lockstep shrink is exactly the ordered IBP-MAP failure — each
-                // active atom's gate is capped by its column index `a_k = σ(l_k/τ)·π_k`,
-                // `π_k = (α/(α+1))^{k+1}` (0.5, 0.25, 0.125… at α=1), so the smoothness
-                // penalty (scaled by λ, NOT the gate) over-shrinks atom k's decoder by
-                // `1/π_k²` (4×, 16×, 64×…). `top_k=1` is only borderline
-                // (`R²≈1−0.75²=0.4375`); `top_k>1` diverges per active atom (#2134-p2 /
-                // real-OLMo multi-active co-collapse). `pin_scale_gauge` peels every
-                // atom's `‖B‖` into the UNPENALIZED `s_k` (unit-`B̂`, scale-free
-                // smoothness) and re-homes each `exp(s_k)~1/a_k` by the joint data-optimal
-                // solve, so every active atom reaches the target regardless of its `π_k`
-                // cap. Runs at this accepted boundary with the solve's monotone keep-best
-                // safeguard, so a healthy fit (K=1 low-amp or multi-active) is inert and
-                // this only ever helps.
-                self.pin_scale_gauge(target, rho)?;
             }
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step

@@ -21,7 +21,7 @@ use super::{
     MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
     SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho,
     SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator, TorusHarmonicEvaluator,
-    resolve_learnable_weight, sae_pca_seed_initial_coords,
+    sae_pca_seed_initial_coords,
 };
 
 const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;

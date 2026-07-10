@@ -7,7 +7,6 @@
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
 use super::*;
 
-
 /// Deflation-derivative regression for a NON-α ρ-component. The deflation that
 /// the IBP-prior negative curvature triggers stiffens the WHOLE per-row `H_tt`
 /// block (logit AND coordinate slots), so it corrupts EVERY outer ρ-component's
@@ -62,7 +61,6 @@ pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
     }
     assert!(checked > 0, "no ARD axes were checked");
 }
-
 
 /// #Bug4 — the assignment log-strength ρ-trace must carry NO contribution from a
 /// FIXED (ungated) logit. `assignment_prior_grad_hdiag` zeroes the assembled

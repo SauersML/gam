@@ -26,7 +26,10 @@
 
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
-use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
+use gam_sae::manifold::{
+    AtlasOrientability, AtlasSeamKind, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
+    SaeManifoldTerm, UnitSpeedChartTransition,
+};
 use gam_sae::structure_harvest::{
     HarvestParams, ProductionRefitParams, RoundDriverConfig, run_production_structure_search,
 };
@@ -99,6 +102,19 @@ fn rho_for(k: usize) -> SaeManifoldRho {
 fn circle_decoder(p: usize, ax_sin: usize, ax_cos: usize) -> Array2<f64> {
     let mut d = Array2::<f64>::zeros((3, p));
     d[[1, ax_sin]] = 1.0;
+    d[[2, ax_cos]] = 1.0;
+    d
+}
+
+/// The SAME unit circle image traced with reversed orientation: `sin` flips sign
+/// (`x(t) = (-sin 2πt, cos 2πt)`), so its coordinate map is `A`'s reflected —
+/// the transition is the orientation-reversing isometry `t_A = -t_B`. Decoding
+/// the identical embedded curve, it is an equivalence (the seam certifier fires),
+/// but no single orientable chart can absorb it, so it must REGISTER (Increment 2)
+/// rather than fuse.
+fn reflected_circle_decoder(p: usize, ax_sin: usize, ax_cos: usize) -> Array2<f64> {
+    let mut d = Array2::<f64>::zeros((3, p));
+    d[[1, ax_sin]] = -1.0;
     d[[2, ax_cos]] = 1.0;
     d
 }
@@ -323,4 +339,183 @@ fn distinct_circles_do_not_glue_end_to_end() {
         2,
         "the negative control must not physically remove either circle"
     );
+}
+
+#[test]
+fn orientation_reversing_pair_registers_atlas_end_to_end() {
+    // Increment 2 — ATLAS REGISTER outcome, end-to-end through the production
+    // driver. Two disjoint-support arcs decode the SAME embedded circle, but the
+    // second chart is REFLECTED (`sin` sign flipped), so their overlap transition
+    // is orientation-reversing (`t_A = -t_B`, sign `-1`). This is a genuine
+    // equivalence — the seam certifier fires exactly as for the plain over-tile —
+    // yet no single ORIENTABLE chart can represent the union. The driver must
+    // therefore take the REGISTER branch (`ChartGlueOutcome::RegisterAtlas`), NOT
+    // the destructive fuse: keep BOTH numerical charts active, quotient them into
+    // one semantic atom carrying the fitted `-1` transition, and expose the chart
+    // gates as `activation × partition-of-unity`.
+    let n = 40;
+    let p = 4;
+    let arcs = [(0usize, 20usize), (20usize, 40usize)];
+    // Same ambient plane (0,1), opposite orientation ⇒ same image, reversed chart.
+    let decoders = [circle_decoder(p, 0, 1), reflected_circle_decoder(p, 0, 1)];
+    let term = build_term(n, &arcs, &decoders);
+    let rho = rho_for(2);
+    let target = target_from_term(&term, p);
+    let fitted_before = term.try_fitted().unwrap();
+
+    assert_eq!(active_atom_count(&term), 2, "fixture starts with 2 active arcs");
+    assert_eq!(term.semantic_atom_count(), 2, "no atlas registered yet");
+
+    let mut ledger = StructureLedger::new();
+    let result = run_production_structure_search(
+        term,
+        rho,
+        target.view(),
+        glue_only_config(),
+        refit_params(),
+        &mut ledger,
+    )
+    .unwrap();
+
+    let glues = accepted_glues(&result);
+    eprintln!(
+        "[1890-e2e-atlas] accepted_glues={glues} k_atoms={} semantic_atoms={} atlases={}",
+        result.term.k_atoms(),
+        result.term.semantic_atom_count(),
+        result.term.chart_atlases().len(),
+    );
+
+    // The bank → certify → apply chain fired on the reversing seam.
+    assert!(
+        glues >= 1,
+        "no Glue certified for the orientation-reversing pair; the atlas-register \
+         lane did not fire end-to-end"
+    );
+    assert!(result.structure_changed(), "a glue applied but structure_changed() is false");
+
+    // REGISTER, not FUSE: both numerical charts survive (nothing is excised) and
+    // both keep routing mass — the register outcome does not demote either chart.
+    assert_eq!(
+        result.term.k_atoms(),
+        2,
+        "atlas registration must keep BOTH local charts (register, not destructive fuse)"
+    );
+    assert_eq!(
+        active_atom_count(&result.term),
+        2,
+        "both charts of a registered atlas stay active under the partition of unity"
+    );
+
+    // The two charts are quotiented into ONE semantic atom carrying the seam.
+    assert_eq!(
+        result.term.semantic_atom_count(),
+        1,
+        "the reversing pair must collapse to one semantic atlas atom"
+    );
+    assert_eq!(result.term.chart_atlases().len(), 1, "exactly one atlas registered");
+    let atlas = &result.term.chart_atlases()[0];
+    assert_eq!(atlas.charts(), &[0, 1], "the atlas covers both charts");
+    assert_eq!(
+        atlas.transitions().len(),
+        1,
+        "the pair registers exactly one directed seam"
+    );
+    assert_eq!(
+        atlas.transitions()[0].sign,
+        -1,
+        "the registered transition must be orientation-reversing"
+    );
+
+    // A single reversing seam is REMOVABLE by flipping one chart's local
+    // orientation, so the two-chart cover is still ORIENTABLE — non-orientability
+    // is a property of the sign COCYCLE (a negative-holonomy cycle), not of one
+    // negative edge. The dedicated Möbius pin below exercises that path.
+    assert_eq!(
+        atlas.orientability(),
+        AtlasOrientability::Orientable,
+        "one reversing edge is a gauge choice; the cover stays orientable"
+    );
+
+    // Registration is an image-EXACT algebraic quotient of the same gates: the
+    // reconstruction is untouched, and the chart gates factor exactly into
+    // activation × a normalized partition of unity on every row.
+    assert_eq!(
+        result.term.try_fitted().unwrap(),
+        fitted_before,
+        "atlas registration must not change the decoded image"
+    );
+    let assignments = result.term.assignment.assignments();
+    for row in 0..n {
+        let (activation, partition) = result
+            .term
+            .atlas_partition_of_unity(0, assignments.row(row))
+            .unwrap();
+        assert!(
+            (partition.sum() - 1.0).abs() < 8.0 * f64::EPSILON,
+            "partition of unity must be normalized on row {row}"
+        );
+        for (slot, &chart) in atlas.charts().iter().enumerate() {
+            assert!(
+                (activation * partition[slot] - assignments[[row, chart]]).abs()
+                    < 8.0 * f64::EPSILON,
+                "activation × partition must reproduce the chart gate on row {row}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mobius_cocycle_reports_non_orientable_via_sign_holonomy() {
+    // A genuine Möbius obstruction (as opposed to a single reflected chart) needs
+    // an overlap whose transition FLIPS sign around a cycle: going once around the
+    // cover reverses the frame with no local re-choice able to undo it. We build
+    // that from a two-chart term whose two overlap COMPONENTS carry opposite signs
+    // — the defining half-twist — and register both through the SAME production
+    // entry point (`register_chart_transition`). The sign cocycle then has
+    // holonomy `-1`, which the orientability readout must report as Möbius.
+    let n = 20;
+    let p = 4;
+    let arcs = [(0usize, 10usize), (10usize, 20usize)];
+    let decoders = [circle_decoder(p, 0, 1), reflected_circle_decoder(p, 0, 1)];
+    let mut term = build_term(n, &arcs, &decoders);
+
+    let period = 1.0;
+    // Overlap component 1: orientation-PRESERVING (sign +1).
+    term.register_chart_transition(
+        UnitSpeedChartTransition::new(0, 1, 1, 0.0, period, AtlasSeamKind::Regular).unwrap(),
+    )
+    .unwrap();
+    // Overlap component 2 on the SAME pair: orientation-REVERSING (sign -1). The
+    // cycle 0 →(+1) 1 →(-1) 0 has sign product -1 — the Möbius holonomy.
+    term.register_chart_transition(
+        UnitSpeedChartTransition::new(1, 0, -1, 0.5, period, AtlasSeamKind::Regular).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(term.chart_atlases().len(), 1, "both seams live in one atlas");
+    let atlas = &term.chart_atlases()[0];
+    assert_eq!(atlas.charts(), &[0, 1]);
+    assert_eq!(atlas.transitions().len(), 2, "two overlap components registered");
+    assert_eq!(
+        atlas.orientability(),
+        AtlasOrientability::NonOrientable,
+        "opposite-sign overlap components give the atlas Möbius holonomy"
+    );
+
+    // Both charts remain one semantic atom under a normalized partition of unity —
+    // the Möbius cover is representable ONLY as this multi-chart atlas atom.
+    assert_eq!(term.k_atoms(), 2);
+    assert_eq!(term.semantic_atom_count(), 1);
+    let assignments = term.assignment.assignments();
+    for row in 0..n {
+        let (activation, partition) =
+            term.atlas_partition_of_unity(0, assignments.row(row)).unwrap();
+        assert!((partition.sum() - 1.0).abs() < 8.0 * f64::EPSILON);
+        for (slot, &chart) in atlas.charts().iter().enumerate() {
+            assert!(
+                (activation * partition[slot] - assignments[[row, chart]]).abs()
+                    < 8.0 * f64::EPSILON
+            );
+        }
+    }
 }

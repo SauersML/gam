@@ -2448,6 +2448,15 @@ fn constant_curvature_kappa_fair_optimum(
         &mut objective,
         &format!("constant-curvature fair profile term {term_idx}"),
     )?;
+    if !result.converged {
+        crate::bail_invalid_estim!(
+            "constant-curvature fair-profile κ optimization did not converge for term {} after {} iterations (negative_log_evidence={:.6e}, final_grad_norm={})",
+            term_idx,
+            result.iterations,
+            result.final_value,
+            result.final_grad_norm_report(),
+        );
+    }
     let kappa_hat = result.rho[0];
     log::info!(
         "[spatial-kappa] continuous fair-profile optimum kappa_hat={:.6} \
@@ -4175,6 +4184,15 @@ fn run_exact_joint_spatial_optimization(
         SpatialHyperKind::Isotropic => "iso-kappa joint REML",
     };
     let result = problem.run(&mut obj, run_label)?;
+    if !result.converged {
+        crate::bail_invalid_estim!(
+            "{} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            run_label,
+            result.iterations,
+            result.final_value,
+            result.final_grad_norm_report(),
+        );
+    }
     drop(obj);
     let kphase_total_s = kphase_optim_start.elapsed().as_secs_f64();
     let kphase_slow_resets = ctx
@@ -7018,6 +7036,14 @@ where
         optim_total_s: kphase_total_s,
     };
 
+    if !result.converged {
+        return Err(format!(
+            "n-block exact-joint spatial κ optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            result.iterations,
+            result.final_value,
+            result.final_grad_norm_report(),
+        ));
+    }
     let theta_star = result.rho;
 
     // ── P7 stage rotation ────────────────────────────────────────────────

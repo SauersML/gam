@@ -2781,7 +2781,6 @@ impl SaeManifoldTerm {
         Ok(0.5 * trace)
     }
 
-
     /// Per-row spectral-deflation correction `tr((H⁻¹)_tt · (D − DΦ[D]))` for one
     /// evidence ρ-component, to be SUBTRACTED from the raw-derivative trace
     /// `tr((H⁻¹)_tt · D)` the trace otherwise accumulates.
@@ -2947,8 +2946,6 @@ impl SaeManifoldTerm {
             Ok((inv_vv, inv_vbeta))
         }
     }
-
-
 
     pub(crate) fn border_channels_for_cache(
         &self,
