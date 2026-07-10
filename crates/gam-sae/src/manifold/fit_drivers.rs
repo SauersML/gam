@@ -179,6 +179,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|atom| SaeManifoldAtomSnapshot {
                 decoder_coefficients: atom.decoder_coefficients.clone(),
+                log_amplitude: atom.log_amplitude,
                 smooth_penalty: atom.smooth_penalty.clone(),
                 // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
                 // are rebuilt from these + coords on restore, avoiding the
@@ -222,6 +223,7 @@ impl SaeManifoldTerm {
                         _ => false,
                     };
                     atom.decoder_coefficients == saved.decoder_coefficients
+                        && atom.log_amplitude.to_bits() == saved.log_amplitude.to_bits()
                         && atom.smooth_penalty == saved.smooth_penalty
                         && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
                         && evaluator_matches
@@ -258,6 +260,7 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         for (atom, snap) in self.atoms.iter_mut().zip(snapshot.atoms.iter()) {
             atom.decoder_coefficients.assign(&snap.decoder_coefficients);
+            atom.log_amplitude = snap.log_amplitude;
             atom.smooth_penalty.assign(&snap.smooth_penalty);
             atom.basis_evaluator.clone_from(&snap.basis_evaluator);
             atom.basis_second_jet.clone_from(&snap.basis_second_jet);

@@ -850,6 +850,15 @@ pub(crate) struct SaeFitIncumbent {
 #[derive(Debug)]
 pub(crate) struct SaeManifoldAtomSnapshot {
     pub(crate) decoder_coefficients: Array2<f64>,
+    /// Explicit log-amplitude `s_k` of the scale quotient (#2022/#1939). The
+    /// physical dictionary is `exp(s_k)·Φ_k·B_k`, so a snapshot that banked only
+    /// the decoder would, on restore, MIX the banked `B_k` with whatever `s_k`
+    /// the fit moved to in the meantime (the boundary amplitude solve
+    /// `pin_scale_gauge` / `optimize_log_amplitudes_closed_form` and the
+    /// affine-gauge transport peel all move `s_k` between snapshot and restore
+    /// under the default-on `quotient_scale`) — a physically different model
+    /// than the one whose objective was banked.
+    pub(crate) log_amplitude: f64,
     pub(crate) smooth_penalty: Array2<f64>,
     pub(crate) basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     pub(crate) basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,
