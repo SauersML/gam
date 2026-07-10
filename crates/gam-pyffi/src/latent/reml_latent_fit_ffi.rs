@@ -4853,6 +4853,79 @@ fn repeat_survival_curve<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Non-parametric Kaplan-Meier survival estimate `S(t) = ∏_{t_i ≤ t} (1 − d_i/n_i)`
+/// (right-continuous step function), evaluated at each point in `grid`.
+/// Non-finite and non-positive times are dropped before fitting. Rows tied at
+/// the same event time are pooled into a single risk-set update, matching the
+/// standard product-limit definition.
+fn benchmark_km_curve(times: &[f64], events: &[f64], grid: &[f64]) -> Vec<f64> {
+    let mut rows: Vec<(f64, f64)> = times
+        .iter()
+        .zip(events.iter())
+        .filter(|(&t, _)| t.is_finite() && t > 0.0)
+        .map(|(&t, &e)| (t, e))
+        .collect();
+    if rows.is_empty() {
+        return vec![1.0; grid.len()];
+    }
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let n_total = rows.len();
+    let mut event_step_times = Vec::<f64>::new();
+    let mut survival_after_step = Vec::<f64>::new();
+    let mut survivor = 1.0;
+    let mut i = 0usize;
+    while i < rows.len() {
+        let t = rows[i].0;
+        let mut j = i;
+        let mut deaths = 0usize;
+        while j < rows.len() && rows[j].0 == t {
+            if rows[j].1 > 0.5 {
+                deaths += 1;
+            }
+            j += 1;
+        }
+        if deaths > 0 {
+            let at_risk = (n_total - i) as f64;
+            survivor *= 1.0 - deaths as f64 / at_risk;
+            event_step_times.push(t);
+            survival_after_step.push(survivor);
+        }
+        i = j;
+    }
+    grid.iter()
+        .map(|&g| {
+            let idx = event_step_times.partition_point(|&t| t <= g);
+            if idx == 0 {
+                1.0
+            } else {
+                survival_after_step[idx - 1]
+            }
+        })
+        .collect()
+}
+
+/// The marginal (covariate-free) Kaplan-Meier survival curve fit on the
+/// training sample, evaluated at `grid`. This is the "null model" baseline
+/// [`survival_lifted_metrics_from_predictions`] scores a model's calibrated
+/// survival matrix against.
+#[pyfunction]
+fn survival_null_curve_from_train<'py>(
+    py: Python<'py>,
+    train_times: Vec<f64>,
+    train_events: Vec<f64>,
+    grid: Vec<f64>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    if train_times.len() != train_events.len() {
+        return Err(PyValueError::new_err(format!(
+            "survival_null_curve_from_train length mismatch: times={} events={}",
+            train_times.len(),
+            train_events.len()
+        )));
+    }
+    let curve = benchmark_km_curve(&train_times, &train_events, &grid);
+    Ok(Array1::from_vec(curve).into_pyarray(py).unbind())
+}
+
 fn benchmark_survival_matrix_from_risk(
     train_times: &[f64],
     train_events: &[f64],

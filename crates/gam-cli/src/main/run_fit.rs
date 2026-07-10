@@ -485,7 +485,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         None
     };
-    let _sas_linkspec = if let Some(choice) = link_choice.as_ref() {
+    if let Some(choice) = link_choice.as_ref() {
         if choice.mixture_components.is_none() && choice.link == LinkFunction::Sas {
             if effective_beta_logistic_init.is_some() {
                 return Err(
@@ -586,11 +586,6 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             ));
         }
     }
-    let _effective_link = link_choice
-        .as_ref()
-        .map(|c| c.link)
-        .unwrap_or_else(|| family.link_function());
-
     let formula_linkwiggle = parsed.linkwiggle.clone();
     if parsed.timewiggle.is_some() {
         return Err("timewiggle(...) is only supported for survival models".to_string());

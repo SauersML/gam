@@ -130,8 +130,8 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let effective_timewiggle = formula_timewiggle.clone();
     let learn_timewiggle = effective_timewiggle.is_some();
 
-    let _survivalspec = match effectivespec.to_ascii_lowercase().as_str() {
-        "net" => SurvivalSpec::Net,
+    match effectivespec.to_ascii_lowercase().as_str() {
+        "net" => {}
         "crude" => {
             return Err(
                 "survival spec 'crude' is not supported by the one-hazard fitter; use survmodel(spec=net) and compute crude risk from separate cause-specific hazards"
@@ -349,10 +349,8 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     };
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
-    let _frozen_termspec =
-        freeze_term_collection_from_design(&termspec, &cov_design).map_err(|e| e.to_string())?;
+    freeze_term_collection_from_design(&termspec, &cov_design).map_err(|e| e.to_string())?;
 
-    let _p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     let mut event_target = Array1::<u8>::zeros(n);
@@ -416,16 +414,6 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let _weibull_builtin_beta_seed =
-        if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
-            let scale = effective_config
-                .baseline_scale
-                .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
-            let shape = effective_config.baseline_shape.unwrap_or(1.0);
-            Some(array![-shape * scale.ln(), shape])
-        } else {
-            None
-        };
     if learn_timewiggle && baseline_cfg.target == SurvivalBaselineTarget::Linear {
         return Err(
             "timewiggle(...) requires a non-linear scalar survival baseline target; use --baseline-target weibull|gompertz|gompertz-makeham, or combine it with --survival-likelihood weibull"

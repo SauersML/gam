@@ -107,7 +107,7 @@ pub(crate) use gam::terms::smooth::build_term_collection_design;
 
 pub(crate) use gam::smooth_test::SmoothTestScale;
 
-pub(crate) use gam::families::survival::{SurvivalSpec, survival_event_code_from_value};
+pub(crate) use gam::families::survival::survival_event_code_from_value;
 
 pub(crate) use gam::families::survival::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
@@ -120,7 +120,7 @@ pub(crate) use gam::families::survival::{
     marginal_slope_baseline_chain_rule_hessian, normalize_survival_time_pair,
     optimize_survival_baseline_config_with_gradient,
     optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
-    parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
+    parse_survival_likelihood_mode, parse_survival_time_basis_config,
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
     resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
@@ -165,7 +165,7 @@ pub(crate) use gam::families::fit_orchestration::{
     route_marginal_slope_deviation_blocks,
 };
 
-pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
+pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 
 pub(crate) use rand::{SeedableRng, rngs::StdRng};
 
