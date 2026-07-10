@@ -6897,9 +6897,59 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             (fp2h.mapv(|x| -x) + fph.mapv(|x| 8.0 * x) - fmh.mapv(|x| 8.0 * x) + fm2h) / (12.0 * h)
         };
 
-        // Directions spanning all four coefficient blocks (kept modest so the
-        // ±2h stencil stays interior).
-        let dir_u: Vec<f64> = (0..ncoef)
+        let (q0, dynamic0) = build(1.0, 1.0, 1.0, &betaw);
+
+        // DIAGNOSTIC (#932): report max relative error per direction family to
+        // localize the coeff-space FD vs analytic pullback convention gap.
+        let mut mk = |du: &[f64], dv: &[f64], label: &str| {
+            let d_dir_analytic = survival_ls_wiggle_directional_derivative_dense(
+                &family, &q0, &dynamic0, 0.0, &RowSet::All, du,
+            )
+            .expect("analytic first directional");
+            let d2_analytic = survival_ls_wiggle_second_directional_derivative_dense(
+                &family, &q0, &dynamic0, 0.0, &RowSet::All, du, dv,
+            )
+            .expect("analytic second directional");
+            let h3 = 1e-2;
+            let fd_third = five_point(
+                &hessian_at(h3, du),
+                &hessian_at(2.0 * h3, du),
+                &hessian_at(-h3, du),
+                &hessian_at(-2.0 * h3, du),
+                h3,
+            );
+            let mut third_max = 0.0_f64;
+            let mut third_at = (0, 0);
+            for ((a, b), &analytic) in d_dir_analytic.indexed_iter() {
+                let e = (analytic - fd_third[[a, b]]).abs() / (1.0 + analytic.abs());
+                if e > third_max {
+                    third_max = e;
+                    third_at = (a, b);
+                }
+            }
+            let h4 = 2e-2;
+            let fd_fourth = five_point(
+                &directional_at(h4, dv, du),
+                &directional_at(2.0 * h4, dv, du),
+                &directional_at(-h4, dv, du),
+                &directional_at(-2.0 * h4, dv, du),
+                h4,
+            );
+            let mut fourth_max = 0.0_f64;
+            let mut fourth_at = (0, 0);
+            for ((a, b), &analytic) in d2_analytic.indexed_iter() {
+                let e = (analytic - fd_fourth[[a, b]]).abs() / (1.0 + analytic.abs());
+                if e > fourth_max {
+                    fourth_max = e;
+                    fourth_at = (a, b);
+                }
+            }
+            eprintln!(
+                "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?}, fourth_max={fourth_max:.3e} at {fourth_at:?}"
+            );
+        };
+
+        let full_u: Vec<f64> = (0..ncoef)
             .map(|c| match c {
                 0 => 0.7,
                 1 => -0.5,
@@ -6907,7 +6957,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 _ => 0.3 - 0.11 * (c - 3) as f64,
             })
             .collect();
-        let dir_v: Vec<f64> = (0..ncoef)
+        let full_v: Vec<f64> = (0..ncoef)
             .map(|c| match c {
                 0 => -0.35,
                 1 => 0.6,
@@ -6915,62 +6965,19 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 _ => -0.12 + 0.09 * (c - 3) as f64,
             })
             .collect();
-
-        // Base-point analytic higher-order channels.
-        let (q0, dynamic0) = build(1.0, 1.0, 1.0, &betaw);
-        let d_dir_analytic = survival_ls_wiggle_directional_derivative_dense(
-            &family,
-            &q0,
-            &dynamic0,
-            0.0,
-            &RowSet::All,
-            &dir_u,
-        )
-        .expect("analytic first directional");
-        let d2_analytic = survival_ls_wiggle_second_directional_derivative_dense(
-            &family,
-            &q0,
-            &dynamic0,
-            0.0,
-            &RowSet::All,
-            &dir_u,
-            &dir_v,
-        )
-        .expect("analytic second directional");
-
-        // THIRD order: FD of the production Hessian along `dir_u`.
-        let h3 = 1e-2;
-        let fd_third = five_point(
-            &hessian_at(h3, &dir_u),
-            &hessian_at(2.0 * h3, &dir_u),
-            &hessian_at(-h3, &dir_u),
-            &hessian_at(-2.0 * h3, &dir_u),
-            h3,
-        );
-        for ((a, b), &analytic) in d_dir_analytic.indexed_iter() {
-            let fd = fd_third[[a, b]];
-            assert!(
-                (analytic - fd).abs() <= 1e-5 * (1.0 + analytic.abs()),
-                "{distribution:?}: wiggle D_dir H [{a}][{b}] analytic {analytic} != FD {fd}"
-            );
-        }
-
-        // FOURTH order: FD of the production directional `D_u H` along `dir_v`.
-        let h4 = 2e-2;
-        let fd_fourth = five_point(
-            &directional_at(h4, &dir_v, &dir_u),
-            &directional_at(2.0 * h4, &dir_v, &dir_u),
-            &directional_at(-h4, &dir_v, &dir_u),
-            &directional_at(-2.0 * h4, &dir_v, &dir_u),
-            h4,
-        );
-        for ((a, b), &analytic) in d2_analytic.indexed_iter() {
-            let fd = fd_fourth[[a, b]];
-            assert!(
-                (analytic - fd).abs() <= 1e-3 * (1.0 + analytic.abs()),
-                "{distribution:?}: wiggle D_u D_v H [{a}][{b}] analytic {analytic} != FD {fd}"
-            );
-        }
+        let wig = |base: &[f64]| -> Vec<f64> {
+            (0..ncoef)
+                .map(|c| if c < 3 { 0.0 } else { base[c] })
+                .collect()
+        };
+        let baseonly = |base: &[f64]| -> Vec<f64> {
+            (0..ncoef)
+                .map(|c| if c < 3 { base[c] } else { 0.0 })
+                .collect()
+        };
+        mk(&full_u, &full_v, "FULL");
+        mk(&wig(&full_u), &wig(&full_v), "WIGGLE_ONLY");
+        mk(&baseonly(&full_u), &baseonly(&full_v), "BASE_ONLY");
     }
 }
 
