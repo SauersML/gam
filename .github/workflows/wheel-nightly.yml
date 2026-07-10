@@ -14,6 +14,12 @@ name: Rolling wheel (warm-start artifact)
 # would tag manylinux_2_35 and refuse to install on the cluster. sccache keeps
 # rebuilds warm across runs. `concurrency` cancels superseded builds so only
 # the newest SHA spends minutes.
+#
+# This channel NEVER publishes to PyPI — pypi-wheels.yml stays the version-gated
+# release path; this is the fleet's iteration artifact. It builds under the
+# iteration profile (LTO off, CGU 16: 2-4x faster rebuilds for ~10% runtime),
+# so use it for correctness/quality/acceptance work — NOT for wall-clock perf
+# measurements, which need a real release-profile build.
 
 on:
   push:
@@ -41,9 +47,14 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release -o dist -i python3.10
+          args: --release --strip -o dist -i python3.10
           manylinux: 2_28
           sccache: true
+        env:
+          # Iteration profile — same knobs as the MSI warm builder: 2-4x faster
+          # rebuilds for ~10% runtime. Numerics are unaffected.
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
 
       - name: Pin to rolling wheel-latest release
         env:
