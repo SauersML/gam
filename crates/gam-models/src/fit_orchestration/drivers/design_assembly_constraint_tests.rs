@@ -1042,14 +1042,15 @@ fn build_smooth_design_rejectsmultiaxis_spatial_shape_constraints() {
     let err = build_smooth_design(data.view(), &terms).expect_err("shape should be rejected");
     match err {
         BasisError::InvalidInput(msg) => {
-            assert!(msg.contains("requires exactly 1 feature axis"));
+            assert!(msg.contains("unsupported"));
+            assert!(msg.contains("tps_shape"));
         }
         other => panic!("unexpected error: {other:?}"),
     }
 }
 
 #[test]
-fn build_smooth_design_accepts_monotone_thin_plate_1dwith_linear_constraints() {
+fn build_smooth_design_rejects_uncertified_monotone_thin_plate_1d() {
     // 1D TPS with `num_centers = 4` requests exactly 4 centers. The
     // polynomial nullspace is represented by separate columns, not by
     // hidden extra knots.
@@ -1071,15 +1072,15 @@ fn build_smooth_design_accepts_monotone_thin_plate_1dwith_linear_constraints() {
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
     }];
-    let sd = build_smooth_design(data.view(), &terms).unwrap_or_else(|e| panic!("{} failed: {:?}", "shape-constrained thin-plate", e));
-    assert!(sd.coefficient_lower_bounds.is_none());
-    let lin = sd
-        .linear_constraints
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "linear constraints should be generated"));
-    assert!(lin.a.nrows() > 0);
-    assert_eq!(lin.a.ncols(), sd.total_smooth_cols());
-    assert_eq!(lin.b.len(), lin.a.nrows());
+    let err = build_smooth_design(data.view(), &terms)
+        .expect_err("a radial basis without a spanwise certificate must be rejected");
+    match err {
+        BasisError::InvalidInput(msg) => {
+            assert!(msg.contains("unsupported"));
+            assert!(msg.contains("mono_tps"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
@@ -1207,7 +1208,7 @@ fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
 }
 
 #[test]
-fn build_smooth_design_accepts_monotone_matern_1dwith_linear_constraints() {
+fn build_smooth_design_rejects_uncertified_monotone_matern_1d() {
     let data = array![[0.0], [0.2], [0.4], [0.6], [0.8], [1.0]];
     let terms = vec![SmoothTermSpec {
         name: "mono_matern".to_string(),
@@ -1229,19 +1230,19 @@ fn build_smooth_design_accepts_monotone_matern_1dwith_linear_constraints() {
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
     }];
-    let sd = build_smooth_design(data.view(), &terms).unwrap_or_else(|e| panic!("{} failed: {:?}", "shape-constrained Matérn", e));
-    assert!(sd.coefficient_lower_bounds.is_none());
-    let lin = sd
-        .linear_constraints
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "linear constraints should be generated"));
-    assert!(lin.a.nrows() > 0);
-    assert_eq!(lin.a.ncols(), sd.total_smooth_cols());
-    assert_eq!(lin.b.len(), lin.a.nrows());
+    let err = build_smooth_design(data.view(), &terms)
+        .expect_err("a radial basis without a spanwise certificate must be rejected");
+    match err {
+        BasisError::InvalidInput(msg) => {
+            assert!(msg.contains("unsupported"));
+            assert!(msg.contains("mono_matern"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
-fn build_smooth_design_accepts_monotone_duchon_1dwith_linear_constraints() {
+fn build_smooth_design_rejects_uncertified_monotone_duchon_1d() {
     let data = array![[0.0], [0.2], [0.4], [0.6], [0.8], [1.0]];
     let terms = vec![SmoothTermSpec {
         name: "mono_duchon".to_string(),
@@ -1264,15 +1265,15 @@ fn build_smooth_design_accepts_monotone_duchon_1dwith_linear_constraints() {
         shape: ShapeConstraint::MonotoneIncreasing,
         joint_null_rotation: None,
     }];
-    let sd = build_smooth_design(data.view(), &terms).unwrap_or_else(|e| panic!("{} failed: {:?}", "shape-constrained Duchon", e));
-    assert!(sd.coefficient_lower_bounds.is_none());
-    let lin = sd
-        .linear_constraints
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "linear constraints should be generated"));
-    assert!(lin.a.nrows() > 0);
-    assert_eq!(lin.a.ncols(), sd.total_smooth_cols());
-    assert_eq!(lin.b.len(), lin.a.nrows());
+    let err = build_smooth_design(data.view(), &terms)
+        .expect_err("a radial basis without a spanwise certificate must be rejected");
+    match err {
+        BasisError::InvalidInput(msg) => {
+            assert!(msg.contains("unsupported"));
+            assert!(msg.contains("mono_duchon"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]
@@ -1307,6 +1308,99 @@ fn build_smooth_design_accepts_monotone_bsplinewith_bounds() {
     assert!(lb[0].is_infinite() && lb[0].is_sign_negative());
     for j in 1..lb.len() {
         assert_eq!(lb[j], 0.0);
+    }
+}
+
+#[test]
+fn build_smooth_design_rejects_bspline_charts_without_raw_open_controls() {
+    let data = array![[0.0], [0.2], [0.4], [0.6], [0.8], [1.0]];
+    let cases = vec![
+        (
+            "periodic_knots",
+            BSplineBasisSpec {
+                degree: 3,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::PeriodicUniform {
+                    data_range: (0.0, 1.0),
+                    num_basis: 7,
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Open,
+                boundary_conditions: BSplineBoundaryConditions::default(),
+            },
+        ),
+        (
+            "natural_cubic",
+            BSplineBasisSpec {
+                degree: 3,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::NaturalCubicRegression {
+                    knots: array![0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Open,
+                boundary_conditions: BSplineBoundaryConditions::default(),
+            },
+        ),
+        (
+            "cyclic_boundary",
+            BSplineBasisSpec {
+                degree: 3,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::Generate {
+                    data_range: (0.0, 1.0),
+                    num_internal_knots: 3,
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Cyclic {
+                    start: 0.0,
+                    end: 1.0,
+                },
+                boundary_conditions: BSplineBoundaryConditions::default(),
+            },
+        ),
+        (
+            "endpoint_transform",
+            BSplineBasisSpec {
+                degree: 3,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::Generate {
+                    data_range: (0.0, 1.0),
+                    num_internal_knots: 3,
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Open,
+                boundary_conditions: BSplineBoundaryConditions {
+                    left: BSplineEndpointBoundaryCondition::Clamped,
+                    right: BSplineEndpointBoundaryCondition::Free,
+                },
+            },
+        ),
+    ];
+
+    for (label, spec) in cases {
+        let terms = vec![SmoothTermSpec {
+            name: label.to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec,
+            },
+            shape: ShapeConstraint::MonotoneIncreasing,
+            joint_null_rotation: None,
+        }];
+        let err = build_smooth_design(data.view(), &terms)
+            .expect_err("a transformed/cyclic coefficient chart must be rejected");
+        match err {
+            BasisError::InvalidInput(msg) => {
+                assert!(msg.contains("unsupported"), "{label}: {msg}");
+                assert!(msg.contains(label), "{label}: {msg}");
+            }
+            other => panic!("{label}: unexpected error: {other:?}"),
+        }
     }
 }
 
