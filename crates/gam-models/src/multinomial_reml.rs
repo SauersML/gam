@@ -2208,8 +2208,7 @@ mod tests {
             family: &MultinomialFamily,
             eta: &[f64; M],
         ) -> ndarray::Array2<f64> {
-            let eta2 =
-                Array2::<f64>::from_shape_vec((1, M), eta.to_vec()).expect("eta (1,M)");
+            let eta2 = Array2::<f64>::from_shape_vec((1, M), eta.to_vec()).expect("eta (1,M)");
             family.row_probabilities(eta2.view())
         }
 
@@ -2273,15 +2272,18 @@ mod tests {
                 let prog = MultinomialJetRow { eta, obs, w };
 
                 // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
-                let (jet_v, jet_g, jet_h) =
-                    generic_row_kernel(&prog, 0).expect("jet row kernel");
+                let (jet_v, jet_g, jet_h) = generic_row_kernel(&prog, 0).expect("jet row kernel");
 
                 // Value + gradient from the live log-lik assembler (NLL = −log_lik,
                 // ∇NLL = −∇log_lik).
                 let probs = active_probs(&family, &eta);
-                let (log_lik, grad_ll) =
-                    family.joint_loglik_and_gradient_from_probs(probs.view());
-                close(jet_v, -log_lik, JET_TOL, &format!("M={M} trial {trial} value"));
+                let (log_lik, grad_ll) = family.joint_loglik_and_gradient_from_probs(probs.view());
+                close(
+                    jet_v,
+                    -log_lik,
+                    JET_TOL,
+                    &format!("M={M} trial {trial} value"),
+                );
                 for a in 0..M {
                     close(
                         jet_g[a],

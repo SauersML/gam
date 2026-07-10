@@ -155,9 +155,10 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
 /// births/deaths, co-collapse incidence, reconstruction quality, criterion, and
 /// wall-clock for each arm. This is the EVIDENCE the team-lead's Option-A
 /// default-flip decision is gated on: ON must not regress quality or re-admit
-/// co-collapse. Marked `#[ignore]` because it runs the full outer cascade twice;
-/// invoke explicitly (`--ignored`). Decides pass/fail only from finiteness +
-/// signal-floor engagement (zz_measure discipline); the A/B numbers are eprintln.
+/// co-collapse. This is an ordinary named measurement test because ignored
+/// tests are forbidden; focused runs select it by its `zz_rank_charge` name.
+/// It decides pass/fail only from finiteness + signal-floor engagement
+/// (zz_measure discipline); the A/B numbers are eprintln.
 #[derive(Debug)]
 struct RankChargeArm {
     rank_charge: bool,
@@ -233,8 +234,8 @@ fn rank_charge_zoo_arm(
 }
 
 #[test]
-// zz_measure A/B: two full outer fits; run explicitly (by zz_ name filter) for
-// the #2022 rank-charge default-flip decision. `#[ignore]` is scanner-banned.
+// zz_measure A/B: two full outer fits; focused runs select it by its zz_ name
+// for the #2022 rank-charge default-flip decision.
 fn zz_rank_charge_ab_zoo_micro_2022() {
     let train = zoo_fixture("train_3000x48_f64le.bin", 3000, 48);
     let test = zoo_fixture("test_1500x48_f64le.bin", 1500, 48);
