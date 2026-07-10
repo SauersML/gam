@@ -2937,7 +2937,7 @@ mod jet_arity_contract_932_tests {
             .expect("2 per-row primaries fit the ladder");
 
         // Softmax routes the dynamically-sized hand path — exempt even wide.
-        let softmax_wide = term_with_atoms(9, AssignmentMode::Softmax { temperature: 0.7 });
+        let softmax_wide = term_with_atoms(9, AssignmentMode::softmax(0.7));
         softmax_wide
             .validate_jet_row_primary_arity(None)
             .expect("softmax mode is exempt from the per-atom jet ladder cap");
