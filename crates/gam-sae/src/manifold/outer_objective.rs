@@ -3879,7 +3879,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         refine_progress_extension: false,
                     },
                 ) {
-                    Ok(_warmed) => {
+                    Ok(warmed) => {
+                        log::debug!(
+                            "gradient-lane rescue stage 1 converged: cost={:.6e}",
+                            warmed.0
+                        );
                         // The envelope parks its converged term in the ρ-keyed
                         // handoff; INSTALL it (exactly as eval's entry does) so
                         // the criterion opens AT the converged optimum instead
@@ -3888,7 +3892,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                             self.term = converged;
                             self.seeded_beta = None;
                         }
-                        self.term.reml_criterion_with_cache(
+                        let stage2 = self.term.reml_criterion_with_cache(
                             self.target.view(),
                             &rho_state,
                             self.registry.as_ref(),
@@ -3896,9 +3900,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
                             self.learning_rate,
                             self.ridge_ext_coord,
                             self.ridge_beta,
-                        )
+                        );
+                        if let Err(reason) = &stage2 {
+                            log::debug!("gradient-lane rescue stage 2 refused: {reason}");
+                        }
+                        stage2
                     }
-                    Err(stage1) => Err(stage1),
+                    Err(stage1) => {
+                        log::debug!("gradient-lane rescue stage 1 refused: {stage1}");
+                        Err(stage1)
+                    }
                 }
             }
             other => other,
