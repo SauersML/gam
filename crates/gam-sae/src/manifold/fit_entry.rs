@@ -451,7 +451,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
     // its purpose (it must not warm-start a FUTURE fresh fit — that is
     // `persistent_warm_start`'s job, with its own TTL/eviction discipline).
     objective.remove_checkpoint();
-    let fitted_result = objective.into_fitted();
+    let fitted_result = objective.into_fitted().map_err(SaeFitError::Fit)?;
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
     // #2235 — the outer termination verdict + ledger, surfaced on the payload.
@@ -590,7 +590,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;
             objective.remove_checkpoint();
-            let fitted_result = objective.into_fitted();
+            let fitted_result = objective.into_fitted().map_err(SaeFitError::Fit)?;
             finalization_invalidated_shape_uncertainty =
                 fitted_result.invalidates_pre_final_shape_uncertainty();
             // #2235 — the returned fit is this pass's; report its termination.
