@@ -2241,8 +2241,63 @@ pub fn orthogonality_transform_for_design(
     if q == 0 {
         return Ok(Array2::eye(k));
     }
-    let (constraint_cross, gram) = design_cross_and_gram(design, constraint_matrix, weights)?;
+    // Scale every constraint column to unit (weighted) L2 norm before forming the
+    // design/constraint cross `M = Bᵀ W C`. The downstream rank detection
+    // (`rrqr_nullspace_basis`) decides HOW MANY parametric directions the smooth
+    // genuinely spans by testing the pivoted magnitudes of `M` against an
+    // essentially absolute floor `α·ε·max(k,q)` (the `max(|R₀₀|, 1)` reference
+    // clamps to 1 whenever the cross is sub-unit). With a RAW constraint column
+    // that floor is scale-wrong: the all-ones intercept has norm √n, so `M`
+    // carries a √n factor while the tolerance is referenced to 1. For a
+    // kernel/radial smooth whose realized design is already (numerically)
+    // orthogonal to the constant, `‖Bᵀ1‖` is pure floating-point roundoff
+    // (~ε·‖B‖·√n); the √n inflation lands it right at the floor, so a rigid
+    // rotation of the covariates — which only perturbs that roundoff — flips the
+    // detected rank between 0 and 1. A spurious rank 1 then removes an ARBITRARY
+    // real smooth direction (the pivot of a noise vector), and the fitted
+    // surface, its EDF, and the REML-selected λ all drift under rotation
+    // (gam#1818). Measuring the design's overlap with UNIT constraint directions
+    // turns the test into a genuine rotation-invariant cosine: a real overlap is
+    // O(1) and always detected, while roundoff-level overlap stays consistently
+    // below the floor (rank 0). Column scaling of `C` leaves `null(Mᵀ)` — hence
+    // the constrained-design span and the emitted transform — unchanged wherever
+    // the rank is unchanged; it only removes the roundoff-driven rank flip.
+    let normalized_constraint = unit_normalize_constraint_columns(constraint_matrix, weights);
+    let (constraint_cross, gram) =
+        design_cross_and_gram(design, normalized_constraint.view(), weights)?;
     orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
+}
+
+/// Scale each column of a constraint block to unit L2 norm under the inner
+/// product used to form the identifiability cross — the `weights`-weighted
+/// product when `Some`, the plain product otherwise. A column that is already
+/// numerically zero (norm 0 or non-finite) is left untouched: its cross entries
+/// are zero regardless, so it contributes no rank. The returned owned copy is
+/// used only to build the cross; the emitted transform and the realized
+/// constrained design are unaffected (column scaling of `C` preserves
+/// `null(Mᵀ)`).
+fn unit_normalize_constraint_columns(
+    constraint_matrix: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Array2<f64> {
+    let mut c = constraint_matrix.to_owned();
+    let (n, q) = c.dim();
+    for col in 0..q {
+        let mut norm_sq = 0.0_f64;
+        for row in 0..n {
+            let v = c[[row, col]];
+            let w = weights.map_or(1.0, |ws| ws[row]);
+            norm_sq += w * v * v;
+        }
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 && norm.is_finite() {
+            let inv = 1.0 / norm;
+            for row in 0..n {
+                c[[row, col]] *= inv;
+            }
+        }
+    }
+    c
 }
 
 #[cfg(test)]
