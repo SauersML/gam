@@ -160,7 +160,6 @@ struct NegbinJointCheckpoint {
 /// atomically prevents several individually acceptable p×p allocations from
 /// jointly exceeding the process-wide memory ledger.
 fn reserve_dense_covariance_bundle(
-    n_design_rows: usize,
     p: usize,
 ) -> Option<gam_runtime::resource::MemoryReservation> {
     const STORED_SQUARE_MATRICES: usize = 10;
@@ -202,7 +201,6 @@ fn reserve_dense_covariance_bundle(
 /// its exported copy, the reusable factor, the exported original-basis
 /// precision, and the transformed penalty surface retained by the fit.
 fn reserve_factorized_inference_state(
-    n_design_rows: usize,
     p: usize,
 ) -> Option<gam_runtime::resource::MemoryReservation> {
     const RETAINED_FACTOR_AND_PRECISION_MATRICES: usize = 7;
@@ -2066,16 +2064,13 @@ where
     let mut dense_covariance_reservation = opts
         .compute_inference
         .then(|| {
-            reserve_dense_covariance_bundle(n_design_rows, pirls_res.reparam_result.qs.nrows())
+            reserve_dense_covariance_bundle(pirls_res.reparam_result.qs.nrows())
         })
         .flatten();
     let mut factorized_inference_reservation = if opts.compute_inference
         && dense_covariance_reservation.is_none()
     {
-        reserve_factorized_inference_state(
-            n_design_rows,
-            pirls_res.reparam_result.qs.nrows(),
-        )
+        reserve_factorized_inference_state(pirls_res.reparam_result.qs.nrows())
     } else {
         None
     };
@@ -2488,7 +2483,7 @@ where
                         // genuinely still live.
                         drop(dense_covariance_reservation.take());
                         factorized_inference_reservation =
-                            reserve_factorized_inference_state(n_design_rows, p_cov);
+                            reserve_factorized_inference_state(p_cov);
                         None
                     }
                 }
