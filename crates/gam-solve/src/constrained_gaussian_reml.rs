@@ -513,7 +513,7 @@ fn add_rho_score_vjp(
         let beta_seed = s_beta.insert_axis(Axis(1)) * (2.0 * energy_seed);
         add_mode_vjp(problem, state, beta_seed.view(), 1.0, out);
         let beta_outer = beta.insert_axis(Axis(1)).dot(&beta.insert_axis(Axis(0)));
-        out.penalty += &(beta_outer * energy_seed);
+        out.penalty += &(&beta_outer * energy_seed);
 
         let deviance_seed =
             -0.5 * seed * state.residual_df * problem.lambda * energy / (deviance * deviance);

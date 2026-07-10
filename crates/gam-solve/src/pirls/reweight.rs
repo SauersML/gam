@@ -13,7 +13,7 @@ use super::{
     ExportedLaplaceCurvature, HessianCurvatureKind, PIRLS_ETA_ABS_CAP, PirlsAcceptedStateCacheKey,
     PirlsStatus, SoftAcceptProgress, WorkingModel, WorkingModelIterationInfo,
     WorkingModelPirlsOptions, WorkingModelPirlsResult, WorkingState,
-    add_scaled_diagonal_to_upper_sparse, array1_l2_norm, commit_pending_arrow_latent,
+    add_scaled_diagonal_to_upper_sparse, commit_pending_arrow_latent,
     compute_constraint_kkt_diagnostics, compute_lm_d2, constrained_stationarity_norm,
     effective_kkt_tolerance, linear_constraints_from_lower_bounds, pirls_soft_acceptance,
     project_coefficients_to_lower_bounds, restore_pending_arrow_latent_if_needed,
