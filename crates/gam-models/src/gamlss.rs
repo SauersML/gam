@@ -85,7 +85,7 @@ use crate::inference::generative::{CustomFamilyGenerative, GenerativeSpec, Noise
 
 use gam_linalg::matrix::SymmetricMatrix;
 
-use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
+use gam_linalg::matrix::{DenseDesignOperator, DesignMatrix};
 
 use gam_solve::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
