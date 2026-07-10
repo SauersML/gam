@@ -966,7 +966,6 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-
     /// #5/(B) — set the per-fit rank-charge evidence opt-in (typed kwarg, no env
     /// lever). Default false ⇒ historical path bit-for-bit. Replaces the
     /// coordinate-block ½log|H_tt| with the honest BIC ½·d_eff·log n on the
@@ -4962,7 +4961,6 @@ impl SaeManifoldTerm {
         let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
         Ok(evals.iter().filter(|&&v| v > tol).count())
     }
-
 }
 
 // [#780 line-count gate] The quasi-Laplace evidence criterion (`reml_criterion*`)

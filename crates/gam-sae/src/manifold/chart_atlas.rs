@@ -602,8 +602,7 @@ mod tests {
     fn bridge_transition_joins_two_connected_atlas_components() {
         let mut left = ManifoldChartAtlas::from_transition(tr(0, 1, 1, 0.1)).unwrap();
         let right = ManifoldChartAtlas::from_transition(tr(2, 3, -1, 0.2)).unwrap();
-        left.merge_with_transition(right, tr(1, 2, 1, 0.3))
-            .unwrap();
+        left.merge_with_transition(right, tr(1, 2, 1, 0.3)).unwrap();
         assert_eq!(left.charts(), &[0, 1, 2, 3]);
         assert_eq!(left.transitions().len(), 3);
         assert_eq!(left.orientability(), AtlasOrientability::Orientable);

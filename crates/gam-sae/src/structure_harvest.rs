@@ -1181,14 +1181,11 @@ fn fit_periodic_transition_from_decoders(
                 )
             };
             if cos_score.hypot(sin_score) > 0.0 {
-                let harmonic_phase = sin_score
-                    .atan2(cos_score)
-                    .rem_euclid(std::f64::consts::TAU);
+                let harmonic_phase = sin_score.atan2(cos_score).rem_euclid(std::f64::consts::TAU);
                 // `h*delta = harmonic_phase (mod 2π)` has exactly h roots.
                 for branch in 0..harmonic {
-                    let phase = (harmonic_phase
-                        + std::f64::consts::TAU * branch as f64)
-                        / harmonic as f64;
+                    let phase =
+                        (harmonic_phase + std::f64::consts::TAU * branch as f64) / harmonic as f64;
                     candidates.push((sign, phase));
                 }
                 break;
@@ -6173,8 +6170,7 @@ mod tests {
         let (sign, offset) =
             fit_periodic_transition_from_decoders(decoder_a.view(), decoder_b.view()).unwrap();
         assert_eq!(sign, -1);
-        let recovered =
-            periodic_decoder_under_transition(decoder_a.view(), sign, offset).unwrap();
+        let recovered = periodic_decoder_under_transition(decoder_a.view(), sign, offset).unwrap();
         for (actual, expected) in recovered.iter().zip(decoder_b.iter()) {
             assert!((actual - expected).abs() < 32.0 * f64::EPSILON);
         }

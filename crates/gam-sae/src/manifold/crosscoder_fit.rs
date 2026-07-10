@@ -851,11 +851,7 @@ pub fn run_sae_crosscoder_fit(
     let anchor_decoders = term
         .atoms
         .iter()
-        .map(|atom| {
-            atom.full_width_decoder()
-                .slice(s![.., 0..p_x])
-                .to_owned()
-        })
+        .map(|atom| atom.full_width_decoder().slice(s![.., 0..p_x]).to_owned())
         .collect();
     layers.push(CrosscoderLayerFit {
         label: request.anchor_label,

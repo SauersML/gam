@@ -223,7 +223,6 @@ pub fn affine_chart_transition(
     })
 }
 
-
 // ===========================================================================
 // F1 — amplitude-concentration certificate (the "intensity is presence vs a
 // hidden radial coordinate" law).
