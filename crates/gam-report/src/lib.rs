@@ -1313,6 +1313,46 @@ mod tests {
     }
 
     #[test]
+    fn render_html_names_analytic_gradient_certificate_as_gradient() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.criterion_certificate = Some(CriterionCertificateRow {
+            stationarity: CriterionStationarityRow::AnalyticGradient {
+                grad_norm: 2.0e-9,
+                projected_grad_norm: 1.0e-9,
+                bound: 1.0e-8,
+            },
+            hessian_psd: Some(true),
+            lambdas_railed: Vec::new(),
+            stationary: true,
+            clean: true,
+        });
+        let html = render_html(&input).unwrap();
+        assert!(html.contains("|g|=2.000e-9"));
+        assert!(!html.contains("fixed-point"));
+    }
+
+    #[test]
+    fn render_html_names_fixed_point_certificate_as_residual() {
+        let mut input = minimal_input("y ~ s(x)");
+        input.criterion_certificate = Some(CriterionCertificateRow {
+            stationarity: CriterionStationarityRow::FixedPoint {
+                residual_inf_norm: 2.0e-9,
+                projected_residual_inf_norm: 1.0e-9,
+                bound: 1.0e-8,
+                covered_coordinates: 7,
+            },
+            hessian_psd: None,
+            lambdas_railed: Vec::new(),
+            stationary: true,
+            clean: true,
+        });
+        let html = render_html(&input).unwrap();
+        assert!(html.contains("fixed-point"));
+        assert!(html.contains("coordinates=7"));
+        assert!(!html.contains("|g|="));
+    }
+
+    #[test]
     fn render_html_escapes_formula_special_chars() {
         let html = render_html(&minimal_input("y ~ <bad>")).unwrap();
         assert!(
