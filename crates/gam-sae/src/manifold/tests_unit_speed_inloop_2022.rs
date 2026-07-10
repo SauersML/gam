@@ -358,6 +358,126 @@ fn joint_step_projection_gauge_orthogonal_first_order_exact_2022() {
     assert!(bdrift == 0.0, "restore must return the decoder exactly");
 }
 
+/// #2099 GATE (fit-level decoder-scale invariance, the acceptance pin the
+/// issue's close-audit says is "coupled to the amplitude-gauge fix"): two
+/// representations of the SAME fitted model that differ by the pure scale gauge
+/// `B ↦ c·B`, `s ↦ s − ln c` (identical physical dictionary `exp(s)·Φ·B`) must
+/// yield
+///  1. the same data-fit as-is (the physical image is identical),
+///  2. the IDENTICAL canonical parameter state after the in-loop scale
+///     retraction that runs at every accepted iterate (`B/‖B‖`, `s + ln‖B‖`),
+///  3. the same criterion at that canonical state, and
+///  4. the same subsequent inner-Newton trajectory (one solve+apply step from
+///     each representation lands on the same physical image).
+/// Pre-canonicalization the RAW smoothness quadratic `½λ tr(BᵀSB)` is allowed
+/// to differ (it reads the representative, scaling as c²) — that residual gauge
+/// dependence is exactly why the boundary retraction + the #2022 step
+/// projection exist, and this gate pins that they remove it at fit level.
+#[test]
+fn fit_level_decoder_rescale_invariance_2099() {
+    let coords_col = array![
+        [0.02_f64],
+        [0.10],
+        [0.17],
+        [0.31],
+        [0.55],
+        [0.66],
+        [0.80],
+        [0.95]
+    ];
+    let n = coords_col.nrows();
+    let p = 3usize;
+    let (phi0, _) = periodic_basis(&coords_col);
+    let m = phi0.ncols();
+    let decoder = Array2::<f64>::from_shape_fn((m, p), |(a, b)| {
+        0.3 * ((a + 1) as f64) - 0.15 * (b as f64) + 0.05 * ((a * p + b) as f64)
+    });
+    let c = 3.7_f64; // the gauge scale relating the two representations
+    let decoder_scaled = decoder.mapv(|v| c * v);
+
+    let mut rep_a = build_circle_term(&coords_col, &decoder);
+    rep_a.atoms[0].log_amplitude = 0.2;
+    let mut rep_b = build_circle_term(&coords_col, &decoder_scaled);
+    rep_b.atoms[0].log_amplitude = 0.2 - c.ln();
+    assert!(rep_a.quotient_scale() && rep_b.quotient_scale());
+
+    let target =
+        Array2::<f64>::from_shape_fn((n, p), |(r, cc)| 0.2 - 0.05 * (r as f64) + 0.1 * (cc as f64));
+    let rho = SaeManifoldRho::new(0.0, -4.0, vec![array![0.0]]);
+
+    // (1) The physical image is identical ⇒ data-fit invariant as-is.
+    let la = rep_a.loss(target.view(), &rho).unwrap();
+    let lb = rep_b.loss(target.view(), &rho).unwrap();
+    assert!(
+        (la.data_fit - lb.data_fit).abs() <= 1.0e-10 * (1.0 + la.data_fit.abs()),
+        "data-fit must be decoder-rescale invariant: {} vs {}",
+        la.data_fit,
+        lb.data_fit
+    );
+
+    // (2) The in-loop scale retraction lands both on the SAME canonical state.
+    rep_a.retract_decoder_gauge_in_loop();
+    rep_b.retract_decoder_gauge_in_loop();
+    let s_a = rep_a.atoms[0].log_amplitude;
+    let s_b = rep_b.atoms[0].log_amplitude;
+    assert!(
+        (s_a - s_b).abs() <= 1.0e-12 * (1.0 + s_a.abs()),
+        "canonical log-amplitudes must agree: {s_a} vs {s_b}"
+    );
+    let frame_drift = rep_a.atoms[0]
+        .decoder_coefficients
+        .iter()
+        .zip(rep_b.atoms[0].decoder_coefficients.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        frame_drift <= 1.0e-13,
+        "canonical unit-Frobenius frames must agree; max drift {frame_drift}"
+    );
+
+    // (3) Criterion invariance at the canonical state (all components now read
+    // the same representative).
+    let ca = rep_a.loss(target.view(), &rho).unwrap();
+    let cb = rep_b.loss(target.view(), &rho).unwrap();
+    assert!(
+        (ca.total() - cb.total()).abs() <= 1.0e-10 * (1.0 + ca.total().abs()),
+        "canonical-state criterion must be invariant: {} vs {}",
+        ca.total(),
+        cb.total()
+    );
+
+    // (4) Trajectory invariance: one inner Newton solve+apply from each
+    // canonical representation lands on the same physical image (the #2022
+    // projected apply keeps the walk on the quotient).
+    let (dta, dba) = rep_a
+        .solve_newton_step(target.view(), &rho, None, 1.0e-4, 1.0e-4)
+        .unwrap();
+    let (dtb, dbb) = rep_b
+        .solve_newton_step(target.view(), &rho, None, 1.0e-4, 1.0e-4)
+        .unwrap();
+    rep_a.apply_newton_step(dta.view(), dba.view(), 0.5).unwrap();
+    rep_b.apply_newton_step(dtb.view(), dbb.view(), 0.5).unwrap();
+    let img_a = rep_a.atoms[0]
+        .basis_values
+        .dot(&rep_a.atoms[0].decoder_coefficients)
+        .mapv(|v| v * rep_a.atoms[0].log_amplitude.exp());
+    let img_b = rep_b.atoms[0]
+        .basis_values
+        .dot(&rep_b.atoms[0].decoder_coefficients)
+        .mapv(|v| v * rep_b.atoms[0].log_amplitude.exp());
+    let img_scale = img_a.iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+    let img_drift = img_a
+        .iter()
+        .zip(img_b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        img_drift <= 1.0e-8 * img_scale,
+        "one Newton step from the two representations must land on the same \
+         physical image; max drift {img_drift:.3e} (scale {img_scale:.3e})"
+    );
+}
+
 /// A faithful monomial line basis `Φ(t) = [1, t, t²]` with its exact jet
 /// `∂Φ/∂t = [0, 1, 2t]`. `d = 1`, Euclidean (Interval) chart. It exists so the
 /// #2070 active-retraction gate below can DRIVE the arc-length retraction to
