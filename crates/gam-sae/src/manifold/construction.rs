@@ -837,6 +837,17 @@ impl SaeManifoldTerm {
     /// as `None`, so the unweighted path stays bit-for-bit identical rather
     /// than "multiplied by 1.0".
     pub fn set_row_loss_weights(&mut self, weights: Vec<f64>) -> Result<(), String> {
+        // The reciprocal of `with_crosscoder_blocks`'s refusal: block pricing
+        // snapshots a full-N pristine copy and prices the Jacobian at the full
+        // row count, so engaging a row subsample AFTER pricing is installed
+        // would desync the two silently (#2231 stage-1 deferral, both ways).
+        if self.crosscoder_pricing_spans.is_some() {
+            return Err(
+                "SaeManifoldTerm::set_row_loss_weights: crosscoder block pricing is installed; \
+                 the #991 row-subsample and block pricing are mutually exclusive (stage 1)"
+                    .to_string(),
+            );
+        }
         if weights.len() != self.n_obs() {
             return Err(format!(
                 "SaeManifoldTerm::set_row_loss_weights: {} weights for {} rows",
