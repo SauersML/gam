@@ -236,12 +236,15 @@ pub fn run_auto_sae_behavior_fit(
     // the converged REML answer is data-selected and returned from rho.
     let initial_behavior = BehaviorBlock::fit(request.probabilities.view(), px, 0.0)?;
     let behavior_target = initial_behavior.target.clone();
+    // The fit report no longer retains layer targets (they doubled its resident
+    // footprint); keep the two targets here for the identifiability diagnostic.
+    let activation_target = request.activation;
     let mut crosscoder = run_auto_sae_crosscoder_fit(SaeCrosscoderAutoFitRequest {
         anchor_label: "activation".to_string(),
-        anchor: request.activation,
+        anchor: activation_target.clone(),
         blocks: vec![NamedCrosscoderTarget {
             label: "behavior".to_string(),
-            target: behavior_target,
+            target: behavior_target.clone(),
         }],
         config: request.config,
         cancel: request.cancel,
@@ -265,9 +268,9 @@ pub fn run_auto_sae_behavior_fit(
         .embedding
         .decode_rows(crosscoder.layers[1].fitted.view())?;
     let weight_identifiability = weight_identifiability(
-        &crosscoder.layers[0].target,
+        &activation_target,
         &crosscoder.layers[0].fitted,
-        &crosscoder.layers[1].target,
+        &behavior_target,
         &crosscoder.layers[1].fitted,
         log_lambda_y,
     )?;
