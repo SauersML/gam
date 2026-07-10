@@ -1,9 +1,14 @@
+use super::evaluation::{
+    sas_effective_epsilon, sas_effective_epsilon_second, sas_log_delta_edge_barriercostgrad,
+    sas_log_delta_edge_barriercostgradhess,
+};
 use super::external_options::resolve_external_family;
 use super::optimizer::external_reml_seed_config;
 use super::penalty::REML_SEED_SCREENING_RHO_CAP;
 use super::prefit::{
     PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
+    reject_prefit_unpenalized_rank_deficiency,
 };
 use super::reml::hyper::link_binomial_aux;
 use super::*;

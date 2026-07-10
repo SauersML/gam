@@ -3257,9 +3257,9 @@ mod negative_binomial_joint_certificate_tests {
 
     #[test]
     fn theta_residual_is_the_log_scale_newton_displacement() {
-        let theta = 2.0;
-        let score = 3.0;
-        let info = 5.0;
+        let theta: f64 = 2.0;
+        let score: f64 = 3.0;
+        let info: f64 = 5.0;
         let expected = (theta * score).abs() / (theta * theta * info - theta * score);
         assert_eq!(
             negbin_theta_stationarity_residual(theta, score, info),
