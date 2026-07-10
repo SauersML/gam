@@ -29,14 +29,6 @@ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 /// well-conditioned solve. Acts as a floor on any caller-supplied `ridge_floor`.
 const SPD_SOLVE_RIDGE_FLOOR: f64 = 1e-15;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
-/// Cache-retention policy for a sparse design's memoized dense copy: dense
-/// copies at or under this size are kept (with their ledger reservation) for
-/// the design's lifetime; larger ones are rematerialized per use so a single
-/// conversion never pins a large slice of the process budget indefinitely.
-/// Admission itself (may this densification happen at all, and does it fit
-/// jointly with everything else live) is decided by the process-wide
-/// [`MemoryGovernor`], not by this constant.
-const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
 /// Minimum n*p product for the dense-row parallel fold/reduce paths
@@ -882,18 +874,26 @@ impl SparseDesignMatrix {
             .into());
         }
         // Memoization is governed: the cache entry holds its ledger charge for
-        // the design's lifetime, so a reservation refusal (transient joint
-        // pressure) skips caching rather than failing the conversion.
-        if dense_bytes <= MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES
-            && let Ok(reservation) = governor.try_reserve(dense_bytes, context)
-        {
-            return Ok(self
-                .dense_cache
-                .get_or_init(|| (self.materialize_dense_arc(), reservation))
-                .0
-                .clone());
-        }
-        Ok(self.materialize_dense_arc())
+        // the design's lifetime. Every dense materialization must be accounted
+        // on the joint ledger for the buffer's lifetime — an unreserved
+        // fallthrough here would let simultaneous sparse densifications that
+        // each individually pass the cap jointly exceed the process budget
+        // (the SPEC 10 failure mode). A refusal is typed evidence to route to
+        // a sparse/matrix-free strategy, not permission to allocate anyway.
+        let reservation = governor.try_reserve(dense_bytes, context).map_err(|err| {
+            String::from(MatrixError::DensificationRefused {
+                reason: format!(
+                    "{context}: refusing to densify sparse design {}x{}: {err}",
+                    self.matrix.nrows(),
+                    self.matrix.ncols(),
+                ),
+            })
+        })?;
+        Ok(self
+            .dense_cache
+            .get_or_init(|| (self.materialize_dense_arc(), reservation))
+            .0
+            .clone())
     }
 
     /// Densify under the process-wide byte governor, coupling the returned

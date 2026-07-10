@@ -5532,7 +5532,13 @@ pub(crate) struct RemlState<'a> {
     /// original-frame Gram skips one dense `O(n·p²)` pass per warm-started
     /// trial while still letting later PIRLS iterations restream the moving
     /// weights. IFT/tangent-predicted starts do not consume this cache.
-    pub(crate) flat_glm_first_step_gram: RwLock<Option<Arc<ndarray::Array2<f64>>>>,
+    ///
+    /// The cached dense `p×p` Gram is coupled to a [`MemoryGovernor`] ledger
+    /// reservation ([`gam_runtime::resource::Governed`]) so a long-lived cache
+    /// entry never holds dense bytes off-ledger; a reservation refusal under
+    /// joint pressure skips caching (the streamed path remains available).
+    pub(crate) flat_glm_first_step_gram:
+        RwLock<Option<gam_runtime::resource::Governed<Arc<ndarray::Array2<f64>>>>>,
     /// Frozen ALO robustness weights for this REML surface.
     ///
     /// The PSIS influence scale is a non-smooth function of the current hat

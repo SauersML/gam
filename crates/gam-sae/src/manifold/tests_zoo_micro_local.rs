@@ -118,6 +118,9 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
         .expect("converged zoo fit carries an analytic certificate");
     assert!(certificate.projected_grad_norm <= certificate.stationarity_bound);
     let fit_secs = t0.elapsed().as_secs_f64();
+    objective
+        .certify_outer_result(&result)
+        .expect("zoo outer result certifies the exact installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let native_fitted = fitted.term.fitted();
     let native_ev = global_ev(&train, &native_fitted.to_owned());

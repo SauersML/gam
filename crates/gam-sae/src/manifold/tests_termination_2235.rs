@@ -21,7 +21,48 @@ fn never_evaluated_objective_cannot_mint_a_fit() {
         Ok(_) => panic!("a never-evaluated objective must not mint a fit"),
         Err(error) => error,
     };
-    assert!(error.contains("no converged evaluation is installed"));
+    assert!(error.contains("not explicitly certified"));
+}
+
+#[test]
+fn successful_evaluation_alone_cannot_mint_a_fit() {
+    use super::tests::planted_circle_embedded;
+    use super::tests_startup_validation_1782::{Topo, objective_and_seed};
+
+    let z = planted_circle_embedded(24, 4, 0.03);
+    let (mut objective, seed) = objective_and_seed(
+        z.view(),
+        1,
+        Topo::Circle,
+        crate::assignment::AssignmentMode::softmax(1.0),
+    );
+    objective
+        .evaluate_with_refine_policy(seed.view(), true)
+        .expect("fixed-rho inner evaluation succeeds");
+    let error = match objective.into_fitted() {
+        Ok(_) => panic!("an evaluated but uncertified objective must not mint a fit"),
+        Err(error) => error,
+    };
+    assert!(error.contains("not explicitly certified"));
+}
+
+#[test]
+fn fixed_rho_entry_stamps_its_explicit_verdict() {
+    use super::tests::planted_circle_embedded;
+    use super::tests_startup_validation_1782::{Topo, objective_and_seed};
+
+    let z = planted_circle_embedded(24, 4, 0.03);
+    let (mut objective, seed) = objective_and_seed(
+        z.view(),
+        1,
+        Topo::Circle,
+        crate::assignment::AssignmentMode::softmax(1.0),
+    );
+    objective
+        .fit_at_fixed_rho(seed.view())
+        .expect("fixed-rho fit converges");
+    let fitted = objective.into_fitted().expect("fixed-rho fit is certified");
+    assert_eq!(fitted.termination.verdict, super::SaeOuterVerdict::FixedRho);
 }
 
 #[test]
@@ -90,6 +131,9 @@ fn planted_circle_fit_returns_with_analytic_certificate() {
         certificate.stationarity_bound
     );
     let certified_rho = result.rho.clone();
+    objective
+        .certify_outer_result(&result)
+        .expect("the analytic OuterResult certifies the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     assert_eq!(
         fitted.rho.to_flat(),

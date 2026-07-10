@@ -314,6 +314,47 @@ pub(crate) const SAE_SEPARATION_BARRIER_EPS: f64 = 1.0e-6;
 /// value never desyncs from the step.
 pub(crate) const SAE_BARRIER_ACTIVE_NORM_REL_FLOOR: f64 = 1.0e-6;
 
+/// Allocation-only workspace for repeated nonlinear Arrow-Schur assemblies.
+///
+/// The current [`ArrowSchurSystem`] owns these buffers while it is being
+/// assembled and solved. The joint-fit driver returns them after every
+/// iteration, so the next iterate can reuse the allocations while still
+/// overwriting every Hessian/gradient entry. Device descriptors and resident
+/// frames are retained only as mutable storage handles; their numerical
+/// operands are refreshed from the newly assembled system before reuse.
+#[derive(Default)]
+pub(crate) struct SaeArrowAssemblyWorkspace {
+    pub(crate) rows: Vec<ArrowRowBlock>,
+    pub(crate) gb: Array1<f64>,
+    pub(crate) device_sae_pcg: Option<Arc<DeviceSaePcgData>>,
+    pub(crate) resident_frame: Option<
+        Arc<dyn gam_solve::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>,
+    >,
+    #[cfg(test)]
+    pub(crate) accepted_observations: Vec<SaeArrowAssemblyObservation>,
+}
+
+impl std::fmt::Debug for SaeArrowAssemblyWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaeArrowAssemblyWorkspace")
+            .field("rows", &self.rows.len())
+            .field("gb", &self.gb.len())
+            .field("device_sae_pcg", &self.device_sae_pcg.is_some())
+            .field("resident_frame", &self.resident_frame.is_some())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct SaeArrowAssemblyObservation {
+    pub(crate) row_htt_ptr: usize,
+    pub(crate) row_htbeta_ptr: usize,
+    pub(crate) gb_ptr: usize,
+    pub(crate) device_frame_ptr: usize,
+    pub(crate) numerical_bits: Vec<u64>,
+}
+
 /// Full SAE-manifold term.
 #[derive(Debug)]
 pub struct SaeManifoldTerm {
@@ -412,6 +453,9 @@ pub struct SaeManifoldTerm {
     /// immediately lowers the dense block into a `BetaPenaltyOp`, so the returned
     /// `ArrowSchurSystem` does not need to keep owning the allocation.
     pub(crate) border_hbb_workspace: Array2<f64>,
+    /// Reusable row/shared/device allocation pool for successive nonlinear
+    /// Arrow-Schur iterations. Numerical factors are never stored here.
+    pub(crate) arrow_assembly_workspace: SaeArrowAssemblyWorkspace,
     /// Fitted Gaussian reconstruction dispersion used only by the empirical
     /// incoherence/curvature certificate-input report. `None` for synthetic terms
     /// or legacy internal callers that have not computed post-fit dispersion.
@@ -700,6 +744,7 @@ impl Clone for SaeManifoldTerm {
             // clones so a cloned term optimizes the same compact top-`k` problem.
             softmax_active_cap: self.softmax_active_cap,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
+            arrow_assembly_workspace: SaeArrowAssemblyWorkspace::default(),
             certificate_dispersion: self.certificate_dispersion,
             curvature_walk_report: self.curvature_walk_report.clone(),
             expected_evidence_gauge_deflated_directions: self

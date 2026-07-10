@@ -706,38 +706,29 @@ impl SaeManifoldTerm {
             0
         };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
-        // layout is active, uniform `q` otherwise.
-        let mut sys = if let Some(ref layout) = row_layout {
-            let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
-            if dense_beta_curvature {
-                let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
-                ArrowSchurSystem::new_with_per_row_dims_and_hbb_and_htbeta_cols(
-                    per_row_dims,
-                    beta_dim,
-                    hbb_workspace,
-                    row_htbeta_dim,
-                )
-            } else {
-                self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
-                ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
-                    per_row_dims,
-                    beta_dim,
-                    row_htbeta_dim,
-                )
-            }
-        } else if dense_beta_curvature {
-            let hbb_workspace = self.take_border_hbb_workspace(beta_dim);
-            ArrowSchurSystem::new_with_hbb_and_htbeta_cols(
-                n,
-                q,
-                beta_dim,
-                hbb_workspace,
-                row_htbeta_dim,
-            )
+        // layout is active, uniform `q` otherwise. Successive nonlinear
+        // iterations take the row/gradient allocations returned by the driver;
+        // `new_with_assembly_buffers` zeroes every numerical entry before this
+        // iterate refills it, so residency never becomes stale factor reuse.
+        let per_row_dims: Vec<usize> = match row_layout.as_ref() {
+            Some(layout) => (0..n).map(|row| layout.row_q_active(row)).collect(),
+            None => vec![q; n],
+        };
+        let hbb_workspace = if dense_beta_curvature {
+            self.take_border_hbb_workspace(beta_dim)
         } else {
             self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
-            ArrowSchurSystem::new_with_empty_hbb_and_htbeta_cols(n, q, beta_dim, row_htbeta_dim)
+            Array2::<f64>::zeros((0, 0))
         };
+        let (rows_workspace, gb_workspace) = self.take_arrow_assembly_buffers();
+        let mut sys = ArrowSchurSystem::new_with_assembly_buffers(
+            per_row_dims,
+            beta_dim,
+            row_htbeta_dim,
+            hbb_workspace,
+            rows_workspace,
+            gb_workspace,
+        );
         // Apply accumulated smoothness-penalty gradients into sys.gb.
         for (i, g) in smooth_grad_gb.iter().enumerate() {
             sys.gb[i] += g;
@@ -2415,7 +2406,7 @@ impl SaeManifoldTerm {
                             rows: &sys.rows,
                         },
                     );
-                    sys.set_device_sae_pcg_data(device);
+                    self.install_device_sae_pcg_data(&mut sys, device);
                 }
             }
         } else if whitens_likelihood {
@@ -2510,7 +2501,7 @@ impl SaeManifoldTerm {
             // reduced-Schur matvec, which routes `H_ββ` through the composite op below
             // (rank-1 included). Healthy fits install no rank-1 and keep the device PCG.
             if sep_rank1.is_empty() {
-                sys.set_device_sae_pcg_data(DeviceSaePcgData {
+                self.install_device_sae_pcg_data(&mut sys, DeviceSaePcgData {
                     p,
                     beta_dim,
                     a_phi: device_a_phi,

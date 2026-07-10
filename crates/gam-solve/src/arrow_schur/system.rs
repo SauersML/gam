@@ -566,6 +566,85 @@ impl ArrowSchurSystem {
         }
     }
 
+    /// Build a fresh numerical system while reusing caller-owned assembly
+    /// allocations when their shapes still match.
+    ///
+    /// This is deliberately an *allocation* workspace, not a factor cache:
+    /// every entry of `rows`, `hbb`, and `gb` is zeroed before the system is
+    /// returned, and all operator/fingerprint/device fields start empty. A
+    /// nonlinear assembler can therefore refill every state-dependent block at
+    /// the new iterate without paying again for the stable row/shared-buffer
+    /// shapes. Shape changes discard only the incompatible allocation.
+    pub fn new_with_assembly_buffers(
+        per_row_dims: Vec<usize>,
+        k: usize,
+        htbeta_cols: usize,
+        mut hbb: Array2<f64>,
+        mut rows: Vec<ArrowRowBlock>,
+        mut gb: Array1<f64>,
+    ) -> Self {
+        assert!(hbb.dim() == (0, 0) || hbb.dim() == (k, k));
+        hbb.fill(0.0);
+
+        let rows_match = rows.len() == per_row_dims.len()
+            && rows.iter().zip(&per_row_dims).all(|(row, &dim)| {
+                row.htt.dim() == (dim, dim)
+                    && row.htbeta.dim() == (dim, htbeta_cols)
+                    && row.gt.len() == dim
+            });
+        if rows_match {
+            for row in &mut rows {
+                row.htt.fill(0.0);
+                row.htbeta.fill(0.0);
+                row.gt.fill(0.0);
+            }
+        } else {
+            rows = per_row_dims
+                .iter()
+                .map(|&dim| ArrowRowBlock::new_with_htbeta_cols(dim, htbeta_cols))
+                .collect();
+        }
+        if gb.len() == k {
+            gb.fill(0.0);
+        } else {
+            gb = Array1::<f64>::zeros(k);
+        }
+
+        let n = per_row_dims.len();
+        let d = per_row_dims.iter().copied().max().unwrap_or(0);
+        let mut offsets = Vec::with_capacity(n + 1);
+        let mut cursor = 0usize;
+        offsets.push(cursor);
+        for &dim in &per_row_dims {
+            cursor += dim;
+            offsets.push(cursor);
+        }
+        Self {
+            rows,
+            hbb,
+            hbb_matvec: None,
+            htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
+            htbeta_dense_supplement: false,
+            hbb_diag: None,
+            gb,
+            d,
+            row_dims: Arc::from(per_row_dims.into_boxed_slice()),
+            row_offsets: Arc::from(offsets.into_boxed_slice()),
+            k,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
+            row_hessian_fingerprint: 0,
+            analytic_row_hessian_fingerprint: 0,
+            block_offsets: Arc::from([] as [Range<usize>; 0]),
+            penalty_op: None,
+            device_sae_pcg: None,
+            cross_row_penalties: Vec::new(),
+            row_gauge_deflation: None,
+            beta_gauge_quotient: None,
+            ibp_cross_row: None,
+        }
+    }
+
     pub fn set_row_gauge_deflation(&mut self, deflation: ArrowRowGaugeDeflation) {
         self.row_gauge_deflation = Some(deflation);
     }
@@ -715,6 +794,19 @@ impl ArrowSchurSystem {
     }
 
     pub fn set_device_sae_pcg_data(&mut self, data: DeviceSaePcgData) {
+        self.set_device_sae_pcg_data_reusing(data, None);
+    }
+
+    /// Install current-iterate SAE device operands while retaining the outer
+    /// descriptor allocation from a completed prior assembly when it is
+    /// uniquely owned. Only the allocation identity is reused: `data` replaces
+    /// the complete numerical payload, so no state-dependent operand or factor
+    /// crosses nonlinear iterates.
+    pub fn set_device_sae_pcg_data_reusing(
+        &mut self,
+        data: DeviceSaePcgData,
+        recycled: Option<Arc<DeviceSaePcgData>>,
+    ) {
         assert_eq!(data.beta_dim, self.k);
         // The frames-engaged builder (`build_framed_device_sae_data`) carries the
         // per-row cross block through `frame.frame_blocks` and intentionally leaves
@@ -725,7 +817,17 @@ impl ArrowSchurSystem {
             assert_eq!(data.a_phi.len(), self.rows.len());
             assert_eq!(data.local_jac.len(), self.rows.len());
         }
-        self.device_sae_pcg = Some(Arc::new(data));
+        let allocation = match recycled {
+            Some(mut allocation) => match Arc::get_mut(&mut allocation) {
+                Some(slot) => {
+                    *slot = data;
+                    allocation
+                }
+                None => Arc::new(data),
+            },
+            None => Arc::new(data),
+        };
+        self.device_sae_pcg = Some(allocation);
     }
 
     /// Return the effective penalty operator: the installed `penalty_op` if

@@ -5088,7 +5088,16 @@ impl<'a> RemlState<'a> {
             && gram_original.ncols() == self.p
             && gram_original.iter().all(|value| value.is_finite())
         {
-            *self.flat_glm_first_step_gram.write().unwrap() = Some(Arc::new(gram_original));
+            // The cache entry can outlive the current outer trial, so its
+            // dense bytes must be charged on the joint ledger for exactly the
+            // entry's lifetime. A refusal under joint memory pressure skips
+            // caching — the warm-started trial then restreams the Gram, which
+            // is the memory-safe fallback this cache only accelerates.
+            let governor = gam_runtime::resource::MemoryGovernor::global();
+            *self.flat_glm_first_step_gram.write().unwrap() = governor
+                .try_reserve_dense_f64(self.p, self.p, "reml::flat_glm_first_step_gram")
+                .ok()
+                .map(|reservation| reservation.bind(Arc::new(gram_original)));
         } else {
             *self.flat_glm_first_step_gram.write().unwrap() = None;
         }

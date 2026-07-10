@@ -203,6 +203,9 @@ fn two_basin_outer_fit_engages_bounded_envelope() {
         .as_ref()
         .expect("converged envelope fit carries an analytic certificate");
     assert!(certificate.projected_grad_norm <= certificate.stationarity_bound);
+    objective
+        .certify_outer_result(&result)
+        .expect("envelope OuterResult certifies the installed state");
     let telemetry = objective.probe_telemetry();
 
     // The dense-admitted value lanes ran the envelope (not the streaming/freeze

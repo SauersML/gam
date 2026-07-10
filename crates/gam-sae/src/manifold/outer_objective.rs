@@ -1202,6 +1202,7 @@ impl SaeManifoldOuterObjective {
     /// Any incompatibility or install failure is logged and the fit proceeds
     /// cold — a checkpoint can improve a fit, never break one.
     pub fn try_resume_from_checkpoint(&mut self, expected_rho_len: usize) -> Option<Vec<f64>> {
+        self.fit_verdict = None;
         if !self.checkpoint_path.exists() {
             return None;
         }
@@ -1611,6 +1612,7 @@ impl SaeManifoldOuterObjective {
     /// the outer seed loop uses `run_curvature_homotopy_entry_at_rho` so every
     /// generated candidate gets its own entry solve before the ρ-anneal.
     pub fn run_curvature_homotopy_entry(&mut self) -> Result<bool, String> {
+        self.fit_verdict = None;
         let rho = self.baseline_rho.clone();
         self.run_curvature_homotopy_entry_at_rho(&rho)
     }
@@ -1622,6 +1624,7 @@ impl SaeManifoldOuterObjective {
         &mut self,
         rho: &SaeManifoldRho,
     ) -> Result<bool, String> {
+        self.fit_verdict = None;
         let rho = rho.clone();
         self.current_rho = rho.clone();
         // #2080 (a) — the homotopy walk mutates the accepted basin through its
@@ -2130,6 +2133,7 @@ impl SaeManifoldOuterObjective {
     }
 
     pub(crate) fn set_isometry_homotopy_weight(&mut self, eta: f64, targets: &[f64]) {
+        self.fit_verdict = None;
         if targets.is_empty() {
             return;
         }
@@ -2955,6 +2959,7 @@ impl SaeManifoldOuterObjective {
     ///   point exists; it stays cost-driven (the cascade still moves it via
     ///   the cost path when EFS is not the active lane for that coord).
     pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
+        self.fit_verdict = None;
         self.probe_telemetry.criterion_calls += 1;
         // #2080 (a) — this lane commits a new accepted basin below; drop any
         // pending probe handoff so it can never be installed across that
@@ -3827,6 +3832,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn reset(&mut self) {
+        self.fit_verdict = None;
         self.term = self.baseline_term.clone();
         self.current_rho = self.baseline_rho.clone();
         self.last_loss = None;
@@ -3845,6 +3851,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        self.fit_verdict = None;
         // Contract (see src/solver/reml/continuation.rs:727-737): an empty-β
         // seed means "no warm-start available, use your own cold default" and
         // MUST be accepted as a no-op. The continuation pre-warm forwards the
