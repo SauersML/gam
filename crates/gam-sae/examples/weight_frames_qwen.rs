@@ -847,7 +847,7 @@ fn render_markdown(
     lines.push("## Curved Fit Summary".to_string());
     lines.push(format!(
         "- Accepted regions: {} of {}.",
-        result.accepted_regions.len(),
+        result.selected_regions.len(),
         result.records.len()
     ));
     lines.push(format!(

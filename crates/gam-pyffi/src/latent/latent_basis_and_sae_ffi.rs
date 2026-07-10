@@ -1592,21 +1592,6 @@ fn canonicalize_assignment_kind(kind: &str) -> Result<String, String> {
     crate::manifold::manifold_sae_coercion::canonical_assignment_kind(kind).map(str::to_string)
 }
 
-/// #1026 — atom-count threshold at/above which per-atom ARD is collapsed to a
-/// CONSTANT number of SHARED outer hyperparameters (one ARD strength per
-/// intrinsic axis, broadcast to all atoms) instead of one-per-atom-per-axis.
-///
-/// Below this, the historical per-atom ARD is unchanged so existing small /
-/// moderate-K fits, tests, and quality runs do not regress. The threshold is
-/// set well above the K of every existing test fixture (which run at K ≤ a few
-/// dozen) and below the large-K regime (K in the hundreds–thousands) where the
-/// `2 + Σ_k d_k` outer-hyperparameter explosion makes the generic outer
-/// optimizer intractable. Shared ARD remains a principled REML
-/// reparameterization (a single shared smoothing parameter tying the replicate
-/// per-atom ARD terms), so the large-K fit is well-posed, just lower-dimensional
-/// in the outer search.
-const SAE_SHARED_ARD_K_THRESHOLD: usize = 256;
-
 // The OOS assignment-logit seeders moved to the library
 // (`gam_sae::manifold::oos_logit_seed`, methods on `SaeManifoldTerm`) so the CLI
 // and Rust callers seed identically to python — issue #2236. The binding calls
@@ -2490,56 +2475,13 @@ fn sae_manifold_fit_inner<'py>(
         None => None,
     };
     let (n_obs, p_out) = z_view.dim();
-    if n_obs == 0 || p_out == 0 {
-        return Err(py_value_error(
-            "sae_manifold_fit requires a non-empty (N, p) response".to_string(),
-        ));
-    }
     let k_atoms = atom_dim.len();
-    // The SEED dictionary size, captured before the structure search may grow or
-    // shrink it (#977). Used to map a structure-search-BORN atom (index ≥
-    // `seed_k_atoms`) back to its template plan when serializing the variable-K
-    // `atom_plans`: births clone atom 0's basis, so a born atom's build plan is
-    // the seed template's, re-derived from the fitted atom below.
+    // Preserve the seed dictionary size for variable-K payload plan recovery.
     let seed_k_atoms = k_atoms;
-    if k_atoms == 0 {
-        return Err(py_value_error(
-            "sae_manifold_fit requires at least one atom".to_string(),
-        ));
-    }
-    if atom_basis.len() != k_atoms || basis_sizes.len() != k_atoms {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit metadata lengths must equal K={k_atoms}; got atom_basis={}, basis_sizes={}",
-            atom_basis.len(),
-            basis_sizes.len()
-        )));
-    }
-    // Front-door enforcement (#985 / E1): the dense manifold engine (this fn's
-    // `SaeManifoldTerm` + its `N×K` `SaeAssignment` routing state) is the small-K
-    // CERTIFICATION lane only. `admit_sae_fit` demotes to the sparse-code lane the
-    // moment the dense assignment state `N·K` would exceed the response scale `N·P`
-    // (K > P). Reaching here on that sparse shape — e.g. a direct FFI caller that
-    // bypassed the Python facade's front-door routing — would silently build the
-    // very `N×K` state the front door exists to avoid, so refuse it and point at
-    // the sparse front door. The dense-cert path (K ≤ P) passes unchanged; this is
-    // refuse-on-SPARSE, never refuse-on-dense. The guard + its boundary test live in
-    // gam-sae `front_door` (a lib-testable crate; gam-pyffi is an extension module
-    // that cannot link a `cargo test` harness).
-    gam::terms::sae::front_door::admit_dense_certification(n_obs, p_out, k_atoms)
-        .map_err(py_value_error)?;
-    // The "t" block addresses the per-row latent coordinates (n_obs × d_max,
-    // tier=Psi) — ARD, Isometry, BlockOrthogonality, etc. target this. The
-    // "beta" block addresses the decoder coefficient matrix. `flatten_beta`
-    // concatenates per-atom (M_k, p_out) blocks; the total decoder vector has
-    // length `(Σ_k M_k) · p_out`. We register one "beta" block covering the
-    // full vector with `d = Σ_k M_k` so the descriptor builder constructs a
-    // valid MechanismSparsityPenalty (target length = d · p_out, feature
-    // groups partitioning p_out). For multi-atom fits the penalty cannot
-    // group-lasso the whole concatenation as a single (Σ M_k, p_out) matrix —
-    // instead `add_sae_beta_penalty` in src/terms/sae/manifold.rs dispatches
-    // the penalty per atom, rebuilding its target range/latent_dim to each
-    // atom's (M_k, p_out) block. For k_atoms == 1 the per-atom dispatch
-    // collapses to exactly this single block, so both paths agree (#240).
+
+    // Registry descriptor parsing remains boundary marshalling because the JSON
+    // descriptor builder lives above gam-sae. Every seed decision after this
+    // point is owned by the typed gam-sae entry.
     let total_basis: usize = basis_sizes.iter().copied().sum();
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
@@ -2556,392 +2498,70 @@ fn sae_manifold_fit_inner<'py>(
         analytic_penalties.as_ref(),
     )
     .map_err(py_value_error)?;
-    if max_iter < 1 {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit requires max_iter >= 1; got {max_iter}"
-        )));
-    }
-    if let Some(k_top) = top_k {
-        if k_top == 0 || k_top > k_atoms {
-            return Err(py_value_error(format!(
-                "top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
-            )));
-        }
-    }
-    if initial_logits.dim() != (n_obs, k_atoms) {
-        return Err(py_value_error(format!(
-            "initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
-            initial_logits.dim()
-        )));
-    }
-    for (name, value) in [
-        ("alpha", alpha),
-        ("tau", tau),
-        ("learning_rate", learning_rate),
-        ("ridge_ext_coord", ridge_ext_coord),
-        ("ridge_beta", ridge_beta),
-    ] {
-        if !value.is_finite() || value <= 0.0 {
-            return Err(py_value_error(format!(
-                "{name} must be finite and positive; got {value}"
-            )));
-        }
-    }
-    // `sparsity_strength == 0.0` is the canonical "no sparsity" baseline
-    // (issue #184). Accept it and floor to a tiny positive sentinel before
-    // taking the log so the log-rho parametrisation stays finite. The
-    // resulting `lambda_sparse = exp(log(SPARSITY_DISABLED_FLOOR))` is
-    // numerically equivalent to zero relative to the data-fit Hessian for
-    // any realistic problem scale. Negatives, infinities, and NaN remain
-    // rejected. `smoothness == 0.0` gets the identical treatment (#2090):
-    // every other penalty weight in the public facade uses zero to disable
-    // its term, and the docstring already declares smoothness_weight
-    // "non-negative"; both weights only seed the outer REML cascade's
-    // log-rho, so the floor keeps that parametrisation finite.
-    if !sparsity_strength.is_finite() || sparsity_strength < 0.0 {
-        return Err(py_value_error(format!(
-            "sparsity_strength must be finite and non-negative; got {sparsity_strength}"
-        )));
-    }
-    if !smoothness.is_finite() || smoothness < 0.0 {
-        return Err(py_value_error(format!(
-            "smoothness must be finite and non-negative; got {smoothness}"
-        )));
-    }
-    const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
-    let sparsity_strength = if sparsity_strength == 0.0 {
-        SPARSITY_DISABLED_FLOOR
-    } else {
-        sparsity_strength
-    };
-    let smoothness = if smoothness == 0.0 {
-        SPARSITY_DISABLED_FLOOR
-    } else {
-        smoothness
-    };
 
-    let basis_values_shape = basis_values.shape().to_vec();
-    if basis_values_shape[0] != k_atoms || basis_values_shape[1] != n_obs {
-        return Err(py_value_error(format!(
-            "basis_values must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
-            basis_values_shape
-        )));
-    }
-    let basis_jacobian_shape = basis_jacobian.shape().to_vec();
-    if basis_jacobian_shape[0] != k_atoms || basis_jacobian_shape[1] != n_obs {
-        return Err(py_value_error(format!(
-            "basis_jacobian must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
-            basis_jacobian_shape
-        )));
-    }
-    let decoder_shape = decoder_coefficients.shape().to_vec();
-    if decoder_shape[0] != k_atoms || decoder_shape[2] != p_out {
-        return Err(py_value_error(format!(
-            "decoder_coefficients must have shape (K, M_max, p)=({k_atoms}, M_max, {p_out}); got {:?}",
-            decoder_shape
-        )));
-    }
-    let smooth_shape = smooth_penalties.shape().to_vec();
-    if smooth_shape[0] != k_atoms || smooth_shape[1] != smooth_shape[2] {
-        return Err(py_value_error(format!(
-            "smooth_penalties must have shape (K, M_max, M_max); got {:?}",
-            smooth_shape
-        )));
-    }
-    let coords_view = initial_coords;
-    let coords_shape = coords_view.shape().to_vec();
-    if coords_shape[0] != k_atoms || coords_shape[1] != n_obs {
-        return Err(py_value_error(format!(
-            "initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
-            coords_shape
-        )));
-    }
-    let max_dim = coords_view.shape().get(2).copied().ok_or_else(|| {
-        py_value_error("initial_coords must be a rank-3 (K, N, D_max) array".to_string())
-    })?;
-    let mut coord_blocks = Vec::with_capacity(k_atoms);
-    for atom_idx in 0..k_atoms {
-        let d = atom_dim[atom_idx];
-        let m = basis_sizes[atom_idx];
-        if m > basis_values_shape[2]
-            || m > basis_jacobian_shape[2]
-            || m > decoder_shape[1]
-            || m > smooth_shape[1]
-        {
-            return Err(py_value_error(format!(
-                "basis_sizes[{atom_idx}]={m} exceeds one of the padded M_max dimensions"
-            )));
-        }
-        if d > max_dim {
-            return Err(py_value_error(format!(
-                "atom_dim[{atom_idx}]={d} exceeds initial_coords D_max={max_dim}"
-            )));
-        }
-        if d > basis_jacobian_shape[3] {
-            return Err(py_value_error(format!(
-                "atom_dim[{atom_idx}]={d} exceeds basis_jacobian D_max={}",
-                basis_jacobian_shape[3]
-            )));
-        }
-        coord_blocks.push(coords_view.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned());
-    }
-
-    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
-        .iter()
-        .map(|kind| sae_atom_basis_kind_from_str(kind))
-        .collect();
-    // #1784/#1777 — use the per-fit IBP concentration override everywhere the
-    // assignment map is materialized, including the *seed* assignment mode below.
-    // `set_fit_config` remains the runtime source of truth for cloned/refit
-    // terms, but constructing the initial `AssignmentMode` with the overridden
-    // α keeps seed decoder solves, metadata, and the first Arrow-Schur pass on
-    // the same K-aware/stated gate instead of briefly using the historical
-    // `alpha=1` geometric mask.
-    let assignment_alpha = ibp_alpha_override.unwrap_or(alpha);
-    let mode = match assignment_kind.as_str() {
-        "softmax" => AssignmentMode::softmax(tau),
-        "ibp_map" => AssignmentMode::ibp_map(tau, assignment_alpha, learnable_alpha),
-        // The ThresholdGate is a hard-thresholded
-        // bounded sigmoid: an atom is active when its raw logit clears
-        // `jumprelu_threshold`, and the gate value is the sigmoid (in [0, 1]) —
-        // the reconstruction *magnitude* lives in the decoder, not the gate.
-        // `tau` is the sigmoid temperature on the same logits; the threshold is
-        // the activation cut. The threshold is caller-configurable (default 0.0);
-        // the cold-start seed (see `sae_manifold_fit_minimal`) starts every logit
-        // above it so the data-fit JVP, the sparsity prior gradient, and the
-        // assignment-weighted decoder gradient are all non-zero at step 0. The
-        // strict incoming token is validated as "threshold_gate" at the FFI boundary
-        // (`canonicalize_assignment_kind`).
-        "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
-        // Hard top-k support: sparsity by construction (no penalty, no gate
-        // coordinates). The fit's `top_k` argument IS the support size.
-        "topk" => {
-            let k_top = top_k.ok_or_else(|| {
-                py_value_error(
-                    "sae_manifold_fit: assignment_kind 'topk' requires the top_k argument \
-                     (the fixed per-row support size)"
-                        .to_string(),
-                )
-            })?;
-            AssignmentMode::top_k_support(k_top)
-        }
-        _ => {
-            return Err(py_value_error(format!(
-                "assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or \
-                 'topk'; got {assignment_kind}"
-            )));
-        }
+    let assignment = SaeFitAssignmentKind::from_tag(&assignment_kind).map_err(py_value_error)?;
+    let temperature_schedule =
+        gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?;
+    let fisher_metric = match fisher_u {
+        Some(factors) => Some(
+            SaeFisherRowMetricRequest::from_tag(
+                factors,
+                n_obs,
+                p_out,
+                fisher_provenance,
+                fisher_mass_residual.as_ref().map(|mass| mass.view()),
+            )
+            .map_err(py_value_error)?,
+        ),
+        None => None,
     };
-    if atom_centers.len() != k_atoms {
-        return Err(py_value_error(format!(
-            "sae_manifold_fit: atom_centers length {} must equal K={k_atoms}",
-            atom_centers.len()
-        )));
-    }
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        &basis_sizes,
-        &atom_dim,
-        &coord_blocks,
+    let seed = build_sae_fit_seed(SaeFitSeedRequest {
+        target: z_view,
+        atom_basis,
+        atom_dim: &atom_dim,
         atom_centers,
-    )
-    .map_err(py_value_error)?;
-    let mut base_term = term_from_padded_blocks_with_mode(
-        n_obs,
-        p_out,
-        &basis_kinds,
         basis_values,
         basis_jacobian,
-        &basis_sizes,
-        &atom_dim,
+        basis_sizes: &basis_sizes,
         decoder_coefficients,
         smooth_penalties,
         initial_logits,
-        &coord_blocks,
-        mode,
-        &evaluators,
-    )
+        initial_coords,
+        alpha,
+        tau,
+        learnable_alpha,
+        assignment_kind: assignment,
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        top_k,
+        threshold: jumprelu_threshold,
+        native_ard_enabled,
+        seed_refine_routing,
+        seed_refine_random_state,
+        quotient_scale,
+        data_row_reseed,
+        rank_charge_evidence,
+        fit_config: gam::terms::sae::manifold::SaeFitConfig {
+            separation_barrier_strength_override,
+            ibp_alpha_override,
+        },
+        temperature_schedule,
+        fisher_metric,
+        row_loss_weights,
+        registry: &registry,
+    })
     .map_err(py_value_error)?;
-    // #2022/#2023/#1893/#2228 — install typed per-fit switches before the fit
-    // consumes the term. The SCALE-gauge (`quotient_scale`) now defaults ON (the
-    // #2228 co-collapse cure); `data_row_reseed` stays opt-in; the Python surface
-    // defaults the rank-charge evidence ledger on because the historical
-    // coordinate-block Laplace charge mis-prices vanishing/co-collapsed atoms.
-    base_term.set_quotient_scale(quotient_scale);
-    base_term.set_data_row_reseed(data_row_reseed);
-    base_term.set_rank_charge_evidence(rank_charge_evidence);
-    // #2022 SEED peel — moved here from the (env-free) padded-blocks builder.
-    // Quotient on (now the default) ⇒ gauge-fix each seed decoder onto the unit
-    // Frobenius sphere with its magnitude in the explicit log-amplitude
-    // (reconstruction preserved: exp(s)·B_unit == B_seed). Explicit off ⇒ s stays 0,
-    // seed bit-for-bit.
-    if quotient_scale {
-        for atom in base_term.atoms.iter_mut() {
-            atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-        }
-    }
-    // Install the per-fit config before the joint fit / ρ selection consumes it.
-    // `set_fit_config` distributes the separation-barrier strength onto the term
-    // and the IBP-α onto the assignment; `None` selects each canonical default.
-    base_term.set_fit_config(gam::terms::sae::manifold::SaeFitConfig {
-        separation_barrier_strength_override,
-        ibp_alpha_override,
-    });
-    if let Some(schedule) =
-        gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?
-    {
-        base_term
-            .set_temperature_schedule(schedule)
-            .map_err(py_value_error)?;
-    }
-    // #2132 — the active-set cap is part of the model being optimized, so the
-    // cold routing refinement must see the same top-k softmax support as the
-    // subsequent Arrow-Schur solve. Installing it only after the EM seed let
-    // the seed decoder LSQ train every atom on every row under dense softmax
-    // responsibilities; with top_k=1 planted mixtures that reintroduced the
-    // uniform co-collapse saddle before the capped solver ever ran.
-    base_term.set_softmax_active_cap(top_k);
+    let SaeFitSeedReport {
+        base_term,
+        initial_rho: init_rho,
+        isometry_pin_active,
+        metric_provenance,
+    } = seed;
 
-    // Cold-start routing seed refinement (#629, #630). The cold residual-logit
-    // seed is computed at the cold (shared-across-atoms) coordinates and cannot
-    // separate planted disjoint atoms, so the joint solve starts in the
-    // near-uniform routing saddle. Alternate the closed-form coordinate
-    // projection (the #628 OOS mechanism) and the weighted LSQ decoder refit a
-    // few times to place each row in the correct atom basin before the joint
-    // Arrow-Schur fit. Gated to cold multi-atom softmax / IBP-MAP fits by the
-    // caller; warm starts and JumpReLU keep their supplied seed.
-    if seed_refine_routing
-        && k_atoms > 1
-        && matches!(assignment_kind.as_str(), "softmax" | "ibp_map")
-    {
-        sae_em_refine_routing_seed(
-            &mut base_term,
-            z_view,
-            &basis_sizes,
-            assignment_kind.as_str(),
-            alpha,
-            tau,
-            jumprelu_threshold,
-            seed_refine_random_state,
-            top_k,
-        )
-        .map_err(py_value_error)?;
-    }
-
-    // WP-D → fit wiring (#980): if a per-row output-Fisher shard was supplied,
-    // build the single `RowMetric::OutputFisher` and install it on the term via
-    // `set_row_metric` *before* the objective consumes the term. This is the only
-    // way the gauge acquires a non-identity weight, and it flips the provenance to
-    // `OutputFisher` (the likelihood stays untouched — the inner product only
-    // drives the isometry gauge, per `RowMetric::whitens_likelihood` == false for
-    // `OutputFisher`). Magic-by-default: presence of `fisher_u` activates it; no
-    // flag. The factor stack stays in its natural `(n_obs, p_out, rank)` layout at
-    // this boundary; the typed gam-sae entry owns shape/rank validation, packing,
-    // and provenance selection.
-    let metric_provenance: &'static str = if let Some(u3) = fisher_u {
-        let request = SaeFisherRowMetricRequest::from_tag(
-            u3,
-            n_obs,
-            p_out,
-            fisher_provenance.as_deref(),
-            fisher_mass_residual.as_ref().map(|mass| mass.view()),
-        )
-        .map_err(py_value_error)?;
-        let metric = build_sae_fisher_row_metric(request).map_err(py_value_error)?;
-        let label = gam::terms::sae::manifold::metric_provenance_label(metric.provenance());
-        base_term.set_row_metric(metric).map_err(py_value_error)?;
-        label
-    } else {
-        "Euclidean"
-    };
-
-    // Per-row design-honesty reconstruction weights (#977). Installed on the
-    // term before it is moved into the outer objective so the √w reweighting
-    // is honored by both the inner joint fit and the outer ρ criterion. The
-    // length / positivity contract is enforced inside `set_row_loss_weights`;
-    // a uniform (or absent) vector self-normalizes to the unweighted path.
-    if let Some(weights) = row_loss_weights {
-        if weights.len() != n_obs {
-            return Err(py_value_error(format!(
-                "sae_manifold_fit: weights length {} must equal the {n_obs} response rows",
-                weights.len()
-            )));
-        }
-        base_term
-            .set_row_loss_weights(weights.to_vec())
-            .map_err(py_value_error)?;
-    }
-
-    let log_ard: Vec<Array1<f64>> = atom_dim
-        .iter()
-        .map(|&d| {
-            if native_ard_enabled {
-                Array1::<f64>::zeros(d)
-            } else {
-                Array1::<f64>::zeros(0)
-            }
-        })
-        .collect();
-    // Drive ρ (sparsity / smoothing λ's + per-atom ARD precisions) through the
-    // one generic outer cascade — the same engine the GAM REML path uses
-    // (`OuterProblem::run` → `plan()` → derivative-free / FD outer strategy).
-    // `SaeManifoldOuterObjective::eval_cost` evaluates the term's true REML
-    // criterion at each candidate ρ via an inner Arrow-Schur joint fit; the
-    // engine selects ρ. No hand-rolled λ-grid, no manual penalized-loss-max:
-    // the criterion + cascade subsume both, so smoothness/sparsity selection is
-    // automatic (magic by default — no per-call grid kwarg).
-    //
-    // `init_rho` packs `[log_lambda_sparse, log_lambda_smooth, per-atom ARD]`;
-    // its `to_flat()` defines the outer ρ vector the engine optimizes, and its
-    // length is the objective's declared `n_params`. For learnable-alpha IBP,
-    // the first coordinate is a dimensionless log-alpha offset rather than a
-    // response-scale penalty strength, so assignment-aware seed scaling leaves it
-    // unshifted while still scaling smoothness and ARD.
-    // #1408/#1409 — fold the inference-time `top_k` cap into the OPTIMIZATION:
-    // for Softmax it engages the compact top-`k` row layout so the inner Newton
-    // assembly/solve and the outer ρ criterion only ever touch each row's top-`k`
-    // atoms (the FFI's after-the-fit top-`k` projection below then collapses to a
-    // no-op at the optimum). A no-op for `top_k >= K`, `None`, and non-softmax
-    // modes (set_softmax_active_cap clamps to `1 <= k < K` and ignores non-softmax).
-    let seed_dispersion = base_term
-        .seed_reconstruction_dispersion(z_view)
-        .map_err(py_value_error)?;
-    // #1026 — at large K, per-atom ARD makes the OUTER optimizer search
-    // `2 + Σ_k d_k` hyperparameters (e.g. ~32 770 at K = 32 768 1-D atoms),
-    // each eval refitting the whole dictionary — intractable. Above the
-    // `SAE_SHARED_ARD_K_THRESHOLD` collapse the per-atom ARD to a CONSTANT
-    // `2 + max_d` SHARED hyperparameters (one ARD strength per intrinsic axis,
-    // broadcast to every atom). Below the threshold the historical per-atom ARD
-    // is unchanged, so existing small/moderate-K fits, tests, and quality runs
-    // are bit-for-bit identical. The inner per-atom precision table is unchanged
-    // in both modes; only the outer search dimension differs.
-    let use_shared_ard = native_ard_enabled && k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
-    let init_rho = if use_shared_ard {
-        SaeManifoldRho::new_shared_ard(sparsity_strength.ln(), smoothness.ln(), log_ard)
-    } else {
-        SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
-    }
-    .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
-    .map_err(py_value_error)?;
-    // Whether an isometry gauge penalty is installed on this fit. Read here,
-    // before the registry is moved into the objective, and threaded into the
-    // residual-gauge certificate below: an inactive isometry pin escalates the
-    // certificate to the `diffeomorphism-unpinned` verdict.
-    let isometry_pin_active = registry.penalties.iter().any(|p| {
-        matches!(
-            p,
-            gam::terms::analytic_penalties::AnalyticPenaltyKind::Isometry(_)
-        )
-    });
-    // #2098 (SPEC-8) — the engine self-protects against the heterogeneous-
-    // `d_atom` + row-block-penalty incompatibility up front, so it surfaces as a
-    // direct `ValueError` here (covering BOTH `sae_manifold_fit` and
-    // `sae_manifold_fit_minimal`, which share this inner) rather than as a deep
-    // `RemlConvergenceError` mid-REML. Native ARD rides `native_ard_enabled` (not
-    // a registry descriptor), so both penalty sources are threaded through.
-    base_term
-        .validate_heterogeneous_atom_compatibility(Some(&registry), native_ard_enabled)
-        .map_err(py_value_error)?;
     // The python boundary owns seed construction and validation; every fit,
     // structured-residual pass, evidence-guarded structure move, certificate,
     // diagnostic, and top-k projection after this point belongs to gam-sae's

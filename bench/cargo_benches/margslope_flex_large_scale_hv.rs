@@ -4,6 +4,12 @@
 //! ```text
 //! cargo bench --bench margslope_flex_large_scale_hv
 //! ```
+//!
+//! Fixture construction and cloning are Criterion setup, not timed work. One
+//! untimed fit reports allocator calls and requested bytes before Criterion
+//! measures the fit with allocation tracking disabled, so the counter itself
+//! cannot bias the timing comparison. For an A/B run, save the old revision as
+//! a Criterion baseline and compare the new revision against that same name.
 
 #[path = "../../tests/test_support/misc/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
@@ -38,7 +44,7 @@ static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+        if !ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::SeqCst) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
             ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
@@ -47,7 +53,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc_zeroed(layout) };
-        if !ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+        if !ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::SeqCst) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
             ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
@@ -60,7 +66,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
+        if !new_ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::SeqCst) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
             ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
         }
@@ -117,6 +123,22 @@ fn bench_margslope_flex_large_scale_cycle0(c: &mut Criterion) {
         );
     }
     let problem = build_large_scale_shape_problem(n);
+    begin_allocation_measurement();
+    let allocation_result = fit_problem(problem.clone(), cycle_capped_options(inner_cycles));
+    let allocations = end_allocation_measurement();
+    let (allocation_fit, allocation_timing) =
+        allocation_result.expect("allocation-probe large-scale margslope fit");
+    eprintln!(
+        "[MS-FLEX-LARGE_SCALE-BENCH-ALLOC] n={} inner_max_cycles={} elapsed_s={:.3} allocation_calls={} allocated_bytes={} beta_len={}",
+        n,
+        inner_cycles,
+        allocation_timing.elapsed.as_secs_f64(),
+        allocations.allocation_calls,
+        allocations.allocated_bytes,
+        allocation_fit.fit.beta.len()
+    );
+    black_box(allocation_fit.fit.beta.len());
+    drop(allocation_fit);
     let mut group = c.benchmark_group("margslope_flex_large_scale_hv_pattern");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(30));
@@ -124,20 +146,16 @@ fn bench_margslope_flex_large_scale_cycle0(c: &mut Criterion) {
         b.iter_batched(
             || problem.clone(),
             |problem| {
-                begin_allocation_measurement();
-                let result = fit_problem(
+                let (fit, timing) = fit_problem(
                     black_box(problem),
                     cycle_capped_options(black_box(inner_cycles)),
-                );
-                let allocations = end_allocation_measurement();
-                let (fit, timing) = result.expect("criterion large-scale margslope fit");
+                )
+                .expect("criterion large-scale margslope fit");
                 eprintln!(
-                    "[MS-FLEX-LARGE_SCALE-BENCH-ITER] n={} inner_max_cycles={} elapsed_s={:.3} allocation_calls={} allocated_bytes={} outer_iters={} inner_cycles={} converged={} beta_len={}",
+                    "[MS-FLEX-LARGE_SCALE-BENCH-ITER] n={} inner_max_cycles={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
                     n,
                     inner_cycles,
                     timing.elapsed.as_secs_f64(),
-                    allocations.allocation_calls,
-                    allocations.allocated_bytes,
                     timing.outer_iterations,
                     timing.inner_cycles,
                     timing.outer_converged,
