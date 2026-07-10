@@ -269,7 +269,7 @@ def select_flat_direction(flat_fit, X, day_indices):
 # --------------------------------------------------------------------------- #
 def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_coords,
                   base_amplitudes,
-                  candidate_ids, flat_dir, ks):
+                  candidate_ids, flat_dir, ks, lift=None):
     """Run manifold + flat steering across base examples × rotation counts k.
 
     ``base_coords[i]`` is the fitted circle coordinate (length d_atom) of
@@ -288,6 +288,9 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_
             t_to[0] = t0[0] + dcoord  # circle retract wraps mod period Rust-side
             plan = model.steer(int(atom), int(metric_row), float(amplitude), t0, t_to)
             delta = np.asarray(plan["delta"], dtype=np.float64)
+            if lift is not None:
+                # Exact ambient lift through the orthonormal PCA rows.
+                delta = delta @ lift
             import torch
 
             # --- on-manifold arm ---
@@ -418,6 +421,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--candidate-prefix", default=" ")
     ap.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="fp32")
     ap.add_argument("--seed", type=int, default=20260709)
+    ap.add_argument("--pca-dim", type=int, default=64,
+                    help="fit-chart PCA dimension (0 disables; deltas are lifted back exactly)")
     ap.add_argument("--out-dir", default="experiments/steering_e1/out")
     return ap.parse_args()
 
@@ -440,10 +445,30 @@ def main() -> int:
     fit_examples = collect_cloud(model_lm, tok, layer, FIT_TEMPLATES)
     base_examples = collect_cloud(model_lm, tok, layer, BASE_TEMPLATES)
     all_examples = fit_examples + base_examples
-    X = np.ascontiguousarray(
+    X_ambient = np.ascontiguousarray(
         np.stack([ex.activation.numpy().astype(np.float64) for ex in all_examples]))
     day_indices = np.asarray([ex.day_index for ex in all_examples])
-    log(f"cloud X shape {X.shape}")
+    log(f"cloud X shape {X_ambient.shape}")
+
+    # Wide-p treatment (same methodology as the committed OLMo fixtures): fit in
+    # a per-layer PCA chart. The steering DELTAS are lifted back to ambient
+    # through the orthonormal basis, so the intervention itself is exact —
+    # x' = x + (delta_pca @ Vr) — and norms are preserved (Vr rows orthonormal).
+    # Raw 3.5k-dim/84-row clouds put outer REML in the wide-p pathological
+    # regime (probe 2026-07-10: all preprocessing variants refused); rank-r PCA
+    # is where the calendar circle lives anyway (rank ~2-3).
+    if args.pca_dim and args.pca_dim < X_ambient.shape[1]:
+        mu = X_ambient.mean(0, keepdims=True)
+        Xc = X_ambient - mu
+        _, svals, vt = np.linalg.svd(Xc, full_matrices=False)
+        r = int(min(args.pca_dim, vt.shape[0]))
+        lift = np.ascontiguousarray(vt[:r])            # (r, p) orthonormal rows
+        X = np.ascontiguousarray(Xc @ lift.T)          # (n, r) fit chart
+        evr = float((svals[:r] ** 2).sum() / max((svals ** 2).sum(), 1e-30))
+        log(f"PCA chart: {X.shape} (explained variance {evr:.4f})")
+    else:
+        lift = None
+        X = X_ambient
 
     log("fitting gamfit.sae_manifold_fit (periodic circle, softmax assignment)")
     model = gamfit.sae_manifold_fit(
@@ -457,6 +482,11 @@ def main() -> int:
     flat_fit = gamfit.sparse_dictionary_fit(
         X.astype(np.float32), min(args.flat_k, X.shape[0] - 1), active=1, max_epochs=40)
     flat_dir, flat_lat = select_flat_direction(flat_fit, X.astype(np.float32), day_indices)
+    if lift is not None:
+        flat_dir = np.asarray(flat_dir, dtype=np.float64) @ lift
+        norm = np.linalg.norm(flat_dir)
+        if norm > 0:
+            flat_dir = flat_dir / norm
 
     # Steering coordinate for a base example = its fitted row coordinate. Base
     # rows are the last len(base_examples) rows of X (all_examples order).
