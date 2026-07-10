@@ -103,7 +103,7 @@ impl SaeManifoldTerm {
         // finalized compact block width; without one every atom is active on
         // every row, so the dense `row_block_dim()` is the exact per-row width.
         let (worst_row, worst_q) = match row_layout {
-            Some(layout) => (0..self.assignment.n_obs())
+            Some(layout) => (0..layout.active_atoms.len())
                 .map(|row| (row, layout.row_q_active(row)))
                 .max_by_key(|&(_, q)| q)
                 .unwrap_or((0, 0)),
