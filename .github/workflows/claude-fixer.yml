@@ -2,7 +2,11 @@ name: Claude Fixer (one issue, done properly)
 
 on:
   schedule:
-    - cron: "*/29 * * * *"
+    # Every 10 minutes, midnight–07:30 US Central (CDT = UTC−5 ⇒ 05:00–12:30
+    # UTC). GitHub cron is UTC-fixed, so under winter CST (UTC−6) the window
+    # reads 23:00–06:30 Central; adjust the hours if that matters.
+    - cron: "*/10 5-11 * * *"
+    - cron: "0,10,20,30 12 * * *"
   workflow_dispatch:
 
 
