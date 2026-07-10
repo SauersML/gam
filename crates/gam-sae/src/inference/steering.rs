@@ -8,8 +8,8 @@
 //! `t_from` to `t_to`". The atom's decoder curve `g_k(t) = Φ_k(t) B_k` maps that
 //! latent move to an **activation-space delta** — the actual vector you add to
 //! the residual stream / reconstruction to realize the move *on the manifold*.
-//! Here `g_k(t) = exp(s_k) Phi_k^eta(t) B_k` is the fitted physical decoder,
-//! including the atom scale and curvature-homotopy state:
+//! Here `g_k(t) = Phi_k^eta(t) B_k` is the fitted physical decoder, including
+//! the curvature-homotopy state:
 //!
 //! ```text
 //! delta = a · ( g_k(t_to) - g_k(t_from) )      (the on-manifold move)

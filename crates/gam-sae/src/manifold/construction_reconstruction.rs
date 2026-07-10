@@ -154,9 +154,8 @@ pub fn reconstruct_persisted_atom_set(
 /// atom's own [`LatentManifold::retract`] (Circle phase add modulo period,
 /// Euclidean translate, product blockwise), derived from the persisted basis kind
 /// — never re-implemented modular arithmetic. The persisted decoder folds the
-/// atom amplitude in already (as in `reconstruct_persisted_atom_set`), so no
-/// separate `exp(s_k)` is applied. Gates are read from the persisted `assignments`
-/// and left untouched by the steer.
+/// atom magnitude in its coefficients (as in `reconstruct_persisted_atom_set`).
+/// Gates are read from the persisted `assignments` and left untouched by the steer.
 pub fn steer_persisted_atom_set(
     basis_kinds: &[SaeAtomBasisKind],
     atom_dims: &[usize],
@@ -817,8 +816,8 @@ impl SaeManifoldTerm {
     /// the beta influence is what retains cross-atom and nuisance effects:
     /// `(A^-1 J A^-1)_beta,beta = sum_i u_i,beta u_i,beta'`,
     /// `u_i = A^-1 s_i`.  The score is built from the same compact support,
-    /// physical `exp(s)` Jacobian, row weights, and row metric as the fitted
-    /// objective.  Its single vector per row also retains every cross-output
+    /// physical decoder Jacobian, row weights, and row metric as the fitted
+    /// objective. Its single vector per row also retains every cross-output
     /// residual product in the outer product.
     fn joint_score_sandwich(
         &self,

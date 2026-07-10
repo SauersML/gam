@@ -23,9 +23,8 @@
 //! * `Product` / `ProductWithMetric` — the group action applied blockwise per
 //!   factor.
 //!
-//! The steered contribution keeps the FITTED amplitude `exp(s_k)` and the fitted
-//! per-row gate `a_{ik}` untouched: the intervention changes only WHICH value
-//! the feature takes (content) at fixed strength, never the strength itself.
+//! The steered contribution keeps the fitted per-row gate `a_{ik}` untouched:
+//! the intervention changes only which value the feature takes at fixed strength.
 //!
 //! Two surfaces:
 //! * [`SaeManifoldTerm::steer_rows`] returns the ambient DELTA
@@ -36,7 +35,7 @@
 use super::*;
 
 impl SaeManifoldAtom {
-    /// Ambient decode `exp(s_k)·Φ_k(coords)·B_k` at ARBITRARY coordinates,
+    /// Ambient decode `Φ_k(coords)·B_k` at arbitrary coordinates,
     /// returned as an `(coords.nrows(), p)` matrix — the steering counterpart of
     /// [`Self::fill_decoded_row`], which reads the atom's stored on-atom basis.
     ///
@@ -213,8 +212,8 @@ impl SaeManifoldTerm {
     /// atom's manifold), staying on the decoded feature image by construction.
     ///
     /// `δ` is a length-`d_k` chart step (the SAME `δ` applied to every selected
-    /// row). Amplitude `exp(s_k)` and gate `a_{ik}` are the fitted values,
-    /// untouched — the delta changes content at fixed strength. Circle closure is
+    /// row). The gate `a_{ik}` is held fixed, so the delta changes content at
+    /// fixed strength. Circle closure is
     /// exact up to floating-point wrap: `δ = 0` is an exactly-zero delta and
     /// `δ = period` returns to the start (`|Δ| ≈ 0`).
     pub fn steer_rows(

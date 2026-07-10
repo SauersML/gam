@@ -1505,8 +1505,8 @@ impl SaeManifoldAtom {
     /// jet `(n, M, d, d)` (from [`SaeManifoldTerm::atom_second_jets`]). This is the
     /// `f''` leg the Gauss-Newton `htt = J̃J̃ᵀ` omits; the SURE within-basin
     /// divergence correction contracts it against the metric residual `M·r`.
-    /// Mirrors [`Self::fill_decoded_derivative_row`] exactly (same decoder axpy,
-    /// same `exp(s)` log-amplitude scaling), only the basis weight is the diagonal
+    /// Mirrors [`Self::fill_decoded_derivative_row`] exactly (same decoder axpy),
+    /// only the basis weight is the diagonal
     /// second jet `∂²Φ/∂t_axis²` instead of the first jet `∂Φ/∂t_axis`.
     pub(crate) fn fill_decoded_second_derivative_row(
         &self,

@@ -305,12 +305,14 @@ pub(crate) fn certify_outer_stage(
 ) -> Result<SaeManifoldOuterObjective, SaeFitError> {
     match run_result {
         Ok(result) if result.converged => {
-            // #2235/#2241 — carry the engine's converged-via certificate
-            // (gradient-stationary / criterion-flat / recurrent-incumbent)
-            // onto the objective so `into_fitted` reports it on the payload.
             let mut objective = objective;
-            objective.outer_search_verdict = result.converged_via;
-            Ok(objective)
+            match objective.certify_outer_result(&result) {
+                Ok(()) => Ok(objective),
+                Err(_) => Err(SaeFitError::OuterDidNotConverge {
+                    stage,
+                    result: Box::new(result),
+                }),
+            }
         }
         Ok(result) => Err(SaeFitError::OuterDidNotConverge {
             stage,
@@ -349,8 +351,8 @@ pub struct SaeFitRequest {
 /// Run the SAE-manifold fit end-to-end from a fully-constructed, fully-configured
 /// seed `base_term` and its seed ρ. This is the python-free single source the
 /// binding, the CLI, and Rust library users all call. `base_term` must already
-/// carry every per-fit switch the binding installs (quotient-scale gauge, fit
-/// config, temperature schedule, softmax active cap, row metric, row loss
+/// carry every per-fit switch the binding installs (fit config, temperature
+/// schedule, softmax active cap, row metric, row loss
 /// weights, and the cold routing seed refinement) — this entry owns the fit and
 /// everything after it, not the seed construction.
 ///

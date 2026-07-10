@@ -1,4 +1,5 @@
 use super::*;
+use gam_solve::rho_optimizer::OuterResult;
 
 /// #1033 — temperature on the chart-geometry routing predictor's cosine-aligned
 /// logit `gate_logit_scale · ⟨x, γ̂⟩`. The alignment `⟨x, γ̂⟩` is on the natural
@@ -802,11 +803,12 @@ pub struct SaeManifoldOuterObjective {
     /// stationary / budget-exhausted). Freezes the criterion once a verdict
     /// fires so the bridge converges onto the banked incumbent.
     pub(crate) termination: OuterTerminationLedger,
-    /// #2235/#2241 — the converged-via certificate of the outer ρ-search,
-    /// stamped by `certify_outer_stage` from the certified `OuterResult`.
-    /// `None` means no outer search ran on this objective (the fixed-ρ lane),
-    /// which `into_fitted` reports as [`SaeOuterVerdict::FixedRho`].
-    pub(crate) outer_search_verdict: Option<OuterConvergedVia>,
+    /// Explicit proof of which converged optimization owns the currently
+    /// installed `(term, rho, loss)` state. `None` means UNCERTIFIED, not
+    /// fixed-rho: ordinary objective evaluations may populate `last_loss`, but
+    /// only [`Self::fit_at_fixed_rho`] or [`Self::certify_outer_result`] may
+    /// stamp a fit-producing verdict.
+    fit_verdict: Option<SaeOuterVerdict>,
     /// SPEC wall-survival: the full-`N` data fingerprint + content-addressed
     /// store path for the fit checkpoint (see [`super::checkpoint`]). Computed
     /// once at construction on the full-data target. Checkpoints are written
@@ -916,7 +918,7 @@ impl SaeManifoldOuterObjective {
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
             termination: OuterTerminationLedger::new(),
-            outer_search_verdict: None,
+            fit_verdict: None,
             checkpoint_fingerprint,
             checkpoint_path,
             crosscoder_blocks: None,
@@ -1366,18 +1368,63 @@ impl SaeManifoldOuterObjective {
         self.warm_start_telemetry.record(&outcome);
     }
 
+    /// Stamp the currently installed state with a successful outer search's
+    /// analytic convergence evidence.
+    ///
+    /// Merely receiving `OuterResult { converged: true, .. }` is insufficient:
+    /// the result must carry both the shared engine's explicit `converged_via`
+    /// verdict and a valid analytic criterion certificate, and its rho must be
+    /// bit-identical to the state currently installed on this objective. This
+    /// closes the #2230 hole where any successful evaluation populated
+    /// `last_loss` and `into_fitted` silently interpreted an absent search
+    /// verdict as `FixedRho`.
+    pub fn certify_outer_result(&mut self, result: &OuterResult) -> Result<(), String> {
+        self.fit_verdict = None;
+        if !result.converged {
+            return Err("outer result is not converged".to_string());
+        }
+        let via = result
+            .converged_via
+            .ok_or_else(|| "converged outer result is missing converged_via".to_string())?;
+        let certificate = result.criterion_certificate.as_ref().ok_or_else(|| {
+            "converged outer result is missing its analytic criterion certificate".to_string()
+        })?;
+        if !certificate.certifies() {
+            return Err(format!(
+                "outer criterion certificate does not certify the installed state: {}",
+                certificate.summary()
+            ));
+        }
+        if self.last_loss.is_none() {
+            return Err("outer result has no installed converged inner loss".to_string());
+        }
+        let installed_rho = self.current_rho.to_flat();
+        let rho_matches = installed_rho.len() == result.rho.len()
+            && installed_rho
+                .iter()
+                .zip(result.rho.iter())
+                .all(|(installed, certified)| installed.to_bits() == certified.to_bits());
+        if !rho_matches {
+            return Err(format!(
+                "outer result rho does not match the installed state (certified={:?}, installed={:?})",
+                result.rho, installed_rho
+            ));
+        }
+        self.fit_verdict = Some(SaeOuterVerdict::Search(via));
+        Ok(())
+    }
+
     /// Consume a converged objective, returning the exact certified `(term, ρ)`
-    /// pair and its inner loss. A never-evaluated objective is an error: only a
-    /// completed fixed-ρ solve or a certified outer search may mint a fit.
+    /// pair and its inner loss. A merely evaluated objective is an error: only a
+    /// completed fixed-ρ solve or an explicitly certified outer search may mint
+    /// a fit.
     pub fn into_fitted(self) -> Result<SaeIntoFittedResult, String> {
-        // #2235 — capture the termination ledger before `self` is consumed.
-        // A search-lane objective carries the converged-via certificate stamped
-        // by `certify_outer_stage`; its absence means no outer search ran here
-        // (the fixed-ρ lane) — that IS the FixedRho verdict, not a fallback.
-        let termination_report = self.termination.report(match self.outer_search_verdict {
-            Some(via) => SaeOuterVerdict::Search(via),
-            None => SaeOuterVerdict::FixedRho,
-        });
+        let verdict = self.fit_verdict.ok_or_else(|| {
+            "SaeManifoldOuterObjective::into_fitted: installed state is not explicitly certified; \
+             run fit_at_fixed_rho or certify a converged OuterResult before minting a fit"
+                .to_string()
+        })?;
+        let termination_report = self.termination.report(verdict);
         let Self {
             term,
             target,
@@ -1390,8 +1437,7 @@ impl SaeManifoldOuterObjective {
         let mut fitted = term;
         if last_loss.is_none() {
             return Err(
-                "SaeManifoldOuterObjective::into_fitted: no converged evaluation is installed; \
-                 run the fixed-rho solve or certify the outer search before minting a fit"
+                "SaeManifoldOuterObjective::into_fitted: certified state has no converged inner loss"
                     .to_string(),
             );
         }
@@ -2309,6 +2355,10 @@ impl SaeManifoldOuterObjective {
         drive: ProbeInnerDrive,
         basin_installed: bool,
     ) -> Result<(f64, Array1<f64>), String> {
+        // Any new criterion drive may change the installed inner state. A fit
+        // certificate is single-use evidence for the exact state/rho pair that
+        // produced it, never a sticky success flag.
+        self.fit_verdict = None;
         let rho = self.baseline_rho.from_flat(rho_flat);
         // #2231 Inc-B — materialize the block-relevance target scaling for THIS ρ
         // before any inner solve reads `self.target`. Every value/refine/member/
@@ -2631,7 +2681,9 @@ impl SaeManifoldOuterObjective {
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
-        self.evaluate_with_refine_policy(rho_flat, true).map(|_| ())
+        self.evaluate_with_refine_policy(rho_flat, true)?;
+        self.fit_verdict = Some(SaeOuterVerdict::FixedRho);
+        Ok(())
     }
 
     /// Evaluate a value-only rho probe without committing the inner basin it

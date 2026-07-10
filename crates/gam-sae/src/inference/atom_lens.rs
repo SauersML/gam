@@ -207,9 +207,7 @@ pub fn atom_two_lens(
     let mut any_coupling = vec![false; k];
 
     for (atom_idx, atom) in model.atoms.iter().enumerate() {
-        // Physical contribution norm `exp(s_k) * ||B_k||_F`. This is invariant
-        // under the exact scale gauge `B <- cB, s <- s - log(c)`, matching the
-        // physical derivatives used by coupling.
+        // Physical decoder norm, matching the derivatives used by coupling.
         let decoder_norm = atom.contribution_frobenius_scale();
 
         let latent_dim = atom.latent_dim;

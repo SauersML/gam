@@ -8426,6 +8426,24 @@ pub fn build_single_local_smooth_term(
                     end: end / s[0],
                 };
             }
+            // The SAME original-units-vs-standardized-frame reasoning applies
+            // to `spec.periodic` (the per-axis period vector the position API
+            // and mixed-periodicity tensor paths use): each declared period is
+            // in original covariate units and must be divided by that axis's
+            // σ_a, or the wrap folds standardized coordinates against an
+            // original-unit period (the #1074 seam failure, previously fixed
+            // only for the 1-D `boundary` spelling above).
+            if let (Some(s), Some(periods)) = (scales.as_ref(), spec_local.periodic.as_mut())
+                && s.len() == periods.len()
+            {
+                for (axis_period, &sigma) in periods.iter_mut().zip(s.iter()) {
+                    if sigma > 0.0
+                        && let Some(p) = axis_period.as_mut()
+                    {
+                        *p /= sigma;
+                    }
+                }
+            }
             if matches!(
                 spec_local.identifiability,
                 SpatialIdentifiability::OrthogonalToParametric

@@ -2671,9 +2671,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|atom| atom.contribution_frobenius_scale())
             .collect();
-        // Median physical contribution scale: the robust dictionary scale. This is
-        // `exp(s_k)‖B_k‖_F`, not just `‖B_k‖_F`, so the same guard remains live after
-        // the quotient representation moves magnitude into `s_k`.
+        // Median physical decoder norm: the robust dictionary scale.
         let mut sorted = norms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if k % 2 == 1 {

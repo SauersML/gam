@@ -313,8 +313,8 @@ impl AmplitudeConcentrationCertificate {
 }
 
 /// Certify one atom's realized amplitude-concentration law from the amplitudes
-/// `a_n ≥ 0` it fires with across its samples (the gated intensity per row, e.g.
-/// `exp(s_k)` times the per-row gate). The verdict is read from the fitted Beta
+/// `a_n ≥ 0` it fires with across its samples (the posterior gate per row). The
+/// verdict is read from the fitted Beta
 /// shape of the saturation-normalized amplitudes: U-shaped (`α < 1 ∧ β < 1`) ⟺
 /// [`AmplitudeConcentration::SpikeAtSaturation`], otherwise
 /// [`AmplitudeConcentration::Continuous`]; a degenerate / no-spread sample is
