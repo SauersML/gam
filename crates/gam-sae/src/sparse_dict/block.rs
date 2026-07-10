@@ -1703,7 +1703,7 @@ pub fn fit_block_sparse_dictionary(
         epochs_run = epoch + 1;
         let step = advance_block_sparse_state(x, &state, config, k)?;
         let (routing, reconstruction) =
-            routing_and_reconstruction_residuals(x, &state, &step.next);
+            routing_and_reconstruction_residuals(x, &state, &step.next, b);
         routing_residual = routing;
         reconstruction_residual = reconstruction;
         ev_residual = relative_scalar_change(
