@@ -200,11 +200,13 @@ pub struct SaeCrosscoderEvaluationConfig {
     pub law_gap_tolerance: Option<f64>,
 }
 
-/// Honest-unit reconstruction and per-atom decoders for one fitted layer.
+/// Honest-unit reconstruction and per-atom decoders for one fitted layer. The
+/// layer's TARGET is deliberately not retained (`reconstruction_r2` is computed
+/// at construction) — keeping it doubled the report's resident footprint for
+/// data every caller already owns.
 #[derive(Clone, Debug)]
 pub struct CrosscoderLayerFit {
     pub label: String,
-    pub target: Array2<f64>,
     pub fitted: Array2<f64>,
     pub reconstruction_r2: f64,
     pub decoders: Vec<Array2<f64>>,
@@ -241,10 +243,15 @@ pub struct SaeCrosscoderWireLayout {
     pub log_lambda_block: Vec<f64>,
 }
 
+/// One layer's wire view. The full `(n, p_l)` honest-unit reconstruction is
+/// deliberately NOT serialized: as nested JSON it cost ~32 bytes per number in
+/// a transient `serde_json::Value` tree (tens of GB at n=100k, p=5120) — read
+/// reconstructions from the Rust report's `layers[l].fitted` (or a dedicated
+/// numpy accessor) instead. Decoders are `(M, p_l)` per atom: small, and the
+/// scientific payload.
 #[derive(Clone, Debug, Serialize)]
 pub struct SaeCrosscoderWireLayer {
     pub label: String,
-    pub fitted: Vec<Vec<f64>>,
     pub reconstruction_r2: f64,
     pub decoders: Vec<Vec<Vec<f64>>>,
 }
@@ -756,7 +763,6 @@ impl SaeCrosscoderFitReport {
                 .iter()
                 .map(|layer| SaeCrosscoderWireLayer {
                     label: layer.label.clone(),
-                    fitted: array2_to_nested(&layer.fitted),
                     reconstruction_r2: layer.reconstruction_r2,
                     decoders: layer.decoders.iter().map(array2_to_nested).collect(),
                 })
@@ -867,7 +873,6 @@ pub fn run_sae_crosscoder_fit(
     layers.push(CrosscoderLayerFit {
         label: request.anchor_label,
         reconstruction_r2: reconstruction_r2(&request.anchor, &anchor_fitted)?,
-        target: request.anchor,
         fitted: anchor_fitted,
         decoders: anchor_decoders,
     });
@@ -882,7 +887,6 @@ pub fn run_sae_crosscoder_fit(
         layers.push(CrosscoderLayerFit {
             label: block.label,
             reconstruction_r2: reconstruction_r2(&block.target, &honest_fitted)?,
-            target: block.target,
             fitted: honest_fitted,
             decoders,
         });
@@ -893,7 +897,7 @@ pub fn run_sae_crosscoder_fit(
         Err(reason)
             if layers
                 .windows(2)
-                .any(|pair| pair[0].target.ncols() != pair[1].target.ncols()) =>
+                .any(|pair| pair[0].fitted.ncols() != pair[1].fitted.ncols()) =>
         {
             CrosscoderDriftStatus::Undefined { reason }
         }

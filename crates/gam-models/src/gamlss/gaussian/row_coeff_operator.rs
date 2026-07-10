@@ -502,12 +502,9 @@ impl gam_problem::HyperOperator for DesignTwoBlockRowCoeffOperator {
 impl DesignTwoBlockRowCoeffOperator {
     pub(crate) fn design_cache_token(design: &DesignMatrix) -> usize {
         match design {
-            DesignMatrix::Dense(DenseDesignMatrix::Materialized(matrix)) => {
-                Arc::as_ptr(matrix) as usize
-            }
-            DesignMatrix::Dense(DenseDesignMatrix::Lazy(op)) => {
-                Arc::as_ptr(op) as *const () as usize
-            }
+            // `cache_identity` is the canonical shared-Arc identity for both
+            // materialized and lazy dense designs.
+            DesignMatrix::Dense(dense) => dense.cache_identity(),
             DesignMatrix::Sparse(sparse) => sparse as *const _ as usize,
         }
     }

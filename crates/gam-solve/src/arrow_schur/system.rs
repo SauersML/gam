@@ -799,9 +799,10 @@ impl ArrowSchurSystem {
 
     /// Install current-iterate SAE device operands while retaining the outer
     /// descriptor allocation from a completed prior assembly when it is
-    /// uniquely owned. Only the allocation identity is reused: `data` replaces
-    /// the complete numerical payload, so no state-dependent operand or factor
-    /// crosses nonlinear iterates.
+    /// uniquely owned. Framed payloads also refill their nested row-cross/frame
+    /// vectors through `Vec::clone_from`, retaining matching capacities. `data`
+    /// still replaces every numerical value, so no state-dependent operand or
+    /// factor crosses nonlinear iterates.
     pub fn set_device_sae_pcg_data_reusing(
         &mut self,
         data: DeviceSaePcgData,
@@ -820,7 +821,7 @@ impl ArrowSchurSystem {
         let allocation = match recycled {
             Some(mut allocation) => match Arc::get_mut(&mut allocation) {
                 Some(slot) => {
-                    *slot = data;
+                    slot.replace_reusing_framed_allocations(data);
                     allocation
                 }
                 None => Arc::new(data),

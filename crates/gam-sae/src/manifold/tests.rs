@@ -1580,12 +1580,18 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
     let first_row_htt_ptr = first_row.htt.as_ptr() as usize;
     let first_row_htbeta_ptr = first_row.htbeta.as_ptr() as usize;
     let first_gb_ptr = term.arrow_assembly_workspace.gb.as_ptr() as usize;
-    let first_device_frame_ptr = term
+    let first_device = term
         .arrow_assembly_workspace
         .device_sae_pcg
         .as_ref()
         .filter(|data| data.frame.is_some())
-        .map_or(0, |data| Arc::as_ptr(data) as usize);
+        .expect("framed assembly returns its device descriptor");
+    let first_device_frame_ptr = Arc::as_ptr(first_device) as usize;
+    let first_device_row_htbeta_ptr = first_device
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.row_htbeta.first())
+        .map_or(0, |row| row.as_ptr() as usize);
     let first_numerical_bits: Vec<u64> = first_row
         .htt
         .iter()
@@ -1611,12 +1617,18 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .rows
         .first()
         .expect("driver returns reused row allocations to the workspace");
-    let second_device_frame_ptr = term
+    let second_device = term
         .arrow_assembly_workspace
         .device_sae_pcg
         .as_ref()
         .filter(|data| data.frame.is_some())
-        .map_or(0, |data| Arc::as_ptr(data) as usize);
+        .expect("reused framed assembly returns its device descriptor");
+    let second_device_frame_ptr = Arc::as_ptr(second_device) as usize;
+    let second_device_row_htbeta_ptr = second_device
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.row_htbeta.first())
+        .map_or(0, |row| row.as_ptr() as usize);
     let second_numerical_bits: Vec<u64> = second_row
         .htt
         .iter()
@@ -1640,14 +1652,24 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         "framed assembly must install DeviceSaePcgData"
     );
     assert_eq!(first_device_frame_ptr, second_device_frame_ptr);
+    assert_ne!(first_device_row_htbeta_ptr, 0);
+    assert_eq!(
+        first_device_row_htbeta_ptr, second_device_row_htbeta_ptr,
+        "dominant framed row H_tbeta host slab must retain its allocation"
+    );
     assert_ne!(
         first_numerical_bits, second_numerical_bits,
         "accepted state change must refresh Hessian/gradient numerical content"
     );
     eprintln!(
         "#1017 accepted-iteration residency telemetry: iterations=2 row_htt_ptr={} \
-         row_htbeta_ptr={} gb_ptr={} device_frame_ptr={} numerical_content_changed=true",
-        first_row_htt_ptr, first_row_htbeta_ptr, first_gb_ptr, first_device_frame_ptr,
+         row_htbeta_ptr={} gb_ptr={} device_frame_ptr={} device_row_htbeta_ptr={} \
+         numerical_content_changed=true",
+        first_row_htt_ptr,
+        first_row_htbeta_ptr,
+        first_gb_ptr,
+        first_device_frame_ptr,
+        first_device_row_htbeta_ptr,
     );
 }
 

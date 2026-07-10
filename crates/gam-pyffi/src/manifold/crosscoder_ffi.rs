@@ -21,8 +21,28 @@ impl ManifoldCrosscoderCore {
     }
 
     fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string(&self.wire_value()?)
-            .map_err(|error| py_value_error(error.to_string()))
+        // Serialize the struct directly — building the intermediate
+        // `serde_json::Value` tree first doubled the serialization cost.
+        serde_json::to_string(&self.wire).map_err(|error| py_value_error(error.to_string()))
+    }
+
+    /// Honest-unit `(n, p_layer)` reconstruction of one fitted layer as a numpy
+    /// array (single copy). Reconstructions are deliberately absent from
+    /// `to_dict`/`to_json` — as nested JSON they cost ~32 bytes per number.
+    fn layer_fitted<'py>(
+        &self,
+        py: Python<'py>,
+        layer: &str,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fit = self
+            .inner
+            .layers
+            .iter()
+            .find(|candidate| candidate.label == layer)
+            .ok_or_else(|| {
+                py_value_error(format!("crosscoder layer {layer:?} is not fitted"))
+            })?;
+        Ok(fit.fitted.clone().into_pyarray(py))
     }
 
     fn steer_layer_delta<'py>(

@@ -63,10 +63,7 @@ impl BetaCouplingGraph {
             }
         }
 
-        let edges: Vec<_> = edge_count
-            .keys()
-            .map(|&(a, b)| BetaEdge { a, b })
-            .collect();
+        let edges: Vec<_> = edge_count.keys().map(|&(a, b)| BetaEdge { a, b }).collect();
         let weights: Vec<f64> = edge_count.values().copied().collect();
         let mut degree = vec![0usize; num_blocks];
         for &BetaEdge { a, b } in &edges {
@@ -102,7 +99,10 @@ impl BetaCouplingGraph {
     }
 
     /// Co-visibility neighbours of `node` paired with their co-firing weights.
-    pub(crate) fn weighted_neighbours(&self, node: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+    pub(crate) fn weighted_neighbours(
+        &self,
+        node: usize,
+    ) -> impl Iterator<Item = (usize, f64)> + '_ {
         let lo = self.adj_start[node];
         let hi = self.adj_start[node + 1];
         self.adj_targets[lo..hi]
@@ -159,8 +159,12 @@ impl BetaCouplingGraph {
         if nb == 0 {
             return clusters;
         }
-        let block_cols =
-            |b: usize| block_offsets[b].end.saturating_sub(block_offsets[b].start).max(1);
+        let block_cols = |b: usize| {
+            block_offsets[b]
+                .end
+                .saturating_sub(block_offsets[b].start)
+                .max(1)
+        };
         let cap = max_block_cols.max(1);
         let mut assigned = vec![false; nb];
         for seed in 0..nb {
@@ -1059,6 +1063,42 @@ pub struct DeviceSaePcgData {
 }
 
 impl DeviceSaePcgData {
+    /// Replace a framed current-iterate payload while retaining the nested host
+    /// allocations that have stable shapes across nonlinear assemblies.
+    ///
+    /// Full-`B` payloads keep their freshly assembled `Arc` slices because those
+    /// exact allocations are shared with the CPU row operator. Framed payloads
+    /// have no such aliasing (`a_phi`/`local_jac` are empty), so `Vec::clone_from`
+    /// can reuse the dominant per-row dense `H_tβ` slabs, frame-Gram blocks, and
+    /// smooth blocks while replacing every numerical value.
+    pub(crate) fn replace_reusing_framed_allocations(&mut self, mut data: Self) {
+        if self.frame.is_none() || data.frame.is_none() {
+            *self = data;
+            return;
+        }
+        let new_frame = data.frame.take().expect("framed replacement checked above");
+        let current_frame = self.frame.as_mut().expect("framed receiver checked above");
+
+        self.p = data.p;
+        self.beta_dim = data.beta_dim;
+        self.a_phi = data.a_phi;
+        self.local_jac = data.local_jac;
+        self.smooth_blocks.clone_from(&data.smooth_blocks);
+        self.sparse_g_blocks.clone_from(&data.sparse_g_blocks);
+        current_frame.ranks.clone_from(&new_frame.ranks);
+        current_frame.basis_sizes.clone_from(&new_frame.basis_sizes);
+        current_frame
+            .border_offsets
+            .clone_from(&new_frame.border_offsets);
+        current_frame
+            .frame_blocks
+            .clone_from(&new_frame.frame_blocks);
+        current_frame
+            .smooth_ranks
+            .clone_from(&new_frame.smooth_ranks);
+        current_frame.row_htbeta.clone_from(&new_frame.row_htbeta);
+    }
+
     /// Snapshot the per-row active-atom support `a_phi` into a shared `Arc<[…]>`
     /// for the CPU residency operator ([`SaeResidentReducedSchur`]). Cloned once
     /// per CG-solve build (cost `O(Σ_i m_i)`, dwarfed by the per-row factor solves
@@ -1124,7 +1164,11 @@ impl std::fmt::Display for SaePcgOperandReport {
             "sae-pcg operand upload [{lane}]: total={total:.1}MiB k={k} \
              a_phi={pairs}pairs/{aphi:.1}MiB local_jac={lj:.1}MiB smooth={sm:.1}MiB \
              sparse_g={sg:.1}MiB row_htbeta={rh:.1}MiB({rhrows}rows) frame_blocks={fb:.1}MiB",
-            lane = if self.framed { "framed-dense" } else { "legacy-sparse" },
+            lane = if self.framed {
+                "framed-dense"
+            } else {
+                "legacy-sparse"
+            },
             total = mib(self.total_bytes),
             k = self.beta_dim,
             pairs = self.a_phi_pairs,
@@ -1165,8 +1209,11 @@ impl DeviceSaePcgData {
             if let Some(frame) = self.frame.as_ref() {
                 let rh_elems: usize = frame.row_htbeta.iter().map(|r| r.len()).sum();
                 let rh_rows = frame.row_htbeta.iter().filter(|r| !r.is_empty()).count();
-                let fb_elems: usize =
-                    frame.frame_blocks.iter().map(|b| b.g.len() + b.w.len()).sum();
+                let fb_elems: usize = frame
+                    .frame_blocks
+                    .iter()
+                    .map(|b| b.g.len() + b.w.len())
+                    .sum();
                 (true, rh_elems * F64, rh_rows, fb_elems * F64)
             } else {
                 (false, 0, 0, 0)

@@ -5599,27 +5599,32 @@ impl DesignMatrix {
     pub fn to_dense_cow(&self) -> Cow<'_, Array2<f64>> {
         match self {
             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => Cow::Borrowed(matrix.as_ref()),
-            Self::Dense(DenseDesignMatrix::Lazy(op)) => {
-                if let Some(dense) = op.as_dense_ref() {
+            Self::Dense(DenseDesignMatrix::Lazy(lazy)) => {
+                if let Some(dense) = lazy.as_dense_ref() {
                     Cow::Borrowed(dense)
                 } else {
                     let policy = ResourcePolicy::default_library();
                     panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
                         "DesignMatrix::to_dense_cow",
-                        op.nrows(),
-                        op.ncols(),
+                        lazy.nrows(),
+                        lazy.ncols(),
                         &policy,
                     )
                     .unwrap_or_else(|reason| std::panic::panic_any(reason));
-                    Cow::Owned(
-                        dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
-                            std::panic::panic_any(format!(
-                                "DesignMatrix::to_dense_cow: failed to materialize {}x{} \
-                                 operator-backed design via row chunks: {err}",
-                                op.nrows(),
-                                op.ncols(),
-                            ))
-                        }),
+                    // Materialize (or reuse) the design's governed dense memo
+                    // and borrow from it: zero-copy for repeat callers, and
+                    // the bytes stay charged on the joint ledger for the
+                    // memo's lifetime instead of escaping as an unaccounted
+                    // owned buffer per call.
+                    lazy.try_governed_dense_arc("DesignMatrix::to_dense_cow")
+                        // SAFETY: dense-by-contract accessor; refusal means the joint ledger cannot fit this design's dense form.
+                        .unwrap_or_else(|msg| std::panic::panic_any(msg));
+                    Cow::Borrowed(
+                        lazy.dense_memo
+                            .get()
+                            .expect("memo initialized by try_governed_dense_arc just above")
+                            .as_ref()
+                            .as_ref(),
                     )
                 }
             }

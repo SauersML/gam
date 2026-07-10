@@ -79,6 +79,25 @@ fn device_sae_fixture() -> ArrowSchurSystem {
     sys
 }
 
+fn framed_device_data(row_value: f64) -> DeviceSaePcgData {
+    DeviceSaePcgData {
+        p: 1,
+        beta_dim: 2,
+        a_phi: Arc::from(Vec::new().into_boxed_slice()),
+        local_jac: Arc::from(Vec::new().into_boxed_slice()),
+        smooth_blocks: Vec::new(),
+        sparse_g_blocks: Vec::new(),
+        frame: Some(DeviceSaeFrameData {
+            ranks: vec![1],
+            basis_sizes: vec![2],
+            border_offsets: vec![0],
+            frame_blocks: Vec::new(),
+            smooth_ranks: Vec::new(),
+            row_htbeta: vec![vec![row_value; 2]; 2],
+        }),
+    }
+}
+
 /// The production large-border mode (`InexactPCG`) must consume one
 /// ladder-scoped SAE resident frame across every recoverable LM ridge trial.
 ///
@@ -170,4 +189,34 @@ fn nonlinear_prepare_keeps_frame_identity_and_refreshes_current_content_1017() {
             .expect("report nonlinear refresh ledger")
             .as_slice(),
     );
+}
+
+/// The framed descriptor's dominant nested row-cross slabs are allocation
+/// workspace too: refill them in place, but replace every numerical value.
+#[test]
+fn framed_device_descriptor_reuses_nested_row_cross_allocations_1017() {
+    let mut sys = ArrowSchurSystem::new(2, 1, 2);
+    sys.set_device_sae_pcg_data(framed_device_data(1.0));
+    let recycled = sys.device_sae_pcg.take().expect("first framed descriptor");
+    let descriptor_ptr = Arc::as_ptr(&recycled) as usize;
+    let row_ptr = recycled
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.row_htbeta.first())
+        .map_or(0, |row| row.as_ptr() as usize);
+
+    sys.set_device_sae_pcg_data_reusing(framed_device_data(7.0), Some(recycled));
+    let refreshed = sys
+        .device_sae_pcg
+        .as_ref()
+        .expect("refreshed framed descriptor");
+    let refreshed_row = refreshed
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.row_htbeta.first())
+        .expect("refreshed row-cross slab");
+    assert_eq!(descriptor_ptr, Arc::as_ptr(refreshed) as usize);
+    assert_ne!(row_ptr, 0);
+    assert_eq!(row_ptr, refreshed_row.as_ptr() as usize);
+    assert!(refreshed_row.iter().all(|&value| value == 7.0));
 }
