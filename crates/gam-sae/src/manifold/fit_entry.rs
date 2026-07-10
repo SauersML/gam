@@ -475,7 +475,12 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
     //
     // Covariance-domain damping (residual-fix's `row_metric_damped`):
     // Σ_t = (1−γ)·Σ_prev + γ·Σ̂_t, with Σ_prev = the previous pass's fitted model
-    // (or I on the first structured pass). A small, increasing γ schedule
+    // (or, on the first structured pass, the MEASURED iid anchor φ̂·I —
+    // `isotropic_dispersion`, #2243 cap #2: a unit-I anchor assumed unit noise,
+    // so near-noiseless factors were whitened ~1/φ̂ too coarsely and the
+    // unit-dispersion REML criterion over-penalized them; anchoring at the
+    // measured scale prices the smoothing penalty against the real
+    // dispersion). A small, increasing γ schedule
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
     // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
     // builds a genuine WhitenedStructured blend).
