@@ -4898,6 +4898,33 @@ impl SaeManifoldTerm {
         // atom (`base`/`step_2300`, `r_k == M_k`) is left untouched, so its
         // design, decoder, and REML criterion are byte-for-byte the historical
         // full-`B` path.
+        {
+            let (n_t, p_t) = target.dim();
+            let mut cmin = f64::INFINITY;
+            let mut cmax = 0.0_f64;
+            let mut first = 0.0_f64;
+            let mut last = 0.0_f64;
+            for c in 0..p_t {
+                let mut s = 0.0_f64;
+                for r in 0..n_t {
+                    s += target[[r, c]] * target[[r, c]];
+                }
+                let cn = (s / (n_t as f64)).sqrt();
+                cmin = cmin.min(cn);
+                cmax = cmax.max(cn);
+                if c == 0 {
+                    first = cn;
+                }
+                if c + 1 == p_t {
+                    last = cn;
+                }
+            }
+            eprintln!(
+                "[zz2015entry] n={n_t} p={p_t} colnorm_first={first:.4e} colnorm_last={last:.4e} colnorm_min={cmin:.4e} colnorm_max={cmax:.4e} ratio={:.4e} k_atoms={}",
+                cmax / cmin.max(1e-300),
+                self.k_atoms(),
+            );
+        }
         self.reduce_atoms_to_data_supported_rank()?;
         // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
         // outer loop, auto-derive and install the low-rank Grassmann frames
