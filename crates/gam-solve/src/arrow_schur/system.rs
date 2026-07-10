@@ -1717,7 +1717,8 @@ impl StreamingArrowSchur {
             let this: &Self = self;
             let row_into = |row_idx: usize,
                             rhs_part: &mut Array1<f64>,
-                            s_part: &mut Array2<f64>|
+                            s_part: &mut Array2<f64>,
+                            stack: &mut ChunkSchurStack|
              -> Result<(), ArrowSchurError> {
                 let row = (this.row_builder)(row_idx)?;
                 let di = row.htt.nrows();
@@ -1740,12 +1741,12 @@ impl StreamingArrowSchur {
                     // the dense Schur subtraction here (see the serial branch).
                     ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
                         let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
-                        backend.block_gemm_subtract(s_part, &htbeta, &solved);
+                        stack.subtract_or_stack(&backend, s_part, &htbeta, &solved);
                     }
                     ArrowSolverMode::SqrtBA => {
                         let whitened =
                             backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
-                        backend.block_gemm_subtract(s_part, &whitened, &whitened);
+                        stack.subtract_or_stack(&backend, s_part, &whitened, &whitened);
                     }
                 }
                 Ok(())
@@ -1756,9 +1757,14 @@ impl StreamingArrowSchur {
                 .map(|idxs| {
                     let mut rhs_part = Array1::<f64>::zeros(k);
                     let mut s_part = Array2::<f64>::zeros((k, k));
+                    // Dense-support rows accumulate into ONE stacked GEMM per
+                    // chunk instead of a per-row scalar scatter; sparse rows
+                    // keep the nnz-scaled scatter (see `ChunkSchurStack`).
+                    let mut stack = ChunkSchurStack::new(k);
                     for i in idxs {
-                        row_into(i, &mut rhs_part, &mut s_part)?;
+                        row_into(i, &mut rhs_part, &mut s_part, &mut stack)?;
                     }
+                    stack.flush(&mut s_part);
                     Ok::<_, ArrowSchurError>((rhs_part, s_part))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3931,5 +3937,105 @@ impl ArrowFactorCache {
             }
         }
         Ok(out)
+    }
+}
+
+/// Per-chunk stacked Schur subtraction for the parallel assembly fan-out.
+///
+/// Dense rows are appended into stacked `(Σd × k)` factors and subtracted with
+/// ONE sequential SIMD GEMM per chunk (`s_part -= Lᵀ R`) — the CPU mirror of
+/// the device `tile_schur_partial` stacking — while rows with sparse column
+/// support keep the nnz-scaled scatter (#1995), which beats a dense GEMM
+/// there.
+///
+/// The crossover is derived, not tuned. The scatter costs
+/// `Σ_c nnz_l(c)·nnz_r(c)` scalar FMAs against a randomly indexed `k×k`
+/// accumulator (unvectorizable), while the row's share of the stacked GEMM is
+/// `d·k²` FMAs at SIMD throughput — ≈8 f64 FMAs per cycle (4-lane vectors,
+/// dual issue) on both x86-64/AVX2 and aarch64/NEON. The GEMM therefore wins
+/// once `scatter_flops > d·k²/8`. Pricing this needs one `O(d·k)` support
+/// count, the same scan the scatter pays to build its active lists, so a
+/// "scatter" verdict wastes nothing and a "stack" verdict wastes only the
+/// count.
+///
+/// Numerics: the stacked GEMM reassociates the within-chunk row sum relative
+/// to the per-row scatter — the same reassociation class as the existing
+/// chunk-partial fold and the device stacking, and deterministic run-to-run
+/// (`Par::Seq` inside the worker per #1557).
+struct ChunkSchurStack {
+    left: Vec<f64>,
+    right: Vec<f64>,
+    stacked_rows: usize,
+    k: usize,
+}
+
+impl ChunkSchurStack {
+    fn new(k: usize) -> Self {
+        Self {
+            left: Vec::new(),
+            right: Vec::new(),
+            stacked_rows: 0,
+            k,
+        }
+    }
+
+    /// Either scatter this row's Schur contribution immediately (sparse
+    /// support) or append its factors to the chunk stack (dense support).
+    fn subtract_or_stack(
+        &mut self,
+        backend: &CpuBatchedBlockSolver,
+        s_part: &mut Array2<f64>,
+        left: &Array2<f64>,
+        right: &Array2<f64>,
+    ) {
+        let k = self.k;
+        let d = left.nrows();
+        debug_assert_eq!(left.ncols(), k);
+        debug_assert_eq!(right.dim(), (d, k));
+        debug_assert_eq!(s_part.dim(), (k, k));
+        let mut scatter_flops = 0usize;
+        for c in 0..d {
+            let mut nnz_left = 0usize;
+            let mut nnz_right = 0usize;
+            for col in 0..k {
+                nnz_left += usize::from(left[[c, col]] != 0.0);
+                nnz_right += usize::from(right[[c, col]] != 0.0);
+            }
+            scatter_flops += nnz_left * nnz_right;
+        }
+        if scatter_flops <= d * k * k / 8 {
+            backend.block_gemm_subtract(s_part, left, right);
+            return;
+        }
+        for source in [(left, &mut self.left), (right, &mut self.right)] {
+            let (matrix, stack) = source;
+            if let Some(values) = matrix.as_slice() {
+                stack.extend_from_slice(values);
+            } else {
+                stack.extend(matrix.iter().copied());
+            }
+        }
+        self.stacked_rows += d;
+    }
+
+    /// Subtract every stacked row in one sequential SIMD GEMM.
+    fn flush(&mut self, s_part: &mut Array2<f64>) {
+        if self.stacked_rows == 0 {
+            return;
+        }
+        let shape = (self.stacked_rows, self.k);
+        let left = ndarray::ArrayView2::from_shape(shape, self.left.as_slice())
+            .expect("ChunkSchurStack left buffer matches its recorded shape");
+        let right = ndarray::ArrayView2::from_shape(shape, self.right.as_slice())
+            .expect("ChunkSchurStack right buffer matches its recorded shape");
+        let product = gam_linalg::faer_ndarray::fast_atb_with_parallelism(
+            &left,
+            &right,
+            faer::Par::Seq,
+        );
+        *s_part -= &product;
+        self.left.clear();
+        self.right.clear();
+        self.stacked_rows = 0;
     }
 }

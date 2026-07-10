@@ -120,10 +120,25 @@ fn column_centered(values: ArrayView2<f64>) -> Array2<f64> {
 fn atom_code_spectrum(contribution: ArrayView2<f64>, code_dim: usize) -> Result<Vec<f64>, String> {
     let rows = contribution.nrows();
     let centered = column_centered(contribution);
+    let denom = (rows.saturating_sub(1)).max(1) as f64;
+    // Flat-atom fast path (#2233). A `code_dim == 1` atom transmits a single
+    // scalar code times one decoder row, so its contribution — and, since
+    // column-centering only subtracts a per-column constant, its centered form —
+    // is exactly rank one. A rank-one matrix has a single nonzero singular value
+    // equal to its Frobenius norm, so `σ₁² = ‖centered‖_F²` with no SVD. This is
+    // the dominant scorer cost at large overcompleteness (a K=32768 TopK
+    // dictionary is entirely flat atoms), where an O(rows·d) sum of squares
+    // replaces an O(rows·d·min(rows,d)) SVD per atom. It is exact for the rank-one
+    // flat contributions the scorer is fed (parity-gated against the SVD path);
+    // it would over-count if handed a genuinely higher-rank `code_dim == 1`
+    // contribution, which the featurizer construction never produces.
+    if code_dim == 1 {
+        let frobenius_sq: f64 = centered.iter().map(|&value| value * value).sum();
+        return Ok(vec![frobenius_sq / denom]);
+    }
     let (_u, singular_values, _vt) = centered
         .svd(false, false)
         .map_err(|e| format!("atom contribution SVD failed: {e:?}"))?;
-    let denom = (rows.saturating_sub(1)).max(1) as f64;
     let keep = code_dim.min(singular_values.len());
     Ok(singular_values
         .iter()
@@ -367,5 +382,62 @@ mod tests {
     fn production_eq4_rejects_negative_dimensions_and_dictionary_cost() {
         assert!(fixture(&[-1], 0).unwrap_err().contains("code_dims"));
         assert!(fixture(&[1], -1).unwrap_err().contains("dictionary_params"));
+    }
+
+    #[test]
+    fn flat_atom_fast_path_matches_svd_to_tolerance() {
+        // A rank-one contribution: scalar codes ⊗ one decoder row — the exact
+        // shape a flat (code_dim == 1) atom transmits. The Frobenius fast path
+        // must equal the top singular value of the column-centered matrix.
+        let codes = array![0.3_f64, -1.2, 2.5, 0.0, 4.1, -0.7];
+        let decoder = array![1.5_f64, -0.5, 2.0, 0.25];
+        let mut contribution = Array2::<f64>::zeros((codes.len(), decoder.len()));
+        for (i, &code) in codes.iter().enumerate() {
+            for (j, &weight) in decoder.iter().enumerate() {
+                contribution[[i, j]] = code * weight;
+            }
+        }
+        let fast = atom_code_spectrum(contribution.view(), 1).unwrap();
+        // Reference: explicit SVD of the column-centered matrix, top value only.
+        let centered = column_centered(contribution.view());
+        let (_u, singular_values, _vt) = centered.svd(false, false).unwrap();
+        let denom = (codes.len() - 1) as f64;
+        let svd_spectrum = singular_values[0] * singular_values[0] / denom;
+        assert_eq!(fast.len(), 1);
+        assert!(
+            (fast[0] - svd_spectrum).abs() <= 1.0e-10 * (1.0 + svd_spectrum.abs()),
+            "fast {} vs svd {}",
+            fast[0],
+            svd_spectrum
+        );
+        // Confirm the centered contribution really is rank one (the assumption
+        // the fast path rests on): the second singular value must vanish.
+        if singular_values.len() > 1 {
+            assert!(
+                singular_values[1] <= 1.0e-9 * singular_values[0].max(1.0),
+                "flat contribution was not rank-one: {singular_values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curved_atom_still_uses_full_svd_spectrum() {
+        // A rank-two contribution with code_dim == 2 must keep both singular
+        // values via the SVD path (the fast path fires only for code_dim == 1).
+        let contribution = array![
+            [1.0_f64, 0.0, 0.5],
+            [0.0, 2.0, 0.5],
+            [1.0, 2.0, 1.0],
+            [2.0, 1.0, 1.5],
+            [3.0, 0.0, 1.5],
+        ];
+        let spectrum = atom_code_spectrum(contribution.view(), 2).unwrap();
+        assert_eq!(spectrum.len(), 2);
+        let centered = column_centered(contribution.view());
+        let (_u, singular_values, _vt) = centered.svd(false, false).unwrap();
+        let denom = (contribution.nrows() - 1) as f64;
+        for (k, value) in spectrum.iter().enumerate() {
+            assert!((value - singular_values[k] * singular_values[k] / denom).abs() < 1.0e-12);
+        }
     }
 }
