@@ -571,6 +571,18 @@ impl CostStallGuard {
             self.no_improve_streak = self.no_improve_streak.saturating_add(1);
         } else {
             self.no_improve_streak = 0;
+            // A genuine super-floor improvement means the last stuck-stall
+            // escape (if any) restored real descent, so replenish the escape
+            // budget: [`STUCK_STALL_MAX_ESCAPES`] then bounds CONSECUTIVE
+            // fruitless escapes — the documented pathological-surface case —
+            // rather than the total number of productive basin hops a
+            // multi-shelf descent needs (measured on the #2253 repro: the
+            // 7th escape bought a 36-point objective drop and the lifetime
+            // cap still killed the seed). Termination is preserved because
+            // each replenishment requires an improvement strictly above the
+            // relative floor and the criterion is bounded below, so only
+            // finitely many resets can occur.
+            self.stuck_escapes = 0;
         }
         if self.no_improve_streak < self.window {
             return CostStallVerdict::Continue;
