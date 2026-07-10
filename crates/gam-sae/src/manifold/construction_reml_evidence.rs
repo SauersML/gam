@@ -725,6 +725,9 @@ impl SaeManifoldTerm {
         };
         let mut previous_refine_grad_norm: Option<f64> = None;
         let mut saw_refine_progress = false;
+        // #2234 — one progress-gated extra refinement window (see the budget
+        // escalation at the non-convergence refusal below). 0 until granted.
+        let mut budget_escalation_extra = 0usize;
         // #1051 — objective-stagnation convergence. On an ill-conditioned
         // penalised bilinear fit (the euclidean / Duchon decoder × latent
         // coordinate system on a trivial shape), the inner Newton crawls: each
@@ -1035,24 +1038,49 @@ impl SaeManifoldTerm {
                 grad_norm,
                 saw_refine_progress,
             );
-            if total_inner_iter >= refine_limit {
-                // Inner solve did not converge in reml_criterion; the returned
-                // Err below carries the non-convergence diagnostic (gradient /
-                // quotient-gradient norms and the tolerance) to the caller. The
-                // historical quotient-Newton-step figures are no longer printed:
-                // the pre-stationarity Newton step was ALWAYS diagnostic-only
-                // (convergence is judged on the factorisation-independent KKT
-                // gradient), and the #2080 restructure above no longer pays the
-                // full dense factorization that produced it at non-stationary
-                // rounds.
-                return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
-                     neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
-                     ‖Π⊥gauge g‖={quotient_grad_norm:.6e} met tolerance {grad_tolerance:.6e} \
-                     after {total_inner_iter} inner iterations. Refusing to rank an \
-                     off-optimum Laplace criterion."
-                ));
+            if total_inner_iter >= refine_limit + budget_escalation_extra {
+                // #2234 stall synthesis — one PROGRESS-GATED budget escalation.
+                // Two prior designs collide here: the #2080 wide-p hang fix makes
+                // budget-limited solves refuse fast, and #2241 maps that refusal
+                // to the finite 1e12 wall — so at any ρ whose inner problem needs
+                // more than the budget, EVERY lane that lands here walls, the
+                // line search sees cliffs in all directions, and the outer fit
+                // freezes at a live gradient and refuses to mint (measured
+                // fleet-wide 2026-07-10: gam-sae 126 test failures, ten-orders
+                // cost-lane disagreement at one ρ). A solve that is MEASURABLY
+                // DESCENDING (`saw_refine_progress`) is an unfinished
+                // computation, not an infeasibility: grant it ONE additional
+                // window of the same size and keep refining. A non-progressing
+                // solve still refuses immediately — exactly the #2080 hang
+                // protection — and a second budget death refuses regardless.
+                if saw_refine_progress && budget_escalation_extra == 0 {
+                    budget_escalation_extra = refine_limit.max(1);
+                    log::debug!(
+                        "SaeManifoldTerm::reml_criterion: budget escalation at fixed ρ — \
+                         ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) still descending after \
+                         {total_inner_iter} inner iterations; granting one extra window of \
+                         {budget_escalation_extra} iterations"
+                    );
+                } else {
+                    // Inner solve did not converge in reml_criterion; the returned
+                    // Err below carries the non-convergence diagnostic (gradient /
+                    // quotient-gradient norms and the tolerance) to the caller. The
+                    // historical quotient-Newton-step figures are no longer printed:
+                    // the pre-stationarity Newton step was ALWAYS diagnostic-only
+                    // (convergence is judged on the factorisation-independent KKT
+                    // gradient), and the #2080 restructure above no longer pays the
+                    // full dense factorization that produced it at non-stationary
+                    // rounds.
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
+                         neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
+                         ‖Π⊥gauge g‖={quotient_grad_norm:.6e} met tolerance {grad_tolerance:.6e} \
+                         after {total_inner_iter} inner iterations. Refusing to rank an \
+                         off-optimum Laplace criterion."
+                    ));
+                }
             }
+            let refine_limit = refine_limit + budget_escalation_extra;
             let remaining = refine_limit - total_inner_iter;
             let refine_iter = inner_max_iter.max(1).min(remaining);
             saw_refine_progress |=
