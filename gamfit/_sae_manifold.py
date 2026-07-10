@@ -2973,7 +2973,7 @@ def sae_manifold_fit_stagewise(
     *,
     d_atom: int = 1,
     atom_topology: str = "circle",
-    assignment: str = "ibp_map",
+    assignment: str = "softmax",
     structured_whitening: bool | None = None,
     fisher_factors: Any = None,
     cone_atom_recovery: bool = False,
@@ -3016,8 +3016,10 @@ def sae_manifold_fit_stagewise(
         Seed atom topology. Only centers-free analytic bases are supported by the
         precomputed stagewise FFI: ``"circle"`` (periodic) and ``"sphere"``.
     assignment
-        Assignment/gate family (``"ibp_map"`` / ``"softmax"`` / ``"threshold_gate"``
-        and their aliases), resolved through the shared public validator.
+        Assignment/gate family, resolved through the shared public validator.
+        ``"softmax"`` is the default and carries posterior responsibility mass
+        through births and backfitting. ``"ibp_map"`` remains an explicit MAP
+        opt-in; ``"threshold_gate"`` selects the hard threshold gate.
     structured_whitening
         Install the Σ-whitened per-row metric on each birth so the K=1 candidate
         fits run under the structured residual covariance from atom one (Σ is
@@ -3068,7 +3070,7 @@ def sae_manifold_fit_stagewise(
         Inner coordinate / β ridges for the stagewise fits.
     alpha, tau
         Assignment concentration / temperature. ``None`` resolves to the seed
-        fit's values (K-aware IBP α; τ = 0.5).
+        fit's values (K-aware IBP α when ``assignment="ibp_map"``; τ = 0.5).
     random_state
         Seed forwarded to the K=1 seed fit's initializer.
     progress_callback
@@ -3151,7 +3153,7 @@ def sae_manifold_fit_stagewise(
         K=1,
         d_atom=d0,
         atom_topology=atom_topology,
-        assignment=assignment,
+        assignment=kind,
         isometry_weight=isometry_weight,
         sparsity_weight=sparsity_weight,
         smoothness_weight=smoothness_weight,

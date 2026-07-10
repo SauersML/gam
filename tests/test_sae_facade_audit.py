@@ -373,6 +373,9 @@ def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
     assert signature.parameters["nuclear_norm_weight"].default == 1.0
     assert signature.parameters["decoder_incoherence_weight"].default == 1.0
 
+    stagewise_signature = inspect.signature(sae.sae_manifold_fit_stagewise)
+    assert stagewise_signature.parameters["assignment"].default == "softmax"
+
 
 def test_trust_diagnostics_normalize_and_round_trip():
     diagnostics = _diagnostics(2, trust=[0.25, 0.75])
