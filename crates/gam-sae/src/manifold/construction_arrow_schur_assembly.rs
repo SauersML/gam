@@ -2394,7 +2394,8 @@ impl SaeManifoldTerm {
             // slab. On the isotropic path it is `Some`, keeping the device PCG.
             if !has_dense_beta_penalty {
                 if let Some(device_frame_blocks) = device_frame_blocks {
-                    let device = crate::frames::build_framed_device_sae_data(
+                    let recycled = self.arrow_assembly_workspace.device_sae_pcg.take();
+                    let device = crate::frames::build_framed_device_sae_data_reusing(
                         crate::frames::FramedDeviceArgs {
                             p,
                             border_dim,
@@ -2405,8 +2406,9 @@ impl SaeManifoldTerm {
                             frame_blocks: device_frame_blocks,
                             rows: &sys.rows,
                         },
+                        recycled,
                     );
-                    self.install_device_sae_pcg_data(&mut sys, device);
+                    sys.set_device_sae_pcg_allocation(device);
                 }
             }
         } else if whitens_likelihood {

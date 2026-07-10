@@ -464,6 +464,107 @@ pub(crate) fn build_framed_device_sae_data(
     }
 }
 
+/// Build current framed device operands while refilling a uniquely owned prior
+/// descriptor in place when its framed layout remains usable. In particular,
+/// each row's dense `H_tβ` vector is resized and overwritten directly from the
+/// production [`gam_solve::arrow_schur::ArrowRowBlock`] instead of allocating a
+/// second full row-slab tree and copying it into the retained descriptor
+/// afterward.
+pub(crate) fn build_framed_device_sae_data_reusing(
+    args: FramedDeviceArgs<'_>,
+    recycled: Option<std::sync::Arc<gam_solve::arrow_schur::DeviceSaePcgData>>,
+) -> std::sync::Arc<gam_solve::arrow_schur::DeviceSaePcgData> {
+    if let Some(mut allocation) = recycled {
+        if let Some(data) = std::sync::Arc::get_mut(&mut allocation) {
+            if data.frame.is_some() {
+                refresh_framed_device_sae_data(data, args);
+                return allocation;
+            }
+        }
+        return std::sync::Arc::new(build_framed_device_sae_data(args));
+    }
+    std::sync::Arc::new(build_framed_device_sae_data(args))
+}
+
+fn refresh_framed_device_sae_data(
+    data: &mut gam_solve::arrow_schur::DeviceSaePcgData,
+    args: FramedDeviceArgs<'_>,
+) {
+    let FramedDeviceArgs {
+        p,
+        border_dim,
+        border_offsets,
+        ranks,
+        basis_sizes,
+        smooth_scaled_s,
+        frame_blocks,
+        rows,
+    } = args;
+    data.p = p;
+    data.beta_dim = border_dim;
+    if !data.a_phi.is_empty() {
+        data.a_phi = std::sync::Arc::from(Vec::new().into_boxed_slice());
+    }
+    if !data.local_jac.is_empty() {
+        data.local_jac = std::sync::Arc::from(Vec::new().into_boxed_slice());
+    }
+    if data.smooth_blocks.len() == smooth_scaled_s.len() {
+        for (atom_idx, (block, source)) in data
+            .smooth_blocks
+            .iter_mut()
+            .zip(smooth_scaled_s)
+            .enumerate()
+        {
+            block.global_offset = border_offsets[atom_idx];
+            block.factor_a.clone_from(source);
+        }
+    } else {
+        data.smooth_blocks = smooth_scaled_s
+            .iter()
+            .enumerate()
+            .map(
+                |(atom_idx, source)| gam_solve::arrow_schur::DeviceSaeSmoothBlock {
+                    global_offset: border_offsets[atom_idx],
+                    factor_a: source.clone(),
+                },
+            )
+            .collect();
+    }
+    data.sparse_g_blocks.clear();
+
+    let frame = data
+        .frame
+        .as_mut()
+        .expect("framed descriptor checked before refresh");
+    frame.ranks.clear();
+    frame.ranks.extend_from_slice(ranks);
+    frame.basis_sizes.clear();
+    frame.basis_sizes.extend_from_slice(basis_sizes);
+    frame.border_offsets.clear();
+    frame.border_offsets.extend_from_slice(border_offsets);
+    frame.frame_blocks = frame_blocks;
+    frame.smooth_ranks.clear();
+    frame.smooth_ranks.extend_from_slice(ranks);
+    frame.row_htbeta.resize_with(rows.len(), Vec::new);
+    for (target, row) in frame.row_htbeta.iter_mut().zip(rows) {
+        let (qi, width) = row.htbeta.dim();
+        if width != border_dim {
+            target.clear();
+            continue;
+        }
+        target.resize(qi * width, 0.0);
+        if let Some(source) = row.htbeta.as_slice() {
+            target.copy_from_slice(source);
+        } else {
+            for c in 0..qi {
+                for a in 0..width {
+                    target[c * width + a] = row.htbeta[[c, a]];
+                }
+            }
+        }
+    }
+}
+
 /// Relative spectral cutoff used when the Grassmann-frame factorization decides
 /// the effective column rank `r` of an atom's decoder `B_k` (issue #972). A
 /// singular value of `B_k` below `cutoff · σ_max` carries `< (σ/σ_max)²` of the

@@ -797,6 +797,16 @@ impl ArrowSchurSystem {
         self.set_device_sae_pcg_data_reusing(data, None);
     }
 
+    /// Install an already allocation-resident SAE device descriptor.
+    pub fn set_device_sae_pcg_allocation(&mut self, data: Arc<DeviceSaePcgData>) {
+        assert_eq!(data.beta_dim, self.k);
+        if data.frame.is_none() {
+            assert_eq!(data.a_phi.len(), self.rows.len());
+            assert_eq!(data.local_jac.len(), self.rows.len());
+        }
+        self.device_sae_pcg = Some(data);
+    }
+
     /// Install current-iterate SAE device operands while retaining the outer
     /// descriptor allocation from a completed prior assembly when it is
     /// uniquely owned. Framed payloads also refill their nested row-cross/frame
@@ -828,7 +838,7 @@ impl ArrowSchurSystem {
             },
             None => Arc::new(data),
         };
-        self.device_sae_pcg = Some(allocation);
+        self.set_device_sae_pcg_allocation(allocation);
     }
 
     /// Return the effective penalty operator: the installed `penalty_op` if

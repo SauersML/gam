@@ -1592,6 +1592,14 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .as_ref()
         .and_then(|frame| frame.row_htbeta.first())
         .map_or(0, |row| row.as_ptr() as usize);
+    let first_device_row_htbeta_bits: Vec<u64> = first_device
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.row_htbeta.first())
+        .into_iter()
+        .flatten()
+        .map(|value| value.to_bits())
+        .collect();
     let first_numerical_bits: Vec<u64> = first_row
         .htt
         .iter()
@@ -1656,6 +1664,18 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
     assert_eq!(
         first_device_row_htbeta_ptr, second_device_row_htbeta_ptr,
         "dominant framed row H_tbeta host slab must retain its allocation"
+    );
+    let second_device_row_htbeta_bits: Vec<u64> = second_device
+        .frame
+        .as_ref()
+        .and_then(|frame| frame.row_htbeta.first())
+        .into_iter()
+        .flatten()
+        .map(|value| value.to_bits())
+        .collect();
+    assert_ne!(
+        first_device_row_htbeta_bits, second_device_row_htbeta_bits,
+        "retained framed row H_tbeta slab must be numerically refreshed"
     );
     assert_ne!(
         first_numerical_bits, second_numerical_bits,

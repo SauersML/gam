@@ -30,6 +30,7 @@ use super::*;
 use crate::assignment::{AssignmentMode, SaeAssignment};
 use approx::assert_abs_diff_eq;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+use gam_solve::rho_optimizer::{FixedPointCoordinateCertificate, OuterObjective};
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
 
@@ -284,6 +285,57 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
     // hard error) precisely because the matrix-free lane is admitted.
     plan.admitted_or_error(n, border_dim, k)
         .expect("matrix-free-admitted plan must not hard-error at the admission gate");
+}
+
+/// The matrix-free planner's unavailable-gradient declaration is only the first
+/// half of the certification contract.  Exercise the objective-owned FINAL
+/// fixed-point proof hook itself on a non-IBP assignment and pin the formerly
+/// dangerous coordinate: `eval_efs` holds `log_lambda_sparse` at a zero iteration
+/// step because softmax entropy has no Fellner--Schall equation, but the proof
+/// hook must report that zero as `Uncovered`, never as a solved residual.
+///
+/// This is deliberately a small dense fixture so the regression is cheap.  The
+/// hook and its coordinate semantics are identical in the wide matrix-free route;
+/// only that route consumes the hook for final certification because its analytic
+/// gradient capability is unavailable.
+#[test]
+fn fixed_point_certificate_hook_refuses_non_ibp_held_zero() {
+    let make_objective = || {
+        let (term, target, rho) = small_two_atom_periodic_term();
+        let rho_flat = rho.to_flat();
+        (
+            SaeManifoldOuterObjective::new(term, target, None, rho, 2, 0.25, 1.0e-4, 1.0e-4),
+            rho_flat,
+        )
+    };
+
+    // Pin the iteration-side precondition: this coordinate really is the held
+    // zero that previously masqueraded as convergence.
+    let (mut iteration_objective, rho) = make_objective();
+    let iteration = iteration_objective
+        .eval_efs(&rho)
+        .expect("non-IBP EFS startup evaluation");
+    assert_eq!(
+        iteration.steps[0], 0.0,
+        "softmax log_lambda_sparse has no EFS equation and must remain held"
+    );
+
+    // A fresh objective calls the final-proof hook, not the iteration surface.
+    // Its result must preserve the distinction between held and proved zero.
+    let (mut proof_objective, proof_rho) = make_objective();
+    let proof = proof_objective
+        .eval_fixed_point_certificate(&proof_rho)
+        .expect("fixed-point proof hook must evaluate");
+    assert_eq!(proof.coordinates.len(), proof_rho.len());
+    match &proof.coordinates[0] {
+        FixedPointCoordinateCertificate::Uncovered { reason } => assert!(
+            reason.contains("no root-equivalent fixed-point equation"),
+            "non-IBP held coordinate must explain the missing equation; got: {reason}"
+        ),
+        FixedPointCoordinateCertificate::Covered { update, scale } => panic!(
+            "a held non-IBP zero is not a stationarity proof (update={update}, scale={scale})"
+        ),
+    }
 }
 
 /// End-to-end: the whitened streaming REML criterion (`reml_criterion_streaming_
