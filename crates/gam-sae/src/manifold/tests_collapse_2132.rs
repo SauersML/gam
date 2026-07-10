@@ -151,7 +151,7 @@ pub(crate) fn oos_heldout_ev(
     )
     .expect("OOS assignment");
     let mut term = SaeManifoldTerm::new(fitted_term.atoms.clone(), assignment).expect("OOS term");
-    term.seed_coords_by_decoder_projection(x, 64)
+    term.seed_coords_by_decoder_projection(x)
         .expect("decoder-projection seed");
     // Seed softmax routing logits from per-atom projection residuals — the exact
     // production step (`seed_oos_softmax_logits_from_projection_residuals`) the

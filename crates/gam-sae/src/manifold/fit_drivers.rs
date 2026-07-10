@@ -4546,16 +4546,13 @@ impl SaeManifoldTerm {
     /// component, and this crate does not yet expose the interval extensions or
     /// polynomial-system solver needed to make that claim honestly.
     ///
-    /// The `resolution` argument is inspected only to report a rejected legacy
-    /// lattice request for those multivariate charts; it never participates in a
-    /// successful coordinate solve. Atoms with unbounded or basis-linear latents
-    /// retain their incoming coordinates. The decoder, assignment logits,
-    /// smoothness penalties and rho are untouched; only exact rank-1 Fourier
-    /// coordinates and their basis caches move.
+    /// Atoms with unbounded or basis-linear latents retain their incoming
+    /// coordinates. The decoder, assignment logits, smoothness penalties and rho
+    /// are untouched; only exact rank-1 Fourier coordinates and their basis
+    /// caches move.
     pub fn seed_coords_by_decoder_projection(
         &mut self,
         target: ArrayView2<'_, f64>,
-        resolution: usize,
     ) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -4584,7 +4581,7 @@ impl SaeManifoldTerm {
             };
             if needs_multivariate_enumerator {
                 return Err(format!(
-                    "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} ({:?}, latent_dim {}) requires complete multivariate stationary-point enumeration; fixed-lattice resolution {resolution} is forbidden",
+                    "SaeManifoldTerm::seed_coords_by_decoder_projection: atom {atom_idx} ({:?}, latent_dim {}) requires complete multivariate stationary-point enumeration; fixed-lattice projection is forbidden",
                     &atom.basis_kind, atom.latent_dim
                 ));
             }
@@ -5924,12 +5921,7 @@ impl SaeManifoldTerm {
                     let snapshot = self.snapshot_mutable_state();
                     let round = self
                         .refit_decoder_least_squares_at_current_state(target, Some(rho))
-                        .and_then(|()| {
-                            self.seed_coords_by_decoder_projection(
-                                target,
-                                SAE_FINAL_DECODER_POLISH_PROJECTION_RESOLUTION,
-                            )
-                        })
+                        .and_then(|()| self.seed_coords_by_decoder_projection(target))
                         .and_then(|()| {
                             self.refit_decoder_least_squares_at_current_state(target, Some(rho))
                         })
@@ -7092,10 +7084,10 @@ mod projection_policy_tests {
 
         let before = term.assignment.coords[0].as_matrix();
         let error = term
-            .seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 2)).view(), 256)
+            .seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 2)).view())
             .unwrap_err();
         assert!(error.contains("complete multivariate stationary-point enumeration"));
-        assert!(error.contains("fixed-lattice resolution 256 is forbidden"));
+        assert!(error.contains("fixed-lattice projection is forbidden"));
         assert_eq!(term.assignment.coords[0].as_matrix(), before);
     }
 }

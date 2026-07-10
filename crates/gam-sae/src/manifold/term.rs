@@ -182,14 +182,6 @@ pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 /// quantity.
 pub(crate) const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 
-/// #1026 — per-row coordinate re-projection grid resolution for the final
-/// reconstruction polish (matches the resolution the curvature-homotopy arrival
-/// polish uses in `outer_objective.rs`). The projection snaps each row's latent
-/// coordinate to the nearest point of a `resolution`-point decode grid, so a
-/// finer grid is a tighter chart re-fit; `256` is the established cost/precision
-/// point for the chart re-projection (a circle/sphere/Euclidean grid sweep).
-pub(crate) const SAE_FINAL_DECODER_POLISH_PROJECTION_RESOLUTION: usize = 256;
-
 pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
 /// #1026/#1610 decoder-repulsion conditioner strength as a DIMENSIONLESS ratio of

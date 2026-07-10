@@ -842,36 +842,24 @@ def jumprelu_bounded_gate(
 
 
 class _TopKActivationFn(torch.autograd.Function):
-    """Top-k SAE activation — a pure-torch, on-device transcription of Rust.
+    """Top-k SAE activation backed by the Rust value-and-gradient kernel.
 
     Forward returns the per-atom **independent**, strictly non-negative
     activation ``a_k = τ·softplus(l_k/τ)`` the ``softmax_topk`` gate scores atoms
-    with. The math is transcribed from the Rust source of truth
-    ``gam_sae::assignment::topk_activation_row_value_grad`` and computed directly
-    in torch, so no ``(N, K)`` matrix ever crosses the Python↔Rust boundary and
-    dtype/device are preserved (works on GPU without a CPU/float64 round-trip).
-    Backward multiplies the upstream gradient by the diagonal derivative
-    ``da/dl_k = σ(l_k/τ)`` (the temperature cancels in the chain rule since
-    ``a = τ·softplus(l/τ)``). The hard top-k *selection* and its masked gradient
-    are applied by the caller on the tape — this Function owns only the smooth
-    activation and its exact derivative, the single-source-of-truth counterpart
-    to the closed-form family's ``ibp_map`` / ``jumprelu`` activations.
+    with. Both that value and its diagonal derivative ``da/dl_k = σ(l_k/τ)``
+    come from ``gam_sae::assignment::topk_activation_batch_value_grad`` through
+    ``sae_topk_activation_value_grad``. Python only caches the returned Jacobian
+    diagonal for Torch's backward pass. The hard top-k *selection* and its masked
+    gradient remain on the caller's tape.
     """
 
     @staticmethod
     def forward(ctx: Any, logits: torch.Tensor, temperature: float) -> torch.Tensor:
-        # Pure-torch, on-device transcription of the Rust source of truth
-        # `gam_sae::assignment::topk_activation_row_value_grad`
-        # (crates/gam-sae/src/assignment.rs). With ``inv_tau = 1/τ`` (matching the
-        # Rust multiply order for bit-parity):
-        #   ``scaled = l · inv_tau``
-        #   ``value  = τ · softplus(scaled)`` (stable_softplus ≡ softplus)
-        #   ``grad   = σ(scaled)``          (stable_logistic ≡ torch.sigmoid)
-        # No CPU/float64 round-trip: dtype and device are preserved.
-        inv_tau = 1.0 / temperature
-        scaled = logits * inv_tau
-        value = temperature * torch.nn.functional.softplus(scaled)
-        grad = torch.sigmoid(scaled)
+        value_np, grad_np = rust_module().sae_topk_activation_value_grad(
+            to_numpy_f64(logits), float(temperature)
+        )
+        value = from_numpy_like(value_np, logits).reshape_as(logits)
+        grad = from_numpy_like(grad_np, logits).reshape_as(logits)
         ctx.save_for_backward(grad)
         return value
 

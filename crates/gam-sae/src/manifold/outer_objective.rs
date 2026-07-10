@@ -2062,7 +2062,7 @@ impl SaeManifoldOuterObjective {
                 .refit_decoder_least_squares_at_current_state(self.target.view(), Some(&rho))
                 .and_then(|()| {
                     self.term
-                        .seed_coords_by_decoder_projection(self.target.view(), 256)
+                        .seed_coords_by_decoder_projection(self.target.view())
                 })
                 .and_then(|()| {
                     self.term.refit_decoder_least_squares_at_current_state(

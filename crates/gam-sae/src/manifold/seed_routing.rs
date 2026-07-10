@@ -16,14 +16,6 @@ use crate::assignment::{ibp_map_row, jumprelu_row, topk_row};
 
 use super::{SaeAtomBasisKind, SaeManifoldTerm};
 
-/// Per-(compact)-axis resolution of the global decoder-projection coordinate
-/// seed used by the fixed-decoder OOS solve. 256 phases on the circle spaces
-/// adjacent grid points ~0.004 apart, comfortably inside the basin of the
-/// analytic Newton refinement for a small harmonic order, while staying cheap
-/// (`O(K*N*256*p)` for periodic atoms). See
-/// [`SaeManifoldTerm::seed_coords_by_decoder_projection`].
-pub const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
-
 /// Build a data-driven asymmetric assignment-logit seed for a cold start
 /// (issue #629). A uniform logit seed (`Array2::zeros`) is an exact symmetric
 /// saddle of the joint objective whenever the atoms are exchangeable under the
@@ -620,16 +612,16 @@ pub fn sae_decoder_lsq_init(
 ///
 /// This is the exact dual of the frozen-decoder OOS fix (#628): there, each row
 /// is placed in the correct latent basin by projecting it onto every atom's
-/// *known* decoder over a dense manifold grid
+/// *known* decoder through the complete rank-1 Fourier stationary set
 /// ([`SaeManifoldTerm::seed_coords_by_decoder_projection`]). Here the decoder is
-/// being *learned*, so we alternate the two cheap closed-form steps the OOS path
-/// and the existing seed already provide:
+/// being *learned*, so we alternate the two exact steps the OOS path and the
+/// existing seed already provide:
 ///
-/// 1. **Coordinate E-step** — project each row's per-atom latent onto the
-///    current decoder over the manifold grid. This separates the atoms'
-///    geometries: a row generated from atom `k` snaps to the coordinate where
-///    atom `k` reconstructs it well, while the off-atoms snap to wherever their
-///    current decoder is least wrong on that row.
+/// 1. **Coordinate E-step** — project each row's rank-1 Fourier latent onto the
+///    current decoder by enumerating every stationary point. This separates the
+///    atoms' geometries: a row generated from atom `k` moves to the coordinate
+///    where atom `k` reconstructs it well, while the off-atoms move to wherever
+///    their current decoder is least wrong on that row.
 /// 2. **Decoder M-step** — refit every atom's decoder by the same weighted joint
 ///    LSQ used for the cold init ([`sae_decoder_lsq_init`]), now at the
 ///    *separated* coordinates, so each atom's block specializes toward the rows
@@ -641,9 +633,11 @@ pub fn sae_decoder_lsq_init(
 ///
 /// A handful of rounds converges this alternation for separable atoms while
 /// leaving an already-routed warm fit at its fixed point (the projection finds
-/// the same basin, the LSQ recovers the same decoder). Atoms whose evaluator has
-/// no projection grid (Duchon / Euclidean patch) are left untouched by step 1,
-/// so the refinement degrades gracefully to the existing cold seed for them.
+/// the same global coordinate, the LSQ recovers the same decoder). Unbounded or
+/// basis-linear atoms (Duchon / Euclidean patch) are left untouched by step 1.
+/// Compact multivariate charts are rejected because this engine does not yet
+/// carry the interval extension needed to enumerate their complete stationary
+/// sets.
 ///
 /// Only invoked for cold-start multi-atom softmax / IBP-MAP fits; JumpReLU keeps
 /// its margin-above-threshold gate seed and warm starts are respected verbatim.
@@ -678,7 +672,7 @@ pub fn sae_em_refine_routing_seed(
     }
     for _ in 0..SAE_SEED_REFINE_ROUNDS {
         // 1. Coordinate E-step: project each row onto the current decoder.
-        term.seed_coords_by_decoder_projection(z, SAE_OOS_PROJECTION_GRID_RESOLUTION)?;
+        term.seed_coords_by_decoder_projection(z)?;
         // Snapshot the refreshed per-atom basis `Φ_k(t_k)` as a padded
         // (K, N, m_max) stack for the closed-form seed helpers.
         let mut basis3 = Array3::<f64>::zeros((k_atoms, n_obs, m_max));

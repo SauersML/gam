@@ -18,10 +18,10 @@ use crate::inference::steering::{SteerPlan, steer_delta};
 
 use super::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SAE_OOS_PROJECTION_GRID_RESOLUTION,
-    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldAtom,
-    SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator,
-    TorusHarmonicEvaluator, resolve_learnable_weight, sae_pca_seed_initial_coords,
+    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho,
+    SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator, TorusHarmonicEvaluator,
+    resolve_learnable_weight, sae_pca_seed_initial_coords,
 };
 
 const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;
@@ -808,7 +808,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
 
     let mut rho = build_rho(regularization, &latent_dims)?;
     if cold_coords {
-        term.seed_coords_by_decoder_projection(target.view(), SAE_OOS_PROJECTION_GRID_RESOLUTION)?;
+        term.seed_coords_by_decoder_projection(target.view())?;
     }
     if cold_logits && assignment == SaeOosAssignmentKind::Softmax {
         term.seed_oos_softmax_logits_from_projection_residuals(target.view(), tau);

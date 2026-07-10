@@ -6,9 +6,7 @@
 //! fit. Python bindings only marshal arrays and call these entries.
 
 use super::*;
-use gam_terms::basis::{
-    DuchonNullspaceOrder, duchon_nullspace_dimension, monomial_exponents,
-};
+use gam_terms::basis::{DuchonNullspaceOrder, duchon_nullspace_dimension, monomial_exponents};
 
 fn duchon_nullspace_from_m(m: usize) -> DuchonNullspaceOrder {
     match m {
@@ -271,7 +269,11 @@ fn sae_build_euclidean_atom(
 /// Deterministically pick Duchon centers from the PCA-seeded coordinates.
 /// Uses a Lehmer (LCG) walk over `0..n_obs` keyed by `random_state` so the
 /// result is reproducible without a heavy RNG dependency.
-pub fn sae_pick_duchon_center_indices(n_obs: usize, n_centers: usize, random_state: u64) -> Vec<usize> {
+pub fn sae_pick_duchon_center_indices(
+    n_obs: usize,
+    n_centers: usize,
+    random_state: u64,
+) -> Vec<usize> {
     let want = n_centers.min(n_obs);
     if want == 0 || n_obs == 0 {
         return Vec::new();
@@ -801,4 +803,59 @@ pub fn sae_build_atom_plans(
         }
     }
     Ok(plans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duchon_center_picker_is_seeded_sorted_and_unique() {
+        let first = sae_pick_duchon_center_indices(64, 12, 7);
+        let again = sae_pick_duchon_center_indices(64, 12, 7);
+        let other = sae_pick_duchon_center_indices(64, 12, 8);
+
+        assert_eq!(first, again);
+        assert_ne!(first, other);
+        assert_eq!(first.len(), 12);
+        assert!(first.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(first.iter().all(|&row| row < 64));
+    }
+
+    #[test]
+    fn periodic_plan_and_padded_stack_share_one_typed_entry() {
+        let z = Array2::<f64>::zeros((4, 3));
+        let mut seed_coords = Array3::<f64>::zeros((1, 4, 2));
+        seed_coords[[0, 1, 0]] = 0.25;
+        seed_coords[[0, 2, 0]] = 0.5;
+        seed_coords[[0, 3, 0]] = 0.75;
+        let plans = sae_build_atom_plans(
+            z.view(),
+            &["periodic".to_string()],
+            &[2],
+            seed_coords.view(),
+            11,
+            &[None],
+        )
+        .expect("periodic plan");
+
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(plans[0].kind, SaeAtomBasisKind::Periodic));
+        assert_eq!(plans[0].latent_dim, 1);
+        assert_eq!(plans[0].n_harmonics, 2);
+        assert_eq!(plans[0].basis_size, 5);
+
+        let (phi, jet, penalty, basis_sizes, coords) =
+            sae_build_padded_basis_stacks(&plans, seed_coords.view(), 4)
+                .expect("periodic padded stack");
+        assert_eq!(phi.dim(), (1, 4, 5));
+        assert_eq!(jet.dim(), (1, 4, 5, 1));
+        assert_eq!(penalty.dim(), (1, 5, 5));
+        assert_eq!(basis_sizes, vec![5]);
+        assert_eq!(coords[0].dim(), (4, 1));
+        assert!(phi.slice(s![0, .., 0]).iter().all(|&value| value == 1.0));
+        assert_eq!(penalty[[0, 0, 0]], 1.0e-8);
+        assert_eq!(penalty[[0, 3, 3]], 16.0);
+        assert_eq!(penalty[[0, 4, 4]], 16.0);
+    }
 }

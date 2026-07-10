@@ -1684,45 +1684,6 @@ fn gumbel_temperature_schedule_from_pydict(
     Ok(Some(schedule_out))
 }
 
-/// Build the per-row output-Fisher `RowMetric` from a flattened factor stack and
-/// the harvest shard's provenance tag (#980).
-///
-/// `"output_fisher"` (the default, and the only tag a same-position shard or a
-/// raw factor array carries) installs the same-position
-/// [`RowMetric::output_fisher`](gam::inference::row_metric::RowMetric::output_fisher);
-/// `"output_fisher_downstream"` (the KV-path aggregate over future positions)
-/// installs
-/// [`RowMetric::output_fisher_downstream`](gam::inference::row_metric::RowMetric::output_fisher_downstream).
-/// Both are gauge-only and consumed identically by the lens/gauge/enrichment;
-/// only the tag (and the science it certifies) differs. An unknown tag errors —
-/// a silent fall-through to the same-position metric would mislabel the
-/// certificate.
-fn row_metric_from_fisher_provenance(
-    u_flat: Array2<f64>,
-    p_out: usize,
-    rank: usize,
-    provenance: Option<&str>,
-) -> PyResult<gam::inference::row_metric::RowMetric> {
-    let u = std::sync::Arc::new(u_flat);
-    match provenance.unwrap_or("output_fisher") {
-        "output_fisher" => gam::inference::row_metric::RowMetric::output_fisher(u, p_out, rank),
-        "output_fisher_downstream" => {
-            gam::inference::row_metric::RowMetric::output_fisher_downstream(u, p_out, rank)
-        }
-        // Rung 1: the same output-Fisher factors, but installed as the
-        // reconstruction *likelihood weight* (GLS in nats) rather than a
-        // gauge-only metric. `rank` is the probe count `s` of the sketch.
-        "behavioral_fisher" => {
-            gam::inference::row_metric::RowMetric::behavioral_fisher(u, p_out, rank)
-        }
-        other => Err(format!(
-            "fisher_provenance must be 'output_fisher', 'output_fisher_downstream', or \
-             'behavioral_fisher'; got {other:?}"
-        )),
-    }
-    .map_err(py_value_error)
-}
-
 fn structured_residual_pass_diagnostics_dict<'py>(
     py: Python<'py>,
     diagnostics: &[gam::terms::sae::manifold::StructuredResidualPassDiagnostic],
@@ -2277,37 +2238,15 @@ fn sae_manifold_fit_stagewise<'py>(
     // `sae_manifold_fit` path performs.
     if let Some(u3ro) = fisher_factors.as_ref() {
         let u3 = u3ro.as_array();
-        let u_shape = u3.shape();
-        if u_shape[0] != n_obs || u_shape[1] != p_out {
-            return Err(py_value_error(format!(
-                "sae_manifold_fit_stagewise: fisher_factors U must be (n, p, r)=({n_obs}, \
-                 {p_out}, r); got leading dims ({}, {})",
-                u_shape[0], u_shape[1]
-            )));
-        }
-        let rank = u_shape[2];
-        if rank == 0 {
-            return Err(py_value_error(
-                "sae_manifold_fit_stagewise: fisher_factors U rank (last axis) must be >= 1"
-                    .to_string(),
-            ));
-        }
-        if rank > p_out {
-            return Err(py_value_error(format!(
-                "sae_manifold_fit_stagewise: fisher_factors U rank {rank} exceeds output dim \
-                 p={p_out}"
-            )));
-        }
-        let mut u_flat = Array2::<f64>::zeros((n_obs, p_out * rank));
-        for row in 0..n_obs {
-            for i in 0..p_out {
-                for k in 0..rank {
-                    u_flat[[row, i * rank + k]] = u3[[row, i, k]];
-                }
-            }
-        }
-        let metric =
-            row_metric_from_fisher_provenance(u_flat, p_out, rank, fisher_provenance.as_deref())?;
+        let request = SaeFisherRowMetricRequest::from_tag(
+            u3,
+            n_obs,
+            p_out,
+            fisher_provenance.as_deref(),
+            None,
+        )
+        .map_err(py_value_error)?;
+        let metric = build_sae_fisher_row_metric(request).map_err(py_value_error)?;
         // A supplied fixed metric and the structured-residual whitener are two
         // rival sources for the SAME per-row inner product: `fit_stagewise`
         // overwrites the term's metric with the refit Σ⁻¹ on each birth round when
@@ -2903,45 +2842,15 @@ fn sae_manifold_fit_inner<'py>(
     // `(n_obs, p_out * rank)` layout `RowMetric::output_fisher` expects
     // (`u[n, i * rank + k] = U[n, i, k]`). Shapes are validated at the boundary.
     let metric_provenance: &'static str = if let Some(u3) = fisher_u {
-        let u_shape = u3.shape();
-        if u_shape[0] != n_obs || u_shape[1] != p_out {
-            return Err(py_value_error(format!(
-                "sae_manifold_fit: fisher_factors U must be (n, p, r)=({n_obs}, {p_out}, r); \
-                 got leading dims ({}, {})",
-                u_shape[0], u_shape[1]
-            )));
-        }
-        let rank = u_shape[2];
-        if rank == 0 {
-            return Err(py_value_error(
-                "sae_manifold_fit: fisher_factors U rank (last axis) must be >= 1".to_string(),
-            ));
-        }
-        if rank > p_out {
-            return Err(py_value_error(format!(
-                "sae_manifold_fit: fisher_factors U rank {rank} exceeds output dim p={p_out}"
-            )));
-        }
-        if let Some(mr) = fisher_mass_residual.as_ref() {
-            if mr.len() != n_obs {
-                return Err(py_value_error(format!(
-                    "sae_manifold_fit: fisher_factors mass_residual must be (n,)=({n_obs},); got \
-                     length {}",
-                    mr.len()
-                )));
-            }
-        }
-        // Flatten (n, p, r) row-major -> (n, p*r) with u[n, i*r + k] = U[n, i, k].
-        let mut u_flat = Array2::<f64>::zeros((n_obs, p_out * rank));
-        for row in 0..n_obs {
-            for i in 0..p_out {
-                for k in 0..rank {
-                    u_flat[[row, i * rank + k]] = u3[[row, i, k]];
-                }
-            }
-        }
-        let metric =
-            row_metric_from_fisher_provenance(u_flat, p_out, rank, fisher_provenance.as_deref())?;
+        let request = SaeFisherRowMetricRequest::from_tag(
+            u3,
+            n_obs,
+            p_out,
+            fisher_provenance.as_deref(),
+            fisher_mass_residual.as_ref().map(|mass| mass.view()),
+        )
+        .map_err(py_value_error)?;
+        let metric = build_sae_fisher_row_metric(request).map_err(py_value_error)?;
         let label = gam::terms::sae::manifold::metric_provenance_label(metric.provenance());
         base_term.set_row_metric(metric).map_err(py_value_error)?;
         label
@@ -4169,7 +4078,6 @@ fn sae_manifold_fit_ibp<'py>(
         true,
     )
 }
-
 
 ///
 /// The full-batch arrow-Schur path retains, for all `n_obs` rows, the basis
