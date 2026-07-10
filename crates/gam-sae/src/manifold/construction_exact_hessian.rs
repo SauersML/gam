@@ -480,11 +480,12 @@ impl SaeManifoldTerm {
     /// The analytic-gradient cluster is DENSE-ONLY today (invariant #3): every
     /// production caller passes `None`, so this `Some` branch is dormant forward
     /// plumbing that the eventual routing flip (once the surrogate lane owns the
-    /// analytic gradient, not just the EFS lane) will exercise. Flipping any
-    /// caller to `Some` still requires matrix-free siblings for the one remaining
-    /// solver-bound channel — `assignment_log_strength_hessian_trace`
-    /// (`logdet_trace[0]`) — so the `solver` argument is still required here and
-    /// the flip stays off until that last gap closes.
+    /// analytic gradient, not just the EFS lane) will exercise. The selected-
+    /// inverse channels, including assignment strength, now all have bundle
+    /// siblings. The remaining solver-bound gap is the exact-stationarity IFT
+    /// solve below: its `B^-1` preconditioner is still the dense
+    /// [`DeflatedArrowSolver`], so the `solver` argument remains required and the
+    /// production routing flip stays off until that solve is matrix-free too.
     pub(crate) fn analytic_outer_rho_gradient_components_with_bundle(
         &self,
         target: ArrayView2<'_, f64>,
@@ -508,9 +509,14 @@ impl SaeManifoldTerm {
         // IBP concentration controls only the Beta--Bernoulli prior. The final
         // posterior-mean gate is `sigmoid(logit/tau)`, so the data likelihood
         // and its Gauss--Newton blocks have no direct alpha derivative.
-        logdet_trace[0] = self
-            .assignment_log_strength_hessian_trace(rho, cache, solver)
-            .map_err(OuterGradientError::internal)?;
+        logdet_trace[0] = match inverse_probe_bundle {
+            Some((probes, sinv)) => self
+                .assignment_log_strength_hessian_trace_from_probes(rho, cache, probes, sinv)
+                .map_err(OuterGradientError::internal)?,
+            None => self
+                .assignment_log_strength_hessian_trace(rho, cache, solver)
+                .map_err(OuterGradientError::internal)?,
+        };
 
         // #1556: λ_smooth is per-atom, so the smoothness gradient block occupies
         // flat indices `1..1+K` (one per atom), not a single index 1. Each atom

@@ -338,6 +338,67 @@ fn fixed_point_certificate_hook_refuses_non_ibp_held_zero() {
     }
 }
 
+/// The non-IBP assignment-strength `0.5 tr(H^-1 dH/dlog_lambda_sparse)` channel
+/// must be reconstructible from the same reduced-Schur inverse-probe bundle as
+/// the smoothness, ARD, and theta-adjoint channels. Full-basis probes with exact
+/// dense `S^-1` make the bundle identity exact, so this isolates the new matrix-
+/// free contraction from stochastic-CG error.
+#[test]
+fn assignment_strength_trace_from_probes_matches_dense_softmax() {
+    let (n, p, k) = (24usize, 2usize, 2usize);
+    let mut term = build_softmax_term(n, p, k);
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        0.4 * ((row + 2 * col) as f64 * 0.17).sin() + 0.1 * col as f64
+    });
+    let rho = SaeManifoldRho::new(
+        0.7_f64.ln(),
+        0.8_f64.ln(),
+        vec![Array1::from_elem(1, 1.2_f64.ln()); k],
+    );
+    let system = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("softmax arrow system");
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+        .expect("direct factorization");
+    assert!(
+        cache.deflated_row_directions.iter().all(Vec::is_empty),
+        "the probe identity is defined on the plain undeflated fixture"
+    );
+
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let dense = term
+        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
+        .expect("dense assignment-strength trace");
+
+    let border_dim = cache.k;
+    let sqrt_dim = (border_dim as f64).sqrt();
+    let probes = (0..border_dim)
+        .map(|column| {
+            let mut probe = Array1::<f64>::zeros(border_dim);
+            probe[column] = sqrt_dim;
+            probe
+        })
+        .collect::<Vec<_>>();
+    let inverse_probes = probes
+        .iter()
+        .map(|probe| {
+            cache
+                .schur_inverse_apply(probe.view())
+                .expect("exact reduced-Schur inverse probe")
+        })
+        .collect::<Vec<_>>();
+    let matrix_free = term
+        .assignment_log_strength_hessian_trace_from_probes(&rho, &cache, &probes, &inverse_probes)
+        .expect("matrix-free assignment-strength trace");
+
+    assert!(
+        dense.abs() > 1.0e-12,
+        "fixture must excite a nonzero assignment-strength trace"
+    );
+    assert_abs_diff_eq!(matrix_free, dense, epsilon = 1.0e-9);
+}
+
 /// End-to-end: the whitened streaming REML criterion (`reml_criterion_streaming_
 /// exact`) must COMPLETE with a finite value rather than surfacing the
 /// `cost-only streaming route is required` hard-error class. The streaming lane is

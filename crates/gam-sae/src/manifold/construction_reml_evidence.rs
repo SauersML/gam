@@ -2771,6 +2771,193 @@ impl SaeManifoldTerm {
         Ok(0.5 * trace)
     }
 
+    /// Matrix-free sibling of [`Self::assignment_log_strength_hessian_trace`]
+    /// for assignment families whose prior curvature is row-local (softmax,
+    /// threshold gate, and TopK).  Reconstructs each undeflated row's selected-
+    /// inverse diagonal from the exact row-local inverse plus the shared
+    /// `(z_j, S^-1 z_j)` reduced-Schur bundle:
+    ///
+    /// `diag(H^-1_tt) = diag(A_i^-1) + (1/m) sum_j
+    ///   (A_i^-1 H_tbeta z_j) * (A_i^-1 H_tbeta S^-1 z_j)`.
+    ///
+    /// This is the missing assignment-strength trace in the matrix-free analytic
+    /// rho-gradient cluster.  It deliberately refuses IBP cross-row curvature and
+    /// per-row spectral/gauge deflation: the border-only bundle represents the
+    /// plain row-block arrow inverse and cannot reconstruct either correction.
+    pub(crate) fn assignment_log_strength_hessian_trace_from_probes(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+    ) -> Result<f64, String> {
+        if matches!(self.assignment.mode, AssignmentMode::IBPMap { .. })
+            || cache.cross_row_woodbury.is_some()
+        {
+            return Err(
+                "assignment_log_strength_hessian_trace_from_probes: IBP cross-row curvature \
+                 is not represented by the border-only inverse-probe bundle"
+                    .to_string(),
+            );
+        }
+        let m = probes.len();
+        if m == 0 || sinv_probes.len() != m {
+            return Err(format!(
+                "assignment_log_strength_hessian_trace_from_probes: need matching non-empty \
+                 probe/solve bundles, got {m} probes and {} solves",
+                sinv_probes.len()
+            ));
+        }
+        let k_border = cache.k;
+        for (label, set) in [("probe", probes), ("solve", sinv_probes)] {
+            for (j, vector) in set.iter().enumerate() {
+                if vector.len() != k_border {
+                    return Err(format!(
+                        "assignment_log_strength_hessian_trace_from_probes: {label} {j} has \
+                         length {} != border dim {k_border}",
+                        vector.len()
+                    ));
+                }
+            }
+        }
+
+        let inv_m = 1.0 / m as f64;
+        let mut row_inverse_diagonals = Vec::with_capacity(self.n_obs());
+        for row in 0..self.n_obs() {
+            if cache
+                .deflated_row_directions
+                .get(row)
+                .is_some_and(|directions| !directions.is_empty())
+            {
+                return Err(format!(
+                    "assignment_log_strength_hessian_trace_from_probes: row {row} carries \
+                     deflation directions; the plain-S^-1 bundle cannot reconstruct the \
+                     Daleckii-Krein correction"
+                ));
+            }
+            let q = cache.row_dims[row];
+            let factor = cache.undamped_factor(row);
+            let mut inverse_diagonal = Array1::<f64>::zeros(q);
+            let mut unit = Array1::<f64>::zeros(q);
+            for slot in 0..q {
+                unit.fill(0.0);
+                unit[slot] = 1.0;
+                inverse_diagonal[slot] = cholesky_solve_vector(factor, unit.view())[slot];
+            }
+
+            let mut probe_rows = Vec::with_capacity(m);
+            let mut solve_rows = Vec::with_capacity(m);
+            let mut cross = Array1::<f64>::zeros(q);
+            for j in 0..m {
+                cross.fill(0.0);
+                if !cache.apply_htbeta_row(row, probes[j].view(), &mut cross) {
+                    return Err(format!(
+                        "assignment_log_strength_hessian_trace_from_probes: H_tbeta^({row}) \
+                         probe apply failed"
+                    ));
+                }
+                probe_rows.push(cholesky_solve_vector(factor, cross.view()));
+                cross.fill(0.0);
+                if !cache.apply_htbeta_row(row, sinv_probes[j].view(), &mut cross) {
+                    return Err(format!(
+                        "assignment_log_strength_hessian_trace_from_probes: H_tbeta^({row}) \
+                         solve apply failed"
+                    ));
+                }
+                solve_rows.push(cholesky_solve_vector(factor, cross.view()));
+            }
+            for slot in 0..q {
+                let border = (0..m)
+                    .map(|j| probe_rows[j][slot] * solve_rows[j][slot])
+                    .sum::<f64>();
+                inverse_diagonal[slot] += inv_m * border;
+            }
+            row_inverse_diagonals.push(inverse_diagonal);
+        }
+
+        let k_atoms = self.k_atoms();
+        if let AssignmentMode::Softmax {
+            temperature,
+            sparsity,
+        } = self.assignment.mode
+        {
+            if k_atoms <= 1 {
+                return Ok(0.0);
+            }
+            let inv_tau = 1.0 / temperature;
+            let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+            let penalty = gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                k_atoms,
+                temperature,
+            );
+            let assignment_dim = self.assignment.assignment_coord_dim();
+            let row_loss_weights = self.row_loss_weights.as_deref();
+            let mut trace = 0.0_f64;
+            for (row, inverse_diagonal) in row_inverse_diagonals.iter().enumerate() {
+                let row_weight = row_loss_weights.map_or(1.0, |weights| weights[row]);
+                match self.last_row_layout {
+                    Some(ref layout) => {
+                        let assignments = crate::assignment::softmax_row(
+                            self.assignment.logits.row(row),
+                            temperature,
+                        );
+                        let assignments = assignments
+                            .as_slice()
+                            .expect("softmax row must be contiguous");
+                        let mean = softmax_majorizer_log_mean(assignments);
+                        for (slot, &atom) in layout.logit_atoms[row].iter().enumerate() {
+                            let curvature = active_softmax_gershgorin_majorizer_entry(
+                                assignments,
+                                atom,
+                                mean,
+                                scale,
+                            );
+                            trace += inverse_diagonal[slot] * row_weight * curvature;
+                        }
+                    }
+                    None => {
+                        let row_logits = (0..k_atoms)
+                            .map(|atom| self.assignment.logits[[row, atom]])
+                            .collect::<Vec<_>>();
+                        let curvature = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
+                        let logit_dim = assignment_dim.min(inverse_diagonal.len());
+                        for atom in 0..logit_dim {
+                            trace += inverse_diagonal[atom] * row_weight * curvature[atom];
+                        }
+                    }
+                }
+            }
+            return Ok(0.5 * trace);
+        }
+
+        let hdiag = crate::assignment::assignment_prior_log_strength_hdiag_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        )?;
+        if hdiag.is_empty() {
+            return Ok(0.0);
+        }
+        let assignment_dim = self.assignment.assignment_coord_dim();
+        let mut trace = 0.0_f64;
+        for (row, inverse_diagonal) in row_inverse_diagonals.iter().enumerate() {
+            let assignment_base = row * k_atoms;
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    for (slot, &atom) in layout.active_atoms[row].iter().enumerate() {
+                        trace += inverse_diagonal[slot] * hdiag[assignment_base + atom];
+                    }
+                }
+                None => {
+                    for slot in 0..assignment_dim.min(inverse_diagonal.len()) {
+                        trace += inverse_diagonal[slot] * hdiag[assignment_base + slot];
+                    }
+                }
+            }
+        }
+        Ok(0.5 * trace)
+    }
+
     /// Per-row spectral-deflation correction `tr((H⁻¹)_tt · (D − DΦ[D]))` for one
     /// evidence ρ-component, to be SUBTRACTED from the raw-derivative trace
     /// `tr((H⁻¹)_tt · D)` the trace otherwise accumulates.
