@@ -208,8 +208,10 @@ pub fn admit_dense_certification(
         return Err(format!(
             "dense manifold engine refused: it is the small-K certification lane \
              (admitted only while N*K <= N*P, i.e. K <= P); N={n_obs}, P={output_dim}, K={n_atoms} \
-             gives N*K={} > N*P={} — route this fit through the sparse-code lane instead of \
-             building the dense N×K assignment state",
+             gives N*K={} > N*P={} — the overcomplete (K > P) routes are the hard TOP-K SUPPORT \
+             curved lane (assignment='topk', admitted by concrete memory budget; penalty-gated \
+             modes cannot take it because their N×K gate logits are live Newton state) or the \
+             linear sparse-code lane; neither builds the dense N×K assignment state",
             admission.dense_assignment_cells, admission.response_cells
         ));
     }
