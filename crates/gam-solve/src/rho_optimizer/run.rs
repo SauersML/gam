@@ -1345,6 +1345,23 @@ pub(crate) fn certify_outer_optimality(
     }
 
     result.converged = true;
+    // #2235/#2241 — record WHICH certificate concluded this run. A
+    // Fellner–Schall model-state fixed point was pre-stamped by the runner and
+    // is preserved (this analytic certificate is its corroborating evidence);
+    // otherwise the verdict is decided by which stationarity band the measured
+    // projected gradient actually cleared: the solver's own tolerance
+    // (gradient-stationary) or only the widened flat certificate band
+    // (criterion-flat, #2241).
+    result.converged_via = match result.converged_via {
+        Some(via @ OuterConvergedVia::RecurrentIncumbent { .. }) => Some(via),
+        _ if projected_grad_norm <= solver_bound => {
+            Some(OuterConvergedVia::GradientStationary)
+        }
+        _ => Some(OuterConvergedVia::CriterionFlat {
+            residual_grad_norm: projected_grad_norm,
+            certificate_bound: stationarity_bound,
+        }),
+    };
     log::info!("[CERTIFICATE] {context}: {}", certificate.summary());
     Ok(certificate)
 }
