@@ -2420,54 +2420,38 @@ fn compact_glued_atoms(
             }
             continue;
         }
+        let seam = seam.ok_or_else(|| {
+            format!("compact_glued_atoms: accepted seam ({a},{b}) is no longer identifiable")
+        })?;
         match outcome {
             ChartGlueOutcome::Fuse => {
-                // A glue the e-gate ACCEPTED must still compact even if the cheap
-                // scoring refit demoted the partner between accept and here (which
-                // makes the seam momentarily unidentifiable): the fold/removal is
-                // the correctness-critical part, the seam-coordinate transplant is
-                // only a warm start, so skip the transplant when the seam is gone.
-                if let Some(seam) = &seam {
-                    if seam.sign != 1.0 {
-                        return Err(format!(
-                            "compact_glued_atoms: refusing to compact orientation-reversing seam ({a},{b})"
-                        ));
-                    }
-                    fold_atom_into(term, a, b)?;
-                    transplant_glued_coords(term, a, b, seam);
-                } else {
-                    fold_atom_into(term, a, b)?;
+                if seam.sign != 1.0 {
+                    return Err(format!(
+                        "compact_glued_atoms: refusing to compact orientation-reversing seam ({a},{b})"
+                    ));
                 }
+                fold_atom_into(term, a, b)?;
+                transplant_glued_coords(term, a, b, &seam);
                 to_remove.insert(b);
             }
             ChartGlueOutcome::RegisterAtlas => {
-                // Same tolerance as the sphere register: the reversing seam was
-                // classified at acceptance; if the scoring refit left it momentarily
-                // unidentifiable, keep the apply-time registration.
-                if let Some(seam) = &seam {
-                    if seam.sign != -1.0 {
-                        return Err(format!(
-                            "compact_glued_atoms: registered seam ({a},{b}) lost its orientation reversal"
-                        ));
-                    }
-                    let transition = UnitSpeedChartTransition::new(
-                        b,
-                        a,
-                        -1,
-                        seam.offset,
-                        seam.period,
-                        AtlasSeamKind::Regular,
-                    )?;
-                    if term.charts_share_atlas(a, b) {
-                        term.refresh_chart_transition(transition)?;
-                    } else {
-                        term.register_chart_transition(transition)?;
-                    }
-                } else if !term.charts_share_atlas(a, b) {
+                if seam.sign != -1.0 {
                     return Err(format!(
-                        "compact_glued_atoms: accepted reversing seam ({a},{b}) is no longer \
-                         identifiable and was never registered"
+                        "compact_glued_atoms: registered seam ({a},{b}) lost its orientation reversal"
                     ));
+                }
+                let transition = UnitSpeedChartTransition::new(
+                    b,
+                    a,
+                    -1,
+                    seam.offset,
+                    seam.period,
+                    AtlasSeamKind::Regular,
+                )?;
+                if term.charts_share_atlas(a, b) {
+                    term.refresh_chart_transition(transition)?;
+                } else {
+                    term.register_chart_transition(transition)?;
                 }
             }
         }
