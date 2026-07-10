@@ -291,9 +291,8 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                 },
             }
         )
-    # SAEBench-shaped view: report the mean circular correlation over the
-    # null-robust atoms only (weekday-style atoms fail the matched-spectrum null
-    # and must not be scored into the headline, per #1942's honesty rule).
+    # SAEBench-shaped view: only correlations that pass their own identical
+    # matched-spectrum statistic may enter the headline aggregate (#2250).
     null_robust = [r for r in results if r["evidentially_valid"]]
     metrics = {"chart_interp": {"n_atoms": len(results), "n_null_robust": len(null_robust)}}
     if null_robust:
