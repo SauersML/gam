@@ -13,7 +13,7 @@ use gam_geometry::{
     GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold, RiemannianObjective,
     RiemannianTrustRegion,
 };
-use ndarray::{Array1, ArrayView1, ArrayView2};
+use ndarray::{Array1, ArrayView1};
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Serialize};
@@ -340,6 +340,21 @@ pub enum LatentCoordinateRequestError {
     },
     #[error("checkpoint stationarity reference must be finite and non-negative, got {value}")]
     InvalidCheckpointReference { value: f64 },
+}
+
+/// Failure constructing a typed resume checkpoint.
+///
+/// A checkpoint carries the same structural contract as a fresh request
+/// ([`LatentCoordinateRequestError`]) *and* must land on the manifold it names,
+/// so it additionally surfaces the geometric feasibility failure
+/// ([`GeometryError`]) raised when the stored point cannot be retracted onto the
+/// manifold (e.g. a non-unit sphere row).
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum LatentCoordinateCheckpointError {
+    #[error(transparent)]
+    Request(#[from] LatentCoordinateRequestError),
+    #[error(transparent)]
+    Geometry(#[from] GeometryError),
 }
 
 /// Invalid numerical data returned through the objective contract.
@@ -818,35 +833,65 @@ fn coordinate_spread(coordinates: ArrayView1<'_, f64>) -> f64 {
     (squared_deviation / count).max(0.0).sqrt()
 }
 
+/// Enforce that `latent_dimension` is compatible with the manifold's intrinsic
+/// geometry: a circle carries exactly one ambient angle, a sphere `S^(k-1)`
+/// needs an ambient dimension `k >= 2`. Euclidean and toroidal latents accept
+/// any positive dimension.
+///
+/// This is the single source of the manifold–dimension contract, shared by the
+/// full-request path ([`validate_request`]), the checkpoint path
+/// ([`validate_dimensions`]), and the domain descriptor
+/// ([`LatentCoordinateManifold::axis_domains`]).
+fn validate_manifold_dimension(
+    manifold: LatentCoordinateManifold,
+    latent_dimension: usize,
+) -> Result<(), LatentCoordinateRequestError> {
+    if latent_dimension == 0 {
+        return Err(LatentCoordinateRequestError::EmptyLatentDimension);
+    }
+    match manifold {
+        LatentCoordinateManifold::Circle if latent_dimension != 1 => {
+            Err(LatentCoordinateRequestError::CircleDimension { latent_dimension })
+        }
+        LatentCoordinateManifold::Sphere if latent_dimension < 2 => {
+            Err(LatentCoordinateRequestError::SphereDimension { latent_dimension })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Validate the `(n_observations, latent_dimension, manifold)` triple and return
+/// the expected flattened coordinate length `n_observations * latent_dimension`.
+///
+/// Rejects empty extents, overflowing products, and manifold-incompatible
+/// dimensions with the same errors [`validate_request`] uses, so a checkpoint
+/// built in isolation carries an identical structural contract.
+fn validate_dimensions(
+    n_observations: usize,
+    latent_dimension: usize,
+    manifold: LatentCoordinateManifold,
+) -> Result<usize, LatentCoordinateRequestError> {
+    if n_observations == 0 {
+        return Err(LatentCoordinateRequestError::EmptyObservations);
+    }
+    if latent_dimension == 0 {
+        return Err(LatentCoordinateRequestError::EmptyLatentDimension);
+    }
+    let expected = n_observations.checked_mul(latent_dimension).ok_or(
+        LatentCoordinateRequestError::DimensionOverflow {
+            n_observations,
+            latent_dimension,
+        },
+    )?;
+    validate_manifold_dimension(manifold, latent_dimension)?;
+    Ok(expected)
+}
+
 fn validate_request(
     request: &LatentCoordinateOptimizationRequest,
 ) -> Result<(), LatentCoordinateRequestError> {
-    if request.n_observations == 0 {
-        return Err(LatentCoordinateRequestError::EmptyObservations);
-    }
-    if request.latent_dimension == 0 {
-        return Err(LatentCoordinateRequestError::EmptyLatentDimension);
-    }
-    let expected = request
-        .n_observations
-        .checked_mul(request.latent_dimension)
-        .ok_or(LatentCoordinateRequestError::DimensionOverflow {
-            n_observations: request.n_observations,
-            latent_dimension: request.latent_dimension,
-        })?;
-    match request.manifold {
-        LatentCoordinateManifold::Circle if request.latent_dimension != 1 => {
-            return Err(LatentCoordinateRequestError::CircleDimension {
-                latent_dimension: request.latent_dimension,
-            });
-        }
-        LatentCoordinateManifold::Sphere if request.latent_dimension < 2 => {
-            return Err(LatentCoordinateRequestError::SphereDimension {
-                latent_dimension: request.latent_dimension,
-            });
-        }
-        _ => {}
-    }
+    let expected =
+        validate_dimensions(request.n_observations, request.latent_dimension, request.manifold)?;
     let options = &request.options;
     if !(options.stationarity_tolerance.is_finite()
         && options.stationarity_tolerance > 0.0

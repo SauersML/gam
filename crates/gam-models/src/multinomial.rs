@@ -423,34 +423,6 @@ fn multinomial_formula_separation_evidence(block_states: &[ParameterBlockState])
 /// scored without Firth bias. A capped probe that failed to converge while it
 /// already carries separation-scale logits is different: spending the full
 /// unbiased outer budget on the same lambda-to-zero surface is the #1082
-/// timeout. Route that case straight to the proper-prior refit.
-fn multinomial_formula_unresolved_probe_separation_evidence(
-    block_states: &[ParameterBlockState],
-) -> Option<String> {
-    if let Some(evidence) = multinomial_formula_separation_evidence(block_states) {
-        return Some(evidence);
-    }
-
-    let mut best = (0.0_f64, 0usize, 0usize);
-    for (active_class, state) in block_states.iter().enumerate() {
-        for (row, &value) in state.eta.iter().enumerate() {
-            let abs = value.abs();
-            if abs > best.0 {
-                best = (abs, row, active_class);
-            }
-        }
-    }
-    if best.0 >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        Some(format!(
-            "separation-scale finite logit |eta[row {}, active class {}]| = {:.3e} \
-             after capped unbiased probe",
-            best.1, best.2, best.0
-        ))
-    } else {
-        None
-    }
-}
-
 /// Inputs to [`fit_penalized_multinomial`].
 ///
 /// The penalty matrix `S` is shared across classes; per-class smoothing
@@ -3216,6 +3188,45 @@ pub fn predict_multinomial_formula_with_intervals(
 #[cfg(test)]
 mod fisher_override_tests {
     use super::*;
+
+    /// Extra evidence used only for a NON-CONVERGED capped unbiased probe.
+    ///
+    /// A converged finite saturated formula fit is still a valid optimum and
+    /// must be scored without Firth bias. A capped probe that failed to
+    /// converge while it already carries separation-scale logits is different:
+    /// spending the full unbiased outer budget on the same lambda-to-zero
+    /// surface is the #1082 timeout. Route that case straight to the
+    /// proper-prior refit.
+    ///
+    /// Kept in the test module: the production routing that would consume this
+    /// (the non-converged-probe branch) is not currently wired, so the helper
+    /// is test-support only rather than dead production code.
+    fn multinomial_formula_unresolved_probe_separation_evidence(
+        block_states: &[ParameterBlockState],
+    ) -> Option<String> {
+        if let Some(evidence) = multinomial_formula_separation_evidence(block_states) {
+            return Some(evidence);
+        }
+
+        let mut best = (0.0_f64, 0usize, 0usize);
+        for (active_class, state) in block_states.iter().enumerate() {
+            for (row, &value) in state.eta.iter().enumerate() {
+                let abs = value.abs();
+                if abs > best.0 {
+                    best = (abs, row, active_class);
+                }
+            }
+        }
+        if best.0 >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
+            Some(format!(
+                "separation-scale finite logit |eta[row {}, active class {}]| = {:.3e} \
+                 after capped unbiased probe",
+                best.1, best.2, best.0
+            ))
+        } else {
+            None
+        }
+    }
     use ndarray::Array3;
 
     fn toy() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {

@@ -14,13 +14,17 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_xt_diag_x, fast_xt_diag_y};
-use gam_linalg::matrix::DesignMatrix;
+use gam_linalg::matrix::{DesignMatrix, LinearOperator};
+// `DeclaredHessianForm`/`Derivative` originate in `gam_problem` and are only
+// re-exported privately inside `gam_solve::rho_optimizer`; import them from the
+// canonical source, matching every other `gam-models` outer-objective site.
+use gam_problem::{DeclaredHessianForm, Derivative};
 use gam_solve::estimate::EstimationError;
 use gam_solve::rho_optimizer::{
-    DeclaredHessianForm, Derivative, HessianValue, OuterCapability, OuterCriterionCertificate,
-    OuterEval, OuterObjective, OuterProblem, SeedOutcome,
+    HessianValue, OuterCapability, OuterCriterionCertificate, OuterEval, OuterObjective,
+    OuterProblem, SeedOutcome,
 };
-use ndarray::{Array1, Array2, Array3, Axis, s};
+use ndarray::{Array1, Array2, Array3, s};
 use serde::{Deserialize, Serialize};
 
 use crate::inference::model::FittedModel;
@@ -396,12 +400,6 @@ struct PreparedPenalty {
     column_start: usize,
     local: Array2<f64>,
     rank: usize,
-}
-
-impl PreparedPenalty {
-    fn column_end(&self) -> usize {
-        self.column_start + self.local.ncols()
-    }
 }
 
 #[derive(Clone, Debug)]

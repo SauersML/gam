@@ -4777,7 +4777,8 @@ fn rebuild_term_collection_auxiliary_state(
         None
     };
     design.linear_constraints =
-        merge_linear_constraints_global(explicit_linear_constraints, lower_bound_constraints);
+        merge_linear_constraints_global(explicit_linear_constraints, lower_bound_constraints)
+            .map_err(|error| error.to_string())?;
     design.dropped_penaltyinfo = design.smooth.dropped_penaltyinfo.clone();
     Ok(())
 }

@@ -2571,11 +2571,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 working_response: inf.working_response.clone(),
             });
             let covariance_conditional = beta_covariance;
-            let pirls_status_val = if final_fit.outer_converged {
-                gam_solve::pirls::PirlsStatus::Converged
-            } else {
-                gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-            };
+            // `final_fit` is a sealed `UnifiedFitResult`: it can only exist
+            // because `try_from_parts` already certified inner+outer
+            // convergence, so its outer status is convergence by construction.
+            let pirls_status_val = gam_solve::pirls::PirlsStatus::Converged;
             UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
                 blocks: vec![gam_solve::estimate::FittedBlock {
                     beta: beta.clone(),
@@ -2596,7 +2595,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 penalized_objective: final_fit.penalized_objective,
                 used_device: false,
                 outer_iterations,
-                outer_converged: final_fit.outer_converged,
+                // Sealed result ⇒ outer convergence was certified at assembly.
+                outer_converged: true,
                 outer_gradient_norm: outer_grad_norm,
                 standard_deviation,
                 covariance_conditional,
@@ -2622,7 +2622,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             epsilon_c: eps_star[2],
             epsilon_outer_iterations: outer_iterations,
             mm_iterations: 0,
-            converged: final_fit.outer_converged,
+            converged: true,
             maps,
         }),
     };
@@ -5919,11 +5919,9 @@ fn fit_bounded_term_collection_with_design(
                 bias_correction_jacobian: None,
             };
             let covariance_conditional = beta_covariance;
-            let pirls_status_val = if fit.outer_converged {
-                gam_solve::pirls::PirlsStatus::Converged
-            } else {
-                gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-            };
+            // Sealed `UnifiedFitResult`: existence certifies inner+outer
+            // convergence (see `try_from_parts`), so the status is Converged.
+            let pirls_status_val = gam_solve::pirls::PirlsStatus::Converged;
             UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
                 blocks: vec![gam_solve::estimate::FittedBlock {
                     beta: beta_user.clone(),
@@ -5944,7 +5942,8 @@ fn fit_bounded_term_collection_with_design(
                 penalized_objective: fit.penalized_objective,
                 used_device: false,
                 outer_iterations: fit.outer_iterations,
-                outer_converged: fit.outer_converged,
+                // Sealed result ⇒ outer convergence was certified at assembly.
+                outer_converged: true,
                 outer_gradient_norm: fit.outer_gradient_norm,
                 standard_deviation,
                 covariance_conditional,

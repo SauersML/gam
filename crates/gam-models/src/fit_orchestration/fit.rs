@@ -188,9 +188,9 @@ fn fit_standard_base(
         }
         fit_term_collectionwith_latent_coord_optimization(
             request.data.view(),
-            request.y.view(),
-            request.weights.view(),
-            request.offset.view(),
+            request.y.as_ref().clone(),
+            request.weights.as_ref().clone(),
+            request.offset.as_ref().clone(),
             &request.spec,
             latent_coord,
             family.clone(),
@@ -226,9 +226,9 @@ fn fit_standard_base(
     } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
             request.data.view(),
-            request.y.view(),
-            request.weights.view(),
-            request.offset.view(),
+            request.y.as_ref().clone(),
+            request.weights.as_ref().clone(),
+            request.offset.as_ref().clone(),
             &request.spec,
             family.clone(),
             options,
