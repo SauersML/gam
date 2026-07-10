@@ -7221,93 +7221,162 @@ fn fit_dataset_impl(
     // silently capped got no signal at all (#1543). Carry them into the
     // serialized payload so gamfit can surface them as `GamInferenceWarning`s
     // and via `model.notes`.
-    let inference_notes = materialized.inference_notes;
+    let mut inference_notes = materialized.inference_notes;
 
     let mut payload = match request {
         FitRequest::Standard(standard_request) => {
-            // Exact O(n) spline-scan fast path (#1030/#1034): a single 1-D
-            // Gaussian cubic smooth is the penalized cubic-spline problem the
-            // state-space scan solves exactly — route through it and persist
-            // the smoother state instead of the dense fit. Detection is
-            // structural; every other shape falls through to the dense fit
-            // below. Mirrors the CLI run_fit path so CLI and FFI saves agree.
-            if let Some(inputs) =
-                gam::families::fit_orchestration::spline_scan_fast_path(&standard_request)
-            {
-                let scan = gam::solver::spline_scan::fit_spline_scan(
-                    &inputs.x,
-                    &inputs.y,
-                    &inputs.w,
-                    inputs.order,
-                )
-                .map_err(|reason| {
-                    gam::families::fit_orchestration::WorkflowError::IntegrationFailed { reason }
-                })?;
-                let feature_col = match &standard_request.spec.smooth_terms[0].basis {
-                    gam::terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                        *feature_col
-                    }
-                    _ => {
-                        return Err(
-                            gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
-                                reason: "spline-scan detection accepted a non-1D basis".to_string(),
-                            },
-                        );
-                    }
-                };
-                let feature_column =
-                    dataset.headers.get(feature_col).cloned().ok_or_else(|| {
-                        gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
-                            reason: format!(
-                                "spline-scan feature column {feature_col} has no header"
-                            ),
-                        }
-                    })?;
-                let mut scan_payload =
-                    gam::inference::model_payload_builders::assemble_spline_scan_payload(
+            // The dispatch materialization above only selects this arm. The fit
+            // itself re-enters `fit_from_formula_with_notes` — the same
+            // loop-owning entry point the CLI uses — because that is where the
+            // standard workflow's estimator routing lives: the exact O(n)
+            // spline scan (#1030/#1034), the multiresolution residual cascade
+            // (#1032), the constant-response short circuit, and the #1689
+            // adaptive spatial-resolution loop that starts every auto spatial
+            // smooth at its structural minimum and escalates only on a
+            // certified saturated basis. Fitting the already-materialized
+            // request with `fit_model` here would pin auto spatial smooths at
+            // the fully provisioned basis and strand Python callers off those
+            // estimator routes (#1777-class entry-point drift).
+            let outcome = gam::families::fit_orchestration::fit_from_formula_with_notes(
+                &formula,
+                &dataset,
+                &fit_config,
+            )?;
+            inference_notes = outcome.inference_notes;
+            match outcome.result {
+                FitResult::Standard(standard_result) => {
+                    let family = standard_request.family.clone();
+                    let saved_fit = standard_result.fit.clone();
+                    build_standard_payload(
                         formula,
-                        feature_column,
-                        &scan,
-                        dataset.schema.clone(),
-                        dataset.headers.clone(),
-                        dataset.feature_ranges(),
-                    );
-                scan_payload.group_metadata = fit_config.group_metadata.clone();
-                scan_payload.training_table_kind = training_table_kind;
-                scan_payload.inference_notes = inference_notes;
-                let model = FittedModel::from_payload(scan_payload);
-                return serde_json::to_vec(&model).map_err(|err| {
-                    gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
-                        reason: format!("failed to serialize model: {err}"),
-                    }
-                });
-            }
-            let family = standard_request.family.clone();
-            let fit_result = fit_model(FitRequest::Standard(standard_request))?;
-            let standard_result = match fit_result {
-                FitResult::Standard(standard_result) => standard_result,
+                        &dataset,
+                        &fit_config,
+                        family,
+                        &saved_fit,
+                        &standard_result.design,
+                        standard_result.resolvedspec,
+                        standard_result.adaptive_diagnostics,
+                        standard_result.wiggle_knots.map(|knots| knots.to_vec()),
+                        standard_result.wiggle_degree,
+                        standard_result.wiggle_saved_warp_beta,
+                        standard_result.wiggle_saved_index_shift,
+                    )?
+                }
+                FitResult::SplineScan(scan) => {
+                    // The scan detection is structural on the materialized
+                    // shape, so the dispatch request's single smooth is the
+                    // same 1-D B-spline the entry point scan-routed.
+                    let feature_col = match &standard_request.spec.smooth_terms[0].basis {
+                        gam::terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
+                            *feature_col
+                        }
+                        _ => {
+                            return Err(
+                                gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
+                                    reason: "spline-scan detection accepted a non-1D basis"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                    };
+                    let feature_column =
+                        dataset.headers.get(feature_col).cloned().ok_or_else(|| {
+                            gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
+                                reason: format!(
+                                    "spline-scan feature column {feature_col} has no header"
+                                ),
+                            }
+                        })?;
+                    let mut scan_payload =
+                        gam::inference::model_payload_builders::assemble_spline_scan_payload(
+                            formula,
+                            feature_column,
+                            &scan,
+                            dataset.schema.clone(),
+                            dataset.headers.clone(),
+                            dataset.feature_ranges(),
+                        );
+                    scan_payload.group_metadata = fit_config.group_metadata.clone();
+                    scan_payload.training_table_kind = training_table_kind;
+                    scan_payload.inference_notes = inference_notes;
+                    let model = FittedModel::from_payload(scan_payload);
+                    return serde_json::to_vec(&model).map_err(|err| {
+                        gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
+                            reason: format!("failed to serialize model: {err}"),
+                        }
+                    });
+                }
+                FitResult::ResidualCascade(cascade) => {
+                    // The cascade fires only for a single scattered radial
+                    // smooth; recover its feature columns from the dispatch
+                    // request the same way the CLI does from its parsed
+                    // formula.
+                    let feature_cols = standard_request
+                        .spec
+                        .smooth_terms
+                        .iter()
+                        .find_map(|term| match &term.basis {
+                            gam::terms::smooth::SmoothBasisSpec::ThinPlate {
+                                feature_cols, ..
+                            }
+                            | gam::terms::smooth::SmoothBasisSpec::Duchon {
+                                feature_cols, ..
+                            }
+                            | gam::terms::smooth::SmoothBasisSpec::Matern {
+                                feature_cols, ..
+                            } => Some(feature_cols.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
+                                reason: "residual-cascade result has no radial smooth in the \
+                                         materialized request"
+                                    .to_string(),
+                            }
+                        })?;
+                    let feature_columns = feature_cols
+                        .into_iter()
+                        .map(|col| {
+                            dataset.headers.get(col).cloned().ok_or_else(|| {
+                                gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
+                                    reason: format!(
+                                        "residual-cascade feature column {col} has no header"
+                                    ),
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut cascade_payload =
+                        gam::inference::model_payload_builders::assemble_residual_cascade_payload(
+                            formula,
+                            feature_columns,
+                            &cascade,
+                            dataset.schema.clone(),
+                            dataset.headers.clone(),
+                            dataset.feature_ranges(),
+                        )
+                        .map_err(|reason| {
+                            gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
+                                reason,
+                            }
+                        })?;
+                    cascade_payload.group_metadata = fit_config.group_metadata.clone();
+                    cascade_payload.training_table_kind = training_table_kind;
+                    cascade_payload.inference_notes = inference_notes;
+                    let model = FittedModel::from_payload(cascade_payload);
+                    return serde_json::to_vec(&model).map_err(|err| {
+                        gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
+                            reason: format!("failed to serialize model: {err}"),
+                        }
+                    });
+                }
                 _ => {
                     return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the standard workflow to return a standard fit result"
                             .to_string(),
                     });
                 }
-            };
-            let saved_fit = standard_result.fit.clone();
-            build_standard_payload(
-                formula,
-                &dataset,
-                &fit_config,
-                family,
-                &saved_fit,
-                &standard_result.design,
-                standard_result.resolvedspec,
-                standard_result.adaptive_diagnostics,
-                standard_result.wiggle_knots.map(|knots| knots.to_vec()),
-                standard_result.wiggle_degree,
-                standard_result.wiggle_saved_warp_beta,
-                standard_result.wiggle_saved_index_shift,
-            )?
+            }
         }
         FitRequest::TransformationNormal(tn_request) => {
             let fit_result = fit_model(FitRequest::TransformationNormal(tn_request))?;
