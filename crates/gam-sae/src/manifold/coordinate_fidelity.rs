@@ -1388,10 +1388,10 @@ pub fn prefer_candidate_basin(
 /// non-monotone boundary hooks (collapse reseeds, gauge retraction/pin, frame
 /// refresh) genuinely damaged the walk — never to veto legitimate descent.
 ///
-/// The objective tolerance is `tol` scale-relative (`tol·(1+max|obj|)`, the
-/// same reading [`crate::manifold::SAE_FINAL_EV_DEGRADATION_TOL`] already has
-/// on objective-scaled quantities); within that band the objectives are
-/// numerically tied and the EV/uniformity certificate picks the basin.
+/// `objective_rel_tol` is the numerical convergence tolerance of the penalized
+/// objective itself; it must not be borrowed from the much coarser,
+/// dimensionless EV negligibility band. Within the objective convergence band,
+/// `ev_tol` controls the EV/uniformity tie-break.
 pub fn prefer_candidate_state(
     candidate_objective: f64,
     candidate_ev: f64,
@@ -1399,7 +1399,8 @@ pub fn prefer_candidate_state(
     incumbent_objective: f64,
     incumbent_ev: f64,
     incumbent_uniformity: Option<f64>,
-    tol: f64,
+    objective_rel_tol: f64,
+    ev_tol: f64,
 ) -> bool {
     if !candidate_objective.is_finite() {
         return false;
@@ -1407,7 +1408,8 @@ pub fn prefer_candidate_state(
     if !incumbent_objective.is_finite() {
         return true;
     }
-    let scale = tol * (1.0 + candidate_objective.abs().max(incumbent_objective.abs()));
+    let scale = objective_rel_tol
+        * (1.0 + candidate_objective.abs().max(incumbent_objective.abs()));
     if candidate_objective < incumbent_objective - scale {
         return true; // strictly lower penalized objective — the walk's own referee
     }
@@ -1419,7 +1421,7 @@ pub fn prefer_candidate_state(
         candidate_uniformity,
         incumbent_ev,
         incumbent_uniformity,
-        tol,
+        ev_tol,
     )
 }
 
@@ -1491,7 +1493,10 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod coordinate_fidelity_tests {
     use super::*;
-    use crate::manifold::{SAE_FINAL_EV_DEGRADATION_TOL, SaeBasisEvaluator};
+    use crate::manifold::{
+        SAE_FINAL_EV_DEGRADATION_TOL, SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL,
+        SaeBasisEvaluator,
+    };
     use ndarray::{Array1, Array2, Array3, Array4, Array5, ArrayView2};
 
     /// A minimal circle-harmonic evaluator for the arc-length-defect tests:
@@ -1879,7 +1884,8 @@ mod coordinate_fidelity_tests {
     /// only a numerical objective tie falls through to EV-then-uniformity.
     #[test]
     fn prefer_candidate_state_prices_objective_then_ev() {
-        let tol = SAE_FINAL_EV_DEGRADATION_TOL;
+        let objective_tol = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL;
+        let ev_tol = SAE_FINAL_EV_DEGRADATION_TOL;
         // Strictly lower objective wins despite much worse EV.
         assert!(prefer_candidate_state(
             100.0,
@@ -1888,7 +1894,8 @@ mod coordinate_fidelity_tests {
             200.0,
             0.65,
             Some(0.01),
-            tol
+            objective_tol,
+            ev_tol,
         ));
         // Strictly higher objective loses despite much better EV — the #2230
         // churn signature (EV 0.65 incumbent vetoing an EV 0.13 walked state).
@@ -1899,17 +1906,19 @@ mod coordinate_fidelity_tests {
             100.0,
             0.13,
             Some(0.5),
-            tol
+            objective_tol,
+            ev_tol,
         ));
-        // Numerically tied objective (within tol·(1+scale)): EV decides.
+        // Numerically tied objective (within objective_tol·(1+scale)): EV decides.
         assert!(prefer_candidate_state(
             100.0,
             0.65,
             Some(0.5),
-            100.0 + 0.5 * tol,
+            100.0 + 0.5 * objective_tol,
             0.13,
             Some(0.01),
-            tol
+            objective_tol,
+            ev_tol,
         ));
         // Tied objective AND near-equal EV: uniformity decides.
         assert!(prefer_candidate_state(
@@ -1919,7 +1928,8 @@ mod coordinate_fidelity_tests {
             100.0,
             0.6502,
             Some(0.20),
-            tol
+            objective_tol,
+            ev_tol,
         ));
         // Non-finite candidate objective never preferred.
         assert!(!prefer_candidate_state(
@@ -1929,7 +1939,8 @@ mod coordinate_fidelity_tests {
             100.0,
             0.1,
             Some(0.5),
-            tol
+            objective_tol,
+            ev_tol,
         ));
         // Non-finite incumbent objective: any finite candidate adopted.
         assert!(prefer_candidate_state(
@@ -1939,7 +1950,24 @@ mod coordinate_fidelity_tests {
             f64::INFINITY,
             0.9,
             None,
-            tol
+            objective_tol,
+            ev_tol,
+        ));
+
+        // The original #2230 patch used the 1e-3 EV tolerance for objective
+        // ties. At the issue's O(1e5) criterion scale that made an O(1)
+        // objective improvement look tied and allowed EV to restore the worse
+        // state. Objective convergence is eight orders tighter than that EV
+        // reporting band, so the walked-to state must win here.
+        assert!(prefer_candidate_state(
+            83_999.0,
+            0.13,
+            Some(0.5),
+            84_000.0,
+            0.65,
+            Some(0.01),
+            objective_tol,
+            ev_tol,
         ));
     }
 

@@ -769,19 +769,6 @@ impl SaeManifoldTerm {
         type SaeGBlocks = std::collections::BTreeMap<(usize, usize), Array2<f64>>;
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
         let mu_offsets: Vec<usize> = beta_offsets.iter().map(|&off| off / p).collect();
-        // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha_eff)
-        // which are constant across rows for the current rho; precompute once.
-        let ibp_prior_vec = match self.assignment.mode {
-            AssignmentMode::IBPMap { .. } => {
-                let alpha = self
-                    .assignment
-                    .resolved_ibp_alpha(rho)
-                    .ok_or_else(|| "IBP assignment alpha resolution failed".to_string())?;
-                Some(ordered_geometric_shrinkage_prior(k_atoms, alpha).to_vec())
-            }
-            _ => None,
-        };
-        let ibp_prior_slice = ibp_prior_vec.as_deref();
         // #991 design honesty weights (mean-1 HT inclusion corrections); see
         // the seam comment at the per-row residual below.
         let row_loss_w = self.row_loss_weights.as_deref();
@@ -1060,13 +1047,11 @@ impl SaeManifoldTerm {
                                 fill_active_atom_logit_jvp(
                                     ActiveAtomLogitJvp {
                                         mode: self.assignment.mode,
-                                        k,
                                         logit_k: logits_row[k],
                                         a_k: assignments[k],
                                         // #1410: compact slot `j`, not global atom `k`.
                                         decoded_k: decoded.row(j),
                                         fitted: fitted.view(),
-                                        ibp_prior: ibp_prior_slice,
                                         compact_index: j,
                                         // #1026/#1033: a FIXED logit (ungated, or every
                                         // atom under frozen routing) has a constant gate
@@ -1107,7 +1092,6 @@ impl SaeManifoldTerm {
                                 assignments.view(),
                                 decoded.view(),
                                 fitted.view(),
-                                ibp_prior_slice,
                                 // #1026/#1033: zero logit-JVP rows for FIXED-logit atoms
                                 // (ungated, and all atoms under frozen routing).
                                 &self.assignment.fixed_logit_mask(),

@@ -13,9 +13,9 @@
 //! atom's #1096 transport ladder is an independent, pure fit (read the shared
 //! model by index, build that atom's canonical per-layer coordinates, run the
 //! pure `transport_ladder` solve), so the reports now fan across rayon. The
-//! parallelization must be OBSERVABLE (results bit-identical to the sequential
-//! walk) and FAST (a real wall-clock speedup when several heavy ladders race on
-//! a multi-core host).
+//! parallelization must preserve results bit-identically to the sequential
+//! walk. Runtime is measured in the benchmark harnesses, never used as a test
+//! oracle or a fit deadline.
 //!
 //! Two properties are pinned:
 //!
@@ -32,15 +32,7 @@
 //!    `?`-walk would have skipped (the per-atom body is pure and cannot panic on
 //!    shape-valid input, so running them is harmless).
 //!
-//! 2. SPEEDUP. With several heavy ladders, the parallel path's wall-clock must
-//!    be strictly less than the forced-sequential path's on a multi-core host.
-//!    The inequality is asserted only when rayon actually has >1 worker thread
-//!    (a single-core CI box cannot speed up and must not flake); parity is
-//!    asserted unconditionally.
-//!
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`.
-
-use std::time::Instant;
 
 use ndarray::{Array1, Array2};
 use rayon::prelude::*;
@@ -196,48 +188,4 @@ fn ladder_first_error_is_deterministic_across_dispatch_1017() {
         parallel_err.contains("out of range for 4 fitted atoms"),
         "the surfaced error must be the index-99 out-of-range one; got: {parallel_err}"
     );
-}
-
-/// SPEEDUP: with several heavy ladders the parallel path is strictly faster than
-/// the forced-sequential path. Only asserted when rayon has >1 worker (a
-/// single-core box cannot speed up and must not flake); parity above is
-/// unconditional.
-#[test]
-fn ladder_parallel_is_faster_than_sequential_1017() {
-    let n_threads = rayon::current_num_threads();
-    let n_atoms = 16usize;
-    let model = model_with_atoms(n_atoms);
-    let ladders: Vec<AtomTransportLadderInput> =
-        (0..n_atoms).map(|k| interval_ladder(k, 256)).collect();
-
-    // Warm any one-time allocator/thread-pool spin-up so it is not charged to the
-    // first measured call.
-    let warm = atom_transport_ladder_reports(&model, &ladders).expect("warm");
-    assert_eq!(warm.len(), n_atoms);
-
-    // Forced-sequential timing: run inside a worker so the guard keeps it serial.
-    let t_seq = {
-        let start = Instant::now();
-        let reports = run_forced_sequential(&model, &ladders).expect("sequential fits");
-        let elapsed = start.elapsed();
-        assert_eq!(reports.len(), n_atoms);
-        elapsed
-    };
-
-    // Parallel timing: outside any worker, fans across rayon.
-    let t_par = {
-        let start = Instant::now();
-        let reports = atom_transport_ladder_reports(&model, &ladders).expect("parallel fits");
-        let elapsed = start.elapsed();
-        assert_eq!(reports.len(), n_atoms);
-        elapsed
-    };
-
-    if n_threads > 1 {
-        assert!(
-            t_par < t_seq,
-            "parallel ladder fits must be faster than sequential on a {n_threads}-thread host: \
-             parallel {t_par:?} vs sequential {t_seq:?}"
-        );
-    }
 }

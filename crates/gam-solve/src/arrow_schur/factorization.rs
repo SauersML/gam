@@ -1101,6 +1101,19 @@ pub(crate) fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 
         }
         None => hasher.write_bool(false),
     }
+    match sys.beta_gauge_quotient.as_ref() {
+        Some(quotient) => {
+            hasher.write_bool(true);
+            hasher.write_usize(quotient.directions.len());
+            for direction in quotient.directions.iter() {
+                hasher.write_usize(direction.len());
+                for &value in direction.iter() {
+                    hasher.write_f64(value);
+                }
+            }
+        }
+        None => hasher.write_bool(false),
+    }
     hasher.finish_u64()
 }
 

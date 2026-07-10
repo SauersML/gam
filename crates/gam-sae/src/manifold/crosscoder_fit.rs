@@ -564,6 +564,52 @@ fn wire_layer_label(
 }
 
 impl SaeCrosscoderFitReport {
+    pub fn layer_from_label(&self, label: &str) -> Result<CrosscoderLayer, String> {
+        let anchor = self
+            .layers
+            .first()
+            .ok_or_else(|| "crosscoder report has no anchor layer".to_string())?;
+        if label == anchor.label {
+            return Ok(CrosscoderLayer::Anchor);
+        }
+        self.layout
+            .labels()
+            .iter()
+            .position(|candidate| candidate == label)
+            .map(CrosscoderLayer::Block)
+            .ok_or_else(|| format!("crosscoder layer label {label:?} is not fitted"))
+    }
+
+    pub fn steer_layer_delta(
+        &self,
+        atom: usize,
+        layer_label: &str,
+        rows: &[usize],
+        delta: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.term.steer_layer_delta(
+            atom,
+            self.layer_from_label(layer_label)?,
+            rows,
+            delta,
+        )
+    }
+
+    pub fn steer_layer_decode(
+        &self,
+        atom: usize,
+        layer_label: &str,
+        rows: &[usize],
+        delta: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.term.steer_layer_decode(
+            atom,
+            self.layer_from_label(layer_label)?,
+            rows,
+            delta,
+        )
+    }
+
     /// Materialize the stable report shared by bindings. The optional transport
     /// experiment is evaluated here, not in pyffi/CLI.
     pub fn wire_report(

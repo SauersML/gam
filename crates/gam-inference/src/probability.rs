@@ -1,8 +1,9 @@
+use gam_math::probability::beta_quantile;
 use gam_problem::types::LikelihoodSpec;
 use gam_solve::estimate::EstimationError;
 use gam_solve::mixture_link::inverse_link_jet_for_family_public;
 use ndarray::{Array1, ArrayView1};
-use statrs::function::beta::{beta_reg, inv_beta_reg};
+use statrs::function::beta::beta_reg;
 
 /// Standard normal PDF φ(x).  Implementation lives in `gam-math`; re-exported
 /// to keep `crate::probability::normal_pdf` resolving for all existing callers.
@@ -122,32 +123,6 @@ pub fn gamma_moment_matched_interval(
     } else {
         None
     }
-}
-
-/// Quantile (inverse CDF) of a Beta distribution with shape parameters `a > 0`
-/// and `b > 0` at probability `p ∈ (0, 1)`: the value `x ∈ [0, 1]` with
-/// `I_x(a, b) = p`, where `I` is the regularized incomplete beta (the Beta CDF).
-///
-/// `p ≤ 0` maps to the `0` support floor and `p ≥ 1` to the `1` support ceiling;
-/// a non-finite or non-positive shape yields `NaN`. Built on the AS 64/109
-/// inverse-incomplete-beta routine.
-///
-/// This is the bounded-support analogue of [`gamma_quantile`]: a Beta response
-/// (a proportion modelled by the Beta family) is skewed toward whichever edge
-/// its mean is near, so a symmetric `μ ± z·σ` predictive band mis-covers *both*
-/// tails even when its width is correct. Equal-tailed Beta quantiles place the
-/// right mass in each tail (#1194).
-pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
-    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
-        return f64::NAN;
-    }
-    if !p.is_finite() || p <= 0.0 {
-        return 0.0;
-    }
-    if p >= 1.0 {
-        return 1.0;
-    }
-    inv_beta_reg(a, b, p)
 }
 
 /// Equal-tailed predictive interval for a `(0, 1)`-bounded response modelled as a
@@ -1182,55 +1157,6 @@ mod tests {
         assert!(gamma_moment_matched_interval(1.0, f64::INFINITY, 0.025, 0.975).is_none());
         // A finite, well-conditioned case still returns Some.
         assert!(gamma_moment_matched_interval(3.0, 2.0, 0.025, 0.975).is_some());
-    }
-
-    #[test]
-    fn beta_quantile_matches_known_reference_values() {
-        // Reference Beta quantiles cross-checked against scipy `beta.ppf(p,a,b)`.
-        // Spans symmetric (a=b), left-skewed (a<b), right-skewed (a>b), and a
-        // high-precision case to exercise the inverse-incomplete-beta branches.
-        let cases: [(f64, f64, f64, f64); 8] = [
-            // (p, a, b, expected) — scipy `beta.ppf`.
-            (0.025, 2.0, 2.0, 0.094_299_3),
-            (0.975, 2.0, 2.0, 0.905_700_7),
-            (0.5, 2.0, 2.0, 0.5),
-            (0.025, 0.8, 4.0, 0.002_339_1),
-            (0.975, 0.8, 4.0, 0.564_717_3),
-            (0.025, 5.0, 1.5, 0.408_549_1),
-            (0.5, 20.0, 80.0, 0.197_994_8),
-            (0.975, 20.0, 80.0, 0.283_367_6),
-        ];
-        for (p, a, b, expected) in cases {
-            let got = beta_quantile(p, a, b);
-            let abs = (got - expected).abs();
-            assert!(
-                abs < 1e-5,
-                "beta_quantile(p={p}, a={a}, b={b}) = {got}, expected ≈ {expected} (abs err {abs})"
-            );
-        }
-    }
-
-    #[test]
-    fn beta_quantile_boundaries_and_degeneracy() {
-        // p at/over the support boundaries map to 0 / 1; bad shapes => NaN; and
-        // the quantile is strictly increasing in p.
-        assert_eq!(beta_quantile(0.0, 2.0, 3.0), 0.0);
-        assert_eq!(beta_quantile(-0.5, 2.0, 3.0), 0.0);
-        assert_eq!(beta_quantile(1.0, 2.0, 3.0), 1.0);
-        assert_eq!(beta_quantile(1.5, 2.0, 3.0), 1.0);
-        assert!(beta_quantile(0.5, -1.0, 3.0).is_nan());
-        assert!(beta_quantile(0.5, 2.0, 0.0).is_nan());
-        assert!(beta_quantile(0.5, f64::NAN, 3.0).is_nan());
-        let mut prev = 0.0;
-        for i in 1..100 {
-            let p = i as f64 / 100.0;
-            let q = beta_quantile(p, 3.0, 5.0);
-            assert!(
-                q > prev,
-                "beta quantile not increasing at p={p}: {q} <= {prev}"
-            );
-            prev = q;
-        }
     }
 
     #[test]

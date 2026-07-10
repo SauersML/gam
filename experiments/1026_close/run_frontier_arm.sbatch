@@ -64,6 +64,7 @@ CURVED_STEPS=${CURVED_STEPS:-6000}
 LR=${LR:-1e-3}
 BATCH_SIZE=${BATCH_SIZE:-2048}  # r4 used bs2048 (the strong external bar)
 MAX_ROWS=${MAX_ROWS:-120000}
+BITS_MAX_ROWS=${BITS_MAX_ROWS:-8192}
 ATOM_MANIFOLD=${ATOM_MANIFOLD:-product}
 ATOM_BASIS=${ATOM_BASIS:-fourier}
 TAG=${TAG:-frontier-K${K}-s${SEED}}
@@ -98,14 +99,16 @@ COMMON=(--arm "$ARM" --chunk-dir "$CHUNK_DIR" --max-rows "$MAX_ROWS"
 case "$ARM" in
   external_topk)
     $PY -u "$DRIVER" "${COMMON[@]}" \
-      --steps "$STEPS" --lr "$LR" --batch-size "$BATCH_SIZE" --cosine-lr
+      --steps "$STEPS" --lr "$LR" --batch-size "$BATCH_SIZE" --cosine-lr \
+      --bits --bits-max-rows "$BITS_MAX_ROWS"
     ;;
   hybrid)
     $PY -u "$DRIVER" "${COMMON[@]}" \
       --steps "$STEPS" --curved-steps "$CURVED_STEPS" --lr "$LR" \
       --batch-size "$BATCH_SIZE" --d-atom "$D_ATOM" \
       --curved-atoms "$CURVED_ATOMS" --curved-k "$CURVED_K" \
-      --atom-manifold "$ATOM_MANIFOLD" --atom-basis "$ATOM_BASIS"
+      --atom-manifold "$ATOM_MANIFOLD" --atom-basis "$ATOM_BASIS" \
+      --bits --bits-max-rows "$BITS_MAX_ROWS"
     ;;
   pca_bar)
     # K-independent linear-optimum yardstick — run ONCE (frontier_matrix.sh

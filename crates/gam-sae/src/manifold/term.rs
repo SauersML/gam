@@ -176,10 +176,9 @@ pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 /// variance" negligibility tolerance (the SAME dimensionless negligibility point
 /// as [`crate::hybrid_split`]'s collapse gate): it debounces round-off-level EV
 /// wobble between iterates from a material EV move, without a corpus-tuned
-/// magnitude. Where it instead gates an OBJECTIVE (not an EV) it is applied
-/// scale-relative as `TOL·(1 + |objective|)` (`fit_drivers.rs` accept floor), so
-/// the same constant reads as a relative tolerance on that scale-bearing
-/// quantity.
+/// magnitude. This tolerance is intentionally EV-only: penalized-objective
+/// comparisons use [`SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL`] so the much
+/// coarser reporting-scale EV band cannot override a genuine objective descent.
 pub(crate) const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 
 pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
@@ -320,6 +319,13 @@ pub(crate) const SAE_BARRIER_ACTIVE_NORM_REL_FLOOR: f64 = 1.0e-6;
 pub struct SaeManifoldTerm {
     pub atoms: Vec<SaeManifoldAtom>,
     pub assignment: SaeAssignment,
+    /// #1890 — multi-chart semantic atoms.  The numerical storage remains one
+    /// decoder/routing block per local chart; each entry records which blocks
+    /// form one atlas plus the fitted unit-speed transition cocycle.  Existing
+    /// gates then factor exactly into atlas activation × partition-of-unity, so
+    /// registration preserves the fitted image while retaining pole and Möbius
+    /// seams that a destructive single-chart fusion would erase.
+    pub(crate) chart_atlases: Vec<ManifoldChartAtlas>,
     pub(crate) temperature_schedule: Option<GumbelTemperatureSchedule>,
     /// Active-set row layout from the most recent `assemble_arrow_schur` call.
     /// `None` for dense modes (Softmax / IBPMap) or when not yet assembled.
@@ -462,21 +468,10 @@ pub struct SaeManifoldTerm {
     /// carried alongside the EV so the multi-start can break (near-)equal-EV ties
     /// on coordinate fidelity ([`prefer_candidate_basin`]).
     pub(crate) best_cocollapse_incumbent: Option<(f64, Option<f64>, SaeManifoldMutableState)>,
-    /// Fit-level keep-best across the WHOLE outer ρ search (#1026 lifted one
-    /// level). The per-call incumbent inside `run_joint_fit_arrow_schur` only
-    /// protects one call: an outer probe sequence that walks the warm-start
-    /// state into a collapse basin loses the earlier good basin across calls
-    /// (measured on the manifold-zoo arena: in-call incumbents decayed
-    /// 0.77 → 0.54 → 0.38 while every call ended in an EV-degraded restore, and
-    /// the terminal model reconstructed held-out data at R² 0.18 against its own
-    /// best-visited 0.77). This banks the best (EV, uniformity, state) at every
-    /// ACCEPTED outer iterate — same [`prefer_candidate_basin`] ordering and
-    /// `SAE_FIT_DATA_COLLAPSE_EV_FLOOR` gate as the co-collapse ledger — and
-    /// `into_fitted` restores it when the terminal state reconstructs strictly
-    /// worse. Transient like `best_cocollapse_incumbent` (never persisted;
-    /// cleared at each outer-optimization entry). Snapshot states are row-count
-    /// bound, so a subsampled search term's bank dies with that term and never
-    /// crosses the full-row seam.
+    /// Exact recurrence ledger for the OBJECTIVE-keyed in-call incumbent
+    /// restore. This is convergence evidence only: the saved state is compared
+    /// for identity on the next call and is never installed across ρ values or
+    /// after the outer certificate.
     pub(crate) best_fit_incumbent: Option<SaeFitIncumbent>,
     /// Bounded high-EV structural-collapse reseeds spent by the frame-coherence
     /// guard in the current optimization. This is separate from total decoder
@@ -738,6 +733,7 @@ impl Clone for SaeManifoldTerm {
         Self {
             atoms: self.atoms.clone(),
             assignment: self.assignment.clone(),
+            chart_atlases: self.chart_atlases.clone(),
             temperature_schedule: self.temperature_schedule.clone(),
             last_row_layout: self.last_row_layout.clone(),
             row_metric: self.row_metric.clone(),
@@ -854,7 +850,7 @@ pub(crate) struct SaeManifoldMutableState {
     pub(crate) last_row_layout: Option<SaeRowLayout>,
 }
 
-/// Fit-global reconstruction incumbent and its outer-stationarity evidence.
+/// Recurrent objective-incumbent identity and its outer-stationarity evidence.
 ///
 /// `consecutive_inner_restores` counts successful joint-fit calls that ended by
 /// restoring exactly the fit-level incumbent model (checked on the snapshot's
@@ -865,8 +861,6 @@ pub(crate) struct SaeManifoldMutableState {
 /// instead of inferring flatness from a workload-tuned relative-cost threshold.
 #[derive(Debug)]
 pub(crate) struct SaeFitIncumbent {
-    pub(crate) ev: f64,
-    pub(crate) uniformity: Option<f64>,
     pub(crate) state: SaeManifoldMutableState,
     pub(crate) consecutive_inner_restores: usize,
 }

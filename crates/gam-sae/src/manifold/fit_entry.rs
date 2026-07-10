@@ -12,21 +12,15 @@
 //! [`SaeFitRequest`], execute [`run_sae_manifold_fit`] on its worker thread, and
 //! marshal the returned [`SaeFitReport`].
 //!
-//! Two seams keep this library entry free of python AND of the two crates that
-//! sit ABOVE `gam-sae` in the dependency graph:
+//! The analytic-penalty registry is the only seam needed to keep this library
+//! entry free of python and of the crate that sits above `gam-sae` in the
+//! dependency graph:
 //!
-//! * The analytic-penalty registry (built by `gam-models`, which depends on
-//!   `gam-sae`) is passed in PRE-BUILT and cloned at each of the three
-//!   objective-construction sites — identical to the binding rebuilding it from
-//!   the same `latent_payload` + descriptor JSON each time.
-//! * The #2071 promotion alignment threshold `align_min(r)` is a Beta-quantile
-//!   of the random-alignment null; `beta_quantile` lives in `gam-inference`
-//!   (also above `gam-sae`), so the derivation is injected as a plain
-//!   `fn(usize) -> f64` the binding supplies. It is only consulted on the
-//!   default-on `promote_from_residual` path (#2239: evidence-certified
-//!   residual structure is promoted by default; the certificate — evidence-
-//!   ladder rank, energy floor, Beta-null alignment, nursery dwell — is the
-//!   gate, not the flag).
+//! The registry (built by `gam-models`, which depends on `gam-sae`) is passed in
+//! PRE-BUILT and cloned at each of the three objective-construction sites —
+//! identical to the binding rebuilding it from the same `latent_payload` +
+//! descriptor JSON each time. Every numerical fit policy, including the #2071
+//! Beta-null residual-promotion threshold, is derived inside this entry.
 //!
 //! Interruptibility is preserved by the caller: the whole entry runs on the
 //! binding's GIL-released worker thread and shares the `cancel` flag, which each
@@ -36,6 +30,7 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use gam_math::probability::beta_quantile;
 use gam_problem::{EstimationError, MetricProvenance};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
@@ -57,6 +52,20 @@ pub const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 /// Canonical structured-residual alternation budget. The iid-only A/B mode was
 /// removed; every production fit starts with this evidence-refined budget.
 pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
+
+/// #2071 residual-promotion alignment threshold under the random-direction
+/// null. Rank one has no informative angle, so its threshold is exactly one.
+/// Keeping this derivation in `gam-sae` makes the typed fit entry self-sufficient
+/// for Rust, CLI, and binding callers alike.
+fn promotion_alignment_threshold(factor_rank: usize) -> f64 {
+    if factor_rank <= 1 {
+        return 1.0;
+    }
+    let rank = factor_rank as f64;
+    beta_quantile(0.95, 0.5, (rank - 1.0) / 2.0)
+        .sqrt()
+        .clamp(0.0, 1.0)
+}
 
 /// One #2021 structured-residual outer-alternation pass's diagnostic record. The
 /// binding serializes a `&[StructuredResidualPassDiagnostic]` into the payload;
@@ -334,7 +343,6 @@ pub struct SaeFitRequest {
     pub promote_from_residual: bool,
     pub run_structure_search: bool,
     pub run_outer_rho_search: bool,
-    pub align_min_from_rank: fn(usize) -> f64,
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -349,10 +357,6 @@ pub struct SaeFitRequest {
 /// * `registry` is the pre-built analytic-penalty registry; it is cloned at each
 ///   objective-construction site (three at most: pass 0, each structured pass, and
 ///   the post-search joint shape recompute).
-/// * `align_min_from_rank` supplies the #2071 promotion alignment threshold from
-///   the current residual factor rank (a Beta-quantile the binding computes,
-///   since its `beta_quantile` lives above `gam-sae`). Consulted only on the
-///   default-on `promote_from_residual` path.
 /// * `cancel`, when present, is polled by every inner objective; the caller sets
 ///   it on interrupt so the abandoned worker's next outer eval bails.
 pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
@@ -373,7 +377,6 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
-        align_min_from_rank,
         cancel,
     } = request;
     let (n_obs, p_out) = z.dim();
@@ -516,11 +519,10 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
         // i.e. the minimal count that distinguishes a repeated structural signal
         // from a one-pass artifact.
         const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
-        // The #2071 per-pass alignment threshold `align_min(r)` (a Beta-quantile
-        // of the random-alignment null keyed to the residual factor rank `r`) is
-        // supplied by the caller via `align_min_from_rank`, since `beta_quantile`
-        // lives above `gam-sae`. Used identically by the producer-side candidate
-        // gate and the nursery lineage-dedup below.
+        // The #2071 per-pass alignment threshold `align_min(r)` is the
+        // Beta-quantile of the random-alignment null keyed to the residual factor
+        // rank `r`. It is derived here and used identically by the producer-side
+        // candidate gate and the nursery lineage-dedup below.
         //
         // `promote_from_residual` is the typed caller flag (default TRUE, #2239:
         // magic-by-default — the evidence certificate above, not the flag, is the
@@ -624,7 +626,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
                 // Per-pass derived alignment threshold from the current residual
                 // factor rank (#2071); used identically by the producer-side
                 // candidate gate and the nursery lineage-dedup below.
-                let align_min = align_min_from_rank(model.factor_rank());
+                let align_min = promotion_alignment_threshold(model.factor_rank());
                 let cands = model.promotion_candidates(
                     Some(prev),
                     align_min,
@@ -1056,4 +1058,21 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
         pre_topk_fitted,
         reported_log_alpha,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::promotion_alignment_threshold;
+
+    #[test]
+    fn promotion_alignment_threshold_is_core_owned_and_rank_aware() {
+        assert_eq!(promotion_alignment_threshold(0), 1.0);
+        assert_eq!(promotion_alignment_threshold(1), 1.0);
+
+        let rank_two = promotion_alignment_threshold(2);
+        let rank_four = promotion_alignment_threshold(4);
+        assert!(rank_two.is_finite() && (0.0..=1.0).contains(&rank_two));
+        assert!(rank_four.is_finite() && (0.0..=1.0).contains(&rank_four));
+        assert!(rank_four < rank_two);
+    }
 }

@@ -2,6 +2,60 @@
 /// Validation, defaults, seeding, fitting, diagnostics, and the wire schema all
 /// live in `gam-sae`.
 
+#[pyclass(module = "gamfit._rust", name = "ManifoldCrosscoderCore")]
+struct ManifoldCrosscoderCore {
+    inner: gam::terms::sae::manifold::SaeCrosscoderFitReport,
+    wire: gam::terms::sae::manifold::SaeCrosscoderWireReport,
+}
+
+impl ManifoldCrosscoderCore {
+    fn wire_value(&self) -> PyResult<serde_json::Value> {
+        serde_json::to_value(&self.wire).map_err(|error| py_value_error(error.to_string()))
+    }
+}
+
+#[pymethods]
+impl ManifoldCrosscoderCore {
+    fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
+        json_value_to_py(py, self.wire_value()?)
+    }
+
+    fn to_json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.wire_value()?)
+            .map_err(|error| py_value_error(error.to_string()))
+    }
+
+    fn steer_layer_delta<'py>(
+        &self,
+        py: Python<'py>,
+        atom: usize,
+        layer: &str,
+        rows: Vec<usize>,
+        delta: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let values = self
+            .inner
+            .steer_layer_delta(atom, layer, &rows, delta.as_array())
+            .map_err(py_value_error)?;
+        Ok(values.into_pyarray(py))
+    }
+
+    fn steer_layer_decode<'py>(
+        &self,
+        py: Python<'py>,
+        atom: usize,
+        layer: &str,
+        rows: Vec<usize>,
+        delta: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let values = self
+            .inner
+            .steer_layer_decode(atom, layer, &rows, delta.as_array())
+            .map_err(py_value_error)?;
+        Ok(values.into_pyarray(py))
+    }
+}
+
 #[pyfunction(signature = (
     anchor,
     anchor_label,
@@ -38,7 +92,7 @@ fn sae_crosscoder_fit<'py>(
     run_outer_rho_search: Option<bool>,
     transport_grid_resolution: Option<usize>,
     law_gap_tolerance: Option<f64>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<ManifoldCrosscoderCore>> {
     use gam::terms::sae::manifold::{
         SaeCrosscoderAutoFitOverrides, SaeCrosscoderAutoFitRequest, SaeCrosscoderEvaluationConfig,
         pair_crosscoder_targets, run_auto_sae_crosscoder_fit,
@@ -73,16 +127,21 @@ fn sae_crosscoder_fit<'py>(
         config,
         cancel: Some(std::sync::Arc::clone(&cancel)),
     };
-    let fitted = run_sae_fit_interruptible(py, "gam-sae-crosscoder-fit", &cancel, move || {
+    let inner = run_sae_fit_interruptible(py, "gam-sae-crosscoder-fit", &cancel, move || {
         run_auto_sae_crosscoder_fit(request)
     })?
     .map_err(|error| sae_fit_error_to_pyerr(py, error))?;
-    let wire = fitted
+    let wire = inner
         .wire_report(SaeCrosscoderEvaluationConfig {
             transport_grid_resolution,
             law_gap_tolerance,
         })
         .map_err(py_value_error)?;
-    let value = serde_json::to_value(wire).map_err(|error| py_value_error(error.to_string()))?;
-    json_value_to_py(py, value)
+    Py::new(
+        py,
+        ManifoldCrosscoderCore {
+            inner,
+            wire,
+        },
+    )
 }

@@ -196,6 +196,7 @@ impl SaeManifoldTerm {
         Ok(Self {
             atoms,
             assignment,
+            chart_atlases: Vec::new(),
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
@@ -397,8 +398,15 @@ impl SaeManifoldTerm {
             .ungated
             .extend(secondary.assignment.ungated);
         primary.assignment.frozen_logits = None;
-        // Atoms.
+        // Atoms and first-class chart atlases.  Secondary atlas chart indices
+        // are local to its atom vector, so shift them by the primary width
+        // before appending; primary indices are unchanged.
+        let mut secondary_atlases = secondary.chart_atlases;
+        for atlas in &mut secondary_atlases {
+            atlas.shift_indices(k1);
+        }
         primary.atoms.extend(secondary.atoms);
+        primary.chart_atlases.extend(secondary_atlases);
         // Reset K-dependent / per-assembly transient state (rebuilt next assembly).
         primary.last_row_layout = None;
         primary.last_frames_active = false;
@@ -515,6 +523,15 @@ impl SaeManifoldTerm {
         // Per-atom Vecs (atoms / coords / ungated) and the paired rho blocks.
         let atoms = std::mem::take(&mut self.atoms);
         self.atoms = Self::gather_by_order(atoms, order);
+        // Atlas endpoints are atom indices.  `order[new] = old`, so invert the
+        // gather permutation to obtain old -> new and remap every seam.
+        let mut old_to_new = vec![None; k];
+        for (new, &old) in order.iter().enumerate() {
+            old_to_new[old] = Some(new);
+        }
+        for atlas in &mut self.chart_atlases {
+            atlas.remap(&old_to_new)?;
+        }
         let coords = std::mem::take(&mut self.assignment.coords);
         self.assignment.coords = Self::gather_by_order(coords, order);
         let ungated = std::mem::take(&mut self.assignment.ungated);

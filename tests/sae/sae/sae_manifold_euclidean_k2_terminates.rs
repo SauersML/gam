@@ -1,5 +1,5 @@
-//! Regression pin for #1094 — a K=2 euclidean SAE fit must TERMINATE (and
-//! converge) within a bounded time on small real-ish activation geometry. The
+//! Regression pin for #1094 — a K=2 euclidean SAE fit must terminate with a
+//! convergence certificate on small real-ish activation geometry. The
 //! issue: on PCA-whitened OLMo activations the K≥2 euclidean fit stalls after
 //! the rank-deficiency audit and never makes an outer iteration (the inner
 //! Arrow-Schur joint solve grinds the ill-conditioned multi-atom Hessian; the
@@ -8,8 +8,8 @@
 //!
 //! This drives the fit exactly the way production does (`OuterProblem::run`
 //! around `SaeManifoldOuterObjective`) on TWO planted euclidean-1D atoms in a
-//! small ambient, and asserts the cascade COMPLETES with a finite criterion in
-//! bounded wall-time — a hang reproduces #1094.
+//! small ambient, and asserts the cascade returns a converged, finite fit.
+//! Elapsed time is reported diagnostically but never controls success.
 
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::solver::rho_optimizer::OuterProblem;
@@ -35,10 +35,6 @@ const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
-// Generous wall-clock ceiling: the K=2 euclidean fit must finish well inside
-// this on N=240, P=6. A true hang blows past it (the issue's 240 s tile cap).
-const WALL_CLOCK_CEILING_SECS: f64 = 150.0;
-
 fn idx_noise(seed: u64) -> f64 {
     let mut s = seed
         .wrapping_mul(6364136223846793005)
@@ -204,10 +200,10 @@ fn sae_manifold_euclidean_k2_fit_terminates() {
         "[#1094] euclidean K=2 fit: final_value={:.6e} recheck_criterion={:.6e} recon_R2={:.6} elapsed={elapsed:.1}s",
         result.final_value, recheck_cost, r2
     );
+    assert!(result.converged, "run() must return only a certified fit");
     assert!(
-        elapsed < WALL_CLOCK_CEILING_SECS,
-        "euclidean K=2 fit took {elapsed:.1}s > {WALL_CLOCK_CEILING_SECS:.0}s ceiling — \
-         the multi-atom joint solve hangs (#1094)"
+        result.converged_via.is_some(),
+        "a returned fit must name its convergence certificate"
     );
     // The fit reconstructs the two planted lines — a FEASIBLE fit by its own
     // reconstruction certificate.

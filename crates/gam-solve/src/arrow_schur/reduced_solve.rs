@@ -2059,7 +2059,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             deflation_subspace_iters,
             seed,
             (DEFLATION_BASIS_CG_REL_TOL, cg_max_iters),
-        );
+        )?;
         let eval = plan.evaluate(&matvec, cg_rel_tol, cg_max_iters)?;
         if eval.std_err <= target || r >= cap {
             return Some(plan);

@@ -257,6 +257,26 @@ impl SphereTangentEmbedding {
         Ok(q.mapv(|value| value * value))
     }
 
+    /// Decode a row-aligned matrix of nats-unit tangent coordinates back to
+    /// probability distributions.  This is the batched public inverse used by
+    /// the behavior-fit report; it delegates every row to [`Self::decode`] so
+    /// the scalar and batched hemisphere/normalization contracts cannot drift.
+    pub fn decode_rows(&self, y: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        if y.ncols() != self.behavior_dim() {
+            return Err(format!(
+                "SphereTangentEmbedding::decode_rows: coordinates have {} columns; chart tangent dim is {}",
+                y.ncols(),
+                self.behavior_dim()
+            ));
+        }
+        let mut probabilities = Array2::<f64>::zeros((y.nrows(), self.vocab()));
+        for row in 0..y.nrows() {
+            let decoded = self.decode(y.row(row))?;
+            probabilities.row_mut(row).assign(&decoded);
+        }
+        Ok(probabilities)
+    }
+
     /// Local (flat-metric) predicted dose in nats for a tangent displacement
     /// `Δy`: `‖Δy‖²`. By construction of the `√2` scaling this equals the
     /// second-order KL between the two decoded distributions, and it is the

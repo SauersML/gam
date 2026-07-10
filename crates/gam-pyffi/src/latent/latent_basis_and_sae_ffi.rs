@@ -1694,25 +1694,6 @@ fn structured_residual_pass_diagnostics_dict<'py>(
     Ok(out)
 }
 
-/// #2071 residual-factor promotion alignment gate. For two independent unit
-/// directions in an r-dimensional subspace, cos²θ follows
-/// Beta(1/2, (r−1)/2); use its 95th percentile as the per-pass false-merge
-/// threshold. Rank one has no informative angle, so the threshold is exactly
-/// one. The fit engine receives this function because the quantile routine lives
-/// above `gam-sae` in the crate graph.
-fn sae_promotion_align_min(factor_rank: usize) -> f64 {
-    if factor_rank <= 1 {
-        return 1.0;
-    }
-    let rank = factor_rank as f64;
-    let cos2 = gam::inference::probability::beta_quantile(0.95, 0.5, (rank - 1.0) / 2.0);
-    if cos2.is_finite() {
-        cos2.sqrt().clamp(0.0, 1.0)
-    } else {
-        1.0
-    }
-}
-
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
 /// the per-atom [`SaeBasisSecondJet`] (analytic harmonic for `Periodic`
@@ -2448,7 +2429,6 @@ fn sae_manifold_fit_inner<'py>(
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
-        align_min_from_rank: sae_promotion_align_min,
         cancel: Some(std::sync::Arc::clone(&cancel_flag)),
     };
     let report = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {

@@ -452,7 +452,7 @@ pub fn sae_decoder_lsq_init(
             // Use the base alpha here. In learnable-alpha fits the first rho
             // coordinate starts at zero, so alpha_eff = alpha at initialization.
             for row in 0..n_obs {
-                let weights = ibp_map_row(initial_logits.row(row), tau, alpha);
+                let weights = ibp_map_row(initial_logits.row(row), tau);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -803,9 +803,9 @@ mod tests {
         // The seeded reconstruction must explain most of Z under the SAME forward
         // map the joint LSQ solved against: fitted[i,:] = Σ_k a_k · Phi_k[i,:] · B_k
         // where a_k is the IBP-MAP activation of the initial (all-zero) logits. For
-        // zero logits the sigmoid gate is σ(0) = 0.5 and the truncated stick-breaking
-        // prior contributes π_k = (α/(α+1))^{k+1}, so a_k = 0.5 · 0.5^{k+1} — i.e.
-        // (0.25, 0.125) here, strictly decreasing in atom index, NOT a flat 0.5.
+        // zero logits the posterior-mean Bernoulli gate is σ(0) = 0.5. Ordered
+        // stick-breaking shrinkage is scored by the IBP prior, not multiplied
+        // into the reconstruction a second time.
         // Reconstructing with the true per-atom weights (rather than an imagined
         // uniform gate) is what makes this a faithful check of the LSQ seed: the
         // solver's design columns are a_k · Phi_k, so the fit it returns is only
@@ -813,7 +813,6 @@ mod tests {
         let a_init = ibp_map_row(
             ndarray::Array1::<f64>::zeros(k).view(),
             0.7, // tau (matches the sae_decoder_lsq_init call above)
-            1.0, // alpha
         );
         let mut fitted = Array2::<f64>::zeros((n, p));
         for i in 0..n {

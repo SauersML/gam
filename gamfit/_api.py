@@ -4179,7 +4179,8 @@ def _resolve_position_penalty(
       single-penalty position helper.
     * ``"thinplate"`` (1D ``t``) → 1D thin-plate ≡ cubic smoothing spline,
       routed through the cubic-basis single-λ penalty at ``m=2``.
-    * ``"bspline"``  → P-spline 2nd-difference coefficient penalty.
+    * ``"bspline"``  → exact integrated second-derivative roughness of the
+      represented B-spline basis (open or periodic).
     """
     import numpy as np
 
@@ -4225,12 +4226,29 @@ def _resolve_position_penalty(
                 "gives each operator its own REML λ."
             )
         if kind in {"bspline", "spline"}:
-            if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
+            if penalty_kind not in {
+                None,
+                "roughness",
+                "bending-energy",
+                "bendingenergy",
+            }:
                 raise ValueError(f"unsupported B-spline penalty {penalty!r}")
             if periodic:
-                k = int(np.asarray(knots_or_centers, dtype=float).size - 1)
+                knots = np.asarray(knots_or_centers, dtype=float)
+                k = int(knots.size - 1)
+                effective_period = (
+                    float(period)
+                    if period is not None
+                    else float(knots[-1] - knots[0])
+                )
                 return np.asarray(
-                    rust_module().cyclic_difference_penalty(k, 2), dtype=float
+                    rust_module().cyclic_bspline_roughness_penalty(
+                        k,
+                        int(basis_order),
+                        effective_period,
+                        2,
+                    ),
+                    dtype=float,
                 )
             s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
             return s

@@ -1,4 +1,23 @@
-use statrs::function::erf::erfc;
+use statrs::function::{beta::inv_beta_reg, erf::erfc};
+
+/// Quantile (inverse CDF) of a Beta distribution with shape parameters `a > 0`
+/// and `b > 0` at probability `p`: the value `x in [0, 1]` with
+/// `I_x(a, b) = p`, where `I` is the regularized incomplete beta.
+///
+/// `p <= 0` maps to the support floor and `p >= 1` to the support ceiling. A
+/// non-finite or non-positive shape yields `NaN`.
+pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
+    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
+        return f64::NAN;
+    }
+    if !p.is_finite() || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return 1.0;
+    }
+    inv_beta_reg(a, b, p)
+}
 
 /// Standard normal PDF phi(x).
 #[inline]
@@ -324,6 +343,46 @@ mod tests {
 
     fn rel_err(got: f64, expected: f64) -> f64 {
         (got - expected).abs() / expected.abs().max(1e-300)
+    }
+
+    #[test]
+    fn beta_quantile_matches_known_reference_values() {
+        let cases: [(f64, f64, f64, f64); 8] = [
+            (0.025, 2.0, 2.0, 0.094_299_3),
+            (0.975, 2.0, 2.0, 0.905_700_7),
+            (0.5, 2.0, 2.0, 0.5),
+            (0.025, 0.8, 4.0, 0.002_339_1),
+            (0.975, 0.8, 4.0, 0.564_717_3),
+            (0.025, 5.0, 1.5, 0.408_549_1),
+            (0.5, 20.0, 80.0, 0.197_994_8),
+            (0.975, 20.0, 80.0, 0.283_367_6),
+        ];
+        for (p, a, b, expected) in cases {
+            let got = beta_quantile(p, a, b);
+            let abs = (got - expected).abs();
+            assert!(
+                abs < 1e-5,
+                "beta_quantile(p={p}, a={a}, b={b}) = {got}, expected ≈ {expected} (abs err {abs})"
+            );
+        }
+    }
+
+    #[test]
+    fn beta_quantile_boundaries_and_degeneracy() {
+        assert_eq!(beta_quantile(0.0, 2.0, 3.0), 0.0);
+        assert_eq!(beta_quantile(-0.5, 2.0, 3.0), 0.0);
+        assert_eq!(beta_quantile(1.0, 2.0, 3.0), 1.0);
+        assert_eq!(beta_quantile(1.5, 2.0, 3.0), 1.0);
+        assert!(beta_quantile(0.5, -1.0, 3.0).is_nan());
+        assert!(beta_quantile(0.5, 2.0, 0.0).is_nan());
+        assert!(beta_quantile(0.5, f64::NAN, 3.0).is_nan());
+        let mut prev = 0.0;
+        for i in 1..100 {
+            let p = i as f64 / 100.0;
+            let q = beta_quantile(p, 3.0, 5.0);
+            assert!(q > prev, "beta quantile not increasing at p={p}");
+            prev = q;
+        }
     }
 
     // ── normal_pdf ────────────────────────────────────────────────────────────

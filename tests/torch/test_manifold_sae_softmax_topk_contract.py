@@ -11,6 +11,7 @@ import inspect
 
 import torch
 
+from gamfit.torch import manifold_sae as torch_manifold_sae
 from gamfit.torch import penalties as torch_penalties
 from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig, SparsityConfig
 
@@ -219,6 +220,55 @@ def test_topk_activation_forward_contains_no_python_numerical_kernel() -> None:
         source = inspect.getsource(bridge.forward)
         assert ffi_name in source
         assert all(token not in source for token in forbidden)
+
+
+def test_softmax_topk_numeric_helpers_remain_rust_routed() -> None:
+    """Guard #2011's complete named helper inventory at the Python boundary."""
+    ffi_by_helper = {
+        torch_manifold_sae._duchon_centers_nd: "sae_duchon_centers_nd",
+        torch_manifold_sae._SparsityLayer._direction_cluster_anchor: (
+            "sae_direction_cluster_anchor"
+        ),
+        torch_manifold_sae._SparsityLayer._quadratic_subspace_anchor: (
+            "sae_quadratic_subspace_anchor"
+        ),
+        torch_manifold_sae._SparsityLayer._apply_global_anchor_rule: (
+            "sae_apply_anchor_rule"
+        ),
+        torch_manifold_sae._SparsityLayer._matching_pursuit_commit: (
+            "sae_matching_pursuit_commit"
+        ),
+        torch_manifold_sae._SparsityLayer._update_assign_ema: (
+            "sae_assign_ema_update"
+        ),
+        torch_manifold_sae._SparsityLayer._sinkhorn_balance: (
+            "sae_sinkhorn_balance_bias"
+        ),
+    }
+    forbidden = (
+        "torch.linalg",
+        "torch.svd",
+        "torch.exp(",
+        "torch.log(",
+        "torch.logsumexp(",
+        "for _ in range(",
+    )
+    for helper, ffi_name in ffi_by_helper.items():
+        source = inspect.getsource(helper)
+        assert ffi_name in source
+        assert all(token not in source for token in forbidden)
+
+    router = inspect.getsource(
+        torch_manifold_sae._SparsityLayer.reconstruction_topk_gate
+    )
+    assert "_ResidualEmScoreFn.apply" in router
+    assert "_sinkhorn_balance" in router
+    assert "_matching_pursuit_commit" in router
+    assert "_update_assign_ema" in router
+    # Softmax, top-k, detaches, and STE arithmetic are deliberately Torch-tape
+    # composition; the residual/code criterion itself must not return to Python.
+    assert "torch.linalg" not in router
+    assert "torch.einsum" not in router
 
 
 def test_duchon_centers_nd_uses_rust_low_discrepancy_lift() -> None:

@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         "grid_resolution": args.grid_resolution,
         "law_gap_tolerance": args.law_gap_tolerance,
     }
-    fit = sae_crosscoder_fit(
+    model = sae_crosscoder_fit(
         anchor,
         [(f"L{args.layer + 1}", block)],
         anchor_label=f"L{args.layer}",
@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         transport_grid_resolution=args.grid_resolution,
         law_gap_tolerance=args.law_gap_tolerance,
     )
+    fit = model.to_dict()
     reports = list(fit["transport"])
 
     import os

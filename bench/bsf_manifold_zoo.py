@@ -202,7 +202,8 @@ class ZooData:
     """
 
     def __init__(self, m_factors: int, d_ambient: int, l0: int, seed: int, *,
-                 curved_fraction: float = 0.5, dgp: str = "toy",
+                 curved_fraction: float = 0.5, kinds: list[str] | None = None,
+                 dgp: str = "toy",
                  zipf: float = 1.0, importance: float = 0.5,
                  amp_sigma: float = 0.6, noise: float = 0.25,
                  n_contexts: int = 4) -> None:
@@ -218,11 +219,23 @@ class ZooData:
         self.n_contexts = int(n_contexts)
         rng = np.random.default_rng(seed)
         self.factors: list[FactorInstance] = []
-        n_curved = int(round(curved_fraction * m_factors))
-        kinds = ["segment"] * (m_factors - n_curved) + [
-            CURVED_CYCLE[i % len(CURVED_CYCLE)] for i in range(n_curved)
-        ]
-        rng.shuffle(kinds)
+        if kinds is None:
+            n_curved = int(round(curved_fraction * m_factors))
+            kinds = ["segment"] * (m_factors - n_curved) + [
+                CURVED_CYCLE[i % len(CURVED_CYCLE)] for i in range(n_curved)
+            ]
+            rng.shuffle(kinds)
+        else:
+            kinds = [str(kind).strip().lower() for kind in kinds]
+            if len(kinds) != m_factors:
+                raise ValueError(
+                    f"explicit kinds has {len(kinds)} entries but m_factors={m_factors}"
+                )
+            unknown = sorted(set(kinds) - ZOO.keys())
+            if unknown:
+                raise ValueError(
+                    f"unknown zoo kinds {unknown}; expected a subset of {sorted(ZOO)}"
+                )
         for kind in kinds:
             zoo = ZOO[kind]
             raw, _ = zoo.sampler(rng, _CALIBRATION_N)
@@ -807,6 +820,14 @@ def main() -> int:
     parser.add_argument("--ambient", type=int, default=128)
     parser.add_argument("--l0", type=int, default=4)
     parser.add_argument("--curved-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--kinds",
+        default=None,
+        help=(
+            "comma-separated planted factor kinds; when supplied, its length "
+            "sets --factors (useful for focused per-kind acceptance runs)"
+        ),
+    )
     parser.add_argument("--dgp", choices=("toy", "llm"), default="toy",
                         help="'llm' = Zipf firing, context co-occurrence, power-law "
                              "importance, lognormal amplitudes, noise floor.")
@@ -840,8 +861,18 @@ def main() -> int:
                         help="Directory for per-featurizer NPZ cloud dumps.")
     args = parser.parse_args()
 
-    data = ZooData(args.factors, args.ambient, args.l0, args.seed,
-                   curved_fraction=args.curved_fraction, dgp=args.dgp,
+    selected_kinds = (
+        [kind.strip().lower() for kind in args.kinds.split(",") if kind.strip()]
+        if args.kinds is not None
+        else None
+    )
+    factors = len(selected_kinds) if selected_kinds is not None else args.factors
+    if factors == 0:
+        raise SystemExit("--kinds must name at least one zoo kind")
+    if args.l0 > factors:
+        raise SystemExit(f"--l0={args.l0} cannot exceed the {factors} planted factors")
+    data = ZooData(factors, args.ambient, args.l0, args.seed,
+                   curved_fraction=args.curved_fraction, kinds=selected_kinds, dgp=args.dgp,
                    zipf=args.llm_zipf, importance=args.llm_importance,
                    amp_sigma=args.llm_amp_sigma, noise=args.llm_noise,
                    n_contexts=args.llm_contexts)
@@ -851,10 +882,10 @@ def main() -> int:
                                                 keep_contributions=True)
     assert contribs is not None
     span_sum = sum(ZOO[k].span_dim for k in data.kinds)
-    atoms = args.atoms or args.factors
+    atoms = args.atoms or factors
     top_k = args.top_k or args.l0
     flat_width = args.flat_width or 2 * span_sum
-    flat_k = args.flat_k or max(args.l0 * int(round(span_sum / args.factors)), args.l0)
+    flat_k = args.flat_k or max(args.l0 * int(round(span_sum / factors)), args.l0)
     out_path = Path(args.out)
     clouds_dir = Path(args.dump_clouds) if args.dump_clouds else None
     if clouds_dir is not None:
@@ -862,7 +893,7 @@ def main() -> int:
 
     header = {
         "record": "config",
-        "factors": args.factors, "ambient": args.ambient, "l0": args.l0,
+        "factors": factors, "ambient": args.ambient, "l0": args.l0,
         "curved_fraction": args.curved_fraction, "kinds": data.kinds,
         "n_train": args.n_train, "n_test": args.n_test,
         "atoms": atoms, "top_k": top_k, "flat_width": flat_width, "flat_k": flat_k,

@@ -1,59 +1,68 @@
-//! #1017 — measure the FULL production color-arm SAE manifold fit.
+//! #1017 — run the complete production color-arm SAE REML fit.
 //!
-//! The flagship #1017 number ("26+ minutes, 0% GPU") is the *full* color-arm
-//! fit: the real outer REML/EFS smoothing-parameter loop wrapping the inner
-//! Newton/PIRLS solve — NOT the single-frame `device_resident_inner_1017`
-//! benchmark (which times one inner solve on a constant-Hessian frame that
-//! converges in 1 iteration). For the color shape the production border is
-//! k=p=5120 > DIRECT_SOLVE_MAX_K (2000), so the inner solve routes through
-//! `ArrowSolverMode::InexactPCG` (matrix-free reduced-Schur PCG), whose matvec
-//! the Phase-1 re-keying offloads to the device when the work clears the floor.
+//! This executable is a convergence and execution-path probe, not a deadline
+//! benchmark. It runs the real `SaeManifoldOuterObjective` through the shared
+//! `OuterProblem`, refuses to materialize a fitted model unless the outer
+//! optimizer reports convergence, and only then reports elapsed time and GPU
+//! telemetry. There is no wall-clock deadline, iteration-cap sweep, or grid
+//! search; work interrupted by a scheduler wall is preserved by the production
+//! SAE checkpoint/resume path owned by the objective.
 //!
-//! This example drives the real production path:
-//!   * one `reml_criterion` eval (one full inner fit at fixed rho), and
-//!   * the full `OuterProblem::run` outer loop,
-//! both on the color shape, with GPU execution telemetry snapshotted around
-//! each so we can prove whether the device actually ran (handle creations,
-//! kernel launches, factorizations, H2D/D2H bytes) or silently fell back to CPU.
-//!
-//! The closure bar for #1017: the full fit completes at ~1.56s (>=1000x over
-//! the 26-min original).
+//! The color arm has `N=180`, ambient output width `P=5120`, and a three-column
+//! periodic basis. Its full decoder therefore has `beta_dim=3*5120=15360`.
+//! Production may profile that decoder through its exact low-rank Grassmann
+//! frame before assembling the Newton system, so the executable separately
+//! reports the post-fit `factored_border_dim`, assembled border width, and the
+//! solver mode selected from that actual border. Conflating `beta_dim` with the
+//! factored border was the source of the old executable's stale InexactPCG
+//! claim.
 //!
 //! Run on a CUDA host:
 //! ```text
 //! cargo run --release --example full_color_fit_1017
 //! ```
 
-use std::io::Write;
+use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gam::gpu::profile::{GpuExecutionTelemetry, telemetry_reset, telemetry_snapshot};
-use gam::solver::arrow_schur::ArrowSolveOptions;
+use gam::solver::arrow_schur::ArrowSolverMode;
+use gam::solver::rho_optimizer::OuterProblem;
+use gam::solver::seeding::SeedConfig;
 use gam::terms::{
     AnalyticPenaltyRegistry, AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator,
-    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm,
+    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective,
+    SaeManifoldRho, SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2};
 
-// Color-arm shape (the #1017 measured gap): few rows, very wide border.
+// Production color-arm shape from #1017: few rows, very wide ambient output.
 const N: usize = 180;
 const P: usize = 5120;
-const K: usize = 1; // atoms
-const D: usize = 1; // latent coords per atom (Circle)
-const TAU: f64 = 0.5;
-const ALPHA: f64 = 1.0;
+const N_ATOMS: usize = 1;
+const LATENT_DIM: usize = 1;
+const PERIODIC_BASIS_WIDTH: usize = 3;
+
+// The inner REML evaluator treats this as a refinement CHUNK, extending until
+// the stationarity certificate is reached and returning an error otherwise.
+// It is not accepted as a fit merely because this many iterations elapsed.
+const INNER_REFINEMENT_CHUNK: usize = 64;
+const LEARNING_RATE: f64 = 1.0;
+const RIDGE_EXT_COORD: f64 = 1.0e-6;
+const RIDGE_BETA: f64 = 1.0e-6;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
 
 struct Lcg {
     state: u64,
 }
+
 impl Lcg {
     fn new(seed: u64) -> Self {
         Self { state: seed }
     }
+
     fn unit(&mut self) -> f64 {
         self.state = self
             .state
@@ -61,88 +70,91 @@ impl Lcg {
             .wrapping_add(1442695040888963407);
         ((self.state >> 11) as f64) / ((1u64 << 53) as f64)
     }
+
     fn signed(&mut self) -> f64 {
         2.0 * self.unit() - 1.0
     }
 }
 
-fn smooth_penalty(width: usize) -> Array2<f64> {
-    let mut s = Array2::<f64>::zeros((width, width));
-    for i in 0..width {
-        s[[i, i]] = if i == 0 { 1.0e-3 } else { 1.0 };
+/// Exact final-function roughness Gram for the periodic Fourier basis.
+///
+/// For `f(t)=B[0,:]+sum_h(B[sin_h,:] sin(2pi h t)+B[cos_h,:] cos(2pi h t))`,
+/// `integral_0^1 ||f''(t)||^2 dt = trace(B^T S B)` with diagonal entries
+/// `S_sin_h=S_cos_h=(2pi h)^4/2` and the constant in the exact null space.
+/// Thus the coefficient quadratic consumed by the solver is precisely the
+/// final-function penalty, rather than an arbitrary coefficient shrinkage.
+fn periodic_second_derivative_roughness(width: usize) -> Result<Array2<f64>, String> {
+    if width == 0 || width % 2 == 0 {
+        return Err(format!(
+            "periodic Fourier roughness requires an odd positive width; got {width}"
+        ));
     }
-    s
+    let mut penalty = Array2::<f64>::zeros((width, width));
+    for harmonic in 1..=(width - 1) / 2 {
+        let omega = std::f64::consts::TAU * harmonic as f64;
+        let integrated_second_derivative_energy = omega.powi(4) / 2.0;
+        penalty[[2 * harmonic - 1, 2 * harmonic - 1]] = integrated_second_derivative_energy;
+        penalty[[2 * harmonic, 2 * harmonic]] = integrated_second_derivative_energy;
+    }
+    Ok(penalty)
 }
 
-fn decoder(width: usize, p: usize, atom: usize, rng: &mut Lcg) -> Array2<f64> {
+fn decoder(width: usize, p: usize, rng: &mut Lcg) -> Array2<f64> {
     let scale = 0.18 / (width as f64).sqrt();
     Array2::from_shape_fn((width, p), |(row, col)| {
         let carrier = ((row + 1) as f64 * 0.17 + (col + 1) as f64 * 0.013).sin();
-        let atom_shift = ((atom + 1) as f64 * (col + 3) as f64 * 0.0021).cos();
-        scale * (0.7 * carrier + 0.3 * atom_shift + 0.05 * rng.signed())
+        let shift = ((col + 3) as f64 * 0.0021).cos();
+        scale * (0.7 * carrier + 0.3 * shift + 0.05 * rng.signed())
     })
 }
 
-fn circle_coords(n: usize, atom: usize) -> Array2<f64> {
-    Array2::from_shape_fn((n, 1), |(row, _)| {
-        ((row as f64) * (0.031 + 0.004 * atom as f64) + 0.07 * atom as f64).rem_euclid(1.0)
+fn circle_coords(n: usize) -> Array2<f64> {
+    Array2::from_shape_fn((n, LATENT_DIM), |(row, _)| {
+        ((row as f64) * 0.031).rem_euclid(1.0)
     })
 }
 
-fn logits(n: usize, k: usize, rng: &mut Lcg) -> Array2<f64> {
-    Array2::from_shape_fn((n, k), |(row, atom)| {
-        let phase = (row as f64) * (0.019 + 0.003 * atom as f64) + atom as f64 * 0.41;
-        -1.1 + 0.9 * phase.sin() + 0.08 * rng.signed()
+fn logits(n: usize, rng: &mut Lcg) -> Array2<f64> {
+    Array2::from_shape_fn((n, N_ATOMS), |(row, _)| {
+        -1.1 + 0.9 * ((row as f64) * 0.019).sin() + 0.08 * rng.signed()
     })
 }
 
 fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), String> {
     let mut rng = Lcg::new(0x5AE0_1017_9E37_79B9 ^ N as u64 ^ ((P as u64) << 17));
-    let mut atoms = Vec::with_capacity(K);
-    let mut coord_blocks = Vec::with_capacity(K);
-    let mut manifolds = Vec::with_capacity(K);
-    for atom_idx in 0..K {
-        let evaluator = PeriodicHarmonicEvaluator::new(3).map_err(|e| e.to_string())?;
-        let coords = circle_coords(N, atom_idx);
-        let (phi, jet) = evaluator
-            .evaluate(coords.view())
-            .map_err(|e| e.to_string())?;
-        let width = phi.ncols();
-        let atom = SaeManifoldAtom::new(
-            format!("circle_{atom_idx}"),
-            SaeAtomBasisKind::Periodic,
-            D,
-            phi,
-            jet,
-            decoder(width, P, atom_idx, &mut rng),
-            smooth_penalty(width),
-        )
-        .map_err(|e| e.to_string())?
-        .with_basis_evaluator(Arc::new(evaluator));
-        atoms.push(atom);
-        coord_blocks.push(coords);
-        manifolds.push(LatentManifold::Circle { period: 1.0 });
-    }
+    let evaluator = PeriodicHarmonicEvaluator::new(PERIODIC_BASIS_WIDTH)?;
+    let coords = circle_coords(N);
+    let (phi, jet) = evaluator.evaluate(coords.view())?;
+    let width = phi.ncols();
+    let atom = SaeManifoldAtom::new(
+        "color_circle",
+        SaeAtomBasisKind::Periodic,
+        LATENT_DIM,
+        phi,
+        jet,
+        decoder(width, P, &mut rng),
+        periodic_second_derivative_roughness(width)?,
+    )?
+    .with_basis_evaluator(Arc::new(evaluator));
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-        logits(N, K, &mut rng),
-        coord_blocks,
-        manifolds,
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
-    )
-    .map_err(|e| e.to_string())?;
-    let term = SaeManifoldTerm::new(atoms, assignment).map_err(|e| e.to_string())?;
+        logits(N, &mut rng),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )?;
+    let term = SaeManifoldTerm::new(vec![atom], assignment)?;
     let target = term.fitted();
     let rho = SaeManifoldRho::new(
         LOG_LAMBDA_SPARSE,
         LOG_LAMBDA_SMOOTH,
-        vec![Array1::<f64>::zeros(0); K],
+        vec![Array1::<f64>::zeros(0); N_ATOMS],
     );
     Ok((term, target, rho))
 }
 
-fn delta(before: &GpuExecutionTelemetry, after: &GpuExecutionTelemetry) -> String {
+fn telemetry_delta(before: &GpuExecutionTelemetry, after: &GpuExecutionTelemetry) -> String {
     format!(
-        "handles=+{} kernels=+{} factorizations=+{} h2d=+{}KB d2h=+{}KB cpu_fallbacks=+{}",
+        "handles=+{} kernels=+{} factorizations=+{} h2d=+{}KiB d2h=+{}KiB cpu_fallbacks=+{}",
         after
             .handle_creation_count
             .saturating_sub(before.handle_creation_count),
@@ -152,121 +164,99 @@ fn delta(before: &GpuExecutionTelemetry, after: &GpuExecutionTelemetry) -> Strin
         after
             .factorization_count
             .saturating_sub(before.factorization_count),
-        (after.h2d_bytes.saturating_sub(before.h2d_bytes)) / 1024,
-        (after.d2h_bytes.saturating_sub(before.d2h_bytes)) / 1024,
+        after.h2d_bytes.saturating_sub(before.h2d_bytes) / 1024,
+        after.d2h_bytes.saturating_sub(before.d2h_bytes) / 1024,
         after
             .cpu_fallback_count
             .saturating_sub(before.cpu_fallback_count),
     )
 }
 
-fn main() -> std::process::ExitCode {
-    println!("FULLCOLOR_1017 shape=color n={N} p={P} K={K} d={D}");
+fn run() -> Result<(), String> {
+    let (term, target, initial_rho) = build_color_term()?;
+    let initial_beta_dim = term.beta_dim();
+    if initial_beta_dim != PERIODIC_BASIS_WIDTH * P {
+        return Err(format!(
+            "color fixture beta_dim {initial_beta_dim} != {}*{P}",
+            PERIODIC_BASIS_WIDTH
+        ));
+    }
 
-    let (term, target, rho) = match build_color_term() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("FULLCOLOR_1017 BUILD_FAILED: {e}");
-            return std::process::ExitCode::from(1);
-        }
-    };
-    println!(
-        "FULLCOLOR_1017 beta_dim={} row_dim={}",
-        term.beta_dim(),
-        term.assignment.row_block_dim()
+    let registry = AnalyticPenaltyRegistry::new();
+    let initial_rho_flat = initial_rho.to_flat();
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        target.clone(),
+        Some(registry.clone()),
+        initial_rho,
+        INNER_REFINEMENT_CHUNK,
+        LEARNING_RATE,
+        RIDGE_EXT_COORD,
+        RIDGE_BETA,
     );
-    std::io::stdout().flush().ok();
+    // A single explicit initial state: the optimizer moves continuously in rho;
+    // no seed lattice or grid is evaluated.
+    let problem = OuterProblem::new(initial_rho_flat.len())
+        .with_initial_rho(initial_rho_flat)
+        .with_seed_config(SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..SeedConfig::default()
+        });
 
-    // The bar is 1.56s; anything past 10s already fails by >6x, so don't wait it
-    // out. Run the whole fit on a worker thread and have main wait with a 10s
-    // deadline (no process::exit — returning from main terminates the process,
-    // killing the detached worker). Each stage flushes as it finishes, so partial
-    // progress survives a timeout.
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let worker = std::thread::spawn(move || {
-        // Empty registry: the #1026 collapse barriers set deferred-factored beta
-        // curvature for the wide color border, so a registry must be present even
-        // with no analytic penalty (zero extra curvature; barrier curvature is in
-        // the system).
-        let registry = AnalyticPenaltyRegistry::new();
-        let mut t = term.clone();
+    telemetry_reset();
+    let telemetry_before = telemetry_snapshot();
+    let started = Instant::now();
+    let outer = problem
+        .run(&mut objective, "#1017 production color SAE")
+        .map_err(|err| format!("full color REML fit failed: {err}"))?;
+    if !outer.converged || outer.converged_via.is_none() {
+        return Err(format!(
+            "outer optimizer returned without a convergence certificate: \
+             converged={} via={:?}",
+            outer.converged, outer.converged_via
+        ));
+    }
 
-        // ---- Stage A: assemble the arrow-Schur system once (timed) ----
-        telemetry_reset();
-        let a0 = telemetry_snapshot();
-        let start = Instant::now();
-        let sys = match t.assemble_arrow_schur(target.view(), &rho, Some(&registry)) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("FULLCOLOR_1017 assemble FAILED: {e}");
-                std::io::stdout().flush().ok();
-                tx.send(()).ok();
-                return;
-            }
-        };
-        let a_ms = start.elapsed().as_secs_f64() * 1e3;
-        let a1 = telemetry_snapshot();
-        println!(
-            "FULLCOLOR_1017 assemble ms={a_ms:.3} k={} rows={} gpu[{}]",
-            sys.k,
-            sys.rows.len(),
-            delta(&a0, &a1)
-        );
-        std::io::stdout().flush().ok();
+    // Only consume/mint the fitted model after the convergence certificate.
+    let fitted = objective.into_fitted();
+    let elapsed = started.elapsed();
+    let telemetry_after = telemetry_snapshot();
+    let mut fitted_term = fitted.term;
+    let factored_border_dim = fitted_term.factored_border_dim();
+    let assembled =
+        fitted_term.assemble_arrow_schur(target.view(), &fitted.rho, Some(&registry))?;
+    let actual_mode = ArrowSolverMode::automatic(assembled.k);
 
-        // Second assemble: is the 9s one-time setup or a per-inner-iter cost? The
-        // production inner Newton re-assembles every iteration.
-        {
-            let start = Instant::now();
-            let sys2 = t.assemble_arrow_schur(target.view(), &rho, Some(&registry));
-            let a2_ms = start.elapsed().as_secs_f64() * 1e3;
-            println!("FULLCOLOR_1017 assemble2 ms={a2_ms:.3} ok={}", sys2.is_ok());
-            std::io::stdout().flush().ok();
-        }
+    println!(
+        "FULLCOLOR_1017 converged=true via={:?} plan={:?} outer_iterations={} \
+         criterion={:.12e} loss_total={:.12e}",
+        outer.converged_via,
+        outer.plan_used,
+        outer.iterations,
+        outer.final_value,
+        fitted.loss.total(),
+    );
+    println!(
+        "FULLCOLOR_1017 shape n={N} p={P} atoms={N_ATOMS} latent_dim={LATENT_DIM} \
+         beta_dim={initial_beta_dim} factored_border_dim={factored_border_dim} \
+         assembled_border_dim={} solver_mode={actual_mode:?}",
+        assembled.k,
+    );
+    println!(
+        "FULLCOLOR_1017 elapsed_seconds={:.6} gpu[{}]",
+        elapsed.as_secs_f64(),
+        telemetry_delta(&telemetry_before, &telemetry_after),
+    );
+    Ok(())
+}
 
-        // ---- Stage C: InexactPCG (PRODUCTION path) with capped iterations to
-        // separate per-iter cost from non-convergence. Linear scaling ⇒ per-iter
-        // cost dominates; plateau ⇒ converges; hits cap ⇒ not converging. ----
-        for &cap in &[2usize, 10, 50] {
-            telemetry_reset();
-            let c0 = telemetry_snapshot();
-            let mut opts = ArrowSolveOptions::inexact_pcg();
-            opts.pcg.max_iterations = cap;
-            opts.trust_region.max_iterations = cap;
-            let start = Instant::now();
-            let r = sys.solve_with_options(0.0, 0.0, &opts);
-            let ms = start.elapsed().as_secs_f64() * 1e3;
-            let c1 = telemetry_snapshot();
-            match r {
-                Ok((_, _, d)) => println!(
-                    "FULLCOLOR_1017 solve_inexact_pcg cap={cap} ms={ms:.3} pcg_iters={} matvec_calls={} used_device_arrow={} final_rel_resid={:.2e} gpu[{}]",
-                    d.iterations,
-                    d.matvec_calls,
-                    d.used_device_arrow,
-                    d.final_relative_residual,
-                    delta(&c0, &c1)
-                ),
-                Err(e) => println!("FULLCOLOR_1017 solve_inexact_pcg cap={cap} FAILED: {e}"),
-            }
-            std::io::stdout().flush().ok();
-        }
-
-        println!("FULLCOLOR_1017 DONE");
-        std::io::stdout().flush().ok();
-        tx.send(()).ok();
-    });
-
-    // Diagnostic cap (single solves, not the full fit): 45s headroom to capture
-    // even a slow InexactPCG number. Returning from main terminates the process.
-    match rx.recv_timeout(Duration::from_secs(45)) {
-        Ok(()) => {
-            worker.join().ok();
-            std::process::ExitCode::SUCCESS
-        }
-        Err(_) => {
-            println!("FULLCOLOR_1017 KILLED_OVER_45S (a single solve exceeded 45s — aborting)");
-            std::io::stdout().flush().ok();
-            std::process::ExitCode::from(1)
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("FULLCOLOR_1017 FAILED: {err}");
+            ExitCode::FAILURE
         }
     }
 }

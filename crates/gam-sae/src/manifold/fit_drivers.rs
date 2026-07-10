@@ -5756,42 +5756,13 @@ impl SaeManifoldTerm {
                         best_reconstruction_obj,
                         best_reconstruction_ev,
                         best_reconstruction_uniformity,
+                        SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL,
                         SAE_FINAL_EV_DEGRADATION_TOL,
                     ) {
                         best_reconstruction_ev = ev;
                         best_reconstruction_obj = candidate_obj;
                         best_reconstruction_uniformity = candidate_uniformity;
                         best_reconstruction_state = Some(self.snapshot_mutable_state());
-                    }
-                    // Fit-LEVEL keep-best (`best_fit_incumbent`): the in-call
-                    // ledger above dies with this call, but the outer ρ search
-                    // re-enters this driver once per probe and each probe's walk
-                    // can drag the shared warm-start state into a collapse basin
-                    // — across calls the good basin is unrecoverable. Bank it on
-                    // the term under the same ordering, floor-gated so a
-                    // sub-collapse basin never becomes the fit's incumbent.
-                    if ev >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR {
-                        let bank = match self.best_fit_incumbent.as_ref() {
-                            None => ev.is_finite(),
-                            Some(incumbent) => prefer_candidate_basin(
-                                ev,
-                                candidate_uniformity,
-                                incumbent.ev,
-                                incumbent.uniformity,
-                                SAE_FINAL_EV_DEGRADATION_TOL,
-                            ),
-                        };
-                        if bank {
-                            self.best_fit_incumbent = Some(SaeFitIncumbent {
-                                ev,
-                                uniformity: candidate_uniformity,
-                                state: self.snapshot_mutable_state(),
-                                // A genuinely better model starts a new incumbent
-                                // trajectory; earlier restore events do not certify
-                                // stationarity around this state.
-                                consecutive_inner_restores: 0,
-                            });
-                        }
                     }
                 }
             }
@@ -5820,7 +5791,7 @@ impl SaeManifoldTerm {
             let final_obj = self
                 .penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 .unwrap_or(f64::INFINITY);
-            let obj_scale = SAE_FINAL_EV_DEGRADATION_TOL
+            let obj_scale = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 * (1.0 + final_obj.abs().max(best_reconstruction_obj.abs()));
             if !(final_obj <= best_reconstruction_obj + obj_scale) {
                 let final_ev = self
@@ -5905,19 +5876,15 @@ impl SaeManifoldTerm {
         // hint would always equal the cold LSQ decoder, never the seed). A freeze
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
-        let pre_polish_reconstruction_incumbent = self
-            .dictionary_reconstruction_ev(target, rho)
-            .ok()
-            .filter(|ev| ev.is_finite())
-            .map(|ev| (ev, self.snapshot_mutable_state()));
         if max_iter > 0 && !self.frames_active() {
             let mut best_objective =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             if best_objective.is_finite() {
-                // #1026: up to 4 alternating decoder-LSQ / coordinate-reprojection
-                // polish rounds; the strict-objective-decrease gate below stops
-                // early and is a bit-for-bit no-op on an already-converged decoder.
-                for _ in 0..4 {
+                // Alternate decoder-LSQ / coordinate reprojection to its
+                // objective fixed point. The strict decrease gate is the
+                // termination certificate; a workload-tuned round cap would
+                // return an under-converged fit on harder data.
+                loop {
                     let snapshot = self.snapshot_mutable_state();
                     let round = self
                         .refit_decoder_least_squares_at_current_state(target, Some(rho))
@@ -5933,7 +5900,8 @@ impl SaeManifoldTerm {
                     // any loss scale. Anything else (already-converged decoder, a
                     // round that traded data-fit for penalty, or a refit/projection
                     // failure) restores the pre-round state and stops.
-                    let accept_floor = SAE_FINAL_EV_DEGRADATION_TOL * (1.0 + best_objective.abs());
+                    let accept_floor = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                        * (1.0 + best_objective.abs());
                     match round {
                         Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
                             best_objective = value;
@@ -5946,41 +5914,26 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // The final decoder-LSQ / coordinate-reprojection polish is accepted by
-        // the penalized objective because that is the scalar consumed by the REML
-        // outer loop. Reconstruction EV is the user-facing fitted quantity,
-        // however, and the polish is allowed to trade data fit for smoothness.
-        // Keep the same #1026 invariant as the Newton loop: a bounded in-fit
-        // refinement may not return a materially worse reconstruction than the
-        // incumbent it started from. This preserves the evidence objective's
-        // monotone path during fitting while ensuring the delivered fitted state is
-        // the best reconstruction basin the inner solve already found, rather than
-        // a smoother-but-collapsed post-polish state.
-        if let Some((pre_polish_ev, pre_polish_state)) = pre_polish_reconstruction_incumbent {
-            if let Ok(final_ev) = self.dictionary_reconstruction_ev(target, rho) {
-                if final_ev.is_finite() && final_ev + SAE_FINAL_EV_DEGRADATION_TOL < pre_polish_ev {
-                    log::warn!(
-                        "[#1026] restoring pre-polish reconstruction incumbent after final \
-                         polish degraded EV from {pre_polish_ev:.4} to {final_ev:.4}"
-                    );
-                    self.restore_mutable_state(&pre_polish_state)?;
-                }
-            }
-        }
-        // Frame refresh and final polish run after the inner-incumbent restore,
-        // so certify identity at the function boundary, not immediately after
-        // the restore. Any later state change correctly breaks the streak.
-        let exact_fit_incumbent_restored = inner_incumbent_restored
-            && self
+        // Track an exact recurrence of the OBJECTIVE-keyed in-call restore.
+        // This is convergence evidence only; it is never a cross-ρ state bank
+        // and is never installed after the outer certificate. A final polish
+        // that moved the state breaks the streak.
+        let exact_objective_incumbent_restored = inner_incumbent_restored
+            && best_reconstruction_state
+                .as_ref()
+                .is_some_and(|state| self.matches_mutable_state(state));
+        if exact_objective_incumbent_restored {
+            let consecutive_inner_restores = self
                 .best_fit_incumbent
                 .as_ref()
-                .is_some_and(|incumbent| self.matches_mutable_state(&incumbent.state));
-        if let Some(incumbent) = self.best_fit_incumbent.as_mut() {
-            incumbent.consecutive_inner_restores = if exact_fit_incumbent_restored {
-                incumbent.consecutive_inner_restores.saturating_add(1)
-            } else {
-                0
-            };
+                .filter(|prior| self.matches_mutable_state(&prior.state))
+                .map_or(1, |prior| prior.consecutive_inner_restores.saturating_add(1));
+            self.best_fit_incumbent = Some(SaeFitIncumbent {
+                state: self.snapshot_mutable_state(),
+                consecutive_inner_restores,
+            });
+        } else {
+            self.best_fit_incumbent = None;
         }
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.

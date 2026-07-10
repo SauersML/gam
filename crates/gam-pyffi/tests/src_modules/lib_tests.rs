@@ -156,6 +156,12 @@ fn sae_fit_seed_construction_stays_in_gam_sae_2236() {
         "sae_manifold_fit_inner must delegate seed construction to the typed gam-sae entry"
     );
     assert!(
+        !source.contains("sae_promotion_align_min")
+            && !source.contains("beta_quantile")
+            && !source.contains("align_min_from_rank"),
+        "residual-promotion policy must be derived inside the typed gam-sae fit entry"
+    );
+    assert!(
         hits.is_empty(),
         "SAE seed construction/config/rho policy must remain in gam-sae; binding contains: {}",
         hits.join(", ")
@@ -185,10 +191,9 @@ fn sae_sibling_fit_seeds_delegate_to_gam_sae_2236() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let main = std::fs::read_to_string(manifest.join("src/latent/latent_basis_and_sae_ffi.rs"))
         .expect("read main SAE binding fragment");
-    let tail = std::fs::read_to_string(
-        manifest.join("src/latent/latent_basis_and_sae_ffi_tail.rs"),
-    )
-    .expect("read SAE binding tail");
+    let tail =
+        std::fs::read_to_string(manifest.join("src/latent/latent_basis_and_sae_ffi_tail.rs"))
+            .expect("read SAE binding tail");
     let minimal = tail
         .split_once("fn sae_manifold_fit_minimal")
         .and_then(|(_, body)| body.split_once("/// Out-of-sample inference"))
@@ -218,8 +223,14 @@ fn sae_sibling_fit_seeds_delegate_to_gam_sae_2236() {
     assert!(stagewise.contains("build_sae_stagewise_seed(SaeStagewiseSeedRequest"));
     assert!(ibp.contains("sae_manifold_fit("));
     for pattern in forbidden {
-        assert!(!minimal.contains(pattern), "minimal binding contains {pattern}");
-        assert!(!stagewise.contains(pattern), "stagewise binding contains {pattern}");
+        assert!(
+            !minimal.contains(pattern),
+            "minimal binding contains {pattern}"
+        );
+        assert!(
+            !stagewise.contains(pattern),
+            "stagewise binding contains {pattern}"
+        );
     }
 }
 

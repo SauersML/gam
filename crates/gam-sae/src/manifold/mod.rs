@@ -180,6 +180,7 @@ mod amortized_routing;
 mod arrow_solver;
 mod atom;
 mod atom_build;
+mod chart_atlas;
 mod basin_bundle;
 mod behavior;
 mod behavior_fit;
@@ -284,6 +285,9 @@ mod tests_termination_2235;
 
 #[cfg(test)]
 mod tests_steering_e4;
+
+#[cfg(test)]
+mod tests_steering_crosscoder_2234;
 
 #[cfg(test)]
 mod tests_schur_seed_refusal_1782;
@@ -430,6 +434,7 @@ mod tests_joint_vs_cascade_2131;
 
 pub use arrow_solver::*;
 pub use atom::*;
+pub use chart_atlas::*;
 pub use basin_bundle::*;
 pub use behavior::*;
 pub use behavior_fit::*;

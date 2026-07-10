@@ -366,12 +366,6 @@ pub struct SaeIntoFittedResult {
     pub term: SaeManifoldTerm,
     pub rho: SaeManifoldRho,
     pub loss: SaeManifoldLoss,
-    /// True when the settled outer state was replaced by the re-solved seeded
-    /// basin at the selected rho.
-    pub used_seed_basin_fallback: bool,
-    /// True when the pristine construction seed beat the returned state and was
-    /// restored with its original rho.
-    pub used_pristine_seed_fallback: bool,
     /// True when post-fit chart canonicalization changed any atom's chart.
     pub charts_canonicalized: bool,
     /// #2235 — how the outer search ended (verdict + eval/wall ledger).
@@ -380,9 +374,7 @@ pub struct SaeIntoFittedResult {
 
 impl SaeIntoFittedResult {
     pub fn invalidates_pre_final_shape_uncertainty(&self) -> bool {
-        self.used_seed_basin_fallback
-            || self.used_pristine_seed_fallback
-            || self.charts_canonicalized
+        self.charts_canonicalized
     }
 }
 

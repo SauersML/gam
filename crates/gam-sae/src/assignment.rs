@@ -867,7 +867,7 @@ impl SaeAssignment {
     }
 
     pub fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
-        self.try_assignments_row_with_alpha(row, None)
+        self.try_assignments_row_inner(row)
     }
 
     /// #1777 — the effective truncated-IBP `α` for this assignment at `rho`,
@@ -949,7 +949,7 @@ impl SaeAssignment {
         let mut occupancy = vec![0.0_f64; k];
         let mut buf = vec![0.0_f64; k];
         for row in 0..n {
-            self.try_assignments_row_with_alpha_into(row, resolved, &mut buf)?;
+            self.try_assignments_row_into(row, &mut buf)?;
             for (acc, &g) in occupancy.iter_mut().zip(buf.iter()) {
                 *acc += g;
             }
@@ -969,10 +969,10 @@ impl SaeAssignment {
         row: usize,
         rho: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
-        self.try_assignments_row(row)
+        self.try_assignments_row_inner(row)
     }
 
-    fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
+    fn try_assignments_row_inner(&self, row: usize) -> Result<Array1<f64>, String> {
         // #1033 — read the ACTIVE routing logits: the ρ-invariant frozen/predicted
         // logits when routing is frozen, else the free `self.logits`. This single
         // source makes the gate value ρ-invariant under frozen routing (the
@@ -2053,12 +2053,10 @@ pub(crate) fn jumprelu_row_into(
 
 pub(crate) struct ActiveAtomLogitJvp<'a> {
     pub(crate) mode: AssignmentMode,
-    pub(crate) k: usize,
     pub(crate) logit_k: f64,
     pub(crate) a_k: f64,
     pub(crate) decoded_k: ArrayView1<'a, f64>,
     pub(crate) fitted: ArrayView1<'a, f64>,
-    pub(crate) ibp_prior: Option<&'a [f64]>,
     pub(crate) compact_index: usize,
     /// #1026 — when `true`, atom `k` is the ungated background tier: its gate is
     /// the constant `1`, so its logit-JVP `da_k/dl_k` is identically zero (the
@@ -2081,12 +2079,10 @@ pub(crate) fn fill_active_atom_logit_jvp(
 ) {
     let ActiveAtomLogitJvp {
         mode,
-        k,
         logit_k,
         a_k,
         decoded_k,
         fitted,
-        ibp_prior,
         compact_index,
         ungated,
     } = input;
@@ -2106,14 +2102,9 @@ pub(crate) fn fill_active_atom_logit_jvp(
             }
         }
         AssignmentMode::IBPMap { temperature, .. } => {
-            // z_k = σ(l_k/τ)·π_k ⇒ dz_k/dl_k = a_k(π_k − a_k)/(π_k τ) · π_k form
-            // (matches `fill_assignment_logit_jvp_rows`).
+            // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`.
             let inv_tau = 1.0 / temperature;
-            let prior =
-                ibp_prior.expect("fill_active_atom_logit_jvp: IBPMap requires precomputed prior");
-            let pi_k = prior[k];
-            let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
-            let dz = sig * (1.0 - sig) * inv_tau * pi_k;
+            let dz = a_k * (1.0 - a_k) * inv_tau;
             for out_col in 0..p {
                 jac_compact[[compact_index, out_col]] = dz * decoded_k[out_col];
             }
@@ -2150,7 +2141,6 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
     assignments: ArrayView1<'_, f64>,
     decoded: ArrayView2<'_, f64>,
     fitted: ArrayView1<'_, f64>,
-    ibp_prior: Option<&[f64]>,
     // #1026 — per-atom ungated flags (length `K`). An ungated atom's gate is
     // constant, so its logit-JVP row is identically zero (skipped below). Empty
     // ⇒ no atom is ungated (the historical path, bit-identical).
@@ -2180,20 +2170,15 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             }
         }
         AssignmentMode::IBPMap { temperature, .. } => {
-            // Truncated-IBP concrete relaxation: z_k = σ(l_k/τ) · π_k where
-            // π_k is the stick-breaking prior. Thus
-            // dz_k/dl_k = σ(l/τ)(1-σ(l/τ))/τ · π_k = a_k(π_k - a_k)/(π_k τ).
+            // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`; ordered
+            // stick-breaking shrinkage is scored once, in the IBP prior.
             let inv_tau = 1.0 / temperature;
-            let prior = ibp_prior
-                .expect("fill_assignment_logit_jvp_rows: IBPMap requires precomputed prior");
             for logit_col in 0..assignments.len() {
                 if is_ungated(logit_col) {
                     continue;
                 }
-                let pi_k = prior[logit_col];
                 let a_k = assignments[logit_col];
-                let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
-                let dz = sig * (1.0 - sig) * inv_tau * pi_k;
+                let dz = a_k * (1.0 - a_k) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = dz * decoded[[logit_col, out_col]];
                 }

@@ -920,7 +920,7 @@ class _SparsityLayer(nn.Module):
             # Route through the Rust IBP-MAP value+grad kernel so the torch
             # forward applies the stick-breaking prior π_k and temperature
             # scaling that the closed-form fit uses (single source of truth).
-            assignments = ibp_map(logits, tau, self._init_alpha)
+            assignments = ibp_map(logits, tau)
             return assignments, logits
         if self.kind == "softmax_topk":
             return self._topk_gate(logits), logits

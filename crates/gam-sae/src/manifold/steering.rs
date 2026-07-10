@@ -91,6 +91,40 @@ impl SaeManifoldAtom {
 }
 
 impl SaeManifoldTerm {
+    fn honest_crosscoder_layer_values(
+        &self,
+        values: &Array2<f64>,
+        layer: CrosscoderLayer,
+    ) -> Result<Array2<f64>, String> {
+        let layout = self.crosscoder_layout().ok_or_else(|| {
+            "SaeManifoldTerm::steer_layer: no crosscoder layout is installed".to_string()
+        })?;
+        if values.ncols() != layout.total_dim() {
+            return Err(format!(
+                "SaeManifoldTerm::steer_layer: augmented value width {} != layout width {}",
+                values.ncols(),
+                layout.total_dim()
+            ));
+        }
+        match layer {
+            CrosscoderLayer::Anchor => {
+                Ok(values.slice(s![.., 0..layout.anchor_dim()]).to_owned())
+            }
+            CrosscoderLayer::Block(index) => {
+                if index >= layout.num_blocks() {
+                    return Err(format!(
+                        "SaeManifoldTerm::steer_layer: block {index} out of range (L-1 = {})",
+                        layout.num_blocks()
+                    ));
+                }
+                let inv_scale = 1.0 / layout.sqrt_lambda(index);
+                Ok(values
+                    .slice(s![.., layout.block_range(index)])
+                    .mapv(|value| value * inv_scale))
+            }
+        }
+    }
+
     /// Apply the manifold group action `t ⊕ δ` to atom `k`'s coordinates on the
     /// selected `rows`, returning the steered coordinates `(rows.len(), d_k)`.
     ///
@@ -219,6 +253,21 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Crosscoder-aware steering delta for one layer in honest activation
+    /// units. The shared fitted coordinate is moved exactly once by
+    /// [`Self::steer_rows`]; this accessor selects the requested decoder column
+    /// block and removes its `sqrt(lambda_l)` fit-space scaling.
+    pub fn steer_layer_delta(
+        &self,
+        atom: usize,
+        layer: CrosscoderLayer,
+        rows: &[usize],
+        delta: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let augmented = self.steer_rows(atom, rows, delta)?;
+        self.honest_crosscoder_layer_values(&augmented, layer)
+    }
+
     /// The full steered per-atom contribution `a_{ik}·Φ_k(t_i ⊕ δ)·B_k` for atom
     /// `k` on the selected `rows`, shape `(rows.len(), p)` — the ABSOLUTE moved
     /// contribution (not a delta), used by the E4 zoo ground-truth check where
@@ -245,5 +294,19 @@ impl SaeManifoldTerm {
             }
         }
         Ok(out)
+    }
+
+    /// Absolute steered contribution in one crosscoder layer's honest units.
+    /// Anchor and downstream layers read the same moved chart coordinate and
+    /// fitted gate; only their decoder column blocks differ.
+    pub fn steer_layer_decode(
+        &self,
+        atom: usize,
+        layer: CrosscoderLayer,
+        rows: &[usize],
+        delta: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let augmented = self.steer_decode(atom, rows, delta)?;
+        self.honest_crosscoder_layer_values(&augmented, layer)
     }
 }

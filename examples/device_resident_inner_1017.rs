@@ -11,9 +11,8 @@
 //! POTRF runs per iterate.
 //!
 //! This bench drives the production color-arm fixture (n=180, p=5120 — the exact
-//! "few rows, very wide border" shape from the measured #1017 gap, the one whose
-//! ≤5s-on-A100 wall-clock gate the issue names) through three paths that share
-//! identical host control flow:
+//! "few rows, very wide border" shape from the measured #1017 gap) through
+//! three paths that share identical host control flow:
 //!
 //!   * resident  — `device_fit`: factor once, resident across iterations.
 //!   * reupload  — `device_reupload_fit`: same GPU kernels, re-factor per iterate
@@ -159,11 +158,10 @@ fn main() {
     let res_s = res_t.as_secs_f64().max(1e-12);
     println!(
         "DEVRES_1017 SPEEDUP resident_vs_reupload={:.2}x resident_vs_cpu={:.2}x \
-         resident_wall_s={:.4} under_5s_gate={}",
+         resident_wall_s={:.4}",
         reup_t.as_secs_f64() / res_s,
         cpu_t.as_secs_f64() / res_s,
         res_s,
-        res_s <= 5.0,
     );
     println!("DEVRES_1017 DONE");
 }

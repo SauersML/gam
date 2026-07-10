@@ -211,6 +211,8 @@ mod model_summary;
 mod multinomial_cli;
 #[path = "main/prediction_csv.rs"]
 mod prediction_csv;
+#[path = "main/run_crosscoder.rs"]
+mod run_crosscoder;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
 #[path = "main/run_fit.rs"]
@@ -232,6 +234,7 @@ pub(crate) use model_build::*;
 pub(crate) use model_summary::*;
 pub(crate) use multinomial_cli::*;
 pub(crate) use prediction_csv::*;
+pub(crate) use run_crosscoder::*;
 pub(crate) use run_diagnose::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_predict::*;
@@ -334,6 +337,7 @@ fn run() -> CliResult<()> {
     );
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),
+        Command::Crosscoder(args) => run_crosscoder(args),
         Command::Report(args) => run_report(args).map_err(CliError::from),
         Command::Predict(args) => run_predict(args).map_err(CliError::from),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),

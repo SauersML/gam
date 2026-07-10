@@ -26,7 +26,7 @@ def sae_crosscoder_fit(
     run_outer_rho_search: bool | None = None,
     transport_grid_resolution: int | None = None,
     law_gap_tolerance: float | None = None,
-) -> dict[str, Any]:
+) -> Any:
     """Fit one shared-chart manifold dictionary across row-aligned layers.
 
     Parameters
@@ -41,10 +41,10 @@ def sae_crosscoder_fit(
 
     Returns
     -------
-    dict
-        The Rust-owned fit report: selected block relevance, honest-unit layer
-        reconstructions/decoders, shared assignments and coordinates,
-        cross-layer drift, and per-atom phase-transport measurements.
+    ManifoldCrosscoderCore
+        Rust-owned fitted model. ``to_dict()`` materializes the shared report;
+        ``steer_layer_delta`` and ``steer_layer_decode`` apply shared-coordinate
+        interventions in any fitted layer's honest units.
     """
     anchor_array = np.ascontiguousarray(np.asarray(anchor, dtype=np.float64))
     labels = [str(label) for label, _ in targets]
@@ -52,25 +52,23 @@ def sae_crosscoder_fit(
         np.ascontiguousarray(np.asarray(values, dtype=np.float64))
         for _, values in targets
     ]
-    return dict(
-        rust_module().sae_crosscoder_fit(
-            anchor_array,
-            str(anchor_label),
-            labels,
-            arrays,
-            int(n_atoms),
-            int(n_harmonics),
-            sparsity_strength,
-            smoothness,
-            max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-            random_state,
-            run_outer_rho_search,
-            transport_grid_resolution,
-            law_gap_tolerance,
-        )
+    return rust_module().sae_crosscoder_fit(
+        anchor_array,
+        str(anchor_label),
+        labels,
+        arrays,
+        int(n_atoms),
+        int(n_harmonics),
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        random_state,
+        run_outer_rho_search,
+        transport_grid_resolution,
+        law_gap_tolerance,
     )
 
 

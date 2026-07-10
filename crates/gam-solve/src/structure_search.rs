@@ -105,8 +105,25 @@ pub enum StructureMove {
     /// against the churn null) — a pre-computed e-value carried on the proposal's
     /// `trigger`, not the held-out fit-improvement gate the other moves use (a
     /// clean glue leaves EV tied, so a likelihood-ratio gate could never accept
-    /// it). Applied by folding the pair through the fitted seam transition.
-    Glue { a: usize, b: usize },
+    /// it). [`ChartGlueOutcome::Fuse`] folds an ordinary over-tile;
+    /// [`ChartGlueOutcome::RegisterAtlas`] preserves a seam whose local charts
+    /// cannot be replaced by one global chart (orientation reversal / pole).
+    Glue {
+        a: usize,
+        b: usize,
+        outcome: ChartGlueOutcome,
+    },
+}
+
+/// Structural outcome certified by a chart-gluing seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChartGlueOutcome {
+    /// A single orientable chart covers the union, so the redundant chart is
+    /// physically folded and removed.
+    Fuse,
+    /// Both local charts are required.  Keep them as the partition-of-unity
+    /// cover of one semantic atlas atom and persist their transition map.
+    RegisterAtlas,
 }
 
 impl StructureMove {
@@ -115,7 +132,7 @@ impl StructureMove {
         match self {
             StructureMove::Birth { .. } => Vec::new(),
             StructureMove::Death { atom } | StructureMove::Fission { atom } => vec![*atom],
-            StructureMove::Fusion { a, b } | StructureMove::Glue { a, b } => vec![*a, *b],
+            StructureMove::Fusion { a, b } | StructureMove::Glue { a, b, .. } => vec![*a, *b],
         }
     }
 
@@ -371,7 +388,7 @@ pub fn search<S, Sh>(
                         MoveVerdict::Demoted { log_e }
                     }
                 }
-                StructureMove::Glue { a, b } => {
+                StructureMove::Glue { a, b, .. } => {
                     // Equivalence acceptance (#1890): the seam e-value was
                     // computed at harvest against the churn null (the two charts
                     // coincide within an isometry tolerance) and carried on

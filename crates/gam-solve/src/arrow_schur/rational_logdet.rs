@@ -300,7 +300,7 @@ impl RationalLogdetPlan {
         subspace_iters: usize,
         seed: u64,
         cg: (f64, usize),
-    ) -> Self {
+    ) -> Option<Self> {
         let (cg_rel_tol, cg_max_iters) = cg;
         let mut cols = build_deflation_basis(matvec, self.dim, top_rank, subspace_iters, seed);
         cols.extend(build_inverse_deflation_basis(
@@ -311,14 +311,14 @@ impl RationalLogdetPlan {
             seed,
             cg_rel_tol,
             cg_max_iters,
-        ));
+        )?);
         // Merge the two orthonormal families into ONE orthonormal basis (the top
         // and bottom blocks are near-orthogonal but not exactly; the second MGS
         // pass in `orthonormalize` cleans the cross terms and drops any collapsed
         // column, so `Q` stays exactly orthonormal — the property term1 needs).
         let basis = orthonormalize(&cols);
         self.deflation = (!basis.is_empty()).then_some(DeflationSpec { basis });
-        self
+        Some(self)
     }
 
     /// Evaluate the surrogate `L̃ ≈ log det S` through `matvec(v) = S·v`.
@@ -493,9 +493,12 @@ impl RationalLogdetPlan {
 }
 
 /// Plain CG on `(A + t·I) y = b` through the un-shifted `matvec(v) = A·v`,
-/// warm-started from `y0`. Returns the solution and the iteration count, or
-/// `None` on a non-finite breakdown (SPD + t > 0 makes that a caller bug or a
-/// non-finite operator, both of which must surface).
+/// warm-started from `y0`. Returns the solution and the iteration count only
+/// after the TRUE residual meets `rel_tol`; exhaustion and non-finite/SPD
+/// breakdowns return `None`. Returning an iteration-capped last iterate would
+/// make the value consume an approximate inverse while the derivative formula
+/// differentiates an exact inverse, re-opening the #2080 objective/gradient
+/// desynchronisation this module exists to prevent.
 fn shifted_cg(
     matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
     t: f64,
@@ -504,6 +507,9 @@ fn shifted_cg(
     rel_tol: f64,
     max_iters: usize,
 ) -> Option<(Array1<f64>, usize)> {
+    if !(rel_tol.is_finite() && rel_tol > 0.0) {
+        return None;
+    }
     let apply = |v: ArrayView1<f64>| -> Array1<f64> {
         let mut out = matvec(v);
         out.scaled_add(t, &v.to_owned());
@@ -536,7 +542,12 @@ fn shifted_cg(
         rs = rs_new;
         iters += 1;
     }
-    Some((y, iters))
+    // CG's recursively updated residual can drift from the actual residual on
+    // an ill-conditioned shifted system. The inverse bundle is admissible only
+    // when the operator's true residual meets the requested contract.
+    let true_residual = b - &apply(y.view());
+    let true_residual_norm = true_residual.dot(&true_residual).sqrt();
+    (true_residual_norm.is_finite() && true_residual_norm <= tol).then_some((y, iters))
 }
 
 /// Modified Gram-Schmidt orthonormalisation of a column block, DROPPING any
@@ -566,10 +577,14 @@ fn orthonormalize(cols: &[Array1<f64>]) -> Vec<Array1<f64>> {
             v.scaled_add(-proj, basis);
         }
         let norm = v.dot(&v).sqrt();
-        let collapsed = !(norm_after_first.is_finite())
-            || norm_after_first <= 1e-12 * v0_norm.max(1e-300)
+        // Numerical rank, not a tuned absolute knob: below √ε of the source
+        // column's norm, orthogonal residuals carry no stable direction.
+        let rank_tol = f64::EPSILON.sqrt() * v0_norm;
+        let collapsed = !(v0_norm.is_finite() && v0_norm > 0.0)
+            || !(norm_after_first.is_finite())
+            || norm_after_first <= rank_tol
             || !(norm.is_finite())
-            || norm <= 1e-12;
+            || norm <= rank_tol;
         if !collapsed {
             v.mapv_inplace(|x| x / norm);
             out.push(v);
@@ -633,7 +648,7 @@ fn build_deflation_basis(
     // for no reason. Determinism per seed is kept.
     let mut master = splitmix64_hash(seed.wrapping_add(0xD1B5_4A32_D192_ED03));
     let mut cols = orthonormalize(&rademacher_block(&mut master, r, dim));
-    for _ in 0..iters.max(1) {
+    for _ in 0..iters {
         if cols.is_empty() {
             break;
         }
@@ -657,11 +672,11 @@ fn build_deflation_basis(
 /// gives no separation); genuine bottom amplification needs `S⁻¹`, whence the CG
 /// inverse iteration here.
 ///
-/// The solves need NOT be accurate — an approximate bottom `Q` only relaxes the
-/// variance reduction, it can NEVER bias the estimate (the log-det split is exact
-/// for ANY orthonormal `Q`; see [`DeflationSpec`]). A loose `cg_rel_tol` and a
-/// bounded `cg_max_iters` therefore suffice, and a CG breakdown falls back to the
-/// (still valid) un-amplified start column. The whole build is a ONE-TIME frozen
+/// The solves may use a loose requested tolerance — an approximate bottom `Q`
+/// only relaxes variance reduction and cannot bias the exact split — but every
+/// requested solve must still CONVERGE to that tolerance. Exhaustion propagates
+/// as `None`; silently retaining an un-amplified start column would falsify the
+/// requested two-sided variance contract. The whole build is a ONE-TIME frozen
 /// cost per outer solve, never per evaluation.
 fn build_inverse_deflation_basis(
     matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
@@ -671,33 +686,30 @@ fn build_inverse_deflation_basis(
     seed: u64,
     cg_rel_tol: f64,
     cg_max_iters: usize,
-) -> Vec<Array1<f64>> {
+) -> Option<Vec<Array1<f64>>> {
     let r = rank.min(dim);
     if r == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     // Distinct master stream from the top-basis start (a different additive
     // offset into splitmix) so the top and bottom start blocks are not aliased.
     let mut master = splitmix64_hash(seed.wrapping_add(0x2545_F491_4F6C_DD1D));
     let mut cols = orthonormalize(&rademacher_block(&mut master, r, dim));
     let zero = Array1::<f64>::zeros(dim);
-    for _ in 0..iters.max(1) {
+    for _ in 0..iters {
         if cols.is_empty() {
             break;
         }
         // Inverse iteration step: apply S⁻¹ column-wise via plain CG (shift 0 on
-        // the SPD operator). Approximate is fine; a breakdown keeps the column.
-        let applied: Vec<Array1<f64>> = cols
+        // the SPD operator). Every solve must meet the caller's (possibly loose)
+        // tolerance; an exhausted solve invalidates the requested bottom peel.
+        let applied: Option<Vec<Array1<f64>>> = cols
             .iter()
-            .map(|c| {
-                shifted_cg(matvec, 0.0, c, &zero, cg_rel_tol, cg_max_iters)
-                    .map(|(y, _)| y)
-                    .unwrap_or_else(|| c.clone())
-            })
+            .map(|c| shifted_cg(matvec, 0.0, c, &zero, cg_rel_tol, cg_max_iters).map(|(y, _)| y))
             .collect();
-        cols = orthonormalize(&applied);
+        cols = orthonormalize(&applied?);
     }
-    cols
+    Some(cols)
 }
 
 /// Solve `(S + t_ℓ I) y = v` for every input vector across the whole shift
@@ -894,6 +906,42 @@ mod tests {
             .expect("eval2")
             .estimate;
         assert_eq!(e1, e2, "fixed plan must be bit-deterministic");
+    }
+
+    #[test]
+    fn shifted_cg_refuses_an_unconverged_iteration_cap() {
+        let a = array![[1.0, 0.0], [0.0, 4.0]];
+        let b = array![1.0, 1.0];
+        let zero = Array1::<f64>::zeros(2);
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+
+        assert!(
+            shifted_cg(&matvec, 0.0, &b, &zero, 1.0e-12, 1).is_none(),
+            "one CG step cannot solve a two-eigenvalue system to 1e-12; the \
+             iteration-capped last iterate must be refused"
+        );
+        let (solved, iterations) = shifted_cg(&matvec, 0.0, &b, &zero, 1.0e-12, 2)
+            .expect("two-dimensional SPD CG must converge in at most two steps");
+        let residual = &b - &matvec(solved.view());
+        assert!(
+            residual.dot(&residual).sqrt() <= 1.0e-12 * b.dot(&b).sqrt(),
+            "returned shifted solve must satisfy its true-residual contract"
+        );
+        assert_eq!(iterations, 2);
+    }
+
+    #[test]
+    fn two_sided_deflation_propagates_bottom_solve_nonconvergence() {
+        let a = array![[1.0, 0.0], [0.0, 4.0]];
+        let matvec = |v: ArrayView1<f64>| a.dot(&v);
+        let plan = RationalLogdetPlan::build(2, 2, 17, 1.0, 4.0, 1.0e-9)
+            .expect("valid rational plan");
+        assert!(
+            plan.with_two_sided_deflation(&matvec, 0, 1, 1, 91, (1.0e-12, 0))
+                .is_none(),
+            "a requested bottom-tail inverse solve may not silently fall back to \
+             the unamplified start column"
+        );
     }
 
     #[test]
@@ -1342,7 +1390,8 @@ mod tests {
         let top64 = base.clone().with_deflation(&matvec, 64, 3, 555); // one-sided, EQUAL total rank
         let two = base
             .clone()
-            .with_two_sided_deflation(&matvec, 32, 32, 3, 555, (1e-3, 5000)); // 32 top + 32 bottom
+            .with_two_sided_deflation(&matvec, 32, 32, 3, 555, (1e-3, 5000))
+            .expect("bottom-tail inverse iteration must converge"); // 32 top + 32 bottom
 
         let e16 = evaluate_exact(&top16, &a);
         let e64 = evaluate_exact(&top64, &a);

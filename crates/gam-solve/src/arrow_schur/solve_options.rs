@@ -552,6 +552,133 @@ pub struct ArrowRowGaugeDeflation {
     pub directions: Arc<[Vec<Array1<f64>>]>,
 }
 
+/// Orthonormal gauge basis on the reduced shared `beta` border.
+///
+/// Evidence factors use this as a Faddeev--Popov pin: for
+/// `Q = [q_1, ..., q_r]` and `P = I - Q Q^T`, the represented reduced
+/// operator is
+///
+/// `S_quot = P S P + Q Q^T`.
+///
+/// The quotient directions therefore contribute exactly `log(1) = 0` to the
+/// Laplace log-determinant, while inverse/trace consumers apply
+/// `P S_quot^-1 P`.  Ordinary Newton solves do not consult this carrier; it is
+/// an evidence-coordinate contract only.
+#[derive(Debug, Clone)]
+pub struct ArrowBetaGaugeQuotient {
+    pub directions: Arc<[Array1<f64>]>,
+}
+
+impl ArrowBetaGaugeQuotient {
+    /// Orthonormalize a non-empty set of same-width border directions.
+    ///
+    /// A zero or linearly-dependent direction is a malformed gauge declaration,
+    /// not a numerical condition to hide, so construction fails loudly.
+    pub fn new(directions: Vec<Array1<f64>>) -> Result<Self, String> {
+        if directions.is_empty() {
+            return Err("ArrowBetaGaugeQuotient requires at least one direction".to_string());
+        }
+        let dim = directions[0].len();
+        if dim == 0 {
+            return Err("ArrowBetaGaugeQuotient directions must be non-empty".to_string());
+        }
+        let mut basis: Vec<Array1<f64>> = Vec::with_capacity(directions.len());
+        for (direction_idx, mut direction) in directions.into_iter().enumerate() {
+            if direction.len() != dim {
+                return Err(format!(
+                    "ArrowBetaGaugeQuotient direction {direction_idx} length {} != {dim}",
+                    direction.len()
+                ));
+            }
+            if direction.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "ArrowBetaGaugeQuotient direction {direction_idx} contains a non-finite value"
+                ));
+            }
+            for existing in &basis {
+                let coefficient = direction.dot(existing);
+                direction.scaled_add(-coefficient, existing);
+            }
+            let norm_sq = direction.dot(&direction);
+            if !(norm_sq.is_finite() && norm_sq > 0.0) {
+                return Err(format!(
+                    "ArrowBetaGaugeQuotient direction {direction_idx} is zero or linearly dependent"
+                ));
+            }
+            direction *= norm_sq.sqrt().recip();
+            basis.push(direction);
+        }
+        Ok(Self {
+            directions: Arc::from(basis.into_boxed_slice()),
+        })
+    }
+
+    pub fn dimension(&self) -> usize {
+        self.directions.len()
+    }
+
+    pub(crate) fn border_dim(&self) -> usize {
+        self.directions[0].len()
+    }
+
+    /// `P x`, where `P = I - Q Q^T`.
+    pub fn project_complement(&self, x: ArrayView1<'_, f64>) -> Array1<f64> {
+        assert_eq!(x.len(), self.border_dim());
+        let mut out = x.to_owned();
+        for direction in self.directions.iter() {
+            let coefficient = out.dot(direction);
+            out.scaled_add(-coefficient, direction);
+        }
+        out
+    }
+
+    /// Dense Faddeev--Popov pin `P S P + Q Q^T`.
+    pub fn pin_reduced_schur(&self, schur: ArrayView2<'_, f64>) -> Array2<f64> {
+        let dim = self.border_dim();
+        assert_eq!(schur.dim(), (dim, dim));
+
+        // Apply P on the right, then on the left. Keeping the two projections
+        // explicit makes the implementation the exact matrix analogue of the
+        // matrix-free apply and avoids materializing a dense projector.
+        let mut right = schur.to_owned();
+        for direction in self.directions.iter() {
+            let schur_q = right.dot(direction);
+            for row in 0..dim {
+                for col in 0..dim {
+                    right[[row, col]] -= schur_q[row] * direction[col];
+                }
+            }
+        }
+        let mut pinned = right;
+        for direction in self.directions.iter() {
+            let q_t_s = direction.dot(&pinned);
+            for row in 0..dim {
+                for col in 0..dim {
+                    pinned[[row, col]] -= direction[row] * q_t_s[col];
+                }
+            }
+        }
+        for direction in self.directions.iter() {
+            for row in 0..dim {
+                for col in 0..dim {
+                    pinned[[row, col]] += direction[row] * direction[col];
+                }
+            }
+        }
+        // Both the input Schur and the mathematical pin are symmetric. Clear
+        // the last-bit asymmetry from the two ordered dense projections before
+        // Cholesky so direct and matrix-free paths expose one self-adjoint op.
+        for row in 0..dim {
+            for col in (row + 1)..dim {
+                let value = 0.5 * (pinned[[row, col]] + pinned[[col, row]]);
+                pinned[[row, col]] = value;
+                pinned[[col, row]] = value;
+            }
+        }
+        pinned
+    }
+}
+
 impl ArrowRowGaugeDeflation {
     pub fn new(directions: Vec<Vec<Array1<f64>>>) -> Self {
         Self {

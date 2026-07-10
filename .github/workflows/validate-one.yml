@@ -159,7 +159,7 @@ jobs:
 
       - name: Run Python tests (filtered, fail-fast)
         if: ${{ github.event.inputs.py_filter != '' }}
-        run: python -m pytest tests/ -k "${{ github.event.inputs.py_filter }}" --continue-on-collection-errors -p no:cacheprovider -x -q --tb=short
+        run: python -m pytest tests/ -k "${{ github.event.inputs.py_filter }}" -p no:cacheprovider -x -q --tb=short
 
       # ---- torch path (opt-in; only when a torch_filter was given) ----------
       - name: Install CPU torch wheel
@@ -168,7 +168,7 @@ jobs:
 
       - name: Run torch tests (filtered, fail-fast)
         if: ${{ github.event.inputs.torch_filter != '' }}
-        run: python -m pytest tests/torch -k "${{ github.event.inputs.torch_filter }}" --continue-on-collection-errors -p no:cacheprovider -x -q --tb=short
+        run: python -m pytest tests/torch -k "${{ github.event.inputs.torch_filter }}" -p no:cacheprovider -x -q --tb=short
 
       - name: Guard against an empty request
         if: ${{ github.event.inputs.rust_filter == '' && github.event.inputs.py_filter == '' && github.event.inputs.torch_filter == '' }}

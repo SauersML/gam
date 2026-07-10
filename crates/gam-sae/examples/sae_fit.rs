@@ -12,12 +12,6 @@ use gam_sae::manifold::{
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
 use ndarray::array;
 
-fn unused_promotion_alignment_threshold(_: usize) -> f64 {
-    // Residual promotion is disabled in this compact example, so the core fit
-    // never consults this callback.
-    0.0
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target = array![
         [1.0, 0.0],
@@ -117,7 +111,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         promote_from_residual: false,
         run_structure_search: false,
         run_outer_rho_search: false,
-        align_min_from_rank: unused_promotion_alignment_threshold,
         cancel: None,
     })?;
 

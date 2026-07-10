@@ -1609,7 +1609,7 @@ mod lever_wiring_2072_tests {
         let rho = SaeManifoldRho::new(0.0, -6.0, vec![array![0.0], array![0.0], array![0.0]]);
 
         // Gate values a_k = σ(20)·π_k (σ(20) = 0.999999998 ⇒ a_k = π_k to 1e-9).
-        let gate = ibp_map_row(Array1::from(vec![20.0_f64; 3]).view(), 1.0, 1.0);
+        let gate = ibp_map_row(Array1::from(vec![20.0_f64; 3]).view(), 1.0);
 
         // Per-atom UNIT-amplitude gated designs C_k = a_k·Φ_k·B̂_k, read off the
         // term's OWN reconstruction (atom k on at s = 0, the rest off) exactly as

@@ -187,6 +187,14 @@ pub struct ArrowSchurSystem {
     /// `tolerate_ill_conditioning` set may stiffen a gauge-explained row
     /// direction.
     pub row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
+    /// Exact scale-gauge quotient on the reduced shared `beta` border.
+    ///
+    /// SAE installs one normalized radial decoder direction per live atom.
+    /// Evidence paths factor `P S P + Q Q^T` and expose the projected inverse
+    /// `P S_quot^-1 P`; ordinary Newton steps ignore this carrier because their
+    /// joint `(delta B, delta log-amplitude)` trajectory projection is owned by
+    /// the SAE step application.
+    pub beta_gauge_quotient: Option<ArrowBetaGaugeQuotient>,
     /// Optional exact cross-row IBP low-rank source (#1038). When set, the
     /// factorization downdates the per-row logit-slot self term and layers the
     /// exact rank-`R` Woodbury correction onto the evidence cache (value,
@@ -218,6 +226,7 @@ impl Clone for ArrowSchurSystem {
             device_sae_pcg: self.device_sae_pcg.clone(),
             cross_row_penalties: self.cross_row_penalties.clone(),
             row_gauge_deflation: self.row_gauge_deflation.clone(),
+            beta_gauge_quotient: self.beta_gauge_quotient.clone(),
             ibp_cross_row: self.ibp_cross_row.clone(),
         }
     }
@@ -349,6 +358,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            beta_gauge_quotient: None,
             ibp_cross_row: None,
         }
     }
@@ -398,6 +408,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            beta_gauge_quotient: None,
             ibp_cross_row: None,
         }
     }
@@ -453,6 +464,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            beta_gauge_quotient: None,
             ibp_cross_row: None,
         }
     }
@@ -498,6 +510,7 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            beta_gauge_quotient: None,
             ibp_cross_row: None,
         }
     }
@@ -548,12 +561,29 @@ impl ArrowSchurSystem {
             device_sae_pcg: None,
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
+            beta_gauge_quotient: None,
             ibp_cross_row: None,
         }
     }
 
     pub fn set_row_gauge_deflation(&mut self, deflation: ArrowRowGaugeDeflation) {
         self.row_gauge_deflation = Some(deflation);
+    }
+
+    /// Install the exact evidence quotient for shared-border gauge directions.
+    pub fn set_beta_gauge_quotient(
+        &mut self,
+        quotient: ArrowBetaGaugeQuotient,
+    ) -> Result<(), String> {
+        if quotient.border_dim() != self.k {
+            return Err(format!(
+                "ArrowSchurSystem::set_beta_gauge_quotient: direction width {} != beta border {}",
+                quotient.border_dim(),
+                self.k
+            ));
+        }
+        self.beta_gauge_quotient = Some(quotient);
+        Ok(())
     }
 
     /// Register the exact cross-row IBP low-rank source (#1038). The assembly
@@ -2594,6 +2624,13 @@ pub struct ArrowFactorCache {
     /// suffices), and every non-SAE-evidence solver path (streaming / device /
     /// cross-row CG). Empty overall when no row deflated spectrally.
     pub deflation_row_spectra: Arc<[Option<RowDeflationSpectrum>]>,
+    /// Shared-border scale gauge used by the evidence factor.
+    ///
+    /// When present, `schur_factor` factors `P S P + Q Q^T`, and every public
+    /// inverse primitive projects both its border RHS and result with `P`.  The
+    /// unit-pinned orbit contributes zero to `arrow_log_det` and zero to every
+    /// analytic trace, so value and gradient live on the same quotient.
+    pub beta_gauge_quotient: Option<ArrowBetaGaugeQuotient>,
     /// Exact cross-row IBP rank-`R` Woodbury correction (#1038), present iff the
     /// source system carried an [`IbpCrossRowSource`]. When set, the per-row
     /// factors above are of the NO-SELF base `H₀'` (self term `d_k·z'_ik²`
@@ -3439,7 +3476,7 @@ impl ArrowFactorCache {
     /// yet supported for the matrix-free PCG mode; that branch needs a separate
     /// Lanczos/Hutchinson estimator.
     pub fn latent_block_inverse_diagonal(&self) -> Result<Array1<f64>, ArrowSchurError> {
-        let Some(schur_factor) = self.schur_factor.as_ref() else {
+        let Some(_schur_factor) = self.schur_factor.as_ref() else {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: "latent_block_inverse_diagonal requires a dense Schur factor; \
                          the InexactPCG mode does not form one"
@@ -3489,7 +3526,7 @@ impl ArrowFactorCache {
                     });
                 }
                 // z = S⁻¹ w; correction = w · z.
-                let z = cholesky_solve_vector(schur_factor, &w);
+                let z = self.schur_inverse_apply(w.view())?;
                 let mut corr = 0.0_f64;
                 for c in 0..self.k {
                     corr += w[c] * z[c];
@@ -3704,8 +3741,15 @@ impl ArrowFactorCache {
                 ),
             });
         }
-        let rhs_owned = rhs.to_owned();
-        Ok(cholesky_solve_vector(schur_factor, &rhs_owned))
+        let rhs_owned = match self.beta_gauge_quotient.as_ref() {
+            Some(quotient) => quotient.project_complement(rhs),
+            None => rhs.to_owned(),
+        };
+        let solved = cholesky_solve_vector(schur_factor, &rhs_owned);
+        Ok(match self.beta_gauge_quotient.as_ref() {
+            Some(quotient) => quotient.project_complement(solved.view()),
+            None => solved,
+        })
     }
 
     /// Dense principal sub-block of the β-block of the full inverse,
@@ -3732,7 +3776,7 @@ impl ArrowFactorCache {
         &self,
         block: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, ArrowSchurError> {
-        let Some(schur_factor) = self.schur_factor.as_ref() else {
+        let Some(_schur_factor) = self.schur_factor.as_ref() else {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: "schur_inverse_block requires a dense Schur factor; \
                          the InexactPCG mode does not form one"
@@ -3760,7 +3804,7 @@ impl ArrowFactorCache {
         for (jc, j) in block.clone().enumerate() {
             e_j.fill(0.0);
             e_j[j] = 1.0;
-            let col = cholesky_solve_vector(schur_factor, &e_j);
+            let col = self.schur_inverse_apply(e_j.view())?;
             for (ic, i) in block.clone().enumerate() {
                 out[[ic, jc]] = col[i];
             }

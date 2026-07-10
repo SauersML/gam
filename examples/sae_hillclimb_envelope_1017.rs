@@ -1,13 +1,12 @@
 //! SAE (n, K) hill-climbing envelope harness (#1017).
 //!
-//! Geometrically sweeps the SAE manifold fit over `n` (rows / data points) and
-//! `K` (dictionary size / number of latent atoms), and at every rung records
-//! wall-clock per stage, reconstruction quality, solve/outer iteration counts,
-//! and the assembled arrow/Schur block dimensions. It AUTO-CLIMBS: starting from
-//! a small rung it keeps doubling `n` and `K` until it hits a CLIFF (a fit
-//! `Err`, a per-rung wall-clock budget breach, or a reconstruction-quality
-//! collapse) and then reports the exact rung coordinates of each cliff along
-//! with the dominant scaling term predicted from the source asymptotics.
+//! Geometrically profiles the SAE manifold fit over `n` (rows / data points)
+//! and `K` (dictionary size / number of latent atoms). At every rung it records
+//! elapsed time per stage, reconstruction quality, solve/outer iteration counts,
+//! and the assembled arrow/Schur block dimensions. Timings are measurements
+//! only: they never terminate a fit or a climb. A rung succeeds only when the
+//! production outer optimizer returns a converged result; otherwise its typed
+//! solver error is the reported cliff.
 //!
 //! Stage cost map (from src/terms/sae/manifold/construction.rs and
 //! src/solver/arrow_schur/*):
@@ -21,7 +20,7 @@
 //!
 //! Usage:
 //!   sae_hillclimb_envelope_1017 [--n0 N] [--k0 K] [--pdim P] [--ddim D]
-//!                               [--budget-ms MS] [--max-n N] [--max-k K]
+//!                               [--max-n N] [--max-k K]
 //!                               [--quality-floor Q] [--topology circle|euclidean]
 //!                               [--single n,K]   (run one rung and stop)
 //!
@@ -49,7 +48,6 @@ const ALPHA: f64 = 1.0;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
 const INNER_MAX_ITER: usize = 12;
-const OUTER_MAX_ITER: usize = 1;
 const LEARNING_RATE: f64 = 1.0;
 const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
@@ -343,7 +341,7 @@ fn run_rung(shape: Shape) -> Result<RungReport, String> {
         .solve_with_options(
             0.0,
             0.0,
-            &ArrowSolveOptions::direct().with_ill_conditioning_tolerated(),
+            &ArrowSolveOptions::automatic(beta_dim).with_ill_conditioning_tolerated(),
         )
         .map_err(|err| format!("inner solve failed: {err}"))?;
     let inner_solve_ms = ms(solve_start);
@@ -363,18 +361,19 @@ fn run_rung(shape: Shape) -> Result<RungReport, String> {
         RIDGE_BETA,
     );
     let mut counted = CountingObjective::new(outer);
-    let problem = OuterProblem::new(n_params)
-        .with_initial_rho(init_rho_flat)
-        .with_max_iter(OUTER_MAX_ITER);
+    let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
     let outer_start = Instant::now();
     let result = problem
         .run(&mut counted, "SAE hillclimb")
         .map_err(|err| format!("outer fit failed: {err}"))?;
     let outer_ms = ms(outer_start);
 
-    // Reconstruction quality from the fitted term vs the clean target.
-    let fitted = fixture.term.fitted();
-    let quality = frac_var_explained(&fixture.target, &fitted);
+    // Reconstruction quality must come from the state the converged objective
+    // actually banked. Reading `fixture.term` here would merely re-read the
+    // pristine seed and could report perfect quality even when the fit failed.
+    let inner_evals = counted.eval_count;
+    let fitted = counted.inner.into_fitted();
+    let quality = frac_var_explained(&fixture.target, &fitted.term.fitted());
 
     Ok(RungReport {
         shape,
@@ -388,7 +387,7 @@ fn run_rung(shape: Shape) -> Result<RungReport, String> {
         outer_ms,
         outer_iters: result.iterations,
         outer_converged: result.converged,
-        inner_evals: counted.eval_count,
+        inner_evals,
         quality,
         total_ms: ms(total_start),
     })
@@ -446,7 +445,6 @@ impl RungReport {
 /// Why a climb stopped at a given rung.
 enum Cliff {
     Error { stage: Shape, message: String },
-    Budget { stage: Shape, total_ms: f64 },
     Quality { stage: Shape, quality: f64 },
 }
 
@@ -461,7 +459,6 @@ struct Config {
     k0: usize,
     p: usize,
     d: usize,
-    budget_ms: f64,
     max_n: usize,
     max_k: usize,
     quality_floor: f64,
@@ -475,7 +472,6 @@ impl Default for Config {
             k0: 32,
             p: 256,
             d: 2,
-            budget_ms: 120_000.0,
             max_n: 1_000_000,
             max_k: 8_192,
             quality_floor: 0.5,
@@ -532,17 +528,6 @@ fn climb(start: Shape, cfg: &Config, step: fn(Shape) -> Shape, label: &str) -> O
                 quality: rung.quality,
             });
         }
-        if rung.total_ms > cfg.budget_ms {
-            println!(
-                "CLIFF axis={label} kind=budget n={} K={} total_ms={:.3} budget_ms={:.3}",
-                shape.n, shape.k, rung.total_ms, cfg.budget_ms
-            );
-            return Some(Cliff::Budget {
-                stage: shape,
-                total_ms: rung.total_ms,
-            });
-        }
-
         let next = step(shape);
         if next.n > cfg.max_n || next.k > cfg.max_k {
             println!(
@@ -561,10 +546,6 @@ fn report_cliff(climb_label: &str, cliff: &Option<Cliff>) {
         Some(Cliff::Error { stage, message }) => println!(
             "SUMMARY climb={climb_label} cliff=error rung_n={} rung_K={} detail=\"{message}\"",
             stage.n, stage.k
-        ),
-        Some(Cliff::Budget { stage, total_ms }) => println!(
-            "SUMMARY climb={climb_label} cliff=budget rung_n={} rung_K={} total_ms={:.3}",
-            stage.n, stage.k, total_ms
         ),
         Some(Cliff::Quality { stage, quality }) => println!(
             "SUMMARY climb={climb_label} cliff=quality rung_n={} rung_K={} quality={:.6}",
@@ -600,7 +581,6 @@ fn run() -> Result<(), String> {
             "--k0" => cfg.k0 = parse_usize("--k0", args.next())?,
             "--pdim" => cfg.p = parse_usize("--pdim", args.next())?,
             "--ddim" => cfg.d = parse_usize("--ddim", args.next())?,
-            "--budget-ms" => cfg.budget_ms = parse_f64("--budget-ms", args.next())?,
             "--max-n" => cfg.max_n = parse_usize("--max-n", args.next())?,
             "--max-k" => cfg.max_k = parse_usize("--max-k", args.next())?,
             "--quality-floor" => cfg.quality_floor = parse_f64("--quality-floor", args.next())?,
@@ -638,12 +618,11 @@ fn run() -> Result<(), String> {
     };
 
     println!(
-        "CONFIG n0={} k0={} p={} d={} budget_ms={:.0} max_n={} max_k={} quality_floor={:.3} topology={}",
+        "CONFIG n0={} k0={} p={} d={} max_n={} max_k={} quality_floor={:.3} topology={}",
         cfg.n0,
         cfg.k0,
         cfg.p,
         d,
-        cfg.budget_ms,
         cfg.max_n,
         cfg.max_k,
         cfg.quality_floor,

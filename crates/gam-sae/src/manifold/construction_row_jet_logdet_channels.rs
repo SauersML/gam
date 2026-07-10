@@ -155,21 +155,13 @@ impl SaeManifoldTerm {
                 vec![0.0; k_atoms],
                 vec![1.0; k_atoms],
             ),
-            AssignmentMode::IBPMap {
-                temperature, alpha, ..
-            } => {
-                let effective_alpha = self
-                    .assignment
-                    .resolved_ibp_alpha(rho)
-                    .unwrap_or(alpha);
-                (
-                    RowGate::PerAtomLogistic {
-                        inv_tau: 1.0 / temperature,
-                    },
-                    vec![0.0; k_atoms],
-                    ordered_geometric_shrinkage_prior(k_atoms, effective_alpha).to_vec(),
-                )
-            }
+            AssignmentMode::IBPMap { temperature, .. } => (
+                RowGate::PerAtomLogistic {
+                    inv_tau: 1.0 / temperature,
+                },
+                vec![0.0; k_atoms],
+                vec![1.0; k_atoms],
+            ),
             AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,

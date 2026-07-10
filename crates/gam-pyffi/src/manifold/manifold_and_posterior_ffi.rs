@@ -2228,28 +2228,23 @@ fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f6
 
 /// IBP-MAP concrete-relaxation activations and their diagonal logit Jacobian.
 ///
-/// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ) · π_k` (consistent stick-breaking
-/// prior mean `π_k = (α/(α+1))^(k+1)`) and `dz_dl_k = ∂z_k/∂l_k`. The map is
-/// diagonal in `k`,
+/// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ)` is the posterior-mean Bernoulli
+/// activation and `dz_dl_k = ∂z_k/∂l_k`. Ordered stick-breaking shrinkage is
+/// scored by the Rust IBP prior rather than multiplied into reconstruction.
+/// The map is diagonal in `k`,
 /// so torch's autograd `Function` multiplies the upstream gradient elementwise
 /// by `dz_dl`. This is the single source of truth shared with the closed-form
 /// `SaeAssignment` IBP path so torch IBP-Gumbel applies the same prior and
 /// temperature scaling as the Rust fit.
-#[pyfunction(signature = (logits, temperature, alpha))]
+#[pyfunction(signature = (logits, temperature))]
 fn sae_ibp_map_value_grad<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray1<'py, f64>,
     temperature: f64,
-    alpha: f64,
 ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(py_value_error(format!(
             "sae_ibp_map_value_grad: temperature must be finite and positive; got {temperature}"
-        )));
-    }
-    if !(alpha.is_finite() && alpha > 0.0) {
-        return Err(py_value_error(format!(
-            "sae_ibp_map_value_grad: alpha must be finite and positive; got {alpha}"
         )));
     }
     let logits_view = logits.as_array();
@@ -2261,7 +2256,7 @@ fn sae_ibp_map_value_grad<'py>(
         }
     }
     let (value, grad) =
-        gam::terms::sae::assignment::ibp_map_row_value_grad(logits_view.view(), temperature, alpha);
+        gam::terms::sae::assignment::ibp_map_row_value_grad(logits_view.view(), temperature);
     Ok((
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),
@@ -2270,21 +2265,15 @@ fn sae_ibp_map_value_grad<'py>(
 
 /// Batched sibling of [`sae_ibp_map_value_grad`] for a complete `(N, K)`
 /// tensor crossing the Python/Rust boundary once per forward pass.
-#[pyfunction(signature = (logits, temperature, alpha))]
+#[pyfunction(signature = (logits, temperature))]
 fn sae_ibp_map_batch_value_grad<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray2<'py, f64>,
     temperature: f64,
-    alpha: f64,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(py_value_error(format!(
             "sae_ibp_map_batch_value_grad: temperature must be finite and positive; got {temperature}"
-        )));
-    }
-    if !(alpha.is_finite() && alpha > 0.0) {
-        return Err(py_value_error(format!(
-            "sae_ibp_map_batch_value_grad: alpha must be finite and positive; got {alpha}"
         )));
     }
     let logits_view = logits.as_array();
@@ -2298,7 +2287,6 @@ fn sae_ibp_map_batch_value_grad<'py>(
     let (value, grad) = gam::terms::sae::assignment::ibp_map_batch_value_grad(
         logits_view.view(),
         temperature,
-        alpha,
     );
     Ok((
         value.into_pyarray(py).unbind(),

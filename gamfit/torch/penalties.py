@@ -718,11 +718,11 @@ class _JumpReLUSTEFn(torch.autograd.Function):
 
 
 class _IBPMapFn(torch.autograd.Function):
-    """IBP-MAP concrete relaxation, value+grad from the Rust source of truth.
+    """IBP posterior-mean gate, value+grad from the Rust source of truth.
 
-    Forward returns ``z_k = σ(l_k/τ) · π_k`` where ``π_k = (α/(α+1))^(k+1)`` is
-    the consistent truncated stick-breaking prior mean (every atom shrunk by one
-    Beta(α,1) stick, #614); backward multiplies the upstream gradient by
+    Forward returns ``z_k = σ(l_k/τ)``. The ordered Beta--Bernoulli shrinkage is
+    scored once by the IBP prior rather than multiplied into the final function;
+    backward multiplies the upstream gradient by
     the diagonal logit Jacobian ``∂z_k/∂l_k`` that Rust returns. Replacing the
     bare ``sigmoid(logits/τ)`` torch path makes torch IBP-Gumbel agree with the
     closed-form ``SaeAssignment`` IBP-MAP assignments (see
@@ -730,11 +730,10 @@ class _IBPMapFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor, temperature: float, alpha: float) -> torch.Tensor:
+    def forward(ctx: Any, logits: torch.Tensor, temperature: float) -> torch.Tensor:
         value_np, grad_np = rust_module().sae_ibp_map_batch_value_grad(
             to_numpy_f64(logits.reshape(logits.shape[0], -1)),
             float(temperature),
-            float(alpha),
         )
         value = from_numpy_like(value_np, logits).reshape_as(logits)
         grad = from_numpy_like(grad_np, logits).reshape_as(logits)
@@ -742,17 +741,17 @@ class _IBPMapFn(torch.autograd.Function):
         return value
 
     @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
         (jac_diag,) = ctx.saved_tensors
-        return grad_output * jac_diag, None, None
+        return grad_output * jac_diag, None
 
 
-def ibp_map(logits: torch.Tensor, temperature: float, alpha: float) -> torch.Tensor:
-    """Differentiable IBP-MAP assignments via the Rust value+grad kernel."""
+def ibp_map(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Differentiable IBP posterior-mean assignments via Rust."""
     if not isinstance(logits, torch.Tensor):
         raise TypeError("ibp_map logits must be a torch.Tensor")
     apply = cast(Callable[..., torch.Tensor], _IBPMapFn.apply)
-    return apply(logits, float(temperature), float(alpha))
+    return apply(logits, float(temperature))
 
 
 class _JumpReLUBoundedGateFn(torch.autograd.Function):

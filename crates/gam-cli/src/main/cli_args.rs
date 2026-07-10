@@ -37,6 +37,8 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Fit a model from a dataset + formula and persist it to disk.
     Fit(FitArgs),
+    /// Fit a row-aligned manifold crosscoder and write its GAM-SAE report.
+    Crosscoder(CrosscoderArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
     /// Predict on a new dataset using a fitted model.
@@ -47,6 +49,100 @@ pub(crate) enum Command {
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
     Generate(GenerateArgs),
+}
+
+/// One named NPY matrix at the CLI transport boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NamedNpyInput {
+    pub(crate) label: String,
+    pub(crate) path: PathBuf,
+}
+
+impl std::str::FromStr for NamedNpyInput {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (label, path) = raw.split_once('=').ok_or_else(|| {
+            format!("expected LABEL=FILE for a named activation matrix, got '{raw}'")
+        })?;
+        if label.trim().is_empty() {
+            return Err(format!("activation label must be non-empty in '{raw}'"));
+        }
+        if path.is_empty() {
+            return Err(format!("activation file path must be non-empty in '{raw}'"));
+        }
+        Ok(Self {
+            label: label.to_string(),
+            path: PathBuf::from(path),
+        })
+    }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CrosscoderArgs {
+    /// Named anchor activation matrix. The NPY must be 2-D floating point.
+    #[arg(long, value_name = "LABEL=FILE")]
+    pub(crate) anchor: NamedNpyInput,
+
+    /// Named non-anchor activation matrix. Repeat once per row-aligned layer.
+    #[arg(long, value_name = "LABEL=FILE", required = true)]
+    pub(crate) block: Vec<NamedNpyInput>,
+
+    /// Number of shared manifold atoms.
+    #[arg(long, value_parser = parse_positive_usize_cli)]
+    pub(crate) atoms: usize,
+
+    /// Harmonic order of each periodic manifold atom.
+    #[arg(long, value_parser = parse_positive_usize_cli)]
+    pub(crate) harmonics: usize,
+
+    /// Override the Rust library's assignment-sparsity strength.
+    #[arg(long, value_parser = parse_nonnegative_f64_cli)]
+    pub(crate) sparsity_strength: Option<f64>,
+
+    /// Override the Rust library's manifold smoothness strength.
+    #[arg(long, value_parser = parse_nonnegative_f64_cli)]
+    pub(crate) smoothness: Option<f64>,
+
+    /// Override the Rust library's fit iteration limit.
+    #[arg(long, value_parser = parse_positive_usize_cli)]
+    pub(crate) max_iter: Option<usize>,
+
+    /// Override the Rust library's inner learning rate.
+    #[arg(long, value_parser = parse_positive_f64_cli)]
+    pub(crate) learning_rate: Option<f64>,
+
+    /// Override the Rust library's external-coordinate ridge.
+    #[arg(long, value_parser = parse_positive_f64_cli)]
+    pub(crate) ridge_ext_coord: Option<f64>,
+
+    /// Override the Rust library's decoder ridge.
+    #[arg(long, value_parser = parse_positive_f64_cli)]
+    pub(crate) ridge_beta: Option<f64>,
+
+    /// Override the Rust library's deterministic random seed.
+    #[arg(long)]
+    pub(crate) random_state: Option<u64>,
+
+    /// Override whether the unified REML outer-rho search runs.
+    #[arg(long, value_name = "BOOL", action = ArgAction::Set)]
+    pub(crate) outer_rho_search: Option<bool>,
+
+    /// Evaluate fitted consecutive-layer transport on this caller-chosen grid.
+    #[arg(long, value_parser = parse_positive_usize_cli)]
+    pub(crate) transport_grid_resolution: Option<usize>,
+
+    /// Classify transport-law gaps using this caller-chosen tolerance.
+    #[arg(
+        long,
+        value_parser = parse_nonnegative_f64_cli,
+        requires = "transport_grid_resolution"
+    )]
+    pub(crate) law_gap_tolerance: Option<f64>,
+
+    /// GAM-SAE-owned wire report JSON output path.
+    #[arg(long, value_name = "REPORT.json")]
+    pub(crate) out: PathBuf,
 }
 
 #[derive(Args, Debug)]
