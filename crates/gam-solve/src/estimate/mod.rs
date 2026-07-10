@@ -24,7 +24,6 @@
 
 use crate::estimate::reml::{DirectionalHyperParam, RemlState};
 use std::fmt;
-use std::time::Instant;
 
 // Crate-level imports
 use gam_terms::construction::{CanonicalPenalty, ReparamInvariant};
@@ -35,7 +34,6 @@ use gam_linalg::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
-use gam_problem::{SeedConfig, SeedRiskProfile};
 use gam_terms::smooth::BlockwisePenalty;
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
@@ -86,11 +84,6 @@ pub use evaluation::{
     evaluate_external_ift_residual_at_perturbed_rho, evaluate_externalcost_andridge,
     evaluate_externalgradient,
 };
-pub(crate) use evaluation::{
-    materialize_link_outer_hessian, sas_effective_epsilon, sas_effective_epsilon_second,
-    sas_log_delta_edge_barriercostgrad, sas_log_delta_edge_barriercostgradhess,
-    sas_log_deltaridgeweight,
-};
 pub use external_options::{ExternalOptimOptions, ExternalOptimResult};
 pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
@@ -103,9 +96,7 @@ pub use outer_eval_capture::{
     OuterEvalRecord, enable_outer_eval_capture, take_outer_eval_capture,
 };
 pub(crate) use penalty::{
-    ParametricColumnConditioning, REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP,
-    REML_SEED_SCREENING_RHO_CAP, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
-    scaled_covariance,
+    ParametricColumnConditioning, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
 };
 pub(crate) use prefit::validate_penalty_specs;
 pub(crate) use smoothing_correction::{
