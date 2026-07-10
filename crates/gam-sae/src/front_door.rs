@@ -255,6 +255,46 @@ pub fn admit_linear_dictionary(
     })
 }
 
+/// #2231 Inc C — BORDER-GROWTH admission for the crosscoder's stacked width.
+///
+/// Stacking `L` layers widens the response to `p̃ = p_x + Σ_ℓ p_ℓ`, and the
+/// row-count admissions above are already correct at `output_dim = p̃` (the
+/// response really is `N×p̃`). What they do NOT see is the arrow-Schur BORDER:
+/// the dense full-`B` border is `beta_dim = Σ_k M_k·p̃` — the one quantity
+/// QUADRATIC in the layer count through the `beta_dim²` Hessian workspace
+/// (`take_border_hbb_workspace`) — while the framed border
+/// (`factored_border_dim = Σ_k M_k·r_k`, decoders profiled as
+/// `B_k = C_k·U_kᵀ`, `U_k ∈ Gr(r_k, p̃)`) is `p̃`-INDEPENDENT. This check
+/// admits the border the fit will actually carry (`border_dim`, which equals
+/// `full_beta_dim` on the all-full-`B` path) against the host in-core budget,
+/// and the refusal names the frame default as the remedy: the crosscoder lane
+/// pays the layer widening on the cheap frame side, never by silently
+/// narrowing the stacked target.
+pub fn admit_crosscoder_border(
+    border_dim: usize,
+    full_beta_dim: usize,
+    budget_bytes: usize,
+) -> Result<(), String> {
+    let border_bytes = border_dim
+        .saturating_mul(border_dim)
+        .saturating_mul(std::mem::size_of::<f64>());
+    if border_bytes <= budget_bytes {
+        return Ok(());
+    }
+    let full_bytes = full_beta_dim
+        .saturating_mul(full_beta_dim)
+        .saturating_mul(std::mem::size_of::<f64>());
+    Err(format!(
+        "crosscoder border refused: the arrow-Schur border workspace at the stacked width is \
+         {border_dim}² · 8 = {border_bytes} bytes, over the host in-core budget \
+         ({budget_bytes} bytes); the dense full-B border at this shape is (Σ M_k·p̃)² · 8 = \
+         {full_bytes} bytes. Default the atoms onto profiled Grassmann frames \
+         (maybe_activate_decoder_frame: the factored border Σ M_k·r_k is p̃-independent) or \
+         reduce the stacked width — a crosscoder request is never silently narrowed to fewer \
+         layers"
+    ))
+}
+
 /// Front-door enforcement for the DENSE manifold engine (#985 / E1): admit the
 /// dense-certification lane, or REFUSE the sparse lane.
 ///
@@ -414,6 +454,29 @@ mod tests {
         assert!(admit_linear_dictionary(4096, 512, 1024, 513).is_err());
         assert!(admit_linear_dictionary(4096, 512, 1024, 0).is_err());
         assert!(admit_linear_dictionary(0, 512, 1024, 1).is_err());
+    }
+
+    /// #2231 Inc C — the crosscoder border admission: the fit's actual border
+    /// (framed or full-B) must pay `border² · 8` bytes against the budget, and
+    /// the refusal names the frame default (the `p̃`-independent factored
+    /// border) rather than silently narrowing the stacked target.
+    #[test]
+    fn crosscoder_border_admission_checks_actual_border_and_names_frames() {
+        // Small border under a small budget: admitted.
+        admit_crosscoder_border(100, 100, 100 * 100 * 8).expect("within-budget border");
+        // Framed border admitted where the full-B border would refuse: the
+        // exact region the frame default exists for.
+        admit_crosscoder_border(512, 4096, 512 * 512 * 8).expect("framed border within budget");
+        let err = admit_crosscoder_border(4096, 4096, 512 * 512 * 8)
+            .expect_err("full-B border over budget must refuse");
+        assert!(
+            err.contains("never silently narrowed"),
+            "refusal must state the no-narrowing contract; got: {err}"
+        );
+        assert!(
+            err.contains("maybe_activate_decoder_frame"),
+            "refusal must name the frame remedy; got: {err}"
+        );
     }
 
     #[test]

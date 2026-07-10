@@ -1044,6 +1044,19 @@ impl SaeManifoldOuterObjective {
                     .to_string(),
             );
         }
+        // #2231 Inc C — border-growth admission at the stacked width p̃. The
+        // row-count admissions are already correct at output_dim = p̃, but the
+        // arrow-Schur border is the one quantity QUADRATIC in the layer count
+        // (beta_dim = Σ M_k·p̃ through the beta_dim² Hessian workspace); the
+        // framed border (factored_border_dim) is p̃-independent. Admit the
+        // border this fit will actually carry; the refusal names the frame
+        // default as the remedy instead of silently narrowing the target.
+        let (budget_bytes, _) = super::sae_host_in_core_budget_bytes();
+        crate::front_door::admit_crosscoder_border(
+            self.term.factored_border_dim(),
+            self.term.beta_dim(),
+            budget_bytes,
+        )?;
         let pristine_blocks = self.target.slice(s![.., p_x..]).to_owned();
         self.crosscoder_blocks = Some(CrosscoderBlockPricing {
             p_x,
