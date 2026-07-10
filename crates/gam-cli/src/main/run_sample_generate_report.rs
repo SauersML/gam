@@ -970,14 +970,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate: fit.artifacts.criterion_certificate.as_ref().map(|cert| {
             report::CriterionCertificateRow {
-                analytic_directional: cert.analytic_directional,
-                fd_directional: cert.fd_directional, // fd-ok: copying FD-audit certificate oracle field into report (reporting only, not math)
-                fd_error: cert.fd_error, // fd-ok: copying FD-audit certificate oracle field into report (reporting only, not math)
-                agreement_z: cert.agreement_z,
                 grad_norm: cert.grad_norm,
-                hessian_pd: cert.hessian_pd,
+                projected_grad_norm: cert.projected_grad_norm,
+                stationarity_bound: cert.stationarity_bound,
+                hessian_psd: cert.hessian_psd,
                 lambdas_railed: cert.lambdas_railed.clone(),
-                consistent: cert.first_order_consistent(),
+                stationary: cert.is_stationary(),
                 clean: cert.is_clean(),
             }
         }),

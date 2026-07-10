@@ -70,20 +70,18 @@ pub struct SmoothingForensicsRow {
     pub seed_screening: Vec<String>,
 }
 
-/// First-order optimality certificate row (#934): the fit's self-audit of its
-/// analytic gradient against a finite difference of the actual criterion
-/// value at the returned optimum, plus curvature-definiteness and λ-rail
-/// facts. `consistent` / `clean` are precomputed verdicts so the renderer
-/// never re-derives policy.
+/// First-order optimality certificate row (#934, post-FD-purge): the fit's
+/// analytic KKT self-audit at the returned optimum — raw and bound-projected
+/// gradient norms against the stationarity bound, plus curvature-definiteness
+/// and λ-rail facts. `stationary` / `clean` are precomputed verdicts so the
+/// renderer never re-derives policy.
 pub struct CriterionCertificateRow {
-    pub analytic_directional: f64,
-    pub fd_directional: f64, // fd-ok: FD-audit certificate, not in math path
-    pub fd_error: f64,       // fd-ok: FD-audit certificate, not in math path
-    pub agreement_z: f64,
     pub grad_norm: f64,
-    pub hessian_pd: Option<bool>,
+    pub projected_grad_norm: f64,
+    pub stationarity_bound: f64,
+    pub hessian_psd: Option<bool>,
     pub lambdas_railed: Vec<usize>,
-    pub consistent: bool,
+    pub stationary: bool,
     pub clean: bool,
 }
 
@@ -429,29 +427,26 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     if let Some(g) = input.outer_gradient_norm {
         summary_pairs.push(("Outer Gradient Norm", format!("{g:.3e}")));
     }
-    // Optimality certificate (#934): the fit's own gradient-vs-objective
-    // audit at the optimum. A desync flag here names the broken criterion
-    // the moment it is introduced — surface it as loudly as non-convergence.
+    // Optimality certificate (#934): the fit's analytic KKT self-audit at the
+    // optimum. A stationarity flag here names the broken criterion the moment
+    // it is introduced — surface it as loudly as non-convergence.
     if let Some(cert) = &input.criterion_certificate {
         let cert_value = if cert.clean {
             format!(
-                "<span class=\"conv-ok\">consistent</span> \
-                 (grad\u{00B7}v={:.3e}, fd\u{00B7}v={:.3e}\u{00B1}{:.1e}, z={:.2})",
-                cert.analytic_directional,
-                cert.fd_directional, // fd-ok: FD-audit certificate, not in math path
-                cert.fd_error,       // fd-ok: FD-audit certificate, not in math path
-                cert.agreement_z     // fd-ok: FD-audit certificate, not in math path
+                "<span class=\"conv-ok\">stationary</span> \
+                 (|g|={:.3e}, |Pg|={:.3e} \u{2264} bound={:.3e})",
+                cert.grad_norm, cert.projected_grad_norm, cert.stationarity_bound
             )
         } else {
             let mut flags = Vec::new();
-            if !cert.consistent {
+            if !cert.stationary {
                 flags.push(format!(
-                    "gradient\u{2194}objective desync (grad\u{00B7}v={:.3e} vs fd\u{00B7}v={:.3e}\u{00B1}{:.1e}, z={:.2})",
-                    cert.analytic_directional, cert.fd_directional, cert.fd_error, cert.agreement_z // fd-ok: FD-audit certificate, not in math path
+                    "non-stationary (|Pg|={:.3e} > bound={:.3e}, |g|={:.3e})",
+                    cert.projected_grad_norm, cert.stationarity_bound, cert.grad_norm
                 ));
             }
-            if cert.hessian_pd == Some(false) {
-                flags.push("outer Hessian not positive definite".to_string());
+            if cert.hessian_psd == Some(false) {
+                flags.push("outer Hessian not positive semidefinite".to_string());
             }
             if !cert.lambdas_railed.is_empty() {
                 flags.push(format!(

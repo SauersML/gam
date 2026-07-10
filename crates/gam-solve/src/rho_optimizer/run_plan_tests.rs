@@ -279,130 +279,86 @@ fn audit_at_railed_optimum(
     certify_outer_optimality(&mut obj, config, "railed-audit-unit", &mut result)
 }
 
-/// TASK 1+2+3: at an optimum where the ONLY disagreement lives on a railed
-/// box-bound coordinate, the certificate must NOT report a gradient-objective
-/// desync. The full-direction FD-vs-analytic check would flag it (the value
-/// slope along the railed coord disagrees with the analytic gradient there,
-/// as it legitimately can under KKT), but the audit restricts the comparison
-/// to the free (box-interior) subspace, where the two paths agree.
+/// KKT projection: at an optimum whose ONLY nonzero gradient component pulls
+/// INTO an active box bound, the bound multiplier balances it, so the
+/// projected gradient drops it and the certificate certifies with the
+/// coordinate reported railed — a legitimately bound-pinned optimum is not a
+/// false alarm.
 #[test]
-fn certificate_does_not_false_flag_when_only_railed_coordinate_disagrees() {
+fn certificate_certifies_kkt_stationary_railed_optimum() {
     let bounded = OuterConfig {
         bounds: Some((array![-5.0, -5.0], array![5.0, 5.0])),
         ..OuterConfig::default()
     };
     // ρ₁ railed at the upper bound (5.0); ρ₀ interior at its quadratic min.
-    let theta_hat = array![0.0, 5.0];
-    // Analytic gradient: free coord 0 consistent (∂=ρ₀=0); railed coord 1
-    // reports a small KKT-balanced slope (−0.5) that DISAGREES with the
-    // value path's slope of +7.0 along ρ₁.
-    let analytic_gradient = array![0.0, -0.5];
-    let value_slope_railed = 7.0;
-
-    // First, confirm the FULL-direction comparison WOULD flag this, so the
-    // test actually exercises the artifact (not a no-op). Reconstruct the
-    // full audit direction and the full-space directional derivatives.
-    let full_dir = certificate_audit_direction(&theta_hat, "railed-audit-unit");
-    assert!(
-        full_dir[1].abs() > 1e-3,
-        "audit direction must have a non-trivial railed component to make \
-         the full-space check meaningful: {full_dir:?}",
-    );
-    let analytic_full = analytic_gradient.dot(&full_dir);
-    // Value-path directional slope along the full direction:
-    //   ∂/∂s [0.5(s·d₀)² + 7·(5 + s·d₁)] at s=0 = 7·d₁  (the ρ₀ term is O(s)).
-    let fd_full_slope = value_slope_railed * full_dir[1];
-    assert!(
-        (analytic_full - fd_full_slope).abs() > 1e-2,
-        "full-direction analytic and value-path slopes should disagree \
-         (artifact precondition): analytic={analytic_full} fd≈{fd_full_slope}",
-    );
-
-    let cert = audit_at_railed_optimum(&bounded, theta_hat, analytic_gradient, value_slope_railed)
-        .expect("railed audit must still produce a certificate");
-
+    // The objective slope on ρ₁ is −7: descent pushes ρ₁ UP into the active
+    // upper bound, so the component is KKT-balanced and must be projected out.
+    let cert = audit_at_railed_optimum(&bounded, array![0.0, 5.0], -7.0)
+        .expect("KKT-stationary railed optimum must certify");
     assert_eq!(
         cert.lambdas_railed,
         vec![1],
         "coord 1 must be detected as railed: {}",
         cert.summary(),
     );
-    // The free subspace is coord 0 only, where value (½ρ₀²) and gradient (ρ₀)
-    // agree exactly at ρ₀=0 → directional derivatives ≈ 0 and consistent.
     assert!(
-        cert.first_order_consistent(),
-        "railed-coordinate disagreement was FALSE-FLAGGED as a desync; the \
-         free subspace agrees, so this must be reported consistent: {}",
+        cert.certifies(),
+        "bound-pinned KKT-stationary optimum was rejected: {}",
         cert.summary(),
     );
     assert!(
-        cert.agreement_z < CERTIFICATE_Z_GATE,
-        "projected-onto-free z must be small: {}",
+        cert.projected_grad_norm <= cert.stationarity_bound,
+        "projected gradient must drop the railed component: {}",
+        cert.summary(),
+    );
+    assert!(
+        cert.grad_norm > cert.stationarity_bound,
+        "raw gradient norm must still see the railed slope (the projection, \
+         not the raw norm, carries the KKT verdict): {}",
         cert.summary(),
     );
 }
 
-/// TASK 3 guard: the projection must NOT blunt the certificate's real job.
-/// A genuine desync on a FREE (interior) coordinate must still fire even when
-/// a different coordinate is railed.
+/// The projection must NOT blunt the certificate's real job: genuine
+/// non-stationarity on a FREE (interior) coordinate must still reject the
+/// point even when a different coordinate is railed.
 #[test]
-fn certificate_still_fires_on_genuine_interior_gradient_desync() {
+fn certificate_rejects_genuine_interior_nonstationarity() {
     let bounded = OuterConfig {
         bounds: Some((array![-5.0, -5.0], array![5.0, 5.0])),
         ..OuterConfig::default()
     };
-    // ρ₁ railed at the upper bound; ρ₀ interior but the analytic gradient on
-    // the FREE coord 0 is wrong: it claims ∂=0 while the value path slopes by
-    // ρ₀ (here ρ₀=2.5 → true slope 2.5). This is the #748/#752/#808 genus on
-    // a free coordinate and MUST be caught.
-    let theta_hat = array![2.5, 5.0];
-    let analytic_gradient = array![0.0, -0.5]; // coord 0 wrong (should be 2.5)
-    let value_slope_railed = 7.0;
-
-    let cert = audit_at_railed_optimum(&bounded, theta_hat, analytic_gradient, value_slope_railed)
-        .expect("railed audit must still produce a certificate");
-
-    assert_eq!(
-        cert.lambdas_railed,
-        vec![1],
-        "coord 1 railed: {}",
-        cert.summary()
-    );
+    // ρ₁ railed at the upper bound (KKT-balanced slope −7), but ρ₀ = 2.5 is
+    // interior with analytic slope 2.5 — real feasible descent remains, so
+    // certification must fail with typed non-convergence.
+    let err = audit_at_railed_optimum(&bounded, array![2.5, 5.0], -7.0)
+        .expect_err("interior non-stationarity must reject certification");
+    let msg = format!("{err}");
     assert!(
-        !cert.first_order_consistent(),
-        "genuine interior (free-coordinate) desync was masked by the railed \
-         projection — the certificate failed its core job: {}",
-        cert.summary(),
-    );
-    assert!(
-        cert.agreement_z > CERTIFICATE_Z_GATE,
-        "interior desync must exceed the z gate: {}",
-        cert.summary(),
+        msg.contains("stationary") || msg.contains("converge"),
+        "rejection must be a typed stationarity failure, got: {msg}"
     );
 }
 
-/// TASK 3 invariance: with nothing railed, the projection is identity and the
-/// audit is byte-identical to the full-space path. A consistent interior
-/// optimum stays clean; the railed list is empty.
+/// With nothing railed, the projection is the identity: an interior
+/// stationary point certifies with an empty railed list.
 #[test]
 fn certificate_full_space_unchanged_when_nothing_railed() {
     let bounded = OuterConfig {
         bounds: Some((array![-30.0, -30.0], array![30.0, 30.0])),
         ..OuterConfig::default()
     };
-    // Interior optimum, far from both bounds; gradient matches the value
-    // path's slope on BOTH coords (value 0.5ρ₀² + 7ρ₁ ⇒ ∂₁=7).
-    let theta_hat = array![0.0, 1.0];
-    let analytic_gradient = array![0.0, 7.0];
-    let cert = audit_at_railed_optimum(&bounded, theta_hat, analytic_gradient, 7.0)
-        .expect("interior audit must produce a certificate");
+    // Interior optimum far from both bounds; slope 0 on ρ₁ and ρ₀ at its
+    // quadratic minimum, so the analytic gradient vanishes identically.
+    let cert = audit_at_railed_optimum(&bounded, array![0.0, 1.0], 0.0)
+        .expect("interior stationary point must certify");
     assert!(
         cert.lambdas_railed.is_empty(),
         "no coordinate is near a bound: {}",
         cert.summary(),
     );
     assert!(
-        cert.first_order_consistent(),
+        cert.certifies(),
         "consistent interior optimum flagged: {}",
         cert.summary(),
     );
