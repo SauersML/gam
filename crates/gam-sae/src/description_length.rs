@@ -58,6 +58,31 @@ pub fn selection_bits(g_dict: i64, k_active: i64) -> f64 {
     bits
 }
 
+fn exact_weighted_water_level(breakpoints: &mut Vec<(f64, f64)>, total_distortion: f64) -> f64 {
+    breakpoints.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+    let mut saturated_distortion = 0.0_f64;
+    let mut active_weight: f64 = breakpoints.iter().map(|(_, weight)| weight).sum();
+    let mut index = 0usize;
+    loop {
+        let next_breakpoint = breakpoints[index].0;
+        let candidate = (total_distortion - saturated_distortion) / active_weight;
+        if candidate <= next_breakpoint {
+            return candidate;
+        }
+        while index < breakpoints.len() && breakpoints[index].0 == next_breakpoint {
+            let (variance, weight) = breakpoints[index];
+            saturated_distortion += weight * variance;
+            active_weight -= weight;
+            index += 1;
+        }
+        if index == breakpoints.len() {
+            // A budget below total variance guarantees an earlier segment;
+            // this protects against a last-bit rounding inversion only.
+            return next_breakpoint;
+        }
+    }
+}
+
 /// Joint reverse-water-filling of weighted Gaussian spectra to a positive
 /// total-distortion budget.  A component weight scales both its distortion and
 /// its rate (for Eq. 4 this is an atom's firing probability; the residual has
@@ -106,28 +131,7 @@ pub fn weighted_reverse_water_filling(
         return Ok(vec![0.0; spectra.len()]);
     }
 
-    breakpoints.sort_by(|(left, _), (right, _)| left.total_cmp(right));
-    let mut saturated_distortion = 0.0_f64;
-    let mut active_weight: f64 = breakpoints.iter().map(|(_, weight)| weight).sum();
-    let mut index = 0usize;
-    let water_level = loop {
-        let next_breakpoint = breakpoints[index].0;
-        let candidate = (total_distortion - saturated_distortion) / active_weight;
-        if candidate <= next_breakpoint {
-            break candidate;
-        }
-        while index < breakpoints.len() && breakpoints[index].0 == next_breakpoint {
-            let (variance, weight) = breakpoints[index];
-            saturated_distortion += weight * variance;
-            active_weight -= weight;
-            index += 1;
-        }
-        if index == breakpoints.len() {
-            // `total_distortion < total_variance` guarantees an earlier segment;
-            // this protects against a last-bit rounding inversion only.
-            break next_breakpoint;
-        }
-    };
+    let water_level = exact_weighted_water_level(&mut breakpoints, total_distortion);
 
     Ok(spectra
         .iter()
@@ -167,26 +171,12 @@ pub fn reverse_water_filling(eigs: &[f64], delta2: f64) -> (f64, Vec<f64>) {
         .expect("positive finite one-component water-fill inputs are valid");
     // Recover the exact water level from the rate allocation segment so the
     // longstanding per-coordinate reporting surface remains available.
-    let mut sorted = variances.clone();
-    sorted.sort_by(f64::total_cmp);
-    let mut saturated = 0.0_f64;
-    let mut active = sorted.len() as f64;
-    let mut index = 0usize;
-    let theta = loop {
-        let next = sorted[index];
-        let candidate = (delta2 - saturated) / active;
-        if candidate <= next {
-            break candidate;
-        }
-        while index < sorted.len() && sorted[index] == next {
-            saturated += sorted[index];
-            active -= 1.0;
-            index += 1;
-        }
-        if index == sorted.len() {
-            break next;
-        }
-    };
+    let mut breakpoints: Vec<(f64, f64)> = variances
+        .iter()
+        .copied()
+        .map(|variance| (variance, 1.0))
+        .collect();
+    let theta = exact_weighted_water_level(&mut breakpoints, delta2);
     let per: Vec<f64> = variances
         .iter()
         .map(|&e| scalar_rate_bits(e, theta))

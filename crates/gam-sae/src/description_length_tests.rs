@@ -9,6 +9,7 @@ use super::{
     evidence_per_log_persistence, kappa_coding_gain_detector, manifold_fit_description_length,
     matched_dl, matched_dl_delta, predicted_birth_dl_bits, reverse_water_filling, scalar_rate_bits,
     score, se_resolution_bits, selection_bits, uniform_unit_range_sd,
+    weighted_reverse_water_filling,
 };
 use crate::atom_codes::SparseAtomCodes;
 
@@ -36,7 +37,15 @@ fn manifold_fit_dl_decomposes_and_sums_to_total() {
     let coord_variances = [1.0_f64, 0.5];
     let delta2 = 0.2;
     let atom_dims = [1.0_f64, 1.0, 1.0, 1.0];
-    let dl = manifold_fit_description_length(&codes, &coord_variances, delta2, &atom_dims, 0.9, 96, None);
+    let dl = manifold_fit_description_length(
+        &codes,
+        &coord_variances,
+        delta2,
+        &atom_dims,
+        0.9,
+        96,
+        None,
+    );
 
     // Per-coordinate rate is the reverse-water-filling mean of the actual spectrum.
     let (coord_total, _) = reverse_water_filling(&coord_variances, delta2);
@@ -474,6 +483,20 @@ fn reverse_water_filling_spends_one_total_distortion_budget() {
     assert!(close(rate, 2.0, 1e-12), "rate {rate}");
     assert!(close(per[0], 1.0, 1e-12));
     assert!(close(per[1], 1.0, 1e-12));
+}
+
+#[test]
+fn weighted_water_filling_solves_shared_level_exactly() {
+    let rates =
+        weighted_reverse_water_filling(&[(0.5, vec![1.0, 0.25]), (1.0, vec![0.5])], 0.375).unwrap();
+    // D(theta)=0.5*min(1,theta)+0.5*min(.25,theta)+min(.5,theta).
+    // At theta=.25 this is .125+.125+.25=.5, so D=.375 lies in the first
+    // segment with total active weight 2 and theta=.1875.
+    let theta = 0.1875_f64;
+    let expected_first = 0.5 * (scalar_rate_bits(1.0, theta) + scalar_rate_bits(0.25, theta));
+    let expected_second = scalar_rate_bits(0.5, theta);
+    assert!(close(rates[0], expected_first, 1.0e-12));
+    assert!(close(rates[1], expected_second, 1.0e-12));
 }
 
 #[test]

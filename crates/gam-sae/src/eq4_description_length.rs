@@ -21,9 +21,8 @@
 //!
 //! Unlike the per-featurizer [`crate::description_length::score`] surface (which
 //! water-fills a single unweighted spectrum), the Eq. 4 scorer water-fills a
-//! COLLECTION of firing-probability-weighted spectra against a shared level —
-//! that joint allocation is [`water_fill_component_bits`], the piece that has no
-//! analogue in [`crate::description_length`] and is ported faithfully here.
+//! collection of firing-probability-weighted spectra against a shared level via
+//! [`crate::description_length::weighted_reverse_water_filling`].
 //!
 //! # The featurizer surface
 //!
@@ -42,6 +41,11 @@
 use ndarray::{Array1, Array2, ArrayView2};
 
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+
+use crate::description_length::{selection_bits, weighted_reverse_water_filling};
+
+/// Standard fixed-distortion reporting points shared by every front-end.
+pub const DEFAULT_EQ4_R2_TARGETS: &[f64] = &[0.99, 0.95, 0.90, 0.80];
 
 /// The firing threshold above which a gate value counts as an active firing.
 const GATE_ACTIVE_THRESHOLD: f64 = 1e-10;
@@ -80,88 +84,6 @@ pub struct Eq4DescriptionLength {
     pub per_target: Vec<Eq4TargetBits>,
     /// The featurizer's own native bits/token, echoed through when supplied.
     pub native_bits_per_token: Option<f64>,
-}
-
-/// Joint reverse-water-filling of firing-weighted Gaussian spectra to a fixed
-/// total distortion.
-///
-/// `components` is a list of `(weight, spectrum)` pairs; each spectrum's
-/// variances are floored at `0`. A single water level `θ` is found by bisection
-/// so that the weighted allocated distortion
-/// `Σ_c weight_c · Σ_i min(variance_{c,i}, θ)` equals `total_distortion`, then
-/// each component's rate is `weight_c · Σ_{i: v>θ} ½·log₂(v/θ)`. Returns one
-/// rate (bits) per component, in input order.
-///
-/// Degenerate cases match the reference NumPy scorer exactly: when
-/// `total_distortion ≥ Σ_c weight_c·Σ_i variance` (the whole source fits inside
-/// the budget) or every variance is zero, all rates are `0`. A non-finite or
-/// non-positive `total_distortion`, a non-finite/negative weight, or a
-/// non-finite spectrum entry is an error.
-pub fn water_fill_component_bits(
-    components: &[(f64, Vec<f64>)],
-    total_distortion: f64,
-) -> Result<Vec<f64>, String> {
-    if !total_distortion.is_finite() || total_distortion <= 0.0 {
-        return Err(format!(
-            "total distortion must be finite and positive, got {total_distortion}"
-        ));
-    }
-    let mut spectra: Vec<(f64, Vec<f64>)> = Vec::with_capacity(components.len());
-    let mut total_variance = 0.0_f64;
-    let mut max_variance = 0.0_f64;
-    for (weight, spectrum) in components {
-        let weight = *weight;
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(format!(
-                "component weight must be finite and nonnegative, got {weight}"
-            ));
-        }
-        let mut variances = Vec::with_capacity(spectrum.len());
-        for &value in spectrum {
-            if !value.is_finite() {
-                return Err("component spectrum must contain only finite values".to_string());
-            }
-            let variance = value.max(0.0);
-            variances.push(variance);
-            if variance > max_variance {
-                max_variance = variance;
-            }
-        }
-        total_variance += weight * variances.iter().sum::<f64>();
-        spectra.push((weight, variances));
-    }
-    if total_distortion >= total_variance || max_variance == 0.0 {
-        return Ok(vec![0.0; spectra.len()]);
-    }
-
-    let (mut low, mut high) = (0.0_f64, max_variance);
-    for _ in 0..200 {
-        let water_level = 0.5 * (low + high);
-        let allocated: f64 = spectra
-            .iter()
-            .map(|(weight, variances)| {
-                weight * variances.iter().map(|&v| v.min(water_level)).sum::<f64>()
-            })
-            .sum();
-        if allocated > total_distortion {
-            high = water_level;
-        } else {
-            low = water_level;
-        }
-    }
-    let water_level = 0.5 * (low + high);
-    let rates = spectra
-        .iter()
-        .map(|(weight, variances)| {
-            weight
-                * variances
-                    .iter()
-                    .filter(|&&v| v > water_level)
-                    .map(|&v| 0.5 * (v / water_level).log2())
-                    .sum::<f64>()
-        })
-        .collect();
-    Ok(rates)
 }
 
 /// The eigenvalues of the sample covariance of `values` (rows = observations),
@@ -270,6 +192,12 @@ where
             n_atoms
         ));
     }
+    if code_dims.iter().any(|&dimension| dimension < 0) {
+        return Err("code_dims must contain only nonnegative dimensions".to_string());
+    }
+    if dictionary_params < 0 {
+        return Err("dictionary_params must be nonnegative".to_string());
+    }
     if !test_x.iter().all(|v| v.is_finite()) || !recon.iter().all(|v| v.is_finite()) {
         return Err("test_x and recon must contain only finite values".to_string());
     }
@@ -284,6 +212,9 @@ where
         .all(|&t| t.is_finite() && (0.0..1.0).contains(&t))
     {
         return Err("every R-squared target must be finite and in [0, 1)".to_string());
+    }
+    if native_bits_per_token.is_some_and(|bits| !bits.is_finite() || bits < 0.0) {
+        return Err("native_bits_per_token must be finite and nonnegative".to_string());
     }
 
     // Support: firing probability per atom and mean per-token support cardinality.
@@ -301,10 +232,7 @@ where
     let l0 = total_active / n as f64;
     // Python `round(L0)` rounds half to even; clamp to `[0, G]`.
     let support_cardinality = (l0.round_ties_even() as i64).clamp(0, n_atoms as i64);
-    let support_bits = (ln_gamma((n_atoms + 1) as f64)
-        - ln_gamma((support_cardinality + 1) as f64)
-        - ln_gamma((n_atoms as i64 - support_cardinality + 1) as f64))
-        / std::f64::consts::LN_2;
+    let support_bits = selection_bits(n_atoms as i64, support_cardinality);
 
     // Residual covariance spectrum and the reference variance the targets scale.
     let mut residual = test_x.to_owned();
@@ -320,7 +248,7 @@ where
     // Per-atom firing-coordinate spectra (weight-`p_g` water-fill components).
     let mut code_spectra: Vec<Vec<f64>> = Vec::with_capacity(n_atoms);
     for atom in 0..n_atoms {
-        let code_dim = code_dims[atom].max(0) as usize;
+        let code_dim = code_dims[atom] as usize;
         let rows: Vec<usize> = (0..n)
             .filter(|&row| gate[[row, atom]] > GATE_ACTIVE_THRESHOLD)
             .collect();
@@ -331,7 +259,7 @@ where
         let take: Vec<usize> = if rows.len() <= SPECTRUM_ROW_CAP {
             rows
         } else {
-            let step = (rows.len() / SPECTRUM_ROW_CAP).max(1);
+            let step = rows.len().div_ceil(SPECTRUM_ROW_CAP);
             rows.iter().step_by(step).copied().collect()
         };
         let contribution = fetch_contribution(atom, &take)?;
@@ -343,14 +271,15 @@ where
             ));
         }
         if !contribution.iter().all(|v| v.is_finite()) {
-            return Err(format!("atom {atom} contribution contains non-finite values"));
+            return Err(format!(
+                "atom {atom} contribution contains non-finite values"
+            ));
         }
         code_spectra.push(atom_code_spectrum(contribution.view(), code_dim)?);
     }
 
     // Dictionary bits are the same at every target.
-    let dictionary_bits =
-        0.5 * dictionary_params as f64 / n as f64 * (n.max(2) as f64).log2();
+    let dictionary_bits = 0.5 * dictionary_params as f64 / n as f64 * (n.max(2) as f64).log2();
 
     let mut per_target = Vec::with_capacity(r2_targets.len());
     for &target in r2_targets {
@@ -361,7 +290,7 @@ where
             .map(|(&probability, spectrum)| (probability, spectrum.clone()))
             .collect();
         components.push((1.0, residual_covariance_eigenvalues.to_vec()));
-        let component_bits = water_fill_component_bits(&components, total_distortion)?;
+        let component_bits = weighted_reverse_water_filling(&components, total_distortion)?;
         let code_bits: f64 = component_bits[..n_atoms].iter().sum();
         let resid_bits = component_bits[n_atoms];
         per_target.push(Eq4TargetBits {
@@ -380,8 +309,63 @@ where
     })
 }
 
-/// `ln Γ(x)` via statrs, matching Python `math.lgamma` on the nonnegative
-/// integer arguments the support term forms.
-fn ln_gamma(x: f64) -> f64 {
-    statrs::function::gamma::ln_gamma(x)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn fixture(code_dims: &[i64], dictionary_params: i64) -> Result<Eq4DescriptionLength, String> {
+        let test_x = array![
+            [0.0, 0.0],
+            [1.0, 0.5],
+            [2.0, 1.5],
+            [3.0, 1.0],
+            [4.0, 2.0],
+            [5.0, 3.0],
+        ];
+        let recon = test_x.mapv(|value| 0.8 * value);
+        let gate = Array2::ones((test_x.nrows(), 1));
+        let contribution = recon.clone();
+        eq4_fixed_distortion_description_length(
+            test_x.view(),
+            recon.view(),
+            gate.view(),
+            code_dims,
+            dictionary_params,
+            &[0.9],
+            Some(1.25),
+            move |_atom, take| {
+                let mut selected = Array2::zeros((take.len(), contribution.ncols()));
+                for (out_row, &source_row) in take.iter().enumerate() {
+                    selected
+                        .row_mut(out_row)
+                        .assign(&contribution.row(source_row));
+                }
+                Ok(selected)
+            },
+        )
+    }
+
+    #[test]
+    fn production_eq4_fixture_reconciles_report_terms() {
+        let result = fixture(&[1], 4).unwrap();
+        assert_eq!(result.support_bits, selection_bits(1, 1));
+        assert_eq!(result.achieved_block_l0, 1.0);
+        assert_eq!(result.native_bits_per_token, Some(1.25));
+        assert_eq!(result.per_target.len(), 1);
+        let target = result.per_target[0];
+        let dictionary_bits = 0.5 * 4.0 / 6.0 * 6.0_f64.log2();
+        assert!(
+            (target.bits
+                - (result.support_bits + target.code_bits + target.resid_bits + dictionary_bits))
+                .abs()
+                < 1.0e-12
+        );
+    }
+
+    #[test]
+    fn production_eq4_rejects_negative_dimensions_and_dictionary_cost() {
+        assert!(fixture(&[-1], 0).unwrap_err().contains("code_dims"));
+        assert!(fixture(&[1], -1).unwrap_err().contains("dictionary_params"));
+    }
 }

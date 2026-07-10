@@ -23,12 +23,7 @@ fn poincare_distance_batch<'py>(
     let left_owned = left.as_array().to_owned();
     let right_owned = right.as_array().to_owned();
     let out = detach_geometry_result(py, "poincare_distance_batch", move || {
-        poincare_distance_batch_impl(
-            left_owned.view(),
-            right_owned.view(),
-            dimension,
-            curvature,
-        )
+        poincare_distance_batch_impl(left_owned.view(), right_owned.view(), dimension, curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -378,7 +373,9 @@ fn sae_eq4_description_length<'py>(
     let gate = gate.as_array();
     let code_dims = code_dims.as_array();
     let code_dims: Vec<i64> = code_dims.iter().copied().collect();
-    let targets = r2_targets.unwrap_or_else(|| vec![0.99, 0.95, 0.90, 0.80]);
+    let targets = r2_targets.unwrap_or_else(|| {
+        gam::terms::sae::eq4_description_length::DEFAULT_EQ4_R2_TARGETS.to_vec()
+    });
 
     // Captures the real Python exception raised inside the callback so it
     // propagates with its original type instead of being flattened to a
@@ -413,7 +410,12 @@ fn sae_eq4_description_length<'py>(
         native_bits_per_token,
         fetch,
     )
-    .map_err(|message| callback_err.borrow_mut().take().unwrap_or_else(|| py_value_error(message)))?;
+    .map_err(|message| {
+        callback_err
+            .borrow_mut()
+            .take()
+            .unwrap_or_else(|| py_value_error(message))
+    })?;
 
     let out = PyDict::new(py);
     out.set_item("support_bits", dl.support_bits)?;
@@ -428,24 +430,6 @@ fn sae_eq4_description_length<'py>(
         out.set_item("native_bits_per_token", native)?;
     }
     Ok(out.into())
-}
-
-/// Joint firing-weighted reverse-water-filling of Gaussian spectra to a fixed
-/// total distortion — the standalone core the Eq. 4 code/residual split uses.
-///
-/// `components` is a sequence of `(weight, spectrum)` pairs; returns one rate
-/// (bits) per component. The whole allocation is owned by
-/// `eq4_description_length::water_fill_component_bits`.
-#[pyfunction]
-fn sae_eq4_water_fill_component_bits(
-    components: Vec<(f64, Vec<f64>)>,
-    total_distortion: f64,
-) -> PyResult<Vec<f64>> {
-    gam::terms::sae::eq4_description_length::water_fill_component_bits(
-        &components,
-        total_distortion,
-    )
-    .map_err(py_value_error)
 }
 
 #[pyfunction]
@@ -5063,6 +5047,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::manifold::manifold_sae_coercion::sae_activation_matrix_from_logits,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        crate::manifold::manifold_sae_coercion::sae_manifold_core_from_stagewise,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
@@ -5288,7 +5276,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_eq4_description_length, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_eq4_water_fill_component_bits, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;

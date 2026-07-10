@@ -7,7 +7,6 @@ import pytest
 
 from gamfit._description_length import (
     FittedFeaturizer,
-    _water_fill_component_bits,
     description_length,
 )
 
@@ -50,21 +49,14 @@ def test_description_length_rejects_shape_mismatch() -> None:
 
 
 def test_fitted_featurizer_requires_one_code_dimension_per_atom() -> None:
+    fitted = FittedFeaturizer(
+        name="invalid",
+        gate=np.ones((4, 2)),
+        atom_contribution=lambda _atom: np.ones((4, 1)),
+        code_dims=np.ones(1, dtype=np.int64),
+        dictionary_params=0,
+        recon=np.ones((4, 1)),
+        fit_seconds=0.0,
+    )
     with pytest.raises(ValueError, match="one entry per atom"):
-        FittedFeaturizer(
-            name="invalid",
-            gate=np.ones((4, 2)),
-            atom_contribution=lambda _atom: np.ones((4, 1)),
-            code_dims=np.ones(1, dtype=int),
-            dictionary_params=0,
-            recon=np.ones((4, 1)),
-            fit_seconds=0.0,
-        )
-
-
-def test_water_filling_uses_gaussian_rate_distortion_and_total_budget() -> None:
-    [rate] = _water_fill_component_bits([(1.0, np.array([1.0]))], 1.0)
-    assert rate == 0.0
-
-    [rate] = _water_fill_component_bits([(1.0, np.array([1.0, 1.0]))], 0.5)
-    assert rate == pytest.approx(2.0)
+        description_length(fitted, np.ones((4, 1)))
