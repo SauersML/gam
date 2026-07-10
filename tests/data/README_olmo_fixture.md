@@ -35,3 +35,22 @@ converges within a single layer to a curved Θ≈2π atom with held-out ΔEV≈0
 
 > A genuine single-layer L25 slice can be regenerated with `tests/sae/extract_olmo_fixture.py`
 > (`--layer 25`), which produces a **635-row** `olmo_l25_pca64.npy` — note 635, not 768.
+
+## olmo_l18_pair_pca64_635.npy + olmo_l19_pair_pca64_635.npy — the ROW-ALIGNED crosscoder pair, shape (635, 64) float32 each
+
+The #2231 Inc D manifold-crosscoder fixture: layers **18 and 19** of the same
+banked OLMo-3-32B corpus (`activations.npy`, 635 prompts × 64 layers × 5120),
+sliced at the SAME 635 prompts so row `i` of both files is the same prompt seen
+one layer apart. Each layer is column-centered and PCA-reduced **with its own
+per-layer basis** to 64 components (explained variance: L18 = 0.496,
+L19 = 0.509) — per-layer bases keep the two ambient charts honestly distinct,
+which is exactly what the crosscoder's per-layer decoders must bridge. Equal
+widths (64/64) make the cross-layer drift report and per-atom phase-transport
+measurements well-defined.
+
+- **Use:** `crates/gam-sae/src/manifold/tests_crosscoder_olmo.rs` — the
+  unified-engine crosscoder entry (`run_auto_sae_crosscoder_fit`) on real
+  consecutive-layer data with measured drift + transport in the wire report.
+- Regenerate from the MSI bank (`olmo_data/base/activations.npy`): center each
+  of `acts[:, 18, :]` and `acts[:, 19, :]`, SVD, project onto that layer's top
+  64 right singular vectors, save float32.
