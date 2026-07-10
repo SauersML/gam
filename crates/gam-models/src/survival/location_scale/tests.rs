@@ -6814,7 +6814,11 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
         survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
             .expect("wiggle design B(q0_exit)");
     let pw = xwiggle.ncols();
-    let betaw = Array1::from_shape_fn(pw, |b| 0.25 - 0.08 * b as f64);
+    // Wiggle amplitude must keep the survival monotonicity contract
+    // (d_eta/dt > 0 at every row) satisfied at the base point AND across the
+    // FD stencil's ±s sweeps; 0.25-scale coefficients drove row 1 to
+    // d_eta/dt = -2.6e-3 and production (correctly) refused the fixture.
+    let betaw = Array1::from_shape_fn(pw, |b| 0.06 - 0.02 * b as f64);
     // Coefficient layout: [time(1), threshold(1), log_sigma(1), wiggle(pw)].
     let ncoef = 3 + pw;
 
