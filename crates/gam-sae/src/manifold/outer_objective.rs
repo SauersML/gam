@@ -3862,8 +3862,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // state and hands back the cache the gradient machinery needs.
                 match self.value_probe_with_budget_rescue(
                     rho.view(),
+                    // extension:false — the PROBE budget policy, measured to
+                    // converge at ρ where the accepted-path policy refuses (the
+                    // accepted path falls back to the BASE budget on a detected
+                    // stall, ending up with LESS room than the flat probe
+                    // policy on stall-prone points).
                     ProbeInnerDrive::Criterion {
-                        refine_progress_extension: true,
+                        refine_progress_extension: false,
                     },
                 ) {
                     Ok(_warmed) => {
