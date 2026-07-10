@@ -699,10 +699,9 @@ mod stream_tests {
         // per-shard normal-eq accumulation as the batch `run`, NOT the outer
         // shared-ρ REML schedule that the public `fit_sparse_dictionary` default
         // now runs (design gam#2232 Increment 2; streaming re-points in a later
-        // increment). `run_linear_fast_kernel` at the shared default ridge is
-        // bit-identical to `run` (parity-gated by
-        // `linear_fast_kernel_matches_legacy_run`), so this is exactly the batch
-        // baseline the streaming path must reproduce.
+        // increment). `run_linear_fast_kernel` at the shared default ridge IS
+        // `run` (it sets both ridges to the one shared ρ and delegates), so this
+        // is exactly the batch baseline the streaming path must reproduce.
         let one_shot = run_linear_fast_kernel(x.view(), &config, config.decoder_ridge as f64)
             .expect("one-shot fit");
 

@@ -1,16 +1,32 @@
-//! SAE front-door lane admission.
+//! SAE front-door lane admission — ONE engine, admitted by memory layout and
+//! model request (design gam#2232, increments 1–6).
 //!
-//! The canonical large-`K` training state is the sparse code state
-//! `(indices[N, s], codes[N, s])`. The dense manifold engine remains available,
-//! but only as the small-`K` certification lane: once the dense routing state
-//! `N×K` is larger than the response matrix scale `N×P`, the front door admits
-//! the sparse/block lane instead of constructing a dense assignment object —
-//! for PENALTY-GATED assignment modes, whose `N×K` logits are live Newton
-//! state. The hard TopK support mode carries no gate coordinates, so its
-//! `K > P` fits are admitted to the CURVED framed/streaming manifold lane
-//! ([`SaeFitLane::CurvedStreaming`], budgeted by
-//! [`crate::manifold::SaeTopKCurvedBudget`]) instead of being demoted to the
-//! linear trainer.
+//! There is one SAE fit engine: the inner arrow-Schur Newton over per-row
+//! active sets `(indices, gates, coords)`, the outer REML evidence loop, and
+//! the birth/death migration ledger. The lanes this door selects are NOT
+//! different models — they are memory-layout admissions and solver
+//! specializations of that engine:
+//!
+//! * [`SaeFitLane::DenseCertification`] — the full-support materialization
+//!   (`N×K` assignment state), admitted only while it is no larger than the
+//!   response (`K ≤ P`): the small-`K` certification lane.
+//! * [`SaeFitLane::SparseCodes`] — the fixed-support LINEAR specialization:
+//!   for genuinely linear atoms with read-only gates, the arrow-Schur inner
+//!   solve degenerates to the `s×s` active-set ridge / block-projection fast
+//!   kernels (`sparse_dict`), with the linear block's ONE variance component
+//!   REML-selected by the shared-ρ schedule. Selected by SHAPE for
+//!   penalty-gated `K > P` requests (whose `N×K` logits are live Newton state
+//!   the architecture forbids), and by REQUEST at any `K` for an explicit
+//!   linear-dictionary model ([`admit_linear_dictionary`]).
+//! * [`SaeFitLane::CurvedStreaming`] — the same curved engine under the
+//!   streaming memory layout: per-row TopK active sets, framed decoders,
+//!   chunked routing; admitted for hard-TopK `K > P` within the concrete host
+//!   budget ([`crate::manifold::SaeTopKCurvedBudget`]) and REFUSED loudly over
+//!   it — a curved manifold request is never silently substituted with the
+//!   linear kernel, and a linear request is never forced onto the dense
+//!   engine. Tiering is a seed policy + alternation cadence of the same
+//!   engine (`tiered`), not a lane; the torch lane is declared interop and
+//!   untouched.
 
 /// Training lane selected by [`admit_sae_fit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

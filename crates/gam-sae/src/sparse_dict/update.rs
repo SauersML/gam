@@ -636,10 +636,11 @@ pub(super) fn run(
 /// component (plug point 4): a single ρ coordinate the outer evidence loop
 /// selects instead of two magic constants.
 ///
-/// At `shared_rho = config.code_ridge = config.decoder_ridge` (the shared default
-/// `1e-6`) this kernel is BIT-IDENTICAL to the historical [`run`] — pinned by the
-/// TEMPORARY parity gate `linear_fast_kernel_matches_legacy_run` (design
-/// Increment 2 shim; removed in Increment 6). It is invoked from the unified
+/// At `shared_rho = config.code_ridge = config.decoder_ridge` this kernel is
+/// [`run`] itself (the unified config sets both ridges to the one shared ρ and
+/// delegates); the TEMPORARY Increment-2 bit-parity gate that pinned this
+/// identity during the migration was removed in Increment 6, the identity now
+/// being structural. It is invoked from the unified
 /// engine's inner-solve seam; [`super::fit_sparse_dictionary`] is the
 /// shared-default entry to the REML schedule (Increment 5), and the single
 /// public entry reaches it at ANY `K` through the explicit linear-dictionary
@@ -2744,67 +2745,6 @@ mod exact_solve_tests {
         assert!(
             decoder.iter().all(|v| v.is_finite()),
             "failed columns must leave the prior finite decoder untouched"
-        );
-    }
-
-    #[test]
-    fn linear_fast_kernel_matches_legacy_run() {
-        // TEMPORARY bit-parity gate (design gam#2232, Increment 2 shim; removed in
-        // Increment 6). The unified linear fast kernel collapses the two historical
-        // ridges into ONE shared ρ; at the shared default (code_ridge ==
-        // decoder_ridge) it MUST reproduce the legacy `fit_sparse_dictionary`
-        // (= `run`) output bit-for-bit, so the unification introduces no behavioral
-        // change at the default. This pins that contract: same decoder, indices,
-        // and codes to the last bit.
-        use super::run_linear_fast_kernel;
-        let (n, p, k) = (48usize, 5usize, 7usize);
-        let mut x = Array2::<f32>::zeros((n, p));
-        for i in 0..n {
-            for c in 0..p {
-                x[[i, c]] = (((i * 5 + c * 3 + 2) % 11) as f32 - 5.0) / 5.0;
-            }
-        }
-        let config = SparseDictConfig {
-            n_atoms: k,
-            active: 2, // s > 1: exercises the coupled decoder solve on both paths
-            minibatch: 16,
-            max_epochs: 20,
-            score_tile: 8,
-            code_ridge: 1.0e-6,
-            decoder_ridge: 1.0e-6, // shared default: kernel must equal legacy run
-            tolerance: 1.0e-9,
-            score_mode: gam_gpu::GpuPolicy::Off,
-        };
-        assert_eq!(
-            config.code_ridge, config.decoder_ridge,
-            "parity gate requires the shared-default (equal-ridge) config"
-        );
-
-        // Reference is the legacy fixed-ridge alternation `run` directly — NOT the
-        // public `fit_sparse_dictionary`, whose shared-default entry now layers the
-        // outer shared-ρ REML schedule on top (design gam#2232 Increment 2 plug 4).
-        // The parity contract this pins is `run_linear_fast_kernel == run` at the
-        // shared default ridge (the inner-solve seam), independent of that outer
-        // selection loop.
-        let legacy = super::run(x.view(), &config).expect("legacy run");
-        let unified = run_linear_fast_kernel(x.view(), &config, config.decoder_ridge as f64)
-            .expect("unified linear fast kernel");
-
-        assert_eq!(
-            legacy.decoder, unified.decoder,
-            "unified kernel decoder must be bit-identical to legacy run"
-        );
-        assert_eq!(
-            legacy.indices, unified.indices,
-            "unified kernel indices must be bit-identical to legacy run"
-        );
-        assert_eq!(
-            legacy.codes, unified.codes,
-            "unified kernel codes must be bit-identical to legacy run"
-        );
-        assert_eq!(
-            legacy.explained_variance, unified.explained_variance,
-            "unified kernel EV must be bit-identical to legacy run"
         );
     }
 
