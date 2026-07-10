@@ -365,15 +365,17 @@ class ManifoldSAEConfig:
     def closed_form_assignment(self) -> str:
         """Map the torch sparsity kind to the closed-form ``assignment`` token.
 
-        The closed-form path accepts ``ibp_map``, ``softmax``, and ``jumprelu``.
+        The closed-form path accepts the canonical ``ibp_map`` and
+        ``threshold_gate`` assignment tokens. This adapter's torch-native
+        ``jumprelu`` sparsity kind maps explicitly to ``threshold_gate``.
 
         ``softmax_topk`` has **no** faithful closed-form assignment and is
         rejected rather than coerced. It is neither ``softmax`` (a competitive
         simplex whose mass always sums to one and can never deselect every atom)
-        nor ``jumprelu`` (a bounded thresholded-logistic gate that carries *no*
+        nor ``threshold_gate`` (a bounded thresholded-logistic gate that carries *no*
         magnitude): the torch ``softmax_topk`` gate is an *independent*
         non-negative softplus-magnitude activation with a hard top-k selection
-        that should honor ``target_k``. Silently mapping it to ``jumprelu`` would
+        that should honor ``target_k``. Silently mapping it to ``threshold_gate`` would
         make ``.fit()`` optimize a fundamentally different family than the torch
         gate trains. So we refuse here; the user must change the sparsity kind or
         use the gradient (torch) training path. The remaining kinds correspond
@@ -384,14 +386,14 @@ class ManifoldSAEConfig:
             raise NotImplementedError(
                 "closed-form .fit() has no assignment matching 'softmax_topk' "
                 "semantics: it is neither the competitive 'softmax' simplex nor "
-                "the magnitude-free 'jumprelu' thresholded gate. Use the "
+                "the magnitude-free 'threshold_gate'. Use the "
                 "gradient (torch) training path for softmax_topk, or set "
                 "sparsity.kind to 'jumprelu'/'ibp_gumbel' for the closed-form "
                 ".fit() lane."
             )
         return {
             "ibp_gumbel": "ibp_map",
-            "jumprelu": "jumprelu",
+            "jumprelu": "threshold_gate",
         }[kind]
 
 
@@ -2023,10 +2025,9 @@ class ManifoldSAE(nn.Module):
                 "decoder.monotonicity_weight=0."
             )
         # The JumpReLU hard-gate threshold is part of the assignment objective:
-        # forward it on the jumprelu-assignment path (kind 'jumprelu' or, via
-        # closed_form_assignment(), 'softmax_topk'). For other assignments the
-        # threshold is meaningless and is not forwarded.
-        if cfg.closed_form_assignment() == "jumprelu":
+        # forward it on the canonical threshold-gate assignment path. For other
+        # assignments the threshold is meaningless and is not forwarded.
+        if cfg.closed_form_assignment() == "threshold_gate":
             kwargs["jumprelu_threshold"] = float(cfg.sparsity.jumprelu_threshold)
         kwargs.update(self._closed_form_initializers(x))
         fit = _closed_form_sae_manifold_fit(

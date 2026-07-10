@@ -327,10 +327,7 @@ def test_gate_sparsity_variants_are_accepted_and_described(
     [
         ("ibp_map", "ibp_map"),
         ("softmax", "softmax"),
-        # #1777 — the hard-sigmoid gate's canonical token is now "threshold_gate";
-        # "jumprelu" is retained as a deprecated alias (the raw spelling survives
-        # only as `assignment_label`).
-        ("jumprelu", "threshold_gate"),
+        ("threshold_gate", "threshold_gate"),
     ],
 )
 def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_kind):

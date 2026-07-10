@@ -166,7 +166,10 @@ mod tests {
             Some(mass_residual.view()),
         )
         .expect("typed request");
-        assert_eq!(request.provenance(), SaeFisherMetricProvenance::OutputFisher);
+        assert_eq!(
+            request.provenance(),
+            SaeFisherMetricProvenance::OutputFisher
+        );
         let metric = build_sae_fisher_row_metric(request).expect("row metric");
         assert_eq!(metric.n_rows(), 2);
         assert_eq!(metric.p_out(), 3);
@@ -195,17 +198,11 @@ mod tests {
         );
         assert!(metric.whitens_likelihood());
 
-        let bad_tag = SaeFisherRowMetricRequest::from_tag(
-            factors.view(),
-            2,
-            3,
-            Some("mystery"),
-            None,
-        );
+        let bad_tag =
+            SaeFisherRowMetricRequest::from_tag(factors.view(), 2, 3, Some("mystery"), None);
         assert!(bad_tag.is_err());
-        let bad_rows =
-            SaeFisherRowMetricRequest::from_tag(factors.view(), 3, 3, None, None)
-                .expect("shape validation runs in entry");
+        let bad_rows = SaeFisherRowMetricRequest::from_tag(factors.view(), 3, 3, None, None)
+            .expect("shape validation runs in entry");
         assert!(build_sae_fisher_row_metric(bad_rows).is_err());
     }
 }

@@ -92,7 +92,7 @@ fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
     let jump = SaeAssignment::from_blocks_with_mode(
         array![[0.2, 0.6, -2.0]],
         vec![array![[0.0]], array![[0.0]], array![[0.0]]],
-        AssignmentMode::jumprelu(0.5, 0.5),
+        AssignmentMode::threshold_gate(0.5, 0.5),
     )
     .expect("jumprelu assignment should build");
     let jump_row = jump

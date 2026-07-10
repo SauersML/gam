@@ -118,7 +118,7 @@ fn planted_term() -> SaeManifoldTerm {
     let assignment = SaeAssignment::from_blocks_with_mode(
         logits,
         coord_blocks,
-        AssignmentMode::jumprelu(0.1, 0.0),
+        AssignmentMode::threshold_gate(0.1, 0.0),
     )
     .expect("assignment must build");
 

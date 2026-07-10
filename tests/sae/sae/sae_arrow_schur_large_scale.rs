@@ -126,7 +126,7 @@ fn k8_softmax_assembly_is_finite() {
 
 #[test]
 fn k8_jumprelu_assembly_is_finite() {
-    let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -180,7 +180,7 @@ fn k16_softmax_assembly_is_finite() {
 
 #[test]
 fn k16_jumprelu_assembly_is_finite() {
-    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -220,7 +220,7 @@ fn k32_softmax_assembly_is_finite() {
 
 #[test]
 fn k32_jumprelu_assembly_is_finite() {
-    let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -490,7 +490,7 @@ fn gate_mode_row_block_dim_keeps_all_k_assignment_coords() {
         "the fixed Softmax reference logit must account for exactly one row coordinate"
     );
 
-    let mut f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)

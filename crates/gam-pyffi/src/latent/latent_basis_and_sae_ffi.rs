@@ -1846,8 +1846,7 @@ fn sae_manifold_fit<'py>(
     // the seed snapshot). Kinds with an analytic, centers-free basis
     // (periodic, sphere, torus) refresh as usual.
     let atom_centers: Vec<Option<Array2<f64>>> = vec![None; atom_basis.len()];
-    // #1777 — accept both the primary "threshold_gate" and the legacy "jumprelu"
-    // spelling; canonicalize to "threshold_gate" before the inner driver parses it.
+    // Validate the strict canonical assignment token before the inner driver parses it.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
     let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
@@ -2232,10 +2231,9 @@ fn sae_manifold_fit_stagewise<'py>(
     // seed term BEFORE the fit consumes it. `fit_stagewise` carries the seed's
     // metric into every birth-candidate / backfit clone (construction.rs clones
     // `row_metric`), so a `"behavioral_fisher"` metric prices EVERY inner
-    // reconstruction in nats (GLS), not just the seed. The factor stack is
-    // `(n, p, r)` row-major, reshaped to the `(n, p*r)` layout the constructor
-    // expects (`u[n, i*r + k] = U[n, i, k]`) — the same repack the
-    // `sae_manifold_fit` path performs.
+    // reconstruction in nats (GLS), not just the seed. The binding borrows the
+    // natural `(n, p, r)` factor stack; gam-sae owns validation, packing, and
+    // provenance selection.
     if let Some(u3ro) = fisher_factors.as_ref() {
         let u3 = u3ro.as_array();
         let request = SaeFisherRowMetricRequest::from_tag(
@@ -2703,7 +2701,7 @@ fn sae_manifold_fit_inner<'py>(
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, assignment_alpha, learnable_alpha),
-        // The ThresholdGate (#1777, formerly "jumprelu") is a hard-thresholded
+        // The ThresholdGate is a hard-thresholded
         // bounded sigmoid: an atom is active when its raw logit clears
         // `jumprelu_threshold`, and the gate value is the sigmoid (in [0, 1]) —
         // the reconstruction *magnitude* lives in the decoder, not the gate.
@@ -2712,9 +2710,8 @@ fn sae_manifold_fit_inner<'py>(
         // the cold-start seed (see `sae_manifold_fit_minimal`) starts every logit
         // above it so the data-fit JVP, the sparsity prior gradient, and the
         // assignment-weighted decoder gradient are all non-zero at step 0. The
-        // incoming token is canonicalized to "threshold_gate" at the FFI boundary
-        // (`canonicalize_assignment_kind`), so the legacy "jumprelu" alias arrives
-        // here as "threshold_gate".
+        // strict incoming token is validated as "threshold_gate" at the FFI boundary
+        // (`canonicalize_assignment_kind`).
         "threshold_gate" => AssignmentMode::threshold_gate(tau, jumprelu_threshold),
         // Hard top-k support: sparsity by construction (no penalty, no gate
         // coordinates). The fit's `top_k` argument IS the support size.
@@ -2731,7 +2728,7 @@ fn sae_manifold_fit_inner<'py>(
         _ => {
             return Err(py_value_error(format!(
                 "assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or \
-                 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
+                 'topk'; got {assignment_kind}"
             )));
         }
     };
@@ -2838,9 +2835,9 @@ fn sae_manifold_fit_inner<'py>(
     // `OutputFisher` (the likelihood stays untouched — the inner product only
     // drives the isometry gauge, per `RowMetric::whitens_likelihood` == false for
     // `OutputFisher`). Magic-by-default: presence of `fisher_u` activates it; no
-    // flag. The factor stack is `(n_obs, p_out, rank)` row-major, reshaped to the
-    // `(n_obs, p_out * rank)` layout `RowMetric::output_fisher` expects
-    // (`u[n, i * rank + k] = U[n, i, k]`). Shapes are validated at the boundary.
+    // flag. The factor stack stays in its natural `(n_obs, p_out, rank)` layout at
+    // this boundary; the typed gam-sae entry owns shape/rank validation, packing,
+    // and provenance selection.
     let metric_provenance: &'static str = if let Some(u3) = fisher_u {
         let request = SaeFisherRowMetricRequest::from_tag(
             u3,

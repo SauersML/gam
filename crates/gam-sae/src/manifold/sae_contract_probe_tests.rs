@@ -1877,7 +1877,7 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
         logits.clone(),
         coords,
         manifolds,
-        AssignmentMode::jumprelu(temperature, threshold),
+        AssignmentMode::threshold_gate(temperature, threshold),
     )
     .expect("valid JumpReLU assignment");
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();

@@ -31,8 +31,6 @@ struct CountingAllocator;
 static TRACK_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
 static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-static DEALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
-static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -57,10 +55,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
-            DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-            DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        }
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -69,8 +63,6 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if !new_ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::Relaxed) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
             ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
-            DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-            DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
         new_ptr
     }
@@ -80,16 +72,12 @@ unsafe impl GlobalAlloc for CountingAllocator {
 struct AllocationSnapshot {
     allocation_calls: u64,
     allocated_bytes: u64,
-    deallocation_calls: u64,
-    deallocated_bytes: u64,
 }
 
 fn begin_allocation_measurement() {
     TRACK_ALLOCATIONS.store(false, Ordering::SeqCst);
     ALLOCATION_CALLS.store(0, Ordering::Relaxed);
     ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-    DEALLOCATION_CALLS.store(0, Ordering::Relaxed);
-    DEALLOCATED_BYTES.store(0, Ordering::Relaxed);
     TRACK_ALLOCATIONS.store(true, Ordering::SeqCst);
 }
 
@@ -98,8 +86,6 @@ fn end_allocation_measurement() -> AllocationSnapshot {
     AllocationSnapshot {
         allocation_calls: ALLOCATION_CALLS.load(Ordering::Relaxed),
         allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-        deallocation_calls: DEALLOCATION_CALLS.load(Ordering::Relaxed),
-        deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -146,14 +132,12 @@ fn bench_margslope_flex_large_scale_cycle0(c: &mut Criterion) {
                 let allocations = end_allocation_measurement();
                 let (fit, timing) = result.expect("criterion large-scale margslope fit");
                 eprintln!(
-                    "[MS-FLEX-LARGE_SCALE-BENCH-ITER] n={} inner_max_cycles={} elapsed_s={:.3} allocation_calls={} allocated_bytes={} deallocation_calls={} deallocated_bytes={} outer_iters={} inner_cycles={} converged={} beta_len={}",
+                    "[MS-FLEX-LARGE_SCALE-BENCH-ITER] n={} inner_max_cycles={} elapsed_s={:.3} allocation_calls={} allocated_bytes={} outer_iters={} inner_cycles={} converged={} beta_len={}",
                     n,
                     inner_cycles,
                     timing.elapsed.as_secs_f64(),
                     allocations.allocation_calls,
                     allocations.allocated_bytes,
-                    allocations.deallocation_calls,
-                    allocations.deallocated_bytes,
                     timing.outer_iterations,
                     timing.inner_cycles,
                     timing.outer_converged,

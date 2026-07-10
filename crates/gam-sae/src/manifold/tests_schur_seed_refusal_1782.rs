@@ -135,7 +135,7 @@ pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782(
         coord_blocks.push(coords.clone());
         manifolds.push(LatentManifold::Euclidean);
     }
-    let assignment_mode = AssignmentMode::jumprelu(1.0, 0.0);
+    let assignment_mode = AssignmentMode::threshold_gate(1.0, 0.0);
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::from_elem((n, k_atoms), 0.5),
         coord_blocks,

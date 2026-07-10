@@ -258,7 +258,7 @@ fn per_token_block_dim_is_independent_of_k_at_fixed_active() {
     // JumpReLU with threshold 0: exactly `n_active` atoms clear the gate per
     // token, so each token's compact row block is `n_active·(1 + d)` wide,
     // independent of K.
-    let mode = AssignmentMode::jumprelu(1.0, 0.0);
+    let mode = AssignmentMode::threshold_gate(1.0, 0.0);
     let expected_block_dim = n_active * (1 + d);
 
     let mut per_row_dims_at_k: Vec<Vec<usize>> = Vec::new();

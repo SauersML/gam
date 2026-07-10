@@ -96,6 +96,39 @@ fn sae_atom_construction_stays_in_gam_sae_2236() {
 }
 
 #[test]
+fn sae_fisher_metric_construction_stays_in_gam_sae_2236() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let binding_fragments = [
+        manifest.join("src/latent/latent_basis_and_sae_ffi.rs"),
+        manifest.join("src/latent/latent_basis_and_sae_ffi_tail.rs"),
+    ];
+    let forbidden_orchestration = [
+        "fn row_metric_from_fisher_provenance",
+        "RowMetric::output_fisher(",
+        "RowMetric::output_fisher_downstream(",
+        "RowMetric::behavioral_fisher(",
+        "let mut u_flat",
+    ];
+
+    let mut hits = Vec::new();
+    for path in binding_fragments {
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        for pattern in forbidden_orchestration {
+            if source.contains(pattern) {
+                hits.push(format!("{} contains {pattern}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        hits.is_empty(),
+        "SAE Fisher validation, packing, and provenance are core orchestration and must remain in gam-sae:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
 fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
     let n = 4usize;
     let k_atoms = 2usize;

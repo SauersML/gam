@@ -1,6 +1,5 @@
-//! Canonical SAE token schema (issue #2236): the alias tables that map every
-//! documented public spelling of a basis kind, topology label, assignment
-//! family, and flat-block gating mode onto its canonical token, plus the
+//! Canonical SAE token schema (issue #2236): the vocabulary for basis kinds,
+//! topology labels, assignment families, and flat-block gating modes, plus the
 //! ingestion-time `n_harmonics` repair and the structural chart periods.
 //!
 //! Moved verbatim from `gam-pyffi`'s coercion module so the vocabulary is
@@ -33,28 +32,26 @@ pub fn canonical_n_harmonics(
         .collect()
 }
 
-
 /// Case-insensitive, `-`/`_`-interchangeable SAE name normalizer.
 pub fn canon_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-/// Canonical assignment-family token for every documented public spelling.
+/// Validate one canonical assignment-family token.
 ///
-/// This is the only assignment alias table at the Python boundary. The fit,
+/// The fit,
 /// stagewise, payload, and distilled-encoder paths all call this parser before
-/// dispatching to the core [`crate::assignment::AssignmentMode`]
-/// implementation, so accepted spellings and emitted tokens cannot drift.
+/// dispatching to the core [`crate::assignment::AssignmentMode`] implementation,
+/// so accepted and emitted tokens cannot drift.
 pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
-    match canon_name(kind).as_str() {
+    match kind {
         "softmax" => Ok("softmax"),
-        "ibp" | "ibp_map" => Ok("ibp_map"),
-        "threshold_gate" | "gated" | "jump_relu" | "jumprelu" => Ok("threshold_gate"),
-        "topk" | "top_k" => Ok("topk"),
+        "ibp_map" => Ok("ibp_map"),
+        "threshold_gate" => Ok("threshold_gate"),
+        "topk" => Ok("topk"),
         _ => Err(format!(
             "assignment={kind:?} is not a recognized assignment kind; expected one of \
-             ['gated', 'ibp', 'ibp_map', 'jump_relu', 'jumprelu', 'softmax', \
-              'threshold_gate', 'top_k', 'topk']"
+             ['ibp_map', 'softmax', 'threshold_gate', 'topk']"
         )),
     }
 }
@@ -140,19 +137,17 @@ pub fn coordinate_periods_for_basis(
     }
 }
 
-
 /// Assignment family implied by the public flat-block gating vocabulary.
 pub fn flat_block_assignment(gating: &str) -> Result<&'static str, String> {
-    match canon_name(gating).as_str() {
-        "norm_selection" | "norm" => Ok("ibp_map"),
-        "separate_gate" | "separate" => Ok("threshold_gate"),
+    match gating {
+        "norm_selection" => Ok("ibp_map"),
+        "separate_gate" => Ok("threshold_gate"),
         _ => Err(format!(
             "flat_block gating={gating:?} is not recognized; expected one of \
-             ['norm', 'norm_selection', 'separate', 'separate_gate']"
+             ['norm_selection', 'separate_gate']"
         )),
     }
 }
-
 
 /// Per-atom topology labels for a resolved bases list (`basis_specs` order).
 pub fn topologies_for_bases(bases: &[String]) -> Vec<String> {
@@ -170,4 +165,3 @@ pub fn topology_for_bases(bases: &[String]) -> Option<String> {
         Some("mixed".to_string())
     }
 }
-

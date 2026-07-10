@@ -1,4 +1,4 @@
-"""End-to-end coverage for JumpReLU (``assignment='jumprelu'``) active-set
+"""End-to-end coverage for the threshold gate (``assignment='threshold_gate'``) active-set
 dynamics during a real SAE-manifold fit.
 
 JumpReLU uses variable-stride compact row layouts where the per-row active
@@ -86,7 +86,7 @@ def test_jumprelu_active_sets_change_across_iterations():
             K=3,
             atom_basis="periodic",
             d_atom=2,
-            assignment="jumprelu",
+            assignment="threshold_gate",
             n_iter=iters,
             learning_rate=0.05,
             random_state=1,
@@ -147,7 +147,7 @@ def test_jumprelu_reconstruction_stable_with_variable_active_sets():
         K=4,
         atom_basis="periodic",
         d_atom=2,
-        assignment="jumprelu",
+        assignment="threshold_gate",
         n_iter=40,
         learning_rate=0.05,
         random_state=2,

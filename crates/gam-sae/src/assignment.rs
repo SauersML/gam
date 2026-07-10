@@ -252,9 +252,6 @@ pub enum AssignmentMode {
     /// magnitude lives entirely in the decoder curve `g_k(t) = φ(t)ᵀ B_k`. The
     /// discontinuity at `threshold` (0 → 0.5) is the intended "jump".
     ///
-    /// BACK-COMPAT: the constructor [`Self::threshold_gate`] is the primary
-    /// spelling; [`Self::jumprelu`] is retained as a deprecated alias, and the FFI
-    /// string parser accepts both `"threshold_gate"` and the legacy `"jumprelu"`.
     ThresholdGate { temperature: f64, threshold: f64 },
     /// Hard top-`k` support gate: the `k` atoms with the LARGEST routing logits
     /// in a row carry gate 1, every other atom carries gate 0 (ties broken
@@ -333,25 +330,13 @@ impl AssignmentMode {
         }
     }
 
-    /// #1777 — construct the hard-sigmoid [`Self::ThresholdGate`] (the accurate
-    /// name for what was `jumprelu`). Primary spelling; [`Self::jumprelu`] is a
-    /// deprecated alias kept for back-compat.
+    /// #1777 — construct the hard-sigmoid [`Self::ThresholdGate`].
     #[must_use]
     pub fn threshold_gate(temperature: f64, threshold: f64) -> Self {
         Self::ThresholdGate {
             temperature,
             threshold,
         }
-    }
-
-    /// Back-compat alias for [`Self::threshold_gate`] (#1777): the mode is a
-    /// hard-sigmoid gate, not the literature JumpReLU magnitude activation. Retained
-    /// (NOT `#[deprecated]`, since the workspace denies warnings and many callers
-    /// and the legacy `"jumprelu"` FFI token still use it) so existing code keeps
-    /// compiling; new code should prefer `threshold_gate`.
-    #[must_use]
-    pub fn jumprelu(temperature: f64, threshold: f64) -> Self {
-        Self::threshold_gate(temperature, threshold)
     }
 
     /// Construct the hard top-`k` support gate ([`Self::TopK`]): sparsity by
@@ -1582,7 +1567,7 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
 /// (issue #2011: python is a thin wrapper, no shadow math).
 ///
 /// `kind` is the canonical assignment token (`"softmax"`, `"ibp_map"`,
-/// `"threshold_gate"`, or the legacy `"jumprelu"` alias). `alpha` is read only
+/// or `"threshold_gate"`). `alpha` is read only
 /// for `"ibp_map"`, `threshold` only for the gate family; both are ignored by
 /// the others. Non-finite logits and unsupported kinds are surfaced as errors.
 pub fn activation_matrix_from_logits(
@@ -1605,7 +1590,7 @@ pub fn activation_matrix_from_logits(
         let activation = match kind {
             "softmax" => softmax_row(row_logits, temperature),
             "ibp_map" => ibp_map_row(row_logits, temperature, alpha),
-            "threshold_gate" | "jumprelu" => jumprelu_row(row_logits, temperature, threshold),
+            "threshold_gate" => jumprelu_row(row_logits, temperature, threshold),
             other => {
                 return Err(format!(
                     "activation_matrix_from_logits: unsupported assignment kind {other:?} \
@@ -3172,7 +3157,7 @@ mod fill_into_buffer_1557_tests {
     fn jumprelu_into_is_bit_identical() {
         // Threshold chosen so SOME atoms fall below it (the untouched-entry path)
         // and some clear it (the sigmoid path) — both branches are exercised.
-        assert_into_matches_alloc(&build(7, 5, AssignmentMode::jumprelu(0.9, 0.2)));
+        assert_into_matches_alloc(&build(7, 5, AssignmentMode::threshold_gate(0.9, 0.2)));
     }
 
     #[test]
@@ -3182,7 +3167,7 @@ mod fill_into_buffer_1557_tests {
             .with_ungated(vec![false, true, false, true])
             .unwrap();
         assert_into_matches_alloc(&a);
-        let j = build(6, 4, AssignmentMode::jumprelu(0.9, 0.15))
+        let j = build(6, 4, AssignmentMode::threshold_gate(0.9, 0.15))
             .with_ungated(vec![true, false, true, false])
             .unwrap();
         assert_into_matches_alloc(&j);
@@ -3194,7 +3179,7 @@ mod fill_into_buffer_1557_tests {
         // free per-atom gate and fall through to the real row functions.
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::softmax(1.0)));
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::ibp_map(0.7, 1.0, false)));
-        assert_into_matches_alloc(&build(5, 1, AssignmentMode::jumprelu(0.8, 0.1)));
+        assert_into_matches_alloc(&build(5, 1, AssignmentMode::threshold_gate(0.8, 0.1)));
     }
 }
 

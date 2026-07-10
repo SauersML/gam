@@ -584,7 +584,7 @@ mod jumprelu_hard_gate_tests {
             logits.clone(),
             coords,
             manifolds,
-            AssignmentMode::jumprelu(temperature, threshold),
+            AssignmentMode::threshold_gate(temperature, threshold),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();

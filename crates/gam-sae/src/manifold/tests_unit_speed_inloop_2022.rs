@@ -49,7 +49,7 @@ fn build_circle_term(coords_col: &Array2<f64>, decoder: &Array2<f64>) -> SaeMani
         logits,
         vec![coords_col.clone()],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::jumprelu(1.0, 0.0),
+        AssignmentMode::threshold_gate(1.0, 0.0),
     )
     .unwrap();
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()
@@ -638,7 +638,7 @@ fn build_line_term(coords_col: &Array2<f64>, decoder: &Array2<f64>) -> SaeManifo
         logits,
         vec![coords_col.clone()],
         vec![LatentManifold::Euclidean],
-        AssignmentMode::jumprelu(1.0, 0.0),
+        AssignmentMode::threshold_gate(1.0, 0.0),
     )
     .unwrap();
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()

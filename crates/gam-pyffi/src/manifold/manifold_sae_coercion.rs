@@ -4,7 +4,7 @@
 //! a Rust-owned `ManifoldSaeCore` built directly from the raw
 //! `sae_manifold_fit_minimal` payload, with no Python dataclass in the middle.
 //!
-//! This module owns assignment and topology aliases, topology naming, distilled
+//! This module owns assignment tokens and topology aliases, topology naming, distilled
 //! assignment activation dispatch, and the periodic shape-band reorder,
 //! exposed to Python as `sae_atom_topologies` / `sae_periodic_shape_band_reorder`
 //! — the same Rust-owner pattern as `sae_canonical_n_harmonics`. The full
@@ -18,16 +18,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
 
-// The pure token-canonicalization schema (basis/topology/assignment alias
+// The pure token-canonicalization schema (basis/topology aliases, assignment
 // tables, n_harmonics repair, chart periods) moved to the library
 // (`gam_sae::atom_schema`) so the CLI, Rust users, and this binding share one
 // vocabulary — issue #2236. Re-exported here so every established
 // `manifold_sae_coercion::X` path keeps resolving.
 pub(crate) use gam::terms::sae::atom_schema::{
     basis_kind_for_topology, basis_to_topology, canon_name, canonical_assignment_kind,
-    canonical_basis_kind, canonical_n_harmonics, canonical_topology,
-    coordinate_periods_for_basis, flat_block_assignment, topologies_for_bases,
-    topology_for_bases,
+    canonical_basis_kind, canonical_n_harmonics, canonical_topology, coordinate_periods_for_basis,
+    flat_block_assignment, topologies_for_bases, topology_for_bases,
 };
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector.
@@ -1069,29 +1068,27 @@ mod manifold_sae_coercion_tests {
     }
 
     #[test]
-    fn assignment_aliases_have_one_canonical_parser() {
-        for (alias, canonical) in [
-            ("softmax", "softmax"),
-            (" SoftMax ", "softmax"),
-            ("ibp", "ibp_map"),
-            ("ibp-map", "ibp_map"),
-            ("ibp_map", "ibp_map"),
-            ("threshold_gate", "threshold_gate"),
-            ("gated", "threshold_gate"),
-            ("jump-relu", "threshold_gate"),
-            ("jumprelu", "threshold_gate"),
-            ("topk", "topk"),
-            ("top-k", "topk"),
-        ] {
+    fn assignment_tokens_have_one_strict_parser() {
+        for canonical in ["softmax", "ibp_map", "threshold_gate", "topk"] {
             assert_eq!(
-                canonical_assignment_kind(alias),
+                canonical_assignment_kind(canonical),
                 Ok(canonical),
-                "alias {alias}"
+                "canonical token {canonical}"
             );
         }
-        let err = canonical_assignment_kind("unknown").expect_err("unknown kind");
-        assert!(err.contains("not a recognized assignment kind"));
-        assert!(err.contains("ibp_map") && err.contains("threshold_gate"));
+        for rejected in [
+            " SoftMax ",
+            "ibp",
+            "ibp-map",
+            "gated",
+            "jump-relu",
+            "jumprelu",
+            "top-k",
+        ] {
+            let err = canonical_assignment_kind(rejected).expect_err("alias must be rejected");
+            assert!(err.contains("not a recognized assignment kind"));
+            assert!(err.contains("ibp_map") && err.contains("threshold_gate"));
+        }
     }
 
     #[test]
@@ -1138,11 +1135,10 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn flat_block_gating_uses_rust_owned_assignment_tokens() {
-        assert_eq!(flat_block_assignment("norm-selection"), Ok("ibp_map"));
-        assert_eq!(
-            flat_block_assignment(" Separate-Gate "),
-            Ok("threshold_gate")
-        );
+        assert_eq!(flat_block_assignment("norm_selection"), Ok("ibp_map"));
+        assert_eq!(flat_block_assignment("separate_gate"), Ok("threshold_gate"));
+        assert!(flat_block_assignment("norm-selection").is_err());
+        assert!(flat_block_assignment(" Separate-Gate ").is_err());
         assert!(flat_block_assignment("unknown").is_err());
     }
 

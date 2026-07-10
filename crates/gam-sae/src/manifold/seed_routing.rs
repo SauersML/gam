@@ -460,7 +460,7 @@ pub fn sae_decoder_lsq_init(
                 }
             }
         }
-        // #1777 canonical token for the hard-sigmoid gate (legacy "jumprelu").
+        // #1777 canonical token for the hard-sigmoid gate.
         "threshold_gate" => {
             if !jumprelu_threshold.is_finite() {
                 return Err(format!(

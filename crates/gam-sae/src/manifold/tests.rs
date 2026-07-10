@@ -553,7 +553,7 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
     let jr = SaeAssignment::from_blocks_with_mode(
         array![[-1.0]],
         vec![array![[0.0]]],
-        AssignmentMode::jumprelu(1.0, 0.0),
+        AssignmentMode::threshold_gate(1.0, 0.0),
     )
     .unwrap();
     assert_abs_diff_eq!(jr.try_assignments_row(0).unwrap()[0], 0.0, epsilon = 1e-12);
@@ -1997,35 +1997,6 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
             assert_eq!(handle.join().unwrap(), mu);
         }
     });
-}
-
-/// #1777 GOAL 3 — the assignment mode is the accurately-named `ThresholdGate`
-/// (a hard-sigmoid gate, NOT the literature JumpReLU magnitude activation); the
-/// legacy `jumprelu` constructor remains a back-compat alias producing the SAME
-/// variant and the SAME gates.
-#[test]
-pub(crate) fn threshold_gate_is_primary_jumprelu_is_backcompat_alias() {
-    let primary = AssignmentMode::threshold_gate(0.9, 0.15);
-    let legacy = AssignmentMode::jumprelu(0.9, 0.15);
-    assert!(matches!(primary, AssignmentMode::ThresholdGate { .. }));
-    assert!(
-        matches!(legacy, AssignmentMode::ThresholdGate { .. }),
-        "the legacy jumprelu constructor must yield the renamed ThresholdGate variant"
-    );
-
-    // Identical gates from either spelling.
-    let logits = array![[0.5, -0.2, 0.4], [0.05, 0.6, -0.3]];
-    let coords = vec![
-        array![[0.1], [0.2]],
-        array![[0.3], [0.4]],
-        array![[0.5], [0.6]],
-    ];
-    let build = |mode: AssignmentMode| {
-        SaeAssignment::from_blocks_with_mode(logits.clone(), coords.clone(), mode).unwrap()
-    };
-    let a_primary = build(primary).assignments();
-    let a_legacy = build(legacy).assignments();
-    assert_eq!(a_primary, a_legacy);
 }
 
 /// #976 Layer-1 guard 2: a single Newton application cannot move a gate

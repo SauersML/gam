@@ -138,10 +138,6 @@ def _canonical_assignment(value: str, label: str) -> str:
         ) from None
 
 
-# Sentinel so ``assignment_prior`` can tell "not supplied" apart from any
-# explicit value.
-_ASSIGNMENT_PRIOR_UNSET = object()
-
 # Sentinel so ``alpha`` can tell "not supplied" apart from an explicit
 # ``alpha=1.0``. When the caller does not set ``alpha`` and the assignment is
 # an explicit ``ibp_map``, the concentration defaults to the K-aware value below
@@ -174,29 +170,6 @@ def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
     """
     cap = rust_module().sae_default_top_k_for_large_dictionary(int(n_obs), int(k_atoms))
     return None if cap is None else int(cap)
-
-
-def _resolve_public_assignment(assignment: Any, assignment_prior: Any) -> str:
-    """Normalize the ``assignment`` / ``assignment_prior`` aliases (#159).
-
-    Both kwargs route through the Rust-owned :func:`_canonical_assignment`
-    validator, so they can never accept different alias sets. If both are
-    supplied and resolve to DIFFERENT canonical kinds, raise an eager
-    ``ValueError`` naming both BEFORE any Rust call. Unknown values raise a
-    ``ValueError`` listing the accepted alias set.
-    """
-    canon_assignment = _canonical_assignment(assignment, "assignment")
-    if assignment_prior is _ASSIGNMENT_PRIOR_UNSET:
-        return canon_assignment
-    canon_prior = _canonical_assignment(assignment_prior, "assignment_prior")
-    if canon_prior != canon_assignment:
-        raise ValueError(
-            f"assignment={assignment!r} (resolves to {canon_assignment!r}) and "
-            f"assignment_prior={assignment_prior!r} (resolves to {canon_prior!r}) "
-            f"were both supplied with conflicting values; pass only one "
-            f"(they are aliases)."
-        )
-    return canon_assignment
 
 
 def _json_ready(value: Any) -> Any:
@@ -1445,7 +1418,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      assignment: str = "softmax", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
-                     assignment_prior: Any = _ASSIGNMENT_PRIOR_UNSET, n_atoms: int | None = None,
+                     n_atoms: int | None = None,
                      sparsity_weight: float = 1.0,
                      coord_sparsity: Any = _COORD_SPARSITY_UNSET,
                      gate_sparsity: Any = _COORD_SPARSITY_UNSET, scad_mcp_gamma: float | None = None,
@@ -1506,15 +1479,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         to the CURVED framed/streaming manifold lane in the overcomplete
         ``K > P`` regime (within the host memory budget; refused with an
         actionable error over it) instead of the penalty-gated sparse-code
-        reroute. Public aliases are accepted (#159):
-        ``"ibp"``/``"ibp-map"``/``"ibp_map"`` -> ``"ibp_map"``,
-        ``"softmax"`` -> ``"softmax"``,
-        ``"topk"``/``"top_k"`` -> ``"topk"``,
-        ``"threshold_gate"`` (primary) and the deprecated
-        ``"gated"``/``"jump_relu"``/``"jumprelu"`` -> ``"threshold_gate"``.
-        ``assignment_prior`` is an alias for ``assignment`` and normalizes
-        through the same validator; supplying both with conflicting resolved
-        values raises ``ValueError``.
+        reroute. The accepted tokens are exactly ``"softmax"``, ``"ibp_map"``,
+        ``"threshold_gate"``, and ``"topk"``.
     schedule
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
         IBP/Gumbel assignment path.
@@ -1957,7 +1923,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"(canonical {_canonical_topology(atom_topology_str)!r}) was also "
             f"supplied; they must describe the same topology."
         )
-    kind = _resolve_public_assignment(assignment, assignment_prior)
+    kind = _canonical_assignment(assignment, "assignment")
     # #1784 — K-aware default IBP concentration. When the caller does not set
     # `alpha` and explicitly chooses the ordered stick-breaking `ibp_map` gate,
     # default the concentration to `default_ibp_concentration_for_k_atoms(K)`

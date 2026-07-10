@@ -311,7 +311,7 @@ fn sae_outer_rho_gradient_certificate_consistent_under_rank_deficient_k2() {
 fn sae_outer_rho_gradient_components_match_centered_fd_jumprelu() {
     // JumpReLU with the threshold below the active logits so both gates sit in
     // the optimization band and the sigmoid-sparsity third channel is live.
-    let f = fixture(AssignmentMode::jumprelu(0.7, 0.0), -1.5);
+    let f = fixture(AssignmentMode::threshold_gate(0.7, 0.0), -1.5);
     assert_full_gradient_matches_fd("jumprelu", &f);
 }
 

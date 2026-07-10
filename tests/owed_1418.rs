@@ -262,6 +262,6 @@ fn sae_ift_uses_exact_stationarity_jacobian_softmax_high_residual_1418() {
 /// Gauss-Newton residual curvature `⟨r, ∂²f⟩` is restored in the implicit step.
 #[test]
 fn sae_ift_uses_exact_stationarity_jacobian_jumprelu_high_residual_1418() {
-    let f = high_residual_curvature_fixture(AssignmentMode::jumprelu(0.7, 0.0), -1.0);
+    let f = high_residual_curvature_fixture(AssignmentMode::threshold_gate(0.7, 0.0), -1.0);
     assert_full_gradient_matches_fd("jumprelu_high_residual", &f);
 }

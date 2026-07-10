@@ -110,7 +110,7 @@ fn sae_manifold_fit_minimal<'py>(
     data_row_reseed: bool,
     rank_charge_evidence: bool,
 ) -> PyResult<Py<PyDict>> {
-    // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
+    // Assignment tokens are strict: only the four canonical schema names pass.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -1189,7 +1189,7 @@ fn steer_delta_from_arrays(
     fisher_factors: Option<ndarray::ArrayView3<'_, f64>>,
     fisher_provenance: Option<&str>,
 ) -> PyResult<gam::inference::steering::SteerPlan> {
-    // #1777 — accept both "threshold_gate" (primary) and legacy "jumprelu".
+    // Assignment tokens are strict: compatibility aliases are rejected.
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
     let k_atoms = atom_basis.len();
     // Guard the per-atom metadata lengths before indexing them into the atom
@@ -1217,7 +1217,8 @@ fn steer_delta_from_arrays(
         "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
         _ => {
             return Err(py_value_error(format!(
-                "sae_steer_delta: assignment_kind must be one of 'softmax', 'ibp_map', 'threshold_gate', or 'topk' (legacy alias 'jumprelu' also accepted); got {assignment_kind}"
+                "sae_steer_delta: assignment_kind must be one of 'softmax', 'ibp_map', \
+                 'threshold_gate', or 'topk'; got {assignment_kind}"
             )));
         }
     };
@@ -1238,51 +1239,21 @@ fn steer_delta_from_arrays(
         .collect();
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
 
-    // Marshal the WP-D output-Fisher shard into a `RowMetric` (array plumbing only):
-    // the `(n, p, r)` → `(n, p*r)` flatten the fit uses plus the provenance
-    // selection. Its presence installs the OutputFisher metric inside the engine so
+    // Borrow the WP-D output-Fisher shard for the typed gam-sae metric entry. Its
+    // presence installs the OutputFisher metric inside the engine so
     // `predicted_nats` / `validity_radius` are available; absence keeps the
     // geometry-only Euclidean path (dose degrades to None).
     let fisher_metric = match fisher_factors {
         Some(u3) => {
-            let u_shape = u3.shape();
-            if u_shape[0] != n_obs || u_shape[1] != p_out {
-                return Err(py_value_error(format!(
-                    "sae_steer_delta: fisher_factors U must be (n, p, r)=({n_obs}, {p_out}, r); \
-                     got leading dims ({}, {})",
-                    u_shape[0], u_shape[1]
-                )));
-            }
-            let rank = u_shape[2];
-            if rank == 0 {
-                return Err(py_value_error(
-                    "sae_steer_delta: fisher_factors U rank (last axis) must be >= 1".to_string(),
-                ));
-            }
-            if rank > p_out {
-                return Err(py_value_error(format!(
-                    "sae_steer_delta: fisher_factors U rank {rank} exceeds output dim p={p_out}"
-                )));
-            }
-            if !u3.iter().all(|v| v.is_finite()) {
-                return Err(py_value_error(
-                    "sae_steer_delta: fisher_factors U contains non-finite values".into(),
-                ));
-            }
-            let mut u_flat = Array2::<f64>::zeros((n_obs, p_out * rank));
-            for row in 0..n_obs {
-                for i in 0..p_out {
-                    for k in 0..rank {
-                        u_flat[[row, i * rank + k]] = u3[[row, i, k]];
-                    }
-                }
-            }
-            Some(row_metric_from_fisher_provenance(
-                u_flat,
+            let request = SaeFisherRowMetricRequest::from_tag(
+                u3,
+                n_obs,
                 p_out,
-                rank,
                 fisher_provenance,
-            )?)
+                None,
+            )
+            .map_err(py_value_error)?;
+            Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
         }
         None => None,
     };
@@ -2461,32 +2432,26 @@ mod sae_euclidean_oos_rebuild_tests {
 mod sae_assignment_kind_tests {
     use super::canonicalize_assignment_kind;
 
-    /// #1777 — the FFI assignment-kind parser EMITS the primary "threshold_gate"
-    /// token and ACCEPTS both it and the legacy "jumprelu" alias, mapping both to
-    /// the renamed `AssignmentMode::ThresholdGate`. "softmax" / "ibp_map" pass
-    /// through unchanged; any other token is a caller error.
+    /// The FFI parser accepts exactly the four canonical assignment tokens.
+    /// Removed compatibility spellings must remain caller errors.
     #[test]
-    fn threshold_gate_accepts_both_spellings_and_emits_primary() {
-        // Both the primary spelling and the legacy alias canonicalize to the same
-        // emitted token.
+    fn assignment_kind_accepts_only_canonical_tokens() {
         assert_eq!(
             canonicalize_assignment_kind("threshold_gate").unwrap(),
             "threshold_gate"
         );
-        assert_eq!(
-            canonicalize_assignment_kind("jumprelu").unwrap(),
-            "threshold_gate",
-            "the legacy 'jumprelu' alias must map to the renamed variant's token"
-        );
-        // The other families pass through unchanged.
         assert_eq!(canonicalize_assignment_kind("softmax").unwrap(), "softmax");
         assert_eq!(canonicalize_assignment_kind("ibp_map").unwrap(), "ibp_map");
-        // An unknown token errors, and the message names the primary spelling
-        // while still advertising the accepted legacy alias.
+        assert_eq!(canonicalize_assignment_kind("topk").unwrap(), "topk");
+        let removed = canonicalize_assignment_kind("jumprelu").unwrap_err();
+        assert!(
+            removed.contains("threshold_gate") && removed.contains("not a recognized"),
+            "removed alias must be rejected while naming the canonical token; got {removed:?}"
+        );
         let err = canonicalize_assignment_kind("bogus").unwrap_err();
         assert!(
-            err.contains("threshold_gate") && err.contains("jumprelu"),
-            "error must name the primary token and the legacy alias; got {err:?}"
+            err.contains("threshold_gate") && err.contains("topk"),
+            "error must name canonical tokens; got {err:?}"
         );
     }
 }

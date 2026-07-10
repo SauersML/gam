@@ -83,12 +83,9 @@ def test_sae_assignment_mode_and_schedule_survive_python_to_rust_bridge(monkeypa
     monkeypatch.setattr(sae, "rust_module", lambda: _FakeRust())
 
     schedule = sae.gumbel_linear_schedule(tau_start=0.9, tau_min=0.2, steps=7, iter_count=3)
-    sae.sae_manifold_fit(np.random.default_rng(0).normal(size=(4, 2)), K=1, assignment="jumprelu", tau=0.7, schedule=schedule, n_iter=1)
+    sae.sae_manifold_fit(np.random.default_rng(0).normal(size=(4, 2)), K=1, assignment="threshold_gate", tau=0.7, schedule=schedule, n_iter=1)
 
-    # #1777 — the legacy "jumprelu" assignment spelling canonicalizes to the
-    # primary "threshold_gate" token (mapping to Rust AssignmentMode::ThresholdGate)
-    # before it crosses the FFI bridge.
-    assert captured["assignment_kind"] == "threshold_gate", "Python AssignmentMode legacy 'jumprelu' alias should canonicalize to 'threshold_gate' (Rust AssignmentMode::ThresholdGate), not any other mode."
+    assert captured["assignment_kind"] == "threshold_gate", "the canonical threshold-gate token must cross the FFI bridge unchanged"
     assert captured["tau"] == 0.7 and captured["gumbel_schedule"] == schedule.to_rust_descriptor(), "Temperature scalar and schedule descriptor should survive the Python-to-Rust FFI bridge unchanged."
 
 

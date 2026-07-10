@@ -113,17 +113,16 @@ def test_missing_x_raises():
 # ---------------------------------------------------------------------------
 # #607 — assignment summary thresholds are mode-specific on the canonical kind.
 # ---------------------------------------------------------------------------
-def test_assignment_aliases_use_the_public_rust_schema():
-    assert sae._canonical_assignment("ibp", "assignment") == "ibp_map"
-    assert sae._canonical_assignment("top-k", "assignment") == "topk"
+def test_assignment_schema_accepts_only_canonical_tokens():
+    for token in ("softmax", "ibp_map", "threshold_gate", "topk"):
+        assert sae._canonical_assignment(token, "assignment") == token
+    for alias in ("ibp", "top-k", "gated", "jumprelu"):
+        with pytest.raises(ValueError):
+            sae._canonical_assignment(alias, "assignment")
 
 
-def test_jumprelu_assignment_is_canonical():
-    # #1777 — the hard-sigmoid gate's canonical token is now "threshold_gate";
-    # the legacy "jumprelu" spelling is retained as a deprecated alias that
-    # canonicalizes to it. Both spellings resolve to the same canonical token.
+def test_threshold_gate_assignment_is_canonical():
     assert sae._canonical_assignment("threshold_gate", "assignment") == "threshold_gate"
-    assert sae._canonical_assignment("jumprelu", "assignment") == "threshold_gate"
 
 
 class _StubModule:

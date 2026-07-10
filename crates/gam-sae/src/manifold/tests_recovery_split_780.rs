@@ -544,7 +544,7 @@ pub(crate) fn jumprelu_assignment_value_matches_logit_gradient_fd() {
         logits,
         coords,
         manifolds,
-        AssignmentMode::jumprelu(temperature, threshold),
+        AssignmentMode::threshold_gate(temperature, threshold),
     )
     .expect("valid JumpReLU assignment");
     let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
@@ -581,7 +581,7 @@ pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep()
         logits.clone(),
         coords,
         manifolds,
-        AssignmentMode::jumprelu(temperature, threshold),
+        AssignmentMode::threshold_gate(temperature, threshold),
     )
     .expect("valid JumpReLU assignment");
     let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);

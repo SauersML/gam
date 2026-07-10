@@ -75,7 +75,7 @@ def test_distilled_softmax_and_threshold_gate_use_rust_assignment_kernel() -> No
 def test_distilled_topk_uses_the_core_hard_support() -> None:
     assignments = _activation_from_logits(
         np.array([[1.0, 3.0, 2.0], [5.0, -1.0, 0.0]]),
-        assignment="top-k",
+        assignment="topk",
         tau=1.0,
         alpha=1.0,
         jumprelu_threshold=0.0,
