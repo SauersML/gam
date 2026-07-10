@@ -87,6 +87,18 @@ pub(crate) fn absolute_degeneracy_ev_floor(
     if n == 0 {
         return f64::NAN;
     }
+    // Saturated floor = no verdict. When the reachable rank q >= n, colspan(Φ)
+    // is ALL of R^n, so the signal-free least-squares fit reproduces the target
+    // EXACTLY: the null floor is 1, every possible EV sits at or below it, and
+    // the statistic carries ZERO evidence about degeneracy. Returning 1.0 here
+    // branded EV = 0.999 fits on small-n/basis-rich fixtures as co-collapsed
+    // ("EV 0.9990 at or below the signal-free null floor 1.0000", 2026-07-10).
+    // NaN is the established "no verdict" convention (see n == 0 above): both
+    // caller arms compare `<= floor`, which is false on NaN, so the absolute
+    // arm stands down and degeneracy detection falls to the relative-norm arm.
+    if dictionary_rank >= n {
+        return f64::NAN;
+    }
     dictionary_rank as f64 / n as f64
 }
 
