@@ -63,12 +63,9 @@ impl PeriodicCurveExtrema {
     ) -> Result<PeriodicExtremum, String> {
         let linear = self.linear_polynomial(linear)?;
         let objective = self.quadratic.add_scaled(&linear, -2.0);
-        global_extremum(
-            &objective,
-            &objective.derivative(),
-            ExtremumKind::Minimum,
-            |t| objective.eval_real(t),
-        )
+        global_extremum(&objective.derivative(), ExtremumKind::Minimum, |t| {
+            objective.eval_real(t)
+        })
     }
 
     /// Maximise `(c^T phi(t))^2 / (phi(t)^T G phi(t))`, the decoder-amplitude
@@ -80,21 +77,43 @@ impl PeriodicCurveExtrema {
         linear: &[f64],
     ) -> Result<PeriodicExtremum, String> {
         let q = self.linear_polynomial(linear)?;
-        if q.is_numerically_zero() || self.quadratic.is_numerically_zero() {
+        if q.is_numerically_zero() {
             return Ok(PeriodicExtremum {
                 coordinate: 0.0,
                 value: 0.0,
             });
         }
+        if self.quadratic.is_numerically_zero() {
+            return Err(
+                "periodic profiled score: nonzero target projection with a zero decoder Gram"
+                    .to_string(),
+            );
+        }
+
+        // The coordinate is invariant under independent positive rescalings of
+        // `q` and `r`.  Forming `2 q' r - q r'` in physical units nevertheless
+        // multiplies three decoder-scale factors: a perfectly ordinary decoder
+        // rescaling can therefore underflow the entire stationarity polynomial
+        // to zero or overflow it to infinity.  Normalize the two Laurent
+        // polynomials BEFORE multiplying them, and restore only the scalar score
+        // ratio after candidate evaluation.
+        let (q, q_scale) = q.normalized()?;
+        let (r, r_scale) = self.quadratic.normalized()?;
         let q_prime = q.derivative();
-        let r_prime = self.quadratic.derivative();
+        let r_prime = r.derivative();
         let stationarity = q_prime
-            .multiply(&self.quadratic)
+            .multiply(&r)
             .scaled(2.0)
             .add_scaled(&q.multiply(&r_prime), -1.0);
-        global_extremum(&stationarity, &stationarity, ExtremumKind::Maximum, |t| {
-            profiled_score_at(&q, &self.quadratic, t)
-        })
+        // Compare candidates in normalized units.  Rescaling inside the
+        // comparison could underflow every finite score to zero (or overflow
+        // every score to infinity) even though their ordering is perfectly
+        // representable.
+        let mut solution = global_extremum(&stationarity, ExtremumKind::Maximum, |t| {
+            profiled_score_at(&q, &r, t)
+        })?;
+        solution.value = rescale_profiled_score(solution.value, q_scale, r_scale)?;
+        Ok(solution)
     }
 
     fn linear_polynomial(&self, linear: &[f64]) -> Result<LaurentPolynomial, String> {
@@ -201,10 +220,38 @@ impl LaurentPolynomial {
     }
 
     fn coefficient_norm(&self) -> f64 {
-        self.coefficients
+        let scale = self
+            .coefficients
             .iter()
             .map(|coefficient| coefficient.re.hypot(coefficient.im))
-            .sum()
+            .fold(0.0_f64, f64::max);
+        if scale == 0.0 || !scale.is_finite() {
+            return scale;
+        }
+        scale
+            * self
+                .coefficients
+                .iter()
+                .map(|coefficient| coefficient.re.hypot(coefficient.im) / scale)
+                .sum::<f64>()
+    }
+
+    fn normalized(&self) -> Result<(Self, f64), String> {
+        let scale = self
+            .coefficients
+            .iter()
+            .map(|coefficient| coefficient.re.hypot(coefficient.im))
+            .fold(0.0_f64, f64::max);
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(format!(
+                "periodic polynomial normalization requires a finite positive scale, got {scale}"
+            ));
+        }
+        let mut normalized = self.clone();
+        for coefficient in &mut normalized.coefficients {
+            *coefficient /= scale;
+        }
+        Ok((normalized, scale))
     }
 
     fn numerical_degree(&self) -> usize {
@@ -327,7 +374,6 @@ enum ExtremumKind {
 }
 
 fn global_extremum(
-    objective: &LaurentPolynomial,
     stationarity: &LaurentPolynomial,
     kind: ExtremumKind,
     mut evaluate: impl FnMut(f64) -> Result<f64, String>,
@@ -357,22 +403,16 @@ fn global_extremum(
         let candidate = PeriodicExtremum { coordinate, value };
         let replace = match best {
             None => true,
-            Some(incumbent) => {
-                let scale = 1.0 + incumbent.value.abs().max(value.abs());
-                let tie = f64::EPSILON * objective.coefficients.len() as f64 * scale;
-                match kind {
-                    ExtremumKind::Minimum => {
-                        value < incumbent.value - tie
-                            || ((value - incumbent.value).abs() <= tie
-                                && coordinate < incumbent.coordinate)
-                    }
-                    ExtremumKind::Maximum => {
-                        value > incumbent.value + tie
-                            || ((value - incumbent.value).abs() <= tie
-                                && coordinate < incumbent.coordinate)
-                    }
+            Some(incumbent) => match kind {
+                ExtremumKind::Minimum => {
+                    value < incumbent.value
+                        || (value == incumbent.value && coordinate < incumbent.coordinate)
                 }
-            }
+                ExtremumKind::Maximum => {
+                    value > incumbent.value
+                        || (value == incumbent.value && coordinate < incumbent.coordinate)
+                }
+            },
         };
         if replace {
             best = Some(candidate);
@@ -423,14 +463,13 @@ fn stationary_coordinates(polynomial: &LaurentPolynomial) -> Result<Vec<f64>, St
         }
     }
     coordinates.sort_by(f64::total_cmp);
-    let separation = f64::EPSILON.sqrt() * (1.0 + degree as f64);
-    coordinates.dedup_by(|left, right| circular_distance(*left, *right) <= separation);
-    if coordinates.len() > 1
-        && circular_distance(coordinates[0], *coordinates.last().unwrap()) <= separation
-    {
-        coordinates.pop();
-        coordinates[0] = 0.0;
-    }
+    // Companion eigenvalues belonging to a repeated root may yield duplicate
+    // angles.  Keeping duplicates is harmless when candidates are scored, while
+    // tolerance-based merging is not: distinct stationary points can be
+    // arbitrarily close, including on opposite sides of the period seam.  Only
+    // remove bit-identical coordinates; never synthesize a seam coordinate that
+    // was not itself verified as a root.
+    coordinates.dedup_by(|left, right| left.to_bits() == right.to_bits());
     Ok(coordinates)
 }
 
@@ -472,8 +511,12 @@ fn profiled_score_at(
     let denominator = quadratic.eval_real(coordinate);
     let denominator_tolerance =
         f64::EPSILON * quadratic.coefficients.len() as f64 * quadratic.coefficient_norm();
-    if denominator > denominator_tolerance {
-        return Ok(numerator * numerator / denominator);
+    if denominator > 0.0 {
+        // A small positive value is still an ordinary nonsingular evaluation.
+        // Treating every value below a coefficient-scale tolerance as an exact
+        // zero can misclassify a merely nearby singular point and then abort the
+        // complete candidate comparison through an inapplicable Taylor limit.
+        return Ok((numerator / denominator) * numerator);
     }
     if denominator < -denominator_tolerance {
         return Err(format!(
@@ -508,6 +551,38 @@ fn profiled_score_at(
             Ok(q_taylor * q_taylor / r_taylor)
         }
     }
+}
+
+fn rescale_profiled_score(
+    normalized_score: f64,
+    numerator_scale: f64,
+    denominator_scale: f64,
+) -> Result<f64, String> {
+    if normalized_score == 0.0 {
+        return Ok(0.0);
+    }
+    if !(numerator_scale.is_finite()
+        && numerator_scale > 0.0
+        && denominator_scale.is_finite()
+        && denominator_scale > 0.0)
+    {
+        return Err(format!(
+            "periodic profiled score has invalid normalization scales ({numerator_scale}, {denominator_scale})"
+        ));
+    }
+    if !(normalized_score.is_finite() && normalized_score > 0.0) {
+        return Err(format!(
+            "periodic profiled score has invalid normalized value {normalized_score}"
+        ));
+    }
+    let log_score = normalized_score.ln() + 2.0 * numerator_scale.ln() - denominator_scale.ln();
+    if log_score > f64::MAX.ln() {
+        return Err("periodic profiled score scale overflows f64".to_string());
+    }
+    if log_score < f64::from_bits(1).ln() {
+        return Ok(0.0);
+    }
+    Ok(log_score.exp())
 }
 
 fn first_nonzero_derivative(
@@ -547,7 +622,7 @@ fn circular_distance(left: f64, right: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{Array2, array};
 
     #[test]
     fn distance_projection_recovers_off_lattice_phase() {
@@ -598,5 +673,80 @@ mod tests {
             .unwrap();
         assert_eq!(zero_score.coordinate, 0.0);
         assert_eq!(zero_score.value, 0.0);
+    }
+
+    #[test]
+    fn profiled_coordinate_is_invariant_to_extreme_decoder_scale() {
+        let planted = 0.173_205_080_756_887_73;
+        let angle = std::f64::consts::TAU * planted;
+        for amplitude in [1.0e-120_f64, 1.0, 1.0e120_f64] {
+            let gram = array![
+                [0.0, 0.0, 0.0],
+                [0.0, amplitude * amplitude, 0.0],
+                [0.0, 0.0, amplitude * amplitude],
+            ];
+            let linear = [0.0, amplitude * angle.sin(), amplitude * angle.cos()];
+            let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
+            let solved = solver.maximize_profiled_score(&linear).unwrap();
+            // A sign-free amplitude identifies a pure circle only modulo its
+            // antipode, so compare on the half-period quotient.
+            let error = (solved.coordinate - planted).rem_euclid(0.5);
+            let error = error.min(0.5 - error);
+            assert!(
+                error < 1.0e-10,
+                "decoder scale {amplitude:e} returned {}, half-period error {error}",
+                solved.coordinate
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_projection_against_zero_gram_is_rejected() {
+        let gram = Array2::<f64>::zeros((3, 3));
+        let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
+        let error = solver
+            .maximize_profiled_score(&[0.0, 1.0, 0.0])
+            .unwrap_err();
+        assert!(error.contains("zero decoder Gram"), "{error}");
+    }
+
+    #[test]
+    fn strict_objective_ordering_beats_coordinate_tie_break() {
+        // sin(2*pi*t) has stationary candidates at 0 and 1/2.  Their supplied
+        // objective values differ by exactly one ulp at 1.0: the larger value
+        // must win even though its coordinate is larger.
+        let stationarity = harmonic_linear(&[0.0, 1.0, 0.0]);
+        let solved = global_extremum(&stationarity, ExtremumKind::Maximum, |coordinate| {
+            Ok::<f64, String>(if (coordinate - 0.5).abs() < f64::EPSILON.sqrt() {
+                1.0 + f64::EPSILON
+            } else {
+                1.0
+            })
+        })
+        .unwrap();
+        assert!((solved.coordinate - 0.5).abs() < f64::EPSILON.sqrt());
+    }
+
+    #[test]
+    fn distinct_roots_are_not_merged_across_the_period_seam() {
+        let offset = 2.0e-8_f64;
+        let sine_with_root = |root: f64| {
+            let angle = std::f64::consts::TAU * root;
+            harmonic_linear(&[0.0, angle.cos(), -angle.sin()])
+        };
+        let polynomial = sine_with_root(offset).multiply(&sine_with_root(1.0 - offset));
+        let roots = stationary_coordinates(&polynomial).unwrap();
+        for expected in [offset, 1.0 - offset, 0.5 - offset, 0.5 + offset] {
+            assert!(
+                roots
+                    .iter()
+                    .any(|&root| circular_distance(root, expected) < 1.0e-8),
+                "missing close stationary root {expected}; got {roots:?}"
+            );
+        }
+        assert!(
+            roots.iter().all(|&root| root != 0.0),
+            "the seam canonicalizer fabricated t=0 from distinct roots: {roots:?}"
+        );
     }
 }
