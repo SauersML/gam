@@ -355,6 +355,27 @@ mod manifold_sae_payload_serde_tests {
         );
     }
 
+    #[test]
+    fn crosscoder_layout_and_reports_round_trip_in_v2() {
+        let mut payload = load_value("golden_full.json");
+        payload.as_object_mut().unwrap().insert(
+            "crosscoder".to_string(),
+            serde_json::json!({
+                "anchor_label": "L12",
+                "anchor_dim": 64,
+                "block_dims": [64, 64],
+                "labels": ["L13", "L14"],
+                "log_lambda_block": [-0.25, 0.5],
+                "drift": {"status": "measured", "mean_drift": 0.2, "steps": []},
+                "transport": [{"atom": 0, "law_gap": 0.01}]
+            }),
+        );
+        let raw = serde_json::to_string(&payload).unwrap();
+        let round_tripped: Value =
+            serde_json::from_str(&roundtrip_json(&raw).expect("crosscoder round trip")).unwrap();
+        assert_eq!(round_tripped["crosscoder"], payload["crosscoder"]);
+    }
+
     /// A non-`v1` schema tag is rejected with the same message shape as the
     /// Python `from_dict` guard.
     #[test]
@@ -370,5 +391,16 @@ mod manifold_sae_payload_serde_tests {
             err.contains("unsupported schema"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn v1_payload_is_rejected_instead_of_guessing_crosscoder_layout() {
+        let mut legacy = load_value("golden_full.json");
+        legacy.as_object_mut().unwrap().insert(
+            "schema".to_string(),
+            Value::String("gamfit.ManifoldSAE/v1".to_string()),
+        );
+        let error = roundtrip_json(&serde_json::to_string(&legacy).unwrap()).unwrap_err();
+        assert!(error.contains("unsupported schema"), "unexpected: {error}");
     }
 }

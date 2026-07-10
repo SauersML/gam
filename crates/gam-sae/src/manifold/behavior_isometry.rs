@@ -45,11 +45,11 @@
 //! the `= 2` kill test on #1942) drives to a constant. This module reports it;
 //! pinning it to `2` is the follow-up arc-length re-gauge of the behavior block.
 
-use ndarray::ArrayView1;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::chart_canonicalization::curve_speeds;
 
-use super::{SaeManifoldTerm, SupportMeasure};
+use super::{SaeBasisEvaluator, SaeManifoldTerm, SupportMeasure};
 
 /// The per-atom representation–behavior isometry certificate of a fitted Rung-2
 /// two-block atom. Produced by [`atom_behavior_isometry`]; `None` for atoms
@@ -222,20 +222,10 @@ pub fn atom_behavior_isometry(
         ));
     }
 
-    let mut report = assemble(
-        atom_idx,
-        &s_x,
-        &s_y,
-        weights,
-        support.mass(),
-    );
+    let mut report = assemble(atom_idx, &s_x, &s_y, weights, support.mass());
     if report.behavior_engaged && report.behavior_metric_collapse_rows == 0 {
-        report.behavior_pinned_chart = behavior_pinned_chart(
-            evaluator.as_ref(),
-            c_k.view(),
-            coords.column(0),
-            &topology,
-        )?;
+        report.behavior_pinned_chart =
+            behavior_pinned_chart(evaluator.as_ref(), c_k.view(), coords.column(0), &topology)?;
     }
     Ok(Some(report))
 }
@@ -264,10 +254,7 @@ fn behavior_pinned_chart(
         }
         CanonicalChartTopology::Interval => {
             let lo = row_coords.iter().copied().fold(f64::INFINITY, f64::min);
-            let hi = row_coords
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let hi = row_coords.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             if !(lo.is_finite() && hi.is_finite() && hi > lo) {
                 return Ok(None);
             }
@@ -319,7 +306,10 @@ fn behavior_pinned_chart(
     let tangent_floor = speeds.iter().copied().fold(0.0_f64, f64::max) * 1.0e-12;
     let mut orientation = 0_i8;
     for radius in 0..=cells {
-        for idx in [anchor_grid.saturating_sub(radius), (anchor_grid + radius).min(cells)] {
+        for idx in [
+            anchor_grid.saturating_sub(radius),
+            (anchor_grid + radius).min(cells),
+        ] {
             if speeds[idx] <= tangent_floor {
                 continue;
             }
@@ -371,8 +361,15 @@ fn behavior_pinned_chart(
         .iter()
         .enumerate()
         .min_by(|(_, a), (_, b)| {
-            a.abs()
-                .partial_cmp(&b.abs())
+            let distance = |value: f64| {
+                if circular {
+                    value.min(coordinate_period - value)
+                } else {
+                    value.abs()
+                }
+            };
+            distance(**a)
+                .partial_cmp(&distance(**b))
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(row, _)| row)
@@ -464,6 +461,7 @@ fn assemble(
             min_ratio_over_scale: f64::NAN,
             max_ratio_over_scale: f64::NAN,
             nats_per_unit_t,
+            behavior_pinned_chart: None,
         };
     }
 
@@ -488,6 +486,7 @@ fn assemble(
             min_ratio_over_scale: f64::NAN,
             max_ratio_over_scale: f64::INFINITY,
             nats_per_unit_t,
+            behavior_pinned_chart: None,
         };
     }
 
@@ -524,6 +523,7 @@ fn assemble(
             min_ratio_over_scale: f64::NAN,
             max_ratio_over_scale: f64::NAN,
             nats_per_unit_t,
+            behavior_pinned_chart: None,
         };
     }
     r_mean /= r_mass;
@@ -552,6 +552,7 @@ fn assemble(
         min_ratio_over_scale: r_min / r_mean,
         max_ratio_over_scale: r_max / r_mean,
         nats_per_unit_t,
+        behavior_pinned_chart: None,
     }
 }
 

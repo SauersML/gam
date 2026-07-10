@@ -148,6 +148,22 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
         "nats/unit t {}",
         cert.nats_per_unit_t
     );
+    let pinned = cert
+        .behavior_pinned_chart
+        .as_ref()
+        .expect("an engaged non-degenerate behavior circle must have a pinned chart");
+    assert_eq!(
+        pinned.coords[pinned.anchor_row], 0.0,
+        "the data-derived anchor row must be pinned exactly at the origin"
+    );
+    assert!(matches!(pinned.orientation, -1 | 1));
+    assert_eq!(pinned.nats_per_unit_coordinate, 2.0);
+    assert!(pinned.behavior_length.is_finite() && pinned.behavior_length > 0.0);
+    let period = pinned.period.expect("the behavior circle must be periodic");
+    assert_eq!(
+        period,
+        pinned.behavior_length * std::f64::consts::FRAC_1_SQRT_2
+    );
     (cert.defect_cv, cert.scale, cert.nats_per_unit_t)
 }
 

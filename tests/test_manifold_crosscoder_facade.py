@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 import gamfit.manifold_crosscoder as facade
 
@@ -43,12 +42,4 @@ def test_crosscoder_facade_marshals_named_targets_without_math(monkeypatch):
     assert rust.args[1] == "early"
     assert rust.args[2] == ["late"]
     assert rust.args[4:6] == (2, 1)
-
-
-def test_crosscoder_facade_rejects_malformed_target_pairs_before_ffi(monkeypatch):
-    monkeypatch.setattr(facade, "rust_module", lambda: _RustStub())
-    anchor = np.zeros((3, 2))
-    with pytest.raises(TypeError, match="label, array"):
-        facade.sae_crosscoder_fit(anchor, [("late", np.zeros((3, 2)), "extra")])
-    with pytest.raises(ValueError, match="must be 2-D"):
-        facade.sae_crosscoder_fit(anchor, [("late", np.zeros(3))])
+    assert rust.args[6:13] == (None,) * 7

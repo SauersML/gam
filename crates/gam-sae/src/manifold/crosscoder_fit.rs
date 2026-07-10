@@ -24,6 +24,26 @@ pub struct NamedCrosscoderTarget {
     pub target: Array2<f64>,
 }
 
+/// Pair the parallel representation used by array-oriented bindings without
+/// allowing `zip` truncation at the boundary.
+pub fn pair_crosscoder_targets(
+    labels: Vec<String>,
+    targets: Vec<Array2<f64>>,
+) -> Result<Vec<NamedCrosscoderTarget>, String> {
+    if labels.len() != targets.len() {
+        return Err(format!(
+            "pair_crosscoder_targets: labels length {} != targets length {}",
+            labels.len(),
+            targets.len()
+        ));
+    }
+    Ok(labels
+        .into_iter()
+        .zip(targets)
+        .map(|(label, target)| NamedCrosscoderTarget { label, target })
+        .collect())
+}
+
 /// Fully typed request for the crosscoder schedule over the unified engine.
 ///
 /// `base_term` must be seeded at the augmented width
@@ -112,6 +132,51 @@ impl SaeCrosscoderAutoFitConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// Optional binding/CLI overrides. Resolution onto the Rust-owned standard
+/// config happens here so every front door has identical defaults.
+#[derive(Clone, Debug, Default)]
+pub struct SaeCrosscoderAutoFitOverrides {
+    pub sparsity_strength: Option<f64>,
+    pub smoothness: Option<f64>,
+    pub max_iter: Option<usize>,
+    pub learning_rate: Option<f64>,
+    pub ridge_ext_coord: Option<f64>,
+    pub ridge_beta: Option<f64>,
+    pub random_state: Option<u64>,
+    pub run_outer_rho_search: Option<bool>,
+}
+
+impl SaeCrosscoderAutoFitOverrides {
+    pub fn resolve(self, n_atoms: usize, n_harmonics: usize) -> SaeCrosscoderAutoFitConfig {
+        let mut config = SaeCrosscoderAutoFitConfig::standard(n_atoms, n_harmonics);
+        if let Some(value) = self.sparsity_strength {
+            config.sparsity_strength = value;
+        }
+        if let Some(value) = self.smoothness {
+            config.smoothness = value;
+        }
+        if let Some(value) = self.max_iter {
+            config.max_iter = value;
+        }
+        if let Some(value) = self.learning_rate {
+            config.learning_rate = value;
+        }
+        if let Some(value) = self.ridge_ext_coord {
+            config.ridge_ext_coord = value;
+        }
+        if let Some(value) = self.ridge_beta {
+            config.ridge_beta = value;
+        }
+        if let Some(value) = self.random_state {
+            config.random_state = value;
+        }
+        if let Some(value) = self.run_outer_rho_search {
+            config.run_outer_rho_search = value;
+        }
+        config
     }
 }
 
@@ -261,6 +326,19 @@ pub struct SaeCrosscoderWireReport {
     pub layers: Vec<SaeCrosscoderWireLayer>,
     pub drift: SaeCrosscoderWireDrift,
     pub transport: Vec<SaeCrosscoderWireTransport>,
+    /// Serialization unit consumed by `ManifoldSaePayload::crosscoder`.
+    pub crosscoder: SaeCrosscoderWirePersistence,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SaeCrosscoderWirePersistence {
+    pub anchor_label: String,
+    pub anchor_dim: usize,
+    pub block_dims: Vec<usize>,
+    pub labels: Vec<String>,
+    pub log_lambda_block: Vec<f64>,
+    pub drift: SaeCrosscoderWireDrift,
+    pub transport: Vec<SaeCrosscoderWireTransport>,
 }
 
 fn validate_label(label: &str, role: &str) -> Result<(), String> {
@@ -378,6 +456,267 @@ fn reconstruction_r2(target: &Array2<f64>, fitted: &Array2<f64>) -> Result<f64, 
         }
     }
     Ok(if tss > 0.0 { 1.0 - rss / tss } else { f64::NAN })
+}
+
+/// Build the production circle seed and run the typed crosscoder schedule. This
+/// is the one automatic front door shared by Python and CLI.
+pub fn run_auto_sae_crosscoder_fit(
+    request: SaeCrosscoderAutoFitRequest,
+) -> Result<SaeCrosscoderFitReport, SaeFitError> {
+    request.config.validate()?;
+    let (stacked, _, _) =
+        stack_crosscoder_targets(&request.anchor_label, &request.anchor, &request.blocks)?;
+    let assignment = SaeFitAssignmentKind::Softmax;
+    let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
+        target: stacked.view(),
+        atom_basis: vec!["periodic".to_string(); request.config.n_atoms],
+        atom_dim: vec![request.config.n_harmonics; request.config.n_atoms],
+        assignment_kind: assignment,
+        alpha: 1.0,
+        tau: 1.0,
+        threshold: 0.0,
+        top_k: None,
+        ibp_alpha_override: None,
+        random_state: request.config.random_state,
+        initial_logits: None,
+        initial_coords: None,
+    })?;
+    let SaeMinimalSeedReport {
+        atom_basis,
+        effective_atom_dim,
+        atom_centers,
+        basis_values,
+        basis_jacobian,
+        basis_sizes,
+        decoder_coefficients,
+        smooth_penalties,
+        initial_logits,
+        initial_coords,
+        refine_routing,
+    } = minimal;
+    let registry = AnalyticPenaltyRegistry::new();
+    let seed = build_sae_fit_seed(SaeFitSeedRequest {
+        target: stacked.view(),
+        atom_basis: &atom_basis,
+        atom_dim: &effective_atom_dim,
+        atom_centers: &atom_centers,
+        basis_values: basis_values.view(),
+        basis_jacobian: basis_jacobian.view(),
+        basis_sizes: &basis_sizes,
+        decoder_coefficients: decoder_coefficients.view(),
+        smooth_penalties: smooth_penalties.view(),
+        initial_logits: initial_logits.view(),
+        initial_coords: initial_coords.view(),
+        alpha: 1.0,
+        tau: 1.0,
+        learnable_alpha: false,
+        assignment_kind: assignment,
+        sparsity_strength: request.config.sparsity_strength,
+        smoothness: request.config.smoothness,
+        max_iter: request.config.max_iter,
+        learning_rate: request.config.learning_rate,
+        ridge_ext_coord: request.config.ridge_ext_coord,
+        ridge_beta: request.config.ridge_beta,
+        top_k: None,
+        threshold: 0.0,
+        native_ard_enabled: true,
+        seed_refine_routing: refine_routing,
+        seed_refine_random_state: request.config.random_state,
+        data_row_reseed: false,
+        fit_config: SaeFitConfig::default(),
+        temperature_schedule: None,
+        fisher_metric: None,
+        row_loss_weights: None,
+        registry: &registry,
+    })?;
+    run_sae_crosscoder_fit(SaeCrosscoderFitRequest {
+        anchor_label: request.anchor_label,
+        anchor: request.anchor,
+        blocks: request.blocks,
+        base_term: seed.base_term,
+        registry,
+        initial_rho: seed.initial_rho,
+        max_iter: request.config.max_iter,
+        learning_rate: request.config.learning_rate,
+        ridge_ext_coord: request.config.ridge_ext_coord,
+        ridge_beta: request.config.ridge_beta,
+        run_outer_rho_search: request.config.run_outer_rho_search,
+        cancel: request.cancel,
+    })
+}
+
+fn array2_to_nested(array: &Array2<f64>) -> Vec<Vec<f64>> {
+    array.rows().into_iter().map(|row| row.to_vec()).collect()
+}
+
+fn wire_layer_label(
+    layer: CrosscoderLayer,
+    anchor_label: &str,
+    block_labels: &[String],
+) -> Result<String, String> {
+    match layer {
+        CrosscoderLayer::Anchor => Ok(anchor_label.to_string()),
+        CrosscoderLayer::Block(index) => block_labels
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("crosscoder wire report: block layer {index} is out of range")),
+    }
+}
+
+impl SaeCrosscoderFitReport {
+    /// Materialize the stable report shared by bindings. The optional transport
+    /// experiment is evaluated here, not in pyffi/CLI.
+    pub fn wire_report(
+        &self,
+        evaluation: SaeCrosscoderEvaluationConfig,
+    ) -> Result<SaeCrosscoderWireReport, String> {
+        if let Some(tolerance) = evaluation.law_gap_tolerance {
+            if !tolerance.is_finite() || tolerance < 0.0 {
+                return Err(format!(
+                    "SaeCrosscoderEvaluationConfig: law_gap_tolerance must be finite and non-negative; got {tolerance}"
+                ));
+            }
+            if evaluation.transport_grid_resolution.is_none() {
+                return Err(
+                    "SaeCrosscoderEvaluationConfig: law_gap_tolerance requires a transport grid"
+                        .to_string(),
+                );
+            }
+        }
+        let anchor_label = self
+            .layers
+            .first()
+            .map(|layer| layer.label.as_str())
+            .ok_or_else(|| "crosscoder report has no anchor layer".to_string())?;
+        let block_labels = self.layout.labels();
+        let layout = SaeCrosscoderWireLayout {
+            anchor_label: anchor_label.to_string(),
+            anchor_dim: self.layout.anchor_dim(),
+            block_dims: self.layout.block_dims().to_vec(),
+            labels: block_labels.to_vec(),
+            log_lambda_block: self.layout.block_log_lambda().to_vec(),
+        };
+        let drift = match &self.drift {
+            CrosscoderDriftStatus::Measured(report) => {
+                let layer_chain = report
+                    .layer_chain
+                    .iter()
+                    .map(|&layer| wire_layer_label(layer, anchor_label, block_labels))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let steps = report
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        Ok(SaeCrosscoderWireDriftStep {
+                            atom: step.atom,
+                            source: wire_layer_label(step.source, anchor_label, block_labels)?,
+                            target: wire_layer_label(step.target, anchor_label, block_labels)?,
+                            drift: step.drift,
+                            principal_angles: step.principal_angles.clone(),
+                            max_principal_angle: step.max_principal_angle(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                SaeCrosscoderWireDrift::Measured {
+                    num_atoms: report.num_atoms,
+                    mean_drift: report.mean_drift(),
+                    most_drifting_atom: report.most_drifting_atom(),
+                    most_stable_atom: report.most_stable_atom(),
+                    layer_chain,
+                    steps,
+                }
+            }
+            CrosscoderDriftStatus::Undefined { reason } => SaeCrosscoderWireDrift::Undefined {
+                reason: reason.clone(),
+            },
+        };
+        let mut transport = Vec::new();
+        if let Some(grid_resolution) = evaluation.transport_grid_resolution {
+            let chain: Vec<CrosscoderLayer> = std::iter::once(CrosscoderLayer::Anchor)
+                .chain((0..self.layout.num_blocks()).map(CrosscoderLayer::Block))
+                .collect();
+            for atom in 0..self.term.k_atoms() {
+                for pair in chain.windows(2) {
+                    let measured = measure_atom_transport_between(
+                        &self.term,
+                        &self.layout,
+                        atom,
+                        pair[0],
+                        pair[1],
+                        grid_resolution,
+                    )?;
+                    transport.push(SaeCrosscoderWireTransport {
+                        atom,
+                        source: wire_layer_label(pair[0], anchor_label, block_labels)?,
+                        target: wire_layer_label(pair[1], anchor_label, block_labels)?,
+                        grid_resolution: measured.grid_resolution,
+                        n_harmonics: measured.n_harmonics,
+                        phase_shift: measured.phase_shift,
+                        phase_r2: measured.phase_r2,
+                        smooth_r2: measured.smooth_r2,
+                        law_gap: measured.law_gap(),
+                        law_holds: evaluation
+                            .law_gap_tolerance
+                            .map(|tolerance| measured.law_holds(tolerance)),
+                        deviation_locus: measured.deviation_locus(),
+                        drift: measured.drift,
+                        principal_angles: measured.principal_angles,
+                        transport_grid: measured.transport_grid,
+                    });
+                }
+            }
+        }
+        let crosscoder = SaeCrosscoderWirePersistence {
+            anchor_label: layout.anchor_label.clone(),
+            anchor_dim: layout.anchor_dim,
+            block_dims: layout.block_dims.clone(),
+            labels: layout.labels.clone(),
+            log_lambda_block: layout.log_lambda_block.clone(),
+            drift: drift.clone(),
+            transport: transport.clone(),
+        };
+        Ok(SaeCrosscoderWireReport {
+            layout,
+            log_lambda_block: self.rho.log_lambda_block.clone(),
+            log_lambda_sparse: self.rho.log_lambda_sparse,
+            log_lambda_smooth: self.rho.log_lambda_smooth.clone(),
+            assignments: array2_to_nested(&self.term.assignment.assignments()),
+            logits: array2_to_nested(&self.term.assignment.logits),
+            coords: self
+                .term
+                .assignment
+                .coords
+                .iter()
+                .map(|coord| array2_to_nested(&coord.as_matrix()))
+                .collect(),
+            loss: SaeCrosscoderWireLoss {
+                data_fit: self.loss.data_fit,
+                assignment_sparsity: self.loss.assignment_sparsity,
+                smoothness: self.loss.smoothness,
+                ard: self.loss.ard,
+                total_penalized_loss: self.loss.total(),
+            },
+            termination: SaeCrosscoderWireTermination {
+                verdict: self.termination.verdict.as_str().to_string(),
+                evals: self.termination.evals,
+                evals_since_improvement: self.termination.evals_since_improvement,
+                wall_seconds: self.termination.wall.as_secs_f64(),
+            },
+            layers: self
+                .layers
+                .iter()
+                .map(|layer| SaeCrosscoderWireLayer {
+                    label: layer.label.clone(),
+                    fitted: array2_to_nested(&layer.fitted),
+                    reconstruction_r2: layer.reconstruction_r2,
+                    decoders: layer.decoders.iter().map(array2_to_nested).collect(),
+                })
+                .collect(),
+            drift,
+            transport,
+            crosscoder,
+        })
+    }
 }
 
 fn certify_crosscoder_outer(

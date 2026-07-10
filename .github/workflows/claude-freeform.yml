@@ -2,8 +2,9 @@ name: Claude Freeform (do whatever you want)
 
 on:
   schedule:
-    # Every 30 minutes, 24/7.
-    - cron: "*/30 * * * *"
+    # Every 30 minutes, 24/7. Offset from :00/:30 because GitHub may delay or
+    # drop scheduled events during the high-load start-of-hour window.
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:

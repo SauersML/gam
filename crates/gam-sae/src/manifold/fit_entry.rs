@@ -47,8 +47,9 @@ use gam_terms::inference::structure_evidence::StructureLedger;
 use crate::structure_harvest;
 
 use super::{
-    AssignmentMode, SaeManifoldFitDiagnostics, SaeManifoldLoss, SaeManifoldOuterObjective,
-    SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty, SaeTrustDiagnostics,
+    AssignmentMode, SaeFitAssignmentKind, SaeManifoldFitDiagnostics, SaeManifoldLoss,
+    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination,
+    SaeShapeUncertainty, SaeTrustDiagnostics,
 };
 
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.

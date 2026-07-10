@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         max_iter=args.inner_max_iter,
         ridge_ext_coord=1e-6,
         ridge_beta=1e-6,
-        grid_resolution=args.grid_resolution,
+        transport_grid_resolution=args.grid_resolution,
         law_gap_tolerance=args.law_gap_tolerance,
     )
     reports = list(fit["transport"])
