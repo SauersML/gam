@@ -1660,7 +1660,7 @@ fn gaussian_reml_fit_formula_dataset_impl(
     let request = gam::families::response_geometry::SharedTangentRemlRequest::new(
         design.design,
         y.to_owned(),
-        standard.weights.clone(),
+        (*standard.weights).clone(),
         fisher_rao_w.map(|metric| metric.to_owned()),
         penalties,
     );
