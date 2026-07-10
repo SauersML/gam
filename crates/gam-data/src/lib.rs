@@ -2992,7 +2992,7 @@ mod tests {
 
     #[test]
     fn direct_parquet_decoder_preserves_string_encounter_order() {
-        use arrow::array::{Array, DictionaryArray};
+        use arrow::array::DictionaryArray;
         use arrow::datatypes::Int8Type;
         use ndarray::Array1;
 
