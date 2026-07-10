@@ -176,7 +176,11 @@ struct RankChargeArm {
     evidence_reanchors: usize,
 }
 
-fn rank_charge_zoo_arm(train: &Array2<f64>, test: &Array2<f64>, rank_charge: bool) -> RankChargeArm {
+fn rank_charge_zoo_arm(
+    train: &Array2<f64>,
+    test: &Array2<f64>,
+    rank_charge: bool,
+) -> RankChargeArm {
     let (mut objective, seed) = objective_and_seed(
         train.view(),
         12,
@@ -205,7 +209,7 @@ fn rank_charge_zoo_arm(train: &Array2<f64>, test: &Array2<f64>, rank_charge: boo
     let grad_norm = result
         .criterion_certificate
         .as_ref()
-        .map(|c| c.projected_grad_norm);
+        .map(|certificate| certificate.stationarity.projected_norm());
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let native_ev = global_ev(train, &fitted.term.fitted().to_owned());
     let cold_train_ev = cold_oos_ev(&fitted.term, &fitted.rho, train, "re-encode(train)");
