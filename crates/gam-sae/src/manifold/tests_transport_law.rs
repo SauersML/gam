@@ -286,6 +286,13 @@ fn planted_nonlinear_transport_flips_the_verdict() {
     let layout = term.crosscoder_layout().unwrap().clone();
     let nonlinear = measure_atom_transport(&term, &layout, 0, 256).unwrap();
 
+    // zz-diagnostic dump (#2234 fallout triage): the raw transport grid lets an
+    // offline refit separate "my smooth-fit math changed" from "the upstream
+    // fitted chart degraded" on identical data.
+    eprintln!(
+        "[zz-grid] phase_r2={:.6} smooth_r2={:.6} phase_shift={:?} grid={:?}",
+        nonlinear.phase_r2, nonlinear.smooth_r2, nonlinear.phase_shift, nonlinear.transport_grid
+    );
     // The phase-law tolerance (0.02, the arm-1 bound) is the reference; a nonlinear
     // transport must beat it by a full order of magnitude — the two verdicts are
     // separated by the measurement, not a tuned threshold.
