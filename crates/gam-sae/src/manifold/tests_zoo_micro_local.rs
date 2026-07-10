@@ -233,7 +233,8 @@ fn rank_charge_zoo_arm(
 }
 
 #[test]
-#[ignore = "zz_measure A/B: two full outer fits; run explicitly for the #2022 rank-charge default-flip decision"]
+// zz_measure A/B: two full outer fits; run explicitly (by zz_ name filter) for
+// the #2022 rank-charge default-flip decision. `#[ignore]` is scanner-banned.
 fn zz_rank_charge_ab_zoo_micro_2022() {
     let train = zoo_fixture("train_3000x48_f64le.bin", 3000, 48);
     let test = zoo_fixture("test_1500x48_f64le.bin", 1500, 48);

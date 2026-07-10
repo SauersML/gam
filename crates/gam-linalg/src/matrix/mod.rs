@@ -1316,7 +1316,7 @@ impl DenseDesignMatrix {
                 // the joint ledger and refuse loudly under joint pressure.
                 // Callers that can hold the charge for the buffer's lifetime
                 // must use `try_to_dense_governed`.
-                let _reservation = MemoryGovernor::global()
+                let construction_charge = MemoryGovernor::global()
                     .try_reserve_dense_f64(
                         lazy.nrows(),
                         lazy.ncols(),
@@ -1324,14 +1324,19 @@ impl DenseDesignMatrix {
                     )
                     // SAFETY: infallible accessor; a joint-ledger refusal here means the caller broke the densification contract.
                     .unwrap_or_else(|err| std::panic::panic_any(err.to_string()));
-                dense_operator_to_dense_by_chunks(lazy.op.as_ref()).unwrap_or_else(|err| {
-                    std::panic::panic_any(format!(
-                        "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
-                         operator-backed design via row chunks: {err}",
-                        lazy.nrows(),
-                        lazy.ncols(),
-                    ))
-                })
+                let dense =
+                    dense_operator_to_dense_by_chunks(lazy.op.as_ref()).unwrap_or_else(|err| {
+                        std::panic::panic_any(format!(
+                            "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
+                             operator-backed design via row chunks: {err}",
+                            lazy.nrows(),
+                            lazy.ncols(),
+                        ))
+                    });
+                // The charge covers exactly the construction window; the escaping
+                // buffer itself cannot carry an RAII charge (doc above).
+                drop(construction_charge);
+                dense
             }
         }
     }

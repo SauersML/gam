@@ -2161,8 +2161,7 @@ mod tests {
         /// directions the production kernels consume ARE the η-space directions —
         /// letting the per-row β-space kernels be compared to the jet's η-space
         /// contractions with no design projection in the way.
-        fn single_row_family<const M: usize>(_eta: &[f64; M], obs: usize, w: f64) -> MultinomialFamily {
-            let k = M + 1;
+        fn single_row_family(obs: usize, w: f64, k: usize) -> MultinomialFamily {
             let mut y = Array2::<f64>::zeros((1, k));
             y[[0, obs]] = 1.0;
             let design = Arc::new(array![[1.0_f64]]);
@@ -2270,7 +2269,7 @@ mod tests {
                 let eta: [f64; M] = std::array::from_fn(|_| rng.uniform(-2.0, 2.0));
                 let obs = trial % (M + 1);
                 let w = rng.uniform(0.25, 2.5);
-                let family = single_row_family(&eta, obs, w);
+                let family = single_row_family(obs, w, M + 1);
                 let prog = MultinomialJetRow { eta, obs, w };
 
                 // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
