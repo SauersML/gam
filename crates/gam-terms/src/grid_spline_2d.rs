@@ -56,10 +56,6 @@
 //! bounding box the boundary cell's cubic polynomial extends naturally (the
 //! cell index clamps, the local coordinate does not).
 
-use faer::Side;
-use gam_linalg::faer_ndarray::FaerEigh;
-use gam_math::score_opt::AffineRemlProfile;
-use ndarray::{Array1, Array2};
 
 /// Dimension of the penalty null space: span{1, x1, x2}. The mixed
 /// `2·a1·a2·f_{x1x2}²` term excludes `x1·x2` (its cross derivative is 1).

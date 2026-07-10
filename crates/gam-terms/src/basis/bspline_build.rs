@@ -534,11 +534,6 @@ pub fn build_bspline_basis_1d(
             }
         }
     };
-    let p_raw = design_sparse_opt
-        .as_ref()
-        .map(|basis| basis.ncols())
-        .or_else(|| design_dense_opt.as_ref().map(Array2::ncols))
-        .expect("B-spline basis should be present");
     let s_bend_raw =
         bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order)?;
     let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
