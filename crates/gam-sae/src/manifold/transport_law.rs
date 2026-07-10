@@ -92,8 +92,9 @@ pub struct AtomTransportReport {
     /// Number of source chart samples reported over `[0, 1)`.  Target
     /// coordinates are solved continuously and do not inherit this resolution.
     pub grid_resolution: usize,
-    /// The atom's harmonic order `H = (M − 1)/2`, which sets the smooth-map
-    /// alternative's Fourier order.
+    /// The atom's harmonic order `H = (M − 1)/2`. The smooth-map ALTERNATIVE
+    /// fits at order `2H + 1` (the empirical transport between order-H curves
+    /// generically carries harmonics above `H`; see the call-site note).
     pub n_harmonics: usize,
     /// The best phase-shift model `t' = s·t + φ`: `(s, φ)` with `s ∈ {+1, −1}`
     /// and `φ` in chart units, wrapped to `[−½, ½)`.
@@ -248,7 +249,7 @@ pub fn measure_atom_transport_between(
     // The smooth alternative fits `K = 2H + 1` Fourier coefficients; it needs at
     // least `K + 1` grid points to be determined (and the phase test needs a
     // non-degenerate grid).
-    let k_smooth = 2 * n_harmonics + 1;
+    let k_smooth = 2 * (2 * n_harmonics + 1) + 1;
     if grid_resolution < k_smooth + 1 {
         return Err(format!(
             "measure_atom_transport: grid_resolution {grid_resolution} is too small for a \
@@ -312,7 +313,18 @@ pub fn measure_atom_transport_between(
         .map(|(&t, &tp)| (t, tp))
         .collect();
 
-    let (phase_shift, phase_r2, smooth_r2) = fit_transport_law(&t_arr, &tprime, n_harmonics);
+    // The smooth ALTERNATIVE's Fourier order is deliberately HIGHER than the
+    // atom's own H: the empirical transport t ↦ t'(t) between two order-H
+    // curves is a projection argmin and generically carries harmonics ABOVE H
+    // (composition/inversion of trigonometric polynomials is not order-H), so
+    // capping the alternative at H under-detects nonlinearity — measured
+    // 2026-07-10 on the planted θ' = θ + a·sinθ arm: the recovered drift needs
+    // ~2H harmonics for R² 0.86 vs 0.72 at H. `2H + 1` keeps the detector a
+    // low-order smooth model (K = 4H + 3 coefficients ≪ grid_resolution, which
+    // the guard above already enforces at the STRICTER alternative order) while
+    // removing the conservative bias the 2026-07-10 audit flagged.
+    let alt_harmonics = 2 * n_harmonics + 1;
+    let (phase_shift, phase_r2, smooth_r2) = fit_transport_law(&t_arr, &tprime, alt_harmonics);
     let drift = decoder_drift(&b_src, &b_tgt);
     let principal_angles = principal_angles_between_images(&b_src, &b_tgt)?;
 
