@@ -619,11 +619,15 @@ impl DesignTwoBlockRowCoeffOperator {
 ///   H = [[X_mu^T diag(w) X_mu,    X_mu^T diag(cross) X_ls],
 ///        [X_ls^T diag(cross) X_mu, X_ls^T diag(scale) X_ls]],
 ///
-/// with `cross = 0` and `scale = 2κ²a` — the block-diagonal Gaussian Fisher
-/// (expected) information (μ ⊥ σ, #684; residual-free (log σ, log σ) block,
-/// #566). This MUST match the dense `exact_newton_joint_hessian_from_designs`
-/// curvature object exactly: the observed cross term `2κm` (mean-zero noise)
-/// over-smooths the scale and is its Fisher expectation 0. The matvec applies
+/// with the OBSERVED joint coefficients `mm = w`, `cross = 2κm`,
+/// `scale = κ′(a−n) + 2κ²n` (#1561 — the old block-Fisher object with
+/// `cross ≡ 0`, `scale = 2κ²a` overstated σ-block information and biased
+/// λ̂_σ upward on flat scale surfaces; at the null `n→a, m→0` observed
+/// collapses back to Fisher). This MUST match the dense
+/// `exact_newton_joint_hessian_from_designs` curvature object exactly, and
+/// both read `gaussian_locscale_observed_joint_row_coeffs` as the single
+/// source of truth so cross-block drift is structurally impossible.
+/// The matvec applies
 /// each block by a single design-matrix multiply on each side, so the cost
 /// is Θ(n (p_mu + p_ls)) per `Hv` rather than Θ(n (p_mu + p_ls)²) to form
 /// the dense matrix.
