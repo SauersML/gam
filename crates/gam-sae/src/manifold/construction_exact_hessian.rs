@@ -16,9 +16,9 @@
 /// response `θ̂_ρ = −A⁻¹g_ρ` there is an unidentifiable `1/μ` amplification,
 /// not a real derivative. That amplification is what flipped the analytic
 /// λ-gradient's sign against the criterion it differentiates (the #931
-/// objective↔gradient desync; the FD safeguard in `outer_objective.rs` exists
-/// only to catch it). Deflating those directions keeps the envelope term
-/// value-consistent by construction.
+/// objective↔gradient desync. The former outer-objective numerical safeguard
+/// has been removed: deflating these directions keeps the envelope term
+/// value-consistent at its analytic source.
 const SAE_IFT_MIN_CURVATURE_FRACTION: f64 = 1.0e-8;
 
 /// Inverse-power refinement sweeps for a suspected near-null `(A, B)`
