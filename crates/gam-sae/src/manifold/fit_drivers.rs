@@ -5502,6 +5502,9 @@ impl SaeManifoldTerm {
             if !(canonical_total.is_finite() && canonical_total <= accepted_total) {
                 self.restore_mutable_state(&accepted_snapshot)?;
             }
+            let zz2015_post_gauge = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
             // and answer breaches with a bounded re-seed or a terminal
@@ -5590,6 +5593,9 @@ impl SaeManifoldTerm {
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).
             self.retract_unit_speed_charts_in_loop()?;
+            let zz2015_post_unitspeed = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each
@@ -5605,6 +5611,14 @@ impl SaeManifoldTerm {
                 self.refresh_active_frames_from_data(target, rho)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
+            let zz2015_post_frame = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
+            eprintln!(
+                "[zz2015] iter={outer_iteration} accepted={accepted_total:.6e} post_gauge={zz2015_post_gauge:.6e} post_unitspeed={zz2015_post_unitspeed:.6e} post_frame={zz2015_post_frame:.6e} frames_active={} ‖g‖={:.4e}",
+                self.frames_active(),
+                grad_norm_sq.sqrt(),
+            );
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
                 // (the walk's own referee) and, at (near-)equal objective, on the
