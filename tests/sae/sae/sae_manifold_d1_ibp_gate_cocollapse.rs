@@ -1,41 +1,11 @@
-//! Honest-red repro pin for #2228 / #1095 / #2226 (K=1 d_atom=1 IBP-gate ↔
-//! decoder co-collapse) — the ACTUAL issue-body configuration.
+//! Regression pin for #2228 / #1095 / #2226: a K=1, d=1 IBP SAE must
+//! converge at fixed rho and reconstruct an exactly representable curve.
 //!
-//! Root cause (verified by code-trace on HEAD; see the fleet report): the IBP-MAP
-//! gate is `a_k = σ(l_k/τ)·π_k` with the ordered stick-breaking prior mean
-//! `π_k = (α/(α+1))^{k+1}` (`assignment.rs` `ibp_map_row` / `ordered_prior_means`).
-//! For K=1 at the production `α = 1`, `π_1 = 0.5`, so the gate is HARD-CAPPED at
-//! `a_1 = σ(l_1/τ)·0.5 ≤ 0.5` even with the logit driven to `+∞`; the repro
-//! (`ibp_map(TAU, ALPHA, /*learnable_alpha=*/false)`) freezes `α`, pinning the cap
-//! at `0.5`. By the gate's OWN design contract ("magnitude lives in the decoder,
-//! the gate stays in [0, 1)", `assignment.rs` `jumprelu_row`), the decoder `B` must
-//! carry the compensating `1/a_1 ≥ 2×` magnitude so the gated reconstruction
-//! `a_1·Φ·B` reaches `z`.
-//!
-//! The bug is a gate-weighting ASYMMETRY between the two decoder terms the joint
-//! solve assembles:
-//!   * the decoder DATA-fit β-Hessian is gate-weighted `a_k²` — the design is
-//!     `D_k = diag(a_·k)·Φ_k` (`construction_arrow_schur_assembly.rs`,
-//!     `w = a_k·φ·…`), so the β Gram is `Σ_i a_{ik}² φ_iφ_iᵀ`;
-//!   * the decoder SMOOTHNESS penalty `S_k` is scaled by `λ_smooth[k]` ONLY, NOT
-//!     by the gate (`construction_arrow_schur_assembly.rs` `scaled_s = λ·S`).
-//! So the effective decoder shrinkage is `λ/a_k²`, which EXPLODES as `a_k → 0.25`:
-//! the penalized decoder argmin is over-shrunk ≥ 16× relative to its data weight,
-//! the gated reconstruction cannot reach `z`, and the inner Newton KKT residual
-//! cannot be driven to tolerance (the reported `‖g‖ ≈ 1e1–1e2` stall →
-//! `RemlConvergenceError`). `into_fitted`'s pristine-seed guard then returns the
-//! cold seed, whose gated reconstruction is exactly `a_1·z = 0.25·z`, giving the
-//! `R² ≈ 1 − (1 − 0.25)² = 0.4375` co-collapse signature. `gauge.rs`
-//! `optimize_log_amplitudes_closed_form` documents the same mechanism from the
-//! amplitude side ("s DRIFTS to collapse under the penalty's residual shape
-//! gradient … instead of co-vanishing") but its retraction is a `k < 2` early-out
-//! and is gated behind the default-OFF `quotient_scale`, so the K=1 default fit
-//! path never compensates the gate.
-//!
-//! This pin plants a 1-D curve that a degree-2 Euclidean patch spans EXACTLY, so
-//! the ONLY obstacle to `R² ≈ 1` is the K=1 gate co-collapse (the basis is not a
-//! confound, unlike a circle a `d = 1` patch cannot represent). A healthy fit
-//! compensates the `0.5` gate cap and recovers the curve; the bug reproduces as a
+//! Ordered IBP shrinkage belongs only to the empirical-Bayes assignment prior.
+//! The forward posterior-mean gate is sigmoid(logit / temperature), without a
+//! second multiplication by the ordered prior mean. Decoder magnitude stays in
+//! the physical coefficient block B, so this fixture directly catches either a
+//! reintroduced prior cap or a convergence path that returns a cold seed.
 //! `RemlConvergenceError` (inner solve stalls) or an `R² ≈ 0.4375` pristine-seed
 //! fallback. Drives the public outer engine at ridge-0 exactly as production does.
 

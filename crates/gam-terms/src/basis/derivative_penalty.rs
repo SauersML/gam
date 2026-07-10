@@ -89,12 +89,12 @@ pub fn bspline_derivative_penalty_matrix(
 /// basis of `num_basis` cardinal translates with spacing `h = period /
 /// num_basis`.
 ///
-/// This is the function-space replacement for
-/// [`create_cyclic_difference_penalty_matrix`]: same `num_basis × num_basis`
-/// shape, same single-dimensional null space (the constants — the only
-/// periodic polynomials), but an exact circulant functional of the function on
-/// the circle. The Gram is independent of the knot anchor (integration over
-/// the whole circle), so no origin argument is needed.
+/// This is the exact function-space penalty for cyclic B-splines (the retired
+/// coefficient-difference operator shared its `num_basis × num_basis` shape
+/// and constant-only null space but penalized coefficients, violating SPEC 5):
+/// an exact circulant functional of the represented function on the circle.
+/// The Gram is independent of the knot anchor (integration over the whole
+/// circle), so no origin argument is needed.
 pub fn cyclic_bspline_derivative_penalty_matrix(
     degree: usize,
     num_basis: usize,

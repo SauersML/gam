@@ -561,25 +561,6 @@ fn periodic_bspline_basis_wraps_and_forms_partition_of_unity() {
 }
 
 #[test]
-fn cyclic_difference_penalty_has_no_endpoint_seam() {
-    let s = create_cyclic_difference_penalty_matrix(16, 2).unwrap();
-    assert_eq!(s.nrows(), 16);
-    assert_eq!(s.ncols(), 16);
-    assert_abs_diff_eq!(s[[0, 15]], -4.0, epsilon = 1e-14);
-    assert_abs_diff_eq!(s[[15, 0]], -4.0, epsilon = 1e-14);
-
-    let constants = Array2::from_elem((16, 1), 3.25);
-    let linear_phase = Array2::from_shape_fn((16, 1), |(i, _)| i as f64);
-    let const_pen = constants.t().dot(&s.dot(&constants))[[0, 0]];
-    let linear_pen = linear_phase.t().dot(&s.dot(&linear_phase))[[0, 0]];
-    assert_abs_diff_eq!(const_pen, 0.0, epsilon = 1e-12);
-    assert!(
-        linear_pen > 100.0,
-        "nonperiodic seam jump must be penalized"
-    );
-}
-
-#[test]
 fn periodic_multioutput_curve_fits_anisotropic_ellipse_and_skewed_loop() {
     let period = std::f64::consts::TAU;
     let n = 240;
@@ -2477,25 +2458,6 @@ fn test_bspline_identifiability_orthogonal_to_design_columns() {
             );
         }
     }
-}
-
-#[test]
-fn test_cyclic_difference_penalty_wraps_nullspace() {
-    let s = create_cyclic_difference_penalty_matrix(8, 2).unwrap();
-    assert_eq!(s.nrows(), 8);
-    assert_eq!(s.ncols(), 8);
-    for i in 0..8 {
-        for j in 0..8 {
-            assert!((s[[i, j]] - s[[j, i]]).abs() < 1e-12);
-        }
-    }
-    let ones = Array1::<f64>::ones(8);
-    let q = ones.dot(&s.dot(&ones));
-    assert!(q.abs() < 1e-10);
-    assert!(
-        s[[0, 7]].abs() > 0.0,
-        "endpoint coefficients must be coupled"
-    );
 }
 
 #[test]

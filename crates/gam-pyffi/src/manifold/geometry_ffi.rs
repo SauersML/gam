@@ -5106,7 +5106,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_spline_curve_basis, module)?)?;
-    module.add_function(wrap_pyfunction!(cyclic_difference_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_with_jets, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;

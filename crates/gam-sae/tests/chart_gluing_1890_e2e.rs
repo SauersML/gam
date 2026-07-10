@@ -363,7 +363,11 @@ fn orientation_reversing_pair_registers_atlas_end_to_end() {
     let target = target_from_term(&term, p);
     let fitted_before = term.try_fitted().unwrap();
 
-    assert_eq!(active_atom_count(&term), 2, "fixture starts with 2 active arcs");
+    assert_eq!(
+        active_atom_count(&term),
+        2,
+        "fixture starts with 2 active arcs"
+    );
     assert_eq!(term.semantic_atom_count(), 2, "no atlas registered yet");
 
     let mut ledger = StructureLedger::new();
@@ -391,7 +395,10 @@ fn orientation_reversing_pair_registers_atlas_end_to_end() {
         "no Glue certified for the orientation-reversing pair; the atlas-register \
          lane did not fire end-to-end"
     );
-    assert!(result.structure_changed(), "a glue applied but structure_changed() is false");
+    assert!(
+        result.structure_changed(),
+        "a glue applied but structure_changed() is false"
+    );
 
     // REGISTER, not FUSE: both numerical charts survive (nothing is excised) and
     // both keep routing mass — the register outcome does not demote either chart.
@@ -412,7 +419,11 @@ fn orientation_reversing_pair_registers_atlas_end_to_end() {
         1,
         "the reversing pair must collapse to one semantic atlas atom"
     );
-    assert_eq!(result.term.chart_atlases().len(), 1, "exactly one atlas registered");
+    assert_eq!(
+        result.term.chart_atlases().len(),
+        1,
+        "exactly one atlas registered"
+    );
     let atlas = &result.term.chart_atlases()[0];
     assert_eq!(atlas.charts(), &[0, 1], "the atlas covers both charts");
     assert_eq!(
@@ -492,10 +503,18 @@ fn mobius_cocycle_reports_non_orientable_via_sign_holonomy() {
     )
     .unwrap();
 
-    assert_eq!(term.chart_atlases().len(), 1, "both seams live in one atlas");
+    assert_eq!(
+        term.chart_atlases().len(),
+        1,
+        "both seams live in one atlas"
+    );
     let atlas = &term.chart_atlases()[0];
     assert_eq!(atlas.charts(), &[0, 1]);
-    assert_eq!(atlas.transitions().len(), 2, "two overlap components registered");
+    assert_eq!(
+        atlas.transitions().len(),
+        2,
+        "two overlap components registered"
+    );
     assert_eq!(
         atlas.orientability(),
         AtlasOrientability::NonOrientable,
@@ -508,8 +527,9 @@ fn mobius_cocycle_reports_non_orientable_via_sign_holonomy() {
     assert_eq!(term.semantic_atom_count(), 1);
     let assignments = term.assignment.assignments();
     for row in 0..n {
-        let (activation, partition) =
-            term.atlas_partition_of_unity(0, assignments.row(row)).unwrap();
+        let (activation, partition) = term
+            .atlas_partition_of_unity(0, assignments.row(row))
+            .unwrap();
         assert!((partition.sum() - 1.0).abs() < 8.0 * f64::EPSILON);
         for (slot, &chart) in atlas.charts().iter().enumerate() {
             assert!(

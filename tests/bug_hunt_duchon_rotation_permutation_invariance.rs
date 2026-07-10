@@ -94,8 +94,7 @@ fn fit_and_predict_formula(
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let FitResult::Standard(fit) =
-        fit_from_formula(formula, &data, &cfg).expect("spatial fit")
+    let FitResult::Standard(fit) = fit_from_formula(formula, &data, &cfg).expect("spatial fit")
     else {
         panic!("expected standard fit");
     };
@@ -302,7 +301,11 @@ fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
     // round-off-robust knots), and `matern` additionally via the #2252
     // rotation-invariant length-scale seed (its enrolled κ/range solve is
     // seed-sensitive, so a rotation-variant seed drifted the fit ~1.6%).
-    for formula in ["y ~ duchon(x, z)", "y ~ thinplate(x, z)", "y ~ matern(x, z)"] {
+    for formula in [
+        "y ~ duchon(x, z)",
+        "y ~ thinplate(x, z)",
+        "y ~ matern(x, z)",
+    ] {
         let (edf0, pred0) = fit_and_predict_formula(formula, &x, &z, &y, &gx, &gz);
         let sr = signal_range(&pred0);
         let mut worst_pred = 0.0_f64;
@@ -313,8 +316,7 @@ fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
                 let (dx, dz) = (px - cx, pz - cz);
                 (cx + c * dx - sn * dz, cz + sn * dx + c * dz)
             };
-            let (rx, rz): (Vec<f64>, Vec<f64>) =
-                x.iter().zip(&z).map(|(&a, &b)| rot(a, b)).unzip();
+            let (rx, rz): (Vec<f64>, Vec<f64>) = x.iter().zip(&z).map(|(&a, &b)| rot(a, b)).unzip();
             let (rgx, rgz): (Vec<f64>, Vec<f64>) =
                 gx.iter().zip(&gz).map(|(&a, &b)| rot(a, b)).unzip();
             let (edf_r, pred_r) = fit_and_predict_formula(formula, &rx, &rz, &y, &rgx, &rgz);
