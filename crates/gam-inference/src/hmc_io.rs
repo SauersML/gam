@@ -2007,6 +2007,46 @@ mod tests {
         assert_eq!(grad_of[0], 0.0);
     }
 
+    /// #2245 finding 16: saved-model sampling must reconstruct the fitted
+    /// *weighted* likelihood, not a unit-weight one. The intercept-only
+    /// Bernoulli with `(y, w) = (1, 100), (0, 1)` has weighted score
+    /// `dℓ/dη = 100·(1 − μ) − 1·μ = 100 − 101·μ`, which vanishes at
+    /// `μ = 100/101`, i.e. the weighted mode `η* = log 100`. Reconstructing the
+    /// target with `weights = ones` (the historical bug) instead centres it at
+    /// `η = 0`. Pinning the weighted kernel here guards the `saved_prior_weights`
+    /// plumbing in `sample.rs` against a silent regression to the unweighted
+    /// posterior.
+    #[test]
+    fn weighted_bernoulli_target_is_centered_at_the_weighted_mode() {
+        let data = SharedData {
+            x: Arc::new(array![[1.0], [1.0]]),
+            y: Arc::new(array![1.0, 0.0]),
+            weights: Arc::new(array![100.0, 1.0]),
+            mode: Arc::new(array![0.0]),
+            offset: None,
+            gamma_shape: 1.0,
+            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            n_samples: 2,
+            dim: 1,
+        };
+        // At the weighted MLE η* = log 100 the score is (numerically) zero.
+        let eta_star = 100.0_f64.ln();
+        let (_, grad_star) = super::logit_logp_and_grad(&data, &array![eta_star, eta_star]);
+        assert!(
+            grad_star[0].abs() < 1e-9,
+            "weighted Bernoulli score must vanish at log 100, got {}",
+            grad_star[0]
+        );
+        // At the *unweighted* mode η = 0 the weighted score is 100 − 101·0.5 =
+        // 49.5 ≫ 0: the unit-weight reconstruction targets the wrong posterior.
+        let (_, grad_zero) = super::logit_logp_and_grad(&data, &array![0.0, 0.0]);
+        assert!(
+            (grad_zero[0] - 49.5).abs() < 1e-9,
+            "unit-weight point must carry a large positive weighted score, got {}",
+            grad_zero[0]
+        );
+    }
+
     #[test]
     fn link_wiggle_posterior_whitening_uses_supplied_explicit_joint_hessian() {
         let x = array![[1.0], [1.0], [1.0]];

@@ -120,7 +120,12 @@ fn outer_criterion_prices_block_relevance_2231() {
         0.04,
         1.0e-6,
         1.0e-6,
-    );
+    )
+    // #2231 Inc-B — engage block-relevance pricing (anchor p_x = 4, one output
+    // block p_1 = 4). Without this the objective carries the coordinate but never
+    // prices it, and the pins below are the honest RED signal.
+    .with_crosscoder_blocks(4, vec![4])
+    .expect("crosscoder block pricing must install (p_x + Σ block_dims == p̃)");
 
     let flat_at = |log_lambda: f64| -> Array1<f64> {
         let mut flat = rho_template.to_flat();
@@ -178,7 +183,12 @@ fn block_relevance_has_interior_stationary_minimum_2231() {
         0.04,
         1.0e-6,
         1.0e-6,
-    );
+    )
+    // #2231 Inc-B — engage block-relevance pricing (anchor p_x = 4, one output
+    // block p_1 = 4). Without this the objective carries the coordinate but never
+    // prices it, and the pins below are the honest RED signal.
+    .with_crosscoder_blocks(4, vec![4])
+    .expect("crosscoder block pricing must install (p_x + Σ block_dims == p̃)");
     let cost_at = |objective: &mut SaeManifoldOuterObjective, ll: f64| -> f64 {
         let mut flat = rho_template.to_flat();
         let last = flat.len() - 1;

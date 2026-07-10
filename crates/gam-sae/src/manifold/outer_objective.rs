@@ -714,6 +714,33 @@ enum ProbeInnerDrive {
     ForcedLineSearchProbe { eta: Option<f64> },
 }
 
+/// #2231 Inc-B (stage 1) — crosscoder block-relevance PRICING state.
+///
+/// When present, the outer objective prices the per-block relevance coordinates
+/// `log λ_ℓ` (`SaeManifoldRho::log_lambda_block`): every eval lane rescales the
+/// stacked target's output-block columns by `√λ_ℓ` at ρ-materialization, and the
+/// criterion carries the change-of-variables Jacobian `−Σ_ℓ (n·p_ℓ/2)·log λ_ℓ`.
+///
+/// INVARIANT: the stacked target handed to [`SaeManifoldOuterObjective::new`] is
+/// the UNSCALED augmented target (all `λ_ℓ = 1`); this state owns every `√λ_ℓ`
+/// scaling thereafter, always rewriting a moved block FROM `pristine_blocks`
+/// (never multiplicatively), so thousands of evals cannot drift.
+struct CrosscoderBlockPricing {
+    /// Anchor width `p_x` — the leading `[0, p_x)` target columns, never scaled.
+    p_x: usize,
+    /// Per-output-block widths `p_ℓ`, length `L-1`, in stacked-column order and
+    /// matching the ρ template's `log_lambda_block`.
+    block_dims: Vec<usize>,
+    /// PRISTINE (unscaled, `λ_ℓ = 1`) copy of the non-anchor target columns
+    /// `[p_x, p̃)` — the drift-free source every `apply_block_scaling` rewrite
+    /// reads from. Block `ℓ` occupies `[Σ_{m<ℓ} p_m, Σ_{m<ℓ} p_m + p_ℓ)` here.
+    pristine_blocks: Array2<f64>,
+    /// Last-applied per-block `log λ_ℓ` (length `L-1`). Seeded to `0` (`λ = 1`,
+    /// the as-handed target), so `apply_block_scaling` rewrites a block only when
+    /// its ρ `log λ` moves off the currently materialized value.
+    last_log_lambda: Vec<f64>,
+}
+
 pub struct SaeManifoldOuterObjective {
     pub(crate) term: SaeManifoldTerm,
     /// Pristine term to restore from on `reset` (multi-start baseline).
@@ -801,6 +828,11 @@ pub struct SaeManifoldOuterObjective {
     /// survival, not cross-fit caching — `persistent_warm_start` covers that).
     pub(crate) checkpoint_fingerprint: super::checkpoint::SaeCheckpointFingerprint,
     pub(crate) checkpoint_path: std::path::PathBuf,
+    /// #2231 Inc-B (stage 1) — optional crosscoder block-relevance pricing. `None`
+    /// for a plain SAE, in which case `apply_block_scaling`/`block_jacobian` both
+    /// early-return and every lane is byte-identical to the historical path.
+    /// Installed by [`Self::with_crosscoder_blocks`].
+    crosscoder_blocks: Option<CrosscoderBlockPricing>,
 }
 
 /// #2230/#2087 basin-bundle sizing, derived from problem structure (no tuning).
@@ -912,7 +944,155 @@ impl SaeManifoldOuterObjective {
             termination: OuterTerminationLedger::new(),
             checkpoint_fingerprint,
             checkpoint_path,
+            crosscoder_blocks: None,
         }
+    }
+
+    /// #2231 Inc-B (stage 1) — enable crosscoder block-relevance PRICING.
+    ///
+    /// `p_x` is the anchor width (leading `[0, p_x)` target columns, never
+    /// scaled); `block_dims` are the `L-1` output-block widths in stacked-column
+    /// order. Snapshots a PRISTINE (unscaled) copy of the non-anchor columns
+    /// `[p_x, p̃)` — the drift-free source every `apply_block_scaling` reads —
+    /// and seeds the last-applied `log λ_ℓ` to `0` (`λ = 1`, matching the target
+    /// as handed in per the [`CrosscoderBlockPricing`] invariant).
+    ///
+    /// Validation (typed `String` error):
+    /// - `p_x + Σ block_dims == target.ncols()` (the stacked augmented width);
+    /// - `block_dims.len() == baseline_rho.log_lambda_block.len()` (the ρ
+    ///   template's block coordinate count);
+    /// - the outer row-subsample (`row_loss_weights`, #991 designed subsample)
+    ///   must NOT be engaged: the pristine block copy would have to be restricted
+    ///   to the sampled rows and the Jacobian's `n` reduced to the effective
+    ///   sample size — deferred to a later stage, so refuse loudly here rather
+    ///   than price on a full-`N` pristine copy that desyncs from a subsampled
+    ///   fit target.
+    ///
+    /// A plain SAE never calls this (leaving `crosscoder_blocks == None`), so an
+    /// empty `block_dims` is rejected — it would carry no coordinates to price.
+    pub fn with_crosscoder_blocks(
+        mut self,
+        p_x: usize,
+        block_dims: Vec<usize>,
+    ) -> Result<Self, String> {
+        if p_x == 0 {
+            return Err("with_crosscoder_blocks: anchor width p_x must be non-zero".to_string());
+        }
+        if block_dims.is_empty() {
+            return Err(
+                "with_crosscoder_blocks: block_dims is empty — a plain SAE must not install \
+                 crosscoder pricing (leave crosscoder_blocks = None)"
+                    .to_string(),
+            );
+        }
+        let block_total: usize = block_dims.iter().sum();
+        let p_tot = self.target.ncols();
+        if p_x + block_total != p_tot {
+            return Err(format!(
+                "with_crosscoder_blocks: p_x ({p_x}) + Σ block_dims ({block_total}) = {} \
+                 must equal the stacked target width p̃ = {p_tot}",
+                p_x + block_total
+            ));
+        }
+        let template_blocks = self.baseline_rho.log_lambda_block.len();
+        if block_dims.len() != template_blocks {
+            return Err(format!(
+                "with_crosscoder_blocks: block_dims length ({}) must match the ρ template's \
+                 log_lambda_block count ({template_blocks})",
+                block_dims.len()
+            ));
+        }
+        if self.term.row_loss_weights.is_some() {
+            return Err(
+                "with_crosscoder_blocks: the outer row-subsample (row_loss_weights, #991) is \
+                 engaged; block pricing needs the pristine copy restricted to the sampled rows \
+                 and the Jacobian n set to the effective sample size — deferred (stage 1)"
+                    .to_string(),
+            );
+        }
+        let pristine_blocks = self.target.slice(s![.., p_x..]).to_owned();
+        self.crosscoder_blocks = Some(CrosscoderBlockPricing {
+            p_x,
+            last_log_lambda: vec![0.0; block_dims.len()],
+            block_dims,
+            pristine_blocks,
+        });
+        Ok(self)
+    }
+
+    /// #2231 Inc-B (stage 1) — rewrite the stacked target's output-block columns
+    /// to `√λ_ℓ · Y_ℓ` for the ρ under evaluation, reading each moved block FROM
+    /// `pristine_blocks` (idempotent, drift-free). A block is rewritten only when
+    /// its `log λ_ℓ` differs from the last materialized value, so a re-evaluation
+    /// at the same ρ is a no-op. NO-OP entirely when crosscoder pricing is off
+    /// (plain SAE byte-identity). Called at the ρ-materialization point of every
+    /// `&mut self` eval lane so no inner solve ever reads a stale-scaled target.
+    fn apply_block_scaling(&mut self, rho: &SaeManifoldRho) {
+        // Disjoint field borrows: the pricing state and the target are rewritten
+        // together, so destructure `self` rather than route through a `self`
+        // method that would alias both.
+        let Self {
+            target,
+            crosscoder_blocks: Some(blocks),
+            ..
+        } = self
+        else {
+            return;
+        };
+        // The builder pinned `block_dims.len() == log_lambda_block.len()`; guard
+        // defensively so a mismatched ρ can never scale a wrong column range.
+        if rho.log_lambda_block.len() != blocks.block_dims.len() {
+            return;
+        }
+        let mut pristine_off = 0usize;
+        for l in 0..blocks.block_dims.len() {
+            let p_l = blocks.block_dims[l];
+            let new_ll = rho.log_lambda_block[l];
+            if new_ll != blocks.last_log_lambda[l] {
+                let sqrt_lambda = (0.5 * new_ll).exp();
+                let target_off = blocks.p_x + pristine_off;
+                for j in 0..p_l {
+                    let src = blocks.pristine_blocks.column(pristine_off + j);
+                    let mut dst = target.column_mut(target_off + j);
+                    dst.assign(&src);
+                    dst *= sqrt_lambda;
+                }
+                blocks.last_log_lambda[l] = new_ll;
+            }
+            pristine_off += p_l;
+        }
+    }
+
+    /// #2231 Inc-B (stage 1) — the block-relevance change-of-variables Jacobian
+    /// added to every eval lane's final cost BEFORE `termination.record`.
+    ///
+    /// Derivation: the outer criterion is the UNIT-dispersion penalized Laplace
+    /// form (`#F1` — no `φ̂` factor; `loss.data_fit` is the raw half-SSE of the
+    /// fit to the stacked target). Scaling output block `ℓ`'s target columns by
+    /// `√λ_ℓ` is a change of variables `Y_ℓ ↦ √λ_ℓ·Y_ℓ` over `n·p_ℓ` entries;
+    /// its log-Jacobian contributes `−(n·p_ℓ/2)·log λ_ℓ` to the criterion (the
+    /// `√λ_ℓ = exp(½ log λ_ℓ)` per entry, `n·p_ℓ` entries). Summed over the
+    /// `L-1` output blocks,
+    ///
+    ///     block_jacobian(ρ) = −Σ_ℓ (n·p_ℓ/2)·log λ_ℓ.
+    ///
+    /// With the scaled-block residual `R_ℓ` flowing through the half-SSE data
+    /// term, `∂C/∂log λ_ℓ = ½·λ_ℓ·R_ℓ − n·p_ℓ/2`, stationary at
+    /// `λ_ℓ = n·p_ℓ/R_ℓ` and coercive at both ends (`λ→0` the Jacobian wall
+    /// `+∞`, `λ→∞` the scaled residual `+∞`) — the interior minimum the Inc-B
+    /// contract pins assert. Returns `0` when crosscoder pricing is off (plain
+    /// SAE byte-identity).
+    fn block_jacobian(&self, rho: &SaeManifoldRho) -> f64 {
+        let Some(blocks) = self.crosscoder_blocks.as_ref() else {
+            return 0.0;
+        };
+        let n = self.target.nrows() as f64;
+        blocks
+            .block_dims
+            .iter()
+            .zip(rho.log_lambda_block.iter())
+            .map(|(&p_l, &log_lambda)| -(n * p_l as f64 / 2.0) * log_lambda)
+            .sum()
     }
 
     /// SPEC wall-survival: bank a resumable checkpoint at a MATERIAL improvement
@@ -2248,6 +2428,11 @@ impl SaeManifoldOuterObjective {
         basin_installed: bool,
     ) -> Result<(f64, Array1<f64>), String> {
         let rho = self.baseline_rho.from_flat(rho_flat);
+        // #2231 Inc-B — materialize the block-relevance target scaling for THIS ρ
+        // before any inner solve reads `self.target`. Every value/refine/member/
+        // discovery lane funnels through this one drive, so a single idempotent
+        // rewrite keeps them all coherent (no-op for a plain SAE).
+        self.apply_block_scaling(&rho);
         // #2080 (a) — install the last value probe's converged inner state when
         // this evaluation re-visits the exact same ρ (the line-search accept
         // pattern). The state IS the inner KKT optimum this solve would converge
@@ -2851,6 +3036,9 @@ impl SaeManifoldOuterObjective {
         // saved envelope basins are keyed to the pre-step accepted basin.
         self.basin_bundle.clear();
         let rho = self.baseline_rho.from_flat(rho_flat);
+        // #2231 Inc-B — scale the block columns for this ρ before the EFS inner
+        // solve reads `self.target` (idempotent; no-op for a plain SAE).
+        self.apply_block_scaling(&rho);
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
         {
@@ -3313,6 +3501,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
             },
         ) {
             Ok((cost, _beta)) => {
+                // #2231 Inc-B — price the block-relevance Jacobian into the SAME
+                // cost that flows to `termination.record` (0 for a plain SAE).
+                let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
                 if self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }
@@ -3342,6 +3533,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             return Err(EstimationError::RemlOptimizationFailed(defect));
         }
         let rho_state = self.baseline_rho.from_flat(rho.view());
+        // #2231 Inc-B — scale the block columns for this ρ before either the
+        // streaming value path or the dense `reml_criterion_with_cache` below
+        // reads `self.target` (idempotent; no-op for a plain SAE).
+        self.apply_block_scaling(&rho_state);
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
         // cache does not exist, so the analytic gradient lane below
         // (`reml_criterion_with_cache` → `outer_gradient_arrow_solver`) cannot run
@@ -3378,6 +3573,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 }
                 Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
             };
+            // #2231 Inc-B — price the block Jacobian into the streaming-lane cost
+            // (0 for a plain SAE), so the recorded and returned value agree.
+            let cost = cost + self.block_jacobian(&rho_state);
             if self.termination.record(cost) {
                 self.bank_checkpoint(rho);
             }
@@ -3519,6 +3717,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let cost = self
             .add_fit_data_collapse_penalty(cost, &rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
+        // #2231 Inc-B — price the block Jacobian into the gradient lane's cost so
+        // the value it records matches the value/ranking/EFS lanes (0 for a plain
+        // SAE). STAGE 1 is pricing only: the analytic block-coordinate gradient
+        // is deferred to stage 2, so `gradient`'s appended entries are not yet the
+        // exact `∂C/∂log λ_ℓ` — the block coordinate is driven by the value/EFS
+        // lanes until then.
+        let cost = cost + self.block_jacobian(&rho_state);
         // The gradient is the EXACT implicit derivative: `outer_gradient_arrow_
         // solver` solves the implicit-function system through the rank-revealing
         // gauge/decoder-null deflation (Rayleigh-band + Faddeev–Popov stiffness),
@@ -3623,6 +3828,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         }
                         Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                     };
+                // #2231 Inc-B — price the block Jacobian into the line-search
+                // probe cost (0 for a plain SAE) so the value the outer search
+                // ranks matches the gradient/EFS lanes.
+                let cost =
+                    cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
                 if self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }
@@ -3647,9 +3857,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
         if let Some(defect) = self.termination.stationarity_defect() {
             return Err(EstimationError::RemlOptimizationFailed(defect));
         }
-        let eval = self
+        let mut eval = self
             .efs_step(rho.view())
             .map_err(EstimationError::RemlOptimizationFailed)?;
+        // #2231 Inc-B — price the block Jacobian into the EFS cost (0 for a plain
+        // SAE) so the value recorded and returned matches the value/gradient
+        // lanes. STAGE 1: the EFS fixed-point coordinate for `log λ_ℓ` is stage 2;
+        // here the block λ is carried by the outer descent, not moved by EFS.
+        eval.cost += self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
         if self.termination.record(eval.cost) {
             self.bank_checkpoint(rho);
         }
@@ -3778,6 +3993,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             return None;
         }
         let rho_state = self.baseline_rho.from_flat(rho.view());
+        // #2231 Inc-B — the curvature-homotopy seed entry solves against
+        // `self.target`; scale its block columns for this ρ too so the seed is
+        // built on the coherently scaled target (idempotent; no-op for a plain
+        // SAE, and at the seed ρ typically λ_ℓ = 1 so a true no-op).
+        self.apply_block_scaling(&rho_state);
         Some(
             self.run_curvature_homotopy_entry_at_rho(&rho_state)
                 .map_err(EstimationError::RemlOptimizationFailed),
