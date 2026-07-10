@@ -76,6 +76,10 @@ pub enum NullKind {
     /// Permute token rows, preserving the activation cloud and column marginals
     /// while destroying row-order structure.
     TokenShuffle,
+    /// Draw independent Gaussian principal-component scores with the same mean
+    /// and variance in every supplied PC column, preserving the eigenspectrum
+    /// while destroying cyclic/non-Gaussian structure.
+    MatchedSpectrumGaussian,
     /// Use separately supplied random-weight activations from the same
     /// architecture, moment-matched to the observed matrix shape.
     ArchitectureMatchedRandomWeight,
@@ -87,6 +91,7 @@ impl NullKind {
             Self::PhaseRandomized => "phase_randomized",
             Self::RandomRotation => "random_rotation",
             Self::TokenShuffle => "token_shuffle",
+            Self::MatchedSpectrumGaussian => "matched_spectrum_gaussian",
             Self::ArchitectureMatchedRandomWeight => "architecture_matched_random_weight",
         }
     }
@@ -110,6 +115,7 @@ impl NullBatteryConfig {
                 NullKind::PhaseRandomized,
                 NullKind::RandomRotation,
                 NullKind::TokenShuffle,
+                NullKind::MatchedSpectrumGaussian,
                 NullKind::ArchitectureMatchedRandomWeight,
             ],
             tail: Tail::Larger,
@@ -324,7 +330,9 @@ pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
     for summary in &report.summaries {
         if matches!(
             summary.kind,
-            NullKind::PhaseRandomized | NullKind::ArchitectureMatchedRandomWeight
+            NullKind::PhaseRandomized
+                | NullKind::MatchedSpectrumGaussian
+                | NullKind::ArchitectureMatchedRandomWeight
         ) {
             selected.push(summary.p_value);
         }
@@ -340,7 +348,9 @@ pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
     for summary in &report.summaries {
         if matches!(
             summary.kind,
-            NullKind::PhaseRandomized | NullKind::ArchitectureMatchedRandomWeight
+            NullKind::PhaseRandomized
+                | NullKind::MatchedSpectrumGaussian
+                | NullKind::ArchitectureMatchedRandomWeight
         ) {
             selected.push(summary.z);
         }
@@ -382,6 +392,9 @@ where
                 NullKind::PhaseRandomized => phase_randomized_surrogate(data, rep_seed)?,
                 NullKind::RandomRotation => random_rotation_null(data, rep_seed)?,
                 NullKind::TokenShuffle => token_shuffle_null(data, rep_seed)?,
+                NullKind::MatchedSpectrumGaussian => {
+                    matched_spectrum_gaussian_null(data, rep_seed)?
+                }
                 NullKind::ArchitectureMatchedRandomWeight => {
                     let Some(rw) = random_weight else {
                         return Err(
@@ -469,6 +482,31 @@ pub fn token_shuffle_null(data: ArrayView2<'_, f64>, seed: u64) -> Result<Array2
     let mut out = Array2::<f64>::zeros(data.raw_dim());
     for (dst, &src) in order.iter().enumerate() {
         out.row_mut(dst).assign(&data.row(src));
+    }
+    Ok(out)
+}
+
+/// Gaussian matched-spectrum null for a matrix already expressed in principal-
+/// component coordinates.
+///
+/// Each output PC column is an independent normal draw with the observed
+/// column's mean and sample standard deviation. Consequently the per-PC
+/// eigenspectrum is preserved while cyclic ordering, higher moments, and
+/// cross-row manifold structure are destroyed. The explicit PC-coordinate
+/// contract avoids a hidden eigen-decomposition or a Python-side reimplementation.
+pub fn matched_spectrum_gaussian_null(
+    pc_scores: ArrayView2<'_, f64>,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    validate_matrix(pc_scores, "matched-spectrum PC scores")?;
+    let mean = column_mean(pc_scores);
+    let sd = column_sd(pc_scores, mean.view());
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f64>::zeros(pc_scores.raw_dim());
+    for row in 0..out.nrows() {
+        for pc in 0..out.ncols() {
+            out[[row, pc]] = mean[pc] + sd[pc] * standard_normal(&mut rng);
+        }
     }
     Ok(out)
 }
@@ -1346,6 +1384,7 @@ fn kind_seed(kind: NullKind) -> u64 {
         NullKind::PhaseRandomized => 0x91E4_11CE,
         NullKind::RandomRotation => 0x807A_7100,
         NullKind::TokenShuffle => 0x70CE_514F,
+        NullKind::MatchedSpectrumGaussian => 0x5EEC_7A11,
         NullKind::ArchitectureMatchedRandomWeight => 0xA2C4_177E,
     }
 }

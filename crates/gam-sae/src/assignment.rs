@@ -969,14 +969,10 @@ impl SaeAssignment {
         row: usize,
         rho: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
-        self.try_assignments_row_with_alpha(row, self.resolved_ibp_alpha(rho))
+        self.try_assignments_row(row)
     }
 
-    fn try_assignments_row_with_alpha(
-        &self,
-        row: usize,
-        resolved_ibp_alpha: Option<f64>,
-    ) -> Result<Array1<f64>, String> {
+    fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
         // #1033 — read the ACTIVE routing logits: the ρ-invariant frozen/predicted
         // logits when routing is frozen, else the free `self.logits`. This single
         // source makes the gate value ρ-invariant under frozen routing (the
@@ -994,9 +990,7 @@ impl SaeAssignment {
         }
         let mut row_gates = match self.mode {
             AssignmentMode::Softmax { temperature, .. } => softmax_row(routing, temperature),
-            AssignmentMode::IBPMap {
-                temperature, alpha, ..
-            } => ibp_map_row(routing, temperature, resolved_ibp_alpha.unwrap_or(alpha)),
+            AssignmentMode::IBPMap { temperature, .. } => ibp_map_row(routing, temperature),
             AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
@@ -1032,19 +1026,18 @@ impl SaeAssignment {
         rho: &SaeManifoldRho,
         out: &mut [f64],
     ) -> Result<(), String> {
-        self.try_assignments_row_with_alpha_into(row, self.resolved_ibp_alpha(rho), out)
+        self.try_assignments_row_into(row, out)
     }
 
-    /// #1557 — fill-into-caller-buffer twin of [`Self::try_assignments_row_with_alpha`].
+    /// #1557 — fill-into-caller-buffer twin of [`Self::try_assignments_row`].
     ///
     /// `out` must have length `k_atoms()`; it is fully overwritten with the same
     /// values the allocating variant would return. Every branch (early-return
     /// K==1 Softmax, the per-mode row math, the #1026 ungated overwrite) mirrors
     /// the allocating path exactly so the two are bit-identical.
-    pub(crate) fn try_assignments_row_with_alpha_into(
+    pub(crate) fn try_assignments_row_into(
         &self,
         row: usize,
-        resolved_ibp_alpha: Option<f64>,
         out: &mut [f64],
     ) -> Result<(), String> {
         // `out` is sized `k_atoms()` by every caller; the per-mode helpers below
@@ -1061,14 +1054,9 @@ impl SaeAssignment {
             AssignmentMode::Softmax { temperature, .. } => {
                 softmax_row_into(routing, temperature, out)
             }
-            AssignmentMode::IBPMap {
-                temperature, alpha, ..
-            } => ibp_map_row_into(
-                routing,
-                temperature,
-                resolved_ibp_alpha.unwrap_or(alpha),
-                out,
-            ),
+            AssignmentMode::IBPMap { temperature, .. } => {
+                ibp_map_row_into(routing, temperature, out)
+            }
             AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
@@ -1187,9 +1175,9 @@ impl SaeAssignment {
 pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Array1<f64> {
     match mode {
         AssignmentMode::Softmax { .. } => Array1::from_elem(k_atoms, 1.0 / (k_atoms.max(1) as f64)),
-        AssignmentMode::IBPMap {
-            temperature, alpha, ..
-        } => ibp_map_row(Array1::<f64>::zeros(k_atoms).view(), temperature, alpha),
+        AssignmentMode::IBPMap { temperature, .. } => {
+            ibp_map_row(Array1::<f64>::zeros(k_atoms).view(), temperature)
+        }
         AssignmentMode::ThresholdGate { .. } => Array1::from_elem(k_atoms, 0.5),
         // At all-equal (zero) logits the deterministic tie-break admits the
         // FIRST k atoms — the neutral support under index-stable ordering.
@@ -1501,40 +1489,40 @@ pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_s
     theta.exp()
 }
 
-/// IBP-MAP row activations: per-atom sigmoid likelihood times the truncated
-/// stick-breaking prior mean `π_k = (α/(α+1))^{k+1}`. With tied logits the prior
-/// dominates and yields strictly decreasing activations in atom index, with the
-/// first atom already shrunk by one Beta(α,1) stick mean (no unshrunk base atom).
-pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) -> Array1<f64> {
-    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
+/// Posterior-mean Bernoulli activations for the IBP assignment model.
+///
+/// Ordered shrinkage belongs to the Beta--Bernoulli prior scored by
+/// [`IBPAssignmentPenalty`], not as a second multiplicative factor on the final
+/// reconstruction. Multiplying by the prior mean capped atom `k` at `mu_k < 1`
+/// even when its posterior inclusion probability was one, double-counted the
+/// prior, and made the fitted function depend on atom index. The concrete
+/// posterior mean is therefore simply `sigmoid(logit_k / temperature)`.
+pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
-        out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature) * prior[i];
+        out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
     }
     out
 }
 
 /// IBP-MAP activations together with the diagonal Jacobian `∂z_k/∂l_k`,
 /// shared with the torch autograd `Function` so the Python IBP-Gumbel path
-/// applies the same stick-breaking prior mean `π_k = (α/(α+1))^{k+1}` and
-/// temperature scaling as the Rust closed form. With `z_k = σ(l_k/τ)·π_k` the
-/// per-atom derivative is
-/// `σ(l_k/τ)(1 − σ(l_k/τ))·π_k / τ`; the map is diagonal in `k`, so the
+/// applies the same posterior-mean gate and temperature scaling as the Rust
+/// closed form. With `z_k = σ(l_k/τ)` the per-atom derivative is
+/// `σ(l_k/τ)(1 − σ(l_k/τ)) / τ`; the map is diagonal in `k`, so the
 /// Jacobian is returned as the per-atom diagonal vector.
 #[must_use]
 pub fn ibp_map_row_value_grad(
     logits: ArrayView1<'_, f64>,
     temperature: f64,
-    alpha: f64,
 ) -> (Array1<f64>, Array1<f64>) {
-    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
     let inv_tau = 1.0 / temperature;
     let mut value = Array1::<f64>::zeros(logits.len());
     let mut grad = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         let sig = gam_linalg::utils::stable_logistic(logits[i] * inv_tau);
-        value[i] = sig * prior[i];
-        grad[i] = sig * (1.0 - sig) * inv_tau * prior[i];
+        value[i] = sig;
+        grad[i] = sig * (1.0 - sig) * inv_tau;
     }
     (value, grad)
 }
@@ -1547,18 +1535,16 @@ pub fn ibp_map_row_value_grad(
 pub fn ibp_map_batch_value_grad(
     logits: ArrayView2<'_, f64>,
     temperature: f64,
-    alpha: f64,
 ) -> (Array2<f64>, Array2<f64>) {
     let (n, k) = logits.dim();
-    let prior = ordered_geometric_shrinkage_prior(k, alpha);
     let inv_tau = 1.0 / temperature;
     let mut value = Array2::<f64>::zeros((n, k));
     let mut grad = Array2::<f64>::zeros((n, k));
     for i in 0..n {
         for j in 0..k {
             let sig = gam_linalg::utils::stable_logistic(logits[[i, j]] * inv_tau);
-            value[[i, j]] = sig * prior[j];
-            grad[[i, j]] = sig * (1.0 - sig) * inv_tau * prior[j];
+            value[[i, j]] = sig;
+            grad[[i, j]] = sig * (1.0 - sig) * inv_tau;
         }
     }
     (value, grad)
@@ -1614,7 +1600,7 @@ pub fn activation_matrix_from_logits(
         validate_finite_logits(row_logits, row)?;
         let activation = match kind {
             "softmax" => softmax_row(row_logits, temperature),
-            "ibp_map" => ibp_map_row(row_logits, temperature, alpha),
+            "ibp_map" => ibp_map_row(row_logits, temperature),
             "threshold_gate" => jumprelu_row(row_logits, temperature, threshold),
             other => {
                 return Err(format!(
@@ -1841,17 +1827,16 @@ mod ibp_map_batch_tests {
         let n = 5usize;
         let k = 7usize;
         let temperature = 0.41_f64;
-        let alpha = 2.5_f64;
         let logits = Array2::from_shape_fn((n, k), |(i, j)| {
             ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
         });
 
-        let (value, grad) = ibp_map_batch_value_grad(logits.view(), temperature, alpha);
+        let (value, grad) = ibp_map_batch_value_grad(logits.view(), temperature);
         assert_eq!(value.dim(), (n, k));
         assert_eq!(grad.dim(), (n, k));
 
         for i in 0..n {
-            let (rv, rg) = ibp_map_row_value_grad(logits.row(i), temperature, alpha);
+            let (rv, rg) = ibp_map_row_value_grad(logits.row(i), temperature);
             for j in 0..k {
                 assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
                 assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
@@ -2042,12 +2027,10 @@ pub(crate) fn softmax_row_into(logits: ArrayView1<'_, f64>, temperature: f64, ou
 pub(crate) fn ibp_map_row_into(
     logits: ArrayView1<'_, f64>,
     temperature: f64,
-    alpha: f64,
     out: &mut [f64],
 ) {
-    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
     for i in 0..logits.len() {
-        out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature) * prior[i];
+        out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
     }
 }
 
