@@ -308,9 +308,13 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
             let eval = obj
                 .eval(&flat_at(ll))
                 .expect("the ValueAndGradient lane must evaluate");
+            let cost_only_at_ll = engaged_objective(&evaluator, &z, &coords)
+                .eval_cost(&flat_at(ll))
+                .expect("cost lane at ll");
             eprintln!(
-                "[fd2231] ll={ll:.3} eval cost={:.6e} telemetry={:?}",
+                "[fd2231] ll={ll:.3} eval cost={:.6e} cost_only={:.6e} telemetry={:?}",
                 eval.cost,
+                cost_only_at_ll,
                 obj.probe_telemetry()
             );
             eval.gradient[eval.gradient.len() - 1]
