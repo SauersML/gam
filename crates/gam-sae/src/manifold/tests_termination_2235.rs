@@ -111,7 +111,7 @@ fn unbudgeted_fit_terminates_bounded_never_hangs() {
         crate::assignment::AssignmentMode::softmax(1.0),
     );
     let n_params = seed.len();
-    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(8)
         .with_seed_config(gam_problem::SeedConfig {
@@ -121,12 +121,15 @@ fn unbudgeted_fit_terminates_bounded_never_hangs() {
         })
         .run(&mut objective, "SAE manifold")
         .expect("the healthy planted-circle fit must converge through the bridge");
-    // #2235/#2241 — a certified engine conclusion always names WHICH
-    // certificate concluded it (gradient-stationary / criterion-flat /
-    // recurrent-incumbent); `certify_outer_optimality` stamps it on every
-    // converged result.
-    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params);
-    drop(result);
+    // #2235/#2241 — a certified conclusion always names WHICH certificate
+    // concluded it (gradient-stationary / criterion-flat / recurrent-
+    // incumbent); `certify_outer_optimality` stamps it on every converged
+    // result the engine returns.
+    assert!(result.converged, "run() only returns certified results");
+    assert!(
+        result.converged_via.is_some(),
+        "a converged OuterResult must carry its converged-via certificate verdict"
+    );
     let fitted = objective.into_fitted();
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     eprintln!(
