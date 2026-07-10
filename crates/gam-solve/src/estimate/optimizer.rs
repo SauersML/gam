@@ -119,6 +119,120 @@ struct NegbinJointCheckpoint {
     theta_bound: f64,
 }
 
+/// Grid-free continuous 1-D descent used by the post-convergence KKT escapes.
+/// Minimizes `eval(t)` over the displacement `t ∈ (0, t_max]` along a
+/// fixed direction from the incumbent point: a geometric bracketing expansion
+/// (step doubling from one log-λ unit, the natural resolution of the ρ
+/// parameterization) locates a descending basin at any distance without fixed
+/// probe nodes, then golden-section refinement of the bracket around the best
+/// expansion probe converges to the continuous interior minimizer — so e.g.
+/// mirror-image data orientations land on the identical optimum (#1548).
+/// Returns the refined `(t, cost)` only when some probe strictly improves on
+/// the incumbent cost `f0` by the shared relative tolerance; otherwise `None`
+/// and the search was an exact no-op.
+fn continuous_directional_descent(
+    eval: &mut dyn FnMut(f64) -> Option<f64>,
+    t_max: f64,
+    f0: f64,
+) -> Option<(f64, f64)> {
+    const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
+    if !(t_max > 0.0) || !f0.is_finite() {
+        return None;
+    }
+    // Geometric expansion: 1, 2, 4, … log-λ units, always ending exactly on
+    // `t_max` so the full feasible segment is covered scale-freely.
+    let mut probes: Vec<f64> = Vec::new();
+    let mut t = 1.0_f64.min(t_max);
+    loop {
+        probes.push(t);
+        if t >= t_max {
+            break;
+        }
+        t = (t * 2.0).min(t_max);
+    }
+    let mut best: Option<(usize, f64, f64)> = None; // (probe index, t, cost)
+    for (idx, &ti) in probes.iter().enumerate() {
+        if let Some(c) = eval(ti)
+            && c.is_finite()
+            && c < f0 - 1e-6 * (1.0 + f0.abs())
+            && best.is_none_or(|(_, _, bc)| c < bc)
+        {
+            best = Some((idx, ti, c));
+        }
+    }
+    let (best_idx, mut t_best, mut f_best) = best?;
+    // Golden-section the bracket formed by the expansion neighbours of the
+    // best probe (clamped to the feasible segment): the continuous minimum of
+    // the basin containing the best probe lies inside it, and the bracket
+    // never re-enters territory the expansion already rejected.
+    let mut a = if best_idx == 0 {
+        0.0
+    } else {
+        probes[best_idx - 1]
+    };
+    let mut b = probes.get(best_idx + 1).copied().unwrap_or(t_max);
+    let mut c = b - GS_R * (b - a);
+    let mut d = a + GS_R * (b - a);
+    let mut fc = eval(c);
+    let mut fd = eval(d);
+    for _ in 0..40 {
+        if !(b - a > 1e-4) {
+            break;
+        }
+        match (fc, fd) {
+            (Some(vc), Some(vd)) if vc <= vd => {
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - GS_R * (b - a);
+                fc = eval(c);
+            }
+            (Some(_), Some(_)) => {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + GS_R * (b - a);
+                fd = eval(d);
+            }
+            // An eval failed inside the bracket: keep the best expansion probe.
+            _ => break,
+        }
+    }
+    let xm = 0.5 * (a + b);
+    if let Some(fm) = eval(xm)
+        && fm.is_finite()
+        && fm < f_best
+    {
+        t_best = xm;
+        f_best = fm;
+    }
+    Some((t_best, f_best))
+}
+
+/// Whether the simultaneous dense covariance bundle fits the runtime resource
+/// policy's single-materialization budget. The bundle holds ~7 dense p×p f64
+/// matrices live at once (posterior `H⁻¹`, the frequentist `Ve = H⁻¹X'WXH⁻¹φ`,
+/// the influence matrix `F = H⁻¹X'WX`, the smoothing-parameter correction and
+/// their workspaces), so the gate prices `7·p²·8` bytes against the policy —
+/// a byte budget, not a fixed p cliff. Beyond the budget the fit takes the
+/// factorized solve-on-demand SE path and the chunked trace reconciliation.
+fn dense_covariance_bundle_allowed(n_design_rows: usize, p: usize) -> bool {
+    const SIMULTANEOUS_DENSE_COVARIANCE_MATRICES: usize = 7;
+    let policy = gam_runtime::resource::ResourcePolicy::for_problem(
+        n_design_rows,
+        p,
+        gam_runtime::resource::ProblemHints::default(),
+    );
+    let Some(bundle_bytes) = p
+        .checked_mul(p)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+        .and_then(|bytes| bytes.checked_mul(SIMULTANEOUS_DENSE_COVARIANCE_MATRICES))
+    else {
+        return false;
+    };
+    bundle_bytes <= policy.material_policy().max_single_dense_bytes
+}
+
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
 pub fn optimize_external_design<X>(
     y: ArrayView1<'_, f64>,
