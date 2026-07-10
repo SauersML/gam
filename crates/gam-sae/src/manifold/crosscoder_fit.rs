@@ -829,6 +829,15 @@ pub fn run_sae_crosscoder_fit(
         ));
     }
 
+    // Wide stacked layers: default every rank-shrinkable atom onto its profiled
+    // Grassmann frame BEFORE border admission — the factored border Σ M_k·r_k is
+    // p̃-independent, while the full-B border (Σ M_k·p̃)² workspace is quadratic
+    // in the stacked width and refuses at real-model widths (magic-by-default;
+    // the admission error's own remedy).
+    request
+        .base_term
+        .ensure_decoder_frames_active_for_current_decoder()
+        .map_err(SaeFitError::Fit)?;
     let initial_flat = request.initial_rho.to_flat();
     let n_params = initial_flat.len();
     let cancel = request

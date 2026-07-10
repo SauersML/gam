@@ -292,7 +292,7 @@ impl SaeManifoldTerm {
     /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
     /// via left-`B`-preconditioned GMRES ([`solve_b_preconditioned_gmres`]) with the
     /// matrix-free `A v = B v + ΔC v` apply ([`Self::apply_exact_hessian`]). The
-    /// IFT step `θ̂_ρ = −A⁻¹ g_ρ` must invert the EXACT `A`, not the surrogate `B`;
+    /// IFT step `θ̂_ρ = −A⁻¹ g_ρ` (the code contracts `−½·⟨Γ, A⁻¹ g_ρ⟩` with rhs `= +∂g/∂ρ`, i.e. `+½·Γᵀθ̂_ρ` of the response — the sign lives in the −0.5 factor) must invert the EXACT `A`, not the surrogate `B`;
     /// GMRES does not require the exact stationarity Jacobian to be SPD; it
     /// refuses non-convergence instead of returning a negative-curvature CG
     /// iterate as though it were an inverse solve.
@@ -631,7 +631,7 @@ impl SaeManifoldTerm {
                 .map_err(OuterGradientError::internal)?,
         };
         // #1418: the implicit-function correction is `−½·Γᵀ·θ̂_ρ` with
-        // `θ̂_ρ = −A⁻¹ g_ρ`, where `A = ∇²_θθ L` is the EXACT stationarity
+        // `θ̂_ρ = −A⁻¹ g_ρ` (the code contracts `−½·⟨Γ, A⁻¹ g_ρ⟩` with rhs `= +∂g/∂ρ`, i.e. `+½·Γᵀθ̂_ρ` of the response — the sign lives in the −0.5 factor), where `A = ∇²_θθ L` is the EXACT stationarity
         // Jacobian of the inner fit — data residual curvature, exact softmax
         // entropy Hessian, exact periodic ARD curvature. The matrix the `solver`
         // factors is `B` (Gauss-Newton data curvature, softmax Fisher metric,
