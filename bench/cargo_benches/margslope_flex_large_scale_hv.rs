@@ -41,8 +41,14 @@ static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
+// SAFETY: `CountingAllocator` delegates every allocation operation to `System`
+// with the original pointer/layout contract unchanged. Its only side effect is
+// updating atomics after successful allocations, which cannot affect ownership.
 unsafe impl GlobalAlloc for CountingAllocator {
+    // SAFETY: callers supply the `GlobalAlloc`-required valid layout; forwarding
+    // it unchanged to `System` preserves that contract.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is valid by this method's `GlobalAlloc` contract.
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::SeqCst) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -51,7 +57,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
         ptr
     }
 
+    // SAFETY: callers supply the `GlobalAlloc`-required valid layout; forwarding
+    // it unchanged to `System` preserves that contract.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is valid by this method's `GlobalAlloc` contract.
         let ptr = unsafe { System.alloc_zeroed(layout) };
         if !ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::SeqCst) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -60,11 +69,17 @@ unsafe impl GlobalAlloc for CountingAllocator {
         ptr
     }
 
+    // SAFETY: `ptr` and `layout` must denote a live `System` allocation by this
+    // allocator's contract, and both are forwarded unchanged.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller guarantees the matching live allocation contract.
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    // SAFETY: `ptr` and `layout` must denote a live `System` allocation and
+    // `new_size` is forwarded unchanged, exactly as required by `GlobalAlloc`.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller guarantees the matching live allocation contract.
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() && TRACK_ALLOCATIONS.load(Ordering::SeqCst) {
             ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
