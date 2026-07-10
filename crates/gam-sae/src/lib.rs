@@ -4,6 +4,7 @@ pub mod assignment_state;
 pub mod front_door;
 pub mod attention_kernel;
 pub mod atom_codes;
+pub mod atom_schema;
 pub mod basis;
 pub mod basis_gpu;
 pub mod candidate_index;

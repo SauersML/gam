@@ -197,6 +197,7 @@ pub(crate) use gam::terms::sae::manifold::{
     SPHERE_CHART_PENALTY_DIAGONAL,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,
     SphereChartEvaluator, TorusHarmonicEvaluator, build_sae_basis_evaluators,
+    sae_atom_basis_kind_from_str, sae_atom_basis_kind_name,
     sae_decoder_lsq_init, sae_duchon_atom_m, sae_em_refine_routing_seed,
     sae_euclidean_degree_for_basis_size, sae_output_energy_cluster_labels,
     sae_periodic_basis_size, sae_refine_periodic_seed_coords_by_cluster,

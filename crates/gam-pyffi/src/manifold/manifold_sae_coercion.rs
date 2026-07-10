@@ -18,31 +18,17 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
 
-/// Repair stale/degenerate periodic `n_harmonics` at ingestion (#1132/N), the
-/// shared core of the `sae_canonical_n_harmonics` pyfunction and the
-/// `from_fit_payload` builder. A periodic-family atom's basis width is
-/// `M = 2H + 1` with `H >= 1`; a stored `H <= 0` is floored to `max(1, (M-1)/2)`
-/// from the trained decoder width. Non-periodic atoms (and periodic atoms whose
-/// `H` is already positive) pass through. Callers guarantee equal-length slices.
-pub(crate) fn canonical_n_harmonics(
-    basis_kinds: &[String],
-    raw_n_harmonics: &[i64],
-    decoder_widths: &[i64],
-) -> Vec<i64> {
-    basis_kinds
-        .iter()
-        .zip(raw_n_harmonics)
-        .zip(decoder_widths)
-        .map(|((bk, &h), &width)| {
-            let kind = canon_name(bk);
-            if matches!(kind.as_str(), "periodic" | "periodic_spline" | "circle") && h <= 0 {
-                ((width - 1) / 2).max(1)
-            } else {
-                h
-            }
-        })
-        .collect()
-}
+// The pure token-canonicalization schema (basis/topology/assignment alias
+// tables, n_harmonics repair, chart periods) moved to the library
+// (`gam_sae::atom_schema`) so the CLI, Rust users, and this binding share one
+// vocabulary — issue #2236. Re-exported here so every established
+// `manifold_sae_coercion::X` path keeps resolving.
+pub(crate) use gam::terms::sae::atom_schema::{
+    basis_kind_for_topology, basis_to_topology, canon_name, canonical_assignment_kind,
+    canonical_basis_kind, canonical_n_harmonics, canonical_topology,
+    coordinate_periods_for_basis, flat_block_assignment, topologies_for_bases,
+    topology_for_bases,
+};
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector.
 /// Owned in Rust so neither the fit builder nor the gamfit SAC lift
@@ -171,112 +157,6 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
-/// Case-insensitive, `-`/`_`-interchangeable SAE name normalizer.
-pub(crate) fn canon_name(name: &str) -> String {
-    name.trim().to_ascii_lowercase().replace('-', "_")
-}
-
-/// Canonical assignment-family token for every documented public spelling.
-///
-/// This is the only assignment alias table at the Python boundary. The fit,
-/// stagewise, payload, and distilled-encoder paths all call this parser before
-/// dispatching to the core [`gam::terms::sae::assignment::AssignmentMode`]
-/// implementation, so accepted spellings and emitted tokens cannot drift.
-pub(crate) fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
-    match canon_name(kind).as_str() {
-        "softmax" => Ok("softmax"),
-        "ibp" | "ibp_map" => Ok("ibp_map"),
-        "threshold_gate" | "gated" | "jump_relu" | "jumprelu" => Ok("threshold_gate"),
-        "topk" | "top_k" => Ok("topk"),
-        _ => Err(format!(
-            "assignment={kind:?} is not a recognized assignment kind; expected one of \
-             ['gated', 'ibp', 'ibp_map', 'jump_relu', 'jumprelu', 'softmax', \
-              'threshold_gate', 'top_k', 'topk']"
-        )),
-    }
-}
-
-fn basis_alias_to_kind(normalized: &str) -> Option<&'static str> {
-    match normalized {
-        "circle" | "periodic" | "periodic_spline" => Some("periodic"),
-        "sphere" => Some("sphere"),
-        "torus" => Some("torus"),
-        "linear" | "linear_rank1" | "affine" => Some("linear"),
-        "linear_block" | "flat_block" => Some("linear_block"),
-        "euclidean" | "euclidean_patch" | "euclidean_quadratic_patch" => Some("euclidean"),
-        "duchon" => Some("duchon"),
-        "poincare" | "hyperbolic" | "poincare_patch" => Some("poincare"),
-        "cylinder" => Some("cylinder"),
-        "mobius" | "mobius_band" => Some("mobius"),
-        "auto" => Some("auto"),
-        _ => None,
-    }
-}
-
-/// Canonical basis kind for a documented topology/basis spelling. Unknown
-/// precomputed kinds are normalized (trim/lower/dash-to-underscore), matching
-/// the fit parser's established treatment of an explicit basis string.
-pub(crate) fn canonical_basis_kind(name: &str) -> String {
-    let normalized = canon_name(name);
-    basis_alias_to_kind(&normalized).map_or(normalized, str::to_string)
-}
-
-/// Resolve a topology spelling to its basis kind while preserving an unknown
-/// caller-supplied precomputed name verbatim.
-pub(crate) fn basis_kind_for_topology(name: &str) -> String {
-    let normalized = canon_name(name);
-    basis_alias_to_kind(&normalized).map_or_else(|| name.to_string(), str::to_string)
-}
-
-/// Canonical topology label for a (possibly aliased) basis kind, falling back
-/// to the original (un-normalized) basis string for an unknown precomputed kind.
-pub(crate) fn basis_to_topology(basis: &str) -> String {
-    match canon_name(basis).as_str() {
-        "periodic" | "periodic_spline" | "circle" => "circle".to_string(),
-        "sphere" => "sphere".to_string(),
-        "torus" => "torus".to_string(),
-        "linear" | "linear_rank1" | "affine" => "linear".to_string(),
-        "linear_block" | "flat_block" => "linear_block".to_string(),
-        "duchon" | "euclidean" | "euclidean_patch" | "euclidean_quadratic_patch" => {
-            "euclidean".to_string()
-        }
-        "poincare" | "hyperbolic" | "poincare_patch" => "poincare".to_string(),
-        "cylinder" => "cylinder".to_string(),
-        "mobius" | "mobius_band" => "mobius".to_string(),
-        "auto" => "auto".to_string(),
-        // Unknown -> the original basis string verbatim.
-        _ => basis.to_string(),
-    }
-}
-
-/// Canonical topology for a topology or basis spelling. Unknown precomputed
-/// names are normalized because this is a canonicalizer, not a round-trip
-/// label conversion.
-pub(crate) fn canonical_topology(name: &str) -> String {
-    basis_to_topology(&canonical_basis_kind(name))
-}
-
-/// Structural coordinate periods for a fitted basis. `None` marks an open
-/// axis; finite values are the chart's exact wrap period.
-fn coordinate_periods_for_basis(
-    basis: &str,
-    latent_dim: usize,
-) -> Result<Vec<Option<f64>>, String> {
-    let kind = canonical_basis_kind(basis);
-    match kind.as_str() {
-        "periodic" | "torus" => Ok(vec![Some(1.0); latent_dim]),
-        "cylinder" if latent_dim == 2 => Ok(vec![Some(1.0), None]),
-        "sphere" if latent_dim == 2 => Ok(vec![None, Some(std::f64::consts::TAU)]),
-        // The Möbius chart is represented on its double cover: angle period 2,
-        // open width axis. Deck invariance lives in the basis parity.
-        "mobius" if latent_dim == 2 => Ok(vec![Some(2.0), None]),
-        "cylinder" | "sphere" | "mobius" => Err(format!(
-            "{kind} atoms require latent dimension 2; got {latent_dim}"
-        )),
-        _ => Ok(vec![None; latent_dim]),
-    }
-}
-
 /// Python bridge for the complete dictionary's structural chart periods.
 #[pyfunction]
 pub(crate) fn sae_coordinate_periods(
@@ -296,18 +176,6 @@ pub(crate) fn sae_coordinate_periods(
         .map(|(basis, dim)| coordinate_periods_for_basis(basis, dim))
         .collect::<Result<Vec<_>, _>>()
         .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
-/// Assignment family implied by the public flat-block gating vocabulary.
-pub(crate) fn flat_block_assignment(gating: &str) -> Result<&'static str, String> {
-    match canon_name(gating).as_str() {
-        "norm_selection" | "norm" => Ok("ibp_map"),
-        "separate_gate" | "separate" => Ok("threshold_gate"),
-        _ => Err(format!(
-            "flat_block gating={gating:?} is not recognized; expected one of \
-             ['norm', 'norm_selection', 'separate', 'separate_gate']"
-        )),
-    }
 }
 
 /// Python bridge for [`canonical_assignment_kind`].
@@ -436,23 +304,6 @@ pub(crate) fn sae_activation_matrix_from_logits<'py>(
     )
     .map(|values| values.into_pyarray(py).unbind())
     .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
-/// Per-atom topology labels for a resolved bases list (`basis_specs` order).
-pub(crate) fn topologies_for_bases(bases: &[String]) -> Vec<String> {
-    bases.iter().map(|b| basis_to_topology(b)).collect()
-}
-
-/// Collapse a resolved bases list to its common topology or the honest
-/// `"mixed"` label. Empty dictionaries have no topology and return `None`.
-pub(crate) fn topology_for_bases(bases: &[String]) -> Option<String> {
-    let per_atom = topologies_for_bases(bases);
-    let first = per_atom.first()?;
-    if per_atom.iter().all(|t| t == first) {
-        Some(first.clone())
-    } else {
-        Some("mixed".to_string())
-    }
 }
 
 struct StagewisePayloadConfig {
