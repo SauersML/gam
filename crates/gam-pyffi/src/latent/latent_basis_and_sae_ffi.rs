@@ -4752,7 +4752,7 @@ fn sae_checkpoint_dynamics(
 /// the FFI boundary.
 #[pyclass(module = "gamfit._rust", name = "_InterventionCalibrationPlan")]
 struct PyInterventionCalibrationPlan {
-    inner: gam::sae::inference::intervention_shard::InterventionCalibrationPlan,
+    inner: gam::terms::sae::inference::intervention_shard::InterventionCalibrationPlan,
 }
 
 fn intervention_atom_labels(atoms: &[i64]) -> Vec<String> {
@@ -4763,14 +4763,14 @@ fn intervention_atom_labels(atoms: &[i64]) -> Vec<String> {
 impl PyInterventionCalibrationPlan {
     #[getter]
     fn formula(&self) -> &'static str {
-        gam::sae::inference::intervention_shard::CHART_CALIBRATION_FORMULA
+        gam::terms::sae::inference::intervention_shard::CHART_CALIBRATION_FORMULA
     }
 
     fn constraints(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let out = PyDict::new(py);
         out.set_item(
-            gam::sae::inference::intervention_shard::CHART_CALIBRATION_SMOOTH_TERM,
-            gam::sae::inference::intervention_shard::CHART_CALIBRATION_SMOOTH_CONSTRAINT,
+            gam::terms::sae::inference::intervention_shard::CHART_CALIBRATION_SMOOTH_TERM,
+            gam::terms::sae::inference::intervention_shard::CHART_CALIBRATION_SMOOTH_CONSTRAINT,
         )?;
         Ok(out.unbind())
     }
@@ -4859,7 +4859,7 @@ fn intervention_calibration_plan<'py>(
     split_seed: u64,
     floor_quantile: f64,
 ) -> PyResult<PyInterventionCalibrationPlan> {
-    use gam::sae::inference::intervention_shard::{
+    use gam::terms::sae::inference::intervention_shard::{
         InterventionCalibrationSpec, InterventionShard, PredictedNats,
         prepare_intervention_calibration,
     };

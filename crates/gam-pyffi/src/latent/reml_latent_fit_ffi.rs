@@ -5248,6 +5248,54 @@ fn sigmoid(value: f64) -> f64 {
     1.0 / (1.0 + (-value).exp())
 }
 
+/// Deterministic synthetic-fixture RNG for the Python-facing `synthetic_*`
+/// generators below. Built on the canonical SplitMix64 stream
+/// ([`gam::utils::splitmix64`]) rather than a bespoke LCG so every seeded draw
+/// here traces back to the one hash primitive the rest of the codebase uses.
+struct SplitMixNormalRng {
+    state: u64,
+    spare_normal: Option<f64>,
+}
+
+impl SplitMixNormalRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed,
+            spare_normal: None,
+        }
+    }
+
+    /// A uniform draw on the open interval `(0, 1)`.
+    fn uniform_open01(&mut self) -> f64 {
+        let bits = gam::utils::splitmix64(&mut self.state) >> 11;
+        (bits as f64 + 0.5) / ((1_u64 << 53) as f64)
+    }
+
+    fn uniform_range(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.uniform_open01()
+    }
+
+    /// A standard-normal draw via the Box-Muller transform.
+    fn standard_normal(&mut self) -> f64 {
+        if let Some(value) = self.spare_normal.take() {
+            return value;
+        }
+        let radius = (-2.0 * self.uniform_open01().ln()).sqrt();
+        let angle = std::f64::consts::TAU * self.uniform_open01();
+        let first = radius * angle.cos();
+        self.spare_normal = Some(radius * angle.sin());
+        first
+    }
+
+    fn normal(&mut self, mean: f64, sd: f64) -> f64 {
+        mean + sd * self.standard_normal()
+    }
+
+    fn bernoulli(&mut self, p: f64) -> bool {
+        self.uniform_open01() < p
+    }
+}
+
 fn standardize_vector(values: &mut [f64]) {
     if values.is_empty() {
         return;
