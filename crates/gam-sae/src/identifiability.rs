@@ -534,7 +534,7 @@ pub fn ridge_reml_select_weight(
     let pairs: Vec<(f64, f64)> = eigvals
         .iter()
         .zip(signal_energy)
-        .filter(|(&g, _)| g > rank_resolution)
+        .filter(|&(&g, _)| g > rank_resolution)
         // Work in u = λ/γ_max so every retained spectral abscissa lies in
         // (0, 1].  This keeps the score and its derivatives finite across the
         // complete representable log-domain even for ill-scaled Gram matrices.
