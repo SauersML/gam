@@ -1737,19 +1737,39 @@ impl SaeManifoldTerm {
                     // own ext-coord point, mirroring the full path's compact
                     // Riemannian block (htbeta is 0-width here, so skipped).
                     if !self.ext_coord_manifold().is_euclidean() {
-                        for row_idx in 0..n {
+                        // Each row rebuilds its own compact ext-manifold from
+                        // immutable `&self`/`layout` and writes ONLY its own
+                        // `sys.rows[row_idx].{gt,htt}` (disjoint), so the row-parallel
+                        // path is bit-identical to the serial sweep.
+                        let this = &*self;
+                        let project_fixed_row = |row_idx: usize, row: &mut ArrowRowBlock| {
                             let (manifold_i, point_i) =
-                                self.compact_row_ext_manifold_and_point(row_idx, layout);
+                                this.compact_row_ext_manifold_and_point(row_idx, layout);
                             let t_i = point_i.view();
-                            let gt_e = sys.rows[row_idx].gt.clone();
-                            let htt_e = sys.rows[row_idx].htt.clone();
-                            sys.rows[row_idx].gt =
-                                manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
-                            sys.rows[row_idx].htt = manifold_i.riemannian_hessian_matrix(
+                            let gt_e = row.gt.clone();
+                            let htt_e = row.htt.clone();
+                            row.gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                            row.htt = manifold_i.riemannian_hessian_matrix(
                                 t_i,
                                 gt_e.view(),
                                 htt_e.view(),
                             );
+                        };
+                        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN
+                            && rayon::current_thread_index().is_none();
+                        if parallel {
+                            use rayon::prelude::*;
+                            // #1557 — pin the projector's faer GEMM to Par::Seq.
+                            sys.rows.par_iter_mut().enumerate().for_each(
+                                |(row_idx, row)| {
+                                    with_nested_parallel(|| project_fixed_row(row_idx, row));
+                                },
+                            );
+                        } else {
+                            for row_idx in 0..n {
+                                let row = &mut sys.rows[row_idx];
+                                project_fixed_row(row_idx, row);
+                            }
                         }
                     }
                 }
@@ -1800,16 +1820,20 @@ impl SaeManifoldTerm {
                     // a single reusable `col_buf` avoids the two dense (q × p) copies
                     // (flatten→Array2, project, unflatten→Vec) that previously fired
                     // per row. `t_buf` still holds the row's ext-coord vector.
-                    let mut t_buf = vec![0.0_f64; q];
-                    let mut col_buf = Array1::<f64>::zeros(q);
-                    for row_idx in 0..n {
+                    // Per-row Jacobian column projection: each row writes ONLY its own
+                    // `kron_jac[row_idx]` and reads immutable `ext`/`raw_gt_rows`/`manifold`,
+                    // so the row-parallel path is bit-identical to the serial sweep
+                    // (disjoint-writes determinism). Per-row `t_buf`/`col_buf` scratch.
+                    let project_row = |row_idx: usize,
+                                       jac_flat: &mut Vec<f64>,
+                                       t_buf: &mut [f64],
+                                       col_buf: &mut Array1<f64>| {
                         let ext_row = ext.row(row_idx);
                         for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
                             *slot = v;
                         }
-                        let t_i = ArrayView1::from(t_buf.as_slice());
+                        let t_i = ArrayView1::from(&*t_buf);
                         let raw_gt = raw_gt_rows[row_idx].view();
-                        let jac_flat = &mut kron_jac[row_idx];
                         let q_row = jac_flat.len() / p;
                         for j in 0..p {
                             for c in 0..q_row {
@@ -1823,6 +1847,32 @@ impl SaeManifoldTerm {
                             for c in 0..q_row {
                                 jac_flat[c * p + j] = projected_col[c];
                             }
+                        }
+                    };
+                    let parallel =
+                        n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                    if parallel {
+                        use rayon::prelude::*;
+                        // #1557 — pin the projector's faer GEMM to Par::Seq.
+                        kron_jac.par_iter_mut().enumerate().for_each(
+                            |(row_idx, jac_flat)| {
+                                with_nested_parallel(|| {
+                                    let mut t_buf = vec![0.0_f64; q];
+                                    let mut col_buf = Array1::<f64>::zeros(q);
+                                    project_row(row_idx, jac_flat, &mut t_buf, &mut col_buf);
+                                });
+                            },
+                        );
+                    } else {
+                        let mut t_buf = vec![0.0_f64; q];
+                        let mut col_buf = Array1::<f64>::zeros(q);
+                        for row_idx in 0..n {
+                            project_row(
+                                row_idx,
+                                &mut kron_jac[row_idx],
+                                &mut t_buf,
+                                &mut col_buf,
+                            );
                         }
                     }
                 }
@@ -1849,37 +1899,51 @@ impl SaeManifoldTerm {
                 // projector is the identity); we early-out so those rows stay
                 // byte-for-byte the historical compact path.
                 if !self.ext_coord_manifold().is_euclidean() {
-                    for row_idx in 0..n {
-                        let (manifold_i, point_i) =
-                            self.compact_row_ext_manifold_and_point(row_idx, layout);
+                    // Each row rebuilds its own compact ext-manifold from immutable
+                    // `&self`/`layout` and writes ONLY its own `sys.rows[row_idx]` (and,
+                    // on the matrix-free path, its own `kron_jac[row_idx]`) — both disjoint
+                    // per row — so the row-parallel path is bit-identical to the serial
+                    // sweep. The frames path touches `htbeta` (no `kron_jac`); the
+                    // matrix-free path touches `kron_jac` (0-width `htbeta` skipped), so
+                    // the two arms parallelize over exactly the live Vec(s).
+                    let this = &*self;
+                    let parallel =
+                        n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+                    // gt / htt projection shared by both arms, exactly as
+                    // `apply_riemannian_latent_geometry` does for dense uniform-q rows.
+                    // Returns the row's `(manifold_i, point_i, gt_e)` so the caller can
+                    // apply the htbeta / kron_jac leg with the SAME pre-projection state.
+                    let project_gt_htt =
+                        |row_idx: usize, row: &mut ArrowRowBlock| -> (LatentManifold, Array1<f64>, Array1<f64>) {
+                            let (manifold_i, point_i) =
+                                this.compact_row_ext_manifold_and_point(row_idx, layout);
+                            let t_i = point_i.view();
+                            let gt_e = row.gt.clone();
+                            let htt_e = row.htt.clone();
+                            row.gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                            row.htt =
+                                manifold_i.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+                            (manifold_i, point_i, gt_e)
+                        };
+                    // Frames arm: `htbeta` column projection with the SAME pre-projection
+                    // gradient `gt_e`.
+                    let frames_row = |row_idx: usize, row: &mut ArrowRowBlock| {
+                        let (manifold_i, point_i, gt_e) = project_gt_htt(row_idx, row);
                         let t_i = point_i.view();
-                        // gt / htt / htbeta on the compact ArrowRowBlock, exactly
-                        // as `apply_riemannian_latent_geometry` does for dense
-                        // uniform-q rows.
-                        let gt_e = sys.rows[row_idx].gt.clone();
-                        let htt_e = sys.rows[row_idx].htt.clone();
-                        sys.rows[row_idx].gt =
-                            manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
-                        sys.rows[row_idx].htt =
-                            manifold_i.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
-                        // #1406: only the frames path holds a real dense `htbeta`
-                        // slab; the matrix-free path leaves it 0-width (the
-                        // cross-block geometry is applied to `kron_jac` below), so
-                        // projecting a zero-column matrix is a no-op we skip.
-                        if frames_engaged {
-                            let htbeta_e = sys.rows[row_idx].htbeta.clone();
-                            sys.rows[row_idx].htbeta = manifold_i
-                                .project_matrix_columns_to_gradient_tangent(
-                                    t_i,
-                                    gt_e.view(),
-                                    htbeta_e.view(),
-                                );
-                        }
-                        // Kronecker local-Jacobian column projection (full-B path
-                        // only), using the SAME pre-projection gradient `gt_e` so
-                        // the cross-block geometry matches the dense branch.
-                        if !frames_engaged {
-                            let jac_flat = &mut kron_jac[row_idx];
+                        let htbeta_e = row.htbeta.clone();
+                        row.htbeta = manifold_i.project_matrix_columns_to_gradient_tangent(
+                            t_i,
+                            gt_e.view(),
+                            htbeta_e.view(),
+                        );
+                    };
+                    // Matrix-free arm: Kronecker local-Jacobian column projection with the
+                    // SAME pre-projection gradient `gt_e` so the cross-block geometry
+                    // matches the dense branch.
+                    let matrix_free_row =
+                        |row_idx: usize, row: &mut ArrowRowBlock, jac_flat: &mut Vec<f64>| {
+                            let (manifold_i, point_i, gt_e) = project_gt_htt(row_idx, row);
+                            let t_i = point_i.view();
                             let q_row = jac_flat.len() / p;
                             let mut col_buf = Array1::<f64>::zeros(q_row);
                             for j in 0..p {
@@ -1895,6 +1959,34 @@ impl SaeManifoldTerm {
                                     jac_flat[c * p + j] = projected_col[c];
                                 }
                             }
+                        };
+                    if frames_engaged {
+                        if parallel {
+                            use rayon::prelude::*;
+                            // #1557 — pin the projector's faer GEMM to Par::Seq.
+                            sys.rows.par_iter_mut().enumerate().for_each(|(row_idx, row)| {
+                                with_nested_parallel(|| frames_row(row_idx, row));
+                            });
+                        } else {
+                            for row_idx in 0..n {
+                                frames_row(row_idx, &mut sys.rows[row_idx]);
+                            }
+                        }
+                    } else if parallel {
+                        use rayon::prelude::*;
+                        // Disjoint per-row writes to BOTH `sys.rows` and `kron_jac`;
+                        // zip the two indexed parallel iterators so each worker owns one
+                        // aligned `(row, jac_flat)` pair. #1557 GEMM guard as above.
+                        sys.rows
+                            .par_iter_mut()
+                            .zip(kron_jac.par_iter_mut())
+                            .enumerate()
+                            .for_each(|(row_idx, (row, jac_flat))| {
+                                with_nested_parallel(|| matrix_free_row(row_idx, row, jac_flat));
+                            });
+                    } else {
+                        for row_idx in 0..n {
+                            matrix_free_row(row_idx, &mut sys.rows[row_idx], &mut kron_jac[row_idx]);
                         }
                     }
                 }
