@@ -14,7 +14,9 @@
 //!     `tests/sbc_family_predictive_interval_coverage.rs` (Poisson, Negative-
 //!     Binomial, Gamma, Beta, Tweedie, Binomial);
 //!   * conformal intervals: `tests/misc/predict/full_conformal_predict_route_quality.rs`;
-//!   * the ALO/LOO predictive SE (#1869): `tests/sbc_alo_predictive_se_coverage.rs`;
+//!   * the ALO/LOO predictive SE (#1869): `tests/quality/families/quality_vs_loo_psis_gaussian_smooth.rs`,
+//!     `quality_vs_brute_force_loo_binomial_logit.rs`, `quality_vs_brute_force_loo_poisson_log.rs`,
+//!     and `quality_vs_scipy_sandwich_glm_gaussian.rs`;
 //!   * smooth-test size under the null (#1872/#1873): the standing
 //!     `bug_hunt_smooth_significance_*` gates.
 //!

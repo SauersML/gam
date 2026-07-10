@@ -22,6 +22,7 @@
 //! the registry is the single index of what is audited and by which gate, not a
 //! second copy of those gates.
 
+use gam::families::multinomial::MultinomialPredictionIntervals;
 use gam_predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
     PredictPosteriorMeanResult, PredictUncertaintyResult,
@@ -241,6 +242,23 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             guards: &[1810, 938],
             audited_by: "perf_scale::sae::rho_posterior_tier1_sae_coverage",
         },
+        // ---- Multinomial mean-probability prediction interval -------------
+        // A completeness sweep of the library's public payload structs (#1891
+        // follow-up) found `MultinomialPredictionIntervals` — the separate
+        // `gam-models::multinomial` driver's own mean/SE/interval payload — was
+        // not one of the three structs this file's completeness lint walked, so
+        // nothing forced it onto the registry. Registered here and given its own
+        // real end-to-end coverage sweep.
+        CalibrationTarget {
+            name: "multinomial_mean_prediction_interval",
+            kind: SurfaceKind::CredibleBand {
+                smoothing_corrected: false,
+            },
+            mode: AuditMode::CoverageSweep,
+            guards: &[1891],
+            audited_by: "sbc_multinomial_prediction_interval_coverage \
+                         (multinomial_mean_prediction_interval_covers_true_probability_at_nominal)",
+        },
     ]
 }
 
@@ -363,6 +381,39 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
     ]
 }
 
+/// Exhaustive classification of every field of [`MultinomialPredictionIntervals`].
+fn multinomial_payload_field_audits(
+    payload: &MultinomialPredictionIntervals,
+) -> Vec<FieldAudit> {
+    let MultinomialPredictionIntervals {
+        mean,
+        standard_error,
+        mean_lower,
+        mean_upper,
+        level,
+    } = payload;
+    std::hint::black_box((mean, standard_error, mean_lower, mean_upper, level));
+    vec![
+        FieldAudit::point("mean"),
+        FieldAudit::audited("standard_error", "multinomial_mean_prediction_interval"),
+        FieldAudit::audited("mean_lower", "multinomial_mean_prediction_interval"),
+        FieldAudit::audited("mean_upper", "multinomial_mean_prediction_interval"),
+        FieldAudit::point("level"),
+    ]
+}
+
+/// A minimal well-formed `MultinomialPredictionIntervals` probe.
+fn multinomial_probe() -> MultinomialPredictionIntervals {
+    let one = ndarray::Array2::<f64>::zeros((1, 1));
+    MultinomialPredictionIntervals {
+        mean: one.clone(),
+        standard_error: one.clone(),
+        mean_lower: one.clone(),
+        mean_upper: one,
+        level: 0.95,
+    }
+}
+
 /// A minimal well-formed `PredictUncertaintyResult` used only as the target of
 /// the exhaustive destructure — the field SET, not the values, is under audit.
 fn payload_probe() -> PredictUncertaintyResult {
@@ -434,6 +485,13 @@ fn posterior_mean_payload_uncertainty_fields_are_all_registered() {
 fn coefficient_payload_uncertainty_fields_are_all_registered() {
     let registry = uq_surface_registry();
     let audits = coefficient_payload_field_audits(&coefficient_probe());
+    assert_registry_covers_fields(&audits, &registry);
+}
+
+#[test]
+fn multinomial_payload_uncertainty_fields_are_all_registered() {
+    let registry = uq_surface_registry();
+    let audits = multinomial_payload_field_audits(&multinomial_probe());
     assert_registry_covers_fields(&audits, &registry);
 }
 
