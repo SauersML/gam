@@ -122,10 +122,10 @@ impl MemoryGovernor {
         GLOBAL.get_or_init(|| MemoryGovernor::with_budget(detect_governor_budget_bytes()))
     }
 
-    /// Construct an isolated ledger for this module's unit tests. Production
-    /// code cannot create independent budgets: every production reservation
-    /// shares [`global`](Self::global).
-    #[cfg(test)]
+    /// Construct a ledger with an explicit budget. Private: production code
+    /// cannot create independent budgets — every production reservation shares
+    /// [`global`](Self::global), which calls this exactly once with the
+    /// detected budget. Unit tests use it for isolated ledgers.
     fn with_budget(budget_bytes: usize) -> Self {
         Self {
             ledger: Arc::new(GovernorLedger {
