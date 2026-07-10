@@ -2087,6 +2087,72 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     );
 }
 
+/// #2253 regression: the stuck-stall cap bounds CONSECUTIVE fruitless escapes,
+/// not the lifetime number of productive shelf crossings. The Qwen K=1 circle
+/// replay consumed its historical budget even though a late escape restored a
+/// large objective decrease; retaining the lifetime count killed the seed at
+/// the next shelf even though the trajectory was descending.
+#[test]
+fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let seed = array![0.0, 0.0];
+    let stuck_grad = 10.9;
+    guard.observe_seed(&seed, 10.0, stuck_grad);
+
+    // Consume the entire escape budget without any real improvement. Each
+    // three-probe infeasible window must be granted exactly one escape.
+    let infeasible_probe = array![-10.0, -10.0];
+    for escape_idx in 0..STUCK_STALL_MAX_ESCAPES {
+        assert!(matches!(
+            guard.observe_infeasible(&infeasible_probe),
+            CostStallVerdict::Continue
+        ));
+        assert!(matches!(
+            guard.observe_infeasible(&infeasible_probe),
+            CostStallVerdict::Continue
+        ));
+        let verdict = guard.observe_infeasible(&infeasible_probe);
+        assert!(
+            matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
+            "escape {} of {} must still keep descending",
+            escape_idx + 1,
+            STUCK_STALL_MAX_ESCAPES,
+        );
+    }
+
+    // A trusted, super-floor accepted improvement proves the escapes were
+    // productive. This must replenish the consecutive-fruitless budget.
+    let descended = array![1.0, -1.0];
+    let descent = guard.observe(&descended, -20.0, stuck_grad, true);
+    assert!(
+        matches!(descent, CostStallVerdict::Continue),
+        "genuine descent must resume the trajectory rather than halt"
+    );
+
+    // At the next shelf the guard must grant a fresh escape. Without c28e6f9f7
+    // the lifetime counter remains exhausted and this is FlatValleyStall.
+    assert!(matches!(
+        guard.observe_infeasible(&infeasible_probe),
+        CostStallVerdict::Continue
+    ));
+    assert!(matches!(
+        guard.observe_infeasible(&infeasible_probe),
+        CostStallVerdict::Continue
+    ));
+    let verdict = guard.observe_infeasible(&infeasible_probe);
+    assert!(
+        matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
+        "a productive descent must replenish the stuck-stall escape budget (#2253)"
+    );
+
+    let published = exit.lock().unwrap();
+    let best = published.as_ref().expect("running best remains published");
+    assert_eq!(best.rho, descended);
+    assert_eq!(best.value, -20.0);
+    assert!(!best.converged);
+}
+
 /// #1426 companion (revised for the #509 score-relative escape gate): a GENUINE
 /// flat-valley floor — cost flatlined AND the projected gradient has floored at
 /// its irreducible band, i.e. only modestly above the SCORE-RELATIVE

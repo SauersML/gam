@@ -5,7 +5,10 @@
 
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
 use crate::manifold::{GraphEdge, LearnedGraphAtom, graph_edge_rank_charge};
-use crate::saebench_metrics::{ChartInterpObservation, chart_interp_score};
+use crate::saebench_metrics::{
+    ChartInterpNullCalibration, ChartInterpNullProtocol, ChartInterpObservation,
+    chart_interp_score,
+};
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use ndarray::{Array2, Array3};
 
@@ -215,11 +218,18 @@ fn nystrom_recovers_noisy_circle_angle() {
             }
         })
         .collect();
-    let report = chart_interp_score(&obs, &[obs.clone()], 0.05).expect("chart interp");
+    let calibration = ChartInterpNullCalibration::new(
+        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        7,
+        1,
+        vec![obs.clone()],
+    )
+    .expect("chart null calibration");
+    let report = chart_interp_score(&obs, &calibration, 0.05).expect("chart interp");
     assert!(
-        report.circular_correlation > 0.95,
+        report.observed.circular_correlation > 0.95,
         "noisy-circle circular correlation {} should exceed 0.95",
-        report.circular_correlation
+        report.observed.circular_correlation
     );
 }
 

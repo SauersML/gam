@@ -1214,47 +1214,6 @@ fn resample_sparse_architecture_null<R: rand::Rng + ?Sized>(
     )
 }
 
-fn larger_tail_null_summary(
-    observed: f64,
-    mut samples: Vec<f64>,
-) -> gam::terms::sae::null_battery::NullSummary {
-    use gam::terms::sae::null_battery::{NullKind, NullSummary};
-    samples.sort_by(|left, right| left.total_cmp(right));
-    let n = samples.len();
-    let mean = samples.iter().sum::<f64>() / n as f64;
-    let variance = if n > 1 {
-        samples
-            .iter()
-            .map(|sample| (sample - mean) * (sample - mean))
-            .sum::<f64>()
-            / (n - 1) as f64
-    } else {
-        0.0
-    };
-    let sd = variance.sqrt();
-    let z = if sd > 0.0 {
-        (observed - mean) / sd
-    } else {
-        0.0
-    };
-    let extreme = samples.iter().filter(|sample| **sample >= observed).count();
-    NullSummary {
-        kind: NullKind::ArchitectureMatchedRandomWeight,
-        observed,
-        n,
-        mean,
-        sd,
-        min: samples[0],
-        q25: samples[n / 4],
-        median: samples[n / 2],
-        q75: samples[(3 * n) / 4],
-        max: samples[n - 1],
-        z,
-        p_value: (extreme + 1) as f64 / (n + 1) as f64,
-        samples,
-    }
-}
-
 /// Build the standing sparse donor null + residual spike-in calibration. Both
 /// observed and donor routing remain `N×s×b`; implicit zeros are never expanded.
 fn standing_sparse_null_calibration(
@@ -1289,9 +1248,15 @@ fn standing_sparse_null_calibration(
             activation_threshold,
         )?);
     }
+    let null_summary = nb::summarize_null_distribution(
+        nb::NullKind::ArchitectureMatchedRandomWeight,
+        observed,
+        samples,
+        nb::Tail::Larger,
+    )?;
     let nulls = nb::NullBatteryReport {
         observed,
-        summaries: vec![larger_tail_null_summary(observed, samples)],
+        summaries: vec![null_summary],
     };
     // Spike-in power: plant a synthetic circle into the real audit residuals and
     // measure the default block-chart/topology detector's recovery rate at the

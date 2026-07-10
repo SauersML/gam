@@ -7,7 +7,7 @@
 //! single audited definition with the steering code instead of reimplementing
 //! math in Python notebooks.
 
-use crate::null_battery::{Tail, empirical_p_value};
+use crate::null_battery::{NullKind, NullSummary, Tail, summarize_null_distribution};
 
 /// One row in the chart-interpretability evaluation: a recovered coordinate,
 /// its ground-truth cyclic label, and the posterior/evidence weight assigned to
@@ -22,27 +22,191 @@ pub struct ChartInterpObservation {
     pub weight: f64,
 }
 
-/// Null-calibrated weighted circular-correlation report for chart interpretability.
+/// Exact statistic calibrated by every chart-interpretability report.
+///
+/// Naming this in the type and persisted artifact prevents an empirical p-value
+/// for a different chart claim (for example, an EV gap or cyclic adjacency)
+/// from being paired with this score (#2250).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartInterpStatistic {
+    OrientationQuotientedWeightedPhaseLock,
+}
+
+impl ChartInterpStatistic {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OrientationQuotientedWeightedPhaseLock => {
+                "orientation_quotiented_weighted_phase_lock_v1"
+            }
+        }
+    }
+}
+
+/// How one complete null observation ledger is produced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartInterpNullDrawPolicy {
+    /// Regenerate the declared surrogate, refit the chart, and run the same
+    /// coordinate readout before evaluating the statistic.
+    RegenerateRefitAndReadout,
+}
+
+impl ChartInterpNullDrawPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RegenerateRefitAndReadout => {
+                "regenerate_surrogate_refit_chart_and_readout_each_draw"
+            }
+        }
+    }
+}
+
+/// Closed chart-null protocols understood by the scorer.
+///
+/// A protocol owns its native [`NullKind`] and draw policy. Callers therefore
+/// cannot label arbitrary rows "matched spectrum" while separately selecting a
+/// contradictory policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartInterpNullProtocol {
+    MatchedSpectrumGaussianChartRefitV1,
+}
+
+impl ChartInterpNullProtocol {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "matched_spectrum_gaussian_chart_refit_v1" => {
+                Ok(Self::MatchedSpectrumGaussianChartRefitV1)
+            }
+            other => Err(format!(
+                "chart_interp: unsupported null protocol {other:?}; expected matched_spectrum_gaussian_chart_refit_v1"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchedSpectrumGaussianChartRefitV1 => {
+                "matched_spectrum_gaussian_chart_refit_v1"
+            }
+        }
+    }
+
+    pub fn null_kind(self) -> NullKind {
+        match self {
+            Self::MatchedSpectrumGaussianChartRefitV1 => NullKind::MatchedSpectrumGaussian,
+        }
+    }
+
+    pub fn draw_policy(self) -> ChartInterpNullDrawPolicy {
+        match self {
+            Self::MatchedSpectrumGaussianChartRefitV1 => {
+                ChartInterpNullDrawPolicy::RegenerateRefitAndReadout
+            }
+        }
+    }
+}
+
+/// Complete null calibration input. There is intentionally no constructor from
+/// scalar statistics: the scorer accepts full per-draw observation ledgers and
+/// recomputes [`ChartInterpStatistic`] itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartInterpNullCalibration {
+    protocol: ChartInterpNullProtocol,
+    seed: u64,
+    expected_draws: usize,
+    observation_draws: Vec<Vec<ChartInterpObservation>>,
+}
+
+impl ChartInterpNullCalibration {
+    pub fn new(
+        protocol: ChartInterpNullProtocol,
+        seed: u64,
+        expected_draws: usize,
+        observation_draws: Vec<Vec<ChartInterpObservation>>,
+    ) -> Result<Self, String> {
+        if expected_draws == 0 {
+            return Err("chart_interp: null calibration requires at least one draw".into());
+        }
+        if observation_draws.len() != expected_draws {
+            return Err(format!(
+                "chart_interp: null protocol declares {expected_draws} draws but artifact contains {} complete observation ledgers",
+                observation_draws.len()
+            ));
+        }
+        Ok(Self {
+            protocol,
+            seed,
+            expected_draws,
+            observation_draws,
+        })
+    }
+
+    pub fn protocol(&self) -> ChartInterpNullProtocol {
+        self.protocol
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    pub fn expected_draws(&self) -> usize {
+        self.expected_draws
+    }
+
+    pub fn observation_draws(&self) -> &[Vec<ChartInterpObservation>] {
+        &self.observation_draws
+    }
+}
+
+/// Observed value of [`ChartInterpStatistic`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChartInterpReport {
+pub struct ChartInterpStatisticValue {
     /// Orientation-quotiented weighted cyclic phase-lock score in `[0, 1]`.
     pub circular_correlation: f64,
     /// Signed correlation before orientation is quotiented out.
     pub signed_circular_correlation: f64,
     /// Sum of accepted observation weights.
     pub effective_weight: f64,
-    /// Mean orientation-quotiented correlation across matched-spectrum null draws.
-    pub matched_spectrum_null_mean: f64,
-    /// Plus-one corrected upper-tail empirical p-value of the observed statistic.
-    pub matched_spectrum_p_value: f64,
-    /// Monte Carlo standard error of [`Self::matched_spectrum_p_value`].
-    pub monte_carlo_standard_error: f64,
-    /// Number of matched-spectrum null draws evaluated with the identical statistic.
-    pub matched_spectrum_draws: usize,
+}
+
+/// Provenance and native null-battery distribution for a chart statistic.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartInterpNullCalibrationReport {
+    /// The statistic recomputed for the observation and every null draw.
+    pub statistic: ChartInterpStatistic,
+    /// Closed generator/refit/readout protocol.
+    pub protocol: ChartInterpNullProtocol,
+    /// Seed from which draw-index-specific surrogates were generated.
+    pub seed: u64,
+    /// Native null distribution, including kind, tail, summary, Monte Carlo
+    /// uncertainty, extreme count, and every statistic sample in draw order.
+    pub null_distribution: NullSummary,
+}
+
+/// Evidential decision after null calibration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartInterpVerdict {
+    Pass,
+    NullCompatible,
+}
+
+impl ChartInterpVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::NullCompatible => "null_compatible",
+        }
+    }
+}
+
+/// Null-calibrated chart-interpretability artifact.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartInterpReport {
+    pub statistic: ChartInterpStatistic,
+    pub observed: ChartInterpStatisticValue,
+    pub calibration: ChartInterpNullCalibrationReport,
     /// Significance level used for the evidential verdict.
     pub significance_level: f64,
-    /// True only when the matched-spectrum empirical p-value clears the requested level.
-    pub evidentially_valid: bool,
+    pub verdict: ChartInterpVerdict,
 }
 
 /// One dose-response calibration point along a steered arc.
@@ -99,12 +263,9 @@ pub struct CoordinatePosterior {
 /// calibrating that same number against its matched null (#2250).
 pub fn chart_interp_score(
     observations: &[ChartInterpObservation],
-    matched_spectrum_null_draws: &[Vec<ChartInterpObservation>],
+    null_calibration: &ChartInterpNullCalibration,
     significance_level: f64,
 ) -> Result<ChartInterpReport, String> {
-    if matched_spectrum_null_draws.is_empty() {
-        return Err("chart_interp: at least one matched-spectrum null draw is required".into());
-    }
     if !(significance_level.is_finite() && significance_level > 0.0 && significance_level < 1.0) {
         return Err(format!(
             "chart_interp: significance_level must be finite and in (0, 1), got {significance_level}"
@@ -112,27 +273,66 @@ pub fn chart_interp_score(
     }
     let (circular_correlation, signed_circular_correlation, weight_sum) =
         chart_correlation(observations, "chart_interp observed")?;
-    let mut null_statistics = Vec::with_capacity(matched_spectrum_null_draws.len());
-    for (draw_idx, draw) in matched_spectrum_null_draws.iter().enumerate() {
+    let mut null_statistics = Vec::with_capacity(null_calibration.expected_draws());
+    for (draw_idx, draw) in null_calibration.observation_draws().iter().enumerate() {
+        validate_null_ledger_alignment(observations, draw, draw_idx)?;
         let (null_statistic, _, _) = chart_correlation(
             draw,
-            &format!("chart_interp matched-spectrum draw {draw_idx}"),
+            &format!("chart_interp null draw {draw_idx}"),
         )?;
         null_statistics.push(null_statistic);
     }
-    let null_mean = null_statistics.iter().sum::<f64>() / null_statistics.len() as f64;
-    let calibration = empirical_p_value(circular_correlation, &null_statistics, Tail::Larger)?;
-    Ok(ChartInterpReport {
+    let statistic = ChartInterpStatistic::OrientationQuotientedWeightedPhaseLock;
+    let protocol = null_calibration.protocol();
+    let null_distribution = summarize_null_distribution(
+        protocol.null_kind(),
         circular_correlation,
-        signed_circular_correlation,
-        effective_weight: weight_sum,
-        matched_spectrum_null_mean: null_mean,
-        matched_spectrum_p_value: calibration.p_value,
-        monte_carlo_standard_error: calibration.monte_carlo_standard_error,
-        matched_spectrum_draws: calibration.draws,
+        null_statistics,
+        Tail::Larger,
+    )?;
+    let verdict = if null_distribution.p_value <= significance_level {
+        ChartInterpVerdict::Pass
+    } else {
+        ChartInterpVerdict::NullCompatible
+    };
+    Ok(ChartInterpReport {
+        statistic,
+        observed: ChartInterpStatisticValue {
+            circular_correlation,
+            signed_circular_correlation,
+            effective_weight: weight_sum,
+        },
+        calibration: ChartInterpNullCalibrationReport {
+            statistic,
+            protocol,
+            seed: null_calibration.seed(),
+            null_distribution,
+        },
         significance_level,
-        evidentially_valid: calibration.p_value <= significance_level,
+        verdict,
     })
+}
+
+fn validate_null_ledger_alignment(
+    observed: &[ChartInterpObservation],
+    null_draw: &[ChartInterpObservation],
+    draw_idx: usize,
+) -> Result<(), String> {
+    if null_draw.len() != observed.len() {
+        return Err(format!(
+            "chart_interp null draw {draw_idx} has {} rows but observed ledger has {}; the refit/readout protocol requires the same labeled rows",
+            null_draw.len(),
+            observed.len()
+        ));
+    }
+    for (row, (observed_row, null_row)) in observed.iter().zip(null_draw).enumerate() {
+        if wrap_turns(observed_row.label_turns) != wrap_turns(null_row.label_turns) {
+            return Err(format!(
+                "chart_interp null draw {draw_idx} changes label_turns at row {row}; matched-spectrum refits must score the identical labeled ledger"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn chart_correlation(

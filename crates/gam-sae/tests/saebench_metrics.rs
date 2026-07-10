@@ -1,7 +1,22 @@
 use gam_sae::saebench_metrics::{
-    ChartInterpObservation, DoseResponseObservation, chart_interp_score,
-    coordinate_posterior_from_precision, dose_response_calibration,
+    ChartInterpNullCalibration, ChartInterpNullDrawPolicy, ChartInterpNullProtocol,
+    ChartInterpObservation, ChartInterpStatistic, ChartInterpVerdict, DoseResponseObservation,
+    chart_interp_score, coordinate_posterior_from_precision, dose_response_calibration,
 };
+use gam_sae::null_battery::{NullKind, Tail};
+
+fn matched_spectrum_calibration(
+    seed: u64,
+    draws: Vec<Vec<ChartInterpObservation>>,
+) -> ChartInterpNullCalibration {
+    ChartInterpNullCalibration::new(
+        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        seed,
+        draws.len(),
+        draws,
+    )
+    .expect("complete matched-spectrum calibration")
+}
 
 #[test]
 fn chart_interp_wraps_cyclic_boundary_and_quotients_orientation() {
@@ -49,16 +64,14 @@ fn chart_interp_wraps_cyclic_boundary_and_quotients_orientation() {
             weight: 1.0,
         },
     ];
-    let report = chart_interp_score(&obs, &[null_draw], 0.05).unwrap();
+    let calibration = matched_spectrum_calibration(7, vec![null_draw]);
+    let report = chart_interp_score(&obs, &calibration, 0.05).unwrap();
     assert!(
-        report.circular_correlation > 0.99,
+        report.observed.circular_correlation > 0.99,
         "orientation-quotiented cyclic chart score should recover the reversed coordinate: {report:?}"
     );
-    assert!(report.signed_circular_correlation < 0.0);
-    assert!(
-        !report.evidentially_valid,
-        "one null draw cannot attain p <= 0.05"
-    );
+    assert!(report.observed.signed_circular_correlation < 0.0);
+    assert_eq!(report.verdict, ChartInterpVerdict::NullCompatible);
 }
 
 fn correlation_fixture(target: f64) -> Vec<ChartInterpObservation> {
@@ -76,10 +89,6 @@ fn correlation_fixture(target: f64) -> Vec<ChartInterpObservation> {
         .collect()
 }
 
-fn perfect_null_draw() -> Vec<ChartInterpObservation> {
-    correlation_fixture(1.0)
-}
-
 fn zero_null_draw() -> Vec<ChartInterpObservation> {
     (0..12)
         .map(|index| ChartInterpObservation {
@@ -90,39 +99,72 @@ fn zero_null_draw() -> Vec<ChartInterpObservation> {
         .collect()
 }
 
-fn calibrated_fixture(
-    target: f64,
-    exceedances: usize,
-) -> gam_sae::saebench_metrics::ChartInterpReport {
-    let mut draws = Vec::with_capacity(2_499);
-    draws.extend((0..exceedances).map(|_| perfect_null_draw()));
-    draws.extend((exceedances..2_499).map(|_| zero_null_draw()));
-    chart_interp_score(&correlation_fixture(target), &draws, 0.05).unwrap()
-}
-
 #[test]
-fn chart_interp_calibration_fixtures_pin_weekday_month_and_color_verdicts_2250() {
-    // 399 exceedances among 2,499 draws => (399 + 1) / 2,500 = 0.16.
-    let weekday = calibrated_fixture(0.973, 399);
-    assert!((weekday.circular_correlation - 0.973).abs() < 1.0e-12);
-    assert!((weekday.matched_spectrum_p_value - 0.16).abs() < 1.0e-12);
-    assert!(!weekday.evidentially_valid);
+fn chart_interp_report_carries_typed_provenance_and_recomputed_samples_2250() {
+    let draws = vec![
+        correlation_fixture(0.9),
+        zero_null_draw(),
+        correlation_fixture(0.6),
+    ];
+    let calibration = matched_spectrum_calibration(0x2250, draws);
+    let report = chart_interp_score(&correlation_fixture(0.8), &calibration, 0.05).unwrap();
 
-    // Zero exceedances => the plus-one Monte Carlo floor 1 / 2,500 = 0.0004.
-    let month = calibrated_fixture(0.95, 0);
-    assert!((month.matched_spectrum_p_value - 0.0004).abs() < 1.0e-12);
-    assert!(month.evidentially_valid);
-
-    // 2,324 exceedances => (2,324 + 1) / 2,500 = 0.93.
-    let color = calibrated_fixture(0.125, 2_324);
-    assert!((color.matched_spectrum_p_value - 0.93).abs() < 1.0e-12);
-    assert!(!color.evidentially_valid);
+    assert_eq!(
+        report.statistic,
+        ChartInterpStatistic::OrientationQuotientedWeightedPhaseLock
+    );
+    assert_eq!(report.calibration.statistic, report.statistic);
+    assert_eq!(
+        report.calibration.protocol,
+        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1
+    );
+    assert_eq!(
+        report.calibration.protocol.draw_policy(),
+        ChartInterpNullDrawPolicy::RegenerateRefitAndReadout
+    );
+    assert_eq!(report.calibration.seed, 0x2250);
+    let null = &report.calibration.null_distribution;
+    assert_eq!(null.kind, NullKind::MatchedSpectrumGaussian);
+    assert_eq!(null.tail, Tail::Larger);
+    assert_eq!(null.n, 3);
+    assert_eq!(null.extreme_draws, 1);
+    assert_eq!(null.samples.len(), 3);
+    assert!((null.samples[0] - 0.9).abs() < 1.0e-12);
+    assert!(null.samples[1].abs() < 1.0e-12);
+    assert!((null.samples[2] - 0.6).abs() < 1.0e-12);
+    assert!((null.p_value - 0.5).abs() < 1.0e-12);
+    assert_eq!(report.verdict, ChartInterpVerdict::NullCompatible);
 }
 
 #[test]
 fn chart_interp_rejects_scalar_only_evidence_2250() {
-    let error = chart_interp_score(&correlation_fixture(0.973), &[], 0.05).unwrap_err();
-    assert!(error.contains("matched-spectrum null draw"));
+    let error = ChartInterpNullCalibration::new(
+        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        0x2250,
+        0,
+        Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.contains("at least one draw"));
+
+    let error = ChartInterpNullCalibration::new(
+        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        0x2250,
+        2,
+        vec![zero_null_draw()],
+    )
+    .unwrap_err();
+    assert!(error.contains("declares 2 draws"));
+}
+
+#[test]
+fn chart_interp_rejects_a_null_ledger_for_different_labels_2250() {
+    let observed = correlation_fixture(0.8);
+    let mut wrong_labels = zero_null_draw();
+    wrong_labels[0].label_turns = 0.25;
+    let calibration = matched_spectrum_calibration(0x2250, vec![wrong_labels]);
+    let error = chart_interp_score(&observed, &calibration, 0.05).unwrap_err();
+    assert!(error.contains("changes label_turns"));
 }
 
 #[test]

@@ -20,6 +20,15 @@ pub enum Tail {
     Smaller,
 }
 
+impl Tail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Larger => "larger",
+            Self::Smaller => "smaller",
+        }
+    }
+}
+
 /// Plus-one-corrected Monte Carlo tail probability and its sampling uncertainty.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EmpiricalPValue {
@@ -124,9 +133,10 @@ impl NullBatteryConfig {
 }
 
 /// Null distribution summary for a single null kind.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NullSummary {
     pub kind: NullKind,
+    pub tail: Tail,
     pub observed: f64,
     pub n: usize,
     pub mean: f64,
@@ -138,6 +148,10 @@ pub struct NullSummary {
     pub max: f64,
     pub z: f64,
     pub p_value: f64,
+    pub monte_carlo_standard_error: f64,
+    pub extreme_draws: usize,
+    /// Statistic values in draw order. Keeping seed order (rather than sorting
+    /// this ledger for quantiles) makes a persisted null artifact replayable.
     pub samples: Vec<f64>,
 }
 
@@ -409,7 +423,12 @@ where
             require_finite(stat, "null statistic")?;
             samples.push(stat);
         }
-        summaries.push(summarize_null(kind, observed, samples, config.tail));
+        summaries.push(summarize_null_distribution(
+            kind,
+            observed,
+            samples,
+            config.tail,
+        )?);
     }
 
     Ok(NullBatteryReport {
@@ -1397,8 +1416,21 @@ fn mix_seed(a: u64, b: u64, c: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn summarize_null(kind: NullKind, observed: f64, mut samples: Vec<f64>, tail: Tail) -> NullSummary {
-    samples.sort_by(|a, b| a.total_cmp(b));
+/// Summarize an explicit Monte Carlo null distribution with the same native
+/// plus-one tail calibration used by [`run_null_battery`].
+///
+/// `samples` remains in draw order in the returned artifact. Quantiles are
+/// computed from a separate sorted copy so a seed and draw index can reproduce
+/// every persisted statistic exactly.
+pub fn summarize_null_distribution(
+    kind: NullKind,
+    observed: f64,
+    samples: Vec<f64>,
+    tail: Tail,
+) -> Result<NullSummary, String> {
+    let calibration = empirical_p_value(observed, &samples, tail)?;
+    let mut sorted = samples.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
     let mean = samples.iter().sum::<f64>() / n as f64;
     let var = if n > 1 {
@@ -1419,24 +1451,24 @@ fn summarize_null(kind: NullKind, observed: f64, mut samples: Vec<f64>, tail: Ta
     } else {
         0.0
     };
-    let p_value = empirical_p_value(observed, &samples, tail)
-        .expect("run_null_battery validates observed and null statistics")
-        .p_value;
-    NullSummary {
+    Ok(NullSummary {
         kind,
+        tail,
         observed,
         n,
         mean,
         sd,
-        min: samples[0],
-        q25: samples[n / 4],
-        median: samples[n / 2],
-        q75: samples[(3 * n) / 4],
-        max: samples[n - 1],
+        min: sorted[0],
+        q25: sorted[n / 4],
+        median: sorted[n / 2],
+        q75: sorted[(3 * n) / 4],
+        max: sorted[n - 1],
         z,
-        p_value,
+        p_value: calibration.p_value,
+        monte_carlo_standard_error: calibration.monte_carlo_standard_error,
+        extreme_draws: calibration.extreme_draws,
         samples,
-    }
+    })
 }
 
 fn random_orthogonal(p: usize, seed: u64) -> Result<Array2<f64>, String> {
