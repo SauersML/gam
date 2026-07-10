@@ -27,7 +27,9 @@ const P: usize = 12; // ambient output dim
 const D: usize = 1; // the #2228 configuration: intrinsic 1-D atom
 const MAX_DEGREE: usize = 2; // degree-2 patch {1, t, t²} — spans the planted curve
 const TAU: f64 = 0.5;
-const ALPHA: f64 = 1.0; // K=1 ⇒ π_1 = (α/(α+1))^1 = 0.5, so the gate caps at 0.5
+// K=1 ⇒ the ordered prior mean is 0.5. It prices the empirical-Bayes assignment
+// prior, but must not multiply the forward posterior-mean gate a second time.
+const ALPHA: f64 = 1.0;
 const INNER_MAX_ITER: usize = 50;
 const LEARNING_RATE: f64 = 1.0;
 const RIDGE_EXT_COORD: f64 = 0.0; // the ridge-0 public path
@@ -186,13 +188,13 @@ fn sae_manifold_d1_ibp_gate_cocollapse() {
          solve stalled under the gate co-collapse (#2228/#1095)",
         result.final_value
     );
-    // The degree-2 patch spans the planted curve exactly, so a fit that COMPENSATES
-    // the 0.5 gate cap recovers it. `R² ≈ 0.4375 = 1 − (1 − 0.25)²` is the
-    // gate-scaled pristine-seed signature: the decoder co-collapsed rather than
-    // scaling to `1/a_1` to undo the gate.
+    // The degree-2 patch spans the planted curve exactly. Reintroducing the old
+    // double prior application multiplies the zero-logit posterior gate 0.5 by
+    // the ordered prior mean 0.5, producing a 0.25-scaled pristine reconstruction:
+    // `R² ≈ 0.4375 = 1 − (1 − 0.25)²`.
     assert!(
         r2 > 0.9,
-        "d=1 K=1 reconstruction R²={r2:.6} < 0.9 — the decoder did not compensate the capped \
-         IBP gate (R²≈0.4375 is the gate-scaled pristine seed; #2228/#1095 co-collapse)"
+        "d=1 K=1 reconstruction R²={r2:.6} < 0.9 — R²≈0.4375 identifies the old \
+         double-prior gate scale and pristine-seed co-collapse (#2228/#1095)"
     );
 }
