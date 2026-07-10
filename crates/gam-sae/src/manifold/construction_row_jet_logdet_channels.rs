@@ -742,12 +742,8 @@ mod batch4_oracle_tests {
                     rho,
                     a.as_slice_mut().expect("contiguous assignment scratch"),
                 )?;
-                let prog = self.reconstruction_row_program_for_logdet(
-                    row,
-                    &vars,
-                    a.view(),
-                    second_jets,
-                )?;
+                let prog =
+                    self.reconstruction_row_program_for_logdet(row, &vars, a.view(), second_jets)?;
                 sqrt_w[i] = self
                     .row_loss_weights
                     .as_deref()

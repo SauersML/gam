@@ -1133,6 +1133,23 @@ impl MomentTerm for Jet2 {
     }
 }
 
+impl MomentTerm for Jet1 {
+    fn moment_term(&self, m: &Self) -> Self {
+        // Grad-only calibration residual term: the order-≤1 truncation of the
+        // [`Jet2`] `moment_term`. The value is stripped (F's VALUE is carried by
+        // the scalar seed) and the gradient keeps the same `j=1` Leibniz weight 1:
+        //   R.g[i] = c_g[i]·M_v
+        // (bit-identical to the `Jet2` gradient line). The order-2 Hessian channel
+        // the `Jet2` term also assembles is simply absent at this order.
+        let p = self.p();
+        let mut g = vec![0.0; p];
+        for i in 0..p {
+            g[i] = self.g[i] * m.v;
+        }
+        Jet1 { v: 0.0, g }
+    }
+}
+
 /// #932 item-2 Phase B-base: the normalization base moments `M_0..M_4` as jets,
 /// carrying their exact θ-derivatives (incl. the moving-edge flux), built from
 /// the cell's already-computed NUMERIC moment vector (`numeric_moments`) plus the

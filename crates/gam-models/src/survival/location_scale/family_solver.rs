@@ -1115,16 +1115,10 @@ impl SurvivalLocationScaleFamily {
                 log_scale,
             )));
         }
-        if self.row_kernel_joint_hessian_supported() {
-            let dynamic = self.build_dynamic_geometry(block_states)?;
-            let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_scale);
-            let rows = crate::row_kernel::RowSet::All;
-            let cache = crate::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
-            return Ok(Some((
-                crate::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows),
-                log_scale,
-            )));
-        }
+        // #932 measured perf exception: the non-wiggle joint Hessian ships the
+        // sparse `assemble_joint_hessian_from_quantities`, NOT the dense
+        // `Order2<9>` single-source row kernel. See that method's doc for the
+        // 3.8–5.3× measurement and the analytic oracles that pin it to the jet.
         Ok(self
             .assemble_joint_hessian_from_quantities(&q, block_states)?
             .map(|h| (h, log_scale)))
@@ -1772,34 +1766,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        if self.row_kernel_joint_hessian_supported() {
-            let q = self.collect_joint_quantities(block_states)?;
-            let dynamic = self.build_dynamic_geometry(block_states)?;
-            let kernel = self.survival_ls_row_kernel(&q, &dynamic);
-            let rows = crate::row_kernel::RowSet::All;
-            let cache = crate::row_kernel::build_row_kernel_cache(&kernel, &rows)?;
-            let ll = crate::row_kernel::row_kernel_log_likelihood(&cache, &rows);
-            let gradient = -crate::row_kernel::row_kernel_gradient(&kernel, &cache, &rows);
-            let hessian = crate::row_kernel::row_kernel_hessian_dense(&kernel, &cache, &rows);
-            let offsets = self.joint_block_offsets();
-            let blockworking_sets = (0..self.expected_blocks())
-                .map(|block_idx| {
-                    let start = offsets[block_idx];
-                    let end = offsets[block_idx + 1];
-                    BlockWorkingSet::ExactNewton {
-                        gradient: gradient.slice(s![start..end]).to_owned(),
-                        hessian: SymmetricMatrix::Dense(
-                            hessian.slice(s![start..end, start..end]).to_owned(),
-                        ),
-                    }
-                })
-                .collect();
-            return Ok(FamilyEvaluation {
-                log_likelihood: ll,
-                blockworking_sets,
-            });
-        }
-
         let (ll, block_gradients) =
             self.evaluate_log_likelihood_and_block_gradients(block_states)?;
 

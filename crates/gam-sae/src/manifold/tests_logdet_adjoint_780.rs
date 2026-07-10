@@ -698,7 +698,6 @@ fn install_low_rank_ibp_metric_2156(term: &mut SaeManifoldTerm) {
     );
 }
 
-
 fn ibp_majorized_hdiag_2156(
     channels: &IbpHessianDiagThirdChannels,
     row: usize,

@@ -5,8 +5,8 @@
 //! and routing admission, never reconstruction quality at a hand-selected alpha.
 
 use crate::assignment::{
-    AssignmentMode, AssignmentModeRequest, admit_assignment_mode_for_size,
-    OrderedPriorSchedule, default_ibp_concentration_for_k_atoms, ordered_prior_means,
+    AssignmentMode, AssignmentModeRequest, OrderedPriorSchedule, admit_assignment_mode_for_size,
+    default_ibp_concentration_for_k_atoms, ordered_prior_means,
 };
 
 #[test]
@@ -53,7 +53,10 @@ fn ibp_mode_admission_requires_explicit_small_fit_request() {
     let default_admitted =
         admit_assignment_mode_for_size(AssignmentModeRequest::Default, n, k, 0.7, 1.0, false, 0.0)
             .expect("default small-fit admission");
-    assert!(matches!(default_admitted.mode, AssignmentMode::Softmax { .. }));
+    assert!(matches!(
+        default_admitted.mode,
+        AssignmentMode::Softmax { .. }
+    ));
     assert_eq!(default_admitted.top_k, None);
 
     let ibp =
