@@ -165,9 +165,20 @@ fn sae_manifold_d1_ibp_gate_cocollapse() {
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let fitted_out = fitted.term.fitted();
     let r2 = reconstruction_r2(&fitted_out, &z);
+    let converged_via = result
+        .converged_via
+        .expect("certified result carries its convergence verdict")
+        .as_str();
+    let criterion_certificate = result
+        .criterion_certificate
+        .as_ref()
+        .expect("certified result carries its analytic criterion certificate")
+        .summary();
     println!(
-        "[#2228/#1095] d=1 K=1 IBP co-collapse: final_value={:.6e} recon_R2={:.6}",
-        result.final_value, r2
+        "[#2228/#1095] d=1 K=1 IBP co-collapse: converged_via={converged_via} \
+         iterations={} final_grad_norm={:?} certificate={criterion_certificate} \
+         final_value={:.6e} recon_R2={:.6}",
+        result.iterations, result.final_grad_norm, result.final_value, r2
     );
     assert!(
         result.final_value.is_finite() && result.final_value < 1.0e11,

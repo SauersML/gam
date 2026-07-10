@@ -795,6 +795,17 @@ fn inframe_curved_p4096_feasible_where_dense_joint_ooms_2134() {
         "in-frame (M·r)² covariance must stay well under a MB, got {} bytes",
         ledger.inframe_cov_bytes
     );
+    eprintln!(
+        "[#2134 p4096] N={n} p={p} frame_rank={} dense_border={} inframe_border={} \
+         dense_cov_bytes={} inframe_cov_bytes={} border_shrink={:.1} cov_shrink={:.1}",
+        rec.frame_rank,
+        ledger.dense_border_coeffs,
+        ledger.inframe_border_coeffs,
+        ledger.dense_cov_bytes,
+        ledger.inframe_cov_bytes,
+        ledger.border_shrink(),
+        ledger.cov_shrink(),
+    );
 
     // The hot-path prediction never materialises the N×p ambient image: it stays
     // N_g×r, so peak working memory is p-independent up to the copied residual.
