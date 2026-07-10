@@ -6947,6 +6947,20 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             eprintln!(
                 "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?}, fourth_max={fourth_max:.3e} at {fourth_at:?}"
             );
+            // The header's contract: a dropped warp-coupling term shows O(1)
+            // relative error, so these bounds gate correctness while leaving
+            // generous room for the five-point stencils' own truncation/
+            // cancellation noise (h=1e-2 / 2e-2).
+            assert!(
+                third_max < 1.0e-5,
+                "{distribution:?} {label}: analytic third directional deviates from \
+                 the five-point FD stencil by {third_max:.3e} at {third_at:?}"
+            );
+            assert!(
+                fourth_max < 1.0e-4,
+                "{distribution:?} {label}: analytic fourth directional deviates from \
+                 the five-point FD stencil by {fourth_max:.3e} at {fourth_at:?}"
+            );
         };
 
         let full_u: Vec<f64> = (0..ncoef)
