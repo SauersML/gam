@@ -305,11 +305,15 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
     for &ll in &[closed_form - 2.0, 0.0, closed_form + 2.0] {
         let analytic = {
             let mut obj = engaged_objective(&evaluator, &z, &coords);
-            let grad = obj
+            let eval = obj
                 .eval(&flat_at(ll))
-                .expect("the ValueAndGradient lane must evaluate")
-                .gradient;
-            grad[grad.len() - 1]
+                .expect("the ValueAndGradient lane must evaluate");
+            eprintln!(
+                "[fd2231] ll={ll:.3} eval cost={:.6e} telemetry={:?}",
+                eval.cost,
+                obj.probe_telemetry()
+            );
+            eval.gradient[eval.gradient.len() - 1]
         };
         let c_plus = engaged_objective(&evaluator, &z, &coords)
             .eval_cost(&flat_at(ll + h))
