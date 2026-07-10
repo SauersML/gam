@@ -269,11 +269,7 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
         n_train,
         n_test
     );
-    assert!(
-        fit.fit.outer_converged,
-        "gam marginal-slope outer solver did not converge (iters={}, reml={:.6})",
-        fit.fit.outer_iterations, fit.fit.reml_score
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // Block layout is [time, marginal, logslope, (score-warp), (link-dev)].
     assert!(

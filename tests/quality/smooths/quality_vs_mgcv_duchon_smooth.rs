@@ -89,7 +89,7 @@ fn gam_duchon_1d_matches_mgcv_ds() {
         panic!("expected a standard GAM fit for a gaussian Duchon smooth");
     };
     eprintln!(
-        "[#1074-duchon] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
+        "[#1074-duchon] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged=certified iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
         fit.fit
             .edf_by_block()
@@ -102,7 +102,6 @@ fn gam_duchon_1d_matches_mgcv_ds() {
             .map(|v| (v * 1000.0).round() / 1000.0)
             .collect::<Vec<_>>(),
         fit.fit.reml_score,
-        fit.fit.outer_converged,
         fit.fit.outer_iterations,
     );
 

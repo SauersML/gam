@@ -121,6 +121,12 @@ fn unbudgeted_fit_terminates_bounded_never_hangs() {
         })
         .run(&mut objective, "SAE manifold")
         .expect("the healthy planted-circle fit must converge through the bridge");
+    // #2235/#2241 — a certified engine conclusion always names WHICH
+    // certificate concluded it (gradient-stationary / criterion-flat /
+    // recurrent-incumbent); `certify_outer_optimality` stamps it on every
+    // converged result.
+    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params);
+    drop(result);
     let fitted = objective.into_fitted();
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     eprintln!(

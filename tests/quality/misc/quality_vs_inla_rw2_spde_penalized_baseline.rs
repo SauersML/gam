@@ -368,7 +368,7 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
         panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");
     };
     eprintln!(
-        "[#1074-quakestp] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
+        "[#1074-quakestp] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged=certified iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
         fit.fit
             .edf_by_block()
@@ -381,7 +381,6 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
             .map(|v| (v * 1000.0).round() / 1000.0)
             .collect::<Vec<_>>(),
         fit.fit.reml_score,
-        fit.fit.outer_converged,
         fit.fit.outer_iterations,
     );
 

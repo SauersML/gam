@@ -161,11 +161,7 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
         panic!("expected a survival location-scale fit result");
     };
     let unified = &fit.fit.fit;
-    assert!(
-        unified.outer_converged,
-        "gam survival location-scale outer optimizer did not converge: iters={} grad_norm={:?}",
-        unified.outer_iterations, unified.outer_gradient_norm
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     let beta_location = unified.beta_threshold();
     let beta_log_sigma = unified.beta_log_sigma();

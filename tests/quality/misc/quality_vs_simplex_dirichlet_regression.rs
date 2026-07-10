@@ -806,10 +806,7 @@ fn gam_dirichlet_regression_recovers_truth() {
         ..BlockwiseFitOptions::default()
     };
     let fit = fit_custom_family(&family, &specs, &options).expect("gam Dirichlet fit");
-    assert!(
-        fit.outer_converged,
-        "gam Dirichlet outer optimization did not converge"
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // gam fitted η_k on the dense grid (reconstruct from per-block β̂).
     let gam_eta_grid: Vec<Vec<f64>> = (0..K)
@@ -1107,10 +1104,7 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
         ..BlockwiseFitOptions::default()
     };
     let fit = fit_custom_family(&family, &specs, &options).expect("gam Dirichlet fit (skye)");
-    assert!(
-        fit.outer_converged,
-        "gam Dirichlet outer optimization did not converge on skye data"
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // gam fitted η_k on the HELD-OUT rows (reconstruct from per-block β̂).
     let gam_eta_test: Vec<Vec<f64>> = (0..K)

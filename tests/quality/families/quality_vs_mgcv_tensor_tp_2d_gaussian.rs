@@ -93,7 +93,7 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
         panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");
     };
     eprintln!(
-        "[#1074-tp2d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
+        "[#1074-tp2d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged=certified iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
         fit.fit
             .edf_by_block()
@@ -106,7 +106,6 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
             .map(|v| (v * 1000.0).round() / 1000.0)
             .collect::<Vec<_>>(),
         fit.fit.reml_score,
-        fit.fit.outer_converged,
         fit.fit.outer_iterations,
     );
 

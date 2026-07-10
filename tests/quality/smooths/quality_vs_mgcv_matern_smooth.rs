@@ -425,7 +425,7 @@ fn diag_matern_internals_1074() {
                 _ => None,
             });
         eprintln!(
-            "[#1074-diag] {formula} fitted_length_scale={fitted_ls:?} kappa_opt_ran={}\n    edf_total={:.3} edf_by_block={:?}\n    log_lambdas={:?}\n    lambdas={:?}\n    reml={:.4} converged={} outer_iters={} rmse_vs_truth={:.4}",
+            "[#1074-diag] {formula} fitted_length_scale={fitted_ls:?} kappa_opt_ran={}\n    edf_total={:.3} edf_by_block={:?}\n    log_lambdas={:?}\n    lambdas={:?}\n    reml={:.4} converged=certified outer_iters={} rmse_vs_truth={:.4}",
             fit.kappa_timing.is_some(),
             fit.fit.edf_total().unwrap(),
             fit.fit
@@ -444,7 +444,6 @@ fn diag_matern_internals_1074() {
                 .map(|v| (v * 1e6).round() / 1e6)
                 .collect::<Vec<_>>(),
             fit.fit.reml_score,
-            fit.fit.outer_converged,
             fit.fit.outer_iterations,
             rmse_t,
         );

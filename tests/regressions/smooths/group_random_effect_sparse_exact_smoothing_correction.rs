@@ -98,7 +98,10 @@ fn group_random_intercept_fits_above_sparse_exact_threshold() {
     };
 
     // The fit must converge with a finite marginal-likelihood objective.
-    assert_eq!(fit.fit.pirls_status, PirlsStatus::Converged);
+    assert_eq!(
+        fit.fit.convergence_evidence().inner_status(),
+        PirlsStatus::Converged
+    );
     assert!(
         fit.fit.reml_score.is_finite(),
         "reml_score must be finite, got {}",
@@ -171,7 +174,10 @@ fn group_random_intercept_just_below_threshold_still_fits() {
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard fit");
     };
-    assert_eq!(fit.fit.pirls_status, PirlsStatus::Converged);
+    assert_eq!(
+        fit.fit.convergence_evidence().inner_status(),
+        PirlsStatus::Converged
+    );
     assert!(fit.fit.reml_score.is_finite());
     assert!(
         fit.fit.covariance_corrected.is_some(),

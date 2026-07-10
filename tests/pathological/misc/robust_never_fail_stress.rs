@@ -55,14 +55,10 @@ impl Lcg {
 /// The classified outcome of a pathological fit under a given robustness policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Path {
-    /// A finite, converged point estimate (the inner+outer KKT certificate held
-    /// and every coefficient / prediction is finite).
+    /// A finite, certified point estimate. A `UnifiedFitResult` that exists IS
+    /// the convergence proof (SPEC 20) — non-converged fits are unmintable —
+    /// so the only remaining check on a successful fit is finiteness.
     ConvergedFinite,
-    /// A finite estimate that did NOT reach the outer convergence certificate
-    /// (budget exhausted at a finite, non-NaN basin). Not a hard failure, but
-    /// not certified either — the escalation must turn this into a sampled
-    /// posterior summary.
-    FiniteNotConverged,
     /// `fit_from_formula` returned `Err` (a hard refusal / runaway).
     Errored,
     /// The fit "succeeded" but produced a non-finite coefficient or prediction.
@@ -102,27 +98,22 @@ fn classify(formula: &str, family: &str, data: &gam::data::EncodedDataset) -> Pa
     match fit_from_formula(formula, data, &cfg(family)) {
         Err(_) => Path::Errored,
         Ok(result) => {
-            let (beta_finite, converged) = match &result {
-                FitResult::Standard(fit) => (
-                    fit.fit.beta.iter().all(|v| v.is_finite()),
-                    fit.fit.outer_converged,
-                ),
-                FitResult::GaussianLocationScale(ls) => (
-                    ls.fit.fit.beta.iter().all(|v| v.is_finite()),
-                    ls.fit.fit.outer_converged,
-                ),
-                FitResult::SurvivalLocationScale(s) => (
-                    s.fit.fit.beta.iter().all(|v| v.is_finite()),
-                    s.fit.fit.outer_converged,
-                ),
-                _ => (false, false),
+            // Fit existence is the sealed convergence proof (SPEC 20); only
+            // finiteness remains to classify on a successful fit.
+            let beta_finite = match &result {
+                FitResult::Standard(fit) => fit.fit.beta.iter().all(|v| v.is_finite()),
+                FitResult::GaussianLocationScale(ls) => {
+                    ls.fit.fit.beta.iter().all(|v| v.is_finite())
+                }
+                FitResult::SurvivalLocationScale(s) => {
+                    s.fit.fit.beta.iter().all(|v| v.is_finite())
+                }
+                _ => false,
             };
-            if !beta_finite {
-                Path::NonFinite
-            } else if converged {
+            if beta_finite {
                 Path::ConvergedFinite
             } else {
-                Path::FiniteNotConverged
+                Path::NonFinite
             }
         }
     }
@@ -247,11 +238,12 @@ fn run_battery() -> Vec<(&'static str, Path)> {
 /// robust path, prints the per-case path, and asserts the property that is
 /// already guaranteed today: the robust fit never produces a NON-FINITE (NaN/Inf)
 /// estimate on any pathological case — the self-limiting Jeffreys penalty bounds
-/// every near-separating direction to a finite basin. (A `FiniteNotConverged`
-/// outcome is permitted here — it is not a hard failure, and it is exactly what
-/// the escalation will upgrade to a sampled posterior.) The full never-fail claim
-/// (every case is converged-finite) is asserted by the strict test once
-/// escalation lands.
+/// every near-separating direction to a finite basin. (An `Errored` outcome is
+/// permitted here — under SPEC 20 a non-converged fit is unmintable, so budget
+/// exhaustion surfaces as a typed `Err` rather than an uncertified result; it
+/// is exactly what the escalation will upgrade to a sampled posterior.) The
+/// full never-fail claim (every case is converged-finite) is asserted by the
+/// strict test once escalation lands.
 #[test]
 fn characterize_robust_paths() {
     init_parallelism();
@@ -272,8 +264,9 @@ fn characterize_robust_paths() {
     // FINITENESS GUARANTEE (true today): the always-on Jeffreys curvature makes
     // the inner objective coercive on every near-separating direction, so no case
     // may return a NON-FINITE coefficient / prediction. (Residual non-convergence
-    // on the hardest cases is permitted — it is `FiniteNotConverged`, which the
-    // HMC escalation will later upgrade to a sampled posterior.)
+    // on the hardest cases is permitted — under SPEC 20 it surfaces as a typed
+    // `Err` (`Path::Errored`), which the HMC escalation will later upgrade to a
+    // sampled posterior.)
     for (label, path) in battery.iter() {
         assert_ne!(
             *path,

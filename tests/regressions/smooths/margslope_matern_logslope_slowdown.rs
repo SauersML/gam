@@ -145,25 +145,17 @@ fn margslope_matern_logslope_timing() {
     let start = Instant::now();
     let result = fit_model(request);
     let elapsed = start.elapsed().as_secs_f64();
-    let (outer_iterations, inner_cycles, outer_converged) = match result {
+    // Fit existence is the sealed convergence proof (SPEC 20).
+    match result {
         Ok(FitResult::BernoulliMarginalSlope(out)) => {
             eprintln!(
-                "[979-REPRO] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged={}",
-                out.fit.outer_iterations, out.fit.inner_cycles, out.fit.outer_converged
+                "[979-REPRO] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged=certified",
+                out.fit.outer_iterations, out.fit.inner_cycles
             );
-            (
-                out.fit.outer_iterations,
-                out.fit.inner_cycles,
-                out.fit.outer_converged,
-            )
         }
         Ok(_) => panic!("wrong FitResult variant"),
         Err(e) => panic!("fit failed: {e}"),
     };
-    assert!(
-        outer_converged,
-        "marginal-slope fit returned without an outer convergence certificate; outer_iterations={outer_iterations} inner_cycles={inner_cycles}"
-    );
     assert!(
         elapsed < 60.0,
         "margslope matern-logslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 60s)"
@@ -193,27 +185,19 @@ fn margslope_matern_logslope_above_cliff() {
     let start = Instant::now();
     let result = fit_model(request);
     let elapsed = start.elapsed().as_secs_f64();
-    let (outer_iterations, inner_cycles, outer_converged) = match result {
+    // Fit existence is the sealed convergence proof (SPEC 20).
+    match result {
         Ok(FitResult::BernoulliMarginalSlope(out)) => {
             eprintln!(
-                "[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged={}",
-                out.fit.outer_iterations, out.fit.inner_cycles, out.fit.outer_converged
+                "[979-ABOVE-CLIFF] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged=certified",
+                out.fit.outer_iterations, out.fit.inner_cycles
             );
-            (
-                out.fit.outer_iterations,
-                out.fit.inner_cycles,
-                out.fit.outer_converged,
-            )
         }
         Ok(_) => panic!("wrong FitResult variant"),
         Err(e) => panic!(
             "above-cliff marginal-slope fit failed after {elapsed:.2}s at n={n} centers={centers}: {e}"
         ),
     };
-    assert!(
-        outer_converged,
-        "above-cliff marginal-slope fit returned without an outer convergence certificate; outer_iterations={outer_iterations} inner_cycles={inner_cycles}"
-    );
     assert!(
         elapsed < 120.0,
         "above-cliff margslope fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"

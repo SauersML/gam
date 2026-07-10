@@ -117,7 +117,7 @@ fn gam_factor_smooth_sz_matches_mgcv() {
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
     let n_cols = ds.headers.len();
     eprintln!(
-        "[#1074-sz] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
+        "[#1074-sz] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged=certified iters={}",
         gam_edf,
         fit.fit
             .edf_by_block()
@@ -130,7 +130,6 @@ fn gam_factor_smooth_sz_matches_mgcv() {
             .map(|v| (v * 1000.0).round() / 1000.0)
             .collect::<Vec<_>>(),
         fit.fit.reml_score,
-        fit.fit.outer_converged,
         fit.fit.outer_iterations,
     );
 

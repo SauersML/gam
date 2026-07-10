@@ -186,8 +186,8 @@ fn margslope_duchon_above_cliff() {
     let out = match result {
         Ok(FitResult::BernoulliMarginalSlope(out)) => {
             eprintln!(
-                "[979-DUCHON] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged={}",
-                out.fit.outer_iterations, out.fit.inner_cycles, out.fit.outer_converged
+                "[979-DUCHON] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged=certified",
+                out.fit.outer_iterations, out.fit.inner_cycles
             );
             out
         }
@@ -201,11 +201,7 @@ fn margslope_duchon_above_cliff() {
         !out.fit.blocks.is_empty(),
         "margslope Duchon fit produced no coefficient blocks"
     );
-    assert!(
-        out.fit.outer_converged,
-        "margslope Duchon fit returned without an outer convergence certificate; outer_iterations={} inner_cycles={}",
-        out.fit.outer_iterations, out.fit.inner_cycles,
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     assert!(
         out.fit
             .blocks

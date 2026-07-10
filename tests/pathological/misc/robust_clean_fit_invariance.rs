@@ -223,12 +223,7 @@ fn full_span_jeffreys_is_invisible_on_clean_well_identified_bms_fit() {
     let fit = run_clean_fit();
 
     assert!(fit.all_finite, "non-finite β on a clean fit");
-    assert!(
-        fit.outer_converged,
-        "clean fit failed to converge (conv={}) — the cohort is supposed to be \
-         well-identified, so the always-on robust path must settle",
-        fit.outer_converged,
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // The self-limiting Jeffreys penalty leaves a clean, well-identified fit at a
     // bounded, finite optimum: coefficient scale stays O(1), the log-likelihood

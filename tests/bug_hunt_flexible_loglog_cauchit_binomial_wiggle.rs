@@ -14,10 +14,11 @@
 //! LogLog/Cauchit, so teaching the gates makes the fit real.
 //!
 //! Asserted, from an angle distinct from the Python predict check:
-//!   * cloglog control — flexible fit converges with the warp engaged,
-//!   * loglog / cauchit — each fit converges (`outer_converged`), the monotone
-//!     warp is actually engaged (`wiggle_degree`/`wiggle_knots` present, not a
-//!     silent drop to the fixed base link), and the deviance is finite,
+//!   * cloglog control — flexible fit mints with the warp engaged,
+//!   * loglog / cauchit — each fit mints (fit existence is the sealed
+//!     convergence proof, SPEC 20), the monotone warp is actually engaged
+//!     (`wiggle_degree`/`wiggle_knots` present, not a silent drop to the fixed
+//!     base link), and the deviance is finite,
 //!   * the loglog and cauchit warped fits are genuinely distinct from cloglog
 //!     (distinct fitted coefficients) — a gate re-restriction or a silent
 //!     fallback to a fixed base link would collapse these.
@@ -52,8 +53,9 @@ fn binomial_data(n: usize, seed: u64) -> gam::data::EncodedDataset {
 }
 
 /// Fit `y ~ x + link(type=flexible(<link>))` as a binomial GAM and return
-/// `(outer_converged, wiggle_degree, wiggle_knots_len, deviance, beta)`.
-fn fit_flexible(link: &str) -> (bool, Option<usize>, Option<usize>, f64, Vec<f64>) {
+/// `(wiggle_degree, wiggle_knots_len, deviance, beta)`. A fit that mints is
+/// the sealed convergence proof (SPEC 20).
+fn fit_flexible(link: &str) -> (Option<usize>, Option<usize>, f64, Vec<f64>) {
     let d = binomial_data(600, 2155);
     let cfg = FitConfig {
         family: Some("binomial".into()),
@@ -66,7 +68,6 @@ fn fit_flexible(link: &str) -> (bool, Option<usize>, Option<usize>, f64, Vec<f64
         panic!("expected a standard binomial GAM fit for flexible({link})");
     };
     (
-        fit.fit.outer_converged,
         fit.wiggle_degree,
         fit.wiggle_knots.as_ref().map(|k| k.len()),
         fit.fit.deviance,
@@ -89,22 +90,22 @@ fn assert_wiggle_engaged(link: &str, degree: Option<usize>, knots: Option<usize>
 
 #[test]
 fn flexible_cloglog_control_binomial_wiggle_converges_2155() {
-    let (converged, degree, knots, dev, _) = fit_flexible("cloglog");
-    assert!(converged, "flexible(cloglog) control must converge");
+    // Fit existence is the sealed convergence proof (SPEC 20).
+    let (degree, knots, dev, _) = fit_flexible("cloglog");
     assert_wiggle_engaged("cloglog", degree, knots, dev);
 }
 
 #[test]
 fn flexible_loglog_binomial_wiggle_converges_2155() {
-    let (converged, degree, knots, dev, _) = fit_flexible("loglog");
-    assert!(converged, "flexible(loglog) must converge (#2155)");
+    // Fit existence is the sealed convergence proof (SPEC 20).
+    let (degree, knots, dev, _) = fit_flexible("loglog");
     assert_wiggle_engaged("loglog", degree, knots, dev);
 }
 
 #[test]
 fn flexible_cauchit_binomial_wiggle_converges_2155() {
-    let (converged, degree, knots, dev, _) = fit_flexible("cauchit");
-    assert!(converged, "flexible(cauchit) must converge (#2155)");
+    // Fit existence is the sealed convergence proof (SPEC 20).
+    let (degree, knots, dev, _) = fit_flexible("cauchit");
     assert_wiggle_engaged("cauchit", degree, knots, dev);
 }
 
@@ -113,9 +114,9 @@ fn flexible_cauchit_binomial_wiggle_converges_2155() {
 /// to a single fixed base link (identical fits) is caught here.
 #[test]
 fn flexible_loglog_cauchit_are_distinct_from_cloglog_2155() {
-    let (_, _, _, _, cloglog) = fit_flexible("cloglog");
-    let (_, _, _, _, loglog) = fit_flexible("loglog");
-    let (_, _, _, _, cauchit) = fit_flexible("cauchit");
+    let (_, _, _, cloglog) = fit_flexible("cloglog");
+    let (_, _, _, loglog) = fit_flexible("loglog");
+    let (_, _, _, cauchit) = fit_flexible("cauchit");
 
     let max_abs_diff = |a: &[f64], b: &[f64]| {
         assert_eq!(a.len(), b.len(), "coefficient vectors must share a width");
