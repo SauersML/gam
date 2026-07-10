@@ -3139,8 +3139,14 @@ impl SaeManifoldTerm {
             std::collections::HashMap::new()
         };
         let mut out = Array2::<f64>::zeros((n, p));
-        let mut g_buf = vec![0.0_f64; p];
-        for row in 0..n {
+        // Per-row reconstruction: each row reads only immutable `&self`/`assignments`
+        // state and writes ONLY its own `out` row (a per-row accumulation over atoms,
+        // never a cross-row float reduction), so the row-parallel path is bit-identical
+        // to the serial sweep (disjoint-writes determinism). Structural twin of the
+        // reconstruction in `try_fitted_with_rho`; the only difference is that the
+        // per-row mass here is read straight from the `assignments` view (no per-row
+        // `?`), so the closure is infallible.
+        let fill_out_row = |row: usize, out_row: &mut [f64], g_buf: &mut [f64]| {
             for atom_idx in 0..k_atoms {
                 let a_k = assignments[[row, atom_idx]];
                 if a_k == 0.0 {
@@ -3148,14 +3154,42 @@ impl SaeManifoldTerm {
                 }
                 if let Some(image) = linear_images.get(&atom_idx) {
                     let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                    image.fill_row(image.coordinate_for_row(row, own_t), &mut g_buf);
+                    image.fill_row(image.coordinate_for_row(row, own_t), g_buf);
                 } else {
-                    self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                    self.atoms[atom_idx].fill_decoded_row(row, g_buf);
                 }
-                let mut out_row = out.row_mut(row);
                 for out_col in 0..p {
                     out_row[out_col] += a_k * g_buf[out_col];
                 }
+            }
+        };
+        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+        if parallel {
+            use rayon::prelude::*;
+            const CHUNK: usize = 32;
+            // #1557 — pin any faer GEMM reached via `fill_decoded_row` / `image.fill_row`
+            // to `Par::Seq` so nested faer does not re-fan the pool (bit-identical).
+            out.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
+                .into_par_iter()
+                .enumerate()
+                .for_each(|(chunk, mut block)| {
+                    with_nested_parallel(|| {
+                        let start = chunk * CHUNK;
+                        let mut g_buf = vec![0.0_f64; p];
+                        for local in 0..block.nrows() {
+                            let row = start + local;
+                            let mut out_row = block.row_mut(local);
+                            let out_row = out_row.as_slice_mut().expect("contiguous out row");
+                            fill_out_row(row, out_row, &mut g_buf);
+                        }
+                    });
+                });
+        } else {
+            let mut g_buf = vec![0.0_f64; p];
+            for row in 0..n {
+                let mut out_row = out.row_mut(row);
+                let out_row = out_row.as_slice_mut().expect("contiguous out row");
+                fill_out_row(row, out_row, &mut g_buf);
             }
         }
         // #2023 C4 — Tier-0 shared mean add-back (no-op when inactive).
