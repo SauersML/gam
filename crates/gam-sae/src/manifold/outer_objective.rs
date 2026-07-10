@@ -3841,6 +3841,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // cost lane converged to 1.13e3 through its rescue while this lane
         // walled at 1e12, desyncing the (f, ∇f) pair the FD gate pins). Genuine
         // non-PD classes fail both attempts and keep their wall semantics.
+        // The failed attempt leaves the term at its refused iterate — every
+        // same-state retry (any drive, any budget) then replays the refusal,
+        // and the envelope's basin bundle seeds from the damaged state too
+        // (measured: a FRESH object converges this ρ with the same drive that
+        // the post-failure object refuses). Snapshot cheaply and restore before
+        // the rescue so stage 1 starts where a fresh evaluation would.
+        let pre_attempt_term = self.term.clone();
         let first_attempt = self.term.reml_criterion_with_cache(
             self.target.view(),
             &rho_state,
@@ -3853,6 +3860,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let attempt = match first_attempt {
             Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
                 self.probe_telemetry.budget_rescued_value_probes += 1;
+                self.term = pre_attempt_term;
                 // Two-stage rescue, mirroring what makes the COST lane succeed at
                 // the same ρ (measured: cost lane 1.128e3 vs this lane's wall,
                 // and a same-drive retry — even at 4× budget — replays the
