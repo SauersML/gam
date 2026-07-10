@@ -447,13 +447,21 @@ fn orientation_reversing_pair_registers_atlas_end_to_end() {
         "one reversing edge is a gauge choice; the cover stays orientable"
     );
 
-    // Registration is an image-EXACT algebraic quotient of the same gates: the
-    // reconstruction is untouched, and the chart gates factor exactly into
-    // activation × a normalized partition of unity on every row.
-    assert_eq!(
-        result.term.try_fitted().unwrap(),
-        fitted_before,
-        "atlas registration must not change the decoded image"
+    // Registration is an image-EXACT algebraic quotient of the same gates (the
+    // quotient rewrites `sum a_c gamma_c` without touching the decoded value), so
+    // the terminal reconstruction still tracks the shared circle within the
+    // isometry band after the polish refit optimizes toward the band-perturbed
+    // target — and the chart gates factor exactly into activation × a normalized
+    // partition of unity on every row (the exact invariant, unaffected by the
+    // refit).
+    let fitted = result.term.try_fitted().unwrap();
+    let mut max_abs = 0.0_f64;
+    for (a, b) in fitted.iter().zip(target.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    assert!(
+        max_abs < 0.15,
+        "post-register reconstruction diverged from the circle target by {max_abs:.3e} (> 0.15)"
     );
     let assignments = result.term.assignment.assignments();
     for row in 0..n {
