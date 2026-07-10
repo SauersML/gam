@@ -3393,7 +3393,7 @@ fn sae_manifold_fit_inner<'py>(
     let report = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
         gam::terms::sae::manifold::run_sae_manifold_fit(request)
     })?
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(|err| sae_fit_error_to_pyerr(py, err))?;
     let gam::terms::sae::manifold::SaeFitReport {
         term,
         rho,

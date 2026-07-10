@@ -1,3 +1,80 @@
+/// Preserve the core SAE fit error taxonomy at the Python boundary.
+///
+/// In particular, a completed-but-nonstationary outer search is not an input
+/// error: it is a typed REML convergence failure whose full `OuterResult`
+/// remains the resume/evidence payload.  Keep that distinction instead of
+/// flattening `SaeFitError` through `Display` into `GamError`.
+fn sae_fit_error_to_pyerr(
+    py: Python<'_>,
+    err: gam::terms::sae::manifold::SaeFitError,
+) -> PyErr {
+    use gam::terms::sae::manifold::SaeFitError;
+
+    let message = err.to_string();
+    match err {
+        SaeFitError::Fit(_) => py_value_error(message),
+        SaeFitError::OuterRun { stage, source } => {
+            let exc = estimation_error_to_pyerr(source);
+            let bound = exc.value(py);
+            if let Err(attach_err) = bound.setattr("stage", stage.to_string()) {
+                attach_err.write_unraisable(py, Some(&bound));
+            }
+            exc
+        }
+        SaeFitError::OuterDidNotConverge { stage, result } => {
+            let exc = RemlConvergenceError::new_err(message);
+            let bound = exc.value(py);
+            let attach_result: PyResult<()> = (|| {
+                bound.setattr("stage", stage.to_string())?;
+                bound.setattr("converged", false)?;
+                bound.setattr("rho_checkpoint", result.rho.clone().into_pyarray(py))?;
+                bound.setattr("final_value", result.final_value)?;
+                bound.setattr("iterations", result.iterations)?;
+                match result.final_grad_norm {
+                    Some(value) => bound.setattr("final_grad_norm", value)?,
+                    None => bound.setattr("final_grad_norm", py.None())?,
+                }
+                match result.final_gradient.as_ref() {
+                    Some(value) => {
+                        bound.setattr("final_gradient", value.clone().into_pyarray(py))?
+                    }
+                    None => bound.setattr("final_gradient", py.None())?,
+                }
+                match result.final_hessian.as_ref() {
+                    Some(value) => {
+                        bound.setattr("final_hessian", value.clone().into_pyarray(py))?
+                    }
+                    None => bound.setattr("final_hessian", py.None())?,
+                }
+                bound.setattr("plan", result.plan_used.to_string())?;
+                bound.setattr(
+                    "operator_stop_reason",
+                    result
+                        .operator_stop_reason
+                        .as_ref()
+                        .map(|reason| format!("{reason:?}")),
+                )?;
+                match result.operator_trust_radius {
+                    Some(value) => bound.setattr("operator_trust_radius", value)?,
+                    None => bound.setattr("operator_trust_radius", py.None())?,
+                }
+                bound.setattr(
+                    "criterion_certificate",
+                    result
+                        .criterion_certificate
+                        .as_ref()
+                        .map(|certificate| format!("{certificate:?}")),
+                )?;
+                Ok(())
+            })();
+            if let Err(attach_err) = attach_result {
+                attach_err.write_unraisable(py, Some(&bound));
+            }
+            exc
+        }
+    }
+}
+
 #[pyfunction(signature = (
     t,
     y,
