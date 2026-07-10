@@ -109,7 +109,7 @@ impl<S> BasinBundle<S> {
             // newest (the member just admitted may carry a placeholder value —
             // e.g. +∞ before its first evaluation — and evicting it here would
             // undo the admission, contradicting the "admission can only lower
-            // the envelope" contract the evaluate() prune already honors).
+            // the envelope" contract).
             let argmin_idx = self.argmin_index();
             let newest_born = self.members.iter().map(|m| m.born_eval).max().unwrap_or(0);
             let candidate = self

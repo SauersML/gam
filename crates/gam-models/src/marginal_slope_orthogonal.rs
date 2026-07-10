@@ -48,26 +48,27 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_terms::smooth::build_term_collection_design;
 use ndarray::{Array1, Array2, ArrayView2};
 
-/// Baseline fixed (NOT REML-learned) log-λ for the influence-absorber block's
-/// ridge.
+/// Floor for the influence-absorber ridge's REML seed.
 ///
-/// The §3 absorbed block `+Z_infl·γ` is an estimating-equation correction, not a
-/// new outcome surface. Its ridge therefore has to live on the same O(n) scale as
-/// the likelihood curvature; otherwise, as n grows, an O(1) ridge makes the
-/// absorber effectively unpenalized and it can fit genuine β(x) signal.  Keep the
-/// historical constant as the lower bound and use [`influence_absorber_log_lambda`]
-/// at call sites that know the training-row count.
-pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
+/// The §3 absorbed block `+Z_infl·γ` is an estimating-equation correction, not
+/// a new outcome surface, so its identity penalty is *seeded* on the
+/// likelihood-curvature scale rather than at the generic ρ₀ = 0 smooth seed.
+/// The log-λ itself is REML-learned like every other precision (SPEC:
+/// shrinkage is explicit or REML-selected, never a pinned magic constant);
+/// this floor only keeps the seed sane for degenerate row counts.
+pub(crate) const INFLUENCE_ABSORBER_SEED_FLOOR_LOG_LAMBDA: f64 = 0.0;
 
-/// Fixed absorber ridge for `n_rows` observations.
+/// REML seed for the absorber ridge with `n_rows` observations.
 ///
-/// Penalizing γ by roughly one unit per observation keeps the absorber a nuisance
-/// leakage correction rather than a competing flexible target surface, while the
-/// residualized columns still contribute when their score improvement is O(n).
+/// Seeding γ's penalty at roughly one unit per observation starts the absorber
+/// as a nuisance leakage correction rather than a competing flexible target
+/// surface; the outer REML then moves λ wherever the evidence puts it (large λ
+/// recovers the null correction, small λ engages a data-supported correction —
+/// the residualized columns carry no marginal-span signal by construction).
 pub(crate) fn influence_absorber_log_lambda(n_rows: usize) -> f64 {
     (n_rows.max(1) as f64)
         .ln()
-        .max(INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA)
+        .max(INFLUENCE_ABSORBER_SEED_FLOOR_LOG_LAMBDA)
 }
 
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the

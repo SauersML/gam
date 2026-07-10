@@ -49,37 +49,26 @@ impl SaeManifoldTerm {
         self.assignment.logits.assign(&seeded_logits);
     }
 
-    /// Seed the IBP-MAP assignment logits from a truncated stick-breaking
-    /// box-constrained least-squares decode of each held-out row.
+    /// Seed IBP assignment logits from a box-constrained least-squares decode of
+    /// each held-out row.
     ///
-    /// For every row a coordinate-descent LSQ with the per-atom gates clamped to
-    /// the truncated IBP stick-breaking prior mean `π_k = (α/(α+1))^{k+1}`
-    /// (#614) recovers each atom's presence gate; the seeded logit is the
-    /// inverse-sigmoid of the gate relative to its prior, scaled by `τ`, so the
-    /// subsequent gate resolution starts at the prior-consistent occupancy.
+    /// For every row, coordinate descent recovers posterior-mean Bernoulli gates
+    /// in `[0,1]`; the seeded logit is their temperature-scaled inverse sigmoid.
+    /// Ordered shrinkage is applied by the IBP prior during fitting, not as a
+    /// second cap in this reconstruction seed.
     pub fn seed_oos_ibp_logits_from_projected_decoder_lsq(
         &mut self,
         target: ArrayView2<'_, f64>,
         tau: f64,
-        alpha: f64,
     ) {
         let (n_obs, p_out) = target.dim();
         let k_atoms = self.k_atoms();
-        // Consistent truncated IBP stick-breaking prior mean π_k = (α/(α+1))^(k+1)
-        // (#614): the first atom is also shrunk by one Beta(α,1) stick mean, matching
-        // the closed-form `ordered_geometric_shrinkage_prior` the fitter applies.
-        let ratio = alpha / (alpha + 1.0);
-        let mut prior = Vec::with_capacity(k_atoms);
-        for atom_idx in 0..k_atoms {
-            prior.push(ratio.powi(atom_idx as i32 + 1).max(f64::MIN_POSITIVE));
-        }
         let mut decoded = vec![vec![0.0_f64; p_out]; k_atoms];
         let mut norm_sq = vec![0.0_f64; k_atoms];
         let mut gates = vec![0.0_f64; k_atoms];
         let mut fitted = vec![0.0_f64; p_out];
         let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-        const OOS_IBP_BOX_LSQ_SWEEPS: usize = 12;
-        const OOS_IBP_GATE_EPS: f64 = 1.0e-6;
+        let numerical_tol = f64::EPSILON.sqrt();
         for row in 0..n_obs {
             for atom_idx in 0..k_atoms {
                 self.atoms[atom_idx].fill_decoded_row(row, &mut decoded[atom_idx]);
@@ -91,7 +80,8 @@ impl SaeManifoldTerm {
                 gates[atom_idx] = 0.0;
             }
             fitted.fill(0.0);
-            for _ in 0..OOS_IBP_BOX_LSQ_SWEEPS {
+            loop {
+                let mut max_change = 0.0_f64;
                 for atom_idx in 0..k_atoms {
                     let old_gate = gates[atom_idx];
                     let g_row = &decoded[atom_idx];
@@ -101,8 +91,9 @@ impl SaeManifoldTerm {
                             target[[row, out_col]] - fitted[out_col] + old_gate * g_row[out_col];
                         numerator += g_row[out_col] * residual_without_atom;
                     }
-                    let upper = prior[atom_idx] * (1.0 - OOS_IBP_GATE_EPS);
+                    let upper = 1.0 - numerical_tol;
                     let new_gate = (numerator / norm_sq[atom_idx]).clamp(0.0, upper);
+                    max_change = max_change.max((new_gate - old_gate).abs());
                     if new_gate != old_gate {
                         let delta = new_gate - old_gate;
                         for out_col in 0..p_out {
@@ -111,10 +102,13 @@ impl SaeManifoldTerm {
                         gates[atom_idx] = new_gate;
                     }
                 }
+                let scale = gates.iter().copied().fold(1.0_f64, f64::max);
+                if max_change <= numerical_tol * scale {
+                    break;
+                }
             }
             for atom_idx in 0..k_atoms {
-                let q = (gates[atom_idx] / prior[atom_idx])
-                    .clamp(OOS_IBP_GATE_EPS, 1.0 - OOS_IBP_GATE_EPS);
+                let q = gates[atom_idx].clamp(numerical_tol, 1.0 - numerical_tol);
                 seeded_logits[[row, atom_idx]] = tau * (q / (1.0 - q)).ln();
             }
         }

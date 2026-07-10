@@ -5813,8 +5813,8 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // #1026 — final EV-gated alternating decoder-LSQ / coordinate-reprojection
-        // polish on the converged (best) basin.
+        // #1026 — final objective-gated alternating decoder-LSQ /
+        // coordinate-reprojection polish on the converged (best) basin.
         //
         // The bounded joint Newton walk above can return an UNDER-converged decoder
         // on real long-tailed activations: a modest `max_iter` (the OLMo real-recon

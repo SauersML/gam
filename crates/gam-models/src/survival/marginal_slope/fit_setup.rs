@@ -356,7 +356,6 @@ pub(crate) fn joint_setup(
     logslope_penalties: usize,
     core_rho0_seed: &[f64],
     extra_rho0: &[f64],
-    pinned_rho_slots: &[(usize, f64)],
     initial_sigma: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
@@ -385,22 +384,8 @@ pub(crate) fn joint_setup(
             rho0vec[start + idx] = value;
         }
     }
-    let mut rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
-    let mut rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
-    // Pin fixed-ridge penalty slots (e.g. the #461 influence absorber) to a
-    // degenerate box so the outer REML optimizer can never move their log-λ:
-    // the absorber ridge is a fixed training-time leakage absorber, not a
-    // smooth/learned surface. Seed rho0 at the pinned value too so the start
-    // point is feasible.
-    for &(slot, value) in pinned_rho_slots {
-        assert!(
-            slot < rho_dim,
-            "pinned rho slot {slot} out of range (rho_dim={rho_dim})"
-        );
-        rho0vec[slot] = value;
-        rho_lower[slot] = value;
-        rho_upper[slot] = value;
-    }
+    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
+    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
     // Time block has no spatial length scales (pure B-spline on time)
     let empty_kappa = SpatialLogKappaCoords::new_with_dims(Array1::zeros(0), vec![]);
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(

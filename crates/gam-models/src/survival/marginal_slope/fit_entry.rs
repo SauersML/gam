@@ -646,10 +646,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     }
     // Penalty seeds for the flex/aux blocks beyond the core (time/marginal/
     // logslope). The absorbed influence block (#461) contributes ONE trailing
-    // fixed-ridge penalty whose log-λ is pinned (not REML-learned); its flat
-    // rho index is recorded in `pinned_rho_slots` so `joint_setup` clamps it to
-    // a degenerate box.
-    let mut pinned_rho_slots: Vec<(usize, f64)> = Vec::new();
+    // REML-learned identity penalty on γ: the outer optimizer selects the
+    // absorber precision like any other random-effect variance, seeded at the
+    // ln(n) leakage scale (SPEC: shrinkage is explicit or REML-selected, never
+    // a pinned magic constant). The absorber columns are residualized against
+    // the marginal span, so a small learned λ cannot absorb genuine β(x)
+    // signal; a large learned λ recovers the null correction.
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
@@ -659,15 +661,12 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             out.extend(std::iter::repeat_n(0.0, prepared.block.penalties.len()));
         }
         if influence_absorber_residualized.is_some() {
-            let core_len = time_penalties_len
-                + marginal_design.penalties.len()
-                + logslope_design.penalties.len();
-            // The absorber's single fixed ridge sits at the trailing extra slot.
-            pinned_rho_slots.push((
-                core_len + out.len(),
-                crate::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
-            ));
-            out.push(crate::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA);
+            // The absorber's single learned ridge sits at the trailing extra
+            // slot; the seed is clamped into the outer ρ box.
+            out.push(
+                crate::marginal_slope_orthogonal::influence_absorber_log_lambda(n)
+                    .clamp(-12.0, 12.0),
+            );
         }
         out
     };
@@ -710,7 +709,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         logslope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
-        &pinned_rho_slots,
         initial_sigma,
         kappa_options_effective,
     );
@@ -1827,8 +1825,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         )?;
         // Absorbed Stage-1 influence block (#461): a trailing additive block whose
         // design is the residualized leakage columns `Z̃_infl` and whose single
-        // fixed-ridge penalty `½·ρ·‖γ‖²` is pinned out of REML (the rho slot is
-        // clamped to `INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA` by `joint_setup`). Its
+        // identity penalty `½·λ·‖γ‖²` is REML-learned from the trailing rho slot
+        // (seeded at `influence_absorber_log_lambda(n)`). Its
         // gauge priority (130) sits strictly between marginal (150) and logslope
         // (120): the residualization already removes the marginal-aligned
         // component, and the 130 tier makes the canonical-gauge RRQR demote the
@@ -1836,7 +1834,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // discrete realization of `ψ − Π_η[ψ]`. Dropped at predict.
         if let Some(z_tilde) = influence_active {
             let p_i = z_tilde.ncols();
-            // The absorber's single fixed-ridge penalty is the trailing rho slot.
+            // The absorber's single learned ridge is the trailing rho slot.
             // It is the last block, so `cursor` is not advanced past it (nothing
             // downstream consumes a further slice).
             let rho_i = rho.slice(s![cursor..cursor + 1]).to_owned();

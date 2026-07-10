@@ -482,10 +482,9 @@ impl SaeManifoldTerm {
     /// plumbing that the eventual routing flip (once the surrogate lane owns the
     /// analytic gradient, not just the EFS lane) will exercise. Flipping any
     /// caller to `Some` still requires matrix-free siblings for the one remaining
-    /// solver-bound channel — the assignment/learnable-IBP log-strength traces
-    /// (`assignment_log_strength_hessian_trace` / `learnable_ibp_data_logdet_alpha_trace`,
-    /// `logdet_trace[0]`) — so the `solver` argument is still required here and the
-    /// flip stays off until that last gap closes.
+    /// solver-bound channel — `assignment_log_strength_hessian_trace`
+    /// (`logdet_trace[0]`) — so the `solver` argument is still required here and
+    /// the flip stays off until that last gap closes.
     pub(crate) fn analytic_outer_rho_gradient_components_with_bundle(
         &self,
         target: ArrayView2<'_, f64>,
@@ -645,7 +644,7 @@ impl SaeManifoldTerm {
         // exact stationarity solve above supplies the required implicit response.
         for coord in 0..n_params {
             let rhs = self
-                .outer_rho_gradient_ift_rhs(rho, target, coord, cache)
+                .outer_rho_gradient_ift_rhs(rho, coord, cache)
                 .map_err(OuterGradientError::internal)?;
             let solved = self
                 .solve_exact_stationarity(rho, target, cache, solver, &rhs)

@@ -1,4 +1,4 @@
-//! Stationary-cache `∂log|H|/∂θ` adjoint regression tests (#1416/#1417),
+//! Stationary-cache `∂log|H|/∂θ` adjoint regression tests (#1416),
 //! split verbatim out of `tests.rs` to keep that tracked file under the #780
 //! 10k-line gate. Declared as a sibling `#[cfg(test)] mod` in `mod.rs`; shared
 //! `gamma_fd_tiny_fixture` / `fixed_state_logdet` are sourced from the sibling
@@ -756,151 +756,6 @@ fn ibp_majorized_hdiag_2156(
     d.max(0.0) * j * j + diag_score_c.max(0.0)
 }
 
-fn ibp_logalpha_dual_channel_report_2156(
-    term: &SaeManifoldTerm,
-    rho: &SaeManifoldRho,
-    cache: &ArrowFactorCache,
-) -> ExactTraceReport {
-    let total_t = cache.delta_t_len();
-    let dim = total_t + cache.k;
-    let k_atoms = term.k_atoms();
-    let alpha = term
-        .assignment
-        .resolved_ibp_alpha(rho)
-        .expect("resolved learnable alpha");
-    let inv_alpha1 = 1.0 / (alpha + 1.0);
-    let second_jets = term.atom_second_jets().expect("second jets");
-    let border = term
-        .border_channels_for_cache(cache)
-        .expect("border channels");
-    let mut assignments = Array1::<f64>::zeros(k_atoms);
-    let mut tt_data = Array2::<f64>::zeros((dim, dim));
-    let mut tt_majorizer = Array2::<f64>::zeros((dim, dim));
-    let mut t_beta = Array2::<f64>::zeros((dim, dim));
-    let mut beta_beta = Array2::<f64>::zeros((dim, dim));
-
-    let kfac = |atom: usize, term: &SaeManifoldTerm| -> f64 {
-        if term.assignment.ungated.get(atom).copied().unwrap_or(false) {
-            0.0
-        } else {
-            (atom + 1) as f64
-        }
-    };
-
-    for row in 0..term.n_obs() {
-        let base = cache.row_offsets[row];
-        let vars = term
-            .row_vars_for_cache_row(row, cache)
-            .expect("IBP row vars");
-        term.assignment
-            .try_assignments_row_for_rho_into(
-                row,
-                rho,
-                assignments.as_slice_mut().expect("assignment scratch"),
-            )
-            .expect("IBP assignments");
-        let mut jets = term
-            .row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)
-            .expect("IBP row jets");
-        if term.whiten_logdet_row_jets() {
-            whiten_row_jets_for_low_rank_metric_2156(term, row, &mut jets);
-        }
-        let var_atom: Vec<usize> = jets
-            .vars
-            .iter()
-            .map(|v| match *v {
-                SaeLocalRowVar::Logit { atom } => atom,
-                SaeLocalRowVar::Coord { atom, .. } => atom,
-            })
-            .collect();
-
-        for a in 0..jets.vars.len() {
-            for b in 0..jets.vars.len() {
-                let kw = kfac(var_atom[a], term) + kfac(var_atom[b], term);
-                tt_data[[base + a, base + b]] =
-                    inv_alpha1 * kw * sae_dot(&jets.first[a], &jets.first[b]);
-            }
-        }
-        for a in 0..jets.vars.len() {
-            for (beta_pos, channel) in border.iter().enumerate() {
-                let kw = kfac(var_atom[a], term) + kfac(channel.atom, term);
-                let entry = inv_alpha1 * kw * sae_dot(&jets.first[a], &jets.beta[beta_pos]);
-                let t_idx = base + a;
-                let b_idx = total_t + channel.index;
-                t_beta[[t_idx, b_idx]] = entry;
-                t_beta[[b_idx, t_idx]] = entry;
-            }
-        }
-        for (beta_i, channel_i) in border.iter().enumerate() {
-            for (beta_j, channel_j) in border.iter().enumerate() {
-                let kw = kfac(channel_i.atom, term) + kfac(channel_j.atom, term);
-                beta_beta[[total_t + channel_i.index, total_t + channel_j.index]] =
-                    inv_alpha1 * kw * sae_dot(&jets.beta[beta_i], &jets.beta[beta_j]);
-            }
-        }
-    }
-
-    let mut hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho).expect("IBP hdiag");
-    let mut channels = ibp_assignment_third_channels(&term.assignment, rho, false)
-        .expect("IBP channels")
-        .expect("IBP channels present");
-    // #2144/#1038: unconditional PSD majorization, mirroring production.
-    for row in 0..term.n_obs() {
-        for atom in 0..k_atoms {
-            let slot = row * k_atoms + atom;
-            hdiag[slot] = ibp_majorized_hdiag_2156(&channels, row, k_atoms, atom, hdiag[slot]);
-        }
-    }
-    for atom in 0..k_atoms {
-        if channels.cross_row_d[atom] < 0.0 {
-            channels.cross_row_d[atom] = 0.0;
-            channels.cross_row_d_logalpha[atom] = 0.0;
-        }
-    }
-
-    let mut col_sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
-    for row in 0..term.n_obs() {
-        let base = cache.row_offsets[row];
-        let vars = term
-            .row_vars_for_cache_row(row, cache)
-            .expect("IBP majorizer row vars");
-        for (pos, var) in vars.iter().enumerate() {
-            if let SaeLocalRowVar::Logit { atom } = *var {
-                let idx = base + pos;
-                tt_majorizer[[idx, idx]] += hdiag[row * k_atoms + atom];
-                col_sites[atom].push((row, idx));
-            }
-        }
-    }
-    for atom in 0..k_atoms {
-        let d_k = channels.cross_row_d_logalpha[atom];
-        if d_k == 0.0 {
-            continue;
-        }
-        for &(row_i, idx_i) in &col_sites[atom] {
-            let j_i = channels.z_jac[row_i * k_atoms + atom];
-            for &(row_j, idx_j) in &col_sites[atom] {
-                if row_i == row_j {
-                    continue;
-                }
-                let j_j = channels.z_jac[row_j * k_atoms + atom];
-                tt_majorizer[[idx_i, idx_j]] += d_k * j_i * j_j;
-            }
-        }
-    }
-
-    let h = dense_cached_arrow_hessian_2156(cache);
-    dual_trace_report_2156(
-        cache,
-        &h,
-        vec![
-            (DerivativeTraceChannel::Tt, tt_data),
-            (DerivativeTraceChannel::Majorizer, tt_majorizer),
-            (DerivativeTraceChannel::Border, t_beta),
-            (DerivativeTraceChannel::Beta, beta_beta),
-        ],
-    )
-}
 
 fn dense_trace_hinv_dh_2156(h: &Array2<f64>, dh: &Array2<f64>) -> f64 {
     assert_eq!(h.raw_dim(), dh.raw_dim(), "trace shape");
@@ -981,10 +836,7 @@ fn assert_dual_rho_logdet_parity_2156(
     let sparse_dual_half = dual_half_logdet_trace_2156(cache, &h, &sparse_dh);
     let sparse_analytic_half = term
         .assignment_log_strength_hessian_trace(rho, cache, &solver)
-        .expect("production sparse rho trace")
-        + term
-            .learnable_ibp_data_logdet_alpha_trace(rho, cache, &solver)
-            .expect("production learnable-alpha data trace");
+        .expect("production sparse rho trace");
     max_rel = max_rel.max(assert_dual_trace_matches_analytic_2156(
         label,
         0,
@@ -1234,7 +1086,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
 }
 
 #[test]
-pub(crate) fn branch_guarded_dual_oracle_pins_live_softmax_and_ibp_channels_2156() {
+pub(crate) fn branch_guarded_dual_oracle_pins_live_softmax_channels_2156() {
     let (mut softmax_term, target, mut softmax_rho) = gamma_fd_tiny_fixture();
     softmax_rho.log_lambda_sparse = 0.5;
     softmax_term
@@ -1281,57 +1133,6 @@ pub(crate) fn branch_guarded_dual_oracle_pins_live_softmax_and_ibp_channels_2156
         softmax_exact_total,
         softmax_production,
         softmax_exact_total,
-    );
-
-    let (mut ibp_term, ibp_target, mut ibp_rho) = gamma_fd_tiny_fixture();
-    ibp_term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
-    install_low_rank_ibp_metric_2156(&mut ibp_term);
-    ibp_rho.log_lambda_sparse = 0.6;
-    let (ibp_value, ibp_loss, ibp_cache) = ibp_term
-        .reml_criterion_with_cache(ibp_target.view(), &ibp_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged low-rank-metric IBP cache");
-    assert!(
-        ibp_value.is_finite() && ibp_loss.total().is_finite(),
-        "IBP guard fixture must produce a finite low-rank cache"
-    );
-    let ibp_solver = DeflatedArrowSolver::plain(&ibp_cache);
-    let ibp_report = ibp_logalpha_dual_channel_report_2156(&ibp_term, &ibp_rho, &ibp_cache);
-    eprintln!(
-        "gam#2156 low-rank IBP branch certificate: {:?}",
-        ibp_report.certificate
-    );
-    let ibp_tt = exact_channel_derivative_2156(&ibp_report, DerivativeTraceChannel::Tt);
-    let ibp_majorizer =
-        exact_channel_derivative_2156(&ibp_report, DerivativeTraceChannel::Majorizer);
-    let ibp_t_beta = exact_channel_derivative_2156(&ibp_report, DerivativeTraceChannel::Border);
-    let ibp_beta_beta = exact_channel_derivative_2156(&ibp_report, DerivativeTraceChannel::Beta);
-    let ibp_data_exact = 0.5 * (ibp_tt + ibp_t_beta + ibp_beta_beta);
-    let ibp_majorizer_exact = 0.5 * ibp_majorizer;
-    let ibp_data_production = ibp_term
-        .learnable_ibp_data_logdet_alpha_trace(&ibp_rho, &ibp_cache, &ibp_solver)
-        .expect("production low-rank IBP data alpha trace");
-    let ibp_majorizer_production = ibp_term
-        .assignment_log_strength_hessian_trace(&ibp_rho, &ibp_cache, &ibp_solver)
-        .expect("production low-rank IBP majorizer alpha trace");
-    assert!(
-        ibp_tt.abs() > 1.0e-10
-            && ibp_majorizer.abs() > 1.0e-10
-            && ibp_t_beta.abs() > 1.0e-10
-            && ibp_beta_beta.abs() > 1.0e-10,
-        "IBP guard must keep every channel live: tt={ibp_tt:.3e}, \
-         majorizer={ibp_majorizer:.3e}, tβ={ibp_t_beta:.3e}, ββ={ibp_beta_beta:.3e}"
-    );
-    assert_close_2156(
-        "IBP learnable-alpha data trace vs dual tt/tβ/ββ channels",
-        ibp_data_exact,
-        ibp_data_production,
-        ibp_data_exact,
-    );
-    assert_close_2156(
-        "IBP assignment majorizer trace vs dual tt-majorizer channel",
-        ibp_majorizer_exact,
-        ibp_majorizer_production,
-        ibp_majorizer_exact,
     );
 }
 
@@ -2179,68 +1980,6 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     );
 }
 
-/// #1417 — for LEARNABLE IBP alpha the joint Laplace `log|H|` depends on alpha
-/// not only through the prior Hessian but EXPLICITLY through the data
-/// Gauss-Newton blocks: `a_ik = σ(ℓ/τ)·π_k(α)`, so `H_ββ`, `H_tβ`, `H_tt` all
-/// carry `α`. The complete `½ ∂log|H|/∂logα` is therefore the prior-Hessian
-/// trace (`assignment_log_strength_hessian_trace`) PLUS the data trace
-/// (`learnable_ibp_data_logdet_alpha_trace`, #1417). The learnable-alpha control
-/// is `α(ρ₀) = α_base·e^{ρ₀}` (`resolve_learnable_weight`), so `∂logα/∂ρ₀ = 1`
-/// and a fixed-state central difference of `log|H|` w.r.t. ρ₀ must equal twice
-/// the SUM of both analytic traces. Omitting the data trace (the pre-#1417 bug)
-/// would fail this FD.
-#[test]
-pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
-    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    // Learnable-alpha IBP-MAP: ρ₀ (log_lambda_sparse) now drives alpha. The
-    // default ρ₀ = 0.1 sits in the indefinite basin and panics at setup (the same
-    // basin the passing `..._pd_region_deflation` sibling documents); ρ₀ = 0.5 is
-    // PD — exactly the value and inner budget that sibling pins for this same
-    // learnable-α fixture, and at it the prior+data trace matches the fixed-state
-    // central difference of log|H| to ≈9 digits. Setup fix only — no tolerance
-    // weakened.
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
-    rho.log_lambda_sparse = 0.5;
-    let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
-    let solver = DeflatedArrowSolver::plain(&cache);
-    // The full ½ ∂log|H|/∂logα = prior trace + data trace, exactly as
-    // `analytic_outer_rho_gradient_components` folds into `logdet_trace[0]`.
-    let prior_trace = term
-        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
-        .expect("prior-Hessian alpha trace");
-    let data_trace = term
-        .learnable_ibp_data_logdet_alpha_trace(&rho, &cache, &solver)
-        .expect("data-Hessian alpha trace");
-    let analytic = prior_trace + data_trace;
-
-    // Fixed-state central difference of log|H| w.r.t. ρ₀ (= log α offset).
-    let h = 1.0e-5;
-    let mut rho_plus = rho.clone();
-    let mut rho_minus = rho.clone();
-    rho_plus.log_lambda_sparse += h;
-    rho_minus.log_lambda_sparse -= h;
-    let fd_half = 0.5
-        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
-            - fixed_state_logdet(term.clone(), &target, &rho_minus))
-        / (2.0 * h);
-    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
-    assert!(
-        (fd_half - analytic).abs() <= tol,
-        "learnable-α logdet trace: fd(½∂log|H|/∂logα)={fd_half:.8e}, \
-         analytic(prior+data)={analytic:.8e} (prior={prior_trace:.6e}, \
-         data={data_trace:.6e})"
-    );
-    // The data trace must be a genuine, nonzero contribution (the #1417 term the
-    // diagonal-only prior trace omitted) — otherwise the test would pass even if
-    // `learnable_ibp_data_logdet_alpha_trace` returned 0.
-    assert!(
-        data_trace.abs() > 1.0e-9,
-        "the #1417 data-Hessian alpha trace must be a live nonzero term; got \
-         {data_trace:.3e}"
-    );
-}
 
 /// #1625 (scope expansion) — the LEARNABLE-α IBP-MAP logit θ-adjoint. This is
 /// the cross-row Woodbury logit channel of `Γ = tr(H⁻¹ ∂H/∂ℓ)` under

@@ -2595,8 +2595,8 @@ pub struct ArrowFactorCache {
     ///
     /// A deflated direction contributes `log(1) = 0` to the row-block log-det
     /// and is ρ/θ-INDEPENDENT, so its true contribution to `∂log|H|/∂ρ` is `0`.
-    /// The analytic outer-gradient traces (`assignment_log_strength_hessian_trace`,
-    /// `learnable_ibp_data_logdet_alpha_trace`, `logdet_theta_adjoint`) contract
+    /// The analytic outer-gradient traces (`assignment_log_strength_hessian_trace`
+    /// and `logdet_theta_adjoint`) contract
     /// `∂H_raw/∂ρ` (the RAW, pre-deflation block derivative) against the DEFLATED
     /// inverse, which assigns `1/λ̃ = 1` to each `vᵢ` and therefore spuriously
     /// adds `½ vᵢᵀ (∂H_raw/∂ρ) vᵢ`. Those traces subtract this per-row term

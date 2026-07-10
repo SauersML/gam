@@ -812,15 +812,8 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     }
     if cold_logits && assignment == SaeOosAssignmentKind::Softmax {
         term.seed_oos_softmax_logits_from_projection_residuals(target.view(), tau);
-    } else if cold_logits {
-        if let SaeOosAssignmentKind::IbpMap { learnable_alpha } = assignment {
-            let seed_alpha = if learnable_alpha {
-                resolve_learnable_weight(alpha, rho.log_lambda_sparse)
-            } else {
-                alpha
-            };
-            term.seed_oos_ibp_logits_from_projected_decoder_lsq(target.view(), tau, seed_alpha);
-        }
+    } else if cold_logits && matches!(assignment, SaeOosAssignmentKind::IbpMap { .. }) {
+        term.seed_oos_ibp_logits_from_projected_decoder_lsq(target.view(), tau);
     }
 
     let loss = term.run_fixed_decoder_arrow_schur(

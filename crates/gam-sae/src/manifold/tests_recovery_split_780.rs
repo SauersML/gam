@@ -1859,10 +1859,8 @@ pub(crate) fn fixed_state_logdet(
 // was split into the sibling `tests_parallelism_invariance_1557.rs` module
 // (declared in `mod.rs`) to keep this tracked file under the 10k limit.
 //
-// The four stationary-cache `∂log|H|/∂θ` adjoint regression tests
-// (`sae_logdet_theta_adjoint_matches_dense_fd_*`,
-// `ibp_rho_sparse_logdet_trace_matches_dense_fd_1416`,
-// `learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417`) were likewise split
-// into the sibling `tests_logdet_adjoint_780.rs` module for the same gate; they
-// still source the shared `gamma_fd_tiny_fixture` / `fixed_state_logdet`
-// helpers, which remain defined here.
+// The stationary-cache `∂log|H|/∂θ` adjoint and assignment-prior trace
+// regressions were likewise split into the sibling
+// `tests_logdet_adjoint_780.rs` module for the same gate; they still source the
+// shared `gamma_fd_tiny_fixture` / `fixed_state_logdet` helpers, which remain
+// defined here.

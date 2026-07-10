@@ -963,7 +963,7 @@ impl SaeAssignment {
     pub(crate) fn try_assignments_row_for_rho(
         &self,
         row: usize,
-        rho: &SaeManifoldRho,
+        _rho: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
         self.try_assignments_row_inner(row)
     }
@@ -1019,7 +1019,7 @@ impl SaeAssignment {
     pub(crate) fn try_assignments_row_for_rho_into(
         &self,
         row: usize,
-        rho: &SaeManifoldRho,
+        _rho: &SaeManifoldRho,
         out: &mut [f64],
     ) -> Result<(), String> {
         self.try_assignments_row_into(row, out)
@@ -1241,19 +1241,12 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
 /// special-cased always-on base atom, so `α` behaves as a genuine IBP
 /// concentration — larger `α` ⇒ heavier mass / slower decay, `α → 0` ⇒ all mass
 /// collapses onto nothing, matching the stick-breaking limit. This is the
-/// deterministic MAP / mean-field form of the IBP prior (the closed form the
+/// deterministic mean-field form of the IBP prior (the closed form the
 /// analytic Newton / Hessian / Woodbury machinery differentiates); no sticks are
 /// *sampled* here, the per-atom weight is the exact expectation of the
 /// stick-breaking product. (#614: previously `π_0 = 1` left the first atom
 /// unshrunk, which is the prior mean of NO stick at all and broke α's role as a
 /// concentration; the consistent product mean restores genuine IBP semantics.)
-pub(crate) fn ordered_geometric_shrinkage_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
-    // Delegate to the schedule-generic [`ordered_prior_means`] (#F2); the
-    // geometric branch there is byte-for-byte the historical log-space
-    // accumulation, so every existing caller is unchanged.
-    ordered_prior_means(k_atoms, OrderedPriorSchedule::Geometric { alpha })
-}
-
 /// Ordered prior-mean *schedule* for the truncated-IBP assignment prior. Both
 /// forms produce a strictly positive, ordered (decreasing) prior mean
 /// `μ_k ∈ (0, 1]` consumed by the Beta--Bernoulli penalty.
@@ -1522,9 +1515,9 @@ pub fn ibp_map_row_value_grad(
 }
 
 /// Batched IBP-MAP value and diagonal logit Jacobian over an `(N, K)` logit
-/// matrix. This shares the exact prior and per-element arithmetic of
-/// [`ibp_map_row_value_grad`] while computing the ordered shrinkage prior only
-/// once for the whole batch.
+/// matrix. This shares the per-element arithmetic of
+/// [`ibp_map_row_value_grad`] while crossing the Rust/Python boundary once for
+/// the whole batch.
 #[must_use]
 pub fn ibp_map_batch_value_grad(
     logits: ArrayView2<'_, f64>,
@@ -2807,7 +2800,7 @@ mod ibp_prior_614_tests {
     fn first_atom_is_shrunk_not_unity() {
         // The #614 defect: π_0 must equal the single-stick mean α/(α+1), NOT 1.0.
         for &alpha in &[0.1_f64, 0.5, 1.0, 2.0, 5.0] {
-            let prior = ordered_geometric_shrinkage_prior(8, alpha);
+            let prior = ordered_prior_means(8, OrderedPriorSchedule::Geometric { alpha });
             let r = ratio(alpha);
             assert!(
                 (prior[0] - r).abs() < 1e-12,
@@ -2827,7 +2820,7 @@ mod ibp_prior_614_tests {
         // π_k = (α/(α+1))^{k+1} exactly, and every successive ratio equals α/(α+1).
         for &alpha in &[0.3_f64, 1.0, 4.0] {
             let k = 12;
-            let prior = ordered_geometric_shrinkage_prior(k, alpha);
+            let prior = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
             let r = ratio(alpha);
             for j in 0..k {
                 let expected = r.powi((j + 1) as i32);
@@ -2852,8 +2845,8 @@ mod ibp_prior_614_tests {
         // Larger α => heavier mass / slower decay: π_0 increases toward 1 and the
         // tail (e.g. π_4) carries more mass. This is the IBP-concentration role
         // the #614 fix restored.
-        let lo = ordered_geometric_shrinkage_prior(8, 0.5);
-        let hi = ordered_geometric_shrinkage_prior(8, 5.0);
+        let lo = ordered_prior_means(8, OrderedPriorSchedule::Geometric { alpha: 0.5 });
+        let hi = ordered_prior_means(8, OrderedPriorSchedule::Geometric { alpha: 5.0 });
         assert!(
             hi[0] > lo[0],
             "larger alpha must raise π_0 (concentration): {} vs {}",
@@ -3224,7 +3217,7 @@ mod ibp_eb_alpha_f1_tests {
         for &alpha in &[0.3_f64, 1.0, 4.5, 37.0] {
             for &k in &[1usize, 3, 8, 64] {
                 let old = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
-                let via = ordered_geometric_shrinkage_prior(k, alpha);
+                let via = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
                 for j in 0..k {
                     assert_eq!(
                         old[j], via[j],

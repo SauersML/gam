@@ -1805,11 +1805,11 @@ next free numbers — the same skip pattern recorded for 0.3.125 at 0.3.126.
   profiled REML is re-fit across a log-κ grid and the strictly-best range adopted,
   so an unlucky single start no longer strands the fit on a poor local range.
 
-**REML correctness (#1417 / #1006, #1038 / #1225 / #1418)**
+**REML correctness (#1006, #1038 / #1225 / #1418)**
 - The REML log-det trace gradients now carry the full Daleckii–Krein
   deflation-derivative correction (with a divided-difference 0/0 guard),
-  spectrally-deflated directions are excluded consistently across all four trace
-  paths, and ungated atoms receive zero α-sensitivity in the data log-det trace.
+  and spectrally-deflated directions are excluded consistently across the live
+  trace paths.
 - Streaming-exact REML now accumulates the cross-row IBP Woodbury log-det in both
   the criterion and the exact-Hessian matvec, matching the dense path to 1e-8; a
   non-PD capacitance is a recoverable ρ-probe refusal rather than a wrong number.
