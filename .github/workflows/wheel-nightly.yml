@@ -50,6 +50,10 @@ jobs:
           args: --release --strip -o dist -i python3.10
           manylinux: 2_28
           sccache: true
+          # build.rs queries git history (author guard); inside the manylinux
+          # container the repo is owned by the runner uid while git runs as
+          # root, so git refuses with "dubious ownership" unless marked safe.
+          before-script-linux: git config --global --add safe.directory "$(pwd)"
         env:
           # Iteration profile — same knobs as the MSI warm builder: 2-4x faster
           # rebuilds for ~10% runtime. Numerics are unaffected.
