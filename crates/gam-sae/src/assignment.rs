@@ -960,32 +960,15 @@ impl SaeAssignment {
         Ok(Some(step))
     }
 
-    /// Post-#1033 the row gates are ρ-invariant (frozen/predicted or free
-    /// routing logits never read ρ), so ρ enters this API purely as a wiring
-    /// contract: reject a ρ minted for a different dictionary before producing
-    /// gates instead of silently pairing mismatched objects.
-    fn check_rho_dictionary(&self, rho: &SaeManifoldRho) -> Result<(), String> {
-        if rho.log_lambda_smooth.len() != self.k_atoms() {
-            return Err(format!(
-                "SaeAssignment: rho carries {} per-atom smoothness coordinates \
-                 but the dictionary has {} atoms",
-                rho.log_lambda_smooth.len(),
-                self.k_atoms()
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn try_assignments_row_for_rho(
-        &self,
-        row: usize,
-        rho: &SaeManifoldRho,
-    ) -> Result<Array1<f64>, String> {
-        self.check_rho_dictionary(rho)?;
-        self.try_assignments_row_inner(row)
-    }
-
-    fn try_assignments_row_inner(&self, row: usize) -> Result<Array1<f64>, String> {
+    /// Post-#1033 the row gates are ρ-INVARIANT (frozen/predicted or free
+    /// routing logits never read ρ), so this API takes no ρ — the signature
+    /// states the invariance instead of threading a dead parameter. (A
+    /// previous "wiring contract" rejected ρ whose per-atom width differed
+    /// from `k_atoms()`, but K legitimately moves mid-fit — births, deaths,
+    /// compaction, topology-race candidates — while ρ updates lag, so that
+    /// contract vetoed valid states and broke seed validation fleet-wide;
+    /// bisected to 6297a7e9f.)
+    pub(crate) fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
         // #1033 — read the ACTIVE routing logits: the ρ-invariant frozen/predicted
         // logits when routing is frozen, else the free `self.logits`. This single
         // source makes the gate value ρ-invariant under frozen routing (the

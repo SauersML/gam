@@ -119,8 +119,12 @@ fn chart_interp_report_carries_typed_provenance_and_recomputed_samples_2250() {
         ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1
     );
     assert_eq!(
-        report.calibration.protocol.draw_policy(),
+        report.calibration.draw_policy,
         ChartInterpNullDrawPolicy::RegenerateRefitAndReadout
+    );
+    assert_eq!(
+        report.calibration.null_kind,
+        NullKind::MatchedSpectrumGaussian
     );
     assert_eq!(report.calibration.seed, 0x2250);
     let null = &report.calibration.null_distribution;

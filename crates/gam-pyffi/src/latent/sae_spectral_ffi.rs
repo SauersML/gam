@@ -2288,11 +2288,8 @@ fn chart_interp_score(
     let calibration = PyDict::new(py);
     calibration.set_item("statistic", report.calibration.statistic.as_str())?;
     calibration.set_item("protocol", report.calibration.protocol.as_str())?;
-    calibration.set_item("null_kind", null.kind.as_str())?;
-    calibration.set_item(
-        "draw_policy",
-        report.calibration.protocol.draw_policy().as_str(),
-    )?;
+    calibration.set_item("null_kind", report.calibration.null_kind.as_str())?;
+    calibration.set_item("draw_policy", report.calibration.draw_policy.as_str())?;
     calibration.set_item("seed", report.calibration.seed)?;
     calibration.set_item("tail", null.tail.as_str())?;
     calibration.set_item("draws", null.n)?;

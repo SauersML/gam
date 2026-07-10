@@ -175,6 +175,10 @@ pub struct ChartInterpNullCalibrationReport {
     pub statistic: ChartInterpStatistic,
     /// Closed generator/refit/readout protocol.
     pub protocol: ChartInterpNullProtocol,
+    /// Native null kind fixed by [`Self::protocol`].
+    pub null_kind: NullKind,
+    /// Per-draw generation/refit/readout policy fixed by [`Self::protocol`].
+    pub draw_policy: ChartInterpNullDrawPolicy,
     /// Seed from which draw-index-specific surrogates were generated.
     pub seed: u64,
     /// Native null distribution, including kind, tail, summary, Monte Carlo
@@ -305,6 +309,8 @@ pub fn chart_interp_score(
         calibration: ChartInterpNullCalibrationReport {
             statistic,
             protocol,
+            null_kind: protocol.null_kind(),
+            draw_policy: protocol.draw_policy(),
             seed: null_calibration.seed(),
             null_distribution,
         },
