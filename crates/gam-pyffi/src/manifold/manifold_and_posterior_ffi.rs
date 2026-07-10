@@ -3470,9 +3470,8 @@ fn periodic_harmonic_basis_derivative<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-fn parse_fit_config(config_json: Option<&str>) -> Result<(FitConfig, Option<String>), String> {
-    let resolved = gam::config_resolve::parse_fit_config_json(config_json)?;
-    Ok((resolved.fit_config, resolved.training_table_kind))
+fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
+    gam::config_resolve::parse_fit_config_json(config_json)
 }
 
 fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bool) {

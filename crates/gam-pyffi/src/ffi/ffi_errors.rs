@@ -827,6 +827,7 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
         WorkflowError::SchemaMismatch { reason } => SchemaMismatchError::new_err(reason),
         WorkflowError::MissingDependency { reason } => MissingDependencyError::new_err(reason),
         WorkflowError::IntegrationFailed { reason } => IntegrationError::new_err(reason),
+        WorkflowError::SpatialUnderresolved { .. } => IntegrationError::new_err(err.to_string()),
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
     }
 }

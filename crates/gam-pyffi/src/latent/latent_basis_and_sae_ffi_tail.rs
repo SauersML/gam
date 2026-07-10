@@ -423,7 +423,8 @@ fn sae_manifold_fit_minimal<'py>(
             &labels,
             &mut atom_basis,
             &mut atom_dim,
-        )?
+        )
+        .map_err(py_value_error)?
     } else {
         vec![None; k_atoms]
     };
@@ -1549,7 +1550,7 @@ fn steer_plan_to_pydict(
     py: Python<'_>,
     plan: gam::inference::steering::SteerPlan,
 ) -> PyResult<Py<PyDict>> {
-    let provenance_str = metric_provenance_label(plan.metric_provenance);
+    let provenance_str = gam::terms::sae::manifold::metric_provenance_label(plan.metric_provenance);
     let out = PyDict::new(py);
     out.set_item("atom", plan.atom)?;
     out.set_item("atom_name", plan.atom_name)?;

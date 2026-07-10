@@ -1606,12 +1606,11 @@ fn gaussian_reml_fit_formula_dataset_impl(
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<TangentRemlMultiResult, SharedTangentFfiError> {
-    let (mut fit_config, _training_table_kind) =
-        parse_fit_config(config_json).map_err(SharedTangentFfiError::Spec)?;
+    let mut fit_config = parse_fit_config(config_json).map_err(SharedTangentFfiError::Spec)?;
     fit_config.family = Some("gaussian".to_string());
     fit_config.link = Some("identity".to_string());
-    let materialized =
-        materialize(&formula, &dataset, &fit_config).map_err(SharedTangentFfiError::Spec)?;
+    let materialized = materialize(&formula, &dataset, &fit_config)
+        .map_err(|err| SharedTangentFfiError::Spec(err.to_string()))?;
     let standard = match materialized.request {
         FitRequest::Standard(request) => request,
         _ => {

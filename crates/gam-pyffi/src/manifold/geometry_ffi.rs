@@ -422,7 +422,7 @@ fn sae_eq4_description_length<'py>(
         })?;
         let array = result.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
             let message = format!("atom {atom} contribution must be a float64 matrix: {e}");
-            *callback_err.borrow_mut() = Some(e);
+            *callback_err.borrow_mut() = Some(PyErr::from(e));
             message
         })?;
         Ok(array.as_array().to_owned())
@@ -7185,7 +7185,7 @@ fn fit_dataset_impl(
     // The stderr `[OUTER step]` log stream (installed by `progress_log::
     // init_logging` at module import) carries solver progress for the Python
     // bindings; the former always-on TUI session lane has been removed.
-    let (mut fit_config, training_table_kind) = parse_fit_config(config_json)?;
+    let mut fit_config = parse_fit_config(config_json)?;
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
@@ -7225,7 +7225,6 @@ fn fit_dataset_impl(
             None,
         )?;
         payload.group_metadata = fit_config.group_metadata.clone();
-        payload.training_table_kind = training_table_kind;
         // The LAWS driver materializes its inner Gaussian design itself; there are
         // no outer materialize advisories to carry (matches `fit_from_formula`).
         payload.inference_notes = Vec::new();
@@ -7326,7 +7325,6 @@ fn fit_dataset_impl(
                             dataset.feature_ranges(),
                         );
                     scan_payload.group_metadata = fit_config.group_metadata.clone();
-                    scan_payload.training_table_kind = training_table_kind;
                     scan_payload.inference_notes = inference_notes;
                     let model = FittedModel::from_payload(scan_payload);
                     return serde_json::to_vec(&model).map_err(|err| {
@@ -7390,7 +7388,6 @@ fn fit_dataset_impl(
                             }
                         })?;
                     cascade_payload.group_metadata = fit_config.group_metadata.clone();
-                    cascade_payload.training_table_kind = training_table_kind;
                     cascade_payload.inference_notes = inference_notes;
                     let model = FittedModel::from_payload(cascade_payload);
                     return serde_json::to_vec(&model).map_err(|err| {
@@ -7599,7 +7596,6 @@ fn fit_dataset_impl(
         }
     };
     payload.group_metadata = fit_config.group_metadata.clone();
-    payload.training_table_kind = training_table_kind;
     payload.inference_notes = inference_notes;
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec(&model).map_err(|err| {
@@ -8098,7 +8094,7 @@ fn validate_formula_dataset_json_impl(
     formula: String,
     config_json: Option<&str>,
 ) -> Result<String, String> {
-    let (mut fit_config, _training_table_kind) = parse_fit_config(config_json)?;
+    let mut fit_config = parse_fit_config(config_json)?;
     // Calibrated marginal-slope chain (#461): validation is purely structural and
     // must stay cheap — it must NOT cross-fit Stage-1. When a CTN Stage-1 recipe
     // is present, strip it and stand in a zero-valued placeholder dose column so
