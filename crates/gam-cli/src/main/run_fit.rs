@@ -586,7 +586,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
             ));
         }
     }
-    let effective_link = link_choice
+    let _effective_link = link_choice
         .as_ref()
         .map(|c| c.link)
         .unwrap_or_else(|| family.link_function());

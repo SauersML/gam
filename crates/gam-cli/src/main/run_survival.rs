@@ -130,7 +130,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let effective_timewiggle = formula_timewiggle.clone();
     let learn_timewiggle = effective_timewiggle.is_some();
 
-    let survivalspec = match effectivespec.to_ascii_lowercase().as_str() {
+    let _survivalspec = match effectivespec.to_ascii_lowercase().as_str() {
         "net" => SurvivalSpec::Net,
         "crude" => {
             return Err(
@@ -349,14 +349,13 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     };
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
-    let frozen_termspec =
+    let _frozen_termspec =
         freeze_term_collection_from_design(&termspec, &cov_design).map_err(|e| e.to_string())?;
 
-    let p_cov = cov_design.design.ncols();
+    let _p_cov = cov_design.design.ncols();
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     let mut event_target = Array1::<u8>::zeros(n);
-    let event_competing = Array1::<u8>::zeros(n);
     let weights = resolve_weight_column(&ds, &col_map, effective_config.weight_column.as_deref())?;
     let threshold_offset =
         resolve_offset_column(&ds, &col_map, effective_config.offset_column.as_deref())?;
@@ -417,7 +416,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let weibull_builtin_beta_seed =
+    let _weibull_builtin_beta_seed =
         if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
             let scale = effective_config
                 .baseline_scale
