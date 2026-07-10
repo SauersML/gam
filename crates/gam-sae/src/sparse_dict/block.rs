@@ -1668,10 +1668,9 @@ pub fn fit_block_sparse_dictionary(
     let b = config.block_size;
     let k = config.block_topk.min(g).max(1);
 
-    let mut decoder = seed_frames(x, g, b);
-    let mut gamma = 1.0f32;
-
-    let mut codes = route_and_code_all(
+    let decoder = seed_frames(x, g, b);
+    let gamma = 1.0f32;
+    let codes = route_and_code_all(
         x,
         decoder.view(),
         gamma,
@@ -1681,87 +1680,52 @@ pub fn fit_block_sparse_dictionary(
         config.minibatch,
         config.block_tile,
     )?;
+    let seed_ev = explained_variance(x, &codes, decoder.view(), b);
+    let mut state = BlockSparseState {
+        decoder,
+        codes,
+        gamma,
+        explained_variance: seed_ev,
+    };
+    canonicalize_matryoshka_state(&mut state, config);
 
-    let mut prev_ev = f64::NEG_INFINITY;
     let mut converged = false;
     let mut epochs_run = 0usize;
-    let mut last_ev = f64::NEG_INFINITY;
     let mut ev_residual = f64::INFINITY;
     let mut gamma_residual = f64::INFINITY;
     let mut frame_residual = f64::INFINITY;
+    let mut routing_residual = f64::INFINITY;
+    let mut reconstruction_residual = f64::INFINITY;
     let mut accepted_births = 0usize;
     let mut polar_failures = 0usize;
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
-        let previous_gamma = gamma;
-
-        // (γ) closed-form shared scalar given current frames/routing.
-        gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
-
-        // (frames) MOD cross-moment + polar reprojection onto St(b, P).
-        let refresh_outcome =
-            refresh_frames(x, &codes, &mut decoder, gamma, g, b, config.frame_ridge);
-        polar_failures = refresh_outcome.0;
-        frame_residual = refresh_outcome.1;
-
-        // (revival) AuxK dead-block reseeding from worst-residual rows.
-        let (revived_blocks, revival_residual) =
-            revive_dead_blocks(x, &codes, &mut decoder, gamma, g, b, config.aux_k);
-        frame_residual = frame_residual.max(revival_residual);
-
-        // (re-encode) fresh routing + codes against the refreshed frames — these
-        // define the post-epoch model, feed the next epoch, and score EV.
-        codes = route_and_code_all(
-            x,
-            decoder.view(),
-            gamma,
+        let step = advance_block_sparse_state(x, &state, config, k)?;
+        let (routing, reconstruction) =
+            routing_and_reconstruction_residuals(x, &state, &step.next);
+        routing_residual = routing;
+        reconstruction_residual = reconstruction;
+        ev_residual = relative_scalar_change(
+            state.explained_variance as f32,
+            step.next.explained_variance as f32,
+        );
+        gamma_residual = relative_scalar_change(state.gamma, step.next.gamma);
+        frame_residual = frame_fixed_point_residual(
+            state.decoder.view(),
+            step.next.decoder.view(),
             g,
             b,
-            k,
-            config.minibatch,
-            config.block_tile,
-        )?;
+        );
+        accepted_births = step.accepted_births;
+        polar_failures = step.polar_failures;
+        state = step.next;
 
-        // Close the γ coordinate on the refreshed frames/routing before testing
-        // stationarity. Routing is invariant to a positive shared γ, and every
-        // signed code is linear in γ, so rescaling is the exact re-encode and
-        // avoids a second O(N·G·P) route pass.
-        let gamma_before_close = gamma;
-        gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
-        if gamma_before_close > 0.0 && gamma != gamma_before_close {
-            let rescale = gamma / gamma_before_close;
-            for code in &mut codes {
-                for value in &mut code.codes {
-                    *value *= rescale;
-                }
-            }
-        }
-        gamma_residual = relative_scalar_change(previous_gamma, gamma);
-
-        let mut revived_mask = vec![false; g];
-        for &block in &revived_blocks {
-            revived_mask[block] = true;
-        }
-        let mut accepted_mask = vec![false; g];
-        for code in &codes {
-            for (slot, &block) in code.blocks.iter().enumerate() {
-                let block = block as usize;
-                if code.gates[slot] != 0.0 && revived_mask[block] {
-                    accepted_mask[block] = true;
-                }
-            }
-        }
-        accepted_births = accepted_mask
-            .into_iter()
-            .filter(|accepted| *accepted)
-            .count();
-
-        let ev = explained_variance(x, &codes, decoder.view(), gamma, b);
-        let improve = ev - prev_ev;
-        last_ev = ev;
-        ev_residual = improve.abs();
-        let fixed_point_residual = ev_residual.max(gamma_residual).max(frame_residual);
+        let fixed_point_residual = ev_residual
+            .max(gamma_residual)
+            .max(frame_residual)
+            .max(routing_residual)
+            .max(reconstruction_residual);
         if accepted_births == 0
             && polar_failures == 0
             && fixed_point_residual <= config.tolerance
@@ -1770,26 +1734,34 @@ pub fn fit_block_sparse_dictionary(
             converged = true;
             break;
         }
-        prev_ev = ev;
     }
 
     if !converged {
         return Err(BlockSparseFitError::NonConvergence {
             epochs: epochs_run,
-            explained_variance: last_ev,
+            explained_variance: state.explained_variance,
             ev_residual,
             gamma_residual,
             frame_residual,
+            routing_residual,
+            reconstruction_residual,
             tolerance: config.tolerance,
             accepted_births,
             polar_failures,
         });
     }
 
+    let BlockSparseState {
+        mut decoder,
+        mut codes,
+        gamma,
+        explained_variance: _,
+    } = state;
+
     // One final γ refresh against the last routing so the returned scalar is the
     // exact least-squares fit to the returned frames + codes.
     let gamma_prev = gamma;
-    gamma = refresh_gamma(x, &codes, decoder.view(), b, gamma);
+    let gamma = refresh_gamma(x, &codes, decoder.view(), b);
     if config.matryoshka_prefix {
         let order = matryoshka_block_order(&codes, g, b);
         reorder_decoder_blocks(&mut decoder, &order, b);
@@ -1821,7 +1793,7 @@ pub fn fit_block_sparse_dictionary(
             }
         }
     }
-    let final_ev = explained_variance(x, &codes, decoder.view(), gamma, b);
+    let final_ev = explained_variance(x, &codes, decoder.view(), b);
     let (block_utilization, block_stable_rank) = block_reports(&codes, g, b, n);
     let prefix_losses = if config.matryoshka_prefix {
         matryoshka_prefix_losses(
@@ -1870,6 +1842,10 @@ pub fn fit_block_sparse_dictionary(
             ev_residual,
             gamma_residual,
             frame_residual,
+            routing_residual,
+            reconstruction_residual,
+            accepted_births,
+            polar_failures,
             tolerance: config.tolerance,
         },
         block_topk: k,

@@ -214,8 +214,8 @@ fn sas_epsilon_objective_profile_measure() {
         log_delta_true.exp()
     );
     eprintln!(
-        "  reml_score={:+.6e}  outer_iters={}  outer_converged={}  outer_grad_norm={:?}",
-        fit.reml_score, fit.outer_iterations, fit.outer_converged, fit.outer_gradient_norm
+        "  reml_score={:+.6e}  outer_iters={}  outer_converged=certified  outer_grad_norm={:?}",
+        fit.reml_score, fit.outer_iterations, fit.outer_gradient_norm
     );
 
     // ANALYTIC gradient the optimizer received at the opening evals. The ε

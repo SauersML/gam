@@ -201,9 +201,12 @@ fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
 }
 
 #[test]
-fn core_saved_fit_result_preserves_nonconverged_status() {
+fn core_saved_fit_result_preserves_summary_metrics() {
+    // A non-converged saved summary is unrepresentable now: the sealed
+    // constructor refuses to mint a UnifiedFitResult from a stalled fit
+    // (SPEC 20). Pin that a converged summary mints and its optimizer
+    // metrics survive the round-trip.
     let mut summary = saved_fit_summary_fixture();
-    summary.pirls_status = gam::pirls::PirlsStatus::StalledAtValidMinimum;
     summary.iterations = 60;
     summary.finalgrad_norm = 42.0;
 
@@ -211,9 +214,9 @@ fn core_saved_fit_result_preserves_nonconverged_status() {
 
     assert_eq!(fit.outer_iterations, 60);
     assert_eq!(fit.outer_gradient_norm, Some(42.0));
-    assert!(
-        !fit.outer_converged,
-        "compact saved fit must not synthesize convergence for stalled fits"
+    assert_eq!(
+        fit.convergence_evidence().inner_status(),
+        gam::pirls::PirlsStatus::Converged
     );
 }
 

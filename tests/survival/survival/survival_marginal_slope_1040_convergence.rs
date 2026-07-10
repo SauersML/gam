@@ -20,7 +20,8 @@
 //! `z_column`, and a matern log-slope surface — on synthetic right-censored
 //! data at a tractable size (small n / centers to stay RAM- and CI-safe), and
 //! asserts the survival-MS fit:
-//!   * converges (`outer_converged == true`) — the load-bearing #1040 guard,
+//!   * converges (a minted fit is the sealed convergence certificate, SPEC 20)
+//!     — the load-bearing #1040 guard,
 //!   * returns at all rather than hanging unbounded (a wall-clock backstop that
 //!     fails a gross slowdown faster than the job ceiling; unlike the binary
 //!     marginal-slope arm, the exact per-cell quadrature makes even a converged
@@ -45,8 +46,8 @@ const CENTERS: usize = 6;
 /// 240-minute timeout, without flaking on the real converged runtime.
 ///
 /// #1040 was a *convergence* bug — the outer REML loop never reached its
-/// stopping criterion — so the load-bearing guard is `outer_converged` below,
-/// not the clock. The clock cannot itself classify converged-vs-hang here: the
+/// stopping criterion — so the load-bearing guard is that the fit mints at all
+/// (fit existence is the sealed convergence proof, SPEC 20), not the clock. The clock cannot itself classify converged-vs-hang here: the
 /// survival marginal-slope objective is an exact per-cell density integral
 /// (∫ φ(z) Φ(η(z)) dz on a 384-node Gauss-Legendre rule, per non-affine
 /// partition cell, per row, per inner cycle), so even a cleanly converged fit
@@ -55,7 +56,7 @@ const CENTERS: usize = 6;
 /// "finishes in seconds" cap (the binary marginal-slope arm's regime) was never
 /// reachable on this arm and would only ever red-flag the heavy-but-correct
 /// quadrature. The honest separator is: a true hang never returns (the 240 min
-/// job ceiling trips) or returns `outer_converged == false`; a converged fit
+/// job ceiling trips) or fails to mint a fit; a converged fit
 /// returns in ~10³ s. This cap brackets that converged runtime with a wide
 /// margin so it only fires on a gross, qualitatively-different slowdown.
 const WALL_BUDGET_S: f64 = 3600.0;
@@ -174,20 +175,15 @@ fn survival_marginal_slope_matern_logslope_converges_within_budget() {
 
     eprintln!(
         "[1040-REPRO] n={N} centers={CENTERS} total_s={elapsed:.2} \
-         outer_iters={} inner_cycles={} converged={}",
-        fit.fit.outer_iterations, fit.fit.inner_cycles, fit.fit.outer_converged
+         outer_iters={} inner_cycles={} converged=certified",
+        fit.fit.outer_iterations, fit.fit.inner_cycles
     );
 
     // ── Assertion 1: the survival-MS outer loop converged ─────────────────
     // This is the #1040 fix: the flat baseline-hazard λ valley used to hang the
     // inner joint-Newton at its ceiling, so the outer REML never terminated.
-    assert!(
-        fit.fit.outer_converged,
-        "survival marginal-slope must converge (outer_converged=false); #1040 \
-         regression — the flat baseline-hazard λ valley is hanging the inner \
-         joint-Newton again instead of taking the relative-plateau / range-space \
-         stationarity exit"
-    );
+    // A minted fit IS the convergence certificate now (SPEC 20): a #1040-class
+    // hang either never returns (assertion 2's clock) or fails to mint.
 
     // ── Assertion 2: it terminated, not the unbounded hang ────────────────
     // Convergence (assertion 1) is the real #1040 guard; this clock backstop

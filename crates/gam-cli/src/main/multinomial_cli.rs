@@ -1,19 +1,10 @@
 use super::*;
 
 use gam::families::multinomial::{
-    MULTINOMIAL_MODEL_CLASS, MultinomialModelEnvelope, MultinomialSavedModel,
-    fit_penalized_multinomial_formula, predict_multinomial_formula,
+    MULTINOMIAL_MODEL_CLASS, MultinomialFitRequest, MultinomialModelEnvelope,
+    MultinomialSavedModel, fit_penalized_multinomial_formula, predict_multinomial_formula,
     predict_multinomial_formula_with_se,
 };
-
-/// Initial uniform smoothing parameter and inner-Newton controls for the
-/// multinomial REML/LAML fit. These mirror the
-/// `gamfit.fit(..., family='multinomial')` FFI defaults
-/// (`fit_multinomial_formula_pyfunc`) so the CLI reaches the same estimator at
-/// the same starting point rather than defining a CLI-specific fit path.
-const MULTINOMIAL_INIT_LAMBDA: f64 = 1.0;
-const MULTINOMIAL_MAX_ITER: usize = 50;
-const MULTINOMIAL_TOL: f64 = 1.0e-7;
 
 /// Peek a model file's JSON discriminator to detect a persisted multinomial
 /// envelope before committing to a full `SavedModel` deserialize. Returns
@@ -136,18 +127,10 @@ pub(crate) fn run_fit_multinomial(
     if args.frailty_kind.is_some() || args.frailty_sd.is_some() || args.hazard_loading.is_some() {
         return Err("frailty options are not supported for --family multinomial".to_string());
     }
-    // Reject flags the shared multinomial driver does not consume, rather than
-    // silently ignoring them (dropping case weights or an offset would quietly
-    // change the fit the user asked for).
-    if args.weights_column.is_some() {
-        return Err("--weights-column is not supported for --family multinomial".to_string());
-    }
-    if args.offset_column.is_some() || args.noise_offset_column.is_some() {
-        return Err(
-            "--offset-column/--noise-offset-column is not supported for --family multinomial"
-                .to_string(),
-        );
-    }
+    // Case weights (`--weights-column` → `fit_config.weight_column`) are
+    // honored by the shared driver; offsets and the other config fields the
+    // softmax family cannot consume are rejected with a typed error inside
+    // `fit_penalized_multinomial_formula`, shared with the Python surface.
     if args.expectile_tau.is_some() {
         return Err("--expectile-tau requires --family expectile".to_string());
     }
@@ -162,7 +145,10 @@ pub(crate) fn run_fit_multinomial(
         );
     };
 
-    let requested_columns = required_columns_for_formula(parsed)?;
+    let mut requested_columns = required_columns_for_formula(parsed)?;
+    // The weight column is consumed by the fit, not the formula; it must ride
+    // along in the projected dataset for the driver to resolve it by name.
+    requested_columns.extend(fit_config.weight_column.iter().cloned());
     // Force the categorical response to a factor encoding. An untyped CSV cannot
     // carry the typed-frame categorical sentinel the Python path uses, so this
     // is exactly the `response_is_categorical` role the dataset loader already
@@ -172,14 +158,11 @@ pub(crate) fn run_fit_multinomial(
 
     let phase_start = std::time::Instant::now();
     log::info!("[PHASE] multinomial fit start n={}", ds.values.nrows());
-    let saved = fit_penalized_multinomial_formula(
+    let saved = fit_penalized_multinomial_formula(&MultinomialFitRequest::new(
         &ds,
         formula_text,
         fit_config,
-        MULTINOMIAL_INIT_LAMBDA,
-        MULTINOMIAL_MAX_ITER,
-        MULTINOMIAL_TOL,
-    )
+    ))
     .map_err(|e| format!("multinomial fit failed: {e}"))?;
     log::info!(
         "[PHASE] multinomial fit end elapsed={:.3}s",

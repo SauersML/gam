@@ -755,7 +755,7 @@ where
                     }
                 }
                 let (r_new, res_new, cache_new) = eval(&trial)?;
-                Ok(Some((trial, r_new, res_new, cache_new)))
+                Ok::<_, String>(Some((trial, r_new, res_new, cache_new)))
             },
             |&(_, _, res_new, _): &_| res_new < res_norm,
         )?;

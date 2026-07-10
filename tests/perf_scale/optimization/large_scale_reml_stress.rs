@@ -281,13 +281,7 @@ fn large_scale_reml_stress_main() {
     .expect("large-scale Duchon-on-PC fit should succeed");
     let elapsed = start.elapsed();
 
-    // (1) REML outer loop converged.
-    assert!(
-        fitted.fit.outer_converged,
-        "REML outer optimization did not converge \
-         (outer_iterations={}, outer_gradient_norm={:?})",
-        fitted.fit.outer_iterations, fitted.fit.outer_gradient_norm,
-    );
+    // (1) Fit existence is the sealed convergence proof (SPEC 20).
     assert!(
         fitted.fit.beta.iter().all(|v| v.is_finite()),
         "fitted coefficients must all be finite",
@@ -405,10 +399,7 @@ fn large_scale_reml_stress_coverage() {
             elapsed.as_secs_f64(),
             WALLCLOCK_BUDGET_PER_COVERAGE_FIT_SECS,
         );
-        assert!(
-            fitted.fit.outer_converged,
-            "coverage-sim {sim_idx}: REML did not converge",
-        );
+        // Fit existence is the sealed convergence proof (SPEC 20).
 
         let frozenspec = freeze_term_collection_from_design(&spec, &fitted.design)
             .expect("coverage-sim freeze spec must succeed");

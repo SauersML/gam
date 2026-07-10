@@ -138,7 +138,6 @@ struct FitDigest {
     beta: Array1<f64>,
     reml_score: f64,
     outer_iterations: usize,
-    outer_converged: bool,
 }
 
 fn fit_once(data: &Array2<f64>, spec: &BernoulliMarginalSlopeTermSpec) -> FitDigest {
@@ -155,7 +154,6 @@ fn fit_once(data: &Array2<f64>, spec: &BernoulliMarginalSlopeTermSpec) -> FitDig
             beta: out.fit.beta.clone(),
             reml_score: out.fit.reml_score,
             outer_iterations: out.fit.outer_iterations,
-            outer_converged: out.fit.outer_converged,
         },
         Ok(_) => panic!("wrong FitResult variant"),
         Err(e) => panic!("fit failed: {e}"),
@@ -212,12 +210,10 @@ fn bms_matern_fit_is_invariant_to_worker_pool_size() {
     let a = fit_on_pool(wide, &data, &spec);
     let b = fit_on_pool(narrow, &data, &spec);
 
-    // The convergence path itself must not fork: a different iteration count or
-    // converged flag means the smaller pool steered the optimizer elsewhere.
-    assert_eq!(
-        a.outer_converged, b.outer_converged,
-        "outer_converged diverged between pools ({wide} vs {narrow})"
-    );
+    // The convergence path itself must not fork: a different iteration count
+    // means the smaller pool steered the optimizer elsewhere. (Both fits are
+    // certified by construction — fit existence is the sealed convergence
+    // proof, SPEC 20.)
     assert_eq!(
         a.outer_iterations, b.outer_iterations,
         "outer_iterations diverged between pools: {} ({wide}) vs {} ({narrow})",

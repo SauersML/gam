@@ -96,5 +96,8 @@ fn fit_surv_two_arg_shorthand_lowers_to_location_scale_with_zero_entry() {
     let FitResult::SurvivalLocationScale(fit) = result else {
         panic!("expected survival location-scale fit result");
     };
-    assert_eq!(fit.fit.fit.pirls_status, PirlsStatus::Converged);
+    assert_eq!(
+        fit.fit.fit.convergence_evidence().inner_status(),
+        PirlsStatus::Converged
+    );
 }

@@ -64,7 +64,7 @@ impl PeriodicCurveExtrema {
         let linear = self.linear_polynomial(linear)?;
         let objective = self.quadratic.add_scaled(&linear, -2.0);
         global_extremum(&objective.derivative(), ExtremumKind::Minimum, |t| {
-            objective.eval_real(t)
+            Ok(objective.eval_real(t))
         })
     }
 

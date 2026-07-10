@@ -12,7 +12,8 @@
 //!
 //! Assertions:
 //!   1. The fit COMPLETES — `fit_from_formula` returns `Ok(FitResult::SurvivalMarginalSlope(...))`.
-//!   2. `outer_converged == true`.
+//!   2. convergence — certified by construction: a minted fit is the sealed
+//!      convergence proof (SPEC 20).
 //!   3. Any V+M drop is attributed to the LOGSLOPE block only (gauge_priority=120,
 //!      the lowest-priority parametric block); drops to time (200) or marginal (150)
 //!      are a regression.
@@ -257,13 +258,8 @@ fn large_scale_survival_marginal_slope_canonical_gauge_fix() {
         ),
     };
 
-    // ── Assertion 2: outer solver converged ──────────────────────────────
-    assert!(
-        result.fit.outer_converged,
-        "large-scale-class fit must converge; outer_converged=false \
-         (iters={}, reml={:.6})",
-        result.fit.outer_iterations, result.fit.reml_score,
-    );
+    // ── Assertion 2 retired: fit existence is the sealed convergence proof
+    // (SPEC 20).
 
     // ── Assertions 3a-b: drop attribution must target logslope only ───────
     //

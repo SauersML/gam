@@ -65,14 +65,13 @@ fn report(tag: &str, fit: &StandardFitResult, fit_secs: f64, predict_secs: f64, 
     let f = &fit.fit;
     eprintln!(
         "[#1689 {tag}] p={p} outer_iter={oi} outer_cost_evals={oce} \
-         inner_pirls_solves={ips} inner_cycles={ic} converged={cv} \
+         inner_pirls_solves={ips} inner_cycles={ic} converged=certified \
          lambdas={nl} | fit={fs:.3}s predict={ps:.3}s total={tot:.3}s | rmse_vs_truth={r:.4}",
         p = f.beta.len(),
         oi = f.outer_iterations,
         oce = f.outer_cost_evals,
         ips = f.inner_pirls_solves,
         ic = f.inner_cycles,
-        cv = f.outer_converged,
         nl = f.lambdas.len(),
         fs = fit_secs,
         ps = predict_secs,
@@ -134,12 +133,7 @@ fn profile_pspline_1d_n400() {
     report("ps-1d-n400", &fit, fs, ps, r);
 
     let f = &fit.fit;
-    assert!(
-        f.outer_converged,
-        "ps-1d-n400: outer REML must converge (got outer_converged=false after \
-         {} iters / {} cost evals)",
-        f.outer_iterations, f.outer_cost_evals
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     // Truth recovery: a converged P-spline at this noise level (σ=0.2, n=400)
     // sits well under 0.06 RMSE on the smooth truth; mgcv lands ~0.03.
     assert!(
@@ -213,12 +207,7 @@ fn profile_thinplate_2d_n1200() {
     report("tp-2d-n1200", &fit, fs, ps, r);
 
     let f = &fit.fit;
-    assert!(
-        f.outer_converged,
-        "tp-2d-n1200: outer REML must converge (got outer_converged=false after \
-         {} iters / {} cost evals)",
-        f.outer_iterations, f.outer_cost_evals
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     // Truth recovery on the gaussian-bump surface (σ=0.1, n=1200): a converged
     // thin-plate fit recovers it to ~0.023 RMSE on the 30x30 grid. 0.05 leaves
     // generous headroom for basis/seed variation without admitting a genuine
@@ -315,12 +304,7 @@ fn profile_duchon_2d_n500() {
         r,
     );
 
-    assert!(
-        f.outer_converged,
-        "duchon-2d-n500: outer REML must converge (outer_converged=false after \
-         {} iters / {} cost evals)",
-        f.outer_iterations, f.outer_cost_evals
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     // Truth recovery on sin+cos over [-1,1]^2 (σ=0.1, n=500). A converged duchon
     // fit recovers this smooth surface comfortably; 0.15 is a generous sanity
     // floor (this is a profiling/measurement test, not the tight #1757 match-or-

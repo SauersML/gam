@@ -29,7 +29,9 @@
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
 use gam_models::fit_orchestration::FitConfig;
-use gam_models::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam_models::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
@@ -125,14 +127,12 @@ fn rmse_vs_truth(
 fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     let (ds, truth) = synth();
     let cfg = FitConfig::default();
-    let model = fit_penalized_multinomial_formula(
-        &ds,
-        "y ~ s(x1, k=6) + s(x2, k=6) + x3",
-        &cfg,
-        1.0,
-        40,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        init_lambda: 1.0,
+        max_iter: 40,
+        tol: 1e-8,
+        ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=6) + s(x2, k=6) + x3", &cfg)
+    })
     .expect("gam multinomial fit");
 
     // (1) Truth recovery. The fused-λ driver measured ≥ 0.13 and the pinned-λ
@@ -186,14 +186,12 @@ fn multinomial_outer_reml_selects_per_term_lambda_and_recovers_truth() {
     // (4) Selection is not a passthrough of the seed. Fit from a very different
     // seed and assert the recovered λ are NOT all ≈ init (the exact
     // dead-selection fingerprint: λ ≡ init for every component).
-    let model_hi = fit_penalized_multinomial_formula(
-        &ds,
-        "y ~ s(x1, k=6) + s(x2, k=6) + x3",
-        &cfg,
-        50.0,
-        40,
-        1e-8,
-    )
+    let model_hi = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        init_lambda: 50.0,
+        max_iter: 40,
+        tol: 1e-8,
+        ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=6) + s(x2, k=6) + x3", &cfg)
+    })
     .expect("gam multinomial fit (init=50)");
     let echoes_seed = model_hi.lambdas.iter().all(|&l| (l - 50.0).abs() < 1e-6);
     assert!(

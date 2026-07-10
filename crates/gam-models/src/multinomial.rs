@@ -2109,6 +2109,109 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix, scale: f64) -> Pena
     }
 }
 
+/// Canonical typed inputs for the formula-driven multinomial fit
+/// ([`fit_penalized_multinomial_formula`]).
+///
+/// Every frontend (Rust, CLI, Python FFI) builds this one request, so the
+/// warm-start / outer-search defaults live here rather than being duplicated
+/// per caller. `config` is the same canonical [`FitConfig`] the scalar formula
+/// families consume: `weight_column` is resolved against the dataset and
+/// honored as per-row case weights, and fields the softmax family cannot
+/// consume (offsets, noise/log-slope formulas, manual Firth, frailty, ...) are
+/// rejected with a typed error instead of being silently dropped.
+#[derive(Clone, Copy)]
+pub struct MultinomialFitRequest<'a> {
+    pub data: &'a EncodedDataset,
+    pub formula: &'a str,
+    pub config: &'a FitConfig,
+    /// Warm-start seed for every per-(class, term) smoothing parameter; λ is
+    /// REML/LAML-selected, so this only seeds the outer search.
+    pub init_lambda: f64,
+    /// OUTER REML/LAML smoothing-parameter iteration budget.
+    pub max_iter: usize,
+    /// Requested accuracy; drives the inner joint-Newton KKT target (see the
+    /// control-split note inside the fit).
+    pub tol: f64,
+}
+
+impl<'a> MultinomialFitRequest<'a> {
+    /// The canonical production controls shared by the CLI and the Python FFI.
+    pub fn new(data: &'a EncodedDataset, formula: &'a str, config: &'a FitConfig) -> Self {
+        Self {
+            data,
+            formula,
+            config,
+            init_lambda: 1.0,
+            max_iter: 50,
+            tol: 1.0e-7,
+        }
+    }
+}
+
+/// Reject canonical-config fields the softmax multinomial family cannot
+/// consume. Silently dropping a requested offset / noise model / manual Firth
+/// toggle would quietly change the estimand the caller asked for (SPEC 3), so
+/// every unsupported field is a typed error shared by all frontends.
+fn reject_unsupported_multinomial_config(config: &FitConfig) -> Result<(), EstimationError> {
+    if config.offset_column.is_some() || config.noise_offset_column.is_some() {
+        crate::bail_invalid_estim!(
+            "multinomial fit does not support offset columns: a single offset column has no \
+             canonical per-logit placement in the reference-coded softmax (offsets are per-class \
+             linear-predictor quantities); remove the offset or fit per-class models"
+        );
+    }
+    if config.noise_formula.is_some() {
+        crate::bail_invalid_estim!(
+            "noise_formula is not supported for the multinomial family: the softmax likelihood \
+             has no dispersion predictor"
+        );
+    }
+    if config.logslope_formula.is_some() || config.z_column.is_some() {
+        crate::bail_invalid_estim!(
+            "logslope_formula/z_column is not supported for the multinomial family"
+        );
+    }
+    if config.transformation_normal {
+        crate::bail_invalid_estim!(
+            "transformation_normal conflicts with the multinomial family"
+        );
+    }
+    if config.expectile_tau.is_some() {
+        crate::bail_invalid_estim!("expectile_tau requires the expectile family");
+    }
+    if config.firth {
+        crate::bail_invalid_estim!(
+            "manual firth is not accepted for the multinomial family: the Firth/Jeffreys \
+             separation stabilizer is armed automatically on separation evidence"
+        );
+    }
+    if !matches!(
+        config.frailty,
+        crate::survival::lognormal_kernel::FrailtySpec::None
+    ) {
+        crate::bail_invalid_estim!("frailty is not supported for the multinomial family");
+    }
+    Ok(())
+}
+
+/// Resolve the canonical `weight_column` into per-row case weights (`None` ⇒
+/// uniform 1.0). Finiteness / non-negativity are enforced by
+/// [`MultinomialFamily::new`], which owns the weight contract.
+fn resolve_multinomial_row_weights(
+    data: &EncodedDataset,
+    config: &FitConfig,
+) -> Result<Array1<f64>, EstimationError> {
+    let Some(name) = config.weight_column.as_deref() else {
+        return Ok(Array1::ones(data.values.nrows()));
+    };
+    let column = data.column_map().get(name).copied().ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "multinomial fit: weight column '{name}' not found in the dataset"
+        ))
+    })?;
+    Ok(data.values.column(column).to_owned())
+}
+
 /// Top-level formula-driven multinomial fit.
 ///
 /// Routes through [`fit_custom_family_with_rho_prior`] so the per-active-class
@@ -2134,18 +2237,22 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix, scale: f64) -> Pena
 /// [`MultinomialSavedModel`] that can be serialised to bytes for the Python
 /// wrapper or used in-process for `predict_probabilities`.
 pub fn fit_penalized_multinomial_formula(
-    data: &EncodedDataset,
-    formula: &str,
-    config: &FitConfig,
-    init_lambda: f64,
-    max_iter: usize,
-    tol: f64,
+    request: &MultinomialFitRequest<'_>,
 ) -> Result<MultinomialSavedModel, EstimationError> {
+    let MultinomialFitRequest {
+        data,
+        formula,
+        config,
+        init_lambda,
+        max_iter,
+        tol,
+    } = *request;
     if !(init_lambda.is_finite() && init_lambda > 0.0) {
         crate::bail_invalid_estim!(
             "multinomial fit: init_lambda must be finite and > 0 (got {init_lambda})"
         );
     }
+    reject_unsupported_multinomial_config(config)?;
     let (raw_spec, design, y_col, response_name, y_kind) =
         build_formula_design_for_multinomial(formula, data, config)?;
     // Freeze the data-derived basis state (B-spline knot vectors, by-factor
@@ -2274,7 +2381,13 @@ pub fn fit_penalized_multinomial_formula(
     let design_arc = Arc::new(x_dense);
     let penalties_arc = Arc::new(per_term_penalties);
     let nullspace_dims_arc = Arc::new(per_term_nullspace_dims);
-    let weights = Array1::<f64>::ones(n_obs);
+    let weights = resolve_multinomial_row_weights(data, config)?;
+    if weights.len() != n_obs {
+        crate::bail_invalid_estim!(
+            "multinomial fit: weight column length {} != N = {n_obs}",
+            weights.len()
+        );
+    }
     // First attempt runs the UNBIASED penalized-REML criterion (no Firth
     // shrinkage toward the uniform simplex); the Jeffreys/Firth proper prior is
     // armed conditionally below, only on separation evidence (#715/#753 — see
@@ -4120,8 +4233,13 @@ mod reference_class_invariance_tests {
         let labels: Vec<String> = cls.iter().map(|&c| name_map[c].to_string()).collect();
         let train = dataset_xy(dir, tag, x, &labels);
         let config = FitConfig::default();
-        let model = fit_penalized_multinomial_formula(&train, "y ~ s(x)", &config, 1.0, 60, 1e-6)
-            .expect("multinomial formula fit must succeed");
+        let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            init_lambda: 1.0,
+            max_iter: 60,
+            tol: 1e-6,
+            ..MultinomialFitRequest::new(&train, "y ~ s(x)", &config)
+        })
+        .expect("multinomial formula fit must succeed");
 
         // Predict on the grid. The categorical `y` column is not needed for
         // prediction, but the schema is simplest if we supply a dummy.

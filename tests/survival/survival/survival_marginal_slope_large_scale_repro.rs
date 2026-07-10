@@ -14,7 +14,7 @@
 //! This test rebuilds the same *structural* shape (duplicated duchon +
 //! linkwiggle on both formulas) at n = 400 and centers = 4 to keep RAM
 //! safe, and asserts:
-//!   * the fit converges (`outer_converged == true`),
+//!   * the fit converges (a minted fit is the sealed convergence proof, SPEC 20),
 //!   * the V+M log line `[smgs phase-4b compiled-map] applying CompiledMap T: ...`
 //!     fires with at least one drop reported (closed-form channel-aware path),
 //!   * fitted β block widths still match RAW design widths (T-lift ran),
@@ -205,11 +205,7 @@ fn survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges() {
         ),
     };
 
-    assert!(
-        result.fit.outer_converged,
-        "large-scale V+M fit must converge; outer_converged=false (iters={}, reml={:.6})",
-        result.fit.outer_iterations, result.fit.reml_score
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     let logs = log_sink().snapshot();
     // After T13's channel-aware Gram migration, the closed-form path

@@ -167,8 +167,7 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
     let gam_mu_err = rmse(&gam_mu, &mu_true);
     let gam_edf = fit.fit.edf_total().unwrap_or(f64::NAN);
     eprintln!(
-        "[diag] gam tweedie: outer_converged={} outer_iterations={} grad_norm={:?} reml_score={:.6} gam_phi={:.6}",
-        fit.fit.outer_converged,
+        "[diag] gam tweedie: outer_converged=certified outer_iterations={} grad_norm={:?} reml_score={:.6} gam_phi={:.6}",
         fit.fit.outer_iterations,
         fit.fit.outer_gradient_norm,
         fit.fit.reml_score,

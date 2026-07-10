@@ -118,7 +118,6 @@ fn truth_mean(x: f64) -> f64 {
 
 struct FitOut {
     edf: f64,
-    converged: bool,
     /// Fitted mean on the response scale across the evaluation grid.
     mean_on_grid: Vec<f64>,
 }
@@ -158,7 +157,6 @@ fn fit_tweedie(double_penalty: bool, data: &gam::data::EncodedDataset, grid_x: &
         panic!("expected a Standard GAM fit");
     };
     let edf = fit.fit.edf_total().expect("edf_total");
-    let converged = fit.fit.outer_converged;
     let col = data.column_map();
     let x_idx = col["x"];
     let mut grid = Array2::<f64>::zeros((grid_x.len(), data.headers.len()));
@@ -169,11 +167,7 @@ fn fit_tweedie(double_penalty: bool, data: &gam::data::EncodedDataset, grid_x: &
         build_term_collection_design(grid.view(), &fit.resolvedspec).expect("rebuild design");
     let eta = design.design.apply(&fit.fit.beta);
     let mean_on_grid: Vec<f64> = eta.iter().map(|e| e.exp()).collect();
-    FitOut {
-        edf,
-        converged,
-        mean_on_grid,
-    }
+    FitOut { edf, mean_on_grid }
 }
 
 #[test]
@@ -193,12 +187,10 @@ fn tweedie_default_double_penalty_matches_single_penalty_no_overshrink_1477() {
         let sp_rmse = rmse(&sp.mean_on_grid, &truth);
         let last = grid.len() - 1;
         eprintln!(
-            "[#1477 dp/sp] seed={seed} dp_rmse={dp_rmse:.4} (edf {:.2}, conv {}) \
-             sp_rmse={sp_rmse:.4} (edf {:.2}, conv {}) x=1: dp={:.3} sp={:.3} truth={:.3}",
+            "[#1477 dp/sp] seed={seed} dp_rmse={dp_rmse:.4} (edf {:.2}, conv certified) \
+             sp_rmse={sp_rmse:.4} (edf {:.2}, conv certified) x=1: dp={:.3} sp={:.3} truth={:.3}",
             dp.edf,
-            dp.converged,
             sp.edf,
-            sp.converged,
             dp.mean_on_grid[last],
             sp.mean_on_grid[last],
             truth[last]
@@ -227,16 +219,15 @@ fn tweedie_default_double_penalty_matches_single_penalty_no_overshrink_1477() {
             sp.edf
         );
 
-        // HONEST VERDICT: a converged double-penalty fit must not be a
-        // near-full-basis overfit (the #1426 silent-overfit contract).
-        if dp.converged {
-            assert!(
-                dp.edf < 8.5,
-                "seed {seed}: Tweedie double-penalty ps reports converged=true with EDF {:.2} \
-                 (near the k=10 full basis) — a silently-certified overfit (#1426/#1477).",
-                dp.edf
-            );
-        }
+        // HONEST VERDICT: a certified double-penalty fit (fit existence is the
+        // sealed convergence proof, SPEC 20) must not be a near-full-basis
+        // overfit (the #1426 silent-overfit contract).
+        assert!(
+            dp.edf < 8.5,
+            "seed {seed}: certified Tweedie double-penalty ps fit with EDF {:.2} \
+             (near the k=10 full basis) — a silently-certified overfit (#1426/#1477).",
+            dp.edf
+        );
 
         if dp_rmse > sp_rmse {
             dp_worse += 1;

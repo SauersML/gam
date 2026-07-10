@@ -78,7 +78,6 @@ fn sphere_m_sweep_lambda_diagnostic() {
         let beta = &fit.fit.beta;
         let beta_l2 = beta.iter().map(|v| v * v).sum::<f64>().sqrt();
         let outer_iters = fit.fit.outer_iterations;
-        let outer_converged = fit.fit.outer_converged;
         let reml_score = fit.fit.reml_score;
         let outer_grad_norm = fit.fit.outer_gradient_norm;
 
@@ -91,7 +90,7 @@ fn sphere_m_sweep_lambda_diagnostic() {
         );
         eprintln!(
             "[diag] m={m} REML score     = {reml_score:.6}   outer_iters={outer_iters}  \
-             outer_converged={outer_converged}  outer_grad_norm={outer_grad_norm:?}"
+             outer_converged=certified  outer_grad_norm={outer_grad_norm:?}"
         );
 
         // ── 15×15 grid prediction variance / range ──────────────────────

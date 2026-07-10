@@ -254,10 +254,7 @@ fn gam_custom_family_location_scale_matches_gamlss() {
         ..BlockwiseFitOptions::default()
     };
     let fit = fit_custom_family(&family, &specs, &options).expect("gam location-scale fit");
-    assert!(
-        fit.outer_converged,
-        "gam location-scale outer optimization did not converge"
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     let beta_mu = &fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].beta;
     let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
@@ -471,10 +468,7 @@ fn gam_custom_family_location_scale_matches_gamlss_on_real_data() {
         ..BlockwiseFitOptions::default()
     };
     let fit = fit_custom_family(&family, &specs, &options).expect("gam location-scale fit (real)");
-    assert!(
-        fit.outer_converged,
-        "gam location-scale outer optimization did not converge (real)"
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     let beta_mu = &fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].beta;
     let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;

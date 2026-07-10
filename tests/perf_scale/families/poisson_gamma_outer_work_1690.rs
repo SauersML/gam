@@ -87,21 +87,17 @@ fn poisson_gamma_single_smooth_outer_work_1690() {
 
         eprintln!(
             "RECORD_1690 family={family} reml_score={:.10} edf={:.6} \
-             outer_cost_evals={} inner_pirls_solves={} grad_norm={:?} converged={}",
+             outer_cost_evals={} inner_pirls_solves={} grad_norm={:?} converged=certified",
             fit.reml_score,
             edf,
             fit.outer_cost_evals,
             fit.inner_pirls_solves,
             fit.outer_gradient_norm,
-            fit.outer_converged,
         );
 
-        assert!(
-            fit.outer_converged,
-            "{family}: outer REML optimizer must certify convergence"
-        );
+        // Fit existence is the sealed convergence proof (SPEC 20).
 
-        // #1690 stationarity contract: a fit that reports `outer_converged` must
+        // #1690 stationarity contract: a minted (certified) fit must
         // carry an authoritative outer gradient that actually clears the
         // score-relative stationarity bound the optimizer certifies against
         // (`FLAT_VALLEY_CONVERGED_REL_GRAD·(1+|score|)`, capped at

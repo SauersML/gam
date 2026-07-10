@@ -281,7 +281,8 @@ fn characterize_robust_paths() {
     // converged estimate or a sampled proper-posterior summary. It does not hold
     // today: full-span Jeffreys alone does not yet clear perfect separation on a
     // penalized direction nor the multimodal case, which surface as
-    // `FiniteNotConverged`. Once the inner/outer non-convergence → HMC sampling
+    // `Errored` (SPEC 20: non-converged fits are unmintable, so budget
+    // exhaustion is a typed error). Once the inner/outer non-convergence → HMC sampling
     // fallback is wired into `fit_from_formula`, tighten the assertion above from
     // `!= NonFinite` to `path.is_never_fail_ok()` for every case. (A blocked
     // no-op test is intentionally not kept as a placeholder — the build scanner

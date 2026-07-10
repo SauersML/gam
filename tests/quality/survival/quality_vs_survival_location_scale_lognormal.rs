@@ -163,11 +163,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
         panic!("expected a survival location-scale fit result");
     };
     let unified = &fit.fit.fit;
-    assert!(
-        unified.outer_converged,
-        "gam lognormal-LS outer optimizer did not converge: iters={} grad_norm={:?}",
-        unified.outer_iterations, unified.outer_gradient_norm
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     let beta_location = unified.beta_threshold();
     let beta_log_sigma = unified.beta_log_sigma();
@@ -487,11 +483,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data() {
         panic!("expected a survival location-scale fit result");
     };
     let unified = &fit.fit.fit;
-    assert!(
-        unified.outer_converged,
-        "gam veteran lognormal-LS outer optimizer did not converge: iters={} grad_norm={:?}",
-        unified.outer_iterations, unified.outer_gradient_norm
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
     let beta_location = unified.beta_threshold();
     let beta_log_sigma = unified.beta_log_sigma();
     assert!(

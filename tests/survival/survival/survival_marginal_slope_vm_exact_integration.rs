@@ -14,7 +14,7 @@
 //! line in `src/families/survival_marginal_slope.rs`.
 //!
 //! Hard contract (see teammate brief):
-//!   * fit converges (`outer_converged == true`),
+//!   * fit converges (a minted fit is the sealed convergence proof, SPEC 20),
 //!   * β block widths after lift equal RAW widths (not compiled widths),
 //!     proving the result-time `Gauge::lift_block_betas` ran,
 //!   * predictions are finite,
@@ -170,11 +170,7 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
         ),
     };
 
-    assert!(
-        result.fit.outer_converged,
-        "V+M-exact cutover must converge; outer_converged=false (iters={}, reml={:.6})",
-        result.fit.outer_iterations, result.fit.reml_score
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     let logs = log_sink().snapshot();
     // After T13's channel-aware Gram migration the closed-form

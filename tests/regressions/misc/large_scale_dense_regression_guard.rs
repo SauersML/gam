@@ -164,11 +164,11 @@ fn large_scale_dense_logit_regression_guard() {
     //     would surface as `MaxIterationsReached` or `LmStepSearchExhausted`.
     assert!(
         matches!(
-            fit.pirls_status,
+            fit.convergence_evidence().inner_status(),
             PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
         ),
         "PIRLS must terminate at a recognised valid-minimum status, got {:?}",
-        fit.pirls_status
+        fit.convergence_evidence().inner_status()
     );
 
     // (b) Final inner P-IRLS iteration count must be safely below the
@@ -195,11 +195,7 @@ fn large_scale_dense_logit_regression_guard() {
         "outer iteration count regressed: {} > 50",
         fit.outer_iterations
     );
-    assert!(
-        fit.outer_converged,
-        "outer optimization must converge (got non-converged with {} iterations)",
-        fit.outer_iterations
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // (d) Wall-clock ceiling. A pre-fix run on this problem can take many
     //     tens of seconds when the inner loop grinds. 30s is generous on
@@ -233,6 +229,6 @@ fn large_scale_dense_logit_regression_guard() {
         elapsed.as_secs_f64(),
         fit.outer_iterations,
         pirls_iter,
-        fit.pirls_status,
+        fit.convergence_evidence().inner_status(),
     );
 }

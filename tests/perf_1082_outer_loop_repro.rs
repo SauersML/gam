@@ -72,19 +72,13 @@ fn negbin_te_2d_outer_loop_converges_in_budget_1082() {
     };
 
     eprintln!(
-        "[#1082 guard] nb te: outer_iterations={} outer_converged={} grad_norm={:?} wall={:.2}s",
+        "[#1082 guard] nb te: outer_iterations={} outer_converged=certified grad_norm={:?} wall={:.2}s",
         fit.fit.outer_iterations,
-        fit.fit.outer_converged,
         fit.fit.outer_gradient_norm,
         elapsed.as_secs_f64(),
     );
 
-    assert!(
-        fit.fit.outer_converged,
-        "#1082 regression: NB te outer REML loop did not converge \
-         (outer_iterations={}, grad_norm={:?})",
-        fit.fit.outer_iterations, fit.fit.outer_gradient_norm,
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     assert!(
         fit.fit.outer_iterations <= 30,

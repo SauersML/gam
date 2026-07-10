@@ -139,8 +139,8 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
         "[{label}] pearson={corr:.5} rmse_ls={rmse_ls:.5} rmse_mu={rmse_mu:.5} \
          | lambdas=[{lambdas_s}] log_lambdas=[{log_lambdas_s}] \
          | edf_by_block=[{edf_s}] edf_total={edf_total:.3} \
-         | outer_conv={} iters={}",
-        fit.fit.outer_converged, fit.fit.outer_iterations
+         | outer_conv=certified iters={}",
+        fit.fit.outer_iterations
     );
     corr
 }

@@ -63,7 +63,8 @@ fn cylinder_fit_n_10k_stages() {
             eprintln!("[info] p (ncols)={}", fit.fit.beta.len());
             eprintln!(
                 "[info] outer_iters={} pirls_status={:?}",
-                fit.fit.outer_iterations, fit.fit.pirls_status
+                fit.fit.outer_iterations,
+                fit.fit.convergence_evidence().inner_status()
             );
             eprintln!(
                 "[info] coef[0..5]={:?}",

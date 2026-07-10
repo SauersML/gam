@@ -172,10 +172,12 @@ fn run_fit_with_k(n: usize, k: usize) -> (f64, usize, usize, bool) {
         .expect("compute_inference=true must populate FitArtifacts::pirls")
         .iteration;
 
+    // Outer convergence is sealed: fit existence is the proof (SPEC 20). Only
+    // the inner PIRLS status remains a distinguishable diagnostic.
     let converged = matches!(
-        fit.pirls_status,
+        fit.convergence_evidence().inner_status(),
         PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
-    ) && fit.outer_converged;
+    );
 
     (elapsed, fit.outer_iterations, pirls_iter, converged)
 }
@@ -198,8 +200,8 @@ fn standard_gam_scaling_law() {
 
     // Fit a power law `total_s = a · n^α` via log-log least squares,
     // gated on rows that GENUINELY converged (outer_iters strictly less
-    // than the max_iter cap of 100 — `outer_converged=true` from the
-    // public API is unreliable when the inner solve hit its own cap).
+    // than the max_iter cap of 100 — a cap-exhausted row is not a clean
+    // scaling sample even though every minted fit is certified).
     // Report R² and the largest log-residual so the verdict is honest:
     // a fit with R²<0.85 is unreliable for extrapolation across decades.
     fit_and_report_power_law(

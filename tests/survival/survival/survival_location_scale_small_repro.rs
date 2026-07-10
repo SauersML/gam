@@ -121,19 +121,11 @@ fn fit_location_scale_survival_with_constant_noise_on_small_right_censored_data(
     let beta_time = unified.beta_time();
     let beta_threshold = unified.beta_threshold();
     let beta_log_sigma = unified.beta_log_sigma();
-    assert!(
-        unified.outer_converged,
-        "outer optimizer did not converge: iterations={} grad_norm={:?} lambdas={:?} log_lambdas={:?} pirls_status={:?} beta_time={:?} beta_threshold={:?} beta_log_sigma={:?}",
-        unified.outer_iterations,
-        unified.outer_gradient_norm,
-        unified.lambdas.to_vec(),
-        unified.log_lambdas.to_vec(),
-        unified.pirls_status,
-        beta_time.to_vec(),
-        beta_threshold.to_vec(),
-        beta_log_sigma.to_vec()
+    // Fit existence is the sealed convergence proof (SPEC 20).
+    assert_eq!(
+        unified.convergence_evidence().inner_status(),
+        PirlsStatus::Converged
     );
-    assert_eq!(unified.pirls_status, PirlsStatus::Converged);
     assert!(
         beta_time
             .iter()

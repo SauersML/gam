@@ -195,11 +195,11 @@ fn large_scale_convergence_regression() {
     //     would surface as `MaxIterationsReached` or similar non-valid exits.
     assert!(
         matches!(
-            fit.pirls_status,
+            fit.convergence_evidence().inner_status(),
             PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
         ),
         "PIRLS must terminate at a recognised valid-minimum status, got {:?}",
-        fit.pirls_status
+        fit.convergence_evidence().inner_status()
     );
 
     // (b) Final inner P-IRLS iteration count must be safely below the 100-iter
@@ -224,11 +224,7 @@ fn large_scale_convergence_regression() {
         "outer iteration count regressed: {} > 50",
         fit.outer_iterations
     );
-    assert!(
-        fit.outer_converged,
-        "outer optimization must converge (got non-converged with {} iterations)",
-        fit.outer_iterations
-    );
+    // Fit existence is the sealed convergence proof (SPEC 20).
 
     // (d) Wall-clock ceiling. A pre-fix run on this problem can grind tens of
     //     seconds when the inner loop is starved of soft-exit. 30s is generous
@@ -276,6 +272,6 @@ fn large_scale_convergence_regression() {
         pirls_iter,
         corr,
         mad,
-        fit.pirls_status,
+        fit.convergence_evidence().inner_status(),
     );
 }

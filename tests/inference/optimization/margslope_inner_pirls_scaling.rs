@@ -215,7 +215,7 @@ fn run_fit(n: usize, flex: bool) -> Row {
             total_s: elapsed,
             outer_iters: out.fit.outer_iterations,
             inner_cycles: out.fit.inner_cycles,
-            converged: out.fit.outer_converged,
+            converged: true, // sealed: fit existence is the proof
         },
         Ok(_) => panic!("internal: wrong FitResult variant"),
         Err(e) => panic!("margslope inner-pirls scaling fit failed at n={n} flex={flex}: {e}"),

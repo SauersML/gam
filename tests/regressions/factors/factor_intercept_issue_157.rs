@@ -101,7 +101,10 @@ fn fit_factor_group_recovers_group_means() {
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit");
     };
-    assert_eq!(fit.fit.pirls_status, PirlsStatus::Converged);
+    assert_eq!(
+        fit.fit.convergence_evidence().inner_status(),
+        PirlsStatus::Converged
+    );
 
     // `s(group, bs='re')` shorthand must take the same code path successfully.
     let result_re = fit_from_formula("y ~ s(x) + s(group, bs='re')", &data, &cfg)
@@ -109,5 +112,8 @@ fn fit_factor_group_recovers_group_means() {
     let FitResult::Standard(fit_re) = result_re else {
         panic!("expected standard fit for s(group, bs='re')");
     };
-    assert_eq!(fit_re.fit.pirls_status, PirlsStatus::Converged);
+    assert_eq!(
+        fit_re.fit.convergence_evidence().inner_status(),
+        PirlsStatus::Converged
+    );
 }

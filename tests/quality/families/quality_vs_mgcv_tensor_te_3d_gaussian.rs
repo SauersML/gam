@@ -110,7 +110,7 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         panic!("expected a standard GAM fit for a gaussian te() smooth");
     };
     eprintln!(
-        "[#1074-te3d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
+        "[#1074-te3d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged=certified iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
         fit.fit
             .edf_by_block()
@@ -123,7 +123,6 @@ fn gam_te_3d_recovers_nonadditive_surface() {
             .map(|v| (v * 1000.0).round() / 1000.0)
             .collect::<Vec<_>>(),
         fit.fit.reml_score,
-        fit.fit.outer_converged,
         fit.fit.outer_iterations,
     );
 
@@ -166,9 +165,8 @@ fn gam_te_3d_recovers_nonadditive_surface() {
             m.sqrt()
         };
         eprintln!(
-            "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged={} rmse_vs_truth={:.5}",
+            "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged=certified rmse_vs_truth={:.5}",
             df.fit.edf_total().unwrap_or(f64::NAN),
-            df.fit.outer_converged,
             drmse,
         );
     }
