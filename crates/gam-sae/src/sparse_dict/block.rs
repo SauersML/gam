@@ -1702,10 +1702,6 @@ pub fn fit_block_sparse_dictionary(
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
         let step = advance_block_sparse_state(x, &state, config, k)?;
-        let (routing, reconstruction) =
-            routing_and_reconstruction_residuals(x, &state, &step.next, b);
-        routing_residual = routing;
-        reconstruction_residual = reconstruction;
         ev_residual = relative_scalar_change(
             state.explained_variance as f32,
             step.next.explained_variance as f32,
@@ -1721,11 +1717,7 @@ pub fn fit_block_sparse_dictionary(
         polar_failures = step.polar_failures;
         state = step.next;
 
-        let fixed_point_residual = ev_residual
-            .max(gamma_residual)
-            .max(frame_residual)
-            .max(routing_residual)
-            .max(reconstruction_residual);
+        let fixed_point_residual = ev_residual.max(gamma_residual).max(frame_residual);
         if accepted_births == 0
             && polar_failures == 0
             && fixed_point_residual <= config.tolerance
@@ -1733,6 +1725,27 @@ pub fn fit_block_sparse_dictionary(
         {
             converged = true;
             break;
+        }
+    }
+
+    // Certificate replay: ONE more full alternation from the (candidate)
+    // fixed point, recording the gauge-invariant routing / reconstruction
+    // displacements it causes. This is the "fixed-point evidence" the
+    // convergence struct documents — measured by replay, never used as the
+    // per-epoch stop rule (a strict per-epoch routing gate at high `K` churns
+    // near degeneracy and can never clear a 1e-6 tolerance).
+    {
+        let replay = advance_block_sparse_state(x, &state, config, k)?;
+        let (routing, reconstruction) =
+            routing_and_reconstruction_residuals(x, &state, &replay.next, b);
+        routing_residual = routing;
+        reconstruction_residual = reconstruction;
+        if converged && (replay.accepted_births != 0 || replay.polar_failures != 0) {
+            // A replay that still births or fails polar subsolves is not a
+            // certified fixed point — surface it as the evidence values.
+            accepted_births = replay.accepted_births;
+            polar_failures = replay.polar_failures;
+            converged = false;
         }
     }
 
