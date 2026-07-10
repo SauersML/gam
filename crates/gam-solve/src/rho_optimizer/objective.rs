@@ -448,7 +448,6 @@ pub(crate) enum CacheSeedDecision {
         /// payload didn't carry one (legacy ρ-only writes or families
         /// that don't surface β).
         beta: Vec<f64>,
-        final_value: f64,
         iterations: usize,
         prior_obj_display: f64,
     },
@@ -508,7 +507,6 @@ pub(crate) fn classify_cache_entry_for_outer(
         return CacheSeedDecision::ExactFinal {
             rho: cached_rho,
             beta: payload.beta,
-            final_value: entry.objective.unwrap_or(payload.cost),
             iterations: entry
                 .iteration
                 .unwrap_or(payload.eval_id)

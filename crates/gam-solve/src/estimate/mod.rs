@@ -31,7 +31,7 @@ use gam_terms::construction::{CanonicalPenalty, ReparamInvariant};
 use gam_linalg::utils::{
     KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
 };
-use gam_linalg::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
+use gam_linalg::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
@@ -107,14 +107,11 @@ pub(crate) use penalty::{
     REML_SEED_SCREENING_RHO_CAP, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
     scaled_covariance,
 };
-pub(crate) use prefit::{
-    reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
-    validate_penalty_specs,
-};
+pub(crate) use prefit::validate_penalty_specs;
 pub(crate) use smoothing_correction::{
     AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
-    AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, MAX_FACTORIZATION_ATTEMPTS,
-    RHO_SOFT_PRIOR_SHARPNESS, RHO_SOFT_PRIOR_WEIGHT, RemlConfig, compute_smoothing_correction,
+    AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, RHO_SOFT_PRIOR_SHARPNESS,
+    RHO_SOFT_PRIOR_WEIGHT, RemlConfig, compute_smoothing_correction,
     smooth_floor_dp,
 };
 // #1521 carve: the spatial-optimization driver reads the unified rho bound as

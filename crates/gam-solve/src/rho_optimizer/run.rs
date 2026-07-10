@@ -641,7 +641,6 @@ impl OuterProblem {
                 CacheSeedDecision::ExactFinal {
                     rho,
                     beta,
-                    final_value: _,
                     iterations,
                     prior_obj_display,
                 } => {
