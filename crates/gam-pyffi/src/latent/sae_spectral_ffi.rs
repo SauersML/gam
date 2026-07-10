@@ -2253,13 +2253,17 @@ fn effect_weighted_retention(
 ///
 /// `observations` are `(recovered_turns, label_turns, weight)` triples: the
 /// recovered chart coordinate and the ground-truth cyclic label, both in turns
-/// (values are wrapped modulo one), plus a non-negative posterior/evidence
-/// weight per row. Returns `{circular_correlation, signed_circular_correlation,
-/// effective_weight}` from the audited [`saebench_metrics::chart_interp_score`]
-/// definition — the orientation-quotiented weighted cyclic phase-lock the #1942
-/// chart-interp metric reports.
-#[pyfunction(signature = (observations,))]
-fn chart_interp_score(py: Python<'_>, observations: Vec<(f64, f64, f64)>) -> PyResult<Py<PyDict>> {
+/// (values are wrapped modulo one), plus a non-negative posterior/evidence weight
+/// per row. `matched_spectrum_null_draws` contains complete ledgers produced by
+/// the identical readout on each matched-spectrum surrogate. The scorer is
+/// fail-closed: neither the null draws nor the significance level is optional.
+#[pyfunction(signature = (observations, matched_spectrum_null_draws, significance_level))]
+fn chart_interp_score(
+    py: Python<'_>,
+    observations: Vec<(f64, f64, f64)>,
+    matched_spectrum_null_draws: Vec<Vec<(f64, f64, f64)>>,
+    significance_level: f64,
+) -> PyResult<Py<PyDict>> {
     let report = detach_py_result(py, "chart_interp_score", move || {
         let rows: Vec<gam::terms::sae::saebench_metrics::ChartInterpObservation> = observations
             .iter()
@@ -2271,7 +2275,26 @@ fn chart_interp_score(py: Python<'_>, observations: Vec<(f64, f64, f64)>) -> PyR
                 }
             })
             .collect();
-        gam::terms::sae::saebench_metrics::chart_interp_score(&rows)
+        let null_draws: Vec<Vec<gam::terms::sae::saebench_metrics::ChartInterpObservation>> =
+            matched_spectrum_null_draws
+                .iter()
+                .map(|draw| {
+                    draw.iter()
+                        .map(|&(recovered_turns, label_turns, weight)| {
+                            gam::terms::sae::saebench_metrics::ChartInterpObservation {
+                                recovered_turns,
+                                label_turns,
+                                weight,
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+        gam::terms::sae::saebench_metrics::chart_interp_score(
+            &rows,
+            &null_draws,
+            significance_level,
+        )
     })?;
     let out = PyDict::new(py);
     out.set_item("circular_correlation", report.circular_correlation)?;
@@ -2280,6 +2303,21 @@ fn chart_interp_score(py: Python<'_>, observations: Vec<(f64, f64, f64)>) -> PyR
         report.signed_circular_correlation,
     )?;
     out.set_item("effective_weight", report.effective_weight)?;
+    out.set_item(
+        "matched_spectrum_null_mean",
+        report.matched_spectrum_null_mean,
+    )?;
+    out.set_item(
+        "matched_spectrum_p_value",
+        report.matched_spectrum_p_value,
+    )?;
+    out.set_item(
+        "monte_carlo_standard_error",
+        report.monte_carlo_standard_error,
+    )?;
+    out.set_item("matched_spectrum_draws", report.matched_spectrum_draws)?;
+    out.set_item("significance_level", report.significance_level)?;
+    out.set_item("evidentially_valid", report.evidentially_valid)?;
     Ok(out.unbind())
 }
 

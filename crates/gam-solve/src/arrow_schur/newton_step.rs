@@ -936,8 +936,13 @@ fn build_resident_base_frame_if_admitted(
 /// `htbeta_matvec.is_some()`), so it re-marshalled and re-uploaded every device
 /// operand through `flatten_device_sae_frame_data` on each ladder trial even
 /// though only `ainv = (H_tt + ridge_t·I)⁻¹` depends on the ridge. This admits
-/// the same shape [`try_device_arrow_direct_sae_pcg`] serves (Direct mode, framed
-/// `device_sae_pcg` present, no cross-row penalties / streaming) and hands the
+/// the same framed `device_sae_pcg` shape served by BOTH production solver
+/// modes: [`try_device_arrow_direct_sae_pcg`] under `Direct`, and the native
+/// matrix-free device branch under `InexactPCG`. The old `Direct`-only gate
+/// meant the actual color-arm shape (`k > DIRECT_SOLVE_MAX_K`, hence
+/// `InexactPCG`) rebuilt and re-uploaded every ridge-independent operand on
+/// every LM retry. Both modes execute the identical resident PCG kernel, so the
+/// frame lifetime belongs to the ridge ladder, not to the mode enum. Hand the
 /// runtime/offload gate + the one-time upload to
 /// [`crate::gpu_kernels::arrow_schur::build_sae_resident_frame`]. Whenever this
 /// returns `Some`, the per-trial device solve it replaces would ALSO have run on
@@ -946,7 +951,10 @@ fn build_resident_sae_frame_if_admitted(
     sys: &ArrowSchurSystem,
     options: &ArrowSolveOptions,
 ) -> Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>> {
-    if options.mode != ArrowSolverMode::Direct {
+    if !matches!(
+        options.mode,
+        ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG
+    ) {
         return None;
     }
     let data = sys.device_sae_pcg.as_ref()?;
@@ -1007,9 +1015,10 @@ pub fn solve_with_lm_escalation_inner(
     // #1017: the matrix-free SAE-PCG system is exactly the shape the dense base
     // frame above declines, so it re-flattened every device operand each trial.
     // Give it a device-resident frame that reuses the ridge-independent buffers
-    // and recomputes only `ainv` per trial (consumed by the Direct SAE-PCG seam
-    // through `options.sae_resident_frame`). Only built when the dense base frame
-    // is absent (mutually exclusive shapes); a `None` keeps the per-trial
+    // and recomputes only `ainv` per trial (consumed through
+    // `options.sae_resident_frame` by both the Direct SAE-PCG seam and the
+    // production large-border InexactPCG branch). Only built when the dense base
+    // frame is absent (mutually exclusive shapes); a `None` keeps the per-trial
     // re-flatten path bit-identical. Carried via a `Cow` so options are cloned
     // only when a resident frame is actually installed.
     let core_options = match resident_frame
@@ -2314,15 +2323,42 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                     // (b) continue on a possibly-wrong step instead of escalating.
                     // Only a genuine "device declined" (`Unavailable` /
                     // `GpuRequiresDenseSystem` / transient) falls through to CPU.
-                    match crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
-                        sys,
-                        device_data.as_ref(),
-                        ridge_t,
-                        ridge_beta,
-                        &rhs_beta,
-                        max_iterations,
-                        relative_tolerance,
-                    ) {
+                    // #1017: the production large-border lane is InexactPCG, not
+                    // Direct. Consume the SAME ladder-scoped resident frame as the
+                    // Direct SAE-PCG seam so LM retries refresh only the
+                    // ridge-dependent `ainv`; the old call below flattened and
+                    // uploaded every ridge-independent operand on every retry.
+                    // `Unavailable` is a residency decline only, so it retries via
+                    // the established per-trial path. Numerical failures remain
+                    // fail-loud and are classified by the shared match below.
+                    let per_trial_flatten = || {
+                        crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
+                            sys,
+                            device_data.as_ref(),
+                            ridge_t,
+                            ridge_beta,
+                            &rhs_beta,
+                            max_iterations,
+                            relative_tolerance,
+                        )
+                    };
+                    let device_result = match options.sae_resident_frame.as_ref() {
+                        Some(resident) => match resident.resolve(
+                            sys,
+                            ridge_t,
+                            ridge_beta,
+                            &rhs_beta,
+                            max_iterations,
+                            relative_tolerance,
+                        ) {
+                            Err(
+                                crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable,
+                            ) => per_trial_flatten(),
+                            other => other,
+                        },
+                        None => per_trial_flatten(),
+                    };
+                    match device_result {
                         Ok((delta, mut diag)) => {
                             diag.used_device_arrow = true;
                             return Ok(ArrowNewtonStepArtifacts {

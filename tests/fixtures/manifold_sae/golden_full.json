@@ -482,6 +482,7 @@
       }
     ]
   },
+  "crosscoder": null,
   "decoder_blocks": [
     [
       [
@@ -843,7 +844,7 @@
     "generators": [],
     "group_signature": "SO(2)"
   },
-  "schema": "gamfit.ManifoldSAE/v1",
+  "schema": "gamfit.ManifoldSAE/v2",
   "selected_log_ard": [
     [
       0.1

@@ -120,7 +120,7 @@ def build_payload() -> dict[str, Any]:
     selected_log_ard = [np.array([0.1]), np.array([0.2, -0.3]), np.array([0.4, 0.5])]
 
     return {
-        "schema": "gamfit.ManifoldSAE/v1",
+        "schema": "gamfit.ManifoldSAE/v2",
         "atoms": atoms,
         "atom_topology": "mixed",
         "atom_topologies": list(kinds),
@@ -147,6 +147,7 @@ def build_payload() -> dict[str, Any]:
         "duchon_centers": [
             None if center is None else center.tolist() for center in duchon_centers
         ],
+        "crosscoder": None,
         "oos_projection_top1": True,
         "alpha": 0.75,
         "learnable_alpha": True,

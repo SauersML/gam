@@ -1,7 +1,10 @@
 //! Rust-owned serde schema for the fitted `ManifoldSAE` model artifact (#2091).
 //!
 //! The fitted SAE-manifold model is serialized to a JSON payload tagged
-//! `"gamfit.ManifoldSAE/v1"` that ~45 consumers read off disk. Historically the
+//! `"gamfit.ManifoldSAE/v2"` schema. Version 2 is deliberately breaking: it
+//! makes the optional crosscoder layout a first-class typed field instead of
+//! accepting legacy payloads that cannot say whether decoder columns are one
+//! ambient or a stack of relevance-weighted layers. Historically the
 //! schema lived only in the Python dataclass `gamfit/_sae_manifold.py::ManifoldSAE`
 //! (`to_dict` / `from_dict`), so a field-name / default / None-handling change
 //! there silently corrupts saved models. This module mirrors that schema in Rust
@@ -34,7 +37,7 @@ use serde_json::Value;
 
 /// The on-disk schema tag. `from_json` rejects any other value, matching the
 /// Python `from_dict` guard.
-pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v1";
+pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v2";
 
 fn default_metric_provenance() -> String {
     "Euclidean".to_string()
@@ -73,6 +76,22 @@ pub(crate) struct AtomPayload {
     pub(crate) shape_band_sd: Option<Vec<Vec<f64>>>,
     #[serde(default)]
     pub(crate) functional_evidence: Option<Value>,
+}
+
+/// Stacked-column metadata required to interpret a manifold crosscoder's
+/// decoder blocks in honest per-layer units. `None` on an ordinary SAE.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub(crate) struct CrosscoderPayload {
+    pub(crate) anchor_label: String,
+    pub(crate) anchor_dim: i64,
+    pub(crate) block_dims: Vec<i64>,
+    pub(crate) labels: Vec<String>,
+    pub(crate) log_lambda_block: Vec<f64>,
+    /// Rust-produced cross-layer drift report, or an explicit undefined status
+    /// when consecutive layers do not share an ambient width.
+    pub(crate) drift: Value,
+    /// Per-atom consecutive-layer transport-law reports.
+    pub(crate) transport: Vec<Value>,
 }
 
 /// The full fitted-model payload. Field names match the JSON keys `to_dict`
@@ -130,6 +149,11 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) coords: Vec<Vec<Vec<f64>>>,
     pub(crate) decoder_blocks: Vec<Vec<Vec<f64>>>,
     pub(crate) duchon_centers: Vec<Option<Vec<Vec<f64>>>>,
+
+    // --- manifold crosscoder layout (#2231 Inc D) ------------------------
+    /// Required key in v2; null for a plain SAE. A v1 payload is rejected by
+    /// the schema tag rather than silently guessing a single-layer layout.
+    pub(crate) crosscoder: Option<CrosscoderPayload>,
 
     // --- E. per-atom payload ---------------------------------------------
     pub(crate) atoms: Vec<AtomPayload>,

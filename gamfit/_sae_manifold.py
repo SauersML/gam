@@ -1390,7 +1390,7 @@ class ManifoldSAE:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ManifoldSAE":
         """Reconstruct from a :meth:`to_dict` payload. The core's ``#[new]``
-        validates the ``gamfit.ManifoldSAE/v1`` schema tag and parses through
+        validates the ``gamfit.ManifoldSAE/v2`` schema tag and parses through
         ``ManifoldSaePayload::from_json`` (the same NaN→reject, ``reml_score``
         fallback, channel-cov reconstruction, and n_harmonics canonicalization the
         legacy reader had — now owned by the core)."""

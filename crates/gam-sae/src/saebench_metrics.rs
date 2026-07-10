@@ -20,7 +20,7 @@ pub struct ChartInterpObservation {
     pub weight: f64,
 }
 
-/// Weighted circular-correlation report for chart interpretability.
+/// Null-calibrated weighted circular-correlation report for chart interpretability.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChartInterpReport {
     /// Orientation-quotiented weighted cyclic phase-lock score in `[0, 1]`.
@@ -29,6 +29,18 @@ pub struct ChartInterpReport {
     pub signed_circular_correlation: f64,
     /// Sum of accepted observation weights.
     pub effective_weight: f64,
+    /// Mean orientation-quotiented correlation across matched-spectrum null draws.
+    pub matched_spectrum_null_mean: f64,
+    /// Plus-one corrected upper-tail empirical p-value of the observed statistic.
+    pub matched_spectrum_p_value: f64,
+    /// Monte Carlo standard error of [`Self::matched_spectrum_p_value`].
+    pub monte_carlo_standard_error: f64,
+    /// Number of matched-spectrum null draws evaluated with the identical statistic.
+    pub matched_spectrum_draws: usize,
+    /// Significance level used for the evidential verdict.
+    pub significance_level: f64,
+    /// True only when the matched-spectrum empirical p-value clears the requested level.
+    pub evidentially_valid: bool,
 }
 
 /// One dose-response calibration point along a steered arc.
@@ -74,11 +86,70 @@ pub struct CoordinatePosterior {
     pub precision_weight: f64,
 }
 
-/// Score chart-coordinate interpretability against cyclic labels.
+/// Score chart-coordinate interpretability against cyclic labels and an explicit
+/// matched-spectrum null distribution.
+///
+/// Every null draw is a complete observation ledger produced by the same chart
+/// fit/readout protocol on one matched-spectrum surrogate. The exact
+/// orientation-quotiented statistic used for the observed ledger is recomputed
+/// for every null ledger. Requiring the draws here makes it impossible for the
+/// public scorer to present a large circular correlation as evidence without
+/// calibrating that same number against its matched null (#2250).
 pub fn chart_interp_score(
     observations: &[ChartInterpObservation],
+    matched_spectrum_null_draws: &[Vec<ChartInterpObservation>],
+    significance_level: f64,
 ) -> Result<ChartInterpReport, String> {
-    let weight_sum = validate_weights(observations.iter().map(|o| o.weight), "chart_interp")?;
+    if matched_spectrum_null_draws.is_empty() {
+        return Err("chart_interp: at least one matched-spectrum null draw is required".into());
+    }
+    if !(significance_level.is_finite() && significance_level > 0.0 && significance_level < 1.0)
+    {
+        return Err(format!(
+            "chart_interp: significance_level must be finite and in (0, 1), got {significance_level}"
+        ));
+    }
+    let (circular_correlation, signed_circular_correlation, weight_sum) =
+        chart_correlation(observations, "chart_interp observed")?;
+    let mut null_sum = 0.0;
+    let mut exceedances = 0usize;
+    for (draw_idx, draw) in matched_spectrum_null_draws.iter().enumerate() {
+        let (null_statistic, _, _) =
+            chart_correlation(draw, &format!("chart_interp matched-spectrum draw {draw_idx}"))?;
+        null_sum += null_statistic;
+        if null_statistic >= circular_correlation - 1.0e-12 {
+            exceedances += 1;
+        }
+    }
+    let draws = matched_spectrum_null_draws.len();
+    let p_value = (exceedances as f64 + 1.0) / (draws as f64 + 1.0);
+    let monte_carlo_standard_error =
+        (p_value * (1.0 - p_value) / (draws as f64 + 1.0)).sqrt();
+    Ok(ChartInterpReport {
+        circular_correlation,
+        signed_circular_correlation,
+        effective_weight: weight_sum,
+        matched_spectrum_null_mean: null_sum / draws as f64,
+        matched_spectrum_p_value: p_value,
+        monte_carlo_standard_error,
+        matched_spectrum_draws: draws,
+        significance_level,
+        evidentially_valid: p_value <= significance_level,
+    })
+}
+
+fn chart_correlation(
+    observations: &[ChartInterpObservation],
+    context: &str,
+) -> Result<(f64, f64, f64), String> {
+    let weight_sum = validate_weights(observations.iter().map(|o| o.weight), context)?;
+    for (row, observation) in observations.iter().enumerate() {
+        if !(observation.recovered_turns.is_finite() && observation.label_turns.is_finite()) {
+            return Err(format!(
+                "{context}: recovered_turns and label_turns must be finite at row {row}"
+            ));
+        }
+    }
     let same = weighted_phase_lock(
         observations.iter().map(|o| {
             (
@@ -98,11 +169,11 @@ pub fn chart_interp_score(
         weight_sum,
     );
     let signed = if same >= reversed { same } else { -reversed };
-    Ok(ChartInterpReport {
-        circular_correlation: same.max(reversed).min(1.0),
-        signed_circular_correlation: signed.clamp(-1.0, 1.0),
-        effective_weight: weight_sum,
-    })
+    Ok((
+        same.max(reversed).min(1.0),
+        signed.clamp(-1.0, 1.0),
+        weight_sum,
+    ))
 }
 
 /// Fit the dose-response calibration ledger.

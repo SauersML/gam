@@ -197,7 +197,7 @@ def _make_fit(
     ]
     topologies = [str(_TOPOLOGY_FOR_BASIS(name)) for name in kinds]
     payload = {
-        "schema": "gamfit.ManifoldSAE/v1",
+        "schema": "gamfit.ManifoldSAE/v2",
         "atom_topology": topologies[0] if topologies and len(set(topologies)) == 1 else "mixed",
         "atom_topologies": topologies,
         "assignment": kind,
@@ -232,6 +232,7 @@ def _make_fit(
         "coords": [coord.tolist() for coord in coords],
         "decoder_blocks": [block.tolist() for block in blocks],
         "duchon_centers": [None] * n_atoms,
+        "crosscoder": None,
         "atoms": atoms,
         "diagnostics": sae._json_ready(
             _diagnostics(n_atoms) if diagnostics is None else diagnostics

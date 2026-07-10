@@ -6581,7 +6581,7 @@ fn sae_manifold_core_from_fit_payload(
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
 /// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
 /// payload. This is the load-bearing `to_dict`/`from_dict` seam moving into Rust:
-/// it enforces the `"gamfit.ManifoldSAE/v1"` schema tag, the
+/// it enforces the `"gamfit.ManifoldSAE/v2"` schema tag, the
 /// `penalized_loss_score`/`reml_score` write-alias, and the write-dropped
 /// `structured_residual_diagnostics` asymmetry. The Python facade will delegate
 /// its save/load round-trip here at cutover; an unsupported schema or malformed
