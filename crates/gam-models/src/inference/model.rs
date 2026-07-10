@@ -4985,6 +4985,7 @@ mod tests {
                 rho_posterior_escalation: None,
                 rho_covariance: None,
                 joint_log_lambdas: None,
+                firth_bias_reduction: false,
             },
             inner_cycles: 0,
         })

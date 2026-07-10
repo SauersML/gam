@@ -2294,9 +2294,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     };
     let check = |dir: Array1<f64>, label: &str| {
         let fd = fd_along(&dir);
-        let operator_hvp = hess0_operator
-            .matvec(&dir)
-            .expect("matrix-free outer Hessian HVP");
+        let operator_hvp = hess0_operator.mul_vec(&dir);
         assert_matches_fd(&operator_hvp, &fd, label, "operator-HVP");
 
         let dense_hvp = hess0_dense.dot(&dir);

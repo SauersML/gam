@@ -2161,7 +2161,7 @@ mod tests {
         /// directions the production kernels consume ARE the η-space directions —
         /// letting the per-row β-space kernels be compared to the jet's η-space
         /// contractions with no design projection in the way.
-        fn single_row_family<const M: usize>(eta: &[f64; M], obs: usize, w: f64) -> MultinomialFamily {
+        fn single_row_family<const M: usize>(_eta: &[f64; M], obs: usize, w: f64) -> MultinomialFamily {
             let k = M + 1;
             let mut y = Array2::<f64>::zeros((1, k));
             y[[0, obs]] = 1.0;
