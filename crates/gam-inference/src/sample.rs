@@ -763,7 +763,7 @@ fn sample_standard_truncated(
     model: &SavedModel,
     cfg: &NutsConfig,
     constraints: &gam_solve::pirls::LinearInequalityConstraints,
-    design: &gam_terms::construction::DesignMatrix,
+    design: &gam_linalg::matrix::DesignMatrix,
 ) -> Result<NutsResult, String> {
     validate_nuts_config(cfg).map_err(String::from)?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
@@ -819,7 +819,7 @@ fn sample_standard_truncated(
         }
         let wz = &geometry.working_weights * &geometry.working_response;
         let rhs = x.t().dot(&wz);
-        let chol = FaerCholesky::cholesky(&penalized_hessian, faer::Side::Lower).map_err(|e| {
+        let chol = penalized_hessian.cholesky(Side::Lower).map_err(|e| {
             format!(
                 "standard constrained-coefficient posterior: Cholesky of the penalised Hessian \
                  failed while recovering the unconstrained center: {e:?}"

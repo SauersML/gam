@@ -487,6 +487,33 @@ mod tests {
         assert!(col.iter().all(|&v| v >= 0.0), "a draw escaped β ≥ 0");
     }
 
+    /// #2245 finding 20: an INFEASIBLE unconstrained center `N(−1, 1)`
+    /// truncated to `β ≥ 0` has mean `−1 + φ(1)/(1−Φ(1)) ≈ 0.52514`, not the
+    /// half-normal `√(2/π) ≈ 0.79788` produced by re-centring at the boundary
+    /// KKT mode. The feasible start is the boundary mode `0`.
+    #[test]
+    fn infeasible_center_matches_truncated_normal_mean() {
+        let h = array![[1.0]]; // σ = 1
+        let center = array![-1.0];
+        let start = array![0.0];
+        let c = constraints(array![[1.0]], array![0.0]); // β ≥ 0
+        let n = 200_000;
+        let s = sample_truncated_gaussian_posterior(&center, &start, &h, 1.0, &c, n, 1, 424242)
+            .expect("sampler");
+        assert_all_feasible(&s, &c);
+        let mean = s.column(0).mean().unwrap();
+        let expect = 0.525_135_7; // −1 + φ(1)/(1−Φ(1))
+        assert!(
+            (mean - expect).abs() < 0.02,
+            "truncated-normal mean {mean} vs analytic {expect}"
+        );
+        let half_normal = (2.0 / std::f64::consts::PI).sqrt();
+        assert!(
+            (mean - half_normal).abs() > 0.2,
+            "mean {mean} matches the boundary-centred half-normal — center regression"
+        );
+    }
+
     /// √φ scales the posterior covariance: doubling φ (×4 covariance) widens the
     /// half-normal moments by the same factor.
     #[test]
