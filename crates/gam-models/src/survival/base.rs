@@ -3180,14 +3180,24 @@ mod tests {
             fn n_rows(&self) -> usize {
                 1
             }
-            fn primaries(&self, _row: usize) -> Result<[f64; 3], String> {
+            fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
+                if row != 0 {
+                    return Err(format!(
+                        "CauseSpecificJetRow holds exactly one row; got row {row}"
+                    ));
+                }
                 Ok(self.base)
             }
             fn row_nll_generic<S: JetScalar<3>>(
                 &self,
-                _row: usize,
+                row: usize,
                 p: &[S; 3],
             ) -> Result<S, String> {
+                if row != 0 {
+                    return Err(format!(
+                        "CauseSpecificJetRow holds exactly one row; got row {row}"
+                    ));
+                }
                 let mut ell = p[0].exp();
                 if self.has_entry {
                     ell = ell.sub(&p[1].exp());

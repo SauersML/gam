@@ -1576,14 +1576,20 @@ mod observed_single_source_oracle_tests {
             fn n_rows(&self) -> usize {
                 1
             }
-            fn primaries(&self, _row: usize) -> Result<[f64; 2], String> {
+            fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+                if row != 0 {
+                    return Err(format!("GaulssJetRow holds exactly one row; got row {row}"));
+                }
                 Ok([self.eta_mu, self.eta_ls])
             }
             fn row_nll_generic<S: JetScalar<2>>(
                 &self,
-                _row: usize,
+                row: usize,
                 p: &[S; 2],
             ) -> Result<S, String> {
+                if row != 0 {
+                    return Err(format!("GaulssJetRow holds exactly one row; got row {row}"));
+                }
                 let sigma = p[1]
                     .exp()
                     .add(&S::constant(crate::sigma_link::LOGB_SIGMA_FLOOR));
