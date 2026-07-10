@@ -126,6 +126,10 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         }
         Err(err) => {
             eprintln!("[zz2234] PLAIN ENGINE STALLED: {err}");
+            eprintln!(
+                "[zz2234] probe telemetry: {:?}",
+                objective.probe_telemetry()
+            );
             // FD-vs-analytic at the banked best iterate: name the coordinate.
             let banked = objective
                 .try_resume_from_checkpoint(n_params)
