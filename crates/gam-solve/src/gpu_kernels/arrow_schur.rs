@@ -964,6 +964,13 @@ pub fn solve_sae_matrix_free_pcg(
 /// be carried through the cfg-independent [`crate::arrow_schur::ArrowSolveOptions`]
 /// without leaking a CUDA-only type into the shared solve options.
 pub trait SaeResidentFrame {
+    /// Refresh every ridge-independent numerical operand from a newly
+    /// assembled nonlinear iterate while retaining the device allocations.
+    /// Implementations must return `Unavailable` when any shape changes; the
+    /// caller then builds a new frame. No factor or old numerical value may be
+    /// reused across accepted iterates.
+    fn refresh(&self, sys: &ArrowSchurSystem) -> Result<(), ArrowSchurGpuFailure>;
+
     /// Recompute only the ridge-dependent per-row `ainv` at this trial's ridge,
     /// then run the framed reduced-Schur PCG against the resident buffers.
     /// Returns the reduced-β step `Δβ` and the PCG diagnostics, exactly as
@@ -4587,6 +4594,55 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         })
     }
 
+    /// Overwrite every ridge-independent resident operand in place. This is the
+    /// accepted-nonlinear-iterate boundary: allocations persist, numerical
+    /// content does not. A shape change declines so the caller replaces the
+    /// complete frame rather than partially refreshing incompatible buffers.
+    fn refresh_frame_buffers(
+        host: &super::FrameHostOperands,
+        buffers: &mut DeviceSaeFrameBuffers,
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        macro_rules! refresh {
+            ($host:expr, $device:expr) => {{
+                if $host.len() != $device.len() {
+                    return Err(ArrowSchurGpuFailure::Unavailable);
+                }
+                stream
+                    .memcpy_htod($host, &mut $device)
+                    .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            }};
+        }
+        if host.s_blocks != buffers.s_blocks
+            || host.g_blocks != buffers.g_blocks
+            || host.g_max_work != buffers.g_max_work
+            || host.n_rows != buffers.n_rows
+            || host.k != buffers.k
+            || host.max_q != buffers.max_q
+        {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        refresh!(&host.s_off, buffers.s_off);
+        refresh!(&host.s_m, buffers.s_m);
+        refresh!(&host.s_r, buffers.s_r);
+        refresh!(&host.s_ptr, buffers.s_ptr);
+        refresh!(&host.s_data, buffers.s_data);
+        refresh!(&host.g_off_i, buffers.g_off_i);
+        refresh!(&host.g_off_j, buffers.g_off_j);
+        refresh!(&host.g_ri, buffers.g_ri);
+        refresh!(&host.g_rj, buffers.g_rj);
+        refresh!(&host.g_mi, buffers.g_mi);
+        refresh!(&host.g_mj, buffers.g_mj);
+        refresh!(&host.g_ptr, buffers.g_ptr);
+        refresh!(&host.g_data, buffers.g_data);
+        refresh!(&host.w_ptr, buffers.w_ptr);
+        refresh!(&host.w_data, buffers.w_data);
+        refresh!(&host.htb_ptr, buffers.htb_ptr);
+        refresh!(&host.htb, buffers.htb);
+        refresh!(&host.q_of, buffers.q_of);
+        Ok(())
+    }
+
     fn sae_frame_penalty_diag_host(
         data: &DeviceSaePcgData,
         frame: &DeviceSaeFrameData,
@@ -5106,6 +5162,29 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
     }
 
     impl super::SaeResidentFrame for ResidentSaeFrameHandle {
+        fn refresh(&self, sys: &ArrowSchurSystem) -> Result<(), ArrowSchurGpuFailure> {
+            if sys.k != self.k || sys.rows.len() != self.n_rows {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            let data = sys
+                .device_sae_pcg
+                .as_ref()
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let frame = data
+                .frame
+                .as_ref()
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let host = super::flatten_frame_host_operands(sys, data, frame)?;
+            if host.q_of != self.q_of || host.max_q != self.max_q {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            let mut buffers = self
+                .buffers
+                .lock()
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            refresh_frame_buffers(&host, &mut buffers, &self.stream)
+        }
+
         fn resolve(
             &self,
             sys: &ArrowSchurSystem,
@@ -5137,9 +5216,11 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .buffers
                 .lock()
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-            buffers.ainv = self
-                .stream
-                .clone_htod(&ainv)
+            if ainv.len() != buffers.ainv.len() {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            self.stream
+                .memcpy_htod(&ainv, &mut buffers.ainv)
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
             let blas = CudaBlas::new(self.stream.clone())
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;

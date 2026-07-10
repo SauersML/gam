@@ -142,6 +142,9 @@ fn sae_manifold_small_n_circle_accepts_a_seed_and_fits() {
             "outer cascade must complete on a small-N circle bank — \
              all seeds rejected reproduces #1095",
         );
+    objective
+        .certify_outer_result(&result)
+        .expect("small-N circle outer result must certify the installed state");
     let fitted_term = objective
         .into_fitted()
         .expect("outer fit was evaluated")

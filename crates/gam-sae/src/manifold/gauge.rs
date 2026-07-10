@@ -10,9 +10,9 @@
 //! outside tests); the `#[cfg(test)]` module verifies each one against finite
 //! differences, which SPEC permits *inside tests only*.
 
-use ndarray::{Array2, ArrayView1, ArrayView2};
 #[cfg(test)]
 use ndarray::Array1;
+use ndarray::{Array2, ArrayView1, ArrayView2};
 
 use super::SaeBasisEvaluator;
 use opt::{BacktrackConfig, backtracking_line_search};

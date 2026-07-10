@@ -184,6 +184,9 @@ fn sae_manifold_euclidean_line_fits_through_production_engine() {
     let result = problem
         .run(&mut objective, "SAE euclidean line fit (#1051)")
         .expect("outer cascade must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("euclidean-line outer result must certify the installed state");
     let fitted_term = objective
         .into_fitted()
         .expect("outer fit was evaluated")

@@ -336,6 +336,9 @@ fn fit_via_engine(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> (SaeMa
     let result = problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("Grassmann-frame outer result must certify the installed state");
     let fitted = objective
         .into_fitted()
         .expect("outer fit was evaluated")

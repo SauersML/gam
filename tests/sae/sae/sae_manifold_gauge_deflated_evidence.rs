@@ -112,12 +112,15 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
     seed_config.seed_budget = 1;
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 0, 0.04, 1.0e-6, 1.0e-6);
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_seed_config(seed_config)
         .with_initial_rho(init_rho_flat)
         .with_max_iter(1)
         .run(&mut objective, label)
         .expect("outer engine must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("gauge-deflated outer result must certify the installed state");
     let fitted = objective
         .into_fitted()
         .expect("outer fit was evaluated")

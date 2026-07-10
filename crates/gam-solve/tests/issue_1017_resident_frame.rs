@@ -4,16 +4,26 @@ use std::sync::{Arc, Mutex};
 
 use gam_solve::arrow_schur::{
     ArrowPcgDiagnostics, ArrowSchurSystem, ArrowSolveOptions, DEFAULT_PROXIMAL_INITIAL_RIDGE,
-    DeviceSaePcgData, solve_with_lm_escalation_inner,
+    DeviceSaeFrameData, DeviceSaePcgData, prepare_sae_resident_frame,
+    solve_with_lm_escalation_inner,
 };
 use gam_solve::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, SaeResidentFrame};
 use ndarray::{Array1, Array2};
 
 struct RecordingFrame {
     calls: Arc<Mutex<Vec<(f64, f64)>>>,
+    refreshes: Arc<Mutex<Vec<f64>>>,
 }
 
 impl SaeResidentFrame for RecordingFrame {
+    fn refresh(&self, sys: &ArrowSchurSystem) -> Result<(), ArrowSchurGpuFailure> {
+        self.refreshes
+            .lock()
+            .expect("record resident refreshes")
+            .push(sys.rows[0].htt[[0, 0]]);
+        Ok(())
+    }
+
     fn resolve(
         &self,
         sys: &ArrowSchurSystem,
@@ -84,6 +94,7 @@ fn inexact_pcg_reuses_one_sae_resident_frame_across_lm_ridge_trials_1017() {
     let mut options = ArrowSolveOptions::inexact_pcg();
     options.sae_resident_frame = Some(Arc::new(RecordingFrame {
         calls: Arc::clone(&calls),
+        refreshes: Arc::new(Mutex::new(Vec::new())),
     }));
 
     let (_delta_t, _delta_beta, diagnostics) =
@@ -108,5 +119,48 @@ fn inexact_pcg_reuses_one_sae_resident_frame_across_lm_ridge_trials_1017() {
             ),
         ],
         "one resident frame must receive both ridge trials in ladder order"
+    );
+}
+
+/// A caller retaining the frame across nonlinear assemblies must keep the same
+/// frame allocation while refreshing it from each new numerical system.
+#[test]
+fn nonlinear_prepare_keeps_frame_identity_and_refreshes_current_content_1017() {
+    let mut sys = device_sae_fixture();
+    Arc::get_mut(
+        sys.device_sae_pcg
+            .as_mut()
+            .expect("fixture device descriptor uniquely owned"),
+    )
+    .expect("fixture device descriptor uniquely owned")
+    .frame = Some(DeviceSaeFrameData {
+        ranks: Vec::new(),
+        basis_sizes: Vec::new(),
+        border_offsets: Vec::new(),
+        frame_blocks: Vec::new(),
+        smooth_ranks: Vec::new(),
+        row_htbeta: vec![Vec::new(); sys.rows.len()],
+    });
+    let refreshes = Arc::new(Mutex::new(Vec::new()));
+    let frame: Arc<dyn SaeResidentFrame + Send + Sync> = Arc::new(RecordingFrame {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        refreshes: Arc::clone(&refreshes),
+    });
+    let options = ArrowSolveOptions::direct();
+
+    let prepared = prepare_sae_resident_frame(&sys, &options, Some(Arc::clone(&frame)))
+        .expect("compatible frame refreshes in place");
+    assert!(Arc::ptr_eq(&prepared, &frame));
+    sys.rows[0].htt[[0, 0]] = 7.0;
+    let prepared_again = prepare_sae_resident_frame(&sys, &options, Some(prepared))
+        .expect("same allocation refreshes for the next iterate");
+    assert!(Arc::ptr_eq(&prepared_again, &frame));
+    assert_eq!(
+        refreshes
+            .lock()
+            .expect("inspect nonlinear refresh ledger")
+            .as_slice(),
+        &[2.0, 7.0],
+        "refresh must observe the newly assembled Hessian, not retain old content"
     );
 }

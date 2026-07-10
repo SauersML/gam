@@ -209,9 +209,12 @@ fn run_production_fit(z: &Array2<f64>, coord_seed: &[f64], label: &str) -> SaeMa
         RIDGE_BETA,
     );
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
-    problem
+    let result = problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("replicate-gauge outer result must certify the installed state");
     objective
         .into_fitted()
         .expect("outer fit was evaluated")

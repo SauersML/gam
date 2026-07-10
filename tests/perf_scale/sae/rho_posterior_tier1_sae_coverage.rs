@@ -166,8 +166,8 @@ fn fit_band_at_rho(
 ) -> (Array2<f64>, Array2<f64>) {
     let mut objective = build_objective(theta, z);
     objective
-        .eval(&rho.to_owned())
-        .expect("SAE exact-gradient evaluation at rho");
+        .fit_at_fixed_rho(rho)
+        .expect("SAE fixed-rho fit must converge");
     let shape = objective
         .decoder_shape_uncertainty()
         .expect("decoder shape uncertainty at rho");
@@ -181,8 +181,8 @@ fn fit_band_at_rho(
 fn fit_mean_at_rho(theta: &[f64], z: &Array2<f64>, rho: ArrayView1<'_, f64>) -> Array2<f64> {
     let mut objective = build_objective(theta, z);
     objective
-        .eval(&rho.to_owned())
-        .expect("SAE exact-gradient evaluation at rho");
+        .fit_at_fixed_rho(rho)
+        .expect("SAE fixed-rho fit must converge");
     let term = objective
         .into_fitted()
         .expect("outer fit was evaluated")

@@ -2501,15 +2501,18 @@ impl SaeManifoldTerm {
             // reduced-Schur matvec, which routes `H_ββ` through the composite op below
             // (rank-1 included). Healthy fits install no rank-1 and keep the device PCG.
             if sep_rank1.is_empty() {
-                self.install_device_sae_pcg_data(&mut sys, DeviceSaePcgData {
-                    p,
-                    beta_dim,
-                    a_phi: device_a_phi,
-                    local_jac: device_local_jac,
-                    smooth_blocks: device_smooth_blocks,
-                    sparse_g_blocks: g_sparse_blocks.clone(),
-                    frame: None,
-                });
+                self.install_device_sae_pcg_data(
+                    &mut sys,
+                    DeviceSaePcgData {
+                        p,
+                        beta_dim,
+                        a_phi: device_a_phi,
+                        local_jac: device_local_jac,
+                        smooth_blocks: device_smooth_blocks,
+                        sparse_g_blocks: g_sparse_blocks.clone(),
+                        frame: None,
+                    },
+                );
             }
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
             ops.push(Arc::new(SparseBlockKroneckerPenaltyOp {

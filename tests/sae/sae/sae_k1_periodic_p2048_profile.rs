@@ -165,13 +165,15 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
         seed_config.seed_budget = 1;
         let n_params = rho.to_flat().len();
         let t_b = Instant::now();
-        OuterProblem::new(n_params)
+        let result = OuterProblem::new(n_params)
             .with_seed_config(seed_config)
             .with_initial_rho(rho.to_flat())
-            .with_max_iter(1)
             .run(&mut obj_full, &format!("profile p={p}"))
             .expect("outer engine must complete");
         let full_s = t_b.elapsed().as_secs_f64();
+        obj_full
+            .certify_outer_result(&result)
+            .expect("profile outer result must certify the installed state");
         let fitted = obj_full
             .into_fitted()
             .expect("outer fit was evaluated")

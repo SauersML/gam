@@ -1008,6 +1008,41 @@ fn build_resident_sae_frame_if_admitted(
     crate::gpu_kernels::arrow_schur::build_sae_resident_frame(sys, cg_iters).ok()
 }
 
+/// Refresh an allocation-resident SAE frame for a newly assembled nonlinear
+/// iterate, or build a replacement when no compatible allocation exists.
+///
+/// The shape/admission predicate is identical to the LM ladder's internal
+/// builder. A compatible frame overwrites *all* ridge-independent device
+/// operands in place; an incompatible shape is discarded and rebuilt. The
+/// caller may retain the returned handle across accepted iterations, but never
+/// its numerical content or row factors.
+pub fn prepare_sae_resident_frame(
+    sys: &ArrowSchurSystem,
+    options: &ArrowSolveOptions,
+    existing: Option<
+        std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>,
+    >,
+) -> Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>> {
+    if !matches!(
+        options.mode,
+        ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG
+    ) || sys
+        .device_sae_pcg
+        .as_ref()
+        .is_none_or(|data| data.frame.is_none())
+        || !sys.cross_row_penalties.is_empty()
+        || options.streaming_chunk_size.is_some()
+    {
+        return None;
+    }
+    if let Some(frame) = existing {
+        if frame.refresh(sys).is_ok() {
+            return Some(frame);
+        }
+    }
+    build_resident_sae_frame_if_admitted(sys, options)
+}
+
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
 ///
 /// On `PerRowFactorFailed` / `PerRowFactorIllConditioned` /
@@ -1056,17 +1091,24 @@ pub fn solve_with_lm_escalation_inner(
     // frame is absent (mutually exclusive shapes); a `None` keeps the per-trial
     // re-flatten path bit-identical. Carried via a `Cow` so options are cloned
     // only when a resident frame is actually installed.
-    let core_options = match resident_frame
-        .is_none()
-        .then(|| build_resident_sae_frame_if_admitted(sys, options))
-        .flatten()
-    {
-        Some(frame) => {
-            let mut owned = options.clone();
-            owned.sae_resident_frame = Some(frame);
-            std::borrow::Cow::Owned(owned)
+    let core_options = if options.sae_resident_frame.is_some() {
+        // A production caller may retain the frame allocation across accepted
+        // nonlinear iterates and refresh it before entering this fixed-system
+        // ridge ladder. Keep that exact handle for every trial.
+        std::borrow::Cow::Borrowed(options)
+    } else {
+        match resident_frame
+            .is_none()
+            .then(|| build_resident_sae_frame_if_admitted(sys, options))
+            .flatten()
+        {
+            Some(frame) => {
+                let mut owned = options.clone();
+                owned.sae_resident_frame = Some(frame);
+                std::borrow::Cow::Owned(owned)
+            }
+            None => std::borrow::Cow::Borrowed(options),
         }
-        None => std::borrow::Cow::Borrowed(options),
     };
     for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
         let damped_ridge_t = ridge_t + proximal_ridge;

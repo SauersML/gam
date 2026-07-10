@@ -327,9 +327,8 @@ pub(crate) struct SaeArrowAssemblyWorkspace {
     pub(crate) rows: Vec<ArrowRowBlock>,
     pub(crate) gb: Array1<f64>,
     pub(crate) device_sae_pcg: Option<Arc<DeviceSaePcgData>>,
-    pub(crate) resident_frame: Option<
-        Arc<dyn gam_solve::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>,
-    >,
+    pub(crate) resident_frame:
+        Option<Arc<dyn gam_solve::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>>,
     #[cfg(test)]
     pub(crate) accepted_observations: Vec<SaeArrowAssemblyObservation>,
 }

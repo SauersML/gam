@@ -265,7 +265,7 @@ fn ew_forcing_engages_on_full_outer_walk() {
     let z = one_circle_target(64, 12, 0.05);
     let (mut objective, seed) = forcing_test_objective(&z, 2);
     let n_params = seed.len();
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(8)
         .with_seed_config(gam_problem::SeedConfig {
@@ -286,6 +286,9 @@ fn ew_forcing_engages_on_full_outer_walk() {
         "the counted probe lane must have driven the line-search value probes; telemetry: \
          {telemetry:?}"
     );
+    objective
+        .certify_outer_result(&result)
+        .expect("forced outer walk must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     assert!(

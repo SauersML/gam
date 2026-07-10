@@ -397,6 +397,9 @@ fn run_production_fit(truth: &Truth, z: &Array2<f64>) -> (SaeManifoldTerm, Array
     let result = problem
         .run(&mut objective, "SAE manifold two-circle recovery")
         .expect("outer cascade must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("two-circle outer result must certify the installed state");
     let fitted_term = objective
         .into_fitted()
         .expect("outer fit was evaluated")
@@ -659,18 +662,25 @@ fn sae_manifold_joint_two_circle_recovery_ibp_map() {
 /// Build the production objective for the two-circle fixture (same cold term and
 /// entry ρ as `run_production_fit`), without driving the outer cascade — the
 /// caller exercises the curvature-homotopy entry walk directly.
-fn build_objective(truth: &Truth, z: &Array2<f64>) -> SaeManifoldOuterObjective {
+fn build_objective(
+    truth: &Truth,
+    z: &Array2<f64>,
+) -> (SaeManifoldOuterObjective, Array1<f64>) {
     let term = build_cold_term(truth, z.view());
     let init_rho = dimensionless_entry_rho(&term, z);
-    SaeManifoldOuterObjective::new(
-        term,
-        z.clone(),
-        None,
-        init_rho,
-        INNER_MAX_ITER,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
+    let init_rho_flat = init_rho.to_flat();
+    (
+        SaeManifoldOuterObjective::new(
+            term,
+            z.clone(),
+            None,
+            init_rho,
+            INNER_MAX_ITER,
+            LEARNING_RATE,
+            RIDGE_EXT_COORD,
+            RIDGE_BETA,
+        ),
+        init_rho_flat,
     )
 }
 
@@ -745,7 +755,7 @@ fn sae_two_circle_curvature_homotopy_entry_arrives_zero_reseed() {
     let truth = planted_truth();
     let (z, signal_scale) = planted_response(&truth, &u_a, &u_b);
 
-    let mut objective = build_objective(&truth, &z);
+    let (mut objective, init_rho_flat) = build_objective(&truth, &z);
     let arrived = objective
         .run_curvature_homotopy_entry()
         .expect("curvature-homotopy entry walk must not hard-error on the gate-0 fixture");
@@ -755,6 +765,12 @@ fn sae_two_circle_curvature_homotopy_entry_arrives_zero_reseed() {
         .expect("a walk that ran must record a report")
         .clone();
 
+    // Re-converge the η=1 arrival at the same fixed ρ through the one public
+    // fixed-ρ fit entry. The homotopy report certifies the branch walk, while
+    // `fit_at_fixed_rho` is the ownership gate that may mint a fitted object.
+    objective
+        .fit_at_fixed_rho(init_rho_flat.view())
+        .expect("homotopy arrival must converge at its fixed rho");
     // Post-walk reconstruction R² at the certified η = 1 state.
     let fitted_term = objective
         .into_fitted()

@@ -2281,9 +2281,7 @@ impl SaeManifoldTerm {
         self.border_hbb_workspace = workspace;
     }
 
-    pub(crate) fn take_arrow_assembly_buffers(
-        &mut self,
-    ) -> (Vec<ArrowRowBlock>, Array1<f64>) {
+    pub(crate) fn take_arrow_assembly_buffers(&mut self) -> (Vec<ArrowRowBlock>, Array1<f64>) {
         (
             std::mem::take(&mut self.arrow_assembly_workspace.rows),
             std::mem::replace(
@@ -2326,10 +2324,7 @@ impl SaeManifoldTerm {
             self.arrow_assembly_workspace
                 .accepted_observations
                 .push(SaeArrowAssemblyObservation {
-                    row_htt_ptr: sys
-                        .rows
-                        .first()
-                        .map_or(0, |row| row.htt.as_ptr() as usize),
+                    row_htt_ptr: sys.rows.first().map_or(0, |row| row.htt.as_ptr() as usize),
                     row_htbeta_ptr: sys
                         .rows
                         .first()
@@ -2345,8 +2340,7 @@ impl SaeManifoldTerm {
         }
 
         self.arrow_assembly_workspace.rows = std::mem::take(&mut sys.rows);
-        self.arrow_assembly_workspace.gb =
-            std::mem::replace(&mut sys.gb, Array1::<f64>::zeros(0));
+        self.arrow_assembly_workspace.gb = std::mem::replace(&mut sys.gb, Array1::<f64>::zeros(0));
         if let Some(device) = sys.device_sae_pcg.take() {
             self.arrow_assembly_workspace.device_sae_pcg = Some(device);
         }

@@ -503,9 +503,12 @@ fn run_production_fit(
         RIDGE_BETA,
     );
     let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
-    problem
+    let result = problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("reconstruction-parity outer result must certify the installed state");
     let fitted_term = objective
         .into_fitted()
         .expect("outer fit was evaluated")

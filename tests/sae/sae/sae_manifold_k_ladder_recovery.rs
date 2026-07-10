@@ -460,6 +460,9 @@ fn run_production_fit(
     let result = problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("K-ladder outer result must certify the installed state");
     let fitted_term = objective
         .into_fitted()
         .expect("outer fit was evaluated")

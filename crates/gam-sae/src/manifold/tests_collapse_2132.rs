@@ -195,7 +195,7 @@ fn fit_circle_dictionary(
     let (mut objective, seed) =
         objective_and_seed(train, k, Topo::Circle, AssignmentMode::softmax(1.0));
     let n_params = seed.len();
-    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(12)
         .with_seed_config(gam_problem::SeedConfig {
@@ -205,6 +205,9 @@ fn fit_circle_dictionary(
         })
         .run(&mut objective, "SAE manifold")
         .expect("circle dictionary fit must not abort");
+    objective
+        .certify_outer_result(&result)
+        .expect("circle dictionary outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let native_ev = global_ev(train, fitted.term.fitted().view());
     (fitted.term, fitted.rho, native_ev)

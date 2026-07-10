@@ -5057,14 +5057,25 @@ impl SaeManifoldTerm {
             // `update_ard_reml` rule (α = n / ‖t‖²) dropped the logdet /
             // effective-dof term and collapsed α on near-degenerate axes; it
             // has been removed in favour of the criterion-driven update.
-            let sys = self
+            let mut sys = self
                 .assemble_arrow_schur(target, rho, analytic_penalties)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             let plan = self
                 .streaming_plan()
                 .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            let solve_options = plan.solve_options_for_border_dim(sys.k);
+            let mut solve_options = plan.solve_options_for_border_dim(sys.k);
+            // #1017 allocation residency across ACCEPTED nonlinear iterates.
+            // The retained handle owns device allocations only; `prepare_*`
+            // overwrites every ridge-independent operand from this freshly
+            // assembled `sys` (or rebuilds on shape drift). The LM ladder then
+            // recomputes `ainv` for each ridge trial as before. No factor or
+            // numerical block crosses the accepted-iterate boundary.
+            let existing_resident_frame = self.arrow_assembly_workspace.resident_frame.take();
+            let resident_frame =
+                prepare_sae_resident_frame(&sys, &solve_options, existing_resident_frame);
+            solve_options.sae_resident_frame = resident_frame;
+            self.arrow_assembly_workspace.resident_frame = solve_options.sae_resident_frame.clone();
             // Inner Newton step with principled LM-style ridge escalation. The
             // PCA-seed starting state on a small batch (e.g. `predict` on a
             // strict subset of the training set) can produce a per-row
@@ -5226,6 +5237,7 @@ impl SaeManifoldTerm {
             // not a KKT certificate: on K=1 near-isotropic clouds it can be tiny
             // along the chart gauge while the outer residual remains large.
             if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
+                self.reclaim_arrow_assembly_workspace(&mut sys, false);
                 break;
             }
             let mut step_norm_sq = 0.0;
@@ -5295,6 +5307,7 @@ impl SaeManifoldTerm {
                 // Pre-step state is unperturbed here; restore is a no-op but
                 // keeps the invariant explicit.
                 self.restore_mutable_state(&snapshot)?;
+                self.reclaim_arrow_assembly_workspace(&mut sys, false);
                 break;
             }
             // #2100/#1117 objective-stagnation gate (see the locals above). The
@@ -5320,6 +5333,7 @@ impl SaeManifoldTerm {
                         // Converged on the quotient — the objective is at its
                         // numerical fixed point. The pre-step state is unperturbed
                         // (the snapshot was taken from it), so no restore is needed.
+                        self.reclaim_arrow_assembly_workspace(&mut sys, false);
                         break;
                     }
                 } else {
@@ -5431,6 +5445,7 @@ impl SaeManifoldTerm {
                             grad_norm_sq.sqrt()
                         );
                         self.restore_mutable_state(&snapshot)?;
+                        self.reclaim_arrow_assembly_workspace(&mut sys, false);
                         break;
                     }
                 };
@@ -5445,6 +5460,7 @@ impl SaeManifoldTerm {
                         grad_norm_sq.sqrt()
                     );
                     self.restore_mutable_state(&snapshot)?;
+                    self.reclaim_arrow_assembly_workspace(&mut sys, false);
                     break;
                 }
             }
@@ -5591,6 +5607,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
+            self.reclaim_arrow_assembly_workspace(&mut sys, true);
         }
         // #1117 — the rank-`r_k` oracle is already pinned: each rank-deficient
         // atom was reparametrized onto its data-supported subspace at fit entry

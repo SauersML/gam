@@ -237,6 +237,9 @@ fn run_wide_outer_fit(
         result.iterations, result.final_value, result.final_grad_norm,
     );
     let telemetry = objective.probe_telemetry();
+    objective
+        .certify_outer_result(&result)
+        .expect("#2080 wide-p outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     (ev, telemetry)
@@ -277,6 +280,9 @@ fn run_k1_generated_seed_outer_fit(
         result.iterations, result.final_value, result.final_grad_norm,
     );
     let telemetry = objective.probe_telemetry();
+    objective
+        .certify_outer_result(&result)
+        .expect("#2153 outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     (ev, telemetry)
@@ -435,6 +441,9 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
                 rho_displacement.is_finite() && rho_displacement <= cfg.step_collapse_radius;
             let huge_final_gradient =
                 final_grad_norm.is_finite() && final_grad_norm >= cfg.huge_final_gradient_floor;
+            objective
+                .certify_outer_result(&result)
+                .expect("ceiling-pathology outer result must certify the installed state");
             let fitted = objective.into_fitted().expect("outer fit was evaluated");
             let ev = global_ev(z.view(), fitted.term.fitted().view());
             let live_lock_present =
@@ -743,6 +752,9 @@ fn entangled_two_circle_outer_reml_separates_2080() {
          iterations={}, final_value={:.6e}, final_grad_norm={:?}",
         result.iterations, result.final_value, result.final_grad_norm,
     );
+    objective
+        .certify_outer_result(&result)
+        .expect("entangled two-circle outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z.view(), fitted.term.fitted().view());
     let mut norms = vec![0.0_f64; k];

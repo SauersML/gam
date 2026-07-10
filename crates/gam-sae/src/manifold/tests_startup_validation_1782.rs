@@ -256,7 +256,7 @@ fn run_full_fit(
 ) -> f64 {
     let (mut objective, seed) = objective_and_seed(z, k, topo, mode);
     let n_params = seed.len();
-    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(4)
         .with_seed_config(gam_problem::SeedConfig {
@@ -274,6 +274,9 @@ fn run_full_fit(
             // refusal as a finite collapse wall instead of `+∞`.
             panic!("#1782 {label} fit must not abort at startup / in the outer solver, got: {e}")
         });
+    objective
+        .certify_outer_result(&result)
+        .expect("#1782 outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let ev = global_ev(z, fitted.term.fitted().view());
     eprintln!("REPRO1782 {label} fit: ev={ev:.4}");

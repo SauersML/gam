@@ -159,6 +159,9 @@ fn sae_manifold_d1_ibp_gate_cocollapse() {
              planted curve — a RemlConvergenceError (inner solve stalls at fixed ρ) reproduces \
              the #2228 IBP-gate/decoder co-collapse",
         );
+    objective
+        .certify_outer_result(&result)
+        .expect("IBP co-collapse outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let fitted_out = fitted.term.fitted();
     let r2 = reconstruction_r2(&fitted_out, &z);

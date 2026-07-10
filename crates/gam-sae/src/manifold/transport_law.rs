@@ -102,14 +102,24 @@ pub struct AtomTransportReport {
     /// goodness of fit; `≈ 1` when transport is a pure phase shift.
     pub phase_r2: f64,
     /// Circular `R²` of the smooth-map alternative (phase shift plus `H`
-    /// harmonics of drift). Always `≥ phase_r2` (the alternative nests the law).
+    /// harmonics of φ̂-centered drift). Nests the law by construction (its
+    /// constant term rides on the phase model's circular mean), so it sits
+    /// `≥ phase_r2` up to the least-squares/chordal metric mismatch on the
+    /// residual harmonics; a (small) negative `law_gap` is honest numerics,
+    /// not a clamp. Note the alternative's Fourier order is capped at the
+    /// atom's own `H`: the empirical map between two order-`H` curves can
+    /// carry harmonics above `H`, so this alternative is CONSERVATIVE — it can
+    /// under-detect nonlinearity, never over-detect it.
     pub smooth_r2: f64,
     /// Honest-units decoder drift `δ_k = ‖B_tgt − B_src‖_F /
-    /// √(‖B_src‖_F · ‖B_tgt‖_F)` (gam#2231 §3). `NaN` if either decoder is zero.
+    /// √(‖B_src‖_F · ‖B_tgt‖_F)` (gam#2231 §3). `NaN` if either decoder is
+    /// numerically dead (Frobenius norm ≤ 1e−12 of the larger layer's norm),
+    /// so a shrunk-out layer cannot manufacture a divergent drift ratio.
     pub drift: f64,
     /// Principal angles (radians, ascending) between the two layer images — the
-    /// row spaces of the honest decoders in `ℝ^p`. Length `min(rank_src,
-    /// rank_tgt)`; empty if either image is numerically rank-0.
+    /// row spaces of the honest decoders in `ℝ^p`. Length `max(rank_src,
+    /// rank_tgt)` with `|rank_src − rank_tgt|` trailing `π/2` entries when the
+    /// ranks differ; empty only if BOTH images are numerically rank-0.
     pub principal_angles: Vec<f64>,
     /// The empirical transport samples `(t_g, t'_g)` in chart units, one per grid
     /// point, for plotting / downstream analysis.
@@ -381,22 +391,32 @@ fn fit_transport_law(t: &[f64], tprime: &[f64], n_harmonics: usize) -> ((f64, f6
     }
     let phase_r2 = circular_r2(ss_tot, best_ss_res);
 
-    // Smooth-map alternative: t' = s·t + f(t), f a Fourier series (constant +
-    // n_harmonics harmonics) of t fit to the wrapped drift d_g = wrap(t'_g − s·t_g)
-    // by least squares. The constant reproduces the phase model, so this nests it.
-    let smooth_r2 =
-        fit_smooth_alternative(t, tprime, best_s, n_harmonics, ss_tot).unwrap_or(phase_r2);
+    // Smooth-map alternative: t' = s·t + φ̂ + f(t), f a Fourier series (constant
+    // + n_harmonics harmonics) of t fit by least squares to the φ̂-CENTERED
+    // wrapped drift d_g = wrap(t'_g − s·t_g − φ̂). Centering by the phase
+    // model's circular mean is load-bearing: when the true offset sits near the
+    // wrap boundary ±½, the UNcentered wrapped drift is a ±½ square-wave-like
+    // discontinuous signal whose Fourier LS fit is garbage — the smooth R²
+    // then craters below the phase R² and a genuinely nonlinear transport
+    // would read as "law holds". Centered, the drift is small and continuous,
+    // and the zero-function f reproduces the phase model exactly, so the
+    // alternative nests the law by construction (no clamp needed — a small
+    // negative gap is honest LS/chordal metric mismatch, and a smooth model
+    // that fails to beat the phase model IS the law holding).
+    let smooth_r2 = fit_smooth_alternative(t, tprime, best_s, best_phi, n_harmonics, ss_tot)
+        .unwrap_or(phase_r2);
 
-    ((best_s, best_phi), phase_r2, smooth_r2.max(phase_r2))
+    ((best_s, best_phi), phase_r2, smooth_r2)
 }
 
-/// Least-squares Fourier fit of the wrapped transport drift; returns the smooth
-/// model's circular `R²`, or `None` if the normal equations are singular (then
-/// the caller falls back to the phase `R²`).
+/// Least-squares Fourier fit of the φ-centered wrapped transport drift; returns
+/// the smooth model's circular `R²`, or `None` if the normal equations are
+/// singular (then the caller falls back to the phase `R²`).
 fn fit_smooth_alternative(
     t: &[f64],
     tprime: &[f64],
     s: f64,
+    phi: f64,
     n_harmonics: usize,
     ss_tot: f64,
 ) -> Option<f64> {
@@ -420,7 +440,9 @@ fn fit_smooth_alternative(
     let mut dtb = Array1::<f64>::zeros(k);
     for (&ti, &tpi) in t.iter().zip(tprime.iter()) {
         let row = design(ti);
-        let d = wrap_half(tpi - s * ti);
+        // φ-centered drift: small and continuous when the law nearly holds,
+        // even for offsets at the wrap boundary ±½.
+        let d = wrap_half(tpi - s * ti - phi);
         for i in 0..k {
             dtb[i] += row[i] * d;
             for j in 0..k {
@@ -435,7 +457,7 @@ fn fit_smooth_alternative(
     for (&ti, &tpi) in t.iter().zip(tprime.iter()) {
         let row = design(ti);
         let f: f64 = row.iter().zip(coeffs.iter()).map(|(&r, &c)| r * c).sum();
-        let pred = s * ti + f;
+        let pred = s * ti + phi + f;
         ss_res += 1.0 - (two_pi * (tpi - pred)).cos();
     }
     Some(circular_r2(ss_tot, ss_res))
@@ -457,12 +479,17 @@ fn wrap_half(x: f64) -> f64 {
 }
 
 /// Honest-units decoder drift `δ = ‖B_tgt − B_src‖_F / √(‖B_src‖_F · ‖B_tgt‖_F)`
-/// (gam#2231 §3). `NaN` if either decoder is numerically zero.
+/// (gam#2231 §3). `NaN` if either decoder is numerically dead — Frobenius norm
+/// ≤ 1e−12 of the LARGER layer's norm (a relative gate, matching the rank
+/// threshold used for principal angles). The exact-zero guard alone let a
+/// shrunk-out-but-not-bitwise-zero layer (‖B‖ ~ 1e−30) blow the geometric-mean
+/// denominator up to δ ~ 1e13 and hijack `most_drifting_atom`.
 pub(crate) fn decoder_drift(b_src: &Array2<f64>, b_tgt: &Array2<f64>) -> f64 {
     let fro = |a: &Array2<f64>| a.iter().map(|&v| v * v).sum::<f64>().sqrt();
     let ns = fro(b_src);
     let nt = fro(b_tgt);
-    if ns > 0.0 && nt > 0.0 {
+    let dead = 1e-12 * ns.max(nt);
+    if ns > dead && nt > dead {
         let diff: f64 = b_src
             .iter()
             .zip(b_tgt.iter())

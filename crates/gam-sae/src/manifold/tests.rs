@@ -1522,6 +1522,76 @@ pub(crate) fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
     assert!(basis_delta > 1.0e-10);
 }
 
+/// #1017 — accepted nonlinear iterations reuse allocation identity while
+/// rebuilding the actual current-iterate system. This drives the production
+/// joint-fit loop with an automatically framed low-rank decoder, then inspects
+/// observations captured only after accepted steps (not arbitrary assemblies).
+#[test]
+pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_fresh_content() {
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let p = 16usize;
+    let mut decoder = Array2::<f64>::zeros((3, p));
+    decoder[[0, 0]] = 0.4;
+    decoder[[1, 0]] = -0.3;
+    decoder[[2, 0]] = 0.2;
+    decoder[[0, 1]] = -0.1;
+    decoder[[1, 1]] = 0.35;
+    decoder[[2, 1]] = 0.25;
+    let mut target = phi0.dot(&decoder);
+    for row in 0..target.nrows() {
+        target[[row, 0]] += 0.08 * (row as f64 + 0.5).sin();
+        target[[row, 1]] -= 0.06 * (row as f64 + 1.0).cos();
+    }
+    let atom = SaeManifoldAtom::new(
+        "resident_periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi0,
+        jet0,
+        decoder,
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((4, 1)),
+        vec![coords0],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(0.7),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1)]);
+
+    term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 2, 0.05, 1.0e-3, 1.0e-3)
+        .expect("two accepted nonlinear iterations");
+
+    let observations = &term.arrow_assembly_workspace.accepted_observations;
+    assert_eq!(
+        observations.len(),
+        2,
+        "fixture must accept both requested nonlinear iterations"
+    );
+    let first = &observations[0];
+    let second = &observations[1];
+    assert_ne!(first.row_htt_ptr, 0);
+    assert_eq!(first.row_htt_ptr, second.row_htt_ptr);
+    assert_ne!(first.row_htbeta_ptr, 0);
+    assert_eq!(first.row_htbeta_ptr, second.row_htbeta_ptr);
+    assert_ne!(first.gb_ptr, 0);
+    assert_eq!(first.gb_ptr, second.gb_ptr);
+    assert_ne!(
+        first.device_frame_ptr, 0,
+        "framed assembly must install DeviceSaePcgData"
+    );
+    assert_eq!(first.device_frame_ptr, second.device_frame_ptr);
+    assert_ne!(
+        first.numerical_bits, second.numerical_bits,
+        "accepted state change must refresh Hessian/gradient numerical content"
+    );
+}
+
 pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
@@ -2396,10 +2466,13 @@ pub(crate) fn planted_circle_ibp_map_n40_sigma018_reaches_high_ev_1744() {
     let n_params = init_rho_flat.len();
     let mut objective =
         SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 50, 0.04, 1.0e-6, 1.0e-6);
-    gam_solve::rho_optimizer::OuterProblem::new(n_params)
+    let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(init_rho_flat)
         .run(&mut objective, "SAE planted circle #1744 focused")
         .unwrap();
+    objective
+        .certify_outer_result(&result)
+        .expect("focused #1744 outer result must certify the installed state");
     let fitted_result = objective.into_fitted().expect("outer fit was evaluated");
     let rho = fitted_result.rho;
     let ev = global_ev(z.view(), fitted_result.term.fitted().view());
@@ -2443,10 +2516,13 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
                     1.0e-6,
                     1.0e-6,
                 );
-                gam_solve::rho_optimizer::OuterProblem::new(n_params)
+                let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
                     .with_initial_rho(init_rho_flat)
                     .run(&mut objective, "SAE planted circle dimensionless seed")
                     .unwrap();
+                objective
+                    .certify_outer_result(&result)
+                    .expect("dimensionless-seed outer result must certify the installed state");
                 let fitted_result = objective.into_fitted().expect("outer fit was evaluated");
                 let fitted_term = fitted_result.term;
                 let rho = fitted_result.rho;

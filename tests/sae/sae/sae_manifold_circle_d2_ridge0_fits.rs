@@ -171,6 +171,9 @@ fn sae_manifold_circle_d2_ridge0_fits() {
             "outer cascade must complete on an over-parametrized (d=2) circle chart at ridge-0 \
              — the rank-1 radial-null refusal reproduces #1095/#2228",
         );
+    objective
+        .certify_outer_result(&result)
+        .expect("d=2 circle outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let mut fitted_term = fitted.term;
     let fitted_out = fitted_term.fitted();
@@ -255,6 +258,9 @@ fn zz_1095_2228_measure_seed_vs_settled_r2() {
             "SAE d=2 circle ridge-0 measure (#1095/#2228)",
         )
         .expect("outer cascade completes");
+    objective
+        .certify_outer_result(&result)
+        .expect("d=2 circle measure outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let charts_canonicalized = fitted.charts_canonicalized;
     let fitted_term = fitted.term;

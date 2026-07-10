@@ -229,10 +229,13 @@ fn run_production_fit(arm: Arm, z: &Array2<f64>, frac: &[f64], label: &str) -> S
         RIDGE_EXT_COORD,
         RIDGE_BETA,
     );
-    OuterProblem::new(n_params)
+    let result = OuterProblem::new(n_params)
         .with_initial_rho(init_flat)
         .run(&mut objective, label)
         .expect("production outer fit must complete");
+    objective
+        .certify_outer_result(&result)
+        .expect("production outer result must certify the installed state");
     objective
         .into_fitted()
         .expect("outer fit was evaluated")
