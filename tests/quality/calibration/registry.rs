@@ -22,7 +22,7 @@
 //! the registry is the single index of what is audited and by which gate, not a
 //! second copy of those gates.
 
-use gam::families::multinomial::MultinomialPredictionIntervals;
+use gam::families::multinomial::{MultinomialPredictionIntervals, MultinomialSmoothSignificance};
 use gam::families::survival::predict::SurvivalPredictResult;
 use gam_predict::{
     CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
@@ -245,6 +245,19 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             mode: AuditMode::TestSizeCurve,
             guards: &[1873],
             audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
+        },
+        // Multinomial per-class Wood smooth test (#1891 follow-up): the SAME
+        // shared `wood_smooth_test` primitive as `wood_smooth_test_pvalue`
+        // above, but reached through `gam-models::multinomial`'s own
+        // block-ordered coefficient/EDF/covariance-slice plumbing — a
+        // completeness sweep found `MultinomialSmoothSignificance` unregistered.
+        CalibrationTarget {
+            name: "multinomial_smooth_test_pvalue",
+            kind: SurfaceKind::TestPValue,
+            mode: AuditMode::TestSizeCurve,
+            guards: &[1891],
+            audited_by: "sbc_multinomial_smooth_significance_size_curve \
+                         (multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null)",
         },
         // ---- Posterior surfaces ------------------------------------------
         // The ρ-posterior (smoothing-hyperparameter) certificate is a posterior
@@ -473,6 +486,41 @@ fn survival_probe() -> SurvivalPredictResult {
     }
 }
 
+/// Exhaustive classification of every field of [`MultinomialSmoothSignificance`].
+fn multinomial_smooth_significance_field_audits(
+    payload: &MultinomialSmoothSignificance,
+) -> Vec<FieldAudit> {
+    let MultinomialSmoothSignificance {
+        class_label,
+        term_label,
+        edf,
+        ref_df,
+        statistic,
+        p_value,
+    } = payload;
+    std::hint::black_box((class_label, term_label, edf, ref_df, statistic, p_value));
+    vec![
+        FieldAudit::point("class_label"),
+        FieldAudit::point("term_label"),
+        FieldAudit::point("edf"),
+        FieldAudit::point("ref_df"),
+        FieldAudit::point("statistic"),
+        FieldAudit::audited("p_value", "multinomial_smooth_test_pvalue"),
+    ]
+}
+
+/// A minimal well-formed `MultinomialSmoothSignificance` probe.
+fn multinomial_smooth_significance_probe() -> MultinomialSmoothSignificance {
+    MultinomialSmoothSignificance {
+        class_label: "class0".to_string(),
+        term_label: "s(x)".to_string(),
+        edf: 3.0,
+        ref_df: 3.0,
+        statistic: 1.0,
+        p_value: 0.5,
+    }
+}
+
 /// A minimal well-formed `MultinomialPredictionIntervals` probe.
 fn multinomial_probe() -> MultinomialPredictionIntervals {
     let one = ndarray::Array2::<f64>::zeros((1, 1));
@@ -570,6 +618,14 @@ fn multinomial_payload_uncertainty_fields_are_all_registered() {
 fn survival_predict_payload_uncertainty_fields_are_all_registered() {
     let registry = uq_surface_registry();
     let audits = survival_payload_field_audits(&survival_probe());
+    assert_registry_covers_fields(&audits, &registry);
+}
+
+#[test]
+fn multinomial_smooth_significance_fields_are_all_registered() {
+    let registry = uq_surface_registry();
+    let audits =
+        multinomial_smooth_significance_field_audits(&multinomial_smooth_significance_probe());
     assert_registry_covers_fields(&audits, &registry);
 }
 
