@@ -1461,7 +1461,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      separation_barrier_strength: float | None = None,
                      ibp_alpha: float | None = None,
                      structured_residual_passes: int = 2,
-                     promote_from_residual: bool = False,
+                     promote_from_residual: bool = True,
                      score_mode: str = "auto",
                      _run_structure_search: bool = True,
                      _run_outer_rho_search: bool = True) -> ManifoldSAE:
@@ -1597,15 +1597,21 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         annealed schedule ``γ_p = (p+1)/(N+1)``, so with the default ``N = 2``
         the final pass installs a majority-structured metric (``γ = 2/3``); ``2``
         is also the ``PROMOTION_NURSERY_MIN_PASSES`` dwell, so the default budget
-        is coherent with the (opt-in) residual-atom promotion. Pass ``0`` to
+        is coherent with the (default-on) residual-atom promotion. Pass ``0`` to
         force the legacy iid fit (bit-identical to the pre-#2021 behavior). Must
         be a non-negative int; the native core clamps the effective count to
         ``STRUCTURED_RESIDUAL_PASSES_MAX`` (currently ``4``), so larger values
         behave like ``4``.
     promote_from_residual
-        When ``True`` (default ``False``), atoms discovered in the structured
-        residual passes are promoted into the primary atom tier rather than kept
-        as a secondary residual dictionary. Only meaningful when
+        When ``True`` (the default, #2239 magic-by-default), factor directions
+        discovered in the structured residual passes that clear the full
+        evidence certificate — evidence-ladder rank selection, energy above the
+        idiosyncratic-noise floor, Beta-null persistence alignment, and the
+        nursery dwell — are promoted (born) into the primary atom tier; the
+        alternation self-extends its pass budget (hard-capped natively at
+        ``STRUCTURED_RESIDUAL_PASSES_MAX``) only while certified lineages are
+        live, so structureless data pays no extra passes. ``False`` pins the
+        historical whitening-without-growth path. Only meaningful when
         ``structured_residual_passes > 0``. Coerced to ``bool``.
     score_mode
         Sparse front-door routing residency for the collapsed sparse-code lane.

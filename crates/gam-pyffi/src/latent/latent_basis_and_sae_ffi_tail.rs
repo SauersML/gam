@@ -265,7 +265,10 @@ fn sae_build_atom_plans(
     separation_barrier_strength_override = None,
     ibp_alpha_override = None,
     structured_residual_passes = 2,
-    promote_from_residual = false,
+    // #2239 magic-by-default: evidence-certified residual structure is promoted
+    // to the primary tier by default (the certificate gates the birth; the
+    // alternation self-extends its pass budget only while lineages are live).
+    promote_from_residual = true,
     run_structure_search = true,
     run_outer_rho_search = true,
     quotient_scale = false,

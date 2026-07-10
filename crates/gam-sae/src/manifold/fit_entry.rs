@@ -23,7 +23,10 @@
 //!   of the random-alignment null; `beta_quantile` lives in `gam-inference`
 //!   (also above `gam-sae`), so the derivation is injected as a plain
 //!   `fn(usize) -> f64` the binding supplies. It is only consulted on the
-//!   default-off `promote_from_residual` path.
+//!   default-on `promote_from_residual` path (#2239: evidence-certified
+//!   residual structure is promoted by default; the certificate — evidence-
+//!   ladder rank, energy floor, Beta-null alignment, nursery dwell — is the
+//!   gate, not the flag).
 //!
 //! Interruptibility is preserved by the caller: the whole entry runs on the
 //! binding's GIL-released worker thread and shares the `cancel` flag, which each
@@ -340,7 +343,7 @@ pub struct SaeFitRequest {
 /// * `align_min_from_rank` supplies the #2071 promotion alignment threshold from
 ///   the current residual factor rank (a Beta-quantile the binding computes,
 ///   since its `beta_quantile` lives above `gam-sae`). Consulted only on the
-///   default-off `promote_from_residual` path.
+///   default-on `promote_from_residual` path.
 /// * `cancel`, when present, is polled by every inner objective; the caller sets
 ///   it on interrupt so the abandoned worker's next outer eval bails.
 pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeFitError> {
@@ -477,8 +480,16 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
         // Λ) and, once a lineage matures, promote it to a born atom so the NEXT
         // pass refits with the discovered structure. A lineage that skips a pass
         // loses its dwell; at most one birth per pass, and only when a later pass
-        // remains to refit the born atom, so K grows ≤ structured_passes and no
+        // remains to refit the born atom, so K grows ≤ the pass budget and no
         // born atom is left unrefit inside the alternation.
+        //
+        // #2239 evidence-driven pass extension: a live nursery lineage is itself
+        // the certificate that residual structure persists. When the planned
+        // budget would expire with lineages still maturing (or a matured lineage
+        // still owed its post-birth refit), the alternation grants itself one
+        // more pass, hard-capped at `STRUCTURED_RESIDUAL_PASSES_MAX`. Compute
+        // grows only while the certificate keeps firing; on structureless data
+        // the nursery stays empty and the planned budget is exact.
         //
         // PROMOTION_ENERGY_FLOOR_MULT — DERIVED (identity). The energy gate is
         // "above the idiosyncratic-noise floor"; the floor is already the
@@ -495,14 +506,17 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
         // lives above `gam-sae`. Used identically by the producer-side candidate
         // gate and the nursery lineage-dedup below.
         //
-        // `promote_from_residual` is the typed caller flag (default false); opt-in,
-        // default-off ⇒ whitening runs without growth unless set.
+        // `promote_from_residual` is the typed caller flag (default TRUE, #2239:
+        // magic-by-default — the evidence certificate above, not the flag, is the
+        // real gate). `false` pins the historical whitening-without-growth path.
         let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
-        for pass in 0..structured_passes {
+        let mut total_passes = structured_passes;
+        let mut pass = 0usize;
+        while pass < total_passes {
             let Some(model) = sae_structured_residual_model(&term, z.view())? else {
                 break;
             };
-            let gamma = (pass as f64 + 1.0) / (structured_passes as f64 + 1.0);
+            let gamma = (pass as f64 + 1.0) / (total_passes as f64 + 1.0);
             let metric = model.row_metric_damped(n_obs, gamma, prev_model.as_ref())?;
             let installed_label = metric_provenance_label(metric.provenance());
             let factor_energy = model.factor().iter().map(|v| v * v).sum::<f64>();
@@ -526,7 +540,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
             );
             let stage = SaeFitStage::StructuredResidual {
                 pass: pass + 1,
-                total_passes: structured_passes,
+                total_passes,
             };
             scope_outer_checkpoint_to_stage(&mut objective, stage);
             // #2021 — a promotion (below) grows K, enlarging ρ; size the outer
@@ -618,10 +632,21 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
                 // A lineage that did not recur this pass loses its dwell.
                 let mut keep = seen.into_iter();
                 nursery.retain(|_| keep.next().unwrap_or(false));
+                // #2239 evidence-driven extension: if the budget is about to
+                // expire while lineages are still live (maturing, or matured and
+                // owed the post-birth refit), grant one more pass, capped at
+                // `STRUCTURED_RESIDUAL_PASSES_MAX`. An empty nursery never
+                // extends, so structureless data keeps the planned budget exact.
+                if !nursery.is_empty()
+                    && pass + 1 == total_passes
+                    && total_passes < STRUCTURED_RESIDUAL_PASSES_MAX
+                {
+                    total_passes += 1;
+                }
                 // Promote at most one matured lineage, and only if a later pass
                 // remains to refit the born atom. Collect the direction BEFORE
                 // mutating `term` to avoid overlapping borrows.
-                let matured = if pass + 1 < structured_passes {
+                let matured = if pass + 1 < total_passes {
                     nursery
                         .iter()
                         .find(|(_, count)| *count >= PROMOTION_NURSERY_MIN_PASSES)
@@ -653,6 +678,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
             }
             // Carry this pass's model forward as the next pass's damping anchor.
             prev_model = Some(model);
+            pass += 1;
         }
     }
     {
