@@ -297,11 +297,12 @@ fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
         }
     }
 
-    // `duchon` and `thinplate` are the isotropic bases covered by the #1818 fix
-    // (the Wood-TPRS `V` reparam path). `matern` is a separate, still-open
-    // rotation-variance path (a distinct length-scale/η-optimizer basin flip) and
-    // is tracked apart from this issue.
-    for formula in ["y ~ duchon(x, z)", "y ~ thinplate(x, z)"] {
+    // Every isotropic spatial basis must be rotation-invariant: `duchon` and
+    // `thinplate` via the #1818 geometry fixes (isotropic standardization +
+    // round-off-robust knots), and `matern` additionally via the #2252
+    // rotation-invariant length-scale seed (its enrolled κ/range solve is
+    // seed-sensitive, so a rotation-variant seed drifted the fit ~1.6%).
+    for formula in ["y ~ duchon(x, z)", "y ~ thinplate(x, z)", "y ~ matern(x, z)"] {
         let (edf0, pred0) = fit_and_predict_formula(formula, &x, &z, &y, &gx, &gz);
         let sr = signal_range(&pred0);
         let mut worst_pred = 0.0_f64;
