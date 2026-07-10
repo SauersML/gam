@@ -36,6 +36,7 @@
 //! (`owed_1551_sae_direct_device_engage.rs`).
 
 use super::tests::{TestPeriodicEvaluator, periodic_basis};
+use super::tests_factored_htbeta::{factored_htbeta_rho, low_rank_factored_htbeta_term};
 use super::*;
 use crate::assignment::{AssignmentMode, SaeAssignment};
 use gam_terms::latent::LatentManifold;
@@ -255,5 +256,65 @@ fn offload_gate_admits_d_atom_1_at_token_scale_1783() {
     assert!(
         !policy.reduced_schur_matvec_should_offload(64, 9, 1, 1),
         "a tiny framed circle fixture must NOT engage the device (honest fallback)"
+    );
+}
+
+/// #1017 production-shape fixture whose *actual assembled border* remains large
+/// after the automatic Grassmann factorization. The color example is important
+/// for end-to-end convergence, but its rank-3 decoder collapses `15360` model
+/// coefficients to a border no wider than `9`, so it cannot exercise the
+/// production InexactPCG/resident-frame lane. This fixture goes through the real
+/// SAE assembler and lands just beyond the direct-solve boundary.
+#[test]
+fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
+    const K_ATOMS: usize = 32;
+    const M: usize = 8;
+    const P: usize = 64;
+    const FRAME_RANK: usize = 8;
+    const LATENT_DIM: usize = 1;
+    const N_OBS: usize = 32;
+
+    let mut term = low_rank_factored_htbeta_term(K_ATOMS, M, P, FRAME_RANK, LATENT_DIM, N_OBS);
+    let rho = factored_htbeta_rho(K_ATOMS, LATENT_DIM);
+    let target = Array2::<f64>::from_shape_fn((N_OBS, P), |(row, col)| {
+        1.0e-3 * ((row + 1) as f64 * (col + 3) as f64).sin()
+    });
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("production large-border assembly");
+
+    assert_eq!(term.beta_dim(), K_ATOMS * M * P);
+    assert_eq!(sys.k, K_ATOMS * M * FRAME_RANK);
+    assert_eq!(sys.k, 2_048, "fixture must clear DIRECT_SOLVE_MAX_K=2000");
+    let device = sys
+        .device_sae_pcg
+        .as_ref()
+        .expect("large factored assembly must install device operands");
+    assert!(
+        device.frame.is_some(),
+        "production fixture must use the framed device payload"
+    );
+    let plan = term
+        .streaming_plan()
+        .admitted_or_error(N_OBS, P, K_ATOMS)
+        .expect("fixture admitted by production memory plan");
+    let options = plan.solve_options_for_border_dim(sys.k);
+    assert_eq!(
+        options.mode,
+        gam_solve::arrow_schur::ArrowSolverMode::InexactPCG,
+        "the actual assembled border, not full beta_dim, selects the solver"
+    );
+    let cg_iters = options
+        .pcg
+        .max_iterations
+        .min(options.trust_region.max_iterations);
+    assert!(
+        gam_gpu::policy::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
+            sys.rows.len(),
+            sys.k,
+            sys.d,
+            cg_iters,
+        ),
+        "representative production system must clear resident-device admission"
     );
 }

@@ -441,11 +441,14 @@ pub struct OuterProbeTelemetry {
     /// fresh discovery trajectory by more than the inner objective stall
     /// tolerance, i.e. where the single-trajectory criterion would have jumped
     /// UP across a basin boundary and the envelope held it down. `basin_max_members`
-    /// — the largest bundle size reached (bounded by the derived `max_members`).
+    /// — the largest bundle size reached. `basin_member_capacity` is the
+    /// cgroup-aware host-memory admission bound; exhausting it refuses the fit
+    /// rather than evicting a branch and returning an inexact envelope.
     pub basin_envelope_evals: usize,
     pub basin_admissions: usize,
     pub basin_envelope_rescues: usize,
     pub basin_max_members: usize,
+    pub basin_member_capacity: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -824,21 +827,29 @@ pub struct SaeManifoldOuterObjective {
     crosscoder_blocks: Option<CrosscoderBlockPricing>,
 }
 
-/// #2230/#2087 basin-bundle sizing, derived from problem structure (no tuning).
+/// #2230/#2087 exact basin-bundle memory admission.
 ///
-/// `max_members` — the number of plausible COEXISTING inner basins the outer
-/// line search can straddle. The pathology is a boundary between (at least) two
-/// basins, so the floor is 2. Distinct basins arise from distinct atom routings;
-/// along the low-dimensional ρ line search only a few compete simultaneously, so
-/// the cap is 4 (which also bounds per-eval cost to ≤ 5 inner solves: 4 members
-/// plus the one discovery trajectory). `K` atoms bound the reachable
-/// single-flip basin count, so clamp to `K` when `K < 4`. Members are never
-/// discarded merely because they have not won for some number of evaluations:
-/// that work-count deadline can delete a branch that wins later and reintroduce
-/// the very trajectory hysteresis the envelope removes.
-
-fn basin_bundle_max_members(k_atoms: usize) -> usize {
-    k_atoms.clamp(2, 4)
+/// A present-value or work-count rule cannot prove global dominance of one
+/// basin over another, so an admitted branch is never evicted. Retained states
+/// live on the host. Reserve one conservative direct-solve peak for the active
+/// criterion evaluation, then charge every saved state another full direct-solve
+/// peak even though a cloned term contains only a subset of that workspace. The
+/// resulting capacity is deliberately conservative and comes from the same
+/// cgroup-aware host budget as the SAE streaming plan. Reaching it is an
+/// explicit feasibility error from `BasinBundle::admit`, not an inexact envelope.
+fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
+    let plan = term.streaming_plan();
+    if !plan.direct_logdet_admitted() {
+        return 0;
+    }
+    let (host_budget, _) = super::sae_host_in_core_budget_bytes();
+    let bytes_per_saved_state = plan
+        .estimated_direct_peak_bytes
+        .max(plan.estimated_full_batch_bytes)
+        .max(std::mem::size_of::<SaeManifoldTerm>());
+    host_budget
+        .saturating_sub(plan.estimated_direct_peak_bytes)
+        / bytes_per_saved_state
 }
 
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
@@ -888,6 +899,7 @@ impl SaeManifoldOuterObjective {
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
         let term_k_atoms = term.k_atoms();
+        let basin_member_capacity = basin_bundle_member_capacity(&term);
         // SPEC wall-survival fingerprint on the full-data target.
         let checkpoint_fingerprint =
             super::checkpoint::SaeCheckpointFingerprint::of_target(target.view(), term_k_atoms);
@@ -913,7 +925,7 @@ impl SaeManifoldOuterObjective {
             probe_converged_handoff: None,
             forcing: ProbeForcingState::new(),
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
-            basin_bundle: BasinBundle::new(basin_bundle_max_members(term_k_atoms)),
+            basin_bundle: BasinBundle::new(basin_member_capacity),
             // #2235 — outer-search accounting + the non-convergence forcing
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
@@ -2785,7 +2797,8 @@ impl SaeManifoldOuterObjective {
         // re-converged below.
         if self.basin_bundle.is_empty() {
             self.basin_bundle
-                .admit(self.term.clone(), f64::INFINITY, |_, _| false);
+                .admit(self.term.clone(), f64::INFINITY, |_, _| false)
+                .map_err(|error| format!("SAE basin-envelope seed admission refused: {error}"))?;
         }
 
         // (3) Discovery trajectory — the historical single warm-start probe. Sets
@@ -2803,7 +2816,7 @@ impl SaeManifoldOuterObjective {
         // (4) Re-converge every saved member from its own state (cheap, pure). The
         // bundle is moved out of `self` so the closure can borrow `&mut self` for
         // the per-member inner drive; restored immediately after.
-        let mut bundle = std::mem::replace(&mut self.basin_bundle, BasinBundle::new(1));
+        let mut bundle = std::mem::replace(&mut self.basin_bundle, BasinBundle::new(0));
         let member_eval = bundle.evaluate(|state: &SaeManifoldTerm| {
             let (res, converged) = self.converge_member_criterion(rho_flat, state, drive);
             res.map(|value| (converged, value))
@@ -2816,9 +2829,15 @@ impl SaeManifoldOuterObjective {
             super::fit_drivers::TargetCenteredColStats::compute(self.target.view()).ss_tot();
         let len_before = bundle.len();
         if let (Some(term), Some(cost)) = (discovery_term, discovery_cost) {
-            bundle.admit(term, cost, |a, b| {
+            let admission = bundle.admit(term, cost, |a, b| {
                 Self::same_basin_at_rho(a, b, &rho_state, ss_tot)
             });
+            if let Err(error) = admission {
+                self.basin_bundle = bundle;
+                return Err(format!(
+                    "SAE exact basin-envelope discovery admission refused: {error}"
+                ));
+            }
         }
         let grew = bundle.len() > len_before;
         let bundle_len = bundle.len();
@@ -2837,6 +2856,7 @@ impl SaeManifoldOuterObjective {
         }
         self.probe_telemetry.basin_max_members =
             self.probe_telemetry.basin_max_members.max(bundle_len);
+        self.probe_telemetry.basin_member_capacity = self.basin_bundle.member_capacity();
 
         match envelope {
             Some((env_value, env_beta, env_term)) => {

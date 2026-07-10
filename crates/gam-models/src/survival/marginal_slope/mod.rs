@@ -116,6 +116,7 @@ pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, 
 
 pub(crate) use rayon::prelude::*;
 
+#[cfg(test)]
 pub(crate) use smallvec::SmallVec;
 
 pub(crate) use std::cell::RefCell;
@@ -124,12 +125,13 @@ pub(crate) use std::sync::atomic::AtomicUsize;
 
 pub(crate) use std::sync::{Arc, Mutex};
 
-/// Inline-stored polynomial coefficient vector for survival marginal-slope
-/// integrand assembly. `poly_*` helpers in this module routinely build
-/// degree ≤ ~28 polynomials (max product of four affine cell coefficient
-/// arrays of length 4) inside per-row hot loops; the previous `Vec<f64>`
-/// returns drove millions of mallocs per outer iteration on large-scale
-/// fits. Thirty-two inline slots cover every observed shape.
+/// Inline-stored polynomial coefficient vector for the survival
+/// marginal-slope hand-oracle tests. The scalar `poly_*` helpers and this
+/// alias became test-only after the #932-2 cutover routed every production
+/// timepoint path through the `flex_jet` runtime jet algebra; they survive
+/// solely as the byte-identical hand oracle the `*_oracle_tests` gates
+/// compare against.
+#[cfg(test)]
 pub(crate) type PolyVec = SmallVec<[f64; 32]>;
 
 mod accumulate;
@@ -156,6 +158,7 @@ mod joint_eval;
 mod joint_workspace;
 mod kkt_refusal;
 mod newton_operators;
+#[cfg(test)]
 mod poly_arith;
 mod primary_geometry;
 mod psi_terms;
@@ -176,6 +179,7 @@ pub(crate) use hessian::*;
 pub(crate) use joint_eval::*;
 pub(crate) use joint_workspace::*;
 pub(crate) use kkt_refusal::*;
+#[cfg(test)]
 pub(crate) use poly_arith::{poly_add, poly_mul, poly_scale, poly_sub};
 pub(crate) use primary_geometry::*;
 pub(crate) use row_kernel::*;

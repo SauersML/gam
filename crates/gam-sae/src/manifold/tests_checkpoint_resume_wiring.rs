@@ -244,9 +244,15 @@ fn convergence_ownership_gate_preserves_typed_evidence_and_checkpoint() {
     let (mut converged_objective, converged_flat) = tiny_objective(salt ^ 0xC0A);
     scope_outer_checkpoint_to_stage(&mut converged_objective, stage);
     let converged = OuterResult::new(converged_flat, 8.0, 3, true, plan);
-    let certified = certify_outer_stage(converged_objective, stage, Ok(converged));
-    assert!(
-        certified.is_ok(),
-        "a converged result returns the objective"
-    );
+    let error = match certify_outer_stage(converged_objective, stage, Ok(converged)) {
+        Ok(_) => panic!("a fabricated converged bit without analytic evidence must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        SaeFitError::OuterDidNotConverge {
+            stage: rejected_stage,
+            ..
+        } if rejected_stage == stage
+    ));
 }
