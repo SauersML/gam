@@ -333,6 +333,9 @@ fn fit_real_chart(
         })
         .run(&mut objective, label)
         .map_err(|err| format!("{label}: outer fit failed: {err}"))?;
+    objective
+        .certify_outer_result(&result)
+        .map_err(|err| format!("{label}: outer fit certificate rejected: {err}"))?;
     let telemetry = objective.probe_telemetry();
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let final_term = fitted.term;

@@ -285,7 +285,7 @@ fn measure_branch(is_score_warp: bool) {
     };
     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
 
-    let mut call = |scratch: &mut BernoulliMarginalSlopeFlexRowScratch| -> f64 {
+    let call = |scratch: &mut BernoulliMarginalSlopeFlexRowScratch| -> f64 {
         fx.family
             .compute_row_analytic_flex_from_parts_into(
                 0,

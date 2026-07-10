@@ -662,10 +662,7 @@ fn sae_manifold_joint_two_circle_recovery_ibp_map() {
 /// Build the production objective for the two-circle fixture (same cold term and
 /// entry ρ as `run_production_fit`), without driving the outer cascade — the
 /// caller exercises the curvature-homotopy entry walk directly.
-fn build_objective(
-    truth: &Truth,
-    z: &Array2<f64>,
-) -> (SaeManifoldOuterObjective, Array1<f64>) {
+fn build_objective(truth: &Truth, z: &Array2<f64>) -> (SaeManifoldOuterObjective, Array1<f64>) {
     let term = build_cold_term(truth, z.view());
     let init_rho = dimensionless_entry_rho(&term, z);
     let init_rho_flat = init_rho.to_flat();

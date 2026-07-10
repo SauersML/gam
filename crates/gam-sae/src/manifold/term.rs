@@ -745,6 +745,7 @@ impl Clone for SaeManifoldTerm {
             row_metric: self.row_metric.clone(),
             collapse_events: self.collapse_events.clone(),
             row_loss_weights: self.row_loss_weights.clone(),
+            crosscoder_pricing_spans: self.crosscoder_pricing_spans.clone(),
             last_frames_active: self.last_frames_active,
             assembly_chunk_override: self.assembly_chunk_override,
             fixed_decoder_assembly: false,

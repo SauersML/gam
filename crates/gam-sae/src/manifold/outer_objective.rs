@@ -1011,6 +1011,10 @@ impl SaeManifoldOuterObjective {
             budget_bytes,
         )?;
         let pristine_blocks = self.target.slice(s![.., p_x..]).to_owned();
+        // Mirror the spans onto the term so the outer-ρ gradient assembler can
+        // build the block coordinates' IFT RHS (the −½·Γᵀθ̂_ρ adjoint channel
+        // completing the analytic block gradient).
+        self.term.crosscoder_pricing_spans = Some((p_x, block_dims.clone()));
         self.crosscoder_blocks = Some(CrosscoderBlockPricing {
             p_x,
             last_log_lambda: vec![0.0; block_dims.len()],

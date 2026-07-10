@@ -208,6 +208,7 @@ impl SaeManifoldTerm {
             guards_enabled: true,
             collapse_events: Vec::new(),
             row_loss_weights: None,
+            crosscoder_pricing_spans: None,
             last_frames_active: false,
             assembly_chunk_override: None,
             fixed_decoder_assembly: false,

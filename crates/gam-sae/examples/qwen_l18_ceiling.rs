@@ -374,6 +374,9 @@ fn fit_ceiling_region(
         })
         .run(&mut objective, "Qwen3-8B L18 K=1 ceiling")
         .map_err(|err| format!("outer fit failed: {err}"))?;
+    objective
+        .certify_outer_result(&result)
+        .map_err(|err| format!("outer fit certificate rejected: {err}"))?;
     let fit_elapsed = fit_started.elapsed();
     let telemetry = objective.probe_telemetry();
     let fitted = objective.into_fitted().expect("outer fit was evaluated");

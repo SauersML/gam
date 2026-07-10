@@ -223,6 +223,9 @@ fn run() -> Result<(), String> {
             outer.converged, outer.converged_via
         ));
     }
+    objective
+        .certify_outer_result(&outer)
+        .map_err(|err| format!("full color outer certificate rejected: {err}"))?;
 
     // Only consume/mint the fitted model after the convergence certificate.
     // A successful fit no longer needs its wall-survival checkpoint; match the
