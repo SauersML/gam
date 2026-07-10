@@ -68,6 +68,11 @@ const PENALTY_NULLITY: usize = 3;
 /// Search interval for log λ (natural log), generous on both sides.
 const LOG_LAMBDA_LO: f64 = -18.0;
 const LOG_LAMBDA_HI: f64 = 18.0;
+/// Coarse REML grid resolution over [LOG_LAMBDA_LO, LOG_LAMBDA_HI] before
+/// golden-section refinement (matches the residual-cascade selector).
+const LOG_LAMBDA_GRID: usize = 25;
+/// Golden-section convergence width on log λ.
+const LOG_LAMBDA_TOL: f64 = 1e-6;
 /// Cholesky pivot floor below which the penalized system is declared singular.
 const PIVOT_FLOOR: f64 = 1e-300;
 /// Dense-Cholesky sizing contract documented in the module header.
