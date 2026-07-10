@@ -20,15 +20,12 @@ use std::sync::atomic::AtomicUsize;
 // keeps resolving byte-for-byte.
 pub use gam_problem::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 
-// The IRLS weight / ridge floors and the block-spec consistency validator are
-// neutral (no `CustomFamily` dependency); they live in `gam-problem` and are
-// re-exported here so every `custom_family::{CUSTOM_FAMILY_WEIGHT_FLOOR,
-// CUSTOM_FAMILY_RIDGE_FLOOR, validate_blockspec_consistency}` path keeps
-// resolving and `CUSTOM_FAMILY_WEIGHT_FLOOR` stays sourced from the canonical
-// `MIN_WEIGHT` floor rather than a hardcoded literal.
-pub use gam_problem::{
-    CUSTOM_FAMILY_RIDGE_FLOOR, CUSTOM_FAMILY_WEIGHT_FLOOR, validate_blockspec_consistency,
-};
+// The IRLS weight floor and block-spec consistency validator are neutral (no
+// `CustomFamily` dependency); they live in `gam-problem`. Coefficient damping
+// deliberately has no model-level default: the custom-family solver derives
+// any transient shift from the current curvature and must converge the
+// undamped score equation.
+pub use gam_problem::{CUSTOM_FAMILY_WEIGHT_FLOOR, validate_blockspec_consistency};
 
 /// Exact outer derivative order for families that expose second-order
 /// coefficient geometry.
@@ -499,8 +496,15 @@ pub struct BlockwiseFitOptions {
     /// optimizer.
     pub rho_lower_bound: f64,
     pub minweight: f64,
+    /// Optional seed for transient solver damping. The default is zero and the
+    /// default [`RidgePolicy`] excludes every damping shift from the quadratic
+    /// objective, penalty determinant, and Laplace Hessian. A nonzero value is
+    /// therefore a numerical step-control request unless a caller explicitly
+    /// selects an objective-including policy.
     pub ridge_floor: f64,
-    /// Shared ridge semantics used by solve/quadratic/logdet terms.
+    /// Shared ridge semantics used by solve/quadratic/logdet terms. Defaults to
+    /// solver-only damping so the converged estimand is the stationary point of
+    /// the undamped statistical objective.
     pub ridge_policy: RidgePolicy,
     /// If true, outer smoothing optimization uses a Laplace/REML-style objective:
     ///   -loglik + penalty + 0.5(log|H| - log|S|_+)
@@ -683,17 +687,13 @@ impl Default for BlockwiseFitOptions {
             outer_rel_cost_tol: None,
             rho_lower_bound: -10.0,
             minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
-            // `ridge_floor` is an ExplicitPrior in the canonical
-            // stabilization ledger taxonomy (`StabilizationKind::ExplicitPrior`):
-            // its δ enters the quadratic term, the Laplace Hessian, and the
-            // penalty log-determinant — `ridge_policy` below is the live
-            // policy that confirms which terms it lands in. The default
-            // pos-part policy enables every inclusion flag, so callers
-            // wanting solver-only damping should construct a custom policy
-            // (or, preferably, a `StabilizationLedger::numerical_perturbation`)
-            // rather than reusing this field.
-            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
-            ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+            // Conditioning is solver state, not a coefficient prior. Start at
+            // the exact Hessian (zero shift); rank/curvature-aware damping may
+            // regularize rejected Newton steps, but none of it enters the
+            // objective or its derivatives and convergence is certified on the
+            // undamped KKT residual.
+            ridge_floor: 0.0,
+            ridge_policy: RidgePolicy::solver_only(),
             use_remlobjective: true,
             // Default ON: families expose exact outer Hessians whenever their
             // analytic dense or operator representation is implemented.
@@ -861,5 +861,15 @@ mod tests {
         // Cost so high only 1 iteration is affordable, but minimum is 4.
         let result = cost_gated_first_order_max_iter(100, u64::MAX / 2, false);
         assert_eq!(result, 4);
+    }
+
+    #[test]
+    fn default_custom_family_objective_is_coefficient_ridge_free() {
+        let options = BlockwiseFitOptions::default();
+        assert_eq!(options.ridge_floor, 0.0);
+        assert!(options.ridge_policy.rho_independent);
+        assert!(!options.ridge_policy.include_quadratic_penalty);
+        assert!(!options.ridge_policy.include_penalty_logdet);
+        assert!(!options.ridge_policy.include_laplacehessian);
     }
 }
