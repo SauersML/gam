@@ -60,7 +60,9 @@ fn build_term(
     block_log_lambda: Vec<f64>,
 ) -> (SaeManifoldTerm, CrosscoderLayout) {
     let n = 8usize;
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(H).unwrap());
+    // `new` takes NUM_BASIS (odd: constant + sin/cos pairs), not the harmonic
+    // order — realize the M = 2H + 1 the constant above documents.
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(2 * H + 1).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
@@ -250,7 +252,9 @@ fn rejects_layers_of_differing_ambient_width() {
     // Build the augmented decoder by hand at the ragged width and install a ragged
     // layout — cross-layer drift needs one shared ambient, so this must be refused.
     let n = 8usize;
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(H).unwrap());
+    // `new` takes NUM_BASIS (odd: constant + sin/cos pairs), not the harmonic
+    // order — realize the M = 2H + 1 the constant above documents.
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(2 * H + 1).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
