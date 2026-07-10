@@ -163,4 +163,11 @@ fn nonlinear_prepare_keeps_frame_identity_and_refreshes_current_content_1017() {
         &[2.0, 7.0],
         "refresh must observe the newly assembled Hessian, not retain old content"
     );
+    eprintln!(
+        "#1017 nonlinear frame telemetry: stable_frame_identity=true refresh_htt={:?}",
+        refreshes
+            .lock()
+            .expect("report nonlinear refresh ledger")
+            .as_slice(),
+    );
 }

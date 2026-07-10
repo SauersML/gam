@@ -406,6 +406,15 @@ pub struct SaeManifoldTerm {
     /// *evidence* about shared structure (decoder β, ρ), not to the latent
     /// priors. `None` ⇒ the exact unweighted path, bit-for-bit.
     pub(crate) row_loss_weights: Option<Vec<f64>>,
+    /// #2231 crosscoder block-relevance pricing spans `(p_x, block_dims)` in
+    /// stacked-column order, installed by
+    /// `SaeManifoldOuterObjective::with_crosscoder_blocks` so the outer-ρ
+    /// gradient assembler can build the block coordinates' IFT RHS
+    /// `∂g/∂log λ_ℓ = −½·Jᵀ(block-masked scaled target)` — the θ-response
+    /// channel that completes the analytic block gradient with the same
+    /// `−½·Γᵀθ̂_ρ` adjoint every other ρ coordinate carries. `None` on a plain
+    /// SAE (the ρ template then has no block coordinates either).
+    pub(crate) crosscoder_pricing_spans: Option<(usize, Vec<usize>)>,
     /// #972 / #977 T1: whether the MOST RECENT `assemble_arrow_schur` built the
     /// β-tier in the *factored* Grassmann-coordinate layout (border width
     /// [`Self::factored_border_dim`], the per-atom `C_k` blocks) rather than the

@@ -1590,6 +1590,15 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         first.numerical_bits, second.numerical_bits,
         "accepted state change must refresh Hessian/gradient numerical content"
     );
+    eprintln!(
+        "#1017 accepted-iteration residency telemetry: iterations={} row_htt_ptr={} \
+         row_htbeta_ptr={} gb_ptr={} device_frame_ptr={} numerical_content_changed=true",
+        observations.len(),
+        first.row_htt_ptr,
+        first.row_htbeta_ptr,
+        first.gb_ptr,
+        first.device_frame_ptr,
+    );
 }
 
 pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {

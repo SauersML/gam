@@ -429,7 +429,7 @@ pub struct OuterProbeTelemetry {
     /// observable from this lane and are excluded identically in both modes.
     pub probe_inner_iterations: usize,
     /// Basin-bundle lower-envelope telemetry (see [`BasinBundle`]). The outer
-    /// value lanes evaluate `V*(ρ) = min_b V_b(ρ)` over a small bundle of saved
+    /// value lanes evaluate `V*(ρ) = min_b V_b(ρ)` over a memory-admitted bundle of saved
     /// inner basins instead of the single hysteretic warm-start trajectory
     /// (#2230/#2087). These counters make the envelope's work observable.
     ///
@@ -847,9 +847,7 @@ fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
         .estimated_direct_peak_bytes
         .max(plan.estimated_full_batch_bytes)
         .max(std::mem::size_of::<SaeManifoldTerm>());
-    host_budget
-        .saturating_sub(plan.estimated_direct_peak_bytes)
-        / bytes_per_saved_state
+    host_budget.saturating_sub(plan.estimated_direct_peak_bytes) / bytes_per_saved_state
 }
 
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
@@ -2779,7 +2777,8 @@ impl SaeManifoldOuterObjective {
     ///
     /// Only the argmin is later re-converged to full tolerance (in `eval`); every
     /// member and the discovery probe run on the cheap value-probe budget, so the
-    /// per-eval cost is at most `len(bundle) + 1` cheap inner solves.
+    /// per-eval cost is `len(bundle) + 1` cheap inner solves. Retention is bounded
+    /// only by memory admission; a work-count cap would make the envelope inexact.
     fn evaluate_envelope_value_probe(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2930,7 +2929,7 @@ impl SaeManifoldOuterObjective {
     /// reconstructions differ by less than that in explained-variance units are
     /// the fit's own definition of the same basin, so no new constant is minted.
     /// A state that cannot be decoded at this ρ is treated as a distinct basin
-    /// (an over-admit is bounded by `max_members` and merely costs an extra cheap
+    /// (an over-admit consumes one memory-admitted saved state and one extra cheap
     /// solve; a false MERGE would silently lose a basin).
     fn same_basin_at_rho(
         a: &SaeManifoldTerm,

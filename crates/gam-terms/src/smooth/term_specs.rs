@@ -8454,11 +8454,33 @@ pub fn build_single_local_smooth_term(
             if let BasisMetadata::Duchon {
                 input_scales,
                 length_scale,
+                periodic,
                 ..
             } = &mut result.metadata
             {
                 *input_scales = scales;
                 *length_scale = spec.length_scale;
+                // Same convention as `length_scale`: metadata (and hence the
+                // frozen replay spec design_freezing copies it into) always
+                // stores the period in ORIGINAL covariate units, and the
+                // standardization rescale above recomputes the standardized
+                // period fresh from `input_scales` on EVERY build — fresh fit
+                // and frozen replay alike — so the compensation stays
+                // idempotent with no fit-vs-replay branch. Leaving the
+                // builder-resolved (standardized-frame) period here would
+                // double-divide on replay. Invariant this relies on: every
+                // producer that sets a Cyclic `boundary` also sets
+                // `spec.periodic` from the same original-units source (the
+                // formula DSL does; see `parse_periodic_axes_option` /
+                // `parse_cyclic_boundary` in term_builder.rs), so the pristine
+                // `spec.periodic` is a valid original-units record for the
+                // boundary spelling too.
+                if spec.periodic.is_some() || spec.boundary.period().is_some() {
+                    *periodic = spec
+                        .periodic
+                        .clone()
+                        .or_else(|| spec.boundary.period().map(|(_, _, p)| vec![Some(p)]));
+                }
             }
             result
         }

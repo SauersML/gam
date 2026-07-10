@@ -257,9 +257,7 @@ mod tests {
             d: -10.0,
         };
         let mut bundle = BasinBundle::new(4);
-        bundle
-            .admit(shallow, f64::INFINITY, |x, y| x == y)
-            .unwrap();
+        bundle.admit(shallow, f64::INFINITY, |x, y| x == y).unwrap();
         let (_, v1) = bundle
             .evaluate(|s: &Basin| Ok::<_, ()>((s.clone(), value(s, 0.3))))
             .unwrap();
@@ -412,9 +410,7 @@ mod tests {
             d: -5.0,
         };
         let mut bundle = BasinBundle::new(4);
-        bundle
-            .admit(b1, f64::INFINITY, |x, y| x == y)
-            .unwrap();
+        bundle.admit(b1, f64::INFINITY, |x, y| x == y).unwrap();
         bundle
             .admit(b2.clone(), f64::INFINITY, |x, y| x == y)
             .unwrap();
@@ -444,9 +440,7 @@ mod tests {
             d: 0.0,
         };
         let mut bundle = BasinBundle::new(2);
-        bundle
-            .admit(b, f64::INFINITY, |x, y| x == y)
-            .unwrap();
+        bundle.admit(b, f64::INFINITY, |x, y| x == y).unwrap();
         let out = bundle.evaluate(|_s: &Basin| Err::<(Basin, f64), _>("boom"));
         assert_eq!(out.unwrap_err(), "boom");
     }

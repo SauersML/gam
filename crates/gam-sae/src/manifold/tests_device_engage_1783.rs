@@ -308,13 +308,22 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
+    let offload_admitted = gam_gpu::policy::GpuDispatchPolicy::default()
+        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters);
+    eprintln!(
+        "#1017 production large-border telemetry: beta_dim={} factored_border={} \
+         rows={} d={} mode={:?} cg_iters={} framed={} offload_admitted={}",
+        term.beta_dim(),
+        sys.k,
+        sys.rows.len(),
+        sys.d,
+        options.mode,
+        cg_iters,
+        device.frame.is_some(),
+        offload_admitted,
+    );
     assert!(
-        gam_gpu::policy::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
-            sys.rows.len(),
-            sys.k,
-            sys.d,
-            cg_iters,
-        ),
+        offload_admitted,
         "representative production system must clear resident-device admission"
     );
 }
