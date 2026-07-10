@@ -20,10 +20,65 @@ class _ReachedCurvedEngine(RuntimeError):
 class _AdmissionRust:
     """Fake of the Rust front door mirroring its lane rule: penalty-gated
     K > P demotes to sparse codes; a hard top-k support request at K > P is
-    admitted to the curved framed/streaming lane."""
+    admitted to the curved framed/streaming lane. Also mirrors the thin
+    Rust-owned vocabulary/default helpers the facade consults on the way to
+    the admission (assignment canonicalization, topology→basis resolution,
+    the large-K top-k default) so the fake tracks the real FFI surface."""
 
     def __init__(self) -> None:
         self.admission_calls: list[dict[str, Any]] = []
+
+    def sae_canonical_assignment_kind(self, kind: str) -> str:
+        mapping = {
+            "softmax": "softmax",
+            "topk": "topk",
+            "top_k": "topk",
+            "ibp": "ibp_map",
+            "ibp-map": "ibp_map",
+            "ibp_map": "ibp_map",
+            "threshold_gate": "threshold_gate",
+            "gated": "threshold_gate",
+            "jump_relu": "threshold_gate",
+            "jumprelu": "threshold_gate",
+        }
+        key = str(kind).strip().lower()
+        if key not in mapping:
+            raise ValueError(f"unknown assignment kind {kind!r}")
+        return mapping[key]
+
+    def sae_basis_kind_for_topology(self, name: str) -> str:
+        return {
+            "circle": "periodic",
+            "periodic": "periodic",
+            "linear": "linear",
+            "euclidean": "euclidean",
+            "auto": "auto",
+        }.get(str(name), str(name))
+
+    def sae_atom_topologies(self, bases: list[str]) -> tuple[str | None, list[str]]:
+        to_topology = {
+            "periodic": "circle",
+            "linear": "linear",
+            "euclidean": "euclidean",
+            "auto": "auto",
+        }
+        per_atom = [to_topology.get(str(b), str(b)) for b in bases]
+        scalar = per_atom[0] if per_atom else None
+        return scalar, per_atom
+
+    def sae_canonical_topology(self, name: str) -> str:
+        return str(name)
+
+    def sae_default_top_k_for_large_dictionary(
+        self, n_obs: int, k_atoms: int
+    ) -> int | None:
+        # Mirror of assignment::default_top_k_for_large_dictionary: None when
+        # the dense softmax path is admitted (N/K >= K, or K <= 1), else
+        # clamp(ceil(N/K), 1, K-1).
+        if k_atoms <= 1 or n_obs >= k_atoms * k_atoms:
+            return None
+        cap = -(-int(n_obs) // int(k_atoms))
+        return max(1, min(cap, int(k_atoms) - 1))
 
     def sae_fit_admission(
         self,
@@ -170,6 +225,120 @@ def test_topk_assignment_requires_explicit_support_size(monkeypatch: Any) -> Non
     with pytest.raises(ValueError, match="requires top_k"):
         _sae_manifold.sae_manifold_fit(x, K=9, assignment="topk", n_iter=1)
     assert rust.admission_calls == []
+
+
+class _LinearAdmissionRust(_AdmissionRust):
+    """Front-door fake extended with the #2232 Inc-5b modeling-choice rule:
+    an explicit linear-dictionary request is sparse_codes at ANY K."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear_admission_calls: list[dict[str, Any]] = []
+
+    def sae_linear_dictionary_admission(
+        self, n_obs: int, output_dim: int, n_atoms: int, block_size: int = 1
+    ) -> dict[str, Any]:
+        self.linear_admission_calls.append(
+            {
+                "n_obs": int(n_obs),
+                "output_dim": int(output_dim),
+                "n_atoms": int(n_atoms),
+                "block_size": int(block_size),
+            }
+        )
+        return {
+            "lane": "sparse_codes",
+            "n_obs": int(n_obs),
+            "output_dim": int(output_dim),
+            "n_atoms": int(n_atoms),
+            "dense_assignment_cells": int(n_obs) * int(n_atoms),
+            "response_cells": int(n_obs) * int(output_dim),
+        }
+
+
+def test_explicit_linear_dictionary_routes_sparse_lane_below_crossover(
+    monkeypatch: Any,
+) -> None:
+    """#2232 Inc 5b (Gap B): atom_topology='linear' + assignment='topk' names
+    the linear sparse-dictionary model, admitted to the unified linear schedule
+    at ANY K — including K <= P, where the shape-derived default would force
+    the dense engine. d_atom=1 routes the atom schedule."""
+
+    rust = _LinearAdmissionRust()
+    monkeypatch.setattr(_sae_manifold, "rust_module", lambda: rust)
+
+    calls: dict[str, Any] = {}
+
+    def fake_sparse_fit(X: Any, K: int, **kwargs: Any) -> str:
+        calls["K"] = int(K)
+        calls["active"] = int(kwargs["active"])
+        return "atom-schedule-fit"
+
+    monkeypatch.setattr(_sae_manifold, "sparse_dictionary_fit", fake_sparse_fit)
+
+    # K=6 <= P=24: below the shape crossover, so only the EXPLICIT request
+    # can select the sparse lane.
+    x = np.zeros((64, 24), dtype=np.float32)
+    fit = _sae_manifold.sae_manifold_fit(
+        x, K=6, d_atom=1, atom_topology="linear", assignment="topk", top_k=2, n_iter=1
+    )
+    assert fit == "atom-schedule-fit"
+    assert calls == {"K": 6, "active": 2}
+    assert rust.linear_admission_calls == [
+        {"n_obs": 64, "output_dim": 24, "n_atoms": 6, "block_size": 1}
+    ]
+    # The shape-derived admission is never consulted: the request owns the lane.
+    assert rust.admission_calls == []
+
+
+def test_explicit_linear_block_dictionary_routes_block_lane(monkeypatch: Any) -> None:
+    """#2232 Inc 5b: uniform d_atom=b>=2 linear atoms are the Grassmann block
+    lane — framed Euclidean d=b atoms with block-TopK — through the single
+    public entry."""
+
+    rust = _LinearAdmissionRust()
+    monkeypatch.setattr(_sae_manifold, "rust_module", lambda: rust)
+
+    calls: dict[str, Any] = {}
+
+    def fake_block_fit(X: Any, n_blocks: int, **kwargs: Any) -> str:
+        calls["n_blocks"] = int(n_blocks)
+        calls["block_size"] = int(kwargs["block_size"])
+        calls["block_topk"] = int(kwargs["block_topk"])
+        return "block-schedule-fit"
+
+    def forbidden_sparse_fit(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a d=b>=2 linear request must take the BLOCK lane")
+
+    monkeypatch.setattr(_sae_manifold, "block_sparse_dictionary_fit", fake_block_fit)
+    monkeypatch.setattr(_sae_manifold, "sparse_dictionary_fit", forbidden_sparse_fit)
+
+    x = np.zeros((64, 24), dtype=np.float32)
+    fit = _sae_manifold.sae_manifold_fit(
+        x, K=4, d_atom=3, atom_topology="linear", assignment="topk", top_k=2, n_iter=1
+    )
+    assert fit == "block-schedule-fit"
+    assert calls == {"n_blocks": 4, "block_size": 3, "block_topk": 2}
+    assert rust.linear_admission_calls == [
+        {"n_obs": 64, "output_dim": 24, "n_atoms": 4, "block_size": 3}
+    ]
+
+
+def test_linear_topology_without_topk_keeps_dense_routing(monkeypatch: Any) -> None:
+    """A penalty-gated (softmax) linear request keeps the historical
+    shape-derived routing: only the HARD-SUPPORT linear request names the
+    sparse-dictionary model (its gates are live Newton state otherwise)."""
+
+    rust = _LinearAdmissionRust()
+    monkeypatch.setattr(_sae_manifold, "rust_module", lambda: rust)
+
+    x = np.zeros((64, 24), dtype=np.float32)
+    with pytest.raises(_ReachedCurvedEngine):
+        _sae_manifold.sae_manifold_fit(
+            x, K=6, d_atom=1, atom_topology="linear", n_iter=1
+        )
+    assert rust.linear_admission_calls == []
+    assert rust.admission_calls, "softmax linear must take the shape-derived door"
 
 
 def test_sparse_dictionary_facade_accepts_no_eager_fitted_payload(monkeypatch: Any) -> None:
