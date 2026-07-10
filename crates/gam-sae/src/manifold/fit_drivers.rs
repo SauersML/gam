@@ -5068,21 +5068,6 @@ impl SaeManifoldTerm {
         // Bit-identical to the historical per-call reduction (see
         // `TargetCenteredColStats`).
         let target_col_stats = TargetCenteredColStats::compute(target);
-        // #2015 line-search step-length warm start. The Armijo backtracking below
-        // only CONTRACTS from `initial_step`; resetting `initial_step` to the full
-        // `step_size` every iterate re-discovers the same tiny accepted step from
-        // scratch (the wide two-block behavior fit backtracks to ~0.05 each
-        // iterate — the ‖g‖ crawl). Carry the previous iterate's accepted step
-        // forward, warmed by one contraction step (`accepted / contraction`, the
-        // exact inverse of the geometric backtracking rate — NOT an independent
-        // magic constant), and cap at the caller's `step_size`. This lets the
-        // accepted length ratchet UP by one contraction-step per iterate as the
-        // fit linearizes, while still contracting freely when a trial overshoots.
-        // Pure globalization: the KKT convergence criterion and the typed
-        // exhaustion refusal (#2235/#2241) are unchanged — only the trajectory to
-        // the same certified stationary point is affected.
-        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
-        let mut warm_step = step_size;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -5447,9 +5432,18 @@ impl SaeManifoldTerm {
             };
             let accepted = accepted_step.is_some();
             if let Some(step) = accepted_step {
-                // Warm the next iterate's line search to one contraction-step above
-                // this accepted length, capped at the caller's `step_size`.
-                warm_step = (step.step * warm_growth).min(step_size);
+                // A CLEAN acceptance (the trial at the warm start itself passed
+                // Armijo, no backtracking) means the overshoot evidence is gone —
+                // reset to the caller's full `step_size` so one hard early
+                // iterate cannot throttle the whole budget (the multiblock EV
+                // regression). Only a BACKTRACKED acceptance carries overshoot
+                // evidence forward, warmed one contraction-step above the
+                // accepted length.
+                warm_step = if step.step >= warm_step {
+                    step_size
+                } else {
+                    (step.step * warm_growth).min(step_size)
+                };
             }
             if !accepted {
                 // The proximal LM correction below re-solves with its own ridge
