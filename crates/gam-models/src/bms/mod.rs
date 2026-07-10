@@ -2114,6 +2114,12 @@ mod test_support;
 pub(crate) mod custom_family_impl;
 #[cfg(test)]
 mod flex_verify_932_tests;
+// #932 direct production-path measurement: forced 65-node empirical grid,
+// warmed/cold row-op allocation counting + ns/row diagnostics for the MSI
+// A/B ledger. The asserted gate is per-row allocation calls (deterministic);
+// timing is eprintln-only per the SPEC ban on wall-clock correctness budgets.
+#[cfg(test)]
+mod flex_measure_932_tests;
 pub(crate) mod row_primary_hessian;
 
 pub use block_specs::fit_bernoulli_marginal_slope_terms;
