@@ -857,6 +857,23 @@ pub fn run_sae_crosscoder_fit(
     super::fit_entry::scope_outer_checkpoint_to_stage(&mut objective, SaeFitStage::Primary);
     objective.set_cancel_flag(cancel);
 
+    // Pin faer to Par::Seq for the ENTIRE fit (outer ρ search / fixed-ρ solve,
+    // every inner Newton fit, the reduced-Schur log-det, and the fitted-layer
+    // materialization). gam already fans all of this over the global Rayon pool
+    // per row; faer's high-level solvers reached inside those workers otherwise
+    // read `get_global_parallelism() == Par::rayon(0)` and re-fan faer's
+    // `spindle` barrier pool into the saturated outer fan-out — measured on an
+    // H100 as ~46% of all cycles spent in `spindle::Barrier::wait_and_clear_while`
+    // + `__pv_queued_spin_lock_slowpath` (the SAE joint fit's 0%-GPU / low-core
+    // profile). `run_joint_fit_arrow_schur` holds its own inner-fit guard, but
+    // the log-det pass runs after it returns, so the scope must live at the whole
+    // fit. faer reductions are parallelism-invariant (`Par::Seq` == `Par::rayon`
+    // bit-for-bit, `tests_parallelism_invariance_1557`), so no fitted value
+    // changes; the coarse per-row Rayon parallelism (the real speedup) is
+    // untouched. Named + dropped before the return (the ban-scanner forbids
+    // `let _guard`, and the `#[must_use]` guard would else warn unused).
+    let faer_sequential_whole_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
+
     let objective = if request.run_outer_rho_search {
         let search_initial = match objective.try_resume_from_checkpoint(n_params) {
             Some(banked) => ndarray::Array1::from(banked),
@@ -926,6 +943,8 @@ pub fn run_sae_crosscoder_fit(
         Err(reason) => return Err(SaeFitError::Fit(reason)),
     };
 
+    // Restore faer's prior parallelism for whatever the caller runs next.
+    drop(faer_sequential_whole_fit);
     Ok(SaeCrosscoderFitReport {
         term,
         rho,
