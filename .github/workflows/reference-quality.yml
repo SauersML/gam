@@ -91,8 +91,7 @@ jobs:
           echo "building grouped quality integration target tests/quality.rs"
           # tests/quality.rs includes the moved tests/quality/** modules as one
           # integration target. Build that target once, then the run step executes
-          # its libtest cases directly. Running one unfiltered grouped binary
-          # would put the whole suite behind a single 360s cap.
+          # each libtest case directly so one failure cannot hide later evidence.
           #
           # gam#1082: build the benchmark OPTIMIZED (`release-dev` = opt-level 3,
           # codegen-units=16, no LTO — the fast-compile optimized profile). The
@@ -103,9 +102,9 @@ jobs:
           # never run. perf shows the opt-0 hot path is dominated by ndarray
           # per-element bounds/stride checks (`index_checked`, `stride_offset_checked`,
           # `precondition_check`) that the optimizer elides, not by real FLOPs. This
-          # makes the 360s budget measure production-representative cost; it is NOT a
-          # budget bump (the per-test cap below is unchanged) — it stops measuring a
-          # debug build no user experiences.
+          # makes the quality measurements reflect production-representative code
+          # rather than a debug build no user experiences. Convergence and the
+          # quality assertions gate the run; elapsed time does not.
           cargo build --keep-going --profile release-dev --test quality \
             || echo "build reported errors; missing quality binary is flagged BUILDFAIL in the run step"
           # A handful of quality tests (RMST, competing risks) shell out to the
