@@ -1,9 +1,9 @@
+use gam_sae::null_battery::{NullKind, Tail};
 use gam_sae::saebench_metrics::{
     ChartInterpNullCalibration, ChartInterpNullDrawPolicy, ChartInterpNullProtocol,
     ChartInterpObservation, ChartInterpStatistic, ChartInterpVerdict, DoseResponseObservation,
     chart_interp_score, coordinate_posterior_from_precision, dose_response_calibration,
 };
-use gam_sae::null_battery::{NullKind, Tail};
 
 fn matched_spectrum_calibration(
     seed: u64,

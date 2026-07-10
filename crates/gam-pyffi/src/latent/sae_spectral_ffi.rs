@@ -2260,13 +2260,12 @@ fn chart_interp_score(
                 .collect();
         let protocol =
             gam::terms::sae::saebench_metrics::ChartInterpNullProtocol::parse(&null_protocol)?;
-        let calibration =
-            gam::terms::sae::saebench_metrics::ChartInterpNullCalibration::new(
-                protocol,
-                null_seed,
-                expected_draws,
-                null_draws,
-            )?;
+        let calibration = gam::terms::sae::saebench_metrics::ChartInterpNullCalibration::new(
+            protocol,
+            null_seed,
+            expected_draws,
+            null_draws,
+        )?;
         gam::terms::sae::saebench_metrics::chart_interp_score(
             &rows,
             &calibration,
@@ -2274,10 +2273,7 @@ fn chart_interp_score(
         )
     })?;
     let observed = PyDict::new(py);
-    observed.set_item(
-        "circular_correlation",
-        report.observed.circular_correlation,
-    )?;
+    observed.set_item("circular_correlation", report.observed.circular_correlation)?;
     observed.set_item(
         "signed_circular_correlation",
         report.observed.signed_circular_correlation,
@@ -2565,12 +2561,7 @@ mod ffi_completeness_tests {
                 .extract()
                 .unwrap();
             assert_eq!(samples.len(), 1);
-            let verdict: String = d
-                .get_item("verdict")
-                .unwrap()
-                .unwrap()
-                .extract()
-                .unwrap();
+            let verdict: String = d.get_item("verdict").unwrap().unwrap().extract().unwrap();
             assert_eq!(verdict, "null_compatible");
         });
     }

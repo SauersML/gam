@@ -6,8 +6,7 @@
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
 use crate::manifold::{GraphEdge, LearnedGraphAtom, graph_edge_rank_charge};
 use crate::saebench_metrics::{
-    ChartInterpNullCalibration, ChartInterpNullProtocol, ChartInterpObservation,
-    chart_interp_score,
+    ChartInterpNullCalibration, ChartInterpNullProtocol, ChartInterpObservation, chart_interp_score,
 };
 use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
 use ndarray::{Array2, Array3};

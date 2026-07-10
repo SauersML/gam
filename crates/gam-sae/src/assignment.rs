@@ -961,14 +961,14 @@ impl SaeAssignment {
     }
 
     /// Post-#1033 the row gates are ρ-INVARIANT (frozen/predicted or free
-    /// routing logits never read ρ), so this API takes no ρ — the signature
-    /// states the invariance instead of threading a dead parameter. (A
-    /// previous "wiring contract" rejected ρ whose per-atom width differed
+    /// routing logits never read ρ), so the assignment APIs take no ρ — the
+    /// signatures state the invariance instead of threading a dead parameter.
+    /// (A previous "wiring contract" rejected ρ whose per-atom width differed
     /// from `k_atoms()`, but K legitimately moves mid-fit — births, deaths,
     /// compaction, topology-race candidates — while ρ updates lag, so that
     /// contract vetoed valid states and broke seed validation fleet-wide;
     /// bisected to 6297a7e9f.)
-    pub(crate) fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
+    fn try_assignments_row_inner(&self, row: usize) -> Result<Array1<f64>, String> {
         // #1033 — read the ACTIVE routing logits: the ρ-invariant frozen/predicted
         // logits when routing is frozen, else the free `self.logits`. This single
         // source makes the gate value ρ-invariant under frozen routing (the
@@ -1008,22 +1008,6 @@ impl SaeAssignment {
             }
         }
         Ok(row_gates)
-    }
-
-    /// #1557 — fill-into-caller-buffer twin of [`Self::try_assignments_row_for_rho`].
-    ///
-    /// Writes the EXACT SAME per-atom assignment row into `out` (length
-    /// `k_atoms()`) instead of allocating a fresh `Array1`. Bit-identical to the
-    /// allocating path; intended for the hot per-row loops that immediately
-    /// consume the row, reusing a single scratch buffer across rows.
-    pub(crate) fn try_assignments_row_for_rho_into(
-        &self,
-        row: usize,
-        rho: &SaeManifoldRho,
-        out: &mut [f64],
-    ) -> Result<(), String> {
-        self.check_rho_dictionary(rho)?;
-        self.try_assignments_row_into(row, out)
     }
 
     /// #1557 — fill-into-caller-buffer twin of [`Self::try_assignments_row`].

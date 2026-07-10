@@ -84,9 +84,7 @@ impl ChartInterpNullProtocol {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::MatchedSpectrumGaussianChartRefitV1 => {
-                "matched_spectrum_gaussian_chart_refit_v1"
-            }
+            Self::MatchedSpectrumGaussianChartRefitV1 => "matched_spectrum_gaussian_chart_refit_v1",
         }
     }
 
@@ -280,10 +278,8 @@ pub fn chart_interp_score(
     let mut null_statistics = Vec::with_capacity(null_calibration.expected_draws());
     for (draw_idx, draw) in null_calibration.observation_draws().iter().enumerate() {
         validate_null_ledger_alignment(observations, draw, draw_idx)?;
-        let (null_statistic, _, _) = chart_correlation(
-            draw,
-            &format!("chart_interp null draw {draw_idx}"),
-        )?;
+        let (null_statistic, _, _) =
+            chart_correlation(draw, &format!("chart_interp null draw {draw_idx}"))?;
         null_statistics.push(null_statistic);
     }
     let statistic = ChartInterpStatistic::OrientationQuotientedWeightedPhaseLock;
