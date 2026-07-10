@@ -209,6 +209,155 @@ fn unit_speed_hook_gradient_consistent_and_noop_safe_2022() {
     );
 }
 
+/// #2022 GATE (inner scale-quotient) — the joint (δB, δs) SCALE-gauge step
+/// projection applied per Newton trial in `apply_decoder_step_from_flat`:
+///
+///  * **Gauge-orthogonality (exact):** the applied joint step
+///    `Δ = (B₁ − B₀, s₁ − s₀)` has zero component along the exact scale-gauge
+///    nullvector `v = (vec B₀, −1)` — `⟨ΔB, B₀⟩_F − Δs = 0` to round-off — so
+///    the inner walk cannot slide along the unobservable scale↔amplitude
+///    trade-off (the direction the PD-floor / deflation budget floor).
+///  * **First-order image exactness (the non-detonation law):** the projected
+///    step's physical atom image `exp(s₁)·Φ·B₁` differs from the RAW
+///    (quotient-off) step's image by `O(step²)` only. This is what
+///    distinguishes the projection from the #2100 mid-solve ‖B‖≡1 peel: no
+///    parameter is rewritten, the iterate path is continuous in `step_size`,
+///    and a healthy fit's line search sees the same first-order model.
+///  * **Opt-out byte-identity:** with `quotient_scale` disabled the applied
+///    step is exactly `B += step·δB`, `s` untouched.
+///  * **Snapshot round-trip:** `restore_mutable_state` returns `s` to its
+///    banked value (the log_amplitude leg of the keep-best snapshot).
+#[test]
+fn joint_step_projection_gauge_orthogonal_first_order_exact_2022() {
+    let coords_col = array![
+        [0.02_f64],
+        [0.10],
+        [0.17],
+        [0.31],
+        [0.55],
+        [0.66],
+        [0.80],
+        [0.95]
+    ];
+    let n = coords_col.nrows();
+    let p = 3usize;
+    let (phi0, _) = periodic_basis(&coords_col);
+    let m = phi0.ncols();
+    let decoder = Array2::<f64>::from_shape_fn((m, p), |(a, b)| {
+        0.3 * ((a + 1) as f64) - 0.15 * (b as f64) + 0.05 * ((a * p + b) as f64)
+    });
+    let mut term = build_circle_term(&coords_col, &decoder);
+    assert!(
+        term.quotient_scale(),
+        "quotient_scale is default-on (#2228); this gate exercises the default path"
+    );
+    // Give the atom a non-trivial starting amplitude so the s-channel is live.
+    term.atoms[0].log_amplitude = 0.35;
+
+    let q = term.assignment.row_block_dim();
+    let beta_dim = term.beta_dim();
+    assert_eq!(beta_dim, m * p);
+    // A deliberately radial-heavy decoder step: δB = 0.6·B₀ + (a structured
+    // tangent part), so the projection has real work to do.
+    let b0 = term.atoms[0].decoder_coefficients.clone();
+    let s0 = term.atoms[0].log_amplitude;
+    let mut delta_beta = ndarray::Array1::<f64>::zeros(beta_dim);
+    for a in 0..m {
+        for b in 0..p {
+            delta_beta[a * p + b] =
+                0.6 * b0[[a, b]] + 0.05 * ((a + 2 * b) as f64) - 0.03 * (b as f64);
+        }
+    }
+    let delta_t = ndarray::Array1::<f64>::zeros(n * q);
+    let eps = 1.0e-4_f64;
+
+    // Bank the state, then apply the projected step on the default path.
+    let snapshot = term.snapshot_mutable_state();
+    term.apply_newton_step(delta_t.view(), delta_beta.view(), eps)
+        .unwrap();
+    let b1 = term.atoms[0].decoder_coefficients.clone();
+    let s1 = term.atoms[0].log_amplitude;
+
+    // (1) Exact gauge-orthogonality of the applied joint step against v = (B₀, −1).
+    let db_b: f64 = b1
+        .iter()
+        .zip(b0.iter())
+        .map(|(after, before)| (after - before) * before)
+        .sum();
+    let ds = s1 - s0;
+    let ortho = db_b - ds;
+    let scale = eps * (1.0 + b0.iter().map(|v| v * v).sum::<f64>());
+    assert!(
+        ortho.abs() <= 1.0e-12 * scale.max(1.0),
+        "applied joint step must be exactly orthogonal to the scale-gauge nullvector: \
+         ⟨ΔB,B₀⟩−Δs = {ortho:.3e}"
+    );
+    assert!(
+        ds.abs() > 0.0,
+        "a radial-heavy δB must genuinely move the s-channel (Δs = {ds:.3e})"
+    );
+
+    // (2) First-order image exactness vs the RAW quotient-off step.
+    let mut raw = build_circle_term(&coords_col, &decoder);
+    raw.atoms[0].log_amplitude = s0;
+    raw.set_quotient_scale(false);
+    raw.apply_newton_step(delta_t.view(), delta_beta.view(), eps)
+        .unwrap();
+    let raw_b1 = raw.atoms[0].decoder_coefficients.clone();
+    assert_eq!(
+        raw.atoms[0].log_amplitude, s0,
+        "quotient-off apply must not touch log_amplitude"
+    );
+    // Opt-out byte-identity: B += eps·δB exactly.
+    for a in 0..m {
+        for b in 0..p {
+            let expect = b0[[a, b]] + eps * delta_beta[a * p + b];
+            assert!(
+                (raw_b1[[a, b]] - expect).abs() <= 1.0e-15 * (1.0 + expect.abs()),
+                "quotient-off decoder step must be the plain += (entry {a},{b})"
+            );
+        }
+    }
+    // Physical atom images: exp(s)·Φ·B (same Φ both sides — coords untouched).
+    let img_proj = term.atoms[0]
+        .basis_values
+        .dot(&term.atoms[0].decoder_coefficients)
+        .mapv(|v| v * s1.exp());
+    let img_raw = raw.atoms[0]
+        .basis_values
+        .dot(&raw.atoms[0].decoder_coefficients)
+        .mapv(|v| v * s0.exp());
+    let img_scale = img_raw.iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+    let img_diff = img_proj
+        .iter()
+        .zip(img_raw.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    // Second-order bound: the two applies agree to O(eps²) — allow a generous
+    // curvature constant, still ~6 orders below a first-order mismatch (eps·scale).
+    assert!(
+        img_diff <= 100.0 * eps * eps * img_scale,
+        "projected and raw steps must agree to first order in the physical image: \
+         max diff {img_diff:.3e} vs bound {:.3e}",
+        100.0 * eps * eps * img_scale
+    );
+
+    // (3) Snapshot round-trip restores the s-channel exactly.
+    term.restore_mutable_state(&snapshot).unwrap();
+    assert_eq!(
+        term.atoms[0].log_amplitude.to_bits(),
+        s0.to_bits(),
+        "restore_mutable_state must return log_amplitude to the banked value"
+    );
+    let b_restored = &term.atoms[0].decoder_coefficients;
+    let bdrift = b_restored
+        .iter()
+        .zip(b0.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(bdrift == 0.0, "restore must return the decoder exactly");
+}
+
 /// A faithful monomial line basis `Φ(t) = [1, t, t²]` with its exact jet
 /// `∂Φ/∂t = [0, 1, 2t]`. `d = 1`, Euclidean (Interval) chart. It exists so the
 /// #2070 active-retraction gate below can DRIVE the arc-length retraction to
