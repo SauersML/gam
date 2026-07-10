@@ -359,6 +359,13 @@ fn fit_evidence_ridge(
     let energy_floor = (total_energy * f64::EPSILON).max(f64::MIN_POSITIVE);
     let mut effective_dof = 0.0_f64;
     let mut last_log_lambda = f64::NAN;
+    // SPEC 20 — the MacKay fixed point must CERTIFY, not merely terminate. The
+    // docstring's geometric-contraction argument makes the cap a safety bound,
+    // but an assumption is not a certificate: if the loop exhausts the cap
+    // without the relative log-λ residual passing `EVIDENCE_REL_TOL`, the final
+    // iterate is a NON-converged evidence state and must not be minted as an
+    // `EvidenceRidge` indistinguishable from a converged one.
+    let mut evidence_converged = false;
     for _ in 0..EVIDENCE_MAX_ITERS {
         let lambda = (alpha / beta).max(f64::MIN_POSITIVE);
         // γ = Σ_i s_i²/(s_i²+λ); pooled ‖w‖² and RSS across targets.
@@ -398,9 +405,20 @@ fn fit_evidence_ridge(
         if last_log_lambda.is_finite()
             && (log_lambda - last_log_lambda).abs() <= EVIDENCE_REL_TOL * (1.0 + log_lambda.abs())
         {
+            evidence_converged = true;
             break;
         }
         last_log_lambda = log_lambda;
+    }
+    if !evidence_converged {
+        let log_lambda = (alpha / beta).ln();
+        return Err(format!(
+            "fit_evidence_ridge: MacKay evidence iteration exhausted its \
+             {EVIDENCE_MAX_ITERS}-iteration safety cap without meeting the relative \
+             log-λ fixed-point tolerance {EVIDENCE_REL_TOL:.1e} (last log λ = \
+             {log_lambda:.6e}, previous = {last_log_lambda:.6e}); refusing to mint a \
+             non-converged evidence ridge — the cap never selects the estimator"
+        ));
     }
 
     let lambda = (alpha / beta).max(f64::MIN_POSITIVE);
