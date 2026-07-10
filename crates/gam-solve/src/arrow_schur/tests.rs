@@ -52,6 +52,137 @@ pub(crate) fn block_gemm_subtract_matches_dense_on_sparse_column_support() {
     }
 }
 
+fn beta_gauge_evidence_fixture(gauge_row: [f64; 3]) -> ArrowSchurSystem {
+    let mut sys = ArrowSchurSystem::new(0, 0, 3);
+    sys.hbb = array![
+        [gauge_row[0], gauge_row[1], gauge_row[2]],
+        [gauge_row[1], 4.0, 1.0],
+        [gauge_row[2], 1.0, 5.0]
+    ];
+    sys.gb = array![-13.0, -2.0, 1.0];
+    sys.set_beta_gauge_quotient(
+        ArrowBetaGaugeQuotient::new(vec![array![1.0, 0.0, 0.0]]).expect("gauge"),
+    )
+    .expect("matching border");
+    sys
+}
+
+/// #2022 evidence-side scale quotient: arbitrary curvature and cross-curvature
+/// on a declared gauge orbit cannot change the quotient logdet, inverse, or
+/// analytic logdet gradient. The matrix-free operator must represent the same
+/// `P S P + Q Q^T` as dense Cholesky.
+#[test]
+pub(crate) fn beta_gauge_quotient_value_inverse_and_gradient_are_orbit_invariant_2022() {
+    let sys_a = beta_gauge_evidence_fixture([7.0, 2.0, -3.0]);
+    let sys_b = beta_gauge_evidence_fixture([-11.0, 9.0, 8.0]);
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_, _, cache_a) =
+        solve_arrow_newton_step_with_options(&sys_a, 0.0, 0.0, &options).expect("factor A");
+    let (_, _, cache_b) =
+        solve_arrow_newton_step_with_options(&sys_b, 0.0, 0.0, &options).expect("factor B");
+
+    let expected_logdet = 19.0_f64.ln();
+    assert_abs_diff_eq!(
+        cache_a.arrow_log_det().expect("quotient logdet A"),
+        expected_logdet,
+        epsilon = 2e-14
+    );
+    assert_eq!(
+        cache_a.arrow_log_det().unwrap().to_bits(),
+        cache_b.arrow_log_det().unwrap().to_bits(),
+        "gauge-row curvature must contribute exactly log(1)=0"
+    );
+
+    let rhs = array![13.0, 2.0, -1.0];
+    let inv_a = cache_a.schur_inverse_apply(rhs.view()).expect("inverse A");
+    let inv_b = cache_b.schur_inverse_apply(rhs.view()).expect("inverse B");
+    let expected = array![0.0, 11.0 / 19.0, -6.0 / 19.0];
+    for i in 0..3 {
+        assert_abs_diff_eq!(inv_a[i], expected[i], epsilon = 2e-14);
+        assert_abs_diff_eq!(inv_b[i], expected[i], epsilon = 2e-14);
+    }
+    assert_abs_diff_eq!(inv_a[0], 0.0, epsilon = 1e-15);
+
+    let quotient_inverse = cache_a.schur_inverse_block(0..3).expect("dense inverse");
+    let derivative_a = array![[31.0, 4.0, -7.0], [4.0, 0.7, -0.2], [-7.0, -0.2, 0.3]];
+    let derivative_b = array![[-99.0, -6.0, 12.0], [-6.0, 0.7, -0.2], [12.0, -0.2, 0.3]];
+    let trace = |derivative: &Array2<f64>| -> f64 {
+        let mut value = 0.0;
+        for i in 0..3 {
+            for j in 0..3 {
+                value += quotient_inverse[[i, j]] * derivative[[j, i]];
+            }
+        }
+        value
+    };
+    assert_abs_diff_eq!(trace(&derivative_a), 5.1 / 19.0, epsilon = 2e-14);
+    assert_eq!(
+        trace(&derivative_a).to_bits(),
+        trace(&derivative_b).to_bits(),
+        "analytic tr(H_quot^-1 dH) must discard every gauge-supported derivative"
+    );
+
+    let factors = ArrowFactorSlab::from_blocks(Vec::new());
+    let backend = CpuBatchedBlockSolver;
+    let mf_a = reduced_schur_inverse_apply(
+        &sys_a,
+        &factors,
+        0.0,
+        &backend,
+        None,
+        None,
+        &rhs,
+        None,
+        1e-13,
+        32,
+    )
+    .expect("matrix-free inverse A");
+    let mf_b = reduced_schur_inverse_apply(
+        &sys_b,
+        &factors,
+        0.0,
+        &backend,
+        None,
+        None,
+        &rhs,
+        None,
+        1e-13,
+        32,
+    )
+    .expect("matrix-free inverse B");
+    for i in 0..3 {
+        assert_abs_diff_eq!(mf_a[i], expected[i], epsilon = 2e-13);
+        assert_abs_diff_eq!(mf_b[i], expected[i], epsilon = 2e-13);
+    }
+
+    let (_, slq_a) = matrix_free_arrow_evidence_log_det(
+        &sys_a,
+        0.0,
+        0.0,
+        &options,
+        32,
+        3,
+        SCHUR_SLQ_LOGDET_SEED,
+    )
+    .expect("matrix-free logdet A");
+    let (_, slq_b) = matrix_free_arrow_evidence_log_det(
+        &sys_b,
+        0.0,
+        0.0,
+        &options,
+        32,
+        3,
+        SCHUR_SLQ_LOGDET_SEED,
+    )
+    .expect("matrix-free logdet B");
+    assert_abs_diff_eq!(slq_a.estimate, expected_logdet, epsilon = 2e-12);
+    assert_eq!(
+        slq_a.estimate.to_bits(),
+        slq_b.estimate.to_bits(),
+        "dense and matrix-free quotient operators must erase the same gauge row"
+    );
+}
+
 /// `SparseBlockKroneckerPenaltyOp` must reproduce the dense
 /// `KroneckerPenaltyOp { factor_a: G, factor_b: I_p }` on every interface
 /// (matvec, gradient, diagonal, to_dense) when the sparse block set covers
@@ -3584,7 +3715,6 @@ pub(crate) fn well_posed_device_sae_system_1551() -> (ArrowSchurSystem, usize, u
 pub(crate) fn inexact_pcg_reuses_one_sae_resident_frame_across_lm_ridge_trials_1017() {
     use std::sync::{Arc, Mutex};
 
-    #[derive(Clone)]
     struct RecordingFrame {
         calls: Arc<Mutex<Vec<(f64, f64)>>>,
     }

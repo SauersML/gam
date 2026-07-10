@@ -233,7 +233,10 @@ fn run_production_fit(arm: Arm, z: &Array2<f64>, frac: &[f64], label: &str) -> S
         .with_initial_rho(init_flat)
         .run(&mut objective, label)
         .expect("production outer fit must complete");
-    objective.into_fitted().expect("outer fit was evaluated").term
+    objective
+        .into_fitted()
+        .expect("outer fit was evaluated")
+        .term
 }
 
 /// Reconstruction explained variance `1 − SSR/SST` (per-column centered),

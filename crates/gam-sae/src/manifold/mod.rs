@@ -258,7 +258,6 @@ mod tests_collapse_prevention;
 mod tests_collapse_2132;
 
 #[cfg(test)]
-mod tests_cocollapse_recovery_gate_2228;
 
 #[cfg(test)]
 mod tests_factored_htbeta;

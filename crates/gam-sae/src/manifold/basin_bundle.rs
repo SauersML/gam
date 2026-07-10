@@ -25,14 +25,12 @@
 //! The module is deliberately generic over the inner state `S` and the solver
 //! closure so the envelope algebra is unit-testable without a fit.
 
-/// One saved basin: its converged inner state and eval-history bookkeeping.
+/// One saved basin and its most recent converged criterion value.
 pub struct BasinMember<S> {
     /// The basin's converged inner state at the most recent evaluation.
     pub state: S,
     /// The basin's criterion value at the most recent evaluation.
     pub last_value: f64,
-    /// Eval counter value the last time this member was the envelope argmin.
-    pub last_win_eval: u64,
     /// Eval counter value when the member was admitted.
     pub born_eval: u64,
 }
@@ -46,18 +44,14 @@ pub struct BasinBundle<S> {
     /// non-argmin member. The caller derives this from problem structure
     /// (number of plausible coexisting basins), not tuning.
     max_members: usize,
-    /// A member that has not won the envelope within this many evaluations
-    /// (and is not the newest) is pruned as dominated. Caller-derived.
-    dominance_window: u64,
 }
 
 impl<S> BasinBundle<S> {
-    pub fn new(max_members: usize, dominance_window: u64) -> Self {
+    pub fn new(max_members: usize) -> Self {
         Self {
             members: Vec::new(),
             eval_counter: 0,
             max_members: max_members.max(1),
-            dominance_window: dominance_window.max(1),
         }
     }
 
@@ -108,7 +102,6 @@ impl<S> BasinBundle<S> {
         self.members.push(BasinMember {
             state,
             last_value: value,
-            last_win_eval: self.eval_counter,
             born_eval: self.eval_counter,
         });
         if self.members.len() > self.max_members {
@@ -153,8 +146,8 @@ impl<S> BasinBundle<S> {
 
     /// One envelope evaluation at the caller's current ρ: re-converge every
     /// member from its own saved state via `solve` (state in, converged
-    /// (state, value) out), take the min, prune members dominated for longer
-    /// than the window, and return `(argmin_index, envelope_value)`.
+    /// (state, value) out), take the min, and return
+    /// `(argmin_index, envelope_value)`.
     ///
     /// A member whose solve errors is treated as infeasible AT THIS ρ (value
     /// = +∞) but retained — an infeasible basin at one ρ can be the winner at
@@ -179,24 +172,10 @@ impl<S> BasinBundle<S> {
                 }
             }
         }
-        let argmin = match self.argmin_index() {
+        let idx = match self.argmin_index() {
             Some(idx) if self.members[idx].last_value.is_finite() => idx,
             _ => return Err(last_err.expect("empty or all-failed bundle must carry an error")),
         };
-        self.members[argmin].last_win_eval = self.eval_counter;
-        let newest_born = self.members.iter().map(|m| m.born_eval).max().unwrap_or(0);
-        let window = self.dominance_window;
-        let counter = self.eval_counter;
-        let argmin_value = self.members[argmin].last_value;
-        // Prune long-dominated members — but never the argmin and never the
-        // newest (it has not had a fair window yet).
-        self.members.retain(|m| {
-            m.last_value <= argmin_value
-                || m.born_eval == newest_born
-                || counter.saturating_sub(m.last_win_eval) < window
-        });
-        // Recompute the argmin index post-retain (indices may have shifted).
-        let idx = self.argmin_index().expect("argmin member is never pruned");
         Ok((idx, self.members[idx].last_value))
     }
 
@@ -236,7 +215,7 @@ mod tests {
             c: 1.0,
             d: 0.0,
         };
-        let mut bundle = BasinBundle::new(4, 100);
+        let mut bundle = BasinBundle::new(4);
         bundle.admit(b1.clone(), f64::INFINITY, |x, y| x == y);
         bundle.admit(b2.clone(), f64::INFINITY, |x, y| x == y);
         let mut prev: Option<f64> = None;
@@ -272,7 +251,7 @@ mod tests {
             c: 0.0,
             d: -10.0,
         };
-        let mut bundle = BasinBundle::new(4, 100);
+        let mut bundle = BasinBundle::new(4);
         bundle.admit(shallow, f64::INFINITY, |x, y| x == y);
         let (_, v1) = bundle
             .evaluate(|s: &Basin| Ok::<_, ()>((s.clone(), value(s, 0.3))))
@@ -292,7 +271,7 @@ mod tests {
             c: 0.0,
             d: 1.0,
         };
-        let mut bundle = BasinBundle::new(4, 100);
+        let mut bundle = BasinBundle::new(4);
         bundle.admit(b.clone(), 3.0, |x, y| x == y);
         bundle.admit(b.clone(), 2.0, |x, y| x == y);
         assert_eq!(bundle.len(), 1);
@@ -303,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn dominated_members_are_pruned_after_the_window_but_argmin_survives() {
+    fn dominated_member_is_retained_and_can_win_at_a_later_rho() {
         let winner = Basin {
             a: 1.0,
             c: 0.0,
@@ -314,22 +293,25 @@ mod tests {
             c: 0.0,
             d: 10.0,
         };
-        let mut bundle = BasinBundle::new(4, 3);
-        bundle.admit(winner, f64::INFINITY, |x, y| x == y);
-        bundle.admit(loser, f64::INFINITY, |x, y| x == y);
-        for _ in 0..2 {
+        let mut bundle = BasinBundle::new(4);
+        bundle.admit(winner.clone(), f64::INFINITY, |x, y| x == y);
+        bundle.admit(loser.clone(), f64::INFINITY, |x, y| x == y);
+        for _ in 0..8 {
             bundle
                 .evaluate(|s: &Basin| Ok::<_, ()>((s.clone(), value(s, 0.0))))
                 .unwrap();
-            assert_eq!(bundle.len(), 2, "inside the window both survive");
+            assert_eq!(bundle.len(), 2, "evaluation count must not prune a basin");
         }
-        for _ in 0..4 {
-            bundle
-                .evaluate(|s: &Basin| Ok::<_, ()>((s.clone(), value(s, 0.0))))
-                .unwrap();
-        }
-        assert_eq!(bundle.len(), 1, "dominated member pruned after window");
-        assert_eq!(bundle.members[0].last_value, -1.0);
+        // Make the formerly dominated branch the true lower-envelope winner.
+        // A workload-count pruning deadline would have lost it and reopened
+        // trajectory hysteresis.
+        let (idx, _) = bundle
+            .evaluate(|s: &Basin| {
+                let branch_value = if *s == loser { -2.0 } else { value(s, 0.0) };
+                Ok::<_, ()>((s.clone(), branch_value))
+            })
+            .unwrap();
+        assert_eq!(bundle.members[idx].state, loser);
     }
 
     #[test]
@@ -346,7 +328,7 @@ mod tests {
             c: 2.0,
             d: -5.0,
         };
-        let mut bundle = BasinBundle::new(4, 100);
+        let mut bundle = BasinBundle::new(4);
         bundle.admit(b1, f64::INFINITY, |x, y| x == y);
         bundle.admit(b2.clone(), f64::INFINITY, |x, y| x == y);
         let (_, v1) = bundle
@@ -374,7 +356,7 @@ mod tests {
             c: 0.0,
             d: 0.0,
         };
-        let mut bundle = BasinBundle::new(2, 10);
+        let mut bundle = BasinBundle::new(2);
         bundle.admit(b, f64::INFINITY, |x, y| x == y);
         let out = bundle.evaluate(|_s: &Basin| Err::<(Basin, f64), _>("boom"));
         assert_eq!(out.unwrap_err(), "boom");

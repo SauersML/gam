@@ -33,7 +33,7 @@ use gam::solver::seeding::SeedConfig;
 use gam::terms::{
     AnalyticPenaltyRegistry, AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator,
     SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective,
-    SaeManifoldRho, SaeManifoldTerm,
+    SaeManifoldRho, SaeManifoldTerm, StagewiseConfig,
 };
 use ndarray::{Array1, Array2};
 
@@ -44,13 +44,6 @@ const N_ATOMS: usize = 1;
 const LATENT_DIM: usize = 1;
 const PERIODIC_BASIS_WIDTH: usize = 3;
 
-// The inner REML evaluator treats this as a refinement CHUNK, extending until
-// the stationarity certificate is reached and returning an error otherwise.
-// It is not accepted as a fit merely because this many iterations elapsed.
-const INNER_REFINEMENT_CHUNK: usize = 64;
-const LEARNING_RATE: f64 = 1.0;
-const RIDGE_EXT_COORD: f64 = 1.0e-6;
-const RIDGE_BETA: f64 = 1.0e-6;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
 const GATE_TEMPERATURE: f64 = 0.5;
@@ -187,16 +180,20 @@ fn run() -> Result<(), String> {
     }
 
     let registry = AnalyticPenaltyRegistry::new();
+    // Single source of truth for production inner-fit controls. `inner_max_iter`
+    // is a refinement chunk: the REML evaluator extends until its stationarity
+    // certificate is reached and returns an error otherwise.
+    let inner = StagewiseConfig::default();
     let initial_rho_flat = initial_rho.to_flat();
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         target.clone(),
         Some(registry.clone()),
         initial_rho,
-        INNER_REFINEMENT_CHUNK,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
+        inner.inner_max_iter,
+        inner.learning_rate,
+        inner.ridge_ext_coord,
+        inner.ridge_beta,
     );
     // A single explicit initial state: the optimizer moves continuously in rho;
     // no seed lattice or grid is evaluated.
@@ -231,7 +228,9 @@ fn run() -> Result<(), String> {
     // A successful fit no longer needs its wall-survival checkpoint; match the
     // production front door's completion transaction before consuming state.
     objective.remove_checkpoint();
-    let fitted = objective.into_fitted();
+    let fitted = objective
+        .into_fitted()
+        .map_err(|err| format!("full color fit finalization failed: {err}"))?;
     let elapsed = started.elapsed();
     let telemetry_after = telemetry_snapshot();
     let mut fitted_term = fitted.term;

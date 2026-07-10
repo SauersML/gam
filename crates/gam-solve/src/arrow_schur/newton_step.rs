@@ -144,12 +144,8 @@ pub fn solve_arrow_newton_step_with_options(
         )
     };
     let mut schur_factor_is_undamped = sys.k == 0 || (ridge_t == 0.0 && ridge_beta == 0.0);
-    let mut beta_gauge_factor_is_pinned = evidence_beta_gauge_active(
-        sys,
-        ridge_t,
-        ridge_beta,
-        options,
-    );
+    let mut beta_gauge_factor_is_pinned =
+        evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options);
     if sys.k > 0 && !schur_factor_is_undamped {
         let evidence_htt_factors = match &htt_factors_undamped {
             ArrowUndampedFactors::SameAsDamped => &htt_factors,
@@ -2263,13 +2259,14 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             };
             if !beta_gauge_active
                 && let Some(attempt) = try_mixed_precision_arrow_solve(
-                sys,
-                ridge_t,
-                ridge_beta,
-                &htt_factors,
-                &schur,
-                options,
-            )? {
+                    sys,
+                    ridge_t,
+                    ridge_beta,
+                    &htt_factors,
+                    &schur,
+                    options,
+                )?
+            {
                 match attempt {
                     MixedPrecisionAttempt::Certified {
                         delta_t,
@@ -2298,13 +2295,12 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                     }
                 }
             }
-            let (db, sf, diag) =
-                solve_dense_reduced_system(
-                    &schur,
-                    &rhs_beta_evidence,
-                    options,
-                    trust_metric_weights,
-                )?;
+            let (db, sf, diag) = solve_dense_reduced_system(
+                &schur,
+                &rhs_beta_evidence,
+                options,
+                trust_metric_weights,
+            )?;
             (db, sf, diag)
         }
         ArrowSolverMode::SqrtBA => {
@@ -2316,13 +2312,14 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             };
             if !beta_gauge_active
                 && let Some(attempt) = try_mixed_precision_arrow_solve(
-                sys,
-                ridge_t,
-                ridge_beta,
-                &htt_factors,
-                &schur,
-                options,
-            )? {
+                    sys,
+                    ridge_t,
+                    ridge_beta,
+                    &htt_factors,
+                    &schur,
+                    options,
+                )?
+            {
                 match attempt {
                     MixedPrecisionAttempt::Certified {
                         delta_t,
@@ -2351,13 +2348,12 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                     }
                 }
             }
-            let (db, sf, diag) =
-                solve_dense_reduced_system(
-                    &schur,
-                    &rhs_beta_evidence,
-                    options,
-                    trust_metric_weights,
-                )?;
+            let (db, sf, diag) = solve_dense_reduced_system(
+                &schur,
+                &rhs_beta_evidence,
+                options,
+                trust_metric_weights,
+            )?;
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {

@@ -118,7 +118,10 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
         .with_max_iter(1)
         .run(&mut objective, label)
         .expect("outer engine must complete");
-    let fitted = objective.into_fitted().expect("outer fit was evaluated").term;
+    let fitted = objective
+        .into_fitted()
+        .expect("outer fit was evaluated")
+        .term;
     fitted
 }
 

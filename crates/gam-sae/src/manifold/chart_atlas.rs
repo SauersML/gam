@@ -236,11 +236,20 @@ impl ManifoldChartAtlas {
         Ok(true)
     }
 
-    pub(crate) fn merge(&mut self, mut other: Self) -> Result<(), String> {
+    pub(crate) fn merge_with_transition(
+        &mut self,
+        mut other: Self,
+        transition: UnitSpeedChartTransition,
+    ) -> Result<(), String> {
         self.charts.append(&mut other.charts);
         self.charts.sort_unstable();
         self.charts.dedup();
         self.transitions.append(&mut other.transitions);
+        // The new edge is what connects the formerly separate atlas
+        // components. Validate only after it is present; validating the plain
+        // union first would (correctly but prematurely) reject it as
+        // disconnected and make atlas growth impossible.
+        self.transitions.push(transition);
         self.canonicalize_transitions();
         self.validate()
     }
@@ -479,8 +488,7 @@ impl SaeManifoldTerm {
                     (right, left)
                 };
                 let other = self.chart_atlases.remove(take);
-                self.chart_atlases[keep].merge(other)?;
-                self.chart_atlases[keep].add_transition(transition)?;
+                self.chart_atlases[keep].merge_with_transition(other, transition)?;
             }
         }
         self.chart_atlases
@@ -588,5 +596,16 @@ mod tests {
         assert!((weights.sum() - 1.0).abs() < f64::EPSILON);
         assert_eq!(activation * weights[0], assignments[0]);
         assert_eq!(activation * weights[1], assignments[2]);
+    }
+
+    #[test]
+    fn bridge_transition_joins_two_connected_atlas_components() {
+        let mut left = ManifoldChartAtlas::from_transition(tr(0, 1, 1, 0.1)).unwrap();
+        let right = ManifoldChartAtlas::from_transition(tr(2, 3, -1, 0.2)).unwrap();
+        left.merge_with_transition(right, tr(1, 2, 1, 0.3))
+            .unwrap();
+        assert_eq!(left.charts(), &[0, 1, 2, 3]);
+        assert_eq!(left.transitions().len(), 3);
+        assert_eq!(left.orientability(), AtlasOrientability::Orientable);
     }
 }

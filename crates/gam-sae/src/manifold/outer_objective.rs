@@ -830,23 +830,13 @@ pub struct SaeManifoldOuterObjective {
 /// along the low-dimensional ρ line search only a few compete simultaneously, so
 /// the cap is 4 (which also bounds per-eval cost to ≤ 5 inner solves: 4 members
 /// plus the one discovery trajectory). `K` atoms bound the reachable
-/// single-flip basin count, so clamp to `K` when `K < 4`.
-///
-/// `dominance_window` — how many envelope evaluations a saved basin may sit
-/// dominated before it is pruned. One outer line-search direction issues at most
-/// a StrongWolfe attempt (≤ 20 value probes) followed by a backtracking fallback
-/// (≤ 50 probes) — 70 envelope evaluations; the outer bridge only declares a
-/// neighbourhood infeasible after TWO such directions fail. A basin can therefore
-/// legitimately sit dominated for a whole outer iteration's probing and win again
-/// at the next accepted iterate, so the window spans two directions: 2 × 70.
-const BASIN_BUNDLE_LINE_SEARCH_PROBES_PER_DIRECTION: u64 = 70;
+/// single-flip basin count, so clamp to `K` when `K < 4`. Members are never
+/// discarded merely because they have not won for some number of evaluations:
+/// that work-count deadline can delete a branch that wins later and reintroduce
+/// the very trajectory hysteresis the envelope removes.
 
 fn basin_bundle_max_members(k_atoms: usize) -> usize {
     k_atoms.clamp(2, 4)
-}
-
-fn basin_bundle_dominance_window() -> u64 {
-    2 * BASIN_BUNDLE_LINE_SEARCH_PROBES_PER_DIRECTION
 }
 
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
@@ -921,10 +911,7 @@ impl SaeManifoldOuterObjective {
             probe_converged_handoff: None,
             forcing: ProbeForcingState::new(),
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
-            basin_bundle: BasinBundle::new(
-                basin_bundle_max_members(term_k_atoms),
-                basin_bundle_dominance_window(),
-            ),
+            basin_bundle: BasinBundle::new(basin_bundle_max_members(term_k_atoms)),
             // #2235 — outer-search accounting + the non-convergence forcing
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
@@ -1401,7 +1388,7 @@ impl SaeManifoldOuterObjective {
         } = self;
         let mut fitted_rho = current_rho;
         let mut fitted = term;
-        let fitted_loss = last_loss.ok_or_else(|| {
+        let _certified_loss = last_loss.ok_or_else(|| {
             "SaeManifoldOuterObjective::into_fitted: no converged evaluation is installed; \
              run the fixed-rho solve or certify the outer search before minting a fit"
                 .to_string()
@@ -1440,6 +1427,7 @@ impl SaeManifoldOuterObjective {
         if fitted.assignment.persist_resolved_ibp_alpha(&fitted_rho) {
             fitted_rho.log_lambda_sparse = 0.0;
         }
+        let fitted_loss = fitted.loss(target.view(), &fitted_rho)?;
         let termination = termination_report;
         log::warn!(
             "[#2235] outer search concluded: {} evals ({} since last improvement, wall {:.1?})",
@@ -2759,7 +2747,7 @@ impl SaeManifoldOuterObjective {
         // the per-member inner drive; restored immediately after.
         let mut bundle = std::mem::replace(
             &mut self.basin_bundle,
-            BasinBundle::new(1, basin_bundle_dominance_window()),
+            BasinBundle::new(1),
         );
         let member_eval = bundle.evaluate(|state: &SaeManifoldTerm| {
             let (res, converged) = self.converge_member_criterion(rho_flat, state, drive);

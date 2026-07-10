@@ -1956,7 +1956,7 @@ mod coordinate_fidelity_tests {
         // The original #2230 patch used the 1e-3 EV tolerance for objective
         // ties. At the issue's O(1e5) criterion scale that made an O(1)
         // objective improvement look tied and allowed EV to restore the worse
-        // state. Objective convergence is eight orders tighter than that EV
+        // state. Objective convergence is five orders tighter than that EV
         // reporting band, so the walked-to state must win here.
         assert!(prefer_candidate_state(
             83_999.0,

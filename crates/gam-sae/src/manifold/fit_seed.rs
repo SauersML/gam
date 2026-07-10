@@ -323,12 +323,8 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         mode,
         &evaluators,
     )?;
-    base_term.set_quotient_scale(true);
     base_term.set_data_row_reseed(request.data_row_reseed);
     base_term.set_rank_charge_evidence(true);
-    for atom in base_term.atoms.iter_mut() {
-        atom.absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
-    }
     base_term.set_fit_config(request.fit_config);
     if let Some(schedule) = request.temperature_schedule {
         base_term.set_temperature_schedule(schedule)?;

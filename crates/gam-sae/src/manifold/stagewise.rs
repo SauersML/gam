@@ -481,17 +481,9 @@ fn fit_single_atom_response_in_place(
         SaeAssignment::with_mode(sub_logits, vec![coord_block], term.assignment.mode)?;
     let mut sub_term = SaeManifoldTerm::new(vec![sub_atom], sub_assignment)?;
     sub_term.set_guards_enabled(false);
-    // #2101: a birth sub-fit is a one-atom response fit, so there is no
-    // dictionary peer against which the normal cone-atom collapse recovery can
-    // identify a scale-gauge failure.  Put this local K=1 problem directly on
-    // the scale quotient before Newton: keep the seeded function unchanged by
-    // moving the decoder Frobenius norm into the explicit log-amplitude, then
-    // let the fit adjust the unit-shape decoder and its amplitude.  This makes
-    // the smoothness/ARD terms see the atom's shape instead of charging the raw
-    // LSQ coefficient magnitude that carries residual scale, which is the
-    // mechanism that collapsed genuine born circles to zero/DC rows.
-    sub_term.set_quotient_scale(true);
-    sub_term.atoms[0].absorb_decoder_norm_into_log_amplitude(f64::MIN_POSITIVE);
+    // The residual decoder is already the physical fitted function. Its
+    // magnitude stays in the coefficients so smoothness, Newton curvature, and
+    // the line-search value all describe the same model.
     if let Some(w) = term.row_loss_weights().map(|w| w.to_vec()) {
         sub_term.set_row_loss_weights(w)?;
     }

@@ -1948,10 +1948,7 @@ fn compact_glued_atoms(
         .moves
         .iter()
         .filter_map(|rec| {
-            if let (
-                StructureMove::Glue { a, b, outcome },
-                MoveVerdict::Accepted { .. },
-            ) =
+            if let (StructureMove::Glue { a, b, outcome }, MoveVerdict::Accepted { .. }) =
                 (&rec.mv, &rec.verdict)
             {
                 Some((*a, *b, *outcome))
@@ -3169,12 +3166,11 @@ pub fn discover_primary_atom_topologies(
                     });
                 }
                 if n_pcs >= 3 {
-                    // Möbius band (#2240): double-cover angle from the leading
-                    // principal pair (s = 2·phase ∈ [0, 2)) and a bounded width
-                    // from the standardized third component. The deck-invariant
-                    // basis makes width-odd structure carry half-period angular
-                    // factors — the non-orientable signature no other candidate
-                    // can express.
+                    // Möbius band (#2240): recover one fundamental domain of the
+                    // period-two double cover plus the SIGNED band width from the
+                    // radial/transverse half-angle vector. The deck-invariant basis
+                    // makes width-odd structure carry half-period angular factors —
+                    // the non-orientable signature no other candidate can express.
                     if let (Ok(coords), Ok(evaluator)) = (
                         crate::manifold::mobius_double_cover_coords_from_projection(
                             proj.view(),
@@ -4414,8 +4410,9 @@ pub fn run_structure_search_rounds(
             // was only a worse starting iterate). When no move landed, the state
             // is byte-identical to the unrefit pre-search parent and needs no
             // polish.
-            let (polished_term, polished_rho) =
+            let (mut polished_term, polished_rho) =
                 finalize_round(next_term, next_rho, &split.estimation_rows);
+            refresh_registered_atlas_transitions(&mut polished_term)?;
             term = polished_term;
             rho = polished_rho;
         } else {
@@ -6152,6 +6149,78 @@ mod tests {
         }
     }
 
+    /// An orientation-reversing seam is a valid equivalence, but it is NOT a
+    /// license to erase either local chart.  The production proposal must select
+    /// the atlas-register outcome, and applying it must preserve the numerical
+    /// chart count and fitted image while reducing the semantic atom count.
+    #[test]
+    fn orientation_reversing_seam_registers_atlas_without_destructive_fusion() {
+        let n = 40usize;
+        let (mut term, rho) = tiled_circle_term(n, 2, &[1.0, 1.0]);
+        // `sin` changes sign under t -> -t; `cos` does not.  B therefore traces
+        // exactly A's image with the orientation-reversing transition t_A=-t_B.
+        term.atoms[1].decoder_coefficients[[1, 0]] = -1.0;
+        let residuals = Array2::<f64>::zeros((n, 4));
+        let transition = glue_pair_evalue(&term, residuals.view(), 0, 1)
+            .expect("reflected charts have an exact seam");
+        assert_eq!(transition.sign, -1);
+        assert!(transition.log_e_value > 5.0);
+
+        let report = harvest_move_proposals(
+            &term,
+            &rho,
+            residuals.view(),
+            &HarvestParams {
+                max_fusions: 4,
+                max_fissions: 0,
+                max_births: 0,
+            },
+        )
+        .unwrap();
+        let mv = report
+            .proposals
+            .iter()
+            .find_map(|proposal| match proposal.mv {
+                StructureMove::Glue {
+                    a,
+                    b,
+                    outcome: ChartGlueOutcome::RegisterAtlas,
+                } => Some(StructureMove::Glue {
+                    a,
+                    b,
+                    outcome: ChartGlueOutcome::RegisterAtlas,
+                }),
+                _ => None,
+            })
+            .expect("negative seam must propose atlas registration");
+
+        let fitted_before = term.try_fitted().unwrap();
+        let (registered, _) = apply_structure_move(&term, &rho, &mv, &[]).unwrap();
+        assert_eq!(registered.k_atoms(), 2, "both local charts must survive");
+        assert_eq!(registered.semantic_atom_count(), 1);
+        assert_eq!(registered.chart_atlases().len(), 1);
+        assert_eq!(registered.chart_atlases()[0].transitions()[0].sign, -1);
+        assert_eq!(
+            registered.try_fitted().unwrap(),
+            fitted_before,
+            "atlas registration is an image-exact quotient"
+        );
+
+        let assignments = registered.assignment.assignments();
+        for row in 0..n {
+            let (activation, partition) = registered
+                .atlas_partition_of_unity(0, assignments.row(row))
+                .unwrap();
+            assert!((partition.sum() - 1.0).abs() < 8.0 * f64::EPSILON);
+            for (slot, &chart) in registered.chart_atlases()[0].charts().iter().enumerate() {
+                assert!(
+                    (activation * partition[slot] - assignments[[row, chart]]).abs()
+                        < 8.0 * f64::EPSILON
+                );
+            }
+        }
+    }
+
     /// #1890 over-birth reassembly — the PHYSICAL-excision resurrection fix, on the
     /// private primitives the `chart_gluing_1890.rs` integration test cannot reach.
     /// A circle over-tiled into 4 disjoint arcs proposes a spanning set of glues
@@ -6223,7 +6292,11 @@ mod tests {
         term.structural_cocollapse_reseeds = 4;
         term.softmax_active_cap = Some(3);
         let accepted_glue = |a: usize, b: usize| MoveRecord {
-            mv: StructureMove::Glue { a, b },
+            mv: StructureMove::Glue {
+                a,
+                b,
+                outcome: ChartGlueOutcome::Fuse,
+            },
             trigger: 40.0,
             structure_hash: 0,
             claim: ClaimKind::Custom {
@@ -6335,7 +6408,11 @@ mod tests {
         let ledger = SearchLedger {
             alpha: 0.05,
             moves: vec![MoveRecord {
-                mv: StructureMove::Glue { a: 0, b: 1 },
+                mv: StructureMove::Glue {
+                    a: 0,
+                    b: 1,
+                    outcome: ChartGlueOutcome::Fuse,
+                },
                 trigger: 40.0,
                 structure_hash: 0,
                 claim: ClaimKind::Custom {
@@ -6383,7 +6460,11 @@ mod tests {
         // must reject the whole ledger before the first fold mutates any logit.
         rho.log_ard.push(Array1::zeros(1));
         let accepted = |a: usize, b: usize| MoveRecord {
-            mv: StructureMove::Glue { a, b },
+            mv: StructureMove::Glue {
+                a,
+                b,
+                outcome: ChartGlueOutcome::Fuse,
+            },
             trigger: 40.0,
             structure_hash: 0,
             claim: ClaimKind::Custom {
