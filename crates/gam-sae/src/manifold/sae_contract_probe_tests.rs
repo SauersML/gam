@@ -1672,6 +1672,64 @@ pub(crate) fn deflated_solver_matches_dense_quotient_pseudoinverse_on_near_null_
     assert_abs_diff_eq!(stiffened[1], 0.5, epsilon = 1.0e-12);
 }
 
+/// #2253 mechanism regression: `DeflatedArrowSolver` preconditions with
+/// `(B + κ Q Qᵀ)⁻¹`, so an exact-stationarity Krylov operator must apply the
+/// matching `A + κ Q Qᵀ`. Leaving `A` raw makes a gauge-bearing right-hand side
+/// inconsistent and the original-residual certificate correctly refuses it.
+#[test]
+pub(crate) fn gauge_fixed_krylov_operator_matches_deflated_preconditioner_2253() {
+    let cache = diagonal_latent_cache(&[2.0_f64, 1.0e-14]);
+    let gauge = array![0.0_f64, 1.0];
+    let stiffness = 2.0;
+    let solver =
+        DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
+            .expect("deflated solver");
+    let rhs = SaeArrowVector {
+        t: array![4.0_f64, 1.0],
+        beta: Array1::zeros(0),
+    };
+    let raw_a = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+        Ok(SaeArrowVector {
+            t: array![2.0 * v.t[0], 0.0],
+            beta: Array1::zeros(0),
+        })
+    };
+
+    // Raw A has the exact null q=e1 while rhs has q-mass, so A x = rhs is
+    // inconsistent. A residual-checked solver must refuse it rather than return
+    // the old CG path's arbitrary last iterate.
+    let raw = solve_b_preconditioned_gmres(&solver, &rhs, |v| raw_a(v));
+    assert!(
+        raw.is_err(),
+        "raw A with rhs mass on its exact gauge null must not pass the residual certificate"
+    );
+
+    // The quotient operator uses the SAME κQQᵀ term as the preconditioner.
+    // It is diag(2,2), so the exact gauge-fixed solution is (2, 1/2).
+    let solved = solve_b_preconditioned_gmres(&solver, &rhs, |v| {
+        let mut out = raw_a(v)?;
+        solver.add_gauge_stiffness(v, &mut out)?;
+        Ok(out)
+    })
+    .expect("gauge-fixed exact-stationarity solve");
+    assert_abs_diff_eq!(solved.t[0], 2.0, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(solved.t[1], 0.5, epsilon = 1.0e-12);
+
+    let mut applied = raw_a(&solved).expect("raw A apply");
+    solver
+        .add_gauge_stiffness(&solved, &mut applied)
+        .expect("gauge stiffness apply");
+    let residual = SaeArrowVector {
+        t: &applied.t - &rhs.t,
+        beta: &applied.beta - &rhs.beta,
+    };
+    assert!(
+        sae_norm(&residual) <= 1.0e-12 * sae_norm(&rhs).max(1.0),
+        "gauge-fixed operator and inverse must satisfy the original residual; got {:.3e}",
+        sae_norm(&residual)
+    );
+}
+
 #[test]
 pub(crate) fn pca_seed_handles_huge_equal_finite_columns_without_mean_overflow() {
     let z = array![[1.0e308_f64, 1.0e308], [1.0e308, 1.0e308]];

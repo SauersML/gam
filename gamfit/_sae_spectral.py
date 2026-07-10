@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -498,59 +499,129 @@ def audit_sae(
 # SAEBench manifold-native metrics (chart-interp, dose-response, posterior)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class ChartInterpReport:
-    """Matched-spectrum-null-calibrated cyclic phase-lock of a recovered chart
-    coordinate against ground-truth cyclic labels (#2250).
-
-    ``circular_correlation`` is the ``[0, 1]`` phase-lock after quotienting
-    orientation; ``signed_circular_correlation`` keeps the sign (negative when
-    the recovered coordinate runs backwards relative to the labels);
-    ``matched_spectrum_p_value`` is the plus-one corrected upper-tail empirical
-    p-value from recomputing that same statistic on every supplied null draw.
-    """
-
+class ChartInterpStatisticValue:
     circular_correlation: float
     signed_circular_correlation: float
     effective_weight: float
-    matched_spectrum_null_mean: float
-    matched_spectrum_p_value: float
+
+
+class ChartInterpNullProtocol(str, Enum):
+    """Closed Rust-owned chart-null generator/refit/readout protocols."""
+
+    MATCHED_SPECTRUM_GAUSSIAN_CHART_REFIT_V1 = (
+        "matched_spectrum_gaussian_chart_refit_v1"
+    )
+
+
+@dataclass(frozen=True)
+class ChartInterpNullCalibration:
+    """Complete null input; scalar null statistics are intentionally invalid."""
+
+    protocol: ChartInterpNullProtocol
+    seed: int
+    expected_draws: int
+    observation_draws: Sequence[Sequence[tuple[float, float, float]]]
+
+
+@dataclass(frozen=True)
+class ChartInterpNullCalibrationReport:
+    statistic: str
+    protocol: str
+    null_kind: str
+    draw_policy: str
+    seed: int
+    tail: str
+    draws: int
+    observed_statistic: float
+    mean: float
+    sd: float
+    minimum: float
+    q25: float
+    median: float
+    q75: float
+    maximum: float
+    z: float
+    p_value: float
     monte_carlo_standard_error: float
-    matched_spectrum_draws: int
+    extreme_draws: int
+    null_statistics: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class ChartInterpReport:
+    """Provenance-complete calibration of one exact chart statistic (#2250)."""
+
+    statistic: str
+    observed: ChartInterpStatisticValue
+    calibration: ChartInterpNullCalibrationReport
     significance_level: float
-    evidentially_valid: bool
+    verdict: str
 
 
 def chart_interp_score(
     observations: list[tuple[float, float, float]],
-    matched_spectrum_null_draws: list[list[tuple[float, float, float]]],
+    null_calibration: ChartInterpNullCalibration,
     significance_level: float,
 ) -> ChartInterpReport:
-    """Score chart-coordinate interpretability against an explicit matched null.
+    """Calibrate chart interpretability against complete null readout ledgers.
 
     ``observations`` are ``(recovered_turns, label_turns, weight)`` triples: the
     recovered chart coordinate and its ground-truth cyclic label, both in turns
     (wrapped modulo one), and a non-negative posterior/evidence weight.
-    ``matched_spectrum_null_draws`` must contain the complete observation ledger
-    emitted by the identical chart/readout protocol for every matched-spectrum
-    surrogate. There is deliberately no scalar-only fallback."""
+    ``null_calibration`` names the closed surrogate/refit/readout protocol and
+    carries every complete draw ledger. Rust recomputes the same named statistic
+    on each ledger; a p-value for an EV gap or adjacency score cannot enter this
+    API. There is deliberately no scalar-only fallback."""
     payload = rust_module().chart_interp_score(
         [(float(t), float(y), float(w)) for t, y, w in observations],
         [
             [(float(t), float(y), float(w)) for t, y, w in draw]
-            for draw in matched_spectrum_null_draws
+            for draw in null_calibration.observation_draws
         ],
+        null_calibration.protocol.value,
+        int(null_calibration.seed),
+        int(null_calibration.expected_draws),
         float(significance_level),
     )
+    observed = payload["observed"]
+    calibration = payload["calibration"]
     return ChartInterpReport(
-        circular_correlation=float(payload["circular_correlation"]),
-        signed_circular_correlation=float(payload["signed_circular_correlation"]),
-        effective_weight=float(payload["effective_weight"]),
-        matched_spectrum_null_mean=float(payload["matched_spectrum_null_mean"]),
-        matched_spectrum_p_value=float(payload["matched_spectrum_p_value"]),
-        monte_carlo_standard_error=float(payload["monte_carlo_standard_error"]),
-        matched_spectrum_draws=int(payload["matched_spectrum_draws"]),
+        statistic=str(payload["statistic"]),
+        observed=ChartInterpStatisticValue(
+            circular_correlation=float(observed["circular_correlation"]),
+            signed_circular_correlation=float(
+                observed["signed_circular_correlation"]
+            ),
+            effective_weight=float(observed["effective_weight"]),
+        ),
+        calibration=ChartInterpNullCalibrationReport(
+            statistic=str(calibration["statistic"]),
+            protocol=str(calibration["protocol"]),
+            null_kind=str(calibration["null_kind"]),
+            draw_policy=str(calibration["draw_policy"]),
+            seed=int(calibration["seed"]),
+            tail=str(calibration["tail"]),
+            draws=int(calibration["draws"]),
+            observed_statistic=float(calibration["observed_statistic"]),
+            mean=float(calibration["mean"]),
+            sd=float(calibration["sd"]),
+            minimum=float(calibration["min"]),
+            q25=float(calibration["q25"]),
+            median=float(calibration["median"]),
+            q75=float(calibration["q75"]),
+            maximum=float(calibration["max"]),
+            z=float(calibration["z"]),
+            p_value=float(calibration["p_value"]),
+            monte_carlo_standard_error=float(
+                calibration["monte_carlo_standard_error"]
+            ),
+            extreme_draws=int(calibration["extreme_draws"]),
+            null_statistics=tuple(
+                float(value) for value in calibration["null_statistics"]
+            ),
+        ),
         significance_level=float(payload["significance_level"]),
-        evidentially_valid=bool(payload["evidentially_valid"]),
+        verdict=str(payload["verdict"]),
     )
 
 

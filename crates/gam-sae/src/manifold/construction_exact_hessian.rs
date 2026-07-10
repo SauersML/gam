@@ -289,9 +289,45 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// Exact stationarity operator on the same gauge-fixed quotient represented
+    /// by `solver`: `A_Q v = A v + κ Q Qᵀ v`.
+    ///
+    /// The raw exact Hessian retains the structural chart-gauge null. The
+    /// preconditioner already inverts `B_Q = B + κ Q Qᵀ`; using raw `A` against
+    /// that inverse is not a quotient solve and can leave an irreducible residual
+    /// in `range(Q)` before the post-solve numerical-null detector is reachable
+    /// (#2253). Adding the identical Faddeev-Popov stiffness makes the exact
+    /// operator and its preconditioner one coherent gauge-fixed pencil.
+    fn apply_gauge_fixed_exact_hessian(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        v: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let mut out = self.apply_exact_hessian(rho, target, cache, v)?;
+        solver.add_gauge_stiffness(v, &mut out)?;
+        Ok(out)
+    }
+
+    /// Majorizer action on the same gauge-fixed quotient:
+    /// `B_Q v = B v + κ Q Qᵀ v`.
+    fn apply_gauge_fixed_majorizer(
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        v: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let mut out = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+        solver.add_gauge_stiffness(v, &mut out)?;
+        Ok(out)
+    }
+
     /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
-    /// via left-`B`-preconditioned GMRES ([`solve_b_preconditioned_gmres`]) with the
-    /// matrix-free `A v = B v + ΔC v` apply ([`Self::apply_exact_hessian`]). The
+    /// on the closed-form gauge quotient via left-`B_Q`-preconditioned GMRES
+    /// ([`solve_b_preconditioned_gmres`]) with the matrix-free
+    /// `A_Q v = B v + ΔC v + κ Q Qᵀv` apply
+    /// ([`Self::apply_gauge_fixed_exact_hessian`]). The
     /// IFT step `θ̂_ρ = −A⁻¹ g_ρ` (the code contracts `−½·⟨Γ, A⁻¹ g_ρ⟩` with rhs `= +∂g/∂ρ`, i.e. `+½·Γᵀθ̂_ρ` of the response — the sign lives in the −0.5 factor) must invert the EXACT `A`, not the surrogate `B`;
     /// GMRES does not require the exact stationarity Jacobian to be SPD; it
     /// refuses non-convergence instead of returning a negative-curvature CG
@@ -305,7 +341,7 @@ impl SaeManifoldTerm {
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
         let mut x = solve_b_preconditioned_gmres(solver, rhs, |v| {
-            self.apply_exact_hessian(rho, target, cache, v)
+            self.apply_gauge_fixed_exact_hessian(rho, target, cache, solver, v)
         })?;
         // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
         //
@@ -326,8 +362,8 @@ impl SaeManifoldTerm {
         let dim = x.t.len() + x.beta.len();
         let rank_floor = sae_ift_min_curvature_fraction();
         for _ in 0..dim {
-            let ax = self.apply_exact_hessian(rho, target, cache, &x)?;
-            let bx = apply_cached_arrow_hessian(cache, x.t.view(), x.beta.view())?;
+            let ax = self.apply_gauge_fixed_exact_hessian(rho, target, cache, solver, &x)?;
+            let bx = Self::apply_gauge_fixed_majorizer(cache, solver, &x)?;
             let x_b_norm_sq = sae_inner(&x, &bx);
             if x_b_norm_sq == 0.0 && sae_inner(&x, &x) == 0.0 {
                 return Ok(x);
@@ -358,7 +394,7 @@ impl SaeManifoldTerm {
             // projecting with `v=x` (which would delete the entire response).
             let mut v = x.clone();
             let normalize_b = |v: &mut SaeArrowVector| -> Result<(), String> {
-                let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+                let bv = Self::apply_gauge_fixed_majorizer(cache, solver, v)?;
                 let norm_sq = sae_inner(v, &bv);
                 if !(norm_sq.is_finite() && norm_sq > 0.0) {
                     return Err(format!(
@@ -374,9 +410,9 @@ impl SaeManifoldTerm {
             normalize_b(&mut v)?;
             let mut direction_converged = false;
             for _ in 0..dim {
-                let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+                let bv = Self::apply_gauge_fixed_majorizer(cache, solver, &v)?;
                 let mut refined = solve_b_preconditioned_gmres(solver, &bv, |w| {
-                    self.apply_exact_hessian(rho, target, cache, w)
+                    self.apply_gauge_fixed_exact_hessian(rho, target, cache, solver, w)
                 })
                 .map_err(|err| {
                     format!(
@@ -384,8 +420,7 @@ impl SaeManifoldTerm {
                     )
                 })?;
                 normalize_b(&mut refined)?;
-                let b_refined =
-                    apply_cached_arrow_hessian(cache, refined.t.view(), refined.beta.view())?;
+                let b_refined = Self::apply_gauge_fixed_majorizer(cache, solver, &refined)?;
                 let alignment = sae_inner(&v, &b_refined).abs();
                 if !alignment.is_finite() {
                     return Err(
@@ -407,8 +442,8 @@ impl SaeManifoldTerm {
             // Refuse to remove a resolved or non-positive direction. A stable
             // converged inner minimum has positive exact curvature; a negative
             // Ritz value is a second-order convergence failure, not a null gauge.
-            let av = self.apply_exact_hessian(rho, target, cache, &v)?;
-            let bv = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+            let av = self.apply_gauge_fixed_exact_hessian(rho, target, cache, solver, &v)?;
+            let bv = Self::apply_gauge_fixed_majorizer(cache, solver, &v)?;
             let v_b_norm_sq = sae_inner(&v, &bv);
             if !(v_b_norm_sq.is_finite() && v_b_norm_sq > 0.0) {
                 return Err(format!(

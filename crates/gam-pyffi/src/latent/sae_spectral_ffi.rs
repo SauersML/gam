@@ -2219,14 +2219,17 @@ fn effect_weighted_retention(
 /// `observations` are `(recovered_turns, label_turns, weight)` triples: the
 /// recovered chart coordinate and the ground-truth cyclic label, both in turns
 /// (values are wrapped modulo one), plus a non-negative posterior/evidence weight
-/// per row. `matched_spectrum_null_draws` contains complete ledgers produced by
-/// the identical readout on each matched-spectrum surrogate. The scorer is
-/// fail-closed: neither the null draws nor the significance level is optional.
-#[pyfunction(signature = (observations, matched_spectrum_null_draws, significance_level))]
+/// per row. `null_observation_draws` contains complete ledgers produced by the
+/// closed `null_protocol`; the declared draw count must match the artifact. The
+/// scorer is fail-closed: neither provenance nor null draws are optional.
+#[pyfunction(signature = (observations, null_observation_draws, null_protocol, null_seed, expected_draws, significance_level))]
 fn chart_interp_score(
     py: Python<'_>,
     observations: Vec<(f64, f64, f64)>,
-    matched_spectrum_null_draws: Vec<Vec<(f64, f64, f64)>>,
+    null_observation_draws: Vec<Vec<(f64, f64, f64)>>,
+    null_protocol: String,
+    null_seed: u64,
+    expected_draws: usize,
     significance_level: f64,
 ) -> PyResult<Py<PyDict>> {
     let report = detach_py_result(py, "chart_interp_score", move || {
@@ -2241,7 +2244,7 @@ fn chart_interp_score(
             })
             .collect();
         let null_draws: Vec<Vec<gam::terms::sae::saebench_metrics::ChartInterpObservation>> =
-            matched_spectrum_null_draws
+            null_observation_draws
                 .iter()
                 .map(|draw| {
                     draw.iter()
@@ -2255,31 +2258,67 @@ fn chart_interp_score(
                         .collect()
                 })
                 .collect();
+        let protocol =
+            gam::terms::sae::saebench_metrics::ChartInterpNullProtocol::parse(&null_protocol)?;
+        let calibration =
+            gam::terms::sae::saebench_metrics::ChartInterpNullCalibration::new(
+                protocol,
+                null_seed,
+                expected_draws,
+                null_draws,
+            )?;
         gam::terms::sae::saebench_metrics::chart_interp_score(
             &rows,
-            &null_draws,
+            &calibration,
             significance_level,
         )
     })?;
-    let out = PyDict::new(py);
-    out.set_item("circular_correlation", report.circular_correlation)?;
-    out.set_item(
+    let observed = PyDict::new(py);
+    observed.set_item(
+        "circular_correlation",
+        report.observed.circular_correlation,
+    )?;
+    observed.set_item(
         "signed_circular_correlation",
-        report.signed_circular_correlation,
+        report.observed.signed_circular_correlation,
     )?;
-    out.set_item("effective_weight", report.effective_weight)?;
-    out.set_item(
-        "matched_spectrum_null_mean",
-        report.matched_spectrum_null_mean,
+    observed.set_item("effective_weight", report.observed.effective_weight)?;
+
+    let null = &report.calibration.null_distribution;
+    let calibration = PyDict::new(py);
+    calibration.set_item("statistic", report.calibration.statistic.as_str())?;
+    calibration.set_item("protocol", report.calibration.protocol.as_str())?;
+    calibration.set_item("null_kind", null.kind.as_str())?;
+    calibration.set_item(
+        "draw_policy",
+        report.calibration.protocol.draw_policy().as_str(),
     )?;
-    out.set_item("matched_spectrum_p_value", report.matched_spectrum_p_value)?;
-    out.set_item(
+    calibration.set_item("seed", report.calibration.seed)?;
+    calibration.set_item("tail", null.tail.as_str())?;
+    calibration.set_item("draws", null.n)?;
+    calibration.set_item("observed_statistic", null.observed)?;
+    calibration.set_item("mean", null.mean)?;
+    calibration.set_item("sd", null.sd)?;
+    calibration.set_item("min", null.min)?;
+    calibration.set_item("q25", null.q25)?;
+    calibration.set_item("median", null.median)?;
+    calibration.set_item("q75", null.q75)?;
+    calibration.set_item("max", null.max)?;
+    calibration.set_item("z", null.z)?;
+    calibration.set_item("p_value", null.p_value)?;
+    calibration.set_item(
         "monte_carlo_standard_error",
-        report.monte_carlo_standard_error,
+        null.monte_carlo_standard_error,
     )?;
-    out.set_item("matched_spectrum_draws", report.matched_spectrum_draws)?;
+    calibration.set_item("extreme_draws", null.extreme_draws)?;
+    calibration.set_item("null_statistics", &null.samples)?;
+
+    let out = PyDict::new(py);
+    out.set_item("statistic", report.statistic.as_str())?;
+    out.set_item("observed", observed)?;
+    out.set_item("calibration", calibration)?;
     out.set_item("significance_level", report.significance_level)?;
-    out.set_item("evidentially_valid", report.evidentially_valid)?;
+    out.set_item("verdict", report.verdict.as_str())?;
     Ok(out.unbind())
 }
 
@@ -2471,30 +2510,71 @@ mod ffi_completeness_tests {
                 (0.49, 0.51, 1.0),
                 (0.74, 0.26, 1.0),
             ];
-            let out = chart_interp_score(py, observations.clone(), vec![observations], 0.05)
-                .expect("chart interp score");
+            let out = chart_interp_score(
+                py,
+                observations.clone(),
+                vec![observations],
+                "matched_spectrum_gaussian_chart_refit_v1".to_string(),
+                17,
+                1,
+                0.05,
+            )
+            .expect("chart interp score");
             let d = out.bind(py);
-            let cc: f64 = d
+            let observed = d
+                .get_item("observed")
+                .unwrap()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            let cc: f64 = observed
                 .get_item("circular_correlation")
                 .unwrap()
                 .unwrap()
                 .extract()
                 .unwrap();
             assert!(cc > 0.99, "circular_correlation = {cc}");
-            let signed: f64 = d
+            let signed: f64 = observed
                 .get_item("signed_circular_correlation")
                 .unwrap()
                 .unwrap()
                 .extract()
                 .unwrap();
             assert!(signed < 0.0, "signed_circular_correlation = {signed}");
-            let valid: bool = d
-                .get_item("evidentially_valid")
+            let calibration = d
+                .get_item("calibration")
+                .unwrap()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            let protocol: String = calibration
+                .get_item("protocol")
                 .unwrap()
                 .unwrap()
                 .extract()
                 .unwrap();
-            assert!(!valid, "a draw equal to observed must not pass the null");
+            assert_eq!(protocol, "matched_spectrum_gaussian_chart_refit_v1");
+            let seed: u64 = calibration
+                .get_item("seed")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(seed, 17);
+            let samples: Vec<f64> = calibration
+                .get_item("null_statistics")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(samples.len(), 1);
+            let verdict: String = d
+                .get_item("verdict")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(verdict, "null_compatible");
         });
     }
 

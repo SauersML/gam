@@ -11,7 +11,7 @@ pub(crate) struct DeflatedArrowSolver<'a> {
     pub(crate) gauge_basis: Vec<Array1<f64>>,
     pub(crate) gauge_response_physical: Vec<Array1<f64>>,
     pub(crate) woodbury_factor: Option<FaerCholeskyFactor>,
-    pub(crate) gauge_stiffness_recip: f64,
+    pub(crate) gauge_stiffness: f64,
 }
 
 impl<'a> DeflatedArrowSolver<'a> {
@@ -21,7 +21,7 @@ impl<'a> DeflatedArrowSolver<'a> {
             gauge_basis: Vec::new(),
             gauge_response_physical: Vec::new(),
             woodbury_factor: None,
-            gauge_stiffness_recip: 0.0,
+            gauge_stiffness: 0.0,
         }
     }
 
@@ -85,8 +85,56 @@ impl<'a> DeflatedArrowSolver<'a> {
             gauge_basis,
             gauge_response_physical,
             woodbury_factor: Some(woodbury_factor),
-            gauge_stiffness_recip: stiffness_recip,
+            gauge_stiffness: stiffness,
         })
+    }
+
+    /// Add the closed-form gauge-fixing action `κ Q Qᵀ v` to an already
+    /// assembled operator product.
+    ///
+    /// [`Self::solve`] is the Woodbury inverse of `B + κ Q Qᵀ`, not of the raw
+    /// arrow operator `B`. Any operator preconditioned by this solver must carry
+    /// the same gauge stiffness. In particular, the exact-stationarity solve
+    /// uses `A + κ Q Qᵀ`: applying raw `A` while preconditioning with the
+    /// gauge-fixed `B` leaves the known gauge null in the Krylov operator and can
+    /// make a perfectly valid quotient solve fail its original-residual check
+    /// (#2253). Plain solvers have an empty basis and remain bit-identical.
+    pub(crate) fn add_gauge_stiffness(
+        &self,
+        vector: &SaeArrowVector,
+        applied: &mut SaeArrowVector,
+    ) -> Result<(), String> {
+        if self.gauge_basis.is_empty() {
+            return Ok(());
+        }
+        let t_len = self.cache.delta_t_len();
+        let beta_len = self.cache.k;
+        if vector.t.len() != t_len
+            || vector.beta.len() != beta_len
+            || applied.t.len() != t_len
+            || applied.beta.len() != beta_len
+        {
+            return Err(format!(
+                "DeflatedArrowSolver: gauge-stiffness operator shapes vector=({}, {}), \
+                 applied=({}, {}) != cache=({t_len}, {beta_len})",
+                vector.t.len(),
+                vector.beta.len(),
+                applied.t.len(),
+                applied.beta.len(),
+            ));
+        }
+        for gauge in &self.gauge_basis {
+            let coefficient = self.gauge_stiffness
+                * (gauge.slice(s![..t_len]).dot(&vector.t)
+                    + gauge.slice(s![t_len..]).dot(&vector.beta));
+            for i in 0..t_len {
+                applied.t[i] += coefficient * gauge[i];
+            }
+            for i in 0..beta_len {
+                applied.beta[i] += coefficient * gauge[t_len + i];
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn solve(
@@ -129,7 +177,7 @@ impl<'a> DeflatedArrowSolver<'a> {
             }
         }
         for (gauge, &weight) in self.gauge_basis.iter().zip(weights.iter()) {
-            let coeff = self.gauge_stiffness_recip * weight;
+            let coeff = self.gauge_stiffness.recip() * weight;
             for i in 0..flat.len() {
                 flat[i] += gauge[i] * coeff;
             }

@@ -218,7 +218,9 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
     angle is converted to turns and scored against the ground-truth calendar
     cyclic label by ``gamfit.chart_interp_score``. Each cyclic-ordering record
     must also carry a ``matched_spectrum_null`` object with the null fit's
-    ``angles_rad`` draws, generator/seed/draw policy, and significance level.
+    ``angles_rad`` draws, closed protocol, seed, declared draw count, and
+    significance level. Null kind and draw policy are owned by that protocol
+    rather than accepted as free-form labels.
     Missing null evidence is an error: a scalar correlation is not a
     chart-interpretability result (#2250)."""
     doc = json.loads(fit_path.read_text())
@@ -266,8 +268,22 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                     for a, i in zip(draw_angles, indices)
                 ]
             )
+        protocol_value = null.get("protocol")
+        try:
+            protocol = gamfit.ChartInterpNullProtocol(protocol_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"atom {entry.get('atom')!r} matched_spectrum_null.protocol "
+                "must name a supported closed chart-null protocol"
+            ) from error
+        calibration = gamfit.ChartInterpNullCalibration(
+            protocol=protocol,
+            seed=int(null["seed"]),
+            expected_draws=int(null["draws"]),
+            observation_draws=null_obs,
+        )
         alpha = float(null["significance_level"])
-        rep = gamfit.chart_interp_score(obs, null_obs, alpha)
+        rep = gamfit.chart_interp_score(obs, calibration, alpha)
         family = "weekday" if period == 7 else ("month" if period == 12 else f"period{period}")
         results.append(
             {
@@ -275,25 +291,41 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                 "family": family,
                 "period": period,
                 "n_words": len(words),
-                "circular_correlation": rep.circular_correlation,
-                "signed_circular_correlation": rep.signed_circular_correlation,
-                "matched_spectrum_null_mean": rep.matched_spectrum_null_mean,
-                "matched_spectrum_p_value": rep.matched_spectrum_p_value,
-                "monte_carlo_standard_error": rep.monte_carlo_standard_error,
-                "matched_spectrum_draws": rep.matched_spectrum_draws,
+                "statistic": rep.statistic,
+                "circular_correlation": rep.observed.circular_correlation,
+                "signed_circular_correlation": rep.observed.signed_circular_correlation,
+                "effective_weight": rep.observed.effective_weight,
                 "significance_level": rep.significance_level,
-                "evidentially_valid": rep.evidentially_valid,
-                "null_policy": {
-                    "generator": null["generator"],
-                    "seed": null["seed"],
-                    "draw_policy": null["draw_policy"],
-                    "draws": rep.matched_spectrum_draws,
+                "verdict": rep.verdict,
+                "null_calibration": {
+                    "statistic": rep.calibration.statistic,
+                    "protocol": rep.calibration.protocol,
+                    "null_kind": rep.calibration.null_kind,
+                    "draw_policy": rep.calibration.draw_policy,
+                    "seed": rep.calibration.seed,
+                    "tail": rep.calibration.tail,
+                    "draws": rep.calibration.draws,
+                    "observed_statistic": rep.calibration.observed_statistic,
+                    "mean": rep.calibration.mean,
+                    "sd": rep.calibration.sd,
+                    "min": rep.calibration.minimum,
+                    "q25": rep.calibration.q25,
+                    "median": rep.calibration.median,
+                    "q75": rep.calibration.q75,
+                    "max": rep.calibration.maximum,
+                    "z": rep.calibration.z,
+                    "p_value": rep.calibration.p_value,
+                    "monte_carlo_standard_error": (
+                        rep.calibration.monte_carlo_standard_error
+                    ),
+                    "extreme_draws": rep.calibration.extreme_draws,
+                    "null_statistics": rep.calibration.null_statistics,
                 },
             }
         )
     # SAEBench-shaped view: only correlations that pass their own identical
     # matched-spectrum statistic may enter the headline aggregate (#2250).
-    null_robust = [r for r in results if r["evidentially_valid"]]
+    null_robust = [r for r in results if r["verdict"] == "pass"]
     metrics = {"chart_interp": {"n_atoms": len(results), "n_null_robust": len(null_robust)}}
     if null_robust:
         metrics["chart_interp"]["mean_circular_correlation_null_robust"] = float(

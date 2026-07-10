@@ -1584,8 +1584,13 @@ mod tests {
     fn structured_signal_beats_required_nulls_but_noise_does_not() {
         let signal = ordered_circle_fixture(96, 6, 0.04);
         let random_weight = noise_fixture(128, 6, 1717);
+        let alpha = 0.05_f64;
+        // With the plus-one correction, zero exceedances attain 1 / (R + 1).
+        // Derive the smallest battery that can actually clear the declared
+        // level instead of weakening alpha to accommodate too few draws.
+        let replicates = (1.0_f64 / alpha).ceil() as usize - 1;
         let config = NullBatteryConfig {
-            replicates: 16,
+            replicates,
             seed: 17,
             kinds: vec![
                 NullKind::PhaseRandomized,
@@ -1605,7 +1610,7 @@ mod tests {
             report
                 .summaries
                 .iter()
-                .all(|s| s.z > 2.0 && s.p_value <= 0.12),
+                .all(|s| s.z > 2.0 && s.p_value <= alpha),
             "structured ordered circle should separate from nulls: {:?}",
             report.summaries
         );
@@ -1623,7 +1628,7 @@ mod tests {
             noise_report
                 .summaries
                 .iter()
-                .all(|s| s.z.abs() < 2.0 || s.p_value > 0.12),
+                .all(|s| s.z.abs() < 2.0 || s.p_value > alpha),
             "pure noise must not look separated from nulls: {:?}",
             noise_report.summaries
         );

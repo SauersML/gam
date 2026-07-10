@@ -401,6 +401,67 @@ mod exact_stationarity_solve_1418_tests {
         );
     }
 
+    /// #2253 production-wiring regression: when the arrow solver installs a
+    /// closed-form gauge stiffness, `solve_exact_stationarity` must invert
+    /// `A_Q = A + κQQᵀ`, not raw `A`. The raw and gauge-fixed systems are both
+    /// well-defined on this healthy fixture, so the two residuals distinguish
+    /// the operator actually used without relying on a non-convergence timeout.
+    #[test]
+    fn solve_exact_stationarity_uses_solver_gauge_fix_2253() {
+        let (term, target, rho, cache) = converged_state_with_residual();
+        let total_t = cache.delta_t_len();
+        let full_len = total_t + cache.k;
+        assert!(full_len > 0, "fixture must have a nonempty inner state");
+
+        // A deterministic unit gauge is sufficient to pin the operator seam.
+        // Production supplies the analytic chart-gauge basis through the same
+        // constructor; this test isolates the algebra from gauge discovery.
+        let mut gauge = Array1::<f64>::zeros(full_len);
+        gauge[0] = 1.0;
+        let stiffness = arrow_factor_max_pivot(&cache)
+            .expect("converged cache must expose a positive pivot scale");
+        let solver =
+            DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
+                .expect("gauge-fixed exact-stationarity preconditioner");
+        let rhs = SaeArrowVector {
+            t: Array1::from_shape_fn(total_t, |i| if i == 0 { 1.0 } else { 0.0 }),
+            beta: Array1::zeros(cache.k),
+        };
+
+        let solved = term
+            .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &rhs)
+            .expect("gauge-fixed exact stationarity solve");
+        let raw_ax = term
+            .apply_exact_hessian(&rho, target.view(), &cache, &solved)
+            .expect("raw A apply");
+        let raw_residual = SaeArrowVector {
+            t: &raw_ax.t - &rhs.t,
+            beta: &raw_ax.beta - &rhs.beta,
+        };
+        let mut gauge_fixed_ax = raw_ax;
+        solver
+            .add_gauge_stiffness(&solved, &mut gauge_fixed_ax)
+            .expect("κQQᵀ action");
+        let gauge_fixed_residual = SaeArrowVector {
+            t: &gauge_fixed_ax.t - &rhs.t,
+            beta: &gauge_fixed_ax.beta - &rhs.beta,
+        };
+        let rhs_norm = sae_norm(&rhs).max(1.0);
+        let fixed_norm = sae_norm(&gauge_fixed_residual);
+        let raw_norm = sae_norm(&raw_residual);
+        assert!(
+            fixed_norm <= 1.0e-6 * rhs_norm,
+            "solve_exact_stationarity must solve the gauge-fixed A_Q system: \
+             ‖A_Qx-rhs‖/‖rhs‖={:.3e}",
+            fixed_norm / rhs_norm
+        );
+        assert!(
+            raw_norm >= 1.0e-3 * rhs_norm,
+            "test must distinguish A_Q from raw A: raw residual was only {:.3e}",
+            raw_norm / rhs_norm
+        );
+    }
+
     /// #2080 defect 4 — with a SATURATED gate logit, the exact stationarity
     /// Jacobian `A` develops a near-null pencil direction (data curvature
     /// `∝ σ'(ℓ)² ≈ 0` against an O(1) majorizer entry in `B`), and the raw
