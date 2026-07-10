@@ -781,9 +781,23 @@ where
         beta: &rhs.beta - &ax.beta,
     };
     let residual_norm = sae_norm(&original);
+    // Round-off-floor acceptance. Full-memory GMRES terminates exactly within
+    // `dim` steps UP TO ROUND-OFF; on a system with condition number kappa the
+    // attainable relative residual is O(kappa*eps), which for healthy but
+    // moderately conditioned Hessians (kappa ~ 1e6) sits ABOVE the 1e-10 target.
+    // A run that exhausted its budget with the true residual at or below sqrt(eps)
+    // IS the round-off-floor solution — rejecting it turned numerically exact
+    // adjoint solves into fit-wide seed refusals (2026-07-10: every plain-SAE fit
+    // failed with "failed to converge ... residual=4e-10"). Anything above sqrt(eps)
+    // remains the typed error — no last-iterate fallback for genuine failures.
+    let roundoff_floor = f64::EPSILON.sqrt() * rhs_norm;
+    if residual_norm <= roundoff_floor {
+        return Ok(candidate);
+    }
     Err(format!(
         "solve_b_preconditioned_gmres: failed to converge in {iterations} iterations; \
-         original relative residual={:.3e}",
-        residual_norm / rhs_norm
+         original relative residual={:.3e} (round-off acceptance floor {:.3e})",
+        residual_norm / rhs_norm,
+        roundoff_floor / rhs_norm
     ))
 }
