@@ -266,6 +266,25 @@ pub struct BlockSparseConvergence {
     pub tolerance: f64,
 }
 
+impl BlockSparseConvergence {
+    /// A certificate whose every residual is exactly zero against a positive
+    /// tolerance, with no accepted births or polar failures — a trivially
+    /// converged full-alternation fixed point. Used to mint [`BlockSparseFit`]
+    /// values from fixed, hand-authored block routings.
+    pub fn trivially_converged() -> Self {
+        Self {
+            ev_residual: 0.0,
+            gamma_residual: 0.0,
+            frame_residual: 0.0,
+            routing_residual: 0.0,
+            reconstruction_residual: 0.0,
+            accepted_births: 0,
+            polar_failures: 0,
+            tolerance: 1e-6,
+        }
+    }
+}
+
 impl BlockSparseFit {
     /// Dense reconstruction `N×P` from the sparse block routing:
     /// `x̂_i = Σ_{g∈S_i} z_{ig} D_g`. Allocates the data-size `N×P`, not `N×K`.

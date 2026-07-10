@@ -208,6 +208,27 @@ pub struct SparseDictConvergence {
     pub outer_iterations: usize,
 }
 
+impl SparseDictConvergence {
+    /// A certificate whose every residual is exactly zero against a positive
+    /// tolerance — i.e. a trivially converged fixed point. Used to mint
+    /// [`SparseDictFit`] values from fixed, hand-authored routings (downstream
+    /// consumers read the routing, not the fixed-point history).
+    pub fn trivially_converged() -> Self {
+        Self {
+            inner_ev_residual: 0.0,
+            inner_tolerance: 1e-6,
+            decoder_residual: 0.0,
+            decoder_tolerance: 1e-6,
+            routing_residual: 0.0,
+            routing_tolerance: 1e-6,
+            outer_rho_residual: 0.0,
+            outer_tolerance: 1e-6,
+            selected_rho: f64::INFINITY,
+            outer_iterations: 0,
+        }
+    }
+}
+
 impl SparseDictFit {
     /// Dense reconstruction `N×P` of the training rows from the sparse routing.
     ///

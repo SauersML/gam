@@ -626,7 +626,7 @@ mod tests {
             codes,
             explained_variance: 1.0,
             epochs: 0,
-            converged: true,
+            convergence: crate::sparse_dict::SparseDictConvergence::trivially_converged(),
             active,
             score_route_stats: ScoreRouteStats::default(),
             decoder_solve_stats: DecoderSolveStats::default(),
@@ -900,7 +900,7 @@ mod tests {
             matryoshka_prefix_losses: Vec::new(),
             explained_variance: 1.0,
             epochs: 0,
-            converged: true,
+            convergence: crate::sparse_dict::BlockSparseConvergence::trivially_converged(),
             block_topk: topk,
             block_size: b,
         };
@@ -951,7 +951,7 @@ mod tests {
             matryoshka_prefix_losses: Vec::new(),
             explained_variance: 0.0,
             epochs: 0,
-            converged: false,
+            convergence: crate::sparse_dict::BlockSparseConvergence::trivially_converged(),
             block_topk: topk,
             block_size: b,
         };

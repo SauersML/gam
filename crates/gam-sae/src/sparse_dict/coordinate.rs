@@ -1279,7 +1279,7 @@ mod tests {
             matryoshka_prefix_losses: Vec::new(),
             explained_variance: 1.0,
             epochs: 1,
-            converged: true,
+            convergence: super::block::BlockSparseConvergence::trivially_converged(),
             block_topk: 1,
             block_size: b,
         }

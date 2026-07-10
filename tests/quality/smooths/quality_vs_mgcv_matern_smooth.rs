@@ -348,10 +348,13 @@ fn gam_matern_smooth_recovers_truth_on_real_data() {
 #[test]
 fn diag_matern_internals_1074() {
     init_parallelism();
+<<<<<<< ours
     // #1074: surface the κ outer-optimizer's own OUTER-FD-AUDIT (analytic-vs-FD
     // ψ-gradient) and KAPPA-PHASE ψ-iterate trace, to understand WHY the 1-D
     // κ-optimizer does not descend from its seed. Writes to stderr (--nocapture).
     gam::solver::progress_log::init_logging();
+=======
+>>>>>>> theirs
     let n = 180usize;
     let mut rng = StdRng::seed_from_u64(456);
     let ux = Uniform::new(0.0, 1.0).unwrap();
@@ -362,10 +365,14 @@ fn diag_matern_internals_1074() {
         1.0 + 0.8 * (4.0 * std::f64::consts::PI * t).sin()
             + 0.4 * (2.0 * std::f64::consts::PI * t).cos()
     };
+<<<<<<< ours
     let y: Vec<f64> = x
         .iter()
         .map(|&t| truth(t) + noise.sample(&mut rng))
         .collect();
+=======
+    let y: Vec<f64> = x.iter().map(|&t| truth(t) + noise.sample(&mut rng)).collect();
+>>>>>>> theirs
     let grid_n = n;
     let x_grid: Vec<f64> = (0..grid_n)
         .map(|i| 0.005 + 0.99 * i as f64 / (grid_n - 1) as f64)
@@ -374,6 +381,7 @@ fn diag_matern_internals_1074() {
 
     for formula in [
         "y ~ matern(x, nu=2.5, k=20)",
+<<<<<<< ours
         // #1074: sweep explicit length_scale at k=20 to find the range that
         // reproduces mgcv's gp default (range = data diameter ≈ 0.98, edf≈13.85,
         // rmse≈0.031). gam's frozen 1-D default is 0.15·diam ≈ 0.147 (edf 17).
@@ -389,6 +397,11 @@ fn diag_matern_internals_1074() {
         "y ~ matern(x, nu=1.5, k=20, length_scale=0.30)",
         "y ~ matern(x, nu=1.5, k=20, length_scale=0.50)",
         "y ~ matern(x, nu=1.5, k=20, length_scale=0.98)",
+=======
+        "y ~ matern(x, nu=2.5, k=15)",
+        "y ~ matern(x, nu=2.5, k=10)",
+        "y ~ matern(x, nu=2.5, k=8)",
+>>>>>>> theirs
     ] {
         let headers = ["x", "y"].into_iter().map(String::from).collect();
         let rows: Vec<csv::StringRecord> = x
@@ -397,6 +410,7 @@ fn diag_matern_internals_1074() {
             .map(|(a, b)| csv::StringRecord::from(vec![a.to_string(), b.to_string()]))
             .collect();
         let ds = encode_recordswith_inferred_schema(headers, rows).unwrap();
+<<<<<<< ours
         let cfg = FitConfig {
             family: Some("gaussian".to_string()),
             ..FitConfig::default()
@@ -405,6 +419,11 @@ fn diag_matern_internals_1074() {
         let FitResult::Standard(fit) = result else {
             panic!()
         };
+=======
+        let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+        let result = fit_from_formula(formula, &ds, &cfg).unwrap();
+        let FitResult::Standard(fit) = result else { panic!() };
+>>>>>>> theirs
         let mut g = Array2::<f64>::zeros((grid_n, 2));
         for (i, &t) in x_grid.iter().enumerate() {
             g[[i, 0]] = t;
@@ -413,6 +432,7 @@ fn diag_matern_internals_1074() {
         let gd = build_term_collection_design(g.view(), &fit.resolvedspec).unwrap();
         let gam_grid: Vec<f64> = gd.design.apply(&fit.fit.beta).to_vec();
         let rmse_t = rmse(&gam_grid, &truth_grid);
+<<<<<<< ours
         // #1074: the converged Matérn length_scale (= 1/kappa) the REML κ-optimizer
         // landed on, to compare against mgcv's effective range. A too-SHORT range
         // (wiggly kernel) is the suspected source of the EDF inflation vs mgcv.
@@ -444,6 +464,16 @@ fn diag_matern_internals_1074() {
                 .map(|v| (v * 1e6).round() / 1e6)
                 .collect::<Vec<_>>(),
             fit.fit.reml_score,
+=======
+        eprintln!(
+            "[#1074-diag] {formula}\n    edf_total={:.3} edf_by_block={:?}\n    log_lambdas={:?}\n    lambdas={:?}\n    reml={:.4} converged={} outer_iters={} rmse_vs_truth={:.4}",
+            fit.fit.edf_total().unwrap(),
+            fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+            fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+            fit.fit.lambdas.iter().map(|v| (v * 1e6).round() / 1e6).collect::<Vec<_>>(),
+            fit.fit.reml_score,
+            fit.fit.outer_converged,
+>>>>>>> theirs
             fit.fit.outer_iterations,
             rmse_t,
         );

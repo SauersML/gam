@@ -143,7 +143,7 @@ fn harmonic_fit_from_codes(rows: &[Vec<f32>], block_size: usize) -> BlockSparseF
         matryoshka_prefix_losses: Vec::new(),
         explained_variance: 1.0,
         epochs: 0,
-        converged: true,
+        convergence: crate::sparse_dict::BlockSparseConvergence::trivially_converged(),
         block_topk: 1,
         block_size,
     }
