@@ -335,6 +335,8 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
     #[cfg(target_os = "linux")]
     if gam_gpu::device_runtime::GpuRuntime::global().is_some() {
         let started = std::time::Instant::now();
+        let max_q = sys.row_dims.iter().copied().max().unwrap_or(0);
+        let ainv_per_trial_bytes = sys.rows.len() * max_q * max_q * std::mem::size_of::<f64>();
         let frame = gam_solve::arrow_schur::prepare_sae_resident_frame(&sys, &options, None)
             .expect("live CUDA runtime must admit the production resident frame");
         let mut device_options = options.clone();
@@ -348,12 +350,15 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         );
         eprintln!(
             "#1017 A100 resident solve telemetry: used_device_arrow={} elapsed_ms={:.3} \
-             pcg_iterations={} matvec_calls={} ridge_escalations={} {}",
+             pcg_iterations={} matvec_calls={} ridge_escalations={} \
+             resident_upload_once_bytes={} per_trial_ainv_upload_bytes={} {}",
             diagnostics.used_device_arrow,
             started.elapsed().as_secs_f64() * 1.0e3,
             diagnostics.iterations,
             diagnostics.matvec_calls,
             diagnostics.ridge_escalations,
+            operand_report.total_bytes,
+            ainv_per_trial_bytes,
             operand_report,
         );
     }
