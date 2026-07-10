@@ -194,8 +194,10 @@ pub(crate) use gam::terms::sae::manifold::{
     GumbelTemperatureSchedule, MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator,
     SPHERE_CHART_PENALTY_DIAGONAL,
     SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldRho, ScheduleKind,
-    SphereChartEvaluator, TorusHarmonicEvaluator, sphere_chart_basis_jet,
-    term_from_padded_blocks_with_mode,
+    SphereChartEvaluator, TorusHarmonicEvaluator, sae_decoder_lsq_init,
+    sae_em_refine_routing_seed, sae_output_energy_cluster_labels,
+    sae_refine_periodic_seed_coords_by_cluster, sae_residual_seed_logits,
+    sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
 };
 
 pub(crate) use gam::terms::decoders::skip_transcoder::{

@@ -467,7 +467,9 @@ fn sae_manifold_fit_minimal<'py>(
         && matches!(assignment_kind.as_str(), "softmax" | "ibp_map")
     {
         let labels = sae_output_energy_cluster_labels(z_view, k_atoms);
-        sae_refine_periodic_seed_coords_by_cluster(z_view, &plans, &labels, &mut start_coords)
+        let plan_kinds: Vec<SaeAtomBasisKind> =
+            plans.iter().map(|plan| plan.kind.clone()).collect();
+        sae_refine_periodic_seed_coords_by_cluster(z_view, &plan_kinds, &labels, &mut start_coords)
             .map_err(py_value_error)?;
     }
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =

@@ -18,14 +18,13 @@ use crate::inference::steering::{SteerPlan, steer_delta};
 
 use super::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho,
-    SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator, TorusHarmonicEvaluator,
-    resolve_learnable_weight, sae_pca_seed_initial_coords,
+    MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SAE_OOS_PROJECTION_GRID_RESOLUTION,
+    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldAtom,
+    SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator,
+    TorusHarmonicEvaluator, resolve_learnable_weight, sae_pca_seed_initial_coords,
 };
 
 const SAE_MAX_PERIODIC_HARMONICS: usize = 4096;
-const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 const SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE: usize = 3;
 const SAE_ACTIVE_ASSIGNMENT_MASS: f64 = 1.0e-8;
 
