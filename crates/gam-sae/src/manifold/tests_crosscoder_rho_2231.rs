@@ -302,31 +302,31 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
     // gradient is `½·R̃_1 − scale`, so `scale` is the natural absolute reference.
     let scale = 0.5 * n as f64 * p_1 as f64;
     let h = 0.1_f64;
-    // Probe within the criterion's EVALUABLE region. At closed_form − 2 the
-    // λ-scaled block is ~7.4× under-weighted and the inner solve at this
-    // fixture genuinely cannot certify within any lane's budget — the eval
-    // pair there is the self-consistent (wall, zero-gradient) refusal, which
-    // an FD spanning the wall boundary misreads as a desync. ±0.75 keeps three
-    // well-separated evaluable points; the gate's discriminating power is
-    // unchanged (a dropped ½, sign flip, or missing n·p/2 still moves the
-    // analytic value by Θ(n·p), orders above the window).
+    // ONE objective, warm continuation — the engine's ACTUAL calling
+    // convention: eval/eval_cost during a search always run on a warm object
+    // (probe handoffs / inner warm starts from the preceding evaluation), and
+    // a COLD off-optimum eval on this fixture legitimately refuses (the inner
+    // solve cannot certify from scratch within any lane's budget; the
+    // (wall, 0) pair is the steering convention, not a gradient). Probing a
+    // fresh object per point measured the cold-refusal wall, not the
+    // (f, ∇f) consistency this gate exists to pin.
+    let mut obj = engaged_objective(&evaluator, &z, &coords);
+    // Warm the object at the template origin first (the seed always converges).
+    obj.eval_cost(&rho_template.to_flat())
+        .expect("the seed evaluation must converge");
     for &ll in &[closed_form - 0.75, 0.0, closed_form + 0.75] {
-        let analytic = {
-            let mut obj = engaged_objective(&evaluator, &z, &coords);
-            let eval = obj
-                .eval(&flat_at(ll))
-                .expect("the ValueAndGradient lane must evaluate");
-            assert!(
-                eval.cost < 1.0e11,
-                "FD probe point ll={ll:.3} must be evaluable (got the refusal wall) — \
-                 move the probe inside the evaluable region"
-            );
-            eval.gradient[eval.gradient.len() - 1]
-        };
-        let c_plus = engaged_objective(&evaluator, &z, &coords)
+        let eval = obj
+            .eval(&flat_at(ll))
+            .expect("the ValueAndGradient lane must evaluate");
+        assert!(
+            eval.cost < 1.0e11,
+            "warm FD probe at ll={ll:.3} must be evaluable (got the refusal wall)"
+        );
+        let analytic = eval.gradient[eval.gradient.len() - 1];
+        let c_plus = obj
             .eval_cost(&flat_at(ll + h))
             .expect("cost at log λ_1 + h must evaluate");
-        let c_minus = engaged_objective(&evaluator, &z, &coords)
+        let c_minus = obj
             .eval_cost(&flat_at(ll - h))
             .expect("cost at log λ_1 − h must evaluate");
         let fd = (c_plus - c_minus) / (2.0 * h);
