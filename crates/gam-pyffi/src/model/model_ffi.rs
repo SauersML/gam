@@ -4142,7 +4142,7 @@ fn stacking_weights_from_log_density(
         table.view(),
         gam::solver::evidence::StackingConfig::default(),
     )
-    .map_err(py_value_error)?;
+    .map_err(|err| py_value_error(err.to_string()))?;
     let weights_by_name: serde_json::Map<String, serde_json::Value> = names
         .iter()
         .zip(solved.weights.iter())
@@ -4150,7 +4150,7 @@ fn stacking_weights_from_log_density(
         .collect();
     let out = serde_json::json!({
         "weights": weights_by_name,
-        "mean_log_score": solved.mean_log_score,
+        "mean_log_score": solved.mean_log_score(),
         "iterations": solved.iterations,
     });
     serde_json::to_string(&out).map_err(|err| {
@@ -4210,7 +4210,7 @@ fn stack_topologies_gaussian(
         .collect();
     let out = serde_json::json!({
         "weights": weights_by_name,
-        "mean_log_score": solved.mean_log_score,
+        "mean_log_score": solved.mean_log_score(),
         "iterations": solved.iterations,
     });
     serde_json::to_string(&out)

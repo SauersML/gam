@@ -935,8 +935,7 @@ fn fit_multinomial_formula_pyfunc<'py>(
     let dataset = rows.dataset.clone();
     let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
         let fit_config = gam::config_resolve::parse_fit_config_json(config_json.as_deref())
-            .map_err(py_value_error)?
-            .fit_config;
+            .map_err(py_value_error)?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343).
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
