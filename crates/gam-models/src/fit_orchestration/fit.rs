@@ -72,7 +72,7 @@ fn survival_pirls_status_is_certified(status: gam_solve::pirls::PirlsStatus) -> 
 fn require_certified_survival_pirls(
     summary: &gam_solve::pirls::WorkingModelPirlsResult,
     context: &str,
-    rho_checkpoint: &[f64],
+    parameter_checkpoint: &[f64],
     durable_checkpoint_key: Option<&str>,
 ) -> Result<(), String> {
     if survival_pirls_status_is_certified(summary.status) {
@@ -82,7 +82,7 @@ fn require_certified_survival_pirls(
         "{context} did not produce a strict PIRLS convergence certificate \
          (status={:?}, iterations={}, projected_gradient_norm={:.6e}, \
          deviance={:.6e}, min_penalized_deviance={:.6e}, last_step_size={:.6e}, \
-         last_step_halving={}, rho_checkpoint={rho_checkpoint:?}{}). The accepted \
+         last_step_halving={}, parameter_checkpoint={parameter_checkpoint:?}{}). The accepted \
          iterate is checkpoint evidence only; no fit was minted.",
         summary.status,
         summary.iterations,
@@ -95,6 +95,47 @@ fn require_certified_survival_pirls(
             .map(|key| format!(", durable_checkpoint_key={key}"))
             .unwrap_or_default(),
     ))
+}
+
+/// Encode a nonlinear baseline candidate in the exact coordinates consumed by
+/// its outer optimizer, so non-convergence evidence can be passed back as a
+/// directly resumable checkpoint rather than as raw distribution parameters.
+fn survival_baseline_parameter_checkpoint(
+    config: &crate::survival::construction::SurvivalBaselineConfig,
+) -> Result<Vec<f64>, String> {
+    let required = |name: &str, value: Option<f64>| {
+        value
+            .filter(|candidate| candidate.is_finite())
+            .ok_or_else(|| format!("survival baseline checkpoint is missing finite {name}"))
+    };
+    let positive_log = |name: &str, value: Option<f64>| {
+        let value = required(name, value)?;
+        if value > 0.0 {
+            Ok(value.ln())
+        } else {
+            Err(format!(
+                "survival baseline checkpoint requires positive {name}, got {value}"
+            ))
+        }
+    };
+
+    use crate::survival::construction::SurvivalBaselineTarget;
+    match config.target {
+        SurvivalBaselineTarget::Linear => Ok(Vec::new()),
+        SurvivalBaselineTarget::Weibull => Ok(vec![
+            positive_log("Weibull scale", config.scale)?,
+            positive_log("Weibull shape", config.shape)?,
+        ]),
+        SurvivalBaselineTarget::Gompertz => Ok(vec![
+            positive_log("Gompertz rate", config.rate)?,
+            required("Gompertz shape", config.shape)?,
+        ]),
+        SurvivalBaselineTarget::GompertzMakeham => Ok(vec![
+            positive_log("Gompertz-Makeham rate", config.rate)?,
+            required("Gompertz-Makeham shape", config.shape)?,
+            positive_log("Gompertz-Makeham makeham", config.makeham)?,
+        ]),
+    }
 }
 
 impl SurvivalLocationScaleProfile {
@@ -200,16 +241,16 @@ fn standard_status_is_certified(
     outer_converged: bool,
     pirls_status: gam_solve::pirls::PirlsStatus,
 ) -> bool {
-    outer_converged
-        && matches!(
-            pirls_status,
-            gam_solve::pirls::PirlsStatus::Converged
-                | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-        )
+    outer_converged && pirls_status.is_converged()
 }
 
 fn standard_fit_is_certified(fit: &UnifiedFitResult) -> bool {
     standard_status_is_certified(fit.outer_converged, fit.pirls_status)
+        && fit
+            .artifacts
+            .criterion_certificate
+            .as_ref()
+            .is_none_or(|certificate| certificate.certifies())
 }
 
 /// Defensive conversion for legacy drivers that still return `Ok` with an
@@ -282,22 +323,23 @@ fn certified_retry_or_original<T, E>(original: E, retry: Result<T, E>) -> Result
 
 #[cfg(test)]
 mod standard_convergence_gate_tests {
-    use super::{certified_retry_or_original, firth_can_rescue, standard_status_is_certified};
+    use super::{
+        certified_retry_or_original, firth_can_rescue, standard_status_is_certified,
+        survival_baseline_parameter_checkpoint, survival_pirls_status_is_certified,
+    };
+    use crate::survival::construction::{SurvivalBaselineConfig, SurvivalBaselineTarget};
     use gam_solve::estimate::EstimationError;
     use gam_solve::pirls::PirlsStatus;
 
     #[test]
     fn standard_gate_requires_outer_and_inner_certificates() {
         assert!(standard_status_is_certified(true, PirlsStatus::Converged));
-        assert!(standard_status_is_certified(
-            true,
-            PirlsStatus::StalledAtValidMinimum
-        ));
         assert!(!standard_status_is_certified(
             false,
             PirlsStatus::Converged
         ));
         for status in [
+            PirlsStatus::StalledAtValidMinimum,
             PirlsStatus::MaxIterationsReached,
             PirlsStatus::LmStepSearchExhausted,
             PirlsStatus::Unstable,
@@ -314,6 +356,32 @@ mod standard_convergence_gate_tests {
             certified_retry_or_original("base evidence", Ok::<_, &str>(7)),
             Ok(7)
         );
+    }
+
+    #[test]
+    fn survival_gate_rejects_every_exhausted_or_stalled_status() {
+        assert!(survival_pirls_status_is_certified(PirlsStatus::Converged));
+        for status in [
+            PirlsStatus::StalledAtValidMinimum,
+            PirlsStatus::MaxIterationsReached,
+            PirlsStatus::LmStepSearchExhausted,
+            PirlsStatus::Unstable,
+        ] {
+            assert!(!survival_pirls_status_is_certified(status));
+        }
+    }
+
+    #[test]
+    fn survival_baseline_checkpoint_matches_outer_coordinates() {
+        let checkpoint = survival_baseline_parameter_checkpoint(&SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(-0.25),
+            rate: Some(2.0),
+            makeham: Some(4.0),
+        })
+        .expect("valid baseline checkpoint");
+        assert_eq!(checkpoint, vec![2.0_f64.ln(), -0.25, 4.0_f64.ln()]);
     }
 
     #[test]
@@ -1485,12 +1553,7 @@ fn optimize_survival_transformation_smoothing(
             gam_problem::Coefficients::new(beta0.clone()),
             &opts,
             |_| {},
-        )
-        .map_err(|error| {
-            gam_solve::estimate::EstimationError::InvalidInput(format!(
-                "survival smoothing PIRLS failed: {error}"
-            ))
-        })?;
+        )?;
         // The envelope gradient exists only at a certified beta optimum. A
         // finite exhausted state is a checkpoint, not a derivative-bearing
         // objective sample; return typed inner non-convergence so the generic
@@ -1579,14 +1642,9 @@ fn optimize_survival_transformation_smoothing(
         format!("survival transformation smoothing-parameter selection (dim={num_smoothing})");
     let mut obj = problem.build_objective(
         (),
+        |_: &mut (), rho: &Array1<f64>| eval_at(rho).map(|(c, _)| c),
         |_: &mut (), rho: &Array1<f64>| {
-            eval_at(rho)
-                .map(|(c, _)| c)
-                .map_err(gam_solve::estimate::EstimationError::InvalidInput)
-        },
-        |_: &mut (), rho: &Array1<f64>| {
-            let (cost, gradient) =
-                eval_at(rho).map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
+            let (cost, gradient) = eval_at(rho)?;
             Ok(OuterEval {
                 cost,
                 gradient,
@@ -1602,35 +1660,32 @@ fn optimize_survival_transformation_smoothing(
             ) -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
         >,
     );
-    // The outer selector only ever IMPROVES on the seed; it must never be able
-    // to fail the whole fit, because the CLI fits the IDENTICAL model at the
-    // seed λ with no outer loop and recovers the truth (gam#1123, "one engine").
-    // Per-trial bad smoothing values are already routed to a high finite cost in
-    // `eval_at`, so the only way `run` can still return Err is a pathological
-    // outer-optimizer state with no usable iterate. In that case fall back to the
-    // seed λ (a known-good, CLI-equivalent fit) rather than aborting — the
-    // selector is an enhancement, not a precondition for a valid model.
-    let result = match problem.run(&mut obj, &context) {
-        Ok(result) => result,
-        Err(err) => {
-            log::warn!(
-                "[#1123] survival transformation smoothing selector did not produce a usable ρ \
-                 ({err}); falling back to the seed λ (the CLI fits this same model at the seed and \
-                 recovers the truth)"
-            );
-            return Ok(Some(seed_lambdas));
-        }
-    };
-    // If the outer loop does not certify convergence (rare flat-LAML plateau),
-    // fall back to the best ρ it reached rather than failing — the seed is
-    // already a valid model.
+    // `OuterProblem::run` returns `Ok` only after its analytic projected-KKT
+    // certificate accepts the selected rho. Exhaustion is
+    // `EstimationError::RemlDidNotConverge`, whose rho checkpoint is preserved
+    // in the error; a seed or best-so-far smoothing value is never promoted to
+    // an estimator merely because a fixed-lambda inner solve was finite.
+    let result = problem.run(&mut obj, &context).map_err(|error| error.to_string())?;
     let selected_rho = result.rho;
+    if selected_rho.len() != num_smoothing {
+        return Err(format!(
+            "survival transformation smoothing selector returned {} coordinates for \
+             {num_smoothing} smoothing parameters; selected-rho checkpoint={:?}",
+            selected_rho.len(),
+            selected_rho.to_vec(),
+        ));
+    }
     let mut lambdas = seed_lambdas;
-    for k in 0..num_smoothing.min(selected_rho.len()) {
+    for k in 0..num_smoothing {
         let lam = selected_rho[k].exp();
-        if lam.is_finite() && lam > 0.0 {
-            lambdas[k] = lam;
+        if !(lam.is_finite() && lam > 0.0) {
+            return Err(format!(
+                "survival transformation smoothing selector produced invalid lambda[{k}]={lam} \
+                 from selected-rho checkpoint={:?}",
+                selected_rho.to_vec(),
+            ));
         }
+        lambdas[k] = lam;
     }
     Ok(Some(lambdas))
 }
@@ -1643,23 +1698,13 @@ fn survival_unified_fit_result(
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<UnifiedFitResult, String> {
     let log_lambdas = lambdas.mapv(|v| v.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln());
+    require_certified_survival_pirls(
+        summary,
+        "survival transformation fit assembly",
+        log_lambdas.as_slice().unwrap_or(&[]),
+        None,
+    )?;
     let reml_score = state.penalized_objective();
-    // #1426-class honesty: report `outer_converged` from the REAL inner PIRLS
-    // verdict, not a hardcoded `true`. The caller (#1123) deliberately accepts a
-    // FINITE-but-non-converged inner solve at the selected λ rather than aborting
-    // the fit — so a `MaxIterationsReached` / `LmStepSearchExhausted` / `Unstable`
-    // optimum can legitimately reach here. Shipping it as `outer_converged = true`
-    // while carrying a real (possibly large) `outer_gradient_norm` is exactly the
-    // silent-non-convergence mislabelling #1426 cured for the REML path. Only the
-    // genuine stationary verdicts — `Converged` and `StalledAtValidMinimum` (the
-    // gradient and Hessian indicate a valid minimum) — count as converged; every
-    // other accepted status is reported honestly as non-converged with its
-    // residual `outer_gradient_norm`.
-    let outer_converged = matches!(
-        summary.status,
-        gam_solve::pirls::PirlsStatus::Converged
-            | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-    );
     gam_solve::estimate::validate_all_finite("survival fit beta", beta.iter().copied())?;
     gam_solve::estimate::validate_all_finite("survival fit lambdas", lambdas.iter().copied())?;
     gam_solve::estimate::ensure_finite_scalar("survival fit log_likelihood", state.log_likelihood)?;
@@ -1721,7 +1766,7 @@ fn survival_unified_fit_result(
         penalized_objective: reml_score,
         used_device: false,
         outer_iterations: summary.iterations,
-        outer_converged,
+        outer_converged: true,
         outer_gradient_norm: Some(summary.lastgradient_norm),
         standard_deviation: 1.0,
         covariance_conditional: None,
@@ -2254,12 +2299,12 @@ fn store_survival_transformation_persistent_warm_start(
     rho: Vec<f64>,
     beta: &Array1<f64>,
     summary: &gam_solve::pirls::WorkingModelPirlsResult,
-) {
+) -> bool {
     if beta.len() != n_cols
         || beta.iter().any(|value| !value.is_finite())
         || rho.iter().any(|value| !value.is_finite())
     {
-        return;
+        return false;
     }
     let mut record = gam_solve::persistent_warm_start::PersistentWarmStartRecord::new(
         key.to_string(),
@@ -2269,21 +2314,28 @@ fn store_survival_transformation_persistent_warm_start(
     record.rho = rho;
     record.beta = beta.to_vec();
     record.last_inner_iters = summary.iterations;
-    record.last_inner_converged = matches!(
-        summary.status,
-        gam_solve::pirls::PirlsStatus::Converged
-            | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
-    );
+    record.last_inner_converged = summary.status.is_converged();
     record.last_pirls_lm_lambda = (summary.final_lm_lambda.is_finite()
         && summary.final_lm_lambda > 0.0)
         .then_some(summary.final_lm_lambda);
     record.last_pirls_accept_rho = summary
         .final_accept_rho
         .filter(|value| value.is_finite() && *value >= 0.0);
-    if let Err(err) = gam_solve::persistent_warm_start::store_record(&record) {
-        log::warn!(
-            "[warm-start-cache] failed to persist survival transformation warm start: {err}"
-        );
+    match gam_solve::persistent_warm_start::store_record(&record) {
+        Ok(()) => gam_solve::persistent_warm_start::load_record(&record.key).is_some_and(
+            |stored| {
+                stored.rho == record.rho
+                    && stored.beta == record.beta
+                    && stored.last_inner_iters == record.last_inner_iters
+                    && stored.last_inner_converged == record.last_inner_converged
+            },
+        ),
+        Err(err) => {
+            log::warn!(
+                "[warm-start-cache] failed to persist survival transformation warm start: {err}"
+            );
+            false
+        }
     }
 }
 
@@ -2534,13 +2586,25 @@ pub(crate) fn fit_survival_transformation_model(
                     initial_lm_lambda: None,
                     arrow_schur: None,
                 };
+                let parameter_checkpoint = survival_baseline_parameter_checkpoint(candidate)?;
                 let summary = gam_solve::pirls::runworking_model_pirls(
                     &mut model,
                     gam_problem::Coefficients::new(beta0),
                     &opts,
                     |_| {},
                 )
-                .map_err(|err| format!("survival PIRLS failed: {err}"))?;
+                .map_err(|error| {
+                    format!(
+                        "survival baseline PIRLS failed at parameter_checkpoint=\
+                         {parameter_checkpoint:?}: {error}; no fit was minted"
+                    )
+                })?;
+                require_certified_survival_pirls(
+                    &summary,
+                    "survival transformation baseline profile",
+                    &parameter_checkpoint,
+                    None,
+                )?;
                 let beta = summary.beta.as_ref().to_owned();
                 let state = model.update_state(&beta).map_err(|err| {
                     format!("failed to evaluate survival baseline candidate: {err}")
@@ -2637,6 +2701,7 @@ pub(crate) fn fit_survival_transformation_model(
         arrow_schur: None,
     };
     let rho_for_cache = survival_transformation_log_lambdas(&penalty_blocks);
+    let expected_beta_len = beta0.len();
     let persistent_warm_start_key = persistent_survival_transformation_key(
         &spec,
         &baseline_cfg,
@@ -2644,13 +2709,13 @@ pub(crate) fn fit_survival_transformation_model(
         &prepared,
         &penalty_blocks,
         &opts,
-        beta0.len(),
+        expected_beta_len,
     );
     let mut opts = opts;
     let beta_start = match load_survival_transformation_persistent_warm_start(
         &persistent_warm_start_key,
         &spec,
-        beta0.len(),
+        expected_beta_len,
         &rho_for_cache,
     ) {
         Some((beta, lm_lambda)) => {
@@ -2665,58 +2730,31 @@ pub(crate) fn fit_survival_transformation_model(
         &opts,
         |_| {},
     )
-    .map_err(|err| format!("survival PIRLS failed: {err}"))?;
-    match summary.status {
-        gam_solve::pirls::PirlsStatus::Converged
-        | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum => {}
-        ref other => {
-            // Non-fatal inner non-convergence at the selected λ (gam#1123). A
-            // `MaxIterationsReached` here used to abort the whole fit — discarding
-            // the converged seed-λ fit that demonstrably exists (the CLI saves it).
-            // An inner solve that exhausts its budget but lands at a FINITE β with a
-            // finite deviance/gradient is a usable (if imperfect) optimum: the
-            // downstream `survival_unified_fit_result` already validates every
-            // finite-ness contract and will reject a genuinely degenerate result. A
-            // transient inner non-convergence during outer selection must not throw
-            // the model away — the CLI tolerates exactly this and finishes. Accept a
-            // finite non-converged result with a warning; only a NON-FINITE result
-            // (β / deviance / gradient norm not finite) remains fatal, since nothing
-            // usable can be built from it.
-            let beta_finite = summary.beta.as_ref().iter().all(|v| v.is_finite());
-            let result_finite = beta_finite
-                && summary.state.deviance.is_finite()
-                && summary.lastgradient_norm.is_finite();
-            if result_finite {
-                log::warn!(
-                    "[#1123] survival transformation inner PIRLS at the selected λ did not reach the \
-                     convergence tolerance (status={other:?}, grad_norm={:.3e}, iterations={}, \
-                     deviance={:.6e}), but landed at a finite optimum; accepting it rather than \
-                     aborting the fit (the outer smoothing selector already steers away from \
-                     un-fittable λ, and a finite optimum is a usable model).",
-                    summary.lastgradient_norm,
-                    summary.iterations,
-                    summary.state.deviance,
-                );
-            } else {
-                return Err(WorkflowError::IntegrationFailed {
-                    reason: format!(
-                        "survival PIRLS did not converge to a finite optimum: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}",
-                        summary.lastgradient_norm, summary.iterations, summary.state.deviance
-                    ),
-                }
-                .into());
-            }
-        }
-    }
+    .map_err(|error| {
+        format!(
+            "survival transformation final fixed-lambda PIRLS failed at \
+             parameter_checkpoint={rho_for_cache:?} (warm_start_key=\
+             {persistent_warm_start_key}): {error}; no fit was minted"
+        )
+    })?;
     let beta = summary.beta.as_ref().to_owned();
-    store_survival_transformation_persistent_warm_start(
+    // Persist every finite accepted iterate before enforcing the certificate:
+    // an exhausted solve is resumable work, but it is never a fit. The record's
+    // `last_inner_converged` bit distinguishes a final mode from a checkpoint.
+    let checkpoint_persisted = store_survival_transformation_persistent_warm_start(
         &persistent_warm_start_key,
         &spec,
-        beta.len(),
-        rho_for_cache,
+        expected_beta_len,
+        rho_for_cache.clone(),
         &beta,
         &summary,
     );
+    require_certified_survival_pirls(
+        &summary,
+        "survival transformation final fixed-lambda PIRLS",
+        &rho_for_cache,
+        checkpoint_persisted.then_some(persistent_warm_start_key.as_str()),
+    )?;
     let state = model
         .update_state(&beta)
         .map_err(|err| format!("failed to evaluate survival optimum: {err}"))?;
