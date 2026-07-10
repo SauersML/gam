@@ -133,6 +133,7 @@ pub fn resolve_fit_request_config(
 ) -> Result<FitConfig, String> {
     let mut fit_config = FitConfig::default();
     fit_config.group_metadata = json_config.group_metadata.and_then(nonempty_group_metadata);
+    fit_config.training_table_kind = json_config.training_table_kind;
     fit_config.penalty_block_gamma_priors =
         parse_precision_hyperpriors(json_config.precision_hyperpriors)?;
     let latent_coordinates = json_config

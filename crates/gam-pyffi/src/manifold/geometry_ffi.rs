@@ -7294,6 +7294,7 @@ fn fit_dataset_impl(
             None,
         )?;
         payload.group_metadata = fit_config.group_metadata.clone();
+        payload.training_table_kind = fit_config.training_table_kind.clone();
         // The LAWS driver materializes its inner Gaussian design itself; there are
         // no outer materialize advisories to carry (matches `fit_from_formula`).
         payload.inference_notes = Vec::new();
@@ -7396,6 +7397,7 @@ fn fit_dataset_impl(
                             dataset.feature_ranges(),
                         );
                     scan_payload.group_metadata = fit_config.group_metadata.clone();
+                    scan_payload.training_table_kind = fit_config.training_table_kind.clone();
                     scan_payload.inference_notes = inference_notes;
                     let model = FittedModel::from_payload(scan_payload);
                     return serde_json::to_vec(&model).map_err(|err| {
@@ -7458,6 +7460,7 @@ fn fit_dataset_impl(
                             }
                         })?;
                     cascade_payload.group_metadata = fit_config.group_metadata.clone();
+                    cascade_payload.training_table_kind = fit_config.training_table_kind.clone();
                     cascade_payload.inference_notes = inference_notes;
                     let model = FittedModel::from_payload(cascade_payload);
                     return serde_json::to_vec(&model).map_err(|err| {
@@ -7666,6 +7669,7 @@ fn fit_dataset_impl(
         }
     };
     payload.group_metadata = fit_config.group_metadata.clone();
+    payload.training_table_kind = fit_config.training_table_kind.clone();
     payload.inference_notes = inference_notes;
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec(&model).map_err(|err| {
