@@ -20,8 +20,8 @@
 //! # What is banked
 //!
 //! The checkpoint holds the *fittable* incumbent state — per-atom decoder
-//! coefficients, latent coordinates, log-amplitudes and the curvature-homotopy
-//! dial, plus the shared per-row assignment logits — the same mutable state
+//! coefficients, latent coordinates, and the curvature-homotopy dial, plus the
+//! shared per-row assignment logits — the same mutable state
 //! [`crate::manifold::term::SaeManifoldMutableState`] captures for the in-fit
 //! keep-best (`best_fit_incumbent`). The transient basis matrices
 //! (`basis_values`, `basis_jacobian`, second-jet caches, the intrinsic roughness
@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 
 /// On-disk schema tag. Hand-bumped only on a layout-breaking change (see module
 /// docs); [`SaeFitCheckpoint::verify_compatible`] rejects any other value.
-pub(crate) const SAE_FIT_CHECKPOINT_SCHEMA: &str = "gam-sae.fit-checkpoint/v1";
+pub(crate) const SAE_FIT_CHECKPOINT_SCHEMA: &str = "gam-sae.fit-checkpoint/v2";
 
 /// Data fingerprint: a checkpoint is only ever resumed against the identical
 /// fitting problem. Equality of every field (including the SHA-256 content hash
