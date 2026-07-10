@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         learning_rate: 1.0,
         ridge_ext_coord: 1.0e-6,
         ridge_beta: 1.0e-6,
-        assignment_kind: assignment_kind.tag().to_string(),
+        assignment_kind,
         alpha: 1.0,
         top_k: None,
         isometry_pin_active,

@@ -2440,7 +2440,7 @@ fn sae_manifold_fit_inner<'py>(
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
-        assignment_kind: assignment_kind.clone(),
+        assignment_kind: assignment,
         alpha,
         top_k,
         isometry_pin_active,

@@ -325,7 +325,7 @@ pub struct SaeFitRequest {
     pub learning_rate: f64,
     pub ridge_ext_coord: f64,
     pub ridge_beta: f64,
-    pub assignment_kind: String,
+    pub assignment_kind: SaeFitAssignmentKind,
     pub alpha: f64,
     pub top_k: Option<usize>,
     pub isometry_pin_active: bool,
@@ -915,7 +915,7 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
     if let Some(k_top) = top_k {
         if k_top < k_atoms {
             let n_obs_local = z.nrows();
-            let renormalise = assignment_kind == "softmax";
+            let renormalise = assignment_kind == SaeFitAssignmentKind::Softmax;
             for row in 0..n_obs_local {
                 // Collect (value, atom_idx) pairs; pick the indices of the
                 // largest k_top values via an O(K) partial selection. The
