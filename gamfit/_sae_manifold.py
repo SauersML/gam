@@ -1582,9 +1582,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         nursery dwell — are promoted (born) into the primary atom tier; the
         alternation self-extends its pass budget (hard-capped natively at
         ``STRUCTURED_RESIDUAL_PASSES_MAX``) only while certified lineages are
-        live, so structureless data pays no extra passes. ``False`` pins the
-        historical whitening-without-growth path. Only meaningful when
-        ``structured_residual_passes > 0``. Coerced to ``bool``.
+        live, so structureless data pays no extra passes. ``False`` keeps
+        whitening while disabling evidence-certified atom birth. Coerced to
+        ``bool``.
     score_mode
         Sparse front-door routing residency for the collapsed sparse-code lane.
         ``"auto"`` (default) uses CUDA only when admitted and otherwise runs the
@@ -2276,10 +2276,8 @@ class StagewiseSAE:
     training_data: np.ndarray
     #: #1939 — the resolved cone-atom RECOVERY opt-in the fit actually ran with
     #: (echoed from the FFI). Lets a harness verify the kwarg engaged rather than
-    #: assuming; default false keeps older constructors valid.
+    #: assuming which recovery policy ran.
     cone_atom_recovery_used: bool = False
-    #: #5/(B) — echoed rank-charge opt-in (the value the fit ran with), so red-tree's
-    #: A/B harness can verify the flag engaged; default false keeps older payloads valid.
 
     @property
     def k(self) -> int:

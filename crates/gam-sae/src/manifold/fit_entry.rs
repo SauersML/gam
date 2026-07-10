@@ -51,8 +51,7 @@ use super::{
     SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty, SaeTrustDiagnostics,
 };
 
-/// Hard cap on the number of #2021 whitened-residual refit passes, mirrored from
-/// the binding's historical `STRUCTURED_RESIDUAL_PASSES_MAX`.
+/// Hard cap on evidence-certified #2021 whitened-residual refit passes.
 pub const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 /// Canonical structured-residual alternation budget. The iid-only A/B mode was
 /// removed; every production fit starts with this evidence-refined budget.
@@ -462,8 +461,8 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
 
     // #2021 (EXPERIMENT) — structured-residual OUTER ALTERNATION.
     // Pass 0 above is the iid fit (unchanged, bit-for-bit). When the caller's
-    // `structured_residual_passes > 0` AND no explicit metric was installed at
-    // pass 0 (a WP-D `OutputFisher` gauge lives in the SAME single metric slot
+    // Run the canonical structured pass budget when no explicit metric was
+    // installed at pass 0 (a WP-D `OutputFisher` gauge lives in the SAME slot
     // and must not be clobbered), run N extra passes: fit the whitened
     // residual-covariance model on the current fitted residuals, materialize the
     // Σ-DAMPED per-row metric, install it — `loss_scaled` and
