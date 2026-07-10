@@ -837,6 +837,31 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             _ => None,
         };
 
+    // Admission before allocation: the ρ-penalty cache densifies every block
+    // penalty and holds them for the whole outer optimization, so its
+    // aggregate footprint is charged on the process-wide ledger up front and
+    // stays reserved for exactly the cache's lifetime (the `Governed` wrapper
+    // couples the reservation to the Vec). A refusal is typed evidence the
+    // joint budget cannot fit this dense cache right now.
+    let rho_penalty_cache_bytes: usize = penalty_counts
+        .iter()
+        .enumerate()
+        .flat_map(|(block_idx, &count)| {
+            (0..count).map(move |penalty_idx| (block_idx, penalty_idx))
+        })
+        .map(|(block_idx, penalty_idx)| {
+            let (nrows, ncols) = specs_arc[block_idx].penalties[penalty_idx].shape();
+            nrows
+                .saturating_mul(ncols)
+                .saturating_mul(std::mem::size_of::<f64>())
+        })
+        .fold(0usize, usize::saturating_add);
+    let rho_penalty_reservation = gam_runtime::resource::MemoryGovernor::global()
+        .try_reserve(
+            rho_penalty_cache_bytes,
+            "custom_family::psi_hyper::rho_penalty_cache",
+        )
+        .map_err(|err| format!("rho-penalty dense cache refused by memory governor: {err}"))?;
     let mut rho_penalty_cache: Vec<RhoPenaltyCacheEntry> = Vec::new();
     for (block_idx, &count) in penalty_counts.iter().enumerate() {
         let (start, end) = ranges_arc[block_idx];
@@ -851,7 +876,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             });
         }
     }
-    let rho_penalty_cache = Arc::new(rho_penalty_cache);
+    let rho_penalty_cache = Arc::new(rho_penalty_reservation.bind(rho_penalty_cache));
 
     // ψ-ψ pair callback
     let ext_ext = {

@@ -6080,7 +6080,7 @@ impl<'a> RemlState<'a> {
             .read()
             .unwrap()
             .as_ref()
-            .map(Arc::clone)
+            .map(|governed| Arc::clone(governed.as_ref()))
     }
 
     /// Install the conditioned-frame exact ψ-derivative pair
