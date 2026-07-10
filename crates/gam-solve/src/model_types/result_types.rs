@@ -638,7 +638,7 @@ impl OuterStationarityCertificate {
 /// finite-difference probes run in production (SPEC rule 2; derivative
 /// cross-checks live only in focused tests). The certificate answers,
 /// machine-checkably, the three questions every non-termination postmortem
-/// asks: is the KKT-projected gradient stationary HERE
+/// asks: does the KKT-projected analytic stationarity equation vanish HERE
 /// ([`Self::is_stationary`]); is the outer curvature admissible for a minimum
 /// HERE ([`Self::curvature_admissible`]); did any smoothing coordinate rail
 /// to a box bound (`lambdas_railed`). A failed certificate REJECTS the fit as
@@ -657,8 +657,8 @@ pub struct OuterCriterionCertificate {
 }
 
 impl OuterCriterionCertificate {
-    /// First-order (KKT) stationarity: the projected gradient norm clears the
-    /// score-relative stationarity bound.
+    /// First-order (KKT) stationarity: the projected analytic gradient or
+    /// root-equivalent fixed-point residual clears its declared bound.
     pub fn is_stationary(&self) -> bool {
         self.stationarity.projected_norm().is_finite()
             && self.stationarity.projected_norm() <= self.stationarity.bound()
@@ -1275,10 +1275,10 @@ impl FitConvergenceEvidence {
             outer_status,
             outer_iterations: parts.outer_iterations,
             final_value: parts.reml_score,
-            gradient_residual: certificate
+            stationarity_residual: certificate
                 .map(|value| value.stationarity.projected_norm())
                 .or(parts.outer_gradient_norm),
-            gradient_bound: certificate.map(|value| value.stationarity.bound()),
+            stationarity_bound: certificate.map(|value| value.stationarity.bound()),
             step_residual: None,
             step_bound: None,
             rho_checkpoint: parts.log_lambdas.to_vec(),

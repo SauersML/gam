@@ -440,8 +440,8 @@ pub enum EstimationError {
     #[error(
         "Fit assembly rejected a non-converged optimization state: inner status \
          {inner_status}, outer status {outer_status}, after {outer_iterations} outer \
-         iteration(s); final objective {final_value:.6e}; gradient residual \
-         {gradient_residual:?} against {gradient_bound:?}, step residual \
+         iteration(s); final objective {final_value:.6e}; stationarity residual \
+         {stationarity_residual:?} against {stationarity_bound:?}, step residual \
          {step_residual:?} against {step_bound:?}. The best rho checkpoint is \
          {rho_checkpoint:?} and the resume token is {resume_token:?}; no fitted-model \
          API was constructed."
@@ -457,10 +457,11 @@ pub enum EstimationError {
         outer_iterations: usize,
         /// Objective value at the best available checkpoint.
         final_value: f64,
-        /// Exact analytic first-order residual, when it was measured.
-        gradient_residual: Option<f64>,
+        /// Exact analytic first-order gradient or root-equivalent fixed-point
+        /// residual, when it was measured.
+        stationarity_residual: Option<f64>,
         /// Bound the first-order residual had to clear.
-        gradient_bound: Option<f64>,
+        stationarity_bound: Option<f64>,
         /// Final accepted-step residual, when the solver exported it.
         step_residual: Option<f64>,
         /// Bound the step residual had to clear.
