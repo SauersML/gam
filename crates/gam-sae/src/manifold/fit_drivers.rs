@@ -5465,7 +5465,7 @@ impl SaeManifoldTerm {
                 let predicted = directional_decrease * (alpha - 0.5 * alpha * alpha);
                 let rho = if predicted != 0.0 { actual / predicted } else { f64::NAN };
                 let overshoot = zz_full_obj - pre_step_total;
-                eprintln!(
+                log::debug!(
                     "[zz2015dir] it={outer_iteration} g={:.4e} dN={:.4e} a={alpha:.4e} gTd={directional_decrease:.4e} act={actual:.4e} pred={predicted:.4e} rho={rho:.4e} fullobj_minus_pre={overshoot:.4e}",
                     grad_norm_sq.sqrt(),
                     step_norm_sq.sqrt(),
