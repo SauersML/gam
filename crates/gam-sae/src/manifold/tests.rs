@@ -1595,11 +1595,15 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         .map(|value| value.to_bits())
         .collect();
 
-    let decoder_after_first = term.atoms[0].decoder_coefficients.clone();
+    // Keep the second call away from the first call's fixed point so the test
+    // exercises a second accepted step instead of merely reassembling a
+    // converged state. The perturbation stays inside the active output frame.
+    term.atoms[0].decoder_coefficients[[0, 0]] += 0.02;
+    let decoder_before_second = term.atoms[0].decoder_coefficients.clone();
     term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 0.05, 1.0e-3, 1.0e-3)
         .expect("second accepted nonlinear iteration");
     assert_ne!(
-        term.atoms[0].decoder_coefficients, decoder_after_first,
+        term.atoms[0].decoder_coefficients, decoder_before_second,
         "second production call must accept a state-changing step"
     );
     let second_row = term
