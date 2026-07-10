@@ -8,9 +8,9 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand::RngExt;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
 use std::f64::consts::PI;
 
 /// Direction of the claim statistic under the null.
@@ -519,7 +519,9 @@ pub fn residual_surrogate_from_moments(
     }
     for (idx, &value) in spec.mean.iter().enumerate() {
         if !value.is_finite() {
-            return Err(format!("residual surrogate mean[{idx}] is not finite: {value}"));
+            return Err(format!(
+                "residual surrogate mean[{idx}] is not finite: {value}"
+            ));
         }
     }
     validate_matrix(spec.covariance.view(), "residual surrogate covariance")?;
@@ -1019,7 +1021,9 @@ fn validate_spike_in_config(config: &SpikeInRocConfig) -> Result<(), String> {
     }
     for (idx, &snr) in config.snrs.iter().enumerate() {
         if !snr.is_finite() || snr < 0.0 {
-            return Err(format!("snr[{idx}] must be finite and non-negative, got {snr}"));
+            return Err(format!(
+                "snr[{idx}] must be finite and non-negative, got {snr}"
+            ));
         }
     }
     if config.fpr_levels.is_empty() {
@@ -1073,7 +1077,11 @@ fn circle_topology_audit_from_harmonic_stat(
     eigenvalues: &[f64],
 ) -> TopologyAuditReport {
     let expected = SpikeInShape::Circle.expected_betti();
-    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(f64::MIN_POSITIVE);
+    let leading = eigenvalues
+        .first()
+        .copied()
+        .unwrap_or(0.0)
+        .max(f64::MIN_POSITIVE);
     let second = eigenvalues.get(1).copied().unwrap_or(0.0).max(0.0);
     let tail = eigenvalues.get(2).copied().unwrap_or(0.0).max(0.0);
     let spectral_balance = second / leading;
@@ -1101,12 +1109,12 @@ fn topology_audit_from_spectrum(
 ) -> TopologyAuditReport {
     let rank = shape.signal_rank();
     let expected = shape.expected_betti();
-    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(f64::MIN_POSITIVE);
-    let rank_tail = eigenvalues
-        .get(rank)
+    let leading = eigenvalues
+        .first()
         .copied()
         .unwrap_or(0.0)
-        .max(0.0);
+        .max(f64::MIN_POSITIVE);
+    let rank_tail = eigenvalues.get(rank).copied().unwrap_or(0.0).max(0.0);
     let weakest_signal = eigenvalues
         .get(rank.saturating_sub(1))
         .copied()
@@ -1484,7 +1492,10 @@ mod tests {
         )
         .expect("structured null battery should run");
         assert!(
-            report.summaries.iter().all(|s| s.z > 2.0 && s.p_value <= 0.12),
+            report
+                .summaries
+                .iter()
+                .all(|s| s.z > 2.0 && s.p_value <= 0.12),
             "structured ordered circle should separate from nulls: {:?}",
             report.summaries
         );
@@ -1570,11 +1581,13 @@ mod tests {
     #[test]
     fn torus_spike_in_detection_reports_expected_betti_payload() {
         let noise = noise_fixture(128, 10, 4321);
-        let spiked =
-            inject_torus_spike(noise.view(), 2.0, 88).expect("torus injection should run");
+        let spiked = inject_torus_spike(noise.view(), 2.0, 88).expect("torus injection should run");
         let report = default_spike_in_detection_pipeline(spiked.view(), SpikeInShape::Torus)
             .expect("torus detector should run");
-        assert!(report.detected, "high-SNR torus should be detected: {report:?}");
+        assert!(
+            report.detected,
+            "high-SNR torus should be detected: {report:?}"
+        );
         assert_eq!(report.topology.measured_betti0, 1);
         assert_eq!(report.topology.measured_betti1, 2);
         assert_eq!(report.topology.measured_betti2, 1);

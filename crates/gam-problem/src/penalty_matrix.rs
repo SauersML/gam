@@ -62,10 +62,9 @@ impl PenaltyMatrix {
     pub fn shape(&self) -> (usize, usize) {
         match self {
             Self::Dense(m) => m.dim(),
-            Self::KroneckerFactored { left, right } => (
-                left.nrows() * right.nrows(),
-                left.ncols() * right.ncols(),
-            ),
+            Self::KroneckerFactored { left, right } => {
+                (left.nrows() * right.nrows(), left.ncols() * right.ncols())
+            }
             Self::Blockwise { total_dim, .. } => (*total_dim, *total_dim),
             Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => inner.shape(),
         }

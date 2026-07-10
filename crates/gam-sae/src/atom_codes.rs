@@ -294,13 +294,7 @@ impl SparseAtomCodes {
             n_b += usize::from(on_b);
             n_joint += usize::from(on_a && on_b);
         }
-        CoactivationStats::from_counts(
-            n_obs,
-            n_a,
-            n_b,
-            n_joint,
-            self.weight_codependence(a, b),
-        )
+        CoactivationStats::from_counts(n_obs, n_a, n_b, n_joint, self.weight_codependence(a, b))
     }
 
     /// All atom pairs that co-fire at least once, with their support and
@@ -600,9 +594,7 @@ fn kt_bernoulli_bits(values: impl IntoIterator<Item = bool>) -> f64 {
 
 /// Conditional KT code with a separate Bernoulli predictor in each binary
 /// parent context.
-fn kt_conditional_bernoulli_bits(
-    values: impl IntoIterator<Item = (bool, bool)>,
-) -> f64 {
+fn kt_conditional_bernoulli_bits(values: impl IntoIterator<Item = (bool, bool)>) -> f64 {
     let mut counts = [[0.5_f64, 0.5_f64], [0.5_f64, 0.5_f64]];
     let mut bits = 0.0;
     for (context, value) in values {

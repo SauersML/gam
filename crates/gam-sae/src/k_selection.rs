@@ -864,8 +864,7 @@ mod k_selection_tests {
         // An atom-count ratio would report a spurious win; the parameter ratio
         // shows the manifold spends MORE scalars and does NOT dominate.
         let manifold = curve_from_pairs(&[(1, 0.90), (2, 0.95)]).expect("manifold curve");
-        let linear =
-            curve_from_pairs(&[(2, 0.30), (5, 0.60), (10, 0.90)]).expect("linear curve");
+        let linear = curve_from_pairs(&[(2, 0.30), (5, 0.60), (10, 0.90)]).expect("linear curve");
         let adv = manifold_vs_linear_advantage(&manifold, &linear, 0.90, 100.0, 1.0);
         assert_eq!(adv.k_manifold, Some(1));
         assert_eq!(adv.k_linear, Some(10));

@@ -209,9 +209,7 @@ pub fn ilr_jet(values: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>)
 
 /// inverse-ILR value and per-row Jacobian
 /// `J[row,j,i] = p_j (V[j,i] − Σ_k p_k V[k,i])`.
-pub fn inverse_ilr_jet(
-    coords: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, Array3<f64>), String> {
+pub fn inverse_ilr_jet(coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
     let value = inverse_ilr(coords)?;
     let (n, dm1) = coords.dim();
     let d = dm1 + 1;
@@ -354,7 +352,9 @@ pub fn simplex_exp_map_jet(
             // Base must be strictly positive to take its log.
             for &value in base_comp.iter() {
                 if value <= 0.0 {
-                    return Err("simplex exp map require strictly positive simplex values".to_string());
+                    return Err(
+                        "simplex exp map require strictly positive simplex values".to_string()
+                    );
                 }
             }
             let mut log_base = Array1::<f64>::zeros(d);
@@ -500,7 +500,7 @@ pub fn sphere_exp_map_jet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     fn norm_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         let mut s = 0.0_f64;
@@ -628,7 +628,9 @@ mod tests {
         let z = array![[0.4_f64, -0.2, 0.7]];
         for reference in [-1_isize, 0, 1] {
             let (_, jac) = inverse_alr_jet(z.view(), reference).unwrap();
-            check_jac_fd(&z, &jac, |v| simplex::inverse_alr(v.view(), reference).unwrap());
+            check_jac_fd(&z, &jac, |v| {
+                simplex::inverse_alr(v.view(), reference).unwrap()
+            });
         }
     }
 
@@ -651,16 +653,15 @@ mod tests {
         let base = array![0.25_f64, 0.35, 0.15, 0.25];
         let tangent_full = array![[0.1_f64, -0.05, 0.02, -0.07]]; // CLR (d cols)
         let tangent_red = array![[0.1_f64, -0.05, 0.02]]; // ILR/ALR (d-1 cols)
-        let (_, jac) = simplex_exp_map_jet(tangent_full.view(), base.view(), LogRatioCoord::Clr, -1)
-            .unwrap();
+        let (_, jac) =
+            simplex_exp_map_jet(tangent_full.view(), base.view(), LogRatioCoord::Clr, -1).unwrap();
         check_jac_fd(&tangent_full, &jac, |v| {
             simplex_exp_map_jet(v.view(), base.view(), LogRatioCoord::Clr, -1)
                 .unwrap()
                 .0
         });
         for coord in [LogRatioCoord::Alr, LogRatioCoord::Ilr] {
-            let (_, jac) =
-                simplex_exp_map_jet(tangent_red.view(), base.view(), coord, -1).unwrap();
+            let (_, jac) = simplex_exp_map_jet(tangent_red.view(), base.view(), coord, -1).unwrap();
             check_jac_fd(&tangent_red, &jac, |v| {
                 simplex_exp_map_jet(v.view(), base.view(), coord, -1)
                     .unwrap()
@@ -705,11 +706,7 @@ mod tests {
     /// pins BOTH pre-migration Python surfaces. Tolerance 1e-12.
     #[test]
     fn pinned_python_twin_parity_fixtures() {
-        let x = array![
-            [0.2_f64, 0.5, 0.3],
-            [0.1, 0.1, 0.8],
-            [0.25, 0.4, 0.35]
-        ];
+        let x = array![[0.2_f64, 0.5, 0.3], [0.1, 0.1, 0.8], [0.25, 0.4, 0.35]];
         let base = array![0.25_f64, 0.35, 0.40];
         let w = array![0.2_f64, 0.3, 0.5];
         let z2 = array![[0.4_f64, -0.2], [0.1, 0.7], [-0.3, 0.05]];
@@ -723,9 +720,17 @@ mod tests {
         let sphere_values = array![[0.6_f64, 0.8, 0.0], [0.0, 0.6, 0.8], [1.0, 0.0, 0.0]];
 
         let expected_clr = array![
-            [-0.44058527999410635_f64, 0.47570545188004865, -0.035120171885942186],
+            [
+                -0.44058527999410635_f64,
+                0.47570545188004865,
+                -0.035120171885942186
+            ],
             [-0.6931471805599452, -0.6931471805599452, 1.3862943611198906],
-            [-0.2688252886223159, 0.20117834062341966, 0.06764694799889681]
+            [
+                -0.2688252886223159,
+                0.20117834062341966,
+                0.06764694799889681
+            ]
         ];
         let expected_ilr = array![
             [-0.6479153900465996_f64, 0.0430132503996988],
@@ -743,7 +748,11 @@ mod tests {
             [-0.3364722366212129, 0.13353139262452277]
         ];
         let expected_inv_alr = array![
-            [0.45062670595568977_f64, 0.24730917976320385, 0.3020641142811064],
+            [
+                0.45062670595568977_f64,
+                0.24730917976320385,
+                0.3020641142811064
+            ],
             [0.2683154674734019, 0.48890265771885366, 0.24278187480774446],
             [0.2653275510048439, 0.37651771737869627, 0.3581547316164598]
         ];
@@ -751,17 +760,28 @@ mod tests {
             [0.6666666666666667_f64, -0.3333333333333333],
             [-0.3333333333333333, 0.6666666666666667]
         ];
-        let expected_frechet =
-            array![0.20350911397742996_f64, 0.3091945687314347, 0.4872963172911353];
+        let expected_frechet = array![
+            0.20350911397742996_f64,
+            0.3091945687314347,
+            0.4872963172911353
+        ];
         let expected_log_ilr = array![
             [-0.4099935898507355_f64, 0.28940539131330195],
             [0.2379218001958641, -1.4514647681070623],
             [-0.09442095322608346, 0.163541888286661]
         ];
         let expected_log_clr = array![
-            [-0.1717599913717902_f64, 0.40805850388115206, -0.23629851250936162],
+            [
+                -0.1717599913717902_f64,
+                0.40805850388115206,
+                -0.23629851250936162
+            ],
             [-0.42432189193762904, -0.7607941285588418, 1.185116020496471],
-            [2.220446049250313e-16, 0.13353139262452307, -0.13353139262452263]
+            [
+                2.220446049250313e-16,
+                0.13353139262452307,
+                -0.13353139262452263
+            ]
         ];
         let expected_log_alr = array![
             [0.0645385211375713_f64, 0.6443570163905135],
@@ -769,17 +789,29 @@ mod tests {
             [0.13353139262452268, 0.2670627852490455]
         ];
         let expected_exp_ilr = array![
-            [0.29979044135614885_f64, 0.23838106660410166, 0.4618284920397494],
+            [
+                0.29979044135614885_f64,
+                0.23838106660410166,
+                0.4618284920397494
+            ],
             [0.351135641326721, 0.4267607158491462, 0.2221036428241327],
             [0.19998199702310523, 0.42793172119833767, 0.3720862817785571]
         ];
         let expected_exp_clr = array![
-            [0.2791639875514708_f64, 0.3363901391426469, 0.3844458733058823],
+            [
+                0.2791639875514708_f64,
+                0.3363901391426469,
+                0.3844458733058823
+            ],
             [0.30890688767827745, 0.3913147149244714, 0.29977839739725126],
             [0.25039144858679213, 0.36852100975062485, 0.381087541662583]
         ];
         let expected_exp_alr = array![
-            [0.35200752444440936_f64, 0.27046015557084196, 0.3775323199847487],
+            [
+                0.35200752444440936_f64,
+                0.27046015557084196,
+                0.3775323199847487
+            ],
             [0.20005176581886308, 0.5103253169698176, 0.2896229172113192],
             [0.19430799370114754, 0.38603063561098605, 0.4196613706878664]
         ];
@@ -789,9 +821,17 @@ mod tests {
             [1.5707963267948966, 0.0, 0.0]
         ];
         let expected_sphere_exp = array![
-            [0.04997167148294343_f64, -0.029983002889766058, 0.9983004816120811],
+            [
+                0.04997167148294343_f64,
+                -0.029983002889766058,
+                0.9983004816120811
+            ],
             [0.2876553231625218, 0.3835404308833624, 0.8775825618903728],
-            [-0.19833749504312567, 0.09916874752156284, 0.9751039932104795]
+            [
+                -0.19833749504312567,
+                0.09916874752156284,
+                0.9751039932104795
+            ]
         ];
 
         let tol = 1e-12_f64;
@@ -869,7 +909,10 @@ mod tests {
 
     #[test]
     fn parse_log_ratio_coord_maps_simplex_to_ilr() {
-        assert_eq!(parse_log_ratio_coord("simplex").unwrap(), LogRatioCoord::Ilr);
+        assert_eq!(
+            parse_log_ratio_coord("simplex").unwrap(),
+            LogRatioCoord::Ilr
+        );
         assert_eq!(parse_log_ratio_coord("ilr").unwrap(), LogRatioCoord::Ilr);
         assert_eq!(parse_log_ratio_coord("clr").unwrap(), LogRatioCoord::Clr);
         assert_eq!(parse_log_ratio_coord("ALR").unwrap(), LogRatioCoord::Alr);

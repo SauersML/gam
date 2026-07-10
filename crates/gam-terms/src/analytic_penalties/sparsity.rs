@@ -173,9 +173,7 @@ impl SoftmaxAssignmentSparsityPenalty {
     pub fn psd_majorizer_abs_row_sums(&self, row: &[f64], scale: f64) -> Vec<f64> {
         let a = self.softmax_row(row);
         let k = self.k_atoms;
-        let l: Vec<f64> = (0..k)
-            .map(|i| entropy_log_plus_one(a[i]))
-            .collect();
+        let l: Vec<f64> = (0..k).map(|i| entropy_log_plus_one(a[i])).collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         let mut d = vec![0.0_f64; k];
         for kk in 0..k {
@@ -214,9 +212,7 @@ impl SoftmaxAssignmentSparsityPenalty {
     pub fn row_dense_hessian(&self, row_logits: &[f64], scale: f64) -> Array2<f64> {
         let k = self.k_atoms;
         let a = self.softmax_row(row_logits);
-        let l: Vec<f64> = (0..k)
-            .map(|i| entropy_log_plus_one(a[i]))
-            .collect();
+        let l: Vec<f64> = (0..k).map(|i| entropy_log_plus_one(a[i])).collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         let mut h = Array2::<f64>::zeros((k, k));
         for kk in 0..k {
@@ -247,9 +243,7 @@ impl SoftmaxAssignmentSparsityPenalty {
         let k = self.k_atoms;
         let inv_tau = 1.0 / self.temperature;
         let a = self.softmax_row(row_logits);
-        let l: Vec<f64> = (0..k)
-            .map(|i| entropy_log_plus_one(a[i]))
-            .collect();
+        let l: Vec<f64> = (0..k).map(|i| entropy_log_plus_one(a[i])).collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         // ∂a_r/∂z_w = a_r (δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r.
         let da: Vec<f64> = (0..k)
@@ -533,8 +527,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             let mut mean_centered_v_log_plus_one = 0.0;
             for k in 0..self.k_atoms {
                 let centered_v = v[start + k] - mean_v;
-                mean_centered_v_log_plus_one +=
-                    a[k] * centered_v * entropy_log_plus_one(a[k]);
+                mean_centered_v_log_plus_one += a[k] * centered_v * entropy_log_plus_one(a[k]);
             }
             for k in 0..self.k_atoms {
                 let log_plus_one = entropy_log_plus_one(a[k]);
@@ -1517,8 +1510,8 @@ mod row_weighted_prior_991_tests {
     //! penalty strength, scaling the strength by `w_i` scales all of them by the
     //! same `w_i` and cannot desync them. These are the CI gate for that
     //! invariant (the fit that consumes it cannot be run here).
-    use super::*;
     use super::AnalyticPenalty;
+    use super::*;
     use approx::assert_abs_diff_eq;
     use ndarray::{Array1, s};
 
@@ -1528,7 +1521,8 @@ mod row_weighted_prior_991_tests {
         let mut v = Array1::<f64>::zeros(n * k);
         for r in 0..n {
             for a in 0..k {
-                v[r * k + a] = 0.35 * (r as f64) - 0.6 * (a as f64) + 0.11 * ((r * k + a) as f64).sin();
+                v[r * k + a] =
+                    0.35 * (r as f64) - 0.6 * (a as f64) + 0.11 * ((r * k + a) as f64).sin();
             }
         }
         v
@@ -1551,12 +1545,20 @@ mod row_weighted_prior_991_tests {
             per_row[r] = base.value(row.view(), rho.view());
         }
         let unweighted: f64 = per_row.iter().sum();
-        assert_abs_diff_eq!(base.value(target.view(), rho.view()), unweighted, epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            base.value(target.view(), rho.view()),
+            unweighted,
+            epsilon = 1e-12
+        );
 
         let w = vec![1.7_f64, 0.3, 1.1, 0.5, 1.4]; // mean = 1.0 exactly.
         let weighted = base.clone().with_row_weights(Some(&w));
         let expect: f64 = (0..n).map(|r| w[r] * per_row[r]).sum();
-        assert_abs_diff_eq!(weighted.value(target.view(), rho.view()), expect, epsilon = 1e-12);
+        assert_abs_diff_eq!(
+            weighted.value(target.view(), rho.view()),
+            expect,
+            epsilon = 1e-12
+        );
         // Mean-1 weights preserve the total (Σ w_i H_i vs Σ H_i differ only by the
         // per-row redistribution, but here we assert the exact reweighted target).
         assert_abs_diff_eq!(

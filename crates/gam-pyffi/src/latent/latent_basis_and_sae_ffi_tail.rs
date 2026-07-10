@@ -603,14 +603,15 @@ impl PySaeAmortizedEncoder {
             .iter()
             .map(|c| c.as_array().to_owned())
             .collect();
-        let encoder = gam::terms::sae::amortized_encoder::LearnedAmortizedEncoder::fit_with_axis_periods(
-            train_x.as_array(),
-            train_logits.as_array(),
-            &coords,
-            train_amplitudes.as_array(),
-            &coord_periods,
-        )
-        .map_err(py_value_error)?;
+        let encoder =
+            gam::terms::sae::amortized_encoder::LearnedAmortizedEncoder::fit_with_axis_periods(
+                train_x.as_array(),
+                train_logits.as_array(),
+                &coords,
+                train_amplitudes.as_array(),
+                &coord_periods,
+            )
+            .map_err(py_value_error)?;
         Ok(Self { encoder })
     }
 
@@ -971,14 +972,9 @@ fn steer_delta_from_arrays(
     // geometry-only Euclidean path (dose degrades to None).
     let fisher_metric = match fisher_factors {
         Some(u3) => {
-            let request = SaeFisherRowMetricRequest::from_tag(
-                u3,
-                n_obs,
-                p_out,
-                fisher_provenance,
-                None,
-            )
-            .map_err(py_value_error)?;
+            let request =
+                SaeFisherRowMetricRequest::from_tag(u3, n_obs, p_out, fisher_provenance, None)
+                    .map_err(py_value_error)?;
             Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
         }
         None => None,

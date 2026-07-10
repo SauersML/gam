@@ -729,11 +729,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let fitted_inverse_link = fit.inverse_link.clone();
         cli_out!(
             "survival location-scale fit | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
-            fit.fit
-                .fit
-                .convergence_evidence()
-                .inner_status()
-                .label(),
+            fit.fit.fit.convergence_evidence().inner_status().label(),
             fit.fit.fit.outer_iterations,
             fit.fit.fit.log_likelihood,
             fit.fit.fit.reml_score
@@ -1529,11 +1525,7 @@ fn run_canonical_survival_transformation(
         "survival fit | likelihood={} | causes={} | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
         survival_likelihood_modename(result.likelihood_mode),
         cause_count.max(1),
-        result
-            .fit
-            .convergence_evidence()
-            .inner_status()
-            .label(),
+        result.fit.convergence_evidence().inner_status().label(),
         result.fit.outer_iterations,
         result.fit.log_likelihood,
         result.fit.reml_score,

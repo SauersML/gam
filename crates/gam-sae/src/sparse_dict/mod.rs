@@ -65,9 +65,6 @@ pub use block_stream::{
     BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
 };
 pub use codes::SparseCode;
-pub use split_lr_fdr::{
-    FdrCertificate, crossfit_ui_log_evalue, family_fdr_certificate, shell_vs_ring_log_evalue,
-};
 pub use cofit::{CofitConfig, CofitReport, CofitRound, cofit_block_and_curved};
 pub use coordinate::{
     BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate,
@@ -80,6 +77,9 @@ pub use scoring::{ScoreRoutePath, ScoreRouteResult, ScoreRouteStats, TileScorer,
 #[cfg(target_os = "linux")]
 pub use scoring_gpu::{
     DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath, score_block_cpu, score_block_required,
+};
+pub use split_lr_fdr::{
+    FdrCertificate, crossfit_ui_log_evalue, family_fdr_certificate, shell_vs_ring_log_evalue,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 pub use update::{

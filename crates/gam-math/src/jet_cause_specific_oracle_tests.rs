@@ -40,7 +40,9 @@
 //! those EXACT production per-row weight formulas at `rel_tol = 1e-11`.
 
 use crate::jet_scalar::JetScalar;
-use crate::jet_tower::{KernelChannels, RowNllProgramGeneric, Tower4, generic_full_tower, verify_kernel_channels};
+use crate::jet_tower::{
+    KernelChannels, RowNllProgramGeneric, Tower4, generic_full_tower, verify_kernel_channels,
+};
 
 /// One cause-specific Royston-Parmar fixture. `s` (the spline derivative) is kept
 /// strictly positive, the finite regime the production formulas require.
@@ -195,11 +197,7 @@ impl Lcg {
 #[test]
 fn cause_specific_royston_parmar_jet_tower_matches_production_directional_weights() {
     let mut rng = Lcg(0x9322_2020_1109_5171);
-    let third_dirs: [[f64; 3]; 3] = [
-        [0.7, -1.3, 0.5],
-        [-0.4, 0.6, -0.9],
-        [1.2, 0.2, 0.3],
-    ];
+    let third_dirs: [[f64; 3]; 3] = [[0.7, -1.3, 0.5], [-0.4, 0.6, -0.9], [1.2, 0.2, 0.3]];
     let fourth_pairs: [([f64; 3], [f64; 3]); 3] = [
         ([0.7, -1.3, 0.5], [-0.4, 0.6, -0.9]),
         ([-0.4, 0.6, -0.9], [1.2, 0.2, 0.3]),

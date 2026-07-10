@@ -234,9 +234,8 @@ pub fn route_blocks_required(
     // default `Auto` policy every below-break-even minibatch and every
     // CUDA-less Linux host lands here, so this closure IS the hot CPU path
     // (#2242: the scalar per-row oracle was burning 75% of block-lane cycles).
-    let cpu_tile_blocks = (GPU_BLOCK_ROUTE_TILE_ELEMS
-        / (rows.nrows().max(1) * b.max(1)))
-    .clamp(1, g.max(1));
+    let cpu_tile_blocks =
+        (GPU_BLOCK_ROUTE_TILE_ELEMS / (rows.nrows().max(1) * b.max(1))).clamp(1, g.max(1));
     let cpu_route =
         || super::block::route_block_minibatch(rows, decoder, g, b, active, cpu_tile_blocks);
 

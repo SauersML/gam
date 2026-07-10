@@ -143,7 +143,6 @@ pub fn sae_residual_seed_logits(
     Ok(logits)
 }
 
-
 pub fn sae_output_energy_cluster_labels(z: ArrayView2<'_, f64>, k_atoms: usize) -> Vec<usize> {
     let (n_obs, p_out) = z.dim();
     let mut labels = vec![0usize; n_obs];
@@ -453,8 +452,7 @@ pub fn sae_decoder_lsq_init(
             // Use the base alpha here. In learnable-alpha fits the first rho
             // coordinate starts at zero, so alpha_eff = alpha at initialization.
             for row in 0..n_obs {
-                let weights =
-                    ibp_map_row(initial_logits.row(row), tau, alpha);
+                let weights = ibp_map_row(initial_logits.row(row), tau, alpha);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -468,11 +466,7 @@ pub fn sae_decoder_lsq_init(
                 ));
             }
             for row in 0..n_obs {
-                let weights = jumprelu_row(
-                    initial_logits.row(row),
-                    tau,
-                    jumprelu_threshold,
-                );
+                let weights = jumprelu_row(initial_logits.row(row), tau, jumprelu_threshold);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -596,7 +590,6 @@ pub fn sae_decoder_lsq_init(
     }
     Ok(out)
 }
-
 
 /// EM-style seed refinement that resolves the cold-start routing collapse of
 /// the training fit (issues #629, #630) before the joint Arrow-Schur solve.
@@ -806,7 +799,7 @@ mod tests {
             max_abs > 1.0e-3,
             "LSQ-seeded decoder should be non-trivial; max |B| = {max_abs:.6}"
         );
-    
+
         // The seeded reconstruction must explain most of Z under the SAME forward
         // map the joint LSQ solved against: fitted[i,:] = Σ_k a_k · Phi_k[i,:] · B_k
         // where a_k is the IBP-MAP activation of the initial (all-zero) logits. For
@@ -851,7 +844,7 @@ mod tests {
             "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
         );
     }
-    
+
     /// Regression test for issue #629: the cold-start residual seed must break
     /// the symmetric saddle of a uniform logit init by preferring, per row, the
     /// atom whose seed geometry best reconstructs that row. Planted: two
@@ -926,7 +919,7 @@ mod tests {
             .expect("residual seed must succeed");
         assert_eq!(logits.shape(), &[n, k]);
         assert!(logits.iter().all(|v| v.is_finite()));
-    
+
         // (a) Symmetry must be broken: at least one row has a non-trivial gap.
         let max_gap = (0..n)
             .map(|i| (logits[[i, 0]] - logits[[i, 1]]).abs())
@@ -936,7 +929,7 @@ mod tests {
             "residual seed left a near-symmetric logit field (max gap {max_gap:.4}); \
                  the uniform saddle would not be escaped"
         );
-    
+
         // (b) The seed must route most rows to their generating atom, up to
         // the trivial atom-label permutation.
         let mut acc_direct = 0usize;

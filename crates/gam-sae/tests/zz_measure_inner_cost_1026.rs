@@ -21,8 +21,7 @@ use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{
-    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
-    sae_pca_seed_initial_coords,
+    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, sae_pca_seed_initial_coords,
 };
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2, s};
@@ -71,8 +70,7 @@ fn planted_micro(n: usize, p: usize, seed: u64) -> Array2<f64> {
     let mut z = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         for (f, (u, v)) in frames.iter().enumerate() {
-            let theta =
-                std::f64::consts::TAU * ((i * (f + 3)) as f64) / (n as f64);
+            let theta = std::f64::consts::TAU * ((i * (f + 3)) as f64) / (n as f64);
             for c in 0..p {
                 z[[i, c]] += theta.cos() * u[c] + theta.sin() * v[c];
             }
@@ -95,8 +93,8 @@ fn zz_measure_inner_joint_fit_cost_at_zoo_micro_shape() {
     let basis_kinds = vec![SaeAtomBasisKind::Periodic; k_atoms];
     let atom_dims = vec![1usize; k_atoms];
     let t_seed = Instant::now();
-    let seed_coords = sae_pca_seed_initial_coords(z.view(), &basis_kinds, &atom_dims)
-        .expect("pca seed");
+    let seed_coords =
+        sae_pca_seed_initial_coords(z.view(), &basis_kinds, &atom_dims).expect("pca seed");
     let seed_secs = t_seed.elapsed().as_secs_f64();
 
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(num_basis).unwrap());
@@ -111,8 +109,7 @@ fn zz_measure_inner_joint_fit_cost_at_zoo_micro_shape() {
             xtx[[i, i]] += 1.0e-8;
         }
         let xtz = fast_atb(&phi, &z);
-        let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz)
-            / (k_atoms as f64);
+        let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz) / (k_atoms as f64);
         atoms.push(
             SaeManifoldAtom::new(
                 format!("circle_{a}"),

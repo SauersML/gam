@@ -468,7 +468,10 @@ mod tests {
         let evidence = accumulator.finish()[0].unwrap();
         assert!((evidence.mean_fisher_quadratic_kl_nats - 0.1).abs() < 1e-12);
         assert!((evidence.total_fisher_quadratic_kl_nats - 10.0).abs() < 1e-12);
-        assert!(evidence.retains(), "total KL 10 must exceed the one-dof BIC price");
+        assert!(
+            evidence.retains(),
+            "total KL 10 must exceed the one-dof BIC price"
+        );
     }
 
     #[test]
@@ -492,15 +495,12 @@ mod tests {
         let evidence = accumulator.finish();
         let atom = evidence[0].unwrap();
         let realized = atom.realized_kl_validation.unwrap();
-        let rel_err = (atom.mean_fisher_quadratic_kl_nats
-            - realized.mean_empirical_realized_kl_nats)
-            .abs()
-            / realized.mean_empirical_realized_kl_nats;
+        let rel_err =
+            (atom.mean_fisher_quadratic_kl_nats - realized.mean_empirical_realized_kl_nats).abs()
+                / realized.mean_empirical_realized_kl_nats;
         eprintln!(
             "small-dose Fisher/realized KL: fisher_mean={:.12e} realized_mean={:.12e} rel_err={:.6e}",
-            atom.mean_fisher_quadratic_kl_nats,
-            realized.mean_empirical_realized_kl_nats,
-            rel_err
+            atom.mean_fisher_quadratic_kl_nats, realized.mean_empirical_realized_kl_nats, rel_err
         );
         assert!(rel_err <= 0.002, "relative error {rel_err}");
     }

@@ -69,11 +69,7 @@ pub fn r2_score(clean: &[f64], approx: &[f64], n_rows: usize, n_cols: usize) -> 
             tss += centered * centered;
         }
     }
-    if tss > 0.0 {
-        1.0 - rss / tss
-    } else {
-        0.0
-    }
+    if tss > 0.0 { 1.0 - rss / tss } else { 0.0 }
 }
 
 /// Mean over rows of KL(clean ‖ other) from natural-log probability rows.
@@ -88,8 +84,16 @@ pub fn kl_categorical_rows(
     n_rows: usize,
     n_cols: usize,
 ) -> f64 {
-    assert_eq!(clean_logprobs.len(), n_rows * n_cols, "clean logprobs shape mismatch");
-    assert_eq!(other_logprobs.len(), n_rows * n_cols, "other logprobs shape mismatch");
+    assert_eq!(
+        clean_logprobs.len(),
+        n_rows * n_cols,
+        "clean logprobs shape mismatch"
+    );
+    assert_eq!(
+        other_logprobs.len(),
+        n_rows * n_cols,
+        "other logprobs shape mismatch"
+    );
     if n_rows == 0 {
         return 0.0;
     }
@@ -116,12 +120,12 @@ pub fn kl_categorical_rows(
 /// is the first (in descending-R² order) point that falls below `plateau −
 /// tol_frac·|plateau|`. If nothing drops, the coarsest R² is returned. `None`
 /// only for an empty sweep.
-pub fn distortion_floor_r2(
-    r2s: &[f64],
-    loss_recovered: &[f64],
-    tol_frac: f64,
-) -> Option<f64> {
-    assert_eq!(r2s.len(), loss_recovered.len(), "parallel arrays length mismatch");
+pub fn distortion_floor_r2(r2s: &[f64], loss_recovered: &[f64], tol_frac: f64) -> Option<f64> {
+    assert_eq!(
+        r2s.len(),
+        loss_recovered.len(),
+        "parallel arrays length mismatch"
+    );
     if r2s.is_empty() {
         return None;
     }

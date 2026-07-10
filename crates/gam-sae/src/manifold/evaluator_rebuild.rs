@@ -128,7 +128,6 @@ pub fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         })
 }
 
-
 /// Compute the per-axis basis size `axis_m = (m)^(1/d)` for a torus atom and
 /// verify that `m = axis_m^d` with `axis_m` odd (i.e. `2H+1`). Returns
 /// `axis_m`.

@@ -267,10 +267,7 @@ impl StratumDesign {
 
     /// Expected number of sampled rows across all strata, `Σ_h N_h π_h`.
     pub fn expected_sample_size(&self) -> f64 {
-        self.strata
-            .iter()
-            .map(|s| s.n_rows as f64 * s.pi)
-            .sum()
+        self.strata.iter().map(|s| s.n_rows as f64 * s.pi).sum()
     }
 }
 
@@ -325,7 +322,10 @@ pub fn stratify_row_energies(energies: &[f64]) -> Vec<RowStratum> {
     let mut bin_rows: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
     for (i, &e) in energies.iter().enumerate() {
-        bin_rows.entry(EnergyExponentHistogram::bin_of(e)).or_default().push(i);
+        bin_rows
+            .entry(EnergyExponentHistogram::bin_of(e))
+            .or_default()
+            .push(i);
     }
     // One stratum per occupied bin, with population moments over the (clamped)
     // energies (negatives / non-finite → 0, matching the histogram floor bin).
@@ -336,7 +336,11 @@ pub fn stratify_row_energies(energies: &[f64]) -> Vec<RowStratum> {
             let m = rows.len() as f64;
             let sum: f64 = rows.iter().map(|&i| clamp(energies[i])).sum();
             let mean = sum / m;
-            let var = (rows.iter().map(|&i| clamp(energies[i]).powi(2)).sum::<f64>() / m
+            let var = (rows
+                .iter()
+                .map(|&i| clamp(energies[i]).powi(2))
+                .sum::<f64>()
+                / m
                 - mean * mean)
                 .max(0.0);
             RowStratum {
@@ -485,11 +489,7 @@ fn allocate_rates(strata: &mut [Stratum], total_rows: u64, budget: usize) {
         if remaining.is_empty() {
             break;
         }
-        let censused_pop: u64 = strata
-            .iter()
-            .filter(|s| s.censused)
-            .map(|s| s.n_rows)
-            .sum();
+        let censused_pop: u64 = strata.iter().filter(|s| s.censused).map(|s| s.n_rows).sum();
         let budget_left = budget as f64 - censused_pop as f64;
         if budget_left <= 0.0 {
             break;
@@ -510,11 +510,7 @@ fn allocate_rates(strata: &mut [Stratum], total_rows: u64, budget: usize) {
     }
 
     // --- Neyman allocation of the leftover budget over the big strata. ---
-    let censused_pop: u64 = strata
-        .iter()
-        .filter(|s| s.censused)
-        .map(|s| s.n_rows)
-        .sum();
+    let censused_pop: u64 = strata.iter().filter(|s| s.censused).map(|s| s.n_rows).sum();
     let budget_left = (budget as f64 - censused_pop as f64).max(0.0);
     let neyman_mass: f64 = strata
         .iter()
@@ -827,23 +823,17 @@ mod tests {
         let mut src = MmapShardSource::open_dir(&dir).expect("open");
 
         let screen = SpanResidualEnergy::new(dominant_basis(p, k_dom));
-        let collected =
-            collect_stratified_target(&mut src, &screen, budget, 7).expect("collect");
+        let collected = collect_stratified_target(&mut src, &screen, budget, 7).expect("collect");
 
         // The design must have censused the high-energy tail (π = 1 there).
-        let top = collected
-            .design
-            .strata()
-            .last()
-            .expect("nonempty strata");
+        let top = collected.design.strata().last().expect("nonempty strata");
         assert!(
             top.censused && (top.pi - 1.0).abs() < 1e-12,
             "top residual-energy stratum must be censused: {top:?}"
         );
 
         // Recall of the planted rare rows under stratification.
-        let selected: std::collections::BTreeSet<u64> =
-            collected.row_ids.iter().copied().collect();
+        let selected: std::collections::BTreeSet<u64> = collected.row_ids.iter().copied().collect();
         let rare_seen_strat = rare_idx
             .iter()
             .filter(|&&i| selected.contains(&(i as u64)))
@@ -903,8 +893,7 @@ mod tests {
         let mut src = MmapShardSource::open_dir(&dir).expect("open");
 
         let screen = SpanResidualEnergy::new(dominant_basis(p, k_dom));
-        let collected =
-            collect_stratified_target(&mut src, &screen, 4_000, 3).expect("collect");
+        let collected = collect_stratified_target(&mut src, &screen, 4_000, 3).expect("collect");
 
         let est = collected.estimated_corpus_rows();
         assert!(
@@ -947,8 +936,7 @@ mod tests {
         let screen = SpanResidualEnergy::new(dominant_basis(p, 2));
 
         // Budget ≥ N ⇒ every row censused, weight 1.0, all rows collected.
-        let collected =
-            collect_stratified_target(&mut src, &screen, n, 1).expect("collect");
+        let collected = collect_stratified_target(&mut src, &screen, n, 1).expect("collect");
         assert_eq!(collected.len(), n);
         assert_eq!(collected.row_ids, (0..n as u64).collect::<Vec<_>>());
         assert!(collected.likelihood_weights.iter().all(|&w| w == 1.0));

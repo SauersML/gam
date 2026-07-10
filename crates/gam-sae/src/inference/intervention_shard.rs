@@ -277,9 +277,7 @@ pub fn prepare_intervention_calibration(
             .ok_or(InterventionCalibrationError::Rung2Unavailable)?,
     };
     let n = shard.n_records();
-    if !(spec.floor_quantile.is_finite()
-        && spec.floor_quantile > 0.0
-        && spec.floor_quantile < 1.0)
+    if !(spec.floor_quantile.is_finite() && spec.floor_quantile > 0.0 && spec.floor_quantile < 1.0)
     {
         return Err(InterventionCalibrationError::InvalidFloorQuantile(
             spec.floor_quantile,
@@ -386,22 +384,18 @@ impl InterventionCalibrationPlan {
         eval_eta: &[f64],
     ) -> Result<InterventionCalibrationResult, InterventionCalibrationError> {
         if reference_eta.len() != self.measurable_atoms.len() {
-            return Err(
-                InterventionCalibrationError::PredictionLengthMismatch {
-                    phase: "reference",
-                    expected: self.measurable_atoms.len(),
-                    got: reference_eta.len(),
-                },
-            );
+            return Err(InterventionCalibrationError::PredictionLengthMismatch {
+                phase: "reference",
+                expected: self.measurable_atoms.len(),
+                got: reference_eta.len(),
+            });
         }
         if eval_eta.len() != self.eval_log_nu.len() {
-            return Err(
-                InterventionCalibrationError::PredictionLengthMismatch {
-                    phase: "held-out",
-                    expected: self.eval_log_nu.len(),
-                    got: eval_eta.len(),
-                },
-            );
+            return Err(InterventionCalibrationError::PredictionLengthMismatch {
+                phase: "held-out",
+                expected: self.eval_log_nu.len(),
+                got: eval_eta.len(),
+            });
         }
         for (phase, values) in [("reference", reference_eta), ("held-out", eval_eta)] {
             for (index, &value) in values.iter().enumerate() {

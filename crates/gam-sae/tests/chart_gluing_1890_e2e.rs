@@ -28,7 +28,7 @@ use gam_sae::assignment::{AssignmentMode, SaeAssignment};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
 use gam_sae::structure_harvest::{
-    run_production_structure_search, HarvestParams, ProductionRefitParams, RoundDriverConfig,
+    HarvestParams, ProductionRefitParams, RoundDriverConfig, run_production_structure_search,
 };
 use gam_solve::structure_search::{MoveBudget, MoveVerdict, StructureMove};
 use gam_terms::inference::structure_evidence::StructureLedger;
@@ -197,7 +197,11 @@ fn over_tiled_circle_glues_end_to_end() {
     let rho = rho_for(k);
     let target = target_from_term(&term, p);
 
-    assert_eq!(active_atom_count(&term), k, "fixture starts with K active arcs");
+    assert_eq!(
+        active_atom_count(&term),
+        k,
+        "fixture starts with K active arcs"
+    );
 
     let mut ledger = StructureLedger::new();
     let result = run_production_structure_search(
@@ -227,7 +231,10 @@ fn over_tiled_circle_glues_end_to_end() {
          proposal-level test passes but bank→certify→apply did not fire"
     );
     // The engine recorded a structural change.
-    assert!(result.structure_changed(), "a glue applied but structure_changed() is false");
+    assert!(
+        result.structure_changed(),
+        "a glue applied but structure_changed() is false"
+    );
 
     // (i) Effective size strictly drops: the co-tiled arcs collapse (folded atoms
     // are demoted to ~0 mass, so this is the ACTIVE count, not raw k_atoms()).

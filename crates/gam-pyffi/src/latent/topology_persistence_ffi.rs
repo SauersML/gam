@@ -1,6 +1,6 @@
+use pyo3::Bound;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use pyo3::Bound;
 
 fn betti_signature_dict<'py>(
     py: Python<'py>,
@@ -44,7 +44,10 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 summary.set_item("h2_bars", report.h2.len())?;
                 summary.set_item("dominant_h1_persistence", report.dominant_h1_persistence)?;
                 summary.set_item("dominant_h2_persistence", report.dominant_h2_persistence)?;
-                atom.set_item("raced_kind", crate::sae_atom_basis_kind_name(&report.raced_kind))?;
+                atom.set_item(
+                    "raced_kind",
+                    crate::sae_atom_basis_kind_name(&report.raced_kind),
+                )?;
                 atom.set_item("support_size", report.support_size)?;
                 atom.set_item("landmark_count", report.landmark_count)?;
                 atom.set_item("stability_band", report.stability_band.as_str())?;
@@ -52,8 +55,14 @@ pub(crate) fn sae_topology_persistence_dict<'py>(
                 atom.set_item("effective_n", report.effective_n)?;
                 atom.set_item("support_ess", report.support_ess)?;
                 atom.set_item("covering_side", report.covering_side.as_str())?;
-                atom.set_item("measured_betti", betti_signature_dict(py, report.measured_betti)?)?;
-                atom.set_item("expected_betti", betti_signature_dict(py, report.expected_betti)?)?;
+                atom.set_item(
+                    "measured_betti",
+                    betti_signature_dict(py, report.measured_betti)?,
+                )?;
+                atom.set_item(
+                    "expected_betti",
+                    betti_signature_dict(py, report.expected_betti)?,
+                )?;
                 atom.set_item("kind", inferred)?;
                 atom.set_item("persistence_summary", summary)?;
                 atom.set_item("contested", report.contested)?;
@@ -143,9 +152,21 @@ mod tests {
                 .extract::<String>()
                 .expect("kind string");
             assert_eq!(kind, "loop");
-            assert!(atom.get_item("measured_betti").expect("read measured_betti").is_some());
-            assert!(atom.get_item("expected_betti").expect("read expected_betti").is_some());
-            assert!(atom.get_item("contested").expect("read contested").is_some());
+            assert!(
+                atom.get_item("measured_betti")
+                    .expect("read measured_betti")
+                    .is_some()
+            );
+            assert!(
+                atom.get_item("expected_betti")
+                    .expect("read expected_betti")
+                    .is_some()
+            );
+            assert!(
+                atom.get_item("contested")
+                    .expect("read contested")
+                    .is_some()
+            );
         });
     }
 }

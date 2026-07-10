@@ -148,9 +148,9 @@ pub(crate) fn resolve_fit_invocation(
         let raw = read_fit_request_json_file(path, "--request document")?;
         crate::config_resolve::parse_fit_request_json(&raw)
     } else {
-        crate::config_resolve::resolve_fit_request_document(
-            fit_request_document_from_fit_args(args)?,
-        )
+        crate::config_resolve::resolve_fit_request_document(fit_request_document_from_fit_args(
+            args,
+        )?)
     }
 }
 
@@ -243,7 +243,10 @@ fn required_columns_for_resolved_fit(
         .as_ref()
         .and_then(serde_json::Value::as_object)
     {
-        for descriptor in descriptors.values().filter_map(serde_json::Value::as_object) {
+        for descriptor in descriptors
+            .values()
+            .filter_map(serde_json::Value::as_object)
+        {
             if let Some(vars) = descriptor.get("vars").and_then(serde_json::Value::as_array) {
                 required.extend(
                     vars.iter()

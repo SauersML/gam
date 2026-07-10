@@ -325,12 +325,13 @@ pub fn atom_geometry_entry_from_parts(
         }
         let total: f64 = energies.iter().sum();
         if total > 0.0 {
-            let (dom_idx, _) = energies
-                .iter()
-                .enumerate()
-                .fold((0usize, f64::NEG_INFINITY), |acc, (i, &e)| {
-                    if e > acc.1 { (i, e) } else { acc }
-                });
+            let (dom_idx, _) =
+                energies
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f64::NEG_INFINITY), |acc, (i, &e)| {
+                        if e > acc.1 { (i, e) } else { acc }
+                    });
             dominant_harmonic = Some(dom_idx + 1);
             if h_max >= 2 && energies[0] > 0.0 {
                 second_harmonic_ratio = Some(energies[1] / energies[0]);
@@ -499,13 +500,7 @@ fn topology_name(kind: &SaeAtomBasisKind) -> String {
 fn topology_is_curved(topology: &str) -> bool {
     matches!(
         topology,
-        "periodic"
-            | "sphere"
-            | "torus"
-            | "cylinder"
-            | "mobius"
-            | "poincare"
-            | "duchon"
+        "periodic" | "sphere" | "torus" | "cylinder" | "mobius" | "poincare" | "duchon"
     )
 }
 
@@ -642,7 +637,9 @@ mod tests {
         assert!((fracs[0] - e1 / (e1 + e2)).abs() < 1.0e-12);
         assert!((fracs[1] - e2 / (e1 + e2)).abs() < 1.0e-12);
         assert_eq!(entry.dominant_harmonic, Some(2));
-        let ratio = entry.second_harmonic_ratio.expect("both harmonics carry energy");
+        let ratio = entry
+            .second_harmonic_ratio
+            .expect("both harmonics carry energy");
         assert!((ratio - (r2 / r1).powi(2)).abs() < 1.0e-12);
     }
 

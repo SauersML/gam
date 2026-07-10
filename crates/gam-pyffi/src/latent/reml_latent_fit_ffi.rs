@@ -4170,7 +4170,7 @@ fn difference_smooth_json(
     request_json: String,
 ) -> PyResult<String> {
     detach_py_result(py, "difference_smooth_json", move || {
-        difference_smooth_core_json_impl(&model_bytes, &request_json)
+        difference_smooth_json_impl(&model_bytes, &request_json)
     })
 }
 
@@ -4181,7 +4181,7 @@ fn difference_smooth_rows(
     request_json: String,
 ) -> PyResult<PyObject> {
     let rows = detach_py_result(py, "difference_smooth_rows", move || {
-        let raw = difference_smooth_core_json_impl(&model_bytes, &request_json)?;
+        let raw = difference_smooth_json_impl(&model_bytes, &request_json)?;
         serde_json::from_str::<Vec<serde_json::Map<String, serde_json::Value>>>(&raw)
             .map_err(|err| format!("failed to parse difference_smooth rows json: {err}"))
     })?;

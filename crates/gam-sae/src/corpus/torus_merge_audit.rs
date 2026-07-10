@@ -172,9 +172,8 @@ pub fn audit_torus_merges(
             let mu1_4 = mu1_2 * mu1_2;
             let mu1_5 = mu1_4 * mu1;
             let mu1_6 = mu1_4 * mu1_2;
-            let var_kappa = (var_s2 / mu1_4 + 4.0 * mu2 * mu2 * var_s / mu1_6
-                - 4.0 * mu2 * cov / mu1_5)
-                / nf;
+            let var_kappa =
+                (var_s2 / mu1_4 + 4.0 * mu2 * mu2 * var_s / mu1_6 - 4.0 * mu2 * cov / mu1_5) / nf;
             if !(var_kappa > 0.0) {
                 // Degenerate (constant radius ⇒ exact κ, zero variance): that is
                 // the strongest possible ring signal. Flag with a saturated z.

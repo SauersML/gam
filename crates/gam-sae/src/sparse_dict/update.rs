@@ -2956,8 +2956,7 @@ mod exact_solve_tests {
                     rho,
                 )
                 .expect("trace evidence");
-                let rho_new =
-                    linear_shared_rho_fs_step(&stats, rho).expect("valid FS evidence");
+                let rho_new = linear_shared_rho_fs_step(&stats, rho).expect("valid FS evidence");
                 last_rel = (rho_new.ln() - rho.ln()).abs();
                 rho = rho_new;
             }

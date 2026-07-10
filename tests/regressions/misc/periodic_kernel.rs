@@ -41,8 +41,8 @@ fn issue_225_periodic_basis_shape_partition_and_seam() {
 #[test]
 fn issue_225_cyclic_penalty_rank_and_nullspace() {
     let k = 12usize;
-    let s = cyclic_bspline_derivative_penalty_matrix(3, k, 1.0, 2)
-        .expect("cyclic derivative penalty");
+    let s =
+        cyclic_bspline_derivative_penalty_matrix(3, k, 1.0, 2).expect("cyclic derivative penalty");
     assert_eq!(s.shape(), &[k, k]);
     let ones = Array2::from_elem((k, 1), 1.0);
     let p = s.dot(&ones);

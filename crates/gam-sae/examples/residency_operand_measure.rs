@@ -123,7 +123,10 @@ fn main() -> Result<(), String> {
     let sys = term.assemble_arrow_schur_scaled(target.view(), &rho, None, 1.0)?;
     let k = sys.k;
     let d = sys.d;
-    println!("assembled Arrow-Schur: border k={k}  per-row d={d}  rows={}", sys.rows.len());
+    println!(
+        "assembled Arrow-Schur: border k={k}  per-row d={d}  rows={}",
+        sys.rows.len()
+    );
 
     // ---- The measurement: per-solve operand upload by category ------------------
     match sys.device_sae_pcg.as_ref() {
@@ -157,14 +160,24 @@ fn main() -> Result<(), String> {
 
     // ---- Offload verdict sweep: the K=2000-vs-#2230 engagement question ---------
     let policy = GpuDispatchPolicy::default();
-    println!("--- reduced_schur_matvec_should_offload(n, k, d={d}, cg_iters={}) ---", args.pcg_iters);
-    println!("    DEVICE_LOOP_MIN_P floor = {}", GpuDispatchPolicy::DEVICE_LOOP_MIN_P);
+    println!(
+        "--- reduced_schur_matvec_should_offload(n, k, d={d}, cg_iters={}) ---",
+        args.pcg_iters
+    );
+    println!(
+        "    DEVICE_LOOP_MIN_P floor = {}",
+        GpuDispatchPolicy::DEVICE_LOOP_MIN_P
+    );
     // Sweep the border from a K=2000-scale value up to the #2230 border, at both
     // the assembled n and the #2230 n, so the crossover is explicit.
     for &probe_n in &[n, 60_000usize] {
         for &probe_k in &[64usize, 512, 2_048, 8_192, 21_504, k] {
-            let verdict =
-                policy.reduced_schur_matvec_should_offload(probe_n, probe_k, d.max(1), args.pcg_iters);
+            let verdict = policy.reduced_schur_matvec_should_offload(
+                probe_n,
+                probe_k,
+                d.max(1),
+                args.pcg_iters,
+            );
             println!(
                 "    n={probe_n:>6} k={probe_k:>6} -> offload={}",
                 if verdict { "YES" } else { "no" }

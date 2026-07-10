@@ -342,6 +342,9 @@ mod manifold_sae_payload_serde_tests {
         );
         let raw = serde_json::to_string(&golden).unwrap();
         let err = roundtrip_json(&raw).unwrap_err();
-        assert!(err.contains("unsupported schema"), "unexpected error: {err}");
+        assert!(
+            err.contains("unsupported schema"),
+            "unexpected error: {err}"
+        );
     }
 }

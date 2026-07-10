@@ -737,13 +737,9 @@ where
                         0.0
                     }
                 });
-                let rhs = Mat::<f64>::from_fn(
-                    big_d + n_params,
-                    1,
-                    |row, _| {
-                        if row < big_d { r[row] } else { 0.0 }
-                    },
-                );
+                let rhs = Mat::<f64>::from_fn(big_d + n_params, 1, |row, _| {
+                    if row < big_d { r[row] } else { 0.0 }
+                });
                 let delta = aug.qr().solve_lstsq(&rhs);
 
                 let mut trial = state.clone();

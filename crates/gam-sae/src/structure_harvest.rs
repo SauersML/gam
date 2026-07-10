@@ -81,13 +81,13 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
 use crate::atom_codes::SparseAtomCodes;
-use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
-use crate::frames::GrassmannFrame;
 use crate::basis::{
     CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeBasisSecondJet, SphereChartEvaluator,
     TorusHarmonicEvaluator,
 };
+use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
+use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw, SaeAtomBasisKind,
     SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, amplitude_concentration_certificate,
@@ -275,9 +275,9 @@ fn participation_ratio(spectrum: &[f64]) -> f64 {
 /// richest curved atom (the torus); the e-gate, never this map, owns acceptance.
 fn curved_topology_for_span(span: f64) -> (usize, usize) {
     match span.round().max(1.0) as usize {
-        0 | 1 | 2 => (1, 3),  // circle (PeriodicHarmonicEvaluator, 2·d+1 harmonics)
-        3 => (2, 7),          // sphere chart (SphereChartEvaluator)
-        _ => (2, 25),         // torus (TorusHarmonicEvaluator, (2H+1)² at H=2)
+        0 | 1 | 2 => (1, 3), // circle (PeriodicHarmonicEvaluator, 2·d+1 harmonics)
+        3 => (2, 7),         // sphere chart (SphereChartEvaluator)
+        _ => (2, 25),        // torus (TorusHarmonicEvaluator, (2H+1)² at H=2)
     }
 }
 
@@ -603,12 +603,8 @@ pub fn harvest_move_proposals(
     // Glue arm banks it against the churn null. The pre-screen only RANKS, so
     // the budget spends its e-value evaluations on the most-aligned pairs; it
     // carries no acceptance threshold of its own (magic-free).
-    let (glues_proposed, glue_candidates_screened) = harvest_glue_proposals(
-        term,
-        residuals,
-        params.max_fusions,
-        &mut proposals,
-    );
+    let (glues_proposed, glue_candidates_screened) =
+        harvest_glue_proposals(term, residuals, params.max_fusions, &mut proposals);
 
     // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
     let mut fission_atoms: Vec<(usize, f64)> = Vec::new();
@@ -820,7 +816,11 @@ pub fn harvest_move_proposals(
                 // index, and cap at `max_births`; the overflow is deferred too.
                 scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
                 for &(candidate, predicted) in scored.iter().take(params.max_births) {
-                    proposals.push(proposal(term, StructureMove::Birth { candidate }, predicted));
+                    proposals.push(proposal(
+                        term,
+                        StructureMove::Birth { candidate },
+                        predicted,
+                    ));
                     birth_predictions.push((candidate, predicted));
                     births_proposed += 1;
                 }
@@ -1290,9 +1290,8 @@ fn glue_pair_evalue(
     for c in 0..p {
         mu[c] /= n_est as f64;
     }
-    let point_null_sq = |pt: ArrayView1<'_, f64>| -> f64 {
-        (0..p).map(|c| (pt[c] - mu[c]).powi(2)).sum::<f64>()
-    };
+    let point_null_sq =
+        |pt: ArrayView1<'_, f64>| -> f64 { (0..p).map(|c| (pt[c] - mu[c]).powi(2)).sum::<f64>() };
     let mut pool_acc = 0.0_f64;
     for &i in &a_est {
         pool_acc += point_null_sq(seam.points_a.row(i));
@@ -1422,7 +1421,11 @@ fn harvest_glue_proposals(
     }
     let floor = ACTIVE_SUPPORT_REL_FLOOR / k as f64;
     let supports: Vec<Vec<bool>> = (0..k)
-        .map(|atom| (0..n_rows).map(|r| assignments[[r, atom]] > floor).collect())
+        .map(|atom| {
+            (0..n_rows)
+                .map(|r| assignments[[r, atom]] > floor)
+                .collect()
+        })
         .collect();
     let support_sizes: Vec<usize> = supports
         .iter()
@@ -1482,11 +1485,7 @@ fn harvest_glue_proposals(
             candidates.push((a, b, alignment));
         }
     }
-    candidates.sort_by(|x, y| {
-        y.2.total_cmp(&x.2)
-            .then(x.0.cmp(&y.0))
-            .then(x.1.cmp(&y.1))
-    });
+    candidates.sort_by(|x, y| y.2.total_cmp(&x.2).then(x.0.cmp(&y.0)).then(x.1.cmp(&y.1)));
 
     let mut proposed = 0usize;
     for &(a, b, _score) in candidates.iter().take(budget) {
@@ -5256,9 +5255,8 @@ mod tests {
         }
         let weights = Array1::<f64>::ones(n);
 
-        let selected =
-            select_periodic_resolution(coords.view(), target.view(), weights.view(), n)
-                .expect("resolution selection must succeed on a supported periodic signal");
+        let selected = select_periodic_resolution(coords.view(), target.view(), weights.view(), n)
+            .expect("resolution selection must succeed on a supported periodic signal");
         assert!(
             selected >= 4,
             "the 4th-harmonic content (past a gap) requires at least 4 harmonics; the fixed \
@@ -5357,12 +5355,15 @@ mod tests {
         assert!(kinds.contains(&AutoTopologyKind::Euclidean), "{kinds:?}");
         // No key collision: each promoted kind appears once.
         assert_eq!(kinds.len(), promoted.len());
-        let expected_radial = standardized_log_birth_amplitudes(birth_row_amplitudes(disk.view()).view())
-            .expect("disk log-amplitude spread");
-        for spec in promoted
-            .iter()
-            .filter(|spec| matches!(spec.kind, AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean))
-        {
+        let expected_radial =
+            standardized_log_birth_amplitudes(birth_row_amplitudes(disk.view()).view())
+                .expect("disk log-amplitude spread");
+        for spec in promoted.iter().filter(|spec| {
+            matches!(
+                spec.kind,
+                AutoTopologyKind::Cylinder | AutoTopologyKind::Euclidean
+            )
+        }) {
             for row in 0..n {
                 assert!(
                     (spec.coords[[row, 1]] - expected_radial[row]).abs() < 1.0e-12,
@@ -7487,10 +7488,6 @@ mod tests {
         });
         let flatten = crate::manifold::flatten_verdict(radii.view(), angles.view()).unwrap();
         assert!(flatten.recommend_flatten, "diameter must flatten");
-        assert_eq!(
-            flatten.residual_rank, 1,
-            "diameter must flatten to rank 1"
-        );
+        assert_eq!(flatten.residual_rank, 1, "diameter must flatten to rank 1");
     }
-
 }

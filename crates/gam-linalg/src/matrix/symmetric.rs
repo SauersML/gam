@@ -392,8 +392,7 @@ pub fn xt_diag_x_symmetric(
                 // Reserve-or-stream: the dense BLAS route runs only while its
                 // full dense footprint is admitted by the process-wide
                 // governor; a refusal picks the bounded streaming CSC path.
-                if let Ok(xd) = xs.try_to_dense_governed("xt_diag_x_symmetric dense sparse route")
-                {
+                if let Ok(xd) = xs.try_to_dense_governed("xt_diag_x_symmetric dense sparse route") {
                     stream_weighted_crossprod_into(
                         &**xd,
                         diag,

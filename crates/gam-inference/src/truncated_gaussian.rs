@@ -466,7 +466,8 @@ mod tests {
         let mode = array![0.0]; // pinned on the boundary (active constraint)
         let c = constraints(array![[1.0]], array![0.0]); // β ≥ 0
         let n = 200_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 7).expect("sampler");
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 7)
+            .expect("sampler");
         assert_all_feasible(&s, &c);
 
         let col = s.column(0);
@@ -577,7 +578,8 @@ mod tests {
         // β ≥ 0 and −β ≥ −1  ⟺  0 ≤ β ≤ 1.
         let c = constraints(array![[1.0], [-1.0]], array![0.0, -1.0]);
         let n = 80_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 5).expect("sampler");
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 5)
+            .expect("sampler");
         assert_all_feasible(&s, &c);
         assert!(s.column(0).iter().all(|&v| v > 0.0 && v < 1.0));
         // Symmetric truncation around the centred mode ⇒ mean ≈ 0.5.

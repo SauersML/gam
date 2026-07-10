@@ -355,8 +355,10 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            ops.slice_mut(s![i, .., ..])
-                .assign(&array![[angle.cos(), -angle.sin()], [angle.sin(), angle.cos()]]);
+            ops.slice_mut(s![i, .., ..]).assign(&array![
+                [angle.cos(), -angle.sin()],
+                [angle.sin(), angle.cos()]
+            ]);
         }
         let (mean, se) = rotation_angle_band(ops.view(), None).unwrap();
         assert!(
@@ -374,7 +376,10 @@ mod tests {
         // one machine-epsilon below 1, which the `√` amplifies to O(√ε) ≈ 1e-8.
         // That IS "collapsed to the angle"; asserting below the estimator's fp
         // floor (1e-9) is unmeetable.
-        assert!(se_one.abs() < 1.0e-7, "point-mass band should collapse; got {se_one}");
+        assert!(
+            se_one.abs() < 1.0e-7,
+            "point-mass band should collapse; got {se_one}"
+        );
     }
 
     #[test]

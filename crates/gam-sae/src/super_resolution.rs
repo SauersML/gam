@@ -144,10 +144,7 @@ pub fn separation_limit(n_harmonics: usize) -> f64 {
 ///
 /// At most `⌊H/2⌋` spikes are identifiable (the classical Prony count); the model
 /// order is chosen from the Hankel singular spectrum and clamped to this bound.
-pub fn recover_spikes(
-    fourier_coeffs: &[(f64, f64)],
-    sigma: f64,
-) -> Result<SpikeRecovery, String> {
+pub fn recover_spikes(fourier_coeffs: &[(f64, f64)], sigma: f64) -> Result<SpikeRecovery, String> {
     let n = fourier_coeffs.len();
     if n < 2 {
         return Err(format!(
@@ -156,9 +153,7 @@ pub fn recover_spikes(
     }
     for (h, &(c, s)) in fourier_coeffs.iter().enumerate() {
         if !c.is_finite() || !s.is_finite() {
-            return Err(format!(
-                "fourier_coeffs[{h}] = ({c}, {s}) is not finite"
-            ));
+            return Err(format!("fourier_coeffs[{h}] = ({c}, {s}) is not finite"));
         }
     }
 
@@ -182,12 +177,7 @@ pub fn recover_spikes(
     let svd = hankel
         .thin_svd()
         .map_err(|e| format!("Hankel SVD failed to converge: {e:?}"))?;
-    let singular_values: Vec<f64> = svd
-        .S()
-        .column_vector()
-        .iter()
-        .map(|c| c.re)
-        .collect();
+    let singular_values: Vec<f64> = svd.S().column_vector().iter().map(|c| c.re).collect();
 
     let threshold = order_threshold(&singular_values, rows, cols, sigma);
     let threshold_order = singular_values
@@ -279,7 +269,11 @@ pub fn recover_spikes(
         .iter()
         .map(|z| {
             let norm = z.norm();
-            if norm > 0.0 { *z / norm } else { c64::new(1.0, 0.0) }
+            if norm > 0.0 {
+                *z / norm
+            } else {
+                c64::new(1.0, 0.0)
+            }
         })
         .collect();
 
@@ -338,9 +332,8 @@ pub fn recover_spikes(
 /// Gavish–Donoho (2014) optimal-hard-threshold coefficient `λ(β)` for known
 /// noise level, `β ∈ (0, 1]` the matrix aspect ratio (short/long dimension).
 fn optimal_hard_threshold_coefficient(beta: f64) -> f64 {
-    (2.0 * (beta + 1.0)
-        + 8.0 * beta / ((beta + 1.0) + (beta * beta + 14.0 * beta + 1.0).sqrt()))
-    .sqrt()
+    (2.0 * (beta + 1.0) + 8.0 * beta / ((beta + 1.0) + (beta * beta + 14.0 * beta + 1.0).sqrt()))
+        .sqrt()
 }
 
 /// Singular-value threshold separating signal from noise for order selection.
@@ -508,7 +501,10 @@ mod tests {
         let (t_err, a_err) = match_error(&rec.spikes, &planted);
         // Perturbation bound for a well-separated pencil is O(sigma); allow a
         // small constant factor.
-        assert!(t_err < 10.0 * sigma / (h as f64), "position error {t_err:.3e}");
+        assert!(
+            t_err < 10.0 * sigma / (h as f64),
+            "position error {t_err:.3e}"
+        );
         assert!(a_err < 5.0 * sigma, "amplitude error {a_err:.3e}");
     }
 

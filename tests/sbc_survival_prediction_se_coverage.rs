@@ -146,7 +146,10 @@ fn survival_posterior_mean_se_covers_true_survival_probability_at_nominal() {
             .arg("--out")
             .arg(&model_path);
         run_or_panic(fit_cmd, "gam fit Weibull Surv(...) ~ x for SE coverage");
-        assert!(model_path.is_file(), "gam fit did not write {model_path:?} (rep {rep})");
+        assert!(
+            model_path.is_file(),
+            "gam fit did not write {model_path:?} (rep {rep})"
+        );
 
         let model = FittedModel::load_from_path(&model_path).expect("load Weibull survival model");
 
@@ -187,13 +190,13 @@ fn survival_posterior_mean_se_covers_true_survival_probability_at_nominal() {
             with_uncertainty: true,
             estimand: SurvivalPredictEstimand::PosteriorMean,
         };
-        let result = predict_survival(request)
-            .unwrap_or_else(|e| panic!("posterior-mean survival predict failed (rep {rep}): {e:?}"));
+        let result = predict_survival(request).unwrap_or_else(|e| {
+            panic!("posterior-mean survival predict failed (rep {rep}): {e:?}")
+        });
         let s_hat = result.survival[[0, 0]];
-        let se = result
-            .survival_se
-            .unwrap_or_else(|| panic!("with_uncertainty=true but survival_se was None (rep {rep})"))
-            [[0, 0]];
+        let se = result.survival_se.unwrap_or_else(|| {
+            panic!("with_uncertainty=true but survival_se was None (rep {rep})")
+        })[[0, 0]];
         assert!(
             s_hat.is_finite() && se.is_finite() && se >= 0.0,
             "rep {rep}: degenerate survival posterior-mean/SE: mean={s_hat}, se={se}"
@@ -292,7 +295,11 @@ fn survival_location_scale_delta_method_se_covers_true_survival_probability_at_n
         let mut exit = Vec::with_capacity(LS_N_TRAIN);
         let mut event = Vec::with_capacity(LS_N_TRAIN);
         for _ in 0..LS_N_TRAIN {
-            let xi = if rng.uniform_open01() < 0.5 { -1.0 } else { 1.0 };
+            let xi = if rng.uniform_open01() < 0.5 {
+                -1.0
+            } else {
+                1.0
+            };
             let mu = LS_INTERCEPT + LS_SLOPE * xi;
             let t_lat = (mu + sigma_true * rng.standard_normal()).exp();
             // Light censoring so most subjects have an event and sigma stays
@@ -318,12 +325,22 @@ fn survival_location_scale_delta_method_se_covers_true_survival_probability_at_n
             .args(["--survival-likelihood", "location-scale"])
             .arg("--out")
             .arg(&model_path);
-        run_or_panic(fit_cmd, "gam fit lognormal location-scale AFT for SE coverage");
-        assert!(model_path.is_file(), "gam fit did not write {model_path:?} (rep {rep})");
+        run_or_panic(
+            fit_cmd,
+            "gam fit lognormal location-scale AFT for SE coverage",
+        );
+        assert!(
+            model_path.is_file(),
+            "gam fit did not write {model_path:?} (rep {rep})"
+        );
 
         let model = FittedModel::load_from_path(&model_path).expect("load lognormal AFT model");
 
-        let x_star = if rng.uniform_open01() < 0.5 { -1.0 } else { 1.0 };
+        let x_star = if rng.uniform_open01() < 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
         let mu_star = LS_INTERCEPT + LS_SLOPE * x_star;
         let s_true = lognormal_survival(LS_QUERY_TIME, mu_star, sigma_true);
 
@@ -355,11 +372,9 @@ fn survival_location_scale_delta_method_se_covers_true_survival_probability_at_n
             panic!("location-scale delta-method survival predict failed (rep {rep}): {e:?}")
         });
         let s_hat = result.survival[[0, 0]];
-        let se = result
-            .survival_se
-            .unwrap_or_else(|| {
-                panic!("with_uncertainty=true but survival_se was None (location-scale, rep {rep})")
-            })[[0, 0]];
+        let se = result.survival_se.unwrap_or_else(|| {
+            panic!("with_uncertainty=true but survival_se was None (location-scale, rep {rep})")
+        })[[0, 0]];
         assert!(
             s_hat.is_finite() && se.is_finite() && se >= 0.0,
             "rep {rep}: degenerate location-scale survival/SE: mean={s_hat}, se={se}"

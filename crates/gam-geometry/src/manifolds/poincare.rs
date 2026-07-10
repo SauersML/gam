@@ -580,12 +580,7 @@ pub fn log_map_batch(
     expected_dim: usize,
     curvature: f64,
 ) -> GeometryResult<Array2<f64>> {
-    require_same_batch_shape(
-        points,
-        targets,
-        expected_dim,
-        "Poincaré batched logarithm",
-    )?;
+    require_same_batch_shape(points, targets, expected_dim, "Poincaré batched logarithm")?;
     let mut out = Array2::zeros(points.raw_dim());
     for row in 0..points.nrows() {
         let value = log_map(points.row(row), targets.row(row), curvature)?;
@@ -601,12 +596,7 @@ pub fn distance_batch(
     expected_dim: usize,
     curvature: f64,
 ) -> GeometryResult<Array1<f64>> {
-    require_same_batch_shape(
-        left,
-        right,
-        expected_dim,
-        "Poincaré batched distance",
-    )?;
+    require_same_batch_shape(left, right, expected_dim, "Poincaré batched distance")?;
     let mut out = Array1::zeros(left.nrows());
     for row in 0..left.nrows() {
         out[row] = poincare_distance(left.row(row), right.row(row), curvature)?;
@@ -620,11 +610,7 @@ pub fn project_into_ball_batch(
     expected_dim: usize,
     curvature: f64,
 ) -> GeometryResult<Array2<f64>> {
-    require_batch_width(
-        points,
-        expected_dim,
-        "Poincaré batched ball projection",
-    )?;
+    require_batch_width(points, expected_dim, "Poincaré batched ball projection")?;
     let mut out = Array2::zeros(points.raw_dim());
     for row in 0..points.nrows() {
         let value = project_into_ball(points.row(row), curvature)?;
@@ -1794,7 +1780,10 @@ mod tests {
             assert_eq!(projected.row(row), scalar_project.view());
             for i in 0..2 {
                 for j in 0..2 {
-                    assert_eq!(metric[[row, i, j]], if i == j { lambda * lambda } else { 0.0 });
+                    assert_eq!(
+                        metric[[row, i, j]],
+                        if i == j { lambda * lambda } else { 0.0 }
+                    );
                 }
             }
         }

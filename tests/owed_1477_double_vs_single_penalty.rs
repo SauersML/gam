@@ -189,11 +189,7 @@ fn tweedie_default_double_penalty_matches_single_penalty_no_overshrink_1477() {
         eprintln!(
             "[#1477 dp/sp] seed={seed} dp_rmse={dp_rmse:.4} (edf {:.2}, conv certified) \
              sp_rmse={sp_rmse:.4} (edf {:.2}, conv certified) x=1: dp={:.3} sp={:.3} truth={:.3}",
-            dp.edf,
-            sp.edf,
-            dp.mean_on_grid[last],
-            sp.mean_on_grid[last],
-            truth[last]
+            dp.edf, sp.edf, dp.mean_on_grid[last], sp.mean_on_grid[last], truth[last]
         );
 
         // CONTRAST: the double-penalty `ps` mean must track the single-penalty

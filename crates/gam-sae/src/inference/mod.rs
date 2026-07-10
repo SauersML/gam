@@ -7,9 +7,9 @@
 //! of the monolith's `gam::inference::*` namespace; the root crate keeps the
 //! old `gam::inference::{atom_lens, steering, ...}` paths valid via re-exports.
 
+pub mod atlas_nerve;
 pub mod atom_geometry;
 pub mod atom_lens;
-pub mod atlas_nerve;
 pub mod checkpoint_dynamics;
 pub mod contracts;
 pub mod cross_model_transport;

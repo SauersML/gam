@@ -1041,15 +1041,7 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     // bit-identical Euclidean metric (geometry-only; dose degrades to None).
     let euclidean = gam_problem::RowMetric::euclidean(n_obs, p_out)?;
     let metric = term.row_metric().unwrap_or(&euclidean);
-    steer_delta(
-        &term,
-        metric,
-        atom_k,
-        metric_row,
-        amplitude,
-        &t_from,
-        &t_to,
-    )
+    steer_delta(&term, metric, atom_k, metric_row, amplitude, &t_from, &t_to)
 }
 
 #[cfg(test)]

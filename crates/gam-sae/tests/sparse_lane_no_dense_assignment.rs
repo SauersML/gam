@@ -12,8 +12,8 @@
 //! research / certification path (which legitimately builds `SaeAssignment` at
 //! K > P for small N) — that path lives in the manifold engine, not here.
 
-use gam_sae::front_door::{admit_dense_certification, admit_sae_fit, SaeFitLane};
-use gam_sae::sparse_dict::{fit_sparse_dictionary, SparseDictConfig};
+use gam_sae::front_door::{SaeFitLane, admit_dense_certification, admit_sae_fit};
+use gam_sae::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
 use ndarray::Array2;
 use std::path::PathBuf;
 
@@ -121,7 +121,10 @@ fn sparse_lane_constructs_no_dense_assignment() {
         scanned += 1;
     }
 
-    assert!(scanned > 0, "expected to scan at least one sparse_dict source file");
+    assert!(
+        scanned > 0,
+        "expected to scan at least one sparse_dict source file"
+    );
     assert!(
         offenders.is_empty(),
         "the production sparse-code lane must construct ZERO dense SaeAssignments — that \

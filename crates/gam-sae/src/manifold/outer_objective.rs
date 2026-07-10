@@ -2874,8 +2874,7 @@ impl SaeManifoldOuterObjective {
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
-        self.evaluate_with_refine_policy(rho_flat, true)
-            .map(|_| ())
+        self.evaluate_with_refine_policy(rho_flat, true).map(|_| ())
     }
 
     /// Evaluate a value-only rho probe without committing the inner basin it
@@ -2996,8 +2995,7 @@ impl SaeManifoldOuterObjective {
             BasinBundle::new(1, basin_bundle_dominance_window()),
         );
         let member_eval = bundle.evaluate(|state: &SaeManifoldTerm| {
-            let (res, converged) =
-                self.converge_member_criterion(rho_flat, state, drive);
+            let (res, converged) = self.converge_member_criterion(rho_flat, state, drive);
             res.map(|value| (converged, value))
         });
 
@@ -3482,8 +3480,7 @@ impl SaeManifoldOuterObjective {
                 .as_ref()
                 .expect("block_scaled_rss returned Some ⇒ crosscoder pricing is installed");
             let tail = n_params - blocks.block_dims.len();
-            for (l, (&p_l, &r_tilde)) in
-                blocks.block_dims.iter().zip(scaled_rss.iter()).enumerate()
+            for (l, (&p_l, &r_tilde)) in blocks.block_dims.iter().zip(scaled_rss.iter()).enumerate()
             {
                 if r_tilde > 0.0 {
                     let step = (n * p_l as f64 / r_tilde).ln();
@@ -3707,8 +3704,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
         // are byte-for-byte unchanged.
         if !self.term.streaming_plan().direct_logdet_admitted() {
-            let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false)
-            {
+            let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
                 Ok(evaluated) => evaluated,
                 // #1782 — recoverable infeasible-ρ refusal → finite collapse
                 // wall (zero gradient), not `+∞`. The wall still steers the
@@ -3964,48 +3960,47 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 let drive = ProbeInnerDrive::ForcedLineSearchProbe {
                     eta: self.forcing.line_search_eta(),
                 };
-                let (cost, _beta_hat) =
-                    match self.evaluate_envelope_value_probe(rho.view(), drive) {
-                        Ok(evaluated) => evaluated,
-                        // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
-                        // log-det) presents to the line search as the SAME finite
-                        // collapse wall the gradient lane (`eval`) and the value /
-                        // EFS / startup lanes (`eval_cost`, `efs_step`) already
-                        // return for this class (#1782). Returning `+∞` here instead
-                        // (an infeasible Wolfe value) desynced this lane from the
-                        // gradient lane: the anchor `(cost, ∇f)` from `eval` carried
-                        // the finite wall, but every line-search probe overshooting
-                        // the seed's PD basin returned `+∞`, which `finite_cost_or_error`
-                        // in the outer bridge converts into a `Recoverable` probe
-                        // refusal. On a seed whose PD basin the first BFGS direction
-                        // immediately exits (the K=2 wide-`p` two-circle fit, whose
-                        // seed sits on the non-PD boundary), EVERY probe refused, the
-                        // consecutive-refusal counter never reset, and the
-                        // non-termination guard escalated the whole fit to a fatal
-                        // "globally infeasible neighbourhood at seed" abort — never
-                        // shipping the perfectly feasible seed dictionary. The finite
-                        // wall is astronomically larger than any real REML value, so
-                        // the Armijo/Wolfe search still rejects a step INTO it (the
-                        // same steering), but the bridge reads a finite cost, resets
-                        // its refusal streak, and BFGS halts at the feasible seed and
-                        // ships best-so-far instead of aborting.
-                        Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                            self.probe_telemetry.record_refusal_kind(&err);
-                            self.probe_telemetry.wall_cost_value_probes += 1;
-                            return Ok(OuterEval {
-                                cost: Self::recoverable_refusal_wall_cost(),
-                                gradient: Array1::zeros(rho.len()),
-                                hessian: HessianValue::Unavailable,
-                                inner_beta_hint: None,
-                            });
-                        }
-                        Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
-                    };
+                let (cost, _beta_hat) = match self.evaluate_envelope_value_probe(rho.view(), drive)
+                {
+                    Ok(evaluated) => evaluated,
+                    // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
+                    // log-det) presents to the line search as the SAME finite
+                    // collapse wall the gradient lane (`eval`) and the value /
+                    // EFS / startup lanes (`eval_cost`, `efs_step`) already
+                    // return for this class (#1782). Returning `+∞` here instead
+                    // (an infeasible Wolfe value) desynced this lane from the
+                    // gradient lane: the anchor `(cost, ∇f)` from `eval` carried
+                    // the finite wall, but every line-search probe overshooting
+                    // the seed's PD basin returned `+∞`, which `finite_cost_or_error`
+                    // in the outer bridge converts into a `Recoverable` probe
+                    // refusal. On a seed whose PD basin the first BFGS direction
+                    // immediately exits (the K=2 wide-`p` two-circle fit, whose
+                    // seed sits on the non-PD boundary), EVERY probe refused, the
+                    // consecutive-refusal counter never reset, and the
+                    // non-termination guard escalated the whole fit to a fatal
+                    // "globally infeasible neighbourhood at seed" abort — never
+                    // shipping the perfectly feasible seed dictionary. The finite
+                    // wall is astronomically larger than any real REML value, so
+                    // the Armijo/Wolfe search still rejects a step INTO it (the
+                    // same steering), but the bridge reads a finite cost, resets
+                    // its refusal streak, and BFGS halts at the feasible seed and
+                    // ships best-so-far instead of aborting.
+                    Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                        self.probe_telemetry.record_refusal_kind(&err);
+                        self.probe_telemetry.wall_cost_value_probes += 1;
+                        return Ok(OuterEval {
+                            cost: Self::recoverable_refusal_wall_cost(),
+                            gradient: Array1::zeros(rho.len()),
+                            hessian: HessianValue::Unavailable,
+                            inner_beta_hint: None,
+                        });
+                    }
+                    Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+                };
                 // #2231 Inc-B — price the block Jacobian into the line-search
                 // probe cost (0 for a plain SAE) so the value the outer search
                 // ranks matches the gradient/EFS lanes.
-                let cost =
-                    cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+                let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
                 if self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }

@@ -8873,8 +8873,12 @@ impl SaeManifoldTerm {
         // Schur factor; gauge / #1038 cross-row Woodbury fall back to the per-β
         // `solve` loop where the row-local Takahashi blocks are not valid.
         let fast_selected = solver.plain_selected_inverse_available();
-        let beta_inv =
-            Self::selected_inverse_beta_block(solver, cache, fast_selected, "logdet_theta_adjoint")?;
+        let beta_inv = Self::selected_inverse_beta_block(
+            solver,
+            cache,
+            fast_selected,
+            "logdet_theta_adjoint",
+        )?;
         // IBP `hessian_diag` logit third-derivative channels (#1006). The full
         // IBP Hessian also has per-column cross-row rank-one terms
         // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE carried in `H` via the #1038

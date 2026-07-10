@@ -96,8 +96,10 @@ pub fn effective_global_parallelism() -> Par {
 /// codebase engineers its faer reductions to be parallelism-invariant
 /// (`tests_parallelism_invariance_1557` asserts byte-identical `Par::Seq` vs
 /// `Par::rayon` output), so collapsing to sequential is bit-for-bit neutral.
-static FAER_SEQ_STATE: std::sync::Mutex<FaerSeqState> =
-    std::sync::Mutex::new(FaerSeqState { depth: 0, saved: None });
+static FAER_SEQ_STATE: std::sync::Mutex<FaerSeqState> = std::sync::Mutex::new(FaerSeqState {
+    depth: 0,
+    saved: None,
+});
 
 struct FaerSeqState {
     depth: usize,
@@ -3232,7 +3234,11 @@ mod tests {
 
         // The convenience wrapper behaves identically and returns the body value.
         let observed = with_faer_sequential(|| faer::get_global_parallelism());
-        assert_eq!(observed, Par::Seq, "with_faer_sequential runs body under Seq");
+        assert_eq!(
+            observed,
+            Par::Seq,
+            "with_faer_sequential runs body under Seq"
+        );
         assert_eq!(
             faer::get_global_parallelism(),
             Par::rayon(4),

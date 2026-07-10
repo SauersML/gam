@@ -1760,11 +1760,12 @@ impl SaeManifoldTerm {
                         if parallel {
                             use rayon::prelude::*;
                             // #1557 — pin the projector's faer GEMM to Par::Seq.
-                            sys.rows.par_iter_mut().enumerate().for_each(
-                                |(row_idx, row)| {
+                            sys.rows
+                                .par_iter_mut()
+                                .enumerate()
+                                .for_each(|(row_idx, row)| {
                                     with_nested_parallel(|| project_fixed_row(row_idx, row));
-                                },
-                            );
+                                });
                         } else {
                             for row_idx in 0..n {
                                 let row = &mut sys.rows[row_idx];
@@ -1824,55 +1825,52 @@ impl SaeManifoldTerm {
                     // `kron_jac[row_idx]` and reads immutable `ext`/`raw_gt_rows`/`manifold`,
                     // so the row-parallel path is bit-identical to the serial sweep
                     // (disjoint-writes determinism). Per-row `t_buf`/`col_buf` scratch.
-                    let project_row = |row_idx: usize,
-                                       jac_flat: &mut Vec<f64>,
-                                       t_buf: &mut [f64],
-                                       col_buf: &mut Array1<f64>| {
-                        let ext_row = ext.row(row_idx);
-                        for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
-                            *slot = v;
-                        }
-                        let t_i = ArrayView1::from(&*t_buf);
-                        let raw_gt = raw_gt_rows[row_idx].view();
-                        let q_row = jac_flat.len() / p;
-                        for j in 0..p {
-                            for c in 0..q_row {
-                                col_buf[c] = jac_flat[c * p + j];
+                    let project_row =
+                        |row_idx: usize,
+                         jac_flat: &mut Vec<f64>,
+                         t_buf: &mut [f64],
+                         col_buf: &mut Array1<f64>| {
+                            let ext_row = ext.row(row_idx);
+                            for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
+                                *slot = v;
                             }
-                            let projected_col = manifold.project_vector_to_gradient_tangent(
-                                t_i,
-                                raw_gt.slice(ndarray::s![..q_row]),
-                                col_buf.slice(ndarray::s![..q_row]),
-                            );
-                            for c in 0..q_row {
-                                jac_flat[c * p + j] = projected_col[c];
+                            let t_i = ArrayView1::from(&*t_buf);
+                            let raw_gt = raw_gt_rows[row_idx].view();
+                            let q_row = jac_flat.len() / p;
+                            for j in 0..p {
+                                for c in 0..q_row {
+                                    col_buf[c] = jac_flat[c * p + j];
+                                }
+                                let projected_col = manifold.project_vector_to_gradient_tangent(
+                                    t_i,
+                                    raw_gt.slice(ndarray::s![..q_row]),
+                                    col_buf.slice(ndarray::s![..q_row]),
+                                );
+                                for c in 0..q_row {
+                                    jac_flat[c * p + j] = projected_col[c];
+                                }
                             }
-                        }
-                    };
+                        };
                     let parallel =
                         n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
                     if parallel {
                         use rayon::prelude::*;
                         // #1557 — pin the projector's faer GEMM to Par::Seq.
-                        kron_jac.par_iter_mut().enumerate().for_each(
-                            |(row_idx, jac_flat)| {
+                        kron_jac
+                            .par_iter_mut()
+                            .enumerate()
+                            .for_each(|(row_idx, jac_flat)| {
                                 with_nested_parallel(|| {
                                     let mut t_buf = vec![0.0_f64; q];
                                     let mut col_buf = Array1::<f64>::zeros(q);
                                     project_row(row_idx, jac_flat, &mut t_buf, &mut col_buf);
                                 });
-                            },
-                        );
+                            });
                     } else {
                         let mut t_buf = vec![0.0_f64; q];
                         let mut col_buf = Array1::<f64>::zeros(q);
                         for row_idx in 0..n {
-                            project_row(
-                                row_idx,
-                                &mut kron_jac[row_idx],
-                                &mut t_buf,
-                                &mut col_buf,
-                            );
+                            project_row(row_idx, &mut kron_jac[row_idx], &mut t_buf, &mut col_buf);
                         }
                     }
                 }
@@ -1914,15 +1912,20 @@ impl SaeManifoldTerm {
                     // Returns the row's `(manifold_i, point_i, gt_e)` so the caller can
                     // apply the htbeta / kron_jac leg with the SAME pre-projection state.
                     let project_gt_htt =
-                        |row_idx: usize, row: &mut ArrowRowBlock| -> (LatentManifold, Array1<f64>, Array1<f64>) {
+                        |row_idx: usize,
+                         row: &mut ArrowRowBlock|
+                         -> (LatentManifold, Array1<f64>, Array1<f64>) {
                             let (manifold_i, point_i) =
                                 this.compact_row_ext_manifold_and_point(row_idx, layout);
                             let t_i = point_i.view();
                             let gt_e = row.gt.clone();
                             let htt_e = row.htt.clone();
                             row.gt = manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
-                            row.htt =
-                                manifold_i.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+                            row.htt = manifold_i.riemannian_hessian_matrix(
+                                t_i,
+                                gt_e.view(),
+                                htt_e.view(),
+                            );
                             (manifold_i, point_i, gt_e)
                         };
                     // Frames arm: `htbeta` column projection with the SAME pre-projection
@@ -1964,9 +1967,12 @@ impl SaeManifoldTerm {
                         if parallel {
                             use rayon::prelude::*;
                             // #1557 — pin the projector's faer GEMM to Par::Seq.
-                            sys.rows.par_iter_mut().enumerate().for_each(|(row_idx, row)| {
-                                with_nested_parallel(|| frames_row(row_idx, row));
-                            });
+                            sys.rows
+                                .par_iter_mut()
+                                .enumerate()
+                                .for_each(|(row_idx, row)| {
+                                    with_nested_parallel(|| frames_row(row_idx, row));
+                                });
                         } else {
                             for row_idx in 0..n {
                                 frames_row(row_idx, &mut sys.rows[row_idx]);
@@ -1986,7 +1992,11 @@ impl SaeManifoldTerm {
                             });
                     } else {
                         for row_idx in 0..n {
-                            matrix_free_row(row_idx, &mut sys.rows[row_idx], &mut kron_jac[row_idx]);
+                            matrix_free_row(
+                                row_idx,
+                                &mut sys.rows[row_idx],
+                                &mut kron_jac[row_idx],
+                            );
                         }
                     }
                 }

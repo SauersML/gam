@@ -101,9 +101,7 @@ impl SaeAssignmentState {
     /// [`SaeAssignment::as_state`].
     #[must_use]
     pub fn full_support(n_obs: usize, k_atoms: usize) -> Self {
-        let indices: Vec<Vec<u32>> = (0..n_obs)
-            .map(|_| (0..k_atoms as u32).collect())
-            .collect();
+        let indices: Vec<Vec<u32>> = (0..n_obs).map(|_| (0..k_atoms as u32).collect()).collect();
         let gate_params = vec![vec![0.0_f64; k_atoms]; n_obs];
         // d_k = 0 for every atom ⇒ empty per-row coord blocks.
         let coords = vec![Vec::new(); n_obs];
@@ -326,15 +324,17 @@ impl SaeAssignmentState {
                     }
                 }
             }
-            coords.push(LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
-                flat,
-                n,
-                d,
-                meta.id_mode.clone(),
-                meta.manifold.clone(),
-                meta.retraction.clone(),
-                meta.latent_id,
-            ));
+            coords.push(
+                LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
+                    flat,
+                    n,
+                    d,
+                    meta.id_mode.clone(),
+                    meta.manifold.clone(),
+                    meta.retraction.clone(),
+                    meta.latent_id,
+                ),
+            );
         }
 
         // Direct field construction (all fields are `pub`, in-crate): the logits
@@ -364,7 +364,11 @@ impl SaeAssignment {
         let n = self.n_obs();
         let k = self.k_atoms();
 
-        let per_atom_dim: Vec<usize> = self.coords.iter().map(LatentCoordValues::latent_dim).collect();
+        let per_atom_dim: Vec<usize> = self
+            .coords
+            .iter()
+            .map(LatentCoordValues::latent_dim)
+            .collect();
 
         let indices: Vec<Vec<u32>> = (0..n).map(|_| (0..k as u32).collect()).collect();
         let mut gate_params = Vec::with_capacity(n);
@@ -437,8 +441,9 @@ mod tests {
                 logits[[i, j]] = 0.3 * (i as f64) - 0.7 * (j as f64) + 0.11 * ((i * k + j) as f64);
             }
         }
-        let coord_blocks: Vec<Array2<f64>> =
-            (0..k).map(|atom| coord_block(n, d, 0.2 * atom as f64)).collect();
+        let coord_blocks: Vec<Array2<f64>> = (0..k)
+            .map(|atom| coord_block(n, d, 0.2 * atom as f64))
+            .collect();
         SaeAssignment::from_blocks_with_mode(logits, coord_blocks, mode)
             .expect("dense fixture builds")
     }
@@ -459,7 +464,11 @@ mod tests {
             "assignments round-trip"
         );
         // Mode, shape, and per-atom flags.
-        assert_eq!(format!("{:?}", dense.mode), format!("{:?}", back.mode), "mode");
+        assert_eq!(
+            format!("{:?}", dense.mode),
+            format!("{:?}", back.mode),
+            "mode"
+        );
         assert_eq!(dense.n_obs(), back.n_obs());
         assert_eq!(dense.k_atoms(), back.k_atoms());
         assert_eq!(dense.ungated, back.ungated, "ungated flags");
@@ -516,14 +525,16 @@ mod tests {
         // The (N, K, s, d) shape the layout contract pins.
         let (n, k, s, d) = (1000usize, 5000usize, 8usize, 2usize);
         let indices: Vec<Vec<u32>> = (0..n)
-            .map(|i| (0..s as u32).map(|j| ((i + j as usize) % k) as u32).collect())
+            .map(|i| {
+                (0..s as u32)
+                    .map(|j| ((i + j as usize) % k) as u32)
+                    .collect()
+            })
             .collect();
         let gate_params: Vec<Vec<f64>> = (0..n).map(|_| vec![1.0_f64; s]).collect();
         let coords: Vec<Vec<f64>> = (0..n).map(|_| vec![0.0_f64; s * d]).collect();
-        let state = SaeAssignmentState::from_topk_support(
-            n, k, s, d, indices, gate_params, coords,
-        )
-        .expect("sparse topk state builds");
+        let state = SaeAssignmentState::from_topk_support(n, k, s, d, indices, gate_params, coords)
+            .expect("sparse topk state builds");
 
         // Cell counts equal the (2 + d_max) budget decomposition.
         assert_eq!(state.index_cells(), n * s, "index cells");

@@ -21,7 +21,7 @@
 use gam_sae::assignment::{AssignmentMode, SaeAssignment};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
-use gam_sae::structure_harvest::{harvest_move_proposals, HarvestParams};
+use gam_sae::structure_harvest::{HarvestParams, harvest_move_proposals};
 use gam_solve::structure_search::{MoveProposal, StructureMove};
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
@@ -36,11 +36,7 @@ const OFF: f64 = -6.0;
 /// full-circle coordinate `t = row / n` and a `Circle { period: 1.0 }` manifold,
 /// so a decoder that maps the fundamental `sin/cos` pair onto two ambient axes
 /// traces a unit circle in that plane.
-fn build_term(
-    n: usize,
-    arcs: &[(usize, usize)],
-    decoders: &[Array2<f64>],
-) -> SaeManifoldTerm {
+fn build_term(n: usize, arcs: &[(usize, usize)], decoders: &[Array2<f64>]) -> SaeManifoldTerm {
     let k = arcs.len();
     assert_eq!(decoders.len(), k);
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());

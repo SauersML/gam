@@ -210,11 +210,7 @@ impl IBPAssignmentPenalty {
     /// precisely the active-sparsity regimes this prior is meant to model. The
     /// prior mean `E[π_k] = a_k/(a_k+1) = μ_k` is the forward gate's multiplier, so
     /// gate and penalty are one model (prior-vs-posterior mean).
-    fn pi_posterior_mean(
-        &self,
-        z: ArrayView1<'_, f64>,
-        a_col: ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    fn pi_posterior_mean(&self, z: ArrayView1<'_, f64>, a_col: ArrayView1<'_, f64>) -> Array1<f64> {
         let (active_mass, n_eff) = self.weighted_active_mass(z);
         let mut pi = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
@@ -519,7 +515,8 @@ impl IBPAssignmentPenalty {
             let pi_score = -mass / pk + (n_f - mass) / one_minus - (a - 1.0) / pk;
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            d_g_dm[k] = (da / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - da * pj / pk;
+            d_g_dm[k] =
+                (da / (denom * denom)) * (psd * (n_f + 1.0 - mass) - pi_score) - da * pj / pk;
         }
         for row in 0..n {
             let start = row * self.k_max;
@@ -607,11 +604,12 @@ impl IBPAssignmentPenalty {
             let d1_p = pi_p / (pk * pk) - pi_p / (one_minus * one_minus);
             let psd = -1.0 / pk + (mass + a - 1.0) * pj / (pk * pk) - 1.0 / one_minus
                 + (n_f - mass) * pj / (one_minus * one_minus);
-            let psd_p = pi_p / (pk * pk) + da * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
-                - 2.0 * (mass + a - 1.0) * pj * pi_p / (pk * pk * pk)
-                - pi_p / (one_minus * one_minus)
-                + (n_f - mass) * pj_p / (one_minus * one_minus)
-                + 2.0 * (n_f - mass) * pj * pi_p / (one_minus * one_minus * one_minus);
+            let psd_p =
+                pi_p / (pk * pk) + da * pj / (pk * pk) + (mass + a - 1.0) * pj_p / (pk * pk)
+                    - 2.0 * (mass + a - 1.0) * pj * pi_p / (pk * pk * pk)
+                    - pi_p / (one_minus * one_minus)
+                    + (n_f - mass) * pj_p / (one_minus * one_minus)
+                    + 2.0 * (n_f - mass) * pj * pi_p / (one_minus * one_minus * one_minus);
             d_score_derivative[k] = pj_p * (d1 + psd) + pj * (d1_p + psd_p);
         }
         (d_score, d_score_derivative)
@@ -791,12 +789,9 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
                 let direct_z_score = ((1.0 - pk) / pk).ln();
                 let implicit_pi_score = pi_score[k] * pi_jac[k];
-                out[start + k] = self.weight
-                    * w_i
-                    * (direct_z_score + implicit_pi_score)
-                    * zk
-                    * (1.0 - zk)
-                    / tau;
+                out[start + k] =
+                    self.weight * w_i * (direct_z_score + implicit_pi_score) * zk * (1.0 - zk)
+                        / tau;
             }
         }
         out

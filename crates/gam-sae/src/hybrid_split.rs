@@ -874,7 +874,13 @@ fn build_atom_candidates(
         g_lin[[0, 0]] = w_sum;
         g_lin[[1, 1]] = s_tt;
         let d_lin = crate::manifold::realised_rank_charge_dof(
-            &g_lin, &b_lin, n_eff, p as f64, dispersion_r, 0.0, None,
+            &g_lin,
+            &b_lin,
+            n_eff,
+            p as f64,
+            dispersion_r,
+            0.0,
+            None,
         )
         .ok()?;
         // Curved arm: refit decoder B + Gram G=ΦᵀWΦ on the same residual.
@@ -882,7 +888,13 @@ fn build_atom_candidates(
             Some(phi) if phi.nrows() == n => {
                 match curved_refit_decoder(phi, assign, target_resid) {
                     Some((_, b_c, g_c)) => crate::manifold::realised_rank_charge_dof(
-                        &g_c, &b_c, n_eff, p as f64, dispersion_r, 0.0, None,
+                        &g_c,
+                        &b_c,
+                        n_eff,
+                        p as f64,
+                        dispersion_r,
+                        0.0,
+                        None,
                     )
                     .ok()?,
                     // Φ refit degenerate: fall back to the raw decoder param count.
@@ -909,7 +921,10 @@ fn build_atom_candidates(
         };
         (
             reduced_laplace_nle(linear_residual_objective * inv_dispersion, d_lin * n_obs_ln),
-            reduced_laplace_nle(curved_residual_objective * inv_dispersion, d_curved * n_obs_ln),
+            reduced_laplace_nle(
+                curved_residual_objective * inv_dispersion,
+                d_curved * n_obs_ln,
+            ),
         )
     } else {
         (
@@ -1737,8 +1752,7 @@ mod tests {
             true,
         )
         .expect("circle candidate pair");
-        let choice =
-            gam_solve::evidence::select_hybrid_atom(&[lin, crv]).expect("non-empty slot");
+        let choice = gam_solve::evidence::select_hybrid_atom(&[lin, crv]).expect("non-empty slot");
         assert_eq!(
             choice.param,
             gam_solve::evidence::HybridAtomParam::Curved { latent_dim: 1 },

@@ -444,7 +444,10 @@ mod tests {
         // K ≤ P: the shape the default rule would send to the dense engine.
         let small = admit_linear_dictionary(640, 24, 16, 1).expect("K<=P linear admission");
         assert_eq!(small.lane, SaeFitLane::SparseCodes);
-        assert_eq!((small.n_obs, small.output_dim, small.n_atoms), (640, 24, 16));
+        assert_eq!(
+            (small.n_obs, small.output_dim, small.n_atoms),
+            (640, 24, 16)
+        );
         // K > P: identical lane — the request, not the shape, selects it.
         let large = admit_linear_dictionary(4096, 512, 32_000, 1).expect("K>P linear admission");
         assert_eq!(large.lane, SaeFitLane::SparseCodes);

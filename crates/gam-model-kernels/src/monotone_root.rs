@@ -285,15 +285,9 @@ mod tests {
     fn error_display_shapes_are_preserved_through_the_shared_solver() {
         // The Display strings are contract: they must be byte-identical to the
         // pre-extraction in-crate solver's output at each failure site.
-        let degenerate = solve_monotone_root(
-            |a| Ok((a - 5.0, 0.0, 0.0)),
-            0.0,
-            "caldbg",
-            1e-12,
-            32,
-            32,
-        )
-        .unwrap_err();
+        let degenerate =
+            solve_monotone_root(|a| Ok((a - 5.0, 0.0, 0.0)), 0.0, "caldbg", 1e-12, 32, 32)
+                .unwrap_err();
         assert_eq!(
             degenerate.to_string(),
             "caldbg: initial derivative is zero or non-finite at a=0.000000"

@@ -314,11 +314,7 @@ fn shortest_coordinate_delta(
     Ok(delta)
 }
 
-fn coordinate_l2_distance(
-    a: &[f64],
-    b: &[f64],
-    periods: &[Option<f64>],
-) -> Result<f64, String> {
+fn coordinate_l2_distance(a: &[f64], b: &[f64], periods: &[Option<f64>]) -> Result<f64, String> {
     Ok(shortest_coordinate_delta(a, b, periods)?
         .iter()
         .map(|d| d * d)
@@ -560,7 +556,9 @@ fn decode_tangents_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array2<f64>, 
     let jet = if atom.homotopy_eta == 1.0 {
         evaluator.evaluate(coords.view())?.1
     } else {
-        evaluator.evaluate_phi_eta(coords.view(), atom.homotopy_eta)?.jet
+        evaluator
+            .evaluate_phi_eta(coords.view(), atom.homotopy_eta)?
+            .jet
     };
     let decoder = &atom.decoder_coefficients;
     let m = decoder.nrows();
@@ -724,7 +722,12 @@ struct SteerContext<'a> {
 fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String> {
     let d = ctx.d;
     let p = ctx.p;
-    let full_len: f64 = ctx.coordinate_delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+    let full_len: f64 = ctx
+        .coordinate_delta
+        .iter()
+        .map(|d| d * d)
+        .sum::<f64>()
+        .sqrt();
     if full_len == 0.0 {
         return Ok(0.0);
     }

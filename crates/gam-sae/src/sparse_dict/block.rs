@@ -1384,9 +1384,13 @@ fn routing_and_reconstruction_residuals(
         }
         for (slot, &block) in new_code.blocks.iter().enumerate() {
             if new_code.gates[slot] == 0.0
-                || old_code.blocks.iter().enumerate().any(|(old_slot, candidate)| {
-                    *candidate == block && old_code.gates[old_slot] != 0.0
-                })
+                || old_code
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(old_slot, candidate)| {
+                        *candidate == block && old_code.gates[old_slot] != 0.0
+                    })
             {
                 continue;
             }
@@ -1395,8 +1399,7 @@ fn routing_and_reconstruction_residuals(
             gate_scale2 += new_gate * new_gate;
         }
 
-        let old_reconstruction =
-            reconstruct_stored_code_row(old_code, previous.decoder.view(), b);
+        let old_reconstruction = reconstruct_stored_code_row(old_code, previous.decoder.view(), b);
         let new_reconstruction = reconstruct_stored_code_row(new_code, next.decoder.view(), b);
         for column in 0..x.ncols() {
             let delta = new_reconstruction[column] as f64 - old_reconstruction[column] as f64;
@@ -1726,12 +1729,8 @@ pub fn fit_block_sparse_dictionary(
             step.next.explained_variance as f32,
         );
         gamma_residual = relative_scalar_change(state.gamma, step.next.gamma);
-        frame_residual = frame_fixed_point_residual(
-            state.decoder.view(),
-            step.next.decoder.view(),
-            g,
-            b,
-        );
+        frame_residual =
+            frame_fixed_point_residual(state.decoder.view(), step.next.decoder.view(), g, b);
         accepted_births = step.accepted_births;
         polar_failures = step.polar_failures;
         state = step.next;

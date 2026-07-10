@@ -168,7 +168,9 @@ fn run(
     )?;
     let n = a.coords_radians.len().min(b.coords_radians.len());
     if n < 16 {
-        return Err(format!("need at least 16 paired fitted coordinates, got {n}"));
+        return Err(format!(
+            "need at least 16 paired fitted coordinates, got {n}"
+        ));
     }
     let coord_a = ModelCoordinate::new(
         a.label,
@@ -192,7 +194,10 @@ fn run(
         println!("transport_phase_rad={:.9}", circle.phase);
         println!("transport_phase_degrees={:.9}", circle.phase_degrees());
         println!("transport_o2_defect={:.9}", circle.defect);
-        println!("transport_gauge_defect_scale={:.9}", report.gauge_defect_scale);
+        println!(
+            "transport_gauge_defect_scale={:.9}",
+            report.gauge_defect_scale
+        );
     }
     println!("transport_degree={:?}", report.fit.degree);
     println!(
@@ -207,7 +212,10 @@ fn run(
         "transport_min_directional_derivative={:.9}",
         report.fit.min_directional_derivative
     );
-    println!("transport_isometry_defect={:.9}", report.fit.isometry_defect);
+    println!(
+        "transport_isometry_defect={:.9}",
+        report.fit.isometry_defect
+    );
     println!(
         "transport_isometry_defect_se={:.9}",
         report.fit.isometry_defect_se
@@ -341,9 +349,9 @@ fn fit_real_chart(
     let topm_linear_ev = verdict
         .topm_linear_ev
         .ok_or_else(|| format!("{label}: hybrid envelope report omitted topm_linear_ev"))?;
-    let curved_vs_envelope_ratio = verdict
-        .curved_vs_envelope_ratio
-        .ok_or_else(|| format!("{label}: hybrid envelope report omitted curved_vs_envelope_ratio"))?;
+    let curved_vs_envelope_ratio = verdict.curved_vs_envelope_ratio.ok_or_else(|| {
+        format!("{label}: hybrid envelope report omitted curved_vs_envelope_ratio")
+    })?;
     let coords_radians = final_term.assignment.coords[0]
         .as_matrix()
         .column(0)
@@ -387,7 +395,8 @@ fn periodic_k1_term(
     let p = z.ncols();
     let dim = 1usize;
     let num_basis = 1 + 2 * harmonics;
-    let evaluator: Arc<dyn SaeBasisSecondJet> = Arc::new(PeriodicHarmonicEvaluator::new(num_basis)?);
+    let evaluator: Arc<dyn SaeBasisSecondJet> =
+        Arc::new(PeriodicHarmonicEvaluator::new(num_basis)?);
     let basis_kinds = vec![SaeAtomBasisKind::Periodic];
     let atom_dims = vec![dim];
     let seed_coords = gam_sae::manifold::sae_pca_seed_initial_coords(z, &basis_kinds, &atom_dims)?;
@@ -503,7 +512,10 @@ fn envelope_report(
     .ok_or_else(|| "hybrid envelope report had no eligible d=1 atom".to_string())
 }
 
-fn reconstruction_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> Result<f64, String> {
+fn reconstruction_ev(
+    target: ArrayView2<'_, f64>,
+    fitted: ArrayView2<'_, f64>,
+) -> Result<f64, String> {
     if target.dim() != fitted.dim() {
         return Err(format!(
             "reconstruction_ev: target {:?} != fitted {:?}",

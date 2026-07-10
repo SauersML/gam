@@ -8,8 +8,8 @@ use faer::Accum;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use gam_runtime::resource::{
-    Governed, MaterializationPolicy, MatrixMaterializationError, MemoryGovernor,
-    MemoryReservation, ResourcePolicy, dense_f64_bytes, rows_for_target_bytes,
+    Governed, MaterializationPolicy, MatrixMaterializationError, MemoryGovernor, MemoryReservation,
+    ResourcePolicy, dense_f64_bytes, rows_for_target_bytes,
 };
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
@@ -124,11 +124,8 @@ fn governed_dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
             limit_bytes: policy.max_single_dense_bytes,
         });
     }
-    let reservation = MemoryGovernor::global().try_reserve_dense_f64(
-        op.nrows(),
-        op.ncols(),
-        context,
-    )?;
+    let reservation =
+        MemoryGovernor::global().try_reserve_dense_f64(op.nrows(), op.ncols(), context)?;
     dense_operator_to_dense_by_chunks(op).map(|matrix| reservation.bind(matrix))
 }
 
@@ -917,15 +914,15 @@ impl SparseDesignMatrix {
             return Ok(reservation.bind(cached.clone()));
         }
         let dense_bytes = self.dense_nbytes()?;
-        let reservation = governor
-            .try_reserve(dense_bytes, context)
-            .map_err(|err| String::from(MatrixError::DensificationRefused {
+        let reservation = governor.try_reserve(dense_bytes, context).map_err(|err| {
+            String::from(MatrixError::DensificationRefused {
                 reason: format!(
                     "{context}: refusing to densify sparse design {}x{}: {err}",
                     self.matrix.nrows(),
                     self.matrix.ncols(),
                 ),
-            }))?;
+            })
+        })?;
         Ok(reservation.bind(self.materialize_dense_arc()))
     }
 
@@ -3132,9 +3129,8 @@ impl CoefficientTransformOperator {
                 // block, refuse densification when the operator's
                 // outer shape says we're in strict territory. Falls
                 // through to streaming row_chunk_into / apply paths.
-                let auto_policy = ResourcePolicy::for_problem(
-                    gam_runtime::resource::ProblemHints::default(),
-                );
+                let auto_policy =
+                    ResourcePolicy::for_problem(gam_runtime::resource::ProblemHints::default());
                 let cache_policy = ResourcePolicy {
                     max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
                     derivative_storage_mode: auto_policy.derivative_storage_mode,
@@ -3327,9 +3323,8 @@ impl ResidualisedDesignOperator {
             .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
         let computed = match bytes {
             Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                let auto_policy = ResourcePolicy::for_problem(
-                    gam_runtime::resource::ProblemHints::default(),
-                );
+                let auto_policy =
+                    ResourcePolicy::for_problem(gam_runtime::resource::ProblemHints::default());
                 let cache_policy = ResourcePolicy {
                     max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
                     derivative_storage_mode: auto_policy.derivative_storage_mode,
@@ -5275,11 +5270,7 @@ impl DesignMatrix {
     /// Unlike [`Self::matrixvectormultiply`], this accepts an `ArrayView1` and
     /// does not require either operand to be copied for materialized dense or
     /// sparse designs.
-    pub fn apply_view_into(
-        &self,
-        vector: ArrayView1<'_, f64>,
-        mut output: ArrayViewMut1<'_, f64>,
-    ) {
+    pub fn apply_view_into(&self, vector: ArrayView1<'_, f64>, mut output: ArrayViewMut1<'_, f64>) {
         assert_eq!(self.ncols(), vector.len());
         assert_eq!(self.nrows(), output.len());
         match self {

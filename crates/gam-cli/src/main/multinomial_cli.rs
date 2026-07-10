@@ -39,8 +39,12 @@ pub(crate) fn reject_multinomial_model(path: &Path, command: &str) -> Result<(),
 fn load_multinomial_model(path: &Path) -> Result<MultinomialSavedModel, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("failed to read multinomial model '{}': {e}", path.display()))?;
-    let envelope = MultinomialModelEnvelope::from_json_bytes(&bytes)
-        .map_err(|e| format!("failed to parse multinomial model '{}': {e}", path.display()))?;
+    let envelope = MultinomialModelEnvelope::from_json_bytes(&bytes).map_err(|e| {
+        format!(
+            "failed to parse multinomial model '{}': {e}",
+            path.display()
+        )
+    })?;
     Ok(envelope.saved)
 }
 
@@ -49,18 +53,18 @@ fn write_multinomial_model(path: &Path, saved: MultinomialSavedModel) -> Result<
         .map_err(|e| e.to_string())?
         .to_json_bytes()
         .map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes)
-        .map_err(|e| format!("failed to write multinomial model '{}': {e}", path.display()))?;
+    std::fs::write(path, bytes).map_err(|e| {
+        format!(
+            "failed to write multinomial model '{}': {e}",
+            path.display()
+        )
+    })?;
     cli_out!("saved model: {}", path.display());
     Ok(())
 }
 
 fn print_multinomial_fit_summary(saved: &MultinomialSavedModel) {
-    let reference = saved
-        .class_levels
-        .last()
-        .map(String::as_str)
-        .unwrap_or("?");
+    let reference = saved.class_levels.last().map(String::as_str).unwrap_or("?");
     cli_out!(
         "multinomial fit | classes={} | reference={} | p_per_class={} | iterations={} | \
          deviance={:.6e}",

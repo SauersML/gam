@@ -78,7 +78,9 @@ pub struct SaeCrosscoderFitReport {
 
 fn validate_label(label: &str, role: &str) -> Result<(), String> {
     if label.trim().is_empty() {
-        return Err(format!("run_sae_crosscoder_fit: {role} label must be non-empty"));
+        return Err(format!(
+            "run_sae_crosscoder_fit: {role} label must be non-empty"
+        ));
     }
     Ok(())
 }
@@ -104,8 +106,7 @@ pub fn stack_crosscoder_targets(
     }
     if blocks.is_empty() {
         return Err(
-            "run_sae_crosscoder_fit: at least one named non-anchor target is required"
-                .to_string(),
+            "run_sae_crosscoder_fit: at least one named non-anchor target is required".to_string(),
         );
     }
 
@@ -203,11 +204,8 @@ fn certify_crosscoder_outer(
 pub fn run_sae_crosscoder_fit(
     mut request: SaeCrosscoderFitRequest,
 ) -> Result<SaeCrosscoderFitReport, SaeFitError> {
-    let (stacked, block_dims, labels) = stack_crosscoder_targets(
-        &request.anchor_label,
-        &request.anchor,
-        &request.blocks,
-    )?;
+    let (stacked, block_dims, labels) =
+        stack_crosscoder_targets(&request.anchor_label, &request.anchor, &request.blocks)?;
     let p_x = request.anchor.ncols();
     if request.base_term.output_dim() != stacked.ncols() {
         return Err(SaeFitError::Fit(format!(
@@ -256,7 +254,7 @@ pub fn run_sae_crosscoder_fit(
     super::fit_entry::scope_outer_checkpoint_to_stage(&mut objective, SaeFitStage::Primary);
     objective.set_cancel_flag(cancel);
 
-    let mut objective = if request.run_outer_rho_search {
+    let objective = if request.run_outer_rho_search {
         let search_initial = match objective.try_resume_from_checkpoint(n_params) {
             Some(banked) => ndarray::Array1::from(banked),
             None => initial_flat,
@@ -280,12 +278,7 @@ pub fn run_sae_crosscoder_fit(
     let rho = fitted_result.rho;
     let loss = fitted_result.loss;
     let termination = fitted_result.termination;
-    let layout = CrosscoderLayout::new(
-        p_x,
-        block_dims,
-        labels,
-        rho.log_lambda_block.clone(),
-    )?;
+    let layout = CrosscoderLayout::new(p_x, block_dims, labels, rho.log_lambda_block.clone())?;
     term.set_crosscoder_layout(layout.clone())?;
 
     let scaled_fitted = term.try_fitted()?;
@@ -326,9 +319,13 @@ pub fn run_sae_crosscoder_fit(
 
     let drift = match measure_crosscoder_drift(&term, &layout) {
         Ok(report) => CrosscoderDriftStatus::Measured(report),
-        Err(reason) if layers.windows(2).any(|pair| {
-            pair[0].target.ncols() != pair[1].target.ncols()
-        }) => CrosscoderDriftStatus::Undefined { reason },
+        Err(reason)
+            if layers
+                .windows(2)
+                .any(|pair| pair[0].target.ncols() != pair[1].target.ncols()) =>
+        {
+            CrosscoderDriftStatus::Undefined { reason }
+        }
         Err(reason) => return Err(SaeFitError::Fit(reason)),
     };
 
@@ -360,9 +357,11 @@ mod tests {
                 target: ndarray::array![[7.0, 8.0], [9.0, 10.0]],
             },
         ];
-        let (stacked, dims, labels) =
-            stack_crosscoder_targets("early", &anchor, &blocks).unwrap();
-        assert_eq!(stacked, ndarray::array![[1.0, 2.0, 5.0, 7.0, 8.0], [3.0, 4.0, 6.0, 9.0, 10.0]]);
+        let (stacked, dims, labels) = stack_crosscoder_targets("early", &anchor, &blocks).unwrap();
+        assert_eq!(
+            stacked,
+            ndarray::array![[1.0, 2.0, 5.0, 7.0, 8.0], [3.0, 4.0, 6.0, 9.0, 10.0]]
+        );
         assert_eq!(dims, vec![1, 2]);
         assert_eq!(labels, vec!["middle", "late"]);
     }

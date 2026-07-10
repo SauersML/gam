@@ -92,13 +92,13 @@ pub use finite_validation::{
 pub use fisher_rao::{
     FisherRaoDefiniteness, normalize_fisher_rao_blocks, normalize_fisher_rao_blocks_pd,
 };
+use gam_linalg::dense;
 pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
 pub use gauge::Gauge;
 pub use identifiability_audit::{
     AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
 };
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
-use gam_linalg::dense;
 pub use linear_constraints::LinearInequalityConstraints;
 pub use monotone_root_error::MonotoneRootError;
 pub use penalty_coordinate::PenaltyCoordinate;

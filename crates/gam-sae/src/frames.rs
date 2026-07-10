@@ -570,8 +570,7 @@ impl GrassmannFrame {
             }
             if i > 0 && gauge_singular_values[i - 1] < value {
                 return Err(
-                    "GrassmannFrame::from_orthonormal: gauge values must be descending"
-                        .to_string(),
+                    "GrassmannFrame::from_orthonormal: gauge values must be descending".to_string(),
                 );
             }
         }

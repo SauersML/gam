@@ -340,7 +340,8 @@ pub fn fit_ov_coordinate_map(
         accumulate_normal_equation(&mut normal, &mut rhs, &basis, unwrapped_delta[index]);
     }
     let coefficients = solve_linear_system(normal, rhs, parameter_count)?;
-    let (sse, sst) = coordinate_sums_of_squares(key_t, &unwrapped_delta, max_harmonic, &coefficients);
+    let (sse, sst) =
+        coordinate_sums_of_squares(key_t, &unwrapped_delta, max_harmonic, &coefficients);
     Ok(CoordinateMapFit {
         intercept: coefficients[0],
         harmonics: harmonic_coefficients_from_regression(&coefficients, max_harmonic),

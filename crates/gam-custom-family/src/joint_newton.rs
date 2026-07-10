@@ -3108,8 +3108,7 @@ mod trust_region_subproblem_tests {
             "the band mode must be resolved (non-zero step component); got {}",
             step.delta[1]
         );
-        let step_norm =
-            (step.delta[0] * step.delta[0] + step.delta[1] * step.delta[1]).sqrt();
+        let step_norm = (step.delta[0] * step.delta[0] + step.delta[1] * step.delta[1]).sqrt();
         assert!(
             step_norm > 0.9e6 && step_norm < 1.1e6,
             "the regularized step sits on the trust boundary, ‖δ‖={step_norm}"

@@ -490,7 +490,14 @@ fn gate_mode_row_block_dim_keeps_all_k_assignment_coords() {
         "the fixed Softmax reference logit must account for exactly one row coordinate"
     );
 
-    let mut f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
+    let mut f = build_fixture(
+        k_atoms,
+        4,
+        d,
+        500,
+        2,
+        AssignmentMode::threshold_gate(1.0, 0.0),
+    );
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)

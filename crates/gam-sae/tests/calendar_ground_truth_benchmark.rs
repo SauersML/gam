@@ -46,12 +46,12 @@
 //! }
 //! ```
 
+use gam_sae::manifold::{
+    GraphCompressionKind, LearnedGraphAtom, OccupancyLaw, graph_edge_rank_charge,
+};
 use gam_sae::sparse_dict::{
     BlockChartComposeConfig, BlockCoordinateReport, BlockSparseFit, block_firing_coordinates,
     compose_block_coordinate_charts,
-};
-use gam_sae::manifold::{
-    GraphCompressionKind, LearnedGraphAtom, OccupancyLaw, graph_edge_rank_charge,
 };
 use gam_sae::structure_harvest::graph_birth_candidate_for_structure_search;
 use ndarray::{Array2, Array3};
@@ -76,8 +76,9 @@ const ENGELS_MONTH_FEATURE_INDICES: &[u64] = &[
     3977, 4140, 5993, 7299, 9104, 9401, 10449, 11196, 12661, 14715, 17068, 17528, 19589, 21033,
     22043, 23304,
 ];
-const ENGELS_YEAR_FEATURE_INDICES: &[u64] =
-    &[1052, 2753, 4427, 6382, 8314, 9576, 9606, 13551, 19734, 20349];
+const ENGELS_YEAR_FEATURE_INDICES: &[u64] = &[
+    1052, 2753, 4427, 6382, 8314, 9576, 9606, 13551, 19734, 20349,
+];
 
 #[derive(Clone)]
 struct CalendarFixture {
@@ -156,7 +157,10 @@ fn planted_calendar_fixture() -> CalendarFixture {
     }
 }
 
-fn calendar_fixture_from_real_clusters(n_rows: usize, clusters: Vec<RealClusterData>) -> CalendarFixture {
+fn calendar_fixture_from_real_clusters(
+    n_rows: usize,
+    clusters: Vec<RealClusterData>,
+) -> CalendarFixture {
     assert_eq!(
         clusters.len(),
         AXES,
@@ -349,7 +353,10 @@ fn ideal_calendar_axis_anchor_embeddings(axis: usize) -> Array2<f64> {
     })
 }
 
-fn recovered_calendar_axis_anchor_embeddings(fixture: &CalendarFixture, axis: usize) -> Array2<f64> {
+fn recovered_calendar_axis_anchor_embeddings(
+    fixture: &CalendarFixture,
+    axis: usize,
+) -> Array2<f64> {
     let fit = block_fit(fixture);
     let report = block_firing_coordinates(&fit, axis)
         .unwrap_or_else(|err| panic!("{} coordinate readout failed: {err}", AXIS_NAMES[axis]));
@@ -397,11 +404,14 @@ fn assert_axis_circle_topology(fixture: &CalendarFixture, axis: usize) {
     let charge = graph_edge_rank_charge(n_eff, embeddings.ncols());
     let precisions = vec![1.0; candidate_edges.len()];
     let deltas = vec![charge * 1.4; candidate_edges.len()];
-    let candidate =
-        graph_birth_candidate_for_structure_search(embeddings.view(), &rows, n_eff, &precisions, &deltas)
-            .unwrap_or_else(|err| {
-                panic!("{} graph birth candidate failed: {err}", AXIS_NAMES[axis])
-            });
+    let candidate = graph_birth_candidate_for_structure_search(
+        embeddings.view(),
+        &rows,
+        n_eff,
+        &precisions,
+        &deltas,
+    )
+    .unwrap_or_else(|err| panic!("{} graph birth candidate failed: {err}", AXIS_NAMES[axis]));
     let readout = &candidate.selection.topology;
 
     assert!(
@@ -527,8 +537,7 @@ fn assert_day_phase_order_and_closed_form_se(fixture: &CalendarFixture) {
             expected_se
         );
         assert_eq!(
-            firing.t_se_clamped,
-            expected_clamped,
+            firing.t_se_clamped, expected_clamped,
             "closed-form day phase SE clamp flag mismatch on row {}",
             firing.row
         );
@@ -691,7 +700,10 @@ fn parse_ground_truth_cluster(cluster: &Value, path: &PathBuf) -> GroundTruthClu
         .iter()
         .map(|entry| {
             entry.as_u64().unwrap_or_else(|| {
-                panic!("{name} in {} has a non-integer feature index", path.display())
+                panic!(
+                    "{name} in {} has a non-integer feature index",
+                    path.display()
+                )
             })
         })
         .collect::<Vec<_>>();
@@ -734,8 +746,7 @@ fn assert_ground_truth_cluster(clusters: &[GroundTruthCluster], axis: usize) {
         .find(|cluster| cluster.name == name)
         .unwrap_or_else(|| panic!("missing Engels GPT-2 SAE {name} cluster"));
     assert_eq!(
-        cluster.label_count,
-        LABEL_COUNTS[axis],
+        cluster.label_count, LABEL_COUNTS[axis],
         "{name} cluster must carry the canonical calendar label count; got {}",
         cluster.label_count
     );
@@ -774,7 +785,12 @@ fn load_engels_real_fixture(path: &PathBuf, clusters: &[GroundTruthCluster]) -> 
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("{} is missing string model", path.display()));
-    assert_eq!(model, "gpt-2", "{} must be a GPT-2 activation fixture", path.display());
+    assert_eq!(
+        model,
+        "gpt-2",
+        "{} must be a GPT-2 activation fixture",
+        path.display()
+    );
     let sae_layer = value
         .get("sae_layer")
         .and_then(Value::as_u64)
@@ -805,21 +821,24 @@ fn load_engels_real_fixture(path: &PathBuf, clusters: &[GroundTruthCluster]) -> 
         let cluster_value = cluster_values
             .iter()
             .find(|cluster| cluster.get("name").and_then(Value::as_str) == Some(name))
-            .unwrap_or_else(|| panic!("{} is missing real activation cluster {name}", path.display()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} is missing real activation cluster {name}",
+                    path.display()
+                )
+            });
         let ground_truth = clusters
             .iter()
             .find(|cluster| cluster.name == name)
             .unwrap_or_else(|| panic!("missing committed ground-truth cluster {name}"));
         let real_cluster = parse_real_cluster_data(cluster_value, path, n_rows);
         assert_eq!(
-            real_cluster.axis,
-            axis,
+            real_cluster.axis, axis,
             "{} real activation cluster axis mismatch",
             AXIS_NAMES[axis]
         );
         assert_eq!(
-            real_cluster.feature_indices,
-            ground_truth.feature_indices,
+            real_cluster.feature_indices, ground_truth.feature_indices,
             "{} real activation cluster feature indices do not match the committed Engels fixture",
             AXIS_NAMES[axis]
         );
@@ -873,7 +892,10 @@ fn parse_u64_array(cluster: &Value, field: &str, path: &PathBuf, name: &str) -> 
         .iter()
         .map(|entry| {
             entry.as_u64().unwrap_or_else(|| {
-                panic!("{name} in {} has a non-integer {field} entry", path.display())
+                panic!(
+                    "{name} in {} has a non-integer {field} entry",
+                    path.display()
+                )
             })
         })
         .collect()
@@ -909,7 +931,10 @@ fn parse_circle_codes(cluster: &Value, path: &PathBuf, name: &str) -> Vec<[f64; 
         .enumerate()
         .map(|(row, entry)| {
             let pair = entry.as_array().unwrap_or_else(|| {
-                panic!("{name} row {row} in {} has a non-array circle code", path.display())
+                panic!(
+                    "{name} row {row} in {} has a non-array circle code",
+                    path.display()
+                )
             });
             assert_eq!(
                 pair.len(),
@@ -918,10 +943,16 @@ fn parse_circle_codes(cluster: &Value, path: &PathBuf, name: &str) -> Vec<[f64; 
                 path.display()
             );
             let x0 = pair[0].as_f64().unwrap_or_else(|| {
-                panic!("{name} row {row} in {} has a non-float first circle coordinate", path.display())
+                panic!(
+                    "{name} row {row} in {} has a non-float first circle coordinate",
+                    path.display()
+                )
             });
             let x1 = pair[1].as_f64().unwrap_or_else(|| {
-                panic!("{name} row {row} in {} has a non-float second circle coordinate", path.display())
+                panic!(
+                    "{name} row {row} in {} has a non-float second circle coordinate",
+                    path.display()
+                )
             });
             [x0, x1]
         })

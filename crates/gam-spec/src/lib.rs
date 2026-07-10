@@ -1698,8 +1698,7 @@ impl LikelihoodSpec {
 
     #[inline]
     pub fn supports_firth(&self) -> bool {
-        matches!(self.response, ResponseFamily::Binomial)
-            && self.link.has_fisher_weight_jet()
+        matches!(self.response, ResponseFamily::Binomial) && self.link.has_fisher_weight_jet()
     }
 
     /// Family-level fixed-dispersion contract. Returns the dispersion parameter

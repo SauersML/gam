@@ -166,11 +166,7 @@ fn binomial_logit_reml_outer_work_bounded_1575() {
 
     eprintln!(
         "RECORD_1575 reml_score={:.10} edf={:.10} outer_cost_evals={} inner_pirls_solves={} outer_grad_norm={:?} converged=certified",
-        fit.reml_score,
-        edf,
-        fit.outer_cost_evals,
-        fit.inner_pirls_solves,
-        fit.outer_gradient_norm
+        fit.reml_score, edf, fit.outer_cost_evals, fit.inner_pirls_solves, fit.outer_gradient_norm
     );
 
     // Fit existence is the sealed convergence proof (SPEC 20).

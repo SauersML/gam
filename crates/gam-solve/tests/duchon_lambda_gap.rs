@@ -35,7 +35,10 @@ fn sin8_dataset(n: usize, sigma: f64, seed: u64) -> (Vec<f64>, Vec<f64>) {
     let mut x: Vec<f64> = (0..n).map(|_| ux.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let tp = 2.0 * std::f64::consts::PI * 8.0;
-    let y: Vec<f64> = x.iter().map(|&t| (tp * t).sin() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&t| (tp * t).sin() + noise.sample(&mut rng))
+        .collect();
     (x, y)
 }
 
@@ -55,7 +58,10 @@ fn duchon_spec(k: usize) -> DuchonBasisSpec {
 }
 
 fn max_abs(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(u, v)| (u - v).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b)
+        .map(|(u, v)| (u - v).abs())
+        .fold(0.0, f64::max)
 }
 fn amp(v: &[f64]) -> f64 {
     v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min)
@@ -74,7 +80,11 @@ fn mgcv_ds(x: &[f64], y: &[f64], k: usize) -> (f64, f64, Vec<f64>) {
             "#
         ),
     );
-    (r.vector("edf")[0], r.vector("sp")[0], r.vector("fit").to_vec())
+    (
+        r.vector("edf")[0],
+        r.vector("sp")[0],
+        r.vector("fit").to_vec(),
+    )
 }
 
 #[test]
@@ -166,7 +176,10 @@ fn zz_measure_duchon_sin8_reml_surface() {
                 amp(&fit)
             );
             let d = (pe.edf - mgcv_edf).abs();
-            if best_at_mgcv_edf.map(|(_, _, e)| (e - mgcv_edf).abs() > d).unwrap_or(true) {
+            if best_at_mgcv_edf
+                .map(|(_, _, e)| (e - mgcv_edf).abs() > d)
+                .unwrap_or(true)
+            {
                 best_at_mgcv_edf = Some((rho, pe.reml_score, pe.edf));
             }
         }

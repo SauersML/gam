@@ -474,8 +474,9 @@ fn fit_level_decoder_rescale_invariance_2099() {
     rep_b.atoms[0].log_amplitude = 0.2 - c.ln();
     assert!(rep_a.quotient_scale() && rep_b.quotient_scale());
 
-    let target =
-        Array2::<f64>::from_shape_fn((n, p), |(r, cc)| 0.2 - 0.05 * (r as f64) + 0.1 * (cc as f64));
+    let target = Array2::<f64>::from_shape_fn((n, p), |(r, cc)| {
+        0.2 - 0.05 * (r as f64) + 0.1 * (cc as f64)
+    });
     let rho = SaeManifoldRho::new(0.0, -4.0, vec![array![0.0]]);
 
     // (1) The physical image is identical ⇒ data-fit invariant as-is.
@@ -528,8 +529,12 @@ fn fit_level_decoder_rescale_invariance_2099() {
     let (dtb, dbb) = rep_b
         .solve_newton_step(target.view(), &rho, None, 1.0e-4, 1.0e-4)
         .unwrap();
-    rep_a.apply_newton_step(dta.view(), dba.view(), 0.5).unwrap();
-    rep_b.apply_newton_step(dtb.view(), dbb.view(), 0.5).unwrap();
+    rep_a
+        .apply_newton_step(dta.view(), dba.view(), 0.5)
+        .unwrap();
+    rep_b
+        .apply_newton_step(dtb.view(), dbb.view(), 0.5)
+        .unwrap();
     let img_a = rep_a.atoms[0]
         .basis_values
         .dot(&rep_a.atoms[0].decoder_coefficients)

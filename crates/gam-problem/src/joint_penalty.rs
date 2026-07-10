@@ -137,7 +137,10 @@ impl std::fmt::Display for JointPenaltyError {
                  {min_eigenvalue:.6e} (max |eigenvalue| {max_abs_eigenvalue:.6e}); the \
                  penalized objective is unbounded below along the negative mode"
             ),
-            Self::NullspaceMismatch { declared, numerical } => write!(
+            Self::NullspaceMismatch {
+                declared,
+                numerical,
+            } => write!(
                 f,
                 "joint penalty declares nullspace_dim={declared} but the eigenspectrum has \
                  {numerical} numerical-zero direction(s); the REML pseudo-logdet rank would \
@@ -234,11 +237,12 @@ impl JointPenaltySpec {
         // thresholds, so it must agree with the spectrum at construction).
         if nrows > 0 {
             use gam_linalg::faer_ndarray::FaerEigh;
-            let (eigenvalues, _) = FaerEigh::eigh(&self.matrix, faer::Side::Lower).map_err(
-                |e| JointPenaltyError::EigendecompositionFailed {
-                    reason: e.to_string(),
-                },
-            )?;
+            let (eigenvalues, _) =
+                FaerEigh::eigh(&self.matrix, faer::Side::Lower).map_err(|e| {
+                    JointPenaltyError::EigendecompositionFailed {
+                        reason: e.to_string(),
+                    }
+                })?;
             let max_abs_eigenvalue = eigenvalues
                 .iter()
                 .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));

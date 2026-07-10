@@ -54,14 +54,17 @@ use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args();
-    let program = args.next().unwrap_or_else(|| "binding_multiplicity".to_string());
+    let program = args
+        .next()
+        .unwrap_or_else(|| "binding_multiplicity".to_string());
     let Some(out_dir_raw) = args.next() else {
         return Err(format!(
             "usage: {program} <out_dir> [--weekday-codes <csv>]"
         ));
     };
     let out_dir = PathBuf::from(out_dir_raw);
-    std::fs::create_dir_all(&out_dir).map_err(|err| format!("create {}: {err}", out_dir.display()))?;
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|err| format!("create {}: {err}", out_dir.display()))?;
 
     let mut weekday_codes: Option<PathBuf> = None;
     let mut two_instance_codes: Option<PathBuf> = None;
@@ -86,7 +89,10 @@ fn main() -> Result<(), String> {
     let fixture = part_a_fixture_sweep();
     let fixture_summary = summarize_fixture(&fixture);
     let diagnostic = part_a_diagnostic();
-    write_json(&out_dir.join("fixture_spike_counts.json"), &Value::Array(fixture.clone()))?;
+    write_json(
+        &out_dir.join("fixture_spike_counts.json"),
+        &Value::Array(fixture.clone()),
+    )?;
 
     let mut report = json!({
         "app": "C_binding_multiplicity",
@@ -111,7 +117,10 @@ fn main() -> Result<(), String> {
     }
 
     write_json(&out_dir.join("binding_multiplicity_report.json"), &report)?;
-    println!("{}", serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 
@@ -207,7 +216,10 @@ fn part_a_diagnostic() -> Value {
         }
         let (gated, eta, used_sr) = recover_measure_from_code(&z, sigma);
         let (raw_order, raw_spikes): (usize, Vec<(f64, f64)>) = match &raw {
-            Ok(r) => (r.model_order, r.spikes.iter().map(|s| (s.t, s.amplitude)).collect()),
+            Ok(r) => (
+                r.model_order,
+                r.spikes.iter().map(|s| (s.t, s.amplitude)).collect(),
+            ),
             Err(_) => (0, Vec::new()),
         };
         cases.push(json!({
@@ -245,7 +257,9 @@ fn run_trial(
         }
     }
 
-    let prony_order = recover_spikes(&coeffs, sigma).map(|r| r.model_order).unwrap_or(0);
+    let prony_order = recover_spikes(&coeffs, sigma)
+        .map(|r| r.model_order)
+        .unwrap_or(0);
 
     // Gated production readout works off the flattened within-block code
     // z = [c_1, s_1, c_2, s_2, ...].
@@ -298,11 +312,16 @@ fn cell_report(outcomes: &[TrialOutcome]) -> Value {
 
     let pos_errors: Vec<f64> = outcomes
         .iter()
-        .filter_map(|o| if o.position_error.is_finite() { Some(o.position_error) } else { None })
+        .filter_map(|o| {
+            if o.position_error.is_finite() {
+                Some(o.position_error)
+            } else {
+                None
+            }
+        })
         .collect();
     let max_pos_error = pos_errors.iter().cloned().fold(0.0f64, f64::max);
-    let mean_eta =
-        outcomes.iter().map(|o| o.dual_eta).sum::<f64>() / n;
+    let mean_eta = outcomes.iter().map(|o| o.dual_eta).sum::<f64>() / n;
 
     json!({
         "h": first.h,
@@ -371,7 +390,11 @@ fn summarize_fixture(cells: &[Value]) -> Value {
         }
     }
     let avg1 = |num: &[f64; 4], den: &[usize; 4], m: usize| -> Value {
-        if den[m] == 0 { Value::Null } else { json!(num[m] / den[m] as f64) }
+        if den[m] == 0 {
+            Value::Null
+        } else {
+            json!(num[m] / den[m] as f64)
+        }
     };
     let by_sep = |grid: &[[f64; 4]; 4], gridn: &[[usize; 4]; 4], m: usize| -> Value {
         let mut obj = serde_json::Map::new();
@@ -426,7 +449,9 @@ fn part_b_real_superposition(csv: &Path) -> Result<Value, String> {
     }
     let b = codes[0].len();
     if b < 4 || b % 2 != 0 {
-        return Err(format!("weekday code width {b} must be even and >= 4 (b = 2H, H >= 2)"));
+        return Err(format!(
+            "weekday code width {b} must be even and >= 4 (b = 2H, H >= 2)"
+        ));
     }
 
     // Per-weekday mean code and its single-spike recovered position.
@@ -564,13 +589,23 @@ fn part_c_two_instance(csv: &Path) -> Result<Value, String> {
         }
         let fields: Vec<&str> = trimmed.split(',').collect();
         if fields.len() < 4 {
-            return Err(format!("{}:{} needs t1,t2,<code...>", csv.display(), lineno + 1));
+            return Err(format!(
+                "{}:{} needs t1,t2,<code...>",
+                csv.display(),
+                lineno + 1
+            ));
         }
         if lineno == 0 && fields[0].trim().parse::<f64>().is_err() {
             continue; // header
         }
-        let t1 = fields[0].trim().parse::<f64>().map_err(|e| format!("t1: {e}"))?;
-        let t2 = fields[1].trim().parse::<f64>().map_err(|e| format!("t2: {e}"))?;
+        let t1 = fields[0]
+            .trim()
+            .parse::<f64>()
+            .map_err(|e| format!("t1: {e}"))?;
+        let t2 = fields[1]
+            .trim()
+            .parse::<f64>()
+            .map_err(|e| format!("t2: {e}"))?;
         let mut code = Vec::with_capacity(fields.len() - 2);
         for f in &fields[2..] {
             code.push(f.trim().parse::<f64>().map_err(|e| format!("code: {e}"))?);
@@ -593,7 +628,10 @@ fn part_c_two_instance(csv: &Path) -> Result<Value, String> {
     let sigma = if norms.len() < 2 {
         0.0
     } else {
-        (norms.iter().map(|&r| (r - mean_norm) * (r - mean_norm)).sum::<f64>()
+        (norms
+            .iter()
+            .map(|&r| (r - mean_norm) * (r - mean_norm))
+            .sum::<f64>()
             / (norms.len() - 1) as f64)
             .sqrt()
             * 0.5
@@ -615,7 +653,9 @@ fn part_c_two_instance(csv: &Path) -> Result<Value, String> {
         // Raw matrix-pencil order (the representational capability, at the 2/H
         // limit) alongside the conservative gated count.
         let coeffs: Vec<(f64, f64)> = code.chunks_exact(2).map(|p| (p[0], p[1])).collect();
-        let raw_order = recover_spikes(&coeffs, sigma).map(|r| r.model_order).unwrap_or(0);
+        let raw_order = recover_spikes(&coeffs, sigma)
+            .map(|r| r.model_order)
+            .unwrap_or(0);
         if raw_order == 2 {
             raw_two += 1;
         }
@@ -806,7 +846,10 @@ fn mix_seed(h: usize, sigma: f64, quant: bool, m: usize, trial: usize) -> u64 {
     let sigma_bits = (sigma * 1e9) as u64;
     let mut x = 0x9E3779B97F4A7C15u64;
     for v in [h as u64, sigma_bits, quant as u64, m as u64, trial as u64] {
-        x ^= v.wrapping_add(0x9E3779B97F4A7C15).wrapping_add(x << 6).wrapping_add(x >> 2);
+        x ^= v
+            .wrapping_add(0x9E3779B97F4A7C15)
+            .wrapping_add(x << 6)
+            .wrapping_add(x >> 2);
     }
     x
 }
@@ -824,7 +867,11 @@ fn read_weekday_codes(path: &Path) -> Result<(Vec<usize>, Vec<Vec<f64>>), String
         // Skip a header row (non-numeric second field).
         let fields: Vec<&str> = trimmed.split(',').collect();
         if fields.len() < 3 {
-            return Err(format!("{}:{} needs weekday,label,<code...>", path.display(), lineno + 1));
+            return Err(format!(
+                "{}:{} needs weekday,label,<code...>",
+                path.display(),
+                lineno + 1
+            ));
         }
         if lineno == 0 && fields[1].trim().parse::<i64>().is_err() {
             continue; // header
@@ -836,9 +883,9 @@ fn read_weekday_codes(path: &Path) -> Result<(Vec<usize>, Vec<Vec<f64>>), String
         let mut code = Vec::with_capacity(fields.len() - 2);
         for f in &fields[2..] {
             code.push(
-                f.trim()
-                    .parse::<f64>()
-                    .map_err(|err| format!("{}:{} parse code: {err}", path.display(), lineno + 1))?,
+                f.trim().parse::<f64>().map_err(|err| {
+                    format!("{}:{} parse code: {err}", path.display(), lineno + 1)
+                })?,
             );
         }
         labels.push(label);
@@ -850,7 +897,11 @@ fn read_weekday_codes(path: &Path) -> Result<(Vec<usize>, Vec<Vec<f64>>), String
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     let mut file =
         std::fs::File::create(path).map_err(|err| format!("create {}: {err}", path.display()))?;
-    file.write_all(serde_json::to_string_pretty(value).map_err(|e| e.to_string())?.as_bytes())
-        .map_err(|err| format!("write {}: {err}", path.display()))?;
+    file.write_all(
+        serde_json::to_string_pretty(value)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+    .map_err(|err| format!("write {}: {err}", path.display()))?;
     Ok(())
 }

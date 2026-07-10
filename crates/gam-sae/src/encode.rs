@@ -1452,13 +1452,8 @@ pub(crate) fn joint_encode_refine_row(
     let mut damping = JOINT_ENCODE_DAMPING_FLOOR;
 
     for _ in 0..JOINT_ENCODE_MAX_ITER {
-        let (value, grad, hess) = joint_encode_value_grad_hess(
-            atoms,
-            &coords,
-            x,
-            amplitudes,
-            metric_factor.clone(),
-        )?;
+        let (value, grad, hess) =
+            joint_encode_value_grad_hess(atoms, &coords, x, amplitudes, metric_factor.clone())?;
         let grad_norm = grad.dot(&grad).sqrt();
         if grad_norm <= JOINT_ENCODE_GRAD_TOL * target_scale {
             return Ok((coords, true));
@@ -1521,8 +1516,7 @@ pub(crate) fn joint_encode_refine_row(
                 accepted = Some((candidate, line_scale * step_unit_norm));
             }
             if accepted.is_some() {
-                damping =
-                    (damping / JOINT_ENCODE_DAMPING_DECAY).max(f64::EPSILON * diag_scale);
+                damping = (damping / JOINT_ENCODE_DAMPING_DECAY).max(f64::EPSILON * diag_scale);
                 break;
             }
             damping *= JOINT_ENCODE_DAMPING_GROWTH;
@@ -1532,25 +1526,15 @@ pub(crate) fn joint_encode_refine_row(
         };
         coords = next;
         if step_norm <= JOINT_ENCODE_STEP_TOL * target_scale {
-            let (_, final_grad, _) = joint_encode_value_grad_hess(
-                atoms,
-                &coords,
-                x,
-                amplitudes,
-                metric_factor.clone(),
-            )?;
-            let converged = final_grad.dot(&final_grad).sqrt()
-                <= JOINT_ENCODE_GRAD_TOL * target_scale;
+            let (_, final_grad, _) =
+                joint_encode_value_grad_hess(atoms, &coords, x, amplitudes, metric_factor.clone())?;
+            let converged =
+                final_grad.dot(&final_grad).sqrt() <= JOINT_ENCODE_GRAD_TOL * target_scale;
             return Ok((coords, converged));
         }
     }
-    let (_, final_grad, _) = joint_encode_value_grad_hess(
-        atoms,
-        &coords,
-        x,
-        amplitudes,
-        metric_factor,
-    )?;
+    let (_, final_grad, _) =
+        joint_encode_value_grad_hess(atoms, &coords, x, amplitudes, metric_factor)?;
     let converged = final_grad.dot(&final_grad).sqrt() <= JOINT_ENCODE_GRAD_TOL * target_scale;
     Ok((coords, converged))
 }
@@ -1674,8 +1658,11 @@ pub(crate) fn encode_grad_hess_core(
             if alpha_axis == 0.0 {
                 continue;
             }
-            let pr =
-                crate::manifold::ArdAxisPrior::eval(alpha_axis, t[axis], latent_axis_period(atom, axis));
+            let pr = crate::manifold::ArdAxisPrior::eval(
+                alpha_axis,
+                t[axis],
+                latent_axis_period(atom, axis),
+            );
             g[axis] += pr.grad;
             h[[axis, axis]] += pr.hess;
         }
@@ -1783,7 +1770,10 @@ fn beta_eta_newton_positive_definite(
         return Ok(None);
     }
     let floor = gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
-    if vals.iter().any(|&lambda| !lambda.is_finite() || lambda <= floor) {
+    if vals
+        .iter()
+        .any(|&lambda| !lambda.is_finite() || lambda <= floor)
+    {
         return Ok(None);
     }
     let lambda_min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1924,8 +1914,15 @@ fn refine_certified_start(
             return Ok(None);
         }
         t = next;
-        let (cert, next_delta) =
-            row_certificate_core(atom, evaluator, t.view(), x, amplitude, lipschitz, objective)?;
+        let (cert, next_delta) = row_certificate_core(
+            atom,
+            evaluator,
+            t.view(),
+            x,
+            amplitude,
+            lipschitz,
+            objective,
+        )?;
         if !cert.certified() {
             return Ok(None);
         }
@@ -2092,8 +2089,15 @@ fn certify_with_basin_warmup(
     if !in_chart(&t) {
         return Ok(None);
     }
-    let (mut cert, mut delta) =
-        row_certificate_core(atom, evaluator, t.view(), x, amplitude, lipschitz, objective)?;
+    let (mut cert, mut delta) = row_certificate_core(
+        atom,
+        evaluator,
+        t.view(),
+        x,
+        amplitude,
+        lipschitz,
+        objective,
+    )?;
     while !cert.certified() {
         // Not steppable (indefinite / non-finite Hessian): flag.
         if !(cert.h.is_finite() && cert.beta.is_finite() && cert.eta.is_finite()) {
@@ -2106,8 +2110,15 @@ fn certify_with_basin_warmup(
             return Ok(None);
         }
         t = next;
-        let (next_cert, next_delta) =
-            row_certificate_core(atom, evaluator, t.view(), x, amplitude, lipschitz, objective)?;
+        let (next_cert, next_delta) = row_certificate_core(
+            atom,
+            evaluator,
+            t.view(),
+            x,
+            amplitude,
+            lipschitz,
+            objective,
+        )?;
         cert = next_cert;
         delta = next_delta;
         // The warm-up only helps while h keeps *multiplicatively* contracting
@@ -2803,10 +2814,7 @@ impl EncodeAtlas {
             objective,
         )?
         else {
-            return Ok((
-                Array1::<f64>::zeros(d),
-                uncertified_certificate(lipschitz),
-            ));
+            return Ok((Array1::<f64>::zeros(d), uncertified_certificate(lipschitz)));
         };
 
         let cold_start = chart.region.center.clone();
@@ -2823,20 +2831,14 @@ impl EncodeAtlas {
             objective,
         )?
         else {
-            return Ok((
-                amortized_probe.coord,
-                uncertified_certificate(lipschitz),
-            ));
+            return Ok((amortized_probe.coord, uncertified_certificate(lipschitz)));
         };
 
         let gap =
             latent_coordinate_distance(atom, amortized_probe.coord.view(), cold_probe.coord.view());
         let tolerance = distilled_probe_tolerance(&amortized_probe, &cold_probe, amplitude, x);
         if !(gap.is_finite() && gap <= tolerance) {
-            return Ok((
-                amortized_probe.coord,
-                uncertified_certificate(lipschitz),
-            ));
+            return Ok((amortized_probe.coord, uncertified_certificate(lipschitz)));
         }
         // F5: return the certificate at the refined landing coordinate
         // (`final_cert`), consistent with the coord actually returned and with the
@@ -4563,7 +4565,9 @@ pub fn joint_encode_fallback_fraction(
         // carry no coupling — same `is_some()` predicate the dense path applied via
         // `tangents[k].is_some()`).
         let active: Vec<usize> = (0..k_atoms)
-            .filter(|&k| amplitudes[[row, k]] > amplitude_floor && atoms[k].basis_evaluator.is_some())
+            .filter(|&k| {
+                amplitudes[[row, k]] > amplitude_floor && atoms[k].basis_evaluator.is_some()
+            })
             .collect();
         if active.len() < 2 {
             continue; // no cross blocks: the per-atom certificate composes trivially
@@ -4638,13 +4642,20 @@ mod encode_fix_tests {
         // independent projections would instead produce (2,1.5).
         let jac = ndarray::array![[1.0_f64, 0.0], [1.0, 1.0]];
         let residual = ndarray::array![-2.0_f64, -1.0];
-        let (_value, grad, hess) =
-            joint_data_value_grad_hess(jac.view(), residual.view(), None);
+        let (_value, grad, hess) = joint_data_value_grad_hess(jac.view(), residual.view(), None);
         let step = joint_encode_damped_step(hess.view(), grad.view(), 1.0e-15)
             .expect("joint system factors")
             .expect("joint system is positive definite");
-        assert!((step[0] - 1.0).abs() < 1.0e-12, "first coefficient={}", step[0]);
-        assert!((step[1] - 1.0).abs() < 1.0e-12, "second coefficient={}", step[1]);
+        assert!(
+            (step[0] - 1.0).abs() < 1.0e-12,
+            "first coefficient={}",
+            step[0]
+        );
+        assert!(
+            (step[1] - 1.0).abs() < 1.0e-12,
+            "second coefficient={}",
+            step[1]
+        );
         let recon0 = step[0] + step[1];
         let recon1 = step[1];
         assert!((recon0 - 2.0).abs() < 1.0e-12 && (recon1 - 1.0).abs() < 1.0e-12);
@@ -5096,11 +5107,7 @@ mod encode_fix_tests {
     /// block instead of silently changing its spectrum.
     #[test]
     fn beta_eta_newton_refuses_rank_deficient_3x3() {
-        let h = ndarray::array![
-            [4.0_f64, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0]
-        ];
+        let h = ndarray::array![[4.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
         let g = Array1::from(vec![4.0_f64, 1.0, 0.0]);
         assert!(beta_eta_newton(h.view(), g.view()).expect("runs").is_none());
     }
@@ -5198,8 +5205,7 @@ mod joint_fallback_tests {
         let amplitudes = Array2::from_shape_fn((n, k), |_| 0.2 + 1.3 * rng.unit());
         // Coordinates are irrelevant for flat atoms (constant tangent), but the
         // diagnostic still evaluates the jet at them.
-        let coords: Vec<Array2<f64>> =
-            (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
         let floor = 1.0e-9;
 
         let sweep = [0.0_f64, 0.2, 0.4, 0.6, 0.8, 0.95];
@@ -5255,8 +5261,7 @@ mod joint_fallback_tests {
         for row in 0..n {
             amplitudes[[row, row % k]] = 1.0;
         }
-        let coords: Vec<Array2<f64>> =
-            (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+        let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
         let frac = joint_encode_fallback_fraction(&atoms, &coords, amplitudes.view(), 1.0e-9)
             .expect("computes");
         assert!(

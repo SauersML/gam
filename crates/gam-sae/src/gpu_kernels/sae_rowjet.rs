@@ -862,13 +862,11 @@ mod tests {
         assert_eq!(slabs.border_hessian, border_h);
         assert_eq!(slabs.border_gradient, border_g);
         // A mismatched border length is rejected at the bridge, not on upload.
-        let bad = resident_slabs_from_rowjet(shape, &ch, cross, grad, border_h, vec![0.1; shape.p + 1]);
+        let bad =
+            resident_slabs_from_rowjet(shape, &ch, cross, grad, border_h, vec![0.1; shape.p + 1]);
         assert!(bad.is_err(), "short border_gradient must fail loudly");
         // Arity mismatch (row-jet K != resident d) is rejected too.
-        let wrong_shape = DeviceResidentArrowShape {
-            d: k + 1,
-            ..shape
-        };
+        let wrong_shape = DeviceResidentArrowShape { d: k + 1, ..shape };
         assert!(
             resident_slabs_from_rowjet(
                 wrong_shape,

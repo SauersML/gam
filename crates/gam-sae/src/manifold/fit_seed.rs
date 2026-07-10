@@ -68,11 +68,11 @@ impl SaeFitAssignmentKind {
 }
 
 /// Borrowed arrays and owned policy needed to construct one fit seed.
-pub struct SaeFitSeedRequest<'a> {
+pub struct SaeFitSeedRequest<'a, 'context> {
     pub target: ArrayView2<'a, f64>,
     pub atom_basis: &'a [String],
     pub atom_dim: &'a [usize],
-    pub atom_centers: &'a [Option<Array2<f64>>],
+    pub atom_centers: &'context [Option<Array2<f64>>],
     pub basis_values: ArrayView3<'a, f64>,
     pub basis_jacobian: ArrayView4<'a, f64>,
     pub basis_sizes: &'a [usize],
@@ -100,7 +100,7 @@ pub struct SaeFitSeedRequest<'a> {
     pub temperature_schedule: Option<GumbelTemperatureSchedule>,
     pub fisher_metric: Option<SaeFisherRowMetricRequest<'a>>,
     pub row_loss_weights: Option<ArrayView1<'a, f64>>,
-    pub registry: &'a AnalyticPenaltyRegistry,
+    pub registry: &'context AnalyticPenaltyRegistry,
 }
 
 /// Fully configured seed objects consumed by [`SaeFitRequest`].
@@ -126,13 +126,14 @@ pub fn admit_sae_fit_shape(
                 "assignment_kind 'topk' requires top_k (the fixed per-row support size)".to_string()
             })?;
             crate::front_door::admit_topk_manifold(n_obs, p_out, k_atoms, d_max.max(1), support)
+                .map(|_| ())
         }
         _ => crate::front_door::admit_dense_certification(n_obs, p_out, k_atoms),
     }
 }
 
 /// Validate and construct the complete Python-free seed for a SAE fit.
-pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_>) -> Result<SaeFitSeedReport, String> {
+pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSeedReport, String> {
     let (n_obs, p_out) = request.target.dim();
     if n_obs == 0 || p_out == 0 {
         return Err("sae_manifold_fit requires a non-empty (N, p) response".to_string());

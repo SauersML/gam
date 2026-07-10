@@ -303,11 +303,9 @@ fn tier1_rho_quadrature_improves_sae_smooth_band_coverage() {
         objective: &mut hessian_objective,
         fixed_rho: rho_hat.clone(),
     };
-    let outer_hessian = scalar_hessian_from_exact_gradient(
-        &mut smooth_hessian_objective,
-        rho_hat_smooth[0],
-    )
-    .expect("smooth-rho Hessian from exact gradients");
+    let outer_hessian =
+        scalar_hessian_from_exact_gradient(&mut smooth_hessian_objective, rho_hat_smooth[0])
+            .expect("smooth-rho Hessian from exact gradients");
     let proposal_precision = outer_hessian.abs().max(100.0);
     let proposal_hessian = Array2::from_shape_vec((1, 1), vec![proposal_precision]).unwrap();
 

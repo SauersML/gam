@@ -71,20 +71,20 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     "crates/gam-report/src/lib.rs",        // reports the audit certificate
     "crates/gam-cli/src/main/run_sample_generate_report.rs", // copies certificate fields into the report
     "crates/gam-sae/src/certificates.rs", // SAE analogue of the audit certificate
-    // The SAE sphere-boost Gauss–Newton chart Jacobian is now the exact analytic
-    // chain through the boost, moved-latitude whitening, `AᵀA`, and profiled
-    // scale. Its finite-difference comparison is confined to `#[cfg(test)]`, so
-    // the production file needs no exemption.
-    // SAE manifold outer-ρ files carry NO finite difference (the #1273 fallback was
-    // removed; the descent direction is the plain analytic `DeflatedArrowSolver`
-    // gradient) and so are NOT listed — they need no exemption.
-    //
-    // (#1440) The survival marginal-slope pilot W-metric chain factors in
-    // `crates/gam-models/src/survival/marginal_slope/row_math.rs` were a central
-    // difference of `rigid_observed_eta`; they are now the EXACT closed-form chain
-    // `∂η₁/∂q = c(g)`, `∂η₁/∂g = q·c'(g) + probit_scale·z` from `c_derivatives` +
-    // `rigid_observed_logslope`, so that file carries no FD and is NO LONGER
-    // listed (the tracked reducible-FD debt is cleared).
+                                          // The SAE sphere-boost Gauss–Newton chart Jacobian is now the exact analytic
+                                          // chain through the boost, moved-latitude whitening, `AᵀA`, and profiled
+                                          // scale. Its finite-difference comparison is confined to `#[cfg(test)]`, so
+                                          // the production file needs no exemption.
+                                          // SAE manifold outer-ρ files carry NO finite difference (the #1273 fallback was
+                                          // removed; the descent direction is the plain analytic `DeflatedArrowSolver`
+                                          // gradient) and so are NOT listed — they need no exemption.
+                                          //
+                                          // (#1440) The survival marginal-slope pilot W-metric chain factors in
+                                          // `crates/gam-models/src/survival/marginal_slope/row_math.rs` were a central
+                                          // difference of `rigid_observed_eta`; they are now the EXACT closed-form chain
+                                          // `∂η₁/∂q = c(g)`, `∂η₁/∂g = q·c'(g) + probit_scale·z` from `c_derivatives` +
+                                          // `rigid_observed_logslope`, so that file carries no FD and is NO LONGER
+                                          // listed (the tracked reducible-FD debt is cleared).
 ];
 
 /// The root crate `src` plus every `crates/*/src`, in stable sorted order. This

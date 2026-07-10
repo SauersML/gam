@@ -264,10 +264,9 @@ pub fn dimension_spectrometer(
     // Build the ladder K_j = k_min · 2^j, j = 0..=n_doublings, guarding overflow.
     let mut widths: Vec<usize> = Vec::with_capacity(cfg.n_doublings + 1);
     for j in 0..=cfg.n_doublings {
-        let k = cfg
-            .k_min
-            .checked_shl(j as u32)
-            .ok_or_else(|| format!("dimension_spectrometer: rung width k_min·2^{j} overflows usize"))?;
+        let k = cfg.k_min.checked_shl(j as u32).ok_or_else(|| {
+            format!("dimension_spectrometer: rung width k_min·2^{j} overflows usize")
+        })?;
         widths.push(k);
     }
 
@@ -507,7 +506,9 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
     let t_bar = t.iter().sum::<f64>() / nrung as f64;
     let stt: f64 = t.iter().map(|&ti| (ti - t_bar) * (ti - t_bar)).sum();
     if stt <= 0.0 {
-        return Err("fit_scaling_law: log-K design is degenerate (all rungs equal width)".to_string());
+        return Err(
+            "fit_scaling_law: log-K design is degenerate (all rungs equal width)".to_string(),
+        );
     }
 
     // The plateau cannot exceed the smallest achieved loss; a variance floor is
@@ -537,7 +538,11 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
     // exact fit (RSS≈0 by construction) would report a finite ~0 SE and an
     // unsaturated floor from 3 points fitting 3 parameters.
     let dof = (nrung as f64) - 3.0;
-    let s2 = if dof > 0.0 { fit.rss / dof } else { f64::INFINITY };
+    let s2 = if dof > 0.0 {
+        fit.rss / dof
+    } else {
+        f64::INFINITY
+    };
     let slope_se = (s2 / stt).sqrt();
 
     let d_hat = -2.0 / slope;
@@ -835,15 +840,17 @@ mod tests {
             "profiled σ² {} should recover planted floor {sigma2_true}",
             law.sigma2
         );
-        assert!(!law.floor_saturated, "clean power law must not read as saturated");
+        assert!(
+            !law.floor_saturated,
+            "clean power law must not read as saturated"
+        );
     }
 
     #[test]
     fn flat_losses_flag_floor_saturation() {
         // Losses at the floor (no decay in K) must flag saturation, not report a
         // spurious finite dimension.
-        let rungs: Vec<(usize, f64)> =
-            [4, 8, 16, 32, 64].iter().map(|&k| (k, 0.05f64)).collect();
+        let rungs: Vec<(usize, f64)> = [4, 8, 16, 32, 64].iter().map(|&k| (k, 0.05f64)).collect();
         let law = fit_scaling_law(&rungs).expect("flat scaling law fit");
         assert!(
             law.floor_saturated,
@@ -928,9 +935,7 @@ mod tests {
         );
         // Points-per-atom is exposed so the drift is inspectable, aligned to the ladder.
         assert_eq!(report.points_per_atom.len(), report.rungs.len());
-        assert!(
-            (report.points_per_atom[0] - n_rows as f64 / rungs[0].0 as f64).abs() < 1.0e-9
-        );
+        assert!((report.points_per_atom[0] - n_rows as f64 / rungs[0].0 as f64).abs() < 1.0e-9);
     }
 
     #[test]

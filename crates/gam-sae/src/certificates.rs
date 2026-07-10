@@ -99,7 +99,11 @@ pub fn certificate_from_samples(samples: &[CoordinateSamples]) -> GradientCriter
             && sample.plus_2h.is_finite()
             && sample.minus_2h.is_finite();
     }
-    let grad_norm = analytic_gradient.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let grad_norm = analytic_gradient
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
     GradientCriterionCertificate {
         grad_norm,
         fd_gradient,

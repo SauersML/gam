@@ -3412,7 +3412,11 @@ mod tests {
         // though their raw bit patterns differ (#2145 / #2146).
         let pos = 0.0_f64;
         let neg = -0.0_f64;
-        assert_ne!(pos.to_bits(), neg.to_bits(), "precondition: raw bits differ");
+        assert_ne!(
+            pos.to_bits(),
+            neg.to_bits(),
+            "precondition: raw bits differ"
+        );
         assert_eq!(pos, neg, "precondition: numerically equal");
         assert_eq!(canonical_level_bits(pos), canonical_level_bits(neg));
         assert_eq!(canonical_level_bits(neg), 0.0_f64.to_bits());
@@ -3425,7 +3429,16 @@ mod tests {
     fn canonical_level_bits_is_bit_stable_on_ordinary_values() {
         // Every ordinary finite value keeps its raw key — the helper must not
         // perturb the identity of any genuine level.
-        for &v in &[1.0_f64, -1.0, 2.5, -3.75, 1e300, -1e-300, f64::MIN, f64::MAX] {
+        for &v in &[
+            1.0_f64,
+            -1.0,
+            2.5,
+            -3.75,
+            1e300,
+            -1e-300,
+            f64::MIN,
+            f64::MAX,
+        ] {
             assert_eq!(canonical_level_bits(v), v.to_bits(), "value {v}");
         }
         // Distinct real values keep distinct keys.

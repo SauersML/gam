@@ -153,7 +153,11 @@ pub fn token_frequency_features(log_freq: &[f64], degree: usize) -> Array2<f64> 
         return z;
     }
     let mean = log_freq.iter().sum::<f64>() / n as f64;
-    let var = log_freq.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n as f64;
+    let var = log_freq
+        .iter()
+        .map(|&v| (v - mean) * (v - mean))
+        .sum::<f64>()
+        / n as f64;
     let sd = var.sqrt();
     if sd <= 0.0 {
         return z; // constant frequency carries no direction
@@ -498,8 +502,8 @@ mod tests {
         let (n, p) = (2000usize, 24usize);
         let planted = plant(n, p, &config, 0x51EDC0FFEE_u64);
         let x = &planted.x;
-        let design =
-            build_nuisance_design(n, &planted.positions, &planted.log_freq, &config).expect("design");
+        let design = build_nuisance_design(n, &planted.positions, &planted.log_freq, &config)
+            .expect("design");
         let fit = fit_nuisance_atlas(x.view(), design.view(), config.ridge).expect("fit");
 
         // Absorbed fraction is in the neighbourhood of the planted nuisance
@@ -584,8 +588,8 @@ mod tests {
         let (n, p) = (1500usize, 20usize);
         let planted = plant(n, p, &config, 0x0DDBA11_u64);
         let x = &planted.x;
-        let design =
-            build_nuisance_design(n, &planted.positions, &planted.log_freq, &config).expect("design");
+        let design = build_nuisance_design(n, &planted.positions, &planted.log_freq, &config)
+            .expect("design");
         let fit = fit_nuisance_atlas(x.view(), design.view(), config.ridge).expect("fit");
         let resid = fit.residual(x.view(), design.view());
         let refit = fit_nuisance_atlas(resid.view(), design.view(), config.ridge).expect("refit");

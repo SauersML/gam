@@ -1785,8 +1785,7 @@ pub(crate) fn floor_positiveworking_weights_rejects_negative_and_nonfinite() {
         .expect_err("NaN curvature must be rejected, not coerced to minweight");
 
     let inf = array![f64::INFINITY, 0.5];
-    floor_positiveworking_weights(&inf, 1.0e-6)
-        .expect_err("infinite curvature must be rejected");
+    floor_positiveworking_weights(&inf, 1.0e-6).expect_err("infinite curvature must be rejected");
 }
 
 #[test]
@@ -4198,7 +4197,7 @@ pub(crate) fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
 /// ceiling were removed this test would hang instead of returning.
 #[test]
 pub(crate) fn bms_flex_marginal_slope_coupled_exact_inner_stall_is_deterministically_bounded_gam1794()
-{
+ {
     let spec0 = ParameterBlockSpec {
         name: "block0".to_string(),
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
@@ -9060,11 +9059,7 @@ pub(crate) fn structural_edf_quotients_nullspace_range_coupling() {
     let eps = 0.01_f64;
     // XᵀX = [[1,1,0],[1,1+ε,0],[0,0,1]] via the Cholesky factor
     // L = [[1,0,0],[1,√ε,0],[0,0,1]], X = Lᵀ.
-    let x = array![
-        [1.0, 1.0, 0.0],
-        [0.0, eps.sqrt(), 0.0],
-        [0.0, 0.0, 1.0]
-    ];
+    let x = array![[1.0, 1.0, 0.0], [0.0, eps.sqrt(), 0.0], [0.0, 0.0, 1.0]];
     let design = DesignMatrix::from(x);
     let s = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let penalty = PenaltyMatrix::Dense(s.clone());

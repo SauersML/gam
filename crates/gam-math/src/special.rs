@@ -148,11 +148,7 @@ mod tests {
             let total: f64 = weights.iter().sum();
             assert!((total - 2.0).abs() < 1e-13, "∫1 dx = 2, got {total}");
             if n >= 2 {
-                let x2: f64 = nodes
-                    .iter()
-                    .zip(&weights)
-                    .map(|(x, w)| w * x * x)
-                    .sum();
+                let x2: f64 = nodes.iter().zip(&weights).map(|(x, w)| w * x * x).sum();
                 assert!((x2 - 2.0 / 3.0).abs() < 1e-13, "∫x² dx = 2/3, got {x2}");
             }
         }

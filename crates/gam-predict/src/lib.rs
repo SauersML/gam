@@ -32,13 +32,13 @@ use crate::linalg::{
 pub use crate::standard::StandardPredictor;
 use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
-use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
-use gam_linalg::utils::predict_gam_dimension_mismatch_message;
 use gam_inference::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
     negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
     tweedie_moment_matched_interval,
 };
+use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
+use gam_linalg::utils::predict_gam_dimension_mismatch_message;
 use gam_math::probability::{normal_cdf, standard_normal_quantile};
 use gam_models::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
@@ -2131,9 +2131,11 @@ where
             } else {
                 source.observation_theta()
             }?;
-            Some(Array1::from_iter(mean.iter().enumerate().map(
-                |(i, &mu)| mu + (mu.powi(2) + v(i)) / theta,
-            )))
+            Some(Array1::from_iter(
+                mean.iter()
+                    .enumerate()
+                    .map(|(i, &mu)| mu + (mu.powi(2) + v(i)) / theta),
+            ))
         }
         ResponseFamily::Tweedie { p } => {
             let phi = source.observation_phi()?;
@@ -2152,9 +2154,11 @@ where
         }
         ResponseFamily::Gamma => {
             let phi = source.observation_phi()?;
-            Some(Array1::from_iter(mean.iter().enumerate().map(
-                |(i, &mu)| phi * (mu.powi(2) + v(i)),
-            )))
+            Some(Array1::from_iter(
+                mean.iter()
+                    .enumerate()
+                    .map(|(i, &mu)| phi * (mu.powi(2) + v(i))),
+            ))
         }
         ResponseFamily::Beta { .. } => {
             let phi = source.observation_phi()?;
@@ -2167,12 +2171,12 @@ where
         // the Bernoulli indicator 1{T > t} with conditional variance S(1−S) —
         // the Binomial law of total variance below with μ = S: E[S(1−S)] =
         // m(1−m) − v, and total predictive variance exactly m(1−m).
-        ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
-            Some(Array1::from_iter(mean.iter().enumerate().map(|(i, &mu)| {
+        ResponseFamily::Binomial | ResponseFamily::RoystonParmar => Some(Array1::from_iter(
+            mean.iter().enumerate().map(|(i, &mu)| {
                 let p = mu.clamp(0.0, 1.0);
                 (p * (1.0 - p) - v(i)).max(0.0)
-            })))
-        }
+            }),
+        )),
     }
 }
 
@@ -2297,14 +2301,9 @@ where
             // the conjugate Negative-Binomial (Gamma–Poisson) posterior
             // predictive — NOT a continuous moment-matched surrogate, which has
             // no zero atom and would over-cover the lower tail at low rates.
-            let response_var = family_response_variance(
-                response,
-                mean,
-                source,
-                None,
-                Some(&mean_variance),
-            )
-            .expect("Poisson has a closed-form conditional variance");
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("Poisson has a closed-form conditional variance");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 poisson_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
@@ -2332,14 +2331,9 @@ where
             // tail at low means.
             // E[Var(Y|μ)] = m + (m² + Var(μ))/θ (law of total variance; the
             // plug-in m + m²/θ omitted Var(μ)/θ).
-            let response_var = family_response_variance(
-                response,
-                mean,
-                source,
-                None,
-                Some(&mean_variance),
-            )
-            .expect("theta availability was checked above");
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("theta availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi)
             })
@@ -2357,14 +2351,9 @@ where
             // surrogate, #1193). Estimation uncertainty is folded into an
             // effective dispersion that matches the inflated total variance.
             // E[Var(Y|μ)] = φE[μ^p] (log-normal-exact), not φ(E[μ])^p.
-            let response_var = family_response_variance(
-                response,
-                mean,
-                source,
-                None,
-                Some(&mean_variance),
-            )
-            .expect("phi availability was checked above");
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("phi availability was checked above");
             let power = *p;
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi)
@@ -2379,14 +2368,9 @@ where
                 return (None, None);
             }
             // E[Var(Y|μ)] = φ(m² + Var(μ)) (the plug-in φm² omitted φ·Var(μ)).
-            let response_var = family_response_variance(
-                response,
-                mean,
-                source,
-                None,
-                Some(&mean_variance),
-            )
-            .expect("phi availability was checked above");
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("phi availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
@@ -2409,14 +2393,9 @@ where
             // E[Var(Y|μ)] = (m(1−m) − Var(μ))/(1+φ), so the total predictive
             // variance is (m(1−m) + φ·Var(μ))/(1+φ) — the plug-in added all of
             // Var(μ) instead of its φ/(1+φ) share.
-            let response_var = family_response_variance(
-                response,
-                mean,
-                source,
-                None,
-                Some(&mean_variance),
-            )
-            .expect("phi availability was checked above");
+            let response_var =
+                family_response_variance(response, mean, source, None, Some(&mean_variance))
+                    .expect("phi availability was checked above");
             skew_predictive_bounds(response_var, &|mu, total_var, p_lo, p_hi| {
                 beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
             })
@@ -6001,9 +5980,21 @@ mod tests {
         );
         let lower = lower.expect("RoystonParmar must produce an observation band");
         let upper = upper.expect("RoystonParmar must produce an observation band");
-        assert_eq!((lower[0], upper[0]), (0.0, 1.0), "interior m covers both support points");
-        assert_eq!((lower[1], upper[1]), (1.0, 1.0), "near-certain survival collapses to {{1}}");
-        assert_eq!((lower[2], upper[2]), (0.0, 0.0), "near-certain event collapses to {{0}}");
+        assert_eq!(
+            (lower[0], upper[0]),
+            (0.0, 1.0),
+            "interior m covers both support points"
+        );
+        assert_eq!(
+            (lower[1], upper[1]),
+            (1.0, 1.0),
+            "near-certain survival collapses to {{1}}"
+        );
+        assert_eq!(
+            (lower[2], upper[2]),
+            (0.0, 0.0),
+            "near-certain event collapses to {{0}}"
+        );
         assert_eq!(
             bernoulli_predictive_quantile(0.75, 0.25),
             0.0,

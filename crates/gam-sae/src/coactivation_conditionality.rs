@@ -14,9 +14,9 @@
 //! Discrete context labels are accepted only by the diagnostic naming helper at
 //! the bottom of the module. They are not part of the conditionality metric.
 
+use crate::null_battery::ClaimNullCalibration;
 use gam_solve::row_sampling_measure::{DesignedRowSample, MeasureProvenance, RowSamplingMeasure};
 use gam_terms::basis::{BasisOptions, Dense, KnotSource, create_basis};
-use crate::null_battery::ClaimNullCalibration;
 use ndarray::{Array1, ArrayView2};
 use std::collections::BTreeMap;
 
@@ -285,9 +285,8 @@ pub fn estimate_on_rows_with_nulls(
         nulls,
         spike_in_roc,
     )?;
-    report.null_calibration = Some(
-        crate::null_battery::ClaimNullCalibration::from_calibrated_roc(calibrated),
-    );
+    report.null_calibration =
+        Some(crate::null_battery::ClaimNullCalibration::from_calibrated_roc(calibrated));
     Ok(report)
 }
 
@@ -299,7 +298,9 @@ fn selected_pair_matrix(
     let mut out = ndarray::Array2::<f64>::zeros((rows.len(), 2));
     for (slot, &row) in rows.iter().enumerate() {
         if row >= gate_i.len() || row >= gate_j.len() {
-            return Err(format!("selected_pair_matrix: sampled row {row} out of range"));
+            return Err(format!(
+                "selected_pair_matrix: sampled row {row} out of range"
+            ));
         }
         out[[slot, 0]] = gate_i[row];
         out[[slot, 1]] = gate_j[row];
@@ -791,15 +792,14 @@ fn fit_varying_coefficient_gam(
         )
     };
     let selected_log_smoothing = minimize_reml_log_smoothing(fit_for_log_lambda)?;
-    let final_fit =
-        penalized_gaussian_fit(
-            &design,
-            &y,
-            likelihood_weights,
-            &penalty,
-            penalty_rank,
-            selected_log_smoothing,
-        )?;
+    let final_fit = penalized_gaussian_fit(
+        &design,
+        &y,
+        likelihood_weights,
+        &penalty,
+        penalty_rank,
+        selected_log_smoothing,
+    )?;
     let mut coefficients = vec![0.0_f64; beta_cols];
     coefficients.copy_from_slice(&final_fit.coef[1..]);
     let mut beta_at_rows = Vec::with_capacity(n);
@@ -953,7 +953,11 @@ where
     golden_section_minimize(&mut evaluate, left, right)
 }
 
-fn golden_section_minimize<F>(evaluate: &mut F, mut left: f64, mut right: f64) -> Result<f64, String>
+fn golden_section_minimize<F>(
+    evaluate: &mut F,
+    mut left: f64,
+    mut right: f64,
+) -> Result<f64, String>
 where
     F: FnMut(f64) -> Result<PenalizedFit, String>,
 {
@@ -1024,7 +1028,6 @@ fn difference_coefficients(order: usize) -> Vec<f64> {
     }
     coeff
 }
-
 
 fn diagnose_context_labels(
     gate_i: &[f64],
@@ -1101,7 +1104,9 @@ fn residualize_gate(
     for row in 0..n {
         let y = gate[row];
         if !y.is_finite() {
-            return Err(format!("residualize_gate: row {row} has non-finite gate {y}"));
+            return Err(format!(
+                "residualize_gate: row {row} has non-finite gate {y}"
+            ));
         }
         let w = weights[row];
         for a in 0..cols {
@@ -1353,8 +1358,8 @@ mod tests {
         }
         let rows: Vec<usize> = (0..n).collect();
         let weights = vec![1.0_f64; n];
-        let influence = coupling_influence_values(&gate_i, &gate_j, &rows, &weights)
-            .expect("influence values");
+        let influence =
+            coupling_influence_values(&gate_i, &gate_j, &rows, &weights).expect("influence values");
         let certificate = influence.certificate();
         let direct = direct_exponential_tilt_radius_to_kill(
             certificate.rho,
@@ -1429,11 +1434,7 @@ mod tests {
         let jackknife_rms = (jackknife_sse / n as f64).sqrt();
         println!(
             "case=weighted_corr_if rho={:.6e} max_closed_form_diff={:.6e} mean_psi={:.6e} max_jackknife_diff={:.6e} jackknife_rms={:.6e}",
-            influence.rho,
-            max_closed_form_diff,
-            weighted_mean,
-            max_jackknife_diff,
-            jackknife_rms
+            influence.rho, max_closed_form_diff, weighted_mean, max_jackknife_diff, jackknife_rms
         );
         // Exact checks: the closed-form influence recomputed independently must
         // match the returned psi to machine precision, and every influence
@@ -1493,8 +1494,7 @@ mod tests {
             let a = if active_i[row] { 1.0 } else { 0.0 };
             let b = if active_j[row] { 1.0 } else { 0.0 };
             // Exact closed form: psi_i = 1_{g_i}(1_{g_j} - pi) / E[1_{g_i}].
-            let closed_form =
-                a * (b - influence.conditional_probability) / influence.active_mass_i;
+            let closed_form = a * (b - influence.conditional_probability) / influence.active_mass_i;
             max_closed_form_diff =
                 max_closed_form_diff.max((closed_form - influence.psi[slot]).abs());
             weighted_mean += influence.normalized_weights[slot] * influence.psi[slot];
@@ -1565,7 +1565,8 @@ mod tests {
         }
         if !(denom > 0.0) {
             return Err(
-                "conditional_probability_excluding: zero active mass in retained sample".to_string(),
+                "conditional_probability_excluding: zero active mass in retained sample"
+                    .to_string(),
             );
         }
         Ok(numer / denom)

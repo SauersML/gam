@@ -264,7 +264,11 @@ fn fit_ppca1(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Result<Ppca1, 
     }
     let (vals, vecs) = jacobi_eigh(cov, q)?;
     let mut order: Vec<usize> = (0..q).collect();
-    order.sort_by(|&a, &b| vals[b].partial_cmp(&vals[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        vals[b]
+            .partial_cmp(&vals[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let trace: f64 = vals.iter().sum();
     let floor = (ridge * trace / q as f64).max(1.0e-300);
     let top = order[0];
@@ -357,7 +361,11 @@ fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Ring {
         Err(_) => (vec![0.0; q], identity_flat(q)),
     };
     let mut order: Vec<usize> = (0..q).collect();
-    order.sort_by(|&a, &b| vals[b].partial_cmp(&vals[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        vals[b]
+            .partial_cmp(&vals[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let k1 = order[0];
     let k2 = order[1];
     let e1: Vec<f64> = (0..q).map(|j| vecs[j * q + k1]).collect();
@@ -463,7 +471,7 @@ fn ln_i0(x: f64) -> f64 {
             * (3.5156229
                 + t2 * (3.0899424
                     + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813))))))
-        .ln()
+            .ln()
     } else {
         let y = 3.75 / ax;
         let poly = 0.39894228
@@ -624,10 +632,13 @@ mod tests {
     fn degenerate_candidate_never_rejected() {
         // A single-channel candidate cannot support a ring and must bank -inf,
         // never contributing a false discovery.
-        let coords = Array2::<f64>::from_shape_vec((10, 1), (0..10).map(|x| x as f64).collect())
-            .unwrap();
+        let coords =
+            Array2::<f64>::from_shape_vec((10, 1), (0..10).map(|x| x as f64).collect()).unwrap();
         let log_e = shell_vs_ring_log_evalue(&coords, 2, 1.0e-6).unwrap();
-        assert!(log_e.is_infinite() && log_e < 0.0, "q<2 must give -inf log_e");
+        assert!(
+            log_e.is_infinite() && log_e < 0.0,
+            "q<2 must give -inf log_e"
+        );
         let cert = family_fdr_certificate(vec![log_e], 0.1);
         assert!(cert.rejected.is_empty());
     }

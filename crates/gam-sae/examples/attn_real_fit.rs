@@ -52,7 +52,11 @@ fn main() -> Result<(), String> {
         right["legibility_score"]
             .as_f64()
             .unwrap_or(f64::NEG_INFINITY)
-            .total_cmp(&left["legibility_score"].as_f64().unwrap_or(f64::NEG_INFINITY))
+            .total_cmp(
+                &left["legibility_score"]
+                    .as_f64()
+                    .unwrap_or(f64::NEG_INFINITY),
+            )
     });
     let best = rows
         .first()
@@ -163,7 +167,11 @@ fn formula_label(
         format!("{harmonic_text} {qk_shift:.0}-bin")
     };
     let ov_bins = ov_shift * period as f64;
-    let stationarity_text = if stationary { "stationary" } else { "nonstationary" };
+    let stationarity_text = if stationary {
+        "stationary"
+    } else {
+        "nonstationary"
+    };
     format!("{stationarity_text} {qk_text}; OV shift {ov_bins:.2} bins")
 }
 
@@ -366,8 +374,12 @@ fn write_report(path: &Path, numbers: &Value) -> Result<(), String> {
             head.get("ov_shift_bins")
                 .and_then(Value::as_f64)
                 .unwrap_or(f64::NAN),
-            head.get("ov_r2").and_then(Value::as_f64).unwrap_or(f64::NAN),
-            head.get("formula").and_then(Value::as_str).unwrap_or("unknown")
+            head.get("ov_r2")
+                .and_then(Value::as_f64)
+                .unwrap_or(f64::NAN),
+            head.get("formula")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
         ));
     }
     lines.push(String::new());

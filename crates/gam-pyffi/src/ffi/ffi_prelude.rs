@@ -55,17 +55,18 @@ pub(crate) use gam::solver::gaussian_reml::{
 pub(crate) use gam::geometry::manifold::GeometryError as EngineGeometryError;
 
 pub(crate) use gam::geometry::poincare::{
-    conformal_factor as poincare_conformal_factor_impl, distance_batch as poincare_distance_batch_impl,
-    exp_map as poincare_exp_map_impl, exp_map_batch as poincare_exp_map_batch_impl,
-    exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
-    log_map as poincare_log_map_impl, log_map_batch as poincare_log_map_batch_impl,
-    log_origin as poincare_log_origin_impl,
+    conformal_factor as poincare_conformal_factor_impl,
+    distance_batch as poincare_distance_batch_impl, exp_map as poincare_exp_map_impl,
+    exp_map_batch as poincare_exp_map_batch_impl, exp_origin as poincare_exp_origin_impl,
+    from_lorentz as poincare_from_lorentz_impl, log_map as poincare_log_map_impl,
+    log_map_batch as poincare_log_map_batch_impl, log_origin as poincare_log_origin_impl,
     lorentz_decode_backward as poincare_lorentz_decode_backward_impl,
     lorentz_decode_forward as poincare_lorentz_decode_forward_impl,
     lorentz_exp_origin as poincare_lorentz_exp_origin_impl,
-    lorentz_log_origin as poincare_lorentz_log_origin_impl, mobius_add as poincare_mobius_add_impl,
+    lorentz_log_origin as poincare_lorentz_log_origin_impl,
     metric_tensor_batch as poincare_metric_tensor_batch_impl,
-    poincare_distance as poincare_distance_impl, project_into_ball as poincare_project_into_ball_impl,
+    mobius_add as poincare_mobius_add_impl, poincare_distance as poincare_distance_impl,
+    project_into_ball as poincare_project_into_ball_impl,
     project_into_ball_batch as poincare_project_into_ball_batch_impl,
     tangent_decode_backward as poincare_tangent_decode_backward_impl,
     tangent_decode_forward as poincare_tangent_decode_forward_impl,
@@ -145,15 +146,15 @@ pub(crate) use gam::terms::basis::{
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
     SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    bspline_tensor_first_derivative, build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
-    build_duchon_operator_penalty_matrices, build_matern_basis, build_matern_basis_literal_aniso,
-    build_periodic_bspline_basis_1d, build_spherical_spline_basis, build_thin_plate_penalty_matrix,
-    bspline_derivative_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
-    create_difference_penalty_matrix, cyclic_bspline_derivative_penalty_matrix,
-    duchon_cubic_default, duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
-    duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd, duchon_sae_atom_basis_with_jet,
-    evaluate_bspline_basis_scalar,
-    matern_input_location_hessian_nd, matern_input_location_jet_nd,
+    bspline_derivative_penalty_matrix, bspline_tensor_first_derivative, build_duchon_basis,
+    build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
+    build_matern_basis, build_matern_basis_literal_aniso, build_periodic_bspline_basis_1d,
+    build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
+    create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
+    cyclic_bspline_derivative_penalty_matrix, duchon_cubic_default, duchon_nullspace_dimension,
+    duchon_polynomial_first_derivative_nd, duchon_pure_kernel_amplification,
+    duchon_radial_first_derivative_nd, duchon_sae_atom_basis_with_jet,
+    evaluate_bspline_basis_scalar, matern_input_location_hessian_nd, matern_input_location_jet_nd,
     matern_radial_first_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
     spherical_spline_design_jet,
@@ -174,8 +175,7 @@ pub(crate) use gam::terms::latent::{AuxPriorFamily, aux_prior_targets};
 
 pub(crate) use gam::terms::dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, LinearDictionaryError,
-    fit_linear_dictionary,
-    linear_dictionary_transform,
+    fit_linear_dictionary, linear_dictionary_transform,
 };
 
 pub(crate) use gam::terms::sae::sparse_dict::{
@@ -194,16 +194,15 @@ pub(crate) use gam::terms::sae::manifold::{
     GumbelTemperatureSchedule, MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator,
     SAE_DEFAULT_TORUS_HARMONICS, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS,
     SAE_MOBIUS_CIRCLE_HARMONICS, SAE_MOBIUS_WIDTH_DEGREE, SAE_SPHERE_BASIS_SIZE,
-    SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeBasisSecondJet, SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitSeedReport,
-    SaeFitSeedRequest, SaeManifoldRho, SaeMinimalSeedReport, SaeMinimalSeedRequest,
-    SaeStagewiseSeedReport, SaeStagewiseSeedRequest, ScheduleKind, SphereChartEvaluator,
-    TorusHarmonicEvaluator, build_sae_basis_evaluators,
-    build_sae_fisher_row_metric, build_sae_fit_seed, build_sae_minimal_seed,
-    build_sae_stagewise_seed,
-    sae_atom_basis_kind_from_str, sae_atom_basis_kind_name, sae_duchon_atom_m,
-    sae_euclidean_degree_for_basis_size, sae_periodic_basis_size, sae_pick_duchon_center_indices,
-    sae_torus_axis_basis_size, sphere_chart_basis_jet,
+    SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet,
+    SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitSeedReport, SaeFitSeedRequest,
+    SaeManifoldRho, SaeMinimalSeedReport, SaeMinimalSeedRequest, SaeStagewiseSeedReport,
+    SaeStagewiseSeedRequest, ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator,
+    build_sae_basis_evaluators, build_sae_fisher_row_metric, build_sae_fit_seed,
+    build_sae_minimal_seed, build_sae_stagewise_seed, sae_atom_basis_kind_from_str,
+    sae_atom_basis_kind_name, sae_duchon_atom_m, sae_euclidean_degree_for_basis_size,
+    sae_periodic_basis_size, sae_pick_duchon_center_indices, sae_torus_axis_basis_size,
+    sphere_chart_basis_jet,
 };
 
 pub(crate) use gam::terms::decoders::skip_transcoder::{
@@ -255,7 +254,6 @@ pub(crate) use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple, 
 pub(crate) use serde::de::{MapAccess, Visitor};
 
 pub(crate) use serde::{Deserialize, Serialize};
-
 
 pub(crate) use std::collections::{BTreeMap, BTreeSet, HashMap};
 

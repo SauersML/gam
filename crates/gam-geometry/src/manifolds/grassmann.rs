@@ -2,8 +2,8 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
-    from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
-    sym, thin_svd_gram,
+    from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin, sym,
+    thin_svd_gram,
 };
 use crate::manifolds::sphere::SphereManifold;
 
@@ -440,17 +440,14 @@ impl RiemannianManifold for GrassmannManifold {
         // divided differences below are analytic at repeated and zero angles,
         // so the pullback is invariant to the arbitrary eigenbasis of a
         // clustered eigenspace.
-        let a_bar = &symmetric_primary_pullback(
-            &vecs,
-            &evals,
-            cos_sqrt_divided_difference,
-            &sym(&c_bar),
-        ) + &symmetric_primary_pullback(
-            &vecs,
-            &evals,
-            sinc_sqrt_divided_difference,
-            &sym(&s_bar),
-        );
+        let a_bar =
+            &symmetric_primary_pullback(&vecs, &evals, cos_sqrt_divided_difference, &sym(&c_bar))
+                + &symmetric_primary_pullback(
+                    &vecs,
+                    &evals,
+                    sinc_sqrt_divided_difference,
+                    &sym(&s_bar),
+                );
 
         // A=ΔᵀΔ contributes 2Δ·sym(Ā); S is symmetric, so the
         // direct Δ pullback is G·S.
@@ -460,9 +457,7 @@ impl RiemannianManifold for GrassmannManifold {
         //   Z̄ = B − Y(YᵀB)
         //   Ȳ += −B(YᵀZ)ᵀ − Z(BᵀY).
         let z_bar = &delta_bar - &fast_ab(&y, &fast_atb(&y, &delta_bar));
-        y_bar = y_bar
-            - &fast_abt(&delta_bar, &yt_z)
-            - &fast_ab(&z, &fast_atb(&delta_bar, &y));
+        y_bar = y_bar - &fast_abt(&delta_bar, &yt_z) - &fast_ab(&z, &fast_atb(&delta_bar, &y));
 
         Ok((flatten(&y_bar), flatten(&z_bar)))
     }
@@ -858,12 +853,16 @@ mod tests {
         let (y, _) = frames_with_angles(6, 2, &[0.0, 0.0]);
         let z = Array2::from_shape_vec(
             (6, 2),
-            vec![0.2, -0.1, 0.05, 0.3, 0.7, -0.2, 0.1, 1.1, -0.4, 0.3, 0.2, 0.5],
+            vec![
+                0.2, -0.1, 0.05, 0.3, 0.7, -0.2, 0.1, 1.1, -0.4, 0.3, 0.2, 0.5,
+            ],
         )
         .unwrap();
         let g = Array2::from_shape_vec(
             (6, 2),
-            vec![0.3, -0.8, 0.6, 0.1, -0.2, 0.5, 0.9, -0.4, 0.7, 0.2, -0.1, 0.4],
+            vec![
+                0.3, -0.8, 0.6, 0.1, -0.2, 0.5, 0.9, -0.4, 0.7, 0.2, -0.1, 0.4,
+            ],
         )
         .unwrap();
         assert_exp_vjp_matches_fd(&y, &z, &g);
@@ -880,7 +879,9 @@ mod tests {
         z[[3, 1]] = theta;
         let g = Array2::from_shape_vec(
             (6, 2),
-            vec![0.5, 0.1, -0.3, 0.7, 0.8, -0.2, 0.4, 0.9, -0.6, 0.2, 0.3, -0.5],
+            vec![
+                0.5, 0.1, -0.3, 0.7, 0.8, -0.2, 0.4, 0.9, -0.6, 0.2, 0.3, -0.5,
+            ],
         )
         .unwrap();
         assert_exp_vjp_matches_fd(&y, &z, &g);
@@ -895,7 +896,9 @@ mod tests {
         // s'(0)=-1/6 without an eigen-gap branch.
         let g = Array2::from_shape_vec(
             (6, 2),
-            vec![0.2, -0.4, 0.8, 0.3, -0.7, 0.5, 0.1, 0.6, -0.2, 0.9, 0.4, -0.1],
+            vec![
+                0.2, -0.4, 0.8, 0.3, -0.7, 0.5, 0.1, 0.6, -0.2, 0.9, 0.4, -0.1,
+            ],
         )
         .unwrap();
         assert_exp_vjp_matches_fd(&y, &z, &g);
@@ -916,7 +919,9 @@ mod tests {
         z[[3, 1]] = theta * (1.0 + 1.0e-10);
         let g = Array2::from_shape_vec(
             (6, 2),
-            vec![0.7, -0.2, 0.1, 0.8, -0.5, 0.4, 0.9, -0.3, 0.2, 0.6, -0.8, 0.5],
+            vec![
+                0.7, -0.2, 0.1, 0.8, -0.5, 0.4, 0.9, -0.3, 0.2, 0.6, -0.8, 0.5,
+            ],
         )
         .unwrap();
         assert_exp_vjp_matches_fd(&y, &z, &g);

@@ -51,13 +51,17 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
         let rows: Vec<StringRecord> = x
             .iter()
             .map(|&xi| {
-                let label = if rng.uniform_open01() < 0.5 { CLASS_HI } else { CLASS_LO };
+                let label = if rng.uniform_open01() < 0.5 {
+                    CLASS_HI
+                } else {
+                    CLASS_LO
+                };
                 StringRecord::from(vec![xi.to_string(), label.to_string()])
             })
             .collect();
         let headers = vec!["x".to_string(), "y".to_string()];
-        let data =
-            encode_recordswith_inferred_schema(headers, rows).expect("encode null multinomial dataset");
+        let data = encode_recordswith_inferred_schema(headers, rows)
+            .expect("encode null multinomial dataset");
 
         let model = fit_penalized_multinomial_formula(
             &data,
@@ -99,7 +103,11 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
     let mut failures = Vec::new();
     for (alpha_idx, &alpha) in ALPHAS.iter().enumerate() {
         let nominal_non_reject = 1.0 - alpha;
-        let verdict = audit_coverage(non_rejections[alpha_idx], replications_used, nominal_non_reject);
+        let verdict = audit_coverage(
+            non_rejections[alpha_idx],
+            replications_used,
+            nominal_non_reject,
+        );
         if verdict.class == CoverageClass::AntiConservative {
             failures.push(format!(
                 "alpha={alpha}: empirical non-reject rate={:.4} (non-rejections {}/{}), \

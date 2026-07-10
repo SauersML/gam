@@ -12,10 +12,9 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb};
 use gam_sae::frames::GrassmannFrame;
 use gam_sae::manifold::{
-    ChartOccupancyStatus, InFrameCurvedConfig, WeightFrameCatalog,
-    WeightFrameCatalogConfig, WeightFrameCatalogEntry, WeightFrameMatrix, WeightFrameOccupancy,
-    WeightFrameSource, fit_inframe_curved_weight_frame_catalog,
-    frame_catalog_from_weight_matrices,
+    ChartOccupancyStatus, InFrameCurvedConfig, WeightFrameCatalog, WeightFrameCatalogConfig,
+    WeightFrameCatalogEntry, WeightFrameMatrix, WeightFrameOccupancy, WeightFrameSource,
+    fit_inframe_curved_weight_frame_catalog, frame_catalog_from_weight_matrices,
 };
 use ndarray::{Array1, Array2, ArrayView2, s};
 use serde_json::Value;
@@ -118,8 +117,7 @@ fn parse_args() -> Result<Args, String> {
                 args.occupancy_null_multiple = value
                     .parse::<f64>()
                     .map_err(|err| format!("{key}: expected finite f64: {err}"))?;
-                if !(args.occupancy_null_multiple.is_finite()
-                    && args.occupancy_null_multiple > 0.0)
+                if !(args.occupancy_null_multiple.is_finite() && args.occupancy_null_multiple > 0.0)
                 {
                     return Err(format!(
                         "{key}: expected positive finite multiplier, got {}",
@@ -177,11 +175,16 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         0.0
     };
-    peel_component(&mut activations, raw_eigenvectors.column(0).to_owned().view());
+    peel_component(
+        &mut activations,
+        raw_eigenvectors.column(0).to_owned().view(),
+    );
     let post_total = matrix_energy(activations.view());
     let union_frame = orthonormal_union_frame(&catalog)?;
     let weight_frame_ev = projected_ev(activations.view(), union_frame.view(), post_total)?;
-    let same_rank = union_frame.ncols().min(raw_eigenvalues.len().saturating_sub(1));
+    let same_rank = union_frame
+        .ncols()
+        .min(raw_eigenvalues.len().saturating_sub(1));
     let data_svd_same_rank_ev = if post_total > 0.0 {
         raw_eigenvalues
             .iter()
@@ -421,8 +424,8 @@ fn left_image_entry_from_wide_matrix(
 
 fn read_model_tensor_2d(model_dir: &Path, tensor_name: &str) -> Result<Array2<f64>, String> {
     let index_path = model_dir.join("model.safetensors.index.json");
-    let index_text =
-        fs::read_to_string(&index_path).map_err(|err| format!("read {}: {err}", index_path.display()))?;
+    let index_text = fs::read_to_string(&index_path)
+        .map_err(|err| format!("read {}: {err}", index_path.display()))?;
     let index_value: Value = serde_json::from_str(&index_text)
         .map_err(|err| format!("parse {}: {err}", index_path.display()))?;
     let file_name = index_value
@@ -448,7 +451,10 @@ fn read_safetensor_2d(path: &Path, tensor_name: &str) -> Result<Array2<f64>, Str
         .map_err(|err| format!("parse safetensors header {}: {err}", path.display()))?;
     let meta = parse_tensor_meta(&header, tensor_name)?;
     if meta.shape.len() != 2 {
-        return Err(format!("{tensor_name}: expected 2-D tensor, got {:?}", meta.shape));
+        return Err(format!(
+            "{tensor_name}: expected 2-D tensor, got {:?}",
+            meta.shape
+        ));
     }
     let rows = meta.shape[0];
     let cols = meta.shape[1];
@@ -606,7 +612,11 @@ fn matrix_energy(x: ArrayView2<'_, f64>) -> f64 {
 
 fn orthonormal_union_frame(catalog: &WeightFrameCatalog) -> Result<Array2<f64>, String> {
     let p = catalog.output_dim();
-    let cols = catalog.entries().iter().map(|e| e.frame.rank()).sum::<usize>();
+    let cols = catalog
+        .entries()
+        .iter()
+        .map(|e| e.frame.rank())
+        .sum::<usize>();
     let mut stacked = Array2::<f64>::zeros((p, cols));
     let mut offset = 0usize;
     for entry in catalog.entries() {
@@ -686,7 +696,9 @@ fn assign_weight_frame_occupancy(
             }
         }
     }
-    let mut rows_by_frame: Vec<Vec<usize>> = (0..frame_count).map(|index| Vec::with_capacity(index.min(1))).collect();
+    let mut rows_by_frame: Vec<Vec<usize>> = (0..frame_count)
+        .map(|index| Vec::with_capacity(index.min(1)))
+        .collect();
     for row in 0..n {
         let frame_index = best_frame[row];
         if frame_index == usize::MAX || row_energy[row] <= 0.0 {
@@ -824,9 +836,7 @@ fn render_markdown(
         .filter(|summary| {
             records_by_frame
                 .get(&summary.frame_index)
-                .map(|record| {
-                    record.occupancy_status == ChartOccupancyStatus::ChartableUnoccupied
-                })
+                .map(|record| record.occupancy_status == ChartOccupancyStatus::ChartableUnoccupied)
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -888,7 +898,10 @@ fn source_label(source: &WeightFrameSource) -> String {
     }
 }
 
-fn parse_npy_header(file: &mut File, path: &Path) -> Result<(usize, usize, usize, bool, u64), String> {
+fn parse_npy_header(
+    file: &mut File,
+    path: &Path,
+) -> Result<(usize, usize, usize, bool, u64), String> {
     let mut magic = [0u8; 6];
     file.read_exact(&mut magic)
         .map_err(|err| format!("read npy magic {}: {err}", path.display()))?;
@@ -930,7 +943,10 @@ fn parse_npy_header(file: &mut File, path: &Path) -> Result<(usize, usize, usize
         ));
     }
     if header.contains("True") {
-        return Err(format!("{}: fortran_order=True is not supported", path.display()));
+        return Err(format!(
+            "{}: fortran_order=True is not supported",
+            path.display()
+        ));
     }
     let shape_start = header
         .find('(')
@@ -952,7 +968,10 @@ fn parse_npy_header(file: &mut File, path: &Path) -> Result<(usize, usize, usize
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| format!("{}: parse npy shape: {err}", path.display()))?;
     if dims.len() != 2 {
-        return Err(format!("{}: expected 2-D npy, got {dims:?}", path.display()));
+        return Err(format!(
+            "{}: expected 2-D npy, got {dims:?}",
+            path.display()
+        ));
     }
     let data_offset = file
         .stream_position()

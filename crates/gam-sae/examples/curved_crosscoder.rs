@@ -62,7 +62,10 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let raw: Vec<String> = std::env::args().collect();
-    let program = raw.first().cloned().unwrap_or_else(|| "curved_crosscoder".to_string());
+    let program = raw
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "curved_crosscoder".to_string());
     let mut layers = Vec::new();
     let mut max_rows = 20000usize;
     let mut pca = 8usize;
@@ -78,19 +81,35 @@ fn parse_args() -> Result<Args, String> {
             }
             "--max-rows" => {
                 i += 1;
-                max_rows = raw.get(i).ok_or("--max-rows needs a value")?.parse().map_err(|e| format!("--max-rows: {e}"))?;
+                max_rows = raw
+                    .get(i)
+                    .ok_or("--max-rows needs a value")?
+                    .parse()
+                    .map_err(|e| format!("--max-rows: {e}"))?;
             }
             "--pca" => {
                 i += 1;
-                pca = raw.get(i).ok_or("--pca needs a value")?.parse().map_err(|e| format!("--pca: {e}"))?;
+                pca = raw
+                    .get(i)
+                    .ok_or("--pca needs a value")?
+                    .parse()
+                    .map_err(|e| format!("--pca: {e}"))?;
             }
             "--harmonics" => {
                 i += 1;
-                harmonics = raw.get(i).ok_or("--harmonics needs a value")?.parse().map_err(|e| format!("--harmonics: {e}"))?;
+                harmonics = raw
+                    .get(i)
+                    .ok_or("--harmonics needs a value")?
+                    .parse()
+                    .map_err(|e| format!("--harmonics: {e}"))?;
             }
             "--sweeps" => {
                 i += 1;
-                sweeps = raw.get(i).ok_or("--sweeps needs a value")?.parse().map_err(|e| format!("--sweeps: {e}"))?;
+                sweeps = raw
+                    .get(i)
+                    .ok_or("--sweeps needs a value")?
+                    .parse()
+                    .map_err(|e| format!("--sweeps: {e}"))?;
             }
             other => layers.push(other.to_string()),
         }
@@ -104,9 +123,18 @@ fn parse_args() -> Result<Args, String> {
         ));
     }
     if pca < 2 {
-        return Err(format!("--pca must be ≥ 2 (need two PCs for the circle seed); got {pca}"));
+        return Err(format!(
+            "--pca must be ≥ 2 (need two PCs for the circle seed); got {pca}"
+        ));
     }
-    Ok(Args { layers, max_rows, pca, harmonics, sweeps, out_dir })
+    Ok(Args {
+        layers,
+        max_rows,
+        pca,
+        harmonics,
+        sweeps,
+        out_dir,
+    })
 }
 
 /// Explained variance of `fitted` against `target` (same shape); scale-invariant,
@@ -227,8 +255,12 @@ fn main() -> Result<(), String> {
     for (idx, block) in blocks.iter().enumerate() {
         let pl = block.block_dim();
         let ev = explained_variance(
-            &augmented.slice(ndarray::s![.., offset..offset + pl]).to_owned(),
-            &fitted.slice(ndarray::s![.., offset..offset + pl]).to_owned(),
+            &augmented
+                .slice(ndarray::s![.., offset..offset + pl])
+                .to_owned(),
+            &fitted
+                .slice(ndarray::s![.., offset..offset + pl])
+                .to_owned(),
         );
         block_ev.push(ev);
         let outcome = &report.blocks[idx];
@@ -449,23 +481,30 @@ fn write_npy(path: &str, shape: &str, data: &[f64]) -> Result<(), String> {
 
 fn read_npy_subsample_f64(path: &Path, cap: usize) -> Result<(usize, usize, Array2<f64>), String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
     let mut head = vec![0u8; 512];
-    file.read_exact(&mut head).map_err(|err| format!("read header {}: {err}", path.display()))?;
+    file.read_exact(&mut head)
+        .map_err(|err| format!("read header {}: {err}", path.display()))?;
     let (n_full, p, elem, is_f4, data_off) = parse_npy_header(&head, path)?;
     let take = cap.min(n_full).max(1);
     let stride = (n_full / take).max(1);
-    let row_bytes = p.checked_mul(elem).ok_or_else(|| format!("{}: row byte overflow", path.display()))?;
+    let row_bytes = p
+        .checked_mul(elem)
+        .ok_or_else(|| format!("{}: row byte overflow", path.display()))?;
     let mut buf = vec![0u8; row_bytes];
     let mut out = Array2::<f64>::zeros((take, p));
     for i in 0..take {
         let off = data_off as u64 + (i * stride) as u64 * row_bytes as u64;
-        file.seek(SeekFrom::Start(off)).map_err(|err| format!("seek {}: {err}", path.display()))?;
-        file.read_exact(&mut buf).map_err(|err| format!("read row {}: {err}", path.display()))?;
+        file.seek(SeekFrom::Start(off))
+            .map_err(|err| format!("seek {}: {err}", path.display()))?;
+        file.read_exact(&mut buf)
+            .map_err(|err| format!("read row {}: {err}", path.display()))?;
         if is_f4 {
             for c in 0..p {
                 let b = c * 4;
-                out[[i, c]] = f32::from_le_bytes([buf[b], buf[b + 1], buf[b + 2], buf[b + 3]]) as f64;
+                out[[i, c]] =
+                    f32::from_le_bytes([buf[b], buf[b + 1], buf[b + 2], buf[b + 3]]) as f64;
             }
         } else {
             for c in 0..p {
@@ -477,7 +516,10 @@ fn read_npy_subsample_f64(path: &Path, cap: usize) -> Result<(usize, usize, Arra
     Ok((n_full, p, out))
 }
 
-fn parse_npy_header(head: &[u8], path: &Path) -> Result<(usize, usize, usize, bool, usize), String> {
+fn parse_npy_header(
+    head: &[u8],
+    path: &Path,
+) -> Result<(usize, usize, usize, bool, usize), String> {
     if head.len() <= 12 || &head[0..6] != b"\x93NUMPY" {
         return Err(format!("{}: not a .npy file", path.display()));
     }
@@ -490,30 +532,49 @@ fn parse_npy_header(head: &[u8], path: &Path) -> Result<(usize, usize, usize, bo
         (header_len, 10 + header_len)
     };
     if data_off > head.len() {
-        return Err(format!("{}: header exceeds initial read buffer", path.display()));
+        return Err(format!(
+            "{}: header exceeds initial read buffer",
+            path.display()
+        ));
     }
     let header = std::str::from_utf8(&head[data_off - header_len..data_off])
         .map_err(|err| format!("{}: header not utf8: {err}", path.display()))?;
     let is_f4 = header.contains("'<f4'") || header.contains("\"<f4\"");
     let is_f2 = header.contains("'<f2'") || header.contains("\"<f2\"");
     if !(is_f4 || is_f2) {
-        return Err(format!("{}: expected <f4 or <f2; header: {header}", path.display()));
+        return Err(format!(
+            "{}: expected <f4 or <f2; header: {header}",
+            path.display()
+        ));
     }
     if !(header.contains("'fortran_order': False") || header.contains("\"fortran_order\": false")) {
-        return Err(format!("{}: expected C-order; header: {header}", path.display()));
+        return Err(format!(
+            "{}: expected C-order; header: {header}",
+            path.display()
+        ));
     }
-    let shape_start = header.find("'shape':").ok_or_else(|| format!("{}: missing shape key", path.display()))?
+    let shape_start = header
+        .find("'shape':")
+        .ok_or_else(|| format!("{}: missing shape key", path.display()))?
         + "'shape':".len();
-    let paren_open = header[shape_start..].find('(').ok_or_else(|| format!("{}: missing shape open paren", path.display()))?
-        + shape_start + 1;
-    let paren_close = header[paren_open..].find(')').ok_or_else(|| format!("{}: missing shape close paren", path.display()))?
+    let paren_open = header[shape_start..]
+        .find('(')
+        .ok_or_else(|| format!("{}: missing shape open paren", path.display()))?
+        + shape_start
+        + 1;
+    let paren_close = header[paren_open..]
+        .find(')')
+        .ok_or_else(|| format!("{}: missing shape close paren", path.display()))?
         + paren_open;
     let dims: Vec<usize> = header[paren_open..paren_close]
         .split(',')
         .filter_map(|token| token.trim().parse::<usize>().ok())
         .collect();
     if dims.len() != 2 {
-        return Err(format!("{}: expected a 2-D array, got {dims:?}", path.display()));
+        return Err(format!(
+            "{}: expected a 2-D array, got {dims:?}",
+            path.display()
+        ));
     }
     let elem = if is_f4 { 4 } else { 2 };
     Ok((dims[0], dims[1], elem, is_f4, data_off))

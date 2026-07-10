@@ -487,9 +487,16 @@ fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
 
     // (b) cross_row_d = max(w·s',0); cross_row_dd gated by the same clamp.
     for c in 0..k {
-        assert_abs_diff_eq!(ch.cross_row_d[c], raw.cross_row_d[c].max(0.0), epsilon = 1.0e-12);
+        assert_abs_diff_eq!(
+            ch.cross_row_d[c],
+            raw.cross_row_d[c].max(0.0),
+            epsilon = 1.0e-12
+        );
         if raw.cross_row_d[c] <= 0.0 {
-            assert_eq!(ch.cross_row_dd[c], 0.0, "clamped column must gate cross_row_dd to 0");
+            assert_eq!(
+                ch.cross_row_dd[c], 0.0,
+                "clamped column must gate cross_row_dd to 0"
+            );
         } else {
             assert_abs_diff_eq!(ch.cross_row_dd[c], raw.cross_row_dd[c], epsilon = 1.0e-12);
         }
@@ -510,7 +517,11 @@ fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
             for i in 0..n {
                 let idx = i * k + col;
                 let fd = (dp[idx] - dm[idx]) / (2.0 * eps);
-                let local = if i == w { ch.local_logit_third[idx] } else { 0.0 };
+                let local = if i == w {
+                    ch.local_logit_third[idx]
+                } else {
+                    0.0
+                };
                 let analytic = local + ch.m_channel[idx] * ch.z_jac[widx];
                 max_err = max_err.max((analytic - fd).abs());
             }
@@ -565,7 +576,8 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
     );
     // Fixed-α leaves the channel at zero (the value `cross_row_d` is used there).
     let fixed = IBPAssignmentPenalty::new(3, 6.0, 0.8, false);
-    let chf = fixed.hessian_diag_logit_third_channels(t.view(), Array1::<f64>::zeros(0).view(), false);
+    let chf =
+        fixed.hessian_diag_logit_third_channels(t.view(), Array1::<f64>::zeros(0).view(), false);
     assert!(
         chf.cross_row_d_logalpha.iter().all(|&v| v == 0.0),
         "fixed-α must leave cross_row_d_logalpha zero"
@@ -748,8 +760,8 @@ fn ibp_row_weighted_channels_are_one_operator_991() {
         let mut tm = t.clone();
         tp[i] += step;
         tm[i] -= step;
-        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view()))
-            / (2.0 * step);
+        let fd =
+            (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * step);
         assert_abs_diff_eq!(g[i], fd, epsilon = 1.0e-6);
     }
 
@@ -788,8 +800,7 @@ fn ibp_row_weighted_channels_are_one_operator_991() {
     let grho = pen.grad_rho(t.view(), rho.view());
     let rp = array![rho[0] + step];
     let rm = array![rho[0] - step];
-    let fd_rho =
-        (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * step);
+    let fd_rho = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * step);
     assert_abs_diff_eq!(grho[0], fd_rho, epsilon = 2.0e-6);
     let dh = pen.hessian_diag_log_alpha_derivative(t.view(), rho.view());
     let hp = pen.hessian_diag(t.view(), rp.view()).expect("hdiag");
@@ -806,8 +817,7 @@ fn ibp_row_weighted_channels_are_one_operator_991() {
         let mut tm = t.clone();
         tp[i] += step;
         tm[i] -= step;
-        let fd = (pen.grad_rho(tp.view(), rho.view())[0]
-            - pen.grad_rho(tm.view(), rho.view())[0])
+        let fd = (pen.grad_rho(tp.view(), rho.view())[0] - pen.grad_rho(tm.view(), rho.view())[0])
             / (2.0 * step);
         assert_abs_diff_eq!(mixed[i], fd, epsilon = 2.0e-6);
     }
@@ -2425,8 +2435,7 @@ fn harmonic_roughness_value_grad_hessian_are_consistent() {
     let n_eff = 10; // F = 2 atoms × K = 5 rows.
     let d = 3;
     let weight = 2.5;
-    let penalty =
-        HarmonicRoughnessPenalty::new(weight, n_eff, row_weights.clone(), false).unwrap();
+    let penalty = HarmonicRoughnessPenalty::new(weight, n_eff, row_weights.clone(), false).unwrap();
     // Row-major (n_eff, d) target with distinct values per entry.
     let target: Array1<f64> = (0..n_eff * d).map(|i| 0.1 * (i as f64) - 0.7).collect();
     let rho = Array1::<f64>::zeros(0);
@@ -2440,7 +2449,11 @@ fn harmonic_roughness_value_grad_hessian_are_consistent() {
         }
     }
     expected *= weight;
-    assert_abs_diff_eq!(penalty.value(target.view(), rho.view()), expected, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        penalty.value(target.view(), rho.view()),
+        expected,
+        epsilon = 1e-12
+    );
 
     // Gradient matches a central finite difference of the value.
     let grad = penalty.grad_target(target.view(), rho.view());

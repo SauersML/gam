@@ -109,7 +109,10 @@ fn run(
     }
     for (row, &label) in labels.iter().enumerate() {
         if label >= WEEKDAYS.len() {
-            return Err(format!("row {row} label {label} outside 0..{}", WEEKDAYS.len()));
+            return Err(format!(
+                "row {row} label {label} outside 0..{}",
+                WEEKDAYS.len()
+            ));
         }
     }
 
@@ -149,14 +152,10 @@ fn run(
         .ok_or_else(|| "behavior block missing after fit".to_string())?
         .augmented_target(acts.view())?;
     let fitted = term.try_fitted_for_rho(&rho)?;
-    let activation_ev = explained_variance(
-        augmented.slice(s![.., ..p_x]),
-        fitted.slice(s![.., ..p_x]),
-    )?;
-    let behavior_ev = explained_variance(
-        augmented.slice(s![.., p_x..]),
-        fitted.slice(s![.., p_x..]),
-    )?;
+    let activation_ev =
+        explained_variance(augmented.slice(s![.., ..p_x]), fitted.slice(s![.., ..p_x]))?;
+    let behavior_ev =
+        explained_variance(augmented.slice(s![.., p_x..]), fitted.slice(s![.., p_x..]))?;
 
     let step = orientation / WEEKDAYS.len() as f64;
     let behavior_dim = term
@@ -177,7 +176,13 @@ fn run(
     }
     let mean_off_manifold_norm = steer_off_norm_sum / n as f64;
 
-    write_coords(out_dir, &labels, raw_t.view(), aligned_t.view(), proxy_t.view())?;
+    write_coords(
+        out_dir,
+        &labels,
+        raw_t.view(),
+        aligned_t.view(),
+        proxy_t.view(),
+    )?;
     write_matrix_csv(&out_dir.join("steering_delta_pca.csv"), deltas.view())?;
     write_svg_chart(
         &out_dir.join("weekday_circle_chart.svg"),
@@ -213,7 +218,10 @@ fn run(
         serde_json::to_string_pretty(&summary).map_err(|err| err.to_string())?,
     )
     .map_err(|err| format!("write fit_results.json: {err}"))?;
-    println!("{}", serde_json::to_string_pretty(&summary).map_err(|err| err.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).map_err(|err| err.to_string())?
+    );
     Ok(())
 }
 
@@ -281,7 +289,11 @@ fn plane_angle_proxy(acts: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
 }
 
 fn labels_to_unit_coords(labels: &[usize]) -> Array1<f64> {
-    Array1::from_iter(labels.iter().map(|&label| label as f64 / WEEKDAYS.len() as f64))
+    Array1::from_iter(
+        labels
+            .iter()
+            .map(|&label| label as f64 / WEEKDAYS.len() as f64),
+    )
 }
 
 fn circular_corr(a_unit: ArrayView1<'_, f64>, b_unit: ArrayView1<'_, f64>) -> Result<f64, String> {
@@ -354,7 +366,10 @@ fn circular_distance(a: f64, b: f64) -> f64 {
     d.min(1.0 - d)
 }
 
-fn explained_variance(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> Result<f64, String> {
+fn explained_variance(
+    target: ArrayView2<'_, f64>,
+    fitted: ArrayView2<'_, f64>,
+) -> Result<f64, String> {
     if target.dim() != fitted.dim() {
         return Err(format!(
             "explained_variance shape mismatch: {:?} vs {:?}",
@@ -381,7 +396,8 @@ fn explained_variance(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) 
 }
 
 fn read_csv_matrix(path: &Path) -> Result<Array2<f64>, String> {
-    let text = std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut rows: Vec<Vec<f64>> = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -423,7 +439,8 @@ fn read_csv_matrix(path: &Path) -> Result<Array2<f64>, String> {
 }
 
 fn read_labels(path: &Path) -> Result<Vec<usize>, String> {
-    let text = std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     let mut labels = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
         let trimmed = line.trim();
@@ -489,7 +506,9 @@ fn write_svg_chart(
     svg.push_str(r##"<svg xmlns="http://www.w3.org/2000/svg" width="960" height="430" viewBox="0 0 960 430">"##);
     svg.push_str(r##"<rect width="960" height="430" fill="#ffffff"/>"##);
     svg.push_str(r##"<text x="40" y="32" font-family="sans-serif" font-size="18" fill="#1f2933">Qwen weekday circle: fitted coordinate recovery</text>"##);
-    svg.push_str(r##"<line x1="70" y1="360" x2="450" y2="360" stroke="#20242a" stroke-width="1"/>"##);
+    svg.push_str(
+        r##"<line x1="70" y1="360" x2="450" y2="360" stroke="#20242a" stroke-width="1"/>"##,
+    );
     svg.push_str(r##"<line x1="70" y1="70" x2="70" y2="360" stroke="#20242a" stroke-width="1"/>"##);
     svg.push_str(r##"<text x="185" y="405" font-family="sans-serif" font-size="13" fill="#20242a">true weekday index</text>"##);
     svg.push_str(r##"<text x="14" y="210" transform="rotate(-90 14 210)" font-family="sans-serif" font-size="13" fill="#20242a">aligned fitted t × 7</text>"##);
@@ -514,7 +533,9 @@ fn write_svg_chart(
             colors[labels[row]]
         ));
     }
-    svg.push_str(r##"<circle cx="705" cy="215" r="125" fill="none" stroke="#20242a" stroke-width="1"/>"##);
+    svg.push_str(
+        r##"<circle cx="705" cy="215" r="125" fill="none" stroke="#20242a" stroke-width="1"/>"##,
+    );
     svg.push_str(r##"<text x="625" y="388" font-family="sans-serif" font-size="13" fill="#20242a">recovered circle by raw t</text>"##);
     for row in 0..labels.len() {
         let angle = TAU * raw_t[row];

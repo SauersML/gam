@@ -2008,7 +2008,11 @@ mod tests {
         // Atom 0's gate is a CONSTANT equal to the pinned value: value == fixed,
         // and every gradient / Hessian channel is exactly zero.
         let g0 = prog.gate_tower::<K, Tower4<K>>(0);
-        assert!((g0.v - fixed_val).abs() < 1e-15, "fixed gate value {}", g0.v);
+        assert!(
+            (g0.v - fixed_val).abs() < 1e-15,
+            "fixed gate value {}",
+            g0.v
+        );
         for a in 0..K {
             assert_eq!(g0.g[a], 0.0, "fixed gate ∂/∂p{a} must be exactly 0");
             for b in 0..K {

@@ -29,7 +29,9 @@ fn noise_stream(seed: u64) -> impl FnMut() -> f64 {
     move || {
         // splitmix-style deterministic uniform in [-1, 1] — same convention as
         // the sibling crosscoder tests (no external RNG dependency).
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 }
@@ -193,7 +195,9 @@ fn block_relevance_has_interior_stationary_minimum_2231() {
         let mut flat = rho_template.to_flat();
         let last = flat.len() - 1;
         flat[last] = ll;
-        objective.eval_cost(&flat).expect("scan point must evaluate")
+        objective
+            .eval_cost(&flat)
+            .expect("scan point must evaluate")
     };
     // Coarse coercivity scan over 16 decades of λ.
     let grid: Vec<f64> = (-4..=4).map(|k| 2.0 * k as f64).collect();
@@ -251,9 +255,18 @@ fn engaged_objective(
     let term = build_k1_circle(evaluator, coords, p_tot);
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
         .with_log_lambda_block(vec![0.0]);
-    SaeManifoldOuterObjective::new(term, z.clone(), None, rho_template, 60, 0.04, 1.0e-6, 1.0e-6)
-        .with_crosscoder_blocks(4, vec![4])
-        .expect("crosscoder block pricing must install (p_x + Σ block_dims == p̃)")
+    SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        None,
+        rho_template,
+        60,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    )
+    .with_crosscoder_blocks(4, vec![4])
+    .expect("crosscoder block pricing must install (p_x + Σ block_dims == p̃)")
 }
 
 /// #2231 Inc-B (stage 2) — the analytic block gradient the ValueAndGradient lane

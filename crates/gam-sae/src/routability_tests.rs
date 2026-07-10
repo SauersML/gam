@@ -183,15 +183,14 @@ fn phase_transition_at_floor() {
                 }
                 d.abs()
             };
-            let g_off = max_cross_gate(x.row(0), &decoder, 1)
-                * {
-                    // max_cross_gate divides by ‖x‖; undo it to compare raw gates.
-                    let mut n2 = 0.0f64;
-                    for c in 0..p {
-                        n2 += x[[0, c]] as f64 * x[[0, c]] as f64;
-                    }
-                    n2.sqrt()
-                };
+            let g_off = max_cross_gate(x.row(0), &decoder, 1) * {
+                // max_cross_gate divides by ‖x‖; undo it to compare raw gates.
+                let mut n2 = 0.0f64;
+                for c in 0..p {
+                    n2 += x[[0, c]] as f64 * x[[0, c]] as f64;
+                }
+                n2.sqrt()
+            };
             if g_target > g_off {
                 successes += 1;
             }
@@ -238,7 +237,10 @@ fn perfect_reconstruction_zero_residual_is_a_defined_audit_not_an_error() {
     assert_eq!(audit.coherence_excess, 0.0);
     assert_eq!(audit.fraction_below_floor, 1.0);
     for &(level, value) in &audit.quantiles {
-        assert_eq!(value, 0.0, "quantile at level {level} must be 0 with no residual");
+        assert_eq!(
+            value, 0.0,
+            "quantile at level {level} must be 0 with no residual"
+        );
     }
     assert_eq!(audit.quantiles.len(), 2);
 

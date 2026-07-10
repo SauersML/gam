@@ -457,7 +457,8 @@ fn fit_evidence_ridge(
         rss_sum += (y_energy[col] - z_energy[col]).max(0.0);
     }
     let log_evidence = t_dim as f64
-        * (0.5 * f_dim as f64 * alpha.ln() + 0.5 * n as f64 * beta.ln() - 0.5 * log_det_a
+        * (0.5 * f_dim as f64 * alpha.ln() + 0.5 * n as f64 * beta.ln()
+            - 0.5 * log_det_a
             - 0.5 * n as f64 * two_pi.ln())
         - 0.5 * beta * rss_sum
         - 0.5 * alpha * w_sq_sum;
@@ -643,8 +644,7 @@ impl LearnedAmortizedEncoder {
         if n == 0 {
             return Err("LearnedAmortizedEncoder::fit: empty training corpus".to_string());
         }
-        let (targets, coord_dims) =
-            Self::stack_targets(logits, coords, amplitudes, coord_periods)?;
+        let (targets, coord_dims) = Self::stack_targets(logits, coords, amplitudes, coord_periods)?;
         let target_std = Standardizer::fit(targets.view());
         let targets_std = target_std.apply(targets.view());
 
@@ -845,7 +845,9 @@ impl LearnedAmortizedEncoder {
                 return Err(format!("error_stats: coord block {atom} shape mismatch"));
             }
             if coord_periods[atom].len() != pc.ncols() {
-                return Err(format!("error_stats: axis-period width mismatch on atom {atom}"));
+                return Err(format!(
+                    "error_stats: axis-period width mismatch on atom {atom}"
+                ));
             }
             for row in 0..pc.nrows() {
                 for axis in 0..pc.ncols() {

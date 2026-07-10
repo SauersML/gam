@@ -150,7 +150,9 @@ impl PerContextMean {
             .ok_or_else(|| "PerContextMean::fit: global mean_axis returned None".to_string())?;
         let mut sums: BTreeMap<i64, (Array1<f64>, usize)> = BTreeMap::new();
         for (row, &g) in z.rows().into_iter().zip(group_ids.iter()) {
-            let entry = sums.entry(g).or_insert_with(|| (Array1::<f64>::zeros(p), 0usize));
+            let entry = sums
+                .entry(g)
+                .or_insert_with(|| (Array1::<f64>::zeros(p), 0usize));
             entry.0 += &row;
             entry.1 += 1;
         }
@@ -340,13 +342,14 @@ pub struct Tier05SinkAtom {
 impl Tier05SinkAtom {
     /// Dense training reconstruction of the sink atom (`N×P`).
     pub fn reconstruction(&self) -> Array2<f64> {
-        self.atom
-            .basis_values
-            .dot(&self.atom.decoder_coefficients)
+        self.atom.basis_values.dot(&self.atom.decoder_coefficients)
     }
 
     /// Peel the sink from a same-row residual matrix before semantic charting.
-    pub fn residual_after_sink(&self, residual: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    pub fn residual_after_sink(
+        &self,
+        residual: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
         let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
         if residual.dim() != expected {
             return Err(format!(
@@ -461,7 +464,9 @@ pub fn fit_tier05_sink_atom(
         .map(|(_anchor, &count)| count)
         .sum();
     if sink_rows == 0 {
-        return Err("fit_tier05_sink_atom: enabled sink atom has no sink-supported rows".to_string());
+        return Err(
+            "fit_tier05_sink_atom: enabled sink atom has no sink-supported rows".to_string(),
+        );
     }
 
     let evaluator = Arc::new(AnchorIndicatorEvaluator::new(anchors.len())?);
@@ -521,8 +526,9 @@ pub fn fit_position0_sink_atom(
     positions: &[i64],
 ) -> Result<Tier05SinkAtom, String> {
     let config = Tier05SinkAtomConfig::position_zero();
-    fit_tier05_sink_atom(residual, positions, &[], &config)?
-        .ok_or_else(|| "fit_position0_sink_atom: position-0 sink config unexpectedly disabled".to_string())
+    fit_tier05_sink_atom(residual, positions, &[], &config)?.ok_or_else(|| {
+        "fit_position0_sink_atom: position-0 sink config unexpectedly disabled".to_string()
+    })
 }
 
 /// Pre-chart residual after Tier-0 and optional Tier-0.5 peeling.
@@ -862,7 +868,9 @@ mod tests {
         let col_sum = demeaned.sum_axis(Axis(0));
         assert!(col_sum[0].abs() < 1e-12 && col_sum[1].abs() < 1e-12);
         // Roundtrip.
-        let back = pcm.reconstruct(demeaned.view(), &groups).expect("reconstruct");
+        let back = pcm
+            .reconstruct(demeaned.view(), &groups)
+            .expect("reconstruct");
         for (a, b) in back.iter().zip(z.iter()) {
             assert!((a - b).abs() < 1e-12);
         }
@@ -898,12 +906,18 @@ mod tests {
             ej[j] = 1.0;
             let qte = sub.q.t().dot(&ej);
             let proj_norm = qte.dot(&qte).sqrt();
-            assert!((proj_norm - 1.0).abs() < 1e-9, "e{j} not fully in Q: {proj_norm}");
+            assert!(
+                (proj_norm - 1.0).abs() < 1e-9,
+                "e{j} not fully in Q: {proj_norm}"
+            );
         }
         // A residual that IS the in-plane curvature signal (chord-sag), unit norm.
         let curvature = array![0.6f64, -0.8, 0.0, 0.0];
         let sig_rms = curvature.dot(&curvature).sqrt();
-        assert!(sig_rms > 0.99, "planted signal should be ~unit; got {sig_rms}");
+        assert!(
+            sig_rms > 0.99,
+            "planted signal should be ~unit; got {sig_rms}"
+        );
         // What the Q⊥ GLS weight would keep: `q_perpᵀ · residual`.
         let qperp_component = sub.q_perp.t().dot(&curvature);
         let qperp_rms = qperp_component.dot(&qperp_component).sqrt();

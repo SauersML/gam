@@ -105,9 +105,7 @@ fn classify(formula: &str, family: &str, data: &gam::data::EncodedDataset) -> Pa
                 FitResult::GaussianLocationScale(ls) => {
                     ls.fit.fit.beta.iter().all(|v| v.is_finite())
                 }
-                FitResult::SurvivalLocationScale(s) => {
-                    s.fit.fit.beta.iter().all(|v| v.is_finite())
-                }
+                FitResult::SurvivalLocationScale(s) => s.fit.fit.beta.iter().all(|v| v.is_finite()),
                 _ => false,
             };
             if beta_finite {

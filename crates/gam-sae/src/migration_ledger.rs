@@ -172,10 +172,16 @@ pub enum SaeMove {
     Birth { stage: MoveStage, seed: BirthSeed },
     /// An atom on `stage` died and fell back toward the residual-factor pool,
     /// for `reason`.
-    Death { stage: MoveStage, reason: MoveReason },
+    Death {
+        stage: MoveStage,
+        reason: MoveReason,
+    },
     /// A proposed move onto `stage` was refused (the evidence did not buy it),
     /// for `reason`. The prior structure is kept.
-    Refuse { stage: MoveStage, reason: MoveReason },
+    Refuse {
+        stage: MoveStage,
+        reason: MoveReason,
+    },
 }
 
 impl SaeMove {

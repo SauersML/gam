@@ -180,7 +180,8 @@ where
     let mut scan_finite = vec![true; n];
     for k in 0..K {
         let t = (k as f64) / ((K - 1) as f64);
-        let eta_node = Array1::from_shape_fn(n, |i| eta_lower[i] + t * (eta_upper[i] - eta_lower[i]));
+        let eta_node =
+            Array1::from_shape_fn(n, |i| eta_lower[i] + t * (eta_upper[i] - eta_lower[i]));
         let transformed = response_map(&eta_node)?;
         for i in 0..n {
             let v = transformed[i];
@@ -1313,9 +1314,8 @@ mod parity_tests {
     #[test]
     fn transform_eta_non_monotone_captures_interior_extrema() {
         let eta = array![0.0];
-        let square = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(e.mapv(|x| x * x))
-        };
+        let square =
+            |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(e.mapv(|x| x * x)) };
         let mean = square(&eta).unwrap();
         let eta_se = array![1.0];
         let z = z95();

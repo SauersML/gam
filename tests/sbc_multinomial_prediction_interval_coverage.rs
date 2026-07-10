@@ -89,7 +89,11 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
         let mut rows: Vec<StringRecord> = Vec::with_capacity(N_TRAIN);
         for &xi in &x {
             let p_hi = sigmoid(truth.eta(xi));
-            let label = if rng.uniform_open01() < p_hi { CLASS_HI } else { CLASS_LO };
+            let label = if rng.uniform_open01() < p_hi {
+                CLASS_HI
+            } else {
+                CLASS_LO
+            };
             rows.push(StringRecord::from(vec![xi.to_string(), label.to_string()]));
         }
         let headers = vec!["x".to_string(), "y".to_string()];

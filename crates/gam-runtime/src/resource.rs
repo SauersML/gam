@@ -487,11 +487,7 @@ pub const fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
 /// `f64` workspaces live while gradients and covariance solves are assembled.
 /// This central policy prevents predictors from drifting to different memory
 /// budgets and chunk bounds for the same operation.
-pub fn prediction_chunk_rows(
-    parameter_dim: usize,
-    local_dim: usize,
-    total_rows: usize,
-) -> usize {
+pub fn prediction_chunk_rows(parameter_dim: usize, local_dim: usize, total_rows: usize) -> usize {
     const MIN_ROWS: usize = 16;
     const MAX_ROWS: usize = 4096;
 
@@ -676,12 +672,11 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             }
         }
 
-        let reservation = match MemoryGovernor::global()
-            .try_reserve(charge, "ByteLruCache resident entry")
-        {
-            Ok(reservation) => reservation,
-            Err(_) => return,
-        };
+        let reservation =
+            match MemoryGovernor::global().try_reserve(charge, "ByteLruCache resident entry") {
+                Ok(reservation) => reservation,
+                Err(_) => return,
+            };
         g.map.insert(key.clone(), (value, charge, reservation));
         g.order.push_back(key);
         g.resident_bytes = g.resident_bytes.saturating_add(charge);

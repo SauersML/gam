@@ -232,7 +232,11 @@ fn number(value: &Value, key: &str) -> Result<f64, String> {
         .ok_or_else(|| format!("missing numeric field {key}"))
 }
 
-fn load_even_rows(path: &Path, take: usize, phase: u64) -> Result<(Array2<f32>, Vec<usize>), String> {
+fn load_even_rows(
+    path: &Path,
+    take: usize,
+    phase: u64,
+) -> Result<(Array2<f32>, Vec<usize>), String> {
     let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let header = read_npy_header(&mut file)?;
     let n_take = take.min(header.rows);
@@ -280,7 +284,10 @@ fn read_npy_header(file: &mut File) -> Result<NpyHeader, String> {
             .map_err(|e| format!("read v2 header len: {e}"))?;
         u32::from_le_bytes(raw) as usize
     } else {
-        return Err(format!("unsupported npy version {}.{}", version[0], version[1]));
+        return Err(format!(
+            "unsupported npy version {}.{}",
+            version[0], version[1]
+        ));
     };
     let mut header_bytes = vec![0u8; header_len];
     file.read_exact(&mut header_bytes)
@@ -722,7 +729,9 @@ fn render_markdown(payload: &Value) -> String {
         }
     }
     out.push_str("\nPositive drop means the curved lane has a lower reconstruction floor.\n");
-    out.push_str("Curvature is the RMS chart correction energy relative to stratum target energy.\n");
+    out.push_str(
+        "Curvature is the RMS chart correction energy relative to stratum target energy.\n",
+    );
     out
 }
 

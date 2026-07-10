@@ -98,9 +98,7 @@ pub fn difference_smooth_report(
             .schema
             .columns
             .iter()
-            .find(|column| {
-                column.kind == ColumnKindTag::Categorical && column.name != request.view
-            })
+            .find(|column| column.kind == ColumnKindTag::Categorical && column.name != request.view)
             .map(|column| column.name.clone())
             .ok_or_else(|| {
                 "difference_smooth could not infer a categorical group column; pass group="
@@ -112,11 +110,7 @@ pub fn difference_smooth_report(
         .columns
         .iter()
         .find(|column| column.name == group)
-        .ok_or_else(|| {
-            format!(
-                "group column {group:?} not found in model schema: {headers:?}"
-            )
-        })?;
+        .ok_or_else(|| format!("group column {group:?} not found in model schema: {headers:?}"))?;
     if group_column.levels.len() < 2 {
         return Err(format!(
             "group column {group:?} must have at least two saved levels"
@@ -134,6 +128,23 @@ pub fn difference_smooth_report(
         }
         pairs
     });
+    if pairs.is_empty() {
+        return Err("difference_smooth requires at least one level pair".to_string());
+    }
+    for (level_1, level_2) in &pairs {
+        if level_1 == level_2 {
+            return Err(format!(
+                "difference_smooth pair levels must differ; got {level_1:?} twice"
+            ));
+        }
+        for level in [level_1, level_2] {
+            if !group_column.levels.contains(level) {
+                return Err(format!(
+                    "difference_smooth level {level:?} is not saved for group {group:?}"
+                ));
+            }
+        }
+    }
 
     let (lo, hi) = inputs.training_feature_ranges[view_idx];
     if !(lo.is_finite() && hi.is_finite() && lo < hi) {
@@ -162,27 +173,12 @@ pub fn difference_smooth_report(
         BandOptions::Pointwise(PointwiseBandOptions { level })
     };
     let covariance_kind = inputs.covariance_source.to_string();
-    let covariance_corrected =
-        inputs.covariance_source == CovarianceSource::SmoothingCorrected;
+    let covariance_corrected = inputs.covariance_source == CovarianceSource::SmoothingCorrected;
     let mut output = Vec::with_capacity(pairs.len() * grid.len());
 
     for (level_1, level_2) in pairs {
-        let rows_left = contrast_rows(
-            &headers,
-            &template,
-            &request.view,
-            &group,
-            &level_1,
-            &grid,
-        );
-        let rows_right = contrast_rows(
-            &headers,
-            &template,
-            &request.view,
-            &group,
-            &level_2,
-            &grid,
-        );
+        let rows_left = contrast_rows(&headers, &template, &request.view, &group, &level_1, &grid);
+        let rows_right = contrast_rows(&headers, &template, &request.view, &group, &level_2, &grid);
         let left = build_design(&headers, &rows_left)?;
         let right = build_design(&headers, &rows_right)?;
         if left.raw_dim() != right.raw_dim() {
@@ -200,10 +196,10 @@ pub fn difference_smooth_report(
             } else {
                 random_ranges.clone()
             };
-            zero_ranges(&mut contrast, &ranges);
+            zero_ranges(&mut contrast, &ranges)?;
         }
         if !request.group_means {
-            zero_ranges(&mut contrast, &group_ranges);
+            zero_ranges(&mut contrast, &group_ranges)?;
         }
         let report = effects::effect_report(
             inputs.beta,
@@ -244,10 +240,7 @@ fn complete_template(
         }
         let value = match column.kind {
             ColumnKindTag::Categorical => column.levels.first().cloned().ok_or_else(|| {
-                format!(
-                    "categorical column {:?} has no saved levels",
-                    column.name
-                )
+                format!("categorical column {:?} has no saved levels", column.name)
             })?,
             ColumnKindTag::Binary => "0".to_string(),
             ColumnKindTag::Continuous => {
@@ -319,10 +312,7 @@ fn random_effect_ranges(
     Ok((all, selected))
 }
 
-fn subtract_ranges(
-    ranges: &[(usize, usize)],
-    excluded: &[(usize, usize)],
-) -> Vec<(usize, usize)> {
+fn subtract_ranges(ranges: &[(usize, usize)], excluded: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut output = Vec::new();
     for &(start, end) in ranges {
         let mut segments = vec![(start, end)];
@@ -347,21 +337,26 @@ fn subtract_ranges(
     output
 }
 
-fn zero_ranges(design: &mut Array2<f64>, ranges: &[(usize, usize)]) {
+fn zero_ranges(design: &mut Array2<f64>, ranges: &[(usize, usize)]) -> Result<(), String> {
     for &(start, end) in ranges {
-        if start < end && start < design.ncols() {
-            design
-                .slice_mut(s![.., start..end.min(design.ncols())])
-                .fill(0.0);
+        if start > end || end > design.ncols() {
+            return Err(format!(
+                "difference_smooth design range {start}..{end} exceeds {} columns",
+                design.ncols()
+            ));
+        }
+        if start < end {
+            design.slice_mut(s![.., start..end]).fill(0.0);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gam_data::SchemaColumn;
-    use ndarray::{array, Array1};
+    use ndarray::{Array1, array};
 
     #[test]
     fn pair_orientation_and_report_are_owned_by_core() {

@@ -5853,7 +5853,7 @@ impl LinkWigglePosterior {
     }
 
     /// Creates a new link-wiggle posterior target.
-        pub fn new(
+    pub fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
         weights: ArrayView1<f64>,
@@ -7054,7 +7054,7 @@ struct JointBetaRhoPosterior {
 }
 
 impl JointBetaRhoPosterior {
-        fn new(
+    fn new(
         x: ArrayView2<f64>,
         y: ArrayView1<f64>,
         weights: ArrayView1<f64>,

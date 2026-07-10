@@ -10,8 +10,8 @@ Pipeline
 1. Load OLMo last-token residual activations for two ADJACENT layers L and L+1
    (same prompts/rows in both layers — the paired input a crosscoder needs).
 2. Fit a 2-layer manifold crosscoder with ONE shared latent chart `t` and two
-   honest per-layer decoders `B^(L)`, `B^(L+1)` (the landed M1 REML driver
-   ``SaeManifoldTerm::run_multiblock_reml_fit`` + ``CrosscoderLayout``).
+   honest per-layer decoders `B^(L)`, `B^(L+1)` through the unified outer-REML
+   engine (``gamfit.sae_crosscoder_fit``).
 3. For each fitted circle atom, measure the empirical anchor→block transport map
    and its phase-shift-law verdict (``measure_atom_transport`` in
    ``crates/gam-sae/src/manifold/transport_law.rs``): phase_r2 vs smooth_r2, the
@@ -32,35 +32,9 @@ Launch (MSI)
         --layer 25 --rows 635 --n-atoms 32 --grid-resolution 512 \
         --out $PWD/transport_law_L25
 
-STATUS — pending pyffi exposure
--------------------------------
-The manifold-crosscoder REML fit (``run_multiblock_reml_fit``) and the transport
-measurement (``measure_atom_transport``) are currently RUST-ONLY; they are not yet
-exposed through ``gam-pyffi``. The Rust math is landed and covered by
-``crates/gam-sae/src/manifold/tests_transport_law.rs`` (planted phase-shift and
-planted nonlinear arms). This driver is the thin marshaling wrapper for the real
-measurement and will run end-to-end once the two FFI entry points below are added
-to ``crates/gam-pyffi`` — it deliberately does NOT reimplement the fit or the
-measurement in Python (Python is a thin wrapper; the math lives in Rust). Until
-then it fails with an actionable message rather than hacking a Python fit.
-
-Required FFI (proposed single fused entry point)
-------------------------------------------------
-    rust_module.sae_crosscoder_measure_transport(
-        anchor: np.ndarray[n, p_L],          # layer-L activations
-        block:  np.ndarray[n, p_{L+1}],      # layer-(L+1) activations
-        n_atoms: int,
-        grid_resolution: int,
-        controls_json: str,                  # TwoBlockRemlControls
-    ) -> str  # JSON: per-atom AtomTransportReport list
-        # [{atom, phase_shift:[s,phi], phase_r2, smooth_r2, law_gap,
-        #   law_holds, drift, principal_angles:[...], n_harmonics}, ...]
-
-which internally: builds circle atoms at the augmented width p_L + p_{L+1},
-seeds the shared chart (PCA / decoder-projection), calls
-``SaeManifoldTerm::run_multiblock_reml_fit`` with one ``OutputBlock`` for
-layer L+1, then ``measure_atom_transport(&term, layout, k, grid_resolution)``
-for each atom k.
+The public call is a thin array marshaller. Target stacking, shared-chart seed,
+block-relevance coordinates, outer REML, honest-unit decoder splitting, drift,
+and transport-law measurement all run in Rust.
 """
 
 from __future__ import annotations
@@ -99,30 +73,17 @@ def _center(x: np.ndarray) -> np.ndarray:
     return x - x.mean(axis=0, keepdims=True)
 
 
-def _require_ffi(rust_module):
-    fn = getattr(rust_module, "sae_crosscoder_measure_transport", None)
-    if fn is None:
-        raise NotImplementedError(
-            "sae_crosscoder_measure_transport is not exposed by gam-pyffi yet.\n"
-            "The transport-law fit + measurement are landed in Rust "
-            "(crates/gam-sae/src/manifold/transport_law.rs, validated by "
-            "tests_transport_law.rs) but not marshaled across the FFI. Add the "
-            "entry point documented in this file's module docstring to "
-            "crates/gam-pyffi/src/manifold, rebuild the wheel, then re-run. This "
-            "driver intentionally does not reimplement the REML fit in Python."
-        )
-    return fn
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--activations", required=True, help="path to activations.npy (n_prompts, n_layers, D)")
     ap.add_argument("--layer", type=int, default=25, help="source layer L (block target is L+1)")
     ap.add_argument("--rows", type=int, default=None, help="max prompts/rows to use (default: all)")
     ap.add_argument("--n-atoms", type=int, default=32, help="number of shared circle atoms K")
+    ap.add_argument("--n-harmonics", type=int, default=3, help="Fourier order per circle atom")
     ap.add_argument("--grid-resolution", type=int, default=512, help="chart grid points over [0,1)")
-    ap.add_argument("--max-sweeps", type=int, default=1, help="REML (fit, λ) outer sweeps")
     ap.add_argument("--inner-max-iter", type=int, default=80, help="inner arrow-Schur iterations")
+    ap.add_argument("--law-gap-tolerance", type=float, default=0.05,
+                    help="maximum smooth-minus-phase circular R2 gap for the phase law verdict")
     ap.add_argument("--out", required=True, help="output directory for the JSON report")
     args = ap.parse_args(argv)
 
@@ -134,32 +95,47 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    from gamfit._binding import rust_module  # noqa: E402  (import after arg parse / data load)
+    from gamfit import sae_crosscoder_fit  # noqa: E402  (import after data load)
 
-    measure = _require_ffi(rust_module)
     controls = {
-        "max_sweeps": args.max_sweeps,
-        "inner_max_iter": args.inner_max_iter,
-        "step_size": 1.0,
+        "max_iter": args.inner_max_iter,
         "ridge_ext_coord": 1e-6,
         "ridge_beta": 1e-6,
-        "log_lambda_tol": 1e-3,
+        "n_harmonics": args.n_harmonics,
+        "grid_resolution": args.grid_resolution,
+        "law_gap_tolerance": args.law_gap_tolerance,
     }
-    report_json = measure(
+    fit = sae_crosscoder_fit(
         anchor,
-        block,
-        args.n_atoms,
-        args.grid_resolution,
-        json.dumps(controls),
+        [(f"L{args.layer + 1}", block)],
+        anchor_label=f"L{args.layer}",
+        n_atoms=args.n_atoms,
+        n_harmonics=args.n_harmonics,
+        max_iter=args.inner_max_iter,
+        ridge_ext_coord=1e-6,
+        ridge_beta=1e-6,
+        grid_resolution=args.grid_resolution,
+        law_gap_tolerance=args.law_gap_tolerance,
     )
-    reports = json.loads(report_json)
+    reports = list(fit["transport"])
 
     import os
 
     os.makedirs(args.out, exist_ok=True)
     out_path = os.path.join(args.out, f"transport_law_L{args.layer}.json")
     with open(out_path, "w") as fh:
-        json.dump({"layer": args.layer, "controls": controls, "atoms": reports}, fh, indent=2)
+        json.dump(
+            {
+                "layer": args.layer,
+                "controls": controls,
+                "layout": fit["layout"],
+                "drift": fit["drift"],
+                "termination": fit["termination"],
+                "atoms": reports,
+            },
+            fh,
+            indent=2,
+        )
 
     # Summarize the law verdict across atoms.
     held = sum(1 for r in reports if r.get("law_holds"))

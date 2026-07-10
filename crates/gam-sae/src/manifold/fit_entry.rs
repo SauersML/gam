@@ -804,7 +804,9 @@ pub fn run_sae_manifold_fit(request: SaeFitRequest) -> Result<SaeFitReport, SaeF
             Err(e) => {
                 // Structure search is a post-fit audit pass; a failure must not
                 // silently corrupt the fit — surface it loudly.
-                return Err(SaeFitError::Fit(format!("structure search around SAE fit failed: {e}")));
+                return Err(SaeFitError::Fit(format!(
+                    "structure search around SAE fit failed: {e}"
+                )));
             }
         }
     };

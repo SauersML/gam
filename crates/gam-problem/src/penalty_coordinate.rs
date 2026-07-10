@@ -2,8 +2,8 @@
 //! under #1521). The enum is pure data; its operators use only gam-problem's own
 //! dense linalg helpers, so hosting it here lets the criterion/solver layers share
 //! one definition without an upward edge into the engine.
-use gam_linalg::dense;
 use crate::reml_contract_panic;
+use gam_linalg::dense;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
 /// A rho-coordinate always contributes

@@ -1873,7 +1873,10 @@ mod tests {
             directions.push(dirs[primary].clone());
         }
         let budget = auto_candidate_budget(k);
-        assert_eq!(budget, CANDIDATE_BUDGET_MAX, "K=10^6 sits at the budget cap");
+        assert_eq!(
+            budget, CANDIDATE_BUDGET_MAX,
+            "K=10^6 sits at the budget cap"
+        );
         // s = 1: each row's exact top-1 is its planted dominant atom (recall floor
         // carries content only at s = 1 — see the frontier test's note).
         let s = 1usize;
@@ -1966,7 +1969,10 @@ mod tests {
         let mut prev = 0usize;
         for &k in &[64usize, 256, 1024, 4096, 65_536, 1_000_000] {
             let c = routability_shortlist_size(p, k, s, delta);
-            assert!(c >= prev, "shortlist size must be monotone in K: {c} < {prev}");
+            assert!(
+                c >= prev,
+                "shortlist size must be monotone in K: {c} < {prev}"
+            );
             assert!(c >= s + 1, "shortlist must exceed the top-s winner count");
             assert!(c <= k, "shortlist can never exceed the dictionary");
             // Logarithmic, not linear: at a million atoms the shortlist stays a

@@ -79,10 +79,7 @@ pub trait SbcModel {
 /// posterior ties occur with probability zero, so the strict comparison is the
 /// canonical SBC rank statistic.
 pub fn sbc_rank(truth: f64, posterior_draws: &[f64]) -> usize {
-    posterior_draws
-        .iter()
-        .filter(|&&draw| draw < truth)
-        .count()
+    posterior_draws.iter().filter(|&&draw| draw < truth).count()
 }
 
 /// Run the full SBC loop and return one rank per replication.
@@ -349,7 +346,10 @@ impl CoverageVerdict {
 /// escaping `[0, 1]`), so the tolerance is derived from the binomial law of the
 /// replicate count — not a hand-picked coverage band.
 pub fn audit_coverage(hits: usize, replications: usize, nominal: f64) -> CoverageVerdict {
-    assert!(replications > 0, "coverage audit needs at least one replication");
+    assert!(
+        replications > 0,
+        "coverage audit needs at least one replication"
+    );
     assert!(
         nominal > 0.0 && nominal < 1.0,
         "nominal coverage must lie in (0, 1)"
@@ -396,12 +396,8 @@ pub trait CoverageModel {
 
     /// Simulate `y ~ p(y | truth)`, fit, and return the surface's `(lower,
     /// upper)` interval at nominal coverage `level ∈ (0, 1)`.
-    fn simulate_and_interval(
-        &self,
-        truth: f64,
-        level: f64,
-        rng: &mut CalibrationRng,
-    ) -> (f64, f64);
+    fn simulate_and_interval(&self, truth: f64, level: f64, rng: &mut CalibrationRng)
+    -> (f64, f64);
 }
 
 /// Run the coverage loop at one nominal level and return the hit count (the
@@ -458,8 +454,8 @@ impl ConjugateGaussianModel {
         let data_precision = self.n_obs as f64 * self.obs_sd.powi(-2);
         let posterior_precision = prior_precision + data_precision;
         let posterior_var = 1.0 / posterior_precision;
-        let posterior_mean = posterior_var
-            * (self.prior_mean * prior_precision + sum_y * self.obs_sd.powi(-2));
+        let posterior_mean =
+            posterior_var * (self.prior_mean * prior_precision + sum_y * self.obs_sd.powi(-2));
         (posterior_mean, posterior_var.sqrt())
     }
 }
@@ -654,12 +650,18 @@ pub struct FieldAudit {
 impl FieldAudit {
     /// A point-estimate / metadata field carrying no coverage claim.
     pub const fn point(field: &'static str) -> Self {
-        Self { field, disposition: FieldDisposition::NotUncertainty }
+        Self {
+            field,
+            disposition: FieldDisposition::NotUncertainty,
+        }
     }
 
     /// An uncertainty field audited by the registered target `target`.
     pub const fn audited(field: &'static str, target: &'static str) -> Self {
-        Self { field, disposition: FieldDisposition::AuditedBy(target) }
+        Self {
+            field,
+            disposition: FieldDisposition::AuditedBy(target),
+        }
     }
 }
 
@@ -706,7 +708,10 @@ pub fn assert_registry_well_formed(registry: &[CalibrationTarget]) {
             problems.push(format!("duplicate registry name `{}`", t.name));
         }
         if t.audited_by.is_empty() {
-            problems.push(format!("target `{}` names no gate (`audited_by` empty)", t.name));
+            problems.push(format!(
+                "target `{}` names no gate (`audited_by` empty)",
+                t.name
+            ));
         }
         let mode_ok = match t.kind {
             // SBC rank uniformity is the ideal posterior audit (it sees shape
@@ -891,7 +896,11 @@ mod tests {
         use super::standard_normal_quantile;
         // Reference two-sided z at the classic levels (accurate to the
         // approximation's ~1e-9), and the symmetry Φ⁻¹(1−p) = −Φ⁻¹(p).
-        for (p, z) in [(0.975_f64, 1.959_963_985), (0.95, 1.644_853_627), (0.9, 1.281_551_566)] {
+        for (p, z) in [
+            (0.975_f64, 1.959_963_985),
+            (0.95, 1.644_853_627),
+            (0.9, 1.281_551_566),
+        ] {
             assert!(
                 (standard_normal_quantile(p) - z).abs() < 1e-6,
                 "Φ⁻¹({p}) = {} != {z}",
@@ -902,7 +911,10 @@ mod tests {
                 "quantile not antisymmetric at p={p}"
             );
         }
-        assert!(standard_normal_quantile(0.5).abs() < 1e-9, "median must be 0");
+        assert!(
+            standard_normal_quantile(0.5).abs() < 1e-9,
+            "median must be 0"
+        );
     }
 
     #[test]
@@ -926,9 +938,7 @@ mod tests {
 
     #[test]
     fn calibrated_conjugate_gaussian_passes_coverage_sweep() {
-        use super::{
-            COVERAGE_NOMINAL_LEVELS, COVERAGE_REPLICATIONS, audit_coverage, run_coverage,
-        };
+        use super::{COVERAGE_NOMINAL_LEVELS, COVERAGE_REPLICATIONS, audit_coverage, run_coverage};
         // Real end-to-end coverage: exact closed-form credible intervals cover at
         // nominal, so every level in the sweep must pass.
         let model = conjugate_model(1.0);
@@ -946,7 +956,7 @@ mod tests {
 
     #[test]
     fn narrowed_interval_fails_coverage_sweep() {
-        use super::{CoverageClass, COVERAGE_REPLICATIONS, audit_coverage, run_coverage};
+        use super::{COVERAGE_REPLICATIONS, CoverageClass, audit_coverage, run_coverage};
         // Teeth: intervals narrowed to half width (posterior_sd_scale = 0.5)
         // under-cover, so the gate must classify anti-conservative and fail. A
         // vacuous coverage check would let this pass.
@@ -958,7 +968,9 @@ mod tests {
             v.class,
             CoverageClass::AntiConservative,
             "narrowed interval must be flagged anti-conservative: empirical={:.4} CI=[{:.4},{:.4}]",
-            v.empirical, v.ci_lo, v.ci_hi
+            v.empirical,
+            v.ci_lo,
+            v.ci_hi
         );
         assert!(!v.passed, "narrowed interval must fail the coverage gate");
     }
@@ -983,7 +995,9 @@ mod tests {
         vec![
             CalibrationTarget {
                 name: "mean_credible_band",
-                kind: SurfaceKind::CredibleBand { smoothing_corrected: false },
+                kind: SurfaceKind::CredibleBand {
+                    smoothing_corrected: false,
+                },
                 mode: AuditMode::CoverageSweep,
                 guards: &[1870, 1871],
                 audited_by: "sbc_gaussian_smooth_band_coverage",
@@ -1011,7 +1025,10 @@ mod tests {
 
         // Introduce a field auditing an UNREGISTERED surface — the exact
         // "recycled SE ships unaudited" failure the lint exists to block.
-        let orphaned = [FieldAudit::audited("observation_lower", "predictive_interval_gaussian")];
+        let orphaned = [FieldAudit::audited(
+            "observation_lower",
+            "predictive_interval_gaussian",
+        )];
         let caught = std::panic::catch_unwind(|| {
             assert_registry_covers_fields(&orphaned, &tiny_registry());
         });
@@ -1035,12 +1052,18 @@ mod tests {
             audited_by: "somewhere",
         }];
         let caught = std::panic::catch_unwind(|| assert_registry_well_formed(&mis));
-        assert!(caught.is_err(), "test p-value on a coverage sweep must be flagged");
+        assert!(
+            caught.is_err(),
+            "test p-value on a coverage sweep must be flagged"
+        );
     }
 
     #[test]
     fn field_disposition_constructors_tag_correctly() {
-        assert_eq!(FieldAudit::point("eta").disposition, FieldDisposition::NotUncertainty);
+        assert_eq!(
+            FieldAudit::point("eta").disposition,
+            FieldDisposition::NotUncertainty
+        );
         assert_eq!(
             FieldAudit::audited("eta_lower", "band").disposition,
             FieldDisposition::AuditedBy("band")

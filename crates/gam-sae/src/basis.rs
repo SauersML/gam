@@ -2332,12 +2332,14 @@ impl MobiusHarmonicEvaluator {
                 }
                 let k = Self::circle_mode(c_a) as f64;
                 let gc = if c_a == 0 { 2.0 } else { 1.0 };
-                let sc = if c_a == 0 { 0.0 } else { (pi * k).powi(4) * 1.0 };
+                let sc = if c_a == 0 {
+                    0.0
+                } else {
+                    (pi * k).powi(4) * 1.0
+                };
                 let gw = moment(m_a + m_b);
                 let sw = if m_a >= 2 && m_b >= 2 {
-                    ((m_a * (m_a - 1)) as f64)
-                        * ((m_b * (m_b - 1)) as f64)
-                        * moment(m_a + m_b - 4)
+                    ((m_a * (m_a - 1)) as f64) * ((m_b * (m_b - 1)) as f64) * moment(m_a + m_b - 4)
                 } else {
                     0.0
                 };
@@ -2767,7 +2769,10 @@ mod tests {
         let mut jet = Array3::<f64>::from_elem(jet_ref.dim(), 999.0);
         eval.evaluate_into(&mut phi, &mut jet, coords.view())
             .expect("evaluate_into");
-        assert_eq!(phi, phi_ref, "evaluate_into Φ must equal evaluate Φ exactly");
+        assert_eq!(
+            phi, phi_ref,
+            "evaluate_into Φ must equal evaluate Φ exactly"
+        );
         assert_eq!(
             jet, jet_ref,
             "evaluate_into jet must equal evaluate jet exactly"
@@ -2792,7 +2797,10 @@ mod tests {
         let (phi_b_ref, jet_b_ref) = eval.evaluate(coords_b.view()).expect("evaluate b");
         eval.evaluate_into(&mut phi, &mut jet, coords_b.view())
             .expect("into b (reused workspace)");
-        assert_eq!(phi, phi_b_ref, "reused workspace Φ must not carry stale data");
+        assert_eq!(
+            phi, phi_b_ref,
+            "reused workspace Φ must not carry stale data"
+        );
         assert_eq!(
             jet, jet_b_ref,
             "reused workspace jet must not carry stale data"
@@ -2812,9 +2820,11 @@ mod tests {
     fn euclidean_patch_evaluate_into_matches() {
         let eval = EuclideanPatchEvaluator::new(2, 2).unwrap();
         let coords_a =
-            Array2::from_shape_vec((4, 2), vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8]).unwrap();
+            Array2::from_shape_vec((4, 2), vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8])
+                .unwrap();
         let coords_b =
-            Array2::from_shape_vec((4, 2), vec![-0.3, 0.9, 0.2, -0.1, 0.5, 0.5, -0.7, 0.3]).unwrap();
+            Array2::from_shape_vec((4, 2), vec![-0.3, 0.9, 0.2, -0.1, 0.5, 0.5, -0.7, 0.3])
+                .unwrap();
         assert_into_matches_evaluate(&eval, &coords_a);
         assert_workspace_reuse(&eval, &coords_a, &coords_b);
     }
@@ -2852,6 +2862,9 @@ mod tests {
         // written past — the shape guard `refresh_basis` relied on.
         let mut phi = Array2::<f64>::zeros((4, 4));
         let mut jet = Array3::<f64>::zeros((4, 5, 1));
-        assert!(eval.evaluate_into(&mut phi, &mut jet, coords.view()).is_err());
+        assert!(
+            eval.evaluate_into(&mut phi, &mut jet, coords.view())
+                .is_err()
+        );
     }
 }

@@ -122,9 +122,8 @@ impl Args {
         let program = raw
             .next()
             .unwrap_or_else(|| "behavioral_curvature_map".to_string());
-        let usage = format!(
-            "usage: {program} <input_dir_or_json> [out.json] [max_rows] [--grid G]"
-        );
+        let usage =
+            format!("usage: {program} <input_dir_or_json> [out.json] [max_rows] [--grid G]");
         let mut input: Option<PathBuf> = None;
         let mut positional: Vec<String> = Vec::new();
         let mut grid = DEFAULT_GRID;
@@ -279,9 +278,7 @@ fn run(args: &Args) -> Result<PathBuf, String> {
                 ChartTopology::Circle,
                 ChartTopology::Circle,
             )
-            .map_err(|e| {
-                format!("transport {}→{} failed: {e}", layers[a], layers[b])
-            })?;
+            .map_err(|e| format!("transport {}→{} failed: {e}", layers[a], layers[b]))?;
             let class = classify_circle_transport_fit(
                 &fit,
                 ChartTopology::Circle,
@@ -368,12 +365,8 @@ fn run(args: &Args) -> Result<PathBuf, String> {
                 // Analytic delta-method composition-law test (independent,
                 // calibrated). Best-effort: record its error rather than aborting
                 // the whole map if a single triple degenerates.
-                let comp: Result<CompositionDefectReport, String> = composition_defect(
-                    &fits[&(a, b)],
-                    &fits[&(b, c)],
-                    &fits[&(a, c)],
-                    args.grid,
-                );
+                let comp: Result<CompositionDefectReport, String> =
+                    composition_defect(&fits[&(a, b)], &fits[&(b, c)], &fits[&(a, c)], args.grid);
 
                 // Attribute the excess holonomy uniformly across the adjacent
                 // intervals spanned by the direct edge (a..c).
@@ -441,12 +434,13 @@ fn run(args: &Args) -> Result<PathBuf, String> {
     }
 
     // --- headline summary ---------------------------------------------------
-    let (max_iv, max_score) = interval_load
-        .iter()
-        .enumerate()
-        .fold((None, 0.0_f64), |(mi, ms), (i, &v)| {
-            if v > ms { (Some(i), v) } else { (mi, ms) }
-        });
+    let (max_iv, max_score) =
+        interval_load
+            .iter()
+            .enumerate()
+            .fold((None, 0.0_f64), |(mi, ms), (i, &v)| {
+                if v > ms { (Some(i), v) } else { (mi, ms) }
+            });
     let any_nontrivial = triangles_json.iter().any(|t| {
         t.get("holonomy")
             .and_then(|h| h.get("is_trivial"))
@@ -491,8 +485,8 @@ fn run(args: &Args) -> Result<PathBuf, String> {
         "intervals": intervals_json,
     });
 
-    let text = serde_json::to_string_pretty(&report)
-        .map_err(|e| format!("serialize report: {e}"))?;
+    let text =
+        serde_json::to_string_pretty(&report).map_err(|e| format!("serialize report: {e}"))?;
     if let Some(parent) = args.out.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -507,11 +501,7 @@ fn run(args: &Args) -> Result<PathBuf, String> {
 /// Non-finite-safe f64 → JSON (maps NaN/±inf to null; serde_json would otherwise
 /// emit them as null anyway, but this is explicit).
 fn jf(v: f64) -> Value {
-    if v.is_finite() {
-        json!(v)
-    } else {
-        Value::Null
-    }
+    if v.is_finite() { json!(v) } else { Value::Null }
 }
 
 /// Keep row `i` iff its angle is finite in every layer and — where gates exist —
@@ -522,7 +512,11 @@ fn build_keep_mask(layers: &[LayerSource], n: usize) -> Vec<bool> {
         .iter()
         .map(|l| {
             l.gate.as_ref().map(|g| {
-                let gmax = g.iter().copied().filter(|v| v.is_finite()).fold(0.0_f64, f64::max);
+                let gmax = g
+                    .iter()
+                    .copied()
+                    .filter(|v| v.is_finite())
+                    .fold(0.0_f64, f64::max);
                 gmax * GATE_REL_FLOOR
             })
         })
@@ -561,7 +555,11 @@ fn edge_mean_gate(ga: &Option<Array1<f64>>, gb: &Option<Array1<f64>>) -> Option<
                     }
                 }
             }
-            if cnt == 0 { None } else { Some(sum / cnt as f64) }
+            if cnt == 0 {
+                None
+            } else {
+                Some(sum / cnt as f64)
+            }
         }
     }
 }
@@ -571,8 +569,7 @@ fn edge_mean_gate(ga: &Option<Array1<f64>>, gb: &Option<Array1<f64>>) -> Option<
 /// Sniff the input (file or directory) and load every layer's circular
 /// coordinates.
 fn load_atlas(input: &Path) -> Result<LoadedAtlas, String> {
-    let meta = std::fs::metadata(input)
-        .map_err(|e| format!("stat {}: {e}", input.display()))?;
+    let meta = std::fs::metadata(input).map_err(|e| format!("stat {}: {e}", input.display()))?;
 
     // A single JSON file: either the banked multi-layer form or a per-layer form.
     if meta.is_file() {
@@ -586,7 +583,10 @@ fn load_atlas(input: &Path) -> Result<LoadedAtlas, String> {
                 let layer = load_single_layer_json(&value, input)?;
                 return Ok(LoadedAtlas {
                     format: "per_layer_theta_json".to_string(),
-                    model: value.get("model").and_then(Value::as_str).map(str::to_string),
+                    model: value
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     coordinate: value
                         .get("coordinate")
                         .and_then(Value::as_str)
@@ -656,7 +656,10 @@ fn load_atlas(input: &Path) -> Result<LoadedAtlas, String> {
                 layers.push(load_single_layer_json(&value, path)?);
                 formats.push("per_layer_theta_json");
                 model = model.or_else(|| {
-                    value.get("model").and_then(Value::as_str).map(str::to_string)
+                    value
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 });
             }
         }
@@ -687,8 +690,7 @@ fn load_atlas(input: &Path) -> Result<LoadedAtlas, String> {
 /// Collect layer-bearing files up to one directory level below `dir` (the
 /// natural weekday_binding.py per-layer-subdir layout).
 fn collect_candidates(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("read dir {}: {e}", dir.display()))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("read dir {}: {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read entry in {}: {e}", dir.display()))?;
         let path = entry.path();
@@ -707,8 +709,8 @@ fn collect_candidates(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Resul
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -734,7 +736,10 @@ fn load_banked_theta(value: &Value, path: &Path) -> Result<LoadedAtlas, String> 
             .ok_or_else(|| format!("{}: theta[{key}] missing or not an array", path.display()))?;
         let angles: Vec<f64> = arr
             .iter()
-            .map(|v| v.as_f64().ok_or_else(|| format!("{}: non-numeric angle in {key}", path.display())))
+            .map(|v| {
+                v.as_f64()
+                    .ok_or_else(|| format!("{}: non-numeric angle in {key}", path.display()))
+            })
             .collect::<Result<_, _>>()?;
         layers.push(LayerSource {
             layer: parse_layer_key(key),
@@ -745,7 +750,10 @@ fn load_banked_theta(value: &Value, path: &Path) -> Result<LoadedAtlas, String> 
     }
     Ok(LoadedAtlas {
         format: "banked_theta_json".to_string(),
-        model: value.get("model").and_then(Value::as_str).map(str::to_string),
+        model: value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         coordinate: value
             .get("coordinate")
             .and_then(Value::as_str)
@@ -762,13 +770,26 @@ fn load_single_layer_json(value: &Value, path: &Path) -> Result<LayerSource, Str
         .ok_or_else(|| format!("{}: `theta` is not an array", path.display()))?;
     let angles: Vec<f64> = arr
         .iter()
-        .map(|v| v.as_f64().ok_or_else(|| format!("{}: non-numeric theta value", path.display())))
+        .map(|v| {
+            v.as_f64()
+                .ok_or_else(|| format!("{}: non-numeric theta value", path.display()))
+        })
         .collect::<Result<_, _>>()?;
     let layer = value
         .get("layer")
         .and_then(Value::as_i64)
-        .or_else(|| value.get("layer_key").and_then(Value::as_str).map(parse_layer_key))
-        .ok_or_else(|| format!("{}: per-layer theta json needs a `layer` integer", path.display()))?;
+        .or_else(|| {
+            value
+                .get("layer_key")
+                .and_then(Value::as_str)
+                .map(parse_layer_key)
+        })
+        .ok_or_else(|| {
+            format!(
+                "{}: per-layer theta json needs a `layer` integer",
+                path.display()
+            )
+        })?;
     // Optional per-row gate array under a few natural names.
     let gate = ["gate", "weight", "amplitude"]
         .iter()
@@ -791,8 +812,7 @@ fn load_single_layer_json(value: &Value, path: &Path) -> Result<LayerSource, Str
 /// its gate is the amplitude `hypot(z0, z1)`. The layer index is read from the
 /// sibling `weekday_frame_meta.json`, falling back to the parent dir name.
 fn load_weekday_codes(csv: &Path, dir: &Path) -> Result<LayerSource, String> {
-    let text = std::fs::read_to_string(csv)
-        .map_err(|e| format!("read {}: {e}", csv.display()))?;
+    let text = std::fs::read_to_string(csv).map_err(|e| format!("read {}: {e}", csv.display()))?;
     let mut theta = Vec::new();
     let mut gate = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
@@ -829,9 +849,8 @@ fn load_weekday_codes(csv: &Path, dir: &Path) -> Result<LayerSource, String> {
     if theta.is_empty() {
         return Err(format!("{}: no data rows", csv.display()));
     }
-    let layer = weekday_layer_index(dir).unwrap_or_else(|| parse_layer_key(
-        dir.file_name().and_then(|f| f.to_str()).unwrap_or(""),
-    ));
+    let layer = weekday_layer_index(dir)
+        .unwrap_or_else(|| parse_layer_key(dir.file_name().and_then(|f| f.to_str()).unwrap_or("")));
     Ok(LayerSource {
         layer,
         theta,

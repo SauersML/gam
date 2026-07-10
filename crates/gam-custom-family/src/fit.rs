@@ -744,9 +744,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     initial_log_lambda: spec.initial_log_lambda,
                     nullspace_dim,
                 };
-                out.validate().map_err(|e| CustomFamilyError::ConstraintViolation {
-                    reason: format!("joint penalty validation failed: {e}"),
-                })?;
+                out.validate()
+                    .map_err(|e| CustomFamilyError::ConstraintViolation {
+                        reason: format!("joint penalty validation failed: {e}"),
+                    })?;
                 Ok(out)
             })
             .collect::<Result<Vec<_>, CustomFamilyError>>()?

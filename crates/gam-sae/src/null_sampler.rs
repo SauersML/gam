@@ -229,7 +229,7 @@ impl CurveballSampler {
 pub struct CoactivationExceedance {
     g: usize,
     n_obs: usize,
-    obs: Vec<f64>,      // upper-tri joint counts
+    obs: Vec<f64>, // upper-tri joint counts
     null_mean: Vec<f64>,
     z: Vec<f64>,
 }
@@ -289,7 +289,10 @@ const NULL_SD_FLOOR: f64 = 1e-9;
 /// Between replicates the chain is advanced by one mixing sweep and thinned, and a
 /// burn-in sweep is run before the first sample, so the replicates are near-
 /// independent draws from the fixed-margin class.
-pub fn coactivation_exceedance(codes: &SparseAtomCodes, replicates: usize) -> CoactivationExceedance {
+pub fn coactivation_exceedance(
+    codes: &SparseAtomCodes,
+    replicates: usize,
+) -> CoactivationExceedance {
     let g = codes.k_atoms();
     let n_obs = codes.n_obs();
     let size = g * g;
@@ -305,7 +308,13 @@ pub fn coactivation_exceedance(codes: &SparseAtomCodes, replicates: usize) -> Co
     let mut null_mean = vec![0.0_f64; size];
     let mut z = vec![0.0_f64; size];
     if g < 2 || n_obs < 2 || replicates == 0 {
-        return CoactivationExceedance { g, n_obs, obs, null_mean, z };
+        return CoactivationExceedance {
+            g,
+            n_obs,
+            obs,
+            null_mean,
+            z,
+        };
     }
 
     let mut sampler = CurveballSampler::from_codes(codes);
@@ -356,7 +365,13 @@ pub fn coactivation_exceedance(codes: &SparseAtomCodes, replicates: usize) -> Co
         }
     }
 
-    CoactivationExceedance { g, n_obs, obs, null_mean, z }
+    CoactivationExceedance {
+        g,
+        n_obs,
+        obs,
+        null_mean,
+        z,
+    }
 }
 
 /// Sparse fixed-margin exceedance for a pre-indexed candidate pair set.

@@ -2217,8 +2217,10 @@ pub fn stable_reparameterizationwith_invariant(
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(i.cmp(&j))
             });
-            range_eigenvalues_sorted =
-                range_order.iter().map(|&idx| range_eigenvalues[idx]).collect();
+            range_eigenvalues_sorted = range_order
+                .iter()
+                .map(|&idx| range_eigenvalues[idx])
+                .collect();
             for (col_idx, &idx) in range_order.iter().enumerate() {
                 for row in 0..penalized_rank {
                     range_rotation[(row, col_idx)] = range_eigenvectors[(row, idx)];

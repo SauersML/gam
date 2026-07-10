@@ -1165,13 +1165,10 @@ mod tests {
     /// one-term formula, panicking if the term is not a random-effect block.
     fn random_effect_lenient_unseen(formula: &str) -> bool {
         let parsed = parse_formula(formula).expect("parse random-effect formula");
-        let re = parsed
-            .terms
-            .iter()
-            .find_map(|t| match t {
-                ParsedTerm::RandomEffect { lenient_unseen, .. } => Some(*lenient_unseen),
-                _ => None,
-            });
+        let re = parsed.terms.iter().find_map(|t| match t {
+            ParsedTerm::RandomEffect { lenient_unseen, .. } => Some(*lenient_unseen),
+            _ => None,
+        });
         re.unwrap_or_else(|| panic!("{formula} did not lower to a RandomEffect term"))
     }
 

@@ -270,13 +270,7 @@ mod gwr_backward_tests {
     use ndarray::{Array1, Array2, Array3};
 
     // Deterministic small fixture; values chosen so `A = XᵀWX + λS` is SPD.
-    fn fixture() -> (
-        Array2<f64>,
-        Array2<f64>,
-        Array2<f64>,
-        Array1<f64>,
-        f64,
-    ) {
+    fn fixture() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>, f64) {
         let x = ndarray::arr2(&[
             [0.5, -1.2, 0.3],
             [1.1, 0.4, -0.7],
@@ -294,11 +288,7 @@ mod gwr_backward_tests {
             [-0.2, 1.3],
         ]);
         // SPD penalty `PPᵀ + m·I`.
-        let p = ndarray::arr2(&[
-            [0.7, -0.2, 0.1],
-            [0.4, 0.9, -0.3],
-            [-0.5, 0.2, 0.8],
-        ]);
+        let p = ndarray::arr2(&[[0.7, -0.2, 0.1], [0.4, 0.9, -0.3], [-0.5, 0.2, 0.8]]);
         let penalty = p.dot(&p.t()) + Array2::<f64>::eye(3) * 3.0;
         let weights = ndarray::arr1(&[0.8, 1.2, 0.6, 1.5, 0.9, 1.1]);
         (x, y, penalty, weights, 0.7)
@@ -453,12 +443,24 @@ mod gwr_backward_tests {
             lam,
         )
         .unwrap();
-        let (rx, ry, rp, rw) =
-            reference(&grad_coef, &grad_fitted, &x, &y, &penalty, &weights, &coef, lam);
+        let (rx, ry, rp, rw) = reference(
+            &grad_coef,
+            &grad_fitted,
+            &x,
+            &y,
+            &penalty,
+            &weights,
+            &coef,
+            lam,
+        );
 
         assert!(max_abs2(&gx, &rx) < 1e-12, "grad_x: {}", max_abs2(&gx, &rx));
         assert!(max_abs2(&gy, &ry) < 1e-12, "grad_y: {}", max_abs2(&gy, &ry));
-        assert!(max_abs2(&gp, &rp) < 1e-12, "grad_penalty: {}", max_abs2(&gp, &rp));
+        assert!(
+            max_abs2(&gp, &rp) < 1e-12,
+            "grad_penalty: {}",
+            max_abs2(&gp, &rp)
+        );
         assert!(max_abs1(&gw, &rw) < 1e-12, "grad_w: {}", max_abs1(&gw, &rw));
     }
 
@@ -494,34 +496,30 @@ mod gwr_backward_tests {
 
         // Scalar loss L = <grad_coef, coef> + <grad_fitted, fitted>; the VJP is
         // dL/d(input). Central differences of the forward validate it.
-        let loss = |xx: &Array2<f64>,
-                    yy: &Array2<f64>,
-                    pp: &Array2<f64>,
-                    ww: &Array1<f64>|
-         -> f64 {
-            let (c, f) =
-                gaussian_weighted_ridge(xx.view(), yy.view(), pp.view(), ww.view(), lam).unwrap();
-            let mut s = 0.0;
-            for (a, b) in c.iter().zip(grad_coef.iter()) {
-                s += a * b;
-            }
-            for (a, b) in f.iter().zip(grad_fitted.iter()) {
-                s += a * b;
-            }
-            s
-        };
+        let loss =
+            |xx: &Array2<f64>, yy: &Array2<f64>, pp: &Array2<f64>, ww: &Array1<f64>| -> f64 {
+                let (c, f) =
+                    gaussian_weighted_ridge(xx.view(), yy.view(), pp.view(), ww.view(), lam)
+                        .unwrap();
+                let mut s = 0.0;
+                for (a, b) in c.iter().zip(grad_coef.iter()) {
+                    s += a * b;
+                }
+                for (a, b) in f.iter().zip(grad_fitted.iter()) {
+                    s += a * b;
+                }
+                s
+            };
 
         let h = 1e-6;
-        let fd2 = |base: &Array2<f64>,
-                   idx: (usize, usize),
-                   eval: &dyn Fn(&Array2<f64>) -> f64|
-         -> f64 {
-            let mut plus = base.clone();
-            let mut minus = base.clone();
-            plus[idx] += h;
-            minus[idx] -= h;
-            (eval(&plus) - eval(&minus)) / (2.0 * h)
-        };
+        let fd2 =
+            |base: &Array2<f64>, idx: (usize, usize), eval: &dyn Fn(&Array2<f64>) -> f64| -> f64 {
+                let mut plus = base.clone();
+                let mut minus = base.clone();
+                plus[idx] += h;
+                minus[idx] -= h;
+                (eval(&plus) - eval(&minus)) / (2.0 * h)
+            };
 
         // grad_x
         for i in 0..x.nrows() {
@@ -550,7 +548,8 @@ mod gwr_backward_tests {
                     plus[[j, i]] += h;
                     minus[[j, i]] -= h;
                 }
-                let g = (loss(&x, &y, &plus, &weights) - loss(&x, &y, &minus, &weights)) / (2.0 * h);
+                let g =
+                    (loss(&x, &y, &plus, &weights) - loss(&x, &y, &minus, &weights)) / (2.0 * h);
                 // The symmetric-perturbation FD equals gp[i,j]+gp[j,i] for i!=j
                 // and gp[i,i] on the diagonal.
                 let analytic = if i == j {

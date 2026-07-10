@@ -93,8 +93,7 @@ struct OnDiskMeta {
 /// expiry is measured from this so a reused entry stays alive, while ordering
 /// (`entry_newer`) keys on `written_*` alone.
 fn meta_activity_nanos(meta: &OnDiskMeta) -> u128 {
-    let written =
-        (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
+    let written = (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
     let accessed =
         (meta.accessed_unix_secs as u128) * 1_000_000_000u128 + meta.accessed_nanos as u128;
     written.max(accessed)

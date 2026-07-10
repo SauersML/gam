@@ -79,8 +79,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // crash; the per-minibatch admission uses the same `minibatch × K` score
     // floor the router enforces.
     gam_gpu::configure_global_policy(args.gpu_policy);
-    let route_plan =
-        gam_gpu::DictionaryScoreRoutePlan::default_for_shape(args.minibatch.min(n_used), args.atoms, p);
+    let route_plan = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
+        args.minibatch.min(n_used),
+        args.atoms,
+        p,
+    );
     println!(
         "[scale_k] gpu={:?} per-minibatch score elems = {} (device_admitted={}, break-even={})",
         args.gpu_policy,
@@ -103,7 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.atoms,
                 args.minibatch.min(n_used).saturating_mul(args.atoms),
                 route_plan.device_min_score_elems,
-                route_plan.device_min_score_elems.div_ceil(args.atoms.max(1)),
+                route_plan
+                    .device_min_score_elems
+                    .div_ceil(args.atoms.max(1)),
             )
             .into());
         }
@@ -452,9 +457,8 @@ fn parse_args() -> Result<Args, String> {
             "--n-peeled" => args.n_peeled = parse_usize(value, key)?,
             "--pca-dim" => args.pca_dim = Some(parse_usize(value, key)?),
             "--gpu" => {
-                args.gpu_policy = gam_gpu::GpuPolicy::parse(value).ok_or_else(|| {
-                    format!("--gpu must be required|auto|off, got {value}")
-                })?;
+                args.gpu_policy = gam_gpu::GpuPolicy::parse(value)
+                    .ok_or_else(|| format!("--gpu must be required|auto|off, got {value}"))?;
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -483,8 +487,7 @@ fn validate_run_contract(args: &Args, n_used: usize, p: usize) -> Result<(), Str
     }
     if args.n_peeled == 0 {
         return Err(
-            "scale_k requires --n-peeled > 0 for the default post-peel/PCA-reduced run"
-                .to_string(),
+            "scale_k requires --n-peeled > 0 for the default post-peel/PCA-reduced run".to_string(),
         );
     }
     let pca_dim = args.pca_dim.ok_or_else(|| {
@@ -580,7 +583,10 @@ fn parse_npy_header(bytes: &[u8], path: &Path) -> Result<NpyHeader, String> {
         ));
     }
     if header.contains("True") {
-        return Err(format!("{} must be C-order, header={header:?}", path.display()));
+        return Err(format!(
+            "{} must be C-order, header={header:?}",
+            path.display()
+        ));
     }
     let shape_open = header
         .find('(')
@@ -602,7 +608,10 @@ fn parse_npy_header(bytes: &[u8], path: &Path) -> Result<NpyHeader, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("{} shape parse error: {e}", path.display()))?;
     if dims.len() != 2 {
-        return Err(format!("{} must be rank-2, got shape {dims:?}", path.display()));
+        return Err(format!(
+            "{} must be rank-2, got shape {dims:?}",
+            path.display()
+        ));
     }
     Ok(NpyHeader {
         rows: dims[0],

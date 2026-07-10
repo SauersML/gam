@@ -1,5 +1,5 @@
-use opt::{BacktrackConfig, ExpandConfig, bidirectional_line_search, constants};
 use ndarray::{Array1, ArrayView1};
+use opt::{BacktrackConfig, ExpandConfig, bidirectional_line_search, constants};
 
 use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
 

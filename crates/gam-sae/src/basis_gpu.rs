@@ -92,9 +92,9 @@ extern "C" __global__ void sae_periodic_basis_with_jet(
                 }
             }
         };
-        let func = module.load_function("sae_periodic_basis_with_jet").map_err(|err| {
-            format!("sae_periodic_basis_with_jet_device: load_function: {err}")
-        })?;
+        let func = module
+            .load_function("sae_periodic_basis_with_jet")
+            .map_err(|err| format!("sae_periodic_basis_with_jet_device: load_function: {err}"))?;
         Ok((module, func))
     }
 
@@ -114,13 +114,11 @@ extern "C" __global__ void sae_periodic_basis_with_jet(
         }
         if num_harmonics == 0 {
             return Err(
-                "sae_periodic_basis_with_jet_device: num_harmonics must be >= 1".to_string()
+                "sae_periodic_basis_with_jet_device: num_harmonics must be >= 1".to_string(),
             );
         }
         if t_dev_ptr == 0 || phi_dev_ptr == 0 || jet_dev_ptr == 0 {
-            return Err(
-                "sae_periodic_basis_with_jet_device: null device pointer".to_string()
-            );
+            return Err("sae_periodic_basis_with_jet_device: null device pointer".to_string());
         }
         let (_module, func) = periodic_function(ordinal)?;
         let ctx = gam_gpu::device_runtime::cuda_context_for(ordinal).ok_or_else(|| {

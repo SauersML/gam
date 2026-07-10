@@ -30,7 +30,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 fn lcg(s: &mut u64) -> f64 {
-    *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *s = s
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*s >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
@@ -158,7 +160,10 @@ fn main() -> Result<(), String> {
     );
     let t0 = Instant::now();
     let fx = fixture(n, p, k, tail, sigma, seed);
-    println!("[probe] fixture built in {:.2}s", t0.elapsed().as_secs_f64());
+    println!(
+        "[probe] fixture built in {:.2}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     let config = StagewiseConfig {
         inner_max_iter: inner,
@@ -224,8 +229,7 @@ fn main() -> Result<(), String> {
         }
         Ok(())
     };
-    let mut cb: &mut dyn for<'e> FnMut(StagewiseProgress<'e>) -> Result<(), String> =
-        &mut callback;
+    let mut cb: &mut dyn for<'e> FnMut(StagewiseProgress<'e>) -> Result<(), String> = &mut callback;
     let result = fit_stagewise(
         term,
         rho,

@@ -475,7 +475,12 @@ pub fn quadratic_subspace_anchor(
 /// high-margin union-of-subspaces discriminant that anchored training. `i` and
 /// `j` are assumed in-bounds (the caller guards `i, j < d`).
 #[must_use]
-pub fn apply_anchor_rule(x: ArrayView2<'_, f64>, i: usize, j: usize, threshold: f64) -> Array2<f64> {
+pub fn apply_anchor_rule(
+    x: ArrayView2<'_, f64>,
+    i: usize,
+    j: usize,
+    threshold: f64,
+) -> Array2<f64> {
     let n = x.nrows();
     let xn = normalize_rows(x);
     let mut onehot = Array2::<f64>::zeros((n, 2));
@@ -614,7 +619,7 @@ mod tests {
         apply_anchor_rule, assign_ema_update, direction_cluster_anchor, duchon_centers_nd,
         matching_pursuit_commit, quadratic_subspace_anchor, sinkhorn_balance_bias,
     };
-    use ndarray::{array, Array2, Array3};
+    use ndarray::{Array2, Array3, array};
 
     #[test]
     fn duchon_centers_nd_preserves_first_axis_and_shape() {
@@ -771,7 +776,10 @@ mod tests {
             assert!(onehot[(r, first_atom)] > 0.5, "+s branch row {r} misrouted");
         }
         for r in 64..128 {
-            assert!(onehot[(r, 1 - first_atom)] > 0.5, "-s branch row {r} misrouted");
+            assert!(
+                onehot[(r, 1 - first_atom)] > 0.5,
+                "-s branch row {r} misrouted"
+            );
         }
     }
 
@@ -781,7 +789,10 @@ mod tests {
         let (onehot, i, j, threshold) =
             quadratic_subspace_anchor(x.view(), 2).expect("confident split");
         let applied = apply_anchor_rule(x.view(), i, j, threshold);
-        assert_eq!(applied, onehot, "applied rule must reproduce the anchor split");
+        assert_eq!(
+            applied, onehot,
+            "applied rule must reproduce the anchor split"
+        );
     }
 
     #[test]

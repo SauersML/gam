@@ -413,9 +413,7 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
 }
 
 /// Exhaustive classification of every field of [`MultinomialPredictionIntervals`].
-fn multinomial_payload_field_audits(
-    payload: &MultinomialPredictionIntervals,
-) -> Vec<FieldAudit> {
+fn multinomial_payload_field_audits(payload: &MultinomialPredictionIntervals) -> Vec<FieldAudit> {
     let MultinomialPredictionIntervals {
         mean,
         standard_error,

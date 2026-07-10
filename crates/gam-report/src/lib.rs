@@ -257,7 +257,11 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                 fitted = json(&diag.y_predicted)?,
                 resid = json(&resid.values)?,
                 marker = marker,
-                layout = plot_style("Residuals vs Fitted", "Fitted Value", &js_escape(&resid.label)),
+                layout = plot_style(
+                    "Residuals vs Fitted",
+                    "Fitted Value",
+                    &js_escape(&resid.label)
+                ),
                 fit_min = fit_min,
                 fit_max = fit_max,
                 cfg = plot_cfg,
@@ -300,7 +304,11 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
                  marker:{{color:'#6366f1',line:{{color:'#4f46e5',width:0.5}}}},opacity:0.85}}],\
                  {layout},{{{cfg}}});",
                 resid = json(&resid.values)?,
-                layout = plot_style("Residual Distribution", &js_escape(&resid.label), "Frequency"),
+                layout = plot_style(
+                    "Residual Distribution",
+                    &js_escape(&resid.label),
+                    "Frequency"
+                ),
                 cfg = plot_cfg,
             ));
 

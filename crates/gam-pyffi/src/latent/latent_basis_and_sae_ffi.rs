@@ -971,8 +971,8 @@ fn predict_multinomial_formula_pyfunc<'py>(
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let probs = detach_pyresult(py, "predict_multinomial_formula", move || {
-        let envelope =
-            MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
+        let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
+            .map_err(estimation_error_to_pyerr)?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
         // subclass via `estimation_error_to_pyerr` (issue #343).
         gam::families::multinomial::predict_multinomial_formula(&envelope.saved, &dataset)
@@ -1000,8 +1000,8 @@ fn predict_multinomial_intervals_pyfunc<'py>(
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let intervals = detach_pyresult(py, "predict_multinomial_intervals", move || {
-        let envelope =
-            MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
+        let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
+            .map_err(estimation_error_to_pyerr)?;
         gam::families::multinomial::predict_multinomial_formula_with_intervals(
             &envelope.saved,
             &dataset,
@@ -1036,8 +1036,8 @@ fn posterior_predict_multinomial_pyfunc<'py>(
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let (draws, class_levels) = detach_pyresult(py, "posterior_predict_multinomial", move || {
-        let envelope =
-            MultinomialModelEnvelope::from_json_bytes(&model_bytes).map_err(estimation_error_to_pyerr)?;
+        let envelope = MultinomialModelEnvelope::from_json_bytes(&model_bytes)
+            .map_err(estimation_error_to_pyerr)?;
         let draws = gam::families::multinomial::posterior_predict_multinomial_formula(
             &envelope.saved,
             &dataset,
@@ -4163,14 +4163,8 @@ impl PyInterventionCalibrationPlan {
         }
         let out = PyDict::new(py);
         out.set_item("respeed", respeed)?;
-        out.set_item(
-            "below_measurement_floor",
-            result.below_measurement_floor,
-        )?;
-        out.set_item(
-            "no_training_intervention",
-            result.no_training_intervention,
-        )?;
+        out.set_item("below_measurement_floor", result.below_measurement_floor)?;
+        out.set_item("no_training_intervention", result.no_training_intervention)?;
         out.set_item("floor_nats", result.floor_nats)?;
         out.set_item("heldout_rmse_lognats", result.heldout_rmse_lognats)?;
         out.set_item("n_train", result.n_train)?;
