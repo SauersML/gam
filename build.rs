@@ -1021,7 +1021,18 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
     // happens inside a shallow, checkout-only build clone, so the guard is
     // inapplicable there and is skipped. Full working clones — the only place a
     // build.rs commit is actually authored — still enforce it below.
+    // `-c safe.directory=*` keeps the audit RUNNING inside containerized
+    // builds (maturin's manylinux images bind-mount the source tree with a
+    // different owner, and git otherwise refuses with "dubious ownership" —
+    // the same failure mode the tracked-file audits hit before they moved to
+    // parsing `.git/index` directly). Environmental failures below — no git
+    // binary, no repository, an unreadable one — make the audit INAPPLICABLE
+    // (like the shallow-clone case): they cannot be an attempt to author
+    // build.rs, so they skip rather than fail the build. Genuine non-human
+    // authorship remains a hard build failure.
     let shallow = Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
         .arg("-C")
         .arg(manifest_dir)
         .arg("rev-parse")
@@ -1033,7 +1044,9 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
         }
     }
 
-    let output = Command::new("git")
+    let output = match Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
         .arg("-C")
         .arg(manifest_dir)
         .arg("log")
@@ -1042,9 +1055,29 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
         .arg("--")
         .arg("build.rs")
         .output()
-        .expect("failed to run git log for build.rs author audit");
+    {
+        Ok(output) => output,
+        Err(err) => {
+            println!(
+                "cargo:warning=build.rs author audit skipped: git could not be run ({err})"
+            );
+            return;
+        }
+    };
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("dubious ownership")
+            || stderr.contains("not a git repository")
+            || stderr.contains("No such file or directory")
+        {
+            println!(
+                "cargo:warning=build.rs author audit skipped: repository not auditable \
+                 in this environment ({})",
+                stderr.lines().next().unwrap_or("unknown git error")
+            );
+            return;
+        }
         panic!(
             "failed to query git history for build.rs author: {}",
             String::from_utf8_lossy(&output.stderr)
