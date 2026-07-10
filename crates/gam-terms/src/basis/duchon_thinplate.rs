@@ -1111,6 +1111,20 @@ pub(crate) fn kernel_constraint_nullspace_from_matrix(
     Ok(z)
 }
 
+/// Relative tolerance (against the data's squared radius) below which two
+/// farthest-point candidates' maximin — or centroid — distances are treated as
+/// *tied* and resolved by the rotation/permutation-invariant support-distance
+/// profile rather than by their exact floating-point ordering.
+///
+/// A generic (non-90°) rigid rotation of the covariates re-expresses every
+/// coordinate with ~1 ulp of round-off, so the squared distances that drive the
+/// farthest-point recursion differ from their exact rotation-invariant values by
+/// ~`ε·‖x‖²`. This tolerance is set several orders of magnitude above that
+/// round-off floor yet far below any genuine gap between geometrically-distinct
+/// candidates, so it absorbs the sub-ulp perturbation without altering the
+/// selection on data whose maximin values are genuinely separated.
+const KNOT_MAXIMIN_TIE_REL_TOL: f64 = 1e-9;
+
 /// Deterministically selects thin-plate knots via farthest-point sampling.
 ///
 /// This produces a space-filling subset without introducing RNG/state coupling.
@@ -1234,20 +1248,24 @@ pub fn select_thin_plate_knots(
         i < j
     };
 
-    // Seed = centroid-nearest row; equidistant ties resolved by the invariant
-    // support-distance profile so the seed is a deterministic, rotation- and
-    // permutation-invariant function of the data.
+    // Round-off-robust tie tolerance (#1818). The data's squared radius sets the
+    // scale of the maximin/centroid distances; a generic rigid rotation perturbs
+    // each of them by ~`ε·radius²`, so exact-equality tie-break gates let that
+    // round-off — rather than the intended rotation-invariant key — decide
+    // near-equidistant candidates, and a single flip cascades into a materially
+    // different knot set. `tie_tol` sits well above that round-off floor and far
+    // below any genuine maximin gap, so near-ties are consistently resolved by
+    // the invariant support-distance profile in every rotated frame.
+    let knot_scale2 = dist2_to_centroid.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let tie_tol = KNOT_MAXIMIN_TIE_REL_TOL * knot_scale2;
+
+    // Seed = centroid-nearest row; near-equidistant rows (within `tie_tol`) are
+    // resolved by the invariant support-distance profile so the seed is a
+    // deterministic, rotation- and permutation-invariant function of the data.
+    let seed_min = dist2_to_centroid.iter().copied().fold(f64::INFINITY, f64::min);
     let seed_idx = (0..n)
-        .into_par_iter()
-        .map(|i| (i, dist2_to_centroid[i]))
-        .reduce_with(|a, b| {
-            if b.1 < a.1 || (b.1 == a.1 && distance_profile_less(b.0, a.0)) {
-                b
-            } else {
-                a
-            }
-        })
-        .map(|(i, _)| i)
+        .filter(|&i| dist2_to_centroid[i] <= seed_min + tie_tol)
+        .reduce(|a, b| if distance_profile_less(a, b) { a } else { b })
         .unwrap_or(0);
 
     let mut selected = Vec::with_capacity(num_knots);
@@ -1268,33 +1286,46 @@ pub fn select_thin_plate_knots(
     min_dist2[seed_idx] = 0.0;
 
     while selected.len() < num_knots {
-        let best_idx = min_dist2
+        // Maximin: take the larger min-distance to the chosen set. Exact
+        // `min_dist2` ties — common on regular grids and, under a generic
+        // rotation, wherever round-off perturbs two near-equidistant candidates —
+        // are resolved by a rotation-invariant key first (the larger distance to
+        // the centroid, which spreads knots outward and is a pure function of the
+        // unordered value set), and only by the invariant support-distance profile
+        // for points that also tie there. Both the maximin and the centroid keys
+        // use `tie_tol` (not exact equality) so sub-ulp coordinate perturbation
+        // can never decide the selection; this keeps the knot SET invariant under
+        // both rigid rotation and row permutation of the data.
+        let max_val = min_dist2
             .par_iter()
             .enumerate()
             .filter(|(i, _)| !chosen[*i])
-            .map(|(i, &cand)| (i, cand))
-            .reduce_with(|a, b| {
-                // Maximin: take the larger min-distance to the chosen set.
-                // Exact `min_dist2` ties — common on regular grids and in float
-                // arithmetic — are resolved by a rotation-invariant key first
-                // (the larger distance to the centroid, which spreads knots
-                // outward and is a pure function of the unordered value set),
-                // and only by the invariant support-distance profile for points
-                // that also tie there.
-                // This keeps the selected knot set invariant under both rigid
-                // rotation and row permutation of the data.
-                let pick_b = b.1 > a.1
-                    || (b.1 == a.1
-                        && (dist2_to_centroid[b.0] > dist2_to_centroid[a.0]
-                            || (dist2_to_centroid[b.0] == dist2_to_centroid[a.0]
-                                && distance_profile_less(b.0, a.0))));
-                if pick_b { b } else { a }
-            })
-            .map(|(i, _)| i);
-        let next_idx = match best_idx {
-            Some(i) => i,
-            None => break,
-        };
+            .map(|(_, &cand)| cand)
+            .reduce(|| f64::NEG_INFINITY, f64::max);
+        if !max_val.is_finite() {
+            break;
+        }
+        // Candidates within round-off tolerance of the maximin extremum, in
+        // canonical (ascending) row order (parallel collect is index-ordered).
+        let mut candidates: Vec<usize> = (0..n)
+            .into_par_iter()
+            .filter(|&i| !chosen[i] && min_dist2[i] >= max_val - tie_tol)
+            .collect();
+        if candidates.is_empty() {
+            break;
+        }
+        // Secondary invariant key: farthest from the centroid, round-off-robust.
+        let cand_max_centroid = candidates
+            .iter()
+            .map(|&i| dist2_to_centroid[i])
+            .fold(f64::NEG_INFINITY, f64::max);
+        candidates.retain(|&i| dist2_to_centroid[i] >= cand_max_centroid - tie_tol);
+        // Tertiary invariant key: smallest support-distance profile (then row
+        // index, for genuinely interchangeable duplicate points).
+        let next_idx = candidates
+            .into_iter()
+            .reduce(|a, b| if distance_profile_less(a, b) { a } else { b })
+            .expect("candidate set is non-empty");
         selected.push(next_idx);
         chosen[next_idx] = true;
 
