@@ -1627,7 +1627,10 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
     assert_ne!(first_row_htbeta_ptr, 0);
     assert_eq!(first_row_htbeta_ptr, second_row.htbeta.as_ptr() as usize);
     assert_ne!(first_gb_ptr, 0);
-    assert_eq!(first_gb_ptr, term.arrow_assembly_workspace.gb.as_ptr() as usize);
+    assert_eq!(
+        first_gb_ptr,
+        term.arrow_assembly_workspace.gb.as_ptr() as usize
+    );
     assert_ne!(
         first_device_frame_ptr, 0,
         "framed assembly must install DeviceSaePcgData"

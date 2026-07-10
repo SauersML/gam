@@ -2306,10 +2306,7 @@ impl SaeManifoldTerm {
     /// Return allocation storage after every consumer of this iteration's
     /// numerical system has finished. No operator or factor cache is retained;
     /// the next assembly zeroes and recomputes all row/shared blocks.
-    pub(crate) fn reclaim_arrow_assembly_workspace(
-        &mut self,
-        sys: &mut ArrowSchurSystem,
-    ) {
+    pub(crate) fn reclaim_arrow_assembly_workspace(&mut self, sys: &mut ArrowSchurSystem) {
         self.arrow_assembly_workspace.rows = std::mem::take(&mut sys.rows);
         self.arrow_assembly_workspace.gb = std::mem::replace(&mut sys.gb, Array1::<f64>::zeros(0));
         if let Some(device) = sys.device_sae_pcg.take() {
