@@ -119,6 +119,22 @@ baseline used for #1026 reconstruction parity. A `d_atom=1` circle is the
 `fit.atom_topologies` (the scalar `fit.atom_topology` collapses to `"mixed"`
 when atoms disagree).
 
+### `K` larger than the data supports
+
+`K` is not auto-reduced. If the requested `K` (for the given `d_atom` /
+`atom_topology`) exceeds what `Z` can identify — e.g. two `circle` atoms
+asked to explain a single planted loop, with no second independent signal
+for the second atom to claim — the co-collapse detector reseeds the
+redundant atom onto a residual principal component a bounded number of
+times and, if that never recovers a materially better fit, the outer solve
+refuses to mint a fit rather than return a degenerate dictionary with a
+duplicated atom. This surfaces as a `RemlConvergenceError` (see
+[Exceptions](exceptions.md)) whose message includes the outer iteration
+count, the final objective value, and the gradient norm. It is not a
+transient failure: retrying with the same `K` on the same data raises
+again. Lower `K`, change `atom_topology` / `d_atom`, or pass more atoms'
+worth of independent signal in `Z`.
+
 ## The objective
 
 The fit minimizes reconstruction error plus a stack of penalties, with
