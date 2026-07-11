@@ -589,6 +589,48 @@ Reconstruction EV alone does not validate the latent coordinate; when the
 ordering matters, read it from a deterministic projection and use the fit for
 reconstruction.
 
+When the ordering plane is known, the gradient circle module can enforce that
+geometry directly. Pass its ambient row frame as `decoder_subspace`:
+
+```python
+from gamfit.torch import (
+    ManifoldSAE,
+    ManifoldSAEConfig,
+    circular_concordance,
+)
+
+cfg = ManifoldSAEConfig(
+    input_dim=activations.shape[1],
+    n_atoms=1,
+    intrinsic_rank=1,
+    atom_manifold="circle",
+    atom_basis="fourier",
+    sparsity={"kind": "softmax_topk", "target_k": 1},
+    decoder_subspace=class_mean_plane,  # shape (2, input_dim)
+)
+model = ManifoldSAE(cfg)
+```
+
+Rust canonicalizes and rank-checks the frame. The circle's DC coefficient stays
+ambient, so constant reconstruction may use every output dimension; every
+angle-bearing Fourier coefficient is stored only as live coordinates inside
+the frame. The optimizer therefore has `D + (K-1)r` decoder parameters per atom,
+not a full ambient decoder followed by a projection with dead parameters.
+
+Across seeds, stack corresponding fitted coordinates as `(replicates, rows)` and
+report their exact rotation/reflection-quotiented agreement:
+
+```python
+report = circular_concordance(torch.stack(seed_coordinates), period=1.0)
+print(report.minimum_aligned_score)
+print(report.pairs)
+```
+
+The report exposes every rotation and reflection score, the selected O(2) gauge,
+phase shift, and a two-axis embedding-rank certificate for each replicate. It
+does not impose a qualitative cutoff. If a replicate is collapsed, pairwise and
+aggregate scores are `None` instead of granting a vacuous perfect alignment.
+
 ### Availability note
 
 `adjudicate_atom_shape` is currently only available when building from

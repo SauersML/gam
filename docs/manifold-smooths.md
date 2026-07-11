@@ -151,6 +151,17 @@ rank-`n_atoms` PCA reconstruction while curvature gradients remain live. An
 omitted explicit call uses the first eligible training batch; using the full
 training corpus explicitly gives the exact training-set baseline.
 
+For a circle whose meaningful ordering plane is already known, set
+`decoder_subspace=frame` on `ManifoldSAEConfig`. Rust converts the supplied
+`(rank, input_dim)` rows to a canonical orthonormal frame and rejects numerical
+rank deficiency. The DC decoder row remains ambient; all Fourier harmonics are
+stored as reduced coordinates in that frame, so angle-dependent motion cannot
+wander out of plane and no projected-away optimizer parameters exist. Use
+`gamfit.torch.circular_concordance` on aligned coordinate vectors from multiple
+seeds to report O(2)-quotiented angle stability alongside EV; collapsed
+replicates produce unavailable (`None`) agreement rather than a misleading
+score.
+
 ## Related reading
 
 - [Formula DSL — periodic / cyclic smooths](formulas.md#periodic-cyclic-smooths)
