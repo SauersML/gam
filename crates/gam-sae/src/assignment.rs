@@ -3082,14 +3082,6 @@ mod fill_into_buffer_1557_tests {
         SaeAssignment::from_blocks_with_mode(logits, coords, mode).unwrap()
     }
 
-    fn rho(k: usize) -> SaeManifoldRho {
-        SaeManifoldRho::new(
-            (1e-2_f64).ln(),
-            (1e-1_f64).ln(),
-            vec![Array1::<f64>::zeros(1); k],
-        )
-    }
-
     fn assert_into_matches_alloc(a: &SaeAssignment) {
         let n = a.n_obs();
         let k = a.k_atoms();

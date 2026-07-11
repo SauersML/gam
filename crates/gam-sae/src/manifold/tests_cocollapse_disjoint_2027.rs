@@ -171,11 +171,6 @@ pub(crate) fn sequential_deflation_gives_both_atoms_material_norm_2027() {
     let p = 16usize;
     let m = 5usize;
     let (mut term, target) = two_circle_k2_term(n, p, m);
-    let rho = SaeManifoldRho::new(
-        0.0,
-        -6.0,
-        vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
-    );
     term.refit_decoder_sequential_deflation(target.view())
         .unwrap();
     let mut norms = [0.0_f64; 2];

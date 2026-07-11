@@ -281,7 +281,7 @@ mod softmax_majorizer_active_entry_1410_tests {
 #[cfg(test)]
 mod exact_stationarity_solve_1418_tests {
     use super::*;
-    use crate::manifold::tests::gamma_fd_tiny_fixture;
+    use crate::manifold::tests::{diagonal_latent_cache, gamma_fd_tiny_fixture};
     use ndarray::Array1;
 
     /// Build a converged tiny SAE state whose inner residual is genuinely
@@ -401,39 +401,47 @@ mod exact_stationarity_solve_1418_tests {
         );
     }
 
-    /// #2253 production-wiring regression: when the arrow solver installs a
-    /// closed-form gauge stiffness, `solve_exact_stationarity` must invert
-    /// `A_Q = A + κQQᵀ`, not raw `A`. The raw and gauge-fixed systems are both
-    /// well-defined on this healthy fixture, so the two residuals distinguish
-    /// the operator actually used without relying on a non-convergence timeout.
+    /// #2253 production-wiring regression: the operator-generic core used by
+    /// `solve_exact_stationarity` must install the solver's closed-form gauge
+    /// stiffness on BOTH raw operators and invert `A_Q = A + κQQᵀ`, not raw
+    /// `A`. Deterministic diagonal `A` and `B` isolate that production seam from
+    /// stochastic inner fitting and its unrelated dictionary-collapse guards.
     #[test]
     fn solve_exact_stationarity_uses_solver_gauge_fix_2253() {
-        let (term, target, rho, cache) = converged_state_with_residual();
-        let total_t = cache.delta_t_len();
-        let full_len = total_t + cache.k;
-        assert!(full_len > 0, "fixture must have a nonempty inner state");
-
-        // A deterministic unit gauge is sufficient to pin the operator seam.
-        // Production supplies the analytic chart-gauge basis through the same
-        // constructor; this test isolates the algebra from gauge discovery.
-        let mut gauge = Array1::<f64>::zeros(full_len);
-        gauge[0] = 1.0;
-        let stiffness = arrow_factor_max_pivot(&cache)
-            .expect("converged cache must expose a positive pivot scale");
+        // B=diag(2,5), A=diag(3,7), q=e0, κ=5. The raw pencil is healthy, and
+        // the quotient pencil is A_Q=diag(8,7), B_Q=diag(7,5). A gauge-bearing
+        // rhs makes the solution of A_Q observably different from raw A⁻¹rhs.
+        let cache = diagonal_latent_cache(&[2.0_f64, 5.0]);
+        let gauge = Array1::from_vec(vec![1.0_f64, 0.0]);
+        let stiffness = 5.0;
         let solver =
             DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
                 .expect("gauge-fixed exact-stationarity preconditioner");
         let rhs = SaeArrowVector {
-            t: Array1::from_shape_fn(total_t, |i| if i == 0 { 1.0 } else { 0.0 }),
-            beta: Array1::zeros(cache.k),
+            t: Array1::from_vec(vec![4.0_f64, 6.0]),
+            beta: Array1::zeros(0),
+        };
+        let apply_raw_a = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            Ok(SaeArrowVector {
+                t: Array1::from_vec(vec![3.0 * v.t[0], 7.0 * v.t[1]]),
+                beta: Array1::zeros(0),
+            })
+        };
+        let apply_raw_b = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            Ok(SaeArrowVector {
+                t: Array1::from_vec(vec![2.0 * v.t[0], 5.0 * v.t[1]]),
+                beta: Array1::zeros(0),
+            })
         };
 
-        let solved = term
-            .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &rhs)
-            .expect("gauge-fixed exact stationarity solve");
-        let raw_ax = term
-            .apply_exact_hessian(&rho, target.view(), &cache, &solved)
-            .expect("raw A apply");
+        let solved = solve_exact_stationarity_on_gauge_quotient(
+            &solver,
+            &rhs,
+            &apply_raw_a,
+            &apply_raw_b,
+        )
+        .expect("gauge-fixed exact stationarity solve");
+        let raw_ax = apply_raw_a(&solved).expect("raw A apply");
         let raw_residual = SaeArrowVector {
             t: &raw_ax.t - &rhs.t,
             beta: &raw_ax.beta - &rhs.beta,

@@ -346,7 +346,7 @@ mod amortized_encoder_glue_tests {
     use crate::assignment::{AssignmentMode, SaeAssignment};
     use crate::manifold::{EuclideanPatchEvaluator, SaeAtomBasisKind, SaeManifoldAtom};
     use gam_terms::latent::LatentManifold;
-    use ndarray::{Array1, Array2};
+    use ndarray::Array2;
     use std::sync::Arc;
 
     struct Lcg(u64);
@@ -379,8 +379,6 @@ mod amortized_encoder_glue_tests {
         term: SaeManifoldTerm,
         /// The ambient target `x = Σ_k z_k (b0_k + t_k·b1_k)`, faithful to the term.
         target: Array2<f64>,
-        /// The term's ρ hyperparameters.
-        rho: SaeManifoldRho,
         /// Planted exact per-(row, atom) gate logits.
         logits: Array2<f64>,
         /// Planted exact per-atom coordinate blocks.
@@ -446,11 +444,6 @@ mod amortized_encoder_glue_tests {
         )
         .expect("assignment");
         let term = SaeManifoldTerm::new(atoms, assignment).expect("term");
-        let rho = SaeManifoldRho::new(
-            0.0,
-            (0.01_f64).ln(),
-            vec![Array1::zeros(1), Array1::zeros(1)],
-        );
         // The exact amplitudes are the term's OWN masses; generate x from them so
         // the term's exact code reconstructs x exactly (self-consistent).
         let amps = term.fitted_assignment_amplitudes().expect("masses");
@@ -467,7 +460,6 @@ mod amortized_encoder_glue_tests {
         PlantedTwoAtomTerm {
             term,
             target: x,
-            rho,
             logits,
             coords: coords_blocks,
             amps,
