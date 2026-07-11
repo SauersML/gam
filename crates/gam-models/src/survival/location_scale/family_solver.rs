@@ -1112,7 +1112,7 @@ impl SurvivalLocationScaleFamily {
             let dynamic = self.build_dynamic_geometry(block_states)?;
             return Ok(Some((
                 super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                    self, &q, &dynamic, log_scale,
+                    self, &dynamic, log_scale,
                 )?,
                 log_scale,
             )));
@@ -1223,7 +1223,6 @@ impl SurvivalLocationScaleFamily {
         Ok(Some(
             super::row_kernel::survival_ls_wiggle_directional_derivative_dense(
                 self,
-                q,
                 dynamic,
                 deriv_log_scale,
                 &rows,
@@ -1945,7 +1944,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             // kernel; non-wiggle rows keep the bespoke path below.
             let dynamic = self.build_dynamic_geometry(block_states)?;
             return Ok(Some(
-                super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &q, &dynamic, 0.0)?,
+                super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, 0.0)?,
             ));
         }
         // #932 measured perf exception: sparse hand assembler, pinned to the
@@ -2208,7 +2207,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             return Ok(Some(
                 super::row_kernel::survival_ls_wiggle_second_directional_derivative_dense(
                     self,
-                    &q,
                     &dynamic,
                     log_rescale,
                     &crate::row_kernel::RowSet::All,
@@ -2314,9 +2312,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // (`survival_ls_row_kernel_matches_bespoke_assembly`).
         let h_joint = if self.x_link_wiggle.is_some() {
             let dynamic = self.build_dynamic_geometry(block_states)?;
-            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                self, &q, &dynamic, log_scale,
-            )?
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, log_scale)?
         } else {
             match self.assemble_joint_hessian_from_quantities(&q, block_states)? {
                 Some(h) => h,
@@ -3314,7 +3310,6 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             return Ok(Some(
                 super::row_kernel::survival_ls_wiggle_second_directional_derivative_dense(
                     &self.family,
-                    &self.q,
                     &self.dynamic,
                     self.deriv_log_scale,
                     &rows,

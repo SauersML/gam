@@ -264,12 +264,7 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         }
     }
 
-    fn variable(
-        x: f64,
-        axis: usize,
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self {
+    fn variable(x: f64, axis: usize, dimension: usize, workspace: &'arena Self::Workspace) -> Self {
         debug_assert_eq!(core::mem::size_of_val(workspace), 0);
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
@@ -350,6 +345,13 @@ impl DynamicJetArena {
     /// Reclaim all scalar outputs while retaining allocated chunks.
     pub fn reset(&mut self) {
         self.bump.reset();
+    }
+
+    /// Bytes currently reserved from the global allocator. A warm-reset-warm
+    /// benchmark uses this to prove the second row requires no arena growth.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> usize {
+        self.bump.allocated_bytes()
     }
 
     #[inline]
@@ -2682,6 +2684,81 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Arena-backed runtime directional jets must reproduce the fixed packed
+    /// algebras channel-for-channel. This isolates the runtime scalar algebra
+    /// from every family row program before the SLS/SAE integration oracles.
+    #[test]
+    fn runtime_directional_jets_match_fixed_packed_algebra_932() {
+        fn expression<'arena, S: RuntimeJetScalar<'arena>>(vars: &[S]) -> S {
+            let bilinear = vars[0].mul(&vars[1]);
+            let curved = vars[2].scale(0.7).add(&vars[3].mul(&vars[3]).scale(-0.2));
+            bilinear
+                .add(&curved)
+                .exp()
+                .mul(&vars[4].compose_unary([0.4, -0.3, 0.2, -0.1, 0.05]))
+        }
+
+        const K: usize = 5;
+        let values = [0.2, -0.7, 0.4, 1.1, -0.3];
+        let direction_u = [0.5, -0.2, 0.7, -0.4, 0.1];
+        let direction_v = [-0.3, 0.8, 0.2, 0.6, -0.5];
+        let close = |actual: f64, expected: f64| {
+            let tolerance = 1.0e-13 * (1.0 + actual.abs().max(expected.abs()));
+            assert!((actual - expected).abs() <= tolerance);
+        };
+
+        let fixed_one: Vec<FixedRuntimeJet<OneSeed<K>, K>> = (0..K)
+            .map(|axis| FixedRuntimeJet {
+                inner: OneSeed::seed_direction(values[axis], axis, direction_u[axis]),
+            })
+            .collect();
+        let arena_one = DynamicJetArena::new();
+        let dynamic_one: Vec<DynamicOneSeed<'_>> = (0..K)
+            .map(|axis| {
+                DynamicOneSeed::seed_direction(values[axis], axis, direction_u[axis], K, &arena_one)
+            })
+            .collect();
+        let fixed_third = expression(&fixed_one).into_inner().contracted_third();
+        let dynamic_third = expression(&dynamic_one);
+        for a in 0..K {
+            for b in 0..K {
+                close(
+                    dynamic_third.contracted_third()[a * K + b],
+                    fixed_third[a][b],
+                );
+            }
+        }
+
+        let fixed_two: Vec<FixedRuntimeJet<TwoSeed<K>, K>> = (0..K)
+            .map(|axis| FixedRuntimeJet {
+                inner: TwoSeed::seed(values[axis], axis, direction_u[axis], direction_v[axis]),
+            })
+            .collect();
+        let arena_two = DynamicJetArena::new();
+        let dynamic_two: Vec<DynamicTwoSeed<'_>> = (0..K)
+            .map(|axis| {
+                DynamicTwoSeed::seed(
+                    values[axis],
+                    axis,
+                    direction_u[axis],
+                    direction_v[axis],
+                    K,
+                    &arena_two,
+                )
+            })
+            .collect();
+        let fixed_fourth = expression(&fixed_two).into_inner().contracted_fourth();
+        let dynamic_fourth = expression(&dynamic_two);
+        for a in 0..K {
+            for b in 0..K {
+                close(
+                    dynamic_fourth.contracted_fourth()[a * K + b],
+                    fixed_fourth[a][b],
+                );
             }
         }
     }

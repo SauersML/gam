@@ -6243,7 +6243,7 @@ fn positive_log_cumulative_hazard_maps_to_baseline_cloglog_survival() {
 /// #932 (survival link-wiggle — the issue's named next step): the survival
 /// location-scale JOINT row NLL written ONCE over [`JetScalar`] is extended with
 /// the link-wiggle warp `q = q0 + Σ_j βw_j·B_j(q0)` (and the qdot coupling
-/// `g = m1·g0`, `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`), with the βw amplitudes as
+/// `g = hdot + m1·qdot0`, `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`), with the βw amplitudes as
 /// extra jet primaries. The mechanically-derived joint Hessian — including the
 /// `(η, βw)` and `(βw, βw)` cross blocks a fixed `JᵀHJ` pullback would drop —
 /// is pinned against central finite differences of the SAME program's value,
@@ -6291,28 +6291,29 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
             }
             // Base nine-channel survival indices (exactly `sls_row_nll`).
             let inv_sigma_entry = p[7].neg().exp();
-            let u0 = p[0].sub(&p[4].mul(&inv_sigma_entry));
+            let q0 = p[4].mul(&inv_sigma_entry).neg();
             let inv_sigma_exit = p[6].neg().exp();
-            let u1 = p[1].sub(&p[3].mul(&inv_sigma_exit));
-            let g0 = p[2].add(&inv_sigma_exit.mul(&p[3].mul(&p[8]).sub(&p[5])));
+            let q1 = p[3].mul(&inv_sigma_exit).neg();
+            let qdot0 = inv_sigma_exit.mul(&p[3].mul(&p[8]).sub(&p[5]));
 
             // Link-wiggle warp: amplitudes are primaries 9..9+PW; each basis is
             // composed onto the BASE index jet (so it carries the η-dependence).
-            let u0v = JetScalar::value(&u0);
-            let u1v = JetScalar::value(&u1);
-            let mut u0w = u0;
-            let mut u1w = u1;
+            let q0v = JetScalar::value(&q0);
+            let q1v = JetScalar::value(&q1);
+            let mut q0w = q0;
+            let mut q1w = q1;
             let mut m1 = S::constant(1.0);
             for j in 0..PW {
                 let bw = p[SLS_ROW_K + j];
-                let b0 = basis(j, u0v);
-                u0w = u0w.add(&bw.mul(&u0.compose_unary([b0[0], b0[1], b0[2], 0.0, 0.0])));
-                let b1 = basis(j, u1v);
-                u1w = u1w.add(&bw.mul(&u1.compose_unary([b1[0], b1[1], b1[2], b1[3], 0.0])));
-                // B'_j(u1) jet for m1 = 1 + Σ βw·B'(u1) → g_warp = m1·g0.
-                m1 = m1.add(&bw.mul(&u1.compose_unary([b1[1], b1[2], b1[3], 0.0, 0.0])));
+                let b0 = basis(j, q0v);
+                q0w = q0w.add(&bw.mul(&q0.compose_unary([b0[0], b0[1], b0[2], 0.0, 0.0])));
+                let b1 = basis(j, q1v);
+                q1w = q1w.add(&bw.mul(&q1.compose_unary([b1[0], b1[1], b1[2], b1[3], 0.0])));
+                m1 = m1.add(&bw.mul(&q1.compose_unary([b1[1], b1[2], b1[3], 0.0, 0.0])));
             }
-            let g = m1.mul(&g0);
+            let u0w = p[0].add(&q0w);
+            let u1w = p[1].add(&q1w);
+            let g = p[2].add(&m1.mul(&qdot0));
 
             let mut nll = u0w
                 .compose_unary(survival_ls_log_survival_stack(
@@ -6420,7 +6421,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
 /// #932 (survival link-wiggle single-source verification): the production
 /// wiggle joint Hessian — `survival_ls_wiggle_joint_hessian_dense`, the §13
 /// warp row program (`sls_row_nll` extended with `q = q0 + Σ βw·B(q0)` and the
-/// qdot coupling `g = m1·g0`) that every production consumer now routes through
+/// qdot coupling `g = hdot + m1·qdot0`) that every production consumer now routes through
 /// — must equal an INDEPENDENT tower assembled here from `wiggle_nll` with a
 /// hand-rolled `JᵀHJ` pullback. This cross-validates the §13 path AND its
 /// row-kernel pullback against independent code; combined with the FD oracle
@@ -6447,10 +6448,9 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     let n = primaries.len();
 
     // Seed indices for the wiggle DESIGN matrix `x_link_wiggle` only (its column
-    // count `pw` and `etaw = X·betaw`). The warp basis derivative stacks are NOT
-    // evaluated here: they must be taken at the model residual `value(u1)` /
-    // `value(u0)` (the point `sls_row_nll_wiggle`'s `compose_unary` composes onto),
-    // which is computed from the production `dynamic` geometry inside the loop.
+    // count `pw` and `etaw = X·betaw`). The warp basis derivative stacks are
+    // evaluated later at the model's unwarped q0 indices, exactly where
+    // `sls_row_nll_wiggle` composes them.
     let q0_exit = Array1::from_shape_fn(n, |i| {
         primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
     });
@@ -6740,7 +6740,7 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         // and is FD-cross-checked separately by
         // `survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932`.
         let dense =
-            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(&family, &q, &dynamic, 0.0)
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
                 .expect("§13 dense wiggle Hessian");
         for ((a, b), &dj) in dense.indexed_iter() {
             let tj = h_tower[[a, b]];
@@ -6759,8 +6759,7 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
 #[test]
 fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
     use super::row_kernel::{
-        survival_ls_wiggle_directional_derivative_dense,
-        survival_ls_wiggle_joint_hessian_dense,
+        survival_ls_wiggle_directional_derivative_dense, survival_ls_wiggle_joint_hessian_dense,
         survival_ls_wiggle_second_directional_derivative_dense,
     };
     use crate::row_kernel::RowSet;
@@ -6779,23 +6778,20 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
     // Cubic clamping (four repeated endpoints) plus eight interior knots gives
     // twelve basis columns: one beyond the retired pw<=11 production ceiling.
     let knots = Array1::from_vec(vec![
-        -2.5, -2.5, -2.5, -2.5, -2.0, -1.4, -0.8, -0.2, 0.4, 1.0, 1.6, 2.2, 3.2, 3.2,
-        3.2, 3.2,
+        -2.5, -2.5, -2.5, -2.5, -2.0, -1.4, -0.8, -0.2, 0.4, 1.0, 1.6, 2.2, 3.2, 3.2, 3.2, 3.2,
     ]);
     let degree = 3usize;
-    let xwiggle = survival_wiggle_basis_with_options(
-        q0_exit.view(),
-        &knots,
-        degree,
-        BasisOptions::value(),
-    )
-    .expect("wide wiggle design");
+    let xwiggle =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .expect("wide wiggle design");
     let pw = xwiggle.ncols();
-    assert!(pw > 11, "fixture must exceed the retired width ceiling, got {pw}");
+    assert!(
+        pw > 11,
+        "fixture must exceed the retired width ceiling, got {pw}"
+    );
 
     let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
-    let mut family =
-        survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+    let mut family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
     family.x_link_wiggle = Some(DesignMatrix::Dense(
         gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
     ));
@@ -6822,11 +6818,10 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
         .map(|axis| -0.007 * (axis as f64 + 0.5))
         .collect();
 
-    let hessian = survival_ls_wiggle_joint_hessian_dense(&family, &q, &dynamic, 0.0)
+    let hessian = survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
         .expect("wide runtime Hessian");
     let third = survival_ls_wiggle_directional_derivative_dense(
         &family,
-        &q,
         &dynamic,
         0.0,
         &RowSet::All,
@@ -6835,7 +6830,6 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
     .expect("wide runtime contracted third");
     let fourth = survival_ls_wiggle_second_directional_derivative_dense(
         &family,
-        &q,
         &dynamic,
         0.0,
         &RowSet::All,
@@ -6959,7 +6953,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             let mut bw = betaw.clone();
             let (bt, bthr, bls) = perturbed(s, dir, &mut bw);
             let (q, dynamic) = build(bt, bthr, bls, &bw);
-            survival_ls_wiggle_joint_hessian_dense(&family, &q, &dynamic, 0.0)
+            survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
                 .expect("§13 dense wiggle Hessian")
         };
         let directional_at = |s: f64, dir_v: &[f64], dir_u: &[f64]| {
@@ -6968,7 +6962,6 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             let (q, dynamic) = build(bt, bthr, bls, &bw);
             survival_ls_wiggle_directional_derivative_dense(
                 &family,
-                &q,
                 &dynamic,
                 0.0,
                 &RowSet::All,
@@ -6992,11 +6985,20 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
         // localize the coeff-space FD vs analytic pullback convention gap.
         let mk = |du: &[f64], dv: &[f64], label: &str| {
             let d_dir_analytic = survival_ls_wiggle_directional_derivative_dense(
-                &family, &q0, &dynamic0, 0.0, &RowSet::All, du,
+                &family,
+                &dynamic0,
+                0.0,
+                &RowSet::All,
+                du,
             )
             .expect("analytic first directional");
             let d2_analytic = survival_ls_wiggle_second_directional_derivative_dense(
-                &family, &q0, &dynamic0, 0.0, &RowSet::All, du, dv,
+                &family,
+                &dynamic0,
+                0.0,
+                &RowSet::All,
+                du,
+                dv,
             )
             .expect("analytic second directional");
             let h3 = 1e-2;

@@ -320,7 +320,6 @@ pub(crate) const SLS_ROW_K: usize = 9;
 /// so the math is identical to the bespoke assembly by construction.
 pub(crate) struct SurvivalLsRowKernel<'a> {
     pub(crate) family: &'a SurvivalLocationScaleFamily,
-    pub(crate) q: &'a SurvivalJointQuantities,
     pub(crate) dynamic: &'a SurvivalDynamicGeometry,
     pub(crate) deriv_log_scale: f64,
     /// Joint block offsets `[0, p_time, p_time+p_thr, p_total]` (3 blocks).
@@ -595,8 +594,9 @@ pub(crate) fn row_set_from_survival_mask(
 }
 
 /// #932 link-wiggle: the survival-LS row NLL extended with the link warp
-/// `q = q0 + Σ_j βw_j·B_j(q0)` and the qdot coupling `g = m1·g0`,
-/// `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`, written ONCE over a generic jet scalar
+/// `q = q0 + Σ_j βw_j·B_j(q0)` and the time-derivative coupling
+/// `g = hdot + m1·qdot0`, `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`, written ONCE over
+/// a generic jet scalar
 /// (`KW = SLS_ROW_K + pw`). `vars[0..9]` are the base channels (exactly
 /// [`sls_row_nll`]); `vars[9..9+pw]` are the wiggle amplitudes βw. The per-row
 /// basis stacks are evaluated at the BASE indices (the warp composes the basis
@@ -738,13 +738,11 @@ impl SurvivalLsDynamicFold {
 impl<'a> SurvivalLsWiggleRowKernel<'a> {
     pub(crate) fn new(
         family: &'a SurvivalLocationScaleFamily,
-        q: &'a SurvivalJointQuantities,
         dynamic: &'a SurvivalDynamicGeometry,
         deriv_log_scale: f64,
     ) -> Result<Self, String> {
         let base = SurvivalLsRowKernel {
             family,
-            q,
             dynamic,
             deriv_log_scale,
             offsets: family.joint_block_offsets(),
@@ -1092,11 +1090,10 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
 /// involved.
 pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
     family: &SurvivalLocationScaleFamily,
-    q: &SurvivalJointQuantities,
     dynamic: &SurvivalDynamicGeometry,
     deriv_log_scale: f64,
 ) -> Result<Array2<f64>, String> {
-    let kernel = SurvivalLsWiggleRowKernel::new(family, q, dynamic, deriv_log_scale)?;
+    let kernel = SurvivalLsWiggleRowKernel::new(family, dynamic, deriv_log_scale)?;
     kernel.hessian_dense(&crate::row_kernel::RowSet::All)
 }
 
@@ -1111,13 +1108,12 @@ pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
 /// through the identical `row_kernel_directional_derivative` free function.
 pub(crate) fn survival_ls_wiggle_directional_derivative_dense(
     family: &SurvivalLocationScaleFamily,
-    q: &SurvivalJointQuantities,
     dynamic: &SurvivalDynamicGeometry,
     deriv_log_scale: f64,
     rows: &crate::row_kernel::RowSet,
     d_beta: &[f64],
 ) -> Result<Array2<f64>, String> {
-    let kernel = SurvivalLsWiggleRowKernel::new(family, q, dynamic, deriv_log_scale)?;
+    let kernel = SurvivalLsWiggleRowKernel::new(family, dynamic, deriv_log_scale)?;
     kernel.directional_derivative_dense(rows, d_beta)
 }
 
@@ -1128,14 +1124,13 @@ pub(crate) fn survival_ls_wiggle_directional_derivative_dense(
 /// that returned `None` (no second-directional curvature for wiggle rows).
 pub(crate) fn survival_ls_wiggle_second_directional_derivative_dense(
     family: &SurvivalLocationScaleFamily,
-    q: &SurvivalJointQuantities,
     dynamic: &SurvivalDynamicGeometry,
     deriv_log_scale: f64,
     rows: &crate::row_kernel::RowSet,
     d_beta_u: &[f64],
     d_beta_v: &[f64],
 ) -> Result<Array2<f64>, String> {
-    let kernel = SurvivalLsWiggleRowKernel::new(family, q, dynamic, deriv_log_scale)?;
+    let kernel = SurvivalLsWiggleRowKernel::new(family, dynamic, deriv_log_scale)?;
     kernel.second_directional_derivative_dense(rows, d_beta_u, d_beta_v)
 }
 
@@ -1796,7 +1791,6 @@ impl SurvivalLocationScaleFamily {
     ) -> SurvivalLsRowKernel<'a> {
         SurvivalLsRowKernel {
             family: self,
-            q,
             dynamic,
             deriv_log_scale,
             offsets: self.joint_block_offsets(),
