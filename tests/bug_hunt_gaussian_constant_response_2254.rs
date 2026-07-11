@@ -16,11 +16,12 @@
 //!
 //! ## The fix
 //!
-//! The fast-path now assembles the complete inference/geometry bundle at a
-//! fully-smoothed λ: the penalized Hessian `H = XᵀWX + λS`, EDF = tr(H⁻¹XᵀWX),
-//! dispersion φ̂ = 0 (the residual is exactly zero), and hence covariance = 0.
-//! This test pins that the fit carries that bundle AND that the end-to-end
-//! payload assembly (the code path that previously threw) succeeds.
+//! The fast-path now assembles the complete inference/geometry bundle at the
+//! floating-point representation of the fully-smoothed boundary: the weakest
+//! non-null penalty direction dominates data information by `1/sqrt(ε)`, EDF =
+//! tr(H⁻¹XᵀWX), dispersion φ̂ = 0 (the residual is exactly zero), and hence
+//! covariance = 0. This test pins that the fit carries that bundle AND that the
+//! end-to-end payload assembly (the code path that previously threw) succeeds.
 
 use csv::StringRecord;
 use gam::data::EncodedDataset;
@@ -212,4 +213,28 @@ fn gaussian_constant_response_inference_bundle_is_self_consistent_2254() {
             p as f64 - sum_trace
         );
     }
+}
+
+/// The zero-dispersion shortcut is an exact boundary, not a tolerance-based
+/// approximation. A response with any represented variation must continue to
+/// the family-owned degeneracy check; otherwise a tiny but nonzero residual is
+/// silently assigned φ̂=0 and the fit lies about convergence/inference.
+#[test]
+fn gaussian_constant_shortcut_does_not_absorb_near_constant_response_2254() {
+    let n = 96usize;
+    let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| 1.0 + if i % 2 == 0 { 0.0 } else { 1.0e-13 })
+        .collect();
+    let data = encode_columns(&["x", "y"], &[&x, &y]);
+
+    let error = match fit_from_formula("y ~ s(x, k=10)", &data, &gaussian_cfg()) {
+        Ok(_) => panic!("a nonconstant response entered the exact zero-dispersion shortcut"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("effectively constant"),
+        "near-constant response reached the wrong path: {message}"
+    );
 }
