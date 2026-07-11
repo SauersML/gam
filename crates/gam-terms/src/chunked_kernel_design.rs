@@ -6,7 +6,7 @@ use faer::linalg::matmul::matmul;
 use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_atv, fast_av};
 use gam_linalg::matrix::{DenseDesignOperator, LinearOperator};
 use gam_problem::Gauge;
-use gam_runtime::resource::MatrixMaterializationError;
+use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
@@ -67,6 +67,10 @@ pub struct ChunkedKernelDesignOperator<K: SpatialKernelEvaluator> {
     poly_basis: Option<Arc<Array2<f64>>>,
     n: usize,
     total_cols: usize,
+    /// The routing contract that selected this streamed representation. It is
+    /// propagated through coefficient/block wrappers so a later permissive
+    /// caller cannot silently materialize the full design.
+    materialization_policy: MaterializationPolicy,
 }
 
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
@@ -76,6 +80,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
         kernel: K,
         kernel_gauge: Option<Arc<Gauge>>,
         poly_basis: Option<Arc<Array2<f64>>>,
+        materialization_policy: MaterializationPolicy,
     ) -> Result<Self, String> {
         let n = data.nrows();
         let k = centers.nrows();
@@ -114,6 +119,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             poly_basis,
             n,
             total_cols: k_eff + poly_cols,
+            materialization_policy,
         })
     }
 
@@ -285,6 +291,10 @@ impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOpera
         None
     }
 
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        Some(self.materialization_policy.clone())
+    }
+
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
@@ -310,14 +320,26 @@ mod chunked_kernel_operator_tests {
     use gam_linalg::matrix::DenseDesignMatrix;
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
+
+    fn strict_materialization_policy() -> MaterializationPolicy {
+        gam_runtime::resource::ResourcePolicy::analytic_operator_required().material_policy()
+    }
+
     #[test]
     fn chunked_kernel_operator_uses_center_rows_for_column_count() {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
         let kernel =
             |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
-        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
-            .expect("chunked kernel operator");
+        let operator = ChunkedKernelDesignOperator::new(
+            data,
+            centers,
+            kernel,
+            None,
+            None,
+            strict_materialization_policy(),
+        )
+        .expect("chunked kernel operator");
 
         assert_eq!(operator.ncols(), 3);
         let chunk = operator.row_chunk_combined(0..2);
@@ -340,6 +362,7 @@ mod chunked_kernel_operator_tests {
             kernel,
             Some(bad_gauge),
             None,
+            strict_materialization_policy(),
         ) {
             // SAFETY: test asserting validation rejects mismatched gauge raw width; Ok means the validator regressed.
             Ok(_) => panic!("gauge raw width should match centers rows"),
@@ -347,12 +370,18 @@ mod chunked_kernel_operator_tests {
         };
         assert!(gauge_err.contains("kernel gauge raw width 2 != centers rows 3"));
 
-        let poly_err =
-            match ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly)) {
-                // SAFETY: test asserting validation rejects mismatched poly rows; Ok means the validator regressed.
-                Ok(_) => panic!("poly rows should match data rows"),
-                Err(err) => err,
-            };
+        let poly_err = match ChunkedKernelDesignOperator::new(
+            data,
+            centers,
+            kernel,
+            None,
+            Some(bad_poly),
+            strict_materialization_policy(),
+        ) {
+            // SAFETY: test asserting validation rejects mismatched poly rows; Ok means the validator regressed.
+            Ok(_) => panic!("poly rows should match data rows"),
+            Err(err) => err,
+        };
         assert!(poly_err.contains("poly_basis rows 3 != data rows 2"));
     }
 
@@ -365,8 +394,15 @@ mod chunked_kernel_operator_tests {
 
         let kernel =
             |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
-        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
-            .expect("chunked kernel operator");
+        let operator = ChunkedKernelDesignOperator::new(
+            data,
+            centers,
+            kernel,
+            None,
+            None,
+            strict_materialization_policy(),
+        )
+        .expect("chunked kernel operator");
         let chunk = operator.row_chunk_combined(0..2);
 
         assert_eq!(chunk.dim(), (2, 3));
@@ -379,8 +415,15 @@ mod chunked_kernel_operator_tests {
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0]]);
         let kernel =
             |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
-        let op = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
-            .expect("chunked kernel operator");
+        let op = ChunkedKernelDesignOperator::new(
+            data,
+            centers,
+            kernel,
+            None,
+            None,
+            strict_materialization_policy(),
+        )
+        .expect("chunked kernel operator");
         let expected = op.to_dense();
 
         let dense_design = DenseDesignMatrix::from(Arc::new(op));

@@ -932,6 +932,7 @@ pub(crate) fn build_matern_basis_seeded(
                 kernel,
                 kernel_gauge.clone(),
                 poly_basis.clone(),
+                workspace.policy().material_policy(),
             )
             .map_err(BasisError::InvalidInput)?;
             DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(op)))
@@ -947,6 +948,7 @@ pub(crate) fn build_matern_basis_seeded(
                 kernel,
                 kernel_gauge,
                 poly_basis,
+                workspace.policy().material_policy(),
             )
             .map_err(BasisError::InvalidInput)?;
             DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(op)))

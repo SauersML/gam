@@ -100,20 +100,23 @@ fn governed_dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
     policy: &MaterializationPolicy,
     context: &'static str,
 ) -> Result<Governed<Array2<f64>>, MatrixMaterializationError> {
-    if !policy.allow_operator_materialization {
+    let effective_policy =
+        merge_operator_materialization_policies(Some(policy.clone()), op.materialization_policy())
+            .expect("caller policy is always present");
+    if !effective_policy.allow_operator_materialization {
         return Err(MatrixMaterializationError::Forbidden {
             context,
             mode: gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired,
         });
     }
     let bytes = dense_f64_bytes(op.nrows(), op.ncols()).unwrap_or(usize::MAX);
-    if bytes > policy.max_single_dense_bytes {
+    if bytes > effective_policy.max_single_dense_bytes {
         return Err(MatrixMaterializationError::TooLarge {
             context,
             nrows: op.nrows(),
             ncols: op.ncols(),
             bytes,
-            limit_bytes: policy.max_single_dense_bytes,
+            limit_bytes: effective_policy.max_single_dense_bytes,
         });
     }
     let reservation =
@@ -1156,20 +1159,25 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         policy: &MaterializationPolicy,
         context: &'static str,
     ) -> Result<Arc<Array2<f64>>, MatrixMaterializationError> {
+        let effective_policy = merge_operator_materialization_policies(
+            Some(policy.clone()),
+            self.materialization_policy(),
+        )
+        .expect("caller policy is always present");
         let bytes = self.estimated_dense_bytes();
-        if !policy.allow_operator_materialization {
+        if !effective_policy.allow_operator_materialization {
             return Err(MatrixMaterializationError::Forbidden {
                 context,
                 mode: gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired,
             });
         }
-        if bytes > policy.max_single_dense_bytes {
+        if bytes > effective_policy.max_single_dense_bytes {
             return Err(MatrixMaterializationError::TooLarge {
                 context,
                 nrows: self.nrows(),
                 ncols: self.ncols(),
                 bytes,
-                limit_bytes: policy.max_single_dense_bytes,
+                limit_bytes: effective_policy.max_single_dense_bytes,
             });
         }
         dense_operator_to_dense_by_chunks(self).map(Arc::new)
@@ -3151,6 +3159,12 @@ impl LinearOperator for MultiChannelOperator {
 }
 
 impl DenseDesignOperator for MultiChannelOperator {
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        self.channels.iter().fold(None, |policy, channel| {
+            merge_operator_materialization_policies(policy, channel.materialization_policy())
+        })
+    }
+
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         let n = self.n_per_channel;
         let total = self.nrows();
@@ -3653,10 +3667,7 @@ impl DenseDesignOperator for ResidualisedDesignOperator {
         self.anchors.iter().fold(
             self.inner.materialization_policy(),
             |policy, (anchor, _)| {
-                merge_operator_materialization_policies(
-                    policy,
-                    anchor.materialization_policy(),
-                )
+                merge_operator_materialization_policies(policy, anchor.materialization_policy())
             },
         )
     }
@@ -3818,6 +3829,10 @@ impl LinearOperator for ConditionedDesign {
 }
 
 impl DenseDesignOperator for ConditionedDesign {
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        self.inner.materialization_policy()
+    }
+
     /// X_c'(w⊙y) = a⊙(X'(w⊙y)) - d·Σ(w⊙y)
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         let mut result = self.inner.compute_xtwy(weights, y)?;
@@ -6125,7 +6140,9 @@ mod tests {
     use crate::types::RidgePolicy;
     use crate::utils::{PcgSolveInfo, StableSolver};
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-    use gam_runtime::resource::{MatrixMaterializationError, MemoryGovernor, ResourcePolicy};
+    use gam_runtime::resource::{
+        MaterializationPolicy, MatrixMaterializationError, MemoryGovernor, ResourcePolicy,
+    };
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
     use std::ops::Range;
     use std::sync::Arc;
@@ -6135,6 +6152,7 @@ mod tests {
         n: usize,
         p: usize,
         row_chunk_calls: AtomicUsize,
+        materialization_policy: Option<MaterializationPolicy>,
     }
 
     impl ChunkOnlyOperator {
@@ -6182,6 +6200,10 @@ mod tests {
     }
 
     impl DenseDesignOperator for ChunkOnlyOperator {
+        fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+            self.materialization_policy.clone()
+        }
+
         fn row_chunk_into(
             &self,
             rows: Range<usize>,
@@ -6860,6 +6882,7 @@ mod tests {
             n,
             p,
             row_chunk_calls: AtomicUsize::new(0),
+            materialization_policy: None,
         });
         let design = DenseDesignMatrix::from(Arc::clone(&op));
 
@@ -6873,6 +6896,36 @@ mod tests {
         for &(i, j) in &[(0, 0), (8_191, 127), (8_192, 0), (10_999, 64)] {
             assert_eq!(dense[[i, j]], op.value(i, j));
         }
+        assert!(
+            design.as_dense_ref().is_some(),
+            "as_dense_ref must expose a populated LazyDense memo so storage certificates can observe it"
+        );
+    }
+
+    #[test]
+    fn construction_policy_survives_nested_coefficient_and_block_operators() {
+        let strict = ResourcePolicy::analytic_operator_required().material_policy();
+        let op = Arc::new(ChunkOnlyOperator {
+            n: 32,
+            p: 2,
+            row_chunk_calls: AtomicUsize::new(0),
+            materialization_policy: Some(strict),
+        });
+        let inner = DenseDesignMatrix::from(Arc::clone(&op));
+        let transformed = CoefficientTransformOperator::new(inner, Array2::<f64>::eye(2))
+            .expect("coefficient transform");
+        let block = BlockDesignOperator::new(vec![DesignBlock::Dense(DenseDesignMatrix::from(
+            Arc::new(transformed),
+        ))])
+        .expect("block design");
+        let design = DenseDesignMatrix::from(Arc::new(block));
+
+        let error = design
+            .try_to_dense_arc("nested construction-policy regression")
+            .expect_err("strict construction policy must survive every wrapper");
+        assert!(error.contains("construction policy requires streamed storage"));
+        assert_eq!(op.row_chunk_calls.load(Ordering::SeqCst), 0);
+        assert!(design.as_dense_ref().is_none());
     }
 
     /// The governed path couples the full allocation to its byte reservation,
@@ -6883,6 +6936,7 @@ mod tests {
             n: 128,
             p: 4,
             row_chunk_calls: AtomicUsize::new(0),
+            materialization_policy: None,
         });
         let design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::clone(&op)));
 
@@ -6917,6 +6971,7 @@ mod tests {
             n,
             p,
             row_chunk_calls: AtomicUsize::new(0),
+            materialization_policy: None,
         });
         let design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::clone(&op)));
 

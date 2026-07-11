@@ -226,6 +226,7 @@ pub fn build_thin_plate_basiswithworkspace(
                 reduced_kernel_transform.clone(),
             ]))),
             Some(Arc::new(poly_block)),
+            workspace.policy().material_policy(),
         )
         .map_err(BasisError::InvalidInput)?;
         let base_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
