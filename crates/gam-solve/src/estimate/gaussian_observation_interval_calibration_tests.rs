@@ -203,7 +203,9 @@ fn gaussian_observation_interval_calibrated_high_edf_1765() {
         let sd_full = (etavar + sigma * sigma).max(0.0).sqrt();
         let sd_noise_only = sigma;
         // MLE-collapsed band: both the noise term AND etavar scale with σ̂².
-        let sd_mle = (etavar * (sig2_mle / (sigma * sigma)) + sig2_mle).max(0.0).sqrt();
+        let sd_mle = (etavar * (sig2_mle / (sigma * sigma)) + sig2_mle)
+            .max(0.0)
+            .sqrt();
         let dev = (y_new - mu).abs();
         if dev <= Z95 * sd_full {
             hits_full += 1;

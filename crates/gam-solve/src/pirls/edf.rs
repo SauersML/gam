@@ -1,7 +1,7 @@
 use crate::estimate::EstimationError;
 use gam_linalg::faer_ndarray::{FaerSymmetricFactor, array2_to_matmut};
-use gam_linalg::utils::{StableSolver, array_is_finite};
 use gam_linalg::matrix::SymmetricMatrix;
+use gam_linalg::utils::{StableSolver, array_is_finite};
 use gam_problem::Coefficients;
 use ndarray::{Array1, Array2};
 
@@ -122,12 +122,11 @@ pub(super) fn calculate_edf_from_sparse_factor(
         return Ok(p as f64);
     }
     let rhs_arr = e_transformed.t().to_owned();
-    let sol =
-        gam_linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr).map_err(|_| {
-            EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            }
-        })?;
+    let sol = gam_linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
             sol[[i, j]]

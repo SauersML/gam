@@ -102,6 +102,12 @@ pub enum AutoTopologyKind {
     Mixture {
         k: usize,
     },
+    /// `k` tight Gaussian clusters whose centers share one fitted circle
+    /// (#2262). This is the density class for discrete cyclic concepts: it
+    /// preserves clustered mass while pricing the common circular geometry.
+    RingOfClusters {
+        k: usize,
+    },
     /// Structured-union composite (#907): a small FIXED set of component
     /// structures joined by a hard responsibility split (e.g. circle+circle,
     /// circle+cluster, line+cluster). Like the mixture rung it is a discrete,
@@ -129,6 +135,7 @@ impl AutoTopologyKind {
             AutoTopologyKind::DuchonSheet => "duchon_sheet",
             AutoTopologyKind::ConstantCurvature => "constant_curvature",
             AutoTopologyKind::Mixture { .. } => "mixture",
+            AutoTopologyKind::RingOfClusters { .. } => "ring_clusters",
             AutoTopologyKind::Union { structure } => structure.as_str(),
         }
     }
@@ -138,6 +145,7 @@ impl AutoTopologyKind {
     pub fn display_name(self) -> String {
         match self {
             AutoTopologyKind::Mixture { k } => format!("mixture_k{k}"),
+            AutoTopologyKind::RingOfClusters { k } => format!("ring_clusters_k{k}"),
             other => other.as_str().to_string(),
         }
     }
@@ -146,6 +154,10 @@ impl AutoTopologyKind {
     /// opposed to a smooth manifold / Euclidean latent topology).
     pub const fn is_discrete_mixture(self) -> bool {
         matches!(self, AutoTopologyKind::Mixture { .. })
+    }
+
+    pub const fn is_ring_of_clusters(self) -> bool {
+        matches!(self, AutoTopologyKind::RingOfClusters { .. })
     }
 
     /// `true` iff this candidate is the structured-union composite class (#907).
@@ -158,13 +170,27 @@ impl AutoTopologyKind {
     /// triggered when a race mixes a smooth/Euclidean candidate with any
     /// discrete one.
     pub const fn is_discrete_class(self) -> bool {
-        self.is_discrete_mixture() || self.is_structured_union()
+        self.is_discrete_mixture() || self.is_ring_of_clusters() || self.is_structured_union()
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
         let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
         if let Some(structure) = parse_union_name(&normalized) {
             return Ok(AutoTopologyKind::Union { structure });
+        }
+        if let Some(rest) = normalized.strip_prefix("ring_clusters") {
+            let Some(rest) = rest.strip_prefix("_k") else {
+                return Err(format!(
+                    "ring-of-clusters candidate must use ring_clusters_k{{n}}; got {value:?}"
+                ));
+            };
+            let k: usize = rest
+                .parse()
+                .map_err(|_| format!("ring-of-clusters order must be an integer; got {value:?}"))?;
+            if k < 3 {
+                return Err("ring-of-clusters order k must be >= 3".to_string());
+            }
+            return Ok(AutoTopologyKind::RingOfClusters { k });
         }
         if let Some(rest) = normalized.strip_prefix("mixture") {
             // Accept "mixture", "mixture_k7", "mixture7", "mixture_7".
@@ -200,7 +226,7 @@ impl AutoTopologyKind {
                 Ok(AutoTopologyKind::ConstantCurvature)
             }
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, duchon_sheet, constant_curvature, mixture[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, duchon_sheet, constant_curvature, mixture[_k{{n}}], ring_clusters_k{{n}}, or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
             )),
         }
     }
@@ -288,6 +314,15 @@ impl AutoTopologyKind {
         MIXTURE_K_LADDER
             .iter()
             .map(|&k| AutoTopologyKind::Mixture { k })
+            .collect()
+    }
+
+    pub fn ring_of_clusters_ladder() -> Vec<Self> {
+        MIXTURE_K_LADDER
+            .iter()
+            .copied()
+            .filter(|&k| k >= 3)
+            .map(|k| AutoTopologyKind::RingOfClusters { k })
             .collect()
     }
 
@@ -1450,6 +1485,115 @@ pub fn fit_mixture_rung(
     })
 }
 
+/// One order of the constrained ring-of-clusters rung (#2262).
+#[derive(Debug, Clone)]
+pub struct RingOfClustersRungFit {
+    pub k: usize,
+    pub fit: crate::evidence::RingGaussianMixtureFit,
+    pub num_parameters: usize,
+    pub negative_log_evidence: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RingOfClustersRungResult {
+    pub fits: Vec<RingOfClustersRungFit>,
+    pub winner_index: usize,
+}
+
+impl RingOfClustersRungResult {
+    pub fn winner(&self) -> &RingOfClustersRungFit {
+        &self.fits[self.winner_index]
+    }
+}
+
+/// Fit and locally refine the constrained ring-of-clusters order ladder.
+/// Orders below three are structurally incapable of identifying a circle and
+/// are excluded. Ranking uses the same certified empirical-Fisher Laplace
+/// evidence as the free Gaussian-mixture rung.
+pub fn fit_ring_of_clusters_rung(
+    data: ArrayView2<'_, f64>,
+    ladder: &[usize],
+    config: GaussianMixtureConfig,
+) -> Result<RingOfClustersRungResult, String> {
+    let n = data.nrows();
+    let mut fits = Vec::<RingOfClustersRungFit>::new();
+    let mut errors = Vec::<String>::new();
+    let mut attempted = std::collections::BTreeSet::<usize>::new();
+    let try_order = |k: usize,
+                     fits: &mut Vec<RingOfClustersRungFit>,
+                     errors: &mut Vec<String>,
+                     attempted: &mut std::collections::BTreeSet<usize>| {
+        if k < 3 || k > n || !attempted.insert(k) {
+            return;
+        }
+        match crate::evidence::fit_ring_gaussian_mixture(data, k, config) {
+            Ok(fit) => match fit.laplace_negative_log_evidence(data) {
+                Ok(negative_log_evidence) => fits.push(RingOfClustersRungFit {
+                    k,
+                    num_parameters: fit.num_free_parameters(),
+                    fit,
+                    negative_log_evidence,
+                }),
+                Err(error) => {
+                    errors.push(format!("ring-of-clusters k={k} evidence: {error}"));
+                }
+            },
+            Err(error) => errors.push(format!("ring-of-clusters k={k} fit: {error}")),
+        }
+    };
+    for &k in ladder {
+        try_order(k, &mut fits, &mut errors, &mut attempted);
+    }
+    if fits.is_empty() {
+        return Err(format!(
+            "ring-of-clusters rung produced no fittable orders{}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", errors.join("; "))
+            }
+        ));
+    }
+    let mut probes = 0usize;
+    while probes < MIXTURE_REFINEMENT_MAX_PROBES {
+        let best_k = fits
+            .iter()
+            .min_by(|left, right| {
+                left.negative_log_evidence
+                    .partial_cmp(&right.negative_log_evidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(left.k.cmp(&right.k))
+            })
+            .map(|fit| fit.k)
+            .unwrap_or(3);
+        let next = [best_k.saturating_sub(1), best_k + 1]
+            .into_iter()
+            .find(|&k| k >= 3 && k <= n && !attempted.contains(&k));
+        let Some(k) = next else {
+            break;
+        };
+        try_order(k, &mut fits, &mut errors, &mut attempted);
+        probes += 1;
+    }
+    let ranked = rank_priority_candidates(
+        fits.into_iter()
+            .enumerate()
+            .map(|(index, fit)| {
+                let score = fit.negative_log_evidence;
+                let tie = fit.k;
+                PriorityCandidate::new(fit, index, score, tie)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|candidate| candidate.item)
+    .collect();
+    Ok(RingOfClustersRungResult {
+        fits: ranked,
+        winner_index: 0,
+    })
+}
+
 // ===========================================================================
 // Structured-union rung (#907)
 // ===========================================================================
@@ -1567,6 +1711,32 @@ pub fn mixture_density_provider<'a>(
             let eval_mat = gather_rows(owned.view(), eval);
             let dens = fit.per_point_log_density(eval_mat.view())?;
             Ok(dens.to_vec())
+        },
+    )
+}
+
+/// Held-out density provider for a fixed ring-of-clusters order. Every fold
+/// refits the circle-constrained mixture on training rows before scoring the
+/// evaluation rows.
+pub fn ring_of_clusters_density_provider<'a>(
+    data: ArrayView2<'a, f64>,
+    k: usize,
+    config: GaussianMixtureConfig,
+) -> HeldOutDensityProvider<'a> {
+    let owned = data.to_owned();
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            let train_mat = gather_rows(owned.view(), train);
+            let train_k = k.min(train.len());
+            if train_k < 3 {
+                return Err(
+                    "ring-of-clusters held-out fold needs at least three training rows".to_string(),
+                );
+            }
+            let fit =
+                crate::evidence::fit_ring_gaussian_mixture(train_mat.view(), train_k, config)?;
+            let eval_mat = gather_rows(owned.view(), eval);
+            Ok(fit.per_point_log_density(eval_mat.view())?.to_vec())
         },
     )
 }

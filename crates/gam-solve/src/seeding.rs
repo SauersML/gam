@@ -497,7 +497,6 @@ pub fn generate_rho_candidates(
     seeds
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,9 +572,6 @@ mod tests {
             "retreat seed should be available before broader exploratory seeds: {retreat_idx}"
         );
     }
-
-
-
 
     #[test]
     fn three_penalty_seeds_include_nu2_reverse_manifold_triplets() {
@@ -666,6 +662,4 @@ mod tests {
         // Aux pinning causes many seeds to collapse, so fewer unique seeds.
         assert!(seeds_with_aux.len() <= seeds_without_aux.len());
     }
-
-
 }

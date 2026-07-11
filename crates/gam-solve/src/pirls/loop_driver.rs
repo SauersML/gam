@@ -1276,8 +1276,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .as_ref()
                 .map(|transform| transform.apply_transpose(&grad_orig))
                 .unwrap_or(grad_orig);
-            let weighted_rss = (cache.centered_weighted_y_sq
-                - 2.0 * qbeta.dot(&cache.xtwy_orig)
+            let weighted_rss = (cache.centered_weighted_y_sq - 2.0 * qbeta.dot(&cache.xtwy_orig)
                 + qbeta.dot(&cache.xtwx_orig.dot(&qbeta)))
             .max(0.0);
             let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);

@@ -53,9 +53,7 @@
 //! boundaries compete exactly. σ² is profiled in closed form from the proper
 //! innovations plus the within-tie residual sum.
 
-use gam_math::score_opt::{
-    ClosedInterval, DerivativeEnclosure, ScoreJet, maximize_score_1d,
-};
+use gam_math::score_opt::{ClosedInterval, DerivativeEnclosure, ScoreJet, maximize_score_1d};
 
 /// One pooled (distinct-abscissa) observation node.
 #[derive(Clone, Copy, Debug)]
@@ -797,7 +795,6 @@ fn concentrated_criterion_enclosure(
     })
 }
 
-
 /// Exact diffuse smoother for the `order−1` partially-diffuse leading nodes
 /// (#1044 — the multi-node generalization of the `m = 2` reverse-Markov
 /// closure).
@@ -1139,16 +1136,7 @@ pub fn fit_spline_scan(
                 },
             )
         },
-        |lo, hi| {
-            concentrated_criterion_enclosure(
-                &nodes,
-                ssr_within,
-                n_obs,
-                lo,
-                hi,
-                order,
-            )
-        },
+        |lo, hi| concentrated_criterion_enclosure(&nodes, ssr_within, n_obs, lo, hi, order),
     )
     .map_err(|error| format!("spline scan: REML stationary isolation failed: {error}"))?;
     fit_spline_scan_at(x, y, w, search.optimum.x, None, order)

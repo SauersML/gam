@@ -221,9 +221,7 @@ impl<'a> GamWorkingModel<'a> {
     /// memoized on the working model and reused across the inner Newton
     /// iterations of this solve, since the design and prior weights are constant
     /// for the model's lifetime.
-    fn ensure_firth_design_factor(
-        &mut self,
-    ) -> Result<Arc<FirthDesignFactor>, EstimationError> {
+    fn ensure_firth_design_factor(&mut self) -> Result<Arc<FirthDesignFactor>, EstimationError> {
         if let Some(factor) = &self.firth_design_factor {
             return Ok(factor.clone());
         }
@@ -416,10 +414,8 @@ impl<'a> GamWorkingModel<'a> {
                     );
                     if !cache_hit {
                         workspace.resident_design_gram =
-                            gam_gpu::linalg_dispatch::ResidentDesignGram::try_new(
-                                x_dense.view(),
-                            )
-                            .map(|g| (key.0, key.1, key.2, g));
+                            gam_gpu::linalg_dispatch::ResidentDesignGram::try_new(x_dense.view())
+                                .map(|g| (key.0, key.1, key.2, g));
                     }
                     if let Some((_, _, _, gram)) = workspace.resident_design_gram.as_ref() {
                         if let Some(h) = gram.gram(weights.view()) {

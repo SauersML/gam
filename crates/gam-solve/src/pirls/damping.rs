@@ -1,7 +1,7 @@
 use crate::estimate::EstimationError;
-use gam_linalg::matrix::SymmetricMatrix;
 use faer::sparse::SparseColMat;
 use faer::sparse::Triplet;
+use gam_linalg::matrix::SymmetricMatrix;
 use ndarray::Array1;
 
 /// Add `lambda * d2[col]` to the diagonal of a sparse upper-triangular CSC matrix.

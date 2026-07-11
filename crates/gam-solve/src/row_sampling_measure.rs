@@ -56,10 +56,10 @@
 //! external tangent supplied, and it collapses to the constant `p` under
 //! Euclidean — which is precisely the uniform-measure degeneracy we want.
 
-use gam_problem::{MetricProvenance, RowMetric};
+use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use gam_linalg::utils::splitmix64_hash;
-use faer::Side;
+use gam_problem::{MetricProvenance, RowMetric};
 use ndarray::{Array2, ArrayView2};
 
 /// Where a [`RowSamplingMeasure`] came from — the honest record of whether the

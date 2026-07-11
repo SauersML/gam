@@ -155,7 +155,10 @@ mod tests {
     #[test]
     fn empty_class_returns_empty() {
         let out = solve_batched_k1_border(&[], 1e-6, 1e-6);
-        assert!(out.is_empty(), "an empty color class must return no results");
+        assert!(
+            out.is_empty(),
+            "an empty color class must return no results"
+        );
     }
 
     #[test]
@@ -183,7 +186,9 @@ mod tests {
         for (idx, sys) in systems.iter().enumerate() {
             let alone = solve_arrow_newton_step_dense_reference(sys, 1e-6, 1e-6)
                 .expect("each PD atom must solve on its own");
-            let in_class = batched[idx].as_ref().expect("each atom must solve in-class");
+            let in_class = batched[idx]
+                .as_ref()
+                .expect("each atom must solve in-class");
             assert_solution_eq(in_class, &alone);
         }
     }
@@ -197,12 +202,17 @@ mod tests {
         let systems = [pd_k1_system(4, 2, 2, 0.0), indefinite_k1_system(4, 2, 2)];
         let batched = solve_batched_k1_border(&systems, 0.0, 0.0);
         assert_eq!(batched.len(), 2);
-        assert!(batched[0].is_ok(), "the PD atom must still solve in a mixed class");
+        assert!(
+            batched[0].is_ok(),
+            "the PD atom must still solve in a mixed class"
+        );
         // Only the `Err` variants are `Debug` (the `Ok` solution type is not), so
         // match rather than format the whole `Result`.
         match &batched[1] {
             Err(ArrowSchurGpuFailure::SchurFactorFailed { .. }) => {}
-            Err(other) => panic!("the indefinite atom must decline as SchurFactorFailed; got {other:?}"),
+            Err(other) => {
+                panic!("the indefinite atom must decline as SchurFactorFailed; got {other:?}")
+            }
             Ok(_) => panic!("the indefinite atom must decline per-atom, but it solved"),
         }
     }

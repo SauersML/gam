@@ -1495,6 +1495,7 @@ struct AtomShapeRaceVerdict {
     stacking_weights: Vec<f64>,
     negative_log_evidence: Vec<f64>,
     mixture_k: usize,
+    ring_clusters_k: usize,
     circle_margin: f64,
     circle_wins: bool,
     is_cross_class: bool,
@@ -1511,7 +1512,8 @@ fn run_atom_shape_race(
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
         AutoTopologyKind, CrossClassCandidate, Headline, adjudicate_cross_class_race,
-        fit_mixture_rung, mixture_density_provider,
+        fit_mixture_rung, fit_ring_of_clusters_rung, mixture_density_provider,
+        ring_of_clusters_density_provider,
     };
 
     if coords.ncols() != 2 {
@@ -1531,6 +1533,8 @@ fn run_atom_shape_race(
     let config = GaussianMixtureConfig::default();
     let mixture = fit_mixture_rung(owned.view(), k_ladder, config)?;
     let mixture_k = mixture.winner().k;
+    let ring_clusters = fit_ring_of_clusters_rung(owned.view(), k_ladder, config)?;
+    let ring_clusters_k = ring_clusters.winner().k;
     let candidates = vec![
         CrossClassCandidate {
             kind: AutoTopologyKind::Circle,
@@ -1550,7 +1554,18 @@ fn run_atom_shape_race(
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(owned.view(), mixture_k, config),
         },
+        CrossClassCandidate {
+            kind: AutoTopologyKind::RingOfClusters { k: ring_clusters_k },
+            negative_log_evidence: ring_clusters.winner().negative_log_evidence,
+            certification: EvidenceCertification::Exact,
+            density_provider: ring_of_clusters_density_provider(
+                owned.view(),
+                ring_clusters_k,
+                config,
+            ),
+        },
     ];
+    let candidate_count = candidates.len();
     let verdict =
         adjudicate_cross_class_race(n, candidates, folds, seed, StackingConfig::default())?;
     let stacking_weights = verdict
@@ -1559,18 +1574,24 @@ fn run_atom_shape_race(
         .map(|stacking| stacking.weights.to_vec())
         .unwrap_or_default();
     let winner = verdict.candidate_names[verdict.winner_index].clone();
-    let circle_margin = if stacking_weights.len() == 3 {
-        stacking_weights[0] - stacking_weights[1].max(stacking_weights[2])
+    let circle_margin = if stacking_weights.len() == candidate_count {
+        stacking_weights[0]
+            - stacking_weights
+                .iter()
+                .copied()
+                .skip(1)
+                .fold(f64::NEG_INFINITY, f64::max)
     } else {
         f64::NAN
     };
     Ok(AtomShapeRaceVerdict {
-        circle_wins: winner.starts_with("circle"),
+        circle_wins: winner.starts_with("circle") || winner.starts_with("ring_clusters"),
         winner,
         candidate_names: verdict.candidate_names,
         stacking_weights,
         negative_log_evidence: verdict.negative_log_evidence,
         mixture_k,
+        ring_clusters_k,
         circle_margin,
         is_cross_class: verdict.is_cross_class,
         headline: match verdict.headline {
@@ -1590,6 +1611,7 @@ fn atom_shape_verdict_dict<'py>(
     out.set_item("stacking_weights", &verdict.stacking_weights)?;
     out.set_item("negative_log_evidence", &verdict.negative_log_evidence)?;
     out.set_item("mixture_k", verdict.mixture_k)?;
+    out.set_item("ring_clusters_k", verdict.ring_clusters_k)?;
     out.set_item("circle_margin", verdict.circle_margin)?;
     out.set_item("circle_wins", verdict.circle_wins)?;
     out.set_item("is_cross_class", verdict.is_cross_class)?;

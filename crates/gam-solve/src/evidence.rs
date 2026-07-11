@@ -1871,6 +1871,662 @@ fn constrained_data_covariance(
 }
 
 // ---------------------------------------------------------------------------
+// Ring-of-clusters candidate (#2262)
+// ---------------------------------------------------------------------------
+//
+// A free Gaussian mixture treats the component means as unrelated points. That
+// is the wrong null for a discrete cyclic concept: weekdays and months form
+// tight clusters, but their component means share a low-dimensional circular
+// constraint. `RingGaussianMixtureFit` models exactly that density,
+//
+//     x | z=j ~ N(c + r u_j, sigma^2 I_2),  ||u_j|| = 1,
+//
+// with free mixture weights, a shared center/radius, one angle per component,
+// and a shared isotropic variance. Its `2k + 3` continuous parameters are
+// priced in the same empirical-Fisher Laplace evidence as the unconstrained
+// mixture's `6k - 1` parameters in two dimensions.
+
+/// Certified Gaussian mixture whose component centers lie on one fitted circle.
+#[derive(Debug, Clone)]
+pub struct RingGaussianMixtureFit {
+    weights: Array1<f64>,
+    center: Array1<f64>,
+    radius: f64,
+    directions: Array2<f64>,
+    variance: f64,
+    k: usize,
+    n_obs: usize,
+    loglik: f64,
+    iterations: usize,
+    certificate: GaussianMixtureCertificate,
+    data_fingerprint: Fingerprint,
+}
+
+impl RingGaussianMixtureFit {
+    pub fn weights(&self) -> ArrayView1<'_, f64> {
+        self.weights.view()
+    }
+
+    pub fn center(&self) -> ArrayView1<'_, f64> {
+        self.center.view()
+    }
+
+    pub fn radius(&self) -> f64 {
+        self.radius
+    }
+
+    pub fn directions(&self) -> ArrayView2<'_, f64> {
+        self.directions.view()
+    }
+
+    pub fn variance(&self) -> f64 {
+        self.variance
+    }
+
+    pub fn iterations(&self) -> usize {
+        self.iterations
+    }
+
+    pub fn certificate(&self) -> GaussianMixtureCertificate {
+        self.certificate
+    }
+
+    /// Free parameters: `k-1` weight logits, center(2), radius(1), `k`
+    /// component angles, and shared log standard deviation(1).
+    pub fn num_free_parameters(&self) -> usize {
+        2 * self.k + 3
+    }
+
+    pub fn per_point_log_density(&self, data: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
+        if data.ncols() != 2 {
+            return Err(format!(
+                "ring-of-clusters density expects two columns, got {}",
+                data.ncols()
+            ));
+        }
+        ring_mixture_log_density(
+            data,
+            &self.weights,
+            &self.center,
+            self.radius,
+            &self.directions,
+            self.variance,
+        )
+    }
+
+    pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if data.nrows() != self.n_obs
+            || data.ncols() != 2
+            || ring_mixture_data_fingerprint(data) != self.data_fingerprint
+        {
+            return Err(
+                "ring-of-clusters Laplace evidence must use the exact data stored in the certified fit"
+                    .to_string(),
+            );
+        }
+        let information = self.empirical_fisher_information(data)?;
+        let p = self.num_free_parameters();
+        let apply_info = |x: &[f64]| -> Vec<f64> {
+            let mut out = vec![0.0; p];
+            for row in 0..p {
+                for col in 0..p {
+                    out[row] += information[[row, col]] * x[col];
+                }
+            }
+            out
+        };
+        let value = laplace_evidence(
+            EvidenceLogDetSource::Hvp(EvidenceHvpLogDet {
+                dim: p,
+                apply: &apply_info,
+            }),
+            0.0,
+            -self.loglik,
+            p as f64,
+            0.0,
+        );
+        if !value.is_finite() {
+            return Err(
+                "ring-of-clusters empirical Fisher is rank deficient; Laplace evidence is undefined"
+                    .to_string(),
+            );
+        }
+        Ok(value)
+    }
+
+    fn empirical_fisher_information(
+        &self,
+        data: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.num_free_parameters();
+        let weight_base = 0usize;
+        let center_base = self.k - 1;
+        let log_radius_index = center_base + 2;
+        let angle_base = log_radius_index + 1;
+        let log_sigma_index = angle_base + self.k;
+        debug_assert_eq!(log_sigma_index + 1, p);
+
+        let responsibilities = ring_mixture_responsibilities(
+            data,
+            &self.weights,
+            &self.center,
+            self.radius,
+            &self.directions,
+            self.variance,
+        )?;
+        let mut information = Array2::<f64>::zeros((p, p));
+        let mut score = vec![0.0; p];
+        for row in 0..data.nrows() {
+            score.fill(0.0);
+            for component in 1..self.k {
+                score[weight_base + component - 1] =
+                    responsibilities[[row, component]] - self.weights[component];
+            }
+            for component in 0..self.k {
+                let responsibility = responsibilities[[row, component]];
+                let ux = self.directions[[component, 0]];
+                let uy = self.directions[[component, 1]];
+                let dx = data[[row, 0]] - self.center[0] - self.radius * ux;
+                let dy = data[[row, 1]] - self.center[1] - self.radius * uy;
+                score[center_base] += responsibility * dx / self.variance;
+                score[center_base + 1] += responsibility * dy / self.variance;
+                score[log_radius_index] +=
+                    responsibility * self.radius * (dx * ux + dy * uy) / self.variance;
+                score[angle_base + component] =
+                    responsibility * self.radius * (-dx * uy + dy * ux) / self.variance;
+                score[log_sigma_index] +=
+                    responsibility * (-2.0 + (dx * dx + dy * dy) / self.variance);
+            }
+            for left in 0..p {
+                for right in 0..p {
+                    information[[left, right]] += score[left] * score[right];
+                }
+            }
+        }
+        for left in 0..p {
+            for right in (left + 1)..p {
+                let symmetric = 0.5 * (information[[left, right]] + information[[right, left]]);
+                information[[left, right]] = symmetric;
+                information[[right, left]] = symmetric;
+            }
+        }
+        Ok(information)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RingMixtureState {
+    weights: Array1<f64>,
+    center: Array1<f64>,
+    radius: f64,
+    directions: Array2<f64>,
+    variance: f64,
+    mean_log_likelihood: f64,
+    completed_iterations: usize,
+}
+
+fn ring_mixture_data_fingerprint(data: ArrayView2<'_, f64>) -> Fingerprint {
+    evidence_matrix_fingerprint("ring-gaussian-mixture-em-v1", data)
+}
+
+fn ring_component_means(
+    center: &Array1<f64>,
+    radius: f64,
+    directions: &Array2<f64>,
+) -> Array2<f64> {
+    let mut means = Array2::<f64>::zeros((directions.nrows(), 2));
+    for component in 0..directions.nrows() {
+        means[[component, 0]] = center[0] + radius * directions[[component, 0]];
+        means[[component, 1]] = center[1] + radius * directions[[component, 1]];
+    }
+    means
+}
+
+fn ring_mixture_log_terms(
+    data: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    center: &Array1<f64>,
+    radius: f64,
+    directions: &Array2<f64>,
+    variance: f64,
+) -> Result<(Array2<f64>, Vec<f64>), String> {
+    if data.ncols() != 2
+        || center.len() != 2
+        || directions.ncols() != 2
+        || directions.nrows() != weights.len()
+        || weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight <= 0.0)
+        || !(radius.is_finite() && radius > 0.0)
+        || !(variance.is_finite() && variance > 0.0)
+    {
+        return Err("invalid ring-of-clusters parameter state".to_string());
+    }
+    let means = ring_component_means(center, radius, directions);
+    let log_normalizer = -(std::f64::consts::TAU).ln() - variance.ln();
+    let mut terms = Array2::<f64>::zeros((data.nrows(), weights.len()));
+    let mut row_log_likelihoods = Vec::with_capacity(data.nrows());
+    for row in 0..data.nrows() {
+        let mut max_term = f64::NEG_INFINITY;
+        for component in 0..weights.len() {
+            let dx = data[[row, 0]] - means[[component, 0]];
+            let dy = data[[row, 1]] - means[[component, 1]];
+            let term =
+                weights[component].ln() + log_normalizer - 0.5 * (dx * dx + dy * dy) / variance;
+            terms[[row, component]] = term;
+            max_term = max_term.max(term);
+        }
+        let values = terms.row(row).to_vec();
+        let log_likelihood = log_sum_exp(&values, max_term);
+        if !log_likelihood.is_finite() {
+            return Err(format!(
+                "ring-of-clusters density is non-finite at training row {row}"
+            ));
+        }
+        row_log_likelihoods.push(log_likelihood);
+    }
+    Ok((terms, row_log_likelihoods))
+}
+
+fn ring_mixture_responsibilities(
+    data: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    center: &Array1<f64>,
+    radius: f64,
+    directions: &Array2<f64>,
+    variance: f64,
+) -> Result<Array2<f64>, String> {
+    let (terms, row_log_likelihoods) =
+        ring_mixture_log_terms(data, weights, center, radius, directions, variance)?;
+    let mut responsibilities = Array2::<f64>::zeros(terms.raw_dim());
+    for row in 0..terms.nrows() {
+        for component in 0..terms.ncols() {
+            responsibilities[[row, component]] =
+                (terms[[row, component]] - row_log_likelihoods[row]).exp();
+        }
+    }
+    Ok(responsibilities)
+}
+
+fn ring_mixture_e_step(
+    data: ArrayView2<'_, f64>,
+    state: &RingMixtureState,
+) -> Result<(Array2<f64>, f64, f64), String> {
+    let (terms, row_log_likelihoods) = ring_mixture_log_terms(
+        data,
+        &state.weights,
+        &state.center,
+        state.radius,
+        &state.directions,
+        state.variance,
+    )?;
+    let mut responsibilities = Array2::<f64>::zeros(terms.raw_dim());
+    for row in 0..terms.nrows() {
+        for component in 0..terms.ncols() {
+            responsibilities[[row, component]] =
+                (terms[[row, component]] - row_log_likelihoods[row]).exp();
+        }
+    }
+    let (mean, roundoff) = pairwise_mean_with_roundoff(row_log_likelihoods)?;
+    Ok((responsibilities, mean, roundoff))
+}
+
+fn ring_mixture_log_density(
+    data: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    center: &Array1<f64>,
+    radius: f64,
+    directions: &Array2<f64>,
+    variance: f64,
+) -> Result<Array1<f64>, String> {
+    let (_, row_log_likelihoods) =
+        ring_mixture_log_terms(data, weights, center, radius, directions, variance)?;
+    Ok(Array1::from_vec(row_log_likelihoods))
+}
+
+fn relative_parameter_step(previous: f64, next: f64) -> f64 {
+    (next - previous).abs() / previous.abs().max(next.abs()).max(1.0)
+}
+
+fn ring_parameter_residual(previous: &RingMixtureState, next: &RingMixtureState) -> f64 {
+    previous
+        .weights
+        .iter()
+        .zip(next.weights.iter())
+        .map(|(&left, &right)| relative_parameter_step(left, right))
+        .chain(
+            previous
+                .center
+                .iter()
+                .zip(next.center.iter())
+                .map(|(&left, &right)| relative_parameter_step(left, right)),
+        )
+        .chain(std::iter::once(relative_parameter_step(
+            previous.radius,
+            next.radius,
+        )))
+        .chain(
+            previous
+                .directions
+                .iter()
+                .zip(next.directions.iter())
+                .map(|(&left, &right)| relative_parameter_step(left, right)),
+        )
+        .chain(std::iter::once(relative_parameter_step(
+            previous.variance,
+            next.variance,
+        )))
+        .fold(0.0, f64::max)
+}
+
+fn fit_weighted_component_circle(
+    component_means: &Array2<f64>,
+    component_mass: &Array1<f64>,
+    initial_center: &Array1<f64>,
+    initial_radius: f64,
+    parameter_tol: f64,
+    max_iter: usize,
+) -> Result<(Array1<f64>, f64, Array2<f64>), String> {
+    let k = component_means.nrows();
+    let total_mass = component_mass.sum();
+    if component_means.ncols() != 2
+        || component_mass.len() != k
+        || component_mass
+            .iter()
+            .any(|mass| !mass.is_finite() || *mass <= 0.0)
+        || !(total_mass.is_finite() && total_mass > 0.0)
+    {
+        return Err("ring M-step requires positive component masses and 2-D means".to_string());
+    }
+    let mut center = initial_center.clone();
+    let mut radius = initial_radius;
+    let mut directions = Array2::<f64>::zeros((k, 2));
+    for _ in 0..max_iter {
+        for component in 0..k {
+            let dx = component_means[[component, 0]] - center[0];
+            let dy = component_means[[component, 1]] - center[1];
+            let norm = dx.hypot(dy);
+            if !(norm.is_finite() && norm > 0.0) {
+                return Err(
+                    "ring M-step reached a component centroid at the circle center; its angle is unidentified"
+                        .to_string(),
+                );
+            }
+            directions[[component, 0]] = dx / norm;
+            directions[[component, 1]] = dy / norm;
+        }
+
+        let mut mean_point = Array1::<f64>::zeros(2);
+        let mut mean_direction = Array1::<f64>::zeros(2);
+        for component in 0..k {
+            let weight = component_mass[component] / total_mass;
+            for axis in 0..2 {
+                mean_point[axis] += weight * component_means[[component, axis]];
+                mean_direction[axis] += weight * directions[[component, axis]];
+            }
+        }
+        let mut numerator = 0.0;
+        let mut denominator = 0.0;
+        for component in 0..k {
+            let mass = component_mass[component];
+            let dux = directions[[component, 0]] - mean_direction[0];
+            let duy = directions[[component, 1]] - mean_direction[1];
+            numerator += mass
+                * (dux * (component_means[[component, 0]] - mean_point[0])
+                    + duy * (component_means[[component, 1]] - mean_point[1]));
+            denominator += mass * (dux * dux + duy * duy);
+        }
+        if !(denominator.is_finite() && denominator > 0.0) {
+            return Err(
+                "ring M-step component directions are identical; radius and center are unidentified"
+                    .to_string(),
+            );
+        }
+        let mut next_radius = numerator / denominator;
+        if !next_radius.is_finite() || next_radius == 0.0 {
+            return Err("ring M-step produced an unidentified zero radius".to_string());
+        }
+        if next_radius < 0.0 {
+            next_radius = -next_radius;
+            directions.mapv_inplace(|value| -value);
+        }
+        let next_center = Array1::from_vec(vec![
+            mean_point[0] - next_radius * mean_direction[0],
+            mean_point[1] - next_radius * mean_direction[1],
+        ]);
+        let residual = center
+            .iter()
+            .zip(next_center.iter())
+            .map(|(&left, &right)| relative_parameter_step(left, right))
+            .chain(std::iter::once(relative_parameter_step(
+                radius,
+                next_radius,
+            )))
+            .fold(0.0, f64::max);
+        center = next_center;
+        radius = next_radius;
+        if residual <= parameter_tol {
+            // Recompute directions at the returned center so the stored angles
+            // are the exact angular block update belonging to that center.
+            for component in 0..k {
+                let dx = component_means[[component, 0]] - center[0];
+                let dy = component_means[[component, 1]] - center[1];
+                let norm = dx.hypot(dy);
+                if !(norm.is_finite() && norm > 0.0) {
+                    return Err("ring M-step terminal component angle is unidentified".to_string());
+                }
+                directions[[component, 0]] = dx / norm;
+                directions[[component, 1]] = dy / norm;
+            }
+            return Ok((center, radius, directions));
+        }
+    }
+    Err(format!(
+        "ring M-step did not certify its constrained center/radius fixed point after {max_iter} iterations"
+    ))
+}
+
+fn ring_mixture_m_step(
+    data: ArrayView2<'_, f64>,
+    responsibilities: ArrayView2<'_, f64>,
+    previous: &RingMixtureState,
+    config: GaussianMixtureConfig,
+) -> Result<RingMixtureState, String> {
+    let n = data.nrows();
+    let k = responsibilities.ncols();
+    let mut component_mass = Array1::<f64>::zeros(k);
+    let mut component_means = Array2::<f64>::zeros((k, 2));
+    for component in 0..k {
+        let mass = responsibilities.column(component).sum();
+        if !(mass.is_finite() && mass > 0.0) {
+            return Err(
+                "ring M-step reached a zero-mass component; the requested order is singular"
+                    .to_string(),
+            );
+        }
+        component_mass[component] = mass;
+        for row in 0..n {
+            for axis in 0..2 {
+                component_means[[component, axis]] +=
+                    responsibilities[[row, component]] * data[[row, axis]];
+            }
+        }
+        for axis in 0..2 {
+            component_means[[component, axis]] /= mass;
+        }
+    }
+    let mut weights = component_mass.mapv(|mass| mass / n as f64);
+    let weight_sum = weights.sum();
+    weights.mapv_inplace(|weight| weight / weight_sum);
+    let (center, radius, directions) = fit_weighted_component_circle(
+        &component_means,
+        &component_mass,
+        &previous.center,
+        previous.radius,
+        config.parameter_tol,
+        config.max_iter,
+    )?;
+    let means = ring_component_means(&center, radius, &directions);
+    let mut expected_squared_error = 0.0;
+    for row in 0..n {
+        for component in 0..k {
+            let dx = data[[row, 0]] - means[[component, 0]];
+            let dy = data[[row, 1]] - means[[component, 1]];
+            expected_squared_error += responsibilities[[row, component]] * (dx * dx + dy * dy);
+        }
+    }
+    let variance = (expected_squared_error / (2 * n) as f64).max(config.covariance_floor);
+    if !variance.is_finite() {
+        return Err("ring M-step produced non-finite shared variance".to_string());
+    }
+    Ok(RingMixtureState {
+        weights,
+        center,
+        radius,
+        directions,
+        variance,
+        mean_log_likelihood: f64::NAN,
+        completed_iterations: previous.completed_iterations + 1,
+    })
+}
+
+/// Fit a deterministic, certified `k`-component isotropic Gaussian mixture
+/// whose component centers are constrained to a common circle.
+pub fn fit_ring_gaussian_mixture(
+    data: ArrayView2<'_, f64>,
+    k: usize,
+    config: GaussianMixtureConfig,
+) -> Result<RingGaussianMixtureFit, String> {
+    validate_gaussian_mixture_problem(data, k, config).map_err(|error| error.to_string())?;
+    if data.ncols() != 2 {
+        return Err(format!(
+            "ring-of-clusters fitting requires exactly two columns, got {}",
+            data.ncols()
+        ));
+    }
+    if k < 3 {
+        return Err(format!(
+            "ring-of-clusters fitting requires at least three component centers, got {k}"
+        ));
+    }
+    let seeded_means = gam_terms::basis::select_centers_by_strategy(
+        data,
+        &gam_terms::basis::CenterStrategy::KMeans {
+            num_centers: k,
+            max_iter: config.kmeans_max_iter,
+        },
+    )
+    .map_err(|error| format!("ring-of-clusters deterministic seeding failed: {error}"))?;
+    let component_mass = Array1::<f64>::ones(k);
+    let mut initial_center = Array1::<f64>::zeros(2);
+    for component in 0..k {
+        initial_center[0] += seeded_means[[component, 0]] / k as f64;
+        initial_center[1] += seeded_means[[component, 1]] / k as f64;
+    }
+    let mut initial_radius = 0.0;
+    for component in 0..k {
+        initial_radius += (seeded_means[[component, 0]] - initial_center[0])
+            .hypot(seeded_means[[component, 1]] - initial_center[1])
+            / k as f64;
+    }
+    if !(initial_radius.is_finite() && initial_radius > 0.0) {
+        return Err("ring-of-clusters seed has an unidentified zero radius".to_string());
+    }
+    let (center, radius, directions) = fit_weighted_component_circle(
+        &seeded_means,
+        &component_mass,
+        &initial_center,
+        initial_radius,
+        config.parameter_tol,
+        config.max_iter,
+    )?;
+    let means = ring_component_means(&center, radius, &directions);
+    let mut squared_error = 0.0;
+    for row in 0..data.nrows() {
+        let mut nearest = f64::INFINITY;
+        for component in 0..k {
+            let dx = data[[row, 0]] - means[[component, 0]];
+            let dy = data[[row, 1]] - means[[component, 1]];
+            nearest = nearest.min(dx * dx + dy * dy);
+        }
+        squared_error += nearest;
+    }
+    let variance = (squared_error / (2 * data.nrows()) as f64).max(config.covariance_floor);
+    let mut state = RingMixtureState {
+        weights: Array1::from_elem(k, 1.0 / k as f64),
+        center,
+        radius,
+        directions,
+        variance,
+        mean_log_likelihood: f64::NAN,
+        completed_iterations: 0,
+    };
+    let data_fingerprint = ring_mixture_data_fingerprint(data);
+    for additional_updates in 0..=config.max_iter {
+        let (responsibilities, current_mean, current_roundoff) = ring_mixture_e_step(data, &state)?;
+        state.mean_log_likelihood = current_mean;
+        let mut next = ring_mixture_m_step(data, responsibilities.view(), &state, config)?;
+        let (_, next_mean, next_roundoff) = ring_mixture_e_step(data, &next)?;
+        next.mean_log_likelihood = next_mean;
+        let objective_scale = current_mean.abs().max(next_mean.abs()).max(1.0);
+        let objective_step = next_mean - current_mean;
+        let objective_residual = objective_step.abs() / objective_scale;
+        let parameter_residual = ring_parameter_residual(&state, &next);
+        let monotonicity_uncertainty = gaussian_mixture_monotonicity_uncertainty(
+            objective_scale,
+            current_roundoff,
+            next_roundoff,
+        );
+        let certificate = GaussianMixtureCertificate {
+            mean_log_likelihood: current_mean,
+            mean_log_likelihood_gain: objective_step,
+            monotonicity_uncertainty,
+            objective_residual,
+            objective_tolerance: config.loglik_tol,
+            parameter_residual,
+            parameter_tolerance: config.parameter_tol,
+        };
+        if objective_step < -monotonicity_uncertainty {
+            return Err(format!(
+                "ring-of-clusters generalized EM violated monotone ascent at iteration {}: {current_mean:.12e} -> {next_mean:.12e} (comparison uncertainty {monotonicity_uncertainty:.3e})",
+                state.completed_iterations
+            ));
+        }
+        if objective_residual <= config.loglik_tol && parameter_residual <= config.parameter_tol {
+            let loglik = current_mean * data.nrows() as f64;
+            if !loglik.is_finite() {
+                return Err("ring-of-clusters total log likelihood overflowed".to_string());
+            }
+            return Ok(RingGaussianMixtureFit {
+                weights: state.weights,
+                center: state.center,
+                radius: state.radius,
+                directions: state.directions,
+                variance: state.variance,
+                k,
+                n_obs: data.nrows(),
+                loglik,
+                iterations: state.completed_iterations,
+                certificate,
+                data_fingerprint,
+            });
+        }
+        if additional_updates == config.max_iter {
+            return Err(format!(
+                "ring-of-clusters generalized EM did not certify after {} iterations: objective residual {:.6e}/{:.3e}, parameter-map residual {:.6e}/{:.3e}",
+                config.max_iter,
+                objective_residual,
+                config.loglik_tol,
+                parameter_residual,
+                config.parameter_tol,
+            ));
+        }
+        state = next;
+    }
+    Err("ring-of-clusters generalized EM exhausted without a terminal certificate".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Structured-union candidates (#907)
 // ---------------------------------------------------------------------------
 //

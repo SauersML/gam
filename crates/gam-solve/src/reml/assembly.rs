@@ -13,8 +13,8 @@ use super::reml_outer_engine::{
     InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
     RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
-use gam_linalg::faer_ndarray::fast_xt_diag_y;
 use crate::model_types::ProjectedKktResidual;
+use gam_linalg::faer_ndarray::fast_xt_diag_y;
 use ndarray::{Array1, Array2};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,

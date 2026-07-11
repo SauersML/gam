@@ -283,8 +283,8 @@ fn weighted_sum_squares(weights: ArrayView1<'_, f64>, values: ArrayView1<'_, f64
 #[cfg(test)]
 mod tests {
     use super::{FixedDesignGramCache, FixedDesignRowCache};
-    use gam_linalg::faer_ndarray::fast_xt_diag_x;
     use approx::assert_abs_diff_eq;
+    use gam_linalg::faer_ndarray::fast_xt_diag_x;
     use ndarray::{Array1, Array2};
 
     fn deterministic_design(n: usize, p: usize) -> Array2<f64> {

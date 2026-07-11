@@ -1,7 +1,7 @@
 pub mod active_set;
 pub mod arrow_schur;
-pub mod continuation_path;
 pub mod constrained_gaussian_reml;
+pub mod continuation_path;
 pub mod cross_node;
 // The custom-family blockwise carrier (`custom_family` + its persistent
 // warm-start cache) was extracted into the `gam-custom-family` crate (#1521),
@@ -12,8 +12,8 @@ pub mod evidence;
 pub mod gauge;
 pub mod gaussian_reml;
 pub mod glm_sufficient_lane;
-pub mod gpu_kernels;
 pub mod gpu;
+pub mod gpu_kernels;
 // Descended inference-tier numerics (#1521): ALO REML-evidence diagnostics whose
 // deps are all ≤ gam-solve. Re-exported at the monolith root as
 // `gam::inference::*` so cross-crate callers resolve unchanged.
@@ -47,9 +47,9 @@ pub mod psis;
 pub mod rho_prior_eval;
 // Rho-uncertainty (Pareto-k heavy-tail) diagnostics (descended #1521): depends
 // only on the descended `crate::psis`; consumed by `rho_optimizer::run`.
-pub mod rho_uncertainty;
 pub mod residual_cascade;
 pub mod rho_optimizer;
+pub mod rho_uncertainty;
 // The `#[macro_export]` error-bail macros live in `gam-problem` (its crate
 // root). Importing `bail_invalid_estim` here makes `crate::bail_invalid_estim!`
 // resolve at every gam-solve call site exactly as it did when these macros
@@ -73,29 +73,30 @@ pub mod warm_start_artifact;
 pub mod warm_start_transfer;
 
 pub use evidence::{
-    EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource,
-    GaussianMixtureCertificate, GaussianMixtureCheckpoint, GaussianMixtureConfig,
-    GaussianMixtureError, GaussianMixtureFit, SelectedTopology, StackingCertificate,
-    StackingCheckpoint, StackingConfig, StackingError, StackingWeights, TopologyCandidate,
-    TopologyKind, TopologyScoreScale, TopologySelectOptions, UNION_STRUCTURE_LADDER,
-    UnionComponentFit, UnionComponentKind, UnionStructure, UnionStructureFit, evidence_grad_rho,
+    EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureCertificate,
+    GaussianMixtureCheckpoint, GaussianMixtureConfig, GaussianMixtureError, GaussianMixtureFit,
+    RingGaussianMixtureFit, SelectedTopology, StackingCertificate, StackingCheckpoint,
+    StackingConfig, StackingError, StackingWeights, TopologyCandidate, TopologyKind,
+    TopologyScoreScale, TopologySelectOptions, UNION_STRUCTURE_LADDER, UnionComponentFit,
+    UnionComponentKind, UnionStructure, UnionStructureFit, evidence_grad_rho,
     evidence_hessian_log_det, evidence_ift_gradient_correction, fit_gaussian_mixture,
-    fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp, laplace_evidence,
-    resume_gaussian_mixture, resume_stacking_weights, select_topology, solve_stacking_weights,
-    union_per_point_log_density, union_responsibility_split,
+    fit_ring_gaussian_mixture, fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp,
+    laplace_evidence, resume_gaussian_mixture, resume_stacking_weights, select_topology,
+    solve_stacking_weights, union_per_point_log_density, union_responsibility_split,
 };
 pub use topology_selector::{
     AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, EvidenceCertification, Headline,
-    HeldOutDensityProvider, MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS,
-    STACKING_CV_SEED, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
+    HeldOutDensityProvider, MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult,
+    RingOfClustersRungFit, RingOfClustersRungResult, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
     TopologyAutoSelectorResult, TopologyCandidateEvidence, TopologyCandidateFailure,
     TopologyCandidateFailureStage, TopologyCandidateOutcome, TopologyCandidateRanked,
     TopologyCandidateSelectionResult, TopologyRaceParallelCandidate, TopologySelectionScoreKind,
-    TopologySelectionScoreScale, UnionRungFit, UnionRungResult,
-    adjudicate_cross_class_race, build_cv_log_density_table, deterministic_cv_folds,
-    deterministic_cv_folds_seeded, fit_mixture_rung, fit_union_candidate, fit_union_rung,
-    mixture_density_provider, parse_union_name, run_topology_race_parallel,
-    select_topology_candidate_lifecycle, select_topology_with_fit,
+    TopologySelectionScoreScale, UnionRungFit, UnionRungResult, adjudicate_cross_class_race,
+    build_cv_log_density_table, deterministic_cv_folds, deterministic_cv_folds_seeded,
+    fit_mixture_rung, fit_ring_of_clusters_rung, fit_union_candidate, fit_union_rung,
+    mixture_density_provider, parse_union_name, ring_of_clusters_density_provider,
+    run_topology_race_parallel, select_topology_candidate_lifecycle, select_topology_with_fit,
     select_topology_with_fit_parallel, tk_normalized_score, union_density_provider,
 };
 

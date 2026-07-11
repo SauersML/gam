@@ -549,10 +549,9 @@ impl HessianFactorization for DenseSpectralOperator {
         // every device via `scatter_batched`; any failure falls through to the
         // faer CPU stream below so the REML criterion is byte-for-byte
         // unchanged on machines without a GPU.
-        if let Some(gpu) = gam_gpu::linalg_dispatch::try_fast_spectral_leverage_diagonal(
-            x,
-            self.g_factor.view(),
-        ) {
+        if let Some(gpu) =
+            gam_gpu::linalg_dispatch::try_fast_spectral_leverage_diagonal(x, self.g_factor.view())
+        {
             return gpu;
         }
         let chunk_rows = byte_balanced_row_chunk(p + rank, n);
