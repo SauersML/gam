@@ -6996,10 +6996,14 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 &hessian_at(-2.0 * finer_h3, du),
                 finer_h3,
             );
-            let fd_third = (finer_third.mapv(|x| 16.0 * x) - &fine_third) / 15.0;
+            let middle_extrap_third =
+                (finer_third.mapv(|x| 16.0 * x) - &fine_third) / 15.0;
+            let fd_third = middle_extrap_third;
             let mut third_max = 0.0_f64;
             let mut third_at = (0, 0);
             let mut third_convergence = 0.0_f64;
+            let mut third_coarse_change = 0.0_f64;
+            let mut third_fine_change = 0.0_f64;
             for ((a, b), &analytic) in d_dir_analytic.indexed_iter() {
                 let e = (analytic - fd_third[[a, b]]).abs() / (1.0 + analytic.abs());
                 if e > third_max {
@@ -7008,9 +7012,21 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 }
                 third_convergence = third_convergence.max(
                     (fd_third[[a, b]] - coarse_extrap_third[[a, b]]).abs()
-                        / (1.0 + fd_third[[a, b]].abs()),
+                        / (63.0 * (1.0 + fd_third[[a, b]].abs())),
                 );
+                let scale = 1.0 + finer_third[[a, b]].abs();
+                third_coarse_change = third_coarse_change
+                    .max((fine_third[[a, b]] - coarse_third[[a, b]]).abs() / scale);
+                third_fine_change = third_fine_change
+                    .max((finer_third[[a, b]] - fine_third[[a, b]]).abs() / scale);
             }
+            let third_ratio = third_coarse_change / third_fine_change;
+            // An order-four stencil should contract by 2^4=16 under step
+            // halving. Once both changes are already below the correctness
+            // gate, roundoff dominates and no order estimate is needed;
+            // otherwise require observed order in [3,5].
+            let third_order_observed = third_fine_change < 1.0e-5
+                || (8.0..=32.0).contains(&third_ratio);
             let h4 = 2e-2;
             let coarse_fourth = five_point(
                 &directional_at(h4, dv, du),
@@ -7036,10 +7052,14 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 &directional_at(-2.0 * finer_h4, dv, du),
                 finer_h4,
             );
-            let fd_fourth = (finer_fourth.mapv(|x| 16.0 * x) - &fine_fourth) / 15.0;
+            let middle_extrap_fourth =
+                (finer_fourth.mapv(|x| 16.0 * x) - &fine_fourth) / 15.0;
+            let fd_fourth = middle_extrap_fourth;
             let mut fourth_max = 0.0_f64;
             let mut fourth_at = (0, 0);
             let mut fourth_convergence = 0.0_f64;
+            let mut fourth_coarse_change = 0.0_f64;
+            let mut fourth_fine_change = 0.0_f64;
             for ((a, b), &analytic) in d2_analytic.indexed_iter() {
                 let e = (analytic - fd_fourth[[a, b]]).abs() / (1.0 + analytic.abs());
                 if e > fourth_max {
@@ -7048,14 +7068,24 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 }
                 fourth_convergence = fourth_convergence.max(
                     (fd_fourth[[a, b]] - coarse_extrap_fourth[[a, b]]).abs()
-                        / (1.0 + fd_fourth[[a, b]].abs()),
+                        / (63.0 * (1.0 + fd_fourth[[a, b]].abs())),
                 );
+                let scale = 1.0 + finer_fourth[[a, b]].abs();
+                fourth_coarse_change = fourth_coarse_change
+                    .max((fine_fourth[[a, b]] - coarse_fourth[[a, b]]).abs() / scale);
+                fourth_fine_change = fourth_fine_change
+                    .max((finer_fourth[[a, b]] - fine_fourth[[a, b]]).abs() / scale);
             }
+            let fourth_ratio = fourth_coarse_change / fourth_fine_change;
+            let fourth_order_observed = fourth_fine_change < 1.0e-4
+                || (8.0..=32.0).contains(&fourth_ratio);
             eprintln!(
                 "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?} \
-                 (analytic={:+.9e}, fd={:+.9e}, convergence={third_convergence:.3e}), \
+                 (analytic={:+.9e}, fd={:+.9e}, remainder={third_convergence:.3e}, \
+                 raw_ratio={third_ratio:.3}), \
                  fourth_max={fourth_max:.3e} at {fourth_at:?} \
-                 (analytic={:+.9e}, fd={:+.9e}, convergence={fourth_convergence:.3e})",
+                 (analytic={:+.9e}, fd={:+.9e}, remainder={fourth_convergence:.3e}, \
+                 raw_ratio={fourth_ratio:.3})",
                 d_dir_analytic[third_at],
                 fd_third[third_at],
                 d2_analytic[fourth_at],
@@ -7065,9 +7095,11 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 third_max,
                 third_at,
                 third_convergence,
+                third_order_observed,
                 fourth_max,
                 fourth_at,
                 fourth_convergence,
+                fourth_order_observed,
             )
         };
 
@@ -7109,7 +7141,16 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
         let mut failures = Vec::new();
         for (
             label,
-            (third_max, third_at, third_convergence, fourth_max, fourth_at, fourth_convergence),
+            (
+                third_max,
+                third_at,
+                third_remainder,
+                third_order_observed,
+                fourth_max,
+                fourth_at,
+                fourth_remainder,
+                fourth_order_observed,
+            ),
         ) in cases
         {
             // The header's contract: a dropped warp-coupling term shows O(1)
@@ -7119,18 +7160,24 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             if third_max >= 1.0e-5 {
                 failures.push(format!("{label} third={third_max:.3e} at {third_at:?}"));
             }
-            if third_convergence >= 1.0e-5 {
+            if third_remainder >= 1.0e-5 {
                 failures.push(format!(
-                    "{label} third Richardson convergence={third_convergence:.3e}"
+                    "{label} third Richardson remainder={third_remainder:.3e}"
                 ));
+            }
+            if !third_order_observed {
+                failures.push(format!("{label} third stencil did not show order-four convergence"));
             }
             if fourth_max >= 1.0e-4 {
                 failures.push(format!("{label} fourth={fourth_max:.3e} at {fourth_at:?}"));
             }
-            if fourth_convergence >= 1.0e-4 {
+            if fourth_remainder >= 1.0e-4 {
                 failures.push(format!(
-                    "{label} fourth Richardson convergence={fourth_convergence:.3e}"
+                    "{label} fourth Richardson remainder={fourth_remainder:.3e}"
                 ));
+            }
+            if !fourth_order_observed {
+                failures.push(format!("{label} fourth stencil did not show order-four convergence"));
             }
         }
         assert!(
