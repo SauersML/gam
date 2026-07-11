@@ -9,8 +9,36 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
+use std::sync::Once;
 
 const PI: f64 = std::f64::consts::PI;
+
+struct OuterLifecycleLogger;
+
+impl log::Log for OuterLifecycleLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static OUTER_LIFECYCLE_LOGGER: OuterLifecycleLogger = OuterLifecycleLogger;
+static INIT_OUTER_LIFECYCLE_LOGGER: Once = Once::new();
+
+fn init_outer_lifecycle_logger() {
+    INIT_OUTER_LIFECYCLE_LOGGER.call_once(|| {
+        if log::set_logger(&OUTER_LIFECYCLE_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    });
+}
 
 struct Lcg(u64);
 impl Lcg {
@@ -64,6 +92,7 @@ fn make_sparse_dense() -> gam::data::EncodedDataset {
 }
 
 fn fit_predict_sparse(formula: &str) -> f64 {
+    init_outer_lifecycle_logger();
     let data = make_sparse_dense();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
