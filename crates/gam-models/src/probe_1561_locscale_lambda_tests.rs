@@ -305,6 +305,33 @@ fn probe_1561_gagurine_scale_geometry() {
         .sqrt();
     let nll = gaussian_nll(&test_gag, &test_mu, &test_sigma);
     let constant_nll = gaussian_nll(&test_gag, &test_mu, &vec![constant_sigma; test_gag.len()]);
+    let standardized_residual_energy = |observed: &[f64], mean: &[f64], sigma: &[f64]| {
+        observed
+            .iter()
+            .zip(mean)
+            .zip(sigma)
+            .map(|((&value, &location), &scale)| ((value - location) / scale).powi(2))
+            .sum::<f64>()
+            / observed.len() as f64
+    };
+    let train_calibration = standardized_residual_energy(&train_gag, &train_mu, &train_sigma);
+    let test_calibration = standardized_residual_energy(&test_gag, &test_mu, &test_sigma);
+    let mut heldout_nll_deltas: Vec<(f64, usize)> = test_gag
+        .iter()
+        .enumerate()
+        .map(|(index, &observed)| {
+            let residual = observed - test_mu[index];
+            let varying = test_sigma[index].ln() + 0.5 * (residual / test_sigma[index]).powi(2);
+            let constant = constant_sigma.ln() + 0.5 * (residual / constant_sigma).powi(2);
+            (varying - constant, index)
+        })
+        .collect();
+    heldout_nll_deltas.sort_by(|left, right| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .expect("finite held-out NLL deltas")
+    });
     let range = |values: &[f64]| {
         (
             values.iter().copied().fold(f64::INFINITY, f64::min),
@@ -318,16 +345,39 @@ fn probe_1561_gagurine_scale_geometry() {
         .map(|inference| (inference.edf_by_block.clone(), inference.edf_total));
     let spectrum = penalized_hessian_spectrum(&fit.fit);
     eprintln!(
-        "[#1561 gagurine] response_scale={response_scale:.6} raw_floor={raw_floor:.6} nll={nll:.6} constant_nll={constant_nll:.6} constant_sigma={constant_sigma:.6} train_sigma_range={:?} test_sigma_range={:?} log_lambdas={} edf={edf:?} spectrum={spectrum:?}",
+        "[#1561 gagurine] response_scale={response_scale:.6} raw_floor={raw_floor:.6} nll={nll:.6} constant_nll={constant_nll:.6} constant_sigma={constant_sigma:.6} train_calibration={train_calibration:.6} test_calibration={test_calibration:.6} train_sigma_range={:?} test_sigma_range={:?} location_edf={:.6} location_lambdas={} scale_edf={:.6} scale_lambdas={} log_lambdas={} edf={edf:?} spectrum={spectrum:?}",
         range(&train_sigma),
         range(&test_sigma),
+        location.edf,
+        fmt_vec(
+            location
+                .lambdas
+                .as_slice()
+                .expect("contiguous location lambdas")
+        ),
+        scale.edf,
+        fmt_vec(scale.lambdas.as_slice().expect("contiguous scale lambdas")),
         fmt_vec(fit.fit.log_lambdas.as_slice().expect("contiguous lambdas")),
     );
+    for (delta, index) in heldout_nll_deltas {
+        eprintln!(
+            "[#1561 gagurine row] delta_nll={delta:.6} age={:.6} observed={:.6} mean={:.6} sigma={:.6} residual={:.6}",
+            test_age[index],
+            test_gag[index],
+            test_mu[index],
+            test_sigma[index],
+            test_gag[index] - test_mu[index],
+        );
+    }
 
     assert!(nll.is_finite());
     assert!(
         test_sigma
             .iter()
             .all(|sigma| sigma.is_finite() && *sigma > 0.0)
+    );
+    assert!(
+        nll < constant_nll,
+        "#1561 gagurine varying-scale NLL {nll:.6} did not beat matched constant-scale NLL {constant_nll:.6}"
     );
 }
