@@ -3493,8 +3493,10 @@ fn reactive_arrival_state(
 fn reactive_domain_arrival_accepts_exact_finite_literal_seed() {
     let seed = array![0.125, -0.75];
     let state = reactive_arrival_state(seed.clone(), 3.5);
-    reactive_arrival_postcondition(&state, &seed)
-        .expect("an exact finite literal-seed state must authorize arrival");
+    assert!(
+        reactive_arrival_postcondition(&state, &seed).is_ok(),
+        "an exact finite literal-seed state must authorize arrival"
+    );
 }
 
 #[test]
