@@ -361,12 +361,62 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
         "entry placement must put the two planted factors on distinct atoms; parity dominance={even_dominant:?}"
     );
 
-    let entry_eval = OuterObjective::eval_with_order(
+    let entry_eval_result = OuterObjective::eval_with_order(
         &mut objective,
         &entry_rho,
         OuterEvalOrder::Value,
-    )
-    .expect("separated legal entry must solve to finite evidence");
+    );
+    if let Err(error) = &entry_eval_result {
+        let entry_rho_state = objective.baseline_rho.from_flat(entry_rho.view());
+        let system = objective
+            .term
+            .assemble_arrow_schur(z.view(), &entry_rho_state, None)
+            .expect("failed-entry KKT diagnostic assembly");
+        let assignment_dim = objective.term.assignment.assignment_coord_dim();
+        let mut assignment_grad_sq = 0.0_f64;
+        let mut chart_grad_sq = 0.0_f64;
+        for row in &system.rows {
+            for (index, value) in row.gt.iter().enumerate() {
+                if index < assignment_dim {
+                    assignment_grad_sq += value * value;
+                } else {
+                    chart_grad_sq += value * value;
+                }
+            }
+        }
+        let decoder_grad = system.gb.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let assignments = objective
+            .term
+            .assignment
+            .try_assignments()
+            .expect("failed-entry assignment diagnostic");
+        let (assignment_min, assignment_max) = assignments.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(minimum, maximum), value| (minimum.min(*value), maximum.max(*value)),
+        );
+        let decoder_norms: Vec<f64> = objective
+            .term
+            .atoms
+            .iter()
+            .map(|atom| {
+                atom.decoder_coefficients
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt()
+            })
+            .collect();
+        eprintln!(
+            "[#2080 reactive-entry KKT] error={error}; assignment_grad={:.6e}, \
+             chart_grad={:.6e}, decoder_grad={decoder_grad:.6e}, \
+             assignment_range=[{assignment_min:.6e},{assignment_max:.6e}], \
+             decoder_norms={decoder_norms:?}, lambda_smooth={:?}",
+            assignment_grad_sq.sqrt(),
+            chart_grad_sq.sqrt(),
+            entry_rho_state.lambda_smooth_vec(),
+        );
+    }
+    let entry_eval = entry_eval_result.expect("separated legal entry must solve to finite evidence");
     assert!(
         entry_eval.cost.is_finite(),
         "separated legal entry returned non-finite evidence {}",
