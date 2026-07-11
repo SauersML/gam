@@ -1820,13 +1820,28 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
-            // The posterior-integrated mean E[g⁻¹(η)] can genuinely overflow
-            // f64 (an all-zero Poisson fit leaves se_eta in the thousands, so
-            // exp(η + se_eta²/2) → +inf). +inf IS the correctly rounded value
-            // of that integral; substituting the finite plug-in g⁻¹(η̂) here —
-            // the pre-audit #1515 behavior — silently reported an unbounded
-            // posterior mean as an innocuous finite number. Report it honestly.
-            strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])
+            let pm = strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])?;
+            if pm.is_finite() {
+                return Ok(pm);
+            }
+            // #1515 (locked owner contract; see issue #2255): a fitted model the
+            // public API accepts must always yield a finite response mean. A
+            // pathological coefficient posterior — an all-zero-count Poisson/NB
+            // fit, whose flat-at-η→−∞ likelihood leaves the penalized Hessian
+            // near-singular with `se_eta` in the thousands — makes the
+            // Laplace-lognormal integral E[g⁻¹(η)] = exp(η + se_eta²/2) overflow
+            // f64. That astronomical value is not a meaningful posterior mean:
+            // it is dominated by the far upper tail of the Gaussian η-posterior,
+            // a region where the Gaussian (Laplace) approximation to the true
+            // log-concave, data-bounded posterior is invalid. It also serializes
+            // to JSON null across the gam-pyffi boundary and crashes the Python
+            // shaper with a `None` mean. Degrade to the plug-in / MAP mean
+            // g⁻¹(η̂): finite (exp(η̂) for the log link) and exactly consistent
+            // with the reported `linear_predictor`. The fallback fires ONLY on a
+            // non-finite exact integral — every well-posed fit still reports the
+            // exact posterior mean, so the honest-reporting contract holds
+            // wherever it does not collide with predictability.
+            strategy.inverse_link(eta[i])
         })
         .collect();
 
@@ -5814,7 +5829,15 @@ mod tests {
     }
 
     #[test]
-    fn posterior_mean_overflow_remains_explicit_infinity() {
+    fn posterior_mean_overflow_degrades_to_finite_plugin() {
+        // A representable covariance whose Laplace-lognormal integral overflows
+        // f64 (E[exp(η)] = exp(η̂ + se²/2) = exp(0 + 800)) must NOT surface the
+        // +inf that serializes to JSON null and crashes the Python shaper: the
+        // owner's locked #1515 contract (see issue #2255) requires a model the
+        // public API accepts to always predict a finite response mean. The row
+        // degrades to the plug-in / MAP mean g⁻¹(η̂) = exp(0) = 1 — finite and
+        // consistent with the reported linear predictor. The fallback fires ONLY
+        // on a non-finite exact integral, so every well-posed fit is unaffected.
         let result = predict_gam_posterior_mean(
             array![[1.0]],
             array![0.0].view(),
@@ -5825,8 +5848,15 @@ mod tests {
         .expect("a representable covariance with an overflowing integral is valid");
         assert_eq!(result.eta[0], 0.0);
         assert!(
-            result.mean[0].is_infinite() && result.mean[0].is_sign_positive(),
-            "E[exp(η)] = exp(800) must be reported as +inf, not plug-in exp(0)=1"
+            result.mean[0].is_finite(),
+            "an overflowing posterior-mean integral must degrade to a finite \
+             plug-in, not report +inf (got {})",
+            result.mean[0]
+        );
+        assert!(
+            (result.mean[0] - 1.0).abs() < 1e-12,
+            "plug-in mean must be g⁻¹(η̂) = exp(0) = 1, got {}",
+            result.mean[0]
         );
     }
 
