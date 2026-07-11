@@ -143,24 +143,14 @@ const TRANSFORM_INTERVAL_SCAN_NODES: usize = 17;
 /// transforms (notably survival tails) are decreasing, the min/max also keeps
 /// the returned `(lower, upper)` genuinely ordered.
 ///
-/// `delta_fallback` supplies the delta-method response SE `SE(μ̂)` (and the
-/// central multiplier `z`) used as a finite fallback: on a degenerate fit (an
-/// all-zero Poisson flat likelihood leaves `se_η` in the thousands) a
-/// transformed endpoint `g⁻¹(η ± z·se_η)` overflows to `+inf`, which serializes
-/// across the gam-pyffi boundary as JSON `null` and surfaces as a non-finite /
-/// `None` interval column in the Python shaper — even though the model is a
-/// valid fit. When *either* transformed endpoint of a row is non-finite, that
-/// row falls back to the delta-method band `μ ± z·SE(μ̂)`, which is finite, so a
-/// model the public API reports as fitted always yields finite interval bounds
-/// (#1515). Both endpoints are checked (not the min/max result): `f64::min`/
-/// `max` return the non-NaN argument, so a single `+inf` endpoint would
-/// otherwise slip through as a finite-but-meaningless bound. `None` disables the
-/// fallback (callers whose endpoints are always finite, e.g. unit tests).
+/// Every transformed node must be finite. A non-finite response image is a
+/// typed prediction failure: changing that row to a delta-method interval would
+/// silently substitute a different uncertainty estimand. Degenerate all-zero
+/// count responses are rejected at the family-validation boundary before a fit
+/// is minted (#2255).
 pub fn transform_eta_interval<F>(
     eta_lower: &Array1<f64>,
     eta_upper: &Array1<f64>,
-    mean: &Array1<f64>,
-    delta_fallback: Option<(&Array1<f64>, f64)>,
     bounds: ResponseBounds,
     response_map: F,
 ) -> Result<(Array1<f64>, Array1<f64>), EstimationError>
@@ -196,14 +186,13 @@ where
     let mut mean_lower = Array1::<f64>::zeros(n);
     let mut mean_upper = Array1::<f64>::zeros(n);
     for i in 0..n {
-        if let (Some((mean_se, z)), false) = (delta_fallback, scan_finite[i]) {
-            let half = z * mean_se[i];
-            mean_lower[i] = mean[i] - half;
-            mean_upper[i] = mean[i] + half;
-        } else {
-            mean_lower[i] = scan_min[i].min(scan_max[i]);
-            mean_upper[i] = scan_max[i].max(scan_min[i]);
+        if !scan_finite[i] {
+            return Err(EstimationError::InvalidInput(format!(
+                "response-scale interval transform produced a non-finite value at row {i}"
+            )));
         }
+        mean_lower[i] = scan_min[i].min(scan_max[i]);
+        mean_upper[i] = scan_max[i].max(scan_min[i]);
     }
     bounds.clamp_in_place(&mut mean_lower);
     bounds.clamp_in_place(&mut mean_upper);
@@ -232,14 +221,11 @@ pub fn delta_mean_interval(
 /// η interval directly, and dispersion families take the delta-method route.
 pub enum MeanBoundMethod<'a> {
     /// Transform `η ± z·SE(η)` through the supplied response map (non-monotone
-    /// safe) and clamp to `bounds`. `mean_se` is the delta-method response SE
-    /// used as a finite fallback when a transformed endpoint overflows on a
-    /// degenerate fit (see [`transform_eta_interval`]); `None` disables the
-    /// fallback for callers whose endpoints are always finite.
+    /// safe) and clamp to `bounds`. Non-finite transformed values are errors;
+    /// this path never substitutes a delta-method interval.
     TransformEta {
         bounds: ResponseBounds,
         response_map: &'a (dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + 'a),
-        mean_se: Option<&'a Array1<f64>>,
     },
     /// `μ ± z·SE(μ)` clamped to `bounds`.
     Delta {
@@ -263,15 +249,7 @@ pub fn mean_bounds(
         MeanBoundMethod::TransformEta {
             bounds,
             response_map,
-            mean_se,
-        } => transform_eta_interval(
-            eta_lower,
-            eta_upper,
-            mean,
-            mean_se.map(|se| (se, z)),
-            bounds,
-            response_map,
-        ),
+        } => transform_eta_interval(eta_lower, eta_upper, bounds, response_map),
         MeanBoundMethod::Delta { mean_se, bounds } => {
             Ok(delta_mean_interval(mean, mean_se, z, bounds))
         }
@@ -648,7 +626,6 @@ fn mean_bound_method_for<'a, T: PredictionTransform>(
         ResponseInterval::TransformEta => MeanBoundMethod::TransformEta {
             bounds: transform.bounds(),
             response_map,
-            mean_se: Some(mean_se),
         },
         ResponseInterval::IdentityEta => MeanBoundMethod::IdentityEta,
         ResponseInterval::CollapsedDelta | ResponseInterval::SymmetricDelta => {
@@ -1114,7 +1091,6 @@ mod parity_tests {
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNIT_PROBABILITY,
                 response_map: &logistic,
-                mean_se: None,
             },
             None,
             UncertaintyProvenance {
@@ -1128,6 +1104,26 @@ mod parity_tests {
         assert_close(&out.eta_upper, &ref_eta_upper, "eta upper");
         assert_close(&out.mean_lower, &ref_mean_lower, "mean lower");
         assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
+    }
+
+    #[test]
+    fn transform_eta_nonfinite_image_is_a_typed_error() {
+        let eta_lower = array![0.0_f64];
+        let eta_upper = array![800.0_f64];
+        let exponential = |eta: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(eta.mapv(f64::exp))
+        };
+        let error = transform_eta_interval(
+            &eta_lower,
+            &eta_upper,
+            ResponseBounds::UNBOUNDED,
+            exponential,
+        )
+        .expect_err("a non-finite transformed interval must not switch estimands");
+        assert!(
+            error.to_string().contains("non-finite value at row 0"),
+            "unexpected error: {error}"
+        );
     }
 
     /// GaussianLocationScalePredictor shape: identity link (mean interval ==
@@ -1261,7 +1257,6 @@ mod parity_tests {
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNIT_PROBABILITY,
                 response_map: &logistic,
-                mean_se: None,
             },
         )
         .expect("engine assembly");
@@ -1291,7 +1286,6 @@ mod parity_tests {
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNIT_PROBABILITY,
                 response_map: &logistic,
-                mean_se: None,
             },
         )
         .expect("engine assembly");
@@ -1331,7 +1325,6 @@ mod parity_tests {
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNBOUNDED,
                 response_map: &square,
-                mean_se: None,
             },
             None,
             UncertaintyProvenance {
@@ -1379,7 +1372,6 @@ mod parity_tests {
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::UNIT_PROBABILITY,
                 response_map: &decreasing,
-                mean_se: None,
             },
             None,
             UncertaintyProvenance {

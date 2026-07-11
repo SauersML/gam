@@ -1,40 +1,41 @@
-"""Regression for #1515: all-zero Poisson predict() must return finite means.
+"""All-zero count responses have no finite log-rate optimum (#1515/#2255).
 
-An all-zero-count Poisson GAM produces a near-flat likelihood with an
-astronomically wide posterior SE. The posterior-integrated mean
-E[exp(η)] = exp(η + se²/2) previously overflowed to +inf (serialized
-as JSON null / Python None), crashing predict() with a TypeError.
-
-The fix floors the exponent when it would overflow, falling back to the
-plug-in exp(η) — a finite, non-negative near-zero rate.
+The historical contract forced such fits through and then changed an
+overflowing posterior mean into a finite plug-in inverse link. That substituted
+a MAP estimand for the required posterior mean. The family validation boundary
+now refuses the unidentifiable fit before optimization, with one typed message
+shared by Rust, CLI, and Python.
 """
 
+from __future__ import annotations
+
 import numpy as np
+import pytest
+
 import gamfit
 
 
-def test_all_zero_poisson_predict_returns_finite_mean():
+@pytest.mark.parametrize("formula", ["y ~ 1", "y ~ s(x)"])
+@pytest.mark.parametrize("family", ["poisson", "negative_binomial"])
+def test_all_zero_count_response_is_rejected_before_fit(formula: str, family: str) -> None:
     data = {"x": np.linspace(0.0, 1.0, 200), "y": np.zeros(200)}
-    m = gamfit.fit(data, "y ~ s(x)", family="poisson")
-    pred = np.asarray(m.predict(data), dtype=float).ravel()
-    assert np.all(np.isfinite(pred)), f"predict must be finite, got non-finite values"
-    assert np.all(pred >= 0.0), f"Poisson mean must be non-negative"
-    assert pred.max() < 1.0, f"all-zero counts must give near-zero rate, got max={pred.max()}"
+
+    with pytest.raises(gamfit.GamError) as excinfo:
+        gamfit.fit(data, formula, family=family)
+
+    message = str(excinfo.value)
+    assert "all counts are 0" in message, message
+    assert "no finite fitted mode or finite posterior mean/variance" in message, message
+    assert "at least one positive count" in message, message
 
 
-def test_all_zero_poisson_intercept_only_predict_returns_finite_mean():
-    data = {"x": np.linspace(0.0, 1.0, 200), "y": np.zeros(200)}
-    m = gamfit.fit(data, "y ~ 1", family="poisson")
-    pred = np.asarray(m.predict(data), dtype=float).ravel()
-    assert np.all(np.isfinite(pred)), f"predict must be finite"
-    assert np.all(pred >= 0.0)
-    assert pred.max() < 1.0, f"all-zero counts must give near-zero rate, got max={pred.max()}"
-
-
-def test_all_zero_negative_binomial_predict_returns_finite_mean():
-    data = {"x": np.linspace(0.0, 1.0, 200), "y": np.zeros(200)}
-    m = gamfit.fit(data, "y ~ 1", family="negative_binomial")
-    pred = np.asarray(m.predict(data), dtype=float).ravel()
-    assert np.all(np.isfinite(pred)), f"predict must be finite"
-    assert np.all(pred >= 0.0)
-    assert pred.max() < 1.0, f"all-zero counts must give near-zero rate, got max={pred.max()}"
+@pytest.mark.parametrize("family", ["poisson", "negative_binomial"])
+def test_count_response_with_positive_event_is_not_rejected_as_degenerate(family: str) -> None:
+    x = np.linspace(0.0, 1.0, 200)
+    y = np.zeros(200)
+    y[::20] = 1.0
+    model = gamfit.fit({"x": x, "y": y}, "y ~ 1", family=family)
+    prediction = np.asarray(model.predict({"x": x, "y": y}), dtype=float).ravel()
+    assert prediction.shape == y.shape
+    assert np.all(np.isfinite(prediction))
+    assert np.all(prediction > 0.0)

@@ -900,6 +900,110 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
+    /// Per-(atom, axis) derivative of the coordinate-block term
+    /// `½ Σ_i log|H_tt^(i)|` that the rank-charge criterion subtracts from the
+    /// full joint Laplace log-determinant.
+    ///
+    /// Unlike [`Self::ard_log_precision_hessian_trace`], this contracts against
+    /// the row-local inverse `H_tt^(i)⁻¹` itself, with no beta-Schur
+    /// back-substitution. Spectrally conditioned rows use the same
+    /// Daleckii--Krein deflation-map differential as the scalar row-factor
+    /// logdet, so this is the exact derivative of the `htt_half` value term.
+    pub(crate) fn coordinate_block_ard_log_precision_hessian_trace(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        let row_weights = self.row_loss_weights.as_deref();
+        let coord_offsets = self.assignment.coord_offsets();
+        let periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(LatentCoordValues::effective_axis_periods)
+            .collect();
+        let mut traces: Vec<Array1<f64>> = self
+            .assignment
+            .coords
+            .iter()
+            .enumerate()
+            .map(|(atom, coord)| {
+                if rho.log_ard[atom].is_empty() {
+                    Array1::<f64>::zeros(0)
+                } else {
+                    Array1::<f64>::zeros(coord.latent_dim())
+                }
+            })
+            .collect();
+
+        for row in 0..self.n_obs() {
+            let q = cache.row_dims[row];
+            let factor = cache.undamped_factor(row);
+            let mut inverse = Array2::<f64>::zeros((q, q));
+            let mut unit = Array1::<f64>::zeros(q);
+            for col in 0..q {
+                unit.fill(0.0);
+                unit[col] = 1.0;
+                let solved = cholesky_solve_vector(factor, unit.view());
+                for inverse_row in 0..q {
+                    inverse[[inverse_row, col]] = solved[inverse_row];
+                }
+            }
+            let directions = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
+            let mut accumulate = |atom: usize, axis: usize, slot: usize| {
+                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                let t = self.assignment.coords[atom].row(row)[axis];
+                let prior = ArdAxisPrior::eval(alpha, t, periods[atom][axis]);
+                let curvature = row_weight * prior.hess.max(0.0);
+                let mut trace = inverse[[slot, slot]] * curvature;
+                if !directions.is_empty() && curvature != 0.0 {
+                    let mut derivative = Array2::<f64>::zeros((q, q));
+                    derivative[[slot, slot]] = curvature;
+                    trace -= Self::deflation_block_correction(
+                        &inverse,
+                        &derivative,
+                        directions,
+                        spectrum,
+                    );
+                }
+                traces[atom][axis] += 0.5 * trace;
+            };
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    for (position, &atom) in layout.active_atoms[row].iter().enumerate() {
+                        if rho.log_ard[atom].is_empty() {
+                            continue;
+                        }
+                        let start = layout.coord_starts[row][position];
+                        for axis in 0..self.assignment.coords[atom].latent_dim() {
+                            accumulate(atom, axis, start + axis);
+                        }
+                    }
+                }
+                None => {
+                    for atom in 0..self.k_atoms() {
+                        if rho.log_ard[atom].is_empty() {
+                            continue;
+                        }
+                        for axis in 0..self.assignment.coords[atom].latent_dim() {
+                            accumulate(atom, axis, coord_offsets[atom] + axis);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(traces)
+    }
+
     /// Per-atom, per-axis `½ tr(H⁻¹ ∂H/∂logα_{kj})` — the ARD ½log|H| ρ-gradient
     /// channel [`Self::ard_log_precision_hessian_trace`] computes — from the #2080
     /// SHARED selected-inverse bundle instead of the dense `DeflatedArrowSolver`

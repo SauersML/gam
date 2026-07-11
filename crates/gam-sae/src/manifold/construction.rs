@@ -132,6 +132,9 @@ include!("softmax_entropy_majorizer.rs");
 // gate.
 include!("construction_exact_hessian.rs");
 
+// [#2253] Exact hard-rank-charge direct and implicit-response derivatives.
+include!("construction_rank_charge_derivative.rs");
+
 // [#780] The outer-gradient error taxonomy (`OuterGradientError`), the
 // `ForcedRowLayout` override alias, the `COTRAIN_*` co-training weight
 // constants, and the `AmortizedEncoderConsistency` report were extracted

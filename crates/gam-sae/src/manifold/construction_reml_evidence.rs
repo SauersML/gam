@@ -2940,6 +2940,189 @@ impl SaeManifoldTerm {
         Ok(0.5 * trace)
     }
 
+    /// Derivative of the coordinate-block logdet
+    /// `½ Σ_i log|H_tt^(i)|` with respect to the assignment-strength rho
+    /// coordinate. The canonical criterion subtracts this term from the full
+    /// joint logdet, so the outer gradient must subtract this trace too.
+    pub(crate) fn coordinate_block_assignment_log_strength_hessian_trace(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+    ) -> Result<f64, String> {
+        let k_atoms = self.k_atoms();
+        let assignment_dim = self.assignment.assignment_coord_dim();
+        let row_weights = self.row_loss_weights.as_deref();
+
+        let softmax = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = temperature.recip();
+                Some((
+                    temperature,
+                    rho.lambda_sparse() * sparsity * inv_tau * inv_tau,
+                    gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms,
+                        temperature,
+                    ),
+                ))
+            }
+            AssignmentMode::Softmax { .. } => return Ok(0.0),
+            _ => None,
+        };
+        let mut hdiag = if softmax.is_none() {
+            crate::assignment::assignment_prior_log_strength_hdiag_weighted(
+                &self.assignment,
+                rho,
+                row_weights,
+            )?
+        } else {
+            Array1::<f64>::zeros(0)
+        };
+        if softmax.is_none() && hdiag.is_empty() {
+            return Ok(0.0);
+        }
+
+        let mut ibp_channels = ibp_assignment_third_channels_weighted(
+            &self.assignment,
+            rho,
+            false,
+            row_weights,
+        )?;
+        let learnable_alpha = matches!(
+            self.assignment.mode,
+            AssignmentMode::IBPMap {
+                learnable_alpha: true,
+                ..
+            }
+        );
+        if let Some(channels) = ibp_channels.as_mut() {
+            for row in 0..self.n_obs() {
+                for atom in 0..k_atoms {
+                    let index = row * k_atoms + atom;
+                    hdiag[index] =
+                        super::construction_arrow_schur_assembly::ibp_psd_majorized_hdiag(
+                            channels,
+                            row,
+                            k_atoms,
+                            atom,
+                            hdiag[index],
+                        );
+                }
+            }
+            for atom in 0..k_atoms {
+                if channels.cross_row_d[atom] < 0.0 {
+                    channels.cross_row_d[atom] = 0.0;
+                    channels.cross_row_d_logalpha[atom] = 0.0;
+                }
+            }
+        }
+
+        let mut total_trace = 0.0_f64;
+        for row in 0..self.n_obs() {
+            let q = cache.row_dims[row];
+            let factor = cache.undamped_factor(row);
+            let mut inverse = Array2::<f64>::zeros((q, q));
+            let mut unit = Array1::<f64>::zeros(q);
+            for col in 0..q {
+                unit.fill(0.0);
+                unit[col] = 1.0;
+                let solved = cholesky_solve_vector(factor, unit.view());
+                for inverse_row in 0..q {
+                    inverse[[inverse_row, col]] = solved[inverse_row];
+                }
+            }
+            let mut derivative = Array2::<f64>::zeros((q, q));
+            if let Some((temperature, scale, penalty)) = softmax.as_ref() {
+                let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
+                match self.last_row_layout {
+                    Some(ref layout) => {
+                        let assignments = crate::assignment::softmax_row(
+                            self.assignment.logits.row(row),
+                            *temperature,
+                        );
+                        let assignments = assignments
+                            .as_slice()
+                            .expect("softmax assignment row is contiguous");
+                        let mean = softmax_majorizer_log_mean(assignments);
+                        for (slot, &atom) in layout.logit_atoms[row].iter().enumerate() {
+                            derivative[[slot, slot]] = row_weight
+                                * active_softmax_gershgorin_majorizer_entry(
+                                    assignments,
+                                    atom,
+                                    mean,
+                                    *scale,
+                                );
+                        }
+                    }
+                    None => {
+                        let logits = (0..k_atoms)
+                            .map(|atom| self.assignment.logits[[row, atom]])
+                            .collect::<Vec<_>>();
+                        let curvature = penalty.psd_majorizer_abs_row_sums(&logits, *scale);
+                        for atom in 0..assignment_dim.min(q) {
+                            derivative[[atom, atom]] = row_weight * curvature[atom];
+                        }
+                    }
+                }
+            } else {
+                let assignment_base = row * k_atoms;
+                let self_curvature = |atom: usize| -> f64 {
+                    let Some(channels) = ibp_channels.as_ref() else {
+                        return 0.0;
+                    };
+                    let coefficient = if learnable_alpha {
+                        channels.cross_row_d_logalpha[atom]
+                    } else {
+                        channels.cross_row_d[atom]
+                    };
+                    let jacobian = channels.z_jac[assignment_base + atom];
+                    coefficient * jacobian * jacobian
+                };
+                match self.last_row_layout {
+                    Some(ref layout) => {
+                        for (slot, &atom) in layout.active_atoms[row].iter().enumerate() {
+                            derivative[[slot, slot]] =
+                                hdiag[assignment_base + atom] - self_curvature(atom);
+                        }
+                    }
+                    None => {
+                        for atom in 0..assignment_dim.min(q) {
+                            derivative[[atom, atom]] =
+                                hdiag[assignment_base + atom] - self_curvature(atom);
+                        }
+                    }
+                }
+            }
+            let mut row_trace = 0.0_f64;
+            for a in 0..q {
+                for b in 0..q {
+                    row_trace += inverse[[b, a]] * derivative[[a, b]];
+                }
+            }
+            let directions = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !directions.is_empty() {
+                let spectrum = cache
+                    .deflation_row_spectra
+                    .get(row)
+                    .and_then(Option::as_ref);
+                row_trace -= Self::deflation_block_correction(
+                    &inverse,
+                    &derivative,
+                    directions,
+                    spectrum,
+                );
+            }
+            total_trace += row_trace;
+        }
+        Ok(0.5 * total_trace)
+    }
+
     /// Matrix-free sibling of [`Self::assignment_log_strength_hessian_trace`]
     /// for assignment families whose prior curvature is row-local (softmax,
     /// threshold gate, and TopK).  Reconstructs each undeflated row's selected-
@@ -3848,6 +4031,27 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<SaeArrowVector, String> {
+        self.logdet_theta_adjoint_for_block(rho, cache, solver, true)
+    }
+
+    /// `Γ_tt = ∂_theta Σ_i log|H_tt^(i)|`, the state derivative of the
+    /// coordinate-block logdet removed by the canonical rank-charge criterion.
+    pub(crate) fn coordinate_block_logdet_theta_adjoint(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+    ) -> Result<SaeArrowVector, String> {
+        self.logdet_theta_adjoint_for_block(rho, cache, solver, false)
+    }
+
+    fn logdet_theta_adjoint_for_block(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        joint_block: bool,
+    ) -> Result<SaeArrowVector, String> {
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
         // the SAME object the evidence factor builds — Gauss-Newton data
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
@@ -3875,13 +4079,17 @@ impl SaeManifoldTerm {
         // #932 FRONT C: plain-arrow `(H⁻¹)_ββ = S⁻¹` formed once from the cached
         // Schur factor; gauge / #1038 cross-row Woodbury fall back to the per-β
         // `solve` loop where the row-local Takahashi blocks are not valid.
-        let fast_selected = solver.plain_selected_inverse_available();
-        let beta_inv = Self::selected_inverse_beta_block(
-            solver,
-            cache,
-            fast_selected,
-            "logdet_theta_adjoint",
-        )?;
+        let fast_selected = joint_block && solver.plain_selected_inverse_available();
+        let beta_inv = if joint_block {
+            Self::selected_inverse_beta_block(
+                solver,
+                cache,
+                fast_selected,
+                "logdet_theta_adjoint",
+            )?
+        } else {
+            Array2::<f64>::zeros((cache.k, cache.k))
+        };
         // IBP `hessian_diag` logit third-derivative channels (#1006). The full
         // IBP Hessian also has per-column cross-row rank-one terms
         // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE carried in `H` via the #1038
@@ -3987,20 +4195,35 @@ impl SaeManifoldTerm {
 
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row
             // full-system `solve` loop under gauge / cross-row Woodbury.
-            let (inv_vv, inv_vbeta) = Self::selected_inverse_row_blocks_or_solve(
-                &SelectedInverseRowSolve {
-                    solver,
-                    cache,
-                    beta_inv: &beta_inv,
-                    fast_selected,
-                    rhs_beta_zero: rhs_beta_zero.view(),
-                    context: "logdet_theta_adjoint",
-                },
-                row,
-                base,
-                q,
-                &mut rhs_t_scratch,
-            )?;
+            let (inv_vv, inv_vbeta) = if joint_block {
+                Self::selected_inverse_row_blocks_or_solve(
+                    &SelectedInverseRowSolve {
+                        solver,
+                        cache,
+                        beta_inv: &beta_inv,
+                        fast_selected,
+                        rhs_beta_zero: rhs_beta_zero.view(),
+                        context: "logdet_theta_adjoint",
+                    },
+                    row,
+                    base,
+                    q,
+                    &mut rhs_t_scratch,
+                )?
+            } else {
+                let factor = cache.undamped_factor(row);
+                let mut inverse = Array2::<f64>::zeros((q, q));
+                let mut unit = Array1::<f64>::zeros(q);
+                for col in 0..q {
+                    unit[col] = 1.0;
+                    let solved = cholesky_solve_vector(factor, unit.view());
+                    unit[col] = 0.0;
+                    for inverse_row in 0..q {
+                        inverse[[inverse_row, col]] = solved[inverse_row];
+                    }
+                }
+                (inverse, Array2::<f64>::zeros((q, cache.k)))
+            };
 
             // Per-row UNIT-stiffness deflated directions: the selected inverse
             // `inv_vv` is the DEFLATED inverse (it assigns `1/λ̃ = 1` to each
@@ -4153,7 +4376,7 @@ impl SaeManifoldTerm {
                                 _ => 0.0,
                             };
                         }
-                        let mut deflated_base_dh = dh;
+                        let mut ibp_self_derivative = 0.0_f64;
                         // #2144: the row factor that spectral deflation conditions is
                         // the IBP no-self base `H0'`, because
                         // `solve_arrow_newton_step_with_options` downdates the
@@ -4175,11 +4398,19 @@ impl SaeManifoldTerm {
                         {
                             if a == b && diag_atom == wrt_atom {
                                 let idx = row * k_atoms + diag_atom;
-                                deflated_base_dh -= 2.0
+                                ibp_self_derivative = 2.0
                                     * channels.cross_row_d[diag_atom]
                                     * channels.z_jac[idx]
                                     * channels.logit_curvature[idx];
                             }
+                        }
+                        let deflated_base_dh = dh - ibp_self_derivative;
+                        if !joint_block {
+                            // `htt_half` is formed from the factored IBP no-self
+                            // row base. Its raw contraction therefore excludes
+                            // the local diagonal piece reintroduced only by the
+                            // joint cross-row Woodbury carrier.
+                            dh = deflated_base_dh;
                         }
                         deflated_base_dh_mat[[a, b]] = deflated_base_dh;
                         gamma += inv_vv[[b, a]] * dh;
@@ -4264,12 +4495,23 @@ impl SaeManifoldTerm {
                 let j = channels.z_jac[idx];
                 let self_mass = channels.cross_row_dd[site.atom] * j * j;
                 let no_self_mass = channels.m_channel[idx] - self_mass;
-                col_coeff[site.atom] += site.raw_diag * channels.m_channel[idx]
+                let raw_mass = if joint_block {
+                    channels.m_channel[idx]
+                } else {
+                    no_self_mass
+                };
+                col_coeff[site.atom] += site.raw_diag * raw_mass
                     - site.no_self_diag_deflation_weight * no_self_mass;
             }
             for site in &ibp_logit_sites {
                 let idx = site.row * k_atoms + site.atom;
                 gamma_t[site.t_index] += col_coeff[site.atom] * channels.z_jac[idx];
+            }
+            if !joint_block {
+                return Ok(SaeArrowVector {
+                    t: gamma_t,
+                    beta: gamma_beta,
+                });
             }
 
             // #1416 / #1641: the EXACT cross-row Woodbury derivative of Γ. The
