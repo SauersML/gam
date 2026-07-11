@@ -551,7 +551,7 @@ impl SaeManifoldTerm {
     }
 
     /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
-    /// on the closed-form gauge quotient via left-`B_Q`-preconditioned GMRES
+    /// on the closed-form gauge quotient via right-`B_Q`-preconditioned GMRES
     /// ([`solve_b_preconditioned_gmres`]) with the matrix-free
     /// `A_Q v = B v + ΔC v + κ Q Qᵀv` apply owned by
     /// [`solve_exact_stationarity_on_gauge_quotient`]. The

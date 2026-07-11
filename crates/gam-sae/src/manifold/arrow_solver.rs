@@ -704,17 +704,20 @@ fn admitted_gmres_restart(dim: usize) -> Result<usize, String> {
     Ok(low)
 }
 
-/// Solve `A x = rhs` by left-preconditioned restarted GMRES.
+/// Solve `A x = rhs` by right-preconditioned restarted GMRES.
 ///
 /// The exact stationarity Jacobian `A` contains residual and prior curvature and
 /// can be indefinite. Conjugate gradients is therefore not admissible: its SPD
 /// recurrence can stop at negative curvature and silently return a non-solution.
-/// GMRES instead minimizes the preconditioned residual without an SPD assumption.
-/// A candidate is returned only after the *original* residual `||rhs - A x||`
-/// meets tolerance; exhaustion or Arnoldi breakdown is a typed error, never a
-/// last-iterate fallback. The preconditioner closure supports both the dense
-/// factor cache and the matrix-free reduced-Schur inverse through this one live
-/// implementation.
+/// GMRES instead minimizes the original residual without an SPD assumption.
+/// Right preconditioning solves `A B⁻¹ y = rhs`, `x = B⁻¹ y`: unlike left
+/// preconditioning, the Arnoldi least-squares norm is exactly the residual that
+/// certifies `A x = rhs`. An ill-scaled `B⁻¹` therefore cannot report numerical
+/// stagnation merely because `B⁻¹(rhs - A x)` is tiny while the physical
+/// equation remains unresolved (#2258). Exhaustion or Arnoldi breakdown is a
+/// typed error, never a last-iterate fallback. The preconditioner closure
+/// supports both the dense factor cache and the matrix-free reduced-Schur
+/// inverse through this one live implementation.
 pub(crate) fn solve_b_preconditioned_gmres_with<F, P>(
     rhs: &SaeArrowVector,
     apply_a: F,
@@ -744,20 +747,13 @@ where
     if !rhs_norm.is_finite() {
         return Err("solve_b_preconditioned_gmres: non-finite right-hand side".to_string());
     }
-    let b = precondition(rhs)
-        .map_err(|err| format!("solve_b_preconditioned_gmres: B inverse: {err}"))?;
-    let b = flatten_arrow_parts(b.t.view(), b.beta.view());
-    let b_norm = b.dot(&b).sqrt();
-    if !(b_norm.is_finite() && b_norm > 0.0) {
-        return Err(format!(
-            "solve_b_preconditioned_gmres: invalid preconditioned right-hand-side norm {b_norm}"
-        ));
-    }
+    let b = rhs_flat;
+    let b_norm = rhs_norm;
     let relative_floor = f64::EPSILON.sqrt();
     // Full-memory whenever the live memory ledger admits it. There is no
     // iteration ceiling: each restarted cycle must make a strictly
-    // representable reduction in the preconditioned residual, and inability to
-    // do so is the typed numerical-stagnation certificate.
+    // representable reduction in the original residual, and inability to do so
+    // is the typed numerical-stagnation certificate.
     let restart = admitted_gmres_restart(dim)?;
     let mut iterations = 0usize;
     let mut x = Array1::<f64>::zeros(dim);
@@ -766,20 +762,23 @@ where
         t: flat.slice(s![..t_len]).to_owned(),
         beta: flat.slice(s![t_len..]).to_owned(),
     };
-    let apply_preconditioned = |flat: &Array1<f64>| -> Result<Array1<f64>, String> {
-        let v = as_arrow(flat);
-        let av = apply_a(&v)?;
-        let pav = precondition(&av)
-            .map_err(|err| format!("solve_b_preconditioned_gmres: B preconditioner: {err}"))?;
-        Ok(flatten_arrow_parts(pav.t.view(), pav.beta.view()))
+    let recover_solution = |flat: &Array1<f64>| -> Result<SaeArrowVector, String> {
+        let right_unknown = as_arrow(flat);
+        precondition(&right_unknown)
+            .map_err(|err| format!("solve_b_preconditioned_gmres: B inverse: {err}"))
+    };
+    let apply_right_preconditioned = |flat: &Array1<f64>| -> Result<Array1<f64>, String> {
+        let physical = recover_solution(flat)?;
+        let applied = apply_a(&physical)?;
+        Ok(flatten_arrow_parts(applied.t.view(), applied.beta.view()))
     };
 
     loop {
-        let px = apply_preconditioned(&x)?;
+        let px = apply_right_preconditioned(&x)?;
         let mut residual = &b - &px;
         let residual_norm = residual.dot(&residual).sqrt();
         if residual_norm <= relative_floor * b_norm {
-            let candidate = as_arrow(&x);
+            let candidate = recover_solution(&x)?;
             let ax = apply_a(&candidate)?;
             let original = SaeArrowVector {
                 t: &rhs.t - &ax.t,
@@ -791,9 +790,7 @@ where
             }
         }
         if !(residual_norm.is_finite() && residual_norm > 0.0) {
-            return Err(
-                "solve_b_preconditioned_gmres: non-finite preconditioned residual".to_string(),
-            );
+            return Err("solve_b_preconditioned_gmres: non-finite original residual".to_string());
         }
 
         residual.mapv_inplace(|value| value / residual_norm);
@@ -808,7 +805,7 @@ where
         let mut used = 0usize;
 
         for j in 0..cycle {
-            let mut w = apply_preconditioned(&basis[j])?;
+            let mut w = apply_right_preconditioned(&basis[j])?;
             // Modified Gram-Schmidt Arnoldi.
             for i in 0..=j {
                 let hij = basis[i].dot(&w);
@@ -877,7 +874,7 @@ where
             }
         }
 
-        let candidate = as_arrow(&x);
+        let candidate = recover_solution(&x)?;
         let ax = apply_a(&candidate)?;
         let original = SaeArrowVector {
             t: &rhs.t - &ax.t,
@@ -892,18 +889,66 @@ where
         if original_norm <= roundoff_floor {
             return Ok(candidate);
         }
-        let next_px = apply_preconditioned(&x)?;
+        let next_px = apply_right_preconditioned(&x)?;
         let next_residual = &b - &next_px;
         let next_norm = next_residual.dot(&next_residual).sqrt();
         if !(next_norm.is_finite() && next_norm < residual_norm) {
             return Err(format!(
                 "solve_b_preconditioned_gmres: no representable residual reduction after \
-                 {iterations} iterations (restart {restart}, dimension {dim}); preconditioned \
-                 residual {residual_norm:.3e} -> {next_norm:.3e}, original relative residual \
+                 {iterations} iterations (restart {restart}, dimension {dim}); original \
+                 residual {residual_norm:.3e} -> {next_norm:.3e}, relative residual \
                  {:.3e}, round-off certification floor {:.3e}",
                 original_norm / rhs_norm,
                 roundoff_floor / rhs_norm,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod right_preconditioned_gmres_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn certifies_original_residual_under_ill_scaled_preconditioner_2258() {
+        // A x = rhs has x=(1,1). B^-1 scales the two physical coordinates in
+        // opposite directions, so a left-preconditioned residual is a poor
+        // proxy for the physical equation. Right GMRES must still solve and
+        // certify rhs-Ax in the original norm.
+        let rhs = SaeArrowVector {
+            t: array![5.0_f64, 5.0],
+            beta: Array1::zeros(0),
+        };
+        let apply_a = |value: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            Ok(SaeArrowVector {
+                t: array![
+                    3.0 * value.t[0] + 2.0 * value.t[1],
+                    value.t[0] + 4.0 * value.t[1],
+                ],
+                beta: Array1::zeros(0),
+            })
+        };
+        let precondition = |value: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            Ok(SaeArrowVector {
+                t: array![1.0e-3 * value.t[0], 1.0e3 * value.t[1]],
+                beta: Array1::zeros(0),
+            })
+        };
+
+        let solved = solve_b_preconditioned_gmres_with(&rhs, apply_a, precondition)
+            .expect("right-preconditioned solve");
+        let applied = apply_a(&solved).expect("physical operator");
+        let residual = SaeArrowVector {
+            t: &rhs.t - &applied.t,
+            beta: Array1::zeros(0),
+        };
+        assert!(
+            sae_norm(&residual) <= f64::EPSILON.sqrt() * sae_norm(&rhs),
+            "physical residual was not certified: relative={:.3e}",
+            sae_norm(&residual) / sae_norm(&rhs),
+        );
+        assert!((solved.t[0] - 1.0).abs() <= f64::EPSILON.sqrt());
+        assert!((solved.t[1] - 1.0).abs() <= f64::EPSILON.sqrt());
     }
 }
