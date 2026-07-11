@@ -478,6 +478,21 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitReport, 
             for mut row in request.target.rows_mut() {
                 row /= &sigma;
             }
+            // The standardization is a CHANGE OF COORDINATES on the output
+            // space, so it must map EVERY fit input into the internal frame —
+            // the target AND the seed state. The seed was constructed by the
+            // caller in raw units; leaving its decoder raw would hand the fit
+            // a warm start mis-scaled by up to the per-column RMS ratio
+            // (x̂_int must satisfy σ ⊙ x̂_int ≈ x_raw ⇒ B_int[:,c] =
+            // B_raw[:,c]/σ_c). Latent coordinates and gate logits are
+            // unit-free and untouched; a cold all-zero decoder is a no-op.
+            for atom in &mut request.base_term.atoms {
+                for (col_idx, s) in sigma.iter().enumerate() {
+                    for coeff in atom.decoder_coefficients.column_mut(col_idx).iter_mut() {
+                        *coeff /= *s;
+                    }
+                }
+            }
             Some(sigma)
         } else {
             None
