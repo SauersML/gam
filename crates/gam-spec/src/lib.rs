@@ -291,6 +291,7 @@ pub struct SasLinkState {
     /// - `Sas`: effective tail parameter `delta = exp(B * tanh(log_delta / B))`,
     ///   `B = SAS_LOG_DELTA_BOUND`.
     /// - `BetaLogistic`: geometric-mean beta shape `exp(log_delta) = sqrt(a*b)`.
+    ///
     /// The beta-logistic derivative kernels take `log_delta` (the log center), so
     /// passing this exponentiated `delta` to them would be off by an `exp`.
     pub delta: f64,

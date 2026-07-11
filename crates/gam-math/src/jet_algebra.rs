@@ -177,6 +177,9 @@ where
     if m >= 4 {
         let full = 1usize << m;
         let mut block_val = [0.0f64; 1 << MAX_SLOTS];
+        // `submask` is both the loop value (bit-scanned below) and the
+        // `block_val` index, so a `.iter_mut()` rewrite doesn't apply here.
+        #[allow(clippy::needless_range_loop)]
         for submask in 1..full {
             labelled.len = 0;
             let mut bits = submask;

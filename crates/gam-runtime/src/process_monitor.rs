@@ -498,7 +498,7 @@ impl ProcessResourceSnapshot {
     fn read() -> Self {
         #[cfg(target_os = "linux")]
         {
-            return Self::read_linux();
+            Self::read_linux()
         }
         #[cfg(not(target_os = "linux"))]
         {
