@@ -128,6 +128,22 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             &audit_solver,
         )
         .expect("frozen accepted-state gradient components");
+    let mut kkt_term = audit_term.clone();
+    let kkt_system = kkt_term
+        .assemble_arrow_schur(
+            gradient_objective.target.view(),
+            &rho_state,
+            gradient_objective.registry.as_ref(),
+        )
+        .expect("accepted-state KKT system");
+    let kkt_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&kkt_system);
+    let kkt_norm = kkt_norm_sq.sqrt();
+    let quotient_kkt_norm = kkt_term.quotient_gradient_norm_from_system(
+        &kkt_system,
+        kkt_norm_sq,
+        &rho_state.lambda_smooth_vec(),
+    );
+    let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
 
     let direction = array![0.6_f64, -0.8_f64];
     let analytic = evaluation.gradient.dot(&direction);
@@ -212,6 +228,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          gradient={:?}, coordinate_fd={coordinate_fd:?}, \
          explicit={:?}, trace={:?}, occam={:?}, adjoint={:?}, \
          frozen_fd={frozen_finite_difference:.9e}, \
+         kkt={kkt_norm:.9e}, quotient_kkt={quotient_kkt_norm:.9e}, \
+         kkt_tolerance={kkt_tolerance:.9e}, \
          base_cost={base_cost:.17e}, plus_cost={plus_cost:.17e}, \
          minus_cost={minus_cost:.17e}",
         (analytic - finite_difference).abs(),
