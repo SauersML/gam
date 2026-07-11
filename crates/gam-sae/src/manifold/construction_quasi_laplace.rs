@@ -1137,6 +1137,52 @@ impl SaeManifoldTerm {
                             continue;
                         }
                     }
+                    // FINAL-GATE decrement certificate — the #2253 doctrine at
+                    // the refusal boundary itself. A stiff narrow valley can
+                    // park the ambient ‖g‖ above the Euclidean tolerance while
+                    // the exact deflated Hessian's own model predicts no
+                    // resolvable descent (measured tier-0: 128 iterations of
+                    // ~1.7e-6 quotient steps, ‖g‖ drifting 5.5e-5 → 8.0e-5
+                    // against a 6.1e-5 band, then this refusal — and the polish
+                    // above cannot contract what the objective's resolution
+                    // cannot express). EVERY refusal lane consults the
+                    // curvature certificate before refusing; paid only on the
+                    // refusal path, and quadratic λ² scaling keeps genuine
+                    // non-convergence refused unchanged.
+                    if let Ok(DeflatedEvidenceFactor {
+                        delta_t: final_dt,
+                        delta_beta: final_db,
+                        cache: final_cache,
+                        ..
+                    }) = self.factor_deflated_evidence_with_grad_norms(
+                        &mut sys,
+                        &lambda_smooth,
+                        options,
+                    ) {
+                        let final_objective_scale = self
+                            .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                            .map(|obj| obj.abs() + 1.0)
+                            .unwrap_or(f64::INFINITY);
+                        let newton_decrement_sq = sae_manifold_newton_directional_decrease(
+                            &sys,
+                            final_dt.view(),
+                            final_db.view(),
+                        )
+                        .max(0.0);
+                        let predicted_relative_decrease =
+                            0.5 * newton_decrement_sq / final_objective_scale;
+                        if predicted_relative_decrease
+                            <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                        {
+                            log::debug!(
+                                "SAE inner final-gate decrement acceptance: ‖g‖={grad_norm:.6e} \
+                                 (tol {grad_tolerance:.6e}) λ²={newton_decrement_sq:.6e} \
+                                 ½λ²/scale={predicted_relative_decrease:.6e} after \
+                                 {total_inner_iter} inner iterations"
+                            );
+                            return Ok(final_cache);
+                        }
+                    }
                     // Inner solve did not converge; the returned Err carries
                     // the non-convergence diagnostic (gradient /
                     // quotient-gradient norms and the tolerance) to the caller.
