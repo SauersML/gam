@@ -543,3 +543,94 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         audit_solver.gauge_basis.len(),
     );
 }
+
+/// Per-coordinate, per-channel FIXED-STATE criterion-derivative audit — the
+/// single-source instrument for the outer criterion (#2253, stage 3.3.iii).
+///
+/// For every ρ coordinate: central FD of the FROZEN criterion (the
+/// `inner_max_iter == 0` verbatim-reuse contract holds θ̂ bit-for-bit fixed,
+/// so the FD sees ONLY the direct ρ-dependence) versus the fixed-state
+/// analytic channel sum `explicit + logdet_trace + occam` (the adjoint /
+/// third-order channel is the θ̂-response and is correctly EXCLUDED at fixed
+/// state). A mismatch therefore isolates a genuine channel-formula desync —
+/// and the failure message prints each channel separately so the desync NAMES
+/// its channel (the instrument that localizes the historical ARD fixed-state
+/// anomaly, FD +0.208 vs analytic +1.066). Trap-immunity: no re-solve is on
+/// the FD path, so an under-converged inner state cannot fake either side.
+#[test]
+fn frozen_state_per_coordinate_channel_fd_audit_2253() {
+    let mut objective = planted_periodic_outer_objective_2253();
+    let base = objective.baseline_rho.to_flat();
+    objective
+        .eval_cost(&base)
+        .expect("base value lane must converge");
+    objective
+        .eval(&base)
+        .expect("base gradient lane must converge");
+    let rho_state = objective.baseline_rho.from_flat(base.view());
+    let mut audit_term = objective.term.clone();
+    let (_frozen_value, audit_loss, audit_cache) = audit_term
+        .reml_criterion_with_cache(
+            objective.target.view(),
+            &rho_state,
+            objective.registry.as_ref(),
+            0,
+            objective.learning_rate,
+            objective.ridge_ext_coord,
+            objective.ridge_beta,
+        )
+        .expect("frozen accepted-state evidence audit must evaluate");
+    let audit_solver = audit_term
+        .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec())
+        .expect("frozen accepted-state outer solver");
+    let components = audit_term
+        .analytic_outer_rho_gradient_components(
+            objective.target.view(),
+            &rho_state,
+            &audit_loss,
+            &audit_cache,
+            &audit_solver,
+        )
+        .expect("frozen accepted-state gradient components");
+
+    let anchor_term = objective.term.clone();
+    let frozen_cost_at = |rho_flat: &Array1<f64>| -> f64 {
+        let mut term = anchor_term.clone();
+        let rho = objective.baseline_rho.from_flat(rho_flat.view());
+        term.reml_criterion_with_cache(
+            objective.target.view(),
+            &rho,
+            objective.registry.as_ref(),
+            0,
+            objective.learning_rate,
+            objective.ridge_ext_coord,
+            objective.ridge_beta,
+        )
+        .expect("frozen per-coordinate value probe")
+        .0
+    };
+
+    let h = 1.0e-4_f64;
+    for idx in 0..base.len() {
+        let mut plus = base.clone();
+        plus[idx] += h;
+        let mut minus = base.clone();
+        minus[idx] -= h;
+        let fd = (frozen_cost_at(&plus) - frozen_cost_at(&minus)) / (2.0 * h);
+        let analytic =
+            components.explicit[idx] + components.logdet_trace[idx] + components.occam[idx];
+        let scale = analytic.abs().max(fd.abs()).max(1.0e-6);
+        let rel = (analytic - fd).abs() / scale;
+        assert!(
+            rel <= 1.0e-3,
+            "fixed-state channel desync at rho[{idx}]: analytic={analytic:.9e} \
+             (explicit={:.9e}, logdet_trace={:.9e}, occam={:.9e}, \
+             excluded third_order={:.9e}) vs frozen central FD={fd:.9e} (rel={rel:.3e}). \
+             The desync lives in whichever channel above disagrees with the FD split.",
+            components.explicit[idx],
+            components.logdet_trace[idx],
+            components.occam[idx],
+            components.third_order_correction[idx],
+        );
+    }
+}
