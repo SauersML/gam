@@ -947,6 +947,12 @@ pub(crate) fn build_manifold_sae_payload(
     };
     let selected_log_lambda_smooth = vopt(raw, "log_lambda_smooth").map(v_arr1).transpose()?;
     let selected_log_ard = vopt(raw, "log_ard").map(v_arr2).transpose()?;
+    let structured_residual_diagnostics: Vec<Value> = serde_json::from_value(
+        vget(raw, "structured_residual_diagnostics")?.clone(),
+    )
+    .map_err(|error| {
+        format!("invalid structured_residual_diagnostics payload: {error}")
+    })?;
     let structure_certificate = vopt(raw, "structure_certificate")
         .and_then(|v| v.as_str())
         .map(str::to_string);
@@ -1021,10 +1027,9 @@ pub(crate) fn build_manifold_sae_payload(
         selected_log_lambda_sparse,
         selected_log_lambda_smooth,
         selected_log_ard,
-        structured_residual_diagnostics: Vec::new(),
-        // #2235 — runtime-only termination ledger, carried straight from the raw
-        // fit payload (the legacy dataclass `from_payload` did the same:
-        // `termination = payload.get("termination")`). Not persisted by to_dict.
+        structured_residual_diagnostics,
+        // #2235 — termination ledger carried straight from the raw fit payload
+        // into the persisted v3 artifact.
         termination: report("termination"),
     })
 }
