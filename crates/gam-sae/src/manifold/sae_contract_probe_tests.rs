@@ -1681,9 +1681,8 @@ pub(crate) fn gauge_fixed_krylov_operator_matches_deflated_preconditioner_2253()
     let cache = diagonal_latent_cache(&[2.0_f64, 1.0e-14]);
     let gauge = array![0.0_f64, 1.0];
     let stiffness = 2.0;
-    let solver =
-        DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
-            .expect("deflated solver");
+    let solver = DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
+        .expect("deflated solver");
     let rhs = SaeArrowVector {
         t: array![4.0_f64, 1.0],
         beta: Array1::zeros(0),

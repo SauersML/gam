@@ -20,7 +20,9 @@ fn planted_circle_cloud() -> (Array2<f64>, usize) {
     let mut state = 0x2468_ace0_1357_9bdfu64;
     let mut unit = move || {
         // LCG → [0,1); NO rand, NO clock (repo #932 rules).
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64) / ((1u64 << 53) as f64)
     };
     let two_pi = std::f64::consts::TAU;

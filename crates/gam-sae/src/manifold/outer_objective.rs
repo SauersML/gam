@@ -3843,7 +3843,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.ridge_ext_coord,
             self.ridge_beta,
         ) {
-
             Ok(evaluated) => evaluated,
             // #1782 — an infeasible-ρ probe (non-PD per-row / cross-row / Schur-
             // complement joint Hessian) has no defined Laplace evidence at this ρ.

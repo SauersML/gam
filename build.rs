@@ -1058,9 +1058,7 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
     {
         Ok(output) => output,
         Err(err) => {
-            println!(
-                "cargo:warning=build.rs author audit skipped: git could not be run ({err})"
-            );
+            println!("cargo:warning=build.rs author audit skipped: git could not be run ({err})");
             return;
         }
     };

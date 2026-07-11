@@ -76,16 +76,16 @@ fn fit_gaussian(formula: &str, ds: &gam::data::EncodedDataset) -> gam::StandardF
     }
 }
 
-/// Fit with the strict analytic-operator policy so the basis builder must use
-/// its operator-backed spatial path whenever the design crosses the derived
-/// single-materialization budget.
-fn fit_gaussian_operator_required(
+/// Fit with the caller's resource policy so a memory-routing fixture can pass
+/// the exact admission boundary that it asserted.
+fn fit_gaussian_with_resource_policy(
     formula: &str,
     ds: &gam::data::EncodedDataset,
+    resource_policy: ResourcePolicy,
 ) -> gam::StandardFitResult {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        resource_policy: Some(ResourcePolicy::analytic_operator_required()),
+        resource_policy: Some(resource_policy),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, ds, &cfg)
@@ -271,37 +271,37 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
     // (`ChunkedKernelDesignOperator`, gated by `should_use_lazy_spatial_design`)
     // and asserts the streamed path is still correct. The lazy path activates
     // when the would-be dense `n × p` design exceeds the active policy's
-    // `max_single_materialization_bytes`. The test fit uses
-    // `ResourcePolicy::analytic_operator_required()`, whose derived
-    // single-materialization budget is the strict operator-path budget.
+    // `max_single_materialization_bytes`. The fixture derives that boundary
+    // from the adjacent design with one fewer basis column, so it is stable
+    // across hosts without an environment override or a fixed magic cap.
     //
-    // n = 40_000, k = 900. WHY THESE NUMBERS: the design has p ≈ k centers (plus
-    // a 2-column affine null space). dense_bytes = n·p·8 ≈ 40_000·902·8
-    // ≈ 275 MiB, which EXCEEDS the 256 MiB budget → the lazy path is taken. Yet
-    // nothing in the fit actually allocates 275 MiB: the input array is
-    // 40_000·2·8 ≈ 0.6 MiB and the dense linear algebra is the p × p normal
-    // equations (902² · 8 ≈ 6.5 MiB), both tiny. So we exercise the lazy
-    // operator's correctness with a strictly bounded CI footprint — never an
-    // actual multi-GB allocation. We additionally ASSERT, with the same policy
-    // the fit uses, that this (n, k) genuinely crosses the threshold, so the
-    // test stays honest if the budget or column accounting ever changes.
+    // n = 40_000, k = 900. WHY THESE NUMBERS: the constrained radial block has
+    // k-2 columns and the affine polynomial block restores 2, so the lazy gate
+    // sees exactly p=k before global identifiability. The forbidden dense block
+    // is 40_000·900·8 = 288,000,000 bytes (≈275 MiB), while streamed row
+    // chunks and the p×p normal-equation folds remain bounded independently of
+    // n. The test therefore exercises the operator's correctness without ever
+    // allocating the full n×p design.
     let n = 40_000usize;
     let k = 900usize;
 
-    // p includes the affine (Linear) null space: d + 1 = 3 polynomial columns
-    // in 1D the kernel-constraint transform trims the centers block, but the
-    // would-be dense width used by the lazy gate is on the order of k; use a
-    // conservative lower bound (k itself) so the assertion can only UNDER-count,
-    // never falsely claim the lazy path triggers.
-    let policy = ResourcePolicy::analytic_operator_required();
-    let dense_bytes_lower_bound = n
-        .saturating_mul(k)
-        .saturating_mul(std::mem::size_of::<f64>());
+    // The policy admits the otherwise-identical (k-1)-column design and rejects
+    // this k-column design. Checked arithmetic makes dimension overflow a test
+    // construction error rather than a falsely tiny routing footprint.
+    let dense_design_bytes = n
+        .checked_mul(k)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+        .expect("lazy-path dense design footprint must fit usize");
+    let fixture_budget = n
+        .checked_mul(k.checked_sub(1).expect("lazy-path k must be positive"))
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+        .expect("lazy-path adjacent-design budget must fit usize");
+    let mut policy = ResourcePolicy::analytic_operator_required();
+    policy.max_single_materialization_bytes = fixture_budget;
     assert!(
-        dense_bytes_lower_bound > policy.max_single_materialization_bytes,
-        "lazy-path test misconfigured: dense lower bound {dense_bytes_lower_bound} bytes does not \
-         exceed the auto-derived materialization budget {} bytes for n={n}, k={k}; pick a larger \
-         k or n so the chunked operator is actually exercised",
+        dense_design_bytes > policy.max_single_materialization_bytes,
+        "lazy-path test misconfigured: dense design {dense_design_bytes} bytes does not exceed \
+         the mechanism-derived materialization budget {} bytes for n={n}, k={k}",
         policy.max_single_materialization_bytes
     );
 
@@ -320,7 +320,23 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
 
     let ds = encode_xy(&x, &y);
     let x_idx = ds.column_map()["x"];
-    let fit = fit_gaussian_operator_required(&format!("y ~ duchon(x, k={k})"), &ds);
+    let fit =
+        fit_gaussian_with_resource_policy(&format!("y ~ duchon(x, k={k})"), &ds, policy.clone());
+
+    let duchon_design = fit
+        .design
+        .smooth
+        .term_designs
+        .first()
+        .expect("lazy-path fit must contain its Duchon term design");
+    assert!(
+        duchon_design.is_operator_backed(),
+        "Duchon term crossed the fixture budget but was not operator-backed"
+    );
+    assert!(
+        duchon_design.as_dense_ref().is_none(),
+        "operator-backed Duchon term exposed a hidden full-design materialization"
+    );
 
     let train_fitted: Vec<f64> = fit.design.design.apply(&fit.fit.beta).to_vec();
     assert!(
@@ -352,9 +368,9 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
     let trivial = rms(&demeaned);
     eprintln!(
         "duchon-scale-lazy: n={n} k={k} sigma={sigma} \
-         dense_lower_bound_MiB={:.1} budget_MiB={:.1} recovery_rmse={recovery_rmse:.4} \
+         dense_design_MiB={:.1} fixture_budget_MiB={:.1} recovery_rmse={recovery_rmse:.4} \
          trivial_predictor_rms={trivial:.4}",
-        dense_bytes_lower_bound as f64 / (1024.0 * 1024.0),
+        dense_design_bytes as f64 / (1024.0 * 1024.0),
         policy.max_single_materialization_bytes as f64 / (1024.0 * 1024.0),
     );
     assert!(

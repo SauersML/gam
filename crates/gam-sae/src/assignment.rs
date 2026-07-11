@@ -2929,15 +2929,11 @@ mod frozen_routing_1033_tests {
             .unwrap();
         assert!(a.routing_is_frozen());
         // Gates BEFORE mutating the free logits.
-        let before: Vec<Array1<f64>> = (0..n)
-            .map(|r| a.try_assignments_row(r).unwrap())
-            .collect();
+        let before: Vec<Array1<f64>> = (0..n).map(|r| a.try_assignments_row(r).unwrap()).collect();
         // Simulate an inner-fit logit update (what the ρ-search would otherwise do
         // every eval): perturb every free logit substantially.
         a.logits.mapv_inplace(|v| v + 5.0);
-        let after: Vec<Array1<f64>> = (0..n)
-            .map(|r| a.try_assignments_row(r).unwrap())
-            .collect();
+        let after: Vec<Array1<f64>> = (0..n).map(|r| a.try_assignments_row(r).unwrap()).collect();
         // FROZEN routing reads the snapshot, so the gates are UNCHANGED by the
         // free-logit perturbation — the routing is decoupled from inner-fit drift.
         for r in 0..n {
@@ -3093,8 +3089,7 @@ mod fill_into_buffer_1557_tests {
             for s in scratch.iter_mut() {
                 *s = f64::NAN;
             }
-            a.try_assignments_row_into(row, &mut scratch)
-                .unwrap();
+            a.try_assignments_row_into(row, &mut scratch).unwrap();
             assert_eq!(allocated.len(), k);
             for kk in 0..k {
                 assert_eq!(

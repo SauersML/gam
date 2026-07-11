@@ -472,9 +472,7 @@ mod amortized_encoder_glue_tests {
     #[test]
     fn amortized_encode_reaches_high_fraction_of_exact_ev() {
         let PlantedTwoAtomTerm {
-            term,
-            target: x_tr,
-            ..
+            term, target: x_tr, ..
         } = planted_two_atom_term(400, 7);
         // Fit the encoder on the term's own exact code (logits/coords/masses).
         let encoder = term

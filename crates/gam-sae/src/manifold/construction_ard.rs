@@ -344,10 +344,8 @@ impl SaeManifoldTerm {
         let floor = Self::SURE_DIVERGENCE_PD_FLOOR;
         let mut acc = 0.0_f64;
         for row in 0..n {
-            self.assignment.try_assignments_row_into(
-                row,
-                assignments.as_mut_slice(),
-            )?;
+            self.assignment
+                .try_assignments_row_into(row, assignments.as_mut_slice())?;
             let r_row = residual.row(row);
             // Metric-applied residual M·r (p-space); identity when not whitening.
             let mr: Vec<f64> = match self.row_metric.as_ref() {
@@ -516,10 +514,8 @@ impl SaeManifoldTerm {
         let mut ranked: Vec<usize> = Vec::with_capacity(k_atoms);
         let mut acc = 0.0_f64;
         for row in 0..n {
-            self.assignment.try_assignments_row_into(
-                row,
-                assignments.as_mut_slice(),
-            )?;
+            self.assignment
+                .try_assignments_row_into(row, assignments.as_mut_slice())?;
             let logits = self.assignment.logits.row(row);
             // Selectable candidates are the GATED atoms (ungated = always-on
             // background tier `a_k≡1`, not part of the selection simplex).

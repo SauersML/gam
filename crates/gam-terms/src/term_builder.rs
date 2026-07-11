@@ -3087,6 +3087,14 @@ pub fn build_smooth_basis(
                 "centers",
                 cap_default_spatial_centers(options, default_centers),
             )?;
+            if requested_centers > ds.values.nrows() {
+                return Err(TermBuilderError::incompatible_config(format!(
+                    "Duchon smooth '{}' requested {requested_centers} centers but only {} rows are available",
+                    vars.join(", "),
+                    ds.values.nrows(),
+                ))
+                .to_string());
+            }
             if requested_centers <= polynomial_cols {
                 return Err(TermBuilderError::incompatible_config(format!(
                     "Duchon smooth '{}' requested basis dimension {} but order={:?} in {}D needs {} polynomial null-space columns; choose centers/k > {}",

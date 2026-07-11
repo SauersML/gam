@@ -59,10 +59,7 @@ impl SaeManifoldTerm {
     /// worker) they are computed in parallel and collected in row order; the
     /// order-preserving `collect` reproduces the serial push order bit-for-bit
     /// (deterministic — each row computed exactly once, no cross-row reduction).
-    pub(crate) fn assignments_all_parallel(
-        &self,
-        n: usize,
-    ) -> Result<Vec<Array1<f64>>, String> {
+    pub(crate) fn assignments_all_parallel(&self, n: usize) -> Result<Vec<Array1<f64>>, String> {
         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
             use rayon::prelude::*;

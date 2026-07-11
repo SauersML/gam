@@ -594,10 +594,9 @@ impl SaeManifoldTerm {
         let mut scratch = vec![0.0_f64; self.k_atoms()];
         for row in 0..n {
             match rho {
-                Some(_) => {
-                    self.assignment
-                        .try_assignments_row_into(row, &mut scratch)?
-                }
+                Some(_) => self
+                    .assignment
+                    .try_assignments_row_into(row, &mut scratch)?,
                 None => {
                     let a = self.assignment.try_assignments_row(row)?;
                     scratch.copy_from_slice(a.as_slice().expect("contiguous assignment row"));
@@ -2312,8 +2311,7 @@ impl SaeManifoldTerm {
         let mut a = vec![0.0_f64; self.k_atoms()];
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
-            self.assignment
-                .try_assignments_row_into(row, &mut a)?;
+            self.assignment.try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2335,8 +2333,7 @@ impl SaeManifoldTerm {
         // ∂g_β/∂η[k,μ,c] = Σ_i a_ik (dΦ_k[i,μ] r_i[c] + Φ^η_k[i,μ] dfitted_i[c]).
         let mut out = Array1::<f64>::zeros(self.beta_dim());
         for row in 0..n {
-            self.assignment
-                .try_assignments_row_into(row, &mut a)?;
+            self.assignment.try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2402,8 +2399,7 @@ impl SaeManifoldTerm {
         let mut a = vec![0.0_f64; self.k_atoms()];
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
-            self.assignment
-                .try_assignments_row_into(row, &mut a)?;
+            self.assignment.try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2426,8 +2422,7 @@ impl SaeManifoldTerm {
         let mut full_buf = vec![0.0_f64; p];
         let mut curved_buf = vec![0.0_f64; p];
         for row in 0..n {
-            self.assignment
-                .try_assignments_row_into(row, &mut a)?;
+            self.assignment.try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2490,9 +2485,7 @@ impl SaeManifoldTerm {
         let mut a = vec![0.0_f64; k];
         for row in 0..n {
             match rho {
-                Some(_) => self
-                    .assignment
-                    .try_assignments_row_into(row, &mut a),
+                Some(_) => self.assignment.try_assignments_row_into(row, &mut a),
                 None => self
                     .assignment
                     .try_assignments_row(row)
@@ -5459,7 +5452,11 @@ impl SaeManifoldTerm {
                 let alpha = step.step;
                 let actual = pre_step_total - step.value;
                 let predicted = directional_decrease * (alpha - 0.5 * alpha * alpha);
-                let rho = if predicted != 0.0 { actual / predicted } else { f64::NAN };
+                let rho = if predicted != 0.0 {
+                    actual / predicted
+                } else {
+                    f64::NAN
+                };
                 let overshoot = zz_full_obj - pre_step_total;
                 log::debug!(
                     "[zz2015dir] it={outer_iteration} g={:.4e} dN={:.4e} a={alpha:.4e} gTd={directional_decrease:.4e} act={actual:.4e} pred={predicted:.4e} rho={rho:.4e} fullobj_minus_pre={overshoot:.4e}",

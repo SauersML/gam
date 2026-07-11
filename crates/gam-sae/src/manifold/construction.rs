@@ -4316,8 +4316,7 @@ impl SaeManifoldTerm {
             // `try_assignments_row` (same arithmetic, same order); this
             // loss reruns every Armijo halving × inner Newton iter × outer ρ
             // eval, so the per-row K-sized allocation was a hot-path churn.
-            self.assignment
-                .try_assignments_row_into(row, assign_buf)?;
+            self.assignment.try_assignments_row_into(row, assign_buf)?;
             let a = &*assign_buf;
             for slot in fitted_row.iter_mut() {
                 *slot = 0.0;

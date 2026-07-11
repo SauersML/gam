@@ -8,18 +8,21 @@ use super::*;
 /// spatial basis — center/knot selection, the thin-plate kernel evaluation, the
 /// kernel-constraint nullspace reparameterisation, the identifiability
 /// transform, and the penalty Grams — is a PURE FUNCTION of `(data, spec)`: it
-/// never reads the response. So the whole [`BasisBuildResult`] is identical
-/// across diseases sharing those exact predictor columns, yet the per-disease
-/// log shows it rebuilt + re-audited from scratch each time (~0.4–2.5 s each).
+/// never reads the response. Its dense-versus-lazy representation additionally
+/// depends on the workspace's storage-routing policy, which is part of the
+/// cache fingerprint below. Thus diseases sharing the same columns and policy
+/// can reuse the complete [`BasisBuildResult`] without crossing a caller's
+/// materialization boundary.
 ///
 /// This is a content-addressed, size-bounded, recomputable memo mirroring the
 /// FFI cross-disease column-encode cache (`encoded_column_cache` in
 /// `crates/gam-pyffi/src/manifold_and_posterior_ffi.rs`): the key is a 128-bit
-/// fingerprint of the data matrix CONTENT (shape + every element bit-pattern)
-/// plus the basis spec, so a different cohort / subsample (different rows) MISSES
-/// — preserving correctness — while the same columns across diseases HIT. A hit
-/// clones the cached `BasisBuildResult` (cheap `Arc`/ndarray clones vs. the
-/// kernel build + RRQR audit), so results are bit-identical to the miss path.
+/// fingerprint of the data matrix CONTENT (shape + every element bit-pattern),
+/// the basis spec, and the policy fields that select dense versus lazy storage.
+/// A different cohort, spec, or routing boundary therefore MISSES; matching
+/// diseases HIT. A hit clones the cached `BasisBuildResult` (cheap
+/// `Arc`/ndarray clones vs. the kernel build + RRQR audit), so results are
+/// bit-identical to the miss path.
 /// Eviction (LRU under a byte budget) only ever forfeits the perf benefit, never
 /// correctness, since every value is exactly recomputable from its key.
 type DuchonBasisCacheKey = (u64, u64);
@@ -70,10 +73,12 @@ fn duchon_basis_cache()
 /// — produces a different key and misses. The spec is hashed via its serialized
 /// form (the spec carries `serde` derives), capturing center strategy, power,
 /// length scale, nullspace order, anisotropy, identifiability, and operator
-/// penalty dials — every input the builder reads.
+/// penalty dials. The materialization cap and storage mode prevent a dense
+/// result built under a permissive policy from bypassing a later lazy route.
 fn duchon_basis_fingerprint(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Option<DuchonBasisCacheKey> {
     let spec_bytes = serde_json::to_vec(spec).ok()?;
     let mut lo = DefaultHasher::new();
@@ -99,6 +104,13 @@ fn duchon_basis_fingerprint(
     for h in [&mut lo, &mut hi] {
         spec_bytes.len().hash(h);
         spec_bytes.hash(h);
+        policy.max_single_materialization_bytes.hash(h);
+        let storage_mode = match policy.derivative_storage_mode {
+            gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired => 0_u8,
+            gam_runtime::resource::DerivativeStorageMode::MaterializeIfSmall => 1_u8,
+            gam_runtime::resource::DerivativeStorageMode::DiagnosticsOnly => 2_u8,
+        };
+        storage_mode.hash(h);
     }
     Some((lo.finish(), hi.finish()))
 }
@@ -108,7 +120,7 @@ pub fn build_duchon_basiswithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let Some(key) = duchon_basis_fingerprint(data, spec) {
+    if let Some(key) = duchon_basis_fingerprint(data, spec, workspace.policy()) {
         if let Some(hit) = duchon_basis_cache().get(&key) {
             return Ok(hit.0);
         }

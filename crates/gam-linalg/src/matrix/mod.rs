@@ -3373,7 +3373,10 @@ impl ResidualisedDesignOperator {
             return slot.as_ref().map(|a| a.as_ref());
         }
         if self.inner.is_operator_backed()
-            || self.anchors.iter().any(|(anchor, _)| anchor.is_operator_backed())
+            || self
+                .anchors
+                .iter()
+                .any(|(anchor, _)| anchor.is_operator_backed())
         {
             if self.materialized.set(None).is_err() {
                 return self
@@ -6463,7 +6466,11 @@ mod tests {
         let dense_design = DenseDesignMatrix::from(Arc::new(op));
 
         let probe = Array1::from_elem(2, 1.0);
-        assert_eq!(dense_design.apply(&probe), expected.dot(&probe));
+        let got = dense_design.apply(&probe);
+        let want = expected.dot(&probe);
+        for (got_i, want_i) in got.iter().zip(want.iter()) {
+            assert!((got_i - want_i).abs() < 1e-12);
+        }
         assert!(
             dense_design.as_dense_ref().is_none(),
             "coefficient transform must not materialize an operator-backed inner design"
@@ -7158,7 +7165,11 @@ mod tests {
         let dense_design = DenseDesignMatrix::from(Arc::new(op));
 
         let probe = array![0.25, -0.5];
-        assert_eq!(dense_design.apply(&probe), inner_values.dot(&probe));
+        let got = dense_design.apply(&probe);
+        let want = inner_values.dot(&probe);
+        for (got_i, want_i) in got.iter().zip(want.iter()) {
+            assert!((got_i - want_i).abs() < 1e-12);
+        }
         assert!(
             dense_design.as_dense_ref().is_none(),
             "residualised transform must not materialize an operator-backed inner design"

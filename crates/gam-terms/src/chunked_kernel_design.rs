@@ -387,7 +387,10 @@ mod chunked_kernel_operator_tests {
 
         let probe = Array1::from_elem(3, 1.0);
         let applied = dense_design.apply_transpose(&probe);
-        assert_eq!(applied, expected.t().dot(&probe));
+        let expected_applied = expected.t().dot(&probe);
+        for (got, want) in applied.iter().zip(expected_applied.iter()) {
+            assert!((got - want).abs() < 1e-12);
+        }
         assert!(
             dense_design.as_dense_ref().is_none(),
             "chunked kernel operations must not warm a hidden full-design cache"

@@ -236,8 +236,7 @@ pub fn measure_crosscoder_drift(
             let mut atom_steps = Vec::with_capacity(num_steps);
             for s in 0..num_steps {
                 let drift = decoder_drift(&honest[s], &honest[s + 1]);
-                let principal_angles =
-                    principal_angles_between_images(&honest[s], &honest[s + 1])?;
+                let principal_angles = principal_angles_between_images(&honest[s], &honest[s + 1])?;
                 atom_steps.push(LayerStepDrift {
                     atom: k,
                     source: layer_chain[s],
