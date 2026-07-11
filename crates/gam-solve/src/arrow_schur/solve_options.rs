@@ -829,12 +829,32 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
 
         let mut left_active = Vec::with_capacity(k);
         let mut right_active = Vec::with_capacity(k);
+        // HOT PATH (measured 2026-07-11, A10 real-workload profile: 50% of ALL
+        // fit cycles in non-inlined bounds-checked ndarray 2-D `IndexMut`, plus
+        // 13% self-time here): every scalar of the scan and of the rank-1
+        // update went through `[[i, j]]` element access — a function call, a
+        // bounds check, and 2-D stride arithmetic per double. Go through the
+        // contiguous row slices and flat 1-D indexing instead. The operation
+        // SEQUENCE is identical (same c → a → b order, same subtractions), so
+        // the result is bit-exact — no reduction-order change.
+        let schur_cols = schur.ncols();
+        let schur_flat = schur
+            .as_slice_mut()
+            .expect("block_gemm_subtract: reduced Schur must be standard-layout");
         for c in 0..d {
             left_active.clear();
             right_active.clear();
+            let left_row = left.row(c);
+            let right_row = right.row(c);
+            let left_row = left_row
+                .as_slice()
+                .expect("block_gemm_subtract: left row must be contiguous");
+            let right_row = right_row
+                .as_slice()
+                .expect("block_gemm_subtract: right row must be contiguous");
             for col in 0..k {
-                let l = left[[c, col]];
-                let r = right[[c, col]];
+                let l = left_row[col];
+                let r = right_row[col];
                 if l != 0.0 {
                     left_active.push((col, l));
                 }
@@ -846,8 +866,9 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
                 continue;
             }
             for &(a, lca) in &left_active {
+                let row_off = a * schur_cols;
                 for &(b, rcb) in &right_active {
-                    schur[[a, b]] -= lca * rcb;
+                    schur_flat[row_off + b] -= lca * rcb;
                 }
             }
         }
