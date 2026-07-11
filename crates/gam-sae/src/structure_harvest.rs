@@ -4943,8 +4943,7 @@ pub fn run_structure_search_rounds(
                 gam_solve::structure_search::MoveVerdict::Accepted { .. }
                     | gam_solve::structure_search::MoveVerdict::Demoted { .. }
             );
-            fired
-                && !matches!(record.mv, StructureMove::Glue { .. })
+            fired && !matches!(record.mv, StructureMove::Glue { .. })
         });
         // Record the atom-sets any APPLIED curl / flatten move fired on into the
         // cooldown ledger, then advance one round — so the inverse move cannot
