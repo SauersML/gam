@@ -2188,7 +2188,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             .into());
         }
         let log_rescale = self.hessian_deriv_log_rescale(block_states);
-        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         if self.x_link_wiggle.is_some() {
             // #932: single-source the wiggle SECOND directional derivative via
@@ -3311,10 +3310,9 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
                 )?,
             ));
         }
-        let kernel = self.family.survival_ls_row_kernel_rescaled(
-            &self.dynamic,
-            self.deriv_log_scale,
-        );
+        let kernel = self
+            .family
+            .survival_ls_row_kernel_rescaled(&self.dynamic, self.deriv_log_scale);
         crate::row_kernel::row_kernel_second_directional_derivative(
             &kernel,
             &rows,
