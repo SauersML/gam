@@ -46,6 +46,10 @@ pub fn canonical_standard_fit_options(
     inputs: StandardFitOptionsInputs,
 ) -> FitOptions {
     FitOptions {
+        resource_policy: resolved_resource_policy(
+            config,
+            gam_runtime::resource::ProblemHints::default(),
+        ),
         latent_cloglog: inputs.latent_cloglog,
         mixture_link: inputs.mixture_link,
         optimize_mixture: inputs.optimize_mixture,

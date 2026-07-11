@@ -3034,6 +3034,7 @@ const NULLSPACE_SELECT_PC_TAIL_PROB: f64 = 0.01;
 
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {
+        resource_policy: options.resource_policy.clone(),
         latent_cloglog: options.latent_cloglog,
         mixture_link: options.mixture_link.clone(),
         optimize_mixture: options.optimize_mixture,
