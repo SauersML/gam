@@ -52,7 +52,33 @@ use std::sync::Arc;
 /// EFS-trace drop-in contract.
 #[test]
 fn streaming_cache_outer_gradient_matches_dense_cache() {
-    let (term0, target, rho) = small_two_atom_periodic_term();
+    let (n, p, k) = (24usize, 2usize, 2usize);
+    let mut term0 = build_softmax_term(n, p, k);
+    // Keep both charts load-bearing throughout the inner solve: atom 0 owns the
+    // first output axis and atom 1 the second, with disjoint row territories.
+    // The former five-row scalar target could only support one chart and was
+    // correctly refused by the production total-co-collapse veto before either
+    // dense/streaming cache route was compared.
+    term0.atoms[0].decoder_coefficients =
+        ndarray::array![[0.20, 0.00], [1.10, 0.00], [0.45, 0.00]];
+    term0.atoms[1].decoder_coefficients =
+        ndarray::array![[0.00, -0.15], [0.00, 0.40], [0.00, 1.20]];
+    for row in 0..n {
+        let first_territory = row < n / 2;
+        term0.assignment.logits[[row, 0]] = if first_territory { 2.0 } else { -2.0 };
+        term0.assignment.logits[[row, 1]] = if first_territory { -2.0 } else { 2.0 };
+    }
+    let rho = SaeManifoldRho::new(
+        0.7_f64.ln(),
+        0.8_f64.ln(),
+        vec![Array1::from_elem(1, 1.2_f64.ln()); k],
+    );
+    let fitted = term0
+        .try_fitted_for_rho(&rho)
+        .expect("resolved two-chart fixture reconstruction");
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        fitted[[row, col]] + 1.0e-3 * ((row + 3 * col) as f64 * 0.19).sin()
+    });
     let mut dense = term0.clone();
     let mut streaming = term0;
 
