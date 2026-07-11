@@ -690,7 +690,8 @@ impl SaeManifoldTerm {
         // and otherwise owns the softmax / euclidean / non-cross-row regimes exactly.
         // This completes the matrix-free selected-inverse cluster (smoothness EDF + ARD
         // Hessian trace + θ-adjoint); the assignment/learnable-IBP log-strength traces
-        // (`logdet_trace[0]`) plus the θ-adjoint's IBP-refused fits remain solver-bound
+        // (when that coordinate exists) plus the θ-adjoint's IBP-refused fits remain
+        // solver-bound
         // — the last gaps before the routing flip (see the docstring).
         let gamma = match inverse_probe_bundle {
             Some((probes, sinv)) => self

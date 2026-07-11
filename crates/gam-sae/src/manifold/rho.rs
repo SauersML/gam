@@ -19,7 +19,8 @@ use super::*;
 ///   strengths, one per axis index `j ∈ 0..max_d` (`max_d = max_k d_k`),
 ///   BROADCAST to every atom that owns axis `j`. The flat outer vector then
 ///   carries a constant `max_d` ARD coordinates (typically 1 or 2) regardless
-///   of K, so the outer optimizer searches `2 + max_d` hyperparameters. This is
+///   of K, so the outer optimizer searches `sparse_dim + K + max_d`
+///   hyperparameters. This is
 ///   a principled shared-λ tie: all atoms share one ARD precision per intrinsic
 ///   axis, exactly the standard "shared smoothing parameter across replicate
 ///   terms" REML reparameterization.
@@ -251,11 +252,13 @@ impl SaeManifoldRho {
     /// The outer ARD parameterization ([`ArdSharing::PerAtom`] vs
     /// [`ArdSharing::Shared`]). Every derivative / trace / EFS / IFT-RHS
     /// consumer of the flat ρ layout must branch on this: the per-atom cursor
-    /// walk `1+K+Σ_{a<k} d_a + j` is only valid in [`ArdSharing::PerAtom`] mode;
+    /// walk `sparse_dim+K+Σ_{a<k} d_a + j` is only valid in
+    /// [`ArdSharing::PerAtom`] mode;
     /// in [`ArdSharing::Shared`] mode atom `k`'s axis `j` maps onto the SINGLE
-    /// shared coordinate `1+K+j` (see [`Self::ard_flat_index`]), so several atoms
+    /// shared coordinate `sparse_dim+K+j` (see [`Self::ard_flat_index`]), so several atoms
     /// alias one coordinate and their contributions must be ACCUMULATED — walking
-    /// them as if per-atom both indexes OOB (flat len is only `1+K+max_d`) and,
+    /// them as if per-atom both indexes OOB (flat len is only
+    /// `sparse_dim+K+max_d`) and,
     /// when it does not panic, splits one shared strength across phantom slots.
     #[must_use]
     pub fn ard_sharing(&self) -> ArdSharing {
@@ -266,9 +269,10 @@ impl SaeManifoldRho {
     /// consistent with [`Self::to_flat`] / [`Self::from_flat`].
     ///
     /// * [`ArdSharing::PerAtom`] — a UNIQUE coordinate per `(k, j)`:
-    ///   `1 + K + Σ_{a<k} d_a + j`. Accumulating (`+=`) into it is therefore the
+    ///   `sparse_dim + K + Σ_{a<k} d_a + j`. Accumulating (`+=`) into it is therefore the
     ///   same as assigning.
-    /// * [`ArdSharing::Shared`] — the shared per-axis coordinate `1 + K + j`,
+    /// * [`ArdSharing::Shared`] — the shared per-axis coordinate
+    ///   `sparse_dim + K + j`,
     ///   which EVERY atom owning axis `j` maps onto. Consumers MUST accumulate
     ///   (gradient / trace / RHS `+=`; EFS numerator/denominator summed over the
     ///   atoms owning the axis), since the outer optimizer searches one strength
@@ -329,6 +333,7 @@ impl SaeManifoldRho {
         dispersion: f64,
         assignment_mode: AssignmentMode,
     ) -> Result<Self, String> {
+        let bound = self.clone().for_assignment(assignment_mode);
         if matches!(assignment_mode, AssignmentMode::IBPMap { .. }) {
             // Validate the dispersion for parity with the scaled path (a
             // non-finite/​non-positive φ is still a caller error), then return the
@@ -339,7 +344,7 @@ impl SaeManifoldRho {
                      be finite and positive; got {dispersion}"
                 ));
             }
-            return Ok(self.clone());
+            return Ok(bound);
         }
         // Separable-gate modes (softmax entropy / ThresholdGate gated-L1).
         //
@@ -366,8 +371,8 @@ impl SaeManifoldRho {
         // which does not enter the decoder Hessian, keeps its full dispersion
         // scaling. The EFS fixed point then descends each λ from this feasible,
         // PD seed to the same interior optimum.
-        if self.log_lambda_smooth.len() <= 1 {
-            return self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true);
+        if bound.log_lambda_smooth.len() <= 1 {
+            return bound.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true);
         }
         if !(dispersion.is_finite() && dispersion > 0.0) {
             return Err(format!(
@@ -377,7 +382,7 @@ impl SaeManifoldRho {
         }
         let shift = dispersion.ln();
         let smooth_ard_shift = shift.max(0.0);
-        let mut scaled = self.clone();
+        let mut scaled = bound;
         scaled.log_lambda_sparse += shift;
         for value in &mut scaled.log_lambda_smooth {
             *value += smooth_ard_shift;
@@ -483,12 +488,12 @@ impl SaeManifoldRho {
     /// * [`ArdSharing::PerAtom`] — the `<ARD>` block concatenates each atom
     ///   `k`'s per-axis `log_ard[k][j]` in atom order, axis `j` in `0..d_k`.
     ///   Empty per-atom blocks contribute no outer coordinates, so the length is
-    ///   `1 + K + Σ_k d_k`.
+    ///   `sparse_dim + K + Σ_k d_k`.
     /// * [`ArdSharing::Shared`] — the `<ARD>` block is a constant `max_d =
     ///   max_k d_k` SHARED strengths, one per axis index `j`. Each shared value
     ///   is the mean of `log_ard[k][j]` over the atoms that own axis `j` (an
     ///   exact read-back when the table is already broadcast, which it always is
-    ///   under this mode); the length is `1 + K + max_d` regardless of d.
+    ///   under this mode); the length is `sparse_dim + K + max_d` regardless of d.
     ///   (Smoothness stays per-atom in both modes; `ard_sharing` governs ARD
     ///   only.)
     ///
@@ -564,8 +569,9 @@ impl SaeManifoldRho {
     ///
     /// The per-atom dims (and ARD sharing mode) are taken from `&self` (the ARD
     /// layout is a fixed property of the term shape; the engine only moves the
-    /// values). The flat vector must have length `1 + K + Σ_k len(log_ard[k])` in
-    /// [`ArdSharing::PerAtom`] mode, or `1 + K + max_k d_k` in
+    /// values). The flat vector must have length
+    /// `sparse_dim + K + Σ_k len(log_ard[k])` in
+    /// [`ArdSharing::PerAtom`] mode, or `sparse_dim + K + max_k d_k` in
     /// [`ArdSharing::Shared`] mode, where `K = len(log_lambda_smooth)` carries the
     /// per-atom smoothness coordinates (#1556) and the few shared per-axis ARD
     /// values are BROADCAST back to every atom that owns that axis, rebuilding the

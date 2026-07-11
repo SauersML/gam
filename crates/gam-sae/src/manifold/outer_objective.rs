@@ -3077,14 +3077,15 @@ impl SaeManifoldOuterObjective {
             }
         }
 
-        // ARD axes (indices 1+K..): Mackay fixed point with posterior variance
+        // ARD axes (after the layout-derived smooth block): Mackay fixed point
+        // with posterior variance
         // (Gaussian closed form on Euclidean axes; the exact von-Mises root on
         // periodic axes, see `von_mises_ard_precision`).
         // #1026 shared-ARD: in `Shared` mode several atoms alias ONE outer
-        // coordinate `1+K+axis`, so the fixed point pools the evidence across the
+        // coordinate `sparse_dim+K+axis`, so the fixed point pools the evidence across the
         // atoms owning the axis — `α_axis_new = (count·n) / Σ_k(‖t_kj‖²+tr_kj)`
         // (#F1 — no `φ̂`) — and writes a single step. Walking a raw per-atom cursor there indexes
-        // past the flat length `1+K+max_d` (OOB) and splits one shared strength
+        // past the flat length `sparse_dim+K+max_d` (OOB) and splits one shared strength
         // across phantom slots. In `PerAtom` mode each `(k, axis)` is its own
         // coordinate and this reduces to the historical per-atom Mackay update.
         // Per-(atom, axis) periodicity: a PERIODIC (Circle) axis's empirical-Bayes

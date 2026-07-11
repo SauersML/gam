@@ -484,6 +484,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
 
     // The seed ρ vector the outer engine optimizes; its length is the objective's
     // declared `n_params`.
+    let init_rho = init_rho.for_assignment(base_term.assignment.mode);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
 

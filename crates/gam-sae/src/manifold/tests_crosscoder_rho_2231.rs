@@ -112,6 +112,7 @@ fn outer_criterion_prices_block_relevance_2231() {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let term = build_k1_circle(&evaluator, &coords, p_tot);
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .for_assignment(AssignmentMode::softmax(1.0))
         .with_log_lambda_block(vec![0.0]);
     let mut objective = SaeManifoldOuterObjective::new(
         term,
@@ -175,6 +176,7 @@ fn block_relevance_has_interior_stationary_minimum_2231() {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let term = build_k1_circle(&evaluator, &coords, p_tot);
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .for_assignment(AssignmentMode::softmax(1.0))
         .with_log_lambda_block(vec![0.0]);
     let mut objective = SaeManifoldOuterObjective::new(
         term,
@@ -254,6 +256,7 @@ fn engaged_objective(
     let p_tot = z.ncols();
     let term = build_k1_circle(evaluator, coords, p_tot);
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .for_assignment(AssignmentMode::softmax(1.0))
         .with_log_lambda_block(vec![0.0]);
     SaeManifoldOuterObjective::new(
         term,
@@ -290,6 +293,7 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let n = z.nrows();
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .for_assignment(AssignmentMode::softmax(1.0))
         .with_log_lambda_block(vec![0.0]);
     let flat_at = |log_lambda: f64| -> Array1<f64> {
         let mut flat = rho_template.to_flat();
@@ -380,6 +384,7 @@ fn block_efs_step_reaches_gradient_root_2231() {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let n = z.nrows();
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .for_assignment(AssignmentMode::softmax(1.0))
         .with_log_lambda_block(vec![0.0]);
     let mut objective = engaged_objective(&evaluator, &z, &coords);
 

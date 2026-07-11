@@ -387,7 +387,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
     } else {
         SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
     }
-    .for_assignment(mode)
     .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)?;
     let isometry_pin_active = request
         .registry

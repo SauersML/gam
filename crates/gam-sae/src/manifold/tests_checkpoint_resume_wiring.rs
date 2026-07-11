@@ -57,7 +57,8 @@ fn tiny_objective(salt: u64) -> (SaeManifoldOuterObjective, Array1<f64>) {
     )
     .unwrap();
     let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
+        .for_assignment(AssignmentMode::softmax(1.0));
     let flat = rho.to_flat();
     (
         SaeManifoldOuterObjective::new(term, z, None, rho, 6, 0.04, 1.0e-6, 1.0e-6),
