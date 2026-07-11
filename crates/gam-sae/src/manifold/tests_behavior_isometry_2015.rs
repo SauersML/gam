@@ -84,7 +84,7 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
     let n = 96usize;
     let p_x = 4usize;
     let vocab = 4usize; // p_y = 3
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(7).unwrap());
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
 
     let mut z = Array2::<f64>::zeros((n, p_x));
@@ -209,11 +209,11 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
     let n = 96usize;
     let p_x = 4usize;
     let vocab = 4usize; // p_y = 3
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(7).unwrap());
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / n as f64);
 
-    // A clean unit circle is EXACTLY harmonic, so the seven-column basis (the
-    // constant plus three sine/cosine harmonic pairs) fits it to
+    // A clean unit circle is EXACTLY harmonic, so the five-column basis (the
+    // constant plus two sine/cosine harmonic pairs) fits it to
     // round-off and R_x → 0 pushes λ_y toward a near-degenerate fixed point that
     // is a poor conditioning test for the REML iteration. A small deterministic
     // activation perturbation (a fixed fraction of a low harmonic the basis
@@ -226,7 +226,7 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
     for i in 0..n {
         let t = i as f64 / n as f64;
         let theta = std::f64::consts::TAU * t;
-        // Deterministic zero-mean high-harmonic wiggle (order 9 > basis order 3),
+        // Deterministic zero-mean high-harmonic wiggle (order 9 > basis order 2),
         // ~5% amplitude: the basis cannot represent it, so it is genuine residual.
         let wiggle = 0.05 * (9.0 * theta).sin();
         // Activation: a clean unit circle (IDENTICAL across the two cases) plus the
