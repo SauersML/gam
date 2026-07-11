@@ -11,9 +11,14 @@
 #![cfg(test)]
 
 use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
-use gam_data::encode_recordswith_inferred_schema;
+use faer::Side;
+use gam_data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
+use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::matrix::LinearOperator;
 use gam_solve::estimate::BlockRole;
+use gam_terms::smooth::build_term_collection_design;
+use ndarray::Array2;
+use std::path::Path;
 
 const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
@@ -82,6 +87,24 @@ fn fmt_vec(v: &[f64]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
+fn penalized_hessian_spectrum(
+    fit: &gam_solve::model_types::UnifiedFitResult,
+) -> Option<(f64, f64, usize)> {
+    let geometry = fit.geometry.as_ref()?;
+    let (eigenvalues, _) = geometry
+        .penalized_hessian
+        .as_array()
+        .eigh(Side::Lower)
+        .ok()?;
+    let min = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = eigenvalues
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let negative = eigenvalues.iter().filter(|&&value| value < 0.0).count();
+    Some((min, max, negative))
+}
+
 fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f64 {
     let (x, y) = locscale_data(n);
     let headers = vec!["x".to_string(), "y".to_string()];
@@ -146,17 +169,31 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
     } else {
         (vec![], f64::NAN)
     };
+    let spectrum = penalized_hessian_spectrum(&fit.fit);
 
     eprintln!(
         "[{label}] pearson={corr:.5} rmse_ls={rmse_ls:.5} rmse_mu={rmse_mu:.5} reml={reml:.4} \
          | lambdas={} log_lambdas={} | edf_by_block={} edf_total={edf_total:.3} \
-         | response_scale={response_scale:.4} outer_conv=certified iters={}",
+         | response_scale={response_scale:.4} outer_conv=certified iters={} spectrum={spectrum:?}",
         fmt_vec(&lambdas),
         fmt_vec(&log_lambdas),
         fmt_vec(&edf_by_block),
         fit.fit.outer_iterations
     );
     corr
+}
+
+fn gaussian_nll(y: &[f64], mu: &[f64], sigma: &[f64]) -> f64 {
+    let half_log_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    y.iter()
+        .zip(mu)
+        .zip(sigma)
+        .map(|((&observed, &mean), &sd)| {
+            let z = (observed - mean) / sd;
+            half_log_2pi + sd.ln() + 0.5 * z * z
+        })
+        .sum::<f64>()
+        / y.len() as f64
 }
 
 #[test]
@@ -190,4 +227,107 @@ fn probe_1561_locscale_penalty_configs() {
             "#1561 probe: {label} log-σ pearson {c:.4} <= 0 — fitted scale surface degenerate"
         );
     }
+}
+
+#[test]
+fn probe_1561_gagurine_scale_geometry() {
+    let dataset_path = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../bench/datasets/gagurine.csv"
+    ));
+    let dataset = load_csvwith_inferred_schema(dataset_path).expect("load gagurine");
+    let columns = dataset.column_map();
+    let age_col = columns["Age"];
+    let gag_col = columns["GAG"];
+    let age = dataset.values.column(age_col).to_vec();
+    let gag = dataset.values.column(gag_col).to_vec();
+    let train_rows: Vec<usize> = (0..age.len()).filter(|index| index % 4 != 0).collect();
+    let test_rows: Vec<usize> = (0..age.len()).filter(|index| index % 4 == 0).collect();
+    let mut train = dataset.clone();
+    train.values = Array2::from_shape_fn((train_rows.len(), dataset.values.ncols()), |(i, j)| {
+        dataset.values[[train_rows[i], j]]
+    });
+    let train_gag: Vec<f64> = train_rows.iter().map(|&index| gag[index]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&index| age[index]).collect();
+    let test_gag: Vec<f64> = test_rows.iter().map(|&index| gag[index]).collect();
+
+    let result = fit_from_formula(
+        "GAG ~ s(Age, bs='tp')",
+        &train,
+        &FitConfig {
+            family: Some("gaussian".to_string()),
+            noise_formula: Some("1 + s(Age, bs='tp')".to_string()),
+            ..FitConfig::default()
+        },
+    )
+    .expect("gagurine location-scale probe fit");
+    let FitResult::GaussianLocationScale(result) = result else {
+        panic!("expected Gaussian location-scale fit");
+    };
+    let response_scale = result.response_scale;
+    let fit = result.fit;
+    let location = fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location block");
+    let scale = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("scale block");
+    let train_mu = fit.mean_design.design.apply(&location.beta).to_vec();
+    let train_eta_scale = fit.noise_design.design.apply(&scale.beta).to_vec();
+
+    let mut test_grid = Array2::<f64>::zeros((test_age.len(), dataset.values.ncols()));
+    for (row, &value) in test_age.iter().enumerate() {
+        test_grid[[row, age_col]] = value;
+    }
+    let test_mean_design = build_term_collection_design(test_grid.view(), &fit.meanspec_resolved)
+        .expect("rebuild gagurine mean design");
+    let test_scale_design = build_term_collection_design(test_grid.view(), &fit.noisespec_resolved)
+        .expect("rebuild gagurine scale design");
+    let test_mu = test_mean_design.design.apply(&location.beta).to_vec();
+    let test_eta_scale = test_scale_design.design.apply(&scale.beta).to_vec();
+    let raw_floor = response_scale * LOGB_SIGMA_FLOOR;
+    let train_sigma: Vec<f64> = train_eta_scale
+        .iter()
+        .map(|&eta| raw_floor + eta.exp())
+        .collect();
+    let test_sigma: Vec<f64> = test_eta_scale
+        .iter()
+        .map(|&eta| raw_floor + eta.exp())
+        .collect();
+    let constant_sigma = (train_gag
+        .iter()
+        .zip(&train_mu)
+        .map(|(&observed, &mean)| (observed - mean).powi(2))
+        .sum::<f64>()
+        / train_gag.len() as f64)
+        .sqrt();
+    let nll = gaussian_nll(&test_gag, &test_mu, &test_sigma);
+    let constant_nll = gaussian_nll(&test_gag, &test_mu, &vec![constant_sigma; test_gag.len()]);
+    let range = |values: &[f64]| {
+        (
+            values.iter().copied().fold(f64::INFINITY, f64::min),
+            values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+    let edf = fit
+        .fit
+        .inference
+        .as_ref()
+        .map(|inference| (inference.edf_by_block.clone(), inference.edf_total));
+    let spectrum = penalized_hessian_spectrum(&fit.fit);
+    eprintln!(
+        "[#1561 gagurine] response_scale={response_scale:.6} raw_floor={raw_floor:.6} nll={nll:.6} constant_nll={constant_nll:.6} constant_sigma={constant_sigma:.6} train_sigma_range={:?} test_sigma_range={:?} log_lambdas={} edf={edf:?} spectrum={spectrum:?}",
+        range(&train_sigma),
+        range(&test_sigma),
+        fmt_vec(fit.fit.log_lambdas.as_slice().expect("contiguous lambdas")),
+    );
+
+    assert!(nll.is_finite());
+    assert!(
+        test_sigma
+            .iter()
+            .all(|sigma| sigma.is_finite() && *sigma > 0.0)
+    );
 }
