@@ -96,8 +96,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .eval(&base)
         .expect("base analytic-gradient lane must converge");
     assert!(
-        gradient_objective.term.frames_active(),
-        "the focused identity witness must exercise the profiled decoder-frame map"
+        !gradient_objective.term.frames_active(),
+        "the focused identity witness must retain complete full-B theta coordinates"
     );
     assert!(
         evaluation.cost.is_finite(),
@@ -174,7 +174,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let frozen_learning_rate = gradient_objective.learning_rate;
     let frozen_ridge_ext_coord = gradient_objective.ridge_ext_coord;
     let frozen_ridge_beta = gradient_objective.ridge_beta;
-    let frozen_parts_at = |rho_flat: &Array1<f64>| {
+    let criterion_parts_at = |rho_flat: &Array1<f64>, inner_max_iter: usize| {
         let mut term = frozen_anchor_term.clone();
         let rho = frozen_baseline_rho.from_flat(rho_flat.view());
         let (criterion, loss, cache) = term
@@ -182,7 +182,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
                 frozen_target.view(),
                 &rho,
                 frozen_registry.as_ref(),
-                0,
+                inner_max_iter,
                 frozen_learning_rate,
                 frozen_ridge_ext_coord,
                 frozen_ridge_beta,
@@ -195,16 +195,63 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         let data_and_priors = loss.total() + extra_penalty.expect("frozen extra penalty");
         let half_logdet =
             0.5 * arrow_log_det_from_cache(&cache).expect("frozen authoritative log determinant");
-        let occam = -term.reml_occam_term(&rho).expect("frozen Occam value");
-        let reconstructed = data_and_priors + half_logdet + occam;
+        let mut htt_half = 0.0_f64;
+        for row in 0..cache.undamped_factor_count() {
+            let factor = cache.undamped_factor(row);
+            for diagonal in 0..factor.nrows() {
+                htt_half += factor[[diagonal, diagonal]].ln();
+            }
+        }
+        let residual = term
+            .reconstruction_residual(frozen_target.view(), &rho)
+            .expect("criterion component audit residual");
+        let dispersion = term
+            .reconstruction_dispersion(&loss, &cache, &rho, Some(residual.view()))
+            .expect("criterion component audit dispersion");
+        let rank_dof = term
+            .per_atom_realised_rank_dof(&rho, dispersion)
+            .expect("criterion component audit rank dof");
+        assert!(
+            rank_dof.iter().all(|&dof| dof > 0.0),
+            "the K=1 derivative witness must stay outside the rank-zero veto"
+        );
+        let n_eff = term.per_atom_effective_sample_size();
+        let rank_charge = if term.soft_rank_charge() {
+            term.per_atom_soft_learning_coefficient(&rho, dispersion)
+                .expect("criterion component audit soft rank")
+                .iter()
+                .zip(n_eff.iter())
+                .map(|(&coefficient, &n)| coefficient * n.max(1.0).ln())
+                .sum()
+        } else {
+            rank_dof
+                .iter()
+                .zip(n_eff.iter())
+                .map(|(&dof, &n)| 0.5 * dof * n.max(1.0).ln())
+                .sum()
+        };
+        let negative_occam = -term.reml_occam_term(&rho).expect("frozen Occam value");
+        let reconstructed =
+            data_and_priors + half_logdet - htt_half + rank_charge + negative_occam;
         let roundoff = 64.0 * f64::EPSILON * (1.0 + criterion.abs().max(reconstructed.abs()));
         assert!(
             (criterion - reconstructed).abs() <= roundoff,
             "frozen criterion atoms must reconstruct exactly: criterion={criterion:.17e}, \
              reconstructed={reconstructed:.17e}, roundoff={roundoff:.3e}"
         );
-        (criterion, data_and_priors, half_logdet, occam)
+        (
+            (
+                criterion,
+                data_and_priors,
+                half_logdet,
+                htt_half,
+                rank_charge,
+                negative_occam,
+            ),
+            term,
+        )
     };
+    let frozen_parts_at = |rho_flat: &Array1<f64>| criterion_parts_at(rho_flat, 0).0;
     let frozen_cost_at = |rho_flat: &Array1<f64>| frozen_parts_at(rho_flat).0;
 
     let direction = array![0.6_f64, -0.8_f64];
