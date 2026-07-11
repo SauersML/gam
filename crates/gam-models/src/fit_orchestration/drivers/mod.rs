@@ -46,9 +46,7 @@ use gam_solve::mixture_link::{
 
 use gam_math::quantile::quantile_from_sorted;
 
-use gam_linalg::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ab, fast_atb, fast_atv, rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 
 use gam_linalg::matrix::{DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix};
 

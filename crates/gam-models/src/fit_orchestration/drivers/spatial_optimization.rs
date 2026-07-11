@@ -7533,181 +7533,16 @@ pub fn fit_term_collectionwith_latent_coord_optimization(
     )
 }
 
-#[derive(Clone, Copy, Debug)]
-struct MaternFrozenDesignRankCertificate {
-    rank: usize,
-    width: usize,
-    rank_tol: f64,
-    leading_diag_abs: f64,
-}
-
-fn matern_frozen_design_rank_certificate(
-    data: ArrayView2<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    term_idx: usize,
-    psi: f64,
-    policy: &gam_runtime::resource::ResourcePolicy,
-) -> Result<MaternFrozenDesignRankCertificate, EstimationError> {
-    if !psi.is_finite() {
-        crate::bail_invalid_estim!(
-            "isotropic Matérn term {term_idx} rank audit received non-finite psi={psi}"
-        );
-    }
-    let length_scale = (-psi).exp();
-    if !(length_scale.is_finite() && length_scale > 0.0) {
-        crate::bail_invalid_estim!(
-            "isotropic Matérn term {term_idx} rank audit produced invalid length scale from psi={psi}"
-        );
-    }
-
-    let mut candidate_spec = resolvedspec.clone();
-    set_spatial_length_scale(&mut candidate_spec, term_idx, length_scale)?;
-    let term_spec = candidate_spec.smooth_terms.get(term_idx).ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "isotropic Matérn rank audit term index {term_idx} is out of bounds"
-        ))
-    })?;
-    let realization =
-        build_single_smooth_term_realization_with_policy(data, term_spec, policy)?;
-    let dense = realization
-        .design_local
-        .try_to_dense_by_chunks("isotropic Matérn frozen-design rank audit")
-        .map_err(EstimationError::InvalidInput)?;
-    let width = dense.ncols();
-    let rrqr = rrqr_with_permutation(&dense, default_rrqr_rank_alpha()).map_err(|err| {
-        EstimationError::InvalidInput(format!(
-            "isotropic Matérn term {term_idx} frozen-design RRQR failed at length_scale={length_scale}: {err:?}"
-        ))
-    })?;
-    Ok(MaternFrozenDesignRankCertificate {
-        rank: rrqr.rank,
-        width,
-        rank_tol: rrqr.rank_tol,
-        leading_diag_abs: rrqr.leading_diag_abs,
-    })
-}
-
-/// Return the largest feasible Matérn range whose frozen design preserves the
-/// incumbent's canonical RRQR rank.
-///
-/// The raw diameter endpoint can flatten radial columns enough to lose a
-/// coefficient direction even though it is inside the generic kernel window.
-/// In that case, rank loss is monotone along the one-dimensional range path:
-/// the raw endpoint brackets the rank-losing side and the already-certified
-/// incumbent brackets the rank-preserving side. Bisection locates their exact
-/// floating-point boundary and returns the rank-preserving neighbor. This is a
-/// geometry/design audit only: it does not inspect the response or evaluate a
-/// profiled objective, so the caller still compares exactly one competing
-/// endpoint and runs exactly one subsequent joint solve.
-fn rank_stable_isotropic_matern_long_psi(
-    data: ArrayView2<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    term_idx: usize,
-    raw_long_psi: f64,
-    policy: &gam_runtime::resource::ResourcePolicy,
-) -> Result<f64, EstimationError> {
-    let incumbent_length_scale = get_spatial_length_scale(resolvedspec, term_idx).ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "isotropic Matérn term {term_idx} has no resolved incumbent length scale"
-        ))
-    })?;
-    if !(incumbent_length_scale.is_finite() && incumbent_length_scale > 0.0) {
-        crate::bail_invalid_estim!(
-            "isotropic Matérn term {term_idx} has invalid incumbent length scale {incumbent_length_scale}"
-        );
-    }
-    let incumbent_psi = -incumbent_length_scale.ln();
-    if raw_long_psi >= incumbent_psi {
-        return Ok(raw_long_psi);
-    }
-
-    let incumbent = matern_frozen_design_rank_certificate(
-        data,
-        resolvedspec,
-        term_idx,
-        incumbent_psi,
-        policy,
-    )?;
-    if incumbent.rank == 0 || incumbent.rank > incumbent.width {
-        crate::bail_invalid_estim!(
-            "isotropic Matérn term {term_idx} incumbent frozen design has invalid RRQR rank {}/{}",
-            incumbent.rank,
-            incumbent.width
-        );
-    }
-    let raw_endpoint = matern_frozen_design_rank_certificate(
-        data,
-        resolvedspec,
-        term_idx,
-        raw_long_psi,
-        policy,
-    )?;
-    if raw_endpoint.width != incumbent.width {
-        crate::bail_invalid_estim!(
-            "isotropic Matérn term {term_idx} changed frozen design width across the range endpoint: incumbent {}, endpoint {}",
-            incumbent.width,
-            raw_endpoint.width
-        );
-    }
-    if raw_endpoint.rank >= incumbent.rank {
-        return Ok(raw_long_psi);
-    }
-
-    let mut rank_losing_psi = raw_long_psi;
-    let mut rank_preserving_psi = incumbent_psi;
-    let mut rank_preserving = incumbent;
-    loop {
-        let midpoint = rank_losing_psi + 0.5 * (rank_preserving_psi - rank_losing_psi);
-        if midpoint == rank_losing_psi || midpoint == rank_preserving_psi {
-            break;
-        }
-        let certificate = matern_frozen_design_rank_certificate(
-            data,
-            resolvedspec,
-            term_idx,
-            midpoint,
-            policy,
-        )?;
-        if certificate.width != incumbent.width {
-            crate::bail_invalid_estim!(
-                "isotropic Matérn term {term_idx} changed frozen design width during RRQR boundary search: incumbent {}, candidate {}",
-                incumbent.width,
-                certificate.width
-            );
-        }
-        if certificate.rank >= incumbent.rank {
-            rank_preserving_psi = midpoint;
-            rank_preserving = certificate;
-        } else {
-            rank_losing_psi = midpoint;
-        }
-    }
-
-    log::info!(
-        "[spatial-kappa] term {term_idx} replaced rank-losing raw long-range endpoint \
-         (psi={raw_long_psi:.12}, rank={}/{}) with canonical RRQR boundary \
-         (psi={rank_preserving_psi:.12}, rank={}/{}, tol={:.3e}, leading_diag={:.3e})",
-        raw_endpoint.rank,
-        raw_endpoint.width,
-        rank_preserving.rank,
-        rank_preserving.width,
-        rank_preserving.rank_tol,
-        rank_preserving.leading_diag_abs,
-    );
-    Ok(rank_preserving_psi)
-}
-
 /// Resolve the two physically distinct isotropic Matérn range basins before the
 /// local joint `[rho, psi]` solve.
 ///
 /// The short/rich basin is represented by the ordinary cold fit at the
 /// center-density seed. The competing long-range basin has one canonical,
-/// data-derived representative: the largest point toward the lower end of the
-/// feasible `psi = log(kappa)` window that preserves the incumbent frozen
-/// design's canonical RRQR rank. Profile all smoothing parameters at that
-/// endpoint once, and retain it only when its certified REML objective is
-/// strictly lower. The subsequent joint optimizer therefore runs exactly once,
-/// from the winning basin.
+/// data-derived representative: the lower end of the term's feasible
+/// `psi = log(kappa)` window, equivalently its largest well-conditioned length
+/// scale. Profile all smoothing parameters at that endpoint once, and retain it
+/// only when its certified REML objective is strictly lower. The subsequent
+/// joint optimizer therefore runs exactly once, from the winning basin.
 ///
 /// This is a closed endpoint comparison, not a lattice, sweep, or collection of
 /// joint restarts. Both profiles pass through `fit_term_collection_forspec`, so
@@ -7753,15 +7588,8 @@ fn select_isotropic_matern_range_basin(
             continue;
         }
 
-        let (raw_psi_long, _psi_short) =
+        let (psi_long, _psi_short) =
             spatial_term_psi_bounds(data, &resolvedspec, term_idx, kappa_options);
-        let psi_long = rank_stable_isotropic_matern_long_psi(
-            data,
-            &resolvedspec,
-            term_idx,
-            raw_psi_long,
-            &options.resource_policy,
-        )?;
         let long_length_scale = (-psi_long).exp();
         if !(long_length_scale.is_finite() && long_length_scale > 0.0) {
             crate::bail_invalid_estim!(
