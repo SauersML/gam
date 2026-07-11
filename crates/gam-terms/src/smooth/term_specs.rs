@@ -3596,6 +3596,44 @@ pub const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 /// capped here to keep the basis geometry well-conditioned.
 pub const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 
+fn spatial_term_stored_input_scales(term: &SmoothTermSpec) -> Option<Vec<f64>> {
+    match &term.basis {
+        SmoothBasisSpec::ThinPlate { input_scales, .. }
+        | SmoothBasisSpec::Matern { input_scales, .. }
+        | SmoothBasisSpec::Duchon { input_scales, .. } => input_scales.clone(),
+        _ => None,
+    }
+}
+
+fn spatial_term_realized_input_scales(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+) -> Option<Vec<f64>> {
+    let (feature_cols, stored) = match &term.basis {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols,
+            input_scales,
+            ..
+        }
+        | SmoothBasisSpec::Matern {
+            feature_cols,
+            input_scales,
+            ..
+        }
+        | SmoothBasisSpec::Duchon {
+            feature_cols,
+            input_scales,
+            ..
+        } => (feature_cols, input_scales),
+        _ => return None,
+    };
+    if let Some(scales) = stored {
+        return Some(scales.clone());
+    }
+    let x = select_columns(data, feature_cols).ok()?;
+    compute_spatial_input_scales(x.view())
+}
+
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
 /// When geometry is unavailable (e.g., fewer than 2 distinct points), falls
@@ -3637,25 +3675,35 @@ pub fn spatial_term_psi_bounds(
     // spec already carries calibrated η_a at setup time (e.g., warm-start
     // or refit paths); for fresh optimization η_a starts at 0 and y = x.
     let aniso = get_spatial_aniso_log_scales(spec, term_idx);
-    let r_bounds = match spatial_term_center_strategy(term) {
+    let (r_bounds, input_scales) = match spatial_term_center_strategy(term) {
         Some(CenterStrategy::UserProvided(centers)) if centers.nrows() >= 2 => {
-            match aniso.as_deref() {
+            let bounds = match aniso.as_deref() {
                 Some(eta) if eta.len() == centers.ncols() => {
                     let y = points_in_aniso_y_space(centers.view(), eta);
                     pairwise_distance_bounds(y.view())
                 }
                 _ => pairwise_distance_bounds(centers.view()),
-            }
+            };
+            // Frozen centers live in the standardized kernel frame. The
+            // persisted input scales are therefore part of the coordinate map
+            // back to the original-unit length-scale chart. An unresolved
+            // user-provided center set has no stored scales and is already in
+            // the spec's original-coordinate chart.
+            (bounds, spatial_term_stored_input_scales(term))
         }
-        _ => standardized_spatial_term_data(data, term)
-            .ok()
-            .and_then(|x| match aniso.as_deref() {
+        _ => {
+            let input_scales = spatial_term_realized_input_scales(data, term);
+            let bounds = standardized_spatial_term_data(data, term)
+                .ok()
+                .and_then(|x| match aniso.as_deref() {
                 Some(eta) if eta.len() == x.ncols() => {
                     let y = points_in_aniso_y_space(x.view(), eta);
                     pairwise_distance_bounds_sampled(y.view())
                 }
                 _ => pairwise_distance_bounds_sampled(x.view()),
-            }),
+                });
+            (bounds, input_scales)
+        }
     };
     let Some((r_min, r_max)) = r_bounds else {
         return fallback;
@@ -3665,8 +3713,26 @@ pub fn spatial_term_psi_bounds(
     // The nullspace already carries constant/linear low-frequency structure,
     // so cap the kernel range at the diameter scale instead of letting the
     // optimizer enter a numerically degenerate basis geometry.
-    let psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
-    let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln();
+    // `r_min`/`r_max` are measured in the standardized kernel frame, where
+    // ℓ_eff = ℓ_original / σ_geom. The optimizer/spec ψ coordinate is
+    // ψ_original = log(1/ℓ_original), hence
+    //
+    //   κ_original = κ_eff / σ_geom
+    //              = κ_eff * compensate_length_scale(1, scales).
+    //
+    // Convert exactly once here before intersecting the data window with the
+    // original-coordinate user options. Previously these standardized κ bounds
+    // were written directly into the spec; the basis builder then divided ℓ by
+    // σ_geom again, making the realized endpoint too long by 1/σ_geom.
+    let inverse_sigma_geom = input_scales
+        .as_deref()
+        .map(|scales| compensate_length_scale_for_standardization(1.0, scales))
+        .unwrap_or(1.0);
+    let psi_chart_offset = inverse_sigma_geom.ln();
+    let psi_lo_data =
+        (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln() + psi_chart_offset;
+    let psi_hi_data =
+        (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln() + psi_chart_offset;
     // #1074: the Matérn-specific length-scale ceiling that used to live here was
     // deleted. It was masking, not fixing, the real defect: a hard upper bound on
     // the kernel range that pinned the κ-optimizer short rather than letting the
@@ -3684,6 +3750,85 @@ pub fn spatial_term_psi_bounds(
         return fallback;
     }
     (psi_lo, psi_hi)
+}
+
+#[cfg(test)]
+mod spatial_psi_bound_coordinate_tests {
+    use super::*;
+    use ndarray::array;
+
+    fn frozen_matern_bounds(theta: f64, dilation: f64) -> (f64, f64) {
+        let source = array![
+            [-1.7, -0.4],
+            [-1.1, 0.8],
+            [-0.2, -1.3],
+            [0.5, 1.6],
+            [1.4, -0.7],
+            [2.1, 0.5],
+        ];
+        let (cos_theta, sin_theta) = (theta.cos(), theta.sin());
+        let mut data = Array2::<f64>::zeros(source.raw_dim());
+        for row in 0..source.nrows() {
+            let x = source[[row, 0]];
+            let y = source[[row, 1]];
+            data[[row, 0]] = dilation * (cos_theta * x - sin_theta * y);
+            data[[row, 1]] = dilation * (sin_theta * x + cos_theta * y);
+        }
+        let input_scales = compute_spatial_input_scales(data.view()).expect("input scales");
+        let mut centers = data.clone();
+        apply_input_standardization(&mut centers, &input_scales);
+        let spec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::UserProvided(centers),
+                        length_scale: 1.0,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
+                        nullspace_shrinkage_survived: None,
+                    },
+                    input_scales: Some(input_scales),
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+        spatial_term_psi_bounds(
+            data.view(),
+            &spec,
+            0,
+            &SpatialLengthScaleOptimizationOptions::default(),
+        )
+    }
+
+    fn assert_close(left: f64, right: f64) {
+        assert!(
+            (left - right).abs() <= 1e-12,
+            "coordinate-equivalent bounds differ: left={left:.16e}, right={right:.16e}"
+        );
+    }
+
+    #[test]
+    fn standardized_center_bounds_return_to_original_units_under_rotation_and_scaling() {
+        let base = frozen_matern_bounds(0.0, 1.0);
+        let rotated = frozen_matern_bounds(0.61, 1.0);
+        assert_close(rotated.0, base.0);
+        assert_close(rotated.1, base.1);
+
+        let dilation = 4.0_f64;
+        let rotated_scaled = frozen_matern_bounds(0.61, dilation);
+        let expected_shift = dilation.ln();
+        assert_close(rotated_scaled.0, base.0 - expected_shift);
+        assert_close(rotated_scaled.1, base.1 - expected_shift);
+    }
 }
 
 /// Data-derived ψ seed for a spatial term when the user has not set an
