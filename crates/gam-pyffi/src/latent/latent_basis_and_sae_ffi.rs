@@ -2422,6 +2422,7 @@ fn sae_manifold_fit_inner<'py>(
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
+        structured_residual_passes: None,
         cancel: Some(std::sync::Arc::clone(&cancel_flag)),
     };
     let report = run_sae_fit_interruptible(py, "gam-sae-fit", &cancel_flag, move || {
