@@ -158,9 +158,9 @@ impl SaeFitCheckpoint {
     }
 
     /// Capture the current fittable incumbent from the term: per-atom decoder /
-    /// coords / log-amplitude / η plus the shared logits — the same recoverable
-    /// state `SaeManifoldMutableState` snapshots (basis matrices are rebuilt on
-    /// resume from `(coords, evaluator, η)`).
+    /// coords / η plus the shared logits — the same recoverable state
+    /// `SaeManifoldMutableState` snapshots (basis matrices are rebuilt on resume
+    /// from `(coords, evaluator, η)`).
     pub(crate) fn capture(
         term: &SaeManifoldTerm,
         fingerprint: &SaeCheckpointFingerprint,
