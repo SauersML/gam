@@ -972,13 +972,21 @@ impl BernoulliRigidRowKernel {
             }
             return acc.to_dense(slices);
         }
-        let acc = chunks.into_par_iter().map(chunk_body).reduce(
-            || BernoulliBlockHessianAccumulator::new(slices),
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            chunks.len(),
+            |range| {
+                let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                for chunk in &chunks[range] {
+                    acc.add(&chunk_body(*chunk));
+                }
+                acc
+            },
             |mut left, right| {
                 left.add(&right);
                 left
             },
-        );
+        )
+        .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         acc.to_dense(slices)
     }
 
@@ -1083,13 +1091,22 @@ impl BernoulliRigidRowKernel {
             }
             return Ok(acc.to_dense(slices));
         }
-        let acc = chunks.into_par_iter().map(chunk_body).try_reduce(
-            || BernoulliBlockHessianAccumulator::new(slices),
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            chunks.len(),
+            |range| {
+                let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                for chunk in &chunks[range] {
+                    let partial = chunk_body(*chunk)?;
+                    acc.add(&partial);
+                }
+                Ok(acc)
+            },
             |mut left, right| {
                 left.add(&right);
                 Ok(left)
             },
-        )?;
+        )?
+        .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         Ok(acc.to_dense(slices))
     }
 
@@ -1516,19 +1533,18 @@ where
     let early_exit_reject_threshold = threshold + early_exit_reject_tol;
     let mut total_ll = 0.0;
     for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
-        let chunk_ll: f64 = chunk
-            .into_par_iter()
-            .try_fold(
-                || 0.0,
-                |mut acc, wr| -> Result<_, String> {
+        let chunk_ll: f64 = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            chunk.len(),
+            |range| -> Result<f64, String> {
+                let mut acc = 0.0;
+                for wr in &chunk[range] {
                     acc += wr.weight * row_ll(wr.index)?;
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || 0.0,
-                |left, right| -> Result<_, String> { Ok(left + right) },
-            )?;
+                }
+                Ok(acc)
+            },
+            |left, right| -> Result<_, String> { Ok(left + right) },
+        )?
+        .unwrap_or(0.0);
         total_ll += chunk_ll;
         // Every Bernoulli marginal-slope row contribution is <= 0 because it is
         // weight_i * log(CDF(.)) with nonnegative weights, so the running sum is

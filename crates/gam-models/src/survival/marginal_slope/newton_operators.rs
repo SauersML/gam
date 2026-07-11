@@ -64,60 +64,68 @@ impl SurvivalMarginalSlopeFamily {
         } else {
             None
         };
-        let final_acc = row_iter
-            .into_par_iter()
-            .try_fold(make_fused, |mut acc, row| -> Result<FusedAcc, String> {
-                let (state, nll_acc, grad_acc, q_geom) = &mut acc;
-                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                let (row_nll, mut g, mut h) = if let Some(ref primary) = primary {
-                    self.compute_row_flex_primary_gradient_hessian_exact(
-                        row,
-                        block_states,
-                        q_geom,
-                        primary,
-                    )?
-                } else {
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
-                };
-                let w = row_weights[row];
-                if w != 1.0 {
-                    g.mapv_inplace(|v| v * w);
-                    h.mapv_inplace(|v| v * w);
-                }
-                // nll: sum over weighted rows. Sign mirrors
-                // `evaluate_exact_newton_joint_dynamic_q_dense` (state.0 -= row_nll).
-                *nll_acc -= row_nll * w;
-                // Joint gradient: q-geometry pullback for time/marginal/logslope
-                // primary outputs, plus identity contribution for flex blocks
-                // (score_warp_dev, link_dev). Matches the gradient half of
-                // `accumulate_dynamic_q_joint_row`.
-                self.accumulate_dynamic_q_core_gradient(
-                    row,
-                    &slices,
-                    q_geom,
-                    g.slice(s![0..N_PRIMARY]),
-                    grad_acc,
-                )?;
-                for (primary_range, joint_range) in identity_blocks.iter() {
-                    for local in 0..primary_range.len() {
-                        grad_acc[joint_range.start + local] -= g[primary_range.start + local];
+        // The combined-across-blocks accumulator excludes the DynRow
+        // workspace: it is per-task scratch, allocated once per base block
+        // and never meaningfully combined across blocks (see `make_fused`'s
+        // doc comment above).
+        type CombinedAcc = (BlockHessianAccumulator, f64, Array1<f64>);
+        let final_acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            row_iter.len(),
+            |range| -> Result<CombinedAcc, String> {
+                let (mut state, mut nll_acc, mut grad_acc, mut q_geom) = make_fused();
+                for idx in range {
+                    let row = row_iter[idx];
+                    self.row_dynamic_q_geometry_into(row, block_states, &mut q_geom)?;
+                    let (row_nll, mut g, mut h) = if let Some(ref primary) = primary {
+                        self.compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            &q_geom,
+                            primary,
+                        )?
+                    } else {
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
+                    };
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        g.mapv_inplace(|v| v * w);
+                        h.mapv_inplace(|v| v * w);
                     }
+                    // nll: sum over weighted rows. Sign mirrors
+                    // `evaluate_exact_newton_joint_dynamic_q_dense` (state.0 -= row_nll).
+                    nll_acc -= row_nll * w;
+                    // Joint gradient: q-geometry pullback for time/marginal/logslope
+                    // primary outputs, plus identity contribution for flex blocks
+                    // (score_warp_dev, link_dev). Matches the gradient half of
+                    // `accumulate_dynamic_q_joint_row`.
+                    self.accumulate_dynamic_q_core_gradient(
+                        row,
+                        &slices,
+                        &q_geom,
+                        g.slice(s![0..N_PRIMARY]),
+                        &mut grad_acc,
+                    )?;
+                    for (primary_range, joint_range) in identity_blocks.iter() {
+                        for local in 0..primary_range.len() {
+                            grad_acc[joint_range.start + local] -= g[primary_range.start + local];
+                        }
+                    }
+                    // Block-Hessian pullback (unchanged).
+                    state.add_pullback_with_q_geometry(self, row, &q_geom, &g, &h)?;
                 }
-                // Block-Hessian pullback (unchanged).
-                state.add_pullback_with_q_geometry(self, row, q_geom, &g, &h)?;
-                Ok(acc)
-            })
-            .try_reduce(make_fused, |mut a, b| -> Result<FusedAcc, String> {
+                Ok((state, nll_acc, grad_acc))
+            },
+            |mut a, b| -> Result<CombinedAcc, String> {
                 a.0.add(&b.0);
                 a.1 += b.1;
                 a.2 += &b.2;
                 Ok(a)
-            })?;
-        // The fourth field (DynRow workspace) is per-thread scratch; the
-        // leftover from the last reducer thread carries no aggregate meaning
-        // and falls out of scope here. The second field accumulates the
-        // *signed* log-likelihood (`state.0 -= row_nll`), mirroring the
-        // sign convention in `evaluate_exact_newton_joint_dynamic_q_dense`.
+            },
+        )?
+        .unwrap_or_else(|| (make_acc(), 0.0, Array1::<f64>::zeros(p_total)));
+        // The second field accumulates the *signed* log-likelihood
+        // (`state.0 -= row_nll`), mirroring the sign convention in
+        // `evaluate_exact_newton_joint_dynamic_q_dense`.
         let acc = final_acc.0;
         let joint_log_likelihood = final_acc.1;
         let joint_gradient = final_acc.2;

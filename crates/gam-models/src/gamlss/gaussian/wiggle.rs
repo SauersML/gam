@@ -2218,7 +2218,10 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let eta_mu_view = eta_mu.view();
         let eta_ls_view = eta_ls.view();
         let etaw_view = etaw.view();
-        let ll: f64 = zmu_s
+        // Per-chunk log-likelihood partials are collected in chunk-index order
+        // (map→collect over an indexed parallel iterator is deterministic),
+        // then reduced with a length-only-dependent pairwise sum.
+        let ll_partials: Vec<f64> = zmu_s
             .par_chunks_mut(CHUNK)
             .zip(wmu_s.par_chunks_mut(CHUNK))
             .zip(zls_s.par_chunks_mut(CHUNK))
@@ -2253,7 +2256,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                     local_ll
                 },
             )
-            .sum();
+            .collect();
+        let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -2330,22 +2334,18 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        use rayon::iter::ParallelIterator;
-        let ll: f64 = subsample
-            .rows
-            .par_iter()
-            .map(|row| {
-                let i = row.index;
-                let wi = self.weights[i];
-                if wi == 0.0 {
-                    return 0.0;
-                }
-                let sigma_i = logb_sigma_from_eta_scalar(eta_ls[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = self.y[i] - eta_mu[i] - etaw[i];
-                row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-            })
-            .sum();
+        let ll: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(subsample.rows.len(), |k| {
+            let row = &subsample.rows[k];
+            let i = row.index;
+            let wi = self.weights[i];
+            if wi == 0.0 {
+                return 0.0;
+            }
+            let sigma_i = logb_sigma_from_eta_scalar(eta_ls[i]);
+            let inv_s2 = (sigma_i * sigma_i).recip();
+            let r = self.y[i] - eta_mu[i] - etaw[i];
+            row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+        });
         Ok(ll)
     }
 

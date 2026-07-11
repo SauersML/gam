@@ -21,20 +21,20 @@ impl SurvivalMarginalSlopeFamily {
         let row_iter = outer_weighted_rows(options, self.n).to_vec();
         if flex_active {
             self.validate_exact_monotonicity(block_states)?;
-            let total: Result<f64, String> = row_iter
-                .into_par_iter()
-                .try_fold(
-                    || 0.0,
-                    |mut ll, weighted| -> Result<_, String> {
+            let total = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                row_iter.len(),
+                |range| -> Result<f64, String> {
+                    let mut ll = 0.0;
+                    for idx in range {
+                        let weighted = row_iter[idx];
                         ll -= weighted.weight
                             * self.row_neglog_flex_value(weighted.index, block_states)?;
-                        Ok(ll)
-                    },
-                )
-                .try_reduce(
-                    || 0.0,
-                    |left, right| -> Result<_, String> { Ok(left + right) },
-                );
+                    }
+                    Ok(ll)
+                },
+                |left, right| -> Result<f64, String> { Ok(left + right) },
+            )
+            .map(|opt| opt.unwrap_or(0.0));
             return total;
         }
         // True fast path: K=1 keeps the original scalar closed form; K>1
@@ -43,11 +43,12 @@ impl SurvivalMarginalSlopeFamily {
         let guard = self.derivative_guard;
         let probit_scale = self.probit_frailty_scale();
         let score_dim = self.score_dim();
-        let total: Result<f64, String> = row_iter
-            .into_par_iter()
-            .try_fold(
-                || 0.0,
-                |mut ll, weighted| -> Result<_, String> {
+        gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            row_iter.len(),
+            |range| -> Result<f64, String> {
+                let mut ll = 0.0;
+                for idx in range {
+                    let weighted = row_iter[idx];
                     let i = weighted.index;
                     let q_geom = self.row_dynamic_q_values(i, block_states)?;
                     if score_dim > 1 {
@@ -58,7 +59,7 @@ impl SurvivalMarginalSlopeFamily {
                                 block_states,
                                 probit_scale,
                             )?;
-                        return Ok(ll);
+                        continue;
                     }
                     let g = block_states[2].eta[i];
                     let (nll, _, _) = row_primary_closed_form(
@@ -73,14 +74,12 @@ impl SurvivalMarginalSlopeFamily {
                         probit_scale,
                     )?;
                     ll -= weighted.weight * nll;
-                    Ok(ll)
-                },
-            )
-            .try_reduce(
-                || 0.0,
-                |left, right| -> Result<_, String> { Ok(left + right) },
-            );
-        total
+                }
+                Ok(ll)
+            },
+            |left, right| -> Result<f64, String> { Ok(left + right) },
+        )
+        .map(|opt| opt.unwrap_or(0.0))
     }
 
     pub(crate) fn is_sigma_aux_index(

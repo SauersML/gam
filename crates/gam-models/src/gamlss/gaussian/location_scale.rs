@@ -1284,9 +1284,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
             w_ls.as_slice_memory_order_mut(),
         ) {
             // Per-row Gaussian LS kernel writes 4 working arrays directly into
-            // the output slices; ll is reduced via Rayon's sum. Independent
-            // across rows.
-            ll += zmu_s
+            // the output slices; ll partials are collected in chunk-index
+            // order (deterministic) and reduced with a length-only-dependent
+            // pairwise sum. Independent across rows.
+            let ll_partials: Vec<f64> = zmu_s
                 .par_chunks_mut(CHUNK)
                 .zip(wmu_s.par_chunks_mut(CHUNK))
                 .zip(zls_s.par_chunks_mut(CHUNK))
@@ -1307,7 +1308,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
                     }
                     local_ll
                 })
-                .sum::<f64>();
+                .collect();
+            ll += gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
         } else {
             // Fallback path: inputs are not contiguous. Outputs (just-allocated
             // Array1::zeros) always are. Reborrow input views into the closure.
@@ -1327,7 +1329,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
             let wls_s = w_ls
                 .as_slice_memory_order_mut()
                 .expect("zeros is contiguous");
-            ll += zmu_s
+            let ll_partials: Vec<f64> = zmu_s
                 .par_chunks_mut(CHUNK)
                 .zip(wmu_s.par_chunks_mut(CHUNK))
                 .zip(zls_s.par_chunks_mut(CHUNK))
@@ -1349,7 +1351,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
                     }
                     local_ll
                 })
-                .sum::<f64>();
+                .collect();
+            ll += gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
         }
 
         Ok(FamilyEvaluation {
@@ -1383,35 +1386,27 @@ impl CustomFamily for GaussianLocationScaleFamily {
             etamu.as_slice_memory_order(),
             eta_log_sigma.as_slice_memory_order(),
         ) {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            ll += (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let wi = w_s[i];
-                    if wi == 0.0 {
-                        return 0.0;
-                    }
-                    let sigma_i = logb_sigma_from_eta_scalar(ls_s[i]);
-                    let inv_s2 = (sigma_i * sigma_i).recip();
-                    let r = y_s[i] - mu_s[i];
-                    wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-                })
-                .sum::<f64>();
+            ll += gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                let wi = w_s[i];
+                if wi == 0.0 {
+                    return 0.0;
+                }
+                let sigma_i = logb_sigma_from_eta_scalar(ls_s[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
+                let r = y_s[i] - mu_s[i];
+                wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+            });
         } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            ll += (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let wi = self.weights[i];
-                    if wi == 0.0 {
-                        return 0.0;
-                    }
-                    let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
-                    let inv_s2 = (sigma_i * sigma_i).recip();
-                    let r = self.y[i] - etamu[i];
-                    wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-                })
-                .sum::<f64>();
+            ll += gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                let wi = self.weights[i];
+                if wi == 0.0 {
+                    return 0.0;
+                }
+                let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
+                let r = self.y[i] - etamu[i];
+                wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+            });
         }
         Ok(ll)
     }
@@ -1445,22 +1440,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        use rayon::iter::ParallelIterator;
-        let ll: f64 = subsample
-            .rows
-            .par_iter()
-            .map(|row| {
-                let i = row.index;
-                let wi = self.weights[i];
-                if wi == 0.0 {
-                    return 0.0;
-                }
-                let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = self.y[i] - etamu[i];
-                row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-            })
-            .sum();
+        let ll: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(subsample.rows.len(), |k| {
+            let row = &subsample.rows[k];
+            let i = row.index;
+            let wi = self.weights[i];
+            if wi == 0.0 {
+                return 0.0;
+            }
+            let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
+            let inv_s2 = (sigma_i * sigma_i).recip();
+            let r = self.y[i] - etamu[i];
+            row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+        });
         Ok(ll)
     }
 

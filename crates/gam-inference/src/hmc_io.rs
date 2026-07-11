@@ -1320,7 +1320,7 @@ fn logit_logp_and_grad_into(
     // Per-row independent: write residual entry into a pre-allocated buffer and
     // reduce the ll contribution in parallel — avoids materialising a
     // Vec<(f64, f64)> and the serial scatter that follows.
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1333,7 +1333,8 @@ fn logit_logp_and_grad_into(
             *slot = w_i * (y_i - mu);
             w_i * (y_i * eta_i - gam_linalg::utils::stable_softplus(eta_i))
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     let grad_ll = fast_atv(data.x.as_ref(), &*residual);
     (ll, grad_ll)
@@ -1358,7 +1359,7 @@ fn probit_logp_and_grad_into(
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     assert_eq!(residual.len(), n);
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1376,7 +1377,8 @@ fn probit_logp_and_grad_into(
             *slot = w_i * grad_i;
             w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg)
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     let grad_ll = fast_atv(data.x.as_ref(), &*residual);
     (ll, grad_ll)
@@ -1429,7 +1431,7 @@ fn cloglog_logp_and_grad_into(
     if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1442,7 +1444,8 @@ fn cloglog_logp_and_grad_into(
             *slot = w_i * residual_i;
             w_i * ll_i
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     // A finite η can still exhaust binary64 (y = 0 with exp(η) overflowing):
     // that is a genuine log-density underflow, rejected as −∞ with a zero
@@ -1482,7 +1485,7 @@ fn gaussian_logp_and_grad_into(
     assert_eq!(weighted_residual.len(), n);
     // Per-row: residual = y - η, weighted_residual = (w/φ)·residual,
     // ll contribution = -0.5·(w/φ)·residual². All independent across rows.
-    let ll: f64 = weighted_residual
+    let ll_parts: Vec<f64> = weighted_residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1494,7 +1497,8 @@ fn gaussian_logp_and_grad_into(
             *slot = scaled * residual;
             -0.5 * scaled * residual * residual
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     let grad_ll = fast_atv(data.x.as_ref(), &*weighted_residual);
     (ll, grad_ll)
@@ -1515,7 +1519,7 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
     let mut residual = Array1::<f64>::zeros(n);
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1528,7 +1532,8 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
             *slot = w_i * (y_i - mu_i);
             w_i * (y_i * eta_i - mu_i)
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     if !ll.is_finite() {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
@@ -1558,7 +1563,7 @@ fn tweedie_log_quasilogp_and_grad(
     }
     let inv_phi = data.dispersion.inv_phi();
     let mut residual = Array1::<f64>::zeros(n);
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1572,7 +1577,8 @@ fn tweedie_log_quasilogp_and_grad(
             let qll = y_i * mu_i.powf(1.0 - p) / (1.0 - p) - mu_i.powf(2.0 - p) / (2.0 - p);
             w_i * qll
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     if !ll.is_finite() {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
@@ -1599,7 +1605,7 @@ fn negative_binomial_log_logp_and_grad(
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
     let mut residual = Array1::<f64>::zeros(n);
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1622,7 +1628,8 @@ fn negative_binomial_log_logp_and_grad(
                 + log_mu_term
                 - y_i * (theta + mu_i).ln())
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     if !ll.is_finite() {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
@@ -1646,7 +1653,7 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
     let log_gamma_shape = statrs::function::gamma::ln_gamma(shape);
     let shape_minus_one = shape - 1.0;
     let mut residual = Array1::<f64>::zeros(n);
-    let ll: f64 = residual
+    let ll_parts: Vec<f64> = residual
         .as_slice_mut()
         .unwrap()
         .par_iter_mut()
@@ -1663,7 +1670,8 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
             *slot = w_i * shape * (y_i / mu_i - 1.0);
             ll_i
         })
-        .sum();
+        .collect();
+    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
 
     if !ll.is_finite() {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
@@ -4584,10 +4592,9 @@ impl NutsResult {
         if n == 0 {
             return 0.0;
         }
-        // Posterior mean of a sample-function: parallel reduction over rows.
+        // Posterior mean of a sample-function: deterministic parallel reduction over rows.
         // `f: Fn(ArrayView1) -> f64` is shared-access so safe across threads.
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let sum: f64 = (0..n).into_par_iter().map(|i| f(self.samples.row(i))).sum();
+        let sum: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| f(self.samples.row(i)));
         sum / n as f64
     }
 

@@ -735,28 +735,33 @@ impl SurvivalMarginalSlopeFamily {
             )
         };
 
-        let acc = (0..self.n)
-            .into_par_iter()
-            .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
-                let (state, q_geom) = &mut acc;
-                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                let (row_nll, primary_gradient, primary_hessian) = row_terms(row, q_geom)?;
-                state.log_likelihood -= row_nll;
-                self.accumulate_dynamic_q_blockwise_row(
-                    row,
-                    q_geom,
-                    primary,
-                    primary_gradient.view(),
-                    primary_hessian.view(),
-                    state,
-                )?;
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            self.n,
+            |range| -> Result<_, String> {
+                let mut acc = make_acc_ws();
+                for row in range {
+                    let (state, q_geom) = &mut acc;
+                    self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
+                    let (row_nll, primary_gradient, primary_hessian) = row_terms(row, q_geom)?;
+                    state.log_likelihood -= row_nll;
+                    self.accumulate_dynamic_q_blockwise_row(
+                        row,
+                        q_geom,
+                        primary,
+                        primary_gradient.view(),
+                        primary_hessian.view(),
+                        state,
+                    )?;
+                }
                 Ok(acc)
-            })
-            .try_reduce(make_acc_ws, |mut left, right| -> Result<_, String> {
+            },
+            |mut left, right| -> Result<_, String> {
                 left.0.add_assign(&right.0);
                 Ok(left)
-            })?
-            .0;
+            },
+        )?
+        .unwrap_or_else(make_acc_ws)
+        .0;
 
         Ok(acc.into_family_evaluation())
     }

@@ -1279,7 +1279,7 @@ impl SurvivalLocationScaleFamily {
             let g_d_s = grad_time_eta_d
                 .as_slice_memory_order_mut()
                 .expect("zeros is contiguous");
-            ll = d1_q0_s
+            let ll_partials: Vec<f64> = d1_q0_s
                 .par_chunks_mut(CHUNK)
                 .zip(d1_q1_s.par_chunks_mut(CHUNK))
                 .zip(d1_qdot_s.par_chunks_mut(CHUNK))
@@ -1287,13 +1287,11 @@ impl SurvivalLocationScaleFamily {
                 .zip(g_h1_s.par_chunks_mut(CHUNK))
                 .zip(g_d_s.par_chunks_mut(CHUNK))
                 .enumerate()
-                .try_fold(
-                    || 0.0_f64,
-                    |local_ll,
-                     (chunk_idx, (((((d1q0_c, d1q1_c), d1qd_c), gh0_c), gh1_c), gd_c))|
+                .map(
+                    |(chunk_idx, (((((d1q0_c, d1q1_c), d1qd_c), gh0_c), gh1_c), gd_c))|
                      -> Result<f64, String> {
                         let start = chunk_idx * CHUNK;
-                        let mut acc = local_ll;
+                        let mut acc = 0.0_f64;
                         for local in 0..d1q0_c.len() {
                             let i = start + local;
                             let state = self.row_predictor_state(
@@ -1318,7 +1316,8 @@ impl SurvivalLocationScaleFamily {
                         Ok(acc)
                     },
                 )
-                .try_reduce(|| 0.0_f64, |a, b| Ok::<_, String>(a + b))?;
+                .collect::<Result<Vec<f64>, String>>()?;
+            ll = gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
         } else {
             for i in 0..n {
                 let state = self.row_predictor_state(

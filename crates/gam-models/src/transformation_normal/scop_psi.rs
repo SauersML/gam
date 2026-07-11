@@ -560,15 +560,14 @@ impl TransformationNormalFamily {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let accum = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiBatchedAccum::new(p_total, p_resp, rank),
-                |mut acc, i| {
+        let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiBatchedAccum::new(p_total, p_resp, rank);
+                for i in range {
                     let cov_row = cov.row(i);
                     let psi_row = cov_psi.row(i);
                     let rv = self.response_val_basis.row(i);
@@ -798,13 +797,12 @@ impl TransformationNormalFamily {
                             }
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiBatchedAccum::new(p_total, p_resp, rank),
-                |left, right| left.merge(right),
-            );
+                }
+                acc
+            },
+            |left, right| left.merge(right),
+        )
+        .unwrap_or_else(|| PsiBatchedAccum::new(p_total, p_resp, rank));
 
         Ok(accum.hvp)
     }
@@ -914,15 +912,14 @@ impl TransformationNormalFamily {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let accum = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiTraceAccum::new(p_resp, rank),
-                |mut acc, i| {
+        let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiTraceAccum::new(p_resp, rank);
+                for i in range {
                     let cov_row = cov.row(i);
                     let psi_row = cov_psi.row(i);
                     let rv = self.response_val_basis.row(i);
@@ -1034,13 +1031,12 @@ impl TransformationNormalFamily {
                                     acc.endpoint_psi_vv[col],
                                 ));
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiTraceAccum::new(p_resp, rank),
-                |left, right| left.merge(right),
-            );
+                }
+                acc
+            },
+            |left, right| left.merge(right),
+        )
+        .unwrap_or_else(|| PsiTraceAccum::new(p_resp, rank));
 
         Ok(accum.value)
     }
@@ -1181,15 +1177,14 @@ impl TransformationNormalFamily {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
-        let accum = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiAllAxesTraceAccum::new(p_resp, rank, n_psi),
-                |mut acc, local_i| {
+        let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiAllAxesTraceAccum::new(p_resp, rank, n_psi);
+                for local_i in range {
                     let i = row_start + local_i;
                     let cov_row = cov.row(local_i);
                     let rv = self.response_val_basis.row(i);
@@ -1344,13 +1339,12 @@ impl TransformationNormalFamily {
                         }
                         acc.values[axis_idx] += axis_value;
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiAllAxesTraceAccum::new(p_resp, rank, n_psi),
-                |left, right| left.merge(right),
-            );
+                }
+                acc
+            },
+            |left, right| left.merge(right),
+        )
+        .unwrap_or_else(|| PsiAllAxesTraceAccum::new(p_resp, rank, n_psi));
 
         Ok(accum.values)
     }
@@ -1471,8 +1465,6 @@ impl TransformationNormalFamily {
                 .ok_or_else(|| "SCOP endpoint lower basis is not contiguous".to_string())?,
         ];
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
         if direction_mat.is_none() {
             let weights = self.effective_weights();
 
@@ -1504,11 +1496,11 @@ impl TransformationNormalFamily {
                 }
             }
 
-            let accum = (0..n)
-                .into_par_iter()
-                .fold(
-                    || PsiPairScoreAccum::new(p_total, p_resp),
-                    |mut acc, row_idx| {
+            let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+                n,
+                |range| {
+                    let mut acc = PsiPairScoreAccum::new(p_total, p_resp);
+                    for row_idx in range {
                         let cov_row = cov.row(row_idx);
                         let cov_i_row = cov_i.row(row_idx);
                         let cov_j_row = cov_j.row(row_idx);
@@ -1645,13 +1637,12 @@ impl TransformationNormalFamily {
                                 acc.score[offset + cidx] += wi * grad;
                             }
                         }
-                        acc
-                    },
-                )
-                .reduce(
-                    || PsiPairScoreAccum::new(p_total, p_resp),
-                    |left, right| left.merge(right),
-                );
+                    }
+                    acc
+                },
+                |left, right| left.merge(right),
+            )
+            .unwrap_or_else(|| PsiPairScoreAccum::new(p_total, p_resp));
 
             return Ok((accum.objective, accum.score, None));
         }
@@ -1692,11 +1683,11 @@ impl TransformationNormalFamily {
             }
         }
 
-        let accum = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiPairDirectionalAccum::new(p_total, p_resp),
-                |mut acc, row_idx| {
+        let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiPairDirectionalAccum::new(p_total, p_resp);
+                for row_idx in range {
                     let cov_row = cov.row(row_idx);
                     let cov_i_row = cov_i.row(row_idx);
                     let cov_j_row = cov_j.row(row_idx);
@@ -1996,13 +1987,12 @@ impl TransformationNormalFamily {
                             acc.hvp[offset + cidx] += wi * hv;
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiPairDirectionalAccum::new(p_total, p_resp),
-                |left, right| left.merge(right),
-            );
+                }
+                acc
+            },
+            |left, right| left.merge(right),
+        )
+        .unwrap_or_else(|| PsiPairDirectionalAccum::new(p_total, p_resp));
 
         Ok((0.0, Array1::<f64>::zeros(p_total), Some(accum.hvp)))
     }
@@ -2138,13 +2128,12 @@ impl TransformationNormalFamily {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
-        let accum = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiPairBatchedAccum::new(p_total, p_resp, rank),
-                |mut acc, row_idx| {
+        let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiPairBatchedAccum::new(p_total, p_resp, rank);
+                for row_idx in range {
                     let cov_row = cov.row(row_idx);
                     let cov_i_row = cov_i.row(row_idx);
                     let cov_j_row = cov_j.row(row_idx);
@@ -2464,13 +2453,12 @@ impl TransformationNormalFamily {
                             }
                         }
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiPairBatchedAccum::new(p_total, p_resp, rank),
-                |left, right| left.merge(right),
-            );
+                }
+                acc
+            },
+            |left, right| left.merge(right),
+        )
+        .unwrap_or_else(|| PsiPairBatchedAccum::new(p_total, p_resp, rank));
 
         Ok(accum.hvp)
     }
@@ -2614,13 +2602,12 @@ impl TransformationNormalFamily {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
-        let total = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiPairBilinearAccum::new(p_resp),
-                |mut acc, row_idx| {
+        let total = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiPairBilinearAccum::new(p_resp);
+                for row_idx in range {
                     let cov_row = cov.row(row_idx);
                     let cov_i_row = cov_i.row(row_idx);
                     let cov_j_row = cov_j.row(row_idx);
@@ -2842,17 +2829,16 @@ impl TransformationNormalFamily {
                             endpoint_ij_l_r,
                         );
                     acc.value += weights[global_row] * value_lr;
-                    acc
-                },
-            )
-            .reduce(
-                || PsiPairBilinearAccum::new(p_resp),
-                |mut left, right| {
-                    left.value += right.value;
-                    left
-                },
-            )
-            .value;
+                }
+                acc
+            },
+            |mut left, right| {
+                left.value += right.value;
+                left
+            },
+        )
+        .unwrap_or_else(|| PsiPairBilinearAccum::new(p_resp))
+        .value;
         Ok(total)
     }
 
@@ -2985,13 +2971,12 @@ impl TransformationNormalFamily {
             }
         }
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
-        let total = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiPairTraceAccum::new(p_resp, rank),
-                |mut acc, row_idx| {
+        let total = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiPairTraceAccum::new(p_resp, rank);
+                for row_idx in range {
                     let cov_row = cov.row(row_idx);
                     let cov_i_row = cov_i.row(row_idx);
                     let cov_j_row = cov_j.row(row_idx);
@@ -3183,17 +3168,16 @@ impl TransformationNormalFamily {
                             );
                         acc.value += wi * value_ff;
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiPairTraceAccum::new(p_resp, rank),
-                |mut left, right| {
-                    left.value += right.value;
-                    left
-                },
-            )
-            .value;
+                }
+                acc
+            },
+            |mut left, right| {
+                left.value += right.value;
+                left
+            },
+        )
+        .unwrap_or_else(|| PsiPairTraceAccum::new(p_resp, rank))
+        .value;
         Ok(total)
     }
 

@@ -2361,11 +2361,11 @@ impl BernoulliMarginalSlopeFamily {
                 n_dirs
             );
         }
-        let traces = weighted_rows
-            .par_iter()
-            .try_fold(
-                || vec![0.0; n_dirs],
-                |mut acc, wr| -> Result<_, String> {
+        let traces = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            weighted_rows.len(),
+            |index_range| -> Result<Vec<f64>, String> {
+                let mut acc = vec![0.0; n_dirs];
+                for wr in &weighted_rows[index_range] {
                     let row = wr.index;
                     let row_ctx = Self::row_ctx(cache, row);
                     let mut projection = vec![0.0; primary.total * rank];
@@ -2391,7 +2391,7 @@ impl BernoulliMarginalSlopeFamily {
                             &gram,
                         )?;
                         acc[0] += wr.weight * row_traces[0];
-                        return Ok(acc);
+                        continue;
                     }
                     let trace_gradient = self.row_primary_third_trace_gradient_with_moments(
                         row,
@@ -2429,18 +2429,17 @@ impl BernoulliMarginalSlopeFamily {
                         }
                         acc[dir_idx] += wr.weight * trace;
                     }
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || vec![0.0; n_dirs],
-                |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.iter()) {
-                        *l += *r;
-                    }
-                    Ok(left)
-                },
-            )?;
+                }
+                Ok(acc)
+            },
+            |mut left, right| -> Result<_, String> {
+                for (l, r) in left.iter_mut().zip(right.iter()) {
+                    *l += *r;
+                }
+                Ok(left)
+            },
+        )?
+        .unwrap_or_else(|| vec![0.0; n_dirs]);
         if log_exact_work(self.y.len()) {
             log::info!(
                 "[BMS rho-correction-trace] sampled done n={} rows={} p={} rank={} dirs={} elapsed={:.3}s",
@@ -2497,9 +2496,11 @@ impl BernoulliMarginalSlopeFamily {
                 n_dirs
             );
         }
-        let traces = (0..n_chunks)
-            .into_par_iter()
-            .map(|chunk_idx| -> Result<Vec<f64>, String> {
+        let traces = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            n_chunks,
+            |chunk_range| -> Result<Vec<f64>, String> {
+                let mut outer_acc = vec![0.0; n_dirs];
+                for chunk_idx in chunk_range {
                 // This chunk runs on a Rayon worker and issues `fast_ab` GEMMs
                 // below; `with_nested_parallel` pins their faer parallelism to
                 // `Par::Seq` so they do not re-fan the global Rayon pool against
@@ -2507,7 +2508,7 @@ impl BernoulliMarginalSlopeFamily {
                 // oversubscription that intermittently stalled the joint-Newton
                 // `hessian_qp` cycle). Bit-identical: faer partitions the matmul
                 // output, never the contracted axis.
-                gam_problem::with_nested_parallel(|| {
+                let chunk_acc: Vec<f64> = gam_problem::with_nested_parallel(|| {
                 let start = chunk_idx * rows_per_chunk;
                 let end = (start + rows_per_chunk).min(n);
                 let rows = start..end;
@@ -2656,17 +2657,21 @@ impl BernoulliMarginalSlopeFamily {
                     }
                 }
                 Ok(acc)
-                })
-            })
-            .try_reduce(
-                || vec![0.0; n_dirs],
-                |mut left, right| -> Result<_, String> {
-                    for (l, r) in left.iter_mut().zip(right.iter()) {
-                        *l += *r;
-                    }
-                    Ok(left)
-                },
-            )?;
+                })?;
+                for (o, c) in outer_acc.iter_mut().zip(chunk_acc.iter()) {
+                    *o += *c;
+                }
+                }
+                Ok(outer_acc)
+            },
+            |mut left, right| -> Result<_, String> {
+                for (l, r) in left.iter_mut().zip(right.iter()) {
+                    *l += *r;
+                }
+                Ok(left)
+            },
+        )?
+        .unwrap_or_else(|| vec![0.0; n_dirs]);
         if log_exact_work(n) {
             log::info!(
                 "[BMS rho-correction-trace] full done n={} chunks={} p={} rank={} dirs={} elapsed={:.3}s",
