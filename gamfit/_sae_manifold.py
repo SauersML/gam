@@ -78,18 +78,6 @@ def _default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: int) -> f
     return float(rust_module().sae_default_ordered_beta_bernoulli_concentration_for_k_atoms(int(max(int(k_atoms), 1))))
 
 
-def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
-    """Default large-K active cap from the data-per-atom ratio.
-
-    Thin wrapper over the Rust source of truth
-    ``assignment::default_top_k_for_large_dictionary`` (FFI
-    ``sae_default_top_k_for_large_dictionary``): ``None`` when the dense softmax
-    path is admitted, else the per-row cap ``clamp(ceil(N/K), 1, K−1)``.
-    """
-    cap = rust_module().sae_default_top_k_for_large_dictionary(int(n_obs), int(k_atoms))
-    return None if cap is None else int(cap)
-
-
 ManifoldSAE = rust_module().ManifoldSAE
 
 def gumbel_geometric_schedule(tau_start: float, tau_min: float, rate: float, iter_count: int = 0) -> GumbelTemperatureSchedule:
@@ -181,14 +169,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Gram block exactly cancels the ``‖B‖⁻⁴`` of the normalizer); the
         planted-circle default-on fit converges at every decoder scale instead
         of stalling at the proximal-ridge saturation. Set ``0.0`` to disable.
-        Issue #673 (resolved): the decoder smoothness
-        penalty is reparameterized by the pulled-back metric ``g = JᵀJ`` in the
-        Rust core, so the roughness — and the ``penalized_loss_score`` topology
-        comparison — is gauge-invariant under reparameterization of the latent
-        coordinate ``t`` even with the isometry penalty off. ``IsometryPenalty``
-        is purely a complementary regularizer when enabled (it drives ``g → I``
-        for an interpretable, near-arc-length chart); it is not a precondition
-        for comparing ``penalized_loss_score`` across topologies.
+        Decoder smoothness uses a fixed, validated reference-function Gram; it
+        is not rebuilt from the fitted decoder metric. ``IsometryPenalty``
+        therefore supplies the chart gauge that makes the declared reference
+        measure interpretable by driving ``g → I``. Disabling it leaves the
+        explicitly chart-relative function seminorm in place.
     ard_per_atom
         If true, adds per-atom ARD row-block regularization on the latent
         coordinate block to select active intrinsic coordinates.
@@ -323,7 +308,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``(N, K)``, ``coords`` as per-atom ``(N, d_k)`` arrays,
         ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices,
         ``basis_specs``, ``atom_topology``/``atom_topologies``, ``assignment``
-        and ``assignment_label``, ``penalized_loss_score``, ``reconstruction_r2``,
+        and ``assignment_label``, ``penalized_loss_score``,
+        ``penalized_laml_criterion``, ``reconstruction_r2``,
         ``dispersion``, ``training_mean``, ``low_level_logits``, and fit-control metadata including ``alpha``,
         ``learnable_alpha``, ``tau``, ``sparsity_strength``, ``smoothness``,
         ``learning_rate``, ``max_iter``, ``random_state``, and ``top_k``. Each
@@ -477,17 +463,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             "threshold_gate_threshold must be finite; got "
             f"{threshold_gate_threshold}"
         )
-    # Gauge-invariance of the topology evidence (issue #673, resolved). The
-    # decoder smoothness penalty is reparameterized by the decoder pullback
-    # metric g = J^T J in the Rust core (arc-length roughness; see
-    # `SaeManifoldAtom::refresh_intrinsic_smooth_penalty`), so the roughness —
-    # and therefore the Occam / joint-log-det terms that enter the
-    # `penalized_loss_score` — is invariant under reparameterizing the latent
-    # coordinate t. Topology comparison (e.g. circle vs euclidean) is thus well
-    # posed regardless of `isometry_weight`. `IsometryPenalty` is purely a
-    # complementary regularizer that drives g -> I for an interpretable
-    # near-arc-length chart; turning it off does not make `penalized_loss_score`
-    # gauge-dependent, so there is nothing to warn about.
+    # Smoothness is the exact fixed-reference function quadratic declared by
+    # each topology. It does not move with the decoder or fitted coordinates.
+    # The isometry term supplies the chart gauge (near-unit pullback metric) that
+    # makes that fixed reference measure interpretable; no hidden moving-metric
+    # derivative is omitted from the smoothness objective.
     # NOTE(#795): isometry now defaults ON. The Rust penalty normalizes
     # g = J^T J by the mean trace per latent dimension (`gbar`) before comparing
     # to I, so the value and gradient no longer scale as decoder^4. The earlier
@@ -604,29 +584,23 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         d_max=max(dims),
         p_out=int(x.shape[1]),
     )
-    # `None` disables the active-set cap; anything in `[1, k_atoms]` is forwarded
-    # to the Rust driver, which folds the cap into the OPTIMIZATION as a
-    # train-time per-token active-set cap (it builds the compact active×active
-    # solve over the capped support and computes `fitted` from it) — NOT a
-    # cosmetic post-fit projection. The driver also auto-caps the active set when
-    # the dense `K` working set would exceed the memory budget. The Rust kernel
-    # owns the cap contract end to end — there is no Python-side mask. Any value
-    # outside `[1, k_atoms]` is a caller error rather than a silent clamp/no-op.
-    if top_k is None:
-        top_k_arg = (
-            _default_top_k_for_large_dictionary(n_obs, k_atoms)
-            if kind == "softmax"
-            else None
+    # `top_k` defines the hard-TopK model's fixed support. Smooth assignment
+    # families are full-support objectives and reject it rather than silently
+    # optimizing or reporting a truncated surrogate.
+    if kind != "topk" and top_k is not None:
+        raise ValueError(
+            f"top_k is valid only with assignment='topk'; got assignment={kind!r}"
         )
-    else:
+    if top_k is not None:
         top_k_int = int(top_k)
         if top_k_int < 1 or top_k_int > k_atoms:
             raise ValueError(
-                f"top_k must be in [1, K={k_atoms}] (or None to disable); "
+                f"top_k must be in [1, K={k_atoms}]; "
                 f"got {top_k_int}"
             )
-        else:
-            top_k_arg = top_k_int
+        top_k_arg = top_k_int
+    else:
+        top_k_arg = None
     # The hard top-k support gate (`AssignmentMode::TopK`) has no default
     # support size: its per-row active set IS the model. Require it eagerly so
     # a K > P topk request can never fall through to the penalty-gated K-vs-P
@@ -830,7 +804,7 @@ class StagewiseSAE:
     construction* (every adopted candidate cleared ``ΔEV >= min_effect_ev >= 0``),
     ``backfit_ev_trace`` is non-decreasing under keep-best, ``birth_records`` logs
     every round (accepted new-atom / chart-extension / rejection) with its ΔEV
-    and the frozen joint-REML before/after, and ``collapse_events`` is the
+    and the frozen joint penalized-LAML value before/after, and ``collapse_events`` is the
     live-decoder collapse log — empty by construction (atoms never compete inside
     one Hessian), which IS the answer to the old joint-vs-grown collapse question
     on the real target.
@@ -843,7 +817,7 @@ class StagewiseSAE:
     births_accepted: int
     births_rejected: int
     stopped_reason: str
-    terminal_joint_reml: float
+    terminal_joint_penalized_laml: float
     terminal_data_fit: float
     birth_records: list[dict[str, Any]]
     collapse_events: list[dict[str, Any]]
@@ -1356,8 +1330,8 @@ def _stagewise_from_payload(
             "kind": str(rec["kind"]),
             "delta_ev": float(rec["delta_ev"]),
             "factor_energy": float(rec["factor_energy"]),
-            "joint_reml_before": float(rec["joint_reml_before"]),
-            "joint_reml_after": float(rec["joint_reml_after"]),
+            "joint_penalized_laml_before": float(rec["joint_penalized_laml_before"]),
+            "joint_penalized_laml_after": float(rec["joint_penalized_laml_after"]),
             "accepted": bool(rec["accepted"]),
         }
         for rec in payload["birth_records"]
@@ -1410,7 +1384,7 @@ def _stagewise_from_payload(
         births_accepted=int(payload["births_accepted"]),
         births_rejected=int(payload["births_rejected"]),
         stopped_reason=str(payload["stopped_reason"]),
-        terminal_joint_reml=float(payload["terminal_joint_reml"]),
+        terminal_joint_penalized_laml=float(payload["terminal_joint_penalized_laml"]),
         terminal_data_fit=float(payload["terminal_data_fit"]),
         birth_records=birth_records,
         collapse_events=collapse_events,

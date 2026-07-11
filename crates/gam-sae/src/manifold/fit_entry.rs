@@ -64,7 +64,7 @@ pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 /// floor (`residual_factor` floors it at `1e-6 · mean_var`, still ~6 orders
 /// below a genuine noise scale on near-noiseless data),
 /// the whitening metric `1/D` becomes near-singular, and the whitened-residual
-/// REML the outer ρ-optimizer then descends is ill-conditioned with NO interior
+/// penalized-LAML criterion the outer ρ-optimizer then descends is ill-conditioned with no interior
 /// stationary point. The outer correctly refuses to certify a non-stationary
 /// optimum, so a fit that SHOULD succeed (its iid pass-0 already certified)
 /// instead fails. Skipping the structured pass when there is nothing to model is
@@ -150,7 +150,7 @@ fn sae_structured_residual_model(
     // numerical precision, the residual is pure convergence noise with no
     // structured covariance to model. Fitting a residual-factor model on it
     // collapses the idiosyncratic diagonal `D → 0`, the whitening `1/D` goes
-    // near-singular, and the whitened-residual REML the outer optimizer descends
+    // near-singular, and the whitened-residual penalized-LAML criterion the outer optimizer descends
     // has no interior stationary point (a fit that SHOULD certify then refuses).
     // Degrade to the pass-0 iid fit (which already certified) instead. Scale-free:
     // the floor is on the residual energy RELATIVE to the target energy. See
@@ -192,14 +192,11 @@ fn sae_structured_residual_model(
 pub struct SaeFitReport {
     pub term: SaeManifoldTerm,
     pub rho: SaeManifoldRho,
-    /// The smooth-optimization penalized loss (the UNPROJECTED model's score).
+    /// Penalized loss of the fitted model.
     pub loss: SaeManifoldLoss,
     /// Certified full penalized-LAML criterion of the smooth fitted model,
     /// including its Laplace and Occam terms. This is not `-loss.total()`.
     pub penalized_laml_criterion: f64,
-    /// The projected-model penalized loss when a hard top-k gate applied (#1232);
-    /// `None` when no projection was applied (top-level score is `loss`).
-    pub post_topk_loss: Option<SaeManifoldLoss>,
     pub assignments: Array2<f64>,
     pub fitted: Array2<f64>,
     pub active_mask: Vec<bool>,
@@ -216,10 +213,6 @@ pub struct SaeFitReport {
     pub structure_search_json: Option<String>,
     /// The anytime-valid structure certificate (#1058/#984), serialized JSON.
     pub structure_certificate_json: String,
-    /// Whether a hard top-k gate projected the reported model (#1232).
-    pub top_k_will_project: bool,
-    pub pre_topk_assignments: Option<Array2<f64>>,
-    pub pre_topk_fitted: Option<Array2<f64>>,
     /// The reported `log_alpha` (ordered Beta--Bernoulli concentration or the caller's α fallback).
     pub reported_log_alpha: f64,
 }
@@ -379,9 +372,7 @@ pub struct SaeFitRequest {
     pub learning_rate: f64,
     pub ridge_ext_coord: f64,
     pub ridge_beta: f64,
-    pub assignment_kind: SaeFitAssignmentKind,
     pub alpha: f64,
-    pub top_k: Option<usize>,
     pub isometry_pin_active: bool,
     pub metric_provenance: &'static str,
     pub promote_from_residual: bool,
@@ -518,9 +509,6 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitReport, 
     // them against `(Z − μ)/σ`); assignment masses carry no mean/scale and are
     // untouched.
     lift_tier0_rows(&mut report.fitted, &mu, sigma.as_ref());
-    if let Some(pre_topk) = report.pre_topk_fitted.as_mut() {
-        lift_tier0_rows(pre_topk, &mu, sigma.as_ref());
-    }
     Ok(report)
 }
 
@@ -551,9 +539,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
-        assignment_kind,
         alpha,
-        top_k,
         isometry_pin_active,
         metric_provenance: metric_provenance_initial,
         promote_from_residual,
@@ -1088,103 +1074,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             }
         })
         .collect();
-    let mut assignments = term.assignment.assignments();
-    let mut fitted = term.try_fitted_target_aware(z.view(), Some(&rho))?;
-    // #1232 — when a hard top-k gate is applied, the smooth optimization model
-    // differs from the projected inference model returned on the payload. Capture
-    // the optimization-era state before projection so the payload can expose both
-    // layers honestly.
-    let top_k_will_project = top_k.is_some_and(|k_top| k_top < k_atoms);
-    let pre_topk_assignments = if top_k_will_project {
-        Some(assignments.clone())
-    } else {
-        None
-    };
-    let pre_topk_fitted = if top_k_will_project {
-        Some(fitted.clone())
-    } else {
-        None
-    };
-    // Apply hard top-k projection per row, then recompute `fitted` from the
-    // projected assignments so the returned `assignments` and `fitted` stay
-    // mutually consistent. Smooth softmax (or ordered Beta--Bernoulli/JumpReLU) drives optimisation;
-    // the hard top-k gate is applied at inference time. For softmax mode the kept
-    // entries are renormalised; for the other modes they retain their unnormalised
-    // values.
-    let mut post_topk_loss: Option<SaeManifoldLoss> = None;
-    if let Some(k_top) = top_k {
-        if k_top < k_atoms {
-            let n_obs_local = z.nrows();
-            let renormalise = assignment_kind == SaeFitAssignmentKind::Softmax;
-            for row in 0..n_obs_local {
-                // Collect (value, atom_idx) pairs; pick the indices of the
-                // largest k_top values via an O(K) partial selection. The
-                // comparator (value desc, then atom index asc) is the total order
-                // the sort used, so the partition's first `k_top` elements are the
-                // sorted top-k_top set (identical `keep` mask, tie-breaking incl.).
-                let mut paired: Vec<(f64, usize)> = (0..k_atoms)
-                    .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
-                    .collect();
-                let cmp = |a: &(f64, usize), b: &(f64, usize)| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.1.cmp(&b.1))
-                };
-                if k_top < k_atoms {
-                    paired.select_nth_unstable_by(k_top - 1, cmp);
-                }
-                let mut keep = vec![false; k_atoms];
-                for &(_, atom_idx) in paired.iter().take(k_top) {
-                    keep[atom_idx] = true;
-                }
-                if renormalise {
-                    let mut kept_sum = 0.0_f64;
-                    for atom_idx in 0..k_atoms {
-                        if keep[atom_idx] {
-                            kept_sum += assignments[[row, atom_idx]];
-                        }
-                    }
-                    if kept_sum > 0.0 {
-                        for atom_idx in 0..k_atoms {
-                            assignments[[row, atom_idx]] = if keep[atom_idx] {
-                                assignments[[row, atom_idx]] / kept_sum
-                            } else {
-                                0.0
-                            };
-                        }
-                    } else {
-                        // Pathological case: all kept entries are zero. Fall
-                        // back to uniform mass over the kept indices so the
-                        // contract `assignments.sum(axis=1) == 1` still holds.
-                        let inv = 1.0 / (k_top as f64);
-                        for atom_idx in 0..k_atoms {
-                            assignments[[row, atom_idx]] = if keep[atom_idx] { inv } else { 0.0 };
-                        }
-                    }
-                } else {
-                    for atom_idx in 0..k_atoms {
-                        if !keep[atom_idx] {
-                            assignments[[row, atom_idx]] = 0.0;
-                        }
-                    }
-                }
-            }
-            // Recompute `fitted` from the projected assignments through the
-            // SHARED collapse-aware assembler so the hard top-k projection
-            // composes with the #1026 hybrid collapse (#1233).
-            fitted =
-                term.reconstruct_from_assignments_target_aware(z.view(), assignments.view())?;
-            // #1232 — projected-model penalized loss: the reconstruction data-fit
-            // recomputed on the projected `fitted`, with the decoder/ρ penalties
-            // carried over unchanged (the top-k gate touches assignments, not the
-            // decoder smoothness / ARD / assignment-prior strength).
-            let projected_data_fit = term.data_fit_for_reconstruction(z.view(), fitted.view())?;
-            post_topk_loss = Some(SaeManifoldLoss {
-                data_fit: projected_data_fit,
-                ..loss
-            });
-        }
-    }
+    let assignments = term.assignment.assignments();
+    let fitted = term.try_fitted_target_aware(z.view(), Some(&rho))?;
     term.record_fit_data_collapse_if_needed(z.view(), fitted.view(), assignments.view(), max_iter)?;
     let trust_diagnostics = term.trust_diagnostics_report(assignments.view())?;
     // Assignment-support diagnostics (atom lens) must read the SAME assignments
@@ -1240,7 +1131,6 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         rho,
         loss,
         penalized_laml_criterion,
-        post_topk_loss,
         assignments,
         fitted,
         active_mask,
@@ -1253,9 +1143,6 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         fit_diagnostics,
         structure_search_json,
         structure_certificate_json,
-        top_k_will_project,
-        pre_topk_assignments,
-        pre_topk_fitted,
         reported_log_alpha,
     })
 }

@@ -122,7 +122,8 @@ out = module(torch.as_tensor(test_activations, dtype=torch.float64))
 The adapter has no trainable parameters and no `.fit()` method. Inputs that
 require gradients are rejected because inference crosses the Torch/native
 boundary. Its output exposes the native reconstruction, codes, per-atom
-coordinates, penalized-loss diagnostic, and selected smoothness precisions.
+coordinates, the inner penalized-loss diagnostic, the certified full
+penalized-LAML criterion, and selected smoothness precisions.
 Use `gamfit.torch.circular_concordance` on coordinate vectors from independent
 native fits to report O(2)-quotiented circle stability.
 

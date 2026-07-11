@@ -13,7 +13,7 @@
 //! objects" — is NOT achievable for the current SAE architecture without
 //! introducing an approximation the code does not currently make. Every O(n)
 //! touch inside one outer evaluation is *ρ-dependent*, not ρ-invariant, because
-//! the outer search drives the NONLINEAR inner joint fit (`reml_criterion*` →
+//! the outer search drives the NONLINEAR inner joint fit (`penalized_laml_criterion*` →
 //! `assemble_arrow_schur`, the inner Newton solve). For one ρ evaluation the
 //! n-sized work is, and each piece DEPENDS on ρ:
 //!
@@ -51,7 +51,7 @@
 //!
 //! This test pins that invariant: build the SAME two-atom term — identical
 //! atoms, decoders, ARD layout, and ρ — over two DIFFERENT row counts, run the
-//! public `reml_criterion_with_cache`, take the public
+//! public `penalized_laml_criterion_with_cache`, take the public
 //! `analytic_outer_rho_gradient_at_converged`, and assert every gradient channel
 //! has the k-dim length `1 + K + Σ_k d_k` for BOTH n, and that the assembled
 //! gradient vector has that same n-invariant length. A regression that routed an
@@ -221,7 +221,7 @@ fn outer_rho_gradient_is_k_dim_and_n_invariant_1033() {
         // Public outer evaluation: run the inner joint fit once at this ρ and read
         // the converged loss + factor cache.
         let (cost, loss, cache) = term
-            .reml_criterion_with_cache(
+            .penalized_laml_criterion_with_cache(
                 target.view(),
                 &rho,
                 None,
@@ -230,7 +230,7 @@ fn outer_rho_gradient_is_k_dim_and_n_invariant_1033() {
                 ridge_ext_coord,
                 ridge_beta,
             )
-            .expect("reml_criterion_with_cache at the ARD ρ");
+            .expect("penalized_laml_criterion_with_cache at the ARD ρ");
         assert!(
             cost.is_finite(),
             "outer REML cost at n={n} must be finite; got {cost}"

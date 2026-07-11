@@ -1,11 +1,5 @@
 use super::*;
 
-/// Basis/topology tag for one SAE manifold atom.
-///
-/// The evaluated basis and input-location jet live on [`SaeManifoldAtom`].
-/// This enum records the user-facing topology choice so downstream diagnostics
-/// and Python wrappers can round-trip whether the atom was a Duchon patch,
-/// periodic curve, sphere, or a caller-supplied precomputed basis.
 /// Declared function-space seminorm used by one atom's smoothing prior.
 ///
 /// The declaration is consumed once, at atom construction or an explicit
@@ -40,6 +34,12 @@ pub enum SaeReferenceRoughnessKind {
 
 const POINCARE_REFERENCE_CURVATURE: f64 = -1.0;
 
+/// Basis/topology tag for one SAE manifold atom.
+///
+/// The evaluated basis and input-location jet live on [`SaeManifoldAtom`].
+/// This enum records the user-facing topology choice so downstream diagnostics
+/// and Python wrappers can round-trip whether the atom was a Duchon patch,
+/// periodic curve, sphere, or a caller-supplied precomputed basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaeAtomBasisKind {
     Duchon,
@@ -82,7 +82,8 @@ pub enum SaeAtomBasisKind {
     /// (the wrapped / tangent parameterisation) and the decoder is the same
     /// polynomial-in-`t` expansion — but its smoothness penalty is measured in
     /// *hyperbolic* arc length rather than flat tangent length
-    /// ([`SaeReferenceRoughness::PoincareConformalDirichlet`]). For the `d = 1` tangent chart the
+    /// ([`SaeReferenceRoughness::PoincareConformalDirichlet`]). For the `d = 1`
+    /// tangent chart the
     /// coordinate runs at a constant multiple of arc length (geodesic distance
     /// `= 2|t|`), so the intrinsic reweighting is a *constant* — coinciding with
     /// the flat arc-length reweighting, since the chart is intrinsically flat in
@@ -601,24 +602,6 @@ impl SaeManifoldAtom {
             decoder_coefficients,
             SaeReferenceRoughness::ProvidedFunctionGram(function_gram),
         )
-    }
-
-    /// Replace the frozen reference seminorm at an explicit structural
-    /// reparameterization boundary. Ordinary parameter updates must not call
-    /// this method: the installed `S_ref` defines the objective being solved.
-    pub fn install_reference_roughness(
-        &mut self,
-        reference_roughness: SaeReferenceRoughness,
-    ) -> Result<(), String> {
-        let (gram, kind) = Self::materialize_reference_roughness(
-            &self.basis_kind,
-            self.latent_dim,
-            self.basis_jacobian.view(),
-            reference_roughness,
-        )?;
-        self.smooth_penalty = gram;
-        self.reference_roughness_kind = kind;
-        Ok(())
     }
 
     fn materialize_reference_roughness(

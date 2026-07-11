@@ -535,55 +535,6 @@ fn build_rho(
     ))
 }
 
-fn project_top_k(
-    assignments: &mut Array2<f64>,
-    top_k: usize,
-    renormalize: bool,
-) -> Result<(), String> {
-    let (n_obs, k_atoms) = assignments.dim();
-    if top_k >= k_atoms {
-        return Ok(());
-    }
-    for row in 0..n_obs {
-        let mut ranked: Vec<(f64, usize)> = (0..k_atoms)
-            .map(|atom_index| (assignments[[row, atom_index]], atom_index))
-            .collect();
-        let compare = |left: &(f64, usize), right: &(f64, usize)| {
-            right.0.total_cmp(&left.0).then(left.1.cmp(&right.1))
-        };
-        ranked.select_nth_unstable_by(top_k - 1, compare);
-        let mut keep = vec![false; k_atoms];
-        for &(_, atom_index) in ranked.iter().take(top_k) {
-            keep[atom_index] = true;
-        }
-        if renormalize {
-            let kept_mass: f64 = (0..k_atoms)
-                .filter(|&atom_index| keep[atom_index])
-                .map(|atom_index| assignments[[row, atom_index]])
-                .sum();
-            if !(kept_mass.is_finite() && kept_mass > 0.0) {
-                return Err(format!(
-                    "run_sae_manifold_oos: top-k softmax projection has non-positive kept mass on row {row}"
-                ));
-            }
-            for atom_index in 0..k_atoms {
-                assignments[[row, atom_index]] = if keep[atom_index] {
-                    assignments[[row, atom_index]] / kept_mass
-                } else {
-                    0.0
-                };
-            }
-        } else {
-            for atom_index in 0..k_atoms {
-                if !keep[atom_index] {
-                    assignments[[row, atom_index]] = 0.0;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Execute frozen-decoder OOS inference from a typed, owned request.
 #[must_use = "OOS inference errors and report must be handled"]
 pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, String> {
@@ -633,11 +584,19 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
             ));
         }
     }
-    if assignment == SaeOosAssignmentKind::TopK && top_k.is_none() {
-        return Err(
-            "run_sae_manifold_oos: TopK assignment requires an explicit top_k support size"
-                .to_string(),
-        );
+    match (assignment, top_k) {
+        (SaeOosAssignmentKind::TopK, None) => {
+            return Err(
+                "run_sae_manifold_oos: TopK assignment requires an explicit top_k support size"
+                    .to_string(),
+            );
+        }
+        (SaeOosAssignmentKind::TopK, Some(_)) | (_, None) => {}
+        (_, Some(limit)) => {
+            return Err(format!(
+                "run_sae_manifold_oos: top_k={limit} is valid only for TopK assignment"
+            ));
+        }
     }
 
     let basis_kinds: Vec<SaeAtomBasisKind> = atom_specs
@@ -734,8 +693,6 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     if !hybrid_linear_images.is_empty() {
         term.set_hybrid_linear_images(hybrid_linear_images.clone())?;
     }
-    term.set_softmax_active_cap(top_k);
-
     let mut rho = build_rho(regularization, &latent_dims)?;
     if cold_coords {
         term.seed_coords_by_decoder_projection(target.view())?;
@@ -759,16 +716,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         learning_rate,
         ridge_ext_coord,
     )?;
-    let mut assignments = term.assignment.assignments();
-    if let Some(limit) = top_k {
-        if limit < k_atoms {
-            project_top_k(
-                &mut assignments,
-                limit,
-                assignment == SaeOosAssignmentKind::Softmax,
-            )?;
-        }
-    }
+    let assignments = term.assignment.assignments();
     let fitted =
         term.reconstruct_from_assignments_target_aware(target.view(), assignments.view())?;
 
@@ -915,6 +863,20 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
             ));
         }
     }
+    match (assignment, top_k) {
+        (SaeOosAssignmentKind::TopK, None) => {
+            return Err(
+                "run_sae_manifold_steer: TopK assignment requires the saved top_k support size"
+                    .to_string(),
+            );
+        }
+        (SaeOosAssignmentKind::TopK, Some(_)) | (_, None) => {}
+        (_, Some(support)) => {
+            return Err(format!(
+                "run_sae_manifold_steer: top_k={support} is valid only for TopK assignment"
+            ));
+        }
+    }
     let mode = match assignment {
         SaeOosAssignmentKind::Softmax => AssignmentMode::softmax(tau),
         SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha } => {
@@ -966,7 +928,6 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     let assignment_state =
         SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coord_blocks, manifolds, mode)?;
     let mut term = SaeManifoldTerm::new(atoms, assignment_state)?;
-    term.set_softmax_active_cap(top_k);
     if let Some(metric) = fisher_metric {
         term.set_row_metric(metric)?;
     }

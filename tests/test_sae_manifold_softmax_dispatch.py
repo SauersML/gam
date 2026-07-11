@@ -119,7 +119,7 @@ class _FakeRustModule:
             "logits": logits,
             "atom_active_mask": [True for _ in atom_dim],
             "fitted": np.zeros_like(z),
-            "reml_score": -1.0,
+            "penalized_laml_criterion": 1.0,
             "penalized_loss_score": -1.0,
             "chosen_k": int(k_atoms),
             "dispersion": 1.0,

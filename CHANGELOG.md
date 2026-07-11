@@ -827,7 +827,7 @@ dictionaries descend their hyperparameters instead of hard-erroring.
   an infeasible fit errors rather than returning an invalid model.
 - **Massive-K SAE descends its hyperparameters matrix-free (#1026).** The EFS
   (Fellner–Schall) lane now takes its ARD/smoothness traces off the streaming
-  arrow-factor cache returned by `reml_criterion_streaming_exact_with_cache`
+  arrow-factor cache returned by `penalized_laml_criterion_streaming_exact_with_cache`
   instead of forcing the dense `O((K·M·p)²)` evidence cache that hard-errors at
   large K (25.9 GB even at K=256). The `gamfit` facade admits an overcomplete
   dictionary (`K ≥ n`) under ARD/smoothness-prior identifiability — a warning, not

@@ -573,7 +573,7 @@ impl SaeManifoldTerm {
         solve_exact_stationarity_on_gauge_quotient(solver, rhs, &apply_raw_a, &apply_raw_b)
     }
 
-    /// Matrix-free exact-stationarity sibling used by the wide-border REML
+    /// Matrix-free exact-stationarity sibling used by the wide-border penalized-LAML
     /// assignment-strength residual. `system` is the reassembled undamped
     /// bordered operator at the converged inner state; `cache` supplies the same
     /// row factors and H_tbeta operator whose rational log-determinant and shared
@@ -782,7 +782,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// Analytic SAE REML outer-ρ gradient components at the already converged
+    /// Analytic SAE penalized-LAML outer-ρ gradient components at the already converged
     /// inner state represented by `loss` and `cache`.
     ///
     /// The returned gradient is the assembled analytic outer derivative:

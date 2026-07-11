@@ -346,78 +346,21 @@ impl SaeManifoldTerm {
             smooth_scaled_s.push(scaled_s);
         }
 
-        // Per-row active-set layout. Engaged for ordered Beta--Bernoulli-MAP at
-        // large `K`, where the dense `(m_total · p)²` data
-        //     Gram is infeasible, so each row is truncated to its
-        //     top-`k_active` atoms above a relative magnitude cutoff
-        //     ([`Self::sparse_active_plan`]). Small-`K` problems return `None`
-        //     and keep the exact full-support layout.
-        // The compact row block is sized `q_active = |active| + Σ_{k∈active}
-        // d_k` instead of the full `q`.
+        // Only the explicit hard-TopK model has a compact row layout. Every
+        // smooth assignment family has nonzero full-support derivatives and
+        // therefore remains exact; silently truncating those rows would make
+        // the assembled gradient/Hessian derivatives of a different forward
+        // objective.
         let coord_dims: Vec<usize> = self
             .assignment
             .coords
             .iter()
             .map(|c| c.latent_dim())
             .collect();
+        let forced_compact = matches!(forced_layout, Some(Some(_)));
         let row_layout: Option<SaeRowLayout> = match forced_layout {
             Some(layout) => layout,
             None => match self.assignment.mode {
-                // The threshold-centered logistic is strictly nonzero with a
-                // nonzero derivative at every finite logit. Its exact Newton
-                // system therefore uses the full dense row layout.
-                AssignmentMode::ThresholdGate { .. } => None,
-                AssignmentMode::Softmax { .. } => match self.softmax_active_plan() {
-                    Some((k_active_cap, relative_cutoff)) => {
-                        // Per-row gate maps are independent read-only computations
-                        // (`&self`, no shared mutable state, no GEMM), so the
-                        // order-preserving parallel collect is bit-identical to the
-                        // serial push (deterministic — each row computed once, no
-                        // cross-row reduction).
-                        let assignments_all = self.assignments_all_parallel(n)?;
-                        Some(SaeRowLayout::from_dense_weights(
-                            &assignments_all,
-                            k_active_cap,
-                            relative_cutoff,
-                            coord_dims.clone(),
-                            self.assignment.coord_offsets(),
-                            // Softmax reduced chart: atom K−1 is the pinned reference
-                            // (coord block but no free logit slot). (#Bug1)
-                            Some(k_atoms - 1),
-                        ))
-                    }
-                    None => None,
-                },
-                AssignmentMode::OrderedBetaBernoulli { .. } => {
-                    match self.sparse_active_plan() {
-                        Some((k_active_cap, relative_cutoff)) => {
-                            // Build per-row dense assignments once to derive the
-                            // active set; the row loop re-derives `assignments`
-                            // (cheap gate map at the same rho) and reuses these
-                            // active sets. Independent read-only per-row builds →
-                            // order-preserving parallel collect is bit-identical to
-                            // the serial push (deterministic).
-                            let assignments_all = self.assignments_all_parallel(n)?;
-                            // #1414: pass the RELATIVE cutoff through;
-                            // `from_dense_weights` applies it per row against that
-                            // row's own peak `max_k |a_{n,k}|`, matching the
-                            // documented `sparse_active_plan` contract. A single
-                            // global threshold (relative_cutoff · whole-dataset
-                            // peak) wrongly drops every atom of a uniformly-small
-                            // row when another row peaks high.
-                            Some(SaeRowLayout::from_dense_weights(
-                                &assignments_all,
-                                k_active_cap,
-                                relative_cutoff,
-                                coord_dims.clone(),
-                                self.assignment.coord_offsets(),
-                                // ordered Beta--Bernoulli-MAP is column-separable: no reference atom.
-                                None,
-                            ))
-                        }
-                        None => None,
-                    }
-                }
                 AssignmentMode::TopK { k } => {
                     // The support IS the layout: TopK gates are exactly {0, 1},
                     // so the compact row block is precisely the k support atoms —
@@ -427,20 +370,56 @@ impl SaeManifoldTerm {
                     // Independent read-only per-row builds → order-preserving
                     // parallel collect is bit-identical to the serial push.
                     let assignments_all = self.assignments_all_parallel(n)?;
-                    Some(SaeRowLayout::from_dense_weights(
+                    Some(SaeRowLayout::from_topk_gates(
                         &assignments_all,
                         k,
-                        // Gates are exact 1/0: any relative cutoff in (0, 1]
-                        // selects exactly the support; ½ is the midpoint.
-                        0.5,
                         coord_dims.clone(),
                         self.assignment.coord_offsets(),
-                        // Column-separable hard support: no reference atom.
-                        None,
-                    ))
+                    )?)
                 }
+                AssignmentMode::Softmax { .. }
+                | AssignmentMode::OrderedBetaBernoulli { .. }
+                | AssignmentMode::ThresholdGate { .. } => None,
             },
         };
+        if !matches!(self.assignment.mode, AssignmentMode::TopK { .. })
+            && forced_compact
+        {
+            return Err(
+                "compact row layouts are valid only for AssignmentMode::TopK; smooth assignment modes require exact full-support assembly"
+                    .to_string(),
+            );
+        }
+
+        // SPEC's never-OOM rule: refuse before allocating an exact dense system
+        // whose two irreducible resident blocks exceed the host in-core budget.
+        // The row tier stores one q×q block per row, while the full-support
+        // decoder data Gram stores m_total² scalar entries (the `⊗ I_p`
+        // structure avoids an additional p² factor). TopK has an exact sparse
+        // representation and never enters this check.
+        if row_layout.is_none() {
+            let m_total: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
+            let row_bytes = n
+                .saturating_mul(q)
+                .saturating_mul(q)
+                .saturating_mul(SAE_BYTES_PER_F64);
+            let gram_bytes = m_total
+                .saturating_mul(m_total)
+                .saturating_mul(SAE_BYTES_PER_F64);
+            let required_bytes = row_bytes.saturating_add(gram_bytes);
+            let budget_bytes = sae_host_in_core_budget_bytes().0;
+            if required_bytes > budget_bytes {
+                return Err(format!(
+                    "exact {} assignment assembly requires at least {required_bytes} bytes for row curvature and decoder Gram, exceeding the in-core budget {budget_bytes} bytes at N={n}, K={k_atoms}. Use assignment='topk' with an explicit support size; smooth assignments are never silently truncated",
+                    match self.assignment.mode {
+                        AssignmentMode::Softmax { .. } => "softmax",
+                        AssignmentMode::OrderedBetaBernoulli { .. } => "ordered_beta_bernoulli",
+                        AssignmentMode::ThresholdGate { .. } => "threshold_gate",
+                        AssignmentMode::TopK { .. } => unreachable!(),
+                    }
+                ));
+            }
+        }
         // #974 likelihood-whitening seam. The single per-row decision: when the
         // installed `RowMetric` is a genuinely estimated noise model
         // (`whitens_likelihood()` — only `WhitenedStructured`), the
@@ -1039,34 +1018,21 @@ impl SaeManifoldTerm {
                         // For dense layout: position `atom_idx` directly.
                         //
                         // H-consistency note (#1006 audit / #1416 update). This
-                        // `assignment_hdiag` is the assignment channel's raw diagonal
-                        // curvature, added un-majorized. It is exact for JumpReLU and exact
-                        // within each ordered Beta--Bernoulli row/column diagonal, and stores ONLY the diagonal of
-                        // two full-Hessian structures — but those off-diagonal structures are
-                        // now carried elsewhere, not dropped:
+                        // `assignment_hdiag` is the assignment channel's diagonal
+                        // curvature. Smooth-threshold curvature is exact; the
+                        // nonconvex assignment modes use their declared PSD
+                        // Loewner majorizers:
                         //
                         //   * softmax entropy has dense within-row Hessian
                         //     H_kj = (λ/τ²) a_k[δ_kj(m-L_k-1) + a_j(L_k+L_j+1-2m)];
                         //     this diagonal stores its Gershgorin Loewner majorizer (#1419).
-                        //   * ordered Beta--Bernoulli empirical-π has cross-row rank-one terms per column
-                        //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j.
-                        //     This per-row diagonal stores only the diagonal/self-row part;
-                        //     the FULL rank-one cross-row block `U D Uᵀ` is now INSTALLED as a
-                        //     separate Woodbury source by `set_ordered_beta_bernoulli_cross_row_source` (#1038),
-                        //     so the assembled operator is `H_full = H₀' + U D Uᵀ` on the
-                        //     NO-SELF base `H₀' = H₀ − Σ_k d_k diag(z'_ik²)` (self term
-                        //     downdated, see `OrderedBetaBernoulliCrossRowSource::self_term_downdate`). The
-                        //     scalar `D`-coefficient `d_k = w·s'_k` is
-                        //     `OrderedBetaBernoulliHessianDiagThirdChannels::cross_row_d` (FD-verified against
-                        //     ∂²value/∂ℓ_ik∂ℓ_jk in
-                        //     `ordered_beta_bernoulli_cross_row_woodbury_d_matches_full_off_diagonal_hessian`),
-                        //     and `z_jac` carries `u_k`'s entries `z'_ik`.
-                        //
-                        // The criterion's log|H| and Γ adjoint differentiate this SAME
-                        // `H_full`: the ρ-trace adds the cross-row off-diagonal in
-                        // `assignment_log_strength_hessian_trace` (#1416, dense AND compact
-                        // layouts) and the θ-adjoint adds it in `logdet_theta_adjoint`
-                        // (#1416/#1641), so value and gradient stay on one operator.
+                        //   * the integrated ordered Beta--Bernoulli marginal has
+                        //     `s'=-ψ₁(M+a)-ψ₁(N-M+1)<0`, so its cross-row
+                        //     rank-one block `w·s'·J Jᵀ` is negative semidefinite.
+                        //     Its PSD Loewner majorizer is therefore exactly zero.
+                        //     The remaining row-local concrete-Jacobian term is
+                        //     isolated and clamped by
+                        //     `ordered_beta_bernoulli_psd_majorized_hdiag`.
                         let assignment_base = row * k_atoms;
                         if let Some(layout) = row_layout.as_ref() {
                             // #Bug1: iterate FREE-logit atoms — softmax's reference
@@ -2396,83 +2362,6 @@ impl SaeManifoldTerm {
             })
         {
             sys.set_row_gauge_deflation(deflation);
-        }
-        // #1038 ordered Beta--Bernoulli cross-row Woodbury source. The exact ordered Beta--Bernoulli Hessian has the
-        // per-column rank-one cross-row block `H_(i,k),(j,k) = w·s'_k·z'_ik·z'_jk`
-        // (for ALL `i,j`, including the `i=j` self term) that couples DISTINCT
-        // latent rows through the shared empirical mass `M_k = Σ_i z_ik`. The
-        // assembled row-block-diagonal `htt` already carries the `i=j` self term
-        // `w·s'_k·z'_ik²` — it is the first summand of `assignment_hdiag`'s
-        // `hessian_diag` value `w·(score_derivative·z_jac² + score·c_ik)` written
-        // at the logit diagonal above. So the consumer (`solver::arrow_schur`,
-        // #1038 `OrderedBetaBernoulliCrossRowSource`/`CrossRowWoodbury`) DOWNDATES exactly
-        // `Σ_k d_k·z'_ik²` (`self_term_downdate`) to recover the NO-SELF base
-        // `H₀'`, then re-adds the FULL rank-one `U D Uᵀ` via the determinant
-        // lemma — so value, the evidence log-determinant, and the θ/ρ-adjoint all
-        // differentiate the SAME `H_full = H₀' + U D Uᵀ`.
-        //
-        // The source is built from the SAME `ordered_beta_bernoulli_assignment_third_channels`
-        // operator the #1006 θ-adjoint consumes:
-        //   * `d[k] = cross_row_d[k]` (the column `D`-coefficient — since #2144
-        //     clamped at the source to `max(w·s'_k, 0)`, so the capacitance
-        //     `C = I + D·UᵀH₀'⁻¹U` the consumer LU-factors is PD; the LU handles
-        //     the non-symmetric `D·M` product, not indefiniteness);
-        //   * `entries[(i,k)] = (global_t_index, k, z'_ik)` with `z'_ik =
-        //     z_jac[i·K + k]`. For the DENSE layout (`assignment_coord_dim() = K`,
-        //     `last_row_layout = None`) atom `k`'s logit slot is local position `k`
-        //     of row `i`'s block, so `global_t_index = sys.row_offsets[i] + k`. For
-        //     the COMPACT layout (#1420) only the row's active atoms are
-        //     coordinates and atom `k` lives at local position `pos` of
-        //     `active_atoms[row]`, so `global_t_index = sys.row_offsets[i] + pos`.
-        //     Both pin the `U`-column convention bit-for-bit to the consumer's
-        //     `ordered_beta_bernoulli_logit_sites`/`row_vars_for_cache_row` slot mapping.
-        if let Some(channels) = ordered_beta_bernoulli_assignment_third_channels_weighted(
-            &self.assignment,
-            rho,
-            false,
-            self.row_loss_weights.as_deref(),
-        )? {
-            let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n * k_atoms);
-            for row in 0..n {
-                let start = row * k_atoms;
-                let g_base = sys.row_offsets[row];
-                match row_layout.as_ref() {
-                    // #1420: compact layout — the local logit slot `pos` (not the
-                    // global atom index `k`) is the t-coordinate. Atom `k`'s logit
-                    // lives at local position `pos` of `active_atoms[row]`, so emit
-                    // `(g_base + pos, atom, z_jac[row·K + atom])` for the active set
-                    // only. Using `g_base + k` would attach atom `k`'s derivative to
-                    // the wrong slot (and run out of range for compact rows),
-                    // violating the `OrderedBetaBernoulliCrossRowSource` contract.
-                    Some(layout) => {
-                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                            let z_prime = channels.z_jac[start + atom];
-                            entries.push((g_base + pos, atom, z_prime));
-                        }
-                    }
-                    // Dense layout: atom `k`'s logit slot is local position `k`.
-                    None => {
-                        for k in 0..k_atoms {
-                            let z_prime = channels.z_jac[start + k];
-                            entries.push((g_base + k, k, z_prime));
-                        }
-                    }
-                }
-            }
-            // #2144/#1038: clamp the rank-one coefficient `d_k = w·s'_k` to its
-            // positive part UNCONDITIONALLY — the SAME `max(w·s',0)` the per-row
-            // diagonal majorizer (`ordered_beta_bernoulli_psd_majorized_hdiag`) uses. The source's `d`
-            // drives BOTH the self-term downdate and the rank-one re-add, so the
-            // clamped `d` keeps `H₀'`'s diagonal at `max(w·s·c,0) ⪰ 0` and the
-            // capacitance `C = I + D·Uᵀ H₀'⁻¹ U ⪰ I` PD — one operator, evidence
-            // log-det defined at every ρ (the streaming value reads THIS `d` too).
-            let d = channels.cross_row_d.mapv(|x| x.max(0.0));
-            let source = OrderedBetaBernoulliCrossRowSource {
-                r: k_atoms,
-                d,
-                entries,
-            };
-            sys.set_ordered_beta_bernoulli_cross_row_source(source);
         }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = row_layout;

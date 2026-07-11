@@ -4952,7 +4952,6 @@ mod tests {
             deflated_row_directions: std::sync::Arc::from(Vec::new()),
             deflation_row_spectra: std::sync::Arc::from(Vec::new()),
             beta_gauge_quotient: None,
-            cross_row_woodbury: None,
         };
         cache.joint_hessian_log_det = cache.compute_undamped_arrow_log_det();
         cache
@@ -5010,7 +5009,6 @@ mod tests {
             deflated_row_directions: std::sync::Arc::from(Vec::new()),
             deflation_row_spectra: std::sync::Arc::from(Vec::new()),
             beta_gauge_quotient: None,
-            cross_row_woodbury: None,
         };
         cache.joint_hessian_log_det = cache.compute_undamped_arrow_log_det();
         cache

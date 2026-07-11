@@ -182,7 +182,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
                 all_born_finite.set(false);
             }
             log.borrow_mut().push(format!(
-                "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} top2col={:.2} PR={:.2} ev={:?} reml_after={:?}",
+                "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} top2col={:.2} PR={:.2} ev={:?} penalized_laml_after={:?}",
                 pg.event,
                 pg.birth_round,
                 pg.backfit_sweep,
@@ -192,7 +192,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
                 top2,
                 pr,
                 pg.ev.map(|e| (e * 10000.0).round() / 10000.0),
-                pg.joint_reml_after.map(|r| (r * 100.0).round() / 100.0),
+                pg.joint_penalized_laml_after.map(|r| (r * 100.0).round() / 100.0),
             ));
             Ok(())
         };

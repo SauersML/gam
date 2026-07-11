@@ -240,7 +240,7 @@ def test_native_sae_manifold_reconstruct_matches_numpy_loop_and_shapes():
         births_accepted=1,
         births_rejected=0,
         stopped_reason="test",
-        terminal_joint_reml=0.0,
+        terminal_joint_penalized_laml=0.0,
         terminal_data_fit=0.0,
         birth_records=[],
         collapse_events=[],

@@ -161,7 +161,7 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
 }
 
 #[test]
-fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
+fn penalized_laml_criterion_keeps_alpha_finite_on_collapsing_axis() {
     // A coordinate axis that collapses (‖t_·j‖² → ~0) would make the deleted
     // α = n/‖t‖² rule explode toward the clamp ceiling. The true REML
     // criterion instead has a finite interior argmin in log α because the
@@ -179,7 +179,7 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
     let log_alpha_grid = [-6.0_f64, -2.0, 0.0, 2.0, 6.0, 10.0, 16.0];
     let mut best = (f64::INFINITY, f64::NAN);
     for &la in &log_alpha_grid {
-        // Fresh term per grid point: reml_criterion runs the inner (t,β) fit
+        // Fresh term per grid point: penalized_laml_criterion runs the inner (t,β) fit
         // IN PLACE, so reusing one term would make each evaluation start from
         // the previous α's fitted state (path-dependent, monotone drift). The
         // criterion is a function of ρ from a FIXED initial state, so each
@@ -188,7 +188,7 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
         // Axis 0 keeps a mild prior; axis 1 (the collapsing one) is swept.
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, la]]);
         let (v, _loss) = term
-            .reml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
+            .penalized_laml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate");
         assert!(
             v.is_finite(),
@@ -208,7 +208,7 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
 }
 
 #[test]
-fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
+fn penalized_laml_criterion_has_interior_minimum_in_log_lambda_smooth() {
     // The −½·p·rank(S)·log λ_smooth Occam term gives the criterion a finite
     // interior argmin in log λ_smooth: too small λ underfits (large penalised
     // loss + logdet), too large λ is penalised by the rank·logλ normaliser.
@@ -256,7 +256,7 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
     let log_lambda_grid = [-8.0_f64, -4.0, -1.0, 1.0, 4.0, 8.0, 12.0];
     let mut best = (f64::INFINITY, f64::NAN);
     for &ll in &log_lambda_grid {
-        // Fresh term per grid point — reml_criterion fits (t,β) in place, so a
+        // Fresh term per grid point — penalized_laml_criterion fits (t,β) in place, so a
         // shared term would carry the previous λ's fit forward and make the
         // sweep path-dependent (monotone), masking the true interior optimum.
         // Run the inner fit to convergence (50 iters) so loss.total() and
@@ -265,7 +265,7 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
         let mut term = base_term.clone();
         let rho = SaeManifoldRho::new(0.0, ll, vec![array![0.0]]);
         let (v, _loss) = term
-            .reml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
+            .penalized_laml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate");
         assert!(
             v.is_finite(),
@@ -304,7 +304,7 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
     // per-row assembly). Channel 0 carries a real signal so the reconstruction
     // residual — and hence the dispersion φ̂ — is nonzero, keeping the ARD α
     // finite. Channel 1 carries the same small-but-identified ±0.01 signal the
-    // sibling `reml_criterion_keeps_alpha_finite_on_collapsing_axis` uses to hold
+    // sibling `penalized_laml_criterion_keeps_alpha_finite_on_collapsing_axis` uses to hold
     // axis 1 near collapse (‖t_·1‖² → ~0 while its decoder column stays nonzero,
     // so the axis keeps real data curvature): exactly the regime where the FS
     // denominator on axis 1 is dominated by the posterior-variance trace
@@ -354,14 +354,14 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
     // Cross-check: the EFS-converged α minimizes the v1 cost criterion. Sweep
     // log α on axis 1 with all other ρ at the EFS optimum and confirm the
     // criterion at the EFS α is no worse than its neighbours (interior min).
-    // Each cost_at call clones a FRESH term from the baseline — reml_criterion
+    // Each cost_at call clones a FRESH term from the baseline — penalized_laml_criterion
     // fits (t,β) in place, so a shared term would make the three probes
     // path-dependent. Inner fit runs to convergence (50 iters).
     let base_term = term;
     let cost_at = |la1: f64| -> f64 {
         let mut t = base_term.clone();
         let rho = SaeManifoldRho::new(rho_flat[0], rho_flat[1], vec![array![rho_flat[2], la1]]);
-        t.reml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
+        t.penalized_laml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate")
             .0
     };

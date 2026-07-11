@@ -2217,7 +2217,7 @@ impl SaeManifoldTerm {
     ///
     /// The engine self-protects here so a genuine incompatibility surfaces as a
     /// direct, actionable error at the FFI boundary rather than as a deep
-    /// `RemlConvergenceError` mid-REML (the failure mode
+    /// `RemlConvergenceError` mid penalized-LAML solve (the failure mode
     /// [`Self::validate_analytic_penalty_registry`] otherwise produces during
     /// `assemble_arrow_schur`).
     ///
@@ -3866,7 +3866,7 @@ impl SaeManifoldTerm {
 
     /// #1154 — amortized-encoder consistency of the CURRENT dictionary against
     /// its own fit-time target. This is the co-training signal of the joint
-    /// amortized-encoder + REML loop (Design A): the amortized (one-mat-vec)
+    /// amortized-encoder + penalized-LAML loop (Design A): the amortized (one-mat-vec)
     /// encode is built from the *current* fitted decoder, run on `targets`, and
     /// scored on two principled axes —
     ///
@@ -3878,7 +3878,7 @@ impl SaeManifoldTerm {
     ///   to first order by the per-chart IFT predictor scores near zero; a
     ///   dictionary the amortized encoder *cannot* invert faithfully (sharp
     ///   curvature, poorly-charted regions) scores high. Minimising this jointly
-    ///   with REML steers the fit toward dictionaries that admit a fast,
+    ///   with penalized LAML steers the fit toward dictionaries that admit a fast,
     ///   faithful amortized encode — the architectural co-adaptation #1154 adds.
     /// * `unconverged_fraction`: the share of rowwise joint shared-residual
     ///   solves that did not meet the first-order stationarity tolerance.
@@ -4542,7 +4542,7 @@ impl SaeManifoldTerm {
     /// NOTE: the coordinate-block penalties with no native `loss.*` twin
     /// (`ScadMcp`, `BlockOrthogonality`) carry the same residual inconsistency
     /// (scored in the line search via `penalized_objective_total`, absent from
-    /// the REML scalar). They are left out here because they share a registry
+    /// the penalized-LAML scalar). They are left out here because they share a registry
     /// dispatch with the always-on `Isometry` gauge, whose inclusion in the
     /// topology-comparison criterion is a separate design question (#673:
     /// topology evidence is gauge-conditional). Folding the coord-tier energy in

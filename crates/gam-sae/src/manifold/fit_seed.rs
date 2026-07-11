@@ -57,6 +57,11 @@ impl SaeFitAssignmentKind {
         top_k: Option<usize>,
     ) -> Result<AssignmentMode, String> {
         match self {
+            Self::Softmax | Self::OrderedBetaBernoulli | Self::ThresholdGate
+                if top_k.is_some() => Err(format!(
+                    "top_k is valid only with assignment_kind 'topk'; got assignment_kind '{}'",
+                    self.tag()
+                )),
             Self::Softmax => Ok(AssignmentMode::softmax(tau)),
             Self::OrderedBetaBernoulli => Ok(AssignmentMode::ordered_beta_bernoulli(
                 tau,
@@ -167,12 +172,26 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.max_iter
         ));
     }
-    if let Some(k_top) = request.top_k {
-        if k_top == 0 || k_top > k_atoms {
+    match (request.assignment_kind, request.top_k) {
+        (SaeFitAssignmentKind::TopK, Some(k_top)) if k_top > 0 && k_top <= k_atoms => {}
+        (SaeFitAssignmentKind::TopK, Some(k_top)) => {
             return Err(format!(
-                "top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
+                "assignment_kind 'topk' requires 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
             ));
         }
+        (SaeFitAssignmentKind::TopK, None) => {
+            return Err(
+                "assignment_kind 'topk' requires top_k (the fixed per-row support size)"
+                    .to_string(),
+            );
+        }
+        (kind, Some(k_top)) => {
+            return Err(format!(
+                "top_k={k_top} is valid only with assignment_kind 'topk'; got assignment_kind '{}'",
+                kind.tag()
+            ));
+        }
+        (_, None) => {}
     }
     if request.initial_logits.dim() != (n_obs, k_atoms) {
         return Err(format!(
@@ -332,7 +351,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
     if let Some(schedule) = request.temperature_schedule {
         base_term.set_temperature_schedule(schedule)?;
     }
-    base_term.set_softmax_active_cap(request.top_k);
 
     if request.seed_refine_routing
         && k_atoms > 1
@@ -350,7 +368,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.tau,
             request.threshold,
             request.seed_refine_random_state,
-            request.top_k,
         )?;
     }
 

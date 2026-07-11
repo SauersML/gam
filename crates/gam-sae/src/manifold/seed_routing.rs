@@ -545,8 +545,8 @@ pub fn sae_refine_mobius_seed_coords_by_cluster(
 /// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
 /// a_init * Phi_K]`, where `a_init` is the assignment map that the inner Newton
 /// driver will produce at iteration 0 from the supplied `initial_logits`.
-/// ordered Beta--Bernoulli-MAP uses the base `alpha` because learnable-alpha fits start with
-/// `rho0 = 0`, and JumpReLU uses the configured hard threshold.
+/// Ordered Beta--Bernoulli uses the base `alpha` because learnable-alpha fits start with
+/// `rho0 = 0`, and the smooth threshold gate uses its configured center.
 ///
 /// Zero-initialised decoder coefficients leave the joint-fit Arrow-Schur
 /// system in a degenerate fixed point on multi-atom configurations: the
@@ -597,18 +597,16 @@ pub fn sae_decoder_lsq_init(
             "sae_decoder_lsq_init: tau must be finite and positive; got {tau}"
         ));
     }
+    if assignment_kind != "topk" && top_k.is_some() {
+        return Err(format!(
+            "sae_decoder_lsq_init: top_k is valid only with assignment_kind 'topk'; got {assignment_kind:?}"
+        ));
+    }
     // Compute per-row, per-atom assignment weight a_init that matches the
     // forward map of `assignment_kind` evaluated at `initial_logits`.
     let mut a_init = Array2::<f64>::zeros((n_obs, k_atoms));
     match assignment_kind {
         "softmax" => {
-            if let Some(k_top) = top_k {
-                if k_top == 0 || k_top > k_atoms {
-                    return Err(format!(
-                        "sae_decoder_lsq_init: top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
-                    ));
-                }
-            }
             let inv_tau = 1.0 / tau;
             for row in 0..n_obs {
                 let mut max_logit = f64::NEG_INFINITY;
@@ -628,38 +626,6 @@ pub fn sae_decoder_lsq_init(
                 if sum > 0.0 && sum.is_finite() {
                     for k in 0..k_atoms {
                         a_init[[row, k]] = buf[k] / sum;
-                    }
-                }
-                if let Some(k_top) = top_k {
-                    if k_top < k_atoms {
-                        let mut paired: Vec<(f64, usize)> =
-                            (0..k_atoms).map(|k| (a_init[[row, k]], k)).collect();
-                        let cmp = |a: &(f64, usize), b: &(f64, usize)| {
-                            b.0.partial_cmp(&a.0)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(a.1.cmp(&b.1))
-                        };
-                        paired.select_nth_unstable_by(k_top - 1, cmp);
-                        let mut keep = vec![false; k_atoms];
-                        for &(_, atom_idx) in paired.iter().take(k_top) {
-                            keep[atom_idx] = true;
-                        }
-                        let kept_sum: f64 = (0..k_atoms)
-                            .filter(|&atom_idx| keep[atom_idx])
-                            .map(|atom_idx| a_init[[row, atom_idx]])
-                            .sum();
-                        if !(kept_sum.is_finite() && kept_sum > 0.0) {
-                            return Err(format!(
-                                "sae_decoder_lsq_init: top_k softmax projection has non-positive kept mass on row {row}"
-                            ));
-                        }
-                        for atom_idx in 0..k_atoms {
-                            a_init[[row, atom_idx]] = if keep[atom_idx] {
-                                a_init[[row, atom_idx]] / kept_sum
-                            } else {
-                                0.0
-                            };
-                        }
                     }
                 }
             }
@@ -866,7 +832,6 @@ pub fn sae_refine_routing_seed(
     tau: f64,
     threshold_gate_threshold: f64,
     random_state: u64,
-    top_k: Option<usize>,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
     const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
@@ -918,7 +883,7 @@ pub fn sae_refine_routing_seed(
             alpha,
             tau,
             threshold_gate_threshold,
-            top_k,
+            None,
         )?;
         for atom_idx in 0..k_atoms {
             let m_k = basis_sizes[atom_idx];

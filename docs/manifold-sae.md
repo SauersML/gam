@@ -139,7 +139,7 @@ worth of independent signal in `Z`.
 ## The objective
 
 The fit minimizes reconstruction error plus a stack of penalties, with
-smoothing weights selected by REML. Each piece plays a distinct role
+smoothing weights selected by the penalized-LAML objective. Each piece plays a distinct role
 (default state in parentheses):
 
 - **Reconstruction.** Squared error between `Z` and the sparse sum of
@@ -157,7 +157,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   the columns do not share latent sticks and the model is therefore not an IBP.
   Integrating each nuisance rate exactly gives the per-column penalty
   `−log a_k − logΓ(M_k+a_k) − logΓ(N−M_k+1) + logΓ(N+a_k+1)`, where
-  `M_k = Σ_i z_ik`. Logit, concentration, Hessian, and REML/LAML channels all
+  `M_k = Σ_i z_ik`. Logit, concentration, Hessian, and penalized-LAML channels all
   differentiate this same scalar. The prior mean is not multiplied into the
   reconstruction, so shrinkage is scored exactly once. `"softmax"` is a dense,
   simplex-normalized gate. `"threshold_gate"` is the smooth bounded gate
@@ -371,7 +371,7 @@ the full surface):
 | `coords` | `[ (N, d_k) ]` per-atom per-token coordinates |
 | `decoder_blocks` | `[ (M_k, p) ]` per-atom decoder matrices |
 | `fitted` / `assignments` | `(N, p)` training reconstruction / `(N, K)` gates |
-| `reconstruction_r2` / `penalized_loss_score` / `dispersion` | fit-quality / negative penalized-loss objective (NOT REML / evidence; `reml_score` is a deprecated read alias) / noise scale |
+| `reconstruction_r2` / `penalized_loss_score` / `penalized_laml_criterion` / `dispersion` | fit quality / negative penalized loss / certified full penalized-LAML value (including Laplace and Occam terms) / noise scale |
 
 Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 `project(X, k)`, `per_atom_latent_for(X)` and `featurize(X)` (coordinates),
@@ -685,8 +685,10 @@ out = module(torch.as_tensor(new_activations, dtype=torch.float64))
 ```
 
 `out.reconstruction`, `out.codes`, and `out.coordinates` come from one native
-converged-latent solve. `out.penalized_loss_score` is a fit diagnostic, not an
-evidence value, and `out.selected_smooth_lambdas` reports the smoothing
+converged-latent solve. `out.penalized_loss_score` is the inner fit diagnostic,
+while `out.penalized_laml_criterion` is the certified full native criterion;
+neither is relabeled as REML or generic evidence.
+`out.selected_smooth_lambdas` reports the smoothing
 precisions selected by that fit. The adapter has no trainable parameters and
 rejects inputs requiring gradients. Its state dict serializes the complete
 native fit, so loading it restores the same inference model.

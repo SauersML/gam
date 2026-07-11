@@ -79,7 +79,7 @@ def test_stagewise_ev_monotone_and_zero_collapse() -> None:
     assert result.collapse_events == [], (
         f"stagewise must log ZERO collapse events; got {result.collapse_events}"
     )
-    assert np.isfinite(result.terminal_joint_reml)
+    assert np.isfinite(result.terminal_joint_penalized_laml)
     # A K=1 seed plus its births: the discovered dictionary is at least the seed.
     assert result.k == 1 + sum(
         1 for r in result.birth_records if r["accepted"] and r["kind"] == "new_atom"
@@ -201,7 +201,7 @@ def test_stagewise_behavioral_fisher_runs_and_auto_disables_structured_whitening
         random_state=5,
     )
     assert result.k >= 1
-    assert np.isfinite(result.terminal_joint_reml)
+    assert np.isfinite(result.terminal_joint_penalized_laml)
     assert result.fitted.shape == x.shape
     # A monotone-by-construction EV trace still holds under the GLS metric.
     assert _is_non_decreasing(result.ev_trace), list(result.ev_trace)

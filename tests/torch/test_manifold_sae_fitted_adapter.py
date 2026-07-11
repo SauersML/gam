@@ -39,10 +39,13 @@ def test_adapter_output_is_one_native_converged_latent_state() -> None:
     assert len(out.coordinates) == len(expected["coords"])
     for actual, reference in zip(out.coordinates, expected["coords"]):
         np.testing.assert_allclose(actual.numpy(), reference)
+    assert out.penalized_laml_criterion.item() == pytest.approx(
+        native.penalized_laml_criterion
+    )
 
 
 def test_adapter_state_dict_restores_the_serialized_native_fit() -> None:
     first = gt.ManifoldSAE(_native_fit())
     second = gt.ManifoldSAE(_native_fit())
     second.load_state_dict(first.state_dict())
-    assert second.fitted.to_dict() == first.fitted.to_dict()
+    assert second.fitted.to_json() == first.fitted.to_json()

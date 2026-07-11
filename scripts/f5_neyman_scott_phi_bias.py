@@ -9,7 +9,7 @@ setup). The dispersion estimate is
 where `coord_edf` is the ARD-shrunk *per-row Laplace* coordinate effective dof
 (`ard_inverse_traces`, a SINGLE-basin curvature `H_tt` inverted per row,
 construction_reconstruction.rs:70-115). The NON-rank-charge evidence branch
-(`reml_criterion`, construction.rs:4800-4801) prices the coordinate block with
+(`penalized_laml_criterion`, construction.rs:4800-4801) prices the coordinate block with
 this same per-row Laplace `½log|H_tt|`.
 
 The concern: when a row's posterior over its circular coordinate is BIMODAL — the
@@ -451,9 +451,9 @@ def _verdict(rows, ns):
         "  over-counts). Land it against an MC-validated acceptance (φ̂/φ within a\n"
         "  derived tolerance, NO over-shoot) before porting to reconstruction_dispersion.\n"
         "  Sites: construction_reconstruction.rs:70-118 (coord_edf) and the\n"
-        "  non-rank-charge reml_criterion coordinate ½log|H_tt| (construction.rs ~4800).\n"
+        "  non-rank-charge penalized_laml_criterion coordinate ½log|H_tt| (construction.rs ~4800).\n"
         "  Feeds bands / dosimetry / MDL, so an over-correction is as harmful as the bias.\n"
-        "  NOTE: the rank-charge reml_criterion branch (construction.rs:4739-4799)\n"
+        "  NOTE: the rank-charge penalized_laml_criterion branch (construction.rs:4739-4799)\n"
         "  re-prices the coordinate block at ½·d_eff·log n (rotation-invariant) but\n"
         "  still calls reconstruction_dispersion for its φ noise floor — so φ̂ must be\n"
         "  fixed regardless of branch."

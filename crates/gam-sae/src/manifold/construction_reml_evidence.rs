@@ -311,29 +311,9 @@ impl SaeManifoldTerm {
         )?;
         loss.evidence_gauge_deflated_directions = cache.gauge_deflated_directions;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-            // Distinguish a GENUINE infeasibility — a probed ρ where the joint
-            // Hessian is not PD so the Laplace evidence log-det is undefined —
-            // from a real factorization defect. The cross-row ordered Beta--Bernoulli Woodbury
-            // capacitance `C = I_R + D·Uᵀ H₀'⁻¹ U` can have det ≤ 0 at a ρ the
-            // outer optimizer line-searches into (the indefinite basin adjacent
-            // to the PD region); there the log-det legitimately does not exist.
-            // That refusal must be RECOVERABLE (the outer BFGS should get +∞ and
-            // steer back into the PD region), exactly like the "non-PD per-row
-            // H_tt block" refusal — not a fatal `RemlOptimizationFailed` that
-            // aborts the whole fit. See `is_recoverable_value_probe_refusal`.
-            // (The old message claimed "no dense Schur factor", which is false
-            // here — the Schur factor is present; the Woodbury correction is the
-            // non-finite term.)
-            if cache.cross_row_woodbury.is_some() && !cache.cross_row_woodbury_log_det().is_finite()
-            {
-                "SaeManifoldTerm::penalized_laml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at \
-                 this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
-                    .to_string()
-            } else {
-                "SaeManifoldTerm::penalized_laml_criterion: arrow_log_det_from_cache returned None \
-                 (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
-                    .to_string()
-            }
+            "SaeManifoldTerm::penalized_laml_criterion: arrow_log_det_from_cache returned None \
+             (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
+                .to_string()
         })?;
 
         // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
@@ -2351,15 +2331,6 @@ impl SaeManifoldTerm {
         };
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
         let mut log_det_tt = 0.0_f64;
-        // #1038 cross-row ordered Beta--Bernoulli Woodbury accumulators. `M = Uᵀ H₀'⁻¹ U` is
-        // chunk-additive in `M0 = Σ Uᵢᵀ Aᵢ⁻¹ Uᵢ` and `W = Σ Bᵢᵀ Aᵢ⁻¹ Uᵢ`
-        // (`A = H₀'` block-diagonal, `U` row-supported), closed against the
-        // GLOBAL reduced Schur `S = schur_acc` after the loop. `None` for every
-        // non-ordered Beta--Bernoulli (softmax / JumpReLU) term, where the streaming log-det is
-        // exactly the bare `log_det_tt + log_det_schur` as before.
-        let mut wood_m0: Option<Array2<f64>> = None;
-        let mut wood_w: Option<Array2<f64>> = None;
-        let mut wood_d: Option<Array1<f64>> = None;
         let options = ArrowSolveOptions::direct()
             .with_ill_conditioning_tolerated()
             .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
@@ -2404,8 +2375,8 @@ impl SaeManifoldTerm {
                 .assemble_arrow_schur_scaled(z_chunk, rho, registry, penalty_scale)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             let mut streaming = StreamingArrowSchur::from_system(&sys, sys.rows.len().max(1));
-            let (chunk_log_det_tt, chunk_schur, chunk_wood) = streaming
-                .reduced_schur_log_det_tt_woodbury(0.0, 0.0, &options)
+            let (chunk_log_det_tt, chunk_schur) = streaming
+                .reduced_schur_and_log_det_tt(0.0, 0.0, &options)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             log_det_tt += chunk_log_det_tt;
             for row in 0..border_dim {
@@ -2413,77 +2384,14 @@ impl SaeManifoldTerm {
                     schur_acc[[row, col]] += chunk_schur[[row, col]];
                 }
             }
-            if chunk_wood.is_some() && chunk_size < n_total {
-                // The cross-row ordered Beta--Bernoulli empirical mass `M_k = Σ_i z_ik` couples ALL
-                // rows, so the per-row `H₀'` diagonal (`score_derivative_k(M_k)`)
-                // and the column coefficient `d_k = w·s'_k(M_k)` are only exact
-                // when every row is assembled together — a SINGLE chunk. Under a
-                // genuine multi-chunk pass each chunk would see a partial mass and
-                // the Woodbury (and the bare per-row log-det) would be inexact, so
-                // refuse loudly and route to the dense resident path rather than
-                // return a silently-wrong evidence. The streaming log-det only
-                // runs when the dense reduced Schur fits budget, so the single-
-                // chunk regime is the common case; this guards the rest.
-                return Err(
-                    "SaeManifoldTerm::streaming_exact_arrow_log_det: exact cross-row ordered Beta--Bernoulli \
-                     Woodbury evidence requires a single-chunk pass (the empirical mass \
-                     M_k = Σ_i z_ik couples all rows); this shape needs >1 chunk. Route \
-                     ordered Beta--Bernoulli-active large-n fits through the dense resident \
-                     ArrowFactorCache::arrow_log_det."
-                        .to_string(),
-                );
-            }
-            if let Some(cw) = chunk_wood {
-                wood_m0 = Some(match wood_m0.take() {
-                    Some(mut acc) => {
-                        acc += &cw.m0;
-                        acc
-                    }
-                    None => cw.m0,
-                });
-                wood_w = Some(match wood_w.take() {
-                    Some(mut acc) => {
-                        acc += &cw.w;
-                        acc
-                    }
-                    None => cw.w,
-                });
-                // `D = diag(d_k)` is per-atom; identical across chunks for a
-                // single-chunk evidence pass (the regime the streaming log-det
-                // runs in — the dense reduced Schur must fit budget here), where
-                // it equals the global mass-derived `cross_row_d`.
-                wood_d = Some(cw.d);
-            }
             start = end;
         }
         let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
             .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
-        let mut total = log_det_tt + log_det_schur;
-        // #1038/#1225: close the exact cross-row ordered Beta--Bernoulli Woodbury correction
-        // `log det(I_R + D Uᵀ H₀'⁻¹ U)` so the streaming evidence equals the
-        // dense `arrow_log_det_from_cache` (which adds the SAME term). Without
-        // it the streaming criterion would silently drop the entire cross-row
-        // coupling and disagree with the dense path by exactly `log|C|`.
-        if let (Some(m0), Some(w), Some(d)) = (wood_m0, wood_w, wood_d) {
-            let correction = streaming_cross_row_woodbury_log_det(
-                &schur_acc,
-                &m0,
-                &w,
-                &d,
-                options.schur_pd_floor,
-            )
-            .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
-            .ok_or_else(|| {
-                "SaeManifoldTerm::penalized_laml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at \
-                     this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
-                    .to_string()
-            })?;
-            total += correction;
-        }
         if let Some(ri) = rank_inputs.as_deref_mut() {
             ri.log_det_tt = log_det_tt;
         }
-        Ok(total)
+        Ok(log_det_tt + log_det_schur)
     }
 
     /// Per-atom decoder-smoothness penalty quadratic form (#1556): entry `k` is
@@ -2812,21 +2720,10 @@ impl SaeManifoldTerm {
             false,
             self.row_loss_weights.as_deref(),
         )?;
-        let learnable_alpha = matches!(
-            self.assignment.mode,
-            AssignmentMode::OrderedBetaBernoulli {
-                learnable_alpha: true,
-                ..
-            }
-        );
-        // gam#2144/#1038: the assembled `H` carries the PSD-majorized ordered Beta--Bernoulli
-        // curvature UNCONDITIONALLY (`ordered_beta_bernoulli_psd_majorized_hdiag` + clamped Woodbury
-        // `d` — the same doctrine as softmax's #1419 Gershgorin). Differentiate the
-        // SAME operator: overwrite the per-slot diagonal with its majorizer and
-        // clamp the rank-one coefficient (`cross_row_d`, and its learnable-α
-        // derivative) to `max(·,0)`. `self_curv`, the diagonal trace, and the
-        // cross-row off-diagonal pass all read these, so the whole ρ-trace stays on
-        // the majorized operator the evidence log-det factors.
+        // The integrated marginal's mass-Hessian coefficient is strictly
+        // negative, so its cross-row rank-one block has the zero PSD Loewner
+        // majorizer. Retain only the positive part of the row-local
+        // concrete-Jacobian term, matching assembly exactly.
         if let Some(ch) = cross_channels.as_mut() {
             for row in 0..self.n_obs() {
                 for atom in 0..k_atoms {
@@ -2840,25 +2737,7 @@ impl SaeManifoldTerm {
                     );
                 }
             }
-            for k in 0..k_atoms {
-                if ch.cross_row_d[k] < 0.0 {
-                    ch.cross_row_d[k] = 0.0;
-                    ch.cross_row_d_logalpha[k] = 0.0;
-                }
-            }
         }
-        let self_curv = |row: usize, atom: usize| -> f64 {
-            let Some(ch) = cross_channels.as_ref() else {
-                return 0.0;
-            };
-            let d_k = if learnable_alpha {
-                ch.cross_row_d_logalpha[atom]
-            } else {
-                ch.cross_row_d[atom]
-            };
-            let j = ch.z_jac[row * k_atoms + atom];
-            d_k * j * j
-        };
         let mut trace = 0.0_f64;
         // Hoisted RHS scratch for the gauge/Woodbury per-row solve fallback:
         // single-entry set/clear instead of a per-column total_t-sized zeroing.
@@ -2868,10 +2747,9 @@ impl SaeManifoldTerm {
             let row_base = cache.row_offsets[row];
             let assignment_base = row * k_atoms;
             let q = cache.row_dims[row];
-            // Per-row diagonal `(∂H₀'/∂ρ)_tt` for the deflation correction: the
+            // Per-row diagonal `(∂H/∂ρ)_tt` for the deflation correction: the
             // assignment prior curves only the logit/assignment slots (coordinate
-            // slots are 0 — ARD handles those), MINUS the downdated cross-row self
-            // curvature. The full-`H` trace contraction keeps the full `hdiag`.
+            // slots are zero; ARD handles those).
             let mut d_diag = Array1::<f64>::zeros(q);
             match self.last_row_layout {
                 Some(ref layout) => {
@@ -2879,7 +2757,7 @@ impl SaeManifoldTerm {
                         let d_slot = hdiag[assignment_base + atom];
                         trace += inv_diag[row_base + pos] * d_slot;
                         if pos < q {
-                            d_diag[pos] = d_slot - self_curv(row, atom);
+                            d_diag[pos] = d_slot;
                         }
                     }
                 }
@@ -2888,7 +2766,7 @@ impl SaeManifoldTerm {
                         let d_slot = hdiag[assignment_base + free_idx];
                         trace += inv_diag[row_base + free_idx] * d_slot;
                         if free_idx < q {
-                            d_diag[free_idx] = d_slot - self_curv(row, free_idx);
+                            d_diag[free_idx] = d_slot;
                         }
                     }
                 }
@@ -2936,101 +2814,6 @@ impl SaeManifoldTerm {
                     .and_then(Option::as_ref);
                 trace -= Self::deflation_block_correction(&inv_vv, &d_mat, dirs, spectrum);
             }
-        }
-        // #1416: the ordered Beta--Bernoulli prior Hessian is `H_p = d·J Jᵀ + diag(s, c)`, where the
-        // rank-one `d·J Jᵀ` couples EVERY row pair `(i, j)` in a column `k`
-        // through the shared empirical mass `M_k`. The assembled `H` carries the
-        // full `H_full = H₀' + U D Uᵀ` (Woodbury, `set_ordered_beta_bernoulli_cross_row_source`), and
-        // for fixed alpha the entire ordered Beta--Bernoulli prior scales with `λ = eᵖ`, so
-        // `∂H_p/∂ρ = H_p`. The diagonal loop above already captures the `i = j`
-        // self terms (the `d·J_ik²` summand lives in `hdiag`); this pass adds the
-        // omitted off-diagonal `½·d_k·Σ_{i≠j}(H⁻¹)_{ik,jk}·J_ik·J_jk`. Only ordered Beta--Bernoulli
-        // has the cross-row rank-one source; for other diagonal modes
-        // `ordered_beta_bernoulli_assignment_third_channels` returns `None` and the trace stays the
-        // pure diagonal contraction.
-        //
-        // #1416 (compact completion): this pass is LAYOUT-AGNOSTIC. Under the dense
-        // layout atom `k`'s logit slot is local position `k`
-        // (`row_offsets[i] + k`); under the compact (#1420 top-`k`) layout only the
-        // row's active atoms carry coordinates and atom `k` lives at local position
-        // `pos` of `active_atoms[row]` (`row_offsets[i] + pos`). The Woodbury source
-        // and the θ-adjoint already use this active-slot mapping, so gating the
-        // cross-row pass to the dense layout (the pre-fix bug) dropped the
-        // off-diagonal term from `∂log|H|/∂ρ` whenever the budget/`top_k` engaged
-        // the compact layout. We build per-column active sites `(row, t_index)` once
-        // — exactly the θ-adjoint `col_sites` construction — then contract the
-        // off-diagonal `i ≠ j` remainder with one solve per active site.
-        if let Some(channels) = cross_channels.as_ref() {
-            let n = self.n_obs();
-            let total_t = cache.delta_t_len();
-            // This trace is ½ ∂log|H|/∂ρ. For FIXED-α ordered Beta--Bernoulli the whole prior
-            // scales with λ=eᵖ so ∂H_p/∂ρ = H_p and the rank-one coefficient
-            // is the VALUE `cross_row_d[k] = w·s'_k`. For LEARNABLE-α this trace
-            // is ½ ∂log|H|/∂logα, and the rank-one block's logα-derivative is
-            // `∂d_k/∂logα = w·∂s'_k/∂logα` (`cross_row_d_logalpha[k]`) — the same
-            // α-derivative the DIAGONAL channel (`hessian_diag_log_alpha_derivative`)
-            // already uses. Using the value `s'_k` here (the pre-fix bug) made the
-            // off-diagonal inconsistent with the diagonal and the α-gradient wrong.
-            // (`learnable_alpha` is the same flag the self-curvature downdate uses.)
-            // Per-column active sites `(row, global t-index)`. Layout-agnostic.
-            let mut col_sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
-            match self.last_row_layout {
-                Some(ref layout) => {
-                    for row in 0..n {
-                        let base = cache.row_offsets[row];
-                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                            col_sites[atom].push((row, base + pos));
-                        }
-                    }
-                }
-                None => {
-                    for row in 0..n {
-                        let base = cache.row_offsets[row];
-                        for k in 0..k_atoms {
-                            col_sites[k].push((row, base + k));
-                        }
-                    }
-                }
-            }
-            let mut cross = 0.0_f64;
-            // Hoisted RHS scratch: each active site sets exactly one t-slot, so
-            // set-then-clear that single entry rather than allocating and zeroing
-            // a total_t-sized vector per (column, site).
-            let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
-            let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
-            for k in 0..k_atoms {
-                let d_k = if learnable_alpha {
-                    channels.cross_row_d_logalpha[k]
-                } else {
-                    channels.cross_row_d[k]
-                };
-                if d_k == 0.0 || col_sites[k].len() < 2 {
-                    continue;
-                }
-                for &(i, t_i) in &col_sites[k] {
-                    let j_ik = channels.z_jac[i * k_atoms + k];
-                    if j_ik == 0.0 {
-                        continue;
-                    }
-                    // (H⁻¹) column at row `i`'s active logit-`k` slot.
-                    rhs_t_scratch[t_i] = 1.0;
-                    let solved = solver
-                        .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
-                        .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
-                    rhs_t_scratch[t_i] = 0.0;
-                    for &(j, t_j) in &col_sites[k] {
-                        if j == i {
-                            continue;
-                        }
-                        let j_jk = channels.z_jac[j * k_atoms + k];
-                        if j_jk == 0.0 {
-                            continue;
-                        }
-                        cross += d_k * solved.t[t_j] * j_ik * j_jk;
-                    }
-                }
-            }
-            trace += cross;
         }
         Ok(0.5 * trace)
     }

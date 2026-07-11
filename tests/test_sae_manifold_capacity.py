@@ -2,10 +2,9 @@
 
 For data with a single circular harmonic mixed into many output dims,
 a 1-atom periodic fit is the truth: any K > 1 is wasted capacity and
-should be penalised by the model evidence. The FFI exposes
-``reml_score = -total_loss`` (larger is better — see
-``evidence_proxy`` in the underlying term), so the K=1 model must
-strictly outscore K in {2, 4, 8} on this 1-harmonic dataset.
+should be penalised by the fitted criterion. The FFI exposes the certified
+``penalized_laml_criterion`` (lower is better), so the K=1 model must have a
+strictly lower value than K in {2, 4, 8} on this 1-harmonic dataset.
 """
 from __future__ import annotations
 
@@ -28,26 +27,14 @@ def _circle_data(n: int, p: int, noise: float, seed: int) -> np.ndarray:
     return z
 
 
-def _evidence(fit) -> float:
-    # Each atom carries a copy of the payload-wide REML evidence.
-    if hasattr(fit, "atoms") and fit.atoms:
-        atom = fit.atoms[0]
-        if hasattr(atom, "evidence"):
-            return float(atom.evidence)
-    for attr in ("reml_score", "evidence", "score"):
-        if hasattr(fit, attr):
-            value = getattr(fit, attr)
-            if isinstance(value, (int, float)):
-                return float(value)
-    raise AssertionError(
-        "SAE-manifold fit result exposes no REML evidence attribute "
-        "(checked atoms[0].evidence, reml_score, evidence, score); "
-        "cannot run capacity / K-selection comparison."
-    )
+def _criterion(fit) -> float:
+    value = float(fit.penalized_laml_criterion)
+    assert np.isfinite(value)
+    return value
 
 
 @pytest.mark.slow
-def test_reml_evidence_picks_k1_on_one_harmonic_data():
+def test_penalized_laml_picks_k1_on_one_harmonic_data():
     z = _circle_data(n=400, p=64, noise=0.04, seed=0)
     candidates = [1, 2, 4, 8]
     scores: dict[int, float] = {}
@@ -62,19 +49,19 @@ def test_reml_evidence_picks_k1_on_one_harmonic_data():
             learning_rate=0.04,
             random_state=0,
         )
-        scores[k] = _evidence(fit)
+        scores[k] = _criterion(fit)
 
-    best_k = max(scores, key=scores.get)
+    best_k = min(scores, key=scores.get)
     assert best_k == 1, (
-        f"REML evidence (larger is better) failed to pick K=1 on "
-        f"1-harmonic circle data; per-K evidence = "
+        f"penalized LAML (lower is better) failed to pick K=1 on "
+        f"1-harmonic circle data; per-K criterion = "
         f"{ {k: round(v, 6) for k, v in scores.items()} }, winner K={best_k}."
     )
     for k in candidates:
         if k == 1:
             continue
-        assert scores[1] > scores[k], (
-            f"REML evidence at K=1 ({scores[1]:.6f}) did not strictly "
-            f"exceed K={k} ({scores[k]:.6f}); full sweep = "
+        assert scores[1] < scores[k], (
+            f"penalized LAML at K=1 ({scores[1]:.6f}) did not remain strictly "
+            f"below K={k} ({scores[k]:.6f}); full sweep = "
             f"{ {kk: round(vv, 6) for kk, vv in scores.items()} }."
         )

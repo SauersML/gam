@@ -9,9 +9,8 @@ a per-atom SOLO contribution callable, ``code_dims`` (1 for a flat latent, d+1
 for a curved chart: intrinsic coords + amplitude), the one-time
 ``dictionary_params`` cost, and the overall ``recon``.
 
-The four wired arms (gam#2233 task 3): ``external_topk``, ``gam_flat``,
-``hybrid`` (torch curved tier), ``hybrid_rust`` (all-Rust curved tier). Hybrid
-arms stack a flat block (``code_dims`` 1) beside curved atoms (``code_dims``
+The three wired arms (gam#2233 task 3): ``external_topk``, ``gam_flat``, and
+``hybrid_rust``. The hybrid arm stacks a flat block (``code_dims`` 1) beside curved atoms (``code_dims``
 1+d) so the theorem's support/code/residual decomposition is visible per tier.
 
 Memory note (K up to 32768): the scorer only ever reads the gate through
@@ -119,41 +118,8 @@ def build_gam_flat(x_bits, *, fit) -> FittedFeaturizer:
 
 
 # --------------------------------------------------------------------------- #
-# Curved blocks (torch ManifoldSAE tier, Rust sae_manifold tier)              #
+# Curved blocks (native sae_manifold tier)                                    #
 # --------------------------------------------------------------------------- #
-def _curved_block_torch(r_bits, *, model, dev):
-    """Curved tier from a trained torch ManifoldSAE, encoding residual r_bits.
-
-    Returns (gate (N,F), contribution(g)->lazy, code_dims (F,), dict_params,
-    recon (N,P)).
-    """
-    import torch
-
-    model.eval()
-    zs, curves_all, recons = [], [], []
-    with torch.no_grad():
-        xt = torch.as_tensor(np.asarray(r_bits, dtype=np.float32), device=dev)
-        for s in range(0, xt.shape[0], 8192):
-            out = model(xt[s:s + 8192])
-            zs.append(out.z.cpu().numpy())
-            curves_all.append(out.curves.cpu().numpy())
-            recons.append(out.x_hat.cpu().numpy())
-    z = np.concatenate(zs, 0).astype(np.float64)              # (N, F)
-    curves = np.concatenate(curves_all, 0).astype(np.float64)  # (N, F, n_basis)
-    recon = np.concatenate(recons, 0).astype(np.float64)       # (N, P)
-    dec = model.decoder_blocks.detach().cpu().numpy().astype(np.float64)  # (F, n_basis, d)
-    f, rank = dec.shape[0], dec.shape[2]
-
-    def atom_contribution(g: int):
-        def fn(take, g=g):
-            return z[take, g:g + 1] * (curves[take, g, :] @ dec[g])
-        return _RowLazyContribution(fn)
-
-    gate = np.abs(z)
-    code_dims = np.full(f, rank + 1, dtype=int)
-    return gate, atom_contribution, code_dims, int(dec.size), recon
-
-
 def _curved_block_rust(r_bits, *, model):
     """Curved tier from a fitted gamfit.sae_manifold model on residual r_bits."""
     _ensure_bench_on_path()
@@ -203,23 +169,6 @@ def _stack_blocks(flat, curved, recon_full) -> FittedFeaturizer:
         name="hybrid", gate=gate, atom_contribution=atom_contribution,
         code_dims=code_dims, dictionary_params=dp_f + dp_c,
         recon=np.asarray(recon_full, dtype=np.float64), fit_seconds=0.0)
-
-
-def build_hybrid_torch(
-    x_bits, r_bits, *, W_enc, W_dec, b_dec, k_lin, curved_model, dev, recon_full,
-) -> FittedFeaturizer:
-    """FittedFeaturizer for the torch hybrid: flat TopK block + torch curved block."""
-    pre = (x_bits.astype(np.float32) - b_dec[None, :]) @ W_enc.T
-    k = W_dec.shape[0]
-    k_lin = min(int(k_lin), k)
-    topi = np.argpartition(-pre, k_lin - 1, axis=1)[:, :k_lin]
-    rows = np.arange(pre.shape[0])[:, None]
-    topv = np.maximum(pre[rows, topi], 0.0)
-    flat = _flat_block_from_sparse(x_bits, W_dec, topi, topv, recon=None)[:4]
-    curved = _curved_block_torch(r_bits, model=curved_model, dev=dev)
-    fit = _stack_blocks(flat, curved, recon_full)
-    fit.name = "hybrid"
-    return fit
 
 
 def build_hybrid_rust(

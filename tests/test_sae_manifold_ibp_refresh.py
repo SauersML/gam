@@ -119,8 +119,8 @@ class _FakeRustModule:
             "logits": logits,
             "atom_active_mask": [True for _ in atom_dim],
             "fitted": np.zeros_like(z),
-            "reml_score": -1.0,
             "penalized_loss_score": -1.0,
+            "penalized_laml_criterion": 1.0,
             "chosen_k": K,
             "dispersion": 1.0,
             "oos_projection_top1": False,
@@ -152,7 +152,7 @@ def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
 
     assert len(fake.basis_snapshots) == 2
     assert not np.allclose(fake.basis_snapshots[0], fake.basis_snapshots[1])
-    assert np.isfinite(fit.reml_score)
+    assert np.isfinite(fit.penalized_laml_criterion)
     assert np.all(np.isfinite(fit.assignments))
     assert np.linalg.norm(fit.coords[0]) > 0.0
 

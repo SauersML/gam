@@ -1125,7 +1125,7 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     }
 
     /// Public, value-only REML criterion (for FD verification of the gradient).
-    pub fn reml_criterion(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
+    pub fn penalized_laml_criterion(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
         Ok(self.eval(rho, z)?.value)
     }
 
@@ -3122,7 +3122,7 @@ mod tests {
         let rho = 0.4_f64;
         let z = 0.3_f64;
         let ev = resp.eval(rho, Some(z)).expect("eval");
-        let v = |r: f64, zz: f64| resp.reml_criterion(r, Some(zz)).expect("v");
+        let v = |r: f64, zz: f64| resp.penalized_laml_criterion(r, Some(zz)).expect("v");
 
         let h = 1e-4_f64;
         let g_fd = (v(rho + h, z) - v(rho - h, z)) / (2.0 * h);
@@ -3153,7 +3153,7 @@ mod tests {
         // The un-augmented criterion drops the cross term and the +1 row.
         let ev0 = resp.eval(rho, None).expect("eval0");
         assert_eq!(ev0.cross, 0.0);
-        let v0 = |r: f64| resp.reml_criterion(r, None).expect("v0");
+        let v0 = |r: f64| resp.penalized_laml_criterion(r, None).expect("v0");
         let g0_fd = (v0(rho + h) - v0(rho - h)) / (2.0 * h);
         assert!((ev0.grad - g0_fd).abs() <= 1e-4 * (1.0 + ev0.grad.abs()));
     }

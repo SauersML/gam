@@ -255,7 +255,7 @@ def compose_tiers(
 
     def _stagewise_callback(event: dict[str, Any]) -> None:
         ev = event.get("ev")
-        reml = event.get("joint_reml_after")
+        reml = event.get("joint_penalized_laml_after")
         ev_s = "nan" if ev is None else f"{float(ev):.6f}"
         reml_s = "nan" if reml is None else f"{float(reml):.6g}"
         print(

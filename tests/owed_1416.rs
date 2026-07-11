@@ -223,7 +223,7 @@ fn evaluate(
 ) -> (SaeManifoldTerm, f64, SaeManifoldLoss, ArrowFactorCache) {
     let mut term = start.clone();
     let (value, loss, cache) = term
-        .reml_criterion_with_cache(
+        .penalized_laml_criterion_with_cache(
             target.view(),
             rho,
             None,

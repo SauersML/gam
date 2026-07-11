@@ -27,15 +27,17 @@ class ManifoldSAEOutput:
     """Tensor view of one converged native manifold-SAE inference.
 
     ``reconstruction``, ``codes``, and ``coordinates`` are all emitted by the
-    same frozen Rust fit.  ``penalized_loss_score`` is the native fit-quality
-    diagnostic, not a REML/evidence or outer-objective value.  No encoder
-    logits, surrogate gates, or eager-only smoothing parameters are exposed.
+    same frozen Rust fit. ``penalized_loss_score`` is the inner fit-quality
+    diagnostic; ``penalized_laml_criterion`` is the certified complete native
+    scalar. Neither is renamed as REML or generic evidence. No encoder logits,
+    surrogate gates, or eager-only smoothing parameters are exposed.
     """
 
     reconstruction: torch.Tensor
     codes: torch.Tensor
     coordinates: tuple[torch.Tensor, ...]
     penalized_loss_score: torch.Tensor | None
+    penalized_laml_criterion: torch.Tensor
     selected_smooth_lambdas: torch.Tensor | None
 
 
@@ -235,6 +237,11 @@ class ManifoldSAE(nn.Module):
             if score_value is None
             else torch.as_tensor(score_value, dtype=x.dtype, device=x.device)
         )
+        penalized_laml_criterion = torch.as_tensor(
+            self._fitted.penalized_laml_criterion,
+            dtype=x.dtype,
+            device=x.device,
+        )
         selected = self._fitted.selected_lambda_smooth
         selected_smooth_lambdas = (
             None
@@ -246,6 +253,7 @@ class ManifoldSAE(nn.Module):
             codes=codes,
             coordinates=coordinates,
             penalized_loss_score=penalized_loss_score,
+            penalized_laml_criterion=penalized_laml_criterion,
             selected_smooth_lambdas=selected_smooth_lambdas,
         )
 

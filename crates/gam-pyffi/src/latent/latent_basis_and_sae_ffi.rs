@@ -2414,9 +2414,7 @@ fn sae_manifold_fit_inner<'py>(
         learning_rate,
         ridge_ext_coord,
         ridge_beta,
-        assignment_kind: assignment,
         alpha,
-        top_k,
         isometry_pin_active,
         metric_provenance,
         promote_from_residual,
@@ -2433,7 +2431,7 @@ fn sae_manifold_fit_inner<'py>(
         term,
         rho,
         loss,
-        post_topk_loss,
+        penalized_laml_criterion,
         assignments,
         fitted,
         active_mask,
@@ -2446,9 +2444,6 @@ fn sae_manifold_fit_inner<'py>(
         fit_diagnostics,
         structure_search_json,
         structure_certificate_json,
-        top_k_will_project,
-        pre_topk_assignments,
-        pre_topk_fitted,
         reported_log_alpha,
     } = report;
 
@@ -2591,40 +2586,10 @@ fn sae_manifold_fit_inner<'py>(
         termination.set_item("wall_seconds", outer_termination.wall.as_secs_f64())?;
         out.set_item("termination", termination)?;
     }
-    // #1231 / #1232 — in-sample fit: the score is the negative penalized loss,
-    // surfaced honestly as `penalized_loss_score` (NOT `reml_score`) with a
-    // breakdown. The top-level payload describes ONE coherent model: when a hard
-    // top-k gate is applied the top-level `assignments`/`fitted`/`diagnostics`
-    // AND this score all describe the PROJECTED model (the score's data-fit is
-    // recomputed on the projected reconstruction; the decoder/ρ penalties are
-    // unchanged by the gate). The unprojected smooth-optimization model — its
-    // assignments, fitted, and score — is carried in full under `pre_topk`, with
-    // a `top_k_projection` descriptor naming the split so no reader ever conflates
-    // the two layers.
-    let top_level_loss = post_topk_loss.as_ref().unwrap_or(&loss);
-    sae_set_penalized_loss_items(&out, top_level_loss, "penalized_loss_score")?;
-    if top_k_will_project {
-        out.set_item("top_k_projection_applied", true)?;
-        // Self-describing split descriptor (#1232): every top-level model field
-        // describes the post-top-k projected model; the pre-projection model is
-        // under `pre_topk`.
-        let descriptor = PyDict::new(py);
-        descriptor.set_item("applied", true)?;
-        if let Some(k_top) = top_k {
-            descriptor.set_item("top_k", k_top)?;
-        }
-        descriptor.set_item("top_level_model", "post_topk")?;
-        descriptor.set_item("pre_projection_model", "pre_topk")?;
-        out.set_item("top_k_projection", descriptor)?;
-        if let (Some(pre_assignments), Some(pre_fitted)) = (pre_topk_assignments, pre_topk_fitted) {
-            let pre_topk = PyDict::new(py);
-            pre_topk.set_item("assignments_z", pre_assignments.into_pyarray(py))?;
-            pre_topk.set_item("fitted", pre_fitted.into_pyarray(py))?;
-            // The smooth-model score (unprojected data-fit + the same penalties).
-            sae_set_penalized_loss_items(&pre_topk, &loss, "penalized_loss_score")?;
-            out.set_item("pre_topk", pre_topk)?;
-        }
-    }
+    // Distinct scalars with distinct semantics: the ordinary penalized loss and
+    // the certified penalized quasi-Laplace criterion are never conflated.
+    sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
+    out.set_item("penalized_laml_criterion", penalized_laml_criterion)?;
     out.set_item("log_alpha", reported_log_alpha)?;
     // Clone, do NOT move the field out: `rho` is still owned and is borrowed
     // again below for the post-fit amortized-encoder diagnostic

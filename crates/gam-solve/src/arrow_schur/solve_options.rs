@@ -250,7 +250,7 @@ pub struct ArrowSolveOptions {
     /// The κ guards exist to protect the accuracy of the Newton *step*: a
     /// barely-PD `H_tt^(i)` or an over-conditioned reduced Schur yields an
     /// inaccurate `Δβ`/`Δt`. Evidence-only callers
-    /// (e.g. `SaeManifoldTerm::reml_criterion_with_cache`) do not consume the
+    /// (e.g. `SaeManifoldTerm::penalized_laml_criterion_with_cache`) do not consume the
     /// step — they need only the factor cache for the log-determinant
     /// (`½log|H|`, exact from `diag(L)` regardless of κ) and the selected-inverse
     /// traces. For those callers the κ rejection is a false abort when ρ sweeps

@@ -144,7 +144,7 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
         let walk_s = t_a.elapsed().as_secs_f64();
 
         // Phase C (gate-safety check): a COLD inner solve with NO walk, via
-        // reml_criterion directly (the curvature walk lives only in the
+        // penalized_laml_criterion directly (the curvature walk lives only in the
         // OuterProblem seed loop). If this reaches EV >= 0.95 for K=1 periodic,
         // the curvature walk is pure overhead here and can be gated off — the
         // circle topology is baked into the fundamental harmonic, so the
@@ -153,7 +153,7 @@ fn profile_k1_periodic_high_p_phase_breakdown() {
         let mut term_cold = build_term(z.view());
         let cold_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![Array1::zeros(1)]);
         let t_c = Instant::now();
-        let cold = term_cold.reml_criterion(z.view(), &cold_rho, None, 25, 1.0, 1.0e-6, 1.0e-6);
+        let cold = term_cold.penalized_laml_criterion(z.view(), &cold_rho, None, 25, 1.0, 1.0e-6, 1.0e-6);
         let cold_s = t_c.elapsed().as_secs_f64();
         let cold_ev = if cold.is_ok() {
             global_ev(z.view(), term_cold.fitted().view())

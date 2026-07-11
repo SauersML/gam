@@ -12,12 +12,8 @@ Arms:
   gam_flat       — gamfit.sparse_dictionary_fit (our certified linear sparse-code
                    lane; the manifold engine rejects the flat config), held-out EV.
   curved_topk    — gamfit.sae_manifold_fit(assignment='topk') (CPU Rust core).
-  torch_manifold — gamfit.torch.ManifoldSAE trained with Adam on the GPU.
-  hybrid         — flat TopK at a reduced active budget + torch manifold on the
-                   flat residual; combined recon scored at the MATCHED total
-                   per-token active-scalar budget (flat k_lin scalars + t·(1+d)
-                   curved scalars == --top-k). This is the dominance-argument
-                   contestant: it strictly generalizes the flat dictionary.
+  hybrid_rust    — native flat sparse coding plus a native curved TopK model on
+                   the residual at a matched active-scalar budget.
 
 EV = 1 − ||X_te − recon||²_F / ||X_te − mean_tr||²_F, train-mean baseline, always
 scored on the untouched held-out split (never train — no overfit reporting).
@@ -184,113 +180,6 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, seed):
     return held_out_ev(x_te, recon, mean_tr)
 
 
-def fit_torch_manifold(x_tr, x_te, mean_tr, *, atoms, target_k, d, steps, lr, bs,
-                       seed, manifold, basis):
-    """The GPU manifold lane (BSF-arena winner lane) fit directly on the data."""
-    recon, _ = _torch_manifold_recon(
-        x_tr, x_te, atoms=atoms, target_k=target_k, d=d, steps=steps, lr=lr,
-        bs=bs, seed=seed, manifold=manifold, basis=basis)
-    return held_out_ev(x_te, recon, mean_tr)
-
-
-def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed,
-                          manifold, basis):
-    import torch
-    from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig
-
-    torch.set_float32_matmul_precision("high")  # TF32 on B200; applied to BOTH torch arms
-    torch.manual_seed(seed)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    if d == 1 and manifold == "product":
-        manifold = "circle"  # product requires rank >= 2; rank-1 atoms are circles
-    cfg = ManifoldSAEConfig(
-        input_dim=x_tr.shape[1], n_atoms=atoms, intrinsic_rank=d,
-        atom_manifold=manifold, atom_basis=basis,
-        sparsity={"kind": "softmax_topk", "target_k": target_k},
-        dtype=torch.float32,  # fp32 GPU training lane; metrics stay f64 numpy
-    )
-    model = ManifoldSAE(cfg).to(dev)
-    xtr = torch.as_tensor(x_tr, device=dev)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    rng = np.random.default_rng(seed)
-    t0 = time.perf_counter()
-    last = t0
-    model.train()
-    for step in range(steps):
-        i = rng.integers(0, xtr.shape[0], size=min(bs, xtr.shape[0]))
-        batch = xtr[i]
-        out = model(batch)
-        loss = (torch.mean((out.x_hat - batch) ** 2)
-                + model.sparsity.penalty(out.gate))
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        now = time.perf_counter()
-        if step % 200 == 0 or step == steps - 1 or now - last >= 30.0:
-            print(f"[torch_manifold] step {step+1}/{steps} loss={float(loss.detach()):.5f} "
-                  f"({(step+1)/max(now-t0,1e-9):.2f} steps/s)", flush=True)
-            last = now
-    model.eval()
-    outs = []
-    with torch.no_grad():
-        xte = torch.as_tensor(x_te, device=dev)
-        for s in range(0, xte.shape[0], 8192):
-            outs.append(model(xte[s:s+8192]).x_hat.float().cpu().numpy())
-    return np.concatenate(outs, 0), model
-
-
-def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
-               flat_steps, curved_steps, lr, bs, seed, manifold, basis,
-               k_flat=None, collect=None):
-    """Flat TopK at reduced budget k_lin + torch manifold on the flat residual.
-
-    Matched per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k.
-
-    ``k_flat`` (gam#2233 theorem-faithful config): the flat tier's ATOM COUNT.
-    When ``None`` it defaults to ``K`` — the legacy "stack curved atoms on the
-    full flat dictionary" arm, whose dictionary_params strictly EXCEED
-    external_topk's, so it carries an MDL surcharge and cannot win the
-    dict-dominated Eq-4 scoreboard regardless of its support/code/residual
-    savings. The crossover theorem's claim is that curvature buys FEWER atoms,
-    so a faithful test passes a REDUCED ``k_flat`` (curved atoms REPLACING flat
-    ones) such that ``k_flat·P + curved_atoms·b·P ≤ K·P``; the flat active
-    budget ``k_lin`` is a per-token quantity and does NOT change the dictionary
-    parameter count.
-    """
-    k_flat = int(k_flat) if k_flat is not None else int(K)
-    k_lin = top_k - curved_k * (1 + d)
-    if k_lin < 1:
-        raise SystemExit(f"hybrid budget infeasible: top_k={top_k} curved_k={curved_k} d={d}")
-    print(f"[hybrid] k_flat={k_flat} (external ref K={K}); "
-          f"k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
-    ev_flat, (encode, decode, dev) = fit_external_topk(
-        x_tr, x_te, mean_tr, K=k_flat, top_k=k_lin, steps=flat_steps, lr=lr, bs=bs,
-        seed=seed, return_model=True, collect=collect)
-    print(f"[hybrid] flat tier ev={ev_flat:.4f} (k_lin={k_lin})", flush=True)
-    import torch
-    with torch.no_grad():
-        def resid(x_np):
-            parts = []
-            xt = torch.from_numpy(x_np).to(dev)
-            for s in range(0, xt.shape[0], 8192):
-                vals, idx = encode(xt[s:s+8192])
-                parts.append((xt[s:s+8192] - decode(vals, idx)).float().cpu().numpy())
-            return np.concatenate(parts, 0)
-        r_tr, r_te = resid(x_tr), resid(x_te)
-    flat_recon_te = x_te - r_te
-    curved_recon_r, curved_model = _torch_manifold_recon(
-        r_tr, r_te, atoms=curved_atoms, target_k=curved_k, d=d, steps=curved_steps,
-        lr=lr, bs=bs, seed=seed, manifold=manifold, basis=basis)
-    combined = flat_recon_te + curved_recon_r
-    if collect is not None:
-        collect["k_lin"] = k_lin
-        collect["r_te"] = r_te
-        collect["curved_model"] = curved_model
-        collect["dev"] = dev
-        collect["recon_full"] = combined
-    return held_out_ev(x_te, combined, mean_tr), ev_flat
-
-
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
                     topology, max_epochs, curved_rows, seed, k_flat=None, collect=None):
     """ALL-RUST hybrid: gam sae_manifold_fit sparse-code (linear) tier at reduced
@@ -298,8 +187,8 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
     per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k.
 
     ``k_flat`` (gam#2233 theorem-faithful config): the linear tier's ATOM COUNT,
-    defaulting to ``K``. See :func:`fit_hybrid` — a faithful crossover test
-    REDUCES it so ``k_flat·P + curved_K·b·P ≤ K·P``."""
+    defaulting to ``K``. A faithful crossover test reduces it so
+    ``k_flat·P + curved_K·b·P ≤ K·P``."""
     import gamfit
 
     k_flat = int(k_flat) if k_flat is not None else int(K)
@@ -345,7 +234,7 @@ def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
     Returns a dict of ``bits_at_r2_*`` / ``code_bits_*`` / ``resid_bits_*`` /
     ``support_bits`` (namespaced ``bits_<key>``) plus the scorer provenance, or
     ``None`` for arms with no bits builder wired (gam#2233 task 3 wires the four
-    dominance-argument contestants: external_topk, gam_flat, hybrid, hybrid_rust).
+    dominance-argument contestants: external_topk, gam_flat, and hybrid_rust).
     """
     # Local imports so a non-bits run never pays the sibling-module import.
     import bits_eq4
@@ -363,14 +252,6 @@ def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
             b_dec=collect["b_dec"], top_k=collect.get("top_k_flat"))
     elif arm == "gam_flat":
         fitted = af.build_gam_flat(x_bits, fit=collect["flat_fit"])
-    elif arm == "hybrid":
-        r_bits = np.ascontiguousarray(collect["r_te"][idx])
-        recon_bits = np.ascontiguousarray(collect["recon_full"][idx])
-        fitted = af.build_hybrid_torch(
-            x_bits, r_bits, W_enc=collect["W_enc"], W_dec=collect["W_dec"],
-            b_dec=collect["b_dec"], k_lin=collect["k_lin"],
-            curved_model=collect["curved_model"], dev=collect["dev"],
-            recon_full=recon_bits)
     elif arm == "hybrid_rust":
         r_bits = np.ascontiguousarray(collect["r_te"][idx])
         recon_bits = np.ascontiguousarray(collect["recon_full"][idx])
@@ -403,7 +284,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True,
                     choices=["external_topk", "gam_flat", "curved_topk",
-                             "torch_manifold", "hybrid", "pca_bar", "hybrid_rust"])
+                             "pca_bar", "hybrid_rust"])
     ap.add_argument("--chunk-dir", required=True)
     ap.add_argument("--max-rows", type=int, default=120_000)
     ap.add_argument("--test-frac", type=float, default=0.2)
@@ -416,8 +297,6 @@ def main() -> int:
     ap.add_argument("--max-epochs", type=int, default=30)
     ap.add_argument("--d-atom", type=int, default=2)
     ap.add_argument("--atom-topology", default="circle")
-    ap.add_argument("--atom-manifold", default="product")
-    ap.add_argument("--atom-basis", default="fourier")
     ap.add_argument("--curved-atoms", type=int, default=256)
     ap.add_argument("--k-flat", type=int, default=None,
                     help="gam#2233 theorem-faithful hybrid: flat-tier ATOM COUNT "
@@ -428,7 +307,6 @@ def main() -> int:
                          "circle). Self-certified via dict_params_faithful in the "
                          "result record.")
     ap.add_argument("--curved-k", type=int, default=2)
-    ap.add_argument("--curved-steps", type=int, default=6000)
     ap.add_argument("--curved-rows", type=int, default=20000,
                     help="hybrid_rust: row subsample for the curved-tier Rust fit")
     ap.add_argument("--cosine-lr", action="store_true",
@@ -471,12 +349,6 @@ def main() -> int:
         ev = fit_curved_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                              d_atom=args.d_atom, topology=args.atom_topology,
                              seed=args.seed)
-    elif args.arm == "torch_manifold":
-        ev = fit_torch_manifold(x_tr, x_te, mean_tr, atoms=args.curved_atoms,
-                                target_k=args.curved_k, d=args.d_atom,
-                                steps=args.steps, lr=args.lr, bs=args.batch_size,
-                                seed=args.seed, manifold=args.atom_manifold,
-                                basis=args.atom_basis)
     elif args.arm == "hybrid_rust":
         ev, ev_flat = fit_hybrid_rust(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                       curved_K=args.curved_atoms, curved_k=args.curved_k,
@@ -488,15 +360,8 @@ def main() -> int:
     elif args.arm == "pca_bar":
         extra = fit_pca_bar(x_tr, x_te, mean_tr, ranks=[16, 32, 64, 128, 512])
         ev = extra[f"pca_ev_r{args.top_k}"] if f"pca_ev_r{args.top_k}" in extra else extra["pca_ev_r32"]
-    else:  # hybrid
-        ev, ev_flat = fit_hybrid(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
-                                 curved_atoms=args.curved_atoms, curved_k=args.curved_k,
-                                 d=args.d_atom, flat_steps=args.steps,
-                                 curved_steps=args.curved_steps, lr=args.lr,
-                                 bs=args.batch_size, seed=args.seed,
-                                 manifold=args.atom_manifold, basis=args.atom_basis,
-                                 k_flat=args.k_flat, collect=collect)
-        extra["ev_flat_tier"] = ev_flat
+    else:
+        raise AssertionError(f"unhandled arm {args.arm!r}")
 
     if args.bits and collect is not None:
         bits = score_bits_for_arm(args.arm, collect, x_te, args.bits_max_rows, args.seed)
