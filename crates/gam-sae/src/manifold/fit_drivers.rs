@@ -5751,10 +5751,24 @@ impl SaeManifoldTerm {
         // solves what the majorized joint Newton does in O(10²–10³) linear-rate
         // iterations. The Newton walk below then starts inside the sweep fixed
         // point's basin and serves as the joint certifier (logits + cross-block
-        // coupling + KKT gate) instead of as the bulk workhorse. Frames-active
-        // fits skip inside the helper (the LSQ writes full-B), and the
+        // coupling + KKT gate) instead of as the bulk workhorse. The
         // max_iter == 0 freeze already returned above.
-        if self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties, allow_heuristic_termination)? {
+        //
+        // DISCOVERY LANES ONLY (#2253 idempotence): the evidence refine loop
+        // re-enters this driver in small chunks, and an ENTRY sweep runs after
+        // the entry hooks (basis refresh, guards, per-assembly gate freezes),
+        // whose ε-level state drift lets each re-entry harvest one more strict
+        // ε-decrease — a fresh state move on every re-entry, so the inner map
+        // never recurs exactly and the fit is refused as non-idempotent
+        // (measured: tier-0 K=2 fixtures, KKT band entered, refused at 512).
+        // Evidence lanes get the POST-loop sweep below instead, which runs at
+        // the walk's own fixed point and reverts there (idempotent — the
+        // historically green polish position); the frames-aware LSQ reset that
+        // killed the wide-p divergence lives in the helper and therefore
+        // applies at the post-loop position identically.
+        if allow_heuristic_termination
+            && self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties, true)?
+        {
             state_moved = true;
         }
         for outer_iteration in 0..max_iter {
