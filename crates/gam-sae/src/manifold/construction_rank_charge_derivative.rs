@@ -64,13 +64,6 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<HardRankChargeDerivative, String> {
-        if self.soft_rank_charge {
-            return Err(
-                "hard_rank_charge_derivative: the soft WBIC rank charge has a different \
-                 continuous spectrum differential and cannot use the hard-branch derivative"
-                    .to_string(),
-            );
-        }
         let residual = self.reconstruction_residual(target, rho)?;
         let dispersion = self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();
