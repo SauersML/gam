@@ -55,6 +55,9 @@ struct LogdetAuditPoint {
     exact_chart_gauge_count: usize,
     solver_gauge_count: usize,
     cache_beta_quotient_dim: usize,
+    loss_smoothness: f64,
+    raw_smoothness_sum: f64,
+    smooth_renorm: f64,
 }
 
 /// Emit every value/gradient channel for one rho from exactly one converged
@@ -80,6 +83,15 @@ fn logdet_audit_point(
     )?;
     let loss = criterion_result.1;
     let cache = criterion_result.2;
+    let raw_smoothness_sum: f64 = term
+        .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec())
+        .iter()
+        .sum();
+    let smooth_renorm = if raw_smoothness_sum.abs() > 0.0 {
+        loss.smoothness / raw_smoothness_sum
+    } else {
+        1.0
+    };
     let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
         "logdet_audit_point: authoritative log determinant unavailable".to_string()
     })?;
@@ -140,6 +152,9 @@ fn logdet_audit_point(
         exact_chart_gauge_count,
         solver_gauge_count,
         cache_beta_quotient_dim,
+        loss_smoothness: loss.smoothness,
+        raw_smoothness_sum,
+        smooth_renorm,
     })
 }
 
@@ -325,6 +340,25 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         eprintln!(
             "[2253-CERT] budget={inner_max_iter} {:?}",
             center.branch_certificate
+        );
+        eprintln!(
+            "[2253-SMOOTH] budget={inner_max_iter} loss_smoothness={:+.17e} \
+             raw_smoothness_sum={:+.17e} renorm={:+.17e}",
+            center.loss_smoothness,
+            center.raw_smoothness_sum,
+            center.smooth_renorm,
+        );
+        let smooth_roundoff = 64.0
+            * f64::EPSILON
+            * (1.0 + center.loss_smoothness.abs().max(center.raw_smoothness_sum.abs()));
+        assert!(
+            (center.loss_smoothness - center.raw_smoothness_sum).abs() <= smooth_roundoff,
+            "#2253 dense full-batch smoothness scale diverged between the returned loss and \
+             current term: loss={:+.17e}, raw_sum={:+.17e}, renorm={:+.17e}, \
+             roundoff={smooth_roundoff:.3e}",
+            center.loss_smoothness,
+            center.raw_smoothness_sum,
+            center.smooth_renorm,
         );
         for atom in center.criterion.atoms() {
             eprintln!(
