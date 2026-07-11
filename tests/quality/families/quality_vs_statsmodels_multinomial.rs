@@ -939,7 +939,9 @@ fn multinomial_coefficient_covariance_equals_observed_information_inverse() {
         "expected P=3 (1,x1,x2) and M=2 active classes"
     );
 
-    let beta = model.coefficients_active(); // (P, M)
+    let beta = model
+        .coefficients_active()
+        .expect("saved active multinomial coefficients"); // (P, M)
     let cov = model
         .coefficient_covariance()
         .expect("stored joint covariance");
@@ -1058,10 +1060,6 @@ fn multinomial_per_class_probability_se_intervals_are_calibrated_over_refits() {
         .expect("multinomial refit");
         let (pp, pse) =
             predict_multinomial_formula_with_se(&rmodel, &pt_data).expect("predict probs + SE");
-        let pse = pse.expect(
-            "the #1101 formula fit must surface a joint coefficient covariance, so per-class \
-             probability SEs must be present (None ⇒ covariance was not stored)",
-        );
         assert_eq!(pp.dim(), (fixed_pts.len(), 3), "predicted prob shape");
         assert_eq!(pse.dim(), (fixed_pts.len(), 3), "predicted prob-SE shape");
 

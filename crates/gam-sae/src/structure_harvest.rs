@@ -4931,10 +4931,12 @@ pub fn run_structure_search_rounds(
                     | gam_solve::structure_search::MoveVerdict::Demoted { .. }
             )
         });
-        // Atlas registration is an exact algebraic quotient: it changes only
-        // semantic/transition state and must not perturb the represented image.
-        // A round containing no numerical move therefore needs no optimizer
-        // polish. Destructive glues and every ordinary accepted/demoted move do.
+        // A certified Glue is an exact geometric quotient, whether it registers
+        // an atlas or physically removes an over-tile: the carried transition
+        // transplants the removed chart and the fold preserves routing mass.
+        // Re-optimizing a glue-only round would turn an evidence-certified image
+        // equivalence into a new numerical fit on only the estimation split.
+        // Mixed rounds still polish because their non-Glue moves are numerical.
         let requires_polish = round_ledger.moves.iter().any(|record| {
             let fired = matches!(
                 record.verdict,
@@ -4942,13 +4944,7 @@ pub fn run_structure_search_rounds(
                     | gam_solve::structure_search::MoveVerdict::Demoted { .. }
             );
             fired
-                && !matches!(
-                    record.mv,
-                    StructureMove::Glue {
-                        outcome: ChartGlueOutcome::RegisterAtlas,
-                        ..
-                    }
-                )
+                && !matches!(record.mv, StructureMove::Glue { .. })
         });
         // Record the atom-sets any APPLIED curl / flatten move fired on into the
         // cooldown ledger, then advance one round — so the inverse move cannot
@@ -5003,8 +4999,10 @@ pub fn run_structure_search_rounds(
                 term = polished_term;
                 rho = polished_rho;
             } else {
-                // A pure RegisterAtlas round is already terminal: optimizer work
-                // here would violate registration's image-exact quotient contract.
+                // A pure certified-Glue round is already terminal: optimizer work
+                // here would violate the carried quotient's image-equivalence
+                // contract (and would fit only the estimation split after the
+                // sample-split verdict).
                 term = next_term;
                 rho = next_rho;
             }
