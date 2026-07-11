@@ -232,7 +232,7 @@ fn standard_fit_options(max_iter: usize) -> FitOptions {
         kronecker_penalty_system: None,
         kronecker_factored: None,
         persist_warm_start_disk: false,
-        resource_policy: Default::default(),
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
     }
 }
 
