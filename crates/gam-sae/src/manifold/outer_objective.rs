@@ -3405,12 +3405,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // #2231 Inc-B — price the block-relevance Jacobian into the SAME
                 // cost that flows to `termination.record` (0 for a plain SAE).
                 let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
-                // #2253 stall probe (temporary): the value lane the outer line
-                // search reads (`OuterEvalOrder::Value`) vs the gradient lane
-                // (`OuterEvalOrder::ValueAndGradient`). Match `rho` across the two
-                // tags in the log to see whether the two lanes price the SAME
-                // criterion at the stall (an inconsistent pair fails Wolfe at iter 0).
-                log::warn!("[2253-VLANE] rho={:?} cost={:.12e}", rho.to_vec(), cost);
                 if self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }
@@ -3656,21 +3650,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // envelope term is a deflation-candidate gap to fix in
         // `outer_gradient_arrow_solver`, not something to paper over with a
         // differenced value path.
-        // #2253 stall probe (temporary): the gradient lane's own criterion value
-        // + gradient at this ρ. Compare to the `[2253-VLANE]` line at the same ρ:
-        // if the two costs differ, the line-search value function and the gradient
-        // price different basins (envelope-handoff desync), which fails Wolfe at
-        // iter 0 exactly as observed. `logdet` and `defl` localize the difference.
-        {
-            let g_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-            log::warn!(
-                "[2253-GLANE] rho={rho_v:?} cost={cost:.12e} |g|={g_norm:.6e} \
-                 logdet={ld:?} defl={defl}",
-                rho_v = rho.to_vec(),
-                ld = crate::manifold::arrow_log_det_from_cache(&cache),
-                defl = cache.gauge_deflated_directions,
-            );
-        }
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
         if self.termination.record(cost) {
