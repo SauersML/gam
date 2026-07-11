@@ -817,7 +817,10 @@ where
 
         for j in 0..cycle {
             let preconditioned_direction = apply_preconditioner(&basis[j])?;
-            if !preconditioned_direction.iter().all(|value| value.is_finite()) {
+            if !preconditioned_direction
+                .iter()
+                .all(|value| value.is_finite())
+            {
                 return Err(format!(
                     "solve_b_preconditioned_gmres: non-finite preconditioned direction at \
                      iteration {}",
@@ -984,9 +987,8 @@ mod right_preconditioned_gmres_tests {
             t: array![3.0_f64, 4.0],
             beta: Array1::zeros(0),
         };
-        let apply_a = |value: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            Ok(value.clone())
-        };
+        let apply_a =
+            |value: &SaeArrowVector| -> Result<SaeArrowVector, String> { Ok(value.clone()) };
         let precondition = |value: &SaeArrowVector| -> Result<SaeArrowVector, String> {
             let norm = sae_norm(value);
             if norm == 0.0 {
