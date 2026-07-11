@@ -283,24 +283,11 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
     );
     let (representative_term, _, representative_rho) = small_two_atom_periodic_term();
     assert_eq!(
-        matrix_free_assignment_gradient_coordinate(
-            plan,
-            &representative_term,
-            &representative_rho,
-        ),
+        hybrid_assignment_gradient_coordinate(&representative_term, &representative_rho),
         representative_rho.sparse_flat_index(),
-        "a matrix-free non-IBP fit must promote its active sparsity strength into \
-         Hybrid-EFS's exact-gradient block"
-    );
-    assert_eq!(
-        matrix_free_assignment_gradient_coordinate(
-            dense_plan,
-            &representative_term,
-            &representative_rho,
-        ),
-        None,
-        "the dense route keeps the complete analytic gradient and must not split \
-         assignment strength into a hybrid-only block"
+        "a non-IBP fit must promote its active sparsity strength into Hybrid-EFS's \
+         exact-gradient block; the outer-plan crossover decides whether that block \
+         is consumed, not whether the coordinate has an analytic root"
     );
     // The admission gate must accept the plan (no 'working set exceeds budget'
     // hard error) precisely because the matrix-free lane is admitted.
@@ -308,19 +295,13 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
         .expect("matrix-free-admitted plan must not hard-error at the admission gate");
 }
 
-/// The matrix-free planner's unavailable-gradient declaration is only the first
-/// half of the certification contract.  Exercise the objective-owned FINAL
-/// fixed-point proof hook itself on a non-IBP assignment and pin the formerly
-/// dangerous coordinate: `eval_efs` holds `log_lambda_sparse` at a zero iteration
-/// step because softmax entropy has no Fellner--Schall equation, but the proof
-/// hook must report that zero as `Uncovered`, never as a solved residual.
-///
-/// This is deliberately a small dense fixture so the regression is cheap.  The
-/// hook and its coordinate semantics are identical in the wide matrix-free route;
-/// only that route consumes the hook for final certification because its analytic
-/// gradient capability is unavailable.
+/// Hybrid-EFS must replace the former held-zero non-IBP assignment coordinate
+/// with the exact REML derivative and expose that same root-equivalent update to
+/// the final fixed-point proof hook. This dense fixture exercises the exact dense
+/// sibling cheaply; the complete-gradient parity test below pins the matrix-free
+/// sibling to identical math.
 #[test]
-fn fixed_point_certificate_hook_refuses_non_ibp_held_zero() {
+fn fixed_point_certificate_covers_non_ibp_exact_gradient() {
     let make_objective = || {
         let (term, target, rho) = small_two_atom_periodic_term();
         let rho_flat = rho.to_flat();
@@ -330,31 +311,38 @@ fn fixed_point_certificate_hook_refuses_non_ibp_held_zero() {
         )
     };
 
-    // Pin the iteration-side precondition: this coordinate really is the held
-    // zero that previously masqueraded as convergence.
     let (mut iteration_objective, rho) = make_objective();
     let iteration = iteration_objective
         .eval_efs(&rho)
         .expect("non-IBP EFS startup evaluation");
+    let gradient = iteration
+        .psi_gradient
+        .as_ref()
+        .expect("assignment strength must be the Hybrid-EFS gradient block")[0];
     assert_eq!(
-        iteration.steps[0], 0.0,
-        "softmax log_lambda_sparse has no EFS equation and must remain held"
+        iteration.psi_indices.as_deref(),
+        Some(&[0][..]),
+        "the Hybrid-EFS gradient must map back to log_lambda_sparse"
+    );
+    assert!(gradient.is_finite(), "assignment gradient must be finite");
+    assert_abs_diff_eq!(
+        iteration.steps[0],
+        -gradient / gradient.abs().max(1.0),
+        epsilon = 1.0e-12
     );
 
-    // A fresh objective calls the final-proof hook, not the iteration surface.
-    // Its result must preserve the distinction between held and proved zero.
     let (mut proof_objective, proof_rho) = make_objective();
     let proof = proof_objective
         .eval_fixed_point_certificate(&proof_rho)
         .expect("fixed-point proof hook must evaluate");
     assert_eq!(proof.coordinates.len(), proof_rho.len());
     match &proof.coordinates[0] {
-        FixedPointCoordinateCertificate::Uncovered { reason } => assert!(
-            reason.contains("no root-equivalent fixed-point equation"),
-            "non-IBP held coordinate must explain the missing equation; got: {reason}"
-        ),
-        FixedPointCoordinateCertificate::Covered { update, scale } => panic!(
-            "a held non-IBP zero is not a stationarity proof (update={update}, scale={scale})"
+        FixedPointCoordinateCertificate::Covered { update, scale } => {
+            assert_abs_diff_eq!(*update, iteration.steps[0], epsilon = 1.0e-12);
+            assert_eq!(*scale, 1.0);
+        }
+        FixedPointCoordinateCertificate::Uncovered { reason } => panic!(
+            "the exact assignment-strength derivative must certify this coordinate: {reason}"
         ),
     }
 }
@@ -429,6 +417,14 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
         .analytic_outer_rho_gradient_components(target.view(), &rho, &loss, &cache, &solver)
         .expect("dense complete outer gradient")
         .gradient()[rho.sparse_flat_index().expect("softmax sparse coordinate")];
+    let dense_coordinate_gradient = term
+        .analytic_assignment_strength_gradient_dense(
+            target.view(),
+            &rho,
+            &cache,
+            &solver,
+        )
+        .expect("dense Hybrid-EFS assignment-strength gradient");
     let matrix_free_gradient = term
         .analytic_assignment_strength_gradient_matrix_free(
             target.view(),
@@ -440,10 +436,13 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
         )
         .expect("matrix-free complete assignment-strength gradient");
     assert!(
-        dense_gradient.is_finite() && matrix_free_gradient.is_finite(),
+        dense_gradient.is_finite()
+            && dense_coordinate_gradient.is_finite()
+            && matrix_free_gradient.is_finite(),
         "complete assignment gradients must be finite (dense={dense_gradient}, \
-         matrix_free={matrix_free_gradient})"
+         dense_coordinate={dense_coordinate_gradient}, matrix_free={matrix_free_gradient})"
     );
+    assert_abs_diff_eq!(dense_coordinate_gradient, dense_gradient, epsilon = 1.0e-10);
     assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
 }
 
