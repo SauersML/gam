@@ -50,6 +50,7 @@ struct Args {
     n_blocks: usize,
     block_size: usize,
     block_topk: usize,
+    aux_k: usize,
     epochs: usize,
     minibatch: usize,
     tier2: bool,
@@ -76,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
         n_blocks: 2_500,
         block_size: 4,
         block_topk: 8,
+        aux_k: 0,
         epochs: 3,
         minibatch: 512,
         tier2: false,
@@ -99,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
             "--blocks" => args.n_blocks = parse_usize(value, key)?,
             "--block-size" => args.block_size = parse_usize(value, key)?,
             "--block-topk" => args.block_topk = parse_usize(value, key)?,
+            "--aux-k" => args.aux_k = parse_usize(value, key)?,
             "--epochs" => args.epochs = parse_usize(value, key)?,
             "--minibatch" => args.minibatch = parse_usize(value, key)?,
             "--gpu" => {
@@ -168,7 +171,7 @@ fn run() -> Result<(), String> {
     let k = args.atoms();
     let admitted = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(args.minibatch, k, args.p);
     println!(
-        "[tiered gpu scale] N={} P={} K={} (blocks={} b={}) topk={} epochs={} minibatch={} \
+        "[tiered gpu scale] N={} P={} K={} (blocks={} b={}) topk={} aux_k={} epochs={} minibatch={} \
          tier2={} gpu={:?}",
         args.rows,
         args.p,
@@ -176,6 +179,7 @@ fn run() -> Result<(), String> {
         args.n_blocks,
         args.block_size,
         args.block_topk,
+        args.aux_k,
         args.epochs,
         args.minibatch,
         args.tier2,
@@ -213,6 +217,7 @@ fn run() -> Result<(), String> {
         TieredFitConfig::linear_bulk(args.n_blocks, args.block_size)
     };
     config.tier1.block_topk = args.block_topk;
+    config.tier1.aux_k = args.aux_k;
     config.tier1.max_epochs = args.epochs;
     config.tier1.minibatch = args.minibatch;
 
