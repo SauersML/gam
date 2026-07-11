@@ -47,6 +47,11 @@ struct LogdetAuditPoint {
     criterion: SaeCriterion,
     components: SaeOuterRhoGradientComponents,
     log_det: f64,
+    kkt_grad_norm: f64,
+    quotient_kkt_grad_norm: f64,
+    kkt_tolerance: f64,
+    branch_certificate: BranchCertificate,
+    exact_chart_gauge_count: usize,
     solver_gauge_count: usize,
     cache_beta_quotient_dim: usize,
 }
@@ -61,9 +66,17 @@ fn logdet_audit_point(
     target: ArrayView2<'_, f64>,
     rho: &SaeManifoldRho,
     registry: Option<&AnalyticPenaltyRegistry>,
+    inner_max_iter: usize,
 ) -> Result<LogdetAuditPoint, String> {
-    let criterion_result =
-        term.reml_criterion_with_cache(target, rho, registry, 40, 0.05, 1.0e-6, 1.0e-6)?;
+    let criterion_result = term.reml_criterion_with_cache(
+        target,
+        rho,
+        registry,
+        inner_max_iter,
+        0.05,
+        1.0e-6,
+        1.0e-6,
+    )?;
     let loss = criterion_result.1;
     let cache = criterion_result.2;
     let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
@@ -79,6 +92,7 @@ fn logdet_audit_point(
     let solver = term
         .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
         .map_err(|err| err.to_string())?;
+    let exact_chart_gauge_count = term.dense_step_gauge_vectors()?.len();
     let solver_gauge_count = solver.gauge_basis.len();
     let cache_beta_quotient_dim = cache
         .beta_gauge_quotient
@@ -96,11 +110,28 @@ fn logdet_audit_point(
         components.occam.clone(),
         components.third_order_correction.clone(),
     );
+    let mut kkt_term = term.clone();
+    let kkt_system = kkt_term.assemble_arrow_schur(target, rho, registry)?;
+    let kkt_grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&kkt_system);
+    let kkt_grad_norm = kkt_grad_norm_sq.sqrt();
+    let quotient_kkt_grad_norm = kkt_term.quotient_gradient_norm_from_system(
+        &kkt_system,
+        kkt_grad_norm_sq,
+        &rho.lambda_smooth_vec(),
+    );
+    let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
+    let branch_certificate =
+        BranchCertificate::from_arrow_cache(&cache, MajorizerAnchorMode::FrozenAnchor);
     Ok(LogdetAuditPoint {
         term,
         criterion,
         components,
         log_det,
+        kkt_grad_norm,
+        quotient_kkt_grad_norm,
+        kkt_tolerance,
+        branch_certificate,
+        exact_chart_gauge_count,
         solver_gauge_count,
         cache_beta_quotient_dim,
     })
@@ -243,96 +274,117 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     );
     let center_term = objective.term.clone();
     let center_rho = objective.baseline_rho.from_flat(banked.view());
-    let center = logdet_audit_point(
-        center_term.clone(),
-        z.view(),
-        &center_rho,
-        objective.registry.as_ref(),
-    )
-    .expect("single-emission audit at the center rho");
-    let center_components = &center.components;
-    let center_logdet = center.log_det;
-    let grad = center.criterion.gradient();
-    eprintln!(
-        "[2253-CHAN] center logdet={center_logdet:+.6e} explicit={:?} trace={:?} \
-         adjoint={:?} occam={:?} solver_gauges={} cache_beta_quotient={}",
-        center_components.explicit,
-        center_components.logdet_trace,
-        center_components.third_order_correction,
-        center_components.occam,
-        center.solver_gauge_count,
-        center.cache_beta_quotient_dim,
-    );
-    for atom in center.criterion.atoms() {
-        eprintln!(
-            "[zz2234] center atom {}: value={:+.6e} grad={:?}",
-            atom.label(),
-            atom.value(),
-            atom.grad(),
-        );
-    }
     let h = 1.0e-4;
     let mut failures = Vec::new();
-    for j in 0..n_params {
-        let mut plus = banked.clone();
-        plus[j] += h;
-        let mut minus = banked.clone();
-        minus[j] -= h;
-        let plus_rho = objective.baseline_rho.from_flat(plus.view());
-        let minus_rho = objective.baseline_rho.from_flat(minus.view());
-        let plus = logdet_audit_point(
-            center.term.clone(),
+    for inner_max_iter in [40usize, 200usize] {
+        let center = logdet_audit_point(
+            center_term.clone(),
             z.view(),
-            &plus_rho,
+            &center_rho,
             objective.registry.as_ref(),
+            inner_max_iter,
         )
-        .expect("single-emission audit at +h");
-        let minus = logdet_audit_point(
-            center.term.clone(),
-            z.view(),
-            &minus_rho,
-            objective.registry.as_ref(),
-        )
-        .expect("single-emission audit at -h");
-        let plus_logdet = plus.log_det;
-        let minus_logdet = minus.log_det;
-        let logdet_fd = 0.5 * (plus_logdet - minus_logdet) / (2.0 * h);
-        let logdet_analytic =
-            center_components.logdet_trace[j] + center_components.third_order_correction[j];
+        .expect("single-emission audit at the center rho");
+        let center_components = &center.components;
+        let center_logdet = center.log_det;
+        let grad = center.criterion.gradient();
         eprintln!(
-            "[2253-CHAN] coord {j}: analytic_logdet={logdet_analytic:+.6e} \
-             central_fd_half_logdet={logdet_fd:+.6e}"
+            "[2253-CHAN] budget={inner_max_iter} center logdet={center_logdet:+.6e} \
+             explicit={:?} trace={:?} adjoint={:?} occam={:?} \
+             kkt={:+.6e} quotient_kkt={:+.6e} kkt_tol={:+.6e} \
+             exact_chart_gauges={} solver_gauges={} cache_beta_quotient={}",
+            center_components.explicit,
+            center_components.logdet_trace,
+            center_components.third_order_correction,
+            center_components.occam,
+            center.kkt_grad_norm,
+            center.quotient_kkt_grad_norm,
+            center.kkt_tolerance,
+            center.exact_chart_gauge_count,
+            center.solver_gauge_count,
+            center.cache_beta_quotient_dim,
         );
-        let c_plus = plus.criterion.value();
-        let c_minus = minus.criterion.value();
-        let fd = (c_plus - c_minus) / (2.0 * h);
-        for (plus_atom, minus_atom) in plus.criterion.atoms().iter().zip(minus.criterion.atoms()) {
-            let atom_fd = (plus_atom.value() - minus_atom.value()) / (2.0 * h);
+        eprintln!(
+            "[2253-CERT] budget={inner_max_iter} {:?}",
+            center.branch_certificate
+        );
+        for atom in center.criterion.atoms() {
             eprintln!(
-                "[zz2234] coord {j} atom {}: analytic={:+.6e} central_fd={:+.6e}",
-                plus_atom.label(),
-                center
-                    .criterion
-                    .atoms()
-                    .iter()
-                    .find(|atom| atom.label() == plus_atom.label())
-                    .expect("matching center atom")
-                    .grad()[j],
-                atom_fd,
+                "[zz2234] budget={inner_max_iter} center atom {}: value={:+.6e} grad={:?}",
+                atom.label(),
+                atom.value(),
+                atom.grad(),
             );
         }
-        let delta = (grad[j] - fd).abs();
-        let tolerance = 5.0e-3 * (1.0 + grad[j].abs().max(fd.abs()));
-        eprintln!(
-            "[zz2234] coord {j}: analytic={:+.6e} eval_fd={:+.6e} |delta|={delta:.3e} tol={tolerance:.3e}",
-            grad[j], fd,
-        );
-        if delta > tolerance {
-            failures.push(format!(
-                "rho coordinate {j}: analytic={:+.12e}, same-emission central FD={:+.12e}, \
-                 delta={delta:.3e}, tolerance={tolerance:.3e}",
+        for j in 0..n_params {
+            let mut plus = banked.clone();
+            plus[j] += h;
+            let mut minus = banked.clone();
+            minus[j] -= h;
+            let plus_rho = objective.baseline_rho.from_flat(plus.view());
+            let minus_rho = objective.baseline_rho.from_flat(minus.view());
+            let plus = logdet_audit_point(
+                center.term.clone(),
+                z.view(),
+                &plus_rho,
+                objective.registry.as_ref(),
+                inner_max_iter,
+            )
+            .expect("single-emission audit at +h");
+            let minus = logdet_audit_point(
+                center.term.clone(),
+                z.view(),
+                &minus_rho,
+                objective.registry.as_ref(),
+                inner_max_iter,
+            )
+            .expect("single-emission audit at -h");
+            let plus_logdet = plus.log_det;
+            let minus_logdet = minus.log_det;
+            let logdet_fd = 0.5 * (plus_logdet - minus_logdet) / (2.0 * h);
+            let logdet_analytic =
+                center_components.logdet_trace[j] + center_components.third_order_correction[j];
+            eprintln!(
+                "[2253-CHAN] budget={inner_max_iter} coord {j}: \
+                 analytic_logdet={logdet_analytic:+.6e} \
+                 central_fd_half_logdet={logdet_fd:+.6e}"
+            );
+            let c_plus = plus.criterion.value();
+            let c_minus = minus.criterion.value();
+            let fd = (c_plus - c_minus) / (2.0 * h);
+            for (plus_atom, minus_atom) in
+                plus.criterion.atoms().iter().zip(minus.criterion.atoms())
+            {
+                let atom_fd = (plus_atom.value() - minus_atom.value()) / (2.0 * h);
+                eprintln!(
+                    "[zz2234] budget={inner_max_iter} coord {j} atom {}: \
+                     analytic={:+.6e} central_fd={:+.6e}",
+                    plus_atom.label(),
+                    center
+                        .criterion
+                        .atoms()
+                        .iter()
+                        .find(|atom| atom.label() == plus_atom.label())
+                        .expect("matching center atom")
+                        .grad()[j],
+                    atom_fd,
+                );
+            }
+            let delta = (grad[j] - fd).abs();
+            let tolerance = 5.0e-3 * (1.0 + grad[j].abs().max(fd.abs()));
+            eprintln!(
+                "[zz2234] budget={inner_max_iter} coord {j}: analytic={:+.6e} \
+                 eval_fd={:+.6e} |delta|={delta:.3e} tol={tolerance:.3e}",
                 grad[j], fd,
-            ));
+            );
+            if delta > tolerance {
+                failures.push(format!(
+                    "budget {inner_max_iter}, rho coordinate {j}: analytic={:+.12e}, \
+                     same-emission central FD={:+.12e}, delta={delta:.3e}, \
+                     tolerance={tolerance:.3e}",
+                    grad[j], fd,
+                ));
+            }
         }
     }
     assert!(
