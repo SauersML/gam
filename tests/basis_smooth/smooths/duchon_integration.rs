@@ -105,6 +105,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
         &spec,
         gaussian_identity_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -195,6 +196,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         &spec,
         gaussian_identity_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -325,6 +327,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
         &spec,
         gaussian_identity_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -469,6 +472,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
         &spec,
         binomial_logit_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -626,6 +630,7 @@ fn duchon_2d_scale_dimensions_does_not_abort_on_clean_data_issue_382() {
         &spec,
         gaussian_identity_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

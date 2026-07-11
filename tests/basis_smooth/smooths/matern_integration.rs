@@ -88,6 +88,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -188,6 +189,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -345,6 +347,7 @@ fn matern_3d_aniso_fits_successfully() {
                 InverseLink::Standard(StandardLink::Identity),
             ),
             &FitOptions {
+                resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
                 latent_cloglog: None,
                 mixture_link: None,
                 optimize_mixture: false,

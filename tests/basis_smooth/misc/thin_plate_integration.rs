@@ -52,6 +52,7 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -141,6 +142,7 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -308,6 +310,7 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

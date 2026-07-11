@@ -45,6 +45,7 @@ fn gaussian_identity_likelihood() -> LikelihoodSpec {
 /// Duchon/Matérn `scale_dimensions` integration tests use.
 fn minimal_fit_options() -> FitOptions {
     FitOptions {
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

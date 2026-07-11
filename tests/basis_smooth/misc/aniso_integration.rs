@@ -101,6 +101,7 @@ fn aniso_matern_recovers_signal_axis() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         options: FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
