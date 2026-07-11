@@ -31,6 +31,17 @@ def test_periodic_spline_curve_basis_rust_pyfunction_is_registered() -> None:
     )
 
 
+def test_standalone_cyclic_roughness_kernel_is_registered_and_identical() -> None:
+    """Torch's penalty-only path must reach the same registered Rust kernel."""
+    from gamfit._binding import rust_module
+
+    rust = rust_module()
+    t = np.linspace(0.0, 1.0, 17, endpoint=False, dtype=float)
+    _, combined = rust.periodic_spline_curve_basis(t, 11, 3, 2)
+    standalone = rust.cyclic_bspline_roughness_penalty(11, 3, 1.0, 2)
+    np.testing.assert_array_equal(standalone, combined)
+
+
 def test_top_level_periodic_spline_curve_basis_returns_basis_and_penalty() -> None:
     t = np.array([0.0, 0.07, 0.25, 0.5, 0.999_999, 1.0, 1.07, -0.93], dtype=float)
     basis, penalty = gamfit.periodic_spline_curve_basis(t, n_knots=12, degree=3)
