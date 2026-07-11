@@ -2114,7 +2114,7 @@ impl SaeManifoldTerm {
     /// 1. Every Psi-tier penalty is either in [`sae_penalty_is_row_block_supported`],
     ///    or `NuclearNorm` (which is redirected to the per-atom decoder (β) block
     ///    rather than the coord "t" row block). Assignment sparsity penalties
-    ///    (`IBPAssignment`, `SoftmaxAssignmentSparsity`) are refused because the SAE
+    ///    (`OrderedBetaBernoulli`, `SoftmaxAssignmentSparsity`) are refused because the SAE
     ///    term already owns them through its built-in assignment path
     ///    (`loss.assignment_sparsity`). Penalty kinds with cross-row structure
     ///    (`TotalVariation`, `Monotonicity`, `BlockSparsity`,
@@ -2143,7 +2143,7 @@ impl SaeManifoldTerm {
             }
             if matches!(
                 penalty,
-                AnalyticPenaltyKind::IBPAssignment(_)
+                AnalyticPenaltyKind::OrderedBetaBernoulli(_)
                     | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             ) {
                 return Err(format!(

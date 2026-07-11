@@ -381,7 +381,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 p.diag_target(self.target.view(), self.rho.view())
             }
             AnalyticPenaltyKind::ScadMcp(p) => p.diag_target(self.target.view(), self.rho.view()),
-            AnalyticPenaltyKind::IBPAssignment(p) => p
+            AnalyticPenaltyKind::OrderedBetaBernoulli(p) => p
                 .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => self.diag_via_matvec(),
@@ -434,7 +434,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::TopKActivation(_)
             | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
-            | AnalyticPenaltyKind::IBPAssignment(_)
+            | AnalyticPenaltyKind::OrderedBetaBernoulli(_)
             | AnalyticPenaltyKind::HarmonicRoughness(_)
             | AnalyticPenaltyKind::NestedPrefix(_) => {
                 let d = self.diag();

@@ -31,7 +31,7 @@ pub const DEFAULT_HARMONIC_ROUGHNESS_WEIGHT: f64 = 5.0e3;
 ///
 /// For every row `r` and output column `j` the contribution is
 ///
-///     weight · row_weights[r mod period] · target[r, j]²
+///     ½ · weight · row_weights[r mod period] · target[r, j]²
 ///
 /// summed over all rows and columns. This is exactly the diagonal periodic
 /// roughness Gram of a Fourier decoder: for the standard odd-`K` layout
@@ -150,7 +150,7 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
             }
             acc += w * row_sq;
         }
-        weight * acc
+        0.5 * weight * acc
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
@@ -165,7 +165,7 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
             if w == 0.0 {
                 continue;
             }
-            let factor = 2.0 * weight * w;
+            let factor = weight * w;
             let base = r * d;
             for j in 0..d {
                 out[base + j] = factor * target[base + j];
@@ -186,7 +186,7 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
         let weight = self.resolved_weight(rho);
         let period = self.row_weights.len();
         for r in 0..self.n_eff {
-            let value = 2.0 * weight * self.row_weights[r % period];
+            let value = weight * self.row_weights[r % period];
             let base = r * d;
             for j in 0..d {
                 out[base + j] = value;
@@ -206,16 +206,11 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
     impl_scalar_apply_schedule!(weight);
 }
 
-/// Floor on the weighted harmonic-coefficient energy `Σ Sᵢᵢ bᵢ²` used as the
-/// denominator of the evidence-optimal precision, keeping `λ` finite as the
-/// harmonics are driven toward zero.
-const HARMONIC_EVIDENCE_ENERGY_FLOOR: f64 = 1.0e-12;
-
 /// Evidence-optimal roughness precision `λ⋆` for a periodic decoder block under
 /// the graduated Gaussian prior encoded by `row_weights` (the periodic penalty
 /// Gram's diagonal, `Sᵢᵢ = h⁴` on harmonic rows, `0` on DC / fundamental).
 ///
-/// This is the empirical-Bayes / REML variance-component optimum: treating each
+/// This is a direct-coefficient empirical-Bayes optimum, not REML: treating each
 /// penalized decoder coefficient `bᵢ` as a directly-observed draw of a zero-mean
 /// Gaussian random effect with precision `λ·Sᵢᵢ`, the marginal-likelihood
 /// stationary point is
@@ -226,20 +221,17 @@ const HARMONIC_EVIDENCE_ENERGY_FLOOR: f64 = 1.0e-12;
 /// ```
 ///
 /// where the sum runs only over coefficients with `Sᵢᵢ > 0` and `N_pen` counts
-/// them. This is exactly the criterion the Rust REML lane's outer ρ search
-/// optimizes for a periodic atom's smoothness, specialized to the degenerate
-/// (noise-free, no data-fit) observation model in which the coefficients are the
-/// effects — so it needs only the current decoder blocks and the Gram the caller
-/// already owns, and can be refreshed cheaply during torch training. It replaces
-/// the former hand-tuned `5e3` constant with an evidence-sourced, decoder-scale-
-/// relative precision: as the harmonics shrink the precision rises, and the
-/// competing reconstruction loss in the joint objective keeps genuinely-needed
-/// coefficients alive, so `λ⋆` self-calibrates instead of running away.
+/// them. It omits data curvature and effective degrees of freedom and therefore
+/// must not be presented as the model's REML/LAML update. The native model-fit
+/// lane uses the curvature-aware rank-minus-EDF update instead.
 ///
 /// The target is the same row-major `(n_eff, d)` block the penalty consumes;
 /// `row_weights` is tiled over the leading axis with period `row_weights.len()`.
-/// Returns `0.0` when there is nothing to penalize (no positive Gram weight or a
-/// malformed shape); the denominator is floored so the result is always finite.
+/// Returns `0.0` when there is no defined penalized block (no positive Gram
+/// weight or a malformed shape). For a valid all-zero penalized block it returns
+/// `+∞`, the exact boundary optimum of the idealized direct-observation model;
+/// callers that require a finite precision must use a proper data-curvature
+/// model rather than imposing an arbitrary energy floor.
 #[must_use]
 pub fn harmonic_roughness_evidence_weight(
     target: ArrayView1<'_, f64>,
@@ -268,5 +260,5 @@ pub fn harmonic_roughness_evidence_weight(
     if n_penalized == 0.0 {
         return 0.0;
     }
-    n_penalized / weighted_energy.max(HARMONIC_EVIDENCE_ENERGY_FLOOR)
+    n_penalized / weighted_energy
 }

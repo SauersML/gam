@@ -644,6 +644,40 @@ mod tangent_basis_tests {
     use crate::manifold::RiemannianManifold;
     use ndarray::Array1;
 
+    /// The affine-invariant metric raise must satisfy the defining Riesz
+    /// identity and must not collapse to Euclidean tangent projection away
+    /// from the identity matrix.
+    #[test]
+    fn spd_riemannian_gradient_is_affine_metric_riesz_representative() {
+        let spd = SpdManifold::new(2);
+        let p = Array1::from(vec![2.0, 0.0, 0.0, 1.0]);
+        let differential = Array1::from(vec![1.0, 0.0, 0.0, 1.0]);
+        let tangent = Array1::from(vec![0.7, 0.2, 0.2, -0.3]);
+
+        let gradient = spd
+            .riemannian_gradient(p.view(), differential.view())
+            .expect("affine-invariant metric raise");
+        let metric = spd.metric_tensor(p.view()).expect("SPD metric tensor");
+        let lhs = gradient.dot(&metric.dot(&tangent));
+        let rhs = differential.dot(&tangent);
+        assert!(
+            (lhs - rhs).abs() <= 1.0e-12,
+            "Riesz identity failed: g_P(grad, xi)={lhs}, <E, xi>={rhs}"
+        );
+
+        let expected = Array1::from(vec![4.0, 0.0, 0.0, 1.0]);
+        for (got, want) in gradient.iter().zip(expected.iter()) {
+            assert!((got - want).abs() <= 1.0e-12);
+        }
+        let projected = spd
+            .project_tangent(p.view(), differential.view())
+            .expect("Euclidean tangent projection");
+        assert!(
+            (&gradient - &projected).dot(&(&gradient - &projected)) > 1.0,
+            "affine metric raise unexpectedly equals Euclidean projection"
+        );
+    }
+
     /// The SPD `tangent_basis` must be orthonormal under the affine-invariant
     /// metric `⟨U,V⟩_P = tr(P⁻¹U P⁻¹V)`, i.e. `Qᵀ W Q = I` with
     /// `W = metric_tensor(P)`. At a non-identity point the old hand-rolled

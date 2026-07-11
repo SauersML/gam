@@ -6,7 +6,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldRho;
 use gam_solve::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use gam_terms::analytic_penalties::{
-    AnalyticPenalty, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
+    AnalyticPenalty, OrderedBetaBernoulliPenalty, OrderedBetaBernoulliHessianDiagThirdChannels,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
@@ -204,50 +204,27 @@ pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 /// been retired.
 pub(crate) const SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET: usize = 3;
 
-/// Machine-precision support cutoff for the smooth JumpReLU assignment prior,
-/// in units of the gate temperature below the hard threshold. The forward gate
-/// remains hard-zero at and below `threshold`, but the prior value/gradient and
-/// compact Newton layout keep every logit with `(logit - threshold)/tau > -36`.
-/// At the excluded edge `sigma(-36) ~= 2e-16`, so dropped value/gradient/Hessian
-/// terms are below f64 noise instead of creating an algorithmic discontinuity.
-pub(crate) const JUMPRELU_OPTIMIZATION_LOGIT_CUTOFF: f64 = -36.0;
-
-/// Shared support predicate for JumpReLU optimization inclusion. This is
-/// strictly weaker than the hard forward gate `logit > threshold`, which still
-/// governs data-fit reconstruction and its logit JVP.
-#[inline]
-pub(crate) fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
-    (logit - threshold) / temperature > JUMPRELU_OPTIMIZATION_LOGIT_CUTOFF
-}
-
 /// Assignment prior/relaxation used by [`SaeAssignment`].
 #[derive(Debug, Clone, Copy)]
 pub enum AssignmentMode {
     /// Row-wise simplex assignment with entropy sparsity.
     Softmax { temperature: f64, sparsity: f64 },
-    /// Deterministic concrete posterior means for a truncated IBP active set:
+    /// Deterministic concrete posterior means for a truncated ordered Beta--Bernoulli active set:
     /// `a_k = σ(logit_k/temperature)`. These are independent Bernoulli gates,
     /// not mixture/simplex responsibilities. The ordered stick-breaking mean
-    /// `π_k = (α/(α+1))^{k+1}` is scored once by the IBP prior; it is not
+    /// `π_k = (α/(α+1))^{k+1}` is scored once by the ordered Beta--Bernoulli prior; it is not
     /// multiplied into the final reconstructed function.
-    IBPMap {
+    OrderedBetaBernoulli {
         temperature: f64,
         alpha: f64,
         learnable_alpha: bool,
     },
-    /// Hard-thresholded bounded gate: each atom is off (gate = 0) when its logit
-    /// is at or below `threshold`, and on with a threshold-centered shifted
-    /// sigmoid `σ((logit − threshold) / temperature) ∈ [0.5, 1)` above it.
-    ///
-    /// #1777 RENAMED from `JumpReLU` (an inaccurate name): this is NOT the
-    /// literature JumpReLU activation `z·1[z>θ]`, which carries the thresholded
-    /// MAGNITUDE `z`. This mode is a thresholded-logistic GATE (a hard-sigmoid
-    /// gate): it carries no magnitude at all — its output is a bounded `[0, 1)`
-    /// indicator. `ThresholdGate` names it for what it is. It is a member of the
-    /// gate family (softmax simplex / IBP sigmoid / this hard gate); reconstruction
-    /// magnitude lives entirely in the decoder curve `g_k(t) = φ(t)ᵀ B_k`. The
-    /// discontinuity at `threshold` (0 → 0.5) is the intended "jump".
-    ///
+    /// Smooth threshold-centered logistic gate
+    /// `a_k = σ((logit_k − threshold) / temperature)`. Magnitude lives in the
+    /// decoder curve `g_k(t) = φ(t)ᵀB_k`; this gate supplies a bounded posterior
+    /// activation in `(0, 1)`. Its derivative is exact on both sides of the
+    /// threshold, so fitted values, data-fit Jacobians, priors, and Hessians are
+    /// derivatives of one smooth objective.
     ThresholdGate { temperature: f64, threshold: f64 },
     /// Hard top-`k` support gate: the `k` atoms with the LARGEST routing logits
     /// in a row carry gate 1, every other atom carries gate 0 (ties broken
@@ -258,23 +235,23 @@ pub enum AssignmentMode {
     /// (`assignment_coord_dim() == 0` — at K = 32,000 this deletes 32k
     /// coordinates from the inner Newton), and no sparsity coordinate in the
     /// outer ρ search. At fixed support size `|S| = k` this is the
-    /// constrained-MAP member of the same spike-slab generative family the IBP
+    /// constrained-MAP member of the same spike-slab generative family the ordered Beta--Bernoulli
     /// gate lives in, with the ℓ2,0 constraint standing in for the
     /// stick-breaking prior. The gate is per-row independent (couples rows
     /// through NOTHING), so fits stream chunk-invariantly at any K, and it is
-    /// exchangeable across atom index — the ordered-IBP concentration
+    /// exchangeable across atom index — the ordered-ordered Beta--Bernoulli concentration
     /// pathology (#1784) cannot arise.
     TopK { k: usize },
 }
 
 /// Caller intent for assignment-mode admission. `Default` is the production
-/// route: it never selects IBP-MAP implicitly.
+/// route: it never selects ordered Beta--Bernoulli-MAP implicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentModeRequest {
     Default,
     Softmax,
     ThresholdGate,
-    IbpMap,
+    OrderedBetaBernoulli,
 }
 
 /// Scale-aware assignment admission result.
@@ -318,8 +295,8 @@ impl AssignmentMode {
     }
 
     #[must_use]
-    pub fn ibp_map(temperature: f64, alpha: f64, learnable_alpha: bool) -> Self {
-        Self::IBPMap {
+    pub fn ordered_beta_bernoulli(temperature: f64, alpha: f64, learnable_alpha: bool) -> Self {
+        Self::OrderedBetaBernoulli {
             temperature,
             alpha,
             learnable_alpha,
@@ -346,7 +323,7 @@ impl AssignmentMode {
     pub fn temperature(&self) -> f64 {
         match *self {
             AssignmentMode::Softmax { temperature, .. }
-            | AssignmentMode::IBPMap { temperature, .. }
+            | AssignmentMode::OrderedBetaBernoulli { temperature, .. }
             | AssignmentMode::ThresholdGate { temperature, .. } => temperature,
             // The hard support gate has no relaxation, hence no temperature; the
             // unit value keeps generic temperature-logging paths well-defined.
@@ -362,7 +339,7 @@ impl AssignmentMode {
         }
         match self {
             AssignmentMode::Softmax { temperature, .. }
-            | AssignmentMode::IBPMap { temperature, .. }
+            | AssignmentMode::OrderedBetaBernoulli { temperature, .. }
             | AssignmentMode::ThresholdGate { temperature, .. } => {
                 *temperature = new_temperature;
             }
@@ -388,10 +365,10 @@ impl AssignmentMode {
                     ));
                 }
             }
-            AssignmentMode::IBPMap { alpha, .. } => {
+            AssignmentMode::OrderedBetaBernoulli { alpha, .. } => {
                 if !(alpha.is_finite() && alpha > 0.0) {
                     return Err(format!(
-                        "AssignmentMode::IBPMap: alpha must be finite and positive; got {alpha}"
+                        "AssignmentMode::OrderedBetaBernoulli: alpha must be finite and positive; got {alpha}"
                     ));
                 }
             }
@@ -413,18 +390,18 @@ impl AssignmentMode {
         Ok(())
     }
 
-    /// Resolve the effective truncated-IBP concentration `α` for this mode.
+    /// Resolve the effective truncated-ordered Beta--Bernoulli concentration `α` for this mode.
     ///
     /// `per_fit_override` is the #1777 PER-FIT override (from
-    /// [`SaeAssignment::ibp_alpha_override`]) and is the source of truth when set.
+    /// [`SaeAssignment::ordered_beta_bernoulli_alpha_override`]) and is the source of truth when set.
     /// Otherwise the mode's canonical fixed `α` or learnable schedule is used.
-    pub(crate) fn resolved_ibp_alpha(
+    pub(crate) fn resolved_ordered_beta_bernoulli_alpha(
         &self,
         rho: &SaeManifoldRho,
         per_fit_override: Option<f64>,
     ) -> Option<f64> {
         match *self {
-            AssignmentMode::IBPMap {
+            AssignmentMode::OrderedBetaBernoulli {
                 alpha,
                 learnable_alpha,
                 ..
@@ -462,7 +439,7 @@ pub fn default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Optio
 }
 
 /// Admit the assignment mode for a fit size. The default route is softmax, with
-/// a top-k cap at large K. IBP-MAP is a research-mode opt-in and is refused once
+/// a top-k cap at large K. ordered Beta--Bernoulli-MAP is a research-mode opt-in and is refused once
 /// the large-K top-k admission engages.
 pub fn admit_assignment_mode_for_size(
     request: AssignmentModeRequest,
@@ -491,16 +468,16 @@ pub fn admit_assignment_mode_for_size(
             mode: AssignmentMode::threshold_gate(temperature, threshold),
             top_k: None,
         },
-        AssignmentModeRequest::IbpMap => {
-            // #F2 — re-admit IBP-MAP at large K, with the same rows-per-atom
+        AssignmentModeRequest::OrderedBetaBernoulli => {
+            // #F2 — re-admit ordered Beta--Bernoulli-MAP at large K, with the same rows-per-atom
             // `top_k` used as the ACTIVE-SET COMPUTE CAP (the softmax lane's
             // large-K cap), instead of refusing the request. The occupancy-driven
             // empirical-Bayes α M-step (#F1) now un-caps the effective atom count
-            // that the fixed geometric schedule used to pin at ~3, so IBP-MAP is a
+            // that the fixed geometric schedule used to pin at ~3, so ordered Beta--Bernoulli-MAP is a
             // usable large-K lane once its per-row work is bounded by `top_k`.
-            // Small fits keep `top_k = None` (dense IBP-MAP), unchanged.
+            // Small fits keep `top_k = None` (dense ordered Beta--Bernoulli-MAP), unchanged.
             AssignmentModeAdmission {
-                mode: AssignmentMode::ibp_map(temperature, alpha, learnable_alpha),
+                mode: AssignmentMode::ordered_beta_bernoulli(temperature, alpha, learnable_alpha),
                 top_k: large_k_top,
             }
         }
@@ -524,7 +501,7 @@ pub fn admit_assignment_mode_for_size(
 /// state off the public API surface to match the demotion.
 ///
 /// The stored assignment parameter is `logits`; non-negative assignments are
-/// derived by row-wise softmax, independent IBP-MAP sigmoid active indicators,
+/// derived by row-wise softmax, independent ordered Beta--Bernoulli-MAP sigmoid active indicators,
 /// or JumpReLU gates. Softmax logits are canonicalized to the reference chart
 /// `logits[K - 1] = 0`, so the row-local Newton coordinates contain only the
 /// first `K - 1` logits (`0` coordinates for `K = 1`). Gate-style modes keep
@@ -540,7 +517,7 @@ pub struct SaeAssignment {
     /// ungated atom is the dense linear/background tier: its per-row gate is
     /// fixed at `a_k ≡ 1` (it contributes `γ_k(t_k)` to EVERY row, unweighted),
     /// it is excluded from the other atoms' gate (for the column-separable
-    /// IBP / JumpReLU modes the remaining atoms are computed independently, so
+    /// ordered Beta--Bernoulli / JumpReLU modes the remaining atoms are computed independently, so
     /// they are unaffected), and its logit is NOT a free parameter — its
     /// logit-JVP, sparsity-prior gradient/curvature, and softmax majorizer
     /// contributions are all zero, leaving its logit slot an inert
@@ -562,12 +539,12 @@ pub struct SaeAssignment {
     /// gates every outer eval — the n-independent-outer-loop lever (#1033). `None`
     /// is the historical free-logit path (bit-identical).
     pub frozen_logits: Option<Array2<f64>>,
-    /// #1777 PER-FIT IBP-α override. `Some(α)` forces a fixed value and bypasses
+    /// #1777 PER-FIT ordered Beta--Bernoulli-α override. `Some(α)` forces a fixed value and bypasses
     /// the learnable schedule for this assignment/fit. `None` uses the
     /// [`AssignmentMode`]'s canonical fixed `α` or learnable schedule. Read via
-    /// [`Self::resolved_ibp_alpha`]; set from the FFI through the term's
+    /// [`Self::resolved_ordered_beta_bernoulli_alpha`]; set from the FFI through the term's
     /// `set_fit_config`.
-    pub ibp_alpha_override: Option<f64>,
+    pub ordered_beta_bernoulli_alpha_override: Option<f64>,
 }
 
 impl SaeAssignment {
@@ -615,7 +592,7 @@ impl SaeAssignment {
             mode,
             ungated: vec![false; k],
             frozen_logits: None,
-            ibp_alpha_override: None,
+            ordered_beta_bernoulli_alpha_override: None,
         })
     }
 
@@ -641,7 +618,7 @@ impl SaeAssignment {
                     "SaeAssignment::with_frozen_routing: frozen routing under Softmax is rejected \
                      — the coupled simplex's entropy majorizer is assembled over the logits, which \
                      a frozen (non-optimized) routing would leave inconsistent; this separable-mode \
-                     contract supports IBP-MAP and JumpReLU, whose per-atom gates have no \
+                     contract supports ordered Beta--Bernoulli-MAP and JumpReLU, whose per-atom gates have no \
                      simplex-coupled curvature to skip"
                         .to_string(),
                 );
@@ -722,7 +699,7 @@ impl SaeAssignment {
         if matches!(self.mode, AssignmentMode::Softmax { .. }) {
             return Err(
                 "SaeAssignment::freeze_routing_in_place: frozen routing under Softmax is rejected \
-                 (coupled-simplex entropy-majorizer); use IBP-MAP or JumpReLU"
+                 (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli-MAP or JumpReLU"
                     .to_string(),
             );
         }
@@ -750,7 +727,7 @@ impl SaeAssignment {
         if matches!(self.mode, AssignmentMode::Softmax { .. }) {
             return Err(
                 "SaeAssignment::set_frozen_routing_in_place: frozen routing under Softmax is \
-                 rejected (coupled-simplex entropy-majorizer); use IBP-MAP or JumpReLU"
+                 rejected (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli-MAP or JumpReLU"
                     .to_string(),
             );
         }
@@ -769,7 +746,7 @@ impl SaeAssignment {
     /// #1026 — designate which atoms are UNGATED (the dense linear/background
     /// tier; see [`SaeAssignment::ungated`]). `flags` must have length `K`.
     ///
-    /// Ungating is defined for the COLUMN-SEPARABLE gate modes (IBP-MAP and
+    /// Ungating is defined for the COLUMN-SEPARABLE gate modes (ordered Beta--Bernoulli-MAP and
     /// JumpReLU): each atom's gate is an independent per-atom function of its own
     /// logit, so pinning one atom to `a_k ≡ 1` leaves every other atom's gate
     /// exactly as computed. Softmax is a coupled simplex (`Σ_k a_k = 1` over all
@@ -778,7 +755,7 @@ impl SaeAssignment {
     /// and the entropy majorizer; this constructor's contract is restricted to
     /// the separable modes, and an ungated atom under Softmax is REJECTED here so
     /// the inner solve never runs on a value/gradient-mismatched gate. Callers
-    /// wanting a dense background tier under Softmax route it as an IBP-MAP or
+    /// wanting a dense background tier under Softmax route it as an ordered Beta--Bernoulli-MAP or
     /// JumpReLU atom.
     #[must_use = "build error must be handled"]
     pub fn with_ungated(mut self, flags: Vec<bool>) -> Result<Self, String> {
@@ -794,7 +771,7 @@ impl SaeAssignment {
                 "SaeAssignment::with_ungated: an ungated atom under Softmax routing is \
                  rejected — the coupled simplex requires a gated-subset renormalization \
                  reflected in the logit-JVP and entropy majorizer, which this separable-mode \
-                 contract does not perform; route a dense background tier as IBP-MAP or JumpReLU"
+                 contract does not perform; route a dense background tier as ordered Beta--Bernoulli-MAP or JumpReLU"
                     .to_string(),
             );
         }
@@ -822,7 +799,7 @@ impl SaeAssignment {
     pub fn assignment_coord_dim(&self) -> usize {
         match self.mode {
             AssignmentMode::Softmax { .. } => self.k_atoms().saturating_sub(1),
-            AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => self.k_atoms(),
+            AssignmentMode::OrderedBetaBernoulli { .. } | AssignmentMode::ThresholdGate { .. } => self.k_atoms(),
             // Sparsity by construction: the support is a deterministic function
             // of the routing logits, so there are NO free gate coordinates in
             // the inner system.
@@ -866,47 +843,47 @@ impl SaeAssignment {
         self.try_assignments_row_inner(row)
     }
 
-    /// #1777 — the effective truncated-IBP `α` for this assignment at `rho`,
-    /// honoring the PER-FIT [`Self::ibp_alpha_override`] before the mode's
+    /// #1777 — the effective truncated-ordered Beta--Bernoulli `α` for this assignment at `rho`,
+    /// honoring the PER-FIT [`Self::ordered_beta_bernoulli_alpha_override`] before the mode's
     /// canonical value or learnable schedule. The single seam every
     /// gate/jet/prior site reads so the per-fit override is applied consistently.
-    /// `None` for non-IBP modes.
-    pub(crate) fn resolved_ibp_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
-        self.mode.resolved_ibp_alpha(rho, self.ibp_alpha_override)
+    /// `None` for non-ordered Beta--Bernoulli modes.
+    pub(crate) fn resolved_ordered_beta_bernoulli_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
+        self.mode.resolved_ordered_beta_bernoulli_alpha(rho, self.ordered_beta_bernoulli_alpha_override)
     }
 
-    /// Whether the truncated-IBP concentration α is a FREE outer parameter that
+    /// Whether the truncated-ordered Beta--Bernoulli concentration α is a FREE outer parameter that
     /// varies with ρ (`rho.log_lambda_sparse`). α is learnable ONLY when the mode
     /// requests it AND no per-fit override pins it: an override forces the fixed
     /// value and bypasses the learnable
-    /// schedule (see [`AssignmentMode::resolved_ibp_alpha`]), so α's ρ-derivatives
+    /// schedule (see [`AssignmentMode::resolved_ordered_beta_bernoulli_alpha`]), so α's ρ-derivatives
     /// are then identically zero and every prior / log-det / IFT term must treat α
-    /// as a constant to stay consistent with the forward gate. `false` for non-IBP
+    /// as a constant to stay consistent with the forward gate. `false` for non-ordered Beta--Bernoulli
     /// modes. (#Bug6)
     pub(crate) fn effective_alpha_is_learnable(&self) -> bool {
         match self.mode {
-            AssignmentMode::IBPMap {
+            AssignmentMode::OrderedBetaBernoulli {
                 learnable_alpha, ..
-            } => learnable_alpha && self.ibp_alpha_override.is_none(),
+            } => learnable_alpha && self.ordered_beta_bernoulli_alpha_override.is_none(),
             _ => false,
         }
     }
 
-    /// #1777 — install (or clear, with `None`) the PER-FIT IBP-α override on this
-    /// assignment. Source of truth used by [`Self::resolved_ibp_alpha`]; the FFI
+    /// #1777 — install (or clear, with `None`) the PER-FIT ordered Beta--Bernoulli-α override on this
+    /// assignment. Source of truth used by [`Self::resolved_ordered_beta_bernoulli_alpha`]; the FFI
     /// reaches it through the term's `set_fit_config`.
-    pub fn set_ibp_alpha_override(&mut self, alpha: Option<f64>) {
-        self.ibp_alpha_override = alpha;
+    pub fn set_ordered_beta_bernoulli_alpha_override(&mut self, alpha: Option<f64>) {
+        self.ordered_beta_bernoulli_alpha_override = alpha;
     }
 
     /// #F1 — the Fellner–Schall-analog empirical-Bayes M-step for the
     /// `log_lambda_sparse` slot: the additive step `Δθ = ln α_EB* − ln α_current`
-    /// that moves the ordered-IBP concentration to the occupancy-driven marginal
+    /// that moves the ordered-ordered Beta--Bernoulli concentration to the occupancy-driven marginal
     /// stationary point (`log_lambda_sparse += Δθ` IS the multiplicative α update,
     /// since the resolved α is `α_base · exp(log_lambda_sparse)`).
     ///
     /// Returns `Some(Δθ)` ONLY when the effective α is a FREE learnable parameter
-    /// (IBP-MAP, `learnable_alpha`, no per-fit override) —
+    /// (ordered Beta--Bernoulli-MAP, `learnable_alpha`, no per-fit override) —
     /// exactly when [`Self::effective_alpha_is_learnable`] holds, so the α
     /// ρ-derivatives are non-zero and the marginal M-step is the coherent update.
     /// `None` for every other sparsity prior (softmax entropy, gated L1) or a
@@ -921,14 +898,14 @@ impl SaeAssignment {
     /// iterate cannot overshoot the α axis; the fixed point is reached over
     /// successive Fellner–Schall iterates, each accepted through the REML cost
     /// lane like every other coordinate's step.
-    pub(crate) fn ibp_eb_log_alpha_step(
+    pub(crate) fn ordered_beta_bernoulli_eb_log_alpha_step(
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Option<f64>, String> {
         if !self.effective_alpha_is_learnable() {
             return Ok(None);
         }
-        let resolved = self.resolved_ibp_alpha(rho);
+        let resolved = self.resolved_ordered_beta_bernoulli_alpha(rho);
         let Some(alpha_current) = resolved else {
             return Ok(None);
         };
@@ -950,7 +927,7 @@ impl SaeAssignment {
                 *acc += g;
             }
         }
-        let alpha_star = ibp_eb_geometric_alpha_fixed_point(&occupancy, n as f64, alpha_current);
+        let alpha_star = ordered_beta_bernoulli_eb_geometric_alpha_fixed_point(&occupancy, n as f64, alpha_current);
         if !(alpha_star.is_finite() && alpha_star > 0.0) {
             return Ok(None);
         }
@@ -977,7 +954,7 @@ impl SaeAssignment {
         let routing = self.routing_logits_row(row);
         validate_finite_logits(routing, row)?;
         // Only Softmax collapses to a fixed assignment at K==1: its
-        // assignment_coord_dim is K-1 = 0, so there is no free logit. IBPMap and
+        // assignment_coord_dim is K-1 = 0, so there is no free logit. OrderedBetaBernoulli and
         // JumpReLU keep a free per-atom gate logit even at K==1
         // (assignment_coord_dim = K = 1), so they must fall through to their real
         // row functions or the logit would move the prior but not the gate.
@@ -986,15 +963,15 @@ impl SaeAssignment {
         }
         let mut row_gates = match self.mode {
             AssignmentMode::Softmax { temperature, .. } => softmax_row(routing, temperature),
-            AssignmentMode::IBPMap { temperature, .. } => ibp_map_row(routing, temperature),
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => ordered_beta_bernoulli_row(routing, temperature),
             AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
-            } => jumprelu_row(routing, temperature, threshold),
+            } => threshold_gate_row(routing, temperature, threshold),
             AssignmentMode::TopK { k } => topk_row(routing, k),
         };
         // #1026 — ungated (background-tier) atoms have a fixed unit gate. For the
-        // column-separable IBP / JumpReLU modes the other atoms' gates are
+        // column-separable ordered Beta--Bernoulli / JumpReLU modes the other atoms' gates are
         // computed independently above, so overwriting the ungated entries to 1.0
         // leaves the gated atoms exactly as they were; the ungated atom then
         // contributes `γ_k(t_k)` unweighted to every row. (Softmax + ungated is
@@ -1035,13 +1012,13 @@ impl SaeAssignment {
             AssignmentMode::Softmax { temperature, .. } => {
                 softmax_row_into(routing, temperature, out)
             }
-            AssignmentMode::IBPMap { temperature, .. } => {
-                ibp_map_row_into(routing, temperature, out)
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
+                ordered_beta_bernoulli_row_into(routing, temperature, out)
             }
             AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
-            } => jumprelu_row_into(routing, temperature, threshold, out),
+            } => threshold_gate_row_into(routing, temperature, threshold, out),
             AssignmentMode::TopK { k } => topk_row_into(routing, k, out),
         };
         // #1026 — ungated (background-tier) atoms have a fixed unit gate, exactly
@@ -1056,8 +1033,8 @@ impl SaeAssignment {
         Ok(())
     }
 
-    pub(crate) fn persist_resolved_ibp_alpha(&mut self, rho: &SaeManifoldRho) -> bool {
-        let AssignmentMode::IBPMap {
+    pub(crate) fn persist_resolved_ordered_beta_bernoulli_alpha(&mut self, rho: &SaeManifoldRho) -> bool {
+        let AssignmentMode::OrderedBetaBernoulli {
             temperature,
             alpha,
             learnable_alpha: true,
@@ -1066,7 +1043,7 @@ impl SaeAssignment {
             return false;
         };
         let resolved_alpha = resolve_learnable_weight(alpha, rho.log_lambda_sparse);
-        self.mode = AssignmentMode::IBPMap {
+        self.mode = AssignmentMode::OrderedBetaBernoulli {
             temperature,
             alpha: resolved_alpha,
             learnable_alpha: false,
@@ -1156,8 +1133,8 @@ impl SaeAssignment {
 pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Array1<f64> {
     match mode {
         AssignmentMode::Softmax { .. } => Array1::from_elem(k_atoms, 1.0 / (k_atoms.max(1) as f64)),
-        AssignmentMode::IBPMap { temperature, .. } => {
-            ibp_map_row(Array1::<f64>::zeros(k_atoms).view(), temperature)
+        AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
+            ordered_beta_bernoulli_row(Array1::<f64>::zeros(k_atoms).view(), temperature)
         }
         AssignmentMode::ThresholdGate { .. } => Array1::from_elem(k_atoms, 0.5),
         // At all-equal (zero) logits the deterministic tie-break admits the
@@ -1223,16 +1200,16 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
 /// `π_k = E[∏_{j=0}^{k} v_j] = (α/(α+1))^{k+1}` for k = 0, .., K-1, with sticks
 /// `v_j ~ Beta(α, 1)` so `E[v_j] = α/(α+1)`. EVERY atom (including the first,
 /// `π_0 = α/(α+1)`) carries the consistent Beta(α, 1) shrinkage: there is no
-/// special-cased always-on base atom, so `α` behaves as a genuine IBP
+/// special-cased always-on base atom, so `α` behaves as a genuine ordered Beta--Bernoulli
 /// concentration — larger `α` ⇒ heavier mass / slower decay, `α → 0` ⇒ all mass
 /// collapses onto nothing, matching the stick-breaking limit. This is the
-/// deterministic mean-field form of the IBP prior (the closed form the
+/// deterministic mean-field form of the ordered Beta--Bernoulli prior (the closed form the
 /// analytic Newton / Hessian / Woodbury machinery differentiates); no sticks are
 /// *sampled* here, the per-atom weight is the exact expectation of the
 /// stick-breaking product. (#614: previously `π_0 = 1` left the first atom
 /// unshrunk, which is the prior mean of NO stick at all and broke α's role as a
-/// concentration; the consistent product mean restores genuine IBP semantics.)
-/// Ordered prior-mean *schedule* for the truncated-IBP assignment prior. Both
+/// concentration; the consistent product mean restores genuine ordered Beta--Bernoulli semantics.)
+/// Ordered prior-mean *schedule* for the truncated-ordered Beta--Bernoulli assignment prior. Both
 /// forms produce a strictly positive, ordered (decreasing) prior mean
 /// `μ_k ∈ (0, 1]` consumed by the Beta--Bernoulli penalty.
 ///
@@ -1245,7 +1222,7 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
 ///   to numerical zero (#F2). This is the correct tail for near-Zipf feature
 ///   frequencies. Both schedules share the SAME occupancy-driven empirical-Bayes
 ///   fixed point (the Beta–Bernoulli marginal is schedule-agnostic; only the
-///   `a_k(θ)` map and its derivatives differ — see [`ibp_eb_marginal_score`]).
+///   `a_k(θ)` map and its derivatives differ — see [`ordered_beta_bernoulli_eb_marginal_score`]).
 #[derive(Debug, Clone, Copy)]
 pub enum OrderedPriorSchedule {
     /// Stick-breaking mean `μ_k = (α/(α+1))^{k+1}`, `α > 0`.
@@ -1288,7 +1265,7 @@ pub fn ordered_prior_means(k_atoms: usize, schedule: OrderedPriorSchedule) -> Ar
     out
 }
 
-/// #1784 — K-aware default IBP concentration.
+/// #1784 — K-aware default ordered Beta--Bernoulli concentration.
 ///
 /// The ordered stick-breaking prior mean `π_k = (α/(α+1))^{k+1}` decays
 /// GEOMETRICALLY in the atom INDEX, so a fixed small concentration (the
@@ -1299,14 +1276,14 @@ pub fn ordered_prior_means(k_atoms: usize, schedule: OrderedPriorSchedule) -> Ar
 /// late atoms carry zero mass and leave the per-row joint Hessian rank-deficient
 /// (the K = 128 `RemlConvergenceError`).
 ///
-/// For a K-atom dictionary to actually USE all K atoms the IBP concentration must
+/// For a K-atom dictionary to actually USE all K atoms the ordered Beta--Bernoulli concentration must
 /// scale with K. Choosing `α` so the LAST atom retains prior mass
 /// `π_{K-1} = (α/(α+1))^K ≈ e^{-1}` spans the whole dictionary while keeping the
 /// prior monotone (still an honest ordered stick-breaking prior — no atom is
 /// structurally masked). Solving `(α/(α+1))^K = e^{-1}` gives
 /// `α = 1/(exp(1/K) − 1) ≈ K − 1/2`. Floored at `1.0` so `K = 1` keeps the
 /// historical `α = 1`.
-pub fn default_ibp_concentration_for_k_atoms(k_atoms: usize) -> f64 {
+pub fn default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: usize) -> f64 {
     let k = k_atoms.max(1) as f64;
     // π_{K-1} = (α/(α+1))^K = e^{-1}  ⇒  α = 1/(e^{1/K} − 1).
     let alpha = 1.0 / ((1.0 / k).exp() - 1.0);
@@ -1334,7 +1311,7 @@ fn trigamma(mut x: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// #F1/#F2 — occupancy-driven empirical-Bayes fixed point for the ordered IBP
+// #F1/#F2 — occupancy-driven empirical-Bayes fixed point for the ordered ordered Beta--Bernoulli
 // assignment prior (the Fellner–Schall-analog M-step for `log_lambda_sparse`).
 //
 // COHERENT MODEL. Each atom's ordered prior mass is `π_k ~ Beta(a_k, 1)` with
@@ -1359,7 +1336,7 @@ fn trigamma(mut x: f64) -> f64 {
 /// This is the schedule-INDEPENDENT core: every schedule reaches the M-step
 /// through the same `(g, g')`, differing only in the `a_k(θ)` map it feeds.
 #[inline]
-fn ibp_eb_atom_score_deriv(m_k: f64, n_obs: f64, a: f64) -> (f64, f64) {
+fn ordered_beta_bernoulli_eb_atom_score_deriv(m_k: f64, n_obs: f64, a: f64) -> (f64, f64) {
     let g = statrs::function::gamma::digamma(m_k + a)
         - statrs::function::gamma::digamma(n_obs + a + 1.0)
         + 1.0 / a;
@@ -1374,23 +1351,23 @@ fn ibp_eb_atom_score_deriv(m_k: f64, n_obs: f64, a: f64) -> (f64, f64) {
 /// schedule supplies its own `a` (pseudo-counts) and `da_dtheta` arrays and this
 /// core assembles the total score. Exposed so a power-law fit reaches the SAME
 /// fixed point as the geometric one.
-pub fn ibp_eb_marginal_score(occupancy: &[f64], n_obs: f64, a: &[f64], da_dtheta: &[f64]) -> f64 {
+pub fn ordered_beta_bernoulli_eb_marginal_score(occupancy: &[f64], n_obs: f64, a: &[f64], da_dtheta: &[f64]) -> f64 {
     let mut s = 0.0;
     for k in 0..occupancy.len() {
-        let (g, _) = ibp_eb_atom_score_deriv(occupancy[k].clamp(0.0, n_obs), n_obs, a[k]);
+        let (g, _) = ordered_beta_bernoulli_eb_atom_score_deriv(occupancy[k].clamp(0.0, n_obs), n_obs, a[k]);
         s += g * da_dtheta[k];
     }
     s
 }
 
 /// Total empirical-Bayes marginal score `S(θ)` and curvature `H(θ)` for the
-/// ordered GEOMETRIC IBP schedule, parameterised in `θ = ln α` (so the additive
+/// ordered GEOMETRIC ordered Beta--Bernoulli schedule, parameterised in `θ = ln α` (so the additive
 /// engine step `log_lambda_sparse += Δθ` IS the multiplicative α update).
 ///
 /// Uses `ρ = σ(θ) = α/(α+1)` (`dρ/dθ = ρ(1−ρ)`, `d²ρ/dθ² = ρ(1−ρ)(1−2ρ)`),
 /// `μ_k = ρ^{k+1}`, and `a_k = μ_k/(1−μ_k)`, all differentiated analytically.
 /// `occupancy[k] = M_k`, `n_obs = N`. Pure closed form (digamma/trigamma).
-pub fn ibp_eb_alpha_score_hess(occupancy: &[f64], n_obs: f64, alpha: f64) -> (f64, f64) {
+pub fn ordered_beta_bernoulli_eb_alpha_score_hess(occupancy: &[f64], n_obs: f64, alpha: f64) -> (f64, f64) {
     let rho = alpha / (alpha + 1.0);
     let one_m_rho = 1.0 - rho;
     let mut s = 0.0;
@@ -1407,7 +1384,7 @@ pub fn ibp_eb_alpha_score_hess(occupancy: &[f64], n_obs: f64, alpha: f64) -> (f6
         let a = mu / om;
         let da = dmu / (om * om);
         let d2a = 2.0 * dmu * dmu / (om * om * om) + d2mu / (om * om);
-        let (g, gp) = ibp_eb_atom_score_deriv(m_k, n_obs, a);
+        let (g, gp) = ordered_beta_bernoulli_eb_atom_score_deriv(m_k, n_obs, a);
         s += g * da;
         h += gp * da * da + g * d2a;
     }
@@ -1415,14 +1392,14 @@ pub fn ibp_eb_alpha_score_hess(occupancy: &[f64], n_obs: f64, alpha: f64) -> (f6
 }
 
 /// Occupancy-driven empirical-Bayes concentration `α*` for the ordered geometric
-/// IBP prior: the stationary point of the Beta–Bernoulli marginal, found by a
+/// ordered Beta--Bernoulli prior: the stationary point of the Beta–Bernoulli marginal, found by a
 /// GUARDED Newton root-find on `S(θ) = 0` in `θ = ln α` with analytic score and
 /// curvature (no grid, no finite differences — SPEC). Guarding: a Newton step
 /// where the marginal is locally concave (`H < 0`), otherwise a trust-region
 /// gradient step; `θ` is clamped to a wide finite band and the per-iterate step
 /// is bounded, so a monotone (data-wants-the-boundary) marginal converges to the
 /// clamp instead of diverging. Returns a finite `α* > 0`.
-pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_seed: f64) -> f64 {
+pub fn ordered_beta_bernoulli_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_seed: f64) -> f64 {
     const THETA_LO: f64 = -12.0; // α ≈ 6e-6
     const THETA_HI: f64 = 16.0; // α ≈ 8.9e6
     const NEWTON_MAX_ITERS: usize = 100;
@@ -1438,7 +1415,7 @@ pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_s
     };
     let mut theta = seed.ln().clamp(THETA_LO, THETA_HI);
     for _ in 0..NEWTON_MAX_ITERS {
-        let (s, h) = ibp_eb_alpha_score_hess(occupancy, n_obs, theta.exp());
+        let (s, h) = ordered_beta_bernoulli_eb_alpha_score_hess(occupancy, n_obs, theta.exp());
         if !s.is_finite() || s.abs() < TOL {
             break;
         }
@@ -1461,15 +1438,15 @@ pub fn ibp_eb_geometric_alpha_fixed_point(occupancy: &[f64], n_obs: f64, alpha_s
     theta.exp()
 }
 
-/// Posterior-mean Bernoulli activations for the IBP assignment model.
+/// Posterior-mean Bernoulli activations for the ordered Beta--Bernoulli assignment model.
 ///
 /// Ordered shrinkage belongs to the Beta--Bernoulli prior scored by
-/// [`IBPAssignmentPenalty`], not as a second multiplicative factor on the final
+/// [`OrderedBetaBernoulliPenalty`], not as a second multiplicative factor on the final
 /// reconstruction. Multiplying by the prior mean capped atom `k` at `mu_k < 1`
 /// even when its posterior inclusion probability was one, double-counted the
 /// prior, and made the fitted function depend on atom index. The concrete
 /// posterior mean is therefore simply `sigmoid(logit_k / temperature)`.
-pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
+pub fn ordered_beta_bernoulli_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
@@ -1477,14 +1454,14 @@ pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64>
     out
 }
 
-/// IBP-MAP activations together with the diagonal Jacobian `∂z_k/∂l_k`,
-/// shared with the torch autograd `Function` so the Python IBP-Gumbel path
+/// ordered Beta--Bernoulli-MAP activations together with the diagonal Jacobian `∂z_k/∂l_k`,
+/// shared with the torch autograd `Function` so the Python ordered Beta--Bernoulli-Gumbel path
 /// applies the same posterior-mean gate and temperature scaling as the Rust
 /// closed form. With `z_k = σ(l_k/τ)` the per-atom derivative is
 /// `σ(l_k/τ)(1 − σ(l_k/τ)) / τ`; the map is diagonal in `k`, so the
 /// Jacobian is returned as the per-atom diagonal vector.
 #[must_use]
-pub fn ibp_map_row_value_grad(
+pub fn ordered_beta_bernoulli_row_value_grad(
     logits: ArrayView1<'_, f64>,
     temperature: f64,
 ) -> (Array1<f64>, Array1<f64>) {
@@ -1499,12 +1476,12 @@ pub fn ibp_map_row_value_grad(
     (value, grad)
 }
 
-/// Batched IBP-MAP value and diagonal logit Jacobian over an `(N, K)` logit
+/// Batched ordered Beta--Bernoulli-MAP value and diagonal logit Jacobian over an `(N, K)` logit
 /// matrix. This shares the per-element arithmetic of
-/// [`ibp_map_row_value_grad`] while crossing the Rust/Python boundary once for
+/// [`ordered_beta_bernoulli_row_value_grad`] while crossing the Rust/Python boundary once for
 /// the whole batch.
 #[must_use]
-pub fn ibp_map_batch_value_grad(
+pub fn ordered_beta_bernoulli_batch_value_grad(
     logits: ArrayView2<'_, f64>,
     temperature: f64,
 ) -> (Array2<f64>, Array2<f64>) {
@@ -1522,17 +1499,14 @@ pub fn ibp_map_batch_value_grad(
     (value, grad)
 }
 
-pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -> Array1<f64> {
+pub fn threshold_gate_row(
+    logits: ArrayView1<'_, f64>,
+    temperature: f64,
+    threshold: f64,
+) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
-        // Hard gate: strictly zero below threshold (the intended "jump"). Above
-        // threshold the surrogate is centered at the threshold so the gate is
-        // most informative exactly at the boundary it switches on:
-        // σ((l−θ)/τ) ∈ [0.5, 1). Magnitude lives in the decoder, so the gate
-        // stays bounded in [0, 1] by design.
-        if logits[i] > threshold {
-            out[i] = gam_linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
-        }
+        out[i] = gam_linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
     }
     out
 }
@@ -1542,12 +1516,12 @@ pub fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f6
 ///
 /// This is the SINGLE SOURCE OF TRUTH for "turn a fitted model's routing logits
 /// into per-atom activations": the closed-form fitter (via [`softmax_row`] /
-/// [`ibp_map_row`] / [`jumprelu_row`]) and the post-hoc distilled-encoder path
+/// [`ordered_beta_bernoulli_row`] / [`threshold_gate_row`]) and the post-hoc distilled-encoder path
 /// both read it, so a distilled encoder's activation is bit-identical to the
 /// model it distills. Formerly the Python `gamfit.distill` module re-derived
 /// this math and drifted (issue #2011: Python is a thin wrapper, no shadow math).
 ///
-/// `kind` is the canonical assignment token (`"softmax"`, `"ibp_map"`,
+/// `kind` is the canonical assignment token (`"softmax"`, `"ordered_beta_bernoulli"`,
 /// or `"threshold_gate"`). `threshold` is read only for the gate family.
 /// Non-finite logits and unsupported kinds are surfaced as errors.
 pub fn activation_matrix_from_logits(
@@ -1568,12 +1542,12 @@ pub fn activation_matrix_from_logits(
         validate_finite_logits(row_logits, row)?;
         let activation = match kind {
             "softmax" => softmax_row(row_logits, temperature),
-            "ibp_map" => ibp_map_row(row_logits, temperature),
-            "threshold_gate" => jumprelu_row(row_logits, temperature, threshold),
+            "ordered_beta_bernoulli" => ordered_beta_bernoulli_row(row_logits, temperature),
+            "threshold_gate" => threshold_gate_row(row_logits, temperature, threshold),
             other => {
                 return Err(format!(
                     "activation_matrix_from_logits: unsupported assignment kind {other:?} \
-                     (expected 'softmax', 'ibp_map', or 'threshold_gate')"
+                     (expected 'softmax', 'ordered_beta_bernoulli', or 'threshold_gate')"
                 ));
             }
         };
@@ -1620,21 +1594,11 @@ pub(crate) fn topk_row_into(logits: ArrayView1<'_, f64>, k: usize, out: &mut [f6
     }
 }
 
-/// Bounded threshold-gate activations together with the straight-through
-/// derivative `∂a_k/∂l_k` of the smooth surrogate, shared with the torch
-/// autograd `Function` so the torch `jumprelu` lane applies the SAME bounded
-/// gate as the closed-form fit (`jumprelu_row`): `a_k = σ((l_k − θ_k)/τ)` for
-/// `l_k > θ_k` and exactly `0` otherwise — magnitude lives in the decoder, the
-/// gate stays in `[0, 1)`. The returned derivative is the smooth surrogate's
-/// `σ'((l_k − θ_k)/τ)/τ` evaluated on BOTH sides of the jump (a straight-through
-/// estimator: the hard forward has zero derivative below threshold, which would
-/// permanently kill gradient flow to gated-off atoms). `∂a_k/∂θ_k` is the
-/// negation of the returned logit derivative; callers negate. `thresholds` is
-/// per-atom (the torch lane learns one threshold per atom); the scalar
-/// closed-form threshold is the constant-vector special case and the value
-/// arithmetic matches `jumprelu_row` exactly there.
+/// Smooth bounded threshold-gate activations and their exact diagonal Jacobian.
+/// With `a_k = σ((l_k − θ_k)/τ)`, `∂a_k/∂l_k = a_k(1-a_k)/τ` and
+/// `∂a_k/∂θ_k = -∂a_k/∂l_k` on the entire real line.
 #[must_use]
-pub fn jumprelu_row_value_grad(
+pub fn threshold_gate_row_value_grad(
     logits: ArrayView1<'_, f64>,
     temperature: f64,
     thresholds: ArrayView1<'_, f64>,
@@ -1642,37 +1606,33 @@ pub fn jumprelu_row_value_grad(
     assert_eq!(
         logits.len(),
         thresholds.len(),
-        "jumprelu_row_value_grad: logits/thresholds length mismatch"
+        "threshold_gate_row_value_grad: logits/thresholds length mismatch"
     );
     let inv_tau = 1.0 / temperature;
     let mut value = Array1::<f64>::zeros(logits.len());
     let mut grad = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         let sig = gam_linalg::utils::stable_logistic((logits[i] - thresholds[i]) * inv_tau);
-        if logits[i] > thresholds[i] {
-            value[i] = sig;
-        }
+        value[i] = sig;
         grad[i] = sig * (1.0 - sig) * inv_tau;
     }
     (value, grad)
 }
 
 /// Batched bounded threshold-gate value+grad over an `(N, K)` logit matrix,
-/// sharing the EXACT per-atom arithmetic of [`jumprelu_row_value_grad`] (same
-/// `stable_logistic`, same `(l − θ) * inv_tau` order, same hard-jump gate) so a
+/// sharing the exact per-atom arithmetic of [`threshold_gate_row_value_grad`] so a
 /// single batched call is bit-identical to invoking the row kernel row-by-row.
 ///
 /// `thresholds` is per-atom (length `K`, broadcast across the `N` rows). Returns
 /// `(value, grad)`, each `(N, K)`:
-///   * `value[i, k] = σ((l − θ)/τ) · 1[l > θ]` — the bounded `[0, 1)` gate,
-///   * `grad[i, k]  = σ·(1 − σ)/τ` — the straight-through diagonal derivative
-///     `∂a/∂l`, alive on BOTH sides of the jump (`∂a/∂θ = −∂a/∂l`).
+///   * `value[i, k] = σ((l − θ)/τ)` — the bounded `(0, 1)` gate,
+///   * `grad[i, k]  = σ·(1 − σ)/τ` — its exact diagonal derivative.
 ///
 /// This is the single source of truth for `gamfit.torch`'s bounded jumprelu
 /// gate: the torch autograd `Function` crosses the FFI boundary ONCE with the
 /// whole matrix instead of once per row.
 #[must_use]
-pub fn jumprelu_batch_value_grad(
+pub fn threshold_gate_batch_value_grad(
     logits: ArrayView2<'_, f64>,
     temperature: f64,
     thresholds: ArrayView1<'_, f64>,
@@ -1681,7 +1641,7 @@ pub fn jumprelu_batch_value_grad(
     assert_eq!(
         k,
         thresholds.len(),
-        "jumprelu_batch_value_grad: logits columns {k} != thresholds length {}",
+        "threshold_gate_batch_value_grad: logits columns {k} != thresholds length {}",
         thresholds.len()
     );
     let inv_tau = 1.0 / temperature;
@@ -1691,9 +1651,7 @@ pub fn jumprelu_batch_value_grad(
         for j in 0..k {
             let sig =
                 gam_linalg::utils::stable_logistic((logits[[i, j]] - thresholds[j]) * inv_tau);
-            if logits[[i, j]] > thresholds[j] {
-                value[[i, j]] = sig;
-            }
+            value[[i, j]] = sig;
             grad[[i, j]] = sig * (1.0 - sig) * inv_tau;
         }
     }
@@ -1787,11 +1745,11 @@ pub fn topk_activation_batch_value_grad(
 }
 
 #[cfg(test)]
-mod ibp_map_batch_tests {
+mod ordered_beta_bernoulli_batch_tests {
     use super::*;
 
     #[test]
-    fn ibp_map_batch_matches_row_kernel_bit_for_bit() {
+    fn ordered_beta_bernoulli_batch_matches_row_kernel_bit_for_bit() {
         let n = 5usize;
         let k = 7usize;
         let temperature = 0.41_f64;
@@ -1799,12 +1757,12 @@ mod ibp_map_batch_tests {
             ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
         });
 
-        let (value, grad) = ibp_map_batch_value_grad(logits.view(), temperature);
+        let (value, grad) = ordered_beta_bernoulli_batch_value_grad(logits.view(), temperature);
         assert_eq!(value.dim(), (n, k));
         assert_eq!(grad.dim(), (n, k));
 
         for i in 0..n {
-            let (rv, rg) = ibp_map_row_value_grad(logits.row(i), temperature);
+            let (rv, rg) = ordered_beta_bernoulli_row_value_grad(logits.row(i), temperature);
             for j in 0..k {
                 assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
                 assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
@@ -1965,7 +1923,7 @@ mod jumprelu_batch_tests {
 }
 
 // #1557 — fill-into-caller-buffer variants of the three per-mode row functions.
-// These compute the EXACT SAME values as `softmax_row` / `ibp_map_row` /
+// These compute the EXACT SAME values as `softmax_row` / `ordered_beta_bernoulli_row` /
 // `jumprelu_row` (same arithmetic, same order of operations) but write into a
 // caller-provided `&mut [f64]` slice instead of heap-allocating a fresh
 // `Array1<f64>` per call. The hot per-row loops (loss eval, arrow/Schur row
@@ -1992,26 +1950,20 @@ pub(crate) fn softmax_row_into(logits: ArrayView1<'_, f64>, temperature: f64, ou
     }
 }
 
-pub(crate) fn ibp_map_row_into(logits: ArrayView1<'_, f64>, temperature: f64, out: &mut [f64]) {
+pub(crate) fn ordered_beta_bernoulli_row_into(logits: ArrayView1<'_, f64>, temperature: f64, out: &mut [f64]) {
     for i in 0..logits.len() {
         out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
     }
 }
 
-pub(crate) fn jumprelu_row_into(
+pub(crate) fn threshold_gate_row_into(
     logits: ArrayView1<'_, f64>,
     temperature: f64,
     threshold: f64,
     out: &mut [f64],
 ) {
     for i in 0..logits.len() {
-        // Match `jumprelu_row`: strictly zero below threshold, sigmoid surrogate
-        // above. The buffer is fully overwritten (no read of prior contents).
-        if logits[i] > threshold {
-            out[i] = gam_linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
-        } else {
-            out[i] = 0.0;
-        }
+        out[i] = gam_linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
     }
 }
 
@@ -2065,7 +2017,7 @@ pub(crate) fn fill_active_atom_logit_jvp(
                     a_k * (decoded_k[out_col] - fitted[out_col]) * inv_tau;
             }
         }
-        AssignmentMode::IBPMap { temperature, .. } => {
+        AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
             // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`.
             let inv_tau = 1.0 / temperature;
             let dz = a_k * (1.0 - a_k) * inv_tau;
@@ -2077,14 +2029,7 @@ pub(crate) fn fill_active_atom_logit_jvp(
             temperature,
             threshold,
         } => {
-            // The data-fit Jacobian follows the hard forward gate. Below the
-            // threshold the reconstruction contribution is exactly zero, so the
-            // data-fit logit derivative must also be zero. Band-only atoms stay
-            // in the compact row for prior terms, not phantom reconstruction
-            // slope.
-            if logit_k <= threshold {
-                return;
-            }
+            // Exact derivative of the smooth threshold-centered logistic gate.
             let inv_tau = 1.0 / temperature;
             let activation = gam_linalg::utils::stable_logistic((logit_k - threshold) * inv_tau);
             let da = activation * (1.0 - activation) * inv_tau;
@@ -2133,9 +2078,9 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
                 }
             }
         }
-        AssignmentMode::IBPMap { temperature, .. } => {
+        AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
             // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`; ordered
-            // stick-breaking shrinkage is scored once, in the IBP prior.
+            // stick-breaking shrinkage is scored once, in the ordered Beta--Bernoulli prior.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
                 if is_ungated(logit_col) {
@@ -2152,13 +2097,10 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             temperature,
             threshold,
         } => {
-            // Data-fit sensitivity follows the hard forward gate: rows at or
-            // below the threshold have zero reconstruction value and therefore
-            // zero data-fit logit derivative. The wider machine-precision prior
-            // support is a compact-layout/prior rule, not a data-fit STE.
+            // Exact derivative of the smooth threshold-centered logistic gate.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
-                if is_ungated(logit_col) || logits[logit_col] <= threshold {
+                if is_ungated(logit_col) {
                     continue;
                 }
                 let activation =
@@ -2187,33 +2129,33 @@ pub(crate) fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
     out
 }
 
-/// Build the IBP sparsity penalty used by every assignment-prior term at `rho`,
+/// Build the ordered Beta--Bernoulli sparsity penalty used by every assignment-prior term at `rho`,
 /// honoring #Bug6 (α is FIXED to the forward-gate value whenever an override
-/// pins it — `effective_alpha_is_learnable`, `resolved_ibp_alpha`) and #Bug4
+/// pins it — `effective_alpha_is_learnable`, `resolved_ordered_beta_bernoulli_alpha`) and #Bug4
 /// (ungated atoms are inert columns excluded from value/gradient/curvature).
 /// Returns `(penalty, rho_view)`; the fixed-α branch uses the `lambda_sparse`
 /// weight convention with an empty `rho_view`.
-fn ibp_prior_penalty(
+fn ordered_beta_bernoulli_prior_penalty(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
     base_alpha: f64,
     temperature: f64,
     row_weights: Option<&[f64]>,
-) -> (IBPAssignmentPenalty, Array1<f64>) {
+) -> (OrderedBetaBernoulliPenalty, Array1<f64>) {
     let learnable = assignment.effective_alpha_is_learnable();
     let alpha_eff = if learnable {
         base_alpha
     } else {
-        assignment.resolved_ibp_alpha(rho).unwrap_or(base_alpha)
+        assignment.resolved_ordered_beta_bernoulli_alpha(rho).unwrap_or(base_alpha)
     };
-    // #991 design-honesty weights: the IBP prior is not row-separable (the
+    // #991 design-honesty weights: the ordered Beta--Bernoulli prior is not row-separable (the
     // plug-in π̂ couples rows through the column active mass), so the weights are
     // installed ON the penalty — its value/grad/hessian/hvp/ρ- and third
     // channels all fold them identically (weighted mass `M_k = Σ w_i z_ik` and
     // carrier `u = w·J`), keeping every channel the exact derivative of one
     // weighted energy. `None` ⇒ bit-for-bit the historical unweighted path.
     let mut penalty =
-        IBPAssignmentPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable)
+        OrderedBetaBernoulliPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable)
             .with_row_weights(row_weights);
     // #Bug4: ungated atoms have a pinned unit gate and a held-constant logit — they
     // are inert columns excluded from the sparsity energy and all its derivatives.
@@ -2239,7 +2181,7 @@ pub fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) 
 /// `w_i`-weighted `ard_value` — each retained row of a design-honest subsample
 /// stands in for `w_i` population rows, so its routing prior carries `w_i` too.
 /// `None` ⇒ the unweighted path, bit-for-bit. Softmax/JumpReLU are row-separable
-/// and fully weighted here; the IBP prior lives in the un-owned `ibp.rs` penalty
+/// and fully weighted here; the ordered Beta--Bernoulli prior lives in the un-owned `ibp.rs` penalty
 /// and is left unweighted (self-consistent) until that penalty gains a per-row
 /// weight hook — see the module note on `assignment_prior_grad_hdiag`.
 pub(crate) fn assignment_prior_value_weighted(
@@ -2272,11 +2214,11 @@ pub(crate) fn assignment_prior_value_weighted(
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             penalty.value(target.view(), rho_view.view())
         }
-        AssignmentMode::IBPMap {
+        AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } => {
             let (penalty, rho_view) =
-                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             penalty.value(target.view(), rho_view.view())
         }
         AssignmentMode::ThresholdGate {
@@ -2294,12 +2236,10 @@ pub(crate) fn assignment_prior_value_weighted(
                 if assignment.logit_is_fixed(idx % k) {
                     continue;
                 }
-                if jumprelu_in_optimization_band(logit, threshold, temperature) {
-                    // #991 — this row stands in for `w_i` population rows.
-                    let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
-                    acc += w_row
-                        * gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
-                }
+                // #991 — this row stands in for `w_i` population rows.
+                let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
+                acc += w_row
+                    * gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
             }
             sparsity_strength * acc
         }
@@ -2317,7 +2257,7 @@ pub fn assignment_prior_log_strength_derivative(
 }
 
 /// #991-weighted [`assignment_prior_log_strength_derivative`]. Softmax/JumpReLU
-/// route through the `w_i`-weighted value; IBP stays unweighted (un-owned
+/// route through the `w_i`-weighted value; ordered Beta--Bernoulli stays unweighted (un-owned
 /// `ibp.rs`).
 pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     assignment: &SaeAssignment,
@@ -2340,13 +2280,13 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
         AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. } => {
             assignment_prior_value_weighted(assignment, rho, row_weights)
         }
-        AssignmentMode::IBPMap {
+        AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } => {
-            // #Bug6: `ibp_prior_penalty` picks the effective-α learnability (an
+            // #Bug6: `ordered_beta_bernoulli_prior_penalty` picks the effective-α learnability (an
             // override forces the fixed-α value branch) and the #Bug4 ungated mask.
             let (penalty, rho_view) =
-                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             if penalty.learnable_alpha {
                 penalty.grad_rho(target.view(), rho_view.view())[0]
             } else {
@@ -2366,7 +2306,7 @@ pub fn assignment_prior_log_strength_hdiag(
 }
 
 /// #991-weighted [`assignment_prior_log_strength_hdiag`]. Softmax/JumpReLU carry
-/// `w_i` per row; IBP stays unweighted (un-owned `ibp.rs`).
+/// `w_i` per row; ordered Beta--Bernoulli stays unweighted (un-owned `ibp.rs`).
 pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2417,9 +2357,6 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
                     continue;
                 }
                 let logit = target[idx];
-                if !jumprelu_in_optimization_band(logit, threshold, temperature) {
-                    continue;
-                }
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 // #991 — row `idx / k`'s design weight.
@@ -2428,18 +2365,18 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
             }
             Ok(d)
         }
-        AssignmentMode::IBPMap {
+        AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } => {
             let (penalty, rho_view) =
-                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             let mut d = if penalty.learnable_alpha {
                 penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view())
             } else {
                 penalty
                     .hessian_diag(target.view(), rho_view.view())
                     .ok_or_else(|| {
-                        "IBP assignment log-strength hessian diag unavailable".to_string()
+                        "ordered Beta--Bernoulli assignment log-strength hessian diag unavailable".to_string()
                     })?
             };
             // #Bug4: zero the curvature diagonal of ungated (inert) columns so the
@@ -2477,7 +2414,7 @@ pub fn assignment_prior_log_strength_target_mixed(
 }
 
 /// #991-weighted [`assignment_prior_log_strength_target_mixed`]. The fixed-α
-/// fall-through reuses the `w_i`-weighted gradient; the learnable-α IBP branch
+/// fall-through reuses the `w_i`-weighted gradient; the learnable-α ordered Beta--Bernoulli branch
 /// lives in the un-owned `ibp.rs` penalty and stays unweighted.
 pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     assignment: &SaeAssignment,
@@ -2500,11 +2437,11 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     // constant and there is no log-α channel, so fall through to the grad_hdiag
     // (fixed-α) path.
     match assignment.mode {
-        AssignmentMode::IBPMap {
+        AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } if assignment.effective_alpha_is_learnable() => {
             let (penalty, rho_view) =
-                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             let mut d = penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view());
             // #Bug4: inert columns carry no mixed derivative.
             mask_fixed_logit_entries(assignment, &mut d);
@@ -2524,10 +2461,10 @@ pub fn assignment_prior_grad_hdiag(
 /// #991-weighted [`assignment_prior_grad_hdiag`] — the per-(row, atom) logit
 /// gradient and Hessian diagonal of the assignment prior, each row scaled by its
 /// design weight `w_i`. Softmax/JumpReLU are fully weighted (row-separable); the
-/// IBP prior is in the un-owned `ibp.rs` penalty and is left unweighted, so a
-/// design-honesty subsample under IBP routing keeps its current (self-consistent)
+/// ordered Beta--Bernoulli prior is in the un-owned `ibp.rs` penalty and is left unweighted, so a
+/// design-honesty subsample under ordered Beta--Bernoulli routing keeps its current (self-consistent)
 /// prior strength — closing that gap needs a per-row weight hook on
-/// `IBPAssignmentPenalty::{value, grad_target, hessian_diag, grad_rho,
+/// `OrderedBetaBernoulliPenalty::{value, grad_target, hessian_diag, grad_rho,
 /// hessian_diag_logit_third_channels}`.
 ///
 /// The assembly (`construction_arrow_schur_assembly`) consumes THIS gradient
@@ -2563,23 +2500,23 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
                 .ok_or_else(|| "softmax assignment hessian diag unavailable".to_string())?;
             (g, d)
         }
-        AssignmentMode::IBPMap {
+        AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } => {
-            // Scale the IBP assignment-sparsity prior by `lambda_sparse` in the
+            // Scale the ordered Beta--Bernoulli assignment-sparsity prior by `lambda_sparse` in the
             // fixed-α branch (Softmax folds it into the penalty's rho coordinate;
-            // JumpReLU multiplies `sparsity_strength`). #Bug6: `ibp_prior_penalty`
+            // JumpReLU multiplies `sparsity_strength`). #Bug6: `ordered_beta_bernoulli_prior_penalty`
             // picks the EFFECTIVE-α learnability — an override pins α so the prior
             // uses the fixed-α weight convention and the resolved (override) α,
             // matching the forward gate — and installs the #Bug4 ungated mask. The
             // per-atom fixed-logit columns are additionally zeroed post-hoc below,
             // so the array (grad/hessian) methods need no internal column mask.
             let (penalty, rho_view) =
-                ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
-                .ok_or_else(|| "IBP assignment hessian diag unavailable".to_string())?;
+                .ok_or_else(|| "ordered Beta--Bernoulli assignment hessian diag unavailable".to_string())?;
             (g, d)
         }
         AssignmentMode::ThresholdGate {
@@ -2598,9 +2535,6 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
             let mut d = Array1::<f64>::zeros(target.len());
             for idx in 0..target.len() {
                 let logit = target[idx];
-                if !jumprelu_in_optimization_band(logit, threshold, temperature) {
-                    continue;
-                }
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 // #991 — row `idx / k`'s design weight scales this row's prior
@@ -2624,7 +2558,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     // frozen routing) is not a free parameter, so it carries NO sparsity-prior
     // gradient or curvature. Zero its flat columns (`flat_logits` is row-major
     // `row*K + atom`) so the assembled `gt` and `htt` logit slots stay zero —
-    // matching the zero logit-JVP. The column-separable IBP / JumpReLU priors are
+    // matching the zero logit-JVP. The column-separable ordered Beta--Bernoulli / JumpReLU priors are
     // per-atom, so zeroing one atom's columns leaves the others' prior intact;
     // under frozen routing ALL atoms' logit columns are zeroed (the whole routing
     // is a fixed predicted function, not optimized).
@@ -2640,30 +2574,30 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     Ok((grad, diag))
 }
 
-/// Build the exact IBP `hessian_diag` logit third-derivative channels (#1006)
+/// Build the exact ordered Beta--Bernoulli `hessian_diag` logit third-derivative channels (#1006)
 /// for the SAE log-det adjoint Γ, using the SAME penalty configuration —
 /// `alpha`/`tau`/`learnable_alpha` and the `lambda_sparse` weight convention —
 /// that [`assignment_prior_grad_hdiag`] assembles into `htt`. Returns `None`
-/// for non-IBP assignment modes (no cross-row empirical-π coupling to correct).
-pub fn ibp_assignment_third_channels(
+/// for non-ordered Beta--Bernoulli assignment modes (no cross-row empirical-π coupling to correct).
+pub fn ordered_beta_bernoulli_assignment_third_channels(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
     majorize: bool,
-) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
-    ibp_assignment_third_channels_weighted(assignment, rho, majorize, None)
+) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
+    ordered_beta_bernoulli_assignment_third_channels_weighted(assignment, rho, majorize, None)
 }
 
-/// As [`ibp_assignment_third_channels`], with the #991 design-honesty per-row
+/// As [`ordered_beta_bernoulli_assignment_third_channels`], with the #991 design-honesty per-row
 /// weights the assembled `htt` carried (the channels must differentiate the
 /// SAME weighted operator; `z_jac` then carries the weighted carrier `u = w·J`
 /// and `logit_curvature` its slot derivative `w·c`).
-pub(crate) fn ibp_assignment_third_channels_weighted(
+pub(crate) fn ordered_beta_bernoulli_assignment_third_channels_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
     majorize: bool,
     row_weights: Option<&[f64]>,
-) -> Result<Option<IbpHessianDiagThirdChannels>, String> {
-    let AssignmentMode::IBPMap {
+) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
+    let AssignmentMode::OrderedBetaBernoulli {
         temperature, alpha, ..
     } = assignment.mode
     else {
@@ -2677,7 +2611,7 @@ pub(crate) fn ibp_assignment_third_channels_weighted(
     // `assignment_prior_grad_hdiag` uses, so an α override differentiates the same
     // fixed-α operator. Fixed-logit columns are zeroed post-hoc below (the channel
     // arrays are not internally column-masked).
-    let (penalty, rho_view) = ibp_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+    let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
     let mut channels =
         penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view(), majorize);
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
@@ -2767,11 +2701,11 @@ pub fn select_hybrid_atom_parameterization(
 }
 
 #[cfg(test)]
-mod ibp_prior_614_tests {
+mod ordered_beta_bernoulli_prior_614_tests {
     // #614: `ibp_stick_breaking_prior` used to compute `π_k = (α/(α+1))^k` with
     // `π_0 = 1`, i.e. an UNSHRUNK first atom — the prior mean of no stick at all,
-    // which broke α's role as an IBP concentration parameter. The consistent
-    // truncated-IBP stick-breaking prior mean is `π_k = (α/(α+1))^{k+1}`, the
+    // which broke α's role as an ordered Beta--Bernoulli concentration parameter. The consistent
+    // truncated-ordered Beta--Bernoulli stick-breaking prior mean is `π_k = (α/(α+1))^{k+1}`, the
     // expectation of the product of (k+1) i.i.d. Beta(α,1) stick means, so EVERY
     // atom (including the first) carries one stick of shrinkage. This test pins
     // that contract so the regression cannot silently return.
@@ -2828,7 +2762,7 @@ mod ibp_prior_614_tests {
     #[test]
     fn alpha_behaves_as_concentration() {
         // Larger α => heavier mass / slower decay: π_0 increases toward 1 and the
-        // tail (e.g. π_4) carries more mass. This is the IBP-concentration role
+        // tail (e.g. π_4) carries more mass. This is the ordered Beta--Bernoulli-concentration role
         // the #614 fix restored.
         let lo = ordered_prior_means(8, OrderedPriorSchedule::Geometric { alpha: 0.5 });
         let hi = ordered_prior_means(8, OrderedPriorSchedule::Geometric { alpha: 5.0 });
@@ -2905,7 +2839,7 @@ mod frozen_routing_1033_tests {
     //! they pin the load-bearing freeze properties without the cluster.
     use super::*;
 
-    fn ibp_assignment(n: usize, k: usize) -> SaeAssignment {
+    fn ordered_beta_bernoulli_assignment(n: usize, k: usize) -> SaeAssignment {
         let logits = Array2::from_shape_fn((n, k), |(i, kk)| {
             0.3 + 0.05 * (i as f64) - 0.1 * (kk as f64)
         });
@@ -2916,7 +2850,7 @@ mod frozen_routing_1033_tests {
         SaeAssignment::from_blocks_with_mode(
             logits,
             coords,
-            AssignmentMode::ibp_map(0.5, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
         )
         .unwrap()
     }
@@ -2924,7 +2858,7 @@ mod frozen_routing_1033_tests {
     #[test]
     fn frozen_routing_decouples_gates_from_logit_updates_1033() {
         let (n, k) = (6usize, 3usize);
-        let mut a = ibp_assignment(n, k)
+        let mut a = ordered_beta_bernoulli_assignment(n, k)
             .freeze_routing_from_current_logits()
             .unwrap();
         assert!(a.routing_is_frozen());
@@ -2951,7 +2885,7 @@ mod frozen_routing_1033_tests {
     #[test]
     fn frozen_routing_gates_are_rho_invariant_1033() {
         let (n, k) = (5usize, 2usize);
-        let a = ibp_assignment(n, k)
+        let a = ordered_beta_bernoulli_assignment(n, k)
             .freeze_routing_from_current_logits()
             .unwrap();
         // The ρ-invariance is now STRUCTURAL: the assignment APIs take no ρ
@@ -2974,7 +2908,7 @@ mod frozen_routing_1033_tests {
     #[test]
     fn frozen_routing_fixes_all_logits_and_thaw_restores_free_path_1033() {
         let (n, k) = (4usize, 3usize);
-        let mut a = ibp_assignment(n, k)
+        let mut a = ordered_beta_bernoulli_assignment(n, k)
             .freeze_routing_from_current_logits()
             .unwrap();
         // Under frozen routing EVERY logit is fixed (not a free Newton coord).
@@ -3060,7 +2994,7 @@ mod fill_into_buffer_1557_tests {
     //! [`SaeAssignment::try_assignments_row_into`] must produce
     //! BIT-IDENTICAL output to the allocating
     //! [`SaeAssignment::try_assignments_row`] across every assignment
-    //! mode (Softmax, IBPMap, JumpReLU), the #1026 ungated case, and the K==1
+    //! mode (Softmax, OrderedBetaBernoulli, JumpReLU), the #1026 ungated case, and the K==1
     //! edge. Exact `==` on f64 — not an approximate tolerance — because the
     //! `_into` path is a pure allocation-elision refactor and any numeric drift
     //! is a regression.
@@ -3108,10 +3042,10 @@ mod fill_into_buffer_1557_tests {
     }
 
     #[test]
-    fn ibp_map_into_is_bit_identical() {
+    fn ordered_beta_bernoulli_into_is_bit_identical() {
         // Both learnable and fixed alpha exercise the resolved-alpha branch.
-        assert_into_matches_alloc(&build(7, 5, AssignmentMode::ibp_map(0.6, 1.3, false)));
-        assert_into_matches_alloc(&build(7, 5, AssignmentMode::ibp_map(0.6, 1.3, true)));
+        assert_into_matches_alloc(&build(7, 5, AssignmentMode::ordered_beta_bernoulli(0.6, 1.3, false)));
+        assert_into_matches_alloc(&build(7, 5, AssignmentMode::ordered_beta_bernoulli(0.6, 1.3, true)));
     }
 
     #[test]
@@ -3123,8 +3057,8 @@ mod fill_into_buffer_1557_tests {
 
     #[test]
     fn ungated_into_is_bit_identical() {
-        // #1026 ungated overwrite under a gate-style mode (IBP/JumpReLU allow it).
-        let a = build(6, 4, AssignmentMode::ibp_map(0.6, 1.1, false))
+        // #1026 ungated overwrite under a gate-style mode (ordered Beta--Bernoulli/JumpReLU allow it).
+        let a = build(6, 4, AssignmentMode::ordered_beta_bernoulli(0.6, 1.1, false))
             .with_ungated(vec![false, true, false, true])
             .unwrap();
         assert_into_matches_alloc(&a);
@@ -3136,16 +3070,16 @@ mod fill_into_buffer_1557_tests {
 
     #[test]
     fn k_equals_one_into_is_bit_identical() {
-        // Softmax K==1 hits the fixed-unit early return; IBP/JumpReLU K==1 keep a
+        // Softmax K==1 hits the fixed-unit early return; ordered Beta--Bernoulli/JumpReLU K==1 keep a
         // free per-atom gate and fall through to the real row functions.
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::softmax(1.0)));
-        assert_into_matches_alloc(&build(5, 1, AssignmentMode::ibp_map(0.7, 1.0, false)));
+        assert_into_matches_alloc(&build(5, 1, AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false)));
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::threshold_gate(0.8, 0.1)));
     }
 }
 
 #[cfg(test)]
-mod ibp_eb_alpha_f1_tests {
+mod ordered_beta_bernoulli_eb_alpha_f1_tests {
     //! #F1/#F2 — empirical-Bayes concentration M-step + power-law schedule.
     use super::*;
 
@@ -3219,7 +3153,7 @@ mod ibp_eb_alpha_f1_tests {
         let h = 1e-6_f64;
         for &alpha in &[0.4_f64, 1.0, 3.0, 12.0] {
             let theta = alpha.ln();
-            let (s, hess) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha);
+            let (s, hess) = ordered_beta_bernoulli_eb_alpha_score_hess(&occupancy, n_obs, alpha);
 
             let l_plus = brute_marginal(&occupancy, n_obs, theta + h);
             let l_minus = brute_marginal(&occupancy, n_obs, theta - h);
@@ -3229,8 +3163,8 @@ mod ibp_eb_alpha_f1_tests {
                 "score mismatch at alpha={alpha}: analytic {s} vs FD {s_fd}"
             );
 
-            let (s_plus, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, (theta + h).exp());
-            let (s_minus, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, (theta - h).exp());
+            let (s_plus, _) = ordered_beta_bernoulli_eb_alpha_score_hess(&occupancy, n_obs, (theta + h).exp());
+            let (s_minus, _) = ordered_beta_bernoulli_eb_alpha_score_hess(&occupancy, n_obs, (theta - h).exp());
             let h_fd = (s_plus - s_minus) / (2.0 * h);
             assert!(
                 (hess - h_fd).abs() <= 1e-3 * (1.0 + h_fd.abs()),
@@ -3255,8 +3189,8 @@ mod ibp_eb_alpha_f1_tests {
                 (a0, da)
             })
             .unzip();
-        let core = ibp_eb_marginal_score(&occupancy, n_obs, &a, &da);
-        let (s, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha);
+        let core = ordered_beta_bernoulli_eb_marginal_score(&occupancy, n_obs, &a, &da);
+        let (s, _) = ordered_beta_bernoulli_eb_alpha_score_hess(&occupancy, n_obs, alpha);
         assert!(
             (core - s).abs() <= 1e-5 * (1.0 + s.abs()),
             "schedule-agnostic core {core} != geometric score {s}"
@@ -3270,14 +3204,14 @@ mod ibp_eb_alpha_f1_tests {
         // α=1 geometric decay, so the EB fixed point must RAISE α far above the
         // seed — the movement the frozen-λ_sparse bug prevented.
         let occupancy = vec![500.0_f64; 8];
-        let alpha_star = ibp_eb_geometric_alpha_fixed_point(&occupancy, n_obs, 1.0);
+        let alpha_star = ordered_beta_bernoulli_eb_geometric_alpha_fixed_point(&occupancy, n_obs, 1.0);
         assert!(
             alpha_star > 5.0,
             "flat occupancy must raise α; got {alpha_star}"
         );
         // Stationarity: at α* the analytic score is ~0 (interior) or α* railed to
         // a clamp (monotone) — here it is interior.
-        let (s, _) = ibp_eb_alpha_score_hess(&occupancy, n_obs, alpha_star);
+        let (s, _) = ordered_beta_bernoulli_eb_alpha_score_hess(&occupancy, n_obs, alpha_star);
         assert!(
             s.abs() < 1e-4,
             "score not stationary at α*={alpha_star}: S={s}"
@@ -3286,7 +3220,7 @@ mod ibp_eb_alpha_f1_tests {
         // Conversely, occupancy that already matches a small-α steep decay pulls
         // α back down toward that value.
         let steep: Vec<f64> = (0..8).map(|k| n_obs * 0.5_f64.powi(k as i32 + 1)).collect();
-        let alpha_low = ibp_eb_geometric_alpha_fixed_point(&steep, n_obs, 20.0);
+        let alpha_low = ordered_beta_bernoulli_eb_geometric_alpha_fixed_point(&steep, n_obs, 20.0);
         assert!(
             alpha_low < 5.0,
             "steep occupancy must lower α; got {alpha_low}"
@@ -3299,7 +3233,7 @@ mod ibp_eb_alpha_f1_tests {
         SaeAssignment::from_blocks_with_mode(
             logits,
             coords,
-            AssignmentMode::ibp_map(1.0, alpha_base, true),
+            AssignmentMode::ordered_beta_bernoulli(1.0, alpha_base, true),
         )
         .unwrap()
     }
@@ -3315,9 +3249,9 @@ mod ibp_eb_alpha_f1_tests {
         // effective α = alpha_base·exp(log_lambda_sparse) = 1·exp(0) = 1.
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
         let step = assign
-            .ibp_eb_log_alpha_step(&rho)
+            .ordered_beta_bernoulli_eb_log_alpha_step(&rho)
             .unwrap()
-            .expect("learnable IBP must yield an EB step");
+            .expect("learnable ordered Beta--Bernoulli must yield an EB step");
         assert!(step.is_finite(), "step must be finite, got {step}");
         assert!(
             step > 1e-3,
@@ -3333,15 +3267,15 @@ mod ibp_eb_alpha_f1_tests {
         )
         .unwrap();
         assert!(
-            softmax.ibp_eb_log_alpha_step(&rho).unwrap().is_none(),
+            softmax.ordered_beta_bernoulli_eb_log_alpha_step(&rho).unwrap().is_none(),
             "softmax sparsity prior has no EB α M-step"
         );
 
         // A pinned (overridden) α is not a free parameter → None.
         let mut pinned = learnable_ibp(logits, 1.0);
-        pinned.set_ibp_alpha_override(Some(3.0));
+        pinned.set_ordered_beta_bernoulli_alpha_override(Some(3.0));
         assert!(
-            pinned.ibp_eb_log_alpha_step(&rho).unwrap().is_none(),
+            pinned.ordered_beta_bernoulli_eb_log_alpha_step(&rho).unwrap().is_none(),
             "override-pinned α must not take the EB M-step"
         );
     }

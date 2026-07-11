@@ -21,8 +21,9 @@ use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
 use gam_terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, HarmonicRoughnessPenalty,
-    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
-    MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
+    OrderedBetaBernoulliPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
@@ -878,7 +879,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     .or_else(|| descriptor.get("learnable_alpha"))
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable);
+                let penalty = OrderedBetaBernoulliPenalty::new(k_max, alpha, tau, learnable);
                 let penalty = match temperature_schedule {
                     Some(schedule) => penalty.with_temperature_schedule(schedule),
                     None => penalty,
@@ -887,7 +888,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(penalty)));
             }
             "softmax_assignment_sparsity" => {
                 descriptor_no_unknown_keys(

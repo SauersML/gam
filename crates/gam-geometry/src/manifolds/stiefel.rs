@@ -614,6 +614,48 @@ mod tangent_basis_tests {
     use crate::manifold::RiemannianManifold;
     use ndarray::Array1;
 
+    /// The canonical Stiefel raise must be the Riesz representative of the
+    /// ambient differential. A vertical tangent distinguishes it from the
+    /// embedded-metric projection, whose vertical component is half as large.
+    #[test]
+    fn stiefel_riemannian_gradient_is_canonical_metric_riesz_representative() {
+        let st = StiefelManifold::new(2, 3).expect("St(3,2) exists");
+        let y = Array1::from(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let differential = Array1::from(vec![0.4, 1.2, -0.3, 0.8, 0.5, -0.7]);
+        let raw_tangent = Array1::from(vec![0.2, -0.6, 0.7, -0.1, 0.3, 0.9]);
+        let tangent = st
+            .project_tangent(y.view(), raw_tangent.view())
+            .expect("Stiefel tangent");
+
+        let gradient = st
+            .riemannian_gradient(y.view(), differential.view())
+            .expect("canonical metric raise");
+        let metric = st.metric_tensor(y.view()).expect("canonical metric");
+        let lhs = gradient.dot(&metric.dot(&tangent));
+        let rhs = differential.dot(&tangent);
+        assert!(
+            (lhs - rhs).abs() <= 1.0e-12,
+            "Riesz identity failed: g_Y(grad, xi)={lhs}, <E, xi>={rhs}"
+        );
+
+        let projected = st
+            .project_tangent(y.view(), differential.view())
+            .expect("embedded tangent projection");
+        assert!(
+            (&gradient - &projected).dot(&(&gradient - &projected)) > 0.1,
+            "canonical metric raise unexpectedly equals embedded projection"
+        );
+        let projected_gradient = st
+            .project_tangent(y.view(), gradient.view())
+            .expect("raised gradient is tangent");
+        assert!(
+            (&gradient - &projected_gradient)
+                .iter()
+                .all(|value| value.abs() <= 1.0e-12),
+            "canonical Riemannian gradient is not tangent"
+        );
+    }
+
     /// The Stiefel `tangent_basis` must be orthonormal under the canonical
     /// metric: `Qᵀ W Q = I` with `W = metric_tensor(Y)`. A Euclidean-orthonormal
     /// basis (the old shared routine) would give `Qᵀ W Q ≠ I` because the

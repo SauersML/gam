@@ -15,8 +15,9 @@
 //!     slice (soft atom
 //!     amplitudes). Differentiable everywhere; the smoothing parameter `ε` may
 //!     itself live in `ρ` so REML shrinks it.
-//!   * [`IBPAssignmentPenalty`] — deterministic continuous-relaxation
-//!     Beta-Bernoulli/IBP prior over per-row SAE-manifold active sets.
+//!   * [`OrderedBetaBernoulliPenalty`] — deterministic posterior-mean
+//!     relaxation with an integrated ordered independent Beta--Bernoulli prior
+//!     over per-row SAE-manifold active sets.
 //!   * [`ARDPenalty`] — one penalty parameter per latent axis. The marginal
 //!     likelihood's Occam factor sends unused axes' precision to infinity,
 //!     discovering intrinsic dimension only after a separate gauge fix
@@ -140,7 +141,7 @@ mod ard;
 mod block_sparsity;
 pub mod equivariant_penalty;
 mod harmonic_roughness;
-mod ibp;
+mod ordered_beta_bernoulli;
 mod isometry;
 mod manifest;
 mod nested_prefix;
@@ -157,7 +158,7 @@ mod total_variation;
 pub use ard::*;
 pub use block_sparsity::*;
 pub use harmonic_roughness::*;
-pub use ibp::*;
+pub use ordered_beta_bernoulli::*;
 pub use isometry::*;
 pub use nested_prefix::*;
 pub use nuclear_norm::*;

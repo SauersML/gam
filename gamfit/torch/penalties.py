@@ -847,37 +847,54 @@ def topk_activation(logits: torch.Tensor, temperature: float) -> torch.Tensor:
 
 
 class RiemannianRetraction(Optimizer):
-    """Optimizer that retracts Euclidean gradient steps onto a manifold."""
+    """One-step Riemannian gradient optimizer using the manifold metric."""
 
-    def __init__(self, params: Any, manifold: str | dict[str, Any] | _ManifoldJson, lr: float = 1e-2, inner_steps: int = 1) -> None:
-        if lr <= 0.0:
-            raise ValueError("lr must be > 0")
-        if inner_steps <= 0:
-            raise ValueError("inner_steps must be > 0")
+    def __init__(
+        self,
+        params: Any,
+        manifold: str | dict[str, Any] | _ManifoldJson,
+        lr: float = 1e-2,
+    ) -> None:
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be finite and > 0")
         self.manifold = manifold
-        defaults = {"lr": float(lr), "inner_steps": int(inner_steps)}
+        defaults = {"lr": float(lr)}
         super().__init__(params, defaults)
 
-    @torch.no_grad()
-    def step(self, closure: Callable[[], torch.Tensor] | None = None) -> torch.Tensor | None:
-        loss = closure() if closure is not None else None
-        manifold_spec = self.manifold.to_json() if isinstance(self.manifold, _ManifoldJson) else self.manifold
-        manifold_json = json.dumps(manifold_spec if isinstance(manifold_spec, dict) else {"kind": manifold_spec})
-        for group in self.param_groups:
-            lr = float(group["lr"])
-            inner_steps = int(group["inner_steps"])
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-                if param.dim() != 2:
-                    raise ValueError("RiemannianRetraction parameters must be 2-D row batches")
-                current = param.detach()
-                grad = param.grad.detach().to(dtype=current.dtype, device=current.device)
-                for _ in range(inner_steps):
-                    delta = -lr * grad
-                    out = rust_module().riemannian_retract(manifold_json, to_numpy_f64(current), to_numpy_f64(delta))
-                    current = from_numpy_like(out, current)
-                param.copy_(current)
+    def step(
+        self, closure: Callable[[], torch.Tensor] | None = None
+    ) -> torch.Tensor | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        manifold_spec = (
+            self.manifold.to_json()
+            if isinstance(self.manifold, _ManifoldJson)
+            else self.manifold
+        )
+        manifold_json = json.dumps(
+            manifold_spec
+            if isinstance(manifold_spec, dict)
+            else {"kind": manifold_spec}
+        )
+        with torch.no_grad():
+            for group in self.param_groups:
+                lr = float(group["lr"])
+                for param in group["params"]:
+                    if param.grad is None:
+                        continue
+                    if param.dim() != 2:
+                        raise ValueError(
+                            "RiemannianRetraction parameters must be 2-D row batches"
+                        )
+                    out = rust_module().riemannian_gradient_step(
+                        manifold_json,
+                        to_numpy_f64(param),
+                        to_numpy_f64(param.grad),
+                        lr,
+                    )
+                    param.copy_(from_numpy_like(out, param))
         return loss
 
 

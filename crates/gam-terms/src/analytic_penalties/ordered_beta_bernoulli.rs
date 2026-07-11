@@ -25,7 +25,7 @@ use statrs::function::gamma::{digamma, ln_gamma};
 /// shrinkage is scored here exactly once and is never multiplied into the
 /// reconstructed function as a second prior factor.
 #[derive(Debug, Clone)]
-pub struct IBPAssignmentPenalty {
+pub struct OrderedBetaBernoulliPenalty {
     pub k_max: usize,
     pub alpha: f64,
     pub tau: f64,
@@ -53,7 +53,7 @@ struct MarginalColumnDerivatives {
     score_second_derivative: f64,
 }
 
-impl IBPAssignmentPenalty {
+impl OrderedBetaBernoulliPenalty {
     #[must_use]
     pub fn new(k_max: usize, alpha: f64, tau: f64, learnable_alpha: bool) -> Self {
         assert!(k_max > 0);
@@ -251,7 +251,7 @@ impl IBPAssignmentPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
         majorize: bool,
-    ) -> IbpHessianDiagThirdChannels {
+    ) -> OrderedBetaBernoulliHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
         let (a_col, _) = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
@@ -327,7 +327,7 @@ impl IBPAssignmentPenalty {
             }
         }
 
-        IbpHessianDiagThirdChannels {
+        OrderedBetaBernoulliHessianDiagThirdChannels {
             k_max: self.k_max,
             z_jac,
             local_logit_third,
@@ -405,7 +405,7 @@ impl IBPAssignmentPenalty {
 
 /// Third-derivative channels for the row-major `(N, K)` assignment-logit block.
 #[derive(Debug, Clone)]
-pub struct IbpHessianDiagThirdChannels {
+pub struct OrderedBetaBernoulliHessianDiagThirdChannels {
     pub k_max: usize,
     /// `u_ik = w_i dz_ik/dell_ik`, used both as the active-mass derivative and
     /// as the per-column rank-one carrier.
@@ -424,7 +424,7 @@ pub struct IbpHessianDiagThirdChannels {
     pub logit_curvature: Array1<f64>,
 }
 
-impl AnalyticPenalty for IBPAssignmentPenalty {
+impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
     }
@@ -511,7 +511,11 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        assert_eq!(v.len(), target.len(), "IBPAssignmentPenalty::hvp dimension mismatch");
+        assert_eq!(
+            v.len(),
+            target.len(),
+            "OrderedBetaBernoulliPenalty::hvp dimension mismatch"
+        );
         let alpha = self.resolved_alpha(rho);
         let (a_col, _) = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);

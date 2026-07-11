@@ -1033,7 +1033,7 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.weight);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
-        AnalyticPenaltyKind::IBPAssignment(p) => {
+        AnalyticPenaltyKind::OrderedBetaBernoulli(p) => {
             hasher.write_str("ibp-assignment");
             hasher.write_usize(p.k_max);
             hasher.write_f64(p.alpha);

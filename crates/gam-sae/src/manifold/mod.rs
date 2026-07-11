@@ -117,7 +117,8 @@ pub(crate) use gam_solve::arrow_schur::{
 
 pub(crate) use gam_terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
-    IbpHessianDiagThirdChannels, IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
+    IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
+    OrderedBetaBernoulliHessianDiagThirdChannels,
     PenaltyTier, PsiSlice, WeightField,
 };
 // The FFI seed path resolves learnable α through the exact terminal-ρ schedule

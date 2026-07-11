@@ -2760,12 +2760,19 @@ fn parse_manifold_kind(value: &serde_json::Value) -> Result<gam::geometry::Manif
     }
 }
 
-#[pyfunction(signature = (manifold_json, points, delta))]
-fn riemannian_retract<'py>(
+/// Take one batched metric-correct Riemannian gradient step.
+///
+/// `euclidean_grad` is an ambient Euclidean differential, not a tangent step.
+/// The geometry implementation raises it through the manifold metric before
+/// scaling and retracting, so affine-invariant SPD and canonical Stiefel
+/// geometry use their actual Riesz representatives.
+#[pyfunction(signature = (manifold_json, points, euclidean_grad, learning_rate))]
+fn riemannian_gradient_step<'py>(
     py: Python<'py>,
     manifold_json: &str,
     points: PyReadonlyArray2<'py, f64>,
-    delta: PyReadonlyArray2<'py, f64>,
+    euclidean_grad: PyReadonlyArray2<'py, f64>,
+    learning_rate: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
@@ -2774,12 +2781,12 @@ fn riemannian_retract<'py>(
         .build()
         .map_err(|err| py_value_error(err.to_string()))?;
     let p = points.as_array();
-    let d = delta.as_array();
-    if p.dim() != d.dim() {
+    let e = euclidean_grad.as_array();
+    if p.dim() != e.dim() {
         return Err(py_value_error(format!(
-            "points shape {:?} does not match delta shape {:?}",
+            "points shape {:?} does not match euclidean_grad shape {:?}",
             p.dim(),
-            d.dim()
+            e.dim()
         )));
     }
     if p.ncols() != manifold.ambient_dim() {
@@ -2791,11 +2798,8 @@ fn riemannian_retract<'py>(
     }
     let mut out = Array2::<f64>::zeros(p.dim());
     for row in 0..p.nrows() {
-        let tangent = manifold
-            .project_tangent(p.row(row), d.row(row))
-            .map_err(|err| py_value_error(err.to_string()))?;
         let next = manifold
-            .retract(p.row(row), tangent.view())
+            .riemannian_gradient_step(p.row(row), e.row(row), learning_rate)
             .map_err(|err| py_value_error(err.to_string()))?;
         out.row_mut(row).assign(&next);
     }
@@ -2805,7 +2809,8 @@ fn riemannian_retract<'py>(
 /// Batched Riemannian exponential map: for each row, return ``exp_p(v)``.
 /// ``points`` has shape ``(N, ambient_dim)`` and ``vecs`` has shape
 /// ``(N, ambient_dim)``. The manifold descriptor is parsed from
-/// ``manifold_json`` using the same schema as :func:`riemannian_retract`.
+/// ``manifold_json`` using the same schema as
+/// :func:`riemannian_gradient_step`.
 #[pyfunction(signature = (manifold_json, points, vecs))]
 fn manifold_exp_map<'py>(
     py: Python<'py>,
@@ -7383,6 +7388,22 @@ impl ManifoldSaeCore {
             .selected_log_lambda_smooth
             .as_ref()
             .map(|v| manifold_sae_vec1(py, v))
+    }
+    /// Selected per-atom smoothing precisions on their natural scale.
+    ///
+    /// The fitted payload stores log-precisions because the native outer solve
+    /// works in unconstrained coordinates.  Exponentiation belongs here in the
+    /// Rust-owned model surface, not in a torch wrapper that would otherwise
+    /// duplicate model math.
+    #[getter]
+    fn selected_lambda_smooth<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner.selected_log_lambda_smooth.as_ref().map(|values| {
+            let lambdas = values.iter().map(|value| value.exp()).collect::<Vec<_>>();
+            manifold_sae_vec1(py, &lambdas)
+        })
     }
     #[getter]
     fn selected_log_ard<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {

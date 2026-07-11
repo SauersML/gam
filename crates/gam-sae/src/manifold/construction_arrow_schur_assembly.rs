@@ -36,7 +36,7 @@ use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_maj
 /// only conditions the Newton step / the Laplace normalizer — the gradient
 /// (which sets the stationary point) is untouched.
 pub(super) fn ibp_psd_majorized_hdiag(
-    channels: &IbpHessianDiagThirdChannels,
+    channels: &OrderedBetaBernoulliHessianDiagThirdChannels,
     row: usize,
     k_atoms: usize,
     atom: usize,
@@ -1193,7 +1193,7 @@ impl SaeManifoldTerm {
                         //     NO-SELF base `H₀' = H₀ − Σ_k d_k diag(z'_ik²)` (self term
                         //     downdated, see `IbpCrossRowSource::self_term_downdate`). The
                         //     scalar `D`-coefficient `d_k = w·s'_k` is
-                        //     `IbpHessianDiagThirdChannels::cross_row_d` (FD-verified against
+                        //     `OrderedBetaBernoulliHessianDiagThirdChannels::cross_row_d` (FD-verified against
                         //     ∂²value/∂ℓ_ik∂ℓ_jk in
                         //     `ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian`),
                         //     and `z_jac` carries `u_k`'s entries `z'_ik`.

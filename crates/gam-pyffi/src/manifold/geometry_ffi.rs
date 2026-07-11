@@ -5309,7 +5309,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_topk_activation_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(jumprelu_gate_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
-    module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
+    module.add_function(wrap_pyfunction!(riemannian_gradient_step, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_exp_map_vjp, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_log_map, module)?)?;

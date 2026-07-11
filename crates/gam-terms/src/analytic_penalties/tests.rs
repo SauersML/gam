@@ -295,7 +295,7 @@ fn softmax_row_fisher_metric_is_psd_gauge_null_and_derivative_matches_fd() {
 
 #[test]
 fn ibp_assignment_grad_target_matches_value_finite_difference() {
-    let pen = IBPAssignmentPenalty::new(4, 6.0, 0.8, false);
+    let pen = OrderedBetaBernoulliPenalty::new(4, 6.0, 0.8, false);
     let t = array![
         0.2_f64, -0.3, 0.7, -0.5, 0.9, 0.4, -0.2, 0.1, -0.4, 0.8, 0.3, -0.1
     ];
@@ -329,7 +329,7 @@ fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
     // rank-one block, including i=j). `cross_row_d[k] = w·s'_k` and
     // `z_jac[i*K+k] = z'_ik`, so the analytic product must reproduce the
     // central-difference second derivative of `value` for every (i≠j) pair.
-    let pen = IBPAssignmentPenalty::new(3, 5.0, 0.85, false);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 5.0, 0.85, false);
     // 4 rows × 3 columns; row-major (N, K).
     let t = array![
         0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
@@ -392,7 +392,7 @@ fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
     //   cross_row_dd[k] = ∂d_k/∂M_k = w·s''_k  (since ∂M_k/∂ℓ_mk = J_mk),
     //   logit_curvature[i*K+k] = ∂J_ik/∂ℓ_ik = c_ik.
     // Verify both against central differences of the base channels.
-    let pen = IBPAssignmentPenalty::new(3, 5.0, 0.85, false);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 5.0, 0.85, false);
     let t = array![
         0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
     ];
@@ -451,7 +451,7 @@ fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
     // are the clamped coefficient and its gated mass-derivative, and (c)
     // m_channel/local_logit_third reproduce the TOTAL logit-derivative of `D_ik`
     // (`δ_iw·local_logit_third + m_channel·J_wk`) against a central difference.
-    let pen = IBPAssignmentPenalty::new(3, 5.0, 0.85, false);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 5.0, 0.85, false);
     let t = array![
         0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
     ];
@@ -541,7 +541,7 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
     // Central-difference the VALUE channel `cross_row_d` w.r.t. ρ₀ and compare.
     // (The pre-fix bug used the value `cross_row_d` itself in the off-diagonal of
     // the logα trace — inconsistent with the α-differentiated diagonal channel.)
-    let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, true);
     let t = array![
         0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
     ];
@@ -575,7 +575,7 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
         "cross_row_d_logalpha vs FD max abs err = {max_err:.3e}"
     );
     // Fixed-α leaves the channel at zero (the value `cross_row_d` is used there).
-    let fixed = IBPAssignmentPenalty::new(3, 6.0, 0.8, false);
+    let fixed = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, false);
     let chf =
         fixed.hessian_diag_logit_third_channels(t.view(), Array1::<f64>::zeros(0).view(), false);
     assert!(
@@ -593,7 +593,7 @@ fn ibp_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
     // posterior-π Jacobian factor. Perturbing every row in one column by the same
     // concrete-probability amount gives a direct central difference of `d_k` with
     // respect to the empirical mass `M_k`.
-    let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, false);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, false);
     let t = array![
         0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
     ];
@@ -632,7 +632,7 @@ fn ibp_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
 
 #[test]
 fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
-    let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, true);
     let t = array![
         0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
     ];
@@ -649,7 +649,7 @@ fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
 
 #[test]
 fn ibp_assignment_learnable_alpha_mixed_log_alpha_target_matches_fd() {
-    let pen = IBPAssignmentPenalty::new(2, 2.0, 0.9, true);
+    let pen = OrderedBetaBernoulliPenalty::new(2, 2.0, 0.9, true);
     let t = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
     let rho = array![0.15_f64];
     let analytic = pen.log_alpha_target_mixed_derivative(t.view(), rho.view());
@@ -668,7 +668,7 @@ fn ibp_assignment_learnable_alpha_mixed_log_alpha_target_matches_fd() {
 
 #[test]
 fn ibp_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
-    let pen = IBPAssignmentPenalty::new(2, 2.0, 0.9, true);
+    let pen = OrderedBetaBernoulliPenalty::new(2, 2.0, 0.9, true);
     let t = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
     let rho = array![0.15_f64];
     let analytic = pen.hessian_diag_log_alpha_derivative(t.view(), rho.view());
@@ -689,7 +689,7 @@ fn ibp_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
 
 #[test]
 fn ibp_assignment_extreme_logits_remain_finite() {
-    let pen = IBPAssignmentPenalty::new(3, 1.5, 1.0e-3, false);
+    let pen = OrderedBetaBernoulliPenalty::new(3, 1.5, 1.0e-3, false);
     let t = array![
         1000.0_f64, -1000.0, 500.0, -500.0, 750.0, -750.0, 250.0, -250.0, 0.0
     ];
@@ -717,7 +717,7 @@ fn ibp_assignment_extreme_logits_remain_finite() {
 #[test]
 fn ibp_assignment_high_k_prior_keeps_positive_gradient_path() {
     let k = 400usize;
-    let pen = IBPAssignmentPenalty::new(k, 0.1, 1.0, false);
+    let pen = OrderedBetaBernoulliPenalty::new(k, 0.1, 1.0, false);
     let t = Array1::<f64>::zeros(k);
     let rho = Array1::<f64>::zeros(0);
 
@@ -749,7 +749,7 @@ fn ibp_row_weighted_channels_are_one_operator_991() {
     let t = array![
         0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
     ];
-    let pen = IBPAssignmentPenalty::new(k, 1.7, 0.8, true).with_row_weights(Some(&w));
+    let pen = OrderedBetaBernoulliPenalty::new(k, 1.7, 0.8, true).with_row_weights(Some(&w));
     let rho = array![0.15_f64];
     let step = 1.0e-6_f64;
 
@@ -849,8 +849,9 @@ fn ibp_row_weighted_channels_are_one_operator_991() {
 
     // (g) None ⇒ bit-for-bit the unit-weight operator.
     let unit = [1.0_f64; 4];
-    let pen_none = IBPAssignmentPenalty::new(k, 1.7, 0.8, true);
-    let pen_unit = IBPAssignmentPenalty::new(k, 1.7, 0.8, true).with_row_weights(Some(&unit));
+    let pen_none = OrderedBetaBernoulliPenalty::new(k, 1.7, 0.8, true);
+    let pen_unit =
+        OrderedBetaBernoulliPenalty::new(k, 1.7, 0.8, true).with_row_weights(Some(&unit));
     assert_eq!(
         pen_none.value(t.view(), rho.view()),
         pen_unit.value(t.view(), rho.view())
@@ -2423,7 +2424,7 @@ fn nested_prefix_rejects_non_monotone_prefixes() {
 }
 
 /// The harmonic-roughness penalty is the graduated diagonal periodic-Gram form:
-/// `weight · Σ_r S[r mod K] · Σ_j target[r,j]²`, only on the harmonic rows.
+/// `½·weight · Σ_r S[r mod K] · Σ_j target[r,j]²`, only on the harmonic rows.
 /// Value, gradient, and Hessian diagonal must be mutually consistent (grad is
 /// the exact derivative of value; the diagonal is the exact second derivative,
 /// which is constant for a quadratic).
@@ -2448,7 +2449,7 @@ fn harmonic_roughness_value_grad_hessian_are_consistent() {
             expected += w * target[r * d + j] * target[r * d + j];
         }
     }
-    expected *= weight;
+    expected *= 0.5 * weight;
     assert_abs_diff_eq!(
         penalty.value(target.view(), rho.view()),
         expected,
@@ -2468,12 +2469,12 @@ fn harmonic_roughness_value_grad_hessian_are_consistent() {
         assert_abs_diff_eq!(grad[i], fd, epsilon = 1e-5);
     }
 
-    // Hessian diagonal is the constant 2·weight·S[r mod K] on every column.
+    // Hessian diagonal is the constant weight·S[r mod K] on every column.
     let diag = penalty.hessian_diag(target.view(), rho.view()).unwrap();
     for r in 0..n_eff {
         let w = row_weights[r % row_weights.len()];
         for j in 0..d {
-            assert_abs_diff_eq!(diag[r * d + j], 2.0 * weight * w, epsilon = 1e-12);
+            assert_abs_diff_eq!(diag[r * d + j], weight * w, epsilon = 1e-12);
         }
     }
 }
@@ -2502,9 +2503,9 @@ fn harmonic_roughness_evidence_weight_matches_closed_form() {
     let got = harmonic_roughness_evidence_weight(target.view(), n_eff, row_weights.view());
     assert_abs_diff_eq!(got, expected, epsilon = 1e-10);
 
-    // An all-zero harmonic block has nothing to penalize → finite (floored) λ,
-    // never a division by zero.
+    // The idealized direct-observation optimum is at the boundary λ → +∞ when
+    // the penalized energy is exactly zero.
     let zeros = Array1::<f64>::zeros(n_eff * d);
     let floored = harmonic_roughness_evidence_weight(zeros.view(), n_eff, row_weights.view());
-    assert!(floored.is_finite() && floored > 0.0, "got {floored}");
+    assert_eq!(floored, f64::INFINITY);
 }

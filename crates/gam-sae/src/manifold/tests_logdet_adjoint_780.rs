@@ -695,7 +695,7 @@ fn install_low_rank_ibp_metric_2156(term: &mut SaeManifoldTerm) {
 }
 
 fn ibp_majorized_hdiag_2156(
-    channels: &IbpHessianDiagThirdChannels,
+    channels: &OrderedBetaBernoulliHessianDiagThirdChannels,
     row: usize,
     k_atoms: usize,
     atom: usize,
@@ -1277,7 +1277,7 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
 /// what the pre-#1416 diagonal-only contractions dropped.
 ///
 /// Oracle values are the exact 2nd/3rd derivatives of the IMPLEMENTED IBP energy
-/// (`IBPAssignmentPenalty::value`), verified three independent ways — a
+/// (`OrderedBetaBernoulliPenalty::value`), verified three independent ways — a
 /// from-scratch Python derivative, the production analytic contraction, and a
 /// central FD of the cache-built `log|H|` — all agreeing to ≈8 digits:
 ///   * ρ-trace half-trace `½ tr(H⁻¹ H_p) = −0.1220750367`,
@@ -1451,7 +1451,7 @@ pub(crate) fn ibp_rho_trace_matches_exact_numerical_oracle_1416() {
     // Exact half-trace `½ tr(H⁻¹ H_p)` for `H = 1.2·I + H_p` with `H_p` the TRUE
     // IBP-MAP energy Hessian (`H_p = s'·J Jᵀ + diag(s·c)`), INCLUDING the
     // cross-row off-diagonal `½ s' Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`. Verified against a
-    // from-scratch Python second-derivative of `IBPAssignmentPenalty::value` AND
+    // from-scratch Python second-derivative of `OrderedBetaBernoulliPenalty::value` AND
     // the FD numerical oracle below. (The pre-#1416 hand-derived constant
     // `-0.1609707929` did NOT match the implemented energy; it is superseded.)
     const ORACLE: f64 = -0.1220750367;
@@ -1498,7 +1498,7 @@ pub(crate) fn ibp_logit_adjoint_matches_exact_numerical_oracle_1416() {
     // IBP-MAP energy Hessian (`H_p = s'·J Jᵀ + diag(s·c)`, `s' = ∂score/∂M`).
     // Verified three independent ways: the analytic θ-adjoint contraction below,
     // the central FD of the cache-built `log|H|`, and a from-scratch Python
-    // second/third-derivative of `IBPAssignmentPenalty::value` — all agree to
+    // second/third-derivative of `OrderedBetaBernoulliPenalty::value` — all agree to
     // ≈8 digits. (The pre-#1416 hand-derived constant `-0.0498935387` did NOT
     // match the implemented energy; it is superseded here.)
     const ORACLE: f64 = -0.0229591145;

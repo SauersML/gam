@@ -264,7 +264,7 @@ pub struct CrossRowLatentPenalty {
 /// * `U` is `delta_t_len × R` with `U[g, k] = z'_ik` at the global latent index
 ///   `g` of row `i`'s logit slot for atom `k` (zero elsewhere) — i.e. column `k`
 ///   is supported on the atom-`k` logit slot of every row;
-/// * `D = diag(d_k)`, `d_k = w·s'_k` ([`gam_terms::analytic_penalties::IbpHessianDiagThirdChannels::cross_row_d`]);
+/// * `D = diag(d_k)`, `d_k = w·s'_k` ([`gam_terms::analytic_penalties::OrderedBetaBernoulliHessianDiagThirdChannels::cross_row_d`]);
 /// * `H₀'` is the assembled latent block-diagonal `H₀` with the per-row self
 ///   term `d_k·z'_ik²` REMOVED from each logit-slot diagonal (the assembled
 ///   `H₀` already carries it, so the FULL rank-one outer product `U D Uᵀ` —
@@ -1023,7 +1023,7 @@ impl ArrowSchurSystem {
     /// `hessian_diag` first. Diagonal penalties (ARD and the shipped
     /// sparsity kernels) are injected directly. The row-block-only Psi-tier
     /// penalties are `ARDPenalty`, `SparsityPenalty`,
-    /// `SoftmaxAssignmentSparsity`, `IBPAssignment`,
+    /// `SoftmaxAssignmentSparsity`, `OrderedBetaBernoulli`,
     /// `RowPrecisionPrior`, `ParametricRowPrecisionPrior`, and
     /// `ScadMcpPenalty`. Their `d × d` per-row Hessian folds into
     /// `rows[i].htt`, so the exact arrow Schur elimination (`N` independent

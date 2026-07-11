@@ -335,8 +335,8 @@ pub(crate) fn sae_registry_refuses_assignment_sparsity_penalties() {
     assert!(softmax_err.contains("assignment sparsity"));
 
     let mut ibp_registry = AnalyticPenaltyRegistry::new();
-    ibp_registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(
-        gam_terms::analytic_penalties::IBPAssignmentPenalty::new(k, 1.2, 0.7, false),
+    ibp_registry.push(AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(
+        gam_terms::analytic_penalties::OrderedBetaBernoulliPenalty::new(k, 1.2, 0.7, false),
     )));
     let ibp_err = term
         .validate_analytic_penalty_registry(&ibp_registry)

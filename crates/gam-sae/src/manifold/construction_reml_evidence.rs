@@ -3701,7 +3701,7 @@ impl SaeManifoldTerm {
         row: usize,
         diag_atom: usize,
         wrt: SaeLocalRowVar,
-        ibp_channels: Option<&IbpHessianDiagThirdChannels>,
+        ibp_channels: Option<&OrderedBetaBernoulliHessianDiagThirdChannels>,
     ) -> f64 {
         let SaeLocalRowVar::Logit { atom: wrt_atom } = wrt else {
             return 0.0;
@@ -3758,7 +3758,7 @@ impl SaeManifoldTerm {
             }
             AssignmentMode::IBPMap { .. } => {
                 // The assembled `htt` diagonal consumes
-                // `IBPAssignmentPenalty::hessian_diag`, whose logit derivative
+                // `OrderedBetaBernoulliPenalty::hessian_diag`, whose logit derivative
                 // splits into a row-local direct-`z` channel and a global
                 // empirical-`M_k` channel (π_k couples every row in column k).
                 // This same-row primitive returns only the LOCAL direct-`z`
