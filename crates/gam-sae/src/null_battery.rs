@@ -85,10 +85,18 @@ pub enum NullKind {
     /// Permute token rows, preserving the activation cloud and column marginals
     /// while destroying row-order structure.
     TokenShuffle,
+    /// Permute every column independently. This preserves each one-dimensional
+    /// empirical marginal exactly while destroying cross-column geometry such
+    /// as an unordered circle or ring of clusters.
+    PerDimensionShuffle,
     /// Draw independent Gaussian principal-component scores with the same mean
     /// and variance in every supplied PC column, preserving the eigenspectrum
     /// while destroying cyclic/non-Gaussian structure.
     MatchedSpectrumGaussian,
+    /// Draw a multivariate Gaussian with the observed mean and full covariance.
+    /// Unlike `MatchedSpectrumGaussian`, this is expressed in the supplied
+    /// coordinates and preserves their cross-covariance as well as their scales.
+    CovarianceMatchedGaussian,
     /// Use separately supplied random-weight activations from the same
     /// architecture, moment-matched to the observed matrix shape.
     ArchitectureMatchedRandomWeight,
@@ -100,7 +108,9 @@ impl NullKind {
             Self::PhaseRandomized => "phase_randomized",
             Self::RandomRotation => "random_rotation",
             Self::TokenShuffle => "token_shuffle",
+            Self::PerDimensionShuffle => "per_dimension_shuffle",
             Self::MatchedSpectrumGaussian => "matched_spectrum_gaussian",
+            Self::CovarianceMatchedGaussian => "covariance_matched_gaussian",
             Self::ArchitectureMatchedRandomWeight => "architecture_matched_random_weight",
         }
     }
@@ -124,7 +134,9 @@ impl NullBatteryConfig {
                 NullKind::PhaseRandomized,
                 NullKind::RandomRotation,
                 NullKind::TokenShuffle,
+                NullKind::PerDimensionShuffle,
                 NullKind::MatchedSpectrumGaussian,
+                NullKind::CovarianceMatchedGaussian,
                 NullKind::ArchitectureMatchedRandomWeight,
             ],
             tail: Tail::Larger,
@@ -346,6 +358,7 @@ pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
             summary.kind,
             NullKind::PhaseRandomized
                 | NullKind::MatchedSpectrumGaussian
+                | NullKind::CovarianceMatchedGaussian
                 | NullKind::ArchitectureMatchedRandomWeight
         ) {
             selected.push(summary.p_value);
@@ -364,6 +377,7 @@ pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
             summary.kind,
             NullKind::PhaseRandomized
                 | NullKind::MatchedSpectrumGaussian
+                | NullKind::CovarianceMatchedGaussian
                 | NullKind::ArchitectureMatchedRandomWeight
         ) {
             selected.push(summary.z);
@@ -406,8 +420,12 @@ where
                 NullKind::PhaseRandomized => phase_randomized_surrogate(data, rep_seed)?,
                 NullKind::RandomRotation => random_rotation_null(data, rep_seed)?,
                 NullKind::TokenShuffle => token_shuffle_null(data, rep_seed)?,
+                NullKind::PerDimensionShuffle => per_dimension_shuffle_null(data, rep_seed)?,
                 NullKind::MatchedSpectrumGaussian => {
                     matched_spectrum_gaussian_null(data, rep_seed)?
+                }
+                NullKind::CovarianceMatchedGaussian => {
+                    covariance_matched_gaussian_null(data, rep_seed)?
                 }
                 NullKind::ArchitectureMatchedRandomWeight => {
                     let Some(rw) = random_weight else {
@@ -505,6 +523,30 @@ pub fn token_shuffle_null(data: ArrayView2<'_, f64>, seed: u64) -> Result<Array2
     Ok(out)
 }
 
+/// Independently permute each dimension of an activation/coordinate matrix.
+///
+/// Every output column is a bit-for-bit permutation of the corresponding input
+/// column, so all empirical marginal moments and tails are preserved exactly.
+/// The independently seeded permutations break cross-dimensional geometry; in
+/// particular, this is the matched shuffle control required for an unordered
+/// circle census, whereas [`token_shuffle_null`] leaves that point cloud intact.
+pub fn per_dimension_shuffle_null(
+    data: ArrayView2<'_, f64>,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    validate_matrix(data, "per-dimension-shuffle input")?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f64>::zeros(data.raw_dim());
+    for col in 0..data.ncols() {
+        let mut order: Vec<usize> = (0..data.nrows()).collect();
+        order.shuffle(&mut rng);
+        for (dst, &src) in order.iter().enumerate() {
+            out[[dst, col]] = data[[src, col]];
+        }
+    }
+    Ok(out)
+}
+
 /// Gaussian matched-spectrum null for a matrix already expressed in principal-
 /// component coordinates.
 ///
@@ -525,6 +567,63 @@ pub fn matched_spectrum_gaussian_null(
     for row in 0..out.nrows() {
         for pc in 0..out.ncols() {
             out[[row, pc]] = mean[pc] + sd[pc] * standard_normal(&mut rng);
+        }
+    }
+    Ok(out)
+}
+
+/// Gaussian null matched to the observed mean and full covariance.
+///
+/// The covariance square root is formed from the symmetric eigendecomposition,
+/// not by adding a ridge: zero empirical eigenvalues stay exactly zero, so a
+/// rank-deficient coordinate cloud produces a rank-deficient matched null
+/// rather than a different full-rank distribution. Tiny negative eigenvalues
+/// produced solely by floating-point eigensolver roundoff are projected to the
+/// positive-semidefinite cone at zero.
+pub fn covariance_matched_gaussian_null(
+    data: ArrayView2<'_, f64>,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    validate_matrix(data, "covariance-matched Gaussian input")?;
+    let n = data.nrows();
+    let p = data.ncols();
+    let mean = column_mean(data);
+    let mut covariance = Array2::<f64>::zeros((p, p));
+    for row in data.rows() {
+        for a in 0..p {
+            let da = row[a] - mean[a];
+            for b in 0..=a {
+                covariance[[a, b]] += da * (row[b] - mean[b]);
+            }
+        }
+    }
+    for a in 0..p {
+        for b in 0..=a {
+            let value = covariance[[a, b]] / n as f64;
+            covariance[[a, b]] = value;
+            covariance[[b, a]] = value;
+        }
+    }
+    let (eigenvalues, eigenvectors) = covariance.eigh(Side::Lower).map_err(|error| {
+        format!("covariance-matched Gaussian eigendecomposition failed: {error}")
+    })?;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f64>::zeros((n, p));
+    let mut scaled_normal = vec![0.0_f64; p];
+    for row in 0..n {
+        for axis in 0..p {
+            scaled_normal[axis] = eigenvalues[axis].max(0.0).sqrt() * standard_normal(&mut rng);
+        }
+        for col in 0..p {
+            let mut draw = mean[col];
+            for axis in 0..p {
+                draw += eigenvectors[[col, axis]] * scaled_normal[axis];
+            }
+            out[[row, col]] = draw;
         }
     }
     Ok(out)
@@ -1409,7 +1508,9 @@ fn kind_seed(kind: NullKind) -> u64 {
         NullKind::PhaseRandomized => 0x91E4_11CE,
         NullKind::RandomRotation => 0x807A_7100,
         NullKind::TokenShuffle => 0x70CE_514F,
+        NullKind::PerDimensionShuffle => 0xD1AE_510F,
         NullKind::MatchedSpectrumGaussian => 0x5EEC_7A11,
+        NullKind::CovarianceMatchedGaussian => 0xC0A4_71A1,
         NullKind::ArchitectureMatchedRandomWeight => 0xA2C4_177E,
     }
 }
@@ -1691,6 +1792,85 @@ mod tests {
                 observed_sd[pc],
                 null_sd[pc]
             );
+        }
+    }
+
+    #[test]
+    fn per_dimension_shuffle_preserves_marginals_but_breaks_geometry_2262() {
+        let rows = 2_048;
+        let mut paired = Array2::<f64>::zeros((rows, 2));
+        for row in 0..rows {
+            let value = row as f64 - (rows as f64 - 1.0) / 2.0;
+            paired[[row, 0]] = value;
+            paired[[row, 1]] = value;
+        }
+        let shuffled = per_dimension_shuffle_null(paired.view(), 2262).expect("shuffle null");
+        let repeated = per_dimension_shuffle_null(paired.view(), 2262).expect("shuffle null");
+        assert_eq!(shuffled, repeated, "seeded shuffle must be reproducible");
+
+        for col in 0..paired.ncols() {
+            let mut observed = paired.column(col).to_vec();
+            let mut null = shuffled.column(col).to_vec();
+            observed.sort_by(f64::total_cmp);
+            null.sort_by(f64::total_cmp);
+            assert_eq!(observed, null, "column {col} marginal changed");
+        }
+        let original_cross = paired
+            .rows()
+            .into_iter()
+            .map(|row| row[0] * row[1])
+            .sum::<f64>();
+        let shuffled_cross = shuffled
+            .rows()
+            .into_iter()
+            .map(|row| row[0] * row[1])
+            .sum::<f64>();
+        assert!(
+            shuffled_cross.abs() < original_cross.abs() / 10.0,
+            "independent permutations did not destroy the paired geometry: original={original_cross} shuffled={shuffled_cross}"
+        );
+    }
+
+    #[test]
+    fn covariance_matched_gaussian_preserves_full_second_moment_2262() {
+        let rows = 16_384;
+        let mut observed = Array2::<f64>::zeros((rows, 3));
+        for row in 0..rows {
+            let t = 2.0 * PI * row as f64 / rows as f64;
+            observed[[row, 0]] = 1.0 + 2.0 * t.cos();
+            observed[[row, 1]] = -2.0 + 0.8 * t.cos() + 1.2 * t.sin();
+            observed[[row, 2]] = 0.5 - 0.6 * t.cos() + 0.3 * t.sin();
+        }
+        let draw = covariance_matched_gaussian_null(observed.view(), 2262)
+            .expect("covariance-matched Gaussian null");
+        let repeated = covariance_matched_gaussian_null(observed.view(), 2262)
+            .expect("covariance-matched Gaussian null");
+        assert_eq!(draw, repeated, "seeded Gaussian null must be reproducible");
+
+        let empirical_covariance = |data: ArrayView2<'_, f64>| {
+            let mean = column_mean(data);
+            let mut covariance = Array2::<f64>::zeros((data.ncols(), data.ncols()));
+            for row in data.rows() {
+                for a in 0..data.ncols() {
+                    for b in 0..data.ncols() {
+                        covariance[[a, b]] += (row[a] - mean[a]) * (row[b] - mean[b]);
+                    }
+                }
+            }
+            covariance / data.nrows() as f64
+        };
+        let target = empirical_covariance(observed.view());
+        let realized = empirical_covariance(draw.view());
+        for a in 0..observed.ncols() {
+            for b in 0..observed.ncols() {
+                let scale = target[[a, a]].sqrt() * target[[b, b]].sqrt();
+                assert!(
+                    (realized[[a, b]] - target[[a, b]]).abs() < 0.04 * scale,
+                    "covariance ({a},{b}) mismatch: target={} realized={} scale={scale}",
+                    target[[a, b]],
+                    realized[[a, b]],
+                );
+            }
         }
     }
 
