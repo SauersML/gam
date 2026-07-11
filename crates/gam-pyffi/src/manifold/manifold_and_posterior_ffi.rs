@@ -6967,7 +6967,7 @@ pub(crate) struct ManifoldSaeCore {
 }
 
 impl ManifoldSaeCore {
-    fn from_payload(
+    pub(crate) fn from_payload(
         inner: crate::manifold::manifold_sae_payload::ManifoldSaePayload,
     ) -> PyResult<Self> {
         let fisher_metric = manifold_sae_resident_fisher_metric(&inner)?;
@@ -7092,7 +7092,10 @@ impl ManifoldSaeCore {
     }
 
     #[staticmethod]
-    fn load(py: Python<'_>, path: &str) -> PyResult<Py<ManifoldSaeCore>> {
+    fn load(
+        py: Python<'_>,
+        path: std::path::PathBuf,
+    ) -> PyResult<Py<ManifoldSaeCore>> {
         let payload_json = std::fs::read_to_string(path)
             .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
         Self::from_json(py, &payload_json)
@@ -7111,7 +7114,7 @@ impl ManifoldSaeCore {
         self.inner.to_json().map_err(py_value_error)
     }
 
-    fn save(&self, path: &str) -> PyResult<()> {
+    fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
         let payload = self.inner.to_json().map_err(py_value_error)?;
         std::fs::write(path, payload)
             .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))

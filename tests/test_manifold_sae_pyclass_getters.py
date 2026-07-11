@@ -1,4 +1,4 @@
-"""Contract for the Rust-owned `ManifoldSaeCore` #[pyclass] (issue #2091 cutover).
+"""Contract for the Rust-owned `ManifoldSAE` #[pyclass] (issue #2091 cutover).
 
 The pyclass owns the fitted-model state in Rust (serde `ManifoldSaePayload`) and
 exposes the flat attribute surface consumers read plus a `to_dict` that round-
@@ -25,7 +25,7 @@ GOLDEN_FULL = (
 )
 
 
-ManifoldSaeCore = rust_module().ManifoldSaeCore
+ManifoldSAE = rust_module().ManifoldSAE
 
 
 def _golden() -> dict:
@@ -33,7 +33,7 @@ def _golden() -> dict:
 
 
 def test_to_dict_is_a_fixed_point() -> None:
-    core = ManifoldSaeCore(_golden())
+    core = ManifoldSAE(_golden())
     again = core.to_dict()
     golden = _golden()
     if again != golden:
@@ -45,7 +45,7 @@ def test_to_dict_is_a_fixed_point() -> None:
 
 def test_dense_array_getters() -> None:
     golden = _golden()
-    core = ManifoldSaeCore(golden)
+    core = ManifoldSAE(golden)
     fitted = core.fitted
     assert isinstance(fitted, np.ndarray)
     assert fitted.shape == np.asarray(golden["fitted"]).shape
@@ -68,7 +68,7 @@ def test_dense_array_getters() -> None:
 
 def test_fisher_and_selected_getters() -> None:
     golden = _golden()
-    core = ManifoldSaeCore(golden)
+    core = ManifoldSAE(golden)
     np.testing.assert_array_equal(
         core.fisher_factors, np.asarray(golden["fisher_factors"])
     )
@@ -87,7 +87,7 @@ def test_fisher_and_selected_getters() -> None:
 
 def test_scalar_and_list_getters() -> None:
     golden = _golden()
-    core = ManifoldSaeCore(golden)
+    core = ManifoldSAE(golden)
     assert core.atom_topology == golden["atom_topology"]
     assert core.assignment == golden["assignment"]
     assert core.assignment_label == golden["assignment_label"]
@@ -96,7 +96,6 @@ def test_scalar_and_list_getters() -> None:
     assert core.top_k == golden["top_k"]
     assert core.reconstruction_r2 == golden["reconstruction_r2"]
     assert core.penalized_loss_score == golden["penalized_loss_score"]
-    assert core.reml_score == golden["penalized_loss_score"]  # deprecated alias
     assert core.chosen_k == len(golden["atoms"])
     assert core.selected_log_lambda_sparse == golden["selected_log_lambda_sparse"]
     assert core.atom_topologies == golden["atom_topologies"]
@@ -109,7 +108,7 @@ def test_atoms_is_an_object_surface() -> None:
     """model.atoms is a list of AtomCore handles read by attribute (the
     Rust-owned AtomCore surface), NOT a list of dicts."""
     golden = _golden()
-    core = ManifoldSaeCore(golden)
+    core = ManifoldSAE(golden)
     atoms = core.atoms
     assert isinstance(atoms, list) and len(atoms) == len(golden["atoms"])
     a0 = atoms[0]
@@ -143,7 +142,7 @@ def test_atom_dense_covariance_is_reconstructed() -> None:
     for c in range(p):
         factor[c] = np.eye(m_k) * (c + 1.0)
     golden["atoms"][0]["decoder_covariance_channel_factors"] = factor.tolist()
-    atom0 = ManifoldSaeCore(golden).atoms[0]
+    atom0 = ManifoldSAE(golden).atoms[0]
     cov = atom0.decoder_covariance
     assert cov is not None and cov.shape == (m_k * p, m_k * p)
     # Same-channel diagonal blocks restored; cross-channel entries zero.
@@ -155,7 +154,7 @@ def test_atom_dense_covariance_is_reconstructed() -> None:
 
 def test_report_block_getters() -> None:
     golden = _golden()
-    core = ManifoldSaeCore(golden)
+    core = ManifoldSAE(golden)
     assert core.diagnostics == golden["diagnostics"]
     assert core.top_k_projection == golden["top_k_projection"]
     assert core.solver_plan == golden["solver_plan"]
@@ -165,4 +164,4 @@ def test_report_block_getters() -> None:
     # A None report block reads back as Python None.
     payload = dict(golden)
     payload["cotrain"] = None
-    assert ManifoldSaeCore(payload).cotrain is None
+    assert ManifoldSAE(payload).cotrain is None

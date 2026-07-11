@@ -283,7 +283,18 @@ impl ManifoldSaePayload {
                 }
             }
         }
-        serde_json::from_value(value).map_err(|e| format!("ManifoldSAE.from_json: {e}"))
+        let payload: Self = serde_json::from_value(value)
+            .map_err(|e| format!("ManifoldSAE.from_json: {e}"))?;
+        let canonical =
+            crate::manifold::manifold_sae_coercion::canonical_assignment_kind(&payload.assignment)
+                .map_err(|error| format!("ManifoldSAE.from_json: {error}"))?;
+        if canonical != payload.assignment {
+            return Err(format!(
+                "ManifoldSAE.from_json: assignment {:?} is not canonical; use {:?}",
+                payload.assignment, canonical
+            ));
+        }
+        Ok(payload)
     }
 
     pub(crate) fn to_json(&self) -> Result<String, String> {

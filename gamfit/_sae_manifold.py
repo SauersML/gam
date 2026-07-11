@@ -342,10 +342,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``(N, K)``, ``coords`` as per-atom ``(N, d_k)`` arrays,
         ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices,
         ``basis_specs``, ``atom_topology``/``atom_topologies``, ``assignment``
-        and ``assignment_label``, ``penalized_loss_score`` (``reml_score`` is a
-        deprecated read alias), ``reconstruction_r2``,
-        ``dispersion``, ``training_mean``, metadata-only ``training_data``,
-        lazy ``low_level_logits``, and fit-control metadata including ``alpha``,
+        and ``assignment_label``, ``penalized_loss_score``, ``reconstruction_r2``,
+        ``dispersion``, ``training_mean``, ``low_level_logits``, and fit-control metadata including ``alpha``,
         ``learnable_alpha``, ``tau``, ``sparsity_strength``, ``smoothness``,
         ``learning_rate``, ``max_iter``, ``random_state``, ``top_k``, and
         ``jumprelu_threshold``. Each atom exposes ``basis``,
@@ -355,10 +353,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``(G, d_k)``, ``shape_band_mean`` ``(G, p)``, and ``shape_band_sd``
         ``(G, p)`` when the Rust payload includes posterior shape uncertainty.
 
-        Useful public methods include ``predict``/``reconstruct``,
-        ``reconstruct_training``, ``encode``, ``converged_latents``,
-        ``project``, ``per_atom_active_set``, ``per_atom_latent_for``, and
-        ``shape_uncertainty(atom=..., n_sd=...)``.
+        Public methods are ``predict``/``reconstruct``,
+        ``reconstruct_training``, ``encode``, ``steer``, ``attach_fisher``, and
+        the strict v3 ``to_dict``/``save`` serialization surface.
     """
     if X is None:
         raise TypeError("sae_manifold_fit requires X input array")
@@ -954,21 +951,15 @@ class StagewiseSAE:
         """Lift the SAC-composed frozen dictionary into a :class:`ManifoldSAE`.
 
         The composed atoms (frozen decoders + their circle/sphere analytic bases)
-        are packed into the SAME per-atom layout
-        :meth:`ManifoldSAE._oos_payload` / the Rust ``sae_manifold_predict_oos``
-        FFI already consume, so the returned object exposes the existing
-        out-of-sample surface — ``reconstruct(X_new)`` / ``encode`` /
-        ``project`` — with NO new numerical path: the frozen-decoder OOS chart
+        are packed into the same per-atom layout the native
+        ``ManifoldSAE`` OOS methods consume, so the returned object exposes
+        ``reconstruct(X_new)`` / ``encode`` with no new numerical path: the frozen-decoder OOS chart
         routing/encode lives in Rust and is reused verbatim, this is pure array
         marshalling (SPEC thin-wrapper rule).
 
         Scalar fit controls (``alpha`` / ``tau`` / ``assignment`` / learning
         rate / ...) are inherited from the K=1 :attr:`seed`, so the held-out
-        solve runs under the same gate family the dictionary was grown with. The
-        lifted object's ``training_data``/``fitted`` are the SAC target and its
-        composed in-sample reconstruction, so scoring the exact training matrix
-        returns the SAC reconstruction bit-for-bit while any fresh ``X`` takes the
-        Rust OOS solve.
+        solve runs under the same gate family the dictionary was grown with.
         """
         seed = self.seed
         if not self.atoms:

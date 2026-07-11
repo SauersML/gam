@@ -1,11 +1,9 @@
-"""#2091 — full-fit bitwise equivalence: the Rust `from_fit_payload` builder vs
-the Python `ManifoldSAE.from_payload` -> `to_dict` path.
+"""#2091 — the direct native fit builder reproduces the public fit artifact.
 
 Design (A) moves the raw-payload -> flat-`to_dict`-schema coercion into Rust so
-`sae_manifold_fit` can return a Rust-owned `ManifoldSaeCore` with no Python
-dataclass. This test proves the builder reproduces the dataclass serialization
-EXACTLY: it captures the real raw `sae_manifold_fit_minimal` payload from a live
-fit, runs both paths, and asserts `core.to_dict() == fit.to_dict()`. Any field
+`sae_manifold_fit` returns the Rust-owned `ManifoldSAE` with no Python adapter.
+This test captures the real raw `sae_manifold_fit_minimal` payload from a live
+fit, rebuilds it independently, and asserts exact artifact equality. Any field
 the builder mis-assembles (kind/topology derivation, n_harmonics, per-atom
 gate-column slicing, channel-cov factor, periodic shape-band reorder, report
 passthroughs) surfaces as a dict mismatch. Three atom kinds are exercised
@@ -26,7 +24,7 @@ from gamfit._sae_manifold import rust_module  # noqa: E402
 
 
 def _builder():
-    return rust_module().sae_manifold_core_from_fit_payload
+    return rust_module().sae_manifold_from_fit_payload
 
 
 def _no_nonfinite(v) -> bool:

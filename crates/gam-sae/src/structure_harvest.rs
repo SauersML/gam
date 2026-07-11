@@ -2567,11 +2567,12 @@ fn compact_glued_atoms(
     Ok(to_remove.len())
 }
 
-/// Refit every production-registered regular seam on the terminal polished
-/// charts.  Atlas state is persisted model state, so it must describe the
-/// returned fit rather than the pre-polish warm start.  A seam that ceases to be
-/// identifiable or changes orientation is a structural-fit failure: returning a
-/// stale atlas would be worse than failing loudly.
+/// Refit every production-registered seam on terminal polished charts. Atlas
+/// state is persisted model state, so after a genuinely numerical move it must
+/// describe the returned fit rather than the pre-polish warm start. A seam that
+/// ceases to be identifiable or changes kind/orientation is a structural-fit
+/// failure: returning a stale atlas would be worse than failing loudly. Pure
+/// registration rounds never call this function because they do not polish.
 fn refresh_registered_atlas_transitions(term: &mut SaeManifoldTerm) -> Result<(), String> {
     let registered: Vec<UnitSpeedChartTransition> = term
         .chart_atlases()
@@ -2600,6 +2601,33 @@ fn refresh_registered_atlas_transitions(term: &mut SaeManifoldTerm) -> Result<()
             transition.sign,
             seam.offset,
             seam.period,
+            transition.seam_kind,
+        )?)?;
+    }
+    let registered_spheres: Vec<SphereChartTransition> = term
+        .chart_atlases()
+        .iter()
+        .flat_map(|atlas| atlas.sphere_transitions().iter().copied())
+        .collect();
+    for transition in registered_spheres {
+        // `fit_sphere_seam_transition(a,b)` likewise returns the map b -> a.
+        let seam = fit_sphere_seam_transition(term, transition.to_chart, transition.from_chart)
+            .ok_or_else(|| {
+                format!(
+                    "terminal sphere atlas seam {}->{} is no longer identifiable",
+                    transition.from_chart, transition.to_chart
+                )
+            })?;
+        if seam.seam_kind != transition.seam_kind {
+            return Err(format!(
+                "terminal sphere atlas seam {}->{} changed kind ({:?} -> {:?})",
+                transition.from_chart, transition.to_chart, transition.seam_kind, seam.seam_kind
+            ));
+        }
+        term.refresh_sphere_chart_transition(SphereChartTransition::new(
+            transition.from_chart,
+            transition.to_chart,
+            seam.rotation,
             transition.seam_kind,
         )?)?;
     }
@@ -7006,6 +7034,15 @@ mod tests {
             flat_a[row * da] = (mapped + 0.37).rem_euclid(seam.period);
         }
         term.assignment.coords[0].set_flat(flat_a.view());
+        // Simulate the scoring-refit drift that caused #1890's production red:
+        // the terminal state can no longer identify a decoder transition.  The
+        // accepted structural object is nevertheless fully specified by the
+        // live harvest certificate above and must not be inferred again here.
+        term.atoms[1].decoder_coefficients.fill(0.0);
+        assert!(
+            fit_seam_transition(&term, 0, 1).is_none(),
+            "post-harvest fixture must make seam re-fitting impossible"
+        );
 
         let ledger = SearchLedger {
             alpha: 0.05,
@@ -7082,6 +7119,22 @@ mod tests {
         let err = compact_glued_atoms(&mut term, &mut rho, &overlapping, &[]).unwrap_err();
         assert!(
             err.contains("not an atom-disjoint matching"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(term.k_atoms(), atoms_before);
+        assert_eq!(term.assignment.logits, logits_before);
+
+        // A structurally valid accepted record without its harvest certificate
+        // is also rejected transactionally.  Re-fitting a replacement seam at
+        // this boundary would recreate the scoring/adoption ordering bug.
+        let missing_certificate = SearchLedger {
+            alpha: 0.05,
+            moves: vec![accepted(0, 1)],
+            collapse_events: Vec::new(),
+        };
+        let err = compact_glued_atoms(&mut term, &mut rho, &missing_certificate, &[]).unwrap_err();
+        assert!(
+            err.contains("no harvest-time certificate"),
             "unexpected error: {err}"
         );
         assert_eq!(term.k_atoms(), atoms_before);

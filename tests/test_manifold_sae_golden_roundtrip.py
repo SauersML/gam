@@ -1,11 +1,10 @@
 """Golden round-trip contract for ``ManifoldSAE`` serialization (issue #2091).
 
-These fixtures are the byte-for-byte output of the *current* Python
+These fixtures are the exact v3 output of the Rust-owned
 ``ManifoldSAE.to_dict()`` on a representative model exercising every optional
 field (see ``tests/fixtures/manifold_sae/generate_golden.py``). They pin the
 on-disk schema so the Rust-owned ``ManifoldSaePayload`` port (and the eventual
-Python-dataclass cutover) cannot silently drift a field name, default, or
-None-handling and thereby corrupt saved models.
+PyO3 model cannot silently drift a field name or null representation.
 
 The contract is a *fixed point*: loading a golden payload and re-serializing it
 must reproduce the same payload value-for-value. That is exactly the invariant
@@ -30,9 +29,9 @@ def _load(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def test_golden_fixture_exists_and_is_schema_v1() -> None:
+def test_golden_fixture_exists_and_is_schema_v3() -> None:
     payload = _load(GOLDEN_FULL)
-    assert payload["schema"] == "gamfit.ManifoldSAE/v2"
+    assert payload["schema"] == "gamfit.ManifoldSAE/v3"
     # The representative model exercises the full optional surface.
     assert len(payload["atoms"]) == 3
     assert payload["fisher_factors"] is not None
@@ -59,39 +58,34 @@ def test_to_dict_from_dict_is_a_fixed_point() -> None:
         )
 
 
-def test_structured_residual_diagnostics_is_write_dropped() -> None:
-    """to_dict never emits structured_residual_diagnostics (from_dict tolerates
-    it with a [] default). The Rust serde port mirrors this: Serialize skips the
-    field, Deserialize accepts + ignores it."""
+def test_all_fields_are_explicit_and_runtime_diagnostics_round_trip() -> None:
     golden = _load(GOLDEN_FULL)
-    assert "structured_residual_diagnostics" not in golden
-    # A payload that *does* carry the key must still load (read-tolerance).
-    with_extra = dict(golden)
-    with_extra["structured_residual_diagnostics"] = [{"pass": 0, "lambda_hat": 0.5}]
-    model = ManifoldSAE.from_dict(with_extra)
-    assert "structured_residual_diagnostics" not in model.to_dict()
+    assert golden["structured_residual_diagnostics"] == []
+    changed = dict(golden)
+    changed["structured_residual_diagnostics"] = [{"pass": 0, "lambda_hat": 0.5}]
+    assert ManifoldSAE.from_dict(changed).to_dict() == changed
+    missing = dict(golden)
+    missing.pop("fisher_factors")
+    with pytest.raises(ValueError, match="missing field.*fisher_factors"):
+        ManifoldSAE.from_dict(missing)
 
 
-def test_reml_score_is_a_duplicate_alias_of_penalized_loss_score() -> None:
+def test_deprecated_score_alias_is_rejected() -> None:
     golden = _load(GOLDEN_FULL)
-    assert golden["reml_score"] == golden["penalized_loss_score"]
-    # from_dict must also accept a legacy dict that carries ONLY reml_score.
-    legacy = dict(golden)
-    legacy.pop("penalized_loss_score")
-    model = ManifoldSAE.from_dict(legacy)
-    assert model.penalized_loss_score == golden["reml_score"]
-
-
-def test_assignment_is_canonicalized_on_load() -> None:
-    """Only canonical assignment spellings round-trip stably; a non-canonical
-    alias (e.g. "jumprelu") is rewritten by from_dict, so the golden fixture
-    stores the canonical form."""
-    golden = _load(GOLDEN_FULL)
-    assert golden["assignment"] == "topk"  # already canonical
+    assert "reml_score" not in golden
     aliased = dict(golden)
-    aliased["assignment"] = "jumprelu"  # canonicalizes to "threshold_gate"
-    model = ManifoldSAE.from_dict(aliased)
-    assert model.assignment == "threshold_gate"
+    aliased["reml_score"] = aliased["penalized_loss_score"]
+    with pytest.raises(ValueError, match="unknown field.*reml_score"):
+        ManifoldSAE.from_dict(aliased)
+
+
+def test_noncanonical_assignment_is_rejected() -> None:
+    golden = _load(GOLDEN_FULL)
+    assert golden["assignment"] == "topk"
+    aliased = dict(golden)
+    aliased["assignment"] = "jumprelu"
+    with pytest.raises(ValueError, match="canonical"):
+        ManifoldSAE.from_dict(aliased)
 
 
 @pytest.mark.skipif(
