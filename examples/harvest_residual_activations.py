@@ -14,7 +14,7 @@ full activation matrix in memory.
 
 Example:
   python harvest_residual_activations.py --model Qwen/Qwen2.5-0.5B \
-      --dataset wikitext --config wikitext-103-raw-v1 --layer 12 \
+      --dataset Salesforce/wikitext --config wikitext-103-raw-v1 --layer 12 \
       --n-tokens 120000 --out qwen05_wikitext_l12/
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ from residual_shard_io import ShardWriter, tokenizer_hash  # noqa: E402
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
-    ap.add_argument("--dataset", default="wikitext")
+    ap.add_argument("--dataset", default="Salesforce/wikitext")
     ap.add_argument("--config", default="wikitext-103-raw-v1")
     ap.add_argument("--split", default="train")
     ap.add_argument("--text-field", default="text")
@@ -126,6 +126,12 @@ def main() -> None:
         f"d_model={d_model}",
         flush=True,
     )
+    # Hard-exit: the `datasets` streaming iterator can leave a non-daemon
+    # background thread (e.g. retrying a dead connection), which keeps the
+    # process alive indefinitely after all outputs are flushed. Everything is
+    # on disk at this point, so exit without waiting on stray threads.
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -466,6 +466,66 @@ The top-level helpers `gamfit.sae_trust_diagnostics(payload)` and
 `gamfit.atom_trust_scores(diagnostics)` compute the same quantities from a raw
 fit payload / diagnostics mapping (for batch or offline analysis).
 
+## Shape adjudication: `adjudicate_atom_shape`
+
+`gamfit.adjudicate_atom_shape(coords, ...)` adjudicates the representational
+shape of a 2-D point set without forcing a topology: it races a smooth **S¹
+ring**, a **Euclidean Gaussian**, and the best **k-cluster Gaussian mixture**
+rung on held-out predictive density (deterministic cross-fitted stacking, the
+same `fit_mixture_rung` / `adjudicate_cross_class_race` machinery the
+production fit drives). The winner is whichever class predicts held-out points
+best. It is a top-level export, used throughout `tests/sae/`, and pairs
+naturally with `fit.coords[k]` from [`sae_manifold_fit`](#the-manifoldsae-result).
+
+```python
+import gamfit
+
+verdict = gamfit.adjudicate_atom_shape(coords, folds=5, seed=11)
+# coords: contiguous float64 (n, 2), n >= 4 (a few dozen points recommended);
+# k_ladder=[2, 3, ...] optionally overrides the mixture orders raced.
+```
+
+Returns a dict:
+
+| Key | Meaning |
+| --- | --- |
+| `winner` | `"circle"`, `"euclidean"`, or `"mixture_k{k}"` |
+| `circle_wins` | bool, the winner is the circle |
+| `circle_margin` | stacking-weight margin of circle over the best rival (`NaN` if weights are unavailable) |
+| `mixture_k` | the mixture order selected inside the mixture rung |
+| `candidate_names` / `stacking_weights` | per-candidate names and held-out stacking weights |
+| `negative_log_evidence` | per-candidate rank-aware negative log evidence |
+| `headline` | `"stacking"` or `"evidence"` — which criterion produced the verdict |
+| `is_cross_class` | bool, the race crossed shape classes |
+
+The mixture rung's EM can refuse to certify convergence (a `GamError`); callers
+adjudicating many groups should catch and skip, as
+`tests/sae/qwen_real_sae_pipeline.py` does.
+
+### Usage caveats on real LLM activations
+
+These were measured on real residual-stream activations (Qwen3-8B and
+OLMo-2 weekday/month token sets, plus injected synthetic controls):
+
+1. **Clusters-on-a-circle read as `mixture`, not `circle`.** Discrete concept
+   tokens arranged on a ring (weekday/month circles) typically adjudicate as a
+   cluster mixture even when the ring is real and causally validated — the
+   mixture explains clustered mass better pointwise (measured margins of
+   `-0.36` to `-0.95` on confirmed circles). A `mixture_k` verdict on a
+   discrete concept must not be read as "no manifold": pair the adjudicator
+   with a centroid-ordering test (are the mixture's own centroids arranged on
+   a circle, against a permutation null?).
+2. **Sparse non-negative codes carry a false-circle floor.** Structureless
+   controls (per-dimension-shuffled activations, covariance-matched Gaussians)
+   pushed through a sparse-SAE + per-group 2-D PCA pipeline still produce
+   adjudicator circle wins in double-digit percentages of groups. Never
+   interpret raw circle-win rates without running the byte-identical pipeline
+   on matched structureless controls.
+3. **2-D PCA masks low-relative-variance rings.** A genuine ring sharing its
+   group with a linear factor at ~1× its radius is already lost after a top-2
+   variance projection, and at 2× the adjudicator prefers a cluster mixture
+   (validated by injection). Absence of circle wins is not absence of circles.
+
 ## Supervised SAE
 
 `gamfit.sae_supervised` fits a manifold dictionary jointly with a supervised
