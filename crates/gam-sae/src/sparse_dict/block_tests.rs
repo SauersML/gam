@@ -460,8 +460,7 @@ fn block_seed_preserves_planted_subspaces_2134() {
     let x = planted_data(&planted, n_blocks, b, p, 200);
     let seeded = seed_frames(x.view(), n_blocks, b);
 
-    let projector_roundoff =
-        (p * b * b) as f64 * f32::EPSILON as f64;
+    let projector_roundoff = (p * b * b) as f64 * f32::EPSILON as f64;
     for planted_block in 0..n_blocks {
         let mut best_overlap = f64::NEG_INFINITY;
         for seeded_block in 0..n_blocks {

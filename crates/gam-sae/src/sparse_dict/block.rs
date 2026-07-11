@@ -1356,11 +1356,8 @@ pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> 
                     .expect("validated non-empty block dictionary input")
             };
 
-            let mut candidate: Vec<f64> = x
-                .row(row_index)
-                .iter()
-                .map(|&value| value as f64)
-                .collect();
+            let mut candidate: Vec<f64> =
+                x.row(row_index).iter().map(|&value| value as f64).collect();
             let input_norm = row_energy[row_index].sqrt();
             // Two-pass modified Gram--Schmidt removes the component in the
             // partial frame to input precision before the axis is normalized.
@@ -1376,9 +1373,12 @@ pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> 
                     }
                 }
             }
-            let mut norm = candidate.iter().map(|value| value * value).sum::<f64>().sqrt();
-            let input_roundoff =
-                f32::EPSILON as f64 * (p.max(1) as f64).sqrt() * input_norm;
+            let mut norm = candidate
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            let input_roundoff = f32::EPSILON as f64 * (p.max(1) as f64).sqrt() * input_norm;
             if norm <= input_roundoff {
                 // The observed rows no longer add rank to this frame.  Complete
                 // the required St(b,P) point with the canonical coordinate
