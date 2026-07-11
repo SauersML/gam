@@ -11,9 +11,9 @@ use super::{
     load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
     parse_surv_response, parse_survival_time_basis_config, predict_gam,
     prepend_id_column_to_prediction_csv, required_columns_for_fit, required_columns_for_formula,
-    resolve_family, summarizewiggle_domain, validate_cli_firth_configuration,
-    validate_fit_args_preflight, write_gaussian_location_scale_prediction_csv,
-    write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
+    summarizewiggle_domain, validate_cli_firth_configuration, validate_fit_args_preflight,
+    write_gaussian_location_scale_prediction_csv, write_prediction_csv,
+    write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
     Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
@@ -73,7 +73,7 @@ use gam::types::{
     StandardLink, WigglePenaltyConfig,
 };
 use gam_predict::{FittedModelPredictExt, PredictableModel};
-use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, array, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -84,6 +84,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
+
+fn resolve_family(
+    arg: FamilyArg,
+    negative_binomial_theta: Option<f64>,
+    link_choice: Option<LinkChoice>,
+    y: ArrayView1<'_, f64>,
+    y_kind: ResponseColumnKind,
+    response_name: &str,
+) -> Result<LikelihoodSpec, String> {
+    if negative_binomial_theta.is_some() && !matches!(arg, FamilyArg::NegativeBinomial) {
+        return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
+    }
+    gam::families::fit_orchestration::resolve_family(
+        family_arg_canonical_name(arg),
+        negative_binomial_theta,
+        link_choice.as_ref(),
+        y,
+        y_kind,
+        response_name,
+    )
+}
 
 fn test_saved_linkwiggle_design(
     q0: &Array1<f64>,
@@ -1172,7 +1193,9 @@ fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
     args.survival_likelihood = "marginal-slope".to_string();
     args.firth = true;
 
-    let fit_config = fit_config_from_fit_args(&args).expect("fit config should resolve");
+    let fit_config = super::resolve_fit_invocation(&args)
+        .expect("fit config should resolve")
+        .fit_config;
     let result = validate_fit_args_preflight(&args, &parsed, &fit_config);
     assert!(
         result.is_ok(),

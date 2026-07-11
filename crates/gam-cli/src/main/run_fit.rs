@@ -154,11 +154,6 @@ pub(crate) fn resolve_fit_invocation(
     }
 }
 
-#[cfg(test)]
-pub fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
-    resolve_fit_invocation(args).map(|resolved| resolved.fit_config)
-}
-
 pub(crate) fn fit_config_from_survival_args(args: &SurvivalArgs) -> Result<FitConfig, String> {
     let frailty = crate::config_resolve::resolve_cli_frailty_spec(
         cli_frailty_kind(args.frailty_kind),
