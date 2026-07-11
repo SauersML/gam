@@ -7067,20 +7067,17 @@ impl ManifoldSaeCore {
     /// through the strict `ManifoldSaePayload::from_json` schema.
     #[new]
     fn new(py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<Self> {
+        Self::from_dict(py, payload)
+    }
+
+    #[staticmethod]
+    fn from_dict(py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<Self> {
         let json_mod = py.import("json")?;
         let dumped = json_mod.getattr("dumps")?.call1((payload,))?;
         let json_str: String = dumped.extract()?;
         let inner = crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(&json_str)
             .map_err(py_value_error)?;
         Self::from_payload(inner)
-    }
-
-    #[staticmethod]
-    fn from_dict(
-        py: Python<'_>,
-        payload: &Bound<'_, PyDict>,
-    ) -> PyResult<Py<ManifoldSaeCore>> {
-        Py::new(py, Self::new(py, payload)?)
     }
 
     #[staticmethod]
@@ -7775,23 +7772,12 @@ impl ManifoldSaeCore {
     fn hybrid_split(&self, py: Python<'_>) -> PyResult<PyObject> {
         manifold_sae_report(py, &self.inner.hybrid_split)
     }
-    /// The outer-ρ termination verdict/ledger (#2235). Runtime-only, like
-    /// `structured_residual_diagnostics`: `to_dict` never emitted it, so it is not
-    /// in the persisted schema; it is populated by the fit-path builder from the
-    /// raw payload and surfaced here so the pyclass exposes the same
-    /// `termination` attribute the legacy dataclass field did. `None` on payloads
-    /// predating the ledger.
+    /// The persisted outer-ρ termination verdict/ledger (#2235).
     #[getter]
     fn termination(&self, py: Python<'_>) -> PyResult<PyObject> {
         manifold_sae_report(py, &self.inner.termination)
     }
-    /// The per-pass structured-residual alternation diagnostics (#2021). The serde
-    /// schema WRITE-DROPS these (`to_dict` never emits the key; read-tolerated on
-    /// load), but the payload struct retains them, so the pyclass surfaces the
-    /// attribute the legacy dataclass field `structured_residual_diagnostics`
-    /// exposed — the accessor surface is thus complete vs the dataclass. Returns a
-    /// list (empty when the fit recorded none), mirroring `from_dict`'s
-    /// `payload.get(..., [])` coercion.
+    /// The persisted per-pass structured-residual alternation diagnostics (#2021).
     #[getter]
     fn structured_residual_diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_value_to_py(

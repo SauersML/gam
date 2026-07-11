@@ -35,12 +35,7 @@ pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v3";
 
 /// Per-atom payload (`atoms[k]`), one per `SaeManifoldAtomFit`.
 ///
-/// The always-emitted optional fields (`coords_u_arc`, `evidence`,
-/// `decoder_covariance_channel_factors`, `shape_band_*`, `functional_evidence`)
-/// serialize as `null` when absent — `to_dict` writes those keys unconditionally,
-/// and a plain `Option<T>` field emits `null` for `None`, so the shape matches.
-/// The `#[serde(default)]` on the read-tolerant ones lets a legacy dict that
-/// omits a newer key still deserialize.
+/// Optional-valued fields serialize explicitly as `null`; omission is invalid.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AtomPayload {
@@ -130,8 +125,7 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) duchon_centers: Vec<Option<Vec<Vec<f64>>>>,
 
     // --- manifold crosscoder layout (#2231 Inc D) ------------------------
-    /// Required key in v2; null for a plain SAE. A v1 payload is rejected by
-    /// the schema tag rather than silently guessing a single-layer layout.
+    /// Required key in v3; null for a plain SAE.
     pub(crate) crosscoder: Option<CrosscoderPayload>,
 
     // --- E. per-atom payload ---------------------------------------------
@@ -283,17 +277,10 @@ impl ManifoldSaePayload {
                 }
             }
         }
-        let payload: Self = serde_json::from_value(value)
-            .map_err(|e| format!("ManifoldSAE.from_json: {e}"))?;
-        let canonical =
-            crate::manifold::manifold_sae_coercion::canonical_assignment_kind(&payload.assignment)
-                .map_err(|error| format!("ManifoldSAE.from_json: {error}"))?;
-        if canonical != payload.assignment {
-            return Err(format!(
-                "ManifoldSAE.from_json: assignment {:?} is not canonical; use {:?}",
-                payload.assignment, canonical
-            ));
-        }
+        let payload: Self =
+            serde_json::from_value(value).map_err(|e| format!("ManifoldSAE.from_json: {e}"))?;
+        crate::manifold::manifold_sae_coercion::canonical_assignment_kind(&payload.assignment)
+            .map_err(|error| format!("ManifoldSAE.from_json: {error}"))?;
         Ok(payload)
     }
 
@@ -347,7 +334,10 @@ mod manifold_sae_payload_serde_tests {
         let mut golden = load_value("golden_full.json");
         golden.as_object_mut().unwrap().remove("fisher_factors");
         let error = roundtrip_json(&serde_json::to_string(&golden).unwrap()).unwrap_err();
-        assert!(error.contains("missing field \"fisher_factors\""), "{error}");
+        assert!(
+            error.contains("missing field \"fisher_factors\""),
+            "{error}"
+        );
     }
 
     #[test]
@@ -359,7 +349,10 @@ mod manifold_sae_payload_serde_tests {
         );
         let raw = serde_json::to_string(&golden).unwrap();
         let out: Value = serde_json::from_str(&roundtrip_json(&raw).unwrap()).unwrap();
-        assert_eq!(out["structured_residual_diagnostics"], golden["structured_residual_diagnostics"]);
+        assert_eq!(
+            out["structured_residual_diagnostics"],
+            golden["structured_residual_diagnostics"]
+        );
     }
 
     #[test]
