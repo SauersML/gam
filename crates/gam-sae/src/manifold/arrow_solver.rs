@@ -734,12 +734,26 @@ where
         });
     }
     let rhs_flat = flatten_arrow_parts(rhs.t.view(), rhs.beta.view());
-    let rhs_norm = rhs_flat.dot(&rhs_flat).sqrt().max(1.0);
+    let rhs_norm = rhs_flat.dot(&rhs_flat).sqrt();
+    if rhs_norm == 0.0 {
+        return Ok(SaeArrowVector {
+            t: Array1::zeros(t_len),
+            beta: Array1::zeros(beta_len),
+        });
+    }
+    if !rhs_norm.is_finite() {
+        return Err("solve_b_preconditioned_gmres: non-finite right-hand side".to_string());
+    }
     let b = precondition(rhs)
         .map_err(|err| format!("solve_b_preconditioned_gmres: B inverse: {err}"))?;
     let b = flatten_arrow_parts(b.t.view(), b.beta.view());
-    let b_norm = b.dot(&b).sqrt().max(1.0);
-    let rel_tol = 1.0e-10;
+    let b_norm = b.dot(&b).sqrt();
+    if !(b_norm.is_finite() && b_norm > 0.0) {
+        return Err(format!(
+            "solve_b_preconditioned_gmres: invalid preconditioned right-hand-side norm {b_norm}"
+        ));
+    }
+    let relative_floor = f64::EPSILON.sqrt();
     // Full-memory whenever the live memory ledger admits it. There is no
     // iteration ceiling: each restarted cycle must make a strictly
     // representable reduction in the preconditioned residual, and inability to
@@ -764,7 +778,7 @@ where
         let px = apply_preconditioned(&x)?;
         let mut residual = &b - &px;
         let residual_norm = residual.dot(&residual).sqrt();
-        if residual_norm <= rel_tol * b_norm {
+        if residual_norm <= relative_floor * b_norm {
             let candidate = as_arrow(&x);
             let ax = apply_a(&candidate)?;
             let original = SaeArrowVector {
@@ -772,7 +786,7 @@ where
                 beta: &rhs.beta - &ax.beta,
             };
             let original_norm = sae_norm(&original);
-            if original_norm <= rel_tol * rhs_norm {
+            if original_norm <= relative_floor * rhs_norm {
                 return Ok(candidate);
             }
         }
@@ -838,7 +852,7 @@ where
             iterations = iterations.checked_add(1).ok_or_else(|| {
                 "solve_b_preconditioned_gmres: iteration counter overflow".to_string()
             })?;
-            if g[j + 1].abs() <= rel_tol * b_norm {
+            if g[j + 1].abs() <= relative_floor * b_norm {
                 break;
             }
         }
@@ -874,8 +888,8 @@ where
         // The attainable residual of a moderately conditioned system is
         // O(kappa*eps), so sqrt(eps) is the scalar-type-derived certification
         // floor rather than a last-iterate fallback.
-        let roundoff_floor = f64::EPSILON.sqrt() * rhs_norm;
-        if original_norm <= (rel_tol * rhs_norm).max(roundoff_floor) {
+        let roundoff_floor = relative_floor * rhs_norm;
+        if original_norm <= roundoff_floor {
             return Ok(candidate);
         }
         let next_px = apply_preconditioned(&x)?;
