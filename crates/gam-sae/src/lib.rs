@@ -11,6 +11,7 @@ pub mod certificate_impls;
 pub mod chart_canonicalization;
 pub mod chart_coordinate_solve;
 pub mod chart_transfer;
+pub mod circular_concordance;
 pub mod coactivation_conditionality;
 pub mod corpus;
 pub mod criterion_atoms;

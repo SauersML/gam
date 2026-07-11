@@ -3,6 +3,43 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldTerm;
 use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb};
 
+/// Canonical orthonormal row frame spanning a requested ambient-output
+/// subspace (#2260).
+///
+/// `raw` is `(r, p)`. Its rows may be scaled or non-orthogonal, but must have
+/// numerical row rank `r`. The returned `(r, p)` rows are orthonormal and use
+/// [`GrassmannFrame`]'s deterministic sign gauge. Rank is certified against the
+/// standard SVD backward-error scale `eps * max(r, p) * sigma_max`; a deficient
+/// request is rejected rather than completed with arbitrary orthogonal vectors.
+pub fn canonical_output_subspace_rows(
+    raw: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let (r, p) = raw.dim();
+    if r == 0 || p == 0 {
+        return Err("canonical_output_subspace_rows: frame must be non-empty".to_string());
+    }
+    if r > p {
+        return Err(format!(
+            "canonical_output_subspace_rows: rank r={r} cannot exceed output dimension p={p}"
+        ));
+    }
+    if raw.iter().any(|value| !value.is_finite()) {
+        return Err("canonical_output_subspace_rows: frame must be finite".to_string());
+    }
+
+    let frame = GrassmannFrame::polar_update(raw.t())?;
+    let singular_values = frame.gauge_singular_values();
+    let rank_resolution = f64::EPSILON * r.max(p) as f64 * singular_values[0];
+    if singular_values[r - 1] <= rank_resolution {
+        return Err(format!(
+            "canonical_output_subspace_rows: requested {r}-row frame is rank deficient \
+             (sigma_min={}, numerical resolution={rank_resolution})",
+            singular_values[r - 1]
+        ));
+    }
+    Ok(frame.frame().t().to_owned())
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FrameProjection {
     pub(crate) p: usize,
