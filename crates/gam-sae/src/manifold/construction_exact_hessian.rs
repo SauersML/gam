@@ -792,15 +792,15 @@ impl SaeManifoldTerm {
     /// deflated rows (the plain-S⁻¹ bundle cannot reconstruct the Daleckii–Krein
     /// correction), routing those fits to the dense channel.
     ///
-    /// The analytic-gradient cluster is DENSE-ONLY today (invariant #3): every
-    /// production caller passes `None`, so this `Some` branch is dormant forward
-    /// plumbing that the eventual routing flip (once the surrogate lane owns the
-    /// analytic gradient, not just the EFS lane) will exercise. The selected-
-    /// inverse channels, including assignment strength, now all have bundle
-    /// siblings. The remaining solver-bound gap is the exact-stationarity IFT
-    /// solve below: its `B^-1` preconditioner is still the dense
-    /// [`DeflatedArrowSolver`], so the `solver` argument remains required and the
-    /// production routing flip stays off until that solve is matrix-free too.
+    /// The complete all-coordinate assembler remains dense-solver-bound: its IFT
+    /// correction requires one exact-stationarity solve per active outer
+    /// coordinate and still accepts a [`DeflatedArrowSolver`]. Production
+    /// Hybrid-EFS deliberately does not route the scalable fit through that O(K)
+    /// surface. It evaluates the sole non-FS assignment-strength coordinate with
+    /// [`Self::analytic_assignment_strength_gradient_matrix_free`] and leaves the
+    /// simultaneous smoothness/ARD block on Fellner-Schall updates. The `Some`
+    /// branch here is retained for exact dense/bundle parity of the complete
+    /// derivative, not as the production matrix-free route.
     pub(crate) fn analytic_outer_rho_gradient_components_with_bundle(
         &self,
         target: ArrayView2<'_, f64>,
@@ -850,11 +850,22 @@ impl SaeManifoldTerm {
         // bit-for-bit (folding in any minibatch `penalty_scale` baked into it).
         let mut smooth_explicit = self.decoder_smoothness_value_per_atom(&lambda_smooth_vec);
         let smooth_explicit_sum: f64 = smooth_explicit.iter().sum();
-        if smooth_explicit_sum.abs() > 0.0 {
-            let renorm = loss.smoothness / smooth_explicit_sum;
-            for v in smooth_explicit.iter_mut() {
-                *v *= renorm;
-            }
+        // #2253: the criterion's smoothness penalty carries `renorm` (= the
+        // penalty_scale / normalization baked into `loss.smoothness`). The explicit
+        // term applies it just below; the θ-adjoint's IFT rhs
+        // `∂g_inner/∂log λ_k = λ_k S_k β̂_k` (`outer_rho_gradient_ift_rhs`)
+        // differentiates the SAME renormed penalty, so its response must be scaled
+        // by `smooth_renorm` too (applied in the adjoint loop below). Without it the
+        // adjoint is off by `1/renorm` and the outer gradient desyncs from
+        // `d(value)/dρ` — the K=1 circle non-stationary stall (measured adjoint
+        // −0.687 vs true −0.389 = renorm·(−0.687)).
+        let smooth_renorm = if smooth_explicit_sum.abs() > 0.0 {
+            loss.smoothness / smooth_explicit_sum
+        } else {
+            1.0
+        };
+        for v in smooth_explicit.iter_mut() {
+            *v *= smooth_renorm;
         }
         // #2080: the per-atom smoothness EDF `tr(H⁻¹ M_k)` off the shared
         // selected-inverse bundle when the surrogate lane supplied it; the dense
@@ -1014,7 +1025,21 @@ impl SaeManifoldTerm {
             for idx in 0..gamma.beta.len() {
                 dot += gamma.beta[idx] * solved.beta[idx];
             }
-            third_order_correction[coord] = -0.5 * dot;
+            // #2253: for a smoothing coordinate the IFT rhs is the penalty
+            // gradient `λ_k S_k β̂_k`, which must carry the same `smooth_renorm`
+            // the criterion's penalty (and its explicit derivative) carries. Since
+            // `A⁻¹` is linear, scaling `−½·⟨Γ, A⁻¹ rhs⟩` by `smooth_renorm` is
+            // identical to scaling the rhs. Other coordinates (sparse/ard/block)
+            // are unaffected (`renorm == 1` for them).
+            let smooth_start = rho.smooth_flat_start();
+            let scale = if k_smooth > 0
+                && (smooth_start..smooth_start + k_smooth).contains(&coord)
+            {
+                smooth_renorm
+            } else {
+                1.0
+            };
+            third_order_correction[coord] = -0.5 * dot * scale;
         }
 
         Ok(SaeOuterRhoGradientComponents {
