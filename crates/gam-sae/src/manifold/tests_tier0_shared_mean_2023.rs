@@ -99,8 +99,15 @@ mod tests {
                 Array2::<f64>::from_shape_fn((N, 1), |(r, _)| theta[r][c] / std::f64::consts::TAU);
             let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
             let mut decoder = Array2::<f64>::zeros((3, P));
-            decoder[[1, 2 * c]] = 1.0;
-            decoder[[2, 2 * c + 1]] = 1.0;
+            // The target loads cos(θ) on dim 2c and sin(θ) on dim 2c+1. The
+            // PeriodicHarmonicEvaluator's column order is [1, sin 2πt, cos 2πt]
+            // (basis.rs) — row 1 is SIN, row 2 is COS — so the decoder must load
+            // COS (row 2) into dim 2c and SIN (row 1) into dim 2c+1. Loading them
+            // the other way round reconstructs a swapped (sinθ,cosθ) circle that is
+            // uncorrelated with the target, giving every circle a spuriously
+            // negative leave-one-atom-out ΔEV.
+            decoder[[2, 2 * c]] = 1.0;
+            decoder[[1, 2 * c + 1]] = 1.0;
             let atom = SaeManifoldAtom::new(
                 format!("circle{c}"),
                 SaeAtomBasisKind::Periodic,
