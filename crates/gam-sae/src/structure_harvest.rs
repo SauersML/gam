@@ -4784,7 +4784,7 @@ pub fn run_structure_search_rounds(
 
     for _ in 0..max_rounds {
         // Harvest from the current fitted state. Residuals R = target − fitted.
-        let fitted = term.try_fitted()?;
+        let fitted = term.try_fitted_target_aware(target, None)?;
         let residuals = &target.to_owned() - &fitted;
         let mut report = harvest_move_proposals(&term, &rho, residuals.view(), &harvest_params)?;
         // Capture the pre-screen predictions before `report.proposals` is consumed
@@ -5445,7 +5445,7 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
     // The fitted reconstruction at the shard's held-out rows, scored against the
     // full target. The term's per-row routing/basis covers all N rows, so the
     // reconstruction at a held-out row is the model's prediction for it.
-    let fitted = match term.try_fitted() {
+    let fitted = match term.try_fitted_target_aware(shard.target.view(), None) {
         Ok(f) => f,
         Err(_) => return f64::NEG_INFINITY,
     };

@@ -7,7 +7,6 @@
 //! typed report. Bindings only translate their wire representation into
 //! [`SaeOosRequest`] and serialize [`SaeOosReport`].
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use gam_terms::basis::{DuchonNullspaceOrder, duchon_sae_atom_penalty, monomial_exponents};
@@ -585,73 +584,6 @@ fn project_top_k(
     Ok(())
 }
 
-fn target_aware_reconstruction(
-    term: &SaeManifoldTerm,
-    target: ArrayView2<'_, f64>,
-    assignments: ArrayView2<'_, f64>,
-    linear_images: &[AtomLinearImage],
-) -> Result<Array2<f64>, String> {
-    if linear_images.is_empty() {
-        return term.reconstruct_from_assignments(assignments, false);
-    }
-    let n_obs = term.n_obs();
-    let p_out = term.output_dim();
-    let k_atoms = term.k_atoms();
-    if target.dim() != (n_obs, p_out) || assignments.dim() != (n_obs, k_atoms) {
-        return Err(format!(
-            "run_sae_manifold_oos: target-aware reconstruction shapes target={:?}, assignments={:?} disagree with (N={n_obs}, P={p_out}, K={k_atoms})",
-            target.dim(),
-            assignments.dim()
-        ));
-    }
-    let mut image_by_atom = HashMap::with_capacity(linear_images.len());
-    for image in linear_images {
-        if image_by_atom.insert(image.atom_idx, image).is_some() {
-            return Err(format!(
-                "run_sae_manifold_oos: duplicate hybrid linear image for atom {}",
-                image.atom_idx
-            ));
-        }
-    }
-    let full_curved = term.reconstruct_from_assignments(assignments, false)?;
-    let mut fitted = Array2::<f64>::zeros((n_obs, p_out));
-    let mut decoded = vec![0.0_f64; p_out];
-    let mut image_row = vec![0.0_f64; p_out];
-    let mut residual = vec![0.0_f64; p_out];
-    for row in 0..n_obs {
-        for atom_index in 0..k_atoms {
-            let mass = assignments[[row, atom_index]];
-            if mass == 0.0 {
-                continue;
-            }
-            if let Some(image) = image_by_atom.get(&atom_index) {
-                let coordinate = if image.is_collapse_rescued() {
-                    term.atoms[atom_index].fill_decoded_row(row, &mut decoded);
-                    for output in 0..p_out {
-                        residual[output] = target[[row, output]] - full_curved[[row, output]]
-                            + mass * decoded[output];
-                    }
-                    image.coordinate_from_residual(&residual).ok_or_else(|| {
-                        format!(
-                            "run_sae_manifold_oos: collapse-rescued image for atom {atom_index} cannot project a {p_out}-channel residual"
-                        )
-                    })?
-                } else {
-                    let own_coordinate = term.assignment.coords[atom_index].as_matrix()[[row, 0]];
-                    image.coordinate_for_row(row, own_coordinate)
-                };
-                image.fill_row(coordinate, &mut image_row);
-            } else {
-                term.atoms[atom_index].fill_decoded_row(row, &mut image_row);
-            }
-            for output in 0..p_out {
-                fitted[[row, output]] += mass * image_row[output];
-            }
-        }
-    }
-    Ok(fitted)
-}
-
 /// Execute frozen-decoder OOS inference from a typed, owned request.
 #[must_use = "OOS inference errors and report must be handled"]
 pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, String> {
@@ -794,13 +726,6 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coord_blocks, manifolds, mode)?;
     let mut term = SaeManifoldTerm::new(atoms, assignment_state)?;
 
-    for (image_index, image) in hybrid_linear_images.iter().enumerate() {
-        if image.row_codes.is_some() {
-            return Err(format!(
-                "run_sae_manifold_oos: hybrid image {image_index} contains train-only row_codes"
-            ));
-        }
-    }
     if !hybrid_linear_images.is_empty() {
         term.set_hybrid_linear_images(hybrid_linear_images.clone())?;
     }
@@ -834,12 +759,8 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
             )?;
         }
     }
-    let fitted = target_aware_reconstruction(
-        &term,
-        target.view(),
-        assignments.view(),
-        &hybrid_linear_images,
-    )?;
+    let fitted =
+        term.reconstruct_from_assignments_target_aware(target.view(), assignments.view())?;
 
     let mut atom_reports = Vec::with_capacity(k_atoms);
     let mut decoded_row = vec![0.0_f64; p_out];

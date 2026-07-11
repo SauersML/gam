@@ -129,7 +129,7 @@ fn sae_structured_residual_model(
     term: &SaeManifoldTerm,
     target: ndarray::ArrayView2<'_, f64>,
 ) -> Result<Option<StructuredResidualModel>, String> {
-    let fitted = term.fitted();
+    let fitted = term.try_fitted_target_aware(target, None)?;
     let (n, p) = fitted.dim();
     // Need >= 2 output channels for an off-diagonal factor subspace.
     if n == 0 || p <= 1 {
@@ -814,7 +814,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     }
     {
         let assignments = term.assignment.assignments();
-        let fitted = term.fitted();
+        let fitted = term.try_fitted_target_aware(z.view(), Some(&rho))?;
         term.record_fit_data_collapse_if_needed(
             z.view(),
             fitted.view(),
@@ -1003,7 +1003,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         })
         .collect();
     let mut assignments = term.assignment.assignments();
-    let mut fitted = term.fitted();
+    let mut fitted = term.try_fitted_target_aware(z.view(), Some(&rho))?;
     // #1232 — when a hard top-k gate is applied, the smooth optimization model
     // differs from the projected inference model returned on the payload. Capture
     // the optimization-era state before projection so the payload can expose both
@@ -1086,7 +1086,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             // Recompute `fitted` from the projected assignments through the
             // SHARED collapse-aware assembler so the hard top-k projection
             // composes with the #1026 hybrid collapse (#1233).
-            fitted = term.reconstruct_from_assignments(assignments.view(), true)?;
+            fitted = term
+                .reconstruct_from_assignments_target_aware(z.view(), assignments.view())?;
             // #1232 — projected-model penalized loss: the reconstruction data-fit
             // recomputed on the projected `fitted`, with the decoder/ρ penalties
             // carried over unchanged (the top-k gate touches assignments, not the
@@ -1106,6 +1107,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         Some(&ard_variances),
         isometry_pin_active,
         Some(shape_uncertainty.dispersion),
+        fitted.view(),
         Some(assignments.view()),
     )?;
 

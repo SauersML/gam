@@ -2029,13 +2029,12 @@ fn collapse_rescue_term_and_target() -> (SaeManifoldTerm, Array2<f64>, SaeManifo
     (term, target, rho)
 }
 
-/// #1777 GOAL 1 — a collapse-rescued atom must reconstruct the SAME rows
-/// identically whether treated as "train" (cached per-row codes) or re-encoded
-/// as "held-out" (the `v`-projection of the row's own leave-this-atom-out
-/// residual), and the `v`-projection OOS reconstruction must BEAT the collapsed
-/// (own-coordinate) fallback in explained variance.
+/// #1777 GOAL 1 — a collapse-rescued atom has exactly one reconstruction model:
+/// the `v`-projection of the row's own leave-this-atom-out residual. Training and
+/// held-out reconstruction must agree through that target-aware path, while a
+/// target-less reconstruction must refuse the rescued image explicitly.
 #[test]
-pub(crate) fn collapse_rescue_oos_v_projection_matches_train_and_beats_fallback() {
+pub(crate) fn collapse_rescue_projection_matches_train_and_oos_and_refuses_targetless() {
     let (mut term, target, rho) = collapse_rescue_term_and_target();
 
     // The joint fit drove this atom into the degenerate fixed point; the hybrid
@@ -2054,20 +2053,25 @@ pub(crate) fn collapse_rescue_oos_v_projection_matches_train_and_beats_fallback(
         rescue_image.is_collapse_rescued() && rescue_image.v.is_some(),
         "a collapse-rescued image must carry a projection direction v"
     );
-    assert!(
-        rescue_image.row_codes.is_some(),
-        "a collapse-rescued image must carry its train per-row codes"
-    );
 
-    // TRAIN reconstruction: the term with the report installed decodes the slot at
-    // its cached per-row codes (`row_codes`).
+    // TRAIN reconstruction uses the same residual projection as OOS. With no
+    // target the term must refuse the rescued image instead of silently decoding
+    // at the collapsed atom coordinate.
     term.hybrid_split_report = Some(report);
-    let train_recon = term.fitted();
+    let refusal = term
+        .try_fitted()
+        .expect_err("a rescued image cannot be reconstructed without its target");
+    assert!(
+        refusal.contains("requires try_fitted_target_aware"),
+        "unexpected target-less refusal: {refusal}"
+    );
+    let train_recon = term
+        .try_fitted_target_aware(target.view(), Some(&rho))
+        .expect("target-aware train reconstruction assembles");
 
     // HELD-OUT reconstruction: a fresh OOS term that knows only the decoder and
     // the trained linear images (no in-fit report) recomputes each row's
-    // coordinate from ITS OWN residual projected onto `v`, via the target-aware
-    // path. Same target ⇒ same residual ⇒ same coordinate ⇒ same reconstruction.
+    // coordinate from ITS OWN residual projected onto `v`.
     let mut oos = term.clone();
     oos.hybrid_split_report = None;
     oos.set_hybrid_linear_images(vec![rescue_image.clone()])
@@ -2081,35 +2085,11 @@ pub(crate) fn collapse_rescue_oos_v_projection_matches_train_and_beats_fallback(
         .fold(0.0_f64, |m, d| m.max(d.abs()));
     assert!(
         max_gap < 1e-10,
-        "train (cached codes) and OOS (v-projection) reconstructions must be the \
-         SAME model within tol; max gap {max_gap:e}"
+        "train and OOS residual-projection reconstructions must be the SAME model \
+         within tol; max gap {max_gap:e}"
     );
-
-    // The v-projection OOS reconstruction must beat the collapsed-coordinate
-    // fallback (row_codes/v cleared ⇒ every row decodes at the atom's own, single,
-    // collapsed coordinate → a constant image that cannot track the residual ramp).
-    let fallback_image = crate::hybrid_split::AtomLinearImage {
-        atom_idx: rescue_image.atom_idx,
-        t_bar: rescue_image.t_bar,
-        b0: rescue_image.b0.clone(),
-        b1: rescue_image.b1.clone(),
-        row_codes: None,
-        v: None,
-    };
-    let mut fallback = term.clone();
-    fallback.hybrid_split_report = None;
-    fallback
-        .set_hybrid_linear_images(vec![fallback_image])
-        .expect("fallback image attaches");
-    let fallback_recon = fallback.fitted();
-
-    let ev_vproj = global_ev(target.view(), oos_recon.view());
-    let ev_fallback = global_ev(target.view(), fallback_recon.view());
-    assert!(
-        ev_vproj > ev_fallback + 0.1 && ev_vproj > 0.95,
-        "the v-projection OOS EV ({ev_vproj:.4}) must beat the collapsed-coordinate \
-         fallback ({ev_fallback:.4}) and recover the residual ramp"
-    );
+    let ev = global_ev(target.view(), oos_recon.view());
+    assert!(ev > 0.95, "residual projection must recover the ramp; EV={ev:.4}");
 }
 
 /// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the

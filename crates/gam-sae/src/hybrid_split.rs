@@ -767,9 +767,11 @@ fn build_atom_candidates(
 /// fit uses). These codes span the residual's strongest linear axis by
 /// construction, so the straight image `b₀ + (uᵢ − ū)·b₁` fit against them
 /// reconstructs that axis at LINEAR quality — exactly the linear-tail reach the
-/// split owes. Returns the forced-LINEAR candidate plus the image carrying `uᵢ`,
+/// split owes. Returns the forced-LINEAR candidate plus the image carrying `v`,
 /// or `None` when the residual itself carries no usable direction (a genuine zero
-/// atom the mass/decoder guards own).
+/// atom the mass/decoder guards own). The per-row `uᵢ` values are fit-local and
+/// are deliberately not stored; reconstruction must project its own target-aware
+/// residual through `v`.
 fn build_collapse_rescue_linear_image(
     atom_idx: usize,
     assign: ArrayView1<'_, f64>,
@@ -890,10 +892,9 @@ fn build_collapse_rescue_linear_image(
         t_bar,
         b0,
         b1,
-        row_codes: Some(u),
-        // #1777 — persist the projection direction so an OOS row's coordinate can
-        // be recomputed as ⟨residual, v⟩ (identical to the train `row_codes`),
-        // rather than falling back to the atom's collapsed own coordinate.
+        // #1777 — persist the projection direction so every row's coordinate is
+        // recomputed as ⟨residual, v⟩ rather than using a train-only cached code
+        // or the atom's collapsed own coordinate.
         v: Some(v),
     };
     Some((linear, image))
@@ -903,29 +904,59 @@ fn build_collapse_rescue_linear_image(
 /// change `δ_k[i,j] = a_k·(γ_k(t_i) − line_k(t_i))` over ALL globally-aligned rows
 /// (the caller presents `coords`/`assign`/`decoded`/`image` on the same `n` rows,
 /// so these δ vectors ARE cross-atom aligned and their inner products are the
-/// genuine cross terms). `line_k` is evaluated at the image's own coordinate
-/// (collapse-rescue slots evaluate at their fresh per-row codes via
-/// [`AtomLinearImage::coordinate_for_row`], exactly as the collapsed reconstruction
-/// does). Collapsing atom `k` shifts the full reconstruction residual by `+δ_k`.
+/// genuine cross terms). Ordinary images are evaluated at the atom coordinate;
+/// collapse-rescued images project the same leave-this-atom-out `target_resid`
+/// used to fit them. Collapsing atom `k` shifts the full reconstruction residual
+/// by `+δ_k`.
 fn slot_delta(
     coords: &Array1<f64>,
     assign: &Array1<f64>,
     decoded: &Array2<f64>,
+    target_resid: &Array2<f64>,
     image: &AtomLinearImage,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let n = decoded.nrows();
     let p = decoded.ncols();
+    if coords.len() != n
+        || assign.len() != n
+        || target_resid.dim() != (n, p)
+        || image.b0.len() != p
+        || image.b1.len() != p
+    {
+        return Err(format!(
+            "slot_delta: incompatible shapes coords={}, assign={}, decoded={:?}, target_resid={:?}, b0={}, b1={}",
+            coords.len(),
+            assign.len(),
+            decoded.dim(),
+            target_resid.dim(),
+            image.b0.len(),
+            image.b1.len()
+        ));
+    }
     let mut d = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let a = assign[i];
-        let coord = image.coordinate_for_row(i, coords[i]);
+        let coord = if image.is_collapse_rescued() {
+            let residual = target_resid
+                .row(i)
+                .as_slice()
+                .expect("target_resid row must be contiguous");
+            image.coordinate_from_residual(residual).ok_or_else(|| {
+                format!(
+                    "slot_delta: collapse-rescued image for atom {} cannot project a {p}-channel residual",
+                    image.atom_idx
+                )
+            })?
+        } else {
+            coords[i]
+        };
         let dt = coord - image.t_bar;
         for j in 0..p {
             let line = image.b0[j] + dt * image.b1[j];
             d[[i, j]] = a * (decoded[[i, j]] - line);
         }
     }
-    d
+    Ok(d)
 }
 
 /// #1026 item-2 — the ALL-CURVED global reconstruction residual
@@ -1188,12 +1219,11 @@ where
                     t_bar,
                     b0,
                     b1,
-                    row_codes: None,
                     // Ordinary straight image: decoded at the atom's own
                     // coordinate, so it carries no residual-projection direction.
                     v: None,
                 };
-                let delta = slot_delta(&coords, &assign, &decoded, &image);
+                let delta = slot_delta(&coords, &assign, &decoded, &target_resid, &image)?;
                 if r0.is_none() {
                     r0 = Some(slot_r0(&assign, &decoded, &target_resid));
                 }
@@ -1223,7 +1253,7 @@ where
                 target_resid.view(),
             ) {
                 Some((linear, image)) => {
-                    let delta = slot_delta(&coords, &assign, &decoded, &image);
+                    let delta = slot_delta(&coords, &assign, &decoded, &target_resid, &image)?;
                     if r0.is_none() {
                         r0 = Some(slot_r0(&assign, &decoded, &target_resid));
                     }

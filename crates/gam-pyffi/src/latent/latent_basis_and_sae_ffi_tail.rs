@@ -281,7 +281,6 @@ fn sae_oos_request_from_arrays(
             t_bar,
             b0,
             b1,
-            row_codes: None,
             v,
         },
     )

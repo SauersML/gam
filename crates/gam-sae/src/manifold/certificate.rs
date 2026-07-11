@@ -325,7 +325,8 @@ pub fn dictionary_incoherence_report(term: &SaeManifoldTerm) -> Result<Certifica
     let dispersion = term.certificate_dispersion.ok_or_else(|| {
         "dictionary_incoherence_report: fitted reconstruction dispersion is unavailable".to_string()
     })?;
-    dictionary_incoherence_report_with_dispersion(term, dispersion)
+    let fitted = term.try_fitted()?;
+    dictionary_incoherence_report_with_dispersion(term, dispersion, fitted.view())
 }
 
 /// Build the empirical curved-dictionary certificate quantities from a fitted
@@ -343,10 +344,19 @@ pub fn dictionary_incoherence_report(term: &SaeManifoldTerm) -> Result<Certifica
 pub fn dictionary_incoherence_report_with_dispersion(
     term: &SaeManifoldTerm,
     dispersion: f64,
+    fitted: ArrayView2<'_, f64>,
 ) -> Result<CertificateInputs, String> {
     if !dispersion.is_finite() || dispersion <= 0.0 {
         return Err(format!(
             "dictionary_incoherence_report: dispersion must be finite and positive, got {dispersion}"
+        ));
+    }
+    if fitted.dim() != (term.n_obs(), term.output_dim()) {
+        return Err(format!(
+            "dictionary_incoherence_report: fitted {:?} != ({}, {})",
+            fitted.dim(),
+            term.n_obs(),
+            term.output_dim()
         ));
     }
     let mu_hat = dictionary_frame_incoherence(term)?;
@@ -379,7 +389,6 @@ pub fn dictionary_incoherence_report_with_dispersion(
         .iter()
         .copied()
         .fold(f64::INFINITY, f64::min);
-    let fitted = term.fitted();
     let signal_power = if fitted.is_empty() {
         0.0
     } else {

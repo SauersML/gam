@@ -327,127 +327,158 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena>
     }
 }
 
-/// Runtime-sized packed first-order scalar: value plus gradient.
-#[derive(Clone, Debug)]
-pub struct DynamicOrder1 {
+/// Reusable storage for runtime-sized packed jets. Scalar primitives write
+/// into this bump arena, so arithmetic performs no heap allocation. Callers
+/// reserve once per worker/chunk and [`reset`](Self::reset) between rows.
+#[derive(Debug)]
+pub struct DynamicJetArena {
+    bump: bumpalo::Bump,
+}
+
+impl DynamicJetArena {
+    /// Create an arena with the allocator's default initial chunk.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            bump: bumpalo::Bump::new(),
+        }
+    }
+
+    /// Create an arena with a row-program-selected initial byte capacity.
+    #[must_use]
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            bump: bumpalo::Bump::with_capacity(bytes),
+        }
+    }
+
+    /// Reclaim all scalar outputs while retaining allocated chunks.
+    pub fn reset(&mut self) {
+        self.bump.reset();
+    }
+
+    #[inline]
+    fn zeros(&self, len: usize) -> &mut [f64] {
+        self.bump.alloc_slice_fill_copy(len, 0.0)
+    }
+}
+
+impl Default for DynamicJetArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runtime-sized packed first-order scalar: value plus arena-backed gradient.
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicOrder1<'arena> {
+    arena: &'arena DynamicJetArena,
     /// Value channel.
     pub v: f64,
     /// Gradient channel, length [`Self::dimension`].
-    pub g: Vec<f64>,
+    pub g: &'arena [f64],
 }
 
-impl DynamicOrder1 {
+impl DynamicOrder1<'_> {
     /// Gradient channel.
     #[inline]
     #[must_use]
     pub fn g(&self) -> &[f64] {
-        &self.g
+        self.g
     }
 
     #[inline]
     fn assert_compatible(&self, o: &Self) {
-        assert_eq!(
-            self.g.len(),
-            o.g.len(),
-            "dynamic first-order jet dimension mismatch"
-        );
+        assert_eq!(self.g.len(), o.g.len(), "dynamic first-order jet dimension mismatch");
+        assert!(std::ptr::eq(self.arena, o.arena), "dynamic jets belong to different arenas");
     }
 }
 
-impl RuntimeJetScalar for DynamicOrder1 {
-    fn constant(c: f64, dimension: usize) -> Self {
-        Self {
-            v: c,
-            g: vec![0.0; dimension],
-        }
+impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
+    type Workspace = DynamicJetArena;
+
+    fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
+        Self { arena, v: c, g: arena.zeros(dimension) }
     }
 
-    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
-        assert!(
-            axis < dimension,
-            "dynamic first-order jet axis out of bounds"
-        );
-        let mut out = Self::constant(x, dimension);
-        out.g[axis] = 1.0;
-        out
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        assert!(axis < dimension, "dynamic first-order jet axis out of bounds");
+        let g = arena.zeros(dimension);
+        g[axis] = 1.0;
+        Self { arena, v: x, g }
     }
 
-    fn dimension(&self) -> usize {
-        self.g.len()
-    }
-
-    fn value(&self) -> f64 {
-        self.v
-    }
+    fn dimension(&self) -> usize { self.g.len() }
+    fn value(&self) -> f64 { self.v }
 
     fn add(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let mut g = self.g.clone();
-        for (out, rhs) in g.iter_mut().zip(&o.g) {
-            *out += rhs;
-        }
-        Self { v: self.v + o.v, g }
+        let g = self.arena.zeros(self.dimension());
+        for i in 0..g.len() { g[i] = self.g[i] + o.g[i]; }
+        Self { arena: self.arena, v: self.v + o.v, g }
     }
 
     fn sub(&self, o: &Self) -> Self {
-        self.add(&o.scale(-1.0))
+        self.assert_compatible(o);
+        let g = self.arena.zeros(self.dimension());
+        for i in 0..g.len() { g[i] = self.g[i] - o.g[i]; }
+        Self { arena: self.arena, v: self.v - o.v, g }
     }
 
     fn mul(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let mut g = vec![0.0; self.dimension()];
-        for (i, out) in g.iter_mut().enumerate() {
-            *out = self.v * o.g[i] + self.g[i] * o.v;
-        }
-        Self { v: self.v * o.v, g }
+        let g = self.arena.zeros(self.dimension());
+        for i in 0..g.len() { g[i] = self.v * o.g[i] + self.g[i] * o.v; }
+        Self { arena: self.arena, v: self.v * o.v, g }
     }
 
-    fn neg(&self) -> Self {
-        self.scale(-1.0)
-    }
+    fn neg(&self) -> Self { self.scale(-1.0) }
 
     fn scale(&self, s: f64) -> Self {
-        let mut g = self.g.clone();
-        for out in &mut g {
-            *out *= s;
-        }
-        Self { v: self.v * s, g }
+        let g = self.arena.zeros(self.dimension());
+        for i in 0..g.len() { g[i] = self.g[i] * s; }
+        Self { arena: self.arena, v: self.v * s, g }
     }
 
     fn compose_unary(&self, d: [f64; 5]) -> Self {
-        let mut g = vec![0.0; self.dimension()];
-        for (i, out) in g.iter_mut().enumerate() {
-            *out = d[1] * self.g[i];
-        }
-        Self { v: d[0], g }
+        let g = self.arena.zeros(self.dimension());
+        for i in 0..g.len() { g[i] = d[1] * self.g[i]; }
+        Self { arena: self.arena, v: d[0], g }
     }
 }
 
 /// Runtime-sized packed second-order scalar: value, gradient, and a row-major
-/// Hessian. Storage is `O(K^2)` in the row's actual primary dimension.
-#[derive(Clone, Debug)]
-pub struct DynamicOrder2 {
+/// Hessian. Storage is `O(K^2)` in the row's actual primary dimension and comes
+/// from the row's reusable [`DynamicJetArena`].
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicOrder2<'arena> {
+    arena: &'arena DynamicJetArena,
     /// Value channel.
     pub v: f64,
     /// Gradient channel.
-    pub g: Vec<f64>,
+    pub g: &'arena [f64],
     /// Row-major Hessian channel.
-    pub h: Vec<f64>,
+    pub h: &'arena [f64],
 }
 
-impl DynamicOrder2 {
+impl DynamicOrder2<'_> {
     /// Gradient channel.
     #[inline]
     #[must_use]
     pub fn g(&self) -> &[f64] {
-        &self.g
+        self.g
     }
 
     /// Row-major Hessian channel.
     #[inline]
     #[must_use]
     pub fn h(&self) -> &[f64] {
-        &self.h
+        self.h
     }
 
     /// Hessian entry `(row, col)`.
@@ -469,26 +500,43 @@ impl DynamicOrder2 {
             o.h.len(),
             "dynamic second-order jet Hessian mismatch"
         );
+        assert!(
+            std::ptr::eq(self.arena, o.arena),
+            "dynamic jets belong to different arenas"
+        );
     }
 }
 
-impl RuntimeJetScalar for DynamicOrder2 {
-    fn constant(c: f64, dimension: usize) -> Self {
+impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
+    type Workspace = DynamicJetArena;
+
+    fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
+            arena,
             v: c,
-            g: vec![0.0; dimension],
-            h: vec![0.0; dimension * dimension],
+            g: arena.zeros(dimension),
+            h: arena.zeros(dimension * dimension),
         }
     }
 
-    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
         assert!(
             axis < dimension,
             "dynamic second-order jet axis out of bounds"
         );
-        let mut out = Self::constant(x, dimension);
-        out.g[axis] = 1.0;
-        out
+        let g = arena.zeros(dimension);
+        g[axis] = 1.0;
+        Self {
+            arena,
+            v: x,
+            g,
+            h: arena.zeros(dimension * dimension),
+        }
     }
 
     fn dimension(&self) -> usize {
@@ -501,15 +549,16 @@ impl RuntimeJetScalar for DynamicOrder2 {
 
     fn add(&self, o: &Self) -> Self {
         self.assert_compatible(o);
-        let mut g = self.g.clone();
-        let mut h = self.h.clone();
-        for (out, rhs) in g.iter_mut().zip(&o.g) {
-            *out += rhs;
+        let g = self.arena.zeros(self.dimension());
+        let h = self.arena.zeros(self.h.len());
+        for i in 0..g.len() {
+            g[i] = self.g[i] + o.g[i];
         }
-        for (out, rhs) in h.iter_mut().zip(&o.h) {
-            *out += rhs;
+        for i in 0..h.len() {
+            h[i] = self.h[i] + o.h[i];
         }
         Self {
+            arena: self.arena,
             v: self.v + o.v,
             g,
             h,
@@ -517,26 +566,46 @@ impl RuntimeJetScalar for DynamicOrder2 {
     }
 
     fn sub(&self, o: &Self) -> Self {
-        self.add(&o.scale(-1.0))
+        self.assert_compatible(o);
+        let g = self.arena.zeros(self.dimension());
+        let h = self.arena.zeros(self.h.len());
+        for i in 0..g.len() {
+            g[i] = self.g[i] - o.g[i];
+        }
+        for i in 0..h.len() {
+            h[i] = self.h[i] - o.h[i];
+        }
+        Self {
+            arena: self.arena,
+            v: self.v - o.v,
+            g,
+            h,
+        }
     }
 
     fn mul(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let n = self.dimension();
-        let mut out = Self::constant(self.v * o.v, n);
+        let g = self.arena.zeros(n);
+        let h = self.arena.zeros(n * n);
         for i in 0..n {
-            out.g[i] = self.v * o.g[i] + self.g[i] * o.v;
+            g[i] = self.v * o.g[i] + self.g[i] * o.v;
         }
         for i in 0..n {
             for j in i..n {
                 let ij = i * n + j;
                 let hij =
                     self.v * o.h[ij] + self.g[i] * o.g[j] + self.g[j] * o.g[i] + self.h[ij] * o.v;
-                out.h[ij] = hij;
-                out.h[j * n + i] = hij;
+                h[ij] = hij;
+                h[j * n + i] = hij;
             }
         }
-        out
+        Self {
+            arena: self.arena,
+            v: self.v * o.v,
+            g,
+            h,
+        }
     }
 
     fn neg(&self) -> Self {
@@ -544,49 +613,66 @@ impl RuntimeJetScalar for DynamicOrder2 {
     }
 
     fn scale(&self, s: f64) -> Self {
-        let mut out = self.clone();
-        out.v *= s;
-        for x in &mut out.g {
-            *x *= s;
+        let g = self.arena.zeros(self.dimension());
+        let h = self.arena.zeros(self.h.len());
+        for i in 0..g.len() {
+            g[i] = self.g[i] * s;
         }
-        for x in &mut out.h {
-            *x *= s;
+        for i in 0..h.len() {
+            h[i] = self.h[i] * s;
         }
-        out
+        Self {
+            arena: self.arena,
+            v: self.v * s,
+            g,
+            h,
+        }
     }
 
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let n = self.dimension();
-        let mut out = Self::constant(d[0], n);
+        let g = self.arena.zeros(n);
+        let h = self.arena.zeros(n * n);
         for i in 0..n {
-            out.g[i] = d[1] * self.g[i];
+            g[i] = d[1] * self.g[i];
         }
         for i in 0..n {
             for j in 0..n {
                 let ij = i * n + j;
-                out.h[ij] = d[1] * self.h[ij] + d[2] * self.g[i] * self.g[j];
+                h[ij] = d[1] * self.h[ij] + d[2] * self.g[i] * self.g[j];
             }
         }
-        out
+        Self {
+            arena: self.arena,
+            v: d[0],
+            g,
+            h,
+        }
     }
 }
 
 /// Runtime-sized one-seed scalar for a Hessian-contracted third derivative.
-#[derive(Clone, Debug)]
-pub struct DynamicOneSeed {
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicOneSeed<'arena> {
     /// Base value/gradient/Hessian channels.
-    pub base: DynamicOrder2,
+    pub base: DynamicOrder2<'arena>,
     /// Nilpotent `epsilon` coefficient.
-    pub eps: DynamicOrder2,
+    pub eps: DynamicOrder2<'arena>,
 }
 
-impl DynamicOneSeed {
+impl<'arena> DynamicOneSeed<'arena> {
     /// Seed one primary with the supplied contraction direction component.
     #[must_use]
-    pub fn seed_direction(x: f64, axis: usize, u_axis: f64, dimension: usize) -> Self {
+    pub fn seed_direction(
+        x: f64,
+        axis: usize,
+        u_axis: f64,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
         Self {
-            base: DynamicOrder2::variable(x, axis, dimension),
-            eps: DynamicOrder2::constant(u_axis, dimension),
+            base: DynamicOrder2::variable(x, axis, dimension, arena),
+            eps: DynamicOrder2::constant(u_axis, dimension, arena),
         }
     }
 
@@ -597,18 +683,25 @@ impl DynamicOneSeed {
     }
 }
 
-impl RuntimeJetScalar for DynamicOneSeed {
-    fn constant(c: f64, dimension: usize) -> Self {
+impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
+    type Workspace = DynamicJetArena;
+
+    fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
-            base: DynamicOrder2::constant(c, dimension),
-            eps: DynamicOrder2::constant(0.0, dimension),
+            base: DynamicOrder2::constant(c, dimension, arena),
+            eps: DynamicOrder2::constant(0.0, dimension, arena),
         }
     }
 
-    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
         Self {
-            base: DynamicOrder2::variable(x, axis, dimension),
-            eps: DynamicOrder2::constant(0.0, dimension),
+            base: DynamicOrder2::variable(x, axis, dimension, arena),
+            eps: DynamicOrder2::constant(0.0, dimension, arena),
         }
     }
 
@@ -664,27 +757,34 @@ impl RuntimeJetScalar for DynamicOneSeed {
 }
 
 /// Runtime-sized two-seed scalar for a Hessian-contracted fourth derivative.
-#[derive(Clone, Debug)]
-pub struct DynamicTwoSeed {
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicTwoSeed<'arena> {
     /// Base value/gradient/Hessian channels.
-    pub base: DynamicOrder2,
+    pub base: DynamicOrder2<'arena>,
     /// Nilpotent `epsilon` coefficient.
-    pub eps: DynamicOrder2,
+    pub eps: DynamicOrder2<'arena>,
     /// Nilpotent `delta` coefficient.
-    pub del: DynamicOrder2,
+    pub del: DynamicOrder2<'arena>,
     /// Mixed `epsilon delta` coefficient.
-    pub eps_del: DynamicOrder2,
+    pub eps_del: DynamicOrder2<'arena>,
 }
 
-impl DynamicTwoSeed {
+impl<'arena> DynamicTwoSeed<'arena> {
     /// Seed one primary with both contraction direction components.
     #[must_use]
-    pub fn seed(x: f64, axis: usize, u_axis: f64, v_axis: f64, dimension: usize) -> Self {
+    pub fn seed(
+        x: f64,
+        axis: usize,
+        u_axis: f64,
+        v_axis: f64,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
         Self {
-            base: DynamicOrder2::variable(x, axis, dimension),
-            eps: DynamicOrder2::constant(u_axis, dimension),
-            del: DynamicOrder2::constant(v_axis, dimension),
-            eps_del: DynamicOrder2::constant(0.0, dimension),
+            base: DynamicOrder2::variable(x, axis, dimension, arena),
+            eps: DynamicOrder2::constant(u_axis, dimension, arena),
+            del: DynamicOrder2::constant(v_axis, dimension, arena),
+            eps_del: DynamicOrder2::constant(0.0, dimension, arena),
         }
     }
 
@@ -695,22 +795,29 @@ impl DynamicTwoSeed {
     }
 }
 
-impl RuntimeJetScalar for DynamicTwoSeed {
-    fn constant(c: f64, dimension: usize) -> Self {
+impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
+    type Workspace = DynamicJetArena;
+
+    fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
-            base: DynamicOrder2::constant(c, dimension),
-            eps: DynamicOrder2::constant(0.0, dimension),
-            del: DynamicOrder2::constant(0.0, dimension),
-            eps_del: DynamicOrder2::constant(0.0, dimension),
+            base: DynamicOrder2::constant(c, dimension, arena),
+            eps: DynamicOrder2::constant(0.0, dimension, arena),
+            del: DynamicOrder2::constant(0.0, dimension, arena),
+            eps_del: DynamicOrder2::constant(0.0, dimension, arena),
         }
     }
 
-    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
         Self {
-            base: DynamicOrder2::variable(x, axis, dimension),
-            eps: DynamicOrder2::constant(0.0, dimension),
-            del: DynamicOrder2::constant(0.0, dimension),
-            eps_del: DynamicOrder2::constant(0.0, dimension),
+            base: DynamicOrder2::variable(x, axis, dimension, arena),
+            eps: DynamicOrder2::constant(0.0, dimension, arena),
+            del: DynamicOrder2::constant(0.0, dimension, arena),
+            eps_del: DynamicOrder2::constant(0.0, dimension, arena),
         }
     }
 

@@ -1339,8 +1339,17 @@ impl SaeManifoldTerm {
         per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
         isometry_pin_active: bool,
         reconstruction_dispersion: Option<f64>,
+        fitted: ArrayView2<'_, f64>,
         assignments_override: Option<ArrayView2<'_, f64>>,
     ) -> Result<SaeManifoldFitDiagnostics, String> {
+        if fitted.dim() != (self.n_obs(), self.output_dim()) {
+            return Err(format!(
+                "fit_diagnostics_report: fitted shape {:?} must be ({}, {})",
+                fitted.dim(),
+                self.n_obs(),
+                self.output_dim()
+            ));
+        }
         if let Some(view) = assignments_override {
             let n = self.n_obs();
             let k = self.k_atoms();
@@ -1440,7 +1449,9 @@ impl SaeManifoldTerm {
             residual_gauge,
             incoherence_report: match reconstruction_dispersion.or(self.certificate_dispersion) {
                 Some(dispersion) => Some(dictionary_incoherence_report_with_dispersion(
-                    self, dispersion,
+                    self,
+                    dispersion,
+                    fitted,
                 )?),
                 None => None,
             },
@@ -3020,7 +3031,9 @@ impl SaeManifoldTerm {
     }
 
     pub fn fitted(&self) -> Array2<f64> {
-        self.try_fitted().expect("assignment logits must be finite")
+        self.try_fitted().expect(
+            "fitted reconstruction requires finite assignments and no target-dependent rescue",
+        )
     }
 
     /// The #1026 hybrid-collapse substitution map: `atom_idx → &AtomLinearImage`
@@ -3053,14 +3066,14 @@ impl SaeManifoldTerm {
     }
 
     /// #1228 — attach the trained dictionary's hybrid-collapsed linear images to
-    /// this (typically OOS) term so its reconstruction (`fitted` / the top-k
-    /// assembler) decodes verdict-linear `d = 1` slots by the SAME straight
-    /// sub-model the training reconstruction used, instead of the original
-    /// curved decoder. Each image's `atom_idx` must index a real slot; an image
-    /// whose channel count `p` disagrees with this term's output dim, or whose
-    /// `atom_idx` is out of range, is rejected so a stale/mismatched payload
-    /// cannot silently corrupt the reconstruction. Pass an empty slice (or never
-    /// call this) for an all-curved OOS reconstruction.
+    /// this (typically OOS) term so target-aware reconstruction decodes
+    /// verdict-linear `d = 1` slots by the SAME straight sub-model the training
+    /// reconstruction used, instead of the original curved decoder. Each image's
+    /// `atom_idx` must be unique and index a real slot; an image whose channel
+    /// count `p` disagrees with this term's output dim, or whose `atom_idx` is out
+    /// of range, is rejected so a stale/mismatched payload cannot silently corrupt
+    /// the reconstruction. Pass an empty vector (or never call this) for an
+    /// all-curved OOS reconstruction.
     ///
     /// `pub` (not `pub(crate)`): this is part of the FFI surface — the gam-pyffi
     /// crate calls it from `latent_basis_and_sae_ffi.rs` to attach a trained
@@ -3073,7 +3086,14 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
+        let mut seen = std::collections::HashSet::with_capacity(images.len());
         for img in &images {
+            if !seen.insert(img.atom_idx) {
+                return Err(format!(
+                    "set_hybrid_linear_images: duplicate image for atom {}",
+                    img.atom_idx
+                ));
+            }
             if img.atom_idx >= k_atoms {
                 return Err(format!(
                     "set_hybrid_linear_images: atom_idx {} out of range (k_atoms={k_atoms})",
@@ -3124,7 +3144,10 @@ impl SaeManifoldTerm {
     /// reconstruction composes with hybrid collapse (#1233) instead of
     /// re-deriving the curved image by hand and silently bypassing the verdict.
     /// The atom coordinates (`t`) and decoded curves are the term's own fitted
-    /// ones; only the assignment masses come from `assignments`.
+    /// ones; only the assignment masses come from `assignments`. Because this
+    /// entry point has no target, it explicitly refuses a collapse-rescued image;
+    /// callers with a target must use
+    /// [`Self::reconstruct_from_assignments_target_aware`].
     pub fn reconstruct_from_assignments(
         &self,
         assignments: ArrayView2<'_, f64>,
@@ -3144,6 +3167,15 @@ impl SaeManifoldTerm {
         } else {
             std::collections::HashMap::new()
         };
+        if let Some(image) = linear_images
+            .values()
+            .find(|image| image.is_collapse_rescued())
+        {
+            return Err(format!(
+                "SaeManifoldTerm::reconstruct_from_assignments: collapse-rescued atom {} requires reconstruct_from_assignments_target_aware",
+                image.atom_idx
+            ));
+        }
         let mut out = Array2::<f64>::zeros((n, p));
         // Per-row reconstruction: each row reads only immutable `&self`/`assignments`
         // state and writes ONLY its own `out` row (a per-row accumulation over atoms,
@@ -3160,7 +3192,7 @@ impl SaeManifoldTerm {
                 }
                 if let Some(image) = linear_images.get(&atom_idx) {
                     let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                    image.fill_row(image.coordinate_for_row(row, own_t), g_buf);
+                    image.fill_row(own_t, g_buf);
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, g_buf);
                 }
@@ -3203,20 +3235,83 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Assemble a hybrid-collapsed reconstruction from explicit assignment
+    /// masses and the response being reconstructed. Ordinary straight images use
+    /// the atom's realized coordinate. A collapse-rescued image derives every
+    /// coordinate from that row's leave-this-atom-out residual projected onto its
+    /// persisted direction `v`; no train-row coordinate cache exists.
+    pub fn reconstruct_from_assignments_target_aware(
+        &self,
+        target: ArrayView2<'_, f64>,
+        assignments: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if target.dim() != (n, p) || assignments.dim() != (n, k_atoms) {
+            return Err(format!(
+                "SaeManifoldTerm::reconstruct_from_assignments_target_aware: target={:?}, assignments={:?} disagree with ({n}, {p}) and ({n}, {k_atoms})",
+                target.dim(),
+                assignments.dim()
+            ));
+        }
+        let linear_images = self.hybrid_linear_image_map();
+        let full_curved = self.reconstruct_from_assignments(assignments, false)?;
+        if linear_images.is_empty() {
+            return Ok(full_curved);
+        }
+
+        let mut out = Array2::<f64>::zeros((n, p));
+        let mut decoded = vec![0.0_f64; p];
+        let mut image_row = vec![0.0_f64; p];
+        let mut residual = vec![0.0_f64; p];
+        for row in 0..n {
+            for atom_idx in 0..k_atoms {
+                let mass = assignments[[row, atom_idx]];
+                if mass == 0.0 {
+                    continue;
+                }
+                if let Some(image) = linear_images.get(&atom_idx) {
+                    let coordinate = if image.is_collapse_rescued() {
+                        self.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
+                        for output in 0..p {
+                            residual[output] = target[[row, output]]
+                                - full_curved[[row, output]]
+                                + mass * decoded[output];
+                        }
+                        image.coordinate_from_residual(&residual).ok_or_else(|| {
+                            format!(
+                                "SaeManifoldTerm::reconstruct_from_assignments_target_aware: collapse-rescued atom {atom_idx} cannot project a {p}-channel residual"
+                            )
+                        })?
+                    } else {
+                        self.assignment.coords[atom_idx].as_matrix()[[row, 0]]
+                    };
+                    image.fill_row(coordinate, &mut image_row);
+                } else {
+                    self.atoms[atom_idx].fill_decoded_row(row, &mut image_row);
+                }
+                for output in 0..p {
+                    out[[row, output]] += mass * image_row[output];
+                }
+            }
+        }
+        self.add_tier0_mean_inplace(&mut out);
+        Ok(out)
+    }
+
     /// #1777 — TARGET-AWARE hybrid-collapsed reconstruction: identical to
     /// [`Self::try_fitted`] except that a #1026 COLLAPSE-RESCUED `d = 1` slot
     /// (whose linear image carries a projection direction `v`) recomputes each
     /// row's coordinate from THIS `target` as
     /// `uᵢ = ⟨y_i − Σ_{j≠k} f_j(x_i), v⟩` — its own leave-this-atom-out residual
-    /// projected onto `v` — instead of reading the train-only cached
-    /// `row_codes[i]` (or, worse, the atom's collapsed own coordinate `own_t`).
+    /// projected onto `v`. This projection is the only collapse-rescue coordinate
+    /// model; there is no train-row cache or own-coordinate substitute.
     ///
-    /// This is the SAME math the train split used to build `row_codes`
-    /// (`row_codes[i] = ⟨target_resid[i], v⟩`), so on the TRAIN rows/target it
-    /// reproduces the train reconstruction bit-for-bit, and on a HELD-OUT
-    /// rows/target it produces the correct out-of-sample coordinate — train and
-    /// OOS are ONE model. Ordinary (non-rescued) straight images and curved slots
-    /// are decoded exactly as in [`Self::try_fitted`]; they ignore `target`.
+    /// This is the SAME math the train split used to fit the image, so train and
+    /// held-out rows use one model. Ordinary (non-rescued) straight images and
+    /// curved slots are decoded exactly as in [`Self::try_fitted`]; they ignore
+    /// `target`.
     ///
     /// `rho` selects the assignment-mass resolution (`Some` uses the ρ-keyed
     /// gates, `None` the persisted gates), mirroring [`Self::try_fitted_with_rho`].
@@ -3261,23 +3356,16 @@ impl SaeManifoldTerm {
                             resid_buf[col] = target[[row, col]] - full_curved[[row, col]]
                                 + a_k * decoded_buf[col];
                         }
-                        // `coordinate_from_residual` returns `None` only on a
-                        // length mismatch (impossible here — validated at attach)
-                        // or a non-rescued image (excluded by the branch); fall
-                        // back to the train code/own-coord path if it ever does.
-                        let coord =
-                            image
-                                .coordinate_from_residual(&resid_buf)
-                                .unwrap_or_else(|| {
-                                    let own_t =
-                                        self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                                    image.coordinate_for_row(row, own_t)
-                                });
+                        let coord = image.coordinate_from_residual(&resid_buf).ok_or_else(|| {
+                            format!(
+                                "SaeManifoldTerm::try_fitted_target_aware: collapse-rescued atom {atom_idx} cannot project a {p}-channel residual"
+                            )
+                        })?;
                         image.fill_row(coord, &mut g_buf);
                     } else {
                         // Ordinary straight image: decode at the atom's own coord.
                         let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                        image.fill_row(image.coordinate_for_row(row, own_t), &mut g_buf);
+                        image.fill_row(own_t, &mut g_buf);
                     }
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
@@ -3340,6 +3428,15 @@ impl SaeManifoldTerm {
         } else {
             std::collections::HashMap::new()
         };
+        if let Some(image) = linear_images
+            .values()
+            .find(|image| image.is_collapse_rescued())
+        {
+            return Err(format!(
+                "SaeManifoldTerm::try_fitted: collapse-rescued atom {} requires try_fitted_target_aware",
+                image.atom_idx
+            ));
+        }
         // Reuse a single scratch buffer across all (row, atom) pairs instead of
         // allocating a fresh `Array1<f64>` of length p per call.
         //
@@ -3358,10 +3455,10 @@ impl SaeManifoldTerm {
                     let a_k = a[atom_idx];
                     if let Some(image) = linear_images.get(&atom_idx) {
                         // Verdict-linear slot: substitute the straight sub-model
-                        // image at this row's fitted on-atom coordinate — or, for a
-                        // #1026 collapse-rescued slot, at its fresh per-row code.
+                        // image at this row's fitted on-atom coordinate. Rescued
+                        // images were refused above because they require a target.
                         let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                        image.fill_row(image.coordinate_for_row(row, own_t), g_buf);
+                        image.fill_row(own_t, g_buf);
                     } else {
                         self.atoms[atom_idx].fill_decoded_row(row, g_buf);
                     }
@@ -3647,7 +3744,9 @@ impl SaeManifoldTerm {
     /// realized inside [`Self::compute_hybrid_split_report`] (no re-fit, no outer
     /// continuation, sidestepping #1051). Returns the curved reconstruction
     /// unchanged when no verdict selected linear, or when the report has not been
-    /// computed yet (`hybrid_split_report == None`).
+    /// computed yet (`hybrid_split_report == None`). A collapse-rescued image is
+    /// refused because this method has no target from which to derive its
+    /// coordinate; use [`Self::try_fitted_target_aware`] instead.
     pub fn hybrid_collapsed_reconstruction(
         &self,
         rho: &SaeManifoldRho,
@@ -3658,8 +3757,8 @@ impl SaeManifoldTerm {
         // instead of its curved curve. This replaces the dedicated re-collapse
         // loop this method used to carry (a parallel layer). The production
         // `try_fitted` shares the identical routine at `rho = None`; this entry
-        // point keeps the rho-keyed collapse for the #1026 EV-dominance reporting
-        // (`hybrid_collapsed_explained_variance`) and the regression battery.
+        // point keeps the rho-keyed, target-less collapse for callers whose
+        // report contains only ordinary straight images.
         self.try_fitted_with_rho(Some(rho), true)
     }
 
@@ -3685,7 +3784,7 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        let collapsed = self.hybrid_collapsed_reconstruction(rho)?;
+        let collapsed = self.try_fitted_target_aware(target, Some(rho))?;
         Ok(reconstruction_explained_variance(target, collapsed.view()))
     }
 
