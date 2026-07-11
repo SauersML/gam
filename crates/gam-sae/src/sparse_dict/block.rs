@@ -1294,20 +1294,164 @@ pub(super) fn stable_rank_symmetric(c: ArrayView2<'_, f64>) -> f32 {
 // Seeding + validation + driver.
 // ---------------------------------------------------------------------------
 
-/// Deterministically seed the block frames from a farthest-point pass over the
-/// rows (reusing the atom lane's [`super::update::seed_decoder`] to pick `K`
-/// distinct direction rows), then orthonormalise each block's `b` rows so every
-/// frame starts as a genuine `St(b, P)` point.
+/// Deterministically seed whole subspaces with a block-aware farthest-point
+/// pass.  Scalar farthest-point seeding followed by grouping adjacent rows can
+/// put directions from unrelated subspaces in the same block.  Every such
+/// mixed block may still receive traffic, so dead-block revival cannot repair
+/// the resulting live local optimum.
+///
+/// This is the block analogue of k-means++ / k-subspaces++:
+///
+/// 1. the next block starts at the row farthest from its nearest completed
+///    block projector;
+/// 2. the remaining axes maximize uncovered energy times both their affinity
+///    to, and novelty beyond, the partial block;
+/// 3. nearest-projector residuals are updated after the completed Stiefel frame.
+///
+/// Orthogonal unrelated subspaces have zero affinity, so they cannot be folded
+/// into the same block while a rank-completing row from the anchor subspace is
+/// available.  Work is `O(N P G b)`, matching the scalar `K = G b` pass up to
+/// the small block factor, and the only corpus-sized scratch is `O(N)` -- no
+/// dense `N x K` or second `N x P` object is formed.
 pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> Array2<f32> {
-    let k = n_blocks * b;
-    let mut decoder = super::update::seed_decoder(x, k);
+    let n = x.nrows();
+    let p = x.ncols();
+    let row_energy: Vec<f64> = x
+        .axis_iter(Axis(0))
+        .map(|row| row.iter().map(|&value| (value as f64).powi(2)).sum())
+        .collect();
+    let mut nearest_projector_residual = row_energy.clone();
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
+
     for g in 0..n_blocks {
-        let mut block = decoder.slice(ndarray::s![g * b..g * b + b, ..]).to_owned();
-        orthonormalize_block(&mut block);
-        for r in 0..b {
-            for c in 0..decoder.ncols() {
-                decoder[[g * b + r, c]] = block[[r, c]];
+        let anchor = (0..n)
+            .max_by(|&left, &right| {
+                nearest_projector_residual[left]
+                    .total_cmp(&nearest_projector_residual[right])
+                    .then_with(|| right.cmp(&left))
+            })
+            .expect("validated non-empty block dictionary input");
+
+        let mut axes: Vec<Vec<f64>> = Vec::with_capacity(b);
+        let mut partial_capture = vec![0.0_f64; n];
+        for axis_index in 0..b {
+            let row_index = if axis_index == 0 {
+                anchor
+            } else {
+                (0..n)
+                    .max_by(|&left, &right| {
+                        let score = |row: usize| {
+                            let captured = partial_capture[row].min(row_energy[row]);
+                            let novel = (row_energy[row] - captured).max(0.0);
+                            nearest_projector_residual[row] * captured * novel
+                        };
+                        score(left)
+                            .total_cmp(&score(right))
+                            .then_with(|| {
+                                nearest_projector_residual[left]
+                                    .total_cmp(&nearest_projector_residual[right])
+                            })
+                            .then_with(|| right.cmp(&left))
+                    })
+                    .expect("validated non-empty block dictionary input")
+            };
+
+            let mut candidate: Vec<f64> = x
+                .row(row_index)
+                .iter()
+                .map(|&value| value as f64)
+                .collect();
+            let input_norm = row_energy[row_index].sqrt();
+            // Two-pass modified Gram--Schmidt removes the component in the
+            // partial frame to input precision before the axis is normalized.
+            for _ in 0..2 {
+                for axis in &axes {
+                    let projection: f64 = candidate
+                        .iter()
+                        .zip(axis.iter())
+                        .map(|(left, right)| left * right)
+                        .sum();
+                    for (value, direction) in candidate.iter_mut().zip(axis.iter()) {
+                        *value -= projection * direction;
+                    }
+                }
             }
+            let mut norm = candidate.iter().map(|value| value * value).sum::<f64>().sqrt();
+            let input_roundoff =
+                f32::EPSILON as f64 * (p.max(1) as f64).sqrt() * input_norm;
+            if norm <= input_roundoff {
+                // The observed rows no longer add rank to this frame.  Complete
+                // the required St(b,P) point with the canonical coordinate
+                // whose residual against the partial frame is largest.  This
+                // is deterministic and threshold-free; p >= b guarantees a
+                // positive direction.
+                let mut best = vec![0.0_f64; p];
+                let mut best_norm2 = f64::NEG_INFINITY;
+                for coordinate in 0..p {
+                    let mut direction = vec![0.0_f64; p];
+                    direction[coordinate] = 1.0;
+                    for axis in &axes {
+                        let projection: f64 = direction
+                            .iter()
+                            .zip(axis.iter())
+                            .map(|(left, right)| left * right)
+                            .sum();
+                        for (value, basis_value) in direction.iter_mut().zip(axis.iter()) {
+                            *value -= projection * basis_value;
+                        }
+                    }
+                    let norm2 = direction.iter().map(|value| value * value).sum::<f64>();
+                    if norm2 > best_norm2 {
+                        best_norm2 = norm2;
+                        best = direction;
+                    }
+                }
+                norm = best_norm2.sqrt();
+                candidate = best;
+            }
+            for value in &mut candidate {
+                *value /= norm;
+            }
+            axes.push(candidate);
+
+            let axis = axes.last().expect("axis was just installed");
+            for row in 0..n {
+                let projection: f64 = x
+                    .row(row)
+                    .iter()
+                    .zip(axis.iter())
+                    .map(|(&value, direction)| value as f64 * direction)
+                    .sum();
+                partial_capture[row] += projection * projection;
+            }
+        }
+
+        let mut block = Array2::<f32>::zeros((b, p));
+        for row in 0..b {
+            for column in 0..p {
+                block[[row, column]] = axes[row][column] as f32;
+            }
+        }
+        orthonormalize_block(&mut block);
+        for row in 0..b {
+            for column in 0..p {
+                decoder[[g * b + row, column]] = block[[row, column]];
+            }
+        }
+
+        for row in 0..n {
+            let mut captured = 0.0_f64;
+            for axis in 0..b {
+                let projection: f64 = x
+                    .row(row)
+                    .iter()
+                    .zip(block.row(axis).iter())
+                    .map(|(&value, &direction)| value as f64 * direction as f64)
+                    .sum();
+                captured += projection * projection;
+            }
+            let residual = (row_energy[row] - captured).max(0.0);
+            nearest_projector_residual[row] = nearest_projector_residual[row].min(residual);
         }
     }
     decoder

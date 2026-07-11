@@ -207,6 +207,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let finite_difference = (plus_cost - minus_cost) / (2.0 * h);
     let frozen_finite_difference = (frozen_plus_cost - frozen_minus_cost) / (2.0 * h);
     let mut coordinate_fd = Array1::<f64>::zeros(base.len());
+    let mut frozen_coordinate_fd = Array1::<f64>::zeros(base.len());
     for coordinate in 0..base.len() {
         let mut axis = Array1::<f64>::zeros(base.len());
         axis[coordinate] = 1.0;
@@ -219,6 +220,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             .eval_cost(&axis_minus)
             .expect("coordinate -h value probe must converge");
         coordinate_fd[coordinate] = (axis_plus_cost - axis_minus_cost) / (2.0 * h);
+        frozen_coordinate_fd[coordinate] =
+            (frozen_cost_at(&axis_plus) - frozen_cost_at(&axis_minus)) / (2.0 * h);
     }
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
@@ -226,6 +229,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         "K=1 Softmax active-coordinate derivative mismatch: analytic direction={analytic:.9e}, \
          central FD={finite_difference:.9e}, error={:.3e}, scale={scale:.3e}, \
          gradient={:?}, coordinate_fd={coordinate_fd:?}, \
+         frozen_coordinate_fd={frozen_coordinate_fd:?}, \
          explicit={:?}, trace={:?}, occam={:?}, adjoint={:?}, \
          frozen_fd={frozen_finite_difference:.9e}, \
          kkt={kkt_norm:.9e}, quotient_kkt={quotient_kkt_norm:.9e}, \

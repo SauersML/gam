@@ -449,6 +449,46 @@ fn small_k_block_fit_runs_on_cpu_baseline_2134() {
 }
 
 #[test]
+fn block_seed_preserves_planted_subspaces_2134() {
+    // The scalar farthest-point seed used to choose G*b unrelated rows and only
+    // then group adjacent pairs.  On this orthogonal four-subspace fixture that
+    // produced four live mixed frames, so usage-only revival could not repair
+    // the EV=0.86 local optimum.  The production block-aware seed must cover
+    // every planted rank-b projector before alternating minimisation begins.
+    let (p, b, n_blocks) = (8usize, 2usize, 4usize);
+    let planted = planted_frames(p, n_blocks, b);
+    let x = planted_data(&planted, n_blocks, b, p, 200);
+    let seeded = seed_frames(x.view(), n_blocks, b);
+
+    let projector_roundoff =
+        (p * b * b) as f64 * f32::EPSILON as f64;
+    for planted_block in 0..n_blocks {
+        let mut best_overlap = f64::NEG_INFINITY;
+        for seeded_block in 0..n_blocks {
+            // tr(P_planted P_seeded) = ||D_planted D_seeded^T||_F^2;
+            // it equals b exactly iff the two rank-b subspaces coincide.
+            let mut overlap = 0.0_f64;
+            for left_axis in 0..b {
+                for right_axis in 0..b {
+                    let mut dot = 0.0_f64;
+                    for column in 0..p {
+                        dot += planted[[planted_block * b + left_axis, column]] as f64
+                            * seeded[[seeded_block * b + right_axis, column]] as f64;
+                    }
+                    overlap += dot * dot;
+                }
+            }
+            best_overlap = best_overlap.max(overlap);
+        }
+        assert!(
+            b as f64 - best_overlap <= projector_roundoff,
+            "block-aware seed must preserve planted subspace {planted_block}: \
+             best projector overlap {best_overlap} vs rank {b}"
+        );
+    }
+}
+
+#[test]
 fn planted_block_subspaces_recovered() {
     let (p, b, n_blocks) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, n_blocks, b);
