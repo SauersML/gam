@@ -63,65 +63,9 @@ impl PeriodicCurveExtrema {
     ) -> Result<PeriodicExtremum, String> {
         let linear = self.linear_polynomial(linear)?;
         let objective = self.quadratic.add_scaled(&linear, -2.0);
-        global_extremum(&objective.derivative(), ExtremumKind::Minimum, |t| {
+        global_minimum(&objective.derivative(), |t| {
             Ok(objective.eval_real(t))
         })
-    }
-
-    /// Maximise `max(c^T phi(t), 0)^2 / (phi(t)^T G phi(t))`, the reconstruction
-    /// gain after profiling the non-negative SAE amplitude. Its positive-score
-    /// stationary points are the roots of `2 q' r - q r'`, with
-    /// `q = c^T phi` and `r = phi^T G phi`. Restricting the score to `q > 0`
-    /// resolves the antipodal ambiguity of a sign-free projection and keeps the
-    /// coordinate solve consistent with the non-negative routed amplitude.
-    pub(crate) fn maximize_nonnegative_profiled_score(
-        &self,
-        linear: &[f64],
-    ) -> Result<PeriodicExtremum, String> {
-        let q = self.linear_polynomial(linear)?;
-        if q.is_numerically_zero() {
-            return Ok(PeriodicExtremum {
-                coordinate: 0.0,
-                value: 0.0,
-            });
-        }
-        if self.quadratic.is_numerically_zero() {
-            return Err(
-                "periodic profiled score: nonzero target projection with a zero decoder Gram"
-                    .to_string(),
-            );
-        }
-
-        // The coordinate is invariant under independent positive rescalings of
-        // `q` and `r`.  Forming `2 q' r - q r'` in physical units nevertheless
-        // multiplies three decoder-scale factors: a perfectly ordinary decoder
-        // rescaling can therefore underflow the entire stationarity polynomial
-        // to zero or overflow it to infinity.  Normalize the two Laurent
-        // polynomials BEFORE multiplying them, and restore only the scalar score
-        // ratio after candidate evaluation.
-        let (q, q_scale) = q.normalized()?;
-        let (r, r_scale) = self.quadratic.normalized()?;
-        let q_prime = q.derivative();
-        let r_prime = r.derivative();
-        let stationarity = q_prime
-            .multiply(&r)
-            .scaled(2.0)
-            .add_scaled(&q.multiply(&r_prime), -1.0);
-        // Compare candidates in normalized units.  Rescaling inside the
-        // comparison could underflow every finite score to zero (or overflow
-        // every score to infinity) even though their ordering is perfectly
-        // representable.
-        let mut solution = global_extremum(&stationarity, ExtremumKind::Maximum, |t| {
-            nonnegative_profiled_score_at(&q, &r, t)
-        })?;
-        if solution.value == 0.0 {
-            // No positive projection exists. The constrained optimum is the
-            // zero-amplitude reconstruction at every coordinate, so choose the
-            // canonical chart origin instead of leaking a root-ordering choice.
-            solution.coordinate = 0.0;
-        }
-        solution.value = rescale_profiled_score(solution.value, q_scale, r_scale)?;
-        Ok(solution)
     }
 
     fn linear_polynomial(&self, linear: &[f64]) -> Result<LaurentPolynomial, String> {
@@ -178,28 +122,6 @@ impl LaurentPolynomial {
         let mut out = Self::zeros(degree);
         for h in -(degree as isize)..=degree as isize {
             *out.coefficient_mut(h) = self.coefficient(h) + rhs.coefficient(h) * scale;
-        }
-        out
-    }
-
-    fn scaled(mut self, scale: f64) -> Self {
-        for coefficient in &mut self.coefficients {
-            *coefficient *= scale;
-        }
-        self
-    }
-
-    fn multiply(&self, rhs: &Self) -> Self {
-        let degree = self.degree + rhs.degree;
-        let mut out = Self::zeros(degree);
-        for left in -(self.degree as isize)..=self.degree as isize {
-            let a = self.coefficient(left);
-            if a == c64::new(0.0, 0.0) {
-                continue;
-            }
-            for right in -(rhs.degree as isize)..=rhs.degree as isize {
-                *out.coefficient_mut(left + right) += a * rhs.coefficient(right);
-            }
         }
         out
     }
@@ -291,29 +213,6 @@ impl LaurentPolynomial {
                 .all(|coefficient| coefficient.re == 0.0 && coefficient.im == 0.0)
     }
 
-    fn derivative_bound(&self, order: usize) -> f64 {
-        self.coefficients
-            .iter()
-            .enumerate()
-            .map(|(index, coefficient)| {
-                let h = index as isize - self.degree as isize;
-                let frequency = std::f64::consts::TAU * h.unsigned_abs() as f64;
-                coefficient.re.hypot(coefficient.im) * frequency.powi(order as i32)
-            })
-            .sum()
-    }
-
-    fn derivative_value(&self, t: f64, order: usize) -> f64 {
-        let theta = std::f64::consts::TAU * t;
-        let mut value = c64::new(0.0, 0.0);
-        for h in -(self.degree as isize)..=self.degree as isize {
-            let frequency = std::f64::consts::TAU * h as f64;
-            let multiplier = c64::new(0.0, frequency).powi(order as i32);
-            let angle = theta * h as f64;
-            value += self.coefficient(h) * multiplier * c64::new(angle.cos(), angle.sin());
-        }
-        value.re
-    }
 }
 
 fn validate_harmonic_width(width: usize) -> Result<(), String> {
@@ -375,15 +274,8 @@ fn harmonic_quadratic(gram: ArrayView2<'_, f64>) -> LaurentPolynomial {
     out
 }
 
-#[derive(Clone, Copy)]
-enum ExtremumKind {
-    Minimum,
-    Maximum,
-}
-
-fn global_extremum(
+fn global_minimum(
     stationarity: &LaurentPolynomial,
-    kind: ExtremumKind,
     mut evaluate: impl FnMut(f64) -> Result<f64, String>,
 ) -> Result<PeriodicExtremum, String> {
     if stationarity.is_numerically_zero() {
@@ -426,16 +318,10 @@ fn global_extremum(
         let candidate = PeriodicExtremum { coordinate, value };
         let replace = match best {
             None => true,
-            Some(incumbent) => match kind {
-                ExtremumKind::Minimum => {
-                    value < incumbent.value
-                        || (value == incumbent.value && coordinate < incumbent.coordinate)
-                }
-                ExtremumKind::Maximum => {
-                    value > incumbent.value
-                        || (value == incumbent.value && coordinate < incumbent.coordinate)
-                }
-            },
+            Some(incumbent) => {
+                value < incumbent.value
+                    || (value == incumbent.value && coordinate < incumbent.coordinate)
+            }
         };
         if replace {
             best = Some(candidate);
@@ -523,121 +409,6 @@ fn polish_real_root(
         coordinate = next;
     }
     coordinate
-}
-
-fn nonnegative_profiled_score_at(
-    linear: &LaurentPolynomial,
-    quadratic: &LaurentPolynomial,
-    coordinate: f64,
-) -> Result<f64, String> {
-    let numerator = linear.eval_real(coordinate);
-    let denominator = quadratic.eval_real(coordinate);
-    let denominator_tolerance =
-        f64::EPSILON * quadratic.coefficients.len() as f64 * quadratic.coefficient_norm();
-    if denominator > 0.0 {
-        // A small positive value is still an ordinary nonsingular evaluation.
-        // Treating every value below a coefficient-scale tolerance as an exact
-        // zero can misclassify a merely nearby singular point and then abort the
-        // complete candidate comparison through an inapplicable Taylor limit.
-        return Ok(if numerator > 0.0 {
-            (numerator / denominator) * numerator
-        } else {
-            0.0
-        });
-    }
-    if denominator < -denominator_tolerance {
-        return Err(format!(
-            "periodic profiled score: decoder Gram produced negative norm {denominator}"
-        ));
-    }
-
-    // At an exact zero of the decoded curve, q^2/r can have a removable limit.
-    // Recover it from the first nonzero Taylor coefficients instead of choosing
-    // an arbitrary norm cutoff or discarding a legitimate limiting direction.
-    let numerator_order = first_nonzero_derivative(linear, coordinate);
-    let denominator_order = first_nonzero_derivative(quadratic, coordinate);
-    let Some((q_order, q_derivative)) = numerator_order else {
-        return Ok(0.0);
-    };
-    let Some((r_order, r_derivative)) = denominator_order else {
-        return Ok(0.0);
-    };
-    match (2 * q_order).cmp(&r_order) {
-        std::cmp::Ordering::Greater => Ok(0.0),
-        std::cmp::Ordering::Less => {
-            Err("periodic profiled score: numerator/Gram zero orders are inconsistent".into())
-        }
-        std::cmp::Ordering::Equal => {
-            let q_taylor = q_derivative / factorial(q_order);
-            let r_taylor = r_derivative / factorial(r_order);
-            if r_taylor <= 0.0 {
-                return Err(format!(
-                    "periodic profiled score: non-positive removable-limit denominator {r_taylor}"
-                ));
-            }
-            // If the leading numerator order is odd, one side of the zero has
-            // a positive projection. For an even order, the sign is the sign of
-            // its Taylor coefficient on both sides. Only a positively reachable
-            // branch belongs to the non-negative-amplitude profile.
-            if q_order % 2 == 1 || q_taylor > 0.0 {
-                Ok(q_taylor * q_taylor / r_taylor)
-            } else {
-                Ok(0.0)
-            }
-        }
-    }
-}
-
-fn rescale_profiled_score(
-    normalized_score: f64,
-    numerator_scale: f64,
-    denominator_scale: f64,
-) -> Result<f64, String> {
-    if normalized_score == 0.0 {
-        return Ok(0.0);
-    }
-    if !(numerator_scale.is_finite()
-        && numerator_scale > 0.0
-        && denominator_scale.is_finite()
-        && denominator_scale > 0.0)
-    {
-        return Err(format!(
-            "periodic profiled score has invalid normalization scales ({numerator_scale}, {denominator_scale})"
-        ));
-    }
-    if !(normalized_score.is_finite() && normalized_score > 0.0) {
-        return Err(format!(
-            "periodic profiled score has invalid normalized value {normalized_score}"
-        ));
-    }
-    let log_score = normalized_score.ln() + 2.0 * numerator_scale.ln() - denominator_scale.ln();
-    if log_score > f64::MAX.ln() {
-        return Err("periodic profiled score scale overflows f64".to_string());
-    }
-    if log_score < f64::from_bits(1).ln() {
-        return Ok(0.0);
-    }
-    Ok(log_score.exp())
-}
-
-fn first_nonzero_derivative(
-    polynomial: &LaurentPolynomial,
-    coordinate: f64,
-) -> Option<(usize, f64)> {
-    for order in 0..=2 * polynomial.degree {
-        let value = polynomial.derivative_value(coordinate, order);
-        let tolerance = f64::EPSILON
-            * polynomial.coefficients.len() as f64
-            * polynomial.derivative_bound(order);
-        if value.abs() > tolerance {
-            return Some((order, value));
-        }
-    }
-    None
-}
-
-fn factorial(order: usize) -> f64 {
-    (1..=order).fold(1.0, |value, factor| value * factor as f64)
 }
 
 fn canonical_coordinate(coordinate: f64) -> f64 {

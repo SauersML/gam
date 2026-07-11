@@ -1364,55 +1364,6 @@ fn sae_matching_pursuit_commit<'py>(
     }
 }
 
-/// Batched rank-1 chart-coordinate E-step solver for the torch `ManifoldSAE`
-/// `softmax_topk` lane (#2011-style Python→Rust trainer-math migration). For
-/// every `(row, atom)` pair it solves the on-manifold coordinate by projecting
-/// the target onto the atom's CURRENT decoded curve, amplitude profiled out,
-/// over a grid of `8·K` points derived from the basis width. The solved
-/// coordinates are E-step constants on the torch tape; the decoder gradient
-/// still flows through the basis evaluation at those coordinates.
-///
-/// * `x` — `(N, D)` observations.
-/// * `decoders` — `(F, K, D)` decoder blocks.
-/// * `n_harmonics` — periodic (Fourier) basis harmonic count; the basis width
-///   is `2·n_harmonics + 1` and must equal the decoder `K`.
-/// * `prev_positions` / `gate_weights` — optional `(N, F)` matrices; when BOTH
-///   are supplied the solver targets the leave-one-out residual
-///   `x − Σ_{g≠f} gate_g · m_g(t_g)` (second sweep). When either is omitted the
-///   plain target `x` is used (first sweep).
-///
-/// Returns solved coordinates `(N, F)` in `[0, 1)`. See
-/// `gam_sae::chart_coordinate_solve::solve_chart_coordinates`.
-#[pyfunction]
-#[pyo3(signature = (x, decoders, n_harmonics, prev_positions = None, gate_weights = None))]
-fn sae_solve_chart_coordinates<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    decoders: PyReadonlyArray3<'py, f64>,
-    n_harmonics: usize,
-    prev_positions: Option<PyReadonlyArray2<'py, f64>>,
-    gate_weights: Option<PyReadonlyArray2<'py, f64>>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let x_owned = x.as_array().to_owned();
-    let dec_owned = decoders.as_array().to_owned();
-    let prev_owned = prev_positions.map(|p| p.as_array().to_owned());
-    let gate_owned = gate_weights.map(|w| w.as_array().to_owned());
-    let out = py
-        .detach(move || {
-            let basis =
-                gam::terms::sae::chart_coordinate_solve::ChartBasisKind::Periodic { n_harmonics };
-            gam::terms::sae::chart_coordinate_solve::solve_chart_coordinates(
-                x_owned.view(),
-                dec_owned.view(),
-                basis,
-                prev_owned.as_ref().map(|p| p.view()),
-                gate_owned.as_ref().map(|w| w.view()),
-            )
-        })
-        .map_err(PyValueError::new_err)?;
-    Ok(out.into_pyarray(py).unbind())
-}
-
 /// Per-row / per-atom SAE trust scores from an assignment matrix and the
 /// per-atom trust vector. Returns `(row, per_atom)` where `row` is `(N,)` and
 /// `per_atom` is `(N, K)`. See `gam_sae::trust_scores::row_trust_scores`.
@@ -1436,30 +1387,6 @@ fn sae_row_trust_scores<'py>(
         row.into_pyarray(py).unbind(),
         per_atom.into_pyarray(py).unbind(),
     ))
-}
-
-/// Value and encoder-gradient of the period-1 coordinate alignment penalty for
-/// the torch manifold-SAE trainer. `encoder` and `solved` are `(N, F)`; returns
-/// `(value, grad)` where `grad` is `∂value/∂encoder` `(N, F)`. `solved` is a
-/// constant (the detached E-step solve). See
-/// `gam_sae::chart_coordinate_solve::position_alignment_penalty`.
-#[pyfunction]
-fn sae_position_alignment_penalty<'py>(
-    py: Python<'py>,
-    encoder: PyReadonlyArray2<'py, f64>,
-    solved: PyReadonlyArray2<'py, f64>,
-) -> PyResult<(f64, Py<PyArray2<f64>>)> {
-    let encoder_owned = encoder.as_array().to_owned();
-    let solved_owned = solved.as_array().to_owned();
-    let (value, grad) = py
-        .detach(move || {
-            gam::terms::sae::chart_coordinate_solve::position_alignment_penalty(
-                encoder_owned.view(),
-                solved_owned.view(),
-            )
-        })
-        .map_err(PyValueError::new_err)?;
-    Ok((value, grad.into_pyarray(py).unbind()))
 }
 
 /// Device-resident periodic basis+jet for the torch manifold-SAE lane.
@@ -5282,9 +5209,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;
     module.add_function(wrap_pyfunction!(sae_matching_pursuit_commit, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_solve_chart_coordinates, module)?)?;
     module.add_function(wrap_pyfunction!(sae_row_trust_scores, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_position_alignment_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_device_basis_width, module)?)?;
     module.add_function(wrap_pyfunction!(sae_duchon_basis_with_jet_cuda, module)?)?;

@@ -54,6 +54,36 @@ jobs:
             *underlying behaviour* must be correct in the general case, not
             just for the repro.
 
+            ## Figure it out MUCH more deeply before and while you fix
+
+            Out-investigate the bug. Do not stop at the first plausible
+            cause — trace the mechanism through the WHOLE system until you
+            can state, in one sentence, the exact line and reason the
+            behaviour is wrong, and predict precisely what your fix changes.
+            Build a real root-cause model: read every lane/branch/caller
+            the code flows through, diff against related history, form a
+            hypothesis, and CONFIRM it empirically (a targeted probe, an FD
+            check, a measured before/after) rather than assuming. When a
+            hypothesis is falsified, say so and re-diagnose — a wrong guess
+            cheaply killed is progress. Spend the bulk of the run
+            understanding; a fix built on a complete mental model is worth
+            ten built on a hunch.
+
+            ## HARD RULE: never end a run without editing code
+
+            Investigation is not a finish line. You MUST NOT stop, yield,
+            or end this session in a state where you have only read,
+            analysed, commented, or planned — you have to have EDITED
+            production code and pushed at least one real, coherent change
+            toward the fix to `main`. "I understand the bug and here's what
+            I'd change" is not acceptable as a stopping point: make the
+            change. If you have genuinely finished one issue (edits pushed,
+            verified), either chain the next related issue and keep editing,
+            or, only then, end. If you find yourself about to stop with no
+            code edited this run, that is a signal to KEEP GOING and land
+            the edit — not to wrap up. A run that ends with zero commits is
+            a failed run and will be automatically resumed to continue.
+
             ## You are not racing the clock
 
             There is no time pressure and no turn budget. If the right
@@ -211,10 +241,31 @@ jobs:
             If the build is broken just fix it and continue.
             
             Have fun. Take your time. Get it perfect.
+
+      # Continuation prompt used by the no-edit auto-resume steps below.
+      CLAUDE_RESUME_PROMPT: |
+            A previous attempt in THIS run ended without pushing any commit
+            to `main` — it stopped without editing code. That is not allowed.
+
+            Continue the work now. Re-read the fixer instructions you were
+            given (survey open issues with `gh issue list --state open`,
+            respect the concurrency lock, and pick up the issue a prior
+            attempt was on if one was claimed). Figure out the root cause
+            deeply, then MAKE THE EDIT: you must edit production code and
+            push at least one real, coherent change toward the fix to `main`
+            in this run. Do NOT stop, yield, or end until you have committed
+            and pushed a code change. Analysis, comments, and plans do not
+            count — land the edit.
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Record starting commit (for the no-edit auto-resume guard)
+        id: startsha
+        run: |
+          git fetch origin main --quiet || true
+          echo "sha=$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-python@v5
         with:
@@ -273,6 +324,66 @@ jobs:
             actions: read
           prompt: ${{ env.CLAUDE_FIXER_PROMPT }}
 
+      # ── No-edit auto-resume ────────────────────────────────────────────
+      # If the run ended without advancing origin/main (i.e. Claude stopped
+      # without editing + pushing code), re-invoke it to continue. Two
+      # chained rounds; each is skipped the moment a commit has landed.
+      - name: Check whether any code was pushed (round 1)
+        id: edited1
+        if: always()
+        run: |
+          git fetch origin main --quiet || true
+          if [ "$(git rev-parse origin/main)" != "${{ steps.startsha.outputs.sha }}" ]; then
+            echo "advanced=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "advanced=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Claude ended without pushing any commit — auto-resuming."
+          fi
+
+      - name: Resume Claude (round 1 — stopped without editing)
+        id: claude_resume1
+        if: always() && steps.edited1.outputs.advanced == 'false'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_ALT_OAUTH_TOKEN }}
+          show_full_output: false
+          claude_args: >-
+            --model claude-opus-4-8
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: ${{ env.CLAUDE_RESUME_PROMPT }}
+
+      - name: Check whether any code was pushed (round 2)
+        id: edited2
+        if: always()
+        run: |
+          git fetch origin main --quiet || true
+          if [ "$(git rev-parse origin/main)" != "${{ steps.startsha.outputs.sha }}" ]; then
+            echo "advanced=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "advanced=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Still no commit after resume 1 — auto-resuming again."
+          fi
+
+      - name: Resume Claude (round 2 — still no edit)
+        id: claude_resume2
+        if: always() && steps.edited2.outputs.advanced == 'false'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: false
+          claude_args: >-
+            --model claude-opus-4-8
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
+          additional_permissions: |
+            actions: read
+          prompt: ${{ env.CLAUDE_RESUME_PROMPT }}
+
       - name: Print Claude transcript
         if: always()
-        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude_fallback.outputs.execution_file || steps.claude_primary.outputs.execution_file }}'
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude_resume2.outputs.execution_file || steps.claude_resume1.outputs.execution_file || steps.claude_fallback.outputs.execution_file || steps.claude_primary.outputs.execution_file }}'

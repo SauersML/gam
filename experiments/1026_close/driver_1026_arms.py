@@ -198,20 +198,6 @@ def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed
     import torch
     from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig
 
-    # Deploy-skew preflight: this arm needs API that older installed gamfit
-    # wheels lack. Fail at entry with an actionable message instead of an
-    # AttributeError minutes into a GPU job (node1 4c04d9ffeb94).
-    for required in ("position_alignment_penalty",):
-        if not hasattr(ManifoldSAE, required):
-            import gamfit
-            raise SystemExit(
-                f"[torch_manifold] installed gamfit "
-                f"{getattr(gamfit, '__version__', '?')} at "
-                f"{os.path.dirname(gamfit.__file__)} predates "
-                f"ManifoldSAE.{required}; upgrade the venv wheel to the current "
-                f"build before submitting this arm."
-            )
-
     torch.set_float32_matmul_precision("high")  # TF32 on B200; applied to BOTH torch arms
     torch.manual_seed(seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -235,8 +221,7 @@ def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed
         batch = xtr[i]
         out = model(batch)
         loss = (torch.mean((out.x_hat - batch) ** 2)
-                + model.sparsity.penalty(out.gate)
-                + model.position_alignment_penalty())
+                + model.sparsity.penalty(out.gate))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
