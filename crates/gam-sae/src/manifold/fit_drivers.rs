@@ -6666,10 +6666,19 @@ impl SaeManifoldTerm {
     /// `penalized_objective_total` (the one scalar the whole inner stack
     /// prices), else the pre-round state is restored bit-for-bit and the loop
     /// stops — so the sweep map is monotone, deterministic given the seed, and
-    /// can never worsen the state. Frames-active fits are skipped (the decoder
-    /// LSQ writes the full-`B` layout, which would desync the factored
-    /// frames); callers must not invoke this under the `max_iter == 0` freeze
-    /// contract (a decoder refit would overwrite the warm-started β).
+    /// can never worsen the state. FRAMES-AWARE: on a frames-active fit each
+    /// decoder-LSQ is followed by the closed-form frame re-polar
+    /// (`refresh_active_frames_from_data` — thin SVD + `B ← (BU)Uᵀ`
+    /// re-projection, the same primitives frame activation itself uses), so
+    /// the factored border stays consistent with the refreshed decoder; the
+    /// whole round is one transaction, so a re-projection that loses the LSQ
+    /// optimality reverts and the sweep degrades to a no-op, never worse.
+    /// This closed the wide-p coverage hole: frames auto-activate at p ≥ 12,
+    /// so the historical frames skip silently excluded the sweep engine from
+    /// most REAL fits — including the wide-p K=4 fixture whose 640-iteration
+    /// walk diverges to ‖g‖ ≈ 3e27 with no LSQ reset on the path. Callers
+    /// must not invoke this under the `max_iter == 0` freeze contract (a
+    /// decoder refit would overwrite the warm-started β).
     ///
     /// This is the stage-4 primary engine (#2228): at fixed gates the decoder
     /// block is an exactly solvable penalized linear LS and the coordinate
@@ -6683,22 +6692,36 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<bool, String> {
-        if self.frames_active() {
-            return Ok(false);
-        }
         let mut best_objective =
             self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
         if !best_objective.is_finite() {
             return Ok(false);
         }
+        let frames = self.frames_active();
         let mut moved = false;
         loop {
             let snapshot = self.snapshot_mutable_state();
             let round = self
                 .refit_decoder_least_squares_at_current_state(target, Some(rho))
+                .and_then(|()| {
+                    if frames {
+                        self.refresh_active_frames_from_data(target)
+                            .map_err(|err| format!("sweep frame re-polar: {err}"))
+                    } else {
+                        Ok(())
+                    }
+                })
                 .and_then(|()| self.seed_coords_by_decoder_projection(target))
                 .and_then(|()| {
                     self.refit_decoder_least_squares_at_current_state(target, Some(rho))
+                })
+                .and_then(|()| {
+                    if frames {
+                        self.refresh_active_frames_from_data(target)
+                            .map_err(|err| format!("sweep frame re-polar: {err}"))
+                    } else {
+                        Ok(())
+                    }
                 })
                 .and_then(|()| {
                     self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
