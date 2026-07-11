@@ -237,17 +237,34 @@ pub trait OuterObjective {
         None
     }
 
-    /// Whether a non-finite cost at the literal outer seed may be repaired by
-    /// the certified heavy-smoothing [`crate::continuation_path::ContinuationPath`].
+    /// Typed scalar continuation contract for repairing a non-finite literal
+    /// outer seed through [`crate::continuation_path::ContinuationPath`].
     ///
     /// This is a typed domain-entry capability, not a fallback objective. The
-    /// runner always probes the real seed first. A finite seed proceeds without
-    /// a continuation walk; only an undefined seed criterion activates the
-    /// heavy-to-real homotopy, whose arrival is re-evaluated at the exact seed.
-    /// If that exact value remains undefined, the seed stays refused. No finite
-    /// sentinel or zero derivative is manufactured.
-    fn supports_reactive_domain_entry(&self) -> bool {
-        false
+    /// objective supplies both the smoother entry state and its literal target
+    /// state. `None` means this objective has no such domain homotopy. The
+    /// runner always probes the real seed first, so merely supplying a contract
+    /// performs no waypoint installation or heavy work on a finite seed.
+    fn reactive_domain_scalar_contract(
+        &self,
+    ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
+        Ok(None)
+    }
+
+    /// Install one scalar waypoint before the continuation rho spine evaluates
+    /// the objective. Objectives that return `Some` from
+    /// [`Self::reactive_domain_scalar_contract`] must override this method; the
+    /// default is a typed contract refusal, never a silent no-op.
+    fn install_reactive_domain_scalar_state(
+        &mut self,
+        state: &crate::continuation_path::ContinuationScalarState,
+    ) -> Result<(), EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(format!(
+            "objective supplied a reactive-domain scalar contract but cannot install its \
+             waypoint (temperature={}, isometry_dim={})",
+            state.assignment_temperature,
+            state.isometry_weights.len(),
+        )))
     }
 
     /// Run the objective's certified curvature-homotopy entry leg, if it has
@@ -688,8 +705,17 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.allow_continuation_prewarm()
     }
 
-    fn supports_reactive_domain_entry(&self) -> bool {
-        self.inner.supports_reactive_domain_entry()
+    fn reactive_domain_scalar_contract(
+        &self,
+    ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
+        self.inner.reactive_domain_scalar_contract()
+    }
+
+    fn install_reactive_domain_scalar_state(
+        &mut self,
+        state: &crate::continuation_path::ContinuationScalarState,
+    ) -> Result<(), EstimationError> {
+        self.inner.install_reactive_domain_scalar_state(state)
     }
 
     fn reset(&mut self) {
@@ -1238,8 +1264,17 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         self.inner.allow_continuation_prewarm()
     }
 
-    fn supports_reactive_domain_entry(&self) -> bool {
-        self.inner.supports_reactive_domain_entry()
+    fn reactive_domain_scalar_contract(
+        &self,
+    ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
+        self.inner.reactive_domain_scalar_contract()
+    }
+
+    fn install_reactive_domain_scalar_state(
+        &mut self,
+        state: &crate::continuation_path::ContinuationScalarState,
+    ) -> Result<(), EstimationError> {
+        self.inner.install_reactive_domain_scalar_state(state)
     }
 
     fn accept_seed_without_outer_iterations(

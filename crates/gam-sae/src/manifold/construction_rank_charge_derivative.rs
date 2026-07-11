@@ -117,7 +117,6 @@ impl SaeManifoldTerm {
                     penalized_gram[[row, col]] +=
                         lambda[atom_idx] * atom.smooth_penalty[[row, col]];
                 }
-                penalized_gram[[row, row]] += 1.0e-12;
             }
             let factor = penalized_gram.cholesky(Side::Lower).map_err(|error| {
                 format!(
@@ -133,8 +132,13 @@ impl SaeManifoldTerm {
             let mut gram_differential = Array2::<f64>::zeros((m, m));
             let mut log_lambda_differential = 0.0_f64;
             if edf_is_interior {
-                let inv_s_inv = inverse.dot(&atom.smooth_penalty).dot(&inverse);
-                gram_differential = inv_s_inv * (0.5 * rank * log_n * lambda[atom_idx]);
+                // d tr((G+λS)⁻¹G) / dG = A⁻¹ − A⁻¹GA⁻¹.
+                // Writing this identity directly keeps the derivative paired to
+                // the exact matrix used by the value, with no hidden diagonal
+                // regularizer whose differential would otherwise be omitted.
+                let inverse_gram_inverse = inverse.dot(gram).dot(&inverse);
+                gram_differential = (&inverse - &inverse_gram_inverse)
+                    * (0.5 * rank * log_n);
                 let inv_g_inv_s = inverse.dot(gram).dot(&inverse).dot(&atom.smooth_penalty);
                 let edf_log_lambda =
                     -lambda[atom_idx] * (0..m).map(|i| inv_g_inv_s[[i, i]]).sum::<f64>();

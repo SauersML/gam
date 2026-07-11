@@ -49,15 +49,15 @@ fn wide_p_k4_in_regime() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         let mut coords = Array2::<f64>::zeros((n_obs, 1));
         for row in 0..n_obs {
             let x = row as f64;
-            coords[[row, 0]] =
-                -0.6 + 0.011 * f * x + 0.05 * (0.03 * f * x + 0.4 * f).sin();
+            coords[[row, 0]] = -0.6 + 0.011 * f * x + 0.05 * (0.03 * f * x + 0.4 * f).sin();
         }
         let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).unwrap());
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         let n_basis = phi.ncols();
         // Distinct nonzero decoders per atom, wide p_out.
         let decoder = Array2::<f64>::from_shape_fn((n_basis, p_out), |(m, c)| {
-            0.12 * f * ((m + 1) as f64) - 0.04 * (c as f64) + 0.03 * (0.7 * f + 0.2 * m as f64).cos()
+            0.12 * f * ((m + 1) as f64) - 0.04 * (c as f64)
+                + 0.03 * (0.7 * f + 0.2 * m as f64).cos()
         });
         let atom = SaeManifoldAtom::new(
             format!("euclid_d1_{atom_idx}"),

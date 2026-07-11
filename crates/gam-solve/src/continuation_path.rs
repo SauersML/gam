@@ -83,8 +83,6 @@ use crate::estimate::reml::continuation::{
     ContinuationFailure, ContinuationState, PATH_BUDGET, continue_path_from, fit_with_continuation,
 };
 use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
-use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
-use gam_terms::analytic_penalties::ScalarWeightSchedule;
 
 /// Number of lockstep waypoints the path visits as `s` walks `1 → 0`. Each
 /// waypoint advances every leg one notch and runs one ρ-anneal spine pass.
@@ -177,6 +175,114 @@ impl LegEndpoints {
     }
 }
 
+/// Literal scalar state of an objective at one coupled-domain waypoint.
+///
+/// The assignment temperature is a single global scalar. Isometry weights are
+/// retained one-per-registered penalty: collapsing them into one synthetic
+/// number would lose the objective's actual target state when several
+/// isometry penalties carry different weights.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinuationScalarState {
+    pub assignment_temperature: f64,
+    pub isometry_weights: Vec<f64>,
+}
+
+impl ContinuationScalarState {
+    pub fn new(
+        assignment_temperature: f64,
+        isometry_weights: Vec<f64>,
+    ) -> Result<Self, String> {
+        if !(assignment_temperature.is_finite() && assignment_temperature > 0.0) {
+            return Err(format!(
+                "continuation assignment temperature must be finite and positive; got \
+                 {assignment_temperature}"
+            ));
+        }
+        if let Some((index, weight)) = isometry_weights
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, weight)| !(weight.is_finite() && *weight >= 0.0))
+        {
+            return Err(format!(
+                "continuation isometry weight[{index}] must be finite and non-negative; got \
+                 {weight}"
+            ));
+        }
+        Ok(Self {
+            assignment_temperature,
+            isometry_weights,
+        })
+    }
+
+    #[must_use]
+    pub fn bitwise_eq(&self, other: &Self) -> bool {
+        self.assignment_temperature.to_bits() == other.assignment_temperature.to_bits()
+            && self.isometry_weights.len() == other.isometry_weights.len()
+            && self
+                .isometry_weights
+                .iter()
+                .zip(&other.isometry_weights)
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+    }
+}
+
+/// Objective-owned scalar endpoints for reactive domain entry. The target is
+/// the literal state of the real objective; the entry is a smoother state
+/// derived by that objective from its own routing and penalty geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContinuationScalarContract {
+    entry: ContinuationScalarState,
+    target: ContinuationScalarState,
+}
+
+impl ContinuationScalarContract {
+    pub fn new(
+        entry: ContinuationScalarState,
+        target: ContinuationScalarState,
+    ) -> Result<Self, String> {
+        if entry.isometry_weights.len() != target.isometry_weights.len() {
+            return Err(format!(
+                "continuation entry/target isometry dimensions differ: {} != {}",
+                entry.isometry_weights.len(),
+                target.isometry_weights.len()
+            ));
+        }
+        Ok(Self { entry, target })
+    }
+
+    #[must_use]
+    pub fn entry(&self) -> &ContinuationScalarState {
+        &self.entry
+    }
+
+    #[must_use]
+    pub fn target(&self) -> &ContinuationScalarState {
+        &self.target
+    }
+
+    #[must_use]
+    pub fn at(&self, s: f64) -> ContinuationScalarState {
+        let s = s.clamp(0.0, 1.0);
+        let temperature = LegEndpoints::new(
+            self.entry.assignment_temperature,
+            self.target.assignment_temperature,
+        )
+        .at(s);
+        let isometry_weights = self
+            .entry
+            .isometry_weights
+            .iter()
+            .zip(&self.target.isometry_weights)
+            .map(|(&entry, &target)| LegEndpoints::new(entry, target).at(s))
+            .collect();
+        ContinuationScalarState {
+            assignment_temperature: temperature,
+            isometry_weights,
+        }
+    }
+}
+
 /// The coupled schedule state that [`ContinuationPath`] owns. Each leg is the
 /// concrete schedule object the rest of the codebase already advances; the
 /// path holds them so they can only ever move together.
@@ -192,39 +298,17 @@ pub struct CoupledSchedules {
     pub rho_target: Array1<f64>,
     /// Legal upper bound on ρ (the spine clamps ρ₀ into this box).
     pub rho_bounds_upper: Array1<f64>,
-    /// Assignment-temperature schedule (τ leg). Consumed, not re-implemented:
-    /// the path reads `tau_start` / `tau_min` as its τ endpoints and advances
-    /// the schedule in lockstep with `s`.
-    pub temperature: GumbelTemperatureSchedule,
-    /// Isometry-weight schedule (gauge leg). Consumed: `w_start` / `w_end` are
-    /// the isometry endpoints; advanced in lockstep with `s`.
-    pub isometry: ScalarWeightSchedule,
+    /// Typed scalar entry/target state supplied by the objective itself.
+    pub scalars: ContinuationScalarContract,
 }
 
 impl CoupledSchedules {
-    /// τ endpoints as `LegEndpoints` in the schedule's natural coordinate.
-    /// `s = 1` → `tau_start` (diffuse), `s = 0` → `tau_min` (sharp).
-    #[must_use]
-    pub fn temperature_endpoints(&self) -> LegEndpoints {
-        LegEndpoints::new(self.temperature.tau_start, self.temperature.tau_min)
-    }
-
-    /// Isometry-weight endpoints. `s = 1` → `w_start` (loose), `s = 0` →
-    /// `w_end` (tight).
-    #[must_use]
-    pub fn isometry_endpoints(&self) -> LegEndpoints {
-        LegEndpoints::new(self.isometry.w_start, self.isometry.w_end)
-    }
-
     /// The coupled lockstep target value of every scalar leg at path parameter
     /// `s`. ρ is a vector and rides the spine, so it is not returned here; the
     /// two scalar legs (τ, isometry weight) are.
     #[must_use]
-    pub fn scalar_targets_at(&self, s: f64) -> ScalarLegTargets {
-        ScalarLegTargets {
-            tau: self.temperature_endpoints().at(s),
-            isometry_weight: self.isometry_endpoints().at(s),
-        }
+    pub fn scalar_targets_at(&self, s: f64) -> ContinuationScalarState {
+        self.scalars.at(s)
     }
 
     /// The ρ target the spine should anneal toward at path parameter `s`:
@@ -250,14 +334,6 @@ impl CoupledSchedules {
 /// The lockstep target values of the two scalar legs at a given `s`. Handed to
 /// the wiring agent so it can install τ on the SAE term and the isometry weight
 /// on the gauge penalty before the spine pass at this waypoint.
-#[derive(Debug, Clone, Copy)]
-pub struct ScalarLegTargets {
-    /// Assignment temperature τ at this waypoint.
-    pub tau: f64,
-    /// Isometry gauge weight at this waypoint.
-    pub isometry_weight: f64,
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Hardening hook interfaces (#976). Defined here; implemented at the call
 //  sites by the wiring agent (rho_optimizer.rs / atom_selection.rs).
@@ -499,13 +575,16 @@ pub enum PathDemotionReason {
 /// variant is the whole point — the type cannot represent "no usable seed".
 #[derive(Debug, Clone)]
 pub(crate) enum ContinuationStep {
+    /// The objective installed and solved the literal heavy scalar entry at
+    /// `s = 1`. Carries the accepted spine state that warms the first descent.
+    Entered { state: ContinuationState },
     /// `s` was lowered toward `0` and the inner solve at the new waypoint
     /// succeeded. Carries the accepted spine state and the new `s`.
     Descended { s: f64, state: ContinuationState },
     /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
     /// tight isometry). Terminal-but-successful; the criterion is the real
     /// objective's, identical for cold and warm entry (#969).
-    Arrived { state: ContinuationState },
+    Arrived,
     /// The inner solve at the attempted waypoint struggled, so the path
     /// re-entered a heavier regime (`s` raised back toward `1` by the back-off
     /// fraction) and will re-descend with a finer step. This is the homotopy
@@ -547,8 +626,8 @@ pub(crate) enum ReentryReason {
 ///
 /// The wiring agent drives the path one waypoint at a time:
 /// `let step = path.step(obj, &mut ledger);` and, per [`ContinuationStep`],
-/// installs the next waypoint's [`ScalarLegTargets`] (τ on the SAE term,
-/// isometry weight on the gauge penalty) and applies the [`LogitTrustRegion`] /
+/// installs the next waypoint's [`ContinuationScalarState`] (τ on the SAE term,
+/// one weight per isometry penalty) and applies the [`LogitTrustRegion`] /
 /// [`ActiveMassFloor`] hooks inside the inner solve.
 #[derive(Debug, Clone)]
 pub struct ContinuationPath {
@@ -590,7 +669,7 @@ impl ContinuationPath {
     #[must_use]
     pub fn enter(schedules: CoupledSchedules) -> Self {
         let entry_targets = schedules.scalar_targets_at(1.0);
-        let logit_tr = LogitTrustRegion::for_tau(entry_targets.tau);
+        let logit_tr = LogitTrustRegion::for_tau(entry_targets.assignment_temperature);
         Self {
             schedules,
             s: 1.0,
@@ -603,32 +682,21 @@ impl ContinuationPath {
         }
     }
 
-    /// No-argument heavy-smoothing entry for a continuation-entry objective
-    /// (the seed cascade ctor). Builds the default coupled schedules — a
-    /// single-component oversmoothed ρ leg, the standard diffuse→sharp τ leg and
-    /// the loose→tight isometry gauge leg — and enters at `s = 1`, the
-    /// heavy-smoothing contraction regime. The seed cascade only reads the
-    /// coarse [`PathRegime`] and the logit step radius from the path; the
-    /// concrete ρ vector is replaced by the spine's own per-component target at
-    /// each waypoint via [`ContinuationPath::current_rho_target`], so the
-    /// single-component default here is the entry placeholder, not a constraint
-    /// on the real fit's dimensionality.
-    #[must_use]
-    pub fn heavy_entry() -> Self {
-        Self::enter(default_coupled_schedules())
-    }
-
     /// Heavy-smoothing entry coupled to a CONCRETE ρ target and legal box. The
     /// seed cascade rebuilds the path per-seed with this once it knows the
     /// objective's real ρ dimension (the no-argument [`ContinuationPath::heavy_entry`]
     /// is a dimension-1 placeholder used only before the seed is in hand). The
     /// ρ leg rides the spine from the spine's own oversmoothed ρ₀ down to
     /// `rho_target` (the real objective ρ\*); `bounds_upper` is the legal ρ box.
-    /// The τ / isometry legs use the standard diffuse→sharp / loose→tight
-    /// default endpoints. Enters at `s = 1`, the heavy-smoothing contraction
-    /// regime. `rho_target` and `bounds_upper` must share length.
+    /// The scalar legs use the typed entry/target contract supplied by the
+    /// objective; no private default may replace its literal target. Enters at
+    /// `s = 1`. `rho_target` and `bounds_upper` must share length.
     #[must_use]
-    pub fn heavy_entry_for_rho(rho_target: Array1<f64>, bounds_upper: Array1<f64>) -> Self {
+    pub fn heavy_entry_for_rho(
+        rho_target: Array1<f64>,
+        bounds_upper: Array1<f64>,
+        scalars: ContinuationScalarContract,
+    ) -> Self {
         assert_eq!(
             rho_target.len(),
             bounds_upper.len(),
@@ -643,15 +711,14 @@ impl ContinuationPath {
             rho_target.clone(),
             rho_target,
             bounds_upper,
-            default_temperature_schedule(),
-            default_isometry_schedule(),
+            scalars,
         );
         Self::enter(schedules)
     }
 
     /// The coarse heavy-smoothing regime the path is currently entering at. The
     /// seed cascade reports this in its demotion ledger and final diagnosis. A
-    /// fresh [`ContinuationPath::heavy_entry`] is in [`PathRegime::Heavy`].
+    /// fresh path is in [`PathRegime::Heavy`].
     #[must_use]
     pub fn enter_regime(&self) -> PathRegime {
         PathRegime::from_s(self.s)
@@ -714,8 +781,9 @@ impl ContinuationPath {
         // site: every arm resolves to the heavier live regime.
         match step {
             ContinuationStep::Reentered { .. }
+            | ContinuationStep::Entered { .. }
             | ContinuationStep::Descended { .. }
-            | ContinuationStep::Arrived { .. } => self.enter_regime(),
+            | ContinuationStep::Arrived => self.enter_regime(),
         }
     }
 
@@ -735,7 +803,7 @@ impl ContinuationPath {
     /// The scalar leg targets (τ, isometry weight) at the current `s`. The
     /// wiring agent installs these before the inner solve at this waypoint.
     #[must_use]
-    pub fn current_scalar_targets(&self) -> ScalarLegTargets {
+    pub fn current_scalar_targets(&self) -> ContinuationScalarState {
         self.schedules.scalar_targets_at(self.s)
     }
 
@@ -787,7 +855,11 @@ impl ContinuationPath {
     fn reenter_heavier(&mut self) {
         self.s = (self.s + REENTRY_BACKOFF).min(1.0);
         self.s_step = (self.s_step * 0.5).max(S_STEP_FLOOR);
-        self.logit_tr = LogitTrustRegion::for_tau(self.schedules.scalar_targets_at(self.s).tau);
+        self.logit_tr = LogitTrustRegion::for_tau(
+            self.schedules
+                .scalar_targets_at(self.s)
+                .assignment_temperature,
+        );
     }
 
     /// Whether the path has arrived at (or below) the real objective `s = 0`.
@@ -817,7 +889,7 @@ impl ContinuationPath {
         &mut self,
         obj: &mut dyn OuterObjective,
         initial_beta: &Array1<f64>,
-    ) -> ContinuationStep {
+    ) -> Result<ContinuationStep, gam_problem::EstimationError> {
         // #968 hard ceiling: total budgeted spine evals across the walk are
         // bounded. At the ceiling the path hands its best converged state to
         // the real optimizer (legs advanced to the target regime) instead of
@@ -825,15 +897,17 @@ impl ContinuationPath {
         // With no converged state yet the walk keeps trying (the consumer's
         // own `CONTINUATION_WALK_BUDGET` loop bounds that case).
         if self.evals_budgeted >= WALK_EVAL_CEILING {
-            if let Some(state) = self.warm.clone() {
+            if self.warm.is_some() {
                 log::warn!(
                     "[PATH] walk eval ceiling {WALK_EVAL_CEILING} reached at s={:.4}; arriving \
                      with the best converged waypoint state (scalar legs advanced to target)",
                     self.s
                 );
-                self.advance_scalar_legs_to(0.0);
+                let target = self.schedules.scalar_targets_at(0.0);
+                obj.install_reactive_domain_scalar_state(&target)?;
+                self.logit_tr = LogitTrustRegion::for_tau(target.assignment_temperature);
                 self.s = 0.0;
-                return ContinuationStep::Arrived { state };
+                return Ok(ContinuationStep::Arrived);
             }
         }
 
@@ -842,18 +916,29 @@ impl ContinuationPath {
         // rejection.
         if self.s_step < S_STEP_FLOOR {
             self.reenter_heavier();
-            return ContinuationStep::Reentered {
+            return Ok(ContinuationStep::Reentered {
                 s: self.s,
                 reason: ReentryReason::StepUnderflow,
-            };
+            });
         }
 
-        let s_next = (self.s - self.s_step).max(0.0);
+        // The cold leg solves the literal heavy entry at s=1 before any
+        // descent. Every later leg lowers s by one path step. This makes the
+        // contraction entry an evaluated waypoint rather than an unevaluated
+        // endpoint that the old implementation skipped on its first call.
+        let entering = self.warm.is_none();
+        let s_next = if entering {
+            1.0
+        } else {
+            (self.s - self.s_step).max(0.0)
+        };
 
-        // Advance the coupled scalar legs to the new waypoint. The schedule
-        // objects are stepped in lockstep so τ and the isometry weight track
-        // exactly the same path parameter the ρ leg is about to anneal to.
-        self.advance_scalar_legs_to(s_next);
+        // Install the objective-owned scalar state before the rho spine. This
+        // is the actual coupling seam: mutating private schedule copies would
+        // leave the evaluated objective unchanged.
+        let scalar_state = self.schedules.scalar_targets_at(s_next);
+        obj.install_reactive_domain_scalar_state(&scalar_state)?;
+        self.logit_tr = LogitTrustRegion::for_tau(scalar_state.assignment_temperature);
 
         // The ρ leg rides the spine: anneal from the spine's own oversmoothed
         // ρ₀ down to this waypoint's ρ target. At s = 1 the waypoint ρ target
@@ -897,17 +982,22 @@ impl ContinuationPath {
             }
         };
 
-        match spine {
+        Ok(match spine {
             Ok(state) => {
                 self.warm = Some(state.clone());
                 self.s = s_next;
                 // Clean descent: restore the nominal step (grow back toward the
                 // coarse schedule) and refresh the τ-tied logit trust region.
                 self.s_step = (1.0 / CONTINUATION_WAYPOINTS as f64).min(self.s.max(S_STEP_FLOOR));
-                self.logit_tr =
-                    LogitTrustRegion::for_tau(self.schedules.scalar_targets_at(self.s).tau);
-                if self.s <= 0.0 {
-                    ContinuationStep::Arrived { state }
+                self.logit_tr = LogitTrustRegion::for_tau(
+                    self.schedules
+                        .scalar_targets_at(self.s)
+                        .assignment_temperature,
+                );
+                if entering {
+                    ContinuationStep::Entered { state }
+                } else if self.s <= 0.0 {
+                    ContinuationStep::Arrived
                 } else {
                     ContinuationStep::Descended { s: self.s, state }
                 }
@@ -923,77 +1013,12 @@ impl ContinuationPath {
                     reason: ReentryReason::SpineStruggled(failure),
                 }
             }
-        }
-    }
-
-    /// Advance the τ and isometry schedule objects so their live values match
-    /// the lockstep targets at `s_next`. Consumes the schedules' own
-    /// `current_*` laws by selecting the schedule iteration whose output is
-    /// closest to the coupled target, keeping a single source of truth for each
-    /// leg's interpolation (no parallel re-derivation of the decay law).
-    fn advance_scalar_legs_to(&mut self, s_next: f64) {
-        let targets = self.schedules.scalar_targets_at(s_next);
-        // τ: walk the schedule's iteration counter to the step whose
-        // `current_tau` first reaches (≤) the coupled target, so the live τ on
-        // the SAE term equals the coupled-path value. Monotone-decreasing, so a
-        // forward scan from the current count is correct and terminates at
-        // tau_min.
-        Self::advance_temperature_to(&mut self.schedules.temperature, targets.tau);
-        Self::advance_isometry_to(&mut self.schedules.isometry, targets.isometry_weight);
-        self.logit_tr = LogitTrustRegion::for_tau(targets.tau);
-    }
-
-    /// Step `schedule.iter_count` forward until `current_tau` is ≤ `target_tau`
-    /// (τ is monotone non-increasing in iter). Leaves the counter pointing at
-    /// the waypoint so the SAE term reads the coupled τ. Bounded by the
-    /// schedule's own `tau_min` floor — never spins past it.
-    fn advance_temperature_to(schedule: &mut GumbelTemperatureSchedule, target_tau: f64) {
-        // Guard: a malformed schedule can't make progress; clamp to one step so
-        // the live τ is still the schedule's current value, never NaN.
-        let max_scan = temperature_scan_budget(schedule);
-        let mut scanned = 0;
-        while scanned < max_scan && schedule.current_tau(schedule.iter_count) > target_tau {
-            schedule.iter_count += 1;
-            scanned += 1;
-        }
-    }
-
-    /// Step `schedule.iter_count` forward until `current_weight` is ≥
-    /// `target_weight` (isometry weight is monotone non-decreasing in iter when
-    /// `w_end ≥ w_start`, the tightening direction). Bounded by `w_end`.
-    fn advance_isometry_to(schedule: &mut ScalarWeightSchedule, target_weight: f64) {
-        let max_scan = isometry_scan_budget(schedule);
-        let mut scanned = 0;
-        while scanned < max_scan && schedule.current_weight(schedule.iter_count) < target_weight {
-            schedule.iter_count += 1;
-            scanned += 1;
-        }
+        })
     }
 }
 
-/// Scan budget for advancing the temperature schedule. For a `Linear` schedule
-/// the number of steps is known; for geometric / reciprocal it is bounded by a
-/// generous waypoint multiple so the lockstep scan always terminates.
-fn temperature_scan_budget(schedule: &GumbelTemperatureSchedule) -> usize {
-    const GEOMETRIC_SCAN_CAP: usize = 4096;
-    match &schedule.decay {
-        ScheduleKind::Linear { steps } => *steps + 1,
-        ScheduleKind::Geometric { .. } | ScheduleKind::ReciprocalIter => GEOMETRIC_SCAN_CAP,
-    }
-}
-
-/// Scan budget for advancing the isometry-weight schedule (mirrors
-/// [`temperature_scan_budget`]).
-fn isometry_scan_budget(schedule: &ScalarWeightSchedule) -> usize {
-    const GEOMETRIC_SCAN_CAP: usize = 4096;
-    match &schedule.kind {
-        ScheduleKind::Linear { steps } => *steps + 1,
-        ScheduleKind::Geometric { .. } | ScheduleKind::ReciprocalIter => GEOMETRIC_SCAN_CAP,
-    }
-}
-
-/// Convenience: build the standard coupled schedules for a K≥2 SAE joint fit
-/// from the ρ box and the τ / isometry schedules the term already carries.
+/// Build a coupled path from the rho box and the typed scalar contract supplied
+/// by the objective.
 ///
 /// `rho_target` is ρ\* (the real objective); `rho_entry` is the oversmoothed
 /// entry ρ₀ (caller supplies, or the spine derives its own offset on top —
@@ -1004,102 +1029,14 @@ pub fn couple_schedules(
     rho_entry: Array1<f64>,
     rho_target: Array1<f64>,
     rho_bounds_upper: Array1<f64>,
-    temperature: GumbelTemperatureSchedule,
-    isometry: ScalarWeightSchedule,
+    scalars: ContinuationScalarContract,
 ) -> CoupledSchedules {
     CoupledSchedules {
         rho_entry,
         rho_target,
         rho_bounds_upper,
-        temperature,
-        isometry,
+        scalars,
     }
-}
-
-/// Default coupled schedules for a no-argument [`ContinuationPath::heavy_entry`].
-///
-/// Builds the standard three legs at their smoothing-extreme entry values:
-/// * ρ — a single-component oversmoothed entry `ρ₀` descending to `ρ* = 0`,
-///   inside a generous legal box. The seed cascade's spine replaces this with
-///   the real per-component ρ target at each waypoint, so the single component
-///   here is only the entry placeholder.
-/// * τ — the diffuse→sharp assignment-temperature leg (`DEFAULT_ENTRY_TAU` down
-///   to `DEFAULT_TARGET_TAU`) over the standard waypoint count.
-/// * isometry — the loose→tight gauge leg (`DEFAULT_ENTRY_ISOMETRY` up to the
-///   tight target weight) over the same waypoint count.
-///
-/// These endpoints match the smoothing-extreme entry regime every leg is at at
-/// `s = 1`; the path walks them down in lockstep exactly as a caller-supplied
-/// [`CoupledSchedules`] would.
-#[must_use]
-fn default_coupled_schedules() -> CoupledSchedules {
-    /// Oversmoothed entry ρ₀ for the single-component placeholder leg.
-    const DEFAULT_ENTRY_RHO: f64 = 5.0;
-    /// Legal ρ upper bound for the placeholder leg.
-    const DEFAULT_RHO_UPPER: f64 = 10.0;
-
-    couple_schedules(
-        Array1::from_elem(1, DEFAULT_ENTRY_RHO),
-        Array1::zeros(1),
-        Array1::from_elem(1, DEFAULT_RHO_UPPER),
-        default_temperature_schedule(),
-        default_isometry_schedule(),
-    )
-}
-
-/// The standard diffuse→sharp assignment-temperature leg (`DEFAULT_ENTRY_TAU`
-/// down to `DEFAULT_TARGET_TAU`) over the standard waypoint count. Shared by
-/// both [`ContinuationPath::heavy_entry`] and
-/// [`ContinuationPath::heavy_entry_for_rho`] so the τ leg has one source.
-#[must_use]
-fn default_temperature_schedule() -> GumbelTemperatureSchedule {
-    /// Diffuse entry τ (the schedule's `tau_start`) at `s = 1`. Entry
-    /// heaviness is tied to the cold-seed logit scale: the production IBP
-    /// residual-energy seed emits logits at gain `4.0`
-    /// (`SAE_RESIDUAL_SEED_GAIN` in `gam-pyffi`), so seeded logits span
-    /// roughly `±4`. Entry τ ≥ that gain keeps every seeded row in the
-    /// near-linear band of the gate (`|logit|/τ ≤ 1`), where the assignment
-    /// map is smooth and contractive — no row enters pre-saturated against
-    /// the argmax cliff. The previous `2.0` entry let ±4-gain seeds start at
-    /// `|logit|/τ = 2`, already in the saturated tail.
-    const DEFAULT_ENTRY_TAU: f64 = 4.0;
-    /// Target τ (`tau_min`) at `s = 0`. The `s = 0` endpoint of every leg
-    /// must be the REAL objective's value, and the production IBP-MAP
-    /// assignment temperature (gamfit `sae_manifold_fit`, `ibp_map` path) is
-    /// `τ = 0.5`. The previous `0.1` target over-sharpened the leg *past*
-    /// the real objective, which tightened the τ-tied logit trust region at
-    /// arrival to radius `0.4` (vs `2.0` at the true operating τ) — choking
-    /// exactly the late-walk logit growth the routing mass needs to climb
-    /// from the diffuse entry to the planted level.
-    const DEFAULT_TARGET_TAU: f64 = 0.5;
-    GumbelTemperatureSchedule::new(
-        DEFAULT_ENTRY_TAU,
-        DEFAULT_TARGET_TAU,
-        ScheduleKind::Linear {
-            steps: CONTINUATION_WAYPOINTS,
-        },
-    )
-    .expect("default continuation temperature schedule must be valid")
-}
-
-/// The standard loose→tight isometry gauge leg (`DEFAULT_ENTRY_ISOMETRY` up to
-/// `DEFAULT_TARGET_ISOMETRY`) over the standard waypoint count. Shared source
-/// for the isometry leg across both heavy-entry constructors.
-#[must_use]
-fn default_isometry_schedule() -> ScalarWeightSchedule {
-    /// Entry isometry weight (`w_start`) at `s = 1`; the chart pin starts fully
-    /// off and ramps after the anchor has settled.
-    const DEFAULT_ENTRY_ISOMETRY: f64 = 0.0;
-    /// Tight target isometry weight (`w_end`) at `s = 0`.
-    const DEFAULT_TARGET_ISOMETRY: f64 = 1.0;
-    ScalarWeightSchedule::new(
-        DEFAULT_ENTRY_ISOMETRY,
-        DEFAULT_TARGET_ISOMETRY,
-        ScheduleKind::Linear {
-            steps: CONTINUATION_WAYPOINTS,
-        },
-    )
-    .expect("default continuation isometry schedule must be valid")
 }
 
 /// View helper: the wiring agent passes the SAE assignment matrix (rows ×

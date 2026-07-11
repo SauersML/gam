@@ -132,6 +132,14 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             &audit_solver,
         )
         .expect("frozen accepted-state gradient components");
+    let rank_charge_derivative = audit_term
+        .hard_rank_charge_derivative(
+            gradient_objective.target.view(),
+            &rho_state,
+            &audit_loss,
+            &audit_cache,
+        )
+        .expect("frozen accepted-state hard-rank-charge derivative");
     let plain_audit_solver = DeflatedArrowSolver::plain(&audit_cache);
     let plain_audit_components = audit_term
         .analytic_outer_rho_gradient_components(
@@ -401,6 +409,37 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let response_htt_half_fd = (state_plus_parts.3 - state_minus_parts.3) / (2.0 * h);
     let response_rank_charge_fd = (state_plus_parts.4 - state_minus_parts.4) / (2.0 * h);
     let response_occam_fd = (state_plus_parts.5 - state_minus_parts.5) / (2.0 * h);
+    let rank_direct_scale = rank_charge_derivative
+        .direct_rho
+        .iter()
+        .chain(frozen_rank_charge_fd.iter())
+        .fold(1.0_f64, |scale, &value| scale.max(value.abs()));
+    let rank_direct_fd_bound = 4.0 * h * h * rank_direct_scale;
+    for coordinate in 0..base.len() {
+        assert!(
+            (rank_charge_derivative.direct_rho[coordinate] - frozen_rank_charge_fd[coordinate])
+                .abs()
+                <= rank_direct_fd_bound,
+            "fixed-state hard-rank-charge differential mismatch at rho[{coordinate}]: \
+             analytic={:.17e}, central_fd={:.17e}, h={h:.3e}, bound={rank_direct_fd_bound:.3e}",
+            rank_charge_derivative.direct_rho[coordinate],
+            frozen_rank_charge_fd[coordinate],
+        );
+    }
+    let rank_response_prediction = rank_charge_derivative.direct_rho.dot(&direction)
+        + rank_charge_derivative.theta.t.dot(&theta_fd.t)
+        + rank_charge_derivative.theta.beta.dot(&theta_fd.beta);
+    let rank_response_scale = rank_response_prediction
+        .abs()
+        .max(response_rank_charge_fd.abs())
+        .max(1.0);
+    let rank_response_fd_bound = 4.0 * h * h * rank_response_scale;
+    assert!(
+        (rank_response_prediction - response_rank_charge_fd).abs() <= rank_response_fd_bound,
+        "hard-rank-charge state-response differential mismatch: \
+         analytic={rank_response_prediction:.17e}, central_fd={response_rank_charge_fd:.17e}, \
+         h={h:.3e}, bound={rank_response_fd_bound:.3e}"
+    );
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
         (analytic - finite_difference).abs() <= 5.0e-3 * scale,

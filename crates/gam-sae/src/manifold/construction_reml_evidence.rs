@@ -182,40 +182,6 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// [`Self::reml_criterion_with_cache`] priced with the Theorem K WBIC SOFT rank
-    /// charge instead of the hard MP count — the unified running-complexity ledger
-    /// `Σ_k λ_k(N_eff,k)·ln N_eff,k`, `λ_k = ½·rank_soft_k·basis_edf_k`.
-    /// Convenience wrapper that evaluates the soft ledger for this call only,
-    /// restoring the persisted `soft_rank_charge` flag
-    /// afterward (use [`Self::set_soft_rank_charge`] to make it stick across a whole
-    /// fit / its clones). Reduces to `reml_criterion_with_cache` away from the MP edge
-    /// (soft→hard) and is strictly smaller for atoms near it (soft<hard) — the finite-n
-    /// Watanabe correction.
-    pub fn reml_criterion_with_cache_soft_charge(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-        inner_max_iter: usize,
-        learning_rate: f64,
-        ridge_ext_coord: f64,
-        ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
-        let prev_soft = self.soft_rank_charge;
-        self.soft_rank_charge = true;
-        let out = self.reml_criterion_with_cache(
-            target,
-            rho,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        );
-        self.soft_rank_charge = prev_soft;
-        out
-    }
-
     pub(crate) fn reml_criterion_with_cache_refine_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -454,28 +420,14 @@ impl SaeManifoldTerm {
                 // log non-negative for a barely-occupied atom (rank_eff>0 ⇒ N_eff,k>0,
                 // and the d_eff==0 veto above already removes the empty case).
                 //
-                // Theorem K: the per-atom coefficient of ln N_eff,k is the running
-                // complexity λ_k(N_eff,k). By default it is the HARD limit ½·d_eff,k
-                // (every above-edge direction a full regular parameter). Under an opt-in
-                // `soft_rank_charge` flag it is the finite-n WBIC SOFT coefficient
-                // λ_k = ½·rank_soft_k·basis_edf_k, which reduces to ½·d_eff,k away from
-                // the MP edge (μ≫e) and shrinks toward the RLCT near it — the same veto
-                // still fires on the hard rank_eff==0 (an atom the soft count also sends
-                // to λ→0, but the categorical veto is the validity guard, not a small λ).
-                let rank_charge: f64 = if self.soft_rank_charge {
-                    let lambda = self.per_atom_soft_learning_coefficient(rho, disp)?;
-                    lambda
-                        .iter()
-                        .zip(n_eff.iter())
-                        .map(|(&lam, &ne)| lam * ne.max(1.0).ln())
-                        .sum()
-                } else {
-                    d_eff
-                        .iter()
-                        .zip(n_eff.iter())
-                        .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
-                        .sum()
-                };
+                // The hard MP branch is the one production charge currency; its
+                // integer rank count is locally constant between edge crossings,
+                // while `basis_edf` and `N_eff` carry the analytic differential.
+                let rank_charge: f64 = d_eff
+                    .iter()
+                    .zip(n_eff.iter())
+                    .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
+                    .sum();
                 // htt_half = the coordinate-block part of ½log|H| = Σ_i Σ_j ln diag(L_i)
                 // (= ½·Σ_i log|H_tt^(i)|; `arrow_log_det_from_cache` doubles this into
                 // `log_det`). Subtracting it removes the per-row coordinate log-det.
@@ -1999,25 +1951,12 @@ impl SaeManifoldTerm {
                 // rationale + inert-row axiom + RLCT veto justification): charge atom k
                 // ½·d_eff,k·ln(N_eff,k), N_eff,k = Σ_i a_{ik}² (here `ri.n_eff`, the same
                 // effective sample size chunk-accumulated for the MP edge), NOT the
-                // global n_obs. Bit-identical to the dense path by design — including the
-                // Theorem K soft ledger: under the `soft_rank_charge` flag the coefficient of
-                // ln N_eff,k is the WBIC soft λ_k off the SAME `ri.grams`/`ri.n_eff` the
-                // dense path derives from `self`, so dense↔streaming stay identical.
-                let rank_charge: f64 = if self.soft_rank_charge {
-                    let lambda =
-                        self.soft_learning_coefficient_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
-                    lambda
-                        .iter()
-                        .zip(ri.n_eff.iter())
-                        .map(|(&lam, &ne)| lam * ne.max(1.0).ln())
-                        .sum()
-                } else {
-                    d_eff
-                        .iter()
-                        .zip(ri.n_eff.iter())
-                        .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
-                        .sum()
-                };
+                // global n_obs. Bit-identical to the dense hard-MP path.
+                let rank_charge: f64 = d_eff
+                    .iter()
+                    .zip(ri.n_eff.iter())
+                    .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
+                    .sum();
                 let htt_half = 0.5 * ri.log_det_tt;
                 loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
                     - occam

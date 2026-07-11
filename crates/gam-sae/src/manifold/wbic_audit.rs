@@ -227,24 +227,23 @@ pub fn recon_spectrum(
     // basis_edf = tr(G(G+λS)⁻¹), the same ridge trace the production core computes.
     let mut mmat = gram.clone();
     if let Some(pen) = smooth_penalty {
-        if pen.dim() == (m, m) {
-            for i in 0..m {
-                for j in 0..m {
-                    mmat[[i, j]] += lam_smooth * pen[[i, j]];
-                }
+        if pen.dim() != (m, m) {
+            return Err(format!(
+                "recon_spectrum: smooth penalty shape {:?} does not match Gram shape ({m}, {m})",
+                pen.dim()
+            ));
+        }
+        for i in 0..m {
+            for j in 0..m {
+                mmat[[i, j]] += lam_smooth * pen[[i, j]];
             }
         }
     }
-    for i in 0..m {
-        mmat[[i, i]] += 1.0e-12;
-    }
-    let basis_edf = match mmat.cholesky(Side::Lower) {
-        Ok(factor) => {
-            let x = factor.solve_mat(gram);
-            (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64)
-        }
-        Err(_) => m as f64,
-    };
+    let factor = mmat.cholesky(Side::Lower).map_err(|error| {
+        format!("recon_spectrum: G + lambda*S is not positive definite: {error}")
+    })?;
+    let x = factor.solve_mat(gram);
+    let basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64);
     Ok(ReconSpectrum {
         mu,
         edge,

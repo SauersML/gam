@@ -15,10 +15,9 @@ use super::*;
 //   • HARD rank (n → ∞ limit, atom well above the noise edge): every resolved
 //     decoder direction is a regular parameter, λ → ½·rank_eff·basis_edf = ½·d_eff.
 //     This is the canonical criterion (hard MP count).
-//   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): a direction
-//     only fractionally resolved contributes a fraction of ½, λ = ½·rank_soft·basis_edf
-//     with rank_soft = Σ_j μ_j/(μ_j+e·log n_eff) the tempered (β=1/log n_eff) count. This is the
-//     opt-in `soft_rank_charge` ledger below (Theorem K, `wbic_audit`).
+//   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): the
+//     audit-only `wbic_audit` report records the tempered fractional count. It
+//     is diagnostic, not an alternative production criterion.
 //   • RLCT (SINGULAR truth, a symmetry orbit or a null atom): λ drops below ½·d
 //     to the real log-canonical threshold. The null atom (truth B*=0) has λ=½ from
 //     the amplitude singularity of a²‖B‖² — see the veto in `reml_criterion`.
@@ -29,13 +28,9 @@ use super::*;
 // (Fisher information actually accumulated by a gated atom), never the global row
 // count — see the #2a inert-row axiom in `reml_criterion`.
 //
-// GATING: the soft ledger is an OPT-IN alternative to the shipped hard charge,
-// selected by the persisted per-fit flag `SaeManifoldTerm::soft_rank_charge`
-// (default false ⇒ bit-for-bit historical hard path). The flag is the SINGLE source
-// of truth: it is carried across clones (including stagewise per-birth clones) and
-// therefore propagates correctly into rayon worker threads during parallel folds —
-// a thread-local scope would silently fail to apply in worker threads, so it is
-// deliberately NOT used.
+// The production criterion has one charge currency: the hard MP branch. Keeping
+// an un-differentiated soft alternative would make value and analytic gradient
+// describe different objectives, so the fractional count remains audit-only.
 
 /// #9 streaming rank-charge inputs, accumulated in a SINGLE pass through
 /// [`SaeManifoldTerm::streaming_exact_arrow_log_det`]: the coordinate-block
@@ -101,24 +96,23 @@ pub(crate) fn realised_rank_charge_dof(
     // basis_edf = tr(gram·(gram+λS)⁻¹).
     let mut mmat = gram.clone();
     if let Some(pen) = smooth_penalty {
-        if pen.dim() == (m, m) {
-            for i in 0..m {
-                for j in 0..m {
-                    mmat[[i, j]] += lam_smooth * pen[[i, j]];
-                }
+        if pen.dim() != (m, m) {
+            return Err(format!(
+                "realised_rank_charge_dof: smooth penalty shape {:?} does not match Gram shape ({m}, {m})",
+                pen.dim()
+            ));
+        }
+        for i in 0..m {
+            for j in 0..m {
+                mmat[[i, j]] += lam_smooth * pen[[i, j]];
             }
         }
     }
-    for i in 0..m {
-        mmat[[i, i]] += 1.0e-12; // SPD guard for the factorization
-    }
-    let basis_edf = match mmat.cholesky(super::Side::Lower) {
-        Ok(factor) => {
-            let x = factor.solve_mat(gram); // X = (G+λS)⁻¹ G
-            (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64)
-        }
-        Err(_) => m as f64, // fallback: full basis count (conservative)
-    };
+    let factor = mmat.cholesky(super::Side::Lower).map_err(|error| {
+        format!("realised_rank_charge_dof: G + lambda*S is not positive definite: {error}")
+    })?;
+    let x = factor.solve_mat(gram); // X = (G+λS)⁻¹ G
+    let basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64);
     Ok(rank_eff * basis_edf)
 }
 
@@ -201,7 +195,6 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
-            soft_rank_charge: false,
             data_row_reseed: false,
             // SAC — the collapse-guard stack is armed by default; the stagewise
             // K=1 lane disarms it explicitly (see the field docs on term.rs).
@@ -975,20 +968,6 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// Theorem K — set the per-fit WBIC SOFT rank-charge ledger opt-in (typed kwarg,
-    /// no env lever). Default false selects the hard realised-rank coefficient.
-    /// Persisted per-fit config,
-    /// carried across clones (including stagewise per-birth clones) and across rayon
-    /// worker threads — the field is the single source of truth.
-    pub fn set_soft_rank_charge(&mut self, enabled: bool) {
-        self.soft_rank_charge = enabled;
-    }
-
-    /// Theorem K — read the per-fit WBIC soft rank-charge ledger opt-in.
-    pub fn soft_rank_charge(&self) -> bool {
-        self.soft_rank_charge
-    }
-
     /// #2023 C4 — install a Tier-0 shared mean μ (the manifold analogue of
     /// [`crate::tiered::Tier0Mean`]). Once set, [`Self::try_fitted_with_rho`] adds
     /// μ back to the assembled per-atom reconstruction, so the atoms only ever
@@ -1117,65 +1096,6 @@ impl SaeManifoldTerm {
                     .expect("term assignment shape must match atom count")
             })
             .collect()
-    }
-
-    /// Theorem K WBIC SOFT learning coefficient `λ_k = ½·rank_soft_k·basis_edf_k` per
-    /// atom, from the PRE-ACCUMULATED per-atom Grams (the streaming twin of
-    /// [`Self::per_atom_soft_learning_coefficient`], as `rank_dof_from_grams` is the
-    /// twin of the dense hard path). `rank_soft_k = Σ_j μ_{kj}/(μ_{kj}+e_k·log n_eff,k)` is the
-    /// tempered (β=1/log n) count on atom k's occupancy-corrected reconstruction
-    /// spectrum `μ = sv(diag(√λ)·Uᵀ·D)²/N_eff` against the SAME Marchenko–Pastur edge
-    /// `e = R·(1+√(p/N_eff))²` the hard count thresholds on. It is bit-consistent with
-    /// the hard `d_eff` (`rank_dof_from_grams`) — both come from one
-    /// [`super::wbic_audit::recon_spectrum`], whose `rank_hard·basis_edf` matches
-    /// `realised_rank_charge_dof` — so the two ledgers agree away from the edge
-    /// (μ≫e ⇒ rank_soft→rank_hard) and the soft one is strictly smaller near it.
-    pub(crate) fn soft_learning_coefficient_from_grams(
-        &self,
-        grams: &[Array2<f64>],
-        n_eff: &[f64],
-        rho: &SaeManifoldRho,
-        dispersion_r: f64,
-    ) -> Result<Vec<f64>, String> {
-        let lam = rho.lambda_smooth_vec();
-        let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
-            dispersion_r
-        } else {
-            f64::MIN_POSITIVE
-        };
-        let p_out = self.output_dim() as f64;
-        let mut out = Vec::with_capacity(self.k_atoms());
-        for k in 0..self.k_atoms() {
-            let n_eff_k = n_eff.get(k).copied().unwrap_or(0.0);
-            let lam_k = lam.get(k).copied().unwrap_or(0.0);
-            let spec = super::wbic_audit::recon_spectrum(
-                &grams[k],
-                &self.atoms[k].decoder_coefficients,
-                n_eff_k,
-                p_out,
-                r_floor,
-                lam_k,
-                Some(&self.atoms[k].smooth_penalty),
-            )
-            .map_err(|e| format!("soft_learning_coefficient_from_grams: atom {k}: {e}"))?;
-            out.push(spec.learning_coefficient());
-        }
-        Ok(out)
-    }
-
-    /// Dense twin of [`Self::soft_learning_coefficient_from_grams`]: materialise the
-    /// per-atom Grams from `self` and return the WBIC soft learning coefficient `λ_k`.
-    /// Used only when the per-fit `soft_rank_charge` flag is on, so the extra Gram pass is off
-    /// the shipped hot path.
-    pub(crate) fn per_atom_soft_learning_coefficient(
-        &self,
-        rho: &SaeManifoldRho,
-        dispersion_r: f64,
-    ) -> Result<Vec<f64>, String> {
-        let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams);
-        let n_eff = self.per_atom_effective_sample_size();
-        self.soft_learning_coefficient_from_grams(&grams, &n_eff, rho, dispersion_r)
     }
 
     /// Shared rank-charge DOF core (#11): `d_eff_k = rank_eff_k · basis_edf_k` from the
