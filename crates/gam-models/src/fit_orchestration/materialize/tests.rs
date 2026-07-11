@@ -685,6 +685,37 @@ fn issue_1561_locscale_large_scale_basis_does_not_crash_joint_newton() {
 }
 
 #[test]
+fn issue_1561_secondary_smooth_retains_null_recovery_default() {
+    let data = workflow_test_dataset();
+    for (noise_formula, expected_double_penalty) in [
+        ("1 + s(z, bs='tp')", true),
+        ("1 + s(z, bs='tp', double_penalty=false)", false),
+    ] {
+        let materialized = materialize(
+            "bmi ~ 1",
+            &data,
+            &FitConfig {
+                family: Some("gaussian".to_string()),
+                noise_formula: Some(noise_formula.to_string()),
+                ..FitConfig::default()
+            },
+        )
+        .expect("materialize Gaussian location-scale formula");
+        let FitRequest::GaussianLocationScale(request) = materialized.request else {
+            panic!("noise formula must materialize Gaussian location-scale");
+        };
+        let basis = &request.spec.log_sigmaspec.smooth_terms[0].basis;
+        let SmoothBasisSpec::ThinPlate { spec, .. } = basis else {
+            panic!("bs='tp' scale formula must resolve a thin-plate basis");
+        };
+        assert_eq!(
+            spec.double_penalty, expected_double_penalty,
+            "secondary materialization must preserve the ordinary null-recovery default and the explicit opt-out for `{noise_formula}`"
+        );
+    }
+}
+
+#[test]
 fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispatch() {
     let data = workflow_test_dataset();
     let config = FitConfig {
