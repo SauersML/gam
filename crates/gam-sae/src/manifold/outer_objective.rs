@@ -425,26 +425,11 @@ pub struct OuterProbeTelemetry {
     /// budget and were RESCUED by a one-shot retry at the accepted-point drive
     /// (full budget) instead of being misclassified as the infeasibility wall.
     pub budget_rescued_value_probes: usize,
-    /// Eisenstat–Walker inexact-probe engagement: line-search value probes
-    /// (`eval_with_order(Value)`) whose inner `(t, β)` solve was ACCEPTED at the
-    /// loosened forcing gate `max(η_j·‖g_inner,entry‖, τ_full)` while the inner
-    /// KKT residual was still strictly ABOVE the full tolerance `τ_full` — i.e.
-    /// probes that genuinely stopped early under the forcing sequence (see
-    /// [`ProbeForcingState`]). A probe that met `τ_full` anyway (or fell back to
-    /// the full-tolerance evaluator) is NOT counted. `0` on the always-tight
-    /// path (forcing disabled, or before two accepted-gradient evaluations have
-    /// established the forcing ratio).
-    pub loosened_probe_calls: usize,
     /// Inner Newton iteration GRANTS issued by the line-search value-probe lane
-    /// (`forced_probe_criterion`): the sum of `run_joint_fit_arrow_schur`
-    /// iteration budgets handed out across its chunks, in BOTH the forced and
-    /// the always-tight (η disabled) modes — the two arms share the one counted
-    /// lane, so this figure is directly comparable across a forcing-on vs
-    /// forcing-off run of the same problem (the forcing acceptance test asserts
-    /// strictly fewer grants under forcing). Grants spent inside the historical
-    /// fallback evaluator (streaming regime, `inner_max_iter == 0` freeze, or a
-    /// probe that exhausted the probe budget without meeting its gate) are not
-    /// observable from this lane and are excluded identically in both modes.
+    /// (`line_search_probe_criterion`): the sum of
+    /// `run_joint_fit_arrow_schur` iteration budgets handed out across its
+    /// chunks. Grants spent inside the streaming/freeze evaluator or after the
+    /// exact probe budget is exhausted are not observable from this lane.
     pub probe_inner_iterations: usize,
     /// Basin-bundle lower-envelope telemetry (see [`BasinBundle`]). The outer
     /// value lanes evaluate `V*(ρ) = min_b V_b(ρ)` over a memory-admitted bundle of saved
@@ -524,197 +509,10 @@ struct ProbeConvergedHandoff {
     /// Flattened ρ of the probe, compared BITWISE (`f64::to_bits`) so only an
     /// exact re-evaluation of the same probed point consumes the state.
     rho_flat: Array1<f64>,
-    /// The probe's converged term state at `rho_flat`. Under the Eisenstat–
-    /// Walker forcing lane this state may be η-INEXACT (converged only to the
-    /// loosened forcing gate, see [`ProbeForcingState`]); that is still a valid
-    /// handoff because the receiving evaluation treats it purely as a WARM
-    /// START — the accepted lane's own criterion convergence loop
-    /// (`converge_inner_for_undamped_logdet`, full KKT tolerance) still
-    /// adjudicates stationarity before any value or gradient is priced, so the
-    /// accepted-iterate quantities remain full-tolerance regardless of how
-    /// loose the probe that produced this state ran.
+    /// The probe's fully converged term state at `rho_flat`. The receiving
+    /// evaluation still treats it as a warm start and independently checks the
+    /// same KKT stationarity condition before pricing value or gradient.
     term: SaeManifoldTerm,
-}
-
-// ─── Eisenstat–Walker line-search probe forcing ─────────────────────────────
-//
-// The outer REML ρ-search converges the inner `(t, β)` Newton solve at EVERY
-// criterion evaluation. But a LINE-SEARCH VALUE PROBE (`eval_with_order(Value)`)
-// only feeds an Armijo/Wolfe accept-reject comparison against the sufficient-
-// decrease bound — it needs the criterion accurately enough to RANK candidate
-// ρ steps, not to full inner tolerance. This is exactly the inexact-Newton
-// setting: the inner KKT system is the "linear solve" whose residual may be
-// left at a forcing tolerance η_j tied to the OUTER optimality measure, with
-// the classical guarantees that overall convergence is preserved as long as
-// η_j is bounded away from 1 and driven to 0 as the outer gradient vanishes.
-//
-// Forcing sequence (every constant is a published Eisenstat–Walker choice; no
-// tuned magic values):
-//
-//   η_j = min(η_max, γ·(‖g_j‖ / ‖g_{j−1}‖)^α),      α = 2
-//
-// — "Choice 2" of S. C. Eisenstat and H. F. Walker, *Choosing the forcing
-// terms in an inexact Newton method*, SIAM J. Sci. Comput. 17(1):16–32, 1996,
-// §2.2, with their recommended γ = 0.9 and α = 2 (the exponent pair they use
-// in the reported experiments; any α ∈ (1, 2] carries their q-superlinear
-// local theory). `g_j` is the analytic outer ρ-gradient at the j-th
-// accepted-gradient evaluation — the outer optimality measure, the direct
-// analog of ‖F(x_j)‖ in EW96.
-//
-// Safeguards (also published, same sources):
-//
-//   * η_j ← max(η_j, γ·η_{j−1}^α) whenever γ·η_{j−1}^α > 0.1 — the EW96 §2.2
-//     Choice-2 safeguard against a one-step collapse of the forcing term after
-//     an accidentally large residual ratio (the 0.1 activation threshold is
-//     theirs, verbatim).
-//   * η_j ≤ η_max = 0.9 — the uniform bound η_j ≤ η_max < 1 required for
-//     local convergence by R. S. Dembo, S. C. Eisenstat and T. Steihaug,
-//     *Inexact Newton methods*, SIAM J. Numer. Anal. 19(2):400–408, 1982
-//     (Thm 2.3); 0.9 is the published default forcing bound of M. Pernice and
-//     H. F. Walker, *NITSOL: a Newton iterative solver for nonlinear systems*,
-//     SIAM J. Sci. Comput. 19(1):302–318, 1998.
-//   * η_j never loosens below the inner solver's own full tolerance: the
-//     realized probe gate is `max(η_j·r_entry, τ_full)` (never DEMANDS more
-//     than the always-tight path either), and before two accepted-gradient
-//     evaluations exist there is no ratio, so probes run tight.
-//
-// Realization: the forcing gate is applied to the inner KKT residual of the
-// probe's joint `(t, β)` solve — `‖g_inner‖ ≤ max(η_j·r_entry, τ_full)` where
-// `r_entry` is the inner KKT residual of the warm-start state at the PROBED ρ
-// (the ‖F(x)‖ analog of the inexact-Newton condition ‖F + F′s‖ ≤ η‖F‖) and
-// `τ_full = SAE_MANIFOLD_INNER_GRAD_REL_TOL·iterate_scale` is the identical
-// stationarity gate `converge_inner_for_undamped_logdet` uses. The criterion
-// at the η-stationary iterate is then priced by the sanctioned freeze
-// evaluation (`inner_max_iter == 0`: one undamped factorization at the frozen
-// state). The criterion-value error this admits is controlled by the inner
-// residual — the penalized-loss part is second-order in it (inner
-// stationarity), the ½log|H| part first-order — and the forcing ties it to
-// the outer gradient, so probes become exact precisely as the outer search
-// converges (and the terminal acceptance never uses this lane at all).
-//
-// WHAT STAYS FULL-TOLERANCE, unconditionally: gradient evaluations at accepted
-// iterates (`eval` / `ValueAndGradient` / `ValueGradientHessian`), the
-// cross-seed ranking / EFS value lane (`eval_cost`), the finalize re-evaluation,
-// and the returned fit (`into_fitted` / `fit_at_fixed_rho`). Only the
-// Armijo/Wolfe comparison probes inside the line search are ever loosened, so
-// the outer KKT test is untouched.
-
-/// EW96 Choice-2 multiplier γ (see the module block above for the citation).
-const EW_FORCING_GAMMA: f64 = 0.9;
-/// DES82 / NITSOL uniform forcing bound η_max < 1.
-const EW_FORCING_ETA_MAX: f64 = 0.9;
-/// EW96 Choice-2 safeguard activation threshold on γ·η_{j−1}^α.
-const EW_FORCING_SAFEGUARD_ACTIVATION: f64 = 0.1;
-
-/// Eisenstat–Walker forcing state for the line-search value-probe lane (see
-/// the block comment above [`EW_FORCING_GAMMA`]). Owned by the objective so no
-/// driver-side plumbing is needed: the objective itself computes the outer
-/// gradient at every accepted-gradient evaluation, which is exactly the
-/// optimality measure the forcing sequence consumes.
-struct ProbeForcingState {
-    /// Whether the forcing lane may loosen probes at all. `false` is the
-    /// ALWAYS-TIGHT arm: value probes still run through the counted lane
-    /// (`forced_probe_criterion` with `eta = None`, whose gate is exactly the
-    /// full inner tolerance), so the probe-lane iteration telemetry stays
-    /// comparable across the two arms while the tight arm's inner solves are
-    /// converged to the identical stationarity measure as the historical path.
-    enabled: bool,
-    /// Flattened ρ of the most recent accepted-gradient evaluation, compared
-    /// bitwise so a RE-evaluation at the same outer iterate (e.g. the finalize
-    /// re-installation) does not masquerade as a new outer step with ratio 1.
-    last_grad_rho: Option<Array1<f64>>,
-    /// ‖g_{j−1}‖ — the previous accepted-gradient norm.
-    g_prev: Option<f64>,
-    /// ‖g_j‖ — the most recent accepted-gradient norm.
-    g_curr: Option<f64>,
-    /// The current forcing term η_j, or `None` before two accepted-gradient
-    /// evaluations exist (probes then run tight — the conservative start).
-    eta: Option<f64>,
-}
-
-impl ProbeForcingState {
-    fn new() -> Self {
-        Self {
-            // #2253 — DEFAULT OFF (always-tight probes). Eisenstat–Walker forcing
-            // loosens the line-search VALUE probe's inner solve while the
-            // gradient-lane anchor (`eval`) stays at full tolerance, so the
-            // Wolfe/Armijo test compares a loose-inner trial cost against a
-            // tight-inner anchor. On the frozen K=1 circle fit that invalid
-            // comparison makes Strong Wolfe fail at iter 0 at a genuinely real
-            // (tight-gradient) |g|≈0.9: the optimizer cannot take the descent
-            // step, exhausts the stall escapes, and reports NON-CONVERGED though
-            // the point is not stationary (measured across every rdim 4..41).
-            // Certification correctness beats line-search-probe speed for these
-            // fits; forcing is re-enabled per-fit via `set_probe_forcing_enabled`
-            // and can return as a default once the anchor is made commensurate
-            // with the loosened probe.
-            enabled: false,
-            last_grad_rho: None,
-            g_prev: None,
-            g_curr: None,
-            eta: None,
-        }
-    }
-
-    /// Forget the gradient history (multi-start reset, subsample→full-N swap):
-    /// the next line searches run tight until two accepted-gradient
-    /// evaluations of the NEW objective state re-establish the ratio.
-    fn clear_history(&mut self) {
-        self.last_grad_rho = None;
-        self.g_prev = None;
-        self.g_curr = None;
-        self.eta = None;
-    }
-
-    /// Record the accepted-gradient norm at outer iterate `rho_flat` and
-    /// update the forcing term per EW96 Choice 2 with the published
-    /// safeguards (see the module block above [`EW_FORCING_GAMMA`]).
-    fn observe_accepted_gradient(&mut self, rho_flat: &Array1<f64>, g_norm: f64) {
-        if !(g_norm.is_finite() && g_norm > 0.0) {
-            return;
-        }
-        if let Some(prev_rho) = &self.last_grad_rho
-            && prev_rho.len() == rho_flat.len()
-            && prev_rho
-                .iter()
-                .zip(rho_flat.iter())
-                .all(|(a, b)| a.to_bits() == b.to_bits())
-        {
-            // Re-evaluation at the same outer iterate (finalize / convergence
-            // guard), not a new outer step: a ratio of ‖g_j‖/‖g_j‖ = 1 would
-            // spuriously reset η to γ — keep the forcing state as-is.
-            return;
-        }
-        self.last_grad_rho = Some(rho_flat.clone());
-        self.g_prev = self.g_curr;
-        self.g_curr = Some(g_norm);
-        let (Some(g_prev), Some(g_curr)) = (self.g_prev, self.g_curr) else {
-            return;
-        };
-        if !(g_prev.is_finite() && g_prev > 0.0) {
-            return;
-        }
-        // EW96 Choice 2: η_j = γ·(‖g_j‖/‖g_{j−1}‖)^α with γ = 0.9, α = 2.
-        let ratio = g_curr / g_prev;
-        let mut eta = EW_FORCING_GAMMA * ratio * ratio;
-        // EW96 Choice-2 safeguard: η_j ← max(η_j, γ·η_{j−1}^α) when
-        // γ·η_{j−1}^α > 0.1, so an accidentally tiny ratio cannot collapse the
-        // forcing term in one step.
-        if let Some(eta_prev) = self.eta {
-            let carry = EW_FORCING_GAMMA * eta_prev * eta_prev;
-            if carry > EW_FORCING_SAFEGUARD_ACTIVATION {
-                eta = eta.max(carry);
-            }
-        }
-        // DES82 / NITSOL uniform bound η_j ≤ η_max < 1.
-        self.eta = Some(eta.min(EW_FORCING_ETA_MAX));
-    }
-
-    /// The forcing term for the NEXT line search's value probes, or `None`
-    /// when probes must run tight (forcing disabled, or no ratio yet).
-    fn line_search_eta(&self) -> Option<f64> {
-        if self.enabled { self.eta } else { None }
-    }
 }
 
 /// How a criterion evaluation drives the inner `(t, β)` solve.
@@ -724,11 +522,10 @@ enum ProbeInnerDrive {
     /// `reml_criterion_with_refine_policy` (accepted-basin evaluations, the
     /// cross-seed ranking / EFS value lane, streaming fits).
     Criterion { refine_progress_extension: bool },
-    /// Eisenstat–Walker line-search probe lane (`forced_probe_criterion`):
-    /// chunked inner Newton with the loosened stationarity gate
-    /// `max(η·r_entry, τ_full)` and probe-lane iteration telemetry. `eta =
-    /// None` is the counted ALWAYS-TIGHT gate (`τ_full` exactly).
-    ForcedLineSearchProbe { eta: Option<f64> },
+    /// Exact line-search probe lane (`line_search_probe_criterion`): chunked
+    /// inner Newton with the same full KKT stationarity gate as accepted-point
+    /// evaluations, plus probe-lane iteration telemetry.
+    LineSearchProbe,
 }
 
 /// #2231 Inc-B (stage 1) — crosscoder block-relevance PRICING state.
@@ -803,10 +600,6 @@ pub struct SaeManifoldOuterObjective {
     /// criterion-driving call and cleared by every state-swapping seam
     /// (`reset`, seed installation, subsample engage/restore, homotopy entry).
     probe_converged_handoff: Option<ProbeConvergedHandoff>,
-    /// Eisenstat–Walker forcing state for line-search value probes (see the
-    /// block comment above [`EW_FORCING_GAMMA`]). Updated at every accepted-
-    /// gradient evaluation; consumed only by the `eval_with_order(Value)` lane.
-    forcing: ProbeForcingState,
     /// #2080 — the frozen per-outer-solve rational log-det surrogate lane. When
     /// the streaming criterion takes the matrix-free massive-K evidence branch
     /// (dense `k×k` reduced Schur over budget), the `log|S|` term is estimated by
@@ -963,7 +756,6 @@ impl SaeManifoldOuterObjective {
             probe_telemetry: OuterProbeTelemetry::default(),
             cancel_flag: None,
             probe_converged_handoff: None,
-            forcing: ProbeForcingState::new(),
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
             basin_bundle: BasinBundle::new(basin_member_capacity),
             // #2235 — outer-search accounting + the non-convergence forcing
@@ -1367,19 +1159,6 @@ impl SaeManifoldOuterObjective {
     /// bounded (a PROBE-COUNT budget, per SPEC's ban on wall-clock budgets).
     pub fn probe_telemetry(&self) -> OuterProbeTelemetry {
         self.probe_telemetry
-    }
-
-    /// Enable/disable the Eisenstat–Walker inexact line-search probes (see the
-    /// block comment above [`EW_FORCING_GAMMA`]). Enabled by default. When
-    /// disabled, value probes still run through the counted probe lane but
-    /// with the gate pinned to the FULL inner tolerance — the always-tight
-    /// arm the forcing acceptance test compares against (its probe values are
-    /// converged to the identical stationarity measure as the historical
-    /// path, and the probe-lane iteration telemetry stays comparable).
-    /// Terminal quantities are full-tolerance in BOTH modes, so the returned
-    /// fit is unaffected by this switch.
-    pub fn set_probe_forcing_enabled(&mut self, enabled: bool) {
-        self.forcing.enabled = enabled;
     }
 
     /// #1033 — opt into AMORTIZED (frozen) routing for the ρ-search: freeze the
@@ -2430,13 +2209,10 @@ impl SaeManifoldOuterObjective {
     }
 
     /// As [`Self::evaluate_with_refine_policy`], but with the inner `(t, β)`
-    /// drive selected by [`ProbeInnerDrive`]: the historical criterion drive,
-    /// or the Eisenstat–Walker forced line-search probe lane
-    /// ([`Self::forced_probe_criterion`]). Everything around the inner drive —
-    /// the probe handoff install, seeded-β warm start, amortized latent warm
-    /// start, and the collapse wall — is shared, so the two drives evaluate the
-    /// SAME criterion and differ only in how far the inner solve is converged
-    /// before pricing it.
+    /// drive selected by [`ProbeInnerDrive`]: the historical criterion drive or
+    /// the exact line-search probe lane ([`Self::line_search_probe_criterion`]).
+    /// Everything around the inner drive — the probe handoff install, seeded-β
+    /// warm start, amortized latent warm start, and collapse wall — is shared.
     fn evaluate_with_inner_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2516,9 +2292,7 @@ impl SaeManifoldOuterObjective {
                 refine_progress_extension,
                 self.surrogate_lane.as_mut(),
             )?,
-            ProbeInnerDrive::ForcedLineSearchProbe { eta } => {
-                self.forced_probe_criterion(&rho, eta)?
-            }
+            ProbeInnerDrive::LineSearchProbe => self.line_search_probe_criterion(&rho)?,
         };
         let beta_hat = self.term.flatten_beta();
         // ONE criterion everywhere. Every outer lane — BFGS/ARC descent, the
@@ -2542,9 +2316,7 @@ impl SaeManifoldOuterObjective {
 
     /// Joint inner KKT gradient norm² read straight off the assembled system —
     /// bit-identical arithmetic to the stationarity residual
-    /// `converge_inner_for_undamped_logdet` computes (Σᵢ‖g_t⁽ⁱ⁾‖² + ‖g_β‖²),
-    /// so the forced-probe gate and the historical gate measure the same
-    /// quantity.
+    /// `converge_inner_for_undamped_logdet` computes (Σᵢ‖g_t⁽ⁱ⁾‖² + ‖g_β‖²).
     fn inner_kkt_grad_norm_sq(sys: &ArrowSchurSystem) -> f64 {
         sys.rows
             .iter()
@@ -2553,46 +2325,35 @@ impl SaeManifoldOuterObjective {
             + sys.gb.iter().map(|&v| v * v).sum::<f64>()
     }
 
-    /// Line-search value-probe criterion under the Eisenstat–Walker forcing
-    /// lane (see the block comment above [`EW_FORCING_GAMMA`] for the forcing
-    /// sequence, its citations, and the exactness invariants).
+    /// Exact line-search value-probe criterion.
     ///
     /// Structure — a faithful, counted port of the historical probe drive
     /// (`reml_criterion_with_cache_refine_policy` at
-    /// `refine_progress_extension == false`), differing ONLY in the
-    /// stationarity gate:
+    /// `refine_progress_extension == false`):
     ///
     /// 1. Chunks of the SAME inner Newton driver
     ///    (`run_joint_fit_arrow_schur`), chunk width `inner_max_iter` and the
     ///    identical total probe budget `max(4·inner_max_iter, 16)` the
     ///    historical probe refine loop grants.
     /// 2. Between chunks, the same assembled-system KKT residual and quotient
-    ///    residual the historical loop gates on, against
-    ///    `gate = max(η_j·r_entry, τ_full)` — with `eta = None` (the
-    ///    always-tight arm) the gate is EXACTLY the historical `τ_full`, so
-    ///    the tight arm converges probes to the identical stationarity
-    ///    measure.
-    /// 3. The same #2080 per-row non-PD fast-refusal between chunks, so an
-    ///    infeasible-ρ probe still refuses after one diagnostic pass instead
-    ///    of grinding the budget.
-    /// 4. At an (η-)stationary iterate, the criterion is priced through the
+    ///    residual the historical loop gates on, against the identical full
+    ///    stationarity tolerance `τ_full`.
+    /// 3. At a stationary iterate, the criterion is priced through the
     ///    sanctioned FREEZE evaluation (`inner_max_iter == 0`: one undamped
     ///    factorization at the frozen state) — the same evidence convention as
     ///    the historical loop's stationary factorization.
-    /// 5. If the gate is not met within the probe budget, adjudication is
+    /// 4. If the exact gate is not met within the probe budget, adjudication is
     ///    handed back verbatim to the historical evaluator (which owns the
     ///    #1051 objective-stagnation acceptance and the typed
     ///    "did not converge" refusal), warm from the partially refined state —
-    ///    the forcing lane can therefore never introduce a NEW refusal class,
-    ///    only stop earlier on probes the historical path would also accept.
+    ///    this lane cannot introduce a new refusal class.
     ///
     /// Regimes with no dense per-round assembly (streaming / matrix-free) and
     /// the `inner_max_iter == 0` freeze contract bypass the lane entirely and
     /// keep the historical evaluator byte-for-byte.
-    fn forced_probe_criterion(
+    fn line_search_probe_criterion(
         &mut self,
         rho: &SaeManifoldRho,
-        eta: Option<f64>,
     ) -> Result<(f64, SaeManifoldLoss), String> {
         let plan = self.term.streaming_plan();
         let admitted = plan.admitted_or_error(
@@ -2613,35 +2374,6 @@ impl SaeManifoldOuterObjective {
                 self.surrogate_lane.as_mut(),
             );
         }
-        let options = ArrowSolveOptions::direct()
-            .with_ill_conditioning_tolerated()
-            .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
-        // Entry inner KKT residual at the PROBED ρ — the ‖F(x)‖ analog of the
-        // inexact-Newton forcing condition ‖F(x) + F′(x)s‖ ≤ η‖F(x)‖ (Dembo–
-        // Eisenstat–Steihaug 1982): the probe's inner solve must reduce the
-        // inner KKT residual by at least the factor η_j relative to the
-        // warm-start state it entered with. Only measured when a forcing η is
-        // active (the tight arm gates on the absolute τ_full alone).
-        let r_entry = match eta {
-            Some(_) => {
-                let sys = self.term.assemble_arrow_schur(
-                    self.target.view(),
-                    rho,
-                    self.registry.as_ref(),
-                )?;
-                let grad_norm_sq = Self::inner_kkt_grad_norm_sq(&sys);
-                if !grad_norm_sq.is_finite() {
-                    return Err(format!(
-                        "SaeManifoldTerm::reml_criterion: undamped inner KKT residual is \
-                         non-finite at the forced line-search probe entry \
-                         (‖g‖²={grad_norm_sq}); the joint Hessian assembly is degenerate at \
-                         this ρ"
-                    ));
-                }
-                Some(grad_norm_sq.sqrt())
-            }
-            None => None,
-        };
         // Identical chunk width and total budget as the historical PROBE path:
         // `reml_criterion_with_cache_refine_policy` grants `inner_max_iter`
         // up front, then refine rounds of `inner_max_iter` each, up to the
@@ -2674,7 +2406,7 @@ impl SaeManifoldOuterObjective {
             if !grad_norm_sq.is_finite() {
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: undamped inner KKT residual is non-finite \
-                     at the forced line-search probe iterate (‖g‖²={grad_norm_sq}); the joint \
+                     at the line-search probe iterate (‖g‖²={grad_norm_sq}); the joint \
                      Hessian assembly is degenerate at this ρ"
                 ));
             }
@@ -2683,48 +2415,13 @@ impl SaeManifoldOuterObjective {
             let quotient_grad_norm =
                 self.term
                     .quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
-            // The same full stationarity tolerance the historical loop uses
-            // (`SAE_MANIFOLD_INNER_GRAD_REL_TOL × iterate scale`), loosened —
-            // never tightened — by the forcing term: the gate can only sit
-            // BETWEEN τ_full and the η_j-relative entry-residual reduction.
-            let tol_full = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
-            let gate = match (eta, r_entry) {
-                (Some(eta_j), Some(entry_residual)) => (eta_j * entry_residual).max(tol_full),
-                _ => tol_full,
-            };
-            // #2080 probe fast-refusal parity: a non-PD per-row H_tt block
-            // before FULL stationarity means the undamped Laplace log-det is
-            // undefined at this ρ — an infeasible-ρ probe verdict the outer
-            // search maps to the finite wall. Adjudicated on EVERY round —
-            // including a gate-met round whose iterate is η-truncated (still
-            // pre-KKT), where the freeze pricing below would otherwise surface
-            // the raw factor error outside the typed recoverable-refusal
-            // class. Refuse after this single per-row diagnostic pass exactly
-            // like the historical probe loop.
-            match probe_undamped_evidence_row_factors(&sys, &options) {
-                Ok(()) => {}
-                Err(err) if SaeManifoldTerm::is_undamped_evidence_row_non_pd(&err) => {
-                    return Err(format!(
-                        "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a \
-                         non-PD per-row H_tt block before KKT stationarity at an infeasible-ρ \
-                         probe (forced line-search lane, ‖g‖={grad_norm:.6e}, gate \
-                         {gate:.6e}); returning the typed infeasible refusal without grinding \
-                         the probe refinement budget; {err}"
-                    ));
-                }
-                Err(err) => {
-                    return Err(format!("SaeManifoldTerm::reml_criterion: {err}"));
-                }
-            }
+            // The exact full stationarity tolerance used by the accepted-point
+            // criterion. Line-search comparisons must evaluate one coherent
+            // objective; an inexact inner solve would make Armijo/Wolfe compare
+            // unlike values and can reject a real descent step (#2253).
+            let gate = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
             if grad_norm <= gate || quotient_grad_norm <= gate {
-                if eta.is_some() && grad_norm > tol_full && quotient_grad_norm > tol_full {
-                    // A genuine early stop: the forcing gate accepted an
-                    // iterate the full-tolerance gate would have kept
-                    // refining. Observable per the telemetry contract.
-                    self.probe_telemetry.loosened_probe_calls =
-                        self.probe_telemetry.loosened_probe_calls.saturating_add(1);
-                }
-                // Price the criterion at the (η-)stationary iterate through the
+                // Price the criterion at the stationary iterate through the
                 // sanctioned FREEZE evaluation (`inner_max_iter == 0`): one
                 // undamped factorization at the frozen state, the same evidence
                 // convention as the historical loop's stationary factorization.
@@ -2748,8 +2445,8 @@ impl SaeManifoldOuterObjective {
                 // to the historical evaluator — which owns the #1051
                 // objective-stagnation acceptance and the canonical typed
                 // "did not converge" refusal — warm from the current
-                // partially-refined state. The forcing lane thus never mints a
-                // refusal of its own for this class.
+                // partially-refined state. This lane never mints a refusal of
+                // its own for this class.
                 return self.term.reml_criterion_with_refine_policy_and_lane(
                     self.target.view(),
                     rho,
@@ -2779,8 +2476,8 @@ impl SaeManifoldOuterObjective {
     /// coordinates/decoder must not become the warm-start state for later
     /// probes or for the accepted iterate. The inner `(t, β)` drive is selected
     /// by the caller: the line-search lane (`eval_with_order(Value)`) passes the
-    /// Eisenstat–Walker forced-probe drive, every other value lane the historical
-    /// criterion drive (`Criterion { refine_progress_extension: false }`).
+    /// exact probe drive; every other value lane uses the historical criterion
+    /// drive (`Criterion { refine_progress_extension: false }`).
     fn evaluate_value_probe_with_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2798,12 +2495,7 @@ impl SaeManifoldOuterObjective {
         // successful value probe. Only a genuinely converged, non-wall value is
         // worth handing off: a collapse-wall probe's state is a degenerate basin
         // the accepted lane must not inherit, and a refused probe never
-        // converged at all. Under the Eisenstat–Walker forced drive the state
-        // may be η-INEXACT (stopped at the loosened gate); that is still a
-        // valid handoff because the receiver treats it purely as a warm start —
-        // the accepted lane's own full-tolerance convergence loop adjudicates
-        // stationarity before pricing any value or gradient (see
-        // [`ProbeConvergedHandoff`]).
+        // converged at all.
         match &result {
             Ok((cost, _beta)) if !Self::probe_value_is_wall(*cost) => {
                 let converged = std::mem::replace(&mut self.term, saved_term);
@@ -2862,12 +2554,11 @@ impl SaeManifoldOuterObjective {
     /// stationary factor (the linear-block seed that produced cost-only 1e12
     /// versus analytic 3.6e13 at the identical ρ).
     ///
-    /// Retry either provisional result once at the accepted-point drive. The
-    /// pre-KKT non-PD retry is deliberately limited to `Criterion` ranking
-    /// evaluations; `ForcedLineSearchProbe` retains #2080's fast rejection for
-    /// an overshooting trial. Only a full-drive refusal reaches the caller's
-    /// wall/hard-error classification, so genuinely non-PD stationary factors
-    /// keep their infeasibility semantics.
+    /// Complete either provisional result once at the accepted-point drive.
+    /// Only a full-drive refusal reaches the caller's wall/hard-error
+    /// classification, so genuinely non-PD stationary factors retain their
+    /// infeasibility semantics while transient pre-KKT indefiniteness never
+    /// masquerades as a property of the probed ρ.
     fn value_probe_with_budget_rescue(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2876,14 +2567,9 @@ impl SaeManifoldOuterObjective {
         match self.evaluate_envelope_value_probe(rho_flat, drive) {
             Err(err)
                 if err.contains("inner solve did not converge at fixed ρ")
-                    || (matches!(
-                        drive,
-                        ProbeInnerDrive::Criterion {
-                            refine_progress_extension: false
-                        }
-                    ) && err.contains(
+                    || err.contains(
                         "undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity",
-                    )) =>
+                    ) =>
             {
                 self.probe_telemetry.budget_rescued_value_probes += 1;
                 self.evaluate_envelope_value_probe(
@@ -3964,14 +3650,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // envelope term is a deflation-candidate gap to fix in
         // `outer_gradient_arrow_solver`, not something to paper over with a
         // differenced value path.
-        // Eisenstat–Walker forcing update: this gradient lane runs only at
-        // accepted iterates (plus the seed and the finalize re-installation,
-        // which the bitwise same-ρ check inside filters out), so its ‖g‖ is
-        // the outer optimality measure the forcing sequence consumes. Wall-
-        // cost and refusal returns above never reach here, so a degenerate
-        // zero gradient can never poison the ratio.
-        let gradient_norm = gradient.dot(&gradient).sqrt();
-        self.forcing.observe_accepted_gradient(rho, gradient_norm);
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
         if self.termination.record(cost) {
@@ -4002,18 +3680,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // (see `solver/rho_optimizer/bridges.rs`). Its cost is compared
                 // against steps whose direction came from `eval`'s pure REML
                 // `∇f` — the same single criterion every lane prices.
-                // Eisenstat–Walker forced-probe drive (see the block comment
-                // above `EW_FORCING_GAMMA`): this lane — and ONLY this lane —
-                // is the Armijo/Wolfe line-search comparison probe, whose
-                // criterion value merely ranks candidate ρ steps, so its inner
-                // solve may stop at the forcing gate `max(η_j·r_entry, τ_full)`
-                // tied to the outer optimality measure. `line_search_eta()` is
-                // `None` (a full-tolerance counted gate) until two accepted-
-                // gradient evaluations establish the EW ratio, and always
-                // `None` when forcing is disabled.
-                let drive = ProbeInnerDrive::ForcedLineSearchProbe {
-                    eta: self.forcing.line_search_eta(),
-                };
+                // Line-search comparisons use the exact same inner KKT gate as
+                // the accepted-point value/gradient lane. Comparing a loosened
+                // trial value with a tight anchor is not one coherent objective
+                // and caused real descent steps to fail Wolfe at iteration zero
+                // on the frozen #2253 circle fit.
+                let drive = ProbeInnerDrive::LineSearchProbe;
                 let (cost, _beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
                 {
                     Ok(evaluated) => evaluated,
@@ -4114,10 +3786,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #2230/#2087 — a multi-start reset starts a NEW outer walk; the previous
         // seed's saved basins are meaningless for it.
         self.basin_bundle.clear();
-        // A multi-start reset starts a NEW outer walk: the previous seed's
-        // gradient decay is meaningless for it, so the Eisenstat–Walker ratio
-        // is re-established from scratch (probes run tight until then).
-        self.forcing.clear_history();
         self.termination.reset_improvement_baseline();
     }
 

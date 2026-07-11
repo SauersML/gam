@@ -391,7 +391,6 @@ mod tests_topk_divergence_2134;
 mod tests_outer_reml_probe_budget_2080;
 
 #[cfg(test)]
-mod tests_outer_probe_forcing;
 
 #[cfg(test)]
 mod lambda_smooth_1556_tests;
