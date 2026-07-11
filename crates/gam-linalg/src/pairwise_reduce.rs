@@ -347,8 +347,8 @@ where
     }
     let mid = lo + left_split(len);
     let (left, right) = rayon::join(
-        || par_reduce_index_range(lo, mid, map, combine, identity),
-        || par_reduce_index_range(mid, hi, map, combine, identity),
+        move || par_reduce_index_range(lo, mid, map, combine, identity),
+        move || par_reduce_index_range(mid, hi, map, combine, identity),
     );
     combine(left, right)
 }
