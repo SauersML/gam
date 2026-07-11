@@ -4522,6 +4522,18 @@ pub(crate) fn gaussian_location_scale_exact_newton_spatial_joint_hyper_returns_f
     let blocks = builder
         .build_blocks(&rho, &mean_design, &noise_design, None, None)
         .expect("build blocks");
+    assert_eq!(
+        builder.noise_penalty_count(&noise_design),
+        noise_design.penalties.len(),
+        "Gaussian scale-block rho layout must contain only formula-native penalties"
+    );
+    assert_eq!(
+        blocks[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
+            .penalties
+            .len(),
+        noise_design.penalties.len(),
+        "Gaussian scale-block construction must not penalize the likelihood-identified log-sigma intercept"
+    );
     let family = builder.build_family(&mean_design, &noise_design);
     let derivative_blocks = builder
         .build_psiderivative_blocks(
