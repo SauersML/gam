@@ -612,19 +612,29 @@ fn constant_gaussian_standard_fit(
 }
 
 fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
-    if !request.family.is_gaussian_identity()
-        || request.y.is_empty()
-        || request.y.iter().any(|value| !value.is_finite())
-    {
+    if !request.family.is_gaussian_identity() || request.y.is_empty() {
         return false;
     }
-    let (lo, hi) = request
-        .y
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &value| {
-            (lo.min(value), hi.max(value))
-        });
-    (hi - lo).abs() <= 1.0e-12 * hi.abs().max(1.0)
+    // The intercept-only shortcut is exact — residual ≡ 0 — precisely when the
+    // OFFSET-ADJUSTED response `y − offset` is constant: then `η = offset +
+    // intercept = y` at every row. Testing the raw `y` alone would (a) miss an
+    // exact fit where a varying offset cancels a varying `y`, and (b) wrongly
+    // fire on a constant `y` under a varying offset, where the fit is NOT exact
+    // and the zero-dispersion inference the shortcut mints would be invalid.
+    if request.y.len() != request.offset.len() {
+        return false;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (&yi, &oi) in request.y.iter().zip(request.offset.iter()) {
+        let value = yi - oi;
+        if !value.is_finite() {
+            return false;
+        }
+        lo = lo.min(value);
+        hi = hi.max(value);
+    }
+    (hi - lo).abs() <= 1.0e-12 * hi.abs().max(lo.abs()).max(1.0)
 }
 
 pub fn fit_from_formula(
