@@ -384,6 +384,14 @@ pub struct SaeFitRequest {
     pub promote_from_residual: bool,
     pub run_structure_search: bool,
     pub run_outer_rho_search: bool,
+    /// Number of structured-residual whitening passes (each installs a NEW
+    /// row-metric likelihood and re-runs the entire outer ρ search). `None` =
+    /// the historical default ([`STRUCTURED_RESIDUAL_PASSES_DEFAULT`] = 2);
+    /// `Some(0)` = the UNBUNDLED direct path: seed → single certified fit on
+    /// the iid likelihood. Together with `promote_from_residual = false` and
+    /// `run_structure_search = false` this is the stage-5 "which path did my
+    /// fit take" answer: exactly one.
+    pub structured_residual_passes: Option<usize>,
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -645,7 +653,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
     // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
     // builds a genuine WhitenedStructured blend).
-    let structured_passes = STRUCTURED_RESIDUAL_PASSES_DEFAULT;
+    let structured_passes =
+        structured_residual_passes.unwrap_or(STRUCTURED_RESIDUAL_PASSES_DEFAULT);
     let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<StructuredResidualModel> = None;
