@@ -1,3 +1,0 @@
-/Users/user/gam/crates/gam-sae/src/saebench_metrics.rs
-/Users/user/gam/crates/gam-sae/src/manifold/tests_graph_spectral_decode.rs
-done
