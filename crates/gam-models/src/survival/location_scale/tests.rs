@@ -7004,22 +7004,15 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 }
             }
             eprintln!(
-                "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?}, fourth_max={fourth_max:.3e} at {fourth_at:?}"
+                "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?} \
+                 (analytic={:+.9e}, fd={:+.9e}), fourth_max={fourth_max:.3e} at {fourth_at:?} \
+                 (analytic={:+.9e}, fd={:+.9e})",
+                d_dir_analytic[third_at],
+                fd_third[third_at],
+                d2_analytic[fourth_at],
+                fd_fourth[fourth_at],
             );
-            // The header's contract: a dropped warp-coupling term shows O(1)
-            // relative error, so these bounds gate correctness while leaving
-            // generous room for the five-point stencils' own truncation/
-            // cancellation noise (h=1e-2 / 2e-2).
-            assert!(
-                third_max < 1.0e-5,
-                "{distribution:?} {label}: analytic third directional deviates from \
-                 the five-point FD stencil by {third_max:.3e} at {third_at:?}"
-            );
-            assert!(
-                fourth_max < 1.0e-4,
-                "{distribution:?} {label}: analytic fourth directional deviates from \
-                 the five-point FD stencil by {fourth_max:.3e} at {fourth_at:?}"
-            );
+            (third_max, third_at, fourth_max, fourth_at)
         };
 
         let full_u: Vec<f64> = (0..ncoef)
@@ -7048,9 +7041,40 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 .map(|c| if c < 3 { base[c] } else { 0.0 })
                 .collect()
         };
-        mk(&full_u, &full_v, "FULL");
-        mk(&wig(&full_u), &wig(&full_v), "WIGGLE_ONLY");
-        mk(&baseonly(&full_u), &baseonly(&full_v), "BASE_ONLY");
+        let wiggle_u = wig(&full_u);
+        let wiggle_v = wig(&full_v);
+        let base_u = baseonly(&full_u);
+        let base_v = baseonly(&full_v);
+        let cases = [
+            ("FULL", mk(&full_u, &full_v, "FULL")),
+            (
+                "WIGGLE_ONLY",
+                mk(&wiggle_u, &wiggle_v, "WIGGLE_ONLY"),
+            ),
+            ("BASE_ONLY", mk(&base_u, &base_v, "BASE_ONLY")),
+        ];
+        let mut failures = Vec::new();
+        for (label, (third_max, third_at, fourth_max, fourth_at)) in cases {
+            // The header's contract: a dropped warp-coupling term shows O(1)
+            // relative error, so these bounds gate correctness while leaving
+            // generous room for the five-point stencils' own truncation/
+            // cancellation noise (h=1e-2 / 2e-2).
+            if third_max >= 1.0e-5 {
+                failures.push(format!(
+                    "{label} third={third_max:.3e} at {third_at:?}"
+                ));
+            }
+            if fourth_max >= 1.0e-4 {
+                failures.push(format!(
+                    "{label} fourth={fourth_max:.3e} at {fourth_at:?}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{distribution:?} analytic higher directional mismatch(es): {}",
+            failures.join(", ")
+        );
     }
 }
 
