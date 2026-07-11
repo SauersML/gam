@@ -2877,6 +2877,94 @@ impl SaeManifoldTerm {
         }
     }
 
+    /// #2015 decoder-scaling-gauge fix (the inner-solve stability keystone).
+    ///
+    /// The joint `(t, β)` reconstruction is invariant under the per-atom amplitude
+    /// gauge `a_k·B_k` (assignment mass × decoder): a DYING atom whose mass
+    /// `a_{ik} → 0` can send its decoder `B_k → ∞` with the product `a_k·B_k` —
+    /// hence the reconstruction and the whole penalized objective — UNCHANGED, so
+    /// the Armijo line search happily accepts it (the objective is flat along the
+    /// gauge). But the KKT stationarity gradient with respect to the assignment
+    /// logit / coordinate is proportional to `Φᵀ B_k`, so an unbounded decoder
+    /// makes `‖g‖` EXPLODE while the fit stays objective-good — measured in the
+    /// #2015 probe as `‖g‖ = 2.887e8` at a decoder norm of `1.6e11` (objective
+    /// flat at ~40, coordinates modest, no reseed), a spurious non-stationarity the
+    /// inner solve then has to grind back down over many iterations (the real
+    /// 600-row `qwen_real_activation_behavior_fit` stall). The coordinate-gauge
+    /// quotient `‖Π⊥gauge g‖` does NOT capture this DECODER-amplitude gauge (a
+    /// different flat direction), which is why raw ≈ quotient at the stall.
+    ///
+    /// This re-gauges any atom whose decoder norm has run past the dictionary's
+    /// robust scale back ONTO that scale, moving the reciprocal factor into the
+    /// softmax logits so the physical contribution `a_k·B_k` is preserved. In the
+    /// dying-atom limit `a_{ik} ≪ 1` — exactly where the runaway lives — the
+    /// softmax normalizer is unchanged by a shift in one column, so `z_{·k} +=
+    /// ln s` reproduces `a_k → s·a_k` and the compensation is EXACT. The caller
+    /// applies this inside the objective-guarded retraction hook, which reverts it
+    /// if it perturbs the objective, so it is safe for any atom. Bounding the
+    /// decoder norm bounds the gradient.
+    ///
+    /// Reuses the collapse guard's robust MEDIAN scale and its single ratio
+    /// constant: an atom fires when its norm exceeds `median /
+    /// SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO` — the exact MIRROR of the collapse
+    /// floor `SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO · median` — and is re-gauged
+    /// back to the median (the same robust scale the collapse arm reseeds onto). No
+    /// new tuning knob. Softmax-only: other assignment modes have no free
+    /// multiplicative amplitude to absorb the scale, so `z += ln s` would not
+    /// reproduce `a → s·a` there. Skipped when decoder frames are active (a
+    /// factored-frame decoder must not be rescaled out from under its frame — the
+    /// same conservative choice `refit_decoder_least_squares` makes). K=1 is a
+    /// strict no-op: mass ≡ 1 (data-fit-pins the scale) and there is no peer
+    /// median.
+    pub(crate) fn fix_decoder_scale_gauge(&mut self) -> Result<(), String> {
+        let k = self.k_atoms();
+        if k < 2 || self.frames_active() {
+            return Ok(());
+        }
+        if !matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            return Ok(());
+        }
+        let norms: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.contribution_frobenius_scale())
+            .collect();
+        let mut sorted = norms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if k % 2 == 1 {
+            sorted[k / 2]
+        } else {
+            0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
+        };
+        if !(median > 0.0) {
+            return Ok(());
+        }
+        let ceiling = median / SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO;
+        let n = self.n_obs();
+        let mut any_regauged = false;
+        for atom in 0..k {
+            if !(norms[atom] > ceiling) {
+                continue;
+            }
+            // Re-gauge the runaway decoder back to the robust median scale and put
+            // the reciprocal into the logits so `a_k·B_k` is preserved.
+            let s = norms[atom] / median;
+            if !(s.is_finite() && s > 1.0) {
+                continue;
+            }
+            self.atoms[atom].decoder_coefficients.mapv_inplace(|v| v / s);
+            let ln_s = s.ln();
+            for row in 0..n {
+                self.assignment.logits[[row, atom]] += ln_s;
+            }
+            any_regauged = true;
+        }
+        if any_regauged {
+            canonicalize_softmax_logits(&mut self.assignment.logits);
+        }
+        Ok(())
+    }
+
     /// #976 Layer-1 guard (decoder arm): the per-atom **decoder-norm** floor,
     /// checked once per accepted outer iteration of the joint K>1 fit.
     ///
@@ -6094,6 +6182,15 @@ impl SaeManifoldTerm {
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             let pre_hook_state = self.snapshot_mutable_state();
             self.retract_unit_speed_charts_in_loop()?;
+            // #2015 — decoder-scaling-gauge fix: re-gauge any atom whose decoder
+            // has run off along the objective-flat `a_k·B_k` amplitude gauge (a
+            // dying atom's mass → 0, decoder → ∞) back onto the robust dictionary
+            // scale, so the KKT gradient (∝ Φᵀ B_k) does not explode at an
+            // objective-good iterate. Sits inside this hook's objective guard
+            // (`post_hook_obj <= pre_hook_obj` below), so a re-gauge that is not
+            // objective-preserving is reverted — the fix is only kept when it is
+            // the true flat-gauge move it is designed for.
+            self.fix_decoder_scale_gauge()?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
             // (lifted through the OLD frames in `apply_newton_step`), re-polar each
