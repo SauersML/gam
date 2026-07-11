@@ -2425,10 +2425,6 @@ fn remove_atoms(
     term.hybrid_split_report = None;
     term.best_cocollapse_incumbent = None;
     term.best_fit_incumbent = None;
-    // A cap equal to or wider than the reduced K is no longer an active-set cap.
-    // Re-normalize it through the canonical setter after K has changed.
-    let softmax_active_cap = term.softmax_active_cap;
-    term.set_softmax_active_cap(softmax_active_cap);
     Ok(())
 }
 
@@ -2762,7 +2758,7 @@ struct TopologyRaceFit {
     jet: ndarray::Array3<f64>,
     /// Penalized-least-squares decoder `B` (`m × p`).
     decoder: Array2<f64>,
-    /// Intrinsic roughness Gram `S` (`m × m`) the atom is seeded with.
+    /// Declared reference-function Gram `S_ref` (`m × m`) the atom is seeded with.
     penalty: Array2<f64>,
 }
 
@@ -3024,12 +3020,11 @@ fn fit_topology_candidate(
         return Err("fit_topology_candidate: degenerate (zero-mass) birth target".into());
     }
 
-    // The candidate basis's raw roughness Gram, the smoothness operator the
-    // topology evidence prices. The gauge-invariant, basis-AGNOSTIC roughness
-    // every candidate here can present analytically is the total second-derivative
-    // (curvature) energy `S = Σ_n Σ_{a,c} Φ''_{·,a,c}(t_n)ᵀ Φ''_{·,a,c}(t_n)` — the
-    // thin-plate / Reinsch penalty — read off each evaluator's analytic second jet
-    // `Φ''[n, μ, a, c]`. A flat (line / patch) basis has a small curvature Gram
+    // The candidate basis's declared reference-function Gram, the smoothness
+    // operator the topology evidence prices. Every candidate is compared under
+    // the same fixed reference measure and second-derivative seminorm
+    // `S_ref = Σ_n Σ_{a,c} Φ''_{·,a,c}(t_n)ᵀ Φ''_{·,a,c}(t_n)`, read off its
+    // analytic second jet `Φ''[n, μ, a, c]`. A flat (line / patch) basis has a small Gram
     // (its low-degree monomials are barely curved), a periodic / sphere basis a
     // large one for its high harmonics: exactly the smoothness price the race must
     // weigh against data fit. Computed identically for every candidate so the
@@ -4292,9 +4287,8 @@ fn born_atom(
     let (born, born_coord_block) = match raced {
         Some(fit) => {
             // Build the born atom directly from the winning topology's realized
-            // basis: its evaluator, penalized decoder, and roughness penalty. The
-            // intrinsic (pullback-metric) penalty is then refreshed from the
-            // seeded decoder so the atom carries exactly the production seeding.
+            // basis: its evaluator, penalized decoder, and declared reference
+            // roughness. Decoder fitting does not redefine that seminorm.
             let reference_roughness = if matches!(fit.basis_kind, SaeAtomBasisKind::Poincare) {
                 SaeReferenceRoughness::PoincareConformalDirichlet {
                     reference_coords: fit.coords.clone(),
@@ -4324,7 +4318,7 @@ fn born_atom(
         }
         None => {
             // The born atom reuses the template's structural basis (kind, latent
-            // dim, basis values + jacobian + raw penalty); only its decoder carries
+            // dim, basis values + Jacobian + reference Gram); only its decoder carries
             // the residual-factor direction.
             let mut atom = template.clone();
             atom.decoder_coefficients = factor_dir.to_owned();
@@ -6895,7 +6889,6 @@ mod tests {
         term.evidence_gauge_deflation_last_delta_sign = -1;
         term.dictionary_cocollapse_reseeds = 3;
         term.structural_cocollapse_reseeds = 4;
-        term.softmax_active_cap = Some(3);
         let accepted_glue = |a: usize, b: usize| MoveRecord {
             mv: StructureMove::Glue {
                 a,
@@ -6959,11 +6952,6 @@ mod tests {
         assert_eq!(term.evidence_gauge_deflation_last_delta_sign, 0);
         assert_eq!(term.dictionary_cocollapse_reseeds, 0);
         assert_eq!(term.structural_cocollapse_reseeds, 0);
-        assert_eq!(
-            term.softmax_active_cap, None,
-            "a width-3 cap is inert after compaction to K=2"
-        );
-
         // The two survivors each now cover a half-circle and STILL glue — the round
         // sequence converges toward the single reassembled chart (K=1).
         let residuals = Array2::<f64>::zeros((n, 4));

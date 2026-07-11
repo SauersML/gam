@@ -711,7 +711,7 @@ impl SaeManifoldTerm {
         self.combine_assignment_strength_gradient(rho, logdet_trace, &gamma, &response, "dense")
     }
 
-    /// Exact non-IBP assignment-strength REML gradient on the matrix-free
+    /// Exact non-IBP assignment-strength penalized-LAML gradient on the matrix-free
     /// evidence path. This is the one coordinate softmax entropy and gated L1
     /// cannot update through a Fellner-Schall equation:
     ///

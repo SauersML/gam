@@ -241,24 +241,6 @@ pub enum AssignmentMode {
     TopK { k: usize },
 }
 
-/// Caller intent for assignment-mode admission. `Default` is the production
-/// route: it never selects ordered Beta--Bernoulli implicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssignmentModeRequest {
-    Default,
-    Softmax,
-    ThresholdGate,
-    OrderedBetaBernoulli,
-}
-
-/// Scale-aware assignment admission result.
-#[derive(Debug, Clone, Copy)]
-pub struct AssignmentModeAdmission {
-    pub mode: AssignmentMode,
-    /// Train-time active-set cap to thread into `SaeManifoldTerm::set_softmax_active_cap`.
-    pub top_k: Option<usize>,
-}
-
 /// #1033 — the fixed-form predictor that produces the ρ-invariant FROZEN routing
 /// (amortized routing). Both forms are NO-learned-net deterministic functions of
 /// the current dictionary; they differ in how faithfully they track the
@@ -418,69 +400,6 @@ impl AssignmentMode {
             _ => None,
         }
     }
-}
-
-/// Default large-K active cap derived from the data-per-atom ratio. When each
-/// atom has fewer rows-per-atom than there are atoms (`N/K < K`), the dense
-/// all-K routing model is the wrong scale; cap each row to the number of rows
-/// available per atom. Otherwise the dense softmax path is admitted.
-pub fn default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Option<usize> {
-    if n_obs == 0 || k_atoms <= 1 {
-        return None;
-    }
-    if n_obs >= k_atoms.saturating_mul(k_atoms) {
-        return None;
-    }
-    let cap = n_obs.div_ceil(k_atoms).clamp(1, k_atoms - 1);
-    Some(cap)
-}
-
-/// Admit the assignment mode for a fit size. The default route is softmax, with
-/// a top-k cap at large K. ordered Beta--Bernoulli is a research-mode opt-in and is refused once
-/// the large-K top-k admission engages.
-pub fn admit_assignment_mode_for_size(
-    request: AssignmentModeRequest,
-    n_obs: usize,
-    k_atoms: usize,
-    temperature: f64,
-    alpha: f64,
-    learnable_alpha: bool,
-    threshold: f64,
-) -> Result<AssignmentModeAdmission, String> {
-    if n_obs == 0 {
-        return Err("admit_assignment_mode_for_size: n_obs must be positive".to_string());
-    }
-    if k_atoms == 0 {
-        return Err("admit_assignment_mode_for_size: k_atoms must be positive".to_string());
-    }
-    let large_k_top = default_top_k_for_large_dictionary(n_obs, k_atoms);
-    let admission = match request {
-        AssignmentModeRequest::Default | AssignmentModeRequest::Softmax => {
-            AssignmentModeAdmission {
-                mode: AssignmentMode::softmax(temperature),
-                top_k: large_k_top,
-            }
-        }
-        AssignmentModeRequest::ThresholdGate => AssignmentModeAdmission {
-            mode: AssignmentMode::threshold_gate(temperature, threshold),
-            top_k: None,
-        },
-        AssignmentModeRequest::OrderedBetaBernoulli => {
-            // #F2 — re-admit ordered Beta--Bernoulli at large K, with the same rows-per-atom
-            // `top_k` used as the ACTIVE-SET COMPUTE CAP (the softmax lane's
-            // large-K cap), instead of refusing the request. The occupancy-driven
-            // empirical-Bayes α M-step (#F1) now un-caps the effective atom count
-            // that the fixed geometric schedule used to pin at ~3, so ordered Beta--Bernoulli is a
-            // usable large-K lane once its per-row work is bounded by `top_k`.
-            // Small fits keep `top_k = None` (dense ordered Beta--Bernoulli), unchanged.
-            AssignmentModeAdmission {
-                mode: AssignmentMode::ordered_beta_bernoulli(temperature, alpha, learnable_alpha),
-                top_k: large_k_top,
-            }
-        }
-    };
-    admission.mode.validate()?;
-    Ok(admission)
 }
 
 /// Per-row latent assignment state — the DENSE-CERTIFICATION / debug-and-research

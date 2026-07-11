@@ -1104,7 +1104,7 @@ pub fn profiled_penalized_laml_criterion(
     0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac
 }
 
-/// The analytic outer-REML gradient of [`profiled_penalized_laml_criterion`] with respect
+/// The analytic outer gradient of [`profiled_penalized_laml_criterion`] with respect
 /// to each block weight `log λ_ℓ` (#2231 §2a), evaluated at a fitted state's
 /// UNSCALED per-block residual sums of squares. At the inner optimum the residual
 /// is stationary in `(t, β)` (the envelope theorem: `∂R/∂β · ∂β/∂λ` vanishes), so
@@ -1124,13 +1124,13 @@ pub fn profiled_penalized_laml_criterion(
 /// The per-coordinate stationary point `λ_ℓ·R_ℓ = (p_ℓ/p̃)·pooled` is met exactly
 /// by the joint variance-ratio fixed point `λ_ℓ = (R_x/p_x)/(R_ℓ/p_ℓ)` (substitute
 /// and use `pooled = R_x·p̃/p_x` there), so the analytic gradient and the
-/// closed-form EFS step ([`profiled_reml_block_efs_log_lambda_steps`]) agree at the
+/// closed-form EFS step ([`profiled_penalized_laml_block_efs_log_lambda_steps`]) agree at the
 /// optimum — the coherence the planted two-layer test pins.
 ///
 /// Returns all-zero for a non-positive pooled residual (the criterion is then
 /// `+∞`; a caller's line search rejects the value and must not consume a NaN
 /// direction).
-pub fn profiled_reml_block_log_lambda_gradient(
+pub fn profiled_penalized_laml_block_log_lambda_gradient(
     n_obs: usize,
     p_x: usize,
     rss_x: f64,
@@ -1173,7 +1173,7 @@ pub fn profiled_reml_block_log_lambda_gradient(
 /// residual variance (`R_ℓ ≤ 0`, or a non-positive anchor variance) is
 /// unidentifiable and HELD (step 0), matching the M1 driver's `identifiable`
 /// gate.
-pub fn profiled_reml_block_efs_log_lambda_steps(
+pub fn profiled_penalized_laml_block_efs_log_lambda_steps(
     p_x: usize,
     rss_x: f64,
     block_rss_unscaled: &[f64],

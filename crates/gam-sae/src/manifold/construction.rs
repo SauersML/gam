@@ -283,7 +283,6 @@ impl SaeManifoldTerm {
             last_frames_active: false,
             assembly_chunk_override: None,
             fixed_decoder_assembly: false,
-            softmax_active_cap: None,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             arrow_assembly_workspace: SaeArrowAssemblyWorkspace::default(),
             certificate_dispersion: None,
@@ -607,18 +606,6 @@ impl SaeManifoldTerm {
         self.last_frames_active = false;
         self.border_hbb_workspace = Array2::<f64>::zeros((0, 0));
         Ok(())
-    }
-
-    /// #1408/#1409 — install the optional hard per-row active-atom cap for
-    /// Softmax mode (threaded from the fit/encode `top_k`). A `Some(k)` with
-    /// `1 <= k < K` makes the Softmax assignment optimize on the COMPACT
-    /// top-`k` row layout (see [`Self::softmax_active_cap`]); `Some(k) >= K`
-    /// and `None` are both no-ops (full support). Non-softmax modes ignore it.
-    pub fn set_softmax_active_cap(&mut self, top_k: Option<usize>) {
-        self.softmax_active_cap = match top_k {
-            Some(k) if k >= 1 && k < self.k_atoms() => Some(k),
-            _ => None,
-        };
     }
 
     /// Install the fitted reconstruction dispersion used by
@@ -2810,174 +2797,6 @@ impl SaeManifoldTerm {
             cursor += width;
         }
         Arc::from(ranges.into_boxed_slice())
-    }
-
-    /// Decide whether the sparse per-row active-set layout is engaged for a
-    /// dense-weight assignment mode, and if so derive the per-row active-atom
-    /// cap and magnitude cutoff.
-    ///
-    /// #1408: this plan is mode-agnostic. `assemble_arrow_schur` consults it
-    /// directly for ordered Beta--Bernoulli-MAP, and for `AssignmentMode::Softmax` via
-    /// [`Self::softmax_active_plan`], which tightens it with an explicit `top_k`
-    /// (`softmax_active_cap`). Softmax therefore engages the compact active-set
-    /// layout whenever `top_k` or the budget bounds the active set (the
-    /// active-sub-block Gershgorin majorizer + coherent logdet/θ-adjoint are
-    /// landed — see `SaeRowLayout`'s doc); it keeps the full `K`-atom layout only
-    /// when neither lever engages. The decision is auto-derived from
-    /// the problem size and the device/host working-set budget — never a CLI flag
-    /// or kwarg. The smooth threshold gate always uses the exact dense layout.
-    /// The dense Gauss-Newton data Gram `G`
-    /// is `(m_total × m_total)` f64; if its dense form fits the budget we keep
-    /// the exact full-support solve (every atom active per row), so small-`K`
-    /// problems are bit-for-bit unchanged. Above that, we cap each row to the
-    /// `k_active` atoms that make the *sparse* Gram fit the same budget, with a
-    /// relative magnitude cutoff that drops assignment mass contributing
-    /// negligible `O(a²)` curvature.
-    ///
-    /// Returns `Some((k_active_cap, cutoff))` to engage sparsity, or `None` to
-    /// keep the dense full-support layout.
-    pub(crate) fn sparse_active_plan(&self) -> Option<(usize, f64)> {
-        // The per-row Riemannian tangent projection for non-Euclidean atom
-        // latents is now applied directly on the compact active-set rows (see
-        // the `Some(layout)` arm in `assemble_arrow_schur`, via
-        // `compact_row_ext_manifold_and_point`), which rebuilds each row's
-        // product manifold in its compact column order and applies the SAME
-        // gt/htt/htbeta + Kronecker-Jacobian projections the dense path uses. So
-        // the sparse plan may engage on curved ext-coord manifolds (circle /
-        // torus / sphere atoms) — the affordability lever for manifold-SAE at
-        // large `K`, where the dense `K²` co-assignment Gram is the cost. (The
-        // former `is_euclidean()`-only restriction punted every curved atom to
-        // the dense layout; it is lifted.) The host/device in-core budget is the
-        // single gate now; it is parameterised in `sparse_active_plan_for_budget`
-        // so the engagement regression can pin a small budget without allocating
-        // a multi-GB dense Gram.
-        // Size gate BEFORE any CUDA probe (startup-tax fix, #1017 ordering):
-        // decide against `min(host budget, conservative device-pool floor)`
-        // first. `sparse_active_plan_for_budget` returns `None` (keep the dense
-        // full-support layout) exactly when the dense data Gram fits the
-        // budget, and that verdict is monotone in the budget — so a Gram that
-        // fits the PESSIMISTIC budget also fits the host budget AND any probed
-        // device pool's budget (every real pool clears
-        // `SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES`). The probe could not flip
-        // the decision, so we return without creating any CUDA context. Only a
-        // Gram that overflows the pessimistic budget needs the real (possibly
-        // pooled-device) budget — and only then do we pay for the probe.
-        let host_budget = sae_host_in_core_budget_bytes().0;
-        let pessimistic = host_budget.min(SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES);
-        if self.sparse_active_plan_for_budget(pessimistic).is_none() {
-            return None;
-        }
-        let budget = match crate::gpu::device_runtime::GpuRuntime::global() {
-            // Allow up to one quarter of the AGGREGATE device budget for the dense
-            // Gram, matching the streaming dispatcher's in-core fraction. The
-            // per-atom-pair Gram blocks fan out across the whole device pool, so
-            // the in-core fraction sums every ordinal's budget, not just the
-            // primary's.
-            Some(rt) => {
-                let aggregate: usize = rt
-                    .device_ordinals()
-                    .iter()
-                    .map(|&ord| rt.memory_budget_for(ord))
-                    .sum();
-                aggregate / 4
-            }
-            None => host_budget,
-        };
-        self.sparse_active_plan_for_budget(budget)
-    }
-
-    /// Budget-parameterised core of [`Self::sparse_active_plan`]. The dense data
-    /// Gram footprint `(m_total · m_total) f64` is compared against `budget`; a
-    /// term whose dense Gram exceeds the budget engages the compact active-set
-    /// plan (returns `Some((k_active_cap, cutoff))`), regardless of whether any
-    /// atom latent is curved. Pulled out so the curved-atom engagement
-    /// regression can pin a small budget deterministically.
-    pub(crate) fn sparse_active_plan_for_budget(&self, budget: usize) -> Option<(usize, f64)> {
-        // Relative magnitude cutoff: assignment mass below this fraction of the
-        // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
-        // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
-        const RELATIVE_CUTOFF: f64 = 1.0e-3;
-
-        let k_atoms = self.k_atoms();
-        if k_atoms <= 1 {
-            return None;
-        }
-        let p = self.output_dim();
-        let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
-        // Dense data Gram footprint: (m_total · m_total) f64.
-        let dense_gram_bytes = m_total
-            .saturating_mul(m_total)
-            .saturating_mul(SAE_BYTES_PER_F64);
-        if dense_gram_bytes <= budget {
-            return None;
-        }
-
-        // Sparse Gram footprint scales with the per-row active basis count
-        // `k_active · m_atom`. Solve for the largest `k_active` whose sparse
-        // Gram `(k_active · m_atom)²` still fits the budget.
-        let m_atom = (m_total as f64 / k_atoms as f64).max(1.0);
-        let max_active_basis = ((budget as f64 / SAE_BYTES_PER_F64 as f64).sqrt() / m_atom).floor();
-        let k_active_cap = (max_active_basis as usize).clamp(1, k_atoms);
-        // p does not enter the Gram dimension (it is carried by the `⊗ I_p`
-        // structure), but a degenerate `p == 0` term has no decoder columns.
-        if p == 0 {
-            return None;
-        }
-        Some((k_active_cap, RELATIVE_CUTOFF))
-    }
-
-    /// #1408/#1409 — per-row active-set plan for the Softmax assignment.
-    ///
-    /// Engages the compact top-`k` row layout when EITHER the user supplied a
-    /// hard `top_k` cap ([`Self::softmax_active_cap`], `1 <= k < K`) OR the
-    /// dense data Gram exceeds the in-core budget (the same memory lever the
-    /// ordered Beta--Bernoulli path uses via [`Self::sparse_active_plan`]). The returned
-    /// `k_active_cap` is the tighter of the two, so an explicit `top_k`
-    /// genuinely bounds the optimization even below the memory threshold and a
-    /// large-K budget breach still bounds it when no `top_k` is set. Returns
-    /// `None` (keep the exact full-`K` dense softmax layout) when neither lever
-    /// engages.
-    ///
-    /// The cutoff is the same relative magnitude floor as the budget plan
-    /// (`1e-3` of the row peak); under an explicit `top_k` cap alone (no budget
-    /// breach) it is `0.0` so exactly the top-`k` atoms are retained.
-    pub(crate) fn softmax_active_plan(&self) -> Option<(usize, f64)> {
-        if self.k_atoms() <= 1 {
-            return None;
-        }
-        let budget_plan = self.sparse_active_plan();
-        // #2134 — the deployment `top_k` (`softmax_active_cap`) is a HARD fit-time
-        // truncation of the softmax RECONSTRUCTION, faithful in only two regimes:
-        //   * the FIXED-DECODER encode / OOS assembly, where the decoder is frozen
-        //     so the dictionary cannot co-collapse — this is the load-bearing
-        //     large-K compact-encode contract
-        //     (`large_k_softmax_compact_encode_is_o1_per_token_and_recovers_support`);
-        //   * the winner-take-all `cap == 1` (#2132): the top-1 truncation's
-        //     optimum coincides with a valid full-softmax state (`a_winner → 1`),
-        //     and installing it keeps the cold routing-refine seed and the
-        //     subsequent Arrow-Schur solve on the SAME support (the saddle escape).
-        //
-        // In the JOINT co-training fit with `cap >= 2`, nothing forces the softmax
-        // to concentrate onto exactly `top_k` atoms per row, so the truncated,
-        // NON-renormalized reconstruction `Σ_{k∈top_k} a_k B_k g_k` (formed
-        // identically by the compact assembly and the line-search objective) is a
-        // SUPPORT-DEPENDENT surrogate: the per-row top-k support flips across outer
-        // Newton iterations, the objective jumps at every re-selection, monotone
-        // descent breaks, and the dictionary co-collapses — the reported top_k>1
-        // divergence. Route joint `cap >= 2` through the memory-budget lever ALONE
-        // (faithful at large K where the softmax IS concentrated so the dropped
-        // mass is `O(a²)`; a no-op dense fit at small/moderate K) and apply `top_k`
-        // only as the post-fit projection. The winner-take-all cap and the
-        // fixed-decoder encode cap are unchanged.
-        let honor_user_cap = self.fixed_decoder_assembly || self.softmax_active_cap == Some(1);
-        let user_cap = self.softmax_active_cap.filter(|_| honor_user_cap);
-        match (user_cap, budget_plan) {
-            (Some(cap), Some((budget_cap, cutoff))) => Some((cap.min(budget_cap), cutoff)),
-            // Explicit cap only: retain exactly the top-`cap` atoms (no extra
-            // magnitude cutoff beyond the cap).
-            (Some(cap), None) => Some((cap, 0.0)),
-            (None, plan) => plan,
-        }
     }
 
     pub fn flatten_beta(&self) -> Array1<f64> {

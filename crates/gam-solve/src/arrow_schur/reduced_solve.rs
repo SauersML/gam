@@ -2291,14 +2291,11 @@ fn validate_matrix_free_arrow_pair(
             ),
         });
     }
-    if !sys.cross_row_penalties.is_empty()
-        || sys.ordered_beta_bernoulli_cross_row.is_some()
-        || cache.cross_row_woodbury.is_some()
-    {
+    if !sys.cross_row_penalties.is_empty() {
         return Err(ArrowSchurError::SchurFactorFailed {
             reason: format!(
-                "{operation} supports the row-block bordered arrow only; cross-row latent or \
-                 ordered-Beta--Bernoulli-Woodbury curvature requires its own matrix-free inverse carrier"
+                "{operation} supports the row-block bordered arrow only; cross-row latent \
+                 curvature requires its own matrix-free inverse carrier"
             ),
         });
     }

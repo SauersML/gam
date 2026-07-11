@@ -6970,6 +6970,56 @@ impl ManifoldSaeCore {
         Ok(fitted.unbind())
     }
 
+    /// One coherent converged latent state.
+    ///
+    /// With no input, this returns the state persisted by the training fit.
+    /// With `x_new`, it runs one frozen-decoder OOS solve and returns its
+    /// reconstruction, assignments, logits, and coordinates together; no field
+    /// is recomputed by a separate inference call.
+    #[pyo3(signature = (x_new=None))]
+    fn converged_latents<'py>(
+        &self,
+        py: Python<'py>,
+        x_new: Option<PyReadonlyArray2<'py, f64>>,
+    ) -> PyResult<Py<PyDict>> {
+        if let Some(values) = x_new {
+            let payload = self.oos_payload_dict(py, values)?;
+            let out = payload.bind(py);
+            let assignments = out
+                .get_item("assignments_z")?
+                .ok_or_else(|| py_value_error("OOS payload missing 'assignments_z'".to_string()))?;
+            out.set_item("assignments", assignments)?;
+
+            let atoms = out
+                .get_item("atoms")?
+                .ok_or_else(|| py_value_error("OOS payload missing 'atoms'".to_string()))?;
+            let atoms = atoms.downcast::<PyList>()?;
+            let coords = PyList::empty(py);
+            for atom in atoms.iter() {
+                let atom = atom.downcast::<PyDict>()?;
+                let block = atom.get_item("on_atom_coords_t")?.ok_or_else(|| {
+                    py_value_error("OOS atom payload missing 'on_atom_coords_t'".to_string())
+                })?;
+                coords.append(block)?;
+            }
+            out.set_item("coords", coords)?;
+            return Ok(payload);
+        }
+
+        let out = PyDict::new(py);
+        out.set_item("fitted", manifold_sae_vec2(py, &self.inner.fitted)?)?;
+        out.set_item(
+            "assignments",
+            manifold_sae_vec2(py, &self.inner.assignments)?,
+        )?;
+        out.set_item(
+            "logits",
+            manifold_sae_vec2(py, &self.inner.low_level_logits)?,
+        )?;
+        out.set_item("coords", manifold_sae_list2(py, &self.inner.coords)?)?;
+        Ok(out.unbind())
+    }
+
     /// Held-out soft assignment codes `(N, K)` for `x_new` — the Rust-owned
     /// counterpart of `ManifoldSAE.encode`. Runs the same frozen-decoder OOS
     /// solve as [`reconstruct`](Self::reconstruct) and returns the payload's

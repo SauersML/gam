@@ -383,7 +383,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::ScadMcp(p) => p.diag_target(self.target.view(), self.rho.view()),
             AnalyticPenaltyKind::OrderedBetaBernoulli(p) => p
                 .psd_majorizer_diag(self.target.view(), self.rho.view())
-                .expect("IBP assignment diag"),
+                .expect("ordered Beta--Bernoulli assignment diag"),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::Sparsity(p) => {
                 if let Some(d) = p.psd_majorizer_diag(self.target.view(), self.rho.view()) {

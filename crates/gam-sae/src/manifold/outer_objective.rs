@@ -343,6 +343,9 @@ pub struct SaeIntoFittedResult {
     pub term: SaeManifoldTerm,
     pub rho: SaeManifoldRho,
     pub loss: SaeManifoldLoss,
+    /// Certified value of the full penalized-LAML criterion at the returned
+    /// stationary state. This is distinct from `loss.total()`.
+    pub penalized_laml_criterion: f64,
     /// True when post-fit chart canonicalization changed any atom's chart.
     pub charts_canonicalized: bool,
     /// #2235 — how the outer search ended (verdict + eval/wall ledger).
@@ -574,6 +577,7 @@ struct ReactiveWaypointCheckpoint {
     registry_isometry_weights: Vec<f64>,
     current_rho: SaeManifoldRho,
     last_loss: Option<SaeManifoldLoss>,
+    certified_penalized_laml_criterion: Option<f64>,
     seeded_beta: Option<Array1<f64>>,
     probe_converged_handoff: Option<ProbeConvergedHandoff>,
     basin_bundle: BasinBundle<SaeManifoldTerm>,
@@ -604,6 +608,9 @@ pub struct SaeManifoldOuterObjective {
     pub(crate) ridge_beta: f64,
     /// Last inner loss breakdown observed (for `into_fitted`).
     pub(crate) last_loss: Option<SaeManifoldLoss>,
+    /// Full criterion value is stamped only by a fixed-rho certificate or a
+    /// certified outer result; ordinary diagnostic evaluations do not mint it.
+    pub(crate) certified_penalized_laml_criterion: Option<f64>,
     /// Optional warm-start β slot. When the cache / continuation walk seeds a
     /// β, the next inner solve opens from it instead of cold.
     pub(crate) seeded_beta: Option<Array1<f64>>,
@@ -802,6 +809,7 @@ impl SaeManifoldOuterObjective {
             ridge_ext_coord,
             ridge_beta,
             last_loss: None,
+            certified_penalized_laml_criterion: None,
             seeded_beta: None,
             warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
             routing_frozen: false,
@@ -1297,6 +1305,7 @@ impl SaeManifoldOuterObjective {
     /// verdict as `FixedRho`.
     pub fn certify_outer_result(&mut self, result: &OuterResult) -> Result<(), String> {
         self.fit_verdict = None;
+        self.certified_penalized_laml_criterion = None;
         if !result.converged {
             return Err("outer result is not converged".to_string());
         }
@@ -1327,6 +1336,10 @@ impl SaeManifoldOuterObjective {
                 result.rho, installed_rho
             ));
         }
+        if !result.final_value.is_finite() {
+            return Err("converged outer result has a non-finite final criterion value".into());
+        }
+        self.certified_penalized_laml_criterion = Some(result.final_value);
         self.fit_verdict = Some(SaeOuterVerdict::Search(via));
         Ok(())
     }
@@ -1348,6 +1361,7 @@ impl SaeManifoldOuterObjective {
             registry,
             current_rho,
             last_loss,
+            certified_penalized_laml_criterion,
             ..
         } = self;
         let mut fitted_rho = current_rho;
@@ -1358,6 +1372,10 @@ impl SaeManifoldOuterObjective {
                     .to_string(),
             );
         }
+        let penalized_laml_criterion = certified_penalized_laml_criterion.ok_or_else(|| {
+            "SaeManifoldOuterObjective::into_fitted: certified state has no certified penalized-LAML criterion value"
+                .to_string()
+        })?;
 
         // Do not arbitrate the certified terminal state against historical
         // reconstruction-EV incumbents or construction seeds here. Those states
@@ -1407,6 +1425,7 @@ impl SaeManifoldOuterObjective {
             term: fitted,
             rho: fitted_rho,
             loss: fitted_loss,
+            penalized_laml_criterion,
             charts_canonicalized,
             termination,
         })
@@ -2470,13 +2489,17 @@ impl SaeManifoldOuterObjective {
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
+        self.fit_verdict = None;
+        self.certified_penalized_laml_criterion = None;
         let (cost, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
+        let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho_flat));
         if !cost.is_finite() {
             return Err(
                 "SaeManifoldOuterObjective::fit_at_fixed_rho: penalized LAML evidence is infeasible at the requested rho"
                     .to_string(),
             );
         }
+        self.certified_penalized_laml_criterion = Some(cost);
         self.fit_verdict = Some(SaeOuterVerdict::FixedRho);
         Ok(())
     }
@@ -4106,6 +4129,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         }
         self.current_rho = self.baseline_rho.clone();
         self.last_loss = None;
+        self.certified_penalized_laml_criterion = None;
         self.seeded_beta = None;
         // #2080 (a) — a reset replaces the accepted basin; a probe handoff from
         // the previous seed's basin must not warm-start the new one.
@@ -4356,6 +4380,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             registry_isometry_weights,
             current_rho: self.current_rho.clone(),
             last_loss: self.last_loss.clone(),
+            certified_penalized_laml_criterion: self.certified_penalized_laml_criterion,
             seeded_beta: self.seeded_beta.clone(),
             probe_converged_handoff: self.probe_converged_handoff.take(),
             basin_bundle,
@@ -4416,6 +4441,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.last_loss = Some(loss);
         self.seeded_beta = None;
         self.fit_verdict = None;
+        self.certified_penalized_laml_criterion = None;
         self.reactive_waypoint_checkpoint = None;
         Ok(())
     }
@@ -4433,6 +4459,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         }
         self.current_rho = checkpoint.current_rho;
         self.last_loss = checkpoint.last_loss;
+        self.certified_penalized_laml_criterion = checkpoint.certified_penalized_laml_criterion;
         self.seeded_beta = checkpoint.seeded_beta;
         self.probe_converged_handoff = checkpoint.probe_converged_handoff;
         self.basin_bundle = checkpoint.basin_bundle;

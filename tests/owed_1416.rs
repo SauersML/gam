@@ -101,7 +101,7 @@ struct Fixture {
 /// are genuinely active so the empirical mass `M_k = Σ_i z_ik` couples the rows
 /// and the per-column cross-row Woodbury coefficient `cross_row_d` is nonzero —
 /// the exact source whose off-diagonal the #1416 ρ-trace must contract.
-fn ibp_cross_row_fixture(log_lambda_sparse: f64) -> Fixture {
+fn ordered_beta_bernoulli_cross_row_fixture(log_lambda_sparse: f64) -> Fixture {
     let n = 80usize;
     let p = 6usize;
     let k_atoms = 2usize;
@@ -282,7 +282,7 @@ fn frozen_theta_partial_fd(
 /// coord 0's remainder disagree with the frozen-θ̂ FD and fails.
 #[test]
 fn ibp_rho_sparse_logdet_trace_includes_cross_row_offdiagonal_1416() {
-    let f = ibp_cross_row_fixture(-1.0);
+    let f = ordered_beta_bernoulli_cross_row_fixture(-1.0);
     let inner_iters = 8usize;
     let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, inner_iters);
 

@@ -1498,6 +1498,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provided_reference_function_gram_rejects_asymmetry_and_negative_energy() {
+        let phi = Array2::<f64>::zeros((2, 2));
+        let jet = Array3::<f64>::zeros((2, 2, 1));
+        let decoder = Array2::<f64>::ones((2, 1));
+
+        let asymmetric = Array2::from_shape_vec((2, 2), vec![1.0, 0.5, 0.0, 1.0]).unwrap();
+        let err = SaeManifoldAtom::new_with_provided_function_gram(
+            "asymmetric",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi.clone(),
+            jet.clone(),
+            decoder.clone(),
+            asymmetric,
+        )
+        .expect_err("an asymmetric reference Gram must be rejected");
+        assert!(err.contains("not symmetric"), "unexpected error: {err}");
+
+        let indefinite = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, -1.0]).unwrap();
+        let err = SaeManifoldAtom::new_with_provided_function_gram(
+            "indefinite",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            indefinite,
+        )
+        .expect_err("an indefinite reference Gram must be rejected");
+        assert!(
+            err.contains("not positive semidefinite"),
+            "unexpected error: {err}"
+        );
+    }
+
     // Build an atom over the degree-2 monomial basis `[1, t, t²]` at the given
     // latent coordinates, with decoder `γ(t) = t + t²`. Poincare atoms declare
     // the conformal-Dirichlet reference norm at these coordinates; other atoms
@@ -1695,7 +1731,7 @@ mod tests {
     #[test]
     fn poincare_d1_uses_hyperbolic_conformal_dirichlet() {
         let ts = [0.1_f64, 1.5, 3.0];
-        let poincare = monomial_atom(SaeAtomBasisKind::Poincare, &ts);
+        let mut poincare = monomial_atom(SaeAtomBasisKind::Poincare, &ts);
         let coords = Array2::from_shape_vec((ts.len(), 1), ts.to_vec()).unwrap();
 
         // Exact wiring: the effective Gram IS the geometry crate's hyperbolic
@@ -1753,5 +1789,14 @@ mod tests {
             "Dirichlet roughness must charge the linear column; got {}",
             poincare.smooth_penalty[[1, 1]]
         );
+
+        // The declaration is frozen. Neither decoder rescaling nor changing
+        // the live first jet silently rebuilds a moving metric Gram.
+        let frozen = poincare.smooth_penalty.clone();
+        poincare
+            .decoder_coefficients
+            .mapv_inplace(|value| value * 9.0);
+        poincare.basis_jacobian.fill(17.0);
+        assert_eq!(poincare.smooth_penalty, frozen);
     }
 }

@@ -677,10 +677,10 @@ impl SaeManifoldTerm {
     ///
     /// The whole pass is additionally gated on the penalized objective: the
     /// canonical state is kept only when the same scalar the line search
-    /// minimized does not increase beyond the image-invariance tolerance
-    /// (the intrinsic smoothness penalty is reparameterization-invariant by
-    /// design, so a genuine increase means the transport went numerically
-    /// wrong and the fitted state is restored verbatim).
+    /// minimized does not increase beyond the image-invariance tolerance. The
+    /// structural basis change transports `S_ref` by congruence, so the declared
+    /// function seminorm is preserved; a genuine increase means that transport
+    /// went numerically wrong and the fitted state is restored verbatim.
     ///
     /// Runs automatically from `into_fitted` after the joint fit converges,
     /// before the payload / residual-gauge certificate is assembled — never
@@ -6408,8 +6408,9 @@ impl SaeManifoldTerm {
             }
             // #2022 — enforce unit-speed (arc-length) charts IN-LOOP at this
             // accepted-outer-iteration boundary (post-acceptance, OUTSIDE the line
-            // search, same cadence as the guards above). Image-frozen ⇒ data-fit +
-            // intrinsic smoothness untouched; re-gauges t so the ARD coordinate
+            // search, same cadence as the guards above). Image-frozen and paired
+            // with an exact reference-Gram congruence ⇒ data fit and the declared
+            // function seminorm are untouched; re-gauges t so the ARD coordinate
             // prior (which pins t→±t+c) is enforced throughout the fit, not merely
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).

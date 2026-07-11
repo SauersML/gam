@@ -1,9 +1,9 @@
-//! #2231 §2a — the crosscoder per-block weight `log λ_ℓ` as an outer-REML
+//! #2231 §2a — the crosscoder per-block weight `log λ_ℓ` as an outer penalized-LAML
 //! coordinate: value/gradient consistency and closed-form-fixed-point coherence.
 //!
 //! These are PURE-MATH gates on the block-criterion trio
-//! ([`profiled_penalized_laml_criterion`], [`profiled_reml_block_log_lambda_gradient`],
-//! [`profiled_reml_block_efs_log_lambda_steps`]) — no fit is run, so they isolate
+//! ([`profiled_penalized_laml_criterion`], [`profiled_penalized_laml_block_log_lambda_gradient`],
+//! [`profiled_penalized_laml_block_efs_log_lambda_steps`]) — no fit is run, so they isolate
 //! the analytic derivative from the inner solve exactly as the FD-ban gate
 //! (#2087 objective↔gradient desync class) demands: the analytic block gradient
 //! must be the finite-difference derivative of the block criterion it is paired
@@ -14,12 +14,12 @@
 
 use super::{
     ArdSharing, SaeManifoldRho, profiled_penalized_laml_criterion,
-    profiled_reml_block_efs_log_lambda_steps, profiled_reml_block_log_lambda_gradient,
+    profiled_penalized_laml_block_efs_log_lambda_steps, profiled_penalized_laml_block_log_lambda_gradient,
 };
 use ndarray::{Array1, arr1};
 
 /// Central-difference FD of [`profiled_penalized_laml_criterion`] with respect to each
-/// block `log λ_ℓ` must match [`profiled_reml_block_log_lambda_gradient`] to high
+/// block `log λ_ℓ` must match [`profiled_penalized_laml_block_log_lambda_gradient`] to high
 /// precision — the consistent-pair (#2087) requirement for the new coordinate.
 #[test]
 fn block_log_lambda_gradient_matches_central_difference() {
@@ -31,7 +31,7 @@ fn block_log_lambda_gradient_matches_central_difference() {
     let log_lambda = [0.2_f64, -0.5, 0.9];
 
     let analytic =
-        profiled_reml_block_log_lambda_gradient(n_obs, p_x, rss_x, &block_rss, &dims, &log_lambda);
+        profiled_penalized_laml_block_log_lambda_gradient(n_obs, p_x, rss_x, &block_rss, &dims, &log_lambda);
     assert_eq!(analytic.len(), block_rss.len());
 
     let h = 1e-6_f64;
@@ -79,7 +79,7 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
         .collect();
 
     let grad =
-        profiled_reml_block_log_lambda_gradient(n_obs, p_x, rss_x, &block_rss, &dims, &log_lambda);
+        profiled_penalized_laml_block_log_lambda_gradient(n_obs, p_x, rss_x, &block_rss, &dims, &log_lambda);
     for (l, g) in grad.iter().enumerate() {
         assert!(
             g.abs() < 1e-9,
@@ -88,7 +88,7 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
     }
 
     let steps =
-        profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
+        profiled_penalized_laml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
     for (l, s) in steps.iter().enumerate() {
         assert!(
             s.abs() < 1e-12,
@@ -110,7 +110,7 @@ fn one_efs_step_reaches_the_variance_ratio_root() {
     let log_lambda = [1.3_f64, -2.1]; // far from the root
 
     let steps =
-        profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
+        profiled_penalized_laml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
     let var_x = rss_x / p_x as f64;
     for l in 0..block_rss.len() {
         let root = (var_x / (block_rss[l] / dims[l] as f64)).ln();
@@ -134,7 +134,7 @@ fn unidentifiable_block_is_held() {
     let log_lambda = [0.0_f64, 0.0];
 
     let steps =
-        profiled_reml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
+        profiled_penalized_laml_block_efs_log_lambda_steps(p_x, rss_x, &block_rss, &dims, &log_lambda);
     assert_eq!(steps[0], 0.0, "unidentifiable block must be held");
     assert!(steps[1] != 0.0, "identifiable block must still move");
 }

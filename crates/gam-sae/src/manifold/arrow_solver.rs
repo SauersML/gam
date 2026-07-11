@@ -572,7 +572,7 @@ pub(crate) fn apply_cached_arrow_hessian(
     // forward apply MUST add `U D Uᵀ v` here — otherwise the forward operator
     // (used by the #1418 exact-stationarity solve) silently drops the cross-row
     // block while its CG preconditioner inverts the full `H_full`, desyncing the
-    // outer-REML gradient. `U` has no `β` support ⇒ only the `t` block changes.
+    // outer penalized-LAML gradient. `U` has no `β` support ⇒ only the `t` block changes.
     if let Some(woodbury) = cache.cross_row_woodbury.as_ref() {
         woodbury.apply_forward_t(v_t, &mut out_t);
     }

@@ -113,7 +113,7 @@ pub struct SaeManifoldRho {
     /// its closed-form REML variance ratio is
     /// [`crate::manifold::behavior::OutputBlock::reml_updated_log_lambda`] and its
     /// analytic outer gradient is
-    /// [`crate::manifold::behavior::profiled_reml_block_log_lambda_gradient`].
+    /// [`crate::manifold::behavior::profiled_penalized_laml_block_log_lambda_gradient`].
     pub log_lambda_block: Vec<f64>,
 }
 

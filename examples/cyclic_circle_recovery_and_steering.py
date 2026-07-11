@@ -300,42 +300,40 @@ def fixed_chart_null(angles: np.ndarray, labels: np.ndarray, period: int,
 
 
 # --------------------------------------------------------------------------- #
-# Circle fit (gamfit torch lane) + explicit chord steering
+# Native circle fit + explicit chord steering
 # --------------------------------------------------------------------------- #
-def torch_circle_fit(Z: np.ndarray, *, steps: int, seed: int, lr: float = 1e-2,
-                     grid: int = 720) -> dict:
-    """Single circle atom via ``gamfit.torch.manifold_sae.ManifoldSAE``.
+def circle_fit(Z: np.ndarray, *, steps: int, seed: int, lr: float = 1e-2,
+               grid: int = 720) -> dict:
+    """Single circle atom via the native converged manifold-SAE fit.
 
     Returns per-row angles (radians), the decoder curve over one period
-    (grid, chart_dim), and training R^2. Torch circle coordinates have
+    (grid, chart_dim), and training R^2. Native circle coordinates have
     period 1.0; angles are converted to radians."""
-    import torch
-    from gamfit.torch.manifold_sae import ManifoldSAE, ManifoldSAEConfig
+    import gamfit
 
-    torch.manual_seed(seed)
-    cfg = ManifoldSAEConfig(input_dim=int(Z.shape[1]), n_atoms=1,
-                            intrinsic_rank=1, atom_manifold="circle")
-    mod = ManifoldSAE(cfg)
-    xt = torch.tensor(np.asarray(Z, dtype=np.float64), dtype=torch.float64)
-    opt = torch.optim.Adam(mod.parameters(), lr=lr)
-    for _ in range(steps):
-        out = mod(xt)
-        loss = ((out.x_hat - xt) ** 2).mean()
-        try:
-            loss = loss + 0.01 * mod.regularization(None)
-        except Exception:  # noqa: BLE001 — penalty optional for K=1
-            pass
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-    with torch.no_grad():
-        out = mod(xt)
-        ss_res = float(((out.x_hat - xt) ** 2).sum())
-        ss_tot = float(((xt - xt.mean(0, keepdim=True)) ** 2).sum())
-        pos = out.positions[:, 0, 0].detach().cpu().numpy()
-        curve = mod.extract_feature_curves(grid)[0].detach().cpu().numpy()
-    return {"angles": (pos % 1.0) * TAU, "curve": curve,
-            "r2": 1.0 - ss_res / max(ss_tot, 1e-30)}
+    fit = gamfit.sae_manifold_fit(
+        X=np.ascontiguousarray(Z, dtype=np.float64),
+        K=1,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="softmax",
+        n_iter=steps,
+        learning_rate=lr,
+        random_state=seed,
+    )
+    pos = np.asarray(fit.coords[0], dtype=np.float64)[:, 0]
+    atom = fit.atoms[0]
+    curve = atom.shape_band_mean
+    if curve is None:
+        raise RuntimeError("native circle fit did not emit a posterior shape grid")
+    curve = np.asarray(curve, dtype=np.float64)
+    if curve.shape[0] != grid:
+        curve = np.stack([curve_point(curve, value / grid) for value in range(grid)])
+    return {
+        "angles": (pos % 1.0) * TAU,
+        "curve": curve,
+        "r2": float(fit.reconstruction_r2),
+    }
 
 
 def curve_point(curve: np.ndarray, t_frac: float) -> np.ndarray:
@@ -440,7 +438,7 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
 
     chart_dim = int(min(pca_dim, period - 1))
     Z, lift, ev = day_signal_chart(X_amb, s_labels, s_tids, chart_dim)
-    tfit = torch_circle_fit(Z, steps=fit_steps, seed=seed)
+    tfit = circle_fit(Z, steps=fit_steps, seed=seed)
     gate = fixed_chart_null(tfit["angles"], s_labels, period, n_perm, seed + 77)
     log(f"  steering fit r2={tfit['r2']:.3f}; gate r={gate['observed_r']:.3f} "
         f"(p={gate['p_value']:.4f}); chart class-mean ev={ev:.3f}")

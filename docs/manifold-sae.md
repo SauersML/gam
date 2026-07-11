@@ -92,24 +92,25 @@ of typed shapes:
 | any other string | any | caller-supplied | `Precomputed`: a precomputed basis you attach yourself |
 
 `duchon` and `euclidean` share the same flat-`ℝᵈ` latent **domain**, but they
-use *different* decoders as well as different roughness penalties. `euclidean`
+use *different* decoders and declared reference-function seminorms. `euclidean`
 is a monomial/polynomial patch. `duchon` is an RKHS/spline surface: a
 radial-kernel block `Φ_radial(t)·Z` (centered on a fixed set of centers) plus a
 null-space polynomial block `P(t)` (see `DuchonCoordinateEvaluator` in the Rust
-core), penalized by the thin-plate roughness Gram. A `euclidean`-vs-`duchon`
-comparison therefore differs in *both* the basis family and the penalty, not the
-penalty alone. `poincare`
-likewise reuses the Euclidean tangent chart and monomial decoder but penalizes
-roughness in the *hyperbolic* metric: its effective smoothness Gram is the
-conformal Dirichlet energy `∫ gᵃᵇ ∂_a f ∂_b f dμ_g` of the Poincaré ball pulled
-back to the tangent chart (`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`
-at curvature `c = −1`, the single source of truth for the hyperbolic metric),
-wired into the atom's `refresh_intrinsic_smooth_penalty`. It therefore differs
-from the flat patch wherever the conformal factor departs from 1 — growing toward
-the ball boundary (tree-/hierarchy-like structure); for `d = 1` the tangent chart
-is intrinsically flat but runs at half arc length, so the Gram is exactly `½` the
-flat first-jet Dirichlet Gram. String matching is case-insensitive and treats `-`
-and `_` interchangeably.
+core), penalized by its validated thin-plate function Gram. A
+`euclidean`-vs-`duchon` comparison therefore differs in both the basis family and
+the reference seminorm. `poincare` likewise reuses the Euclidean tangent chart
+and monomial decoder but declares a hyperbolic reference seminorm: the conformal
+Dirichlet energy `∫ gᵃᵇ ∂_a f ∂_b f dμ_g` of the Poincaré ball pulled back to a
+fixed set of reference coordinates
+(`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty` at curvature
+`c = −1`). Those reference coordinates are validated and consumed when the atom
+or a structural reparameterization is constructed. The resulting Gram is frozen;
+fitted latent coordinates and decoder coefficients do not redefine it. Missing
+or invalid Poincaré reference coordinates are an error, never a silent flat-Gram
+fallback. For `d = 1` the declared tangent chart is intrinsically flat but runs
+at half arc length, so this reference Gram is exactly `½` the flat first-jet
+Dirichlet Gram. String matching is case-insensitive and treats `-` and `_`
+interchangeably.
 
 A `d_atom=1` linear atom is the true rank-1 **line** primitive. A
 `d_atom=1` Euclidean atom is a stronger polynomial patch, not the pure-linear
@@ -207,27 +208,23 @@ smoothing weights selected by REML. Each piece plays a distinct role
 - **Isometry gauge** (`isometry_weight=1.0`, **on by default**).
   `IsometryPenalty` drives the pulled-back metric
   `g = J^T J` toward a unit-average-speed chart, making `t` easier to read as
-  near arc length. It is not required for topology comparison: the smoothness
-  penalty is measured on the decoded FUNCTION's intrinsic geometry (below), not
-  on the raw coordinate, so `fit.penalized_loss_score` is gauge-invariant under
-  reparameterizing `t` even with `isometry_weight=0.0`. Set the weight to `0.0`
-  to disable the gauge.
+  near arc length. This gauge matters because each smoothing prior is defined
+  relative to a declared reference chart/measure; the smoothing Gram does not
+  move with the fitted decoder. Set the weight to `0.0` to disable the gauge.
 
-- **Smoothness** (`smoothness_weight=1.0`). Roughness penalty on each atom's
-  decoded curve/surface, measured intrinsically so it is invariant to
-  reparameterizing the latent coordinate `t` (SPEC: penalise the final function,
-  not the chart). For a non-Poincaré atom the effective Gram is the total squared
-  SECOND FUNDAMENTAL FORM of the decoded embedding `γ(t) = BᵀΦ(t)`,
-  `∫_M ‖II‖²_g dμ`, at every latent dim `d ≥ 1`; for `d = 1` this is exactly the
-  reparameterization-invariant bending `∫ κ² ds = Σ_i ‖P_N γ''(t_i)‖²/‖γ'(t_i)‖³`
-  (the NORMAL-projected acceleration — a straight segment traced as `γ(t)=t²e₁`
-  scores zero, whereas a raw coordinate second-difference Gram would charge
-  `γ''=2e₁`). Poincaré atoms use the hyperbolic conformal Dirichlet Gram instead
-  (see the topology table). A fixed finite-/cyclic-difference Gram in the latent
-  coordinate is the *base operator*; the intrinsic (function-space) Gram is
-  refreshed from it between assemblies via the current decoder pullback
-  (lagged diffusivity). Each inner solve differentiates the frozen quadratic
-  surrogate; it does not include derivatives of the geometry-dependent Gram.
+- **Smoothness** (`smoothness_weight=1.0`). Each atom declares a fixed
+  reference-function seminorm. If
+  `S_ref[i,j] = ⟨Lφ_i,Lφ_j⟩_(ν_ref)` and
+  `f_B(t)=Bᵀφ(t)`, then bilinearity gives
+  `‖Lf_B‖²_(ν_ref)=Σ_c b_cᵀS_ref b_c=tr(BᵀS_refB)`. The implemented prior is
+  therefore exactly `½ λ tr(BᵀS_refB)`, with gradient `λS_refB` and Hessian
+  `λ(S_ref⊗I)`. Finite-/cyclic-difference, Duchon, and caller-provided Grams are
+  explicit representations of their declared reference operator and measure;
+  they are validated as finite, symmetric, and positive semidefinite. Poincaré
+  atoms instead build the conformal-Dirichlet Gram at their declared frozen
+  reference coordinates (see the topology table). This is a final-function
+  seminorm in a fixed reference geometry. It is not the moving intrinsic bending
+  energy of the current decoder, and no omitted `dS/dB` or `dS/dt` terms exist.
 
 - **Coordinate-magnitude penalty** (`coord_sparsity="scad"` default; `"l1"` /
   `"mcp"` alternatives). Despite the parameter name, `scad` and `mcp` do **not**

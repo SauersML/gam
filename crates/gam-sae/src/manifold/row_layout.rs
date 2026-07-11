@@ -1,52 +1,23 @@
 use super::*;
 
-/// Per-row active-set layout for sparse SAE assignment (any mode).
+/// Per-row layout for the explicit hard-TopK assignment model.
 ///
-/// When the assignment is effectively sparse (softmax / ordered
-/// Beta--Bernoulli at large `K`, where the assignment mass
-/// concentrates on a small support) — only a subset of `K` atoms are active
-/// per observation.  The Arrow-Schur row block for observation `i` has dim
-/// `q_active_i = |active_atoms_i| + Σ_{k ∈ active_i} d_k` rather than
-/// `q = assignment_dim + Σ_k d_k`.  This struct records which atoms are active per row
-/// and maps compressed block positions back to full-q positions so that
-/// `apply_newton_step` can unpack the compact `delta_t` from the solve.
-///
-/// For ordered Beta--Bernoulli the active set is the union of a top-`k_active_cap`
-/// truncation and a magnitude cutoff on `a_{n,k}`; this is only enabled when
-/// `K` is large enough that the dense `(m_total · p)²` data Gram would not
-/// fit the host / device working-set budget, and the dropped atoms carry
-/// `O(a_{n,k}²)` curvature that is negligible by construction of the cutoff.
-///
-/// #1408: SOFTMAX engages this compact layout when an explicit `top_k`
-/// (`softmax_active_cap`) and/or the in-core memory budget bounds the active
-/// set — the `AssignmentMode::Softmax` arm of `assemble_arrow_schur` consults
-/// [`crate::manifold::SaeManifoldTerm::softmax_active_plan`] and,
-/// on `Some((cap, cutoff))`, builds the active set via
-/// [`Self::from_dense_weights`]. The full-`K` dense softmax layout is retained
-/// only when neither lever engages (no `top_k`, in-budget `K`). Folding softmax
-/// `top_k` into the compact solve required writing the active×active Gershgorin
-/// Loewner majorizer sub-block (#1419; the softmax entropy curvature is
-/// indefinite, so its raw diagonal cannot be used) AND contracting that SAME
-/// majorizer over the compact logit slots in the logdet ρ-trace
-/// (`assignment_log_strength_hessian_trace`) and the θ-adjoint, so value,
-/// `log|H|`, and Γ differentiate one operator on the compact support. That
-/// coordinated change is landed and FD-certified; the FFI's after-the-fit
-/// top-`k` projection is then a no-op at the optimum.
+/// TopK gates are exactly zero or one and carry no optimizable logit
+/// coordinates. Only the selected atoms' manifold coordinates enter a row's
+/// Arrow-Schur block, whose dimension is exactly
+/// `Σ_{k ∈ support_i} d_k`. Dense Softmax, ordered independent
+/// Beta--Bernoulli, and threshold gates never use this type: each has nonzero
+/// derivatives on its full support and is assembled exactly or refused before
+/// allocation if the exact system does not fit the declared memory budget.
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
     /// `active_atoms[row]` — sorted indices of active atoms for that row. Every
     /// active atom carries a coord block; not every one carries a free logit slot
     /// (see `logit_atoms`).
     pub active_atoms: Vec<Vec<usize>>,
-    /// `logit_atoms[row]` — the subset of `active_atoms[row]` (same ascending
-    /// order) carrying a FREE assignment-logit slot. Equals `active_atoms` for the
-    /// column-separable modes. For SOFTMAX the reduced chart
-    /// has only `K−1` free logits: the reference atom `K−1` (pinned to zero, no
-    /// logit coordinate) is excluded. Since `K−1` is the largest atom and
-    /// `active_atoms` is sorted, the reference (when active) is always last, so
-    /// `logit_atoms[row] == active_atoms[row][..n_logit_active(row)]`. The compact
-    /// block is `[one slot per logit atom]` then `[one coord block per active
-    /// atom]`. (#Bug1)
+    /// Free assignment-logit slots. Empty for every production TopK row; kept as
+    /// an explicit field because the common row-assembly operator indexes this
+    /// prefix before the coordinate blocks.
     pub logit_atoms: Vec<Vec<usize>>,
     /// For row `i`, active atom `active_atoms[i][j]` has its coord block
     /// starting at compressed position `coord_starts[i][j]`.
@@ -58,80 +29,60 @@ pub struct SaeRowLayout {
 }
 
 impl SaeRowLayout {
-    /// Mode-agnostic effective active set for dense-weight modes (softmax /
-    /// ordered Beta--Bernoulli) at large `K`: keep, per row, the top-`k_active_cap` atoms by
-    /// `|a_{n,k}|` whose magnitude also exceeds `relative_cutoff · rowpeak`.
-    ///
-    /// #1414: the cutoff is RELATIVE TO EACH ROW'S OWN PEAK `max_k |a_{n,k}|`,
-    /// matching the documented `sparse_active_plan` contract
-    /// (`construction.rs:1763-1766`). A global cutoff (one threshold from the
-    /// whole-dataset peak) would wrongly drop both atoms of a uniformly-small row
-    /// `[0.0009, 0.0008]` just because another row peaks at `1.0`, changing the
-    /// high-`K` compact model.
-    ///
-    /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
-    /// The active set is always non-empty (the single largest-magnitude atom is
-    /// retained even if below cutoff) so every row keeps a valid block.
-    /// `reference_atom` is `Some(K−1)` for the reduced SOFTMAX chart (that atom
-    /// gets a coord block but no free logit slot) and `None` for ordered Beta--Bernoulli. (#Bug1)
-    pub(crate) fn from_dense_weights(
+    /// Build the exact compact layout from hard TopK gates. Every row must have
+    /// exactly `support_size` entries equal to one and every other entry equal
+    /// to zero; accepting approximate weights here would silently change the
+    /// model by dropping nonzero derivatives.
+    pub(crate) fn from_topk_gates(
         assignments: &[Array1<f64>],
-        k_active_cap: usize,
-        relative_cutoff: f64,
+        support_size: usize,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
-        reference_atom: Option<usize>,
-    ) -> Self {
-        let cap = k_active_cap.max(1);
+    ) -> Result<Self, String> {
+        if support_size == 0 {
+            return Err("SaeRowLayout::from_topk_gates requires positive support_size".to_string());
+        }
         let mut per_row = Vec::with_capacity(assignments.len());
-        for a in assignments {
-            let k = a.len();
-            // #1411: select the top-`cap` atoms by |a_k| in O(K) with a PARTIAL
-            // select (`select_nth_unstable_by`), not a full O(K log K) sort. Only
-            // the cap-sized active prefix matters; its internal order is
-            // irrelevant (sorted at the end). The row peak is a separate O(K) max
-            // scan. End-to-end this keeps support proposal O(K) (single pass +
-            // partial select), the contracted per-token cost the high-K plan
-            // claims, instead of sorting all K per row.
-            let row_peak = a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-            let cutoff = relative_cutoff * row_peak;
-            let mut idx: Vec<usize> = (0..k).collect();
-            // Partition so the `cap` largest-|a| indices occupy `idx[..cap]`
-            // (unordered within); cheaper than a full sort when `cap << k`.
-            if cap < k {
-                idx.select_nth_unstable_by(cap - 1, |&i, &j| {
-                    a[j].abs()
-                        .partial_cmp(&a[i].abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                idx.truncate(cap);
-            }
-            let mut active: Vec<usize> = idx
-                .into_iter()
-                .filter(|&k_idx| a[k_idx].abs() > cutoff)
-                .collect();
-            if active.is_empty() {
-                // Retain the single largest-magnitude atom so the row block is
-                // never empty (a degenerate empty block would zero the row).
-                let top = (0..k).fold(None::<usize>, |best, i| match best {
-                    Some(b) if a[b].abs() >= a[i].abs() => Some(b),
-                    _ => Some(i),
-                });
-                if let Some(top) = top {
-                    active.push(top);
+        for (row, gates) in assignments.iter().enumerate() {
+            let mut active = Vec::with_capacity(support_size);
+            for (atom, &gate) in gates.iter().enumerate() {
+                if gate == 1.0 {
+                    active.push(atom);
+                } else if gate != 0.0 {
+                    return Err(format!(
+                        "SaeRowLayout::from_topk_gates: row {row}, atom {atom} has non-binary gate {gate}"
+                    ));
                 }
             }
-            active.sort_unstable();
+            if active.len() != support_size.min(gates.len()) {
+                return Err(format!(
+                    "SaeRowLayout::from_topk_gates: row {row} has {} active atoms; expected {}",
+                    active.len(),
+                    support_size.min(gates.len())
+                ));
+            }
             per_row.push(active);
         }
-        Self::from_active_atoms_with_reference(
-            per_row,
-            coord_dims,
+        let mut coord_starts = Vec::with_capacity(per_row.len());
+        for active in &per_row {
+            let mut cursor = 0usize;
+            let mut starts = Vec::with_capacity(active.len());
+            for &atom in active {
+                starts.push(cursor);
+                cursor += coord_dims[atom];
+            }
+            coord_starts.push(starts);
+        }
+        Ok(Self {
+            logit_atoms: vec![Vec::new(); per_row.len()],
+            active_atoms: per_row,
+            coord_starts,
             coord_offsets_full,
-            reference_atom,
-        )
+            coord_dims,
+        })
     }
 
+    #[cfg(test)]
     /// Build honoring an optional `reference_atom` that carries a COORD block but
     /// NO free logit slot (softmax's pinned reference `K−1`). When a row's active
     /// set contains it, it is excluded from `logit_atoms` but kept in
@@ -171,9 +122,7 @@ impl SaeRowLayout {
         }
     }
 
-    /// Number of FREE logit slots in row `row`'s compact block (the leading
-    /// slots). Equals `active_atoms[row].len()` except on a softmax row whose
-    /// active set includes the reference atom, where it is one fewer. (#Bug1)
+    /// Number of free logit slots in row `row`'s compact block.
     pub fn n_logit_active(&self, row: usize) -> usize {
         self.logit_atoms[row].len()
     }

@@ -571,7 +571,8 @@ impl SaeManifoldTerm {
     ///
     /// A trial runs a full [`Self::run_joint_fit_arrow_schur`], which moves far
     /// more than the decoder β and latent coords: it refreshes each atom's cached
-    /// `basis_values` / `basis_jacobian` and (lagged-diffusivity) `smooth_penalty`,
+    /// `basis_values` / `basis_jacobian` while preserving or structurally
+    /// transporting the fixed reference `smooth_penalty`,
     /// rewrites the assignment `logits`, re-derives the active-set `last_row_layout`,
     /// and advances the Gumbel `temperature_schedule` one anneal step per inner
     /// iteration. The canonical [`Self::snapshot_mutable_state`] captures the first

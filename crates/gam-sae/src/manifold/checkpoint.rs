@@ -24,10 +24,10 @@
 //! shared per-row assignment logits — the same mutable state
 //! [`crate::manifold::term::SaeManifoldMutableState`] captures for the in-fit
 //! keep-best (`best_fit_incumbent`). The transient basis matrices
-//! (`basis_values`, `basis_jacobian`, second-jet caches, the intrinsic roughness
-//! Gram) are NOT stored: they are a deterministic function of `(coords,
-//! evaluator, η)` and are rebuilt on resume by `refresh_basis_from_current_coords`
-//! against the freshly constructed term's evaluators. The current ρ (flat outer
+//! (`basis_values`, `basis_jacobian`) and the frozen reference-function Gram are
+//! not duplicated in the checkpoint: the basis is rebuilt from `(coords,
+//! evaluator, η)`, while `S_ref` comes from the freshly reconstructed atom's
+//! validated reference-norm declaration. The current ρ (flat outer
 //! vector) and the outer termination-ledger counters ride alongside so the
 //! resumed outer search opens at the banked coordinate with the accounting
 //! intact.

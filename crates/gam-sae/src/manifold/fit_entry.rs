@@ -194,6 +194,9 @@ pub struct SaeFitReport {
     pub rho: SaeManifoldRho,
     /// The smooth-optimization penalized loss (the UNPROJECTED model's score).
     pub loss: SaeManifoldLoss,
+    /// Certified full penalized-LAML criterion of the smooth fitted model,
+    /// including its Laplace and Occam terms. This is not `-loss.total()`.
+    pub penalized_laml_criterion: f64,
     /// The projected-model penalized loss when a hard top-k gate applied (#1232);
     /// `None` when no projection was applied (top-level score is `loss`).
     pub post_topk_loss: Option<SaeManifoldLoss>,
@@ -643,6 +646,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     let mut term = fitted_result.term;
     let mut rho = fitted_result.rho;
     let mut loss = fitted_result.loss;
+    let mut penalized_laml_criterion = fitted_result.penalized_laml_criterion;
 
     // #2021 (EXPERIMENT) — structured-residual OUTER ALTERNATION.
     // Pass 0 above is the iid fit (unchanged, bit-for-bit). When the caller's
@@ -790,6 +794,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             term = fitted_result.term;
             rho = fitted_result.rho;
             loss = fitted_result.loss;
+            penalized_laml_criterion = fitted_result.penalized_laml_criterion;
             structured_residual_diagnostics.push(StructuredResidualPassDiagnostic {
                 pass: pass + 1,
                 gamma,
@@ -1234,6 +1239,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         term,
         rho,
         loss,
+        penalized_laml_criterion,
         post_topk_loss,
         assignments,
         fitted,
