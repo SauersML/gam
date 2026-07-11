@@ -294,6 +294,7 @@ pub(crate) fn run_outer_with_plan(
     // A reactive domain-entry path is created per seed only after the
     // objective's exact seed cost is non-finite. Keeping `None` here is the
     // zero-heavy-entry fast path for every already-feasible seed.
+    let reactive_domain_entry_available = obj.supports_reactive_domain_entry();
     let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = None;
     // Demotion ledger: every structural defect that would historically have
     // rejected a seed (or short-circuited the cascade) is instead recorded
@@ -383,6 +384,10 @@ pub(crate) fn run_outer_with_plan(
         if started_seeds == seed_budget {
             break;
         }
+        // Domain entry is a property of this literal seed. Never carry a path
+        // (or its regime) across seed attempts: every candidate first receives
+        // its own exact-value probe below.
+        continuation_path = None;
         // Lazy structured classification: convert any new entries in
         // `rejection_reasons` into `SeedRejection`s and probe whether
         // the seed cascade has slipped into a uniform structural
@@ -396,65 +401,22 @@ pub(crate) fn run_outer_with_plan(
             if let Some(key) =
                 uniform_structural_key(&seed_rejections, STRUCTURAL_EARLY_EXIT_MIN_COUNT)
             {
-                if let Some(path) = continuation_path.as_mut() {
-                    // Continuation-entry objective: a uniform structural
-                    // diagnosis is NOT a reason to skip the remaining seeds
-                    // (that would empty the candidate set and fall through to
-                    // the fatal "no seeds passed"). The seed cascade is only an
-                    // *optimization* over warm-starts, never a feasibility
-                    // gate — so we DEMOTE the cascade to a heavier path regime
-                    // and keep evaluating. The heavier-smoothing entry gives
-                    // the joint solver a feasible basin the cold seed could not
-                    // reach. Record the demotion with its reason; never fatal.
-                    let reason = format!(
-                        "uniform structural diagnosis={} carrying-block={} after {} consistent \
-                         rejection(s)",
-                        key.0.as_str(),
-                        key.1.as_deref().unwrap_or("<unknown>"),
-                        seed_rejections.len(),
-                    );
-                    let regime = path.demote_with_reason(
-                        crate::continuation_path::PathDemotionReason::UniformStructural,
-                    );
-                    log::warn!(
-                        "[OUTER] {context}: continuation-entry objective demoted to heavier path \
-                         regime {regime:?} instead of structural early-exit ({reason}); \
-                         re-entering remaining seed(s) at the heavier regime"
-                    );
-                    path_demotions.push(PathDemotionRecord {
-                        seed_idx,
-                        regime,
-                        reason,
-                    });
-                    // Reset the structured mirror's structural signal so the
-                    // heavier-regime re-entries are judged on their own merits
-                    // and a single later defect does not immediately re-fire
-                    // the demotion at the same level.
-                    seed_rejections.clear();
-                    last_classified_reason_idx = rejection_reasons.len();
-                } else {
-                    log::warn!(
-                        "[OUTER] {context}: structural early-exit after {} uniform structural \
-                         rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
-                        seed_rejections.len(),
-                        key.0.as_str(),
-                        key.1.as_deref().unwrap_or("<unknown>"),
-                        seeds.len().saturating_sub(seed_idx),
-                    );
-                    structural_early_exit_key = Some(key);
-                    break;
-                }
+                log::warn!(
+                    "[OUTER] {context}: structural early-exit after {} uniform structural \
+                     rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
+                    seed_rejections.len(),
+                    key.0.as_str(),
+                    key.1.as_deref().unwrap_or("<unknown>"),
+                    seeds.len().saturating_sub(seed_idx),
+                );
+                structural_early_exit_key = Some(key);
+                break;
             }
         }
-        // Generic cross-seed structural bail (#1036): only for objectives that
-        // do NOT enter through the continuation path. Continuation-entry
-        // objectives demote to a heavier regime on any uniform structural
-        // signal (handled above) and must never empty their candidate set on a
-        // failure signature, so they opt out of the generic bail entirely.
-        if structural_early_exit_key.is_none()
-            && generic_structural_bail.is_none()
-            && continuation_path.is_none()
-        {
+        // Generic cross-seed structural bail (#1036). Reactive domain entry is
+        // only a repair for an undefined literal seed value; it does not turn
+        // later, repeated structural solver failures into path re-entry.
+        if structural_early_exit_key.is_none() && generic_structural_bail.is_none() {
             if let Some((sig, run_len)) = crate::startup_stats::consecutive_generic_signature(
                 &seed_rejections,
                 GENERIC_STRUCTURAL_BAIL_MIN_RUN,
