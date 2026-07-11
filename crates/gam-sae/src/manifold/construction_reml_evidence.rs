@@ -709,8 +709,26 @@ impl SaeManifoldTerm {
             // log-det / selected-inverse traces; β stays at the warm-start seed.
             return Ok(factored.2);
         }
+        // #2253: floor the ACCEPTED / outer-gradient lane's inner refine BUDGET and
+        // ROUND SIZE to a convergence seed independent of the outer `max_iter`. The
+        // outer gradient needs a KKT-stationary θ̂ (envelope theorem); a small
+        // budget makes each refine round too short to progress, so the per-round
+        // objective decrease looks stalled after STALL_MIN_ROUNDS and the
+        // #1051/#2226 acceptance returns a NON-KKT iterate — desyncing the gradient
+        // (K=1 circle: correct to ~2e-5 at inner budget 200, stalls at |g|≈1.09 at
+        // 40). This seed governs the refine budgets and per-round size below. It
+        // does NOT change `total_inner_iter` (the count of iterations the CALLER
+        // already spent, which is the original `inner_max_iter`) nor the value /
+        // ranking lane (`refine_progress_extension == false`, whose #1051 stagnation
+        // acceptance is correct). The freeze (`inner_max_iter == 0`) is handled
+        // above and never reaches here.
+        let gradient_inner_seed = if refine_progress_extension {
+            inner_max_iter.max(SAE_MANIFOLD_GRADIENT_INNER_CONVERGENCE_SEED)
+        } else {
+            inner_max_iter
+        };
         let mut total_inner_iter = inner_max_iter;
-        let accepted_base_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
+        let accepted_base_refine_iter = gradient_inner_seed.max(1).saturating_mul(16).max(64);
         let value_probe_base_refine_iter = inner_max_iter.max(1).saturating_mul(4).max(16);
         let base_refine_iter = if refine_progress_extension {
             accepted_base_refine_iter
@@ -718,7 +736,7 @@ impl SaeManifoldTerm {
             value_probe_base_refine_iter
         };
         let progress_refine_iter = if refine_progress_extension {
-            inner_max_iter.max(1).saturating_mul(64).max(256)
+            gradient_inner_seed.max(1).saturating_mul(64).max(256)
         } else {
             base_refine_iter
         };
@@ -1023,7 +1041,7 @@ impl SaeManifoldTerm {
                             ));
                         }
                         let remaining = refine_limit - total_inner_iter;
-                        let refine_iter = inner_max_iter.max(1).min(remaining);
+                        let refine_iter = gradient_inner_seed.max(1).min(remaining);
                         saw_refine_progress |=
                             Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                         previous_refine_grad_norm = Some(grad_norm);
@@ -1133,7 +1151,7 @@ impl SaeManifoldTerm {
                      ({total_inner_iter} iterations consumed past limit {refine_limit})"
                 )
             })?;
-            let refine_iter = inner_max_iter.max(1).min(remaining);
+            let refine_iter = gradient_inner_seed.max(1).min(remaining);
             saw_refine_progress |=
                 Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);

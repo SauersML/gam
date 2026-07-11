@@ -100,6 +100,26 @@ pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
 /// refine budget — terminating the ill-conditioned crawl early is the goal.
 pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS: usize = 3;
 
+/// #2253: minimum inner-solve budget seed for the ACCEPTED / outer-gradient lane
+/// (`refine_progress_extension == true`), independent of the outer `max_iter`.
+///
+/// The outer-REML gradient assumes the envelope theorem — that the inner state is
+/// KKT-stationary (`∂(D+P)/∂θ̂ ≈ 0`). On an ill-conditioned `n ≈ p` fit (the K=1
+/// circle, 42×48, with a weakly-identified / marginally-indefinite direction) a
+/// small inner budget makes each refine round too short to progress, so the
+/// per-round objective decrease looks stalled after `STALL_MIN_ROUNDS` and the
+/// #1051/#2226 acceptance returns a NON-KKT iterate. Differentiating there
+/// desyncs the analytic outer gradient from `d(value)/dρ` (measured: the gradient
+/// is CORRECT to ~2e-5 once the inner is converged at budget 200, but stalls at
+/// |g|≈1.09 at budget 40). Flooring the accepted lane's inner budget to this seed
+/// drives the inner Newton to genuine KKT-stationarity before the outer gradient
+/// is formed, decoupled from the user's outer `n_iter`. Well-conditioned fits
+/// exit early on the existing KKT-stationarity check, so only fits that need it
+/// spend the extra budget; the value / ranking lane keeps its own budget (its
+/// #1051 stagnation acceptance is correct there). The `inner_max_iter == 0`
+/// warm-start freeze is never floored.
+pub(crate) const SAE_MANIFOLD_GRADIENT_INNER_CONVERGENCE_SEED: usize = 200;
+
 /// Above this full-`B` β width, dense beta-penalty curvature is never
 /// materialized when Grassmann frames are engaged; exact curvature is probed
 /// directly in the factored coordinate space instead.
