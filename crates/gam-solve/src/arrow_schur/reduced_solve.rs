@@ -2475,7 +2475,8 @@ pub fn matrix_free_arrow_inverse_apply(
         }
     }
     // The transpose helper accumulates the eliminated term positively.
-    let reduced_rhs = rhs_beta - &eliminated;
+    let mut reduced_rhs = rhs_beta.to_owned();
+    reduced_rhs -= &eliminated;
 
     let solved_beta = if cache.k == 0 {
         Array1::<f64>::zeros(0)
