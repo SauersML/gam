@@ -914,7 +914,7 @@ mod tests {
     /// and (b) sit STRICTLY BELOW the hard charge near the edge — a filled disk whose
     /// directions pile just above the edge, where the hard count prices each as a full
     /// unit but the tempered count discounts them. This is the finite-n Watanabe
-    /// correction the opt-in `reml_criterion_with_cache_soft_charge` engages.
+    /// correction reported by this audit-only module.
     #[test]
     fn soft_ledger_reduces_to_hard_away_from_edge_and_undercuts_near_it() {
         let n = 1200usize;
