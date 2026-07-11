@@ -1422,21 +1422,36 @@ pub(crate) fn seed_inner_state_accepts_empty_beta_as_noslot() {
 /// A populated β whose length matches the decoder dimension must be
 /// INSTALLED and then GENUINELY REUSED by the next inner solve — this is
 /// the warm-start the continuation walk relies on for the big speedup
-/// (gam#577 / gam#579). We verify reuse behaviorally: seed a known β, run
-/// one eval with zero inner Newton iterations (so the solve cannot move
-/// β off the seed), and confirm the published `inner_beta_hint` is exactly
-/// the seeded β. A cold start would have published the term's pristine β
-/// instead.
+/// (gam#577 / gam#579). We verify reuse behaviorally with a β produced by a
+/// converged evidence solve—the state a real continuation step supplies—then run
+/// one eval with zero inner Newton iterations and confirm the published
+/// `inner_beta_hint` is exactly that seed. An arbitrary off-optimum β can have no
+/// defined frozen Laplace evidence and is not a valid continuation witness.
 #[test]
 pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
+    let mut source = warmstart_test_objective();
+    let source_rho = source.baseline_rho.clone();
+    source
+        .term
+        .reml_criterion_with_cache(
+            source.target.view(),
+            &source_rho,
+            source.registry.as_ref(),
+            source.inner_max_iter,
+            source.learning_rate,
+            source.ridge_ext_coord,
+            source.ridge_beta,
+        )
+        .expect("source continuation state must have finite converged evidence");
+    let seed = source.term.flatten_beta();
+
     let mut obj = warmstart_test_objective();
     let dim = obj.term.beta_dim();
-    // A distinctive seed that differs from the term's pristine decoder.
     let pristine = obj.term.flatten_beta();
-    let seed: Array1<f64> = Array1::from_shape_fn(dim, |i| pristine[i] + 0.5 + 0.01 * (i as f64));
+    assert_eq!(seed.len(), dim, "source β must match the target layout");
     assert!(
         (&seed - &pristine).iter().any(|d| d.abs() > 1e-6),
-        "seed must differ from the pristine β for the reuse check to be meaningful"
+        "converged continuation β must differ from the pristine target β for the reuse check"
     );
 
     let outcome = obj
