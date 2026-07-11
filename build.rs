@@ -4185,6 +4185,17 @@ fn locate_git_index(root: &Path) -> PathBuf {
 }
 
 fn read_git_index_tracked_files(root: &Path) -> Vec<PathBuf> {
+    // Source-archive builds (sdists, GitHub tarballs) have no `.git` at all.
+    // The tracked-file audits are repo-hygiene gates, not build correctness
+    // gates, and "what belongs to this repo" is undefined without an index —
+    // so skip them loudly instead of panicking the whole wheel build.
+    if !root.join(".git").exists() {
+        println!(
+            "cargo:warning=no .git at {}; skipping tracked-file audits (source-archive build)",
+            root.display()
+        );
+        return Vec::new();
+    }
     let index_path = locate_git_index(root);
     let bytes = fs::read(&index_path).unwrap_or_else(|err| {
         panic!(
