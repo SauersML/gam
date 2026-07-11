@@ -1001,7 +1001,12 @@ fn plan_penalty_like_without_fixed_point_stays_bfgs() {
 }
 
 #[test]
-fn plan_efs_not_selected_few_params_even_if_penalty_like() {
+fn plan_efs_selected_few_params_when_penalty_like() {
+    // The former ≤8-coordinate BFGS crossover routed exactly the failing
+    // small fits (2–7 ρ coords) into the fragile Wolfe/probe lane while large
+    // fits got the robust trace-based fixed point. A fixed-point-capable,
+    // all-penalty-like objective now routes to EFS at every dimension (see
+    // `SMALL_OUTER_BFGS_MAX_PARAMS`).
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
@@ -1013,8 +1018,8 @@ fn plan_efs_not_selected_few_params_even_if_penalty_like() {
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
 }
 
 #[test]

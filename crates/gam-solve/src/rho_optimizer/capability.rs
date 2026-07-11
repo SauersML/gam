@@ -5,7 +5,21 @@ use super::*;
 /// Each call site that optimizes smoothing parameters constructs one of these
 /// to describe its analytic derivative coverage. The [`plan`] function then
 /// selects the optimizer and Hessian strategy.
-pub(crate) const SMALL_OUTER_BFGS_MAX_PARAMS: usize = 8;
+///
+/// HISTORY: this crossover used to be 8 — a "performance choice" that routed
+/// every small-dimensional problem WITH an analytic gradient to BFGS on the
+/// theory that a dense quasi-Newton is cheaper below the cutoff. On the
+/// criteria that actually fail (the SAE manifold Laplace evidence: 2–7 ρ
+/// coordinates, piecewise-smooth basin-envelope value, inner-solve truncation
+/// noise), BFGS is not cheaper — its Strong-Wolfe line search is the consumer
+/// of the entire probe-lane / wall / escape / rescue apparatus, and every cost
+/// probe is a full inner re-convergence. EFS is the declared canonical REML
+/// method, needs only the traces `tr(H⁻¹S_k)` (no line search, no Wolfe, no
+/// value/gradient-lane agreement), and already drives every large fit. The
+/// crossover is therefore 0: a fixed-point-capable objective routes to
+/// EFS/HybridEfs at EVERY dimension, and BFGS remains the fallback for
+/// objectives with no fixed-point hook (or after `disable_fixed_point`).
+pub(crate) const SMALL_OUTER_BFGS_MAX_PARAMS: usize = 0;
 
 pub(crate) const SECOND_ORDER_GEOMETRY_PROBE_MAX_PARAMS: usize = 64;
 
@@ -222,12 +236,11 @@ impl OuterCapability {
         self.fixed_point_available
             && !self.disable_fixed_point
             && self.all_penalty_like()
-            // With an analytic gradient, the small-dimensional crossover is a
-            // performance choice: BFGS is cheaper below the cutoff. Without a
-            // gradient, EFS is the objective's only declared analytic
-            // stationarity mechanism and must remain eligible at every
-            // dimension. Routing a two-coordinate matrix-free problem to BFGS
-            // merely guarantees a capability error before the first step.
+            // A fixed-point-capable objective routes to EFS at every dimension
+            // (see `SMALL_OUTER_BFGS_MAX_PARAMS`): the former ≤8-coordinate
+            // BFGS crossover sent exactly the failing small fits into the
+            // fragile Wolfe/probe lane while large fits got the robust
+            // trace-based fixed point.
             && (self.gradient == Derivative::Unavailable
                 || self.n_params > SMALL_OUTER_BFGS_MAX_PARAMS)
     }
