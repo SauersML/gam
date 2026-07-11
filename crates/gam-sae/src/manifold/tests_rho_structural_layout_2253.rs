@@ -146,12 +146,27 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          plus_telemetry={plus_telemetry:?}, minus_telemetry={minus_telemetry:?}"
     );
     let finite_difference = (plus_cost - minus_cost) / (2.0 * h);
+    let mut coordinate_fd = Array1::<f64>::zeros(base.len());
+    for coordinate in 0..base.len() {
+        let mut axis = Array1::<f64>::zeros(base.len());
+        axis[coordinate] = 1.0;
+        let axis_plus = &base + &(h * &axis);
+        let axis_minus = &base - &(h * &axis);
+        let axis_plus_cost = gradient_objective
+            .eval_cost(&axis_plus)
+            .expect("coordinate +h value probe must converge");
+        let axis_minus_cost = gradient_objective
+            .eval_cost(&axis_minus)
+            .expect("coordinate -h value probe must converge");
+        coordinate_fd[coordinate] = (axis_plus_cost - axis_minus_cost) / (2.0 * h);
+    }
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
         (analytic - finite_difference).abs() <= 5.0e-3 * scale,
         "K=1 Softmax active-coordinate derivative mismatch: analytic direction={analytic:.9e}, \
          central FD={finite_difference:.9e}, error={:.3e}, scale={scale:.3e}, \
-         gradient={:?}, base_cost={base_cost:.17e}, plus_cost={plus_cost:.17e}, \
+         gradient={:?}, coordinate_fd={coordinate_fd:?}, \
+         base_cost={base_cost:.17e}, plus_cost={plus_cost:.17e}, \
          minus_cost={minus_cost:.17e}",
         (analytic - finite_difference).abs(),
         evaluation.gradient
