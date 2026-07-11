@@ -136,7 +136,7 @@ fn circle_atom(
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, dir_a % p]] = 1.0;
     decoder[[2, dir_b % p]] = 1.0;
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         name.to_string(),
         SaeAtomBasisKind::Periodic,
         1,

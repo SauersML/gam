@@ -94,7 +94,15 @@ pub(crate) fn assignment_log_strength_trace_ignores_fixed_logit_bug4() {
             let mut rr = rho.clone();
             rr.log_lambda_sparse = r;
             if probe
-                .penalized_laml_criterion_with_cache(target.view(), &rr, None, 5, 0.4, 1.0e-6, 1.0e-6)
+                .penalized_laml_criterion_with_cache(
+                    target.view(),
+                    &rr,
+                    None,
+                    5,
+                    0.4,
+                    1.0e-6,
+                    1.0e-6,
+                )
                 .is_ok()
             {
                 found = Some(r);

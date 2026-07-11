@@ -59,7 +59,7 @@ fn wide_p_k4_in_regime() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
             0.12 * f * ((m + 1) as f64) - 0.04 * (c as f64)
                 + 0.03 * (0.7 * f + 0.2 * m as f64).cos()
         });
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("euclid_d1_{atom_idx}"),
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -198,8 +198,7 @@ fn inner_gnorm_vs_budget_trajectory_2015() {
         eprintln!(
             "[2015-TRAJ] {budget:>5} | {g:.6e} | {qg:.6e} | {pen_obj:.6e} | {max_abs_coord:.4e} | \
              {} | [{min_dec:.3e},{max_dec:.3e}] | fp={} | {delta}",
-            term.dictionary_cocollapse_reseeds,
-            outcome.fixed_point,
+            term.dictionary_cocollapse_reseeds, outcome.fixed_point,
         );
         prev = Some(g);
         final_g = g;
@@ -242,18 +241,10 @@ fn inner_gradient_matches_penalized_objective_fd_2015() {
     .expect("inner evidence fit must not hard-error");
     let rho = rho_fixed;
 
-    // Align the base's frozen intrinsic bending Gram S̃ with what
-    // `assemble_arrow_schur` freezes at entry (the #673 lagged-diffusivity
-    // chokepoint): the assembled `gt` does NOT differentiate through S̃'s
-    // coord-dependence, and `refresh_basis` (used on every perturbation clone
-    // below) leaves `atom.smooth_penalty` untouched, so the coord FD correctly
-    // differentiates the SAME frozen-Gram objective `gt` prices — provided base
-    // is refreshed once here. Skipping this injects a spurious ~λ(S̃−I)B coord
-    // desync that is a fixture artifact, not a term bug (see `sae_fd_check_case`).
+    // The reference-function Gram is fixed by construction, so every coordinate
+    // perturbation below differentiates the same objective as the assembled
+    // analytic coordinate gradient.
     let mut base = term;
-    for atom in &mut base.atoms {
-        atom.refresh_intrinsic_smooth_penalty();
-    }
     // Freeze the transient collinearity gates on the base and re-install them on
     // every perturbation clone (the custom `Clone` resets them to `None`), exactly
     // as the optimizer's snapshot/restore does — otherwise the FD silently omits

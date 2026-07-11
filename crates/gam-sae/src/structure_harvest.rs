@@ -3108,10 +3108,8 @@ fn fit_topology_candidate(
         effective_dim = 1.0;
     }
 
-    // The born atom is seeded with the RAW roughness Gram; `SaeManifoldAtom::new`
-    // installs it as `smooth_penalty_raw` and `refresh_intrinsic_smooth_penalty`
-    // recomputes the pullback-metric `smooth_penalty` from it + the fitted decoder
-    // (the production seeding path).
+    // The born atom carries the topology candidate's declared function-space
+    // roughness Gram unchanged. Decoder fitting never rewrites that objective.
     let penalty = s_raw.clone();
     Ok(TopologyAutoFitEvidence {
         topology_name: spec.kind.as_str().to_string(),
@@ -4297,17 +4295,23 @@ fn born_atom(
             // basis: its evaluator, penalized decoder, and roughness penalty. The
             // intrinsic (pullback-metric) penalty is then refreshed from the
             // seeded decoder so the atom carries exactly the production seeding.
-            let mut atom = SaeManifoldAtom::new(
+            let reference_roughness = if matches!(fit.basis_kind, SaeAtomBasisKind::Poincare) {
+                SaeReferenceRoughness::PoincareConformalDirichlet {
+                    reference_coords: fit.coords.clone(),
+                }
+            } else {
+                SaeReferenceRoughness::ProvidedFunctionGram(fit.penalty.clone())
+            };
+            let atom = SaeManifoldAtom::new(
                 format!("atom_born_{k}"),
                 fit.basis_kind.clone(),
                 fit.latent_dim,
                 fit.phi.clone(),
                 fit.jet.clone(),
                 fit.decoder.clone(),
-                fit.penalty.clone(),
+                reference_roughness,
             )?
             .with_basis_second_jet(fit.evaluator.clone());
-            atom.refresh_intrinsic_smooth_penalty();
             // Coordinate block matched to the winning evaluator's intrinsic dim,
             // carrying the winning chart manifold so the joint refit retracts on
             // the right geometry.
@@ -4324,7 +4328,6 @@ fn born_atom(
             // the residual-factor direction.
             let mut atom = template.clone();
             atom.decoder_coefficients = factor_dir.to_owned();
-            atom.refresh_intrinsic_smooth_penalty();
             (atom, term.assignment.coords[0].clone())
         }
     };
@@ -4422,7 +4425,7 @@ pub(crate) fn born_circle_atom(
         use crate::manifold::SaeBasisEvaluator;
         evaluator.evaluate(phase_coords.view())?
     };
-    let mut born = SaeManifoldAtom::new(
+    let born = SaeManifoldAtom::new_with_provided_function_gram(
         format!("atom_born_{k}"),
         SaeAtomBasisKind::Periodic,
         1,
@@ -4432,7 +4435,6 @@ pub(crate) fn born_circle_atom(
         Array2::<f64>::eye(m),
     )?
     .with_basis_second_jet(evaluator.clone());
-    born.refresh_intrinsic_smooth_penalty();
 
     let born_coord_block = gam_terms::latent::LatentCoordValues::from_matrix_with_manifold(
         phase_coords.view(),
@@ -6279,7 +6281,7 @@ mod tests {
             // non-degenerate.
             decoder[[1, atom_idx % p]] = 1.0;
             decoder[[2, (atom_idx + 1) % p]] = 1.0;
-            let atom = SaeManifoldAtom::new(
+            let atom = SaeManifoldAtom::new_with_provided_function_gram(
                 format!("atom_{atom_idx}"),
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -6647,7 +6649,7 @@ mod tests {
             let mut decoder = Array2::<f64>::zeros((m, p));
             decoder[[1, 0]] = scale;
             decoder[[2, 1]] = scale;
-            let atom = SaeManifoldAtom::new(
+            let atom = SaeManifoldAtom::new_with_provided_function_gram(
                 format!("arc_{j}"),
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -8012,7 +8014,7 @@ mod tests {
         for j in 0..p {
             decoder[[1, j]] = dir[j];
         }
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name.to_string(),
             SaeAtomBasisKind::Linear,
             1,
@@ -8197,7 +8199,7 @@ mod tests {
         let mut decoder = Array2::<f64>::zeros((3, p));
         decoder[[2, 0]] = radius; // cos₁ · e0
         decoder[[1, 1]] = radius; // sin₁ · e1
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle".to_string(),
             SaeAtomBasisKind::Periodic,
             1,

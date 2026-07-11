@@ -691,7 +691,7 @@ mod certificate_verdict_tests {
             let mut decoder = Array2::<f64>::zeros((2, 2));
             decoder[[0, 0]] = r;
             decoder[[1, 1]] = r;
-            let atom = SaeManifoldAtom::new(
+            let atom = SaeManifoldAtom::new_with_provided_function_gram(
                 "circle",
                 SaeAtomBasisKind::Periodic,
                 1,

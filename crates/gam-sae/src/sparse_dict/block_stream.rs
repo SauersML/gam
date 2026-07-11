@@ -581,11 +581,8 @@ impl BlockSparseStreamState {
             (self.pending_birth.as_mut(), baseline_codes.as_ref())
         {
             for (row, code) in baseline_codes.iter().enumerate() {
-                let reconstruction = reconstruct_stored_code_row(
-                    code,
-                    pending.baseline_decoder.view(),
-                    b,
-                );
+                let reconstruction =
+                    reconstruct_stored_code_row(code, pending.baseline_decoder.view(), b);
                 for column in 0..p {
                     let residual = shard[[row, column]] - reconstruction[column];
                     pending.baseline_rss += residual as f64 * residual as f64;
@@ -843,9 +840,7 @@ impl BlockSparseStreamState {
             baseline_rss: 0.0,
             baseline_rows: 0,
             baseline_usage: vec![0; self.g],
-            baseline_second: (0..self.g)
-                .map(|_| Array2::<f64>::zeros((b, b)))
-                .collect(),
+            baseline_second: (0..self.g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
         });
         true
     }

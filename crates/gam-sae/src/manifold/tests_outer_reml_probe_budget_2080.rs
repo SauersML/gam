@@ -39,7 +39,7 @@ fn joint_decoder_gauge_quotients_full_rank_atom_redistribution_2080() -> Result<
     let phi = Array2::<f64>::ones((n, 1));
     let jet = ndarray::Array3::<f64>::zeros((n, 1, 1));
     let make_atom = |name: &str, decoder: f64| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Linear,
             1,
@@ -262,7 +262,7 @@ fn two_circle_periodic_term(
                 rss += r * r;
             }
         }
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle",
             SaeAtomBasisKind::Periodic,
             dim,
@@ -311,7 +311,9 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
         })
         .collect();
     assert!(
-        seed_norms.iter().all(|norm| norm.is_finite() && *norm > 0.0),
+        seed_norms
+            .iter()
+            .all(|norm| norm.is_finite() && *norm > 0.0),
         "regression requires the nonzero decoder seed that bypassed the old cold-entry placement; norms={seed_norms:?}"
     );
 
@@ -361,11 +363,8 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
         "entry placement must put the two planted factors on distinct atoms; parity dominance={even_dominant:?}"
     );
 
-    let entry_eval_result = OuterObjective::eval_with_order(
-        &mut objective,
-        &entry_rho,
-        OuterEvalOrder::Value,
-    );
+    let entry_eval_result =
+        OuterObjective::eval_with_order(&mut objective, &entry_rho, OuterEvalOrder::Value);
     if let Err(error) = &entry_eval_result {
         let entry_rho_state = objective.baseline_rho.from_flat(entry_rho.view());
         let system = objective
@@ -384,7 +383,12 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
                 }
             }
         }
-        let decoder_grad = system.gb.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let decoder_grad = system
+            .gb
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
         let assignments = objective
             .term
             .assignment
@@ -416,7 +420,8 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
             entry_rho_state.lambda_smooth_vec(),
         );
     }
-    let entry_eval = entry_eval_result.expect("separated legal entry must solve to finite evidence");
+    let entry_eval =
+        entry_eval_result.expect("separated legal entry must solve to finite evidence");
     assert!(
         entry_eval.cost.is_finite(),
         "separated legal entry returned non-finite evidence {}",
@@ -1088,7 +1093,7 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
     }
     let xtz = fast_atb(&phi, &z);
     let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,

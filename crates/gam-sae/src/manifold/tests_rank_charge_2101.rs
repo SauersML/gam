@@ -54,7 +54,7 @@ fn fitted_circle_term(n: usize, p: usize) -> (SaeManifoldTerm, SaeManifoldRho) {
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = 1.0;
     decoder[[2, 1]] = 1.0;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,
@@ -88,7 +88,15 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     let (mut term, rho) = fitted_circle_term(80, 16);
     // Dispersion (noise floor R) from a reml pass.
     let (_v, loss, cache) = term
-        .penalized_laml_criterion_with_cache(unit_target(&term).view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_laml_criterion_with_cache(
+            unit_target(&term).view(),
+            &rho,
+            None,
+            0,
+            1.0,
+            1e-6,
+            1e-6,
+        )
         .unwrap_or_else(|_| panic!("reml pass"));
     let disp = term
         .reconstruction_dispersion(&loss, &cache, &rho, None)
@@ -171,7 +179,7 @@ fn rank_charge_healthy_k3_control_well_conditioned() {
         let mut decoder = Array2::<f64>::zeros((3, p));
         decoder[[1, 2 * c]] = 1.0;
         decoder[[2, 2 * c + 1]] = 1.0;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle{c}"),
             SaeAtomBasisKind::Periodic,
             1,
@@ -249,7 +257,7 @@ fn fit_circle_subset(
         let mut decoder = Array2::<f64>::zeros((3, p));
         decoder[[1, 2 * c]] = 1.0;
         decoder[[2, 2 * c + 1]] = 1.0;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle{c}"),
             SaeAtomBasisKind::Periodic,
             1,

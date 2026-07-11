@@ -54,7 +54,7 @@ fn circle_atom(
 ) -> SaeManifoldAtom {
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         "cc",
         SaeAtomBasisKind::Periodic,
         1,

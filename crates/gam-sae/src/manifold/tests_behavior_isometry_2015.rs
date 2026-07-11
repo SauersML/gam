@@ -65,7 +65,7 @@ fn augmented_circle_atom(
 ) -> (SaeManifoldAtom, Array2<f64>) {
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "b0",
         SaeAtomBasisKind::Periodic,
         1,

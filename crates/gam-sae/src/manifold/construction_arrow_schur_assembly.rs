@@ -17,15 +17,13 @@ use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_maj
 /// curvature `raw = w·(s'·J² + s·c)` at one logit slot, for the low-rank-metric
 /// PD-repair path.
 ///
-/// The exact ordered Beta--Bernoulli column-`k` Hessian block is `H_p = w·s'·J Jᵀ + diag(w·s·c)`,
-/// with both the rank-one coefficient `w·s' = cross_row_d[k]` and the concrete
-/// second-jacobian diagonal `w·s·c` possibly NEGATIVE (`s'` is the not-sign-
-/// definite empirical-mass score derivative; `s·c` flips past the inflection of
-/// the binary-concrete map). Under a low-rank whitening metric the whitened data
-/// Gauss-Newton block is rank-deficient and cannot dominate that negative
-/// curvature, so the per-row `H_tt` and the cross-row Woodbury capacitance
-/// `C = I + D·Uᵀ H₀'⁻¹ U` go non-PD and the undamped evidence log-det is
-/// undefined. Clamp each piece to its positive part — exactly the MM/Loewner
+/// The exact ordered Beta--Bernoulli column-`k` Hessian block is
+/// `H_p = w·s'·J Jᵀ + diag(w·s·c)`. Its rank-one coefficient is always
+/// negative because `s' = -ψ₁(M+a)-ψ₁(N-M+1) < 0`; the concrete
+/// second-Jacobian diagonal `w·s·c` can have either sign. Under a low-rank
+/// whitening metric the data Gauss--Newton block need not dominate that
+/// negative curvature, so an undamped exact-Hessian log determinant need not
+/// exist. Clamp each piece to its positive part — exactly the MM/Loewner
 /// pattern ARD (`max(V'',0)`) and softmax (Gershgorin `D ⪰ H`) already use — so
 /// the assembled column block is `max(w·s',0)·J Jᵀ + diag(max(w·s·c,0)) ⪰ 0`.
 ///
@@ -35,7 +33,7 @@ use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_maj
 /// `D = max(w·s',0) ⪰ 0` makes `C ⪰ I`. Majorizing a FIXED prior's curvature
 /// only conditions the Newton step / the Laplace normalizer — the gradient
 /// (which sets the stationary point) is untouched.
-pub(super) fn ibp_psd_majorized_hdiag(
+pub(super) fn ordered_beta_bernoulli_psd_majorized_hdiag(
     channels: &OrderedBetaBernoulliHessianDiagThirdChannels,
     row: usize,
     k_atoms: usize,
@@ -53,7 +51,7 @@ impl SaeManifoldTerm {
     /// Build the per-row dense gate maps `a_{n,·}` at `rho` for all `n` rows.
     ///
     /// `try_assignments_row` is a pure read-only per-row computation
-    /// (softmax / ordered Beta--Bernoulli-MAP / TopK over that row's routing logits — no shared
+    /// (softmax / ordered Beta--Bernoulli sigmoid / TopK over that row's routing logits — no shared
     /// mutable state, no faer GEMM), so the rows are independent. Above the
     /// `SAE_LOSS_PARALLEL_ROW_MIN` floor (and when not already inside a rayon
     /// worker) they are computed in parallel and collected in row order; the
@@ -195,13 +193,10 @@ impl SaeManifoldTerm {
                 ));
             }
         }
-        // `smooth_penalty` is fixed for the lifetime of this objective.  In
-        // particular it is not rebuilt from the current decoder/coordinates at
-        // an assembly boundary: doing so would optimize
-        // 1/2 lambda B' S(B,t) B while assembling only lambda S B and lambda S,
-        // silently dropping every derivative of S.  Basis reparameterizations
-        // transport the fixed operator explicitly; ordinary Newton/REML steps
-        // all differentiate the same quadratic form.
+        // `smooth_penalty` is the validated reference-function Gram and is fixed
+        // for the lifetime of this objective. Basis reparameterizations
+        // transport it by congruence; ordinary Newton and penalized-LAML steps
+        // all differentiate the same declared quadratic form.
         // #1026 — freeze the decoder-repulsion collinearity gate at the SAME
         // assembly chokepoint as the smoothness Gram, so the repulsion's
         // gradient/curvature (assembled below) and its value (read by the
@@ -577,7 +572,7 @@ impl SaeManifoldTerm {
         // are bit-for-bit unchanged.
         let low_rank_whiten = whitens_likelihood && w_dim < p;
         // #2144/#1038 — PSD-majorize the ordered Beta--Bernoulli assignment-prior curvature
-        // UNCONDITIONALLY (see `ibp_psd_majorized_hdiag`), exactly as softmax's
+        // UNCONDITIONALLY (see `ordered_beta_bernoulli_psd_majorized_hdiag`), exactly as softmax's
         // Gershgorin majorizer (#1419) and ARD's `max(V'',0)` already are. The raw
         // ordered Beta--Bernoulli pieces (`w·s'` rank-one, `w·s·c` diagonal) are not sign-definite, so
         // the raw operator's cross-row capacitance `C = I + D·M` goes indefinite by
@@ -591,15 +586,16 @@ impl SaeManifoldTerm {
         // θ-adjoint differentiate this SAME majorized operator (their sites clamp
         // identically), keeping value/trace/adjoint on one branch. `None` on every
         // non-ordered Beta--Bernoulli mode (the third channels only exist for ordered Beta--Bernoulli-MAP).
-        // RAW channels: `ibp_psd_majorized_hdiag` and the source-`d` clamp below do
+        // RAW channels: `ordered_beta_bernoulli_psd_majorized_hdiag` and the source-`d` clamp below do
         // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
         // un-majorized channel set.
-        let ibp_majorizer = ordered_beta_bernoulli_assignment_third_channels_weighted(
-            &self.assignment,
-            rho,
-            false,
-            self.row_loss_weights.as_deref(),
-        )?;
+        let ordered_beta_bernoulli_majorizer =
+            ordered_beta_bernoulli_assignment_third_channels_weighted(
+                &self.assignment,
+                rho,
+                false,
+                self.row_loss_weights.as_deref(),
+            )?;
         // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`
         // output channels and identical in each: with the flat β layout
         // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
@@ -1056,14 +1052,14 @@ impl SaeManifoldTerm {
                         //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j.
                         //     This per-row diagonal stores only the diagonal/self-row part;
                         //     the FULL rank-one cross-row block `U D Uᵀ` is now INSTALLED as a
-                        //     separate Woodbury source by `set_ibp_cross_row_source` (#1038),
+                        //     separate Woodbury source by `set_ordered_beta_bernoulli_cross_row_source` (#1038),
                         //     so the assembled operator is `H_full = H₀' + U D Uᵀ` on the
                         //     NO-SELF base `H₀' = H₀ − Σ_k d_k diag(z'_ik²)` (self term
-                        //     downdated, see `IbpCrossRowSource::self_term_downdate`). The
+                        //     downdated, see `OrderedBetaBernoulliCrossRowSource::self_term_downdate`). The
                         //     scalar `D`-coefficient `d_k = w·s'_k` is
                         //     `OrderedBetaBernoulliHessianDiagThirdChannels::cross_row_d` (FD-verified against
                         //     ∂²value/∂ℓ_ik∂ℓ_jk in
-                        //     `ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian`),
+                        //     `ordered_beta_bernoulli_cross_row_woodbury_d_matches_full_off_diagonal_hessian`),
                         //     and `z_jac` carries `u_k`'s entries `z'_ik`.
                         //
                         // The criterion's log|H| and Γ adjoint differentiate this SAME
@@ -1129,9 +1125,9 @@ impl SaeManifoldTerm {
                                         let raw = assignment_hdiag[assignment_base + k];
                                         // #2144: PSD-majorize the ordered Beta--Bernoulli diagonal under a
                                         // low-rank whitening metric (no-op otherwise).
-                                        let val = match ibp_majorizer.as_ref() {
+                                        let val = match ordered_beta_bernoulli_majorizer.as_ref() {
                                             Some(ch) => {
-                                                ibp_psd_majorized_hdiag(ch, row, k_atoms, k, raw)
+                                                ordered_beta_bernoulli_psd_majorized_hdiag(ch, row, k_atoms, k, raw)
                                             }
                                             None => raw,
                                         };
@@ -1194,8 +1190,8 @@ impl SaeManifoldTerm {
                                     let raw = assignment_hdiag[assignment_base + free_idx];
                                     // #2144: PSD-majorize the ordered Beta--Bernoulli diagonal under a
                                     // low-rank whitening metric (no-op otherwise).
-                                    let val = match ibp_majorizer.as_ref() {
-                                        Some(ch) => ibp_psd_majorized_hdiag(
+                                    let val = match ordered_beta_bernoulli_majorizer.as_ref() {
+                                        Some(ch) => ordered_beta_bernoulli_psd_majorized_hdiag(
                                             ch, row, k_atoms, free_idx, raw,
                                         ),
                                         None => raw,
@@ -2409,7 +2405,7 @@ impl SaeManifoldTerm {
         // `w·s'_k·z'_ik²` — it is the first summand of `assignment_hdiag`'s
         // `hessian_diag` value `w·(score_derivative·z_jac² + score·c_ik)` written
         // at the logit diagonal above. So the consumer (`solver::arrow_schur`,
-        // #1038 `IbpCrossRowSource`/`CrossRowWoodbury`) DOWNDATES exactly
+        // #1038 `OrderedBetaBernoulliCrossRowSource`/`CrossRowWoodbury`) DOWNDATES exactly
         // `Σ_k d_k·z'_ik²` (`self_term_downdate`) to recover the NO-SELF base
         // `H₀'`, then re-adds the FULL rank-one `U D Uᵀ` via the determinant
         // lemma — so value, the evidence log-determinant, and the θ/ρ-adjoint all
@@ -2429,7 +2425,7 @@ impl SaeManifoldTerm {
         //     coordinates and atom `k` lives at local position `pos` of
         //     `active_atoms[row]`, so `global_t_index = sys.row_offsets[i] + pos`.
         //     Both pin the `U`-column convention bit-for-bit to the consumer's
-        //     `ibp_logit_sites`/`row_vars_for_cache_row` slot mapping.
+        //     `ordered_beta_bernoulli_logit_sites`/`row_vars_for_cache_row` slot mapping.
         if let Some(channels) = ordered_beta_bernoulli_assignment_third_channels_weighted(
             &self.assignment,
             rho,
@@ -2447,7 +2443,7 @@ impl SaeManifoldTerm {
                     // `(g_base + pos, atom, z_jac[row·K + atom])` for the active set
                     // only. Using `g_base + k` would attach atom `k`'s derivative to
                     // the wrong slot (and run out of range for compact rows),
-                    // violating the `IbpCrossRowSource` contract.
+                    // violating the `OrderedBetaBernoulliCrossRowSource` contract.
                     Some(layout) => {
                         for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
                             let z_prime = channels.z_jac[start + atom];
@@ -2465,18 +2461,18 @@ impl SaeManifoldTerm {
             }
             // #2144/#1038: clamp the rank-one coefficient `d_k = w·s'_k` to its
             // positive part UNCONDITIONALLY — the SAME `max(w·s',0)` the per-row
-            // diagonal majorizer (`ibp_psd_majorized_hdiag`) uses. The source's `d`
+            // diagonal majorizer (`ordered_beta_bernoulli_psd_majorized_hdiag`) uses. The source's `d`
             // drives BOTH the self-term downdate and the rank-one re-add, so the
             // clamped `d` keeps `H₀'`'s diagonal at `max(w·s·c,0) ⪰ 0` and the
             // capacitance `C = I + D·Uᵀ H₀'⁻¹ U ⪰ I` PD — one operator, evidence
             // log-det defined at every ρ (the streaming value reads THIS `d` too).
             let d = channels.cross_row_d.mapv(|x| x.max(0.0));
-            let source = IbpCrossRowSource {
+            let source = OrderedBetaBernoulliCrossRowSource {
                 r: k_atoms,
                 d,
                 entries,
             };
-            sys.set_ibp_cross_row_source(source);
+            sys.set_ordered_beta_bernoulli_cross_row_source(source);
         }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = row_layout;

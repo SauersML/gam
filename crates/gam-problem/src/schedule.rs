@@ -12,7 +12,7 @@ impl ScheduleKind {
     ///
     /// This is the single source for the endpoints-and-steps geometric spec, so
     /// callers that only know the `(tau_start, tau_min, steps)` triple (e.g. the
-    /// Python `SparsityConfig.gumbel_schedule`) hand the spec over verbatim and
+    /// Python `sae_manifold_fit(schedule=...)` callers hand the spec over verbatim and
     /// let the schedule derive the rate rather than duplicating the arithmetic.
     #[must_use]
     pub fn geometric_rate_from_steps(tau_start: f64, tau_min: f64, steps: usize) -> f64 {

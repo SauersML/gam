@@ -10,7 +10,7 @@ use crate::assignment::{
 };
 
 #[test]
-fn k_aware_ibp_prior_spans_large_dictionary_without_capping_forward_gate() {
+fn k_aware_ordered_beta_bernoulli_prior_spans_large_dictionary_without_capping_forward_gate() {
     let k = 128usize;
     let alpha = default_ordered_beta_bernoulli_concentration_for_k_atoms(k);
     let ratio = alpha / (alpha + 1.0);
@@ -27,7 +27,7 @@ fn k_aware_ibp_prior_spans_large_dictionary_without_capping_forward_gate() {
 }
 
 #[test]
-fn default_mode_admission_uses_top_k_at_large_k_and_never_implicit_ibp() {
+fn default_mode_admission_uses_top_k_at_large_k_and_never_implicit_ordered_beta_bernoulli() {
     let n = 300_000usize;
     let k = 32_768usize;
     let admitted =
@@ -36,15 +36,25 @@ fn default_mode_admission_uses_top_k_at_large_k_and_never_implicit_ibp() {
     assert!(matches!(admitted.mode, AssignmentMode::Softmax { .. }));
     assert_eq!(admitted.top_k, Some(n.div_ceil(k)));
 
-    let explicit =
-        admit_assignment_mode_for_size(AssignmentModeRequest::OrderedBetaBernoulli, n, k, 1.0, 1.0, false, 0.0)
-            .expect("explicit large-K ordered Beta--Bernoulli admission");
-    assert!(matches!(explicit.mode, AssignmentMode::OrderedBetaBernoulli { .. }));
+    let explicit = admit_assignment_mode_for_size(
+        AssignmentModeRequest::OrderedBetaBernoulli,
+        n,
+        k,
+        1.0,
+        1.0,
+        false,
+        0.0,
+    )
+    .expect("explicit large-K ordered Beta--Bernoulli admission");
+    assert!(matches!(
+        explicit.mode,
+        AssignmentMode::OrderedBetaBernoulli { .. }
+    ));
     assert_eq!(explicit.top_k, Some(n.div_ceil(k)));
 }
 
 #[test]
-fn ibp_mode_admission_requires_explicit_small_fit_request() {
+fn ordered_beta_bernoulli_mode_admission_requires_explicit_small_fit_request() {
     let n = 4096usize;
     let k = 32usize;
     let default_admitted =
@@ -56,16 +66,23 @@ fn ibp_mode_admission_requires_explicit_small_fit_request() {
     ));
     assert_eq!(default_admitted.top_k, None);
 
-    let ibp =
-        admit_assignment_mode_for_size(AssignmentModeRequest::OrderedBetaBernoulli, n, k, 0.7, 1.3, true, 0.0)
-            .expect("explicit small-fit ordered Beta--Bernoulli admission");
+    let ordered_beta_bernoulli = admit_assignment_mode_for_size(
+        AssignmentModeRequest::OrderedBetaBernoulli,
+        n,
+        k,
+        0.7,
+        1.3,
+        true,
+        0.0,
+    )
+    .expect("explicit small-fit ordered Beta--Bernoulli admission");
     assert!(matches!(
-        ibp.mode,
+        ordered_beta_bernoulli.mode,
         AssignmentMode::OrderedBetaBernoulli {
             alpha,
             learnable_alpha: true,
             ..
         } if (alpha - 1.3).abs() < 1.0e-12
     ));
-    assert_eq!(ibp.top_k, None);
+    assert_eq!(ordered_beta_bernoulli.top_k, None);
 }

@@ -4631,7 +4631,7 @@ mod encode_fix_tests {
         let jet = Array3::<f64>::zeros((m, m, latent_dim));
         let dec = Array2::<f64>::from_elem((m, 1), 0.5);
         let smooth = Array2::<f64>::eye(m);
-        SaeManifoldAtom::new("tiny", kind, latent_dim, phi, jet, dec, smooth)
+        SaeManifoldAtom::new_with_provided_function_gram("tiny", kind, latent_dim, phi, jet, dec, smooth)
             .expect("tiny atom builds")
     }
 
@@ -5173,7 +5173,7 @@ mod joint_fallback_tests {
                 // unit tangent direction on it.
                 dec[[1, 0]] = rho.sqrt();
                 dec[[1, atom_idx + 1]] = (1.0 - rho).sqrt();
-                SaeManifoldAtom::new(
+                SaeManifoldAtom::new_with_provided_function_gram(
                     "lin",
                     SaeAtomBasisKind::EuclideanPatch,
                     1,

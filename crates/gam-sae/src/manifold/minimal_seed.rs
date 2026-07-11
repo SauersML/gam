@@ -187,7 +187,9 @@ pub fn build_sae_minimal_seed(
                 request.threshold + THRESHOLD_GATE_SEED_MARGIN,
             )
         }
-        None if k_atoms == 1 && request.assignment_kind == SaeFitAssignmentKind::OrderedBetaBernoulli => {
+        None if k_atoms == 1
+            && request.assignment_kind == SaeFitAssignmentKind::OrderedBetaBernoulli =>
+        {
             const ORDERED_BETA_BERNOULLI_K1_PRESENT_GATE_LOGIT: f64 = 6.0;
             Array2::<f64>::from_elem(
                 (n_obs, k_atoms),
@@ -233,7 +235,9 @@ pub fn build_sae_minimal_seed(
         request.target,
         initial_logits.view(),
         request.assignment_kind.tag(),
-        request.ordered_beta_bernoulli_alpha_override.unwrap_or(request.alpha),
+        request
+            .ordered_beta_bernoulli_alpha_override
+            .unwrap_or(request.alpha),
         request.tau,
         request.threshold,
         request.top_k,

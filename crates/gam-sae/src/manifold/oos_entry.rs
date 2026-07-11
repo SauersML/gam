@@ -477,7 +477,7 @@ fn build_oos_atom(
         ));
     }
 
-    Ok(SaeManifoldAtom::new(
+    Ok(SaeManifoldAtom::new_with_provided_function_gram(
         format!("oos_atom_{atom_index}"),
         spec.basis_kind.clone(),
         spec.latent_dim,
@@ -684,7 +684,12 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         }
         None => {
             let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
-            if k_atoms == 1 && matches!(assignment, SaeOosAssignmentKind::OrderedBetaBernoulli { .. }) {
+            if k_atoms == 1
+                && matches!(
+                    assignment,
+                    SaeOosAssignmentKind::OrderedBetaBernoulli { .. }
+                )
+            {
                 logits.column_mut(0).fill(4.0);
             }
             logits
@@ -737,7 +742,12 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     }
     if cold_logits && assignment == SaeOosAssignmentKind::Softmax {
         term.seed_oos_softmax_logits_from_projection_residuals(target.view(), tau);
-    } else if cold_logits && matches!(assignment, SaeOosAssignmentKind::OrderedBetaBernoulli { .. }) {
+    } else if cold_logits
+        && matches!(
+            assignment,
+            SaeOosAssignmentKind::OrderedBetaBernoulli { .. }
+        )
+    {
         term.seed_oos_ibp_logits_from_projected_decoder_lsq(target.view(), tau);
     }
 

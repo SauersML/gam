@@ -281,8 +281,8 @@ mod softmax_majorizer_active_entry_1410_tests {
 #[cfg(test)]
 mod exact_stationarity_solve_1418_tests {
     use super::*;
-    use approx::assert_abs_diff_eq;
     use crate::manifold::tests::{diagonal_latent_cache, gamma_fd_tiny_fixture};
+    use approx::assert_abs_diff_eq;
     use ndarray::Array1;
 
     /// Build a converged tiny SAE state whose inner residual is genuinely
@@ -415,9 +415,8 @@ mod exact_stationarity_solve_1418_tests {
         let cache = diagonal_latent_cache(&[2.0_f64, 5.0]);
         let gauge = Array1::from_vec(vec![1.0_f64, 0.0]);
         let stiffness = 5.0;
-        let solver =
-            DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
-                .expect("gauge-fixed exact-stationarity preconditioner");
+        let solver = DeflatedArrowSolver::from_orthonormal_gauges(&cache, vec![gauge], stiffness)
+            .expect("gauge-fixed exact-stationarity preconditioner");
         let rhs = SaeArrowVector {
             t: Array1::from_vec(vec![4.0_f64, 6.0]),
             beta: Array1::zeros(0),
@@ -435,13 +434,9 @@ mod exact_stationarity_solve_1418_tests {
             })
         };
 
-        let solved = solve_exact_stationarity_on_gauge_quotient(
-            &solver,
-            &rhs,
-            &apply_raw_a,
-            &apply_raw_b,
-        )
-        .expect("gauge-fixed exact stationarity solve");
+        let solved =
+            solve_exact_stationarity_on_gauge_quotient(&solver, &rhs, &apply_raw_a, &apply_raw_b)
+                .expect("gauge-fixed exact stationarity solve");
         let raw_ax = apply_raw_a(&solved).expect("raw A apply");
         let raw_residual = SaeArrowVector {
             t: &raw_ax.t - &rhs.t,
@@ -492,17 +487,11 @@ mod exact_stationarity_solve_1418_tests {
                 beta: Array1::zeros(0),
             })
         };
-        let apply_raw_b = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            Ok(v.clone())
-        };
+        let apply_raw_b = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> { Ok(v.clone()) };
 
-        let solved = solve_exact_stationarity_on_gauge_quotient(
-            &solver,
-            &rhs,
-            &apply_raw_a,
-            &apply_raw_b,
-        )
-        .expect("resolved indefinite response");
+        let solved =
+            solve_exact_stationarity_on_gauge_quotient(&solver, &rhs, &apply_raw_a, &apply_raw_b)
+                .expect("resolved indefinite response");
         assert_abs_diff_eq!(solved.t[0], 2.0, epsilon = 1.0e-10);
         assert_abs_diff_eq!(solved.t[1], 1.0, epsilon = 1.0e-10);
     }
@@ -608,7 +597,7 @@ mod exact_stationarity_solve_1418_tests {
     /// Build a converged ordered Beta--Bernoulli-MAP tiny SAE state whose cache carries the exact
     /// cross-row rank-`R` Woodbury (`H_full = H₀' + U D Uᵀ`), with a genuinely
     /// nonzero inner residual so `ΔC = A − B` is also live.
-    fn converged_ibp_state_with_woodbury() -> (
+    fn converged_ordered_beta_bernoulli_state_with_woodbury() -> (
         SaeManifoldTerm,
         Array2<f64>,
         SaeManifoldRho,
@@ -722,8 +711,8 @@ mod exact_stationarity_solve_1418_tests {
     /// the residual equals exactly the dropped cross-row term `U D Uᵀ v` (asserted
     /// to be materially nonzero, so the test is non-vacuous).
     #[test]
-    fn apply_exact_hessian_includes_ibp_cross_row_woodbury_1038() {
-        let (term, target, rho, cache) = converged_ibp_state_with_woodbury();
+    fn apply_exact_hessian_includes_ordered_beta_bernoulli_cross_row_woodbury_1038() {
+        let (term, target, rho, cache) = converged_ordered_beta_bernoulli_state_with_woodbury();
 
         // (2) The production ordered Beta--Bernoulli path must actually carry the Woodbury.
         assert!(
@@ -970,8 +959,6 @@ mod smoothness_dof_hutchinson_tests {
         );
     }
 }
-
-
 
 #[cfg(test)]
 mod shape_uncertainty_joint_recompute_tests {

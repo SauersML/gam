@@ -1222,11 +1222,7 @@ impl SmoothThresholdPenalty {
 ///   ∂φ/∂z   = g + z · g (1 − g) / ε
 ///   ∂φ/∂τ   = − z · g (1 − g) / ε
 #[must_use]
-pub fn smooth_threshold_gate_value_grad(
-    z: f64,
-    tau: f64,
-    smoothing_eps: f64,
-) -> (f64, f64, f64) {
+pub fn smooth_threshold_gate_value_grad(z: f64, tau: f64, smoothing_eps: f64) -> (f64, f64, f64) {
     let g = gam_linalg::utils::stable_logistic((z - tau) / smoothing_eps);
     let value = z * g;
     let slope = z * g * (1.0 - g) / smoothing_eps;

@@ -36,7 +36,7 @@ pub(crate) fn streaming_polar_refresh_reorients_frame() {
         jet[[mu, mu, 0]] = 1.0;
     }
     let s_raw = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
-    let mut atom = SaeManifoldAtom::new(
+    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "stream",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -83,7 +83,7 @@ pub(crate) fn small_p_zero_decoder_stays_full_b() {
         jet[[row, row, 0]] = 1.0;
     }
     let smooth_penalty = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
-    let mut atom = SaeManifoldAtom::new(
+    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "small-p-zero",
         SaeAtomBasisKind::EuclideanPatch,
         1,

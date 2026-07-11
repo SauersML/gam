@@ -28,7 +28,6 @@ pub(crate) fn decoder_norm_guard_reseeds_collapsed_atom_to_distinct_nonzero() {
     // Collapse atom 1's decoder to ≈0 while leaving its assignment gates
     // spread (the mass guard sees nothing wrong). Atom 0 keeps its signal.
     term.atoms[1].decoder_coefficients.fill(0.0);
-    term.atoms[1].refresh_intrinsic_smooth_penalty();
 
     let norm = |a: &SaeManifoldAtom| -> f64 {
         a.decoder_coefficients
@@ -106,7 +105,7 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
     // mass guard/inner solve, not here) and no atom is *relatively* behind its
     // peers (all norms within ~1.5×, none below `1e-3·median`).
     let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, scale: f64| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,
@@ -251,7 +250,7 @@ pub(crate) fn co_collapse_multistart_restores_best_basin_not_last_reseed() {
     let (phi1, jet1) = periodic_basis(&coords1);
     let (phi2, jet2) = periodic_basis(&coords2);
     let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, scale: f64| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,
@@ -352,7 +351,7 @@ pub(crate) fn decoder_repulsion_gate_off_when_separated_on_when_collinear() {
     let (phi1, jet1) = periodic_basis(&coords1);
     // Periodic basis is M=3 wide; output p=3. Build two atoms; decoders set below.
     let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,
@@ -469,7 +468,7 @@ pub(crate) fn separation_barrier_is_collapse_prevention_not_bandaid_1522() {
     ];
     let build = |dec0: Array2<f64>, dec1: Array2<f64>| {
         let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 name,
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -643,7 +642,7 @@ fn aligned_two_atom_term_with_c2(c2: f64) -> SaeManifoldTerm {
         d
     };
     let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,
@@ -881,7 +880,7 @@ fn separation_barrier_collapse_prevention_is_scale_invariant_1610() {
     let build_at_scale = |s: f64| {
         let scale_row = |r: [f64; 3]| [r[0] * s, r[1] * s, r[2] * s];
         let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 name,
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -999,7 +998,7 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
         dec1[[0, 0]] = 0.9 * s;
         dec1[[0, 1]] = (1.0 - 0.9 * 0.9_f64).sqrt() * s; // ‖row‖ = s, cosine with dec0 = 0.9
         let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 name,
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -1110,7 +1109,7 @@ pub(crate) fn barrier_strength_tracks_data_fit_inseparability_1610() {
     // Two atoms with the SAME chart design (identical Φ) so the ONLY thing that
     // sets γ is the coactivation-weighted routing overlap we pass in.
     let make = |name: &str, decoder: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,
@@ -1769,7 +1768,7 @@ fn jeffreys_two_atom_term(n: usize, dec0: [f64; 3], dec1: [f64; 3]) -> SaeManifo
         d
     };
     let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,

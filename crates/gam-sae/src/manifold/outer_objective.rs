@@ -724,9 +724,7 @@ pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivativ
 /// sparse coordinate uses this lane, including learnable ordered-Beta
 /// concentration: its prior value, inner-mode response, and log-determinant
 /// derivative must be differentiated as one penalized-LAML scalar.
-pub(crate) fn assignment_strength_gradient_coordinate(
-    rho: &SaeManifoldRho,
-) -> Option<usize> {
+pub(crate) fn assignment_strength_gradient_coordinate(rho: &SaeManifoldRho) -> Option<usize> {
     rho.sparse_flat_index()
 }
 
@@ -1391,7 +1389,10 @@ impl SaeManifoldOuterObjective {
             .iter()
             .zip(pre_canonical_flags.iter())
             .any(|(atom, before)| atom.chart_canonicalized != *before);
-        if fitted.assignment.persist_resolved_ordered_beta_bernoulli_alpha(&fitted_rho) {
+        if fitted
+            .assignment
+            .persist_resolved_ordered_beta_bernoulli_alpha(&fitted_rho)
+        {
             fitted_rho.log_lambda_sparse = 0.0;
         }
         let fitted_loss = fitted.loss(target.view(), &fitted_rho)?;
@@ -2269,17 +2270,19 @@ impl SaeManifoldOuterObjective {
         let (penalized_laml_cost, loss) = match drive {
             ProbeInnerDrive::Criterion {
                 refine_progress_extension,
-            } => self.term.penalized_laml_criterion_with_refine_policy_and_lane(
-                self.target.view(),
-                &rho,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-                refine_progress_extension,
-                self.surrogate_lane.as_mut(),
-            )?,
+            } => self
+                .term
+                .penalized_laml_criterion_with_refine_policy_and_lane(
+                    self.target.view(),
+                    &rho,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                    refine_progress_extension,
+                    self.surrogate_lane.as_mut(),
+                )?,
             ProbeInnerDrive::LineSearchProbe => self.line_search_probe_criterion(&rho)?,
         };
         let beta_hat = self.term.flatten_beta();
@@ -2357,17 +2360,19 @@ impl SaeManifoldOuterObjective {
             self.term.k_atoms(),
         )?;
         if self.inner_max_iter == 0 || admitted.streaming || !plan.direct_logdet_admitted() {
-            return self.term.penalized_laml_criterion_with_refine_policy_and_lane(
-                self.target.view(),
-                rho,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-                false,
-                self.surrogate_lane.as_mut(),
-            );
+            return self
+                .term
+                .penalized_laml_criterion_with_refine_policy_and_lane(
+                    self.target.view(),
+                    rho,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                    false,
+                    self.surrogate_lane.as_mut(),
+                );
         }
         // Identical chunk width and total budget as the historical PROBE path:
         // `penalized_laml_criterion_with_cache_refine_policy` grants `inner_max_iter`
@@ -2423,17 +2428,19 @@ impl SaeManifoldOuterObjective {
                 // Its remaining refusal classes (border Schur non-PD, cross-row
                 // non-PD) are the typed recoverable probe refusals the outer
                 // bridge already maps to an infeasible trial.
-                return self.term.penalized_laml_criterion_with_refine_policy_and_lane(
-                    self.target.view(),
-                    rho,
-                    self.registry.as_ref(),
-                    0,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                    false,
-                    self.surrogate_lane.as_mut(),
-                );
+                return self
+                    .term
+                    .penalized_laml_criterion_with_refine_policy_and_lane(
+                        self.target.view(),
+                        rho,
+                        self.registry.as_ref(),
+                        0,
+                        self.learning_rate,
+                        self.ridge_ext_coord,
+                        self.ridge_beta,
+                        false,
+                        self.surrogate_lane.as_mut(),
+                    );
             }
             if spent >= budget {
                 // Gate not met within the probe budget: hand adjudication back
@@ -2442,17 +2449,19 @@ impl SaeManifoldOuterObjective {
                 // "did not converge" refusal without KKT — warm from the current
                 // partially-refined state. This lane never mints a refusal of
                 // its own for this class.
-                return self.term.penalized_laml_criterion_with_refine_policy_and_lane(
-                    self.target.view(),
-                    rho,
-                    self.registry.as_ref(),
-                    self.inner_max_iter,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                    false,
-                    self.surrogate_lane.as_mut(),
-                );
+                return self
+                    .term
+                    .penalized_laml_criterion_with_refine_policy_and_lane(
+                        self.target.view(),
+                        rho,
+                        self.registry.as_ref(),
+                        self.inner_max_iter,
+                        self.learning_rate,
+                        self.ridge_ext_coord,
+                        self.ridge_beta,
+                        false,
+                        self.surrogate_lane.as_mut(),
+                    );
             }
         }
     }
@@ -2961,53 +2970,52 @@ impl SaeManifoldOuterObjective {
                 assignment_strength_gradient_coordinate(&rho),
                 Some(sparse_index)
             );
-            let gradient =
-                if let Some((probes, inverse_probes)) = inverse_probe_bundle.as_ref() {
-                    let system = self.term.assemble_full_matrix_free_evidence_system(
+            let gradient = if let Some((probes, inverse_probes)) = inverse_probe_bundle.as_ref() {
+                let system = self.term.assemble_full_matrix_free_evidence_system(
+                    self.target.view(),
+                    &rho,
+                    self.registry.as_ref(),
+                    None,
+                )?;
+                self.term
+                    .analytic_assignment_strength_gradient_matrix_free(
                         self.target.view(),
                         &rho,
-                        self.registry.as_ref(),
-                        None,
-                    )?;
-                    self.term
-                        .analytic_assignment_strength_gradient_matrix_free(
-                            self.target.view(),
-                            &rho,
-                            &cache,
-                            &system,
-                            probes,
-                            inverse_probes,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "SaeManifoldOuterObjective::efs_step: matrix-free \
+                        &cache,
+                        &system,
+                        probes,
+                        inverse_probes,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "SaeManifoldOuterObjective::efs_step: matrix-free \
                                  assignment-strength gradient: {error}"
-                            )
-                        })?
-                } else {
-                    let solver = self
-                        .term
-                        .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
-                        .map_err(|error| {
-                            format!(
-                                "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
-                                 solver: {error}"
-                            )
-                        })?;
-                    self.term
-                        .analytic_assignment_strength_gradient_dense(
-                            self.target.view(),
-                            &rho,
-                            &cache,
-                            &solver,
                         )
-                        .map_err(|error| {
-                            format!(
-                                "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
+                    })?
+            } else {
+                let solver = self
+                    .term
+                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+                    .map_err(|error| {
+                        format!(
+                            "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
+                                 solver: {error}"
+                        )
+                    })?;
+                self.term
+                    .analytic_assignment_strength_gradient_dense(
+                        self.target.view(),
+                        &rho,
+                        &cache,
+                        &solver,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
                                  gradient: {error}"
-                            )
-                        })?
-                };
+                        )
+                    })?
+            };
             // A normalized negative gradient is a bounded feasible-descent
             // update whose zero is exactly the full criterion root.
             let gradient_scale = gradient.abs().max(1.0);
@@ -3396,9 +3404,8 @@ fn reactive_smooth_curvature_scale(
             atom.smooth_penalty.dim()
         ));
     }
-    let (rank, penalty_pinv) =
-        gam_linalg::utils::block_penalty_rank_and_pinv(&atom.smooth_penalty)
-            .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
+    let (rank, penalty_pinv) = gam_linalg::utils::block_penalty_rank_and_pinv(&atom.smooth_penalty)
+        .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
     if rank == 0 {
         return Ok(None);
     }
@@ -3427,8 +3434,7 @@ fn reactive_smooth_curvature_scale(
         for left in 0..m {
             let weighted_left = weight * atom.basis_values[[row, left]];
             for right in 0..m {
-                data_gram[[left, right]] +=
-                    weighted_left * atom.basis_values[[row, right]];
+                data_gram[[left, right]] += weighted_left * atom.basis_values[[row, right]];
             }
         }
     }
@@ -3592,9 +3598,7 @@ fn reactive_rho_domain_upper(
     let mut largest_native_scale = 0.0_f64;
 
     for atom_idx in 0..rho.k_atoms() {
-        if let Some(scale) =
-            reactive_smooth_curvature_scale(&entry_term, &assignments, atom_idx)?
-        {
+        if let Some(scale) = reactive_smooth_curvature_scale(&entry_term, &assignments, atom_idx)? {
             largest_native_scale = largest_native_scale.max(scale);
             let index = rho.smooth_flat_index(atom_idx);
             let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
@@ -3642,9 +3646,8 @@ fn reactive_rho_domain_upper(
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
-        let assignment_gradient_dim = usize::from(
-            assignment_strength_gradient_coordinate(&self.baseline_rho).is_some(),
-        );
+        let assignment_gradient_dim =
+            usize::from(assignment_strength_gradient_coordinate(&self.baseline_rho).is_some());
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
@@ -3719,9 +3722,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(f64::INFINITY);
                 }
-                if self.reactive_waypoint_checkpoint.is_none()
-                    && self.termination.record(cost)
-                {
+                if self.reactive_waypoint_checkpoint.is_none() && self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }
                 Ok(cost)
@@ -3925,14 +3926,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
-                self.term.analytic_outer_rho_gradient_components_with_bundle(
-                    self.target.view(),
-                    &rho_state,
-                    &loss,
-                    &cache,
-                    &solver,
-                    None,
-                )
+                self.term
+                    .analytic_outer_rho_gradient_components_with_bundle(
+                        self.target.view(),
+                        &rho_state,
+                        &loss,
+                        &cache,
+                        &solver,
+                        None,
+                    )
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
         let mut gradient = grad_components.gradient();
@@ -4048,9 +4050,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
-                if self.reactive_waypoint_checkpoint.is_none()
-                    && self.termination.record(cost)
-                {
+                if self.reactive_waypoint_checkpoint.is_none() && self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }
                 Ok(OuterEval {
@@ -4192,15 +4192,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// literal per-penalty vector (including heterogeneous weights).
     fn reactive_domain_scalar_contract(
         &self,
-    ) -> Result<
-        Option<gam_solve::continuation_path::ContinuationScalarContract>,
-        EstimationError,
-    > {
+    ) -> Result<Option<gam_solve::continuation_path::ContinuationScalarContract>, EstimationError>
+    {
         if self.baseline_term.k_atoms() < 2
-            || !self
-                .baseline_term
-                .streaming_plan()
-                .direct_logdet_admitted()
+            || !self.baseline_term.streaming_plan().direct_logdet_admitted()
         {
             return Ok(None);
         }
@@ -4348,10 +4343,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             ));
         }
         let bundle_capacity = self.basin_bundle.member_capacity();
-        let basin_bundle = std::mem::replace(
-            &mut self.basin_bundle,
-            BasinBundle::new(bundle_capacity),
-        );
+        let basin_bundle =
+            std::mem::replace(&mut self.basin_bundle, BasinBundle::new(bundle_capacity));
         let registry_isometry_weights = self
             .registry
             .as_ref()
@@ -4391,13 +4384,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 )
             })?;
         let rho_state = self.baseline_rho.from_flat(rho.view());
-        let target_contract = self
-            .reactive_domain_scalar_contract()?
-            .ok_or_else(|| {
-                EstimationError::RemlOptimizationFailed(
-                    "active reactive waypoint lost its scalar contract before commit".to_string(),
-                )
-            })?;
+        let target_contract = self.reactive_domain_scalar_contract()?.ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(
+                "active reactive waypoint lost its scalar contract before commit".to_string(),
+            )
+        })?;
         let committed_isometry_weights = self
             .registry
             .as_ref()
@@ -5022,7 +5013,7 @@ mod linear_parity_anchor_1026_tests {
             }
             let decoder = Array2::<f64>::zeros((2, p));
             atoms.push(
-                SaeManifoldAtom::new(
+                SaeManifoldAtom::new_with_provided_function_gram(
                     format!("lin_{idx}"),
                     SaeAtomBasisKind::Linear,
                     1,
@@ -5281,7 +5272,7 @@ mod linear_parity_anchor_1026_tests {
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         let m = phi.ncols();
         let decoder = Array2::<f64>::zeros((m, p));
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "lin_bg",
             SaeAtomBasisKind::Linear,
             d,
@@ -5452,7 +5443,7 @@ mod linear_parity_anchor_1026_tests {
                 0.1 * (((idx * 5 + r * 3 + c) % 7) as f64 - 3.0)
             });
             atoms.push(
-                SaeManifoldAtom::new(
+                SaeManifoldAtom::new_with_provided_function_gram(
                     format!("atom_{idx}"),
                     SaeAtomBasisKind::Linear,
                     d,

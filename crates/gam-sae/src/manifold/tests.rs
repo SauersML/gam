@@ -117,7 +117,7 @@ pub(crate) fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
 pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
     let n = 4usize;
     let p = 3usize;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "atom0",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -155,7 +155,8 @@ pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
 pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() {
     let mut term = trivial_k1_euclidean_term();
     // Pin the expected count at a realistic large level (like the circle fit).
-    term.record_evidence_gauge_deflation_count(150, true).unwrap();
+    term.record_evidence_gauge_deflation_count(150, true)
+        .unwrap();
     // A sustained 150<->147 flicker reverses direction on EVERY step — far more
     // reversals than the K=1 budget of 6 — yet the amplitude (3) is well inside
     // the relative jitter band (150/4 = 37), so none charge the budget.
@@ -179,12 +180,17 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
     // But a WIDE-amplitude oscillation at the SAME level is still the runaway
     // pathology and must still be refused: 150<->40 swings ~73% of the level.
     let mut term2 = trivial_k1_euclidean_term();
-    term2.record_evidence_gauge_deflation_count(150, true).unwrap();
+    term2
+        .record_evidence_gauge_deflation_count(150, true)
+        .unwrap();
     let mut errored = false;
     for &c in &[
         40usize, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150,
     ] {
-        if term2.record_evidence_gauge_deflation_count(c, true).is_err() {
+        if term2
+            .record_evidence_gauge_deflation_count(c, true)
+            .is_err()
+        {
             errored = true;
             break;
         }
@@ -212,11 +218,13 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
 
     // First observation pins the expected count (high, like a real K=2 walk
     // that starts with many near-null evidence directions).
-    term.record_evidence_gauge_deflation_count(60, true).unwrap();
+    term.record_evidence_gauge_deflation_count(60, true)
+        .unwrap();
     assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
 
     // A matching later observation is a no-op (still Ok, count unchanged).
-    term.record_evidence_gauge_deflation_count(60, true).unwrap();
+    term.record_evidence_gauge_deflation_count(60, true)
+        .unwrap();
     assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
 
     // A MONOTONE drift (the #1217 benign case — a per-row conditioning count
@@ -283,7 +291,7 @@ pub(crate) fn curvature_homotopy_eta_inertness_probe_tracks_curved_columns() {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(7).unwrap());
     let coords = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic7",
         SaeAtomBasisKind::Periodic,
         1,
@@ -314,7 +322,7 @@ pub(crate) fn linear_span_anchor_recovers_planted_two_plane_configuration() {
     let decoder = Array2::<f64>::zeros((2, p));
     let smooth = Array2::<f64>::eye(2);
     let atoms = vec![
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             "plane0",
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -324,7 +332,7 @@ pub(crate) fn linear_span_anchor_recovers_planted_two_plane_configuration() {
             smooth.clone(),
         )
         .unwrap(),
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             "plane1",
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -382,7 +390,7 @@ pub(crate) fn circle_certificate_fixture(
         let mut decoder = Array2::<f64>::zeros((3, p));
         decoder[[1, axis_sin]] = radius;
         decoder[[2, axis_cos]] = radius;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{atom_idx}"),
             SaeAtomBasisKind::Periodic,
             1,
@@ -672,7 +680,7 @@ pub(crate) fn ard_value_continuous_across_periodic_cut_d1() {
     // Single periodic atom, one row sitting just below the cut at t≈1.
     let coords0 = array![[0.999_f64]];
     let (phi0, jet0) = periodic_basis(&coords0);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -740,7 +748,7 @@ pub(crate) fn ard_value_continuous_across_periodic_cut_d1() {
 pub(crate) fn penalized_objective_continuous_across_periodic_cut_with_registry_ard() {
     let coords0 = array![[0.999_f64]];
     let (phi0, jet0) = periodic_basis(&coords0);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -822,7 +830,7 @@ pub(crate) fn scad_coord_penalty_inert_and_continuous_on_periodic_axis() {
 
     let coords0 = array![[0.999_f64]];
     let (phi0, jet0) = periodic_basis(&coords0);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -979,7 +987,7 @@ pub(crate) fn scad_no_origin_pinning_occupancy_on_circle() {
     let scad_contribution = |coords: Array2<f64>| -> f64 {
         let n = coords.nrows();
         let (phi, jet) = periodic_basis(&coords);
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "periodic",
             SaeAtomBasisKind::Periodic,
             1,
@@ -1104,7 +1112,7 @@ pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
     // Two rows past the quarter period (t in (0.25, 0.75)) where cos(2πt) < 0.
     let coords0 = array![[0.40_f64], [0.60_f64]];
     let (phi0, jet0) = periodic_basis(&coords0);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1177,7 +1185,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     let coords_b = array![[0.81_f64], [0.05], [0.48], [0.23]];
     let (phi_a, jet_a) = periodic_basis(&coords_a);
     let (phi_b, jet_b) = periodic_basis(&coords_b);
-    let atom_a = SaeManifoldAtom::new(
+    let atom_a = SaeManifoldAtom::new_with_provided_function_gram(
         "circle_a",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1188,7 +1196,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     )
     .unwrap()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-    let atom_b = SaeManifoldAtom::new(
+    let atom_b = SaeManifoldAtom::new_with_provided_function_gram(
         "circle_b",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1304,7 +1312,7 @@ pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
         let (phi, jet) = periodic_basis(&coords);
         let atoms: Vec<SaeManifoldAtom> = (0..k)
             .map(|j| {
-                SaeManifoldAtom::new(
+                SaeManifoldAtom::new_with_provided_function_gram(
                     format!("atom_{j}"),
                     SaeAtomBasisKind::Periodic,
                     1,
@@ -1380,7 +1388,7 @@ pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
 pub(crate) fn snapshot_restore_round_trips_mutated_state() {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
     let (phi0, jet0) = periodic_basis(&coords0);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1449,7 +1457,7 @@ pub(crate) fn snapshot_restore_round_trips_mutated_state() {
 pub(crate) fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
     let (phi0, jet0) = periodic_basis(&coords0);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1512,7 +1520,7 @@ pub(crate) fn accepted_iterations_reuse_arrow_and_device_frame_allocations_with_
         target[[row, 0]] += 0.08 * (row as f64 + 0.5).sin();
         target[[row, 1]] -= 0.06 * (row as f64 + 1.0).cos();
     }
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "resident_periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1723,7 +1731,7 @@ pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, S
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
     let (phi0, jet0) = periodic_basis(&coords0);
     let (phi1, jet1) = periodic_basis(&coords1);
-    let atom0 = SaeManifoldAtom::new(
+    let atom0 = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic0",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1734,7 +1742,7 @@ pub(crate) fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, S
     )
     .unwrap()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-    let atom1 = SaeManifoldAtom::new(
+    let atom1 = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic1",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1964,7 +1972,7 @@ fn collapse_rescue_term_and_target() -> (SaeManifoldTerm, Array2<f64>, SaeManifo
     // Collapsed coordinate: every row at the SAME t → zero coordinate spread.
     let coords = Array2::<f64>::from_elem((n, 1), 0.3);
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "collapsed_circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -2083,7 +2091,10 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
     });
 
     // Round-trips through the config accessor.
-    assert_eq!(term_a.fit_config().ordered_beta_bernoulli_alpha_override, Some(0.2));
+    assert_eq!(
+        term_a.fit_config().ordered_beta_bernoulli_alpha_override,
+        Some(0.2)
+    );
     assert_eq!(
         term_b.fit_config().separation_barrier_strength_override,
         Some(3.0)
@@ -2091,8 +2102,18 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
 
     // ordered Beta--Bernoulli-α: the per-fit override is the resolved α (bypassing the mode schedule),
     // and the two terms resolve different α values.
-    assert_eq!(term_a.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_a), Some(0.2));
-    assert_eq!(term_b.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_b), Some(5.0));
+    assert_eq!(
+        term_a
+            .assignment
+            .resolved_ordered_beta_bernoulli_alpha(&rho_a),
+        Some(0.2)
+    );
+    assert_eq!(
+        term_b
+            .assignment
+            .resolved_ordered_beta_bernoulli_alpha(&rho_b),
+        Some(5.0)
+    );
 
     // Distinct α ⇒ distinct gates (the ordered geometric prior π_k differs).
     let gates_a = term_a.assignment.try_assignments().unwrap();
@@ -2113,8 +2134,18 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha()
     // Isolation: clearing term_a's config leaves term_b untouched, and term_a
     // uses the mode's canonical α.
     term_a.set_fit_config(SaeFitConfig::default());
-    assert_eq!(term_a.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_a), Some(1.0)); // the mode's compiled α
-    assert_eq!(term_b.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_b), Some(5.0));
+    assert_eq!(
+        term_a
+            .assignment
+            .resolved_ordered_beta_bernoulli_alpha(&rho_a),
+        Some(1.0)
+    ); // the mode's compiled α
+    assert_eq!(
+        term_b
+            .assignment
+            .resolved_ordered_beta_bernoulli_alpha(&rho_b),
+        Some(5.0)
+    );
 }
 
 /// F5 — the per-fit separation-barrier override (#1777) must isolate two
@@ -2300,7 +2331,7 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
 pub(crate) fn fit_data_collapse_records_terminal_event_for_active_atom() {
     let coords = array![[0.0], [0.25], [0.5], [0.75]];
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -2475,7 +2506,7 @@ pub(crate) fn planted_circle_seed_term(
         }
     }
     let seed_dispersion = (rss / (n * z.ncols()) as f64).max(1.0e-12);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -2700,7 +2731,15 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
         .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .unwrap();
     let (stream_cost, stream_loss) = streaming
-        .penalized_laml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_streaming_exact(
+            target.view(),
+            &rho,
+            None,
+            2,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+        )
         .unwrap();
     assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
@@ -2717,7 +2756,7 @@ pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeMan
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
     let (phi0, jet0) = periodic_basis(&coords0);
     let (phi1, jet1) = periodic_basis(&coords1);
-    let atom0 = SaeManifoldAtom::new(
+    let atom0 = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic0",
         SaeAtomBasisKind::Periodic,
         1,
@@ -2728,7 +2767,7 @@ pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeMan
     )
     .unwrap()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-    let atom1 = SaeManifoldAtom::new(
+    let atom1 = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic1",
         SaeAtomBasisKind::Periodic,
         1,
@@ -2837,7 +2876,16 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
     let mut full = term0.clone();
     let mut probe = term0;
     let (full_cost, full_loss) = full
-        .penalized_laml_criterion_with_refine_policy(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4, true)
+        .penalized_laml_criterion_with_refine_policy(
+            target.view(),
+            &rho,
+            None,
+            2,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+            true,
+        )
         .expect("full-budget criterion must converge on the small fixture");
     let (probe_cost, probe_loss) = probe
         .penalized_laml_criterion_with_refine_policy(
@@ -3047,7 +3095,15 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     assert!(log_det.is_finite());
 
     let (stream_cost, stream_loss) = streaming
-        .penalized_laml_criterion_streaming_exact(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_streaming_exact(
+            target.view(),
+            &rho,
+            None,
+            1,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+        )
         .expect("streaming REML must share the dense refinement retry");
     assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
@@ -3135,7 +3191,7 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
         target[[row, 0]] += 1.0e-3 * (0.37 * row as f64).sin();
         target[[row, 1]] += 1.0e-3 * (0.29 * row as f64).cos();
     }
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -3213,7 +3269,7 @@ fn matrix_free_smoothness_edf_from_probes_matches_dense_selected_inverse() {
     let p = 2usize;
     let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -3300,7 +3356,7 @@ fn matrix_free_ard_traces_from_probes_matches_dense_selected_inverse() {
     let p = 2usize;
     let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -3386,7 +3442,7 @@ fn matrix_free_ard_logdet_hessian_trace_from_probes_matches_dense() {
     let p = 2usize;
     let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -3481,7 +3537,7 @@ fn analytic_outer_gradient_with_bundle_matches_dense_assembly() {
         target[[row, 0]] += 1.0e-3 * (0.37 * row as f64).sin();
         target[[row, 1]] += 1.0e-3 * (0.29 * row as f64).cos();
     }
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -3584,7 +3640,7 @@ pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
     let p = 2usize;
     let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -3844,7 +3900,7 @@ fn planted_softmax_sae_term(
         let mut decoder = Array2::<f64>::zeros((2, p));
         decoder[[1, atom_idx % p]] = 0.1 + 0.01 * ((atom_idx % 7) as f64);
         atoms.push(
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 format!("atom{atom_idx}"),
                 SaeAtomBasisKind::EuclideanPatch,
                 1,
@@ -4026,7 +4082,7 @@ pub(crate) fn run_joint_fit_arrow_schur_escalates_ridge_on_non_pd_row_block() {
     // recover.
     let coords = array![[0.1], [0.4], [0.7]];
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -4101,7 +4157,7 @@ pub(crate) fn rank_revealing_reduction_collapses_unexcited_circle_harmonic_to_fu
     );
     let penalty = Array2::<f64>::eye(5);
     let decoder = array![[0.05], [-0.05], [0.05], [0.02], [-0.02]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -4405,7 +4461,7 @@ pub(crate) fn rank_reduction_is_idempotent_on_already_reduced_atom() {
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let penalty = Array2::<f64>::eye(5);
     let decoder = array![[0.05], [-0.05], [0.05], [0.02], [-0.02]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -4472,7 +4528,7 @@ pub(crate) fn full_rank_circle_design_keeps_full_harmonic_depth_unchanged() {
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let penalty = Array2::<f64>::eye(5);
     let decoder = array![[0.05], [-0.05], [0.05], [0.02], [-0.02]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -4541,7 +4597,7 @@ pub(crate) fn solve_newton_step_escalates_ridge_on_non_pd_row_block() {
     // 1e-6 the Cholesky still finds a tiny negative pivot from rounding.
     let coords = array![[0.1], [0.4], [0.7]];
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -4576,7 +4632,7 @@ pub(crate) fn solve_newton_step_escalates_ridge_on_non_pd_row_block() {
 pub(crate) fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change() {
     let coords = array![[0.10], [0.35], [0.80]];
     let (phi, jet) = periodic_basis(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -5008,7 +5064,7 @@ pub(crate) fn sae_mechsparsity_beta_block_routes_through_arrow_schur_gb() {
         [-0.5, 0.6, -0.1, 0.3],
         [0.2, 0.0, -0.4, -0.6],
     ];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -5131,7 +5187,7 @@ pub(crate) fn sae_nuclear_norm_beta_block_routes_through_gb_and_shrinks_spectrum
     ];
     let m = 3usize;
     let p = 4usize;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -5265,7 +5321,7 @@ fn hetero_compat_term(d0: usize, d1: usize) -> SaeManifoldTerm {
     let p = 3usize;
     let m = 2usize;
     let make_atom = |name: &'static str, d: usize| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::EuclideanPatch,
             d,
@@ -5411,7 +5467,7 @@ fn ard_atom_and_coord(
     let (n, d) = coords.dim();
     let m = 2usize;
     let p = 3usize;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         name,
         SaeAtomBasisKind::EuclideanPatch,
         d,

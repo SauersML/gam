@@ -299,9 +299,12 @@ fn overcomplete_stream_accepts_one_evidence_birth_then_dead_tail_is_quiescent_20
     // blocks must stay quiescent so the stream can certify instead of reseeding
     // them forever.
     let (rows, p, g, b) = (64usize, 2usize, 16usize, 1usize);
-    let x = Array2::<f32>::from_shape_fn((rows, p), |(row, column)| {
-        if column == row % 2 { 1.0 } else { 0.0 }
-    });
+    let x = Array2::<f32>::from_shape_fn(
+        (rows, p),
+        |(row, column)| {
+            if column == row % 2 { 1.0 } else { 0.0 }
+        },
+    );
     let mut decoder = Array2::<f32>::zeros((g * b, p));
     decoder[[0, 0]] = 1.0;
     let cfg = BlockSparseConfig {
@@ -316,8 +319,7 @@ fn overcomplete_stream_accepts_one_evidence_birth_then_dead_tail_is_quiescent_20
         matryoshka_prefix: false,
         tolerance: 0.0,
     };
-    let mut state =
-        BlockSparseStreamState::new_with_decoder(decoder, &cfg).expect("stream state");
+    let mut state = BlockSparseStreamState::new_with_decoder(decoder, &cfg).expect("stream state");
     let mut accepted_total = 0usize;
     let mut saw_pending = false;
     let mut final_stats = None;

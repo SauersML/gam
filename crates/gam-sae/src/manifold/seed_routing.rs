@@ -3,7 +3,7 @@
 //! These are the closed-form seeding-policy primitives the fit entry uses
 //! before the joint Arrow-Schur solve: the joint ridge-LSQ decoder seed, the
 //! mean-centred residual-logit routing seed, the output-energy clustering that
-//! separates periodic seed coordinates, and the EM-style alternation that
+//! separates periodic seed coordinates, and the deterministic alternating initialization that
 //! refines all three together. Moved here from `gam-pyffi` (issue #2236) so the
 //! CLI, Rust library users, and the Python binding seed identically; the
 //! binding is marshalling only.
@@ -19,12 +19,12 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// Build a data-driven asymmetric assignment-logit seed for a cold start
 /// (issue #629). A uniform logit seed (`Array2::zeros`) is an exact symmetric
 /// saddle of the joint objective whenever the atoms are exchangeable under the
-/// assignment forward map: every atom carries identical responsibility, the
+/// assignment forward map: every atom carries an identical routing weight, the
 /// LSQ decoder init projects the same target onto every atom, and the
 /// assignment update has no gradient to break the tie, so the fit never routes.
 /// The tiny `random_state` jitter is too weak to escape on conditioned data.
 ///
-/// This helper runs one EM-style M-then-E step on the seed geometry: it fits
+/// This helper runs one decoder-then-routing initialization step on the seed geometry: it fits
 /// each atom's decoder independently against the *full* response (each atom's
 /// own seed coordinates already give it a distinct `Phi_k`), measures the
 /// per-row reconstruction residual under that fit, and emits mean-centred logits
@@ -35,7 +35,7 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// the Newton refinement — head start. The mean-centring is translation-identity
 /// for softmax and keeps the ordered Beta--Bernoulli-MAP `sigmoid(logit/τ)` gate neutral (0.5) on
 /// ties instead of slamming both gates shut, so the seed is safe for both
-/// assignment maps. The result is a proper responsibility seed rather than a
+/// assignment maps. The result is a proper routing seed rather than a
 /// saddle.
 pub fn sae_residual_seed_logits(
     basis_values: ArrayView3<'_, f64>,
@@ -813,7 +813,7 @@ pub fn sae_decoder_lsq_init(
     Ok(out)
 }
 
-/// EM-style seed refinement that resolves the cold-start routing collapse of
+/// Deterministic alternating seed refinement that resolves the cold-start routing collapse of
 /// the training fit (issues #629, #630) before the joint Arrow-Schur solve.
 ///
 /// The cold residual-logit seed ([`sae_residual_seed_logits`]) is computed at
@@ -823,7 +823,7 @@ pub fn sae_decoder_lsq_init(
 /// equally mediocre on every row: the per-row residual barely separates the
 /// atoms and the logit seed stays near the symmetric saddle the random jitter
 /// cannot escape. The joint solver then never routes (the planted disjoint
-/// atoms collapse to a near-uniform mixture, negative R²).
+/// atoms collapse to a near-uniform additive blend with negative R²).
 ///
 /// This is the exact dual of the frozen-decoder OOS fix (#628): there, each row
 /// is placed in the correct latent basin by projecting it onto every atom's
@@ -832,12 +832,12 @@ pub fn sae_decoder_lsq_init(
 /// being *learned*, so we alternate the two exact steps the OOS path and the
 /// existing seed already provide:
 ///
-/// 1. **Coordinate E-step** — project each row's rank-1 Fourier latent onto the
+/// 1. **Coordinate update** — project each row's rank-1 Fourier latent onto the
 ///    current decoder by enumerating every stationary point. This separates the
 ///    atoms' geometries: a row generated from atom `k` moves to the coordinate
 ///    where atom `k` reconstructs it well, while the off-atoms move to wherever
 ///    their current decoder is least wrong on that row.
-/// 2. **Decoder M-step** — refit every atom's decoder by the same weighted joint
+/// 2. **Decoder refit** — refit every atom's decoder by the same weighted joint
 ///    LSQ used for the cold init ([`sae_decoder_lsq_init`]), now at the
 ///    *separated* coordinates, so each atom's block specializes toward the rows
 ///    it actually explains.
@@ -854,9 +854,10 @@ pub fn sae_decoder_lsq_init(
 /// carry the interval extension needed to enumerate their complete stationary
 /// sets.
 ///
-/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli-MAP fits; JumpReLU keeps
-/// its margin-above-threshold gate seed and warm starts are respected verbatim.
-pub fn sae_em_refine_routing_seed(
+/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli-MAP
+/// fits; the smooth threshold gate keeps its threshold-centered seed and warm
+/// starts are respected verbatim.
+pub fn sae_refine_routing_seed(
     term: &mut SaeManifoldTerm,
     z: ArrayView2<'_, f64>,
     basis_sizes: &[usize],
@@ -873,7 +874,7 @@ pub fn sae_em_refine_routing_seed(
     // #178): the refined residual logits are decisive (O(gain)), so this 1e-3
     // perturbation does not change which atom wins, but it keeps distinct
     // `random_state` values on distinct inner Newton trajectories and fixed
-    // seeds bit-identical. Without it, the deterministic EM seed would erase
+    // seeds bit-identical. Without it, the deterministic alternating seed would erase
     // the seed-dependence the cold-start jitter installed upstream.
     const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
     let k_atoms = basis_sizes.len();
@@ -886,7 +887,7 @@ pub fn sae_em_refine_routing_seed(
         return Ok(());
     }
     for _ in 0..SAE_SEED_REFINE_ROUNDS {
-        // 1. Coordinate E-step: project each row onto the current decoder.
+        // 1. Coordinate update: project each row onto the current decoder.
         term.seed_coords_by_decoder_projection(z)?;
         // Snapshot the refreshed per-atom basis `Φ_k(t_k)` as a padded
         // (K, N, m_max) stack for the closed-form seed helpers.
@@ -896,7 +897,7 @@ pub fn sae_em_refine_routing_seed(
             let m_k = basis_sizes[atom_idx];
             if phi.dim() != (n_obs, m_k) {
                 return Err(format!(
-                    "sae_em_refine_routing_seed: atom {atom_idx} basis is {:?}, expected ({n_obs}, {m_k})",
+                    "sae_refine_routing_seed: atom {atom_idx} basis is {:?}, expected ({n_obs}, {m_k})",
                     phi.dim()
                 ));
             }
@@ -906,8 +907,8 @@ pub fn sae_em_refine_routing_seed(
                 }
             }
         }
-        // 2. Decoder M-step: weighted joint LSQ at the refined coordinates,
-        //    using the current routing as the responsibility weights.
+        // 2. Decoder refit: weighted joint LSQ at the refined coordinates,
+        //    using the current gates as routing weights.
         let decoder = sae_decoder_lsq_init(
             basis3.view(),
             basis_sizes,
@@ -1295,7 +1296,7 @@ mod tests {
         assert!(
             acc >= 0.9,
             "residual seed routing accuracy {acc:.3} (up to permutation) is too low; \
-                 the E-step seed should recover the planted one-hot assignment"
+                 the alternating seed should recover the planted one-hot assignment"
         );
     }
 }

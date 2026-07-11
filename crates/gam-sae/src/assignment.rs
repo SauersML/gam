@@ -6,7 +6,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldRho;
 use gam_solve::evidence::{HybridAtomCandidate, HybridAtomChoice, select_hybrid_atom};
 use gam_terms::analytic_penalties::{
-    AnalyticPenalty, OrderedBetaBernoulliPenalty, OrderedBetaBernoulliHessianDiagThirdChannels,
+    AnalyticPenalty, OrderedBetaBernoulliHessianDiagThirdChannels, OrderedBetaBernoulliPenalty,
     SoftmaxAssignmentSparsityPenalty, resolve_learnable_weight,
 };
 use gam_terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
@@ -234,13 +234,10 @@ pub enum AssignmentMode {
     /// in the objective, no gate logit in the inner system
     /// (`assignment_coord_dim() == 0` — at K = 32,000 this deletes 32k
     /// coordinates from the inner Newton), and no sparsity coordinate in the
-    /// outer ρ search. At fixed support size `|S| = k` this is the
-    /// constrained-MAP member of the same spike-slab generative family the ordered Beta--Bernoulli
-    /// gate lives in, with the ℓ2,0 constraint standing in for the
-    /// ordered independent-Beta prior. The gate is per-row independent (couples rows
-    /// through NOTHING), so fits stream chunk-invariantly at any K, and it is
-    /// exchangeable across atom index — the ordered Beta--Bernoulli concentration
-    /// pathology (#1784) cannot arise.
+    /// outer ρ search. This is deterministic fixed-cardinality support, not a
+    /// probabilistic prior or a MAP approximation to one. The gate is per-row
+    /// independent (couples rows through NOTHING), so fits stream
+    /// chunk-invariantly at any K, and it is exchangeable across atom index.
     TopK { k: usize },
 }
 
@@ -799,7 +796,9 @@ impl SaeAssignment {
     pub fn assignment_coord_dim(&self) -> usize {
         match self.mode {
             AssignmentMode::Softmax { .. } => self.k_atoms().saturating_sub(1),
-            AssignmentMode::OrderedBetaBernoulli { .. } | AssignmentMode::ThresholdGate { .. } => self.k_atoms(),
+            AssignmentMode::OrderedBetaBernoulli { .. } | AssignmentMode::ThresholdGate { .. } => {
+                self.k_atoms()
+            }
             // Sparsity by construction: the support is a deterministic function
             // of the routing logits, so there are NO free gate coordinates in
             // the inner system.
@@ -848,8 +847,12 @@ impl SaeAssignment {
     /// canonical value or learnable schedule. The single seam every
     /// gate/jet/prior site reads so the per-fit override is applied consistently.
     /// `None` for non-ordered Beta--Bernoulli modes.
-    pub(crate) fn resolved_ordered_beta_bernoulli_alpha(&self, rho: &SaeManifoldRho) -> Option<f64> {
-        self.mode.resolved_ordered_beta_bernoulli_alpha(rho, self.ordered_beta_bernoulli_alpha_override)
+    pub(crate) fn resolved_ordered_beta_bernoulli_alpha(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Option<f64> {
+        self.mode
+            .resolved_ordered_beta_bernoulli_alpha(rho, self.ordered_beta_bernoulli_alpha_override)
     }
 
     /// Whether the ordered independent Beta--Bernoulli concentration α is a FREE outer parameter that
@@ -902,7 +905,9 @@ impl SaeAssignment {
         }
         let mut row_gates = match self.mode {
             AssignmentMode::Softmax { temperature, .. } => softmax_row(routing, temperature),
-            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => ordered_beta_bernoulli_row(routing, temperature),
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
+                ordered_beta_bernoulli_row(routing, temperature)
+            }
             AssignmentMode::ThresholdGate {
                 temperature,
                 threshold,
@@ -972,7 +977,10 @@ impl SaeAssignment {
         Ok(())
     }
 
-    pub(crate) fn persist_resolved_ordered_beta_bernoulli_alpha(&mut self, rho: &SaeManifoldRho) -> bool {
+    pub(crate) fn persist_resolved_ordered_beta_bernoulli_alpha(
+        &mut self,
+        rho: &SaeManifoldRho,
+    ) -> bool {
         let AssignmentMode::OrderedBetaBernoulli {
             temperature,
             alpha,
@@ -1398,7 +1406,11 @@ pub(crate) fn softmax_row_into(logits: ArrayView1<'_, f64>, temperature: f64, ou
     }
 }
 
-pub(crate) fn ordered_beta_bernoulli_row_into(logits: ArrayView1<'_, f64>, temperature: f64, out: &mut [f64]) {
+pub(crate) fn ordered_beta_bernoulli_row_into(
+    logits: ArrayView1<'_, f64>,
+    temperature: f64,
+    out: &mut [f64],
+) {
     for i in 0..logits.len() {
         out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
     }
@@ -1594,7 +1606,9 @@ fn ordered_beta_bernoulli_prior_penalty(
     let alpha_eff = if learnable {
         base_alpha
     } else {
-        assignment.resolved_ordered_beta_bernoulli_alpha(rho).unwrap_or(base_alpha)
+        assignment
+            .resolved_ordered_beta_bernoulli_alpha(rho)
+            .unwrap_or(base_alpha)
     };
     // #991 design-honesty weights: the ordered Beta--Bernoulli prior is not row-separable (the
     // plug-in π̂ couples rows through the column active mass), so the weights are
@@ -1665,8 +1679,13 @@ pub(crate) fn assignment_prior_value_weighted(
         AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } => {
-            let (penalty, rho_view) =
-                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+            let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(
+                assignment,
+                rho,
+                alpha,
+                temperature,
+                row_weights,
+            );
             penalty.value(target.view(), rho_view.view())
         }
         AssignmentMode::ThresholdGate {
@@ -1686,8 +1705,8 @@ pub(crate) fn assignment_prior_value_weighted(
                 }
                 // #991 — this row stands in for `w_i` population rows.
                 let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
-                acc += w_row
-                    * gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
+                acc +=
+                    w_row * gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
             }
             sparsity_strength * acc
         }
@@ -1733,8 +1752,13 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
         } => {
             // #Bug6: `ordered_beta_bernoulli_prior_penalty` picks the effective-α learnability (an
             // override forces the fixed-α value branch) and the #Bug4 ungated mask.
-            let (penalty, rho_view) =
-                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+            let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(
+                assignment,
+                rho,
+                alpha,
+                temperature,
+                row_weights,
+            );
             if penalty.learnable_alpha {
                 penalty.grad_rho(target.view(), rho_view.view())[0]
             } else {
@@ -1816,15 +1840,21 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
         AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } => {
-            let (penalty, rho_view) =
-                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+            let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(
+                assignment,
+                rho,
+                alpha,
+                temperature,
+                row_weights,
+            );
             let mut d = if penalty.learnable_alpha {
                 penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view())
             } else {
                 penalty
                     .hessian_diag(target.view(), rho_view.view())
                     .ok_or_else(|| {
-                        "ordered Beta--Bernoulli assignment log-strength hessian diag unavailable".to_string()
+                        "ordered Beta--Bernoulli assignment log-strength hessian diag unavailable"
+                            .to_string()
                     })?
             };
             // #Bug4: zero the curvature diagonal of ungated (inert) columns so the
@@ -1888,8 +1918,13 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
         AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
         } if assignment.effective_alpha_is_learnable() => {
-            let (penalty, rho_view) =
-                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+            let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(
+                assignment,
+                rho,
+                alpha,
+                temperature,
+                row_weights,
+            );
             let mut d = penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view());
             // #Bug4: inert columns carry no mixed derivative.
             mask_fixed_logit_entries(assignment, &mut d);
@@ -1959,12 +1994,19 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
             // matching the forward gate — and installs the #Bug4 ungated mask. The
             // per-atom fixed-logit columns are additionally zeroed post-hoc below,
             // so the array (grad/hessian) methods need no internal column mask.
-            let (penalty, rho_view) =
-                ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+            let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(
+                assignment,
+                rho,
+                alpha,
+                temperature,
+                row_weights,
+            );
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
-                .ok_or_else(|| "ordered Beta--Bernoulli assignment hessian diag unavailable".to_string())?;
+                .ok_or_else(|| {
+                    "ordered Beta--Bernoulli assignment hessian diag unavailable".to_string()
+                })?;
             (g, d)
         }
         AssignmentMode::ThresholdGate {
@@ -2059,7 +2101,8 @@ pub(crate) fn ordered_beta_bernoulli_assignment_third_channels_weighted(
     // `assignment_prior_grad_hdiag` uses, so an α override differentiates the same
     // fixed-α operator. Fixed-logit columns are zeroed post-hoc below (the channel
     // arrays are not internally column-masked).
-    let (penalty, rho_view) = ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+    let (penalty, rho_view) =
+        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
     let mut channels =
         penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view(), majorize);
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
@@ -2411,8 +2454,16 @@ mod fill_into_buffer_1557_tests {
     #[test]
     fn ordered_beta_bernoulli_into_is_bit_identical() {
         // Both learnable and fixed alpha exercise the resolved-alpha branch.
-        assert_into_matches_alloc(&build(7, 5, AssignmentMode::ordered_beta_bernoulli(0.6, 1.3, false)));
-        assert_into_matches_alloc(&build(7, 5, AssignmentMode::ordered_beta_bernoulli(0.6, 1.3, true)));
+        assert_into_matches_alloc(&build(
+            7,
+            5,
+            AssignmentMode::ordered_beta_bernoulli(0.6, 1.3, false),
+        ));
+        assert_into_matches_alloc(&build(
+            7,
+            5,
+            AssignmentMode::ordered_beta_bernoulli(0.6, 1.3, true),
+        ));
     }
 
     #[test]
@@ -2425,9 +2476,13 @@ mod fill_into_buffer_1557_tests {
     #[test]
     fn ungated_into_is_bit_identical() {
         // #1026 ungated overwrite under a gate-style mode (ordered Beta--Bernoulli/threshold gate allow it).
-        let a = build(6, 4, AssignmentMode::ordered_beta_bernoulli(0.6, 1.1, false))
-            .with_ungated(vec![false, true, false, true])
-            .unwrap();
+        let a = build(
+            6,
+            4,
+            AssignmentMode::ordered_beta_bernoulli(0.6, 1.1, false),
+        )
+        .with_ungated(vec![false, true, false, true])
+        .unwrap();
         assert_into_matches_alloc(&a);
         let j = build(6, 4, AssignmentMode::threshold_gate(0.9, 0.15))
             .with_ungated(vec![true, false, true, false])
@@ -2440,7 +2495,11 @@ mod fill_into_buffer_1557_tests {
         // Softmax K==1 hits the fixed-unit early return; ordered Beta--Bernoulli/threshold gate K==1 keep a
         // free per-atom gate and fall through to the real row functions.
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::softmax(1.0)));
-        assert_into_matches_alloc(&build(5, 1, AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false)));
+        assert_into_matches_alloc(&build(
+            5,
+            1,
+            AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
+        ));
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::threshold_gate(0.8, 0.1)));
     }
 }

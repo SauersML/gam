@@ -134,8 +134,7 @@ impl OrderedBetaBernoulliPenalty {
         let mut a_col = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             let log_mu = ((k + 1) as f64) * log_ratio;
-            a_col[k] = (1.0 / (-log_mu).exp_m1().max(f64::MIN_POSITIVE))
-                .max(f64::MIN_POSITIVE);
+            a_col[k] = (1.0 / (-log_mu).exp_m1().max(f64::MIN_POSITIVE)).max(f64::MIN_POSITIVE);
         }
         a_col
     }

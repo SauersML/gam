@@ -132,9 +132,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             gradient_objective.ridge_beta,
         )
         .expect("rank-adjusted criterion atoms must assemble");
-    let atom_identity_roundoff = 64.0
-        * f64::EPSILON
-        * (1.0 + audit_value.abs().max(atomized_criterion.value().abs()));
+    let atom_identity_roundoff =
+        64.0 * f64::EPSILON * (1.0 + audit_value.abs().max(atomized_criterion.value().abs()));
     assert!(
         (atomized_criterion.value() - audit_value).abs() <= atom_identity_roundoff,
         "criterion atoms must equal the production rank-adjusted scalar: \
@@ -193,11 +192,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
     assert!(
-        SaeManifoldTerm::evidence_kkt_stationary(
-            kkt_norm,
-            quotient_kkt_norm,
-            kkt_tolerance,
-        ),
+        SaeManifoldTerm::evidence_kkt_stationary(kkt_norm, quotient_kkt_norm, kkt_tolerance,),
         "an off-KKT state cannot emit or certify the analytic envelope gradient: \
          raw={kkt_norm:.9e}, quotient={quotient_kkt_norm:.9e}, \
          tolerance={kkt_tolerance:.9e}"

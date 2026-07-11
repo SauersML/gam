@@ -11,12 +11,7 @@ use gam::terms::PsiSlice;
 use gam::terms::analytic_penalties::{AnalyticPenalty, SmoothThresholdPenalty};
 use ndarray::Array1;
 
-fn build(
-    thresholds: Vec<f64>,
-    weight: f64,
-    eps: f64,
-    n_obs: usize,
-) -> SmoothThresholdPenalty {
+fn build(thresholds: Vec<f64>, weight: f64, eps: f64, n_obs: usize) -> SmoothThresholdPenalty {
     let d = thresholds.len();
     let slice = PsiSlice {
         range: 0..(n_obs * d),

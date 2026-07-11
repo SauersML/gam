@@ -31,6 +31,10 @@ pub fn solve_row_codes(
     s: usize,
     ridge: f32,
 ) -> SparseCode {
+    assert!(
+        ridge.is_finite() && ridge >= 0.0,
+        "active-set ridge must be finite and nonnegative, got {ridge}"
+    );
     let m = active.len();
     if m == 0 {
         // No live atom — emit zero code on atom 0 (padding contract).
@@ -45,6 +49,10 @@ pub fn solve_row_codes(
     let mut rhs = Array1::<f64>::zeros(m);
     for i in 0..m {
         let ai = active[i].0 as usize;
+        assert!(
+            ai < decoder.nrows(),
+            "active atom index {ai} is out of range"
+        );
         let di = decoder.row(ai);
         let mut proj = 0.0f64;
         for c in 0..p {
@@ -79,31 +87,66 @@ pub fn solve_row_codes(
     SparseCode { indices, codes }
 }
 
-/// SPD solve via Cholesky with a Tikhonov-bumped fallback. The system is `s×s`
-/// with `s` tiny, so an in-place dense factorisation is appropriate.
+/// Solve the positive-semidefinite active Gram system. A positive ridge makes
+/// the system strictly positive definite and takes the Cholesky path. With
+/// zero ridge, collinear selected atoms are legitimate; the Moore--Penrose
+/// solution is then the unique minimum-norm joint least-squares code. At no
+/// point are off-diagonal Gram terms discarded.
 fn solve_spd(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
     use faer::Side;
-    use gam_linalg::faer_ndarray::FaerCholesky;
+    use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 
     let m = rhs.len();
-    let mut a = gram.clone();
-    let mut bump = 0.0f64;
-    for _attempt in 0..6 {
-        if let Ok(factor) = a.cholesky(Side::Lower) {
-            return factor.solvevec(rhs);
-        }
-        // Indefinite (e.g. exactly collinear atoms): bump the diagonal and retry.
-        bump = if bump == 0.0 { 1.0e-8 } else { bump * 16.0 };
-        a = gram.clone();
-        for i in 0..m {
-            a[[i, i]] += bump;
-        }
+    if let Ok(factor) = gram.cholesky(Side::Lower) {
+        return factor.solvevec(rhs);
     }
-    // Degenerate beyond recovery: fall back to the diagonal (independent atoms).
+
+    let (eigenvalues, eigenvectors) = gram
+        .eigh(Side::Lower)
+        .expect("an active Gram matrix must admit a symmetric eigendecomposition");
+    let spectral_radius = eigenvalues
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if spectral_radius == 0.0 {
+        return Array1::<f64>::zeros(m);
+    }
+    let cutoff = f64::EPSILON * (m as f64) * spectral_radius;
     let mut out = Array1::<f64>::zeros(m);
-    for i in 0..m {
-        let d = gram[[i, i]].max(1.0e-12);
-        out[i] = rhs[i] / d;
+    for eigen_index in 0..m {
+        let eigenvalue = eigenvalues[eigen_index];
+        assert!(
+            eigenvalue >= -cutoff,
+            "active Gram matrix is not positive semidefinite: eigenvalue {eigenvalue:e}, cutoff {cutoff:e}"
+        );
+        if eigenvalue <= cutoff {
+            continue;
+        }
+        let eigenvector = eigenvectors.column(eigen_index);
+        let projection = eigenvector.dot(rhs) / eigenvalue;
+        for coordinate in 0..m {
+            out[coordinate] += projection * eigenvector[coordinate];
+        }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn duplicate_selected_atoms_use_joint_minimum_norm_least_squares() {
+        let row = array![1.0_f32, 0.0];
+        let decoder = array![[1.0_f32, 0.0], [1.0_f32, 0.0]];
+        let active = vec![(0_u32, 0.0_f32), (1_u32, 0.0_f32)];
+
+        let code = solve_row_codes(row.view(), decoder.view(), &active, 2, 0.0);
+
+        assert!((code.codes[0] - 0.5).abs() < 1.0e-6);
+        assert!((code.codes[1] - 0.5).abs() < 1.0e-6);
+        let reconstructed = code.codes[0] * decoder[[0, 0]] + code.codes[1] * decoder[[1, 0]];
+        assert!((reconstructed - 1.0).abs() < 1.0e-6);
+    }
 }

@@ -13,7 +13,7 @@
 //! Construction-path fidelity note: the gam crate cannot reach the pyffi-only
 //! seed helpers (`sae_pca_seed_initial_coords` cluster-refine,
 //! `sae_residual_seed_logits`, `sae_decoder_lsq_init`,
-//! `sae_em_refine_routing_seed`). We replicate the two seed stages that
+//! `sae_refine_routing_seed`). We replicate the two seed stages that
 //! determine the routing collapse VERBATIM from those bodies (residual-energy
 //! IBP logits at gain 4.0; weighted-LSQ decoder init at the IBP gate), and
 //! seed the latent coordinates from the planted angles (the production PCA /

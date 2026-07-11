@@ -37,7 +37,7 @@ fn tiny_objective(salt: u64) -> (SaeManifoldOuterObjective, Array1<f64>) {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "ckpt-e2e",
         SaeAtomBasisKind::Periodic,
         1,

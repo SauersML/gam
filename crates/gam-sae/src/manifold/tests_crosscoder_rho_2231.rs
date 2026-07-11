@@ -46,7 +46,7 @@ fn build_k1_circle(
     let n = coords.nrows();
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "cc2231",
         SaeAtomBasisKind::Periodic,
         1,

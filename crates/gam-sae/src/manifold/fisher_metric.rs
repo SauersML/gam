@@ -146,9 +146,7 @@ pub fn build_sae_fisher_row_metric(
     }?;
     match request.mass_residual {
         None => Ok(metric),
-        Some(residual) => {
-            metric.with_truncation_mass_residual(Arc::new(residual.to_owned()))
-        }
+        Some(residual) => metric.with_truncation_mass_residual(Arc::new(residual.to_owned())),
     }
 }
 

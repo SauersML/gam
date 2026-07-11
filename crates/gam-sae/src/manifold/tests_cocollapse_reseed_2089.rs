@@ -90,7 +90,7 @@ fn white_noise_circle_term(z: ArrayView2<'_, f64>, k: usize, harmonics: usize) -
         // circle decoders out of the null floor at a non-trivial smoothing ρ, so
         // the dictionary totally co-collapses and the reseed multi-start fires.
         let decoder = Array2::<f64>::zeros((mm, p));
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle",
             SaeAtomBasisKind::Periodic,
             dim,

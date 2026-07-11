@@ -13,8 +13,8 @@
 //! block vector is byte-identical to the plain-SAE layout.
 
 use super::{
-    ArdSharing, SaeManifoldRho, profiled_reml_block_efs_log_lambda_steps,
-    profiled_reml_block_log_lambda_gradient, profiled_penalized_laml_criterion,
+    ArdSharing, SaeManifoldRho, profiled_penalized_laml_criterion,
+    profiled_reml_block_efs_log_lambda_steps, profiled_reml_block_log_lambda_gradient,
 };
 use ndarray::{Array1, arr1};
 
@@ -41,7 +41,8 @@ fn block_log_lambda_gradient_matches_central_difference() {
         plus[l] += h;
         minus[l] -= h;
         let c_plus = profiled_penalized_laml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &plus);
-        let c_minus = profiled_penalized_laml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &minus);
+        let c_minus =
+            profiled_penalized_laml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &minus);
         let fd = (c_plus - c_minus) / (2.0 * h);
         let tol = 1e-5 * (1.0 + analytic[l].abs());
         assert!(

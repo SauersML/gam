@@ -29,7 +29,7 @@ pub(crate) fn co_collapse_ev_arm_is_disarmed_at_iteration_zero_s1() {
     let (phi0, jet0) = periodic_basis(&coords0);
     let (phi1, jet1) = periodic_basis(&coords1);
     let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, scale: f64| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,

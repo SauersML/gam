@@ -1612,8 +1612,7 @@ fn run_atom_shape_race(
         .unwrap_or_default();
     let winner = verdict.candidate_names[verdict.winner_index].clone();
     let circular_margin = if stacking_weights.len() == candidate_count {
-        let (mut circular_best, mut noncircular_best) =
-            (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let (mut circular_best, mut noncircular_best) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         for (name, &weight) in verdict.candidate_names.iter().zip(&stacking_weights) {
             if name.starts_with("circle") || name.starts_with("ring_clusters") {
                 circular_best = circular_best.max(weight);

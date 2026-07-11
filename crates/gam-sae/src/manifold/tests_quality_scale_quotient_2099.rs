@@ -52,7 +52,7 @@ fn build_circle_term(n: usize, p: usize) -> SaeManifoldTerm {
     let coords_col = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| (i as f64) / (n as f64));
     let (phi, jet) = periodic_basis(&coords_col);
     let m = phi.ncols();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,

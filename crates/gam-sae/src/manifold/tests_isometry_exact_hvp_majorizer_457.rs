@@ -29,7 +29,7 @@ pub(crate) fn build_isometry_atom_for_evaluator(
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
     let decoder = deterministic_decoder(m, p_out, seed);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "exact_hvp_atom",
         kind,
         coords.ncols(),
@@ -399,7 +399,7 @@ pub(crate) fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
             }
         }
         let smooth = Array2::<f64>::eye(m);
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             latent_dim,

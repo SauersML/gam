@@ -38,7 +38,7 @@ pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>
     let m = phi.ncols();
     let smooth_penalty =
         gam_terms::basis::create_difference_penalty_matrix(m, 2, None).expect("penalty");
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "contract-line",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -286,7 +286,7 @@ fn amortized_encoder_is_faithful_on_known_manifold() {
         let scale = 1.0 / (1.0 + b as f64);
         scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
     });
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic_truth",
         SaeAtomBasisKind::Periodic,
         1,
@@ -538,7 +538,7 @@ fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
 
     let isometry_curvature_norm = |lambda: f64| -> f64 {
         let decoder = &base_decoder * lambda;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "iso_scale",
             SaeAtomBasisKind::Periodic,
             1,
@@ -646,7 +646,7 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
     let fit_at_scale = |physical_scale: f64| -> ScaleFit {
         let scale_sq = physical_scale * physical_scale;
         let decoder = &base_decoder * physical_scale;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "iso_converge",
             SaeAtomBasisKind::Periodic,
             1,
@@ -935,7 +935,15 @@ fn sae_k1_circle_penalized_laml_criterion_ranks_fixed_point_2226() {
     // criterion must rank that stationary iterate instead of hard-refusing on an
     // absolute raw-gradient tolerance that is not reachable on every SIMD target.
     let (value, loss, _cache) = term
-        .penalized_laml_criterion_with_cache(z.view(), &rho, Some(&registry), 200, 0.04, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(
+            z.view(),
+            &rho,
+            Some(&registry),
+            200,
+            0.04,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect(
             "#2226: the K=1 planted-circle inner solve reaches a numerical fixed point; \
              penalized_laml_criterion must rank that stationary iterate (affine-invariant Newton \
@@ -1086,7 +1094,7 @@ fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
         let scale = 1.0 / (1.0 + b as f64);
         scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
     });
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic_truth",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1233,7 +1241,7 @@ fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() 
         .collect();
 
     let build_term = || {
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "periodic_truth",
             SaeAtomBasisKind::Periodic,
             1,
@@ -1353,9 +1361,15 @@ fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() 
         probe
             .warm_start_latents_from_amortized_encoder(target.view(), rho)
             .ok();
-        let Ok((cotrained, _loss, _consistency)) =
-            probe.penalized_laml_criterion_cotrained(target.view(), rho, None, 64, 1.0, 1.0e-4, 1.0e-4)
-        else {
+        let Ok((cotrained, _loss, _consistency)) = probe.penalized_laml_criterion_cotrained(
+            target.view(),
+            rho,
+            None,
+            64,
+            1.0,
+            1.0e-4,
+            1.0e-4,
+        ) else {
             continue;
         };
         if cotrained < best_cot_cost {
@@ -1442,7 +1456,7 @@ fn sae_1026_curved_beats_linear_reconstruction_through_solver() {
 
     // CURVED arm: one periodic atom on the circle.
     let curved_ev = {
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle",
             SaeAtomBasisKind::Periodic,
             1,
@@ -1473,7 +1487,7 @@ fn sae_1026_curved_beats_linear_reconstruction_through_solver() {
         let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 1).unwrap());
         let (phi_l, jet_l) = evaluator.evaluate(coords.view()).unwrap();
         let ml = phi_l.ncols();
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "linear",
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -1529,7 +1543,7 @@ fn sae_1026_full_encode_decode_heldout_curved_certifies() {
     let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
         (1.0 / (1.0 + b as f64)) * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
     });
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -1635,7 +1649,7 @@ fn sae_1026_solver_recovers_separable_superposition_but_not_below_2k() {
         let (pa, ja) = periodic_basis(&seed_a);
         let (pb, jb) = periodic_basis(&seed_b);
         let m = pa.ncols();
-        let a0 = SaeManifoldAtom::new(
+        let a0 = SaeManifoldAtom::new_with_provided_function_gram(
             "cA",
             SaeAtomBasisKind::Periodic,
             1,
@@ -1646,7 +1660,7 @@ fn sae_1026_solver_recovers_separable_superposition_but_not_below_2k() {
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-        let a1 = SaeManifoldAtom::new(
+        let a1 = SaeManifoldAtom::new_with_provided_function_gram(
             "cB",
             SaeAtomBasisKind::Periodic,
             1,
@@ -1920,7 +1934,7 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
     .expect("valid logit grid");
     let atoms: Vec<SaeManifoldAtom> = (0..k)
         .map(|i| {
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 &format!("atom{i}"),
                 SaeAtomBasisKind::EuclideanPatch,
                 1,
@@ -2022,7 +2036,7 @@ fn encode_grad_hess_and_beta_eta_match_finite_differences() {
     let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
         (1.0 / (1.0 + b as f64)) * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
     });
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,

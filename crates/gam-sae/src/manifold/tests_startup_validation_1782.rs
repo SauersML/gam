@@ -79,7 +79,7 @@ pub(crate) fn build_term(
                 rss += r * r;
             }
         }
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             topo_name,
             basis_kind.clone(),
             dim,
@@ -100,7 +100,7 @@ pub(crate) fn build_term(
     let seed_dispersion = (rss / (k * n * z.ncols()) as f64).max(1.0e-12);
     // Routing seed. ordered Beta--Bernoulli-MAP starts every gate on (the production cold seed). The
     // separable gates start from a round-robin row->atom assignment — a stand-in
-    // for the FFI's EM routing refine — so the routing is not degenerately
+    // for the deterministic alternating routing refine — so the routing is not degenerately
     // symmetric (every atom carries mass; no atom is a duplicate of another).
     let mut logits = Array2::<f64>::zeros((n, k));
     for row in 0..n {
@@ -308,7 +308,10 @@ fn assignment_kinds_fit_on_circle_1782() {
     let z = planted_circle_embedded(48, 6, 0.03);
     let k = 4usize;
     for (label, mode) in [
-        ("circle/ordered_beta_bernoulli", AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false)),
+        (
+            "circle/ordered_beta_bernoulli",
+            AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
+        ),
         ("circle/softmax", AssignmentMode::softmax(1.0)),
         (
             "circle/threshold_gate",
@@ -366,7 +369,9 @@ fn cocollapse_startup_frontier_1026() {
     // extends the startup frontier, decoupling the routing wall from seed
     // co-collapse.
     let modes: [(&str, fn() -> AssignmentMode); 3] = [
-        ("ordered_beta_bernoulli    ", || AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false)),
+        ("ordered_beta_bernoulli    ", || {
+            AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false)
+        }),
         ("thresh_gate", || AssignmentMode::threshold_gate(1.0, 0.5)),
         ("softmax    ", || AssignmentMode::softmax(1.0)),
     ];

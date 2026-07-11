@@ -1047,7 +1047,12 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn assignment_tokens_have_one_strict_parser() {
-        for canonical in ["softmax", "ordered_beta_bernoulli", "threshold_gate", "topk"] {
+        for canonical in [
+            "softmax",
+            "ordered_beta_bernoulli",
+            "threshold_gate",
+            "topk",
+        ] {
             assert_eq!(
                 canonical_assignment_kind(canonical),
                 Ok(canonical),
@@ -1113,7 +1118,10 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn flat_block_gating_uses_rust_owned_assignment_tokens() {
-        assert_eq!(flat_block_assignment("norm_selection"), Ok("ordered_beta_bernoulli"));
+        assert_eq!(
+            flat_block_assignment("norm_selection"),
+            Ok("ordered_beta_bernoulli")
+        );
         assert_eq!(flat_block_assignment("separate_gate"), Ok("threshold_gate"));
         assert!(flat_block_assignment("norm-selection").is_err());
         assert!(flat_block_assignment(" Separate-Gate ").is_err());

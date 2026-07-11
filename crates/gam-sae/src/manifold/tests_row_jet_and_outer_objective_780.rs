@@ -274,7 +274,7 @@ fn fixed_gate_probe_term() -> (SaeManifoldTerm, SaeManifoldRho) {
     use ndarray::{Array1, Array2, Array3};
     let (n, m, p) = (1usize, 1usize, 1usize);
     let mk_atom = |name: &str, phi: f64, dphi: f64, dec: f64| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,

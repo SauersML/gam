@@ -61,8 +61,7 @@ fn streaming_cache_outer_gradient_matches_dense_cache() {
     // unrelated non-idempotent inner map and was correctly refused before cache
     // comparison. This branch is already certified KKT-stationary and recurrent.
     let target = planted_circle_embedded(32, 4, 0.02);
-    let mut term0 =
-        planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
+    let mut term0 = planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
     term0.atoms[0].basis_second_jet = Some(Arc::new(
         PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
     ));
@@ -181,8 +180,7 @@ fn build_softmax_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
     let coord_cols: Vec<Array2<f64>> = (0..k)
         .map(|i| {
             Array2::<f64>::from_shape_fn((n, 1), |(r, _)| {
-                (0.03 + 0.11 * i as f64 + 0.017 * (i + 1) as f64 * r as f64)
-                    .rem_euclid(1.0)
+                (0.03 + 0.11 * i as f64 + 0.017 * (i + 1) as f64 * r as f64).rem_euclid(1.0)
             })
         })
         .collect();
@@ -194,7 +192,7 @@ fn build_softmax_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
             let decoder = Array2::<f64>::from_shape_fn((3, p), |(m, c)| {
                 0.1 * f * ((m + 1) as f64) - 0.05 * (c as f64) + 0.02 * f
             });
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 format!("atom{i}"),
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -449,9 +447,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     // partial implementation that wires only 0.5 tr(B^-1 dB/drho) while silently
     // dropping -0.5 Gamma^T A^-1 dg/drho.
     let loss = term.loss(target.view(), &rho).expect("softmax loss");
-    let sparse_index = rho
-        .sparse_flat_index()
-        .expect("softmax sparse coordinate");
+    let sparse_index = rho.sparse_flat_index().expect("softmax sparse coordinate");
     let dense_components = term
         .analytic_outer_rho_gradient_components(target.view(), &rho, &loss, &cache, &solver)
         .expect("dense complete outer gradient");
@@ -520,7 +516,15 @@ fn whitened_streaming_criterion_completes() {
     );
 
     let (cost, loss) = term
-        .penalized_laml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_streaming_exact(
+            target.view(),
+            &rho,
+            None,
+            2,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+        )
         .expect("whitened streaming criterion must complete, not hard-error");
     assert!(
         cost.is_finite(),

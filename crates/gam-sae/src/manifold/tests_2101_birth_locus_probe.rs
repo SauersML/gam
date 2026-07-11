@@ -81,7 +81,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = 1.0;
     decoder[[2, 1]] = 1.0;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "seed".to_string(),
         SaeAtomBasisKind::Periodic,
         1,
@@ -294,7 +294,7 @@ fn probe_2101_proper_circle_seed_survival() {
         let mut decoder = Array2::<f64>::zeros((3, p));
         decoder[[1, 0]] = 1.0;
         decoder[[2, 1]] = 1.0;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle".to_string(),
             SaeAtomBasisKind::Periodic,
             1,

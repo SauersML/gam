@@ -108,7 +108,7 @@ mod tests {
             // negative leave-one-atom-out ΔEV.
             decoder[[2, 2 * c]] = 1.0;
             decoder[[1, 2 * c + 1]] = 1.0;
-            let atom = SaeManifoldAtom::new(
+            let atom = SaeManifoldAtom::new_with_provided_function_gram(
                 format!("circle{c}"),
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -148,7 +148,7 @@ mod tests {
             for j in 0..P {
                 decoder[[0, j]] = zombie_dc;
             }
-            let atom = SaeManifoldAtom::new(
+            let atom = SaeManifoldAtom::new_with_provided_function_gram(
                 "dc_zombie".to_string(),
                 SaeAtomBasisKind::Periodic,
                 1,

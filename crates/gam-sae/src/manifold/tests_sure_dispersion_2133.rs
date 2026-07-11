@@ -69,7 +69,7 @@ fn fitted_circle(
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = radius;
     decoder[[2, 1]] = radius;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

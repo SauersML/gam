@@ -451,8 +451,7 @@ pub fn steer_delta(
     // Whether the metric can/does match this term and carries behavior.
     let provenance = metric.provenance();
     let behavior_available = metric_carries_behavior(provenance);
-    let fisher_mass_captured =
-        behavior_available.then(|| metric.row_traces()[metric_row]);
+    let fisher_mass_captured = behavior_available.then(|| metric.row_traces()[metric_row]);
     let fisher_mass_residual = behavior_available
         .then(|| metric.truncation_mass_residual(metric_row))
         .flatten();

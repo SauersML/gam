@@ -42,7 +42,7 @@ fn circle_atom(
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, col_sin]] = 1.0;
     decoder[[2, col_cos]] = 1.0;
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         name,
         SaeAtomBasisKind::Periodic,
         1,

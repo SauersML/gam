@@ -83,7 +83,7 @@ fn two_circle_multi_active_target(n: usize, p: usize, sigma: f64) -> Array2<f64>
 
 /// Fresh softmax K-atom periodic term on the multi-active target, production PCA
 /// seed, decoders cold at zero, and a mild round-robin favored-atom routing seed
-/// (the stand-in for the FFI's EM routing refine: every atom carries mass, no
+/// (the stand-in for the alternating routing refine: every atom carries mass, no
 /// degenerate symmetry). `active_cap` installs the fit-time softmax top-k cap.
 fn softmax_multi_active_term(
     n: usize,

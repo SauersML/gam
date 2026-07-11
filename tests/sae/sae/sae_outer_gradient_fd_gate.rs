@@ -324,7 +324,10 @@ fn sae_outer_rho_gradient_components_match_centered_fd_ordered_beta_bernoulli() 
     // every row in a column, so the outer-ρ gradient through log|H| depends on
     // the cross-row M_k channel of `logdet_theta_adjoint`. lambda_sparse is the
     // active prior weight here, so coord 0's FD directly stresses it.
-    let f = fixture(AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false), -1.5);
+    let f = fixture(
+        AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false),
+        -1.5,
+    );
     assert_full_gradient_matches_fd("ordered_beta_bernoulli", &f);
 }
 
@@ -440,7 +443,10 @@ fn sae_outer_rho_gradient_channel_decomposition_ordered_beta_bernoulli_2087() {
     // channels of `logdet_theta_adjoint`. The decomposition pins whether a #2087
     // desync lives in the explicit prior channel or the Hessian log-det block —
     // the located artifact a build-capable seat consumes to fix the θ-adjoint.
-    let f = fixture(AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false), -1.5);
+    let f = fixture(
+        AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false),
+        -1.5,
+    );
     assert_channel_decomposition("ordered_beta_bernoulli", &f);
 }
 

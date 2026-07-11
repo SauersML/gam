@@ -330,8 +330,9 @@ impl SaeManifoldTerm {
     /// and before fitting; distinct terms remain isolated by construction.
     pub fn set_fit_config(&mut self, config: SaeFitConfig) {
         self.separation_barrier_strength_override = config.separation_barrier_strength_override;
-        self.assignment
-            .set_ordered_beta_bernoulli_alpha_override(config.ordered_beta_bernoulli_alpha_override);
+        self.assignment.set_ordered_beta_bernoulli_alpha_override(
+            config.ordered_beta_bernoulli_alpha_override,
+        );
     }
 
     /// #1777 — the per-fit configuration currently in force on this term,
@@ -341,7 +342,9 @@ impl SaeManifoldTerm {
     pub fn fit_config(&self) -> SaeFitConfig {
         SaeFitConfig {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override: self.assignment.ordered_beta_bernoulli_alpha_override,
+            ordered_beta_bernoulli_alpha_override: self
+                .assignment
+                .ordered_beta_bernoulli_alpha_override,
         }
     }
 
@@ -3065,7 +3068,6 @@ impl SaeManifoldTerm {
                         beta[[off + basis_col, out_col]];
                 }
             }
-            self.atoms[atom_idx].refresh_intrinsic_smooth_penalty();
         }
         Ok(())
     }
@@ -4853,7 +4855,11 @@ impl SaeManifoldTerm {
             Some(reg) => self.analytic_penalty_value_total(reg, 1.0)?,
             None => 0.0,
         };
-        Ok(registry_energy + self.decoder_repulsion_value(1.0) + self.separation_barrier_value(1.0))
+        Ok(
+            registry_energy
+                + self.decoder_repulsion_value(1.0)
+                + self.separation_barrier_value(1.0),
+        )
     }
 
     pub fn penalized_objective_total(

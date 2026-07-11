@@ -787,12 +787,10 @@ impl Clone for SaeManifoldTerm {
 /// The profiled decoder frame is not static: the block-coordinate polar refresh
 /// changes it between Newton steps, so it is part of the canonical state below.
 ///
-/// The canonical `smooth_penalty_raw` / `smooth_penalty_order` are static, but
-/// the live intrinsic roughness Gram `smooth_penalty` is mutable state: it is
-/// refreshed by assembly from the current decoder and basis Jacobian, and the
-/// line-search objective reads it directly. Restoring it with the decoder keeps
-/// every rejected trial's baseline and nonlinear objective on the same
-/// lagged-diffusivity quadratic.
+/// The reference-function Gram `smooth_penalty` is fixed for an objective and
+/// transported only by an explicit basis reparameterization. It remains in the
+/// snapshot so restoring a rejected structural trial restores the complete
+/// declared quadratic together with its decoder coordinates.
 #[derive(Debug)]
 pub(crate) struct SaeManifoldMutableState {
     /// Per-atom differential state

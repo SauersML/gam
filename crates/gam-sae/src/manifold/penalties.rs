@@ -195,8 +195,8 @@ impl SaeManifoldTerm {
     }
 
     /// #1026 — refresh the frozen per-assembly decoder-repulsion gate from the
-    /// current decoder state. Lagged-diffusivity discipline (mirrors
-    /// [`SaeManifoldAtom::refresh_intrinsic_smooth_penalty`]): the gate WEIGHT is
+    /// current decoder state. Lagged-diffusivity discipline applies only to this
+    /// repulsion heuristic (the atom's reference roughness is fixed): the gate WEIGHT is
     /// frozen here at assembly entry so the assembly's gradient/curvature and the
     /// line-search value path use the same gate even as trial decoders move.
     ///
@@ -2633,7 +2633,7 @@ mod tests_findings_234 {
         let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
         let (phi0, jet0) = periodic_basis(&coords0);
         let (phi1, jet1) = periodic_basis(&coords1);
-        let atom0 = SaeManifoldAtom::new(
+        let atom0 = SaeManifoldAtom::new_with_provided_function_gram(
             "a0",
             SaeAtomBasisKind::Periodic,
             1,
@@ -2644,7 +2644,7 @@ mod tests_findings_234 {
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-        let atom1 = SaeManifoldAtom::new(
+        let atom1 = SaeManifoldAtom::new_with_provided_function_gram(
             "a1",
             SaeAtomBasisKind::Periodic,
             1,
@@ -2854,7 +2854,7 @@ mod tests_findings_234 {
         let coords1 = array![[0.15], [0.30], [0.65], [0.90]];
         let (phi0, jet0) = periodic_basis(&coords0);
         let (phi1, jet1) = periodic_basis(&coords1);
-        let atom0 = SaeManifoldAtom::new(
+        let atom0 = SaeManifoldAtom::new_with_provided_function_gram(
             "a0",
             SaeAtomBasisKind::Periodic,
             1,
@@ -2865,7 +2865,7 @@ mod tests_findings_234 {
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-        let atom1 = SaeManifoldAtom::new(
+        let atom1 = SaeManifoldAtom::new_with_provided_function_gram(
             "a1",
             SaeAtomBasisKind::Periodic,
             1,

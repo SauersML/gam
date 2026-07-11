@@ -33,7 +33,7 @@ pub(crate) fn factored_border_dim_invariant_and_reconstruction() {
         jet[[mu, mu, 0]] = 1.0;
     }
     let s_raw = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
-    let mut atom = SaeManifoldAtom::new(
+    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "lowrank",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -127,7 +127,7 @@ pub(crate) fn factored_beta_penalty_probing_matches_projected_dense_curvature() 
             c[[basis_col, 1]] = -0.2 + 0.05 * (basis_col * 2 + atom_idx) as f64;
         }
         let decoder = fast_abt(&c, &frame);
-        let mut atom = SaeManifoldAtom::new(
+        let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
             "factored_probe",
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -294,7 +294,7 @@ pub(crate) fn low_rank_factored_htbeta_term(
             0.2 + 0.03 * (basis_col + 2 * frame_col + atom_idx) as f64
         });
         let decoder = coords_c.dot(&frame.t());
-        let mut atom = SaeManifoldAtom::new(
+        let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
             "factored_htbeta_shape",
             SaeAtomBasisKind::EuclideanPatch,
             latent_dim,
@@ -356,7 +356,7 @@ pub(crate) fn factored_row_htbeta_native_solve_matches_full_b_then_project() {
             0.2 + 0.04 * (basis_col + 2 * frame_col + atom_idx) as f64
         });
         let decoder = fast_abt(&c, &frame);
-        let mut atom = SaeManifoldAtom::new(
+        let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
             "factored_row_native",
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -474,7 +474,7 @@ pub(crate) fn whitened_frames_974_native_solve_matches_full_b_then_project() {
             0.2 + 0.04 * (basis_col + 2 * frame_col + atom_idx) as f64
         });
         let decoder = fast_abt(&c, &frame);
-        let mut atom = SaeManifoldAtom::new(
+        let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
             "whitened_frames_974",
             SaeAtomBasisKind::EuclideanPatch,
             1,
@@ -719,7 +719,7 @@ pub(crate) fn factored_evidence_matches_full_b_at_small_p() {
         jet[[mu, mu, 0]] = 1.0;
     }
     let s_raw = gam_terms::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
-    let mut atom = SaeManifoldAtom::new(
+    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "fullrank",
         SaeAtomBasisKind::EuclideanPatch,
         1,

@@ -41,7 +41,7 @@ fn build_topk_term(
         let m = phi.ncols();
         let smooth_penalty =
             gam_terms::basis::create_difference_penalty_matrix(m, 2, None).expect("penalty");
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "topk-patch",
             SaeAtomBasisKind::EuclideanPatch,
             1,

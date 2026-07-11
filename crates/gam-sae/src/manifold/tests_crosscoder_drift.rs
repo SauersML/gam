@@ -73,7 +73,7 @@ fn build_term(
         .map(|angles| {
             let decoder = augmented_decoder(m, angles, &block_log_lambda);
             assert_eq!(decoder.ncols(), p_tot);
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 "cc",
                 SaeAtomBasisKind::Periodic,
                 1,
@@ -266,7 +266,7 @@ fn rejects_layers_of_differing_ambient_width() {
                 if r == 0 && c == 0 { 1.0 } else { 0.0 }
             },
         );
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "cc",
         SaeAtomBasisKind::Periodic,
         1,

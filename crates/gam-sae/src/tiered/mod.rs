@@ -487,7 +487,7 @@ pub fn fit_tier05_sink_atom(
         }
     }
     let smooth_penalty = Array2::<f64>::zeros((anchors.len(), anchors.len()));
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "tier0_5_attention_sink",
         SaeAtomBasisKind::FiniteSet,
         1,

@@ -195,12 +195,12 @@ pub struct ArrowSchurSystem {
     /// joint `(delta B, delta log-amplitude)` trajectory projection is owned by
     /// the SAE step application.
     pub beta_gauge_quotient: Option<ArrowBetaGaugeQuotient>,
-    /// Optional exact cross-row IBP low-rank source (#1038). When set, the
+    /// Optional exact cross-row ordered Beta--Bernoulli low-rank source (#1038). When set, the
     /// factorization downdates the per-row logit-slot self term and layers the
     /// exact rank-`R` Woodbury correction onto the evidence cache (value,
-    /// log-determinant, and θ/ρ-adjoint together). `None` for all non-IBP
+    /// log-determinant, and θ/ρ-adjoint together). `None` for all other
     /// systems — the row-block-diagonal arrow path is then unchanged.
-    pub ibp_cross_row: Option<IbpCrossRowSource>,
+    pub ordered_beta_bernoulli_cross_row: Option<OrderedBetaBernoulliCrossRowSource>,
 }
 
 impl Clone for ArrowSchurSystem {
@@ -227,7 +227,7 @@ impl Clone for ArrowSchurSystem {
             cross_row_penalties: self.cross_row_penalties.clone(),
             row_gauge_deflation: self.row_gauge_deflation.clone(),
             beta_gauge_quotient: self.beta_gauge_quotient.clone(),
-            ibp_cross_row: self.ibp_cross_row.clone(),
+            ordered_beta_bernoulli_cross_row: self.ordered_beta_bernoulli_cross_row.clone(),
         }
     }
 }
@@ -256,7 +256,7 @@ pub struct CrossRowLatentPenalty {
     pub target_t: Array1<f64>,
 }
 
-/// Exact cross-row low-rank IBP source (#1038): the per-column rank-one Hessian
+/// Exact cross-row low-rank ordered Beta--Bernoulli source (#1038): the per-column rank-one Hessian
 /// terms `H_(i,k),(j,k) = d_k·z'_ik·z'_jk` (for ALL `i,j`, including the `i=j`
 /// self term) that couple DISTINCT latent rows through a shared atom column `k`.
 ///
@@ -281,7 +281,7 @@ pub struct CrossRowLatentPenalty {
 /// log-determinant, and the θ/ρ-adjoint TOGETHER (they all describe the SAME
 /// `H_full`).
 #[derive(Clone, Debug, Default)]
-pub struct IbpCrossRowSource {
+pub struct OrderedBetaBernoulliCrossRowSource {
     /// Number of atom columns `R` (the rank of the cross-row update).
     pub r: usize,
     /// `d_k = w·s'_k`, the scalar `D`-coefficient of column `k`. Length `R`.
@@ -293,7 +293,7 @@ pub struct IbpCrossRowSource {
     pub entries: Vec<(usize, usize, f64)>,
 }
 
-impl IbpCrossRowSource {
+impl OrderedBetaBernoulliCrossRowSource {
     /// Build the dense `delta_t_len × R` factor `U` (each column supported on
     /// its atom's per-row logit slots) from the sparse entry list.
     pub(crate) fn dense_u(&self, delta_t_len: usize) -> Array2<f64> {
@@ -359,7 +359,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -409,7 +409,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -465,7 +465,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -511,7 +511,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -562,7 +562,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -641,7 +641,7 @@ impl ArrowSchurSystem {
             cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -665,17 +665,20 @@ impl ArrowSchurSystem {
         Ok(())
     }
 
-    /// Register the exact cross-row IBP low-rank source (#1038). The assembly
+    /// Register the exact cross-row ordered Beta--Bernoulli low-rank source (#1038). The assembly
     /// passes the per-column `D`-coefficients (`cross_row_d`) and the `(global
     /// latent index, atom, z'_ik)` entries built from `z_jac`; the factorization
     /// then carries the exact rank-`R` Woodbury (value + log-determinant +
     /// θ/ρ-adjoint) on the evidence cache. An empty source (`r == 0` or no
     /// entries) is treated as absent so the row-block-diagonal path is unchanged.
-    pub fn set_ibp_cross_row_source(&mut self, source: IbpCrossRowSource) {
+    pub fn set_ordered_beta_bernoulli_cross_row_source(
+        &mut self,
+        source: OrderedBetaBernoulliCrossRowSource,
+    ) {
         if source.r == 0 || source.entries.is_empty() {
-            self.ibp_cross_row = None;
+            self.ordered_beta_bernoulli_cross_row = None;
         } else {
-            self.ibp_cross_row = Some(source);
+            self.ordered_beta_bernoulli_cross_row = Some(source);
         }
     }
 
@@ -1402,18 +1405,18 @@ pub struct StreamingArrowSchur {
     /// from the options; defaults to `false` so direct callers of
     /// [`Self::accumulate_chunk`] keep the full guard.
     pub(crate) tolerate_ill_conditioning: bool,
-    /// Set when the source system carried an exact cross-row IBP source
-    /// ([`IbpCrossRowSource`], #1038). The streaming chunked accumulator cannot
+    /// Set when the source system carried an exact cross-row ordered Beta--Bernoulli source
+    /// ([`OrderedBetaBernoulliCrossRowSource`], #1038). The streaming chunked accumulator cannot
     /// hold the rank-`R` Woodbury correction chunk-locally — `U`'s columns span
     /// ALL rows, so the capacitance `I_R + D Uᵀ H₀'⁻¹ U` needs the per-row
     /// factors retained for a global `H₀'⁻¹U` back-solve, which is exactly the
     /// `(N·K)`-scale residency the streaming path exists to avoid. Rather than
     /// silently DROP the cross-row term (an inexact logdet that would desync
     /// from the dense-resident gradient), the streaming log-determinant errors
-    /// loudly when this is set, forcing IBP-active fits onto the dense resident
+    /// loudly when this is set, forcing ordered-Beta--Bernoulli-active fits onto the dense resident
     /// [`ArrowFactorCache::arrow_log_det`] path (which carries the exact
     /// Woodbury). See the #1038 streaming note.
-    pub(crate) ibp_cross_row_active: bool,
+    pub(crate) ordered_beta_bernoulli_cross_row_active: bool,
     /// SAE manifold evidence-path per-row gauge deflation, copied from the
     /// source [`ArrowSchurSystem::row_gauge_deflation`] (#1273/#1377). When
     /// present, the streaming per-row factor MUST apply the SAME spectral
@@ -1425,7 +1428,7 @@ pub struct StreamingArrowSchur {
     /// regression: #1273 wired the deflation into the dense path only). `None`
     /// for every non-evidence caller, which keeps the strict non-PD refusal.
     pub(crate) row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
-    /// The exact cross-row IBP source ([`IbpCrossRowSource`], #1038), cloned from
+    /// The exact cross-row ordered Beta--Bernoulli source ([`OrderedBetaBernoulliCrossRowSource`], #1038), cloned from
     /// the assembled [`ArrowSchurSystem`]. The bare streaming paths
     /// ([`Self::solve`] / [`Self::reduced_schur_and_log_det_tt`]) still REFUSE
     /// when this is present (they cannot carry the rank-`R` Woodbury), but the
@@ -1434,10 +1437,10 @@ pub struct StreamingArrowSchur {
     /// and `W = Bᵀ A⁻¹ U` against the NO-SELF base `H₀'` (self term downdated),
     /// which the caller closes into the exact `log det(I_R + D Uᵀ H₀'⁻¹ U)` via
     /// [`streaming_cross_row_woodbury_log_det`].
-    pub(crate) ibp_cross_row: Option<IbpCrossRowSource>,
+    pub(crate) ordered_beta_bernoulli_cross_row: Option<OrderedBetaBernoulliCrossRowSource>,
 }
 
-/// One chunk's contribution to the streaming cross-row IBP Woodbury (#1038).
+/// One chunk's contribution to the streaming cross-row ordered Beta--Bernoulli Woodbury (#1038).
 ///
 /// The capacitance `C = I_R + D·M` with `M = Uᵀ H₀'⁻¹ U` is chunk-additive in
 /// its two ingredients (`A = H₀'` is block-diagonal over rows, `U` is supported
@@ -1496,9 +1499,9 @@ impl StreamingArrowSchur {
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
             tolerate_ill_conditioning: false,
-            ibp_cross_row_active: false,
+            ordered_beta_bernoulli_cross_row_active: false,
             row_gauge_deflation: None,
-            ibp_cross_row: None,
+            ordered_beta_bernoulli_cross_row: None,
         }
     }
 
@@ -1550,8 +1553,9 @@ impl StreamingArrowSchur {
         );
         streaming.htbeta_matvec = htbeta_matvec;
         streaming.htbeta_transpose_matvec = sys.htbeta_transpose_matvec.clone();
-        streaming.ibp_cross_row_active = sys.ibp_cross_row.is_some();
-        streaming.ibp_cross_row = sys.ibp_cross_row.clone();
+        streaming.ordered_beta_bernoulli_cross_row_active =
+            sys.ordered_beta_bernoulli_cross_row.is_some();
+        streaming.ordered_beta_bernoulli_cross_row = sys.ordered_beta_bernoulli_cross_row.clone();
         // Carry the SAE evidence-path per-row gauge deflation so the streaming
         // per-row factor matches the dense `factor_blocks_for_system` exactly
         // (#1377): without it, a row with an intrinsic-dimension-flat `H_tt`
@@ -1833,12 +1837,12 @@ impl StreamingArrowSchur {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(f64, Array2<f64>), ArrowSchurError> {
-        if self.ibp_cross_row_active {
+        if self.ordered_beta_bernoulli_cross_row_active {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "streaming arrow log-det cannot carry the exact cross-row IBP \
+                reason: "streaming arrow log-det cannot carry the exact cross-row ordered Beta--Bernoulli \
                          Woodbury correction (#1038): U's columns span all rows, so the \
                          rank-R capacitance needs the per-row factors retained — the very \
-                         (N·K) residency the streaming path avoids. Route IBP-active fits \
+                         (N·K) residency the streaming path avoids. Route ordered-Beta--Bernoulli-active fits \
                          through the dense resident ArrowFactorCache::arrow_log_det instead."
                     .to_string(),
             });
@@ -1877,14 +1881,14 @@ impl StreamingArrowSchur {
     }
 
     /// As [`Self::reduced_schur_and_log_det_tt`], but ALSO accumulates the exact
-    /// cross-row IBP Woodbury building blocks (#1038) when this streaming system
-    /// carried an [`IbpCrossRowSource`].
+    /// cross-row ordered Beta--Bernoulli Woodbury building blocks (#1038) when this streaming system
+    /// carried an [`OrderedBetaBernoulliCrossRowSource`].
     ///
     /// Mirrors the dense `factor_blocks_for_system` + [`CrossRowWoodbury::build`]
     /// path exactly:
     ///
     /// * the per-row logit self term `Σ_k d_k·z'_ik²`
-    ///   ([`IbpCrossRowSource::self_term_downdate`]) is subtracted from each
+    ///   ([`OrderedBetaBernoulliCrossRowSource::self_term_downdate`]) is subtracted from each
     ///   `H_tt^(i)` BEFORE factoring, so the factored base — and therefore the
     ///   returned `log_det_tt`/Schur — is the NO-SELF `H₀'` (the dense path
     ///   factors `H₀'` too, then layers the rank-`R` Woodbury);
@@ -1900,16 +1904,16 @@ impl StreamingArrowSchur {
     /// the dense [`ArrowFactorCache::arrow_log_det`] returns — the streaming and
     /// dense evidence then optimize the SAME REML objective (#1225).
     ///
-    /// When no IBP source is present this delegates to
+    /// When no ordered Beta--Bernoulli source is present this delegates to
     /// [`Self::reduced_schur_and_log_det_tt`] and returns `None` woodbury, so
-    /// every non-IBP (softmax / JumpReLU) caller is bit-for-bit unchanged.
+    /// every other (softmax / JumpReLU) caller is bit-for-bit unchanged.
     pub fn reduced_schur_log_det_tt_woodbury(
         &mut self,
         ridge_t: f64,
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(f64, Array2<f64>, Option<StreamingWoodburyChunk>), ArrowSchurError> {
-        let Some(source) = self.ibp_cross_row.clone() else {
+        let Some(source) = self.ordered_beta_bernoulli_cross_row.clone() else {
             // Temporarily clear the refusal flag so the shared bare path runs;
             // it is `false` whenever the source is absent, so this is a no-op.
             let (log_det_tt, schur) =
@@ -2034,10 +2038,10 @@ impl StreamingArrowSchur {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(Array1<f64>, Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
-        if self.ibp_cross_row_active {
+        if self.ordered_beta_bernoulli_cross_row_active {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "streaming arrow solve cannot carry the exact cross-row IBP \
-                         Woodbury correction (#1038); route IBP-active fits through the \
+                reason: "streaming arrow solve cannot carry the exact cross-row ordered Beta--Bernoulli \
+                         Woodbury correction (#1038); route ordered-Beta--Bernoulli-active fits through the \
                          dense resident solve_arrow_newton_step_with_options instead."
                     .to_string(),
             });
@@ -2750,8 +2754,8 @@ pub struct ArrowFactorCache {
     /// unit-pinned orbit contributes zero to `arrow_log_det` and zero to every
     /// analytic trace, so value and gradient live on the same quotient.
     pub beta_gauge_quotient: Option<ArrowBetaGaugeQuotient>,
-    /// Exact cross-row IBP rank-`R` Woodbury correction (#1038), present iff the
-    /// source system carried an [`IbpCrossRowSource`]. When set, the per-row
+    /// Exact cross-row ordered Beta--Bernoulli rank-`R` Woodbury correction (#1038), present iff the
+    /// source system carried an [`OrderedBetaBernoulliCrossRowSource`]. When set, the per-row
     /// factors above are of the NO-SELF base `H₀'` (self term `d_k·z'_ik²`
     /// downdated from each logit diagonal), and this carrier supplies the exact
     /// rank-`R` correction so the value/curvature solve
@@ -2761,7 +2765,7 @@ pub struct ArrowFactorCache {
     pub cross_row_woodbury: Option<CrossRowWoodbury>,
 }
 
-/// Materialized exact cross-row IBP Woodbury correction (#1038), built against
+/// Materialized exact cross-row ordered Beta--Bernoulli Woodbury correction (#1038), built against
 /// an [`ArrowFactorCache`] whose per-row factors are the NO-SELF base `H₀'`.
 ///
 /// Holds `U` (the `delta_t_len × R` arrow-`t` factor, β-part implicitly zero),
@@ -2797,7 +2801,7 @@ pub struct CrossRowWoodbury {
     pub entries: Vec<(usize, usize, f64)>,
 }
 
-/// Dense partial-pivot LU of a small square matrix. Used for the cross-row IBP
+/// Dense partial-pivot LU of a small square matrix. Used for the cross-row ordered Beta--Bernoulli
 /// capacitance `C = I_R + D·M`, which is generally non-symmetric and possibly
 /// indefinite (`d_k = w·s'_k` is not sign-definite), so a Cholesky/LDLᵀ is
 /// unavailable. `R` is the atom count, so this is a cheap dense factorization.
@@ -2935,7 +2939,7 @@ impl SmallLu {
     }
 }
 
-/// Close the streaming cross-row IBP Woodbury (#1038) into its exact evidence
+/// Close the streaming cross-row ordered Beta--Bernoulli Woodbury (#1038) into its exact evidence
 /// log-determinant correction.
 ///
 /// Given the chunk-summed `M0 = Uᵀ A⁻¹ U` (`R×R`), `W = Bᵀ A⁻¹ U` (`k×R`), the
@@ -2948,7 +2952,7 @@ impl SmallLu {
 /// the dense [`CrossRowWoodbury::log_det`] returns (symmetrize `M`, scale rows
 /// by `D`, partial-pivot LU, reject a non-positive determinant). Returns
 /// `Ok(None)` when the capacitance is non-PD / singular — the recoverable
-/// "cross-row IBP joint Hessian is non-PD at this ρ" infeasible-probe refusal,
+/// "cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ" infeasible-probe refusal,
 /// NOT a silent wrong value.
 ///
 /// `schur_pd_floor` is the #1038 spectral floor (`options.schur_pd_floor`). The
@@ -2960,7 +2964,7 @@ impl SmallLu {
 /// when the caller had opted into the floor — the last plumbing gap #1795 calls
 /// out. Threading the floor through `factor_dense_reduced_schur` (unit-deflating
 /// the null decoder directions, the evidence/log-det convention) keeps this
-/// cross-row IBP arrow-Schur solve consistent with the direct path and
+/// cross-row ordered Beta--Bernoulli arrow-Schur solve consistent with the direct path and
 /// byte-identical on well-conditioned `S`.
 pub fn streaming_cross_row_woodbury_log_det(
     schur: &Array2<f64>,
@@ -3013,7 +3017,7 @@ pub fn streaming_cross_row_woodbury_log_det(
 }
 
 impl CrossRowWoodbury {
-    /// Build the exact rank-`R` cross-row Woodbury carrier from the IBP source
+    /// Build the exact rank-`R` cross-row Woodbury carrier from the ordered Beta--Bernoulli source
     /// and a cache whose per-row factors are the NO-SELF base `H₀'`.
     ///
     /// Computes `H₀'⁻¹U` (one [`ArrowFactorCache::full_inverse_apply`] back-solve
@@ -3025,7 +3029,7 @@ impl CrossRowWoodbury {
     /// key off the presence of this carrier).
     pub(crate) fn build(
         cache: &ArrowFactorCache,
-        source: &IbpCrossRowSource,
+        source: &OrderedBetaBernoulliCrossRowSource,
     ) -> Result<Option<Self>, ArrowSchurError> {
         let r = source.r;
         let total_len = cache.delta_t_len();
@@ -3444,7 +3448,7 @@ impl ArrowFactorCache {
     /// This is the matrix-free large-`k` SAE evidence path: the reduced Schur is
     /// never Cholesky-factored, so `schur_factor` is `None` and `log|S|` comes
     /// from Stochastic Lanczos Quadrature ([`crate::arrow_schur::slq_logdet`]).
-    /// The per-row latent-block term and the cross-row IBP Woodbury correction
+    /// The per-row latent-block term and the cross-row ordered Beta--Bernoulli Woodbury correction
     /// are computed exactly as in [`Self::compute_undamped_arrow_log_det`], with
     /// the same ridge / positivity / finiteness guards, so a non-PD per-row
     /// factor or a non-finite estimate yields `None` rather than a silent NaN.
@@ -3538,9 +3542,9 @@ impl ArrowFactorCache {
             .filter(|log_det| log_det.is_finite())
     }
 
-    /// The exact cross-row IBP correction `log det(I_R + D·M)` to add to the
+    /// The exact cross-row ordered Beta--Bernoulli correction `log det(I_R + D·M)` to add to the
     /// base `log det H₀'` (#1038). Zero when no [`CrossRowWoodbury`] is present,
-    /// so non-IBP caches are unaffected. The determinant lemma gives
+    /// so other caches are unaffected. The determinant lemma gives
     /// `log det H_full = log det H₀' + log det(I_R + D Uᵀ H₀'⁻¹ U)`; this is the
     /// second term, the only piece beyond the bare arrow log-determinant.
     ///
@@ -3688,7 +3692,7 @@ impl ArrowFactorCache {
     /// criterion's own `H` — never a damped surrogate (that would desync the
     /// gradient from the reported evidence).
     ///
-    /// When the cache carries an exact cross-row IBP
+    /// When the cache carries an exact cross-row ordered Beta--Bernoulli
     /// [`CrossRowWoodbury`] (#1038), the per-row factors are the NO-SELF base
     /// `H₀'` and this method layers the rank-`R` Woodbury correction so the
     /// returned solve is against the FULL `H_full = H₀' + U D Uᵀ` — the same
@@ -3827,12 +3831,12 @@ impl ArrowFactorCache {
     /// same not-yet-supported branch as [`Self::latent_block_inverse_diagonal`]
     /// — or when `rhs.len() != k`.
     ///
-    /// Cross-row IBP (#1038) note: this is the β-block primitive of the
+    /// Cross-row ordered Beta--Bernoulli (#1038) note: this is the β-block primitive of the
     /// factored base `S_β` (`H₀'` when a [`CrossRowWoodbury`] is present), used
     /// internally by [`Self::full_inverse_apply_base`]; it is deliberately NOT
     /// Woodbury-corrected so the base solve stays bare. The cross-row term has
     /// no `β` support, so `(H_full⁻¹)_ββ = S_β⁻¹` exactly on the directions any
-    /// IBP ρ-trace contracts. A consumer needing the full `(H_full⁻¹)_ββ` for a
+    /// ordered Beta--Bernoulli ρ-trace contracts. A consumer needing the full `(H_full⁻¹)_ββ` for a
     /// β-supported direction should call [`Self::full_inverse_apply`] with a
     /// unit `β`-RHS (which applies the rank-`R` correction).
     pub fn schur_inverse_apply(
@@ -4032,11 +4036,8 @@ impl ChunkSchurStack {
             .expect("ChunkSchurStack left buffer matches its recorded shape");
         let right = ndarray::ArrayView2::from_shape(shape, self.right.as_slice())
             .expect("ChunkSchurStack right buffer matches its recorded shape");
-        let product = gam_linalg::faer_ndarray::fast_atb_with_parallelism(
-            &left,
-            &right,
-            faer::Par::Seq,
-        );
+        let product =
+            gam_linalg::faer_ndarray::fast_atb_with_parallelism(&left, &right, faer::Par::Seq);
         *s_part -= &product;
         self.left.clear();
         self.right.clear();

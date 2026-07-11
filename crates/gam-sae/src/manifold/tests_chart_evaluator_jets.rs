@@ -129,7 +129,7 @@ pub(crate) fn seed_coords_by_decoder_projection_recovers_continuous_minimiser() 
     let (phi0, jet0) = evaluator.evaluate(init_coords.view()).unwrap();
     // (basis = [1, sin, cos]) × (2 output channels): decode(t) = (sin, cos).
     let decoder = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -189,7 +189,7 @@ pub(crate) fn seed_coords_by_decoder_projection_rejects_shape_mismatch() {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let (phi0, jet0) = evaluator.evaluate(init_coords.view()).unwrap();
     let decoder = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
@@ -921,7 +921,7 @@ pub(crate) fn euclidean_affine_gauge_canonicalization_preserves_reconstruction()
     }
     let (phi, jet) = evaluator.evaluate(coords.view())?;
     let decoder = array![[0.25, -0.4], [1.2, 0.3], [-0.15, 0.5]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "euclidean_patch",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -965,7 +965,7 @@ pub(crate) fn quotient_step_norm_removes_pure_euclidean_affine_gauge() -> Result
     let coords = array![[-1.0_f64], [-0.4], [0.2], [0.8], [1.3]];
     let (phi, jet) = evaluator.evaluate(coords.view())?;
     let decoder = array![[0.1, -0.2], [1.0, 0.4], [0.25, -0.3]];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "euclidean_patch",
         SaeAtomBasisKind::EuclideanPatch,
         1,

@@ -1593,7 +1593,7 @@ mod tests {
         let decoder = Array2::from_shape_fn((m, p), |(bidx, c)| {
             (1.0 / (1.0 + bidx as f64)) * (((bidx as f64 + 1.0) * (c as f64 + 1.0)) * 0.3).cos()
         });
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "euclid",
             SaeAtomBasisKind::EuclideanPatch,
             d,

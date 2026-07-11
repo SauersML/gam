@@ -33,7 +33,7 @@ fn build_circle_term(coords_col: &Array2<f64>, decoder: &Array2<f64>) -> SaeMani
     let (phi, jet) = periodic_basis(coords_col);
     let m = phi.ncols();
     assert_eq!(decoder.nrows(), m, "decoder rows must equal basis width");
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -280,7 +280,7 @@ fn build_line_term(coords_col: &Array2<f64>, decoder: &Array2<f64>) -> SaeManifo
         .expect("monomial basis evaluates");
     let m = phi.ncols();
     assert_eq!(decoder.nrows(), m, "decoder rows must equal basis width");
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "line",
         SaeAtomBasisKind::Linear,
         1,

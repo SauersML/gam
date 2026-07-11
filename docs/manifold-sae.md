@@ -24,7 +24,7 @@ fit = gamfit.sae_manifold_fit(
     K=16,                       # dictionary size
     d_atom=1,                   # intrinsic dim per atom (default 2; int, or per-atom list)
     atom_topology="circle",     # default "circle"; see the topology table below
-    assignment="ordered_beta_bernoulli",       # ordered independent Beta--Bernoulli sparsity
+    assignment="softmax",           # production default
 )
 
 print(fit)              # ManifoldSAE(K=16, d_atom=1, atom_topology='circle', ...)
@@ -146,7 +146,8 @@ smoothing weights selected by REML. Each piece plays a distinct role
 
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
   is selected by the assignment prior. The three supported kinds are
-  `"ordered_beta_bernoulli"` (default), `"softmax"`, and `"threshold_gate"`.
+  `"softmax"` (default), `"ordered_beta_bernoulli"`, `"threshold_gate"`, and
+  `"topk"`.
   The ordered Beta--Bernoulli route uses posterior-mean relaxed indicators
   `z_ik = σ(ℓ_ik/τ)` directly in reconstruction. Its independent column rates
   satisfy `π_k ~ Beta(a_k, 1)` with

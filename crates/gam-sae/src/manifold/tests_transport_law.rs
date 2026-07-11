@@ -49,7 +49,7 @@ fn circle_atom(
 ) -> SaeManifoldAtom {
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let m = phi.ncols();
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         "cc",
         SaeAtomBasisKind::Periodic,
         1,
@@ -133,7 +133,7 @@ fn transport_projection_recovers_off_lattice_phase_at_coarse_reporting_density()
     decoder[[1, 3]] = -angle.sin();
     decoder[[2, 2]] = angle.sin();
     decoder[[2, 3]] = angle.cos();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "off-lattice-transport",
         SaeAtomBasisKind::Periodic,
         1,

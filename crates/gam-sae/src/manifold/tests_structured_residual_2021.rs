@@ -58,7 +58,7 @@ fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
             let decoder = Array2::<f64>::from_shape_fn((2, p), |(m, c)| {
                 0.1 * f * ((m + 1) as f64) - 0.05 * (c as f64) + 0.02 * f
             });
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 format!("atom{i}"),
                 SaeAtomBasisKind::EuclideanPatch,
                 1,

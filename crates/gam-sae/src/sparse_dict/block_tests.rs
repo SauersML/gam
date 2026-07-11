@@ -88,9 +88,8 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
     // SELECTED — the historical selection-only gate committed it forever even
     // though it changed no objective value. The transaction must reject on the
     // strict RSS/evidence gate and restore every live field.
-    let x = Array2::<f32>::from_shape_fn((16, 2), |(_, column)| {
-        if column == 0 { 1.0 } else { 0.0 }
-    });
+    let x =
+        Array2::<f32>::from_shape_fn((16, 2), |(_, column)| if column == 0 { 1.0 } else { 0.0 });
     let config = BlockSparseConfig {
         n_blocks: 2,
         block_size: 1,
@@ -106,17 +105,8 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
     let mut decoder = Array2::<f32>::zeros((2, 2));
     decoder[[1, 0]] = 1.0;
     let mut gamma = 1.0_f32;
-    let mut codes = route_and_code_all(
-        x.view(),
-        decoder.view(),
-        gamma,
-        2,
-        1,
-        1,
-        16,
-        2,
-    )
-    .expect("baseline route");
+    let mut codes = route_and_code_all(x.view(), decoder.view(), gamma, 2, 1, 1, 16, 2)
+        .expect("baseline route");
     let mut rss = reconstruction_rss(x.view(), &codes, decoder.view(), 1);
     let tss = centered_total_sum_squares(x.view());
     let mut criterion = explained_variance_from_rss(rss, tss);
@@ -126,15 +116,12 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
     };
 
     let mut candidate_decoder = decoder.clone();
-    candidate_decoder.row_mut(0).assign(&proposal.proposed_frame.row(0));
-    let (_, candidate_codes) = route_and_close_gamma(
-        x.view(),
-        candidate_decoder.view(),
-        gamma,
-        &config,
-        1,
-    )
-    .expect("candidate route");
+    candidate_decoder
+        .row_mut(0)
+        .assign(&proposal.proposed_frame.row(0));
+    let (_, candidate_codes) =
+        route_and_close_gamma(x.view(), candidate_decoder.view(), gamma, &config, 1)
+            .expect("candidate route");
     assert!(
         proposal_is_selected(&candidate_codes, 0, 1),
         "fixture must defeat a selection-only birth gate"
@@ -159,7 +146,10 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
     )
     .expect("birth transaction");
 
-    assert!(!accepted, "a zero-improvement selected birth must be rejected");
+    assert!(
+        !accepted,
+        "a zero-improvement selected birth must be rejected"
+    );
     assert_eq!(decoder, decoder_before, "decoder frame was not restored");
     assert_eq!(gamma.to_bits(), gamma_before.to_bits());
     assert_eq!(rss.to_bits(), rss_before.to_bits());
@@ -175,19 +165,10 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
 fn positive_rss_noise_birth_still_fails_rank_charge_2023() {
     let decoder = ndarray::array![[1.0_f32, 0.0_f32]];
     let gram = ndarray::array![[100.0_f64]];
-    let margin = block_birth_evidence_margin(
-        0,
-        1.0e-2,
-        100.0,
-        100,
-        &gram,
-        decoder.view(),
-        100,
-        2,
-        1,
-    )
-    .expect("birth evidence calculation")
-    .expect("fixture has positive realised rank");
+    let margin =
+        block_birth_evidence_margin(0, 1.0e-2, 100.0, 100, &gram, decoder.view(), 100, 2, 1)
+            .expect("birth evidence calculation")
+            .expect("fixture has positive realised rank");
     assert!(
         margin < 0.0,
         "a representable but sub-charge RSS gain must not birth a noise specialist: margin={margin}"

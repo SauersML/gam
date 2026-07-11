@@ -120,7 +120,7 @@ pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782(
             decoder[[m - 1, col]] = 0.1 + 0.02 * ((atom_idx + col) % 3) as f64;
         }
         atoms.push(
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 format!("euclid{atom_idx}"),
                 SaeAtomBasisKind::EuclideanPatch,
                 1,

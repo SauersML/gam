@@ -58,7 +58,11 @@ impl SaeFitAssignmentKind {
     ) -> Result<AssignmentMode, String> {
         match self {
             Self::Softmax => Ok(AssignmentMode::softmax(tau)),
-            Self::OrderedBetaBernoulli => Ok(AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable_alpha)),
+            Self::OrderedBetaBernoulli => Ok(AssignmentMode::ordered_beta_bernoulli(
+                tau,
+                alpha,
+                learnable_alpha,
+            )),
             Self::ThresholdGate => Ok(AssignmentMode::threshold_gate(tau, threshold)),
             Self::TopK => top_k.map(AssignmentMode::top_k_support).ok_or_else(|| {
                 "assignment_kind 'topk' requires top_k (the fixed per-row support size)".to_string()
@@ -337,7 +341,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
         )
     {
-        sae_em_refine_routing_seed(
+        sae_refine_routing_seed(
             &mut base_term,
             request.target,
             request.basis_sizes,

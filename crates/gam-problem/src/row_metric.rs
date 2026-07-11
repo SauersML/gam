@@ -470,8 +470,7 @@ impl RowMetric {
     ) -> Result<Self, String> {
         if self.factors.is_none() {
             return Err(
-                "RowMetric::with_truncation_mass_residual requires a factored metric"
-                    .to_string(),
+                "RowMetric::with_truncation_mass_residual requires a factored metric".to_string(),
             );
         }
         if residual.len() != self.n_rows {
@@ -533,9 +532,8 @@ impl RowMetric {
                 match self.truncation_mass_residual.as_ref() {
                     None => Ok(metric),
                     Some(residual) => {
-                        let gathered = ndarray::Array1::from_iter(
-                            rows.iter().map(|&row| residual[row]),
-                        );
+                        let gathered =
+                            ndarray::Array1::from_iter(rows.iter().map(|&row| residual[row]));
                         metric.with_truncation_mass_residual(Arc::new(gathered))
                     }
                 }

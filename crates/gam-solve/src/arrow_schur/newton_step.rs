@@ -69,7 +69,7 @@ pub fn solve_arrow_newton_step_with_options(
             reason: "streaming Arrow-Schur solve does not materialize the factor cache required by this entry point".to_string(),
         });
     }
-    // #1038 cross-row IBP: when the system carries the exact rank-`R` source, the
+    // #1038 cross-row ordered Beta--Bernoulli: when the system carries the exact rank-`R` source, the
     // evidence base must be the NO-SELF `H₀'` (per-row logit-slot self term
     // `d_k·z'_ik²` downdated), so the full rank-one outer product `U D Uᵀ` — which
     // re-adds the `i=j` diagonal — does not double-count. We factor against `H₀'`,
@@ -77,8 +77,9 @@ pub fn solve_arrow_newton_step_with_options(
     // resulting cache. The Newton step is corrected to `H_full⁻¹(−g)` below so the
     // returned step and the reported curvature describe the SAME `H_full`.
     let downdated_owner;
-    let ibp_source: Option<&IbpCrossRowSource> = sys.ibp_cross_row.as_ref();
-    let sys: &ArrowSchurSystem = match ibp_self_term_downdated_system(sys) {
+    let ordered_beta_bernoulli_source: Option<&OrderedBetaBernoulliCrossRowSource> =
+        sys.ordered_beta_bernoulli_cross_row.as_ref();
+    let sys: &ArrowSchurSystem = match ordered_beta_bernoulli_self_term_downdated_system(sys) {
         Some(downdated) => {
             downdated_owner = downdated;
             &downdated_owner
@@ -190,7 +191,7 @@ pub fn solve_arrow_newton_step_with_options(
     };
     let mut delta_t = step.delta_t;
     let mut delta_beta = step.delta_beta;
-    if let Some(source) = ibp_source {
+    if let Some(source) = ordered_beta_bernoulli_source {
         // The cache's per-row factors are now `H₀'`; build the exact rank-`R`
         // Woodbury (one back-solve per atom column + the `R×R` capacitance LU)
         // and store it so the logdet/inverse/adjoint all read the same
@@ -225,17 +226,19 @@ pub fn solve_arrow_newton_step_with_options(
     Ok((delta_t, delta_beta, cache))
 }
 
-/// #1038 — build the NO-SELF `H₀'` system for an IBP cross-row source: clone the
+/// #1038 — build the NO-SELF `H₀'` system for an ordered Beta--Bernoulli cross-row source: clone the
 /// system and downdate each per-row logit-slot diagonal by the self term
 /// `d_k·z'_ik²`, so factoring against it plus the exact rank-`R` Woodbury
 /// `U D Uᵀ` correction never double-counts the `i = j` diagonal. Returns `None`
-/// when the system carries no `ibp_cross_row` source (factor the system as-is).
+/// when the system carries no `ordered_beta_bernoulli_cross_row` source (factor the system as-is).
 /// Single source of the downdate arithmetic for the full evidence entry
 /// ([`solve_arrow_newton_step_with_options`]) and the per-row feasibility probe
 /// ([`probe_undamped_evidence_row_factors`]), so both always factor the SAME
 /// per-row blocks and reach the identical PD / non-PD verdict.
-pub(crate) fn ibp_self_term_downdated_system(sys: &ArrowSchurSystem) -> Option<ArrowSchurSystem> {
-    let source = sys.ibp_cross_row.as_ref()?;
+pub(crate) fn ordered_beta_bernoulli_self_term_downdated_system(
+    sys: &ArrowSchurSystem,
+) -> Option<ArrowSchurSystem> {
+    let source = sys.ordered_beta_bernoulli_cross_row.as_ref()?;
     let mut downdated = sys.clone();
     let total_len = downdated.row_offsets[downdated.rows.len()];
     let down = source.self_term_downdate(total_len);
@@ -255,7 +258,8 @@ pub(crate) fn ibp_self_term_downdated_system(sys: &ArrowSchurSystem) -> Option<A
 /// #2080 — per-row-only UNDAMPED evidence feasibility factorization.
 ///
 /// Factors ONLY the per-row `H_tt^(i)` blocks at `ridge_t = 0` — with the same
-/// IBP self-term downdate ([`ibp_self_term_downdated_system`]) and the same
+/// ordered Beta--Bernoulli self-term downdate
+/// ([`ordered_beta_bernoulli_self_term_downdated_system`]) and the same
 /// gauge / spectral deflation policy ([`factor_blocks_for_system`]) the full
 /// evidence entry `solve_arrow_newton_step_with_options(sys, 0.0, 0.0, options)`
 /// applies as its FIRST stage — then discards the factors. It never forms the
@@ -279,8 +283,8 @@ pub(crate) fn ibp_self_term_downdated_system(sys: &ArrowSchurSystem) -> Option<A
 /// failures surfaced — at the stationary iterate's full factorization).
 /// Cross-row-penalty systems route the full solve through matrix-free CG,
 /// where no per-row-only verdict exists, so they return `Ok(())` here; the SAE
-/// evidence path never carries `cross_row_penalties` (its IBP coupling is the
-/// separate `ibp_cross_row` Woodbury source, which IS downdated and checked).
+/// evidence path never carries `cross_row_penalties` (its ordered Beta--Bernoulli coupling is the
+/// separate `ordered_beta_bernoulli_cross_row` Woodbury source, which IS downdated and checked).
 pub fn probe_undamped_evidence_row_factors(
     sys: &ArrowSchurSystem,
     options: &ArrowSolveOptions,
@@ -300,7 +304,7 @@ pub fn probe_undamped_evidence_row_factors(
         return Ok(());
     }
     let downdated_owner;
-    let sys: &ArrowSchurSystem = match ibp_self_term_downdated_system(sys) {
+    let sys: &ArrowSchurSystem = match ordered_beta_bernoulli_self_term_downdated_system(sys) {
         Some(downdated) => {
             downdated_owner = downdated;
             &downdated_owner

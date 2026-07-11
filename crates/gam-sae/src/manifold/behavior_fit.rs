@@ -279,8 +279,14 @@ impl SaeManifoldTerm {
             let base_unscaled: Vec<f64> = (0..blocks.len())
                 .map(|i| base_scaled[i] / cur_log_lambda[i].exp())
                 .collect();
-            let baseline_crit =
-                profiled_penalized_laml_criterion(n_obs, px, base_rx, &base_unscaled, &dims, &cur_log_lambda);
+            let baseline_crit = profiled_penalized_laml_criterion(
+                n_obs,
+                px,
+                base_rx,
+                &base_unscaled,
+                &dims,
+                &cur_log_lambda,
+            );
             // The improved current-λ fit to fall back to if no λ step is accepted.
             let baseline_state = self.fit_state_snapshot();
             // The term currently holds this baseline fit; record its loss so any
@@ -396,8 +402,14 @@ impl SaeManifoldTerm {
                     let trb_unscaled: Vec<f64> = (0..blocks.len())
                         .map(|i| trb_scaled[i] / trial_ll[i].exp())
                         .collect();
-                    let trial_crit =
-                        profiled_penalized_laml_criterion(n_obs, px, trx, &trb_unscaled, &dims, &trial_ll);
+                    let trial_crit = profiled_penalized_laml_criterion(
+                        n_obs,
+                        px,
+                        trx,
+                        &trb_unscaled,
+                        &dims,
+                        &trial_ll,
+                    );
                     Ok(Some((trial_crit, (trial_ll, trial_loss))))
                 },
                 |_s, trial_crit| trial_crit < baseline_crit - armijo_eps,

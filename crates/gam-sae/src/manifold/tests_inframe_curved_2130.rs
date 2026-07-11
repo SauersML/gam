@@ -589,7 +589,7 @@ fn activate_residual_frame_installs_factored_decoder_and_engages_frames() {
     let basis_values = Array2::<f64>::zeros((1, m));
     let basis_jacobian = Array3::<f64>::zeros((1, m, 1));
     let smooth_penalty = Array2::<f64>::eye(m);
-    let mut atom = SaeManifoldAtom::new(
+    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
         "seam",
         SaeAtomBasisKind::Periodic,
         1,

@@ -42,7 +42,7 @@ fn e3_crosscoder_handoff_uses_one_shared_moved_coordinate() {
     decoder[[2, 2]] = block_sqrt_lambda * phase_angle.sin();
     decoder[[2, 3]] = block_sqrt_lambda * phase_angle.cos();
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "e3-shared-circle",
         SaeAtomBasisKind::Periodic,
         1,

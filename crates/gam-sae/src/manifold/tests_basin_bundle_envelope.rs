@@ -121,7 +121,7 @@ fn two_circle_periodic_term(
                 rss += r * r;
             }
         }
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle",
             SaeAtomBasisKind::Periodic,
             dim,
@@ -319,11 +319,8 @@ fn fixed_legal_rho_envelope_value_is_stable_across_re_evaluation() {
     let scalar_contract = OuterObjective::reactive_domain_scalar_contract(&objective)
         .expect("reactive scalar contract construction must succeed")
         .expect("dense K=2 objective must advertise a reactive scalar entry");
-    OuterObjective::install_reactive_domain_scalar_state(
-        &mut objective,
-        scalar_contract.entry(),
-    )
-    .expect("objective must install its own legal scalar entry");
+    OuterObjective::install_reactive_domain_scalar_state(&mut objective, scalar_contract.entry())
+        .expect("objective must install its own legal scalar entry");
 
     let c1 = objective
         .eval_cost(&legal_rho)

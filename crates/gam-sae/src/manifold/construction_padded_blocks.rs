@@ -62,6 +62,13 @@ pub fn term_from_padded_blocks_with_mode(
         let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
         let b = decoder_coefficients.slice(s![k, 0..m, 0..p_out]).to_owned();
         let s = smooth_penalties.slice(s![k, 0..m, 0..m]).to_owned();
+        let reference_roughness = if matches!(basis_kinds[k], SaeAtomBasisKind::Poincare) {
+            SaeReferenceRoughness::PoincareConformalDirichlet {
+                reference_coords: coords[k].clone(),
+            }
+        } else {
+            SaeReferenceRoughness::ProvidedFunctionGram(s)
+        };
         let atom = SaeManifoldAtom::new(
             format!("atom_{k}"),
             basis_kinds[k].clone(),
@@ -69,7 +76,7 @@ pub fn term_from_padded_blocks_with_mode(
             phi,
             jet,
             b,
-            s,
+            reference_roughness,
         )?;
         let atom = match evaluators.get(k).and_then(|slot| slot.clone()) {
             // Install through the second-jet slot so the analytic Hessian is

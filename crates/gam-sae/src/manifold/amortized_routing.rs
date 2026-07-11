@@ -420,7 +420,7 @@ mod amortized_encoder_glue_tests {
                 dec[[0, col]] = OFFSETS[atom_idx][col];
                 dec[[1, col]] = DIRS[atom_idx][col];
             }
-            let atom = SaeManifoldAtom::new(
+            let atom = SaeManifoldAtom::new_with_provided_function_gram(
                 "lin",
                 SaeAtomBasisKind::EuclideanPatch,
                 1,

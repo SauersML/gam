@@ -107,19 +107,19 @@ use std::sync::Arc;
 pub(crate) use gam_solve::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
-    DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
-    IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
-    SparseRankOnePenaltyOp, StreamingArrowSchur, matrix_free_arrow_inverse_apply,
-    matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions,
-    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
-    solve_with_lm_escalation_inner, streaming_cross_row_woodbury_log_det,
+    DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp,
+    IdentityRightKroneckerPenaltyOp, OrderedBetaBernoulliCrossRowSource,
+    SparseBlockKroneckerPenaltyOp, SparseGBlock, SparseRankOnePenaltyOp, StreamingArrowSchur,
+    matrix_free_arrow_inverse_apply, matrix_free_arrow_operator_apply, prepare_sae_resident_frame,
+    row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction,
+    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
+    streaming_cross_row_woodbury_log_det,
 };
 
 pub(crate) use gam_terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,
     IsometryPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
-    OrderedBetaBernoulliHessianDiagThirdChannels,
-    PenaltyTier, PsiSlice, WeightField,
+    OrderedBetaBernoulliHessianDiagThirdChannels, PenaltyTier, PsiSlice, WeightField,
 };
 // The FFI seed path resolves learnable α through the exact terminal-ρ schedule
 // (`gam::terms::sae::manifold::resolve_learnable_weight`), so this re-export
@@ -272,7 +272,7 @@ mod tests_parallelism_invariance_1557;
 mod tests_olmo;
 
 #[cfg(test)]
-mod tests_ibp_capacity_1784;
+mod tests_ordered_beta_bernoulli_capacity_1784;
 
 #[cfg(test)]
 mod tests_startup_validation_1782;

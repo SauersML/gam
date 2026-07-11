@@ -1163,7 +1163,7 @@ pub(crate) fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
 }
 
 /// #1117/#1118: a per-row `H_tt` that is gauge-flat AND genuinely indefinite
-/// off the gauge orbit (the K>1 IBP/softmax row-sharing state) must be
+/// off the gauge orbit (the K>1 ordered-Beta--Bernoulli/softmax row-sharing state) must be
 /// conditioned by the undamped evidence factor through **unit-stiffness
 /// spectral deflation** — `factor_spectral_deflated_evidence_row` discovers
 /// the negative/flat eigen-direction the closed-form gauge deflation cannot
@@ -2376,7 +2376,7 @@ pub(crate) fn streaming_mixed_precision_default_upgrades_only_off() {
 }
 
 // ----------------------------------------------------------------------
-// #1038 cross-row IBP Woodbury: value + log-determinant + adjoint must all
+// #1038 cross-row ordered Beta--Bernoulli Woodbury: value + log-determinant + adjoint must all
 // describe the SAME dense `H_full = H₀' + U D Uᵀ`. These checks build the
 // dense bordered `H_full` explicitly (the i≠j cross-row terms layered onto
 // the assembled self-term `H₀`) and assert the cache reproduces its
@@ -2384,11 +2384,15 @@ pub(crate) fn streaming_mixed_precision_default_upgrades_only_off() {
 // Newton step `H_full⁻¹(−g)` exactly.
 // ----------------------------------------------------------------------
 
-/// Build a small `(N, d, K_beta)` system with `R` IBP atom columns whose
+/// Build a small `(N, d, K_beta)` system with `R` ordered Beta--Bernoulli atom columns whose
 /// logit slots are the first `R` latent coords of every row. Returns the
 /// system (with the self term `d_k·z'_ik²` already on the logit diagonals,
 /// as the assembly writes it), the source, and the per-(row, atom) `z'_ik`.
-pub(crate) fn build_ibp_woodbury_fixture() -> (ArrowSchurSystem, IbpCrossRowSource, Vec<Vec<f64>>) {
+pub(crate) fn build_ordered_beta_bernoulli_woodbury_fixture() -> (
+    ArrowSchurSystem,
+    OrderedBetaBernoulliCrossRowSource,
+    Vec<Vec<f64>>,
+) {
     let n = 3usize;
     let d = 2usize;
     let k_beta = 2usize;
@@ -2407,7 +2411,7 @@ pub(crate) fn build_ibp_woodbury_fixture() -> (ArrowSchurSystem, IbpCrossRowSour
     sys.hbb = array![[12.0_f64, 0.7], [0.7, 10.0]];
     sys.gb = array![0.5_f64, -0.8];
 
-    // IBP source: d_k coefficients (one positive, one negative — exercise the
+    // ordered Beta--Bernoulli source: d_k coefficients (one positive, one negative — exercise the
     // indefinite-capacitance LU path) and z'_ik per (row, atom).
     let d_coef = array![0.6_f64, -0.35];
     let zprime = vec![
@@ -2429,7 +2433,7 @@ pub(crate) fn build_ibp_woodbury_fixture() -> (ArrowSchurSystem, IbpCrossRowSour
             sys.rows[i].htt[[k, k]] += d_coef[k] * zprime[i][k] * zprime[i][k];
         }
     }
-    let source = IbpCrossRowSource {
+    let source = OrderedBetaBernoulliCrossRowSource {
         r,
         d: d_coef,
         entries,
@@ -2441,7 +2445,7 @@ pub(crate) fn build_ibp_woodbury_fixture() -> (ArrowSchurSystem, IbpCrossRowSour
 /// the self-term system + source.
 pub(crate) fn dense_h_full(
     sys: &ArrowSchurSystem,
-    source: &IbpCrossRowSource,
+    source: &OrderedBetaBernoulliCrossRowSource,
     zprime: &[Vec<f64>],
 ) -> Array2<f64> {
     let n = sys.rows.len();
@@ -2486,12 +2490,12 @@ pub(crate) fn dense_h_full(
 }
 
 #[test]
-pub(crate) fn ibp_cross_row_woodbury_logdet_matches_dense() {
-    let (mut sys, source, zprime) = build_ibp_woodbury_fixture();
-    sys.set_ibp_cross_row_source(source.clone());
+pub(crate) fn ordered_beta_bernoulli_cross_row_woodbury_logdet_matches_dense() {
+    let (mut sys, source, zprime) = build_ordered_beta_bernoulli_woodbury_fixture();
+    sys.set_ordered_beta_bernoulli_cross_row_source(source.clone());
     let options = ArrowSolveOptions::direct();
     let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
-        .expect("IBP Woodbury cache should factor");
+        .expect("ordered Beta--Bernoulli Woodbury cache should factor");
     assert!(
         cache.cross_row_woodbury.is_some(),
         "the cache must carry the cross-row Woodbury"
@@ -2542,7 +2546,7 @@ pub(crate) fn ibp_cross_row_woodbury_logdet_matches_dense() {
     );
 }
 
-/// #1795 — the streaming cross-row IBP Woodbury log-det must honor the #1038
+/// #1795 — the streaming cross-row ordered Beta--Bernoulli Woodbury log-det must honor the #1038
 /// spectral PD-floor on the reduced Schur it inverts, exactly like every other
 /// SAE-path factorization. In the overcomplete / dead-atom regime the GLOBAL
 /// reduced Schur `S` (projecting `M0 → M`) can be slightly indefinite; the site
@@ -2550,7 +2554,7 @@ pub(crate) fn ibp_cross_row_woodbury_logdet_matches_dense() {
 /// even when the caller had opted into the floor (`options.schur_pd_floor`),
 /// which is the last plumbing gap the issue calls out.
 ///
-/// This constructs a cross-row IBP arrow-Schur case whose reduced Schur is
+/// This constructs a cross-row ordered Beta--Bernoulli arrow-Schur case whose reduced Schur is
 /// indefinite (eigenvalues `+3, −1`): WITHOUT the floor the solve aborts with
 /// `SchurFactorFailed`; WITH the floor the null decoder direction is
 /// unit-deflated, `S` factors PD, and the capacitance log-det comes back finite.
@@ -2590,7 +2594,7 @@ pub(crate) fn streaming_cross_row_woodbury_log_det_honors_pd_floor_1795() {
     );
 }
 
-/// #1795 — the cross-row IBP preconditioner builder is another reduced-Schur
+/// #1795 — the cross-row ordered Beta--Bernoulli preconditioner builder is another reduced-Schur
 /// factorization entry point. It must use the same spectral PD-floor as the
 /// direct dense solve, rather than a raw Cholesky, because the preconditioner
 /// inverts the same collapsed decoder subspace before CG handles the explicit
@@ -2630,13 +2634,13 @@ pub(crate) fn cross_row_preconditioner_build_honors_pd_floor_1795() {
 }
 
 #[test]
-pub(crate) fn ibp_cross_row_woodbury_full_inverse_and_newton_match_dense() {
-    let (mut sys, source, zprime) = build_ibp_woodbury_fixture();
-    sys.set_ibp_cross_row_source(source.clone());
+pub(crate) fn ordered_beta_bernoulli_cross_row_woodbury_full_inverse_and_newton_match_dense() {
+    let (mut sys, source, zprime) = build_ordered_beta_bernoulli_woodbury_fixture();
+    sys.set_ordered_beta_bernoulli_cross_row_source(source.clone());
     let options = ArrowSolveOptions::direct();
     let (delta_t, delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
-            .expect("IBP Woodbury cache should factor");
+            .expect("ordered Beta--Bernoulli Woodbury cache should factor");
 
     let n = sys.rows.len();
     let d = sys.d;
@@ -2733,13 +2737,13 @@ pub(crate) fn ibp_cross_row_woodbury_full_inverse_and_newton_match_dense() {
 /// cross-row correction's own internal coherence: removing the source must
 /// recover the bare-`H₀'` log-determinant (no double-count), and the
 /// rank-`R` capacitance LU determinant matches the dense ratio. (Covered by
-/// `ibp_cross_row_woodbury_logdet_matches_dense`.) Here we additionally
+/// `ordered_beta_bernoulli_cross_row_woodbury_logdet_matches_dense`.) Here we additionally
 /// check that a system WITHOUT the source yields no Woodbury carrier and an
-/// unchanged (bare) log-determinant, so the path is a strict no-op off-IBP.
+/// unchanged (bare) log-determinant, so the path is a strict no-op outside ordered Beta--Bernoulli mode.
 #[test]
-pub(crate) fn ibp_cross_row_woodbury_absent_is_strict_noop() {
-    let (sys, _source, zprime) = build_ibp_woodbury_fixture();
-    // No set_ibp_cross_row_source call: the source is absent.
+pub(crate) fn ordered_beta_bernoulli_cross_row_woodbury_absent_is_strict_noop() {
+    let (sys, _source, zprime) = build_ordered_beta_bernoulli_woodbury_fixture();
+    // No set_ordered_beta_bernoulli_cross_row_source call: the source is absent.
     let options = ArrowSolveOptions::direct();
     let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
         .expect("bare cache should factor");
@@ -2793,18 +2797,18 @@ pub(crate) fn ibp_cross_row_woodbury_absent_is_strict_noop() {
     assert_eq!(zprime.len(), n);
 }
 
-/// The streaming log-det path must REFUSE an IBP-active system rather than
+/// The streaming log-det path must REFUSE an ordered-Beta--Bernoulli-active system rather than
 /// silently drop the cross-row correction (a value↔gradient desync).
 #[test]
-pub(crate) fn ibp_cross_row_streaming_logdet_refuses() {
-    let (mut sys, source, _zprime) = build_ibp_woodbury_fixture();
-    sys.set_ibp_cross_row_source(source);
+pub(crate) fn ordered_beta_bernoulli_cross_row_streaming_logdet_refuses() {
+    let (mut sys, source, _zprime) = build_ordered_beta_bernoulli_woodbury_fixture();
+    sys.set_ordered_beta_bernoulli_cross_row_source(source);
     let mut streaming = StreamingArrowSchur::from_system(&sys, 2);
     let options = ArrowSolveOptions::direct();
     let err = streaming.reduced_schur_and_log_det_tt(0.0, 0.0, &options);
     assert!(
         err.is_err(),
-        "streaming arrow log-det must refuse an IBP-active system"
+        "streaming arrow log-det must refuse an ordered-Beta--Bernoulli-active system"
     );
 }
 
@@ -5124,7 +5128,11 @@ fn cholesky_lower_faer_path_matches_scalar_reference_on_wide_schur() {
     for i in 0..k {
         for j in 0..k {
             if j > i {
-                assert_eq!(l[[i, j]], 0.0, "faer factor must be lower-triangular at ({i},{j})");
+                assert_eq!(
+                    l[[i, j]],
+                    0.0,
+                    "faer factor must be lower-triangular at ({i},{j})"
+                );
             } else {
                 max_factor_diff = max_factor_diff.max((l[[i, j]] - ref_l[[i, j]]).abs());
             }
@@ -5915,46 +5923,33 @@ fn matrix_free_full_arrow_apply_and_inverse_match_dense_cache() {
         .expect("undamped dense oracle factorization");
 
     let t_len = cache.delta_t_len();
-    let vector_t = Array1::<f64>::from_shape_fn(t_len, |index| {
-        0.2 * ((index as f64 + 1.0) * 0.37).sin()
-    });
-    let vector_beta = Array1::<f64>::from_shape_fn(k, |index| {
-        0.15 * ((index as f64 + 2.0) * 0.23).cos()
-    });
-    let (dense_t, dense_beta) = arrow_operator_apply(
-        &sys,
-        0.0,
-        0.0,
-        vector_t.view(),
-        vector_beta.view(),
-    );
-    let (matrix_free_t, matrix_free_beta) = matrix_free_arrow_operator_apply(
-        &sys,
-        &cache,
-        vector_t.view(),
-        vector_beta.view(),
-    )
-    .expect("matrix-free full-arrow apply");
+    let vector_t =
+        Array1::<f64>::from_shape_fn(t_len, |index| 0.2 * ((index as f64 + 1.0) * 0.37).sin());
+    let vector_beta =
+        Array1::<f64>::from_shape_fn(k, |index| 0.15 * ((index as f64 + 2.0) * 0.23).cos());
+    let (dense_t, dense_beta) =
+        arrow_operator_apply(&sys, 0.0, 0.0, vector_t.view(), vector_beta.view());
+    let (matrix_free_t, matrix_free_beta) =
+        matrix_free_arrow_operator_apply(&sys, &cache, vector_t.view(), vector_beta.view())
+            .expect("matrix-free full-arrow apply");
     let apply_error = (&matrix_free_t - &dense_t)
         .mapv(|value| value * value)
         .sum()
         + (&matrix_free_beta - &dense_beta)
             .mapv(|value| value * value)
             .sum();
-    let apply_scale = dense_t.mapv(|value| value * value).sum()
-        + dense_beta.mapv(|value| value * value).sum();
+    let apply_scale =
+        dense_t.mapv(|value| value * value).sum() + dense_beta.mapv(|value| value * value).sum();
     assert!(
         apply_error.sqrt() <= 1.0e-11 * apply_scale.sqrt().max(1.0),
         "matrix-free Bv must match the dense assembled operator: rel={:.3e}",
         apply_error.sqrt() / apply_scale.sqrt().max(1.0)
     );
 
-    let rhs_t = Array1::<f64>::from_shape_fn(t_len, |index| {
-        0.1 * ((index as f64 + 3.0) * 0.41).cos()
-    });
-    let rhs_beta = Array1::<f64>::from_shape_fn(k, |index| {
-        0.12 * ((index as f64 + 4.0) * 0.19).sin()
-    });
+    let rhs_t =
+        Array1::<f64>::from_shape_fn(t_len, |index| 0.1 * ((index as f64 + 3.0) * 0.41).cos());
+    let rhs_beta =
+        Array1::<f64>::from_shape_fn(k, |index| 0.12 * ((index as f64 + 4.0) * 0.19).sin());
     let (dense_solved_t, dense_solved_beta) = cache
         .full_inverse_apply(rhs_t.view(), rhs_beta.view())
         .expect("dense full-arrow inverse");

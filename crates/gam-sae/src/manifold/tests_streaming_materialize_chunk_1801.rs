@@ -24,7 +24,7 @@ fn materialize_chunk_synthesizes_euclidean_patch_evaluator() -> Result<(), Strin
     let decoder = array![[0.2, -0.5], [1.1, 0.35], [-0.15, 0.6]];
     // Built via the general constructor WITHOUT `with_basis_evaluator`, so the
     // atom carries no evaluator — exactly the streaming-unfriendly shape.
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "euclidean_patch",
         SaeAtomBasisKind::EuclideanPatch,
         1,

@@ -61,6 +61,7 @@ fn standard_smooth_fit_saves_successfully_with_out() {
         stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n")
     );
 
-    let saved = std::fs::metadata(out.path()).expect("model file must exist after a successful fit");
+    let saved =
+        std::fs::metadata(out.path()).expect("model file must exist after a successful fit");
     assert!(saved.len() > 0, "saved model file must be non-empty");
 }

@@ -34,7 +34,7 @@ pub(crate) fn real_data_torus_seed_term(
         }
         let xtz = fast_atb(&phi, &z.to_owned());
         let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "torus",
             SaeAtomBasisKind::Periodic,
             2,
@@ -504,7 +504,7 @@ pub(crate) fn fit_data_collapse_verdict_is_absolute_degeneracy_not_competitivene
         jet[[row, 1, 0]] = 2.0 * std::f64::consts::PI * angle.cos();
         jet[[row, 2, 0]] = -2.0 * std::f64::consts::PI * angle.sin();
     }
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -952,7 +952,7 @@ pub(crate) fn oos_train_curved(
         }
         let xtz = fast_atb(&phi, &z_tr.to_owned());
         let dec = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             "t",
             SaeAtomBasisKind::Periodic,
             d,
@@ -1154,7 +1154,7 @@ fn certified_encode_is_globally_sound_near_self_crossing() {
     let mut decoder = Array2::<f64>::zeros((m, 2));
     decoder[[2, 0]] = 1.0; // x = cos 2πt
     decoder[[3, 1]] = 1.0; // y = sin 4πt
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "fig8",
         SaeAtomBasisKind::Periodic,
         1,

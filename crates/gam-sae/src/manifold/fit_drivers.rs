@@ -30,21 +30,6 @@ struct JointFitOutcome {
     state_moved: bool,
 }
 
-/// Whether disjoint chart placement starts a new ordinary inner objective or
-/// moves inside an already-declared reactive objective.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DisjointChartPenaltyPolicy {
-    /// Ordinary cold entry is the initialization boundary: derive the intrinsic
-    /// coefficient-space roughness operator from the placed decoder before the
-    /// first joint assembly freezes it.
-    RefreshAtColdEntry,
-    /// Reactive continuation moves inside one objective whose native roughness
-    /// operator already defined the advertised rho face. Preserve that operator
-    /// exactly; changing it here would make the installed waypoint a different
-    /// objective from the one whose legal face the runner queried.
-    PreserveReactiveObjective,
-}
-
 pub(crate) struct EvidenceJointFitOutcome {
     pub(crate) loss: SaeManifoldLoss,
     /// A whole evidence-only re-entry started at the current state and found no
@@ -2967,7 +2952,9 @@ impl SaeManifoldTerm {
             if !(s.is_finite() && s > 1.0) {
                 continue;
             }
-            self.atoms[atom].decoder_coefficients.mapv_inplace(|v| v / s);
+            self.atoms[atom]
+                .decoder_coefficients
+                .mapv_inplace(|v| v / s);
             let ln_s = s.ln();
             for row in 0..n {
                 self.assignment.logits[[row, atom]] += ln_s;
@@ -3787,7 +3774,6 @@ impl SaeManifoldTerm {
                     self.atoms[best_atom].decoder_coefficients[[col, out]] = beta[[col, out]];
                 }
             }
-            self.atoms[best_atom].refresh_intrinsic_smooth_penalty();
             remaining.retain(|&a| a != best_atom);
         }
         Ok(())
@@ -4167,10 +4153,7 @@ impl SaeManifoldTerm {
         &mut self,
         target: ArrayView2<'_, f64>,
     ) -> Result<(), String> {
-        self.seed_disjoint_charts_with_penalty_policy(
-            target,
-            DisjointChartPenaltyPolicy::RefreshAtColdEntry,
-        )
+        self.seed_disjoint_charts(target)
     }
 
     /// #2080 reactive-domain chart placement.
@@ -4185,17 +4168,10 @@ impl SaeManifoldTerm {
         &mut self,
         target: ArrayView2<'_, f64>,
     ) -> Result<(), String> {
-        self.seed_disjoint_charts_with_penalty_policy(
-            target,
-            DisjointChartPenaltyPolicy::PreserveReactiveObjective,
-        )
+        self.seed_disjoint_charts(target)
     }
 
-    fn seed_disjoint_charts_with_penalty_policy(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        penalty_policy: DisjointChartPenaltyPolicy,
-    ) -> Result<(), String> {
+    fn seed_disjoint_charts(&mut self, target: ArrayView2<'_, f64>) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let k = self.k_atoms();
@@ -4267,9 +4243,6 @@ impl SaeManifoldTerm {
                 for out in 0..p {
                     self.atoms[atom].decoder_coefficients[[col, out]] = beta[[col, out]];
                 }
-            }
-            if penalty_policy == DisjointChartPenaltyPolicy::RefreshAtColdEntry {
-                self.atoms[atom].refresh_intrinsic_smooth_penalty();
             }
         }
         Ok(())
@@ -4391,8 +4364,8 @@ impl SaeManifoldTerm {
                 } else {
                     let assignments = self.assignment.try_assignments_row(row)?;
                     for basis_col in 0..m {
-                        design[[row, basis_col]] = assignments[atom]
-                            * self.atoms[atom].basis_values[[row, basis_col]];
+                        design[[row, basis_col]] =
+                            assignments[atom] * self.atoms[atom].basis_values[[row, basis_col]];
                     }
                 }
             }
@@ -4540,7 +4513,6 @@ impl SaeManifoldTerm {
                     self.atoms[atom].decoder_coefficients[[col, out]] = beta[[col, out]];
                 }
             }
-            self.atoms[atom].refresh_intrinsic_smooth_penalty();
         }
         Ok(())
     }
@@ -6467,9 +6439,11 @@ impl SaeManifoldTerm {
                 term.retract_unit_speed_charts_in_loop()?;
                 term.fix_decoder_scale_gauge()?;
                 if term.frames_active() {
-                    term.refresh_active_frames_from_data(target).map(drop).map_err(|err| {
-                        format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
-                    })?;
+                    term.refresh_active_frames_from_data(target)
+                        .map(drop)
+                        .map_err(|err| {
+                            format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                        })?;
                 }
                 Ok(())
             })? {
@@ -6554,9 +6528,11 @@ impl SaeManifoldTerm {
                         analytic_penalties,
                         obj_scale,
                         |term| {
-                            term.refresh_active_frames_from_data(target).map(drop).map_err(|err| {
-                                format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
-                            })
+                            term.refresh_active_frames_from_data(target)
+                                .map(drop)
+                                .map_err(|err| {
+                                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                                })
                         },
                     )?;
                 }
@@ -6581,7 +6557,7 @@ impl SaeManifoldTerm {
         // entry_at_rho`, outer_objective.rs): a closed-form least-squares decoder
         // refit at the current coordinates/gates (the exact data-optimal decoder for
         // the fixed chart), then a per-row coordinate re-projection onto that
-        // refreshed decoder (a Lloyd/EM step that globally projects each rank-1
+        // refreshed decoder (an objective-guarded block-coordinate sweep that globally projects each rank-1
         // Fourier coordinate through all companion roots), then one more decoder
         // refit at the re-projected coordinates. Coupled compact charts fail this
         // optional round transactionally instead of using a lattice.
@@ -6626,7 +6602,12 @@ impl SaeManifoldTerm {
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
         if max_iter > 0
-            && self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties, allow_heuristic_termination)?
+            && self.sweep_blocks_to_objective_fixed_point(
+                target,
+                rho,
+                analytic_penalties,
+                allow_heuristic_termination,
+            )?
         {
             state_moved = true;
         }
@@ -6775,19 +6756,19 @@ impl SaeManifoldTerm {
                 .refit_decoder_least_squares_at_current_state(target, Some(rho))
                 .and_then(|()| {
                     if frames {
-                        self.refresh_active_frames_from_data(target).map(drop)
+                        self.refresh_active_frames_from_data(target)
+                            .map(drop)
                             .map_err(|err| format!("sweep frame re-polar: {err}"))
                     } else {
                         Ok(())
                     }
                 })
                 .and_then(|()| self.seed_coords_by_decoder_projection(target))
-                .and_then(|()| {
-                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))
-                })
+                .and_then(|()| self.refit_decoder_least_squares_at_current_state(target, Some(rho)))
                 .and_then(|()| {
                     if frames {
-                        self.refresh_active_frames_from_data(target).map(drop)
+                        self.refresh_active_frames_from_data(target)
+                            .map(drop)
                             .map_err(|err| format!("sweep frame re-polar: {err}"))
                     } else {
                         Ok(())
@@ -6819,10 +6800,10 @@ impl SaeManifoldTerm {
         // (no-op at K=1) followed by the decoder refit the anchor contract
         // requires, then a fresh (t, B) chain — each as its OWN
         // strict-decrease transaction, so a rejected gate move can never claw
-        // back committed (t, B) progress. This is the EM shape: E-step gates
-        // toward the decoder that owns each row, M-step refits decoders and
-        // coordinates; the objective gate makes it monotone rather than
-        // heuristic, and the bound (2) exists only because each committed
+        // back committed (t, B) progress. The routing update moves gates toward
+        // the decoder that best explains each row, then the decoder and
+        // coordinate blocks are refit. The shared-objective gate makes the
+        // sweep monotone, and the bound (2) exists only because each committed
         // anchor changes the ownership pattern it would recompute — two dry
         // rounds prove the pattern is stable. Discovery lanes only (see the
         // `discovery_lane` doc): evidence re-entries must be idempotent.
@@ -6830,9 +6811,7 @@ impl SaeManifoldTerm {
             let snapshot = self.snapshot_mutable_state();
             let round = self
                 .anchor_logits_to_residual_ownership(target)
-                .and_then(|()| {
-                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))
-                })
+                .and_then(|()| self.refit_decoder_least_squares_at_current_state(target, Some(rho)))
                 .and_then(|()| {
                     if frames {
                         self.refresh_active_frames_from_data(target)
@@ -6843,9 +6822,7 @@ impl SaeManifoldTerm {
                     }
                 })
                 .and_then(|()| self.seed_coords_by_decoder_projection(target))
-                .and_then(|()| {
-                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))
-                })
+                .and_then(|()| self.refit_decoder_least_squares_at_current_state(target, Some(rho)))
                 .and_then(|()| {
                     self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 });
@@ -7227,20 +7204,17 @@ impl SaeManifoldTerm {
                     atom.latent_dim
                 ));
             }
-            // Seed the chunk atom from the *raw* roughness Gram (not the
-            // already arc-length-reweighted `smooth_penalty`), so its
-            // constructor recovers the true operator order and its own
-            // `refresh_intrinsic_smooth_penalty` reweights from the canonical
-            // penalty on the chunk's coordinates rather than double-applying
-            // the metric (issue #673).
-            let mut chunk_atom = SaeManifoldAtom::new(
+            // Every chunk uses the identical frozen reference-function Gram as
+            // the full objective. Re-estimating a chunk-specific metric would
+            // change both the quadratic and its Laplace normalizer.
+            let mut chunk_atom = SaeManifoldAtom::new_with_provided_function_gram(
                 atom.name.clone(),
                 atom.basis_kind.clone(),
                 atom.latent_dim,
                 phi,
                 jet,
                 atom.decoder_coefficients.clone(),
-                atom.smooth_penalty_raw.clone(),
+                atom.smooth_penalty.clone(),
             )?;
             // Carry the atom's own evaluator when it has one; otherwise seed the
             // chunk with the synthesized monomial-patch evaluator (#1801) so the
@@ -7288,7 +7262,8 @@ impl SaeManifoldTerm {
         //   * frozen routing is per-row (n×K) — the caller slices it to the chunk's
         //     rows and passes it as `chunk_frozen_logits`.
         assignment.ungated = self.assignment.ungated.clone();
-        assignment.ordered_beta_bernoulli_alpha_override = self.assignment.ordered_beta_bernoulli_alpha_override;
+        assignment.ordered_beta_bernoulli_alpha_override =
+            self.assignment.ordered_beta_bernoulli_alpha_override;
         if let Some(frozen) = chunk_frozen_logits {
             if frozen.dim() != (n_chunk, k_atoms) {
                 return Err(format!(
@@ -7937,7 +7912,7 @@ mod projection_policy_tests {
     #[test]
     fn multivariate_compact_projection_skips_without_mutation() {
         // A compact multivariate chart (sphere) has no complete rank-1 Fourier
-        // stationary enumeration, so the decoder-projection E-step must SKIP it
+        // stationary enumeration, so the decoder-projection coordinate update must SKIP it
         // — leaving its incoming natural-chart coordinates untouched — and
         // return Ok, rather than aborting the whole fit. (A fixed-lattice
         // projection is still never performed: honesty is preserved by not
@@ -7945,7 +7920,7 @@ mod projection_policy_tests {
         let coordinates = array![[0.2, 0.3]];
         let evaluator = Arc::new(SphereChartEvaluator);
         let (phi, jet) = evaluator.evaluate(coordinates.view()).unwrap();
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "sphere",
             SaeAtomBasisKind::Sphere,
             2,

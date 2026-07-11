@@ -69,7 +69,7 @@ pub(crate) fn collapse_bar_uses_reachable_dictionary_rank_not_nominal_count_1610
     let (phi_b, jet_b) = periodic_basis(&coords_b);
 
     let make = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,

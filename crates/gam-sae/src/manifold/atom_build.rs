@@ -180,8 +180,8 @@ fn sae_build_duchon_atom(
     // it from the evaluator's fixed-`m` basis — the #1026 32K Duchon shape bug.
     // `duchon_sae_atom_penalty` keeps all `m` columns; degenerate directions get
     // ~zero penalty (handled by the inner solve's per-row Tikhonov ridge), the
-    // SAE-specific arc-length reweighting in `refresh_intrinsic_smooth_penalty`
-    // plays TPRS's metric role for the atom.
+    // matrix itself is the declared Duchon reference-function seminorm used by
+    // the atom; no decoder-dependent metric reweighting is applied.
     let dim = centers.ncols();
     let m: usize = sae_duchon_atom_m(dim);
     let penalty = gam_terms::basis::duchon_sae_atom_penalty(centers, duchon_nullspace_from_m(m))
