@@ -12,6 +12,7 @@
 
 use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_data::encode_recordswith_inferred_schema;
+use gam_linalg::matrix::LinearOperator;
 use gam_solve::estimate::BlockRole;
 
 const LOGB_SIGMA_FLOOR: f64 = 0.01;
