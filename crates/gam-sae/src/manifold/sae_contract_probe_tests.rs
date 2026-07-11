@@ -609,18 +609,21 @@ fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
 /// #2099 — the end-to-end joint `(t, β)` fit with the dimensionless isometry
 /// gauge is equivariant under a change of physical output units.
 ///
-/// Co-scaling the physical target and decoder by `c` makes every data/smoothness
-/// energy and Hessian block scale by `c²`. The dimensionless isometry residual
-/// and coordinate prior do not change, so their dimensional coefficients and
-/// the two numerical ridge curvatures must co-scale by `c²` as well. Under that complete physical
-/// co-scale, the normalized reconstruction `f/c` and normalized penalized
-/// criterion `V/c²` must agree with the unit-scale fit. This is the actual
-/// gauge-invariant fit property. Requiring each penalized optimum to have nearly
-/// zero data residual was invalid: nonzero smoothness/isometry deliberately trade
-/// data fit for regularity, and absolute planted-circle recovery is already owned
-/// by `sae_single_planted_circle_embedded_isometry_fit_converges_795` below.
+/// Changing output units by `c` sends the target and decoder to `c Z` and `c B`,
+/// while the residual covariance becomes `c² Σ`. The shared likelihood/gauge
+/// precision is therefore `W/c²`: it cancels the decoder scale in both the GLS
+/// residual and the isometry pullback. Decoder smoothness precision and the
+/// solver-only decoder ridge carry inverse-output-squared units and likewise
+/// scale by `1/c²`; the coordinate prior and coordinate ridge are dimensionless
+/// and stay fixed. Under that complete physical-unit change, the reconstruction
+/// `f/c` and the full, unnormalised penalized criterion must agree with the
+/// unit-scale fit. Requiring each penalized optimum to have nearly zero data
+/// residual was invalid: nonzero smoothness/isometry deliberately trade data fit
+/// for regularity, and absolute planted-circle recovery is already owned by
+/// `sae_single_planted_circle_embedded_isometry_fit_converges_795` below.
 #[test]
 fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
+    use gam_problem::RowMetric;
     use gam_terms::analytic_penalties::{
         AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
     };
@@ -636,13 +639,13 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
 
     struct ScaleFit {
         normalized_reconstruction: Array2<f64>,
-        normalized_criterion: f64,
-        normalized_components: [f64; 7],
+        criterion: f64,
+        components: [f64; 7],
     }
 
-    let fit_at_scale = |lambda: f64| -> ScaleFit {
-        let scale_sq = lambda * lambda;
-        let decoder = &base_decoder * lambda;
+    let fit_at_scale = |physical_scale: f64| -> ScaleFit {
+        let scale_sq = physical_scale * physical_scale;
+        let decoder = &base_decoder * physical_scale;
         let atom = SaeManifoldAtom::new(
             "iso_converge",
             SaeAtomBasisKind::Periodic,
@@ -663,12 +666,29 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        // Residual covariance transforms as Σ -> c²Σ, so its precision factor
+        // transforms as U -> U/c. The identical RowMetric also supplies the
+        // isometry pullback, making (cJ)'(W/c²)(cJ) exactly invariant.
+        let metric_factor = Array2::from_shape_fn((n, p * p), |(_, flat)| {
+            let output = flat / p;
+            let probe = flat % p;
+            if output == probe {
+                physical_scale.recip()
+            } else {
+                0.0
+            }
+        });
+        term.set_row_metric(
+            RowMetric::behavioral_fisher(Arc::new(metric_factor), p, p)
+                .expect("physical-unit precision metric is valid"),
+        )
+        .expect("physical-unit precision metric matches the output dimension");
 
         let mut registry = AnalyticPenaltyRegistry::new();
-        let mut isometry = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1);
-        isometry.scalar_weight = scale_sq;
-        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(isometry)));
-        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![scale_sq.ln()]]);
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
+        )));
+        let mut rho = SaeManifoldRho::new(0.0, (0.8_f64 / scale_sq).ln(), vec![array![0.0]]);
 
         let loss = term
             .run_joint_fit_arrow_schur(
@@ -677,13 +697,13 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
                 Some(&registry),
                 12,
                 1.0,
-                1.0e-4 * scale_sq,
-                1.0e-4 * scale_sq,
+                1.0e-4,
+                1.0e-4 / scale_sq,
             )
             .expect("joint fit with isometry gauge ON must converge at every decoder scale");
         assert!(
             loss.total().is_finite(),
-            "converged loss must be finite at λ={lambda}, got {}",
+            "converged loss must be finite at c={physical_scale}, got {}",
             loss.total()
         );
 
@@ -695,7 +715,7 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
             .expect("co-scaled penalized criterion is defined");
         assert!(
             criterion.is_finite(),
-            "penalized criterion must be finite at λ={lambda}, got {criterion}"
+            "penalized criterion must be finite at c={physical_scale}, got {criterion}"
         );
         let scored_loss = term
             .loss_scaled(target.view(), &rho, 1.0)
@@ -706,16 +726,16 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
         let repulsion = term.decoder_repulsion_value(1.0);
         let separation = term.separation_barrier_value(1.0);
         ScaleFit {
-            normalized_reconstruction: recon.mapv(|value| value / lambda),
-            normalized_criterion: criterion / scale_sq,
-            normalized_components: [
-                scored_loss.data_fit / scale_sq,
-                scored_loss.assignment_sparsity / scale_sq,
-                scored_loss.smoothness / scale_sq,
-                scored_loss.ard / scale_sq,
-                analytic / scale_sq,
-                repulsion / scale_sq,
-                separation / scale_sq,
+            normalized_reconstruction: recon.mapv(|value| value / physical_scale),
+            criterion,
+            components: [
+                scored_loss.data_fit,
+                scored_loss.assignment_sparsity,
+                scored_loss.smoothness,
+                scored_loss.ard,
+                analytic,
+                repulsion,
+                separation,
             ],
         }
     };
@@ -730,8 +750,8 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
         base_image_norm_sq.is_finite() && base_image_norm_sq > 0.0,
         "unit-scale fitted image must be finite and nonzero"
     );
-    for &lambda in &[5.0_f64, 25.0] {
-        let scaled = fit_at_scale(lambda);
+    for &physical_scale in &[5.0_f64, 25.0] {
+        let scaled = fit_at_scale(physical_scale);
         let image_defect = base
             .normalized_reconstruction
             .iter()
@@ -743,26 +763,22 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
             .sum::<f64>()
             .sqrt()
             / base_image_norm_sq.sqrt();
-        let criterion_defect = (scaled.normalized_criterion - base.normalized_criterion).abs()
-            / (1.0
-                + scaled
-                    .normalized_criterion
-                    .abs()
-                    .max(base.normalized_criterion.abs()));
+        let criterion_defect = (scaled.criterion - base.criterion).abs()
+            / (1.0 + scaled.criterion.abs().max(base.criterion.abs()));
         eprintln!(
-            "[#2099 fit co-scale] λ={lambda}: image_defect={image_defect:.3e} \
-             criterion_defect={criterion_defect:.3e}; normalized components \
+            "[#2099 fit co-scale] c={physical_scale}: image_defect={image_defect:.3e} \
+             criterion_defect={criterion_defect:.3e}; components \
              [data,assignment,smooth,ard,analytic,repulsion,separation] base={:?} scaled={:?}",
-            base.normalized_components, scaled.normalized_components,
+            base.components, scaled.components,
         );
         assert!(
             image_defect < 1.0e-3,
-            "normalized fitted reconstruction changed under physical co-scale λ={lambda}: \
+            "normalized fitted reconstruction changed under physical co-scale c={physical_scale}: \
              relative image defect {image_defect:.3e}"
         );
         assert!(
             criterion_defect < 1.0e-3,
-            "normalized penalized criterion changed under physical co-scale λ={lambda}: \
+            "penalized criterion changed under physical co-scale c={physical_scale}: \
              relative criterion defect {criterion_defect:.3e}"
         );
     }
