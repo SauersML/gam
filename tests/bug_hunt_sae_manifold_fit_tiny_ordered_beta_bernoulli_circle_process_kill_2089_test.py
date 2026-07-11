@@ -55,7 +55,7 @@ _REPRO = textwrap.dedent(
 )
 
 
-def test_tiny_ordered_beta_circle_fit_does_not_kill_the_process() -> None:
+def test_tiny_ordered_beta_bernoulli_circle_fit_does_not_kill_the_process() -> None:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _REPRO],

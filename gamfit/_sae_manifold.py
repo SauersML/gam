@@ -260,11 +260,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         loss, derivatives, diagnostics, and OOS encoder all use this same exact
         hard support; there is no post-fit projection.
     t_init, a_init
-        Warm starts for amortized encoder distillation (#357). ``a_init`` has
+        Optional native-solver warm starts. ``a_init`` has
         shape ``(N, K)`` and seeds assignment logits. ``t_init`` has shape
         ``(K, N, D_max)`` with ``D_max >= max(d_atom)`` and seeds per-atom
-        coordinates. ``converged_latents()``, ``encode()``, and ``project()``
-        expose the refined supervision targets.
+        coordinates. The returned model exposes its converged state through
+        ``converged_latents()``.
     tau
         Starting assignment temperature. If ``None`` (the default), it is
         inferred from ``schedule`` or defaults to ``0.5``.
@@ -634,11 +634,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             "sae_manifold_fit admits only the native manifold engine; this request "
             "belongs to sparse_dictionary_fit and is not silently substituted"
         )
-    # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
-    # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
-    # amortized encoder can predict `(a_init, t_init)` and have the joint solver
-    # refine them for a bounded `n_iter` steps. Both are optional and validated
-    # eagerly here against (N, K) / (K, N, D_max) where D_max = max(dims).
+    # Warm starts: `a_init` (N, K) seeds assignment logits and `t_init`
+    # (K, N, D_max) seeds per-atom on-manifold coordinates for the bounded
+    # native solve.
     d_max = max(dims)
     logits_init = None
     if a_init is not None:

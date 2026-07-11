@@ -1,4 +1,4 @@
-"""Four verbs over the tiered dictionary artifact: fit / encode / steer / diff.
+"""Three verbs over the tiered dictionary artifact: fit / steer / diff.
 
 WS-J. A thin CLI/API surface (SPEC.md: Python is a thin wrapper — every verb
 dispatches into a Rust fitter or a frozen-artifact reader; the only Python logic
@@ -6,12 +6,10 @@ is argument routing and the canonical-hash / subspace-diff serialization glue,
 which lives in ``tiered_artifact.py``).
 
     fit     drive the tiered pipeline (T1 → SAC T2 → assemble) → write artifact dir
-    encode  amortized encoder over rows, exact-solve certificate fallback,
-            fallback rate reported by token-frequency decile
     steer   dose-calibrated chart move on one atom; predicted_nats before the edit
     diff    compare two artifacts: atom matching, subspace angles, per-tier hash deltas
 
-Import as a library (``fit_artifact`` / ``encode_rows`` / ``steer_atom`` /
+Import as a library (``fit_artifact`` / ``steer_atom`` /
 ``diff_artifacts``) or run as ``python examples/dictionary_cli.py <verb> ...``.
 """
 
@@ -28,7 +26,6 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tiered_artifact import (  # noqa: E402
     TieredArtifact,
-    load_encoder,
     load_sac_result,
     load_t0_from_manifest,
     load_tier1_artifact,
@@ -55,8 +52,8 @@ def fit_artifact(
     """Fit T1 (+ SAC T2) on ``X`` and serialize the union artifact.
 
     ``use_sac=True`` runs the stagewise K=1 composition (``sac_prototype.sac_fit``,
-    the SAC_PLAN Part-2 path that avoids the joint co-collapse); ``False`` falls
-    back to the joint ``compose_tiers`` path. Heavy math is entirely in the Rust
+    the SAC_PLAN Part-2 path that avoids the joint co-collapse); ``False`` selects
+    the joint ``compose_tiers`` path. Heavy math is entirely in the Rust
     fitters underneath both.
     """
     import gamfit
@@ -98,71 +95,17 @@ def fit_artifact(
 
 
 # ======================================================================= #
-# encode — amortized encoder with exact-solve certificate fallback.        #
-# ======================================================================= #
-def encode_rows(
-    artifact_dir: str,
-    X: np.ndarray,
-    *,
-    fit: Any | None = None,
-    frequencies: np.ndarray | None = None,
-) -> dict[str, Any]:
-    """Encode rows through the distilled encoder, exact solve as fallback.
-
-    ``fit`` is a live ``gamfit.ManifoldSAE`` (the exact-solve teacher/fallback);
-    when the artifact carries a distilled encoder bundle it is loaded and used as
-    the amortized fast path via ``ManifoldSAE.encode(..., encoder=...)``, which
-    accepts only rows matching the warm-started exact solve and falls back
-    otherwise (``EncoderFallbackStats``). Returns the assignments plus the fallback
-    accounting, broken out by token-frequency decile when ``frequencies`` is given.
-    """
-    art = TieredArtifact.load(artifact_dir)
-    x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-    if fit is None:
-        raise ValueError(
-            "encode needs a live ManifoldSAE teacher (fit=...); the artifact stores "
-            "the distilled encoder + hash but the exact-solve fallback is the Rust "
-            "fitter and cannot be reconstructed from serialized bytes alone.")
-
-    encoder = None
-    if art.encoder_meta is not None:
-        want = art.content_hash()
-        got = art.encoder_meta.get("distilled_from_content_hash")
-        if got not in (None, "none", want):
-            raise ValueError(
-                f"encoder was distilled on {got!r} but this artifact hashes to "
-                f"{want!r}; refusing to encode with a mismatched feature map")
-        _, state_path = load_encoder(os.path.join(artifact_dir, "encoder"))
-        if state_path is not None and hasattr(fit, "distill_encoder"):
-            # WS-E's DistilledEncoder is a torch module; rehydrate via the fit's
-            # loader when present, else distill fresh on X (still exact-teachered).
-            encoder = fit.distill_encoder(x)
-
-    encoded, stats = fit.encode(x, encoder=encoder, return_stats=True)
-    out: dict[str, Any] = {"assignments": encoded, "fallback": stats,
-                           "content_hash": art.content_hash()}
-    if frequencies is not None:
-        out["fallback_by_decile"] = _fallback_by_decile(encoded, np.asarray(frequencies))
-    return out
-
-
-def _fallback_by_decile(encoded: np.ndarray, frequencies: np.ndarray) -> list[dict[str, float]]:
-    """Per token-frequency decile row counts (the WS-E gate: fallback rate by
-    frequency decile). Rows are ranked by frequency; the exact fallback vs
-    encoder-accepted split is a per-row property the encode call must surface — we
-    report the decile occupancy here so the caller can join it to accepted flags."""
-    order = np.argsort(frequencies)
-    deciles = np.array_split(order, 10)
-    return [{"decile": i, "n_rows": int(len(d)),
-             "freq_lo": float(frequencies[d].min()) if len(d) else 0.0,
-             "freq_hi": float(frequencies[d].max()) if len(d) else 0.0}
-            for i, d in enumerate(deciles)]
-
-
-# ======================================================================= #
 # steer — dose-calibrated chart move (W8 machinery).                       #
 # ======================================================================= #
-def steer_atom(fit: Any, atom_k: int, t_from: Any, t_to: Any) -> dict[str, Any]:
+def steer_atom(
+    fit: Any,
+    atom_k: int,
+    t_from: Any,
+    t_to: Any,
+    *,
+    metric_row: int = 0,
+    amplitude: float = 1.0,
+) -> dict[str, Any]:
     """Predicted output effect of moving atom ``atom_k`` from ``t_from`` to ``t_to``.
 
     Thin pass-through to ``ManifoldSAE.steer`` (the SAC_PLAN W8 dose machinery): the
@@ -171,8 +114,13 @@ def steer_atom(fit: Any, atom_k: int, t_from: Any, t_to: Any) -> dict[str, Any]:
     the edit. The dose-calibration experiment validated this predictor (slope
     ≈ 0.85, unbiased median ratio ≈ 1.1); see REPORT.md control row.
     """
-    plan = fit.steer(int(atom_k), np.asarray(t_from, dtype=float),
-                     np.asarray(t_to, dtype=float))
+    plan = fit.steer(
+        int(atom_k),
+        int(metric_row),
+        float(amplitude),
+        np.atleast_1d(np.asarray(t_from, dtype=float)),
+        np.atleast_1d(np.asarray(t_to, dtype=float)),
+    )
     return dict(plan)
 
 
@@ -334,8 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("artifact")
     i.set_defaults(func=_cmd_inspect)
 
-    # encode / steer need a live ManifoldSAE teacher in-process, so they are the
-    # library API (encode_rows / steer_atom); the CLI exposes fit/diff/inspect.
+    # Steering needs a live ManifoldSAE in-process, so it remains a library API;
+    # the CLI exposes fit/diff/inspect.
     return ap
 
 

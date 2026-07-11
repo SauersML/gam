@@ -494,7 +494,7 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
     assert_abs_diff_eq!(ordered_beta_gate, 0.5, epsilon = 1e-9);
     assert!(
         (ordered_beta_gate - 1.0).abs() > 1e-6,
-        "K=1 ordered Beta--Bernoulli-MAP must not pin the gate to 1.0"
+        "K=1 ordered Beta--Bernoulli must not pin the gate to 1.0"
     );
 
     // Smooth threshold gate, K=1: the logit remains a live logistic coordinate.
@@ -1223,11 +1223,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
         [-0.12, 0.08],
         [0.05, -0.20]
     ];
-    let rho = SaeManifoldRho::new(
-        0.0,
-        0.0,
-        vec![array![5.0_f64.ln()], array![5.0_f64.ln()]],
-    );
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![5.0_f64.ln()], array![5.0_f64.ln()]]);
     let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
 
     // Dense layout: pin `Some(None)` so the override forces the dense path
@@ -1292,7 +1288,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
 /// the supplied budget. It never changes the model into a compact surrogate.
 #[test]
 pub(crate) fn dense_assignment_budget_refuses_without_truncation() {
-    // Build a `k`-atom ordered Beta--Bernoulli-MAP term with the given per-atom coordinate manifold.
+    // Build a `k`-atom ordered Beta--Bernoulli term with the given per-atom coordinate manifold.
     // Each atom carries the width-3 periodic basis, so `m_total = 3·k`.
     fn build_term(k: usize, curved: bool) -> SaeManifoldTerm {
         let n = 4usize;
@@ -2272,7 +2268,7 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
         epsilon = 1.0e-14
     );
 
-    // #1744 — ordered Beta--Bernoulli-MAP admits NO response-dispersion scaling on ANY ρ coordinate
+    // #1744 — ordered Beta--Bernoulli admits NO response-dispersion scaling on ANY ρ coordinate
     // (learnable-α or fixed-α). Its free per-row Bernoulli gates overfit under a
     // dispersion-weakened smoothness/ARD seed, collapsing the Fellner–Schall
     // fixed point; the sparse coordinate is a dimensionless log-α concentration
@@ -2295,8 +2291,16 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
             rho.log_lambda_smooth[0],
             epsilon = 1.0e-14
         );
-        assert_abs_diff_eq!(ordered_beta.log_ard[0][0], rho.log_ard[0][0], epsilon = 1.0e-14);
-        assert_abs_diff_eq!(ordered_beta.log_ard[0][1], rho.log_ard[0][1], epsilon = 1.0e-14);
+        assert_abs_diff_eq!(
+            ordered_beta.log_ard[0][0],
+            rho.log_ard[0][0],
+            epsilon = 1.0e-14
+        );
+        assert_abs_diff_eq!(
+            ordered_beta.log_ard[0][1],
+            rho.log_ard[0][1],
+            epsilon = 1.0e-14
+        );
     }
 }
 
@@ -2671,15 +2675,6 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
             "SaeManifoldTerm::penalized_laml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );
-    // A non-PD cross-row ordered Beta--Bernoulli joint Hessian at a probed ρ is genuine infeasibility
-    // (the Laplace evidence log-det is undefined there) — recoverable, the same
-    // class as the per-row non-PD refusal, so the outer optimizer returns +∞ and
-    // steers back into the PD region instead of aborting the whole fit.
-    assert!(
-        SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_laml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
-        )
-    );
     // The generic "log-det unavailable" message (a real factorization defect, not
     // an infeasibility) stays FATAL — it is NOT in the recoverable set.
     assert!(
@@ -2718,12 +2713,9 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
-/// As [`small_two_atom_periodic_term`], but in **ordered Beta--Bernoulli-MAP** assignment mode so
-/// the exact joint Hessian carries the #1038 cross-row rank-`R` Woodbury block
-/// `H_full = H₀' + U D Uᵀ` (the empirical-mass coupling between distinct latent
-/// rows through a shared atom column). The dense evidence log-det therefore
-/// includes the capacitance term `log|C| = log det(I_R + D Uᵀ H₀'⁻¹ U)` — the
-/// quantity the streaming path must reproduce.
+/// As [`small_two_atom_periodic_term`], but in ordered independent
+/// Beta--Bernoulli assignment mode. The full-batch and streaming paths must
+/// assemble the same shared-mass-dependent PSD curvature majorizer.
 pub(crate) fn small_two_atom_ordered_beta_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
@@ -3973,19 +3965,13 @@ pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
     }
     let coord_dims = vec![1usize; k_atoms];
     let coord_offsets_full: Vec<usize> = (0..k_atoms).collect();
-    let layout = SaeRowLayout::from_topk_gates(
-        &gates,
-        3,
-        coord_dims,
-        coord_offsets_full,
-    )
-    .unwrap();
+    let layout = SaeRowLayout::from_topk_gates(&gates, 3, coord_dims, coord_offsets_full).unwrap();
     for row in 0..n {
         assert_eq!(layout.active_atoms[row].len(), 3);
         assert_eq!(layout.row_q_active(row), 3);
     }
     let compact_work: usize = (0..n)
-        .map(|row| {
+        .map(|_| {
             let q = layout.row_q_active(row);
             q * q
         })
@@ -4736,13 +4722,8 @@ pub(crate) fn sae_row_layout_from_topk_gates_is_exact() {
         Array1::from_vec(vec![1.0, 0.0, 1.0]),
         Array1::from_vec(vec![1.0, 1.0, 0.0]),
     ];
-    let layout = SaeRowLayout::from_topk_gates(
-        &assignments,
-        2,
-        coord_dims,
-        coord_offsets_full,
-    )
-    .unwrap();
+    let layout =
+        SaeRowLayout::from_topk_gates(&assignments, 2, coord_dims, coord_offsets_full).unwrap();
     assert_eq!(layout.active_atoms[0], vec![0, 2]);
     assert_eq!(layout.active_atoms[1], vec![0, 1]);
     assert_eq!(layout.row_q_active(0), 4);
@@ -4774,13 +4755,9 @@ pub(crate) fn from_topk_gates_large_k_support_is_exact() {
         })
         .collect();
     let coord_offsets: Vec<usize> = (0..k_atoms).collect();
-    let layout = SaeRowLayout::from_topk_gates(
-        &assignments,
-        k_true,
-        vec![d; k_atoms],
-        coord_offsets,
-    )
-    .unwrap();
+    let layout =
+        SaeRowLayout::from_topk_gates(&assignments, k_true, vec![d; k_atoms], coord_offsets)
+            .unwrap();
     for row in 0..n {
         assert_eq!(layout.active_atoms[row], planted, "row {row} wrong atoms");
         assert_eq!(layout.row_q_active(row), k_true * d);
@@ -4812,13 +4789,8 @@ pub(crate) fn sae_row_layout_from_topk_gates_large_k_work_scales_with_support() 
     }
     let coord_dims = vec![1usize; k_atoms];
     let coord_offsets_full: Vec<usize> = (0..k_atoms).collect();
-    let layout = SaeRowLayout::from_topk_gates(
-        &assignments,
-        cap,
-        coord_dims,
-        coord_offsets_full,
-    )
-    .unwrap();
+    let layout =
+        SaeRowLayout::from_topk_gates(&assignments, cap, coord_dims, coord_offsets_full).unwrap();
     for row in 0..n {
         // Exact support recovery: the proposal must return exactly the planted
         // top-`cap` atoms (all background weights are below the cutoff).

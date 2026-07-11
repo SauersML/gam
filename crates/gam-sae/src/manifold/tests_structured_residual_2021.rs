@@ -76,7 +76,7 @@ fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
     let manifolds = vec![LatentManifold::Euclidean; k];
     let logits =
         Array2::<f64>::from_shape_fn((n, k), |(r, c)| 0.3 * (c as f64) - 0.1 * (r as f64) + 0.2);
-    // ordered Beta--Bernoulli-MAP (fixed alpha): small K ⇒ dense layout, so the iid and whitened
+    // ordered Beta--Bernoulli (fixed alpha): small K ⇒ dense layout, so the iid and whitened
     // assemblies share the exact same row structure and only the metric differs.
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,

@@ -33,7 +33,7 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// to the neutral state), so the existing jitter still breaks those rare ties;
 /// rows with a clear best atom get a decisive — but bounded, hence escapable by
 /// the Newton refinement — head start. The mean-centring is translation-identity
-/// for softmax and keeps the ordered Beta--Bernoulli-MAP `sigmoid(logit/τ)` gate neutral (0.5) on
+/// for softmax and keeps the ordered Beta--Bernoulli `sigmoid(logit/τ)` gate neutral (0.5) on
 /// ties instead of slamming both gates shut, so the seed is safe for both
 /// assignment maps. The result is a proper routing seed rather than a
 /// saddle.
@@ -116,7 +116,7 @@ pub fn sae_residual_seed_logits(
     //
     // The mean-centring is what keeps the seed safe across assignment maps.
     // Softmax is translation-invariant, so subtracting the per-row mean leaves
-    // it bit-identical to the raw `-gain·r/m` form. ordered Beta--Bernoulli-MAP, by contrast, maps
+    // it bit-identical to the raw `-gain·r/m` form. ordered Beta--Bernoulli, by contrast, maps
     // each logit through an unnormalised `sigmoid(logit/τ)`: an *uncentred*
     // negative-only seed would push *every* gate below 0.5 and slam a tied row
     // shut (`sigmoid(-gain/τ)≈0`), which is worse than the neutral 0.5/0.5 state
@@ -633,7 +633,7 @@ pub fn sae_decoder_lsq_init(
         "ordered_beta_bernoulli" => {
             if !alpha.is_finite() || alpha <= 0.0 {
                 return Err(format!(
-                    "sae_decoder_lsq_init: alpha must be finite and positive for ordered Beta--Bernoulli-MAP; got {alpha}"
+                    "sae_decoder_lsq_init: alpha must be finite and positive for ordered Beta--Bernoulli; got {alpha}"
                 ));
             }
             // Use the base alpha here. In learnable-alpha fits the first rho
@@ -820,7 +820,7 @@ pub fn sae_decoder_lsq_init(
 /// carry the interval extension needed to enumerate their complete stationary
 /// sets.
 ///
-/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli-MAP
+/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli
 /// fits; the smooth threshold gate keeps its threshold-centered seed and warm
 /// starts are respected verbatim.
 pub fn sae_refine_routing_seed(
@@ -991,7 +991,7 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #174: the joint LSQ seed for K=2 ordered Beta--Bernoulli-MAP
+    /// Regression test for issue #174: the joint LSQ seed for K=2 ordered Beta--Bernoulli
     /// must produce a non-zero decoder and a residual smaller than the
     /// trivial zero-decoder baseline. Without this seed the joint Newton
     /// driver collapses A → 0 before any data signal accumulates.

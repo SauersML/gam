@@ -111,7 +111,7 @@ fn zz_measure_inner_joint_fit_cost_at_zoo_micro_shape() {
         let xtz = fast_atb(&phi, &z);
         let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz) / (k_atoms as f64);
         atoms.push(
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 format!("circle_{a}"),
                 SaeAtomBasisKind::Periodic,
                 1,

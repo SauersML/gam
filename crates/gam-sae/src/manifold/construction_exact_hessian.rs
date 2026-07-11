@@ -975,13 +975,12 @@ impl SaeManifoldTerm {
         // #2080: the envelope Γ = tr(H⁻¹ ∂H/∂θ) off the SAME shared selected-inverse
         // bundle (the all-or-nothing cluster's third channel) when present; the dense
         // selected inverse otherwise. The border-only bundle reconstructs the NO-SELF
-        // base inverse `(H₀')⁻¹`, so `logdet_theta_adjoint_from_probes` HARD-REFUSES
-        // (routes to dense) any cache carrying a T-space rank-R correction the border
-        // cannot span — per-row gauge/rotation deflation OR an ordered Beta--Bernoulli cross-row Woodbury —
-        // and otherwise owns the softmax / euclidean / non-cross-row regimes exactly.
+        // base inverse `(H₀')⁻¹`, so `logdet_theta_adjoint_from_probes` hard-refuses
+        // (routes to dense) a cache carrying a T-space gauge/rotation deflation
+        // that the border probes cannot span. Ordered Beta--Bernoulli uses its
+        // row-local PSD majorizer and shared-mass derivative directly.
         // This completes the matrix-free selected-inverse cluster (smoothness EDF + ARD
-        // Hessian trace + θ-adjoint); the assignment/learnable-ordered Beta--Bernoulli log-strength traces
-        // (when that coordinate exists) plus the θ-adjoint's ordered Beta--Bernoulli-refused fits remain
+        // Hessian trace + θ-adjoint); assignment log-strength traces remain
         // solver-bound
         // — the last gaps before the routing flip (see the docstring).
         let mut gamma = match inverse_probe_bundle {

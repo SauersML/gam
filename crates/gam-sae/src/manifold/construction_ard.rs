@@ -647,10 +647,9 @@ impl SaeManifoldTerm {
     /// `t`-block — so the Hadamard product `z ⊙ u_t` has expectation exactly
     /// `diag((H⁻¹)_tt)` (off-diagonal `i≠j` terms are mean-zero under
     /// `E[z_i z_j] = 0`). Averaging over probes gives the unbiased diagonal. Each
-    /// probe is ONE [`ArrowFactorCache::full_inverse_apply`] (per-row solves + a
-    /// SINGLE Schur solve + the rank-`R` cross-row Woodbury correction — the same
-    /// `H_full` the exact path inverts), so the ordered Beta--Bernoulli curvature is included
-    /// identically.
+    /// probe is one [`ArrowFactorCache::full_inverse_apply`] (per-row solves, one
+    /// Schur solve, and any gauge-deflation correction), so it applies the same
+    /// assembled curvature operator as the exact path.
     ///
     /// Probes run serially and accumulate in a fixed order, so for a fixed
     /// `(seed, num_probes)` the estimate is bit-reproducible (the REML determinism
@@ -682,7 +681,7 @@ impl SaeManifoldTerm {
                 remaining -= 1;
             }
             // u_t = (H⁻¹)_tt z (w_β = 0 ⇒ the border coupling drops from the
-            // t-block); this is the FULL H_full inverse incl. cross-row Woodbury.
+            // t-block); this applies the full assembled inverse.
             let (u_t, _u_beta) = cache.full_inverse_apply(z.view(), w_beta_zero.view())?;
             for i in 0..total_len {
                 out[i] += z[i] * u_t[i];

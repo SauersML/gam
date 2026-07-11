@@ -66,7 +66,7 @@ fn white_noise_gaussian_target(n: usize, p: usize) -> Array2<f64> {
     z
 }
 
-/// K-atom, d=1 periodic (circle) SAE term with ordered Beta--Bernoulli-MAP assignment, seeded the way
+/// K-atom, d=1 periodic (circle) SAE term with ordered Beta--Bernoulli assignment, seeded the way
 /// the production cold path does (PCA-seed the coordinates, ridge-LSQ each decoder).
 /// `harmonics` sets the basis size `m = 1 + 2·harmonics`. Mirrors the #2080 fixture.
 fn white_noise_circle_term(z: ArrayView2<'_, f64>, k: usize, harmonics: usize) -> SaeManifoldTerm {

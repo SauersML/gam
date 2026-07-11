@@ -1,7 +1,7 @@
 //! Regression pin for #2228 / #1095 / #2226: a K=1, d=1 ordered independent Beta--Bernoulli SAE must
 //! converge at fixed rho and reconstruct an exactly representable curve.
 //!
-//! Ordered ordered independent Beta--Bernoulli shrinkage belongs only to the empirical-Bayes assignment prior.
+//! Ordered independent Beta--Bernoulli shrinkage belongs only to the empirical-Bayes assignment prior.
 //! The forward posterior-mean gate is sigmoid(logit / temperature), without a
 //! second multiplication by the ordered prior mean. Decoder magnitude stays in
 //! the physical coefficient block B, so this fixture directly catches either a
@@ -156,12 +156,12 @@ fn sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse() {
     let result = problem
         .run(
             &mut objective,
-            "SAE d=1 K=1 ordered independent Beta--Bernoulli-gate co-collapse (#2228/#1095)",
+            "SAE d=1 K=1 ordered independent Beta--Bernoulli gate co-collapse (#2228/#1095)",
         )
         .expect(
             "outer cascade must complete on a K=1 d=1 atom whose degree-2 patch spans its \
              planted curve — a RemlConvergenceError (inner solve stalls at fixed ρ) reproduces \
-             the #2228 ordered independent Beta--Bernoulli-gate/decoder co-collapse",
+             the #2228 ordered independent Beta--Bernoulli gate/decoder co-collapse",
         );
     objective
         .certify_outer_result(&result)

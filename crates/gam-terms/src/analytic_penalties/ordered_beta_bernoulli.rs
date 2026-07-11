@@ -271,11 +271,8 @@ impl OrderedBetaBernoulliPenalty {
                 diagonal_term[start + k] = raw_diagonal_term;
                 local_logit_third[start + k] =
                     self.weight * diagonal_gate * column.score * u * dz_curvature;
-                m_channel[start + k] = self.weight
-                    * diagonal_gate
-                    * column.score_derivative
-                    * w_i
-                    * curvature;
+                m_channel[start + k] =
+                    self.weight * diagonal_gate * column.score_derivative * w_i * curvature;
             }
         }
 
@@ -377,7 +374,7 @@ impl OrderedBetaBernoulliPenalty {
 pub struct OrderedBetaBernoulliHessianDiagThirdChannels {
     pub k_max: usize,
     /// `u_ik = w_i dz_ik/dell_ik`, used both as the active-mass derivative and
-    /// as the per-column rank-one carrier.
+    /// in the exact per-column rank-one Hessian term.
     pub z_jac: Array1<f64>,
     /// Row-local third derivative of the diagonal Hessian entry.
     pub local_logit_third: Array1<f64>,

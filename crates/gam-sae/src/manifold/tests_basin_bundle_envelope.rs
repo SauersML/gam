@@ -85,7 +85,7 @@ fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
 
 /// Build a K-atom, d=1 periodic SAE term seeded the way the production cold path
 /// does (PCA-seed the per-atom coordinates, ridge-LSQ each per-atom decoder), with
-/// ordered Beta--Bernoulli-MAP assignment. Returns the term and the seed reconstruction dispersion.
+/// ordered Beta--Bernoulli assignment. Returns the term and the seed reconstruction dispersion.
 fn two_circle_periodic_term(
     z: ArrayView2<'_, f64>,
     k: usize,

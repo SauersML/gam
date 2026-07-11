@@ -1,10 +1,9 @@
-"""One serialized tiered dictionary artifact: T0 ∪ T1 ∪ T2 ∪ Σ ∪ encoder ∪ hash.
+"""One serialized tiered dictionary artifact: T0 ∪ T1 ∪ T2 ∪ Σ ∪ hash.
 
 WS-J. This is the single canonical, content-hashed object of the SAC done-state
 (SAC_PLAN Part 4): the union of the corpus statistics (T0), the linear sparse
 dictionary (T1), the typed curved atoms (T2), the structured-residual whitening
-model (Σ), the amortized encoder, and a content hash that folds every tier's
-bytes.
+model (Σ), and a content hash that folds every tier's bytes.
 
 Per SPEC.md this file is *serialization / composition glue only* — the fitters
 are Rust; the only arithmetic here is (a) the explained-variance ledger already
@@ -29,7 +28,7 @@ from typing import Any
 
 import numpy as np
 
-_HASH_VERSION = b"gam-tiered-artifact-v1"
+_HASH_VERSION = b"gam-tiered-artifact-v2"
 _T2_HASH_VERSION = b"gam-sae-dictionary-artifact-v1"  # matches dictionary_artifact.rs
 _EPS = 1.0e-12
 
@@ -127,9 +126,6 @@ class TieredArtifact:
     t2_meta: dict[str, Any] | None = None               # ev_trace, birth_log, EVs
     # Σ — structured residual whitening model
     sigma_root: np.ndarray | None = None          # (P, P) or (P, r) f32, optional
-    # encoder — amortized distilled encoder bundle
-    encoder_meta: dict[str, Any] | None = None
-    encoder_state_path: str | None = None         # relative path to encoder.pt
     # provenance
     provenance: dict[str, Any] = field(default_factory=dict)
 
@@ -201,10 +197,6 @@ class TieredArtifact:
             h.update(b"T2")
             gauge = (self.t2_meta or {}).get("gauge_certificate", "unspecified")
             h.update(t2_dictionary_hash(specs, gauge).encode())
-        # encoder binding
-        enc_hash = (self.encoder_meta or {}).get("distilled_from_content_hash", "none")
-        h.update(b"ENC")
-        h.update(str(enc_hash).encode())
         return "sha256:" + h.hexdigest()
 
     # ---- (de)serialization ----------------------------------------------- #
@@ -213,7 +205,7 @@ class TieredArtifact:
         os.makedirs(artifact_dir, exist_ok=True)
         manifest: dict[str, Any] = {
             "schema": "gam-tiered-artifact",
-            "schema_version": 1,
+            "schema_version": 2,
             "tiers_present": [],
             "provenance": self.provenance,
         }
@@ -247,18 +239,6 @@ class TieredArtifact:
             manifest["tiers_present"].append("sigma")
         else:
             manifest["sigma"] = None
-        if self.encoder_meta is not None:
-            enc_dir = os.path.join(artifact_dir, "encoder")
-            os.makedirs(enc_dir, exist_ok=True)
-            with open(os.path.join(enc_dir, "encoder_meta.json"), "w") as f:
-                json.dump(_jsonable(self.encoder_meta), f)
-            manifest["encoder"] = {"meta": "encoder/encoder_meta.json"}
-            if self.encoder_state_path and os.path.exists(self.encoder_state_path):
-                import shutil
-                shutil.copyfile(self.encoder_state_path,
-                                os.path.join(enc_dir, "encoder.pt"))
-                manifest["encoder"]["state"] = "encoder/encoder.pt"
-            manifest["tiers_present"].append("encoder")
         content_hash = self.content_hash()
         manifest["content_hash"] = content_hash
         with open(os.path.join(artifact_dir, "artifact.json"), "w") as f:
@@ -269,6 +249,12 @@ class TieredArtifact:
     def load(cls, artifact_dir: str) -> "TieredArtifact":
         with open(os.path.join(artifact_dir, "artifact.json")) as f:
             manifest = json.load(f)
+        if manifest.get("schema") != "gam-tiered-artifact" or manifest.get(
+            "schema_version"
+        ) != 2:
+            raise ValueError(
+                "TieredArtifact.load requires schema 'gam-tiered-artifact' version 2"
+            )
         art = cls(provenance=manifest.get("provenance", {}))
         art.t0 = manifest.get("t0")
         t1 = manifest.get("t1")
@@ -285,12 +271,6 @@ class TieredArtifact:
         sigma = manifest.get("sigma")
         if sigma:
             art.sigma_root = np.load(os.path.join(artifact_dir, sigma["root"]))["root"]
-        enc = manifest.get("encoder")
-        if enc:
-            with open(os.path.join(artifact_dir, enc["meta"])) as f:
-                art.encoder_meta = json.load(f)
-            if "state" in enc:
-                art.encoder_state_path = os.path.join(artifact_dir, enc["state"])
         # Verify the recorded hash still matches the bytes on disk.
         recorded = manifest.get("content_hash")
         if recorded is not None and recorded != art.content_hash():
@@ -409,14 +389,6 @@ def load_sac_result(source: Any) -> tuple[dict[str, Any] | None, list[dict[str, 
                           "frame": np.atleast_2d(np.asarray(frame, dtype=np.float64)),
                           "residual_gauge": atom.get("residual_finite_gauge", "")})
     return None, specs, meta
-
-
-def load_encoder(encoder_dir: str) -> tuple[dict[str, Any], str | None]:
-    """Encoder bundle from WS-E (``encoder_meta.json`` + optional ``encoder.pt``)."""
-    with open(os.path.join(encoder_dir, "encoder_meta.json")) as f:
-        meta = json.load(f)
-    pt = os.path.join(encoder_dir, "encoder.pt")
-    return meta, (pt if os.path.exists(pt) else None)
 
 
 # --------------------------------------------------------------------------- #

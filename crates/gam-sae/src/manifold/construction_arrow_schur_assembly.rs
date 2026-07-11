@@ -271,8 +271,8 @@ impl SaeManifoldTerm {
             .iter()
             .map(|&l| l * penalty_scale)
             .collect();
-        // #991 — the softmax/JumpReLU assignment prior's per-(row, atom) gradient
-        // (and, for JumpReLU/ordered Beta--Bernoulli, its curvature diagonal) is design-weighted by
+        // #991 — each differentiable assignment prior's per-(row, atom) gradient
+        // (and its declared curvature majorizer) is design-weighted by
         // `w_i` here so `gt`/`htt` estimate the same target as the `√w`-weighted
         // data likelihood. The softmax curvature written to `htt` below is the
         // per-row Gershgorin/`row_psd_majorizer` block, weighted by folding
@@ -290,8 +290,8 @@ impl SaeManifoldTerm {
         // `assignment_hdiag` diagonal. Build the shared penalty + `scale = λ/τ²`
         // once here so the dense row block written into `block.htt` below, the
         // criterion's `log|H|`, and the #1006 θ-adjoint all differentiate the
-        // SAME operator. JumpReLU / ordered Beta--Bernoulli keep their (separately exact) diagonal /
-        // cross-row channels and leave this `None`. The block is gauge-null in
+        // SAME operator. Threshold-gate and ordered Beta--Bernoulli modes keep
+        // their separate diagonal majorizers and leave this `None`. The block is gauge-null in
         // isolation (`H·𝟙 = 0`); it is only ever summed onto the gauge-breaking
         // data-fit row block before the Cholesky factor, never factored alone.
         let softmax_dense: Option<(
@@ -412,9 +412,7 @@ impl SaeManifoldTerm {
                 | AssignmentMode::ThresholdGate { .. } => None,
             },
         };
-        if !matches!(self.assignment.mode, AssignmentMode::TopK { .. })
-            && forced_compact
-        {
+        if !matches!(self.assignment.mode, AssignmentMode::TopK { .. }) && forced_compact {
             return Err(
                 "compact row layouts are valid only for AssignmentMode::TopK; smooth assignment modes require exact full-support assembly"
                     .to_string(),
@@ -843,11 +841,10 @@ impl SaeManifoldTerm {
                             }
                         }
 
-                        // Determine whether this row uses the compact active-set layout.
-                        //   * JumpReLU: gated atoms plus the smooth prior's
-                        //     machine-precision support enter.
-                        //   * ordered Beta--Bernoulli-MAP at large K: only the top-`k_active` atoms.
-                        //   * Otherwise (small K): the dense uniform-q layout.
+                        // Determine whether this row uses the compact hard-TopK
+                        // support layout. Every differentiable assignment mode
+                        // uses the dense layout because its nonzero derivatives
+                        // must not be truncated.
                         let (q_row, mut local_jac_row) = if let Some(layout) = row_layout.as_ref() {
                             let active = &layout.active_atoms[row];
                             let starts = &layout.coord_starts[row];

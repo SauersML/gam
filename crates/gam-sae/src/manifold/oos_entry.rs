@@ -780,7 +780,7 @@ pub struct SaeSteerRequest {
     /// restores the fitted assignment contract rather than guessing from the
     /// current logits.
     pub top_k: Option<usize>,
-    /// ordered Beta--Bernoulli-MAP concentration α (ignored outside `ordered_beta_bernoulli`).
+    /// ordered Beta--Bernoulli concentration α (ignored outside `ordered_beta_bernoulli`).
     pub alpha: f64,
     /// Softmax / gate temperature.
     pub tau: f64,

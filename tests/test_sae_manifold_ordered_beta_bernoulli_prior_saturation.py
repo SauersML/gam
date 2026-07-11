@@ -106,7 +106,7 @@ def test_penalized_laml_resolves_true_k_under_prior_saturation():
     )
 
 
-def test_ordered_beta_assignments_decay_not_truncate_under_saturation():
+def test_ordered_beta_bernoulli_assignments_decay_not_truncate_under_saturation():
     """Even when alpha=0.1 drives the prior weights down geometrically, the
     realized assignment masses must remain finite and strictly positive
     (they decay, they do not hard-truncate to zero) — a truncation to

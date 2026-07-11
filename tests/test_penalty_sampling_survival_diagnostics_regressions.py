@@ -39,7 +39,7 @@ def test_penalty_specs_sampling_survival_and_diagnostics_regressions():
         "total_variation",
         "block_orthogonality",
         "softmax_assignment_sparsity",
-        "ordered_beta_bernoulli_assignment_map",
+        "ordered_beta_bernoulli",
     }
     assert expected.issubset(kinds), "Penalty specs should serialize to Rust and round-trip back with expected kinds."
 

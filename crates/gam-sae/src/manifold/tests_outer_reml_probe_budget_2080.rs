@@ -224,7 +224,7 @@ fn one_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
 
 /// Build a K-atom, d=1 periodic SAE term seeded the way the production cold path
 /// does (PCA-seed the per-atom coordinates, ridge-LSQ each per-atom decoder), with
-/// ordered Beta--Bernoulli-MAP assignment. Returns the term and the seed reconstruction dispersion the
+/// ordered Beta--Bernoulli assignment. Returns the term and the seed reconstruction dispersion the
 /// outer cascade scales its ρ seed by. `harmonics` sets the basis size `m = 1 +
 /// 2·harmonics`.
 fn two_circle_periodic_term(
@@ -753,12 +753,11 @@ fn wide_p_outer_reml_terminates_within_probe_budget_2080() {
     let (ev, telemetry) = run_wide_outer_fit(n, p, k, harmonics);
     eprintln!(
         "[#2080] wide-p outer fit: ev={ev:.4}, criterion_calls={}, \
-         infeasible(non_pd_per_row={},cross_row={},schur={},inner_nc={}), \
+         infeasible(non_pd_per_row={},schur={},inner_nc={}), \
          infeasible_criterion_evals={}, reactive_scalar_installs={}, \
          reactive_target_restores={}",
         telemetry.criterion_calls,
         telemetry.infeasible_non_pd_per_row,
-        telemetry.infeasible_cross_row,
         telemetry.infeasible_schur,
         telemetry.infeasible_inner_not_converged,
         telemetry.infeasible_criterion_evals,

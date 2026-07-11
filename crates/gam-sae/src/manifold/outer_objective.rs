@@ -389,7 +389,7 @@ impl AmortizedWarmStartTelemetry {
 /// the penalised quasi-Laplace evidence score (see
 /// [`SaeManifoldTerm::penalized_laml_criterion`]). #1421: this is NOT a true
 /// normalized-prior REML/evidence objective — the softmax-entropy and
-/// JumpReLU assignment priors have no finite normalizer, so there is no
+/// threshold-gate assignment priors have no finite normalizer, so there is no
 /// ρ-independent prior constant to drop; only the proper-Gaussian
 /// smoothing-penalty normalizer is a genuine REML term.
 ///
@@ -420,7 +420,6 @@ pub struct OuterProbeTelemetry {
     pub criterion_calls: usize,
     /// Infeasible probes by refusal kind (non-PD Laplace log-det at that ρ).
     pub infeasible_non_pd_per_row: usize,
-    pub infeasible_cross_row: usize,
     pub infeasible_schur: usize,
     /// Probes refused because the inner solve did not converge at fixed ρ.
     pub infeasible_inner_not_converged: usize,
@@ -473,8 +472,6 @@ impl OuterProbeTelemetry {
     fn record_refusal_kind(&mut self, err: &str) {
         if err.contains("inner solve did not converge at fixed ρ") {
             self.infeasible_inner_not_converged += 1;
-        } else if err.contains("cross-row ordered Beta--Bernoulli joint Hessian is non-PD") {
-            self.infeasible_cross_row += 1;
         } else if err.contains("Schur complement Cholesky failed") {
             self.infeasible_schur += 1;
         } else if err.contains("non-PD per-row H_tt block") {
@@ -484,10 +481,7 @@ impl OuterProbeTelemetry {
 
     /// Total infeasible probes across all refusal kinds.
     pub fn infeasible_total(&self) -> usize {
-        self.infeasible_non_pd_per_row
-            + self.infeasible_cross_row
-            + self.infeasible_schur
-            + self.infeasible_inner_not_converged
+        self.infeasible_non_pd_per_row + self.infeasible_schur + self.infeasible_inner_not_converged
     }
 }
 
@@ -2113,13 +2107,6 @@ impl SaeManifoldOuterObjective {
             || err.contains(
                 "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
             )
-            // A probed ρ whose cross-row ordered Beta--Bernoulli joint Hessian is non-PD has an
-            // undefined Laplace evidence log-det — a genuine infeasibility, the
-            // same class as the per-row non-PD refusal above. The outer optimizer
-            // must read it as +∞ and steer back into the PD region, NOT abort the
-            // whole fit (the indefinite basin is adjacent to the PD optimum, so
-            // line searches WILL overshoot into it).
-            || err.contains("cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ")
             // #1782 — at a seed ρ, a K>1 jumprelu/softmax (or a rank-deficient
             // euclidean/linear) fit's OFF-OPTIMUM inner state can leave the
             // reduced joint-Hessian Schur complement indefinite, so the undamped
@@ -2128,7 +2115,7 @@ impl SaeManifoldOuterObjective {
             // `ArrowSchurError::SchurFactorFailed` (rendered
             // "arrow-Schur: Schur complement Cholesky failed: … not positive
             // definite"). That is the SAME infeasible-ρ-probe class as the
-            // per-row / cross-row non-PD refusals above: the indefinite basin is
+            // per-row non-PD refusal above: the indefinite basin is
             // adjacent to the PD optimum, so the outer optimizer must read it as
             // +∞ and steer back into the PD region rather than reject the seed and
             // abort the whole fit ("no candidate seeds passed outer startup
@@ -3679,7 +3666,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
             //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
-            //    every assignment mode incl. ordered Beta--Bernoulli-MAP (#1006).
+            //    every assignment mode, including ordered Beta--Bernoulli (#1006).
             //  * Matrix-free (dense evidence factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): no dense cache exists for the
             //    IFT solve, so the fixed-point lane updates covered ρ coordinates
@@ -5290,7 +5277,7 @@ mod linear_parity_anchor_1026_tests {
 
     /// Build a single-atom LINEAR SAE whose one atom has latent dim `d` (basis
     /// `{1, t_1, …, t_d}`), with the atom's coordinates seeded to `coords`
-    /// (`n × d`) and the per-row ordered Beta--Bernoulli gate logits set explicitly. ordered Beta--Bernoulli-MAP routing.
+    /// (`n × d`) and the per-row ordered Beta--Bernoulli gate logits set explicitly. ordered Beta--Bernoulli routing.
     /// Returns the term; the caller marks the atom ungated (or not).
     fn single_linear_atom_term(
         coords: Array2<f64>,

@@ -3,9 +3,9 @@
 //! rather than a single `hvp == FD(grad)·v` point check.
 //!
 //! After #809, `hvp` returns the exact `∂²P·v`. The penalty's Hessian has a
-//! specific shape the fix must reproduce: because every per-column quantity
-//! (`active_mass[k]`, `π[k]`) aggregates over all rows of column `k` and nothing
-//! couples distinct columns, the Hessian is **block-diagonal per column** and,
+//! specific shape the fix must reproduce: the integrated marginal depends on
+//! each column only through its active mass `M_k = sum_i z_ik`, so nothing
+//! couples distinct columns. The Hessian is **block-diagonal per column** and,
 //! within each column, a **rank-1 perturbation of a diagonal**:
 //!
 //! ```text
@@ -27,9 +27,9 @@
 //!      bit-for-bit — the diagonal accessor stays consistent with the full
 //!      operator (the fix must not perturb the already-correct diagonal).
 //!
-//! A fifth check covers the clamped-π degenerate regime: at extreme target
-//! magnitudes the column aggregate saturates (`pi_jac = 0 ⇒ score_derivative=0`),
-//! the rank-1 block vanishes, and `hvp` must collapse onto `diag(H)·v`.
+//! A fifth check covers saturated sigmoid gates: at extreme target magnitudes
+//! every `dz/dell` vanishes, so the rank-one block vanishes and `hvp` collapses
+//! onto `diag(H)·v`.
 //!
 //! Related: #809 (this fix), #810 (sibling DecoderIncoherencePenalty hvp dropped
 //! the residual cross term).
@@ -68,7 +68,7 @@ fn ordered_beta_bernoulli_hvp_reproduces_full_hessian_and_is_block_diagonal() {
     let n_rows = 4usize;
     let total = n_rows * k_max;
 
-    // Moderate magnitudes -> π and z stay off their clamp guards.
+    // Moderate magnitudes keep every sigmoid derivative well away from zero.
     let target = Array1::from(vec![
         0.3, -0.4, 0.7, //
         -0.2, 0.5, -0.6, //
@@ -149,15 +149,15 @@ fn ordered_beta_bernoulli_hvp_reproduces_full_hessian_and_is_block_diagonal() {
 }
 
 #[test]
-fn ordered_beta_bernoulli_hvp_collapses_to_diagonal_when_pi_is_clamped() {
+fn ordered_beta_bernoulli_hvp_collapses_to_diagonal_when_sigmoids_saturate() {
     let k_max = 2usize;
     let penalty = OrderedBetaBernoulliPenalty::new(k_max, 1.0, 1.0, false);
     let rho = Array1::<f64>::zeros(0);
     let n_rows = 4usize;
     let total = n_rows * k_max;
 
-    // Extreme magnitudes drive z -> {0,1} and the column aggregate π to its
-    // clamp, freezing it: pi_jac = 0 => score_derivative = 0 => no rank-1 block.
+    // Extreme magnitudes drive z -> {0,1}, hence dz/dell -> 0 and the
+    // mass-coupled rank-one block vanishes.
     let target = Array1::from(vec![
         40.0, -40.0, //
         40.0, -40.0, //
@@ -175,14 +175,14 @@ fn ordered_beta_bernoulli_hvp_collapses_to_diagonal_when_pi_is_clamped() {
     let diag = penalty
         .hessian_diag(target.view(), rho.view())
         .expect("hessian_diag available");
-    // In the frozen-π regime the operator is purely diagonal, so hvp == diag ⊙ v.
+    // In the saturated-sigmoid regime the operator is numerically diagonal.
     let mut max_diff = 0.0_f64;
     for j in 0..total {
         max_diff = max_diff.max((hv[j] - diag[j] * v[j]).abs());
     }
     assert!(
         max_diff < 1e-12,
-        "with π clamped the rank-1 block must vanish so hvp == diag(H)·v; \
+        "with saturated sigmoid Jacobians the rank-1 block must vanish so hvp == diag(H)·v; \
          max|hvp - diag⊙v| = {max_diff:.3e}"
     );
 }

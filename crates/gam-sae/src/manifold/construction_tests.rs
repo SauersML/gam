@@ -725,7 +725,7 @@ mod shape_uncertainty_joint_recompute_tests {
     #[test]
     fn recompute_reproduces_joint_and_differs_from_per_atom_marginal() {
         // A reliably-converging tiny state: the fixture target was assembled under
-        // a softmax gate, so switching to an ordered Beta--Bernoulli-MAP gate at the PD-region ρ
+        // a softmax gate, so switching to an ordered Beta--Bernoulli gate at the PD-region ρ
         // (`log_lambda_sparse = 0.5`, the deflation-regression config) leaves a
         // genuine reconstruction residual — a real dispersion and nonzero bands —
         // while the state stays near its inner optimum so the undamped joint

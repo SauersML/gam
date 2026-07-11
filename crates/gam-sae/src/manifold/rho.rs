@@ -38,7 +38,7 @@ pub enum ArdSharing {
 /// the inner assignment prior, but the flat outer layout includes it only when
 /// the assignment family has a non-constant strength-dependent objective:
 ///
-/// * [`Self::PenaltyWeight`] always carries the coordinate (ordered Beta--Bernoulli-MAP and
+/// * [`Self::PenaltyWeight`] always carries the coordinate (ordered Beta--Bernoulli and
 ///   threshold-gate priors).
 /// * [`Self::SoftmaxEntropy`] carries it only for `K > 1`. At `K = 1` the
 ///   simplex assignment is identically one and its entropy is identically zero,
@@ -70,7 +70,7 @@ impl AssignmentStrengthLayout {
 #[derive(Debug, Clone)]
 pub struct SaeManifoldRho {
     /// `log(lambda_sparse)` for softmax entropy or JumpReLU gated L1, or the
-    /// learnable `log(alpha)` offset for ordered Beta--Bernoulli-MAP assignment.
+    /// learnable `log(alpha)` offset for ordered Beta--Bernoulli assignment.
     pub log_lambda_sparse: f64,
     /// Typed assignment-strength layout. This is assignment-family state, not
     /// an optimizer mask: when the coordinate is structurally absent it is not
@@ -310,7 +310,7 @@ impl SaeManifoldRho {
     /// while the decoder/coordinates are refit, so `λ/φ` is exactly the effective
     /// stiffness.
     ///
-    /// ordered Beta--Bernoulli-MAP is different in kind. Its per-row Bernoulli gates are FREE latent
+    /// ordered Beta--Bernoulli is different in kind. Its per-row Bernoulli gates are FREE latent
     /// variables the inner joint solve co-optimizes with the coordinates and
     /// decoder. A response-dispersion-WEAKENED smoothness/ARD seed
     /// (`φ_seed ≪ 1` at any non-trivial noise scale) hands that extra gate +
@@ -321,7 +321,7 @@ impl SaeManifoldRho {
     /// stalls in (#1744: ordered_beta_bernoulli n=40 σ=0.18 stalled at EV 0.86). The ordered Beta--Bernoulli sparse
     /// coordinate is additionally a dimensionless log-alpha concentration offset,
     /// not a squared-output-unit penalty weight, so it was never dispersion-
-    /// scalable either. NONE of the ordered Beta--Bernoulli-MAP ρ coordinates therefore admit the
+    /// scalable either. NONE of the ordered Beta--Bernoulli ρ coordinates therefore admit the
     /// Gaussian response-dispersion scaling; the seed stays at its absolute
     /// (already dimensionless) construction values, which keeps the smoothing/ARD
     /// penalties strong enough that the inner ordered Beta--Bernoulli solve cannot overfit at the seed
@@ -337,7 +337,7 @@ impl SaeManifoldRho {
         if matches!(assignment_mode, AssignmentMode::OrderedBetaBernoulli { .. }) {
             // Validate the dispersion for parity with the scaled path (a
             // non-finite/​non-positive φ is still a caller error), then return the
-            // unscaled seed: no ordered Beta--Bernoulli-MAP ρ coordinate is response-dispersion-scalable.
+            // unscaled seed: no ordered Beta--Bernoulli ρ coordinate is response-dispersion-scalable.
             if !(dispersion.is_finite() && dispersion > 0.0) {
                 return Err(format!(
                     "SaeManifoldRho::seed_scaled_by_dispersion_for_assignment: dispersion must \

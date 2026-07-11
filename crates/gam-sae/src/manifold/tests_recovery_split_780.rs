@@ -545,7 +545,7 @@ pub(crate) fn ordered_beta_bernoulli_k2_periodic_torus_recovers_signal_with_lsq_
         jet_k.push(jet);
     }
 
-    // LSQ seed: joint design X = [0.5 * Phi_1 | 0.5 * Phi_2] (ordered Beta--Bernoulli-MAP
+    // LSQ seed: joint design X = [0.5 * Phi_1 | 0.5 * Phi_2] (ordered Beta--Bernoulli
     // logit 0 gives sigmoid(0/tau) = 0.5 for both atoms), solve normal
     // equations with a small ridge.
     let m_total = k * m;
@@ -642,7 +642,7 @@ pub(crate) fn ordered_beta_bernoulli_k2_periodic_torus_recovers_signal_with_lsq_
     let r2 = 1.0 - ssr / sst.max(1.0e-12);
     assert!(
         r2 > 0.5,
-        "K=2 periodic torus ordered Beta--Bernoulli-MAP R² = {r2:.4} (ssr={ssr:.4}, sst={sst:.4}) should be > 0.5 with LSQ-seeded decoder"
+        "K=2 periodic torus ordered Beta--Bernoulli R² = {r2:.4} (ssr={ssr:.4}, sst={sst:.4}) should be > 0.5 with LSQ-seeded decoder"
     );
     // Also confirm at least one atom remains active (assignment did not
     // collapse to ~0) — the active mass averaged over rows must exceed

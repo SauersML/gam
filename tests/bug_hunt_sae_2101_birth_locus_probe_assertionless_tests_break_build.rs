@@ -7,7 +7,7 @@
 //! module tree by `crates/gam-sae/src/manifold/mod.rs:194`,
 //! `mod tests_2101_birth_locus_probe;`). It contains TWO `#[test]` functions —
 //!
-//!   * `probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli`   (line 32)
+//!   * `probe_2101_birth_locus_disjoint_6circle_ordered_beta` (line 32)
 //!   * `probe_2101_proper_circle_seed_survival`          (line 156)
 //!
 //! — and each is a pure `eprintln!`-only trajectory dump. Neither body contains

@@ -154,15 +154,17 @@ used over — where each manifold lives, what shape, and how confident.
 
 ```python
 fit = gamfit.sae_manifold_fit(X=acts, K=16, d_atom=1, atom_topology="circle")
-recon = fit.predict(acts)              # (N, p) reconstruction
-band = fit.shape_uncertainty(0)        # {"coords","mean","sd","lower","upper"}
+recon = fit.reconstruct_training()     # exact stored (N, p) reconstruction
+atom = fit.atoms[0]
+band = (atom.shape_band_coords, atom.shape_band_mean, atom.shape_band_sd)
 extent = fit.coords[0].min(0), fit.coords[0].max(0)   # where atom 0 lives
-plan = fit.steer(atom_k=0, t_from=0.0, t_to=1.0)      # steering + dosimetry
+plan = fit.steer(0, 0, 1.0, np.array([0.0]), np.array([1.0]))
 ```
 
-The dictionary supports three gating families (`assignment="ordered_beta_bernoulli"`,
-`"softmax"`, `"jumprelu"`) and a `gamfit.torch.ManifoldSAE` autograd
-mirror with out-of-sample encoder distillation. Around it: `select_topology`
+The dictionary supports four gating families (`assignment="ordered_beta_bernoulli"`,
+`"softmax"`, `"threshold_gate"`, or `"topk"`) and a frozen
+`gamfit.torch.ManifoldSAE` tensor adapter over the same converged native fit.
+Around it: `select_topology`
 to choose an atom's shape by evidence; `sae_checkpoint_dynamics` to track
 atoms across training checkpoints; `gamfit.crosscoder.Crosscoder` and
 `layer_transport_fit` / `layer_transport_ladder` for cross-layer

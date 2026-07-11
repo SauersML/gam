@@ -370,7 +370,6 @@ from ._sae_manifold import (
 )
 from ._sae_viz import plot_atom, plot_fit
 from ._sae_trust import atom_trust_scores, sae_trust_diagnostics
-from .distill import DistilledEncoder, EncoderFallbackStats
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation

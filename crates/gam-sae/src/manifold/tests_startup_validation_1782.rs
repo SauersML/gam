@@ -98,7 +98,7 @@ pub(crate) fn build_term(
         });
     }
     let seed_dispersion = (rss / (k * n * z.ncols()) as f64).max(1.0e-12);
-    // Routing seed. ordered Beta--Bernoulli-MAP starts every gate on (the production cold seed). The
+    // Routing seed. ordered Beta--Bernoulli starts every gate on (the production cold seed). The
     // separable gates start from a round-robin row->atom assignment — a stand-in
     // for the deterministic alternating routing refine — so the routing is not degenerately
     // symmetric (every atom carries mass; no atom is a duplicate of another).
@@ -362,7 +362,7 @@ fn topologies_fit_on_circle_data_1782() {
 fn cocollapse_startup_frontier_1026() {
     let z = planted_circle_embedded(96, 10, 0.03);
     let ks = [4usize, 8];
-    // Compare the assignment modes: ordered Beta--Bernoulli-MAP couples all rows through a cross-row
+    // Compare the assignment modes: ordered Beta--Bernoulli couples all rows through a cross-row
     // Woodbury evidence with NO matrix-free log-det route (so large-K refuses on
     // the dense reduced Schur), whereas the hard-sigmoid gate (threshold_gate /
     // "jumprelu") is per-row independent and streams. This measures which mode
@@ -403,8 +403,8 @@ fn cocollapse_startup_frontier_1026() {
 
 /// WIN artifact (#1026 / #1610). A PRINCIPLED joint manifold SAE — curved 1-D
 /// circle fibers, hard-sigmoid gate (`threshold_gate`/"jumprelu", the per-row
-/// streaming assignment whose evidence log-det takes the matrix-free SLQ route,
-/// unlike ordered Beta--Bernoulli's cross-row Woodbury) — fit end-to-end by the real outer penalized-LAML
+/// streaming assignment whose evidence log-det takes the matrix-free SLQ route)
+/// — fit end-to-end by the real outer penalized-LAML
 /// cascade must MATCH-OR-BEAT a traditional linear SAE (`fit_sparse_dictionary`,
 /// the "large linear SAE" of #1026) at matched, OVERCOMPLETE dictionary size K on
 /// genuinely curved data. On a planted circle a linear dictionary is rank-capped

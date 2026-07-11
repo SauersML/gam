@@ -227,7 +227,7 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// mass, so the co-activation it would register and the anti-collapse repulsion /
 /// separation it would receive are negligible.
 ///
-/// For structurally sparse assignments (JumpReLU hard gate, ordered Beta--Bernoulli-MAP) the surviving
+/// For structurally sparse assignments (JumpReLU hard gate, ordered Beta--Bernoulli) the surviving
 /// active atoms sit far above this floor and the hard zeros are excluded anyway,
 /// so the co-active support is unchanged. It is load-bearing for SOFTMAX, whose
 /// normalization gives EVERY atom a tiny but strictly nonzero tail mass: a plain

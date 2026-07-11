@@ -4996,9 +4996,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_behavior_fit, module)?)?;
     module.add_class::<ManifoldBehaviorCore>()?;
     module.add_function(wrap_pyfunction!(sae_manifold_predict_oos, module)?)?;
-    module.add_function(wrap_pyfunction!(build_sae_encode_atlas, module)?)?;
-    module.add_class::<PySaeEncodeAtlas>()?;
-    module.add_class::<PySaeAmortizedEncoder>()?;
     module.add_function(wrap_pyfunction!(sae_steer_delta, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
     module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;

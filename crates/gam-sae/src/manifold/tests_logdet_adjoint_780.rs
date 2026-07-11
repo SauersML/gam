@@ -367,10 +367,11 @@ fn ordered_beta_bernoulli_sparse_rho_derivative_matrix_2156(
     let k_atoms = term.k_atoms();
     let mut hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho)
         .expect("ordered Beta--Bernoulli hdiag");
-    let channels =
-        ordered_beta_bernoulli_psd_majorizer_third_channels(&term.assignment, rho)
-    .expect("ordered Beta--Bernoulli channels")
-    .expect("ordered Beta--Bernoulli sparse derivative requires ordered Beta--Bernoulli channels");
+    let channels = ordered_beta_bernoulli_psd_majorizer_third_channels(&term.assignment, rho)
+        .expect("ordered Beta--Bernoulli channels")
+        .expect(
+            "ordered Beta--Bernoulli sparse derivative requires ordered Beta--Bernoulli channels",
+        );
     // #2144/#1038: the production assembly PSD-majorizes the ordered Beta--Bernoulli curvature
     // UNCONDITIONALLY, so this mirror does too.
     for row in 0..term.n_obs() {
@@ -977,8 +978,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
         ordered_beta_bernoulli_term
             .row_metric()
             .is_some_and(|m| m.whitens_likelihood()
-                && m.metric_rank() < ordered_beta_bernoulli_term.output_dim())
-            ,
+                && m.metric_rank() < ordered_beta_bernoulli_term.output_dim()),
         "ordered Beta--Bernoulli parity fixture must exercise the low-rank metric branch; \
          certificate={low_rank_certificate:?}"
     );

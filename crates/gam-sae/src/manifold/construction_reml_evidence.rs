@@ -2973,12 +2973,11 @@ impl SaeManifoldTerm {
         if softmax.is_none() && hdiag.is_empty() {
             return Ok(0.0);
         }
-        let ordered_channels =
-            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
-                &self.assignment,
-                rho,
-                self.row_loss_weights.as_deref(),
-            )?;
+        let ordered_channels = ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        )?;
         let learnable_alpha = matches!(
             self.assignment.mode,
             AssignmentMode::OrderedBetaBernoulli {
@@ -3823,11 +3822,10 @@ impl SaeManifoldTerm {
         // Newton/Schur Cholesky factorizes — so each block's θ-derivative channel
         // is differentiated on the criterion's own branch (no value/gradient
         // desync). The integrated ordered Beta--Bernoulli prior is the one block
-        // whose row-local majorizer depends on the shared empirical mass
+        // whose row-local majorizer depends on the shared active mass
         // `M_k = Σ_i z_ik`; its logit derivative therefore has a
-        // row-local channel (handled inline via
-        // `assignment_prior_hdiag_derivative_entry`) and a cross-row channel
-        // (accumulated column-wise after the row loop, below).
+        // row-local channel and a shared-mass channel accumulated column-wise
+        // after the row loop.
         if cache.arrow_log_det().is_none() {
             return Err(
                 "logdet_theta_adjoint: cache lacks an authoritative joint-Hessian log-det \
@@ -3869,9 +3867,9 @@ impl SaeManifoldTerm {
         // `block.htt` has off-diagonal logit terms whose θ-derivative the adjoint
         // must contract too (not just the diagonal). Build the SAME penalty +
         // `scale = λ/τ²` the assembly uses so value/logdet/adjoint differentiate
-        // one operator. `None` for non-softmax modes (their diagonal/cross-row
-        // channels are handled by `assignment_prior_hdiag_derivative_entry` and
-        // the ordered Beta--Bernoulli column pass).
+        // one operator. `None` for non-softmax modes, whose diagonal channels
+        // are handled by the assignment-prior derivative entry and the ordered
+        // Beta--Bernoulli shared-mass column pass.
         let softmax_dense_adjoint: Option<(
             gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
             f64,
@@ -4192,8 +4190,7 @@ impl SaeManifoldTerm {
             }
             for site in &ordered_beta_bernoulli_logit_sites {
                 let index = site.row * k_atoms + site.atom;
-                gamma_t[site.t_index] +=
-                    column_coefficient[site.atom] * channels.z_jac[index];
+                gamma_t[site.t_index] += column_coefficient[site.atom] * channels.z_jac[index];
             }
         }
 
@@ -4574,15 +4571,11 @@ impl SaeManifoldTerm {
 
         if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
             let mut column_coefficient = vec![0.0_f64; k_atoms];
-            for &(row, atom, _t_index, inverse_diagonal) in
-                &ordered_beta_bernoulli_logit_sites
-            {
+            for &(row, atom, _t_index, inverse_diagonal) in &ordered_beta_bernoulli_logit_sites {
                 let index = row * k_atoms + atom;
                 column_coefficient[atom] += inverse_diagonal * channels.m_channel[index];
             }
-            for &(row, atom, t_index, _inverse_diagonal) in
-                &ordered_beta_bernoulli_logit_sites
-            {
+            for &(row, atom, t_index, _inverse_diagonal) in &ordered_beta_bernoulli_logit_sites {
                 let index = row * k_atoms + atom;
                 gamma_t[t_index] += column_coefficient[atom] * channels.z_jac[index];
             }

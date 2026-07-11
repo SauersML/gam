@@ -19,10 +19,10 @@ struct Fixture {
 
 /// Build the K=2 periodic-harmonic SAE fixture under a given assignment `mode`.
 ///
-/// `log_lambda_sparse` is exposed so the ordered independent Beta--Bernoulli arm can run its empirical-π
+/// `log_lambda_sparse` is exposed so the ordered independent Beta--Bernoulli arm can run its integrated
 /// prior at a genuinely active weight (the fixed-`alpha` ordered independent Beta--Bernoulli penalty reads
 /// `lambda_sparse` as its weight lever), which is what exercises the #1006
-/// empirical-`M_k` third channel through the outer-ρ gradient.
+/// shared-`M_k` third channel through the outer-ρ gradient.
 fn fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixture {
     let n = 80usize;
     let p = 6usize;
@@ -320,9 +320,9 @@ fn sae_outer_rho_gradient_components_match_centered_fd_jumprelu() {
 
 #[test]
 fn sae_outer_rho_gradient_components_match_centered_fd_ordered_beta_bernoulli() {
-    // ordered independent Beta--Bernoulli exercises the #1006 empirical-π third channel: pi_k(M_k) couples
-    // every row in a column, so the outer-ρ gradient through log|H| depends on
-    // the cross-row M_k channel of `logdet_theta_adjoint`. lambda_sparse is the
+    // The integrated ordered independent Beta--Bernoulli scalar depends on each
+    // column's shared mass M_k, so the outer-ρ gradient through log|H| depends
+    // on the shared-mass channel of `logdet_theta_adjoint`. lambda_sparse is the
     // active prior weight here, so coord 0's FD directly stresses it.
     let f = fixture(
         AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false),
@@ -377,11 +377,11 @@ fn frozen_explicit_fd(
 ///     envelope FD of the RE-SOLVED criterion MINUS the frozen-θ `explicit` FD.
 ///     A mismatch localizes the defect to the Hessian log-det derivative — the
 ///     direct trace `½ tr(H⁻¹ ∂H/∂ρ)` and/or the θ-adjoint `Γ` that feeds the
-///     #1006 third-order correction (the cross-row ordered independent Beta--Bernoulli Woodbury / empirical-`M`
-///     channel of `logdet_theta_adjoint`).
+///     #1006 third-order correction (the ordered Beta--Bernoulli shared-`M`
+///     majorizer channel of `logdet_theta_adjoint`).
 ///
-/// This is the durable localization artifact for the #1798/#1795/#2087 cross-row
-/// ordered independent Beta--Bernoulli Woodbury logdet genus: a red run PRINTS the per-coordinate channel split
+/// This is the durable localization artifact for the #1798/#1795/#2087 ordered
+/// Beta--Bernoulli shared-mass logdet path: a red run prints the per-coordinate channel split
 /// and its assertion message NAMES the culprit block.
 fn assert_channel_decomposition(label: &str, f: &Fixture) {
     let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
@@ -423,14 +423,14 @@ fn assert_channel_decomposition(label: &str, f: &Fixture) {
              vs analytic (logdet_trace {logdet_a:.8e} + occam {occam_a:.8e} + third_order {third_a:.8e}) \
              = {block_a:.8e}. The direct prior/data-fit channel is clean (asserted above), so the \
              defect is in the Hessian log-det derivative: the direct trace ½tr(H⁻¹∂H/∂ρ) and/or the \
-             θ-adjoint Γ feeding the #1006 third-order (cross-row ordered independent Beta--Bernoulli Woodbury / empirical-M channel)."
+             θ-adjoint Γ feeding the #1006 third-order ordered Beta--Bernoulli shared-M channel."
         );
     }
 }
 
 #[test]
 fn sae_outer_rho_gradient_channel_decomposition_softmax_2087() {
-    // Control arm: softmax carries no cross-row ordered independent Beta--Bernoulli log-det channel, so BOTH the
+    // Control arm: softmax carries no ordered Beta--Bernoulli shared-mass log-det channel, so both the
     // explicit and the log|H|-block FD attributions must hold — this pins that the
     // decomposition instrument itself is sound before it is read on the ordered independent Beta--Bernoulli arm.
     let f = fixture(AssignmentMode::softmax(0.7), -8.0);
@@ -439,8 +439,8 @@ fn sae_outer_rho_gradient_channel_decomposition_softmax_2087() {
 
 #[test]
 fn sae_outer_rho_gradient_channel_decomposition_ordered_beta_bernoulli_2087() {
-    // Suspect arm: ordered independent Beta--Bernoulli drives the cross-row empirical-`M` / Woodbury log-det
-    // channels of `logdet_theta_adjoint`. The decomposition pins whether a #2087
+    // Suspect arm: ordered independent Beta--Bernoulli drives the shared-`M`
+    // log-det channels of `logdet_theta_adjoint`. The decomposition pins whether a #2087
     // desync lives in the explicit prior channel or the Hessian log-det block —
     // the located artifact a build-capable seat consumes to fix the θ-adjoint.
     let f = fixture(

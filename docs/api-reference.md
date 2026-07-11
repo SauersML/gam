@@ -1267,17 +1267,7 @@ See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
       show_root_heading: true
       heading_level: 3
 
-## Distillation and staged coordinates
-
-::: gamfit.DistilledEncoder
-    options:
-      show_root_heading: true
-      heading_level: 3
-
-::: gamfit.EncoderFallbackStats
-    options:
-      show_root_heading: true
-      heading_level: 3
+## Staged coordinates
 
 ::: gamfit.CtnStage1
     options:

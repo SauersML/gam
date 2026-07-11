@@ -221,12 +221,12 @@ fn sae_manifold_circle_d2_ridge0_fits() {
 
 /// zz_ loop discriminator (#1095/#2228): is the failing R²≈0.4347 the gate-scaled
 /// PRISTINE SEED reconstruction rather than any fitted state? For K=1 with α=1 the
-/// ordered-ordered independent Beta--Bernoulli prior mass is π₀=(α/(α+1))¹=0.5, and the seed logits are 0, so the
+/// ordered independent Beta--Bernoulli prior mass is π₀=(α/(α+1))¹=0.5, and the seed logits are 0, so the
 /// gate is a₁=σ(0)·π₀=0.5·0.5=0.25. `decoder_lsq_init` fits the decoder UNGATED
 /// (z≈Φ·B), so the gated reconstruction is 0.25·Φ·B≈0.25·z on the signal columns →
 /// R²≈1−(1−0.25)²=0.4375, which matches the measured 0.434688. If `into_fitted`
 /// returns the pristine seed (because the settled curved fit reconstructs even
-/// worse — the ordered independent Beta--Bernoulli-gate/decoder co-collapse), the reported R² is this FIXED seed
+/// worse — the ordered independent Beta--Bernoulli gate/decoder co-collapse), the reported R² is this FIXED seed
 /// value, byte-identical across builds and INDEPENDENT of any inner-solve
 /// coordinate fix. This prints the cold-seed R², the returned R², and which
 /// into_fitted fallback fired so the loop can confirm the binding mechanism is the
