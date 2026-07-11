@@ -8944,15 +8944,13 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             lb_local.is_some(),
             built.linear_constraints.is_some(),
         ) {
-            (Some(rot), false, false) => {
-                let q = &rot.rotation;
-                let dense = built
-                    .design
-                    .try_to_dense_by_chunks("joint-null absorption rotation")
-                    .map_err(BasisError::InvalidInput)?;
-                let rotated = gam_linalg::faer_ndarray::fast_ab(&dense, q);
-                built.design =
-                    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(rotated));
+        (Some(rot), false, false) => {
+            let q = &rot.rotation;
+            built.design = apply_smooth_transform_to_design(
+                built.design.clone(),
+                q,
+                &term.name,
+            )?;
                 built.penalties = built
                     .penalties
                     .into_iter()

@@ -1556,7 +1556,7 @@ fn build_parametric_constraint_block_for_term(
     Ok(c)
 }
 
-fn apply_smooth_transform_to_design(
+pub fn apply_smooth_transform_to_design(
     design_local: DesignMatrix,
     transform: &Array2<f64>,
     termname: &str,

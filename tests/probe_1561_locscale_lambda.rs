@@ -1,8 +1,7 @@
 //! Probe (NOT a permanent guard): measure the Gaussian location-scale
 //! over-smoothing of the log-sigma surface (#1561) under several penalty
-//! configurations, to localize whether the over-smoothing is driven by adding
-//! null-space shrinkage to the SCALE block (the shipped default and mgcv
-//! `gaulss` both leave it off) vs the wiggliness-lambda selection itself.
+//! configurations, separating the shipped null-recovery default from explicit
+//! scale-only and both-block null-space-shrinkage opt-outs.
 //! Prints pearson(log sigma, truth), rmse, lambdas, edf.
 
 use gam::estimate::BlockRole;
@@ -73,7 +72,11 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
             return f64::NAN;
         }
     };
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         eprintln!("[{label}] not a location-scale fit");
         return f64::NAN;
@@ -104,7 +107,7 @@ fn run_case(label: &str, mean_formula: &str, noise_formula: &str, n: usize) -> f
     let gam_eta_sigma = scale_design.design.apply(&beta_scale).to_vec();
     let gam_log_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| (LOGB_SIGMA_FLOOR + e.exp()).ln())
+        .map(|&e| (response_scale * LOGB_SIGMA_FLOOR + e.exp()).ln())
         .collect();
 
     let true_mu: Vec<f64> = x.iter().map(|&t| mean_truth(t)).collect();
@@ -150,13 +153,13 @@ fn probe_1561_locscale_penalty_configs() {
     init_parallelism();
     let n = 200;
     eprintln!("=== #1561 probe: Gaussian location-scale log-sigma recovery (n={n}) ===");
-    // Shipped default: mean double penalty on, secondary/scale penalty off.
+    // Shipped null-recovery default: both double penalties on.
     let default_corr = run_case("default", "y ~ s(x, bs='tp')", "1 + s(x, bs='tp')", n);
-    // Explicitly add null-space shrinkage to the scale block.
-    let scale_with_double_corr = run_case(
-        "scale_with_double",
+    // Explicitly disable null-space shrinkage on the scale block only.
+    let scale_nodbl_corr = run_case(
+        "scale_nodbl",
         "y ~ s(x, bs='tp')",
-        "1 + s(x, bs='tp', double_penalty=true)",
+        "1 + s(x, bs='tp', double_penalty=false)",
         n,
     );
     // BOTH blocks without null-space double penalty.
@@ -173,7 +176,7 @@ fn probe_1561_locscale_penalty_configs() {
     // over-smoothing question this probe investigates.
     for (label, c) in [
         ("default", default_corr),
-        ("scale_with_double", scale_with_double_corr),
+        ("scale_nodbl", scale_nodbl_corr),
         ("both_nodbl", both_nodbl_corr),
     ] {
         assert!(

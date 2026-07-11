@@ -3,8 +3,8 @@
 //! gam-models (immune to the gam-umbrella recompile churn). Measures
 //! pearson(fitted logσ, true logσ), rmse, the selected lambdas, the REML score,
 //! and the per-block EDF under three genuinely distinct penalty configs:
-//!   (a) shipped default (mean double penalty on, scale double penalty off),
-//!   (b) explicitly add the scale-block null-space double penalty,
+//!   (a) shipped null-recovery default (both double penalties on),
+//!   (b) explicitly disable the scale-block null-space double penalty,
 //!   (c) disable the double penalty on both blocks.
 //! It is a measurement probe (not a permanent quality gate): each config must
 //! still produce a finite, positively-correlated log-σ surface.
@@ -201,10 +201,10 @@ fn probe_1561_locscale_penalty_configs() {
     let n = 200;
     eprintln!("=== #1561 gam-models probe: Gaussian location-scale log-σ recovery (n={n}) ===");
     let default_corr = run_case("default", "y ~ s(x, bs='tp')", "1 + s(x, bs='tp')", n);
-    let scale_with_double_corr = run_case(
-        "scale_with_double",
+    let scale_nodbl_corr = run_case(
+        "scale_nodbl",
         "y ~ s(x, bs='tp')",
-        "1 + s(x, bs='tp', double_penalty=true)",
+        "1 + s(x, bs='tp', double_penalty=false)",
         n,
     );
     let both_nodbl_corr = run_case(
@@ -215,7 +215,7 @@ fn probe_1561_locscale_penalty_configs() {
     );
     for (label, c) in [
         ("default", default_corr),
-        ("scale_with_double", scale_with_double_corr),
+        ("scale_nodbl", scale_nodbl_corr),
         ("both_nodbl", both_nodbl_corr),
     ] {
         assert!(

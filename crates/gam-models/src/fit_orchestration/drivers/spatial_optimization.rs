@@ -4388,18 +4388,17 @@ fn wrap_local_build_as_realization(
     ) {
         (Some(rot), false, false) => {
             let q = &rot.rotation;
-            let dense = local
-                .design
-                .try_to_dense_by_chunks("joint-null absorption rotation (single realization)")
-                .map_err(|e| {
-                    format!(
-                        "joint-null absorption rotation: dense conversion failed for term '{}': {}",
-                        termspec.name, e
-                    )
-                })?;
-            let rotated = gam_linalg::faer_ndarray::fast_ab(&dense, q);
-            local.design =
-                DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(rotated));
+            local.design = apply_smooth_transform_to_design(
+                local.design.clone(),
+                q,
+                &termspec.name,
+            )
+            .map_err(|e| {
+                format!(
+                    "joint-null absorption rotation failed for term '{}': {}",
+                    termspec.name, e
+                )
+            })?;
             local.penalties = local
                 .penalties
                 .into_iter()
