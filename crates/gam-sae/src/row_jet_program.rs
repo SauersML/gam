@@ -1640,6 +1640,65 @@ mod tests {
         check_recon_vs_hand::<16>(softmax_fixture_k(8, 1, n_basis, out_dim, inv_tau), inv_tau);
     }
 
+    /// The runtime production backend must remain exact beyond the former
+    /// 16-primary monomorphization ceiling. A nine-atom softmax row has 18
+    /// primaries (nine logits plus nine coordinates), so it could not enter the
+    /// old dispatch ladder. Compare its dynamic reconstruction and β-border
+    /// channels directly with independently instantiated fixed-size oracles.
+    #[test]
+    fn runtime_row_jets_match_fixed_oracle_above_old_arity_ceiling_932() {
+        const K: usize = 18;
+        let program = softmax_fixture_k(9, 1, 3, 5, 1.3);
+        assert_eq!(program.n_primaries, K);
+
+        let arena = DynamicJetArena::new();
+        let dynamic_columns = program.reconstruction_all_columns_dynamic(&arena);
+        let fixed_columns = program.reconstruction_all_columns_packed::<K>();
+        assert_eq!(dynamic_columns.len(), fixed_columns.len());
+        for (column, (dynamic, fixed)) in dynamic_columns.iter().zip(&fixed_columns).enumerate() {
+            let close = |actual: f64, expected: f64, channel: &str| {
+                let tolerance = 1.0e-12 * (1.0 + actual.abs().max(expected.abs()));
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "column {column} {channel}: dynamic={actual:.16e}, fixed={expected:.16e}, \
+                     tolerance={tolerance:.3e}"
+                );
+            };
+            close(dynamic.value(), fixed.value(), "value");
+            for a in 0..K {
+                close(dynamic.g()[a], fixed.g()[a], "gradient");
+                for b in 0..K {
+                    close(dynamic.h_at(a, b), fixed.h()[a][b], "Hessian");
+                }
+            }
+        }
+
+        let channels: Vec<(usize, usize)> = program
+            .atoms
+            .iter()
+            .enumerate()
+            .flat_map(|(atom, jet)| (0..jet.n_basis()).map(move |basis| (atom, basis)))
+            .collect();
+        let dynamic_border = program.beta_border_order1_dynamic(&channels, &arena);
+        let fixed_border = program.beta_border_order1_packed::<K>(&channels);
+        assert_eq!(dynamic_border.len(), fixed_border.len());
+        for (channel, (dynamic, fixed)) in dynamic_border.iter().zip(&fixed_border).enumerate() {
+            let tolerance = 1.0e-12 * (1.0 + dynamic.value().abs().max(fixed.value().abs()));
+            assert!(
+                (dynamic.value() - fixed.value()).abs() <= tolerance,
+                "β-border channel {channel} value mismatch"
+            );
+            for a in 0..K {
+                let tolerance =
+                    1.0e-12 * (1.0 + dynamic.g()[a].abs().max(fixed.g()[a].abs()));
+                assert!(
+                    (dynamic.g()[a] - fixed.g()[a]).abs() <= tolerance,
+                    "β-border channel {channel} gradient[{a}] mismatch"
+                );
+            }
+        }
+    }
+
     fn check_recon_vs_hand<const K: usize>(prog: SaeReconstructionRowProgram, inv_tau: f64) {
         let out_dim = prog.out_dim();
         let cols = prog.reconstruction_all_columns_packed::<K>();
