@@ -1429,7 +1429,7 @@ impl SaeManifoldOuterObjective {
         // Laplace inner solve at the settled ρ. Although the term is at the outer
         // optimum, that re-solve can still refuse to certify the full-budget joint
         // factor (the same recoverable "inner solve did not converge at fixed ρ"
-        // class the value/gradient/EFS lanes map to a finite wall). This path is
+        // class the value/gradient/EFS lanes map to an infeasible eval). This path is
         // optional — a recoverable refusal must degrade to no-covariance shape
         // bands, NOT abort the public fit. `reml_criterion_with_cache` mutates
         // `self.term` while re-solving, so snapshot and restore the fitted term
@@ -1821,7 +1821,7 @@ impl SaeManifoldOuterObjective {
         // bounded by the cumulative low-rank (PCA) ceiling — well under any fixed
         // floor on real LLM activations — so an absolute floor would reject EVERY
         // genuine arrival, the fit would fall to the blind cascade, and the cascade
-        // would collapse to the `1e12` data-collapse sentinel (the #1189 bug). The
+        // would collapse into a structurally degenerate basin (the #1189 bug). The
         // Eckart-Young SVD projection's OWN reconstruction EV is exactly that
         // achievable rank ceiling (`anchor_ev = 1 − ‖residual‖² / SST`) — a bound on
         // every η, not a linearity claim about the η=0 chart; the arrival floor below
@@ -2099,8 +2099,8 @@ impl SaeManifoldOuterObjective {
             // surfaces the DISTINCT "gated off at every row (all-zero gated design)"
             // marker (NOT the generic `solve_design_least_squares` "zero numerical rank",
             // which stays fatal for genuinely defective designs), so the outer solver
-            // reads it as the finite collapse wall and steers ρ back to where the gate
-            // turns atoms on (or ships best-so-far) rather than aborting the whole fit
+            // reads it as an infeasible trial and steers ρ back to where the gate
+            // turns atoms on rather than treating it as a finite objective value
             // with "no candidate seeds passed outer startup validation".
             || err.contains("gated off at every row (all-zero gated design)")
             // #2089 — a ρ whose smoothing / sparsity penalty is strong enough to
@@ -2109,8 +2109,8 @@ impl SaeManifoldOuterObjective {
             // cannot re-anchor `K` distinct charts) is a GENUINE INFEASIBILITY OF
             // THAT ρ — the same class as the non-PD Hessian / all-zero gated-design
             // probes above. A neighbouring, weaker-penalty ρ admits a non-degenerate
-            // fit, so the outer optimizer must read this as the finite collapse wall
-            // (+∞) and steer ρ back toward the feasible region — or ship best-so-far —
+            // fit, so the outer optimizer must read this as an infeasible trial
+            // (+∞) and steer ρ back toward the feasible region
             // NOT abort the entire alpha="auto" search the first time a line search
             // overshoots into a co-collapsing ρ. Aborting there fails fits that have a
             // perfectly good feasible ρ the search had not yet reached; and letting
@@ -2393,7 +2393,7 @@ impl SaeManifoldOuterObjective {
                 // convention as the historical loop's stationary factorization.
                 // Its remaining refusal classes (border Schur non-PD, cross-row
                 // non-PD) are the typed recoverable probe refusals the outer
-                // bridge already maps to the finite wall.
+                // bridge already maps to an infeasible trial.
                 return self.term.reml_criterion_with_refine_policy_and_lane(
                     self.target.view(),
                     rho,
@@ -2432,7 +2432,13 @@ impl SaeManifoldOuterObjective {
     /// resulting basin without running the outer-rho search or its derivative
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
-        self.evaluate_with_refine_policy(rho_flat, true)?;
+        let (cost, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
+        if !cost.is_finite() {
+            return Err(
+                "SaeManifoldOuterObjective::fit_at_fixed_rho: REML/LAML evidence is infeasible at the requested rho"
+                    .to_string(),
+            );
+        }
         self.fit_verdict = Some(SaeOuterVerdict::FixedRho);
         Ok(())
     }
@@ -2458,12 +2464,11 @@ impl SaeManifoldOuterObjective {
         // hand it off (a move: swapped against the restored `saved_term`, no
         // extra clone) to the next evaluation at this exact ρ — the line-search
         // accept pattern re-evaluates the accepted point at the ρ of its last
-        // successful value probe. Only a genuinely converged, non-wall value is
-        // worth handing off: a collapse-wall probe's state is a degenerate basin
-        // the accepted lane must not inherit, and a refused probe never
-        // converged at all.
+        // successful value probe. Only a genuinely converged finite value is
+        // worth handing off; a refused or non-finite probe never defines usable
+        // REML/LAML evidence.
         match &result {
-            Ok((cost, _beta)) if !Self::probe_value_is_wall(*cost) => {
+            Ok((cost, _beta)) if !Self::probe_value_is_infeasible(*cost) => {
                 let converged = std::mem::replace(&mut self.term, saved_term);
                 self.probe_converged_handoff = Some(ProbeConvergedHandoff {
                     rho_flat: rho_flat.to_owned(),
@@ -2517,11 +2522,11 @@ impl SaeManifoldOuterObjective {
     /// per-row factor BEFORE inner KKT stationarity: that factor describes the
     /// current warm-start iterate, not the probed ρ. The full accepted-point
     /// drive can cross that transient indefinite state and reach a finite
-    /// stationary factor (the linear-block seed that produced cost-only 1e12
-    /// versus analytic 3.6e13 at the identical ρ).
+    /// stationary factor (the linear-block seed that produced an infeasible
+    /// value probe versus a finite analytic evaluation at the identical ρ).
     ///
     /// Complete either provisional result once at the accepted-point drive.
-    /// Only a full-drive refusal reaches the caller's wall/hard-error
+    /// Only a full-drive refusal reaches the caller's infeasible/hard-error
     /// classification, so genuinely non-PD stationary factors retain their
     /// infeasibility semantics while transient pre-KKT indefiniteness never
     /// masquerades as a property of the probed ρ.
@@ -2571,10 +2576,10 @@ impl SaeManifoldOuterObjective {
         }
 
         // (3) Discovery trajectory — the historical single warm-start probe. Sets
-        // the probe handoff (if non-wall) to its converged term at this exact ρ.
+        // the probe handoff (when finite) to its converged term at this exact ρ.
         let discovery = self.evaluate_value_probe_with_drive(rho_flat, drive);
         let discovery_cost = match &discovery {
-            Ok((cost, _)) if !Self::probe_value_is_wall(*cost) => Some(*cost),
+            Ok((cost, _)) if !Self::probe_value_is_infeasible(*cost) => Some(*cost),
             _ => None,
         };
         // Reclaim the discovery basin's converged term from the handoff it just
@@ -2640,8 +2645,8 @@ impl SaeManifoldOuterObjective {
                 }
                 // Install the argmin basin's converged state as the handoff so the
                 // gradient lane prices THIS basin (envelope theorem). Only a
-                // non-wall envelope is worth handing off.
-                if !Self::probe_value_is_wall(env_value) {
+                // finite REML envelope is worth handing off.
+                if !Self::probe_value_is_infeasible(env_value) {
                     self.probe_converged_handoff = Some(ProbeConvergedHandoff {
                         rho_flat: rho_flat.to_owned(),
                         term: env_term,
@@ -2650,8 +2655,8 @@ impl SaeManifoldOuterObjective {
                 Ok((env_value, env_beta))
             }
             // Every member AND the discovery trajectory were infeasible at this ρ.
-            // Return the discovery verdict verbatim (its typed refusal / error is
-            // what the value lanes already map to the finite collapse wall).
+            // Return the discovery verdict verbatim; the caller maps a recoverable
+            // refusal to the optimizer's conventional infeasible value.
             None => {
                 drop(member_eval);
                 discovery
@@ -2820,6 +2825,27 @@ impl SaeManifoldOuterObjective {
                     self.surrogate_lane.as_mut(),
                 )
         };
+        let infeasible_evaluation = |reason: &str| {
+            (
+                EfsEval {
+                    cost: f64::INFINITY,
+                    steps: vec![0.0_f64; n_params],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
+                },
+                (0..n_params)
+                    .map(|index| {
+                        FixedPointCoordinateCertificate::uncovered(format!(
+                            "coordinate {index}: fixed-point evidence unavailable: {reason}"
+                        ))
+                    })
+                    .collect(),
+            )
+        };
         let (cost, loss, cache) = match criterion {
             Ok(evaluated) => evaluated,
             // #1782 — the EFS lane IS the SAE seed-startup-VALIDATION lane
@@ -2830,48 +2856,28 @@ impl SaeManifoldOuterObjective {
             // Laplace factorization refuses ("Schur complement Cholesky failed:
             // … not positive definite"), and any other infeasible-ρ-probe class
             // (non-PD per-row / cross-row joint Hessian, inner non-convergence).
-            // Propagating that `Err` here made the FIXED-POINT bridge REJECT the
-            // seed, and with the single PCA seed that emptied the candidate set →
-            // "no candidate seeds passed outer startup validation" for exactly the
-            // assignments/topologies whose seed does not land in the PD region
-            // (ibp_map+circle does, which is why it converged on identical data).
-            //
-            // A recoverable refusal is a REJECTABLE infeasibility WALL, not a hard
-            // failure: return a finite collapse-wall cost with all-zero EFS steps
-            // (the same finite barrier `add_fit_data_collapse_penalty` uses). The
-            // seed then STARTS the fixed-point solver, whose Wood–Fasiolo λ-update
-            // steers ρ off the wall toward the PD region on the next iterate rather
-            // than aborting the whole fit. A non-finite cost would be rejected by
-            // the bridge as a seed refusal, so the wall must stay finite. Genuine
-            // (non-recoverable) defects still propagate as a hard error.
+            // A recoverable refusal means the Laplace evidence is undefined at
+            // this ρ. It is an infeasible fixed-point evaluation, not a finite
+            // pseudo-objective with zero updates. Returning `+inf` and uncovered
+            // coordinates lets the fixed-point runner reject/backtrack without
+            // ever certifying the point. Genuine defects still propagate.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
-                self.probe_telemetry.wall_cost_value_probes += 1;
+                self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
-                return Ok((
-                    EfsEval {
-                        cost: SAE_FIT_DATA_COLLAPSE_COST,
-                        steps: vec![0.0_f64; n_params],
-                        beta: None,
-                        psi_gradient: None,
-                        psi_indices: None,
-                        inner_hessian_scale: None,
-                        logdet_enclosure_gap: None,
-                        consecutive_restored_incumbents: None,
-                    },
-                    (0..n_params)
-                        .map(|index| {
-                            FixedPointCoordinateCertificate::uncovered(format!(
-                                "coordinate {index}: fixed-point evidence unavailable at an infeasible rho wall"
-                            ))
-                        })
-                        .collect(),
-                ));
+                return Ok(infeasible_evaluation("infeasible REML/LAML evidence"));
             }
             Err(err) => return Err(err),
         };
+        self.record_fit_data_collapse_verdict(&rho)?;
         self.current_rho = rho.clone();
         self.last_loss = Some(loss);
+        if !cost.is_finite() {
+            self.probe_telemetry.infeasible_criterion_evals += 1;
+            return Ok(infeasible_evaluation(
+                "the REML/LAML criterion is non-finite",
+            ));
+        }
 
         // The MacKay/Fellner–Schall fixed point uses the observed row count.
         // Design-honesty weights are mean-one and only redistribute the weighted
@@ -3285,7 +3291,6 @@ impl SaeManifoldOuterObjective {
         }
 
         let beta_hat = self.term.flatten_beta();
-        let cost = self.add_fit_data_collapse_penalty(cost, &rho)?;
         let consecutive_restored_incumbents = self
             .term
             .best_fit_incumbent
@@ -3415,10 +3420,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // two ways now: efs_step's update targets the FINITE REML stationary
             // point λ_new = (rank−edof)/energy (#F1 — the unit-dispersion fixed
             // point the value criterion's ∂/∂ρ = 0 defines; `rank−edof ≤ rank`
-            // bounded and `energy > 0`, so λ cannot rail to a mean-collapse), and
-            // the data-floor collapse penalty (add_fit_data_collapse_penalty) on the
-            // value lane rejects a mean-collapsed dictionary. So the fixed-point
-            // lane is enabled.
+            // bounded and `energy > 0`, so λ cannot rail to a mean-collapse).
+            // Fitted-data collapse is recorded separately as a structure-search
+            // verdict and never changes this fixed-point objective.
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
@@ -3455,22 +3459,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // #2231 Inc-B — price the block-relevance Jacobian into the SAME
                 // cost that flows to `termination.record` (0 for a plain SAE).
                 let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+                if !cost.is_finite() {
+                    return Ok(f64::INFINITY);
+                }
                 if self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }
                 Ok(cost)
             }
-            // #1782 — a recoverable infeasible-ρ refusal presents the SAME finite
-            // collapse wall the EFS lane returns, not `+∞`. A finite (huge) wall is
-            // still rejected by the cross-seed / EFS-backtracking comparison this
-            // lane feeds, but it keeps the seed neighbourhood BOUNDED so the outer
-            // bridge's non-termination guard cannot escalate a globally-refused
-            // neighbourhood to a fatal seed rejection (see
-            // `recoverable_refusal_wall_cost`).
+            // A recoverable fixed-ρ refusal means the Laplace evidence is
+            // undefined. Cost-only objectives use `+inf` as their conventional
+            // infeasible result; no finite pseudo-objective is introduced.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
-                self.probe_telemetry.wall_cost_value_probes += 1;
-                Ok(Self::recoverable_refusal_wall_cost())
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                Ok(f64::INFINITY)
             }
             Err(err) => Err(EstimationError::RemlOptimizationFailed(err)),
         }
@@ -3501,27 +3504,22 @@ impl OuterObjective for SaeManifoldOuterObjective {
         if !self.term.streaming_plan().direct_logdet_admitted() {
             let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
                 Ok(evaluated) => evaluated,
-                // #1782 — recoverable infeasible-ρ refusal → finite collapse
-                // wall (zero gradient), not `+∞`. The wall still steers the
-                // outer descent away from the infeasible basin, but keeps the
-                // seed neighbourhood bounded so a globally-refused seed ships
-                // the best-so-far dictionary instead of aborting the fit (see
-                // `recoverable_refusal_wall_cost`).
+                // A recoverable refusal means the streaming Laplace evidence is
+                // undefined at this ρ. Return the objective contract's typed
+                // infeasible evaluation, never a finite surrogate value.
                 Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                     self.probe_telemetry.record_refusal_kind(&err);
-                    self.probe_telemetry.wall_cost_value_probes += 1;
-                    return Ok(OuterEval {
-                        cost: Self::recoverable_refusal_wall_cost(),
-                        gradient: Array1::zeros(rho.len()),
-                        hessian: HessianValue::Unavailable,
-                        inner_beta_hint: None,
-                    });
+                    self.probe_telemetry.infeasible_criterion_evals += 1;
+                    return Ok(OuterEval::infeasible(rho.len()));
                 }
                 Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
             };
             // #2231 Inc-B — price the block Jacobian into the streaming-lane cost
             // (0 for a plain SAE), so the recorded and returned value agree.
             let cost = cost + self.block_jacobian(&rho_state);
+            if !cost.is_finite() {
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
             if self.termination.record(cost) {
                 self.bank_checkpoint(rho);
             }
@@ -3604,31 +3602,24 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.ridge_beta,
         ) {
             Ok(evaluated) => evaluated,
-            // #1782 — an infeasible-ρ probe (non-PD per-row / cross-row / Schur-
-            // complement joint Hessian) has no defined Laplace evidence at this ρ.
-            // Present it to the BFGS/ARC line search as the SAME finite collapse
-            // wall the `Value` order and the EFS lane (`efs_step`) return (a huge
-            // but BOUNDED cost with a zero gradient) so the search steers back into
-            // the PD region WITHOUT the seed's own gradient eval being an unbounded
-            // `+∞`. An `+∞` seed sample left BFGS with `iter_count == 0` and every
-            // probe infeasible, so the bridge's non-termination guard escalated the
-            // globally-refused neighbourhood to a fatal seed rejection (the softmax
-            // "globally infeasible neighbourhood at seed" abort); the finite wall
-            // keeps the neighbourhood bounded so the fit ships the best-so-far seed
-            // dictionary instead (see `recoverable_refusal_wall_cost`). Genuine
-            // (non-recoverable) defects still hard-error below.
+            // A non-PD per-row/cross-row/Schur factor has no defined Laplace
+            // evidence at this ρ. Return the objective contract's typed
+            // infeasible evaluation so the optimizer rejects/backtracks. A
+            // finite sentinel here would be a different objective. Genuine
+            // evaluation defects still hard-error below.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
-                self.probe_telemetry.wall_cost_value_probes += 1;
-                return Ok(OuterEval {
-                    cost: Self::recoverable_refusal_wall_cost(),
-                    gradient: Array1::zeros(rho.len()),
-                    hessian: HessianValue::Unavailable,
-                    inner_beta_hint: None,
-                });
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok(OuterEval::infeasible(rho.len()));
             }
             Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
         };
+        self.record_fit_data_collapse_verdict(&rho_state)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        if !cost.is_finite() {
+            self.probe_telemetry.infeasible_criterion_evals += 1;
+            return Ok(OuterEval::infeasible(rho.len()));
+        }
         // Exact implicit derivative through the converged inner state. The arrow
         // solver first applies a rank-revealing projection of the closed-form
         // chart gauge and penalty-aware decoder nulls, then solves the resulting
@@ -3674,14 +3665,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
         // is the gradient we return: the consistent pair `(f, ∇f)` for the pure
         // REML criterion — the SAME criterion every value/ranking/EFS lane prices
-        // (one coherent objective; see `evaluate_with_inner_drive`). The collapse
-        // penalty is a discrete infeasibility wall (a huge constant on a
-        // degenerate fit), not a smooth regularizer — BFGS simply rejects steps
-        // into it, which is the intended barrier behaviour, so it stays on all
-        // lanes.
-        let cost = self
-            .add_fit_data_collapse_penalty(cost, &rho_state)
-            .map_err(EstimationError::RemlOptimizationFailed)?;
+        // (one coherent objective; see `evaluate_with_inner_drive`). Collapse was
+        // recorded above as a structural verdict and leaves this value unchanged.
         // #2231 Inc-B — price the block Jacobian into the gradient lane's cost so
         // the value it records matches the value/ranking/EFS lanes (0 for a plain
         // SAE). This Jacobian and the block-tail gradient populated above
@@ -3739,37 +3724,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 let (cost, _beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
                 {
                     Ok(evaluated) => evaluated,
-                    // #2080 — a recoverable infeasible-ρ refusal (non-PD Laplace
-                    // log-det) presents to the line search as the SAME finite
-                    // collapse wall the gradient lane (`eval`) and the value /
-                    // EFS / startup lanes (`eval_cost`, `efs_step`) already
-                    // return for this class (#1782). Returning `+∞` here instead
-                    // (an infeasible Wolfe value) desynced this lane from the
-                    // gradient lane: the anchor `(cost, ∇f)` from `eval` carried
-                    // the finite wall, but every line-search probe overshooting
-                    // the seed's PD basin returned `+∞`, which `finite_cost_or_error`
-                    // in the outer bridge converts into a `Recoverable` probe
-                    // refusal. On a seed whose PD basin the first BFGS direction
-                    // immediately exits (the K=2 wide-`p` two-circle fit, whose
-                    // seed sits on the non-PD boundary), EVERY probe refused, the
-                    // consecutive-refusal counter never reset, and the
-                    // non-termination guard escalated the whole fit to a fatal
-                    // "globally infeasible neighbourhood at seed" abort — never
-                    // shipping the perfectly feasible seed dictionary. The finite
-                    // wall is astronomically larger than any real REML value, so
-                    // the Armijo/Wolfe search still rejects a step INTO it (the
-                    // same steering), but the bridge reads a finite cost, resets
-                    // its refusal streak, and BFGS halts at the feasible seed and
-                    // ships best-so-far instead of aborting.
+                    // A recoverable non-PD/non-converged probe has undefined
+                    // Laplace evidence. `OuterEval::infeasible` is the
+                    // line-search contract for rejection/backtracking and carries
+                    // no derivative.
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                         self.probe_telemetry.record_refusal_kind(&err);
-                        self.probe_telemetry.wall_cost_value_probes += 1;
-                        return Ok(OuterEval {
-                            cost: Self::recoverable_refusal_wall_cost(),
-                            gradient: Array1::zeros(rho.len()),
-                            hessian: HessianValue::Unavailable,
-                            inner_beta_hint: None,
-                        });
+                        self.probe_telemetry.infeasible_criterion_evals += 1;
+                        return Ok(OuterEval::infeasible(rho.len()));
                     }
                     Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
                 };
@@ -3777,6 +3739,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // probe cost (0 for a plain SAE) so the value the outer search
                 // ranks matches the gradient/EFS lanes.
                 let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+                if !cost.is_finite() {
+                    return Ok(OuterEval::infeasible(rho.len()));
+                }
                 if self.termination.record(cost) {
                     self.bank_checkpoint(rho);
                 }

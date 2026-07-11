@@ -88,16 +88,16 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .eval_cost(&base)
         .expect("base value lane must converge");
     assert!(
-        base_cost.is_finite() && base_cost < SAE_FIT_DATA_COLLAPSE_COST,
-        "the active-rho derivative witness must start in a real noncollapsed basin, \
-         not on the discrete fit-data wall: base={base_cost:.17e}"
+        base_cost.is_finite(),
+        "the active-rho derivative witness must start at feasible REML evidence: \
+         base={base_cost:.17e}"
     );
     let evaluation = gradient_objective
         .eval(&base)
         .expect("base analytic-gradient lane must converge");
     assert!(
-        evaluation.cost.is_finite() && evaluation.cost < SAE_FIT_DATA_COLLAPSE_COST,
-        "the analytic-gradient lane must price the same real noncollapsed basin: \
+        evaluation.cost.is_finite(),
+        "the analytic-gradient lane must price the same feasible REML basin: \
          cost={:.17e}",
         evaluation.cost
     );
@@ -118,22 +118,22 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let (plus_cost, plus_telemetry) = cost_at(&plus);
     let (minus_cost, minus_telemetry) = cost_at(&minus);
     assert!(
-        plus_cost.is_finite() && plus_cost < SAE_FIT_DATA_COLLAPSE_COST,
-        "+h must evaluate the real REML criterion, not the discrete fit-data wall: \
+        plus_cost.is_finite(),
+        "+h must evaluate feasible REML evidence: \
          cost={plus_cost:.17e}, telemetry={plus_telemetry:?}"
     );
     assert!(
-        minus_cost.is_finite() && minus_cost < SAE_FIT_DATA_COLLAPSE_COST,
-        "-h must evaluate the real REML criterion, not the discrete fit-data wall: \
+        minus_cost.is_finite(),
+        "-h must evaluate feasible REML evidence: \
          cost={minus_cost:.17e}, telemetry={minus_telemetry:?}"
     );
     assert_eq!(
-        plus_telemetry.wall_cost_value_probes, 0,
-        "+h value probe returned the recoverable-refusal wall: {plus_telemetry:?}"
+        plus_telemetry.infeasible_criterion_evals, 0,
+        "+h value probe returned infeasible evidence: {plus_telemetry:?}"
     );
     assert_eq!(
-        minus_telemetry.wall_cost_value_probes, 0,
-        "-h value probe returned the recoverable-refusal wall: {minus_telemetry:?}"
+        minus_telemetry.infeasible_criterion_evals, 0,
+        "-h value probe returned infeasible evidence: {minus_telemetry:?}"
     );
     assert_ne!(
         plus_cost.to_bits(),

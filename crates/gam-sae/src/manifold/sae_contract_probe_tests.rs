@@ -952,8 +952,8 @@ fn sae_k1_circle_reml_criterion_ranks_fixed_point_2226() {
 /// The amortized-encoder consistency diagnostic `c(ρ)` has no analytic
 /// derivative, so it cannot rank `f+c` while BFGS descends `f`: the selected fit
 /// would not be stationary for its selection criterion. Both lanes therefore
-/// report their matched pure-REML value (plus the shared discrete collapse
-/// wall), while encoder consistency remains a read-only diagnostic.
+/// report their matched pure-REML value, while encoder consistency and the
+/// fitted-data collapse ledger remain read-only diagnostics.
 #[test]
 fn ranking_and_gradient_lanes_match_bare_reml() {
     let mut objective = warmstart_test_objective_with_evaluator();
@@ -988,8 +988,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
     // difference between a lane and its matched bare is the objective plumbing.
 
     // Bare REML for the VALUE lane, computed on the SAME probe refine policy
-    // (`refine_progress_extension = false`) the value lane uses, plus the
-    // collapse barrier it also keeps.
+    // (`refine_progress_extension = false`) the value lane uses.
     let bare_value = {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
@@ -1012,9 +1011,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
                 false,
             )
             .expect("bare value-lane REML criterion evaluates");
-        probe
-            .add_fit_data_collapse_penalty(reml, &rho_state)
-            .expect("collapse penalty evaluates")
+        reml
     };
     let value_vs_bare = (value_lane - bare_value).abs();
     assert!(
@@ -1026,8 +1023,8 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
 
     // Bare REML for the GRADIENT lane, computed on the SAME full-refine path
     // (`reml_criterion_with_cache`, i.e. `refine_progress_extension = true`)
-    // the gradient lane uses, plus the collapse barrier. The gradient lane
-    // must EQUAL this (it carries NO consistency fold), so its (cost, ∇f) pair
+    // the gradient lane uses. The gradient lane must EQUAL this (it carries NO
+    // consistency or collapse fold), so its (cost, ∇f) pair
     // describes one function — the #1206 contract for BFGS Armijo. (The
     // gradient-lane and value-lane bares may differ by the refine policy, so
     // each lane is checked against its OWN matched bare.)
@@ -1052,9 +1049,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
                 probe.ridge_beta,
             )
             .expect("bare gradient-lane REML criterion evaluates");
-        probe
-            .add_fit_data_collapse_penalty(reml, &rho_state)
-            .expect("collapse penalty evaluates")
+        reml
     };
     let gradient_vs_bare = (gradient_lane - bare_grad).abs();
     assert!(

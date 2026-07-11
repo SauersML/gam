@@ -150,23 +150,6 @@ impl SaeBetaPenaltyAssembly {
 /// "worse than the mean" reference is genuinely wanted (arrival / incumbent gates).
 pub(crate) const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
 
-/// #1189/#1217/#1610 — the finite BFGS INFEASIBILITY WALL substituted for a
-/// non-finite / collapsed REML criterion so the outer line search REJECTS the
-/// step and backtracks toward the feasible basin instead of aborting the whole
-/// outer solve (the `opt` BFGS treats a non-finite probe as "line search failed"
-/// and gives up at the current iterate — observed on real OLMo K=2, stall at
-/// iter 2 with |g|≈65; see [`super::outer_objective`]). It is deliberately a
-/// FINITE wall, not `∞`: an `∞` probe is non-differentiable and un-backtrackable,
-/// whereas a large finite value presents as an ordinary infeasible step. The
-/// magnitude is NOT a tuned operating point — it is a sentinel chosen only to
-/// DOMINATE any realizable REML criterion for a non-collapsed SAE fit (which is
-/// `O(N·p·log σ²)` — tens to thousands in magnitude) by many orders, so a
-/// collapsed/infeasible probe always loses the line-search comparison. `1e12`
-/// clears that with headroom while staying far below `f64::MAX` (the sum path
-/// clamps to `2·wall` so a near-`f64::MAX` finite base can never overflow to
-/// `∞`). The non-collapsed, finite-cost path is byte-for-byte unchanged.
-pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
-
 /// #1026 — reconstruction EV-improvement / EV-degradation tolerance for the
 /// inner-fit reconstruction INCUMBENT. A new inner iterate is recorded as the
 /// best-reconstruction state only when its explained variance improves by more
