@@ -298,67 +298,74 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
         flat
     };
 
+    use gam_solve::rho_optimizer::OuterProblem;
+    use gam_solve::seeding::SeedConfig;
+
     // Stationarity scale n·p_1/2 (the Jacobian half-count): the analytic block
     // gradient is `½·R̃_1 − scale`, so `scale` is the natural absolute reference.
     let scale = 0.5 * n as f64 * p_1 as f64;
     let h = 0.05_f64;
-    // ONE objective, warm continuation — the engine's ACTUAL calling
-    // convention: eval/eval_cost during a search always run on a warm object
-    // (probe handoffs / inner warm starts from the preceding evaluation), and a
-    // COLD off-optimum eval on this fixture legitimately refuses (the inner
-    // solve cannot certify within budget; the (wall, 0) pair is the steering
-    // convention, not a gradient). This gate confirms the (f, ∇f) CONSISTENCY
-    // at points that are actually evaluable — the exact block-gradient VALUE is
-    // pinned to 1e-5 by the pure-math sibling `tests_crosscoder_block_fd_2231`.
+    // FD-check the block gradient AT A POINT THE GRADIENT LANE PROVABLY
+    // EVALUATED. The ValueAndGradient lane opens the inner solve from the
+    // accepted-basin warm start the outer search builds; a COLD eval at a
+    // hand-picked off-optimum ρ legitimately refuses (the inner solve cannot
+    // certify from scratch within budget — the (wall, 0) pair is the steering
+    // convention, not a gradient), whereas the cost lane's two-stage
+    // basin/envelope path certifies there. So run the real outer search, take
+    // its BANKED CHECKPOINT (an accepted iterate where `termination.record`
+    // fired ⇒ the gradient lane succeeded), and FD-check there. The exact
+    // block-gradient VALUE is independently pinned to 1e-6 by the pure-math
+    // sibling `tests_crosscoder_block_fd_2231`; this gate adds the full-engine
+    // (f, ∇f) consistency at a real search iterate.
     let mut obj = engaged_objective(&evaluator, &z, &coords);
-    obj.eval_cost(&rho_template.to_flat())
-        .expect("the seed evaluation must converge");
-    // Walk outward from the warm origin in small monotone steps; a point counts
-    // only when the center eval AND both ±h cost probes certify (non-wall).
-    // Require at least one such comparison so the gate cannot pass vacuously,
-    // and assert the desync bound on every comparison it does make.
+    let initial = rho_template.to_flat();
+    let n_params = initial.len();
+    let problem = OuterProblem::new(n_params)
+        .with_initial_rho(initial.clone())
+        .with_seed_config(SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let _ = problem.run(&mut obj, "block FD gate 2231");
+    // The banked checkpoint is the best accepted iterate — a ρ the gradient
+    // lane evaluated (fell through `termination.record`). Fall back to the
+    // origin only if nothing banked (then the warm seed is evaluable).
+    let banked = obj
+        .try_resume_from_checkpoint(n_params)
+        .map(Array1::from)
+        .unwrap_or(initial);
+    let banked_ll = banked[banked.len() - 1];
+
     let is_wall = |c: f64| !(c < 1.0e11);
-    let mut checked = 0usize;
-    for &ll in &[0.0_f64, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3] {
-        // Mirror the engine's real sequence: a search runs the ValueAndGradient
-        // lane at ρ only AFTER the Value lane (cost probe) has converged there
-        // and parked a ρ-keyed handoff (the two-stage basin/envelope path the
-        // cost lane owns but the raw gradient call does not). Warming with
-        // eval_cost at THIS ρ immediately before eval lets eval open at the
-        // converged optimum instead of re-tracing from a cold state.
-        let center_cost = obj.eval_cost(&flat_at(ll));
-        if !matches!(center_cost, Ok(c) if !is_wall(c)) {
-            continue;
-        }
-        let eval = match obj.eval(&flat_at(ll)) {
-            Ok(eval) if !is_wall(eval.cost) => eval,
-            _ => continue,
-        };
-        let (Ok(c_plus), Ok(c_minus)) = (
-            obj.eval_cost(&flat_at(ll + h)),
-            obj.eval_cost(&flat_at(ll - h)),
-        ) else {
-            continue;
-        };
-        if is_wall(c_plus) || is_wall(c_minus) {
-            continue;
-        }
-        let analytic = eval.gradient[eval.gradient.len() - 1];
-        let fd = (c_plus - c_minus) / (2.0 * h);
-        let tol = 0.1 * scale + 0.1 * analytic.abs();
-        assert!(
-            (analytic - fd).abs() < tol,
-            "block gradient desync at log λ_1 = {ll:.3}: analytic ½·R̃_1 − n·p_1/2 = \
-             {analytic:.4} vs central-difference of eval_cost = {fd:.4} (|Δ| = {:.4}, \
-             tol = {tol:.4}) — the #2087 objective↔gradient pair is inconsistent",
-            (analytic - fd).abs()
-        );
-        checked += 1;
-    }
+    let eval = obj
+        .eval(&banked)
+        .expect("the ValueAndGradient lane must evaluate at the banked iterate");
     assert!(
-        checked >= 1,
-        "no evaluable FD probe point found near the warm origin — the fixture's \
-         evaluable window collapsed (would make this gate pass vacuously)"
+        !is_wall(eval.cost),
+        "the banked search iterate (log λ_1 = {banked_ll:.3}) is on the wall — \
+         the outer search banked an infeasible point"
+    );
+    let analytic = eval.gradient[eval.gradient.len() - 1];
+    let c_plus = obj
+        .eval_cost(&flat_at(banked_ll + h))
+        .expect("cost at banked log λ_1 + h");
+    let c_minus = obj
+        .eval_cost(&flat_at(banked_ll - h))
+        .expect("cost at banked log λ_1 − h");
+    assert!(
+        !is_wall(c_plus) && !is_wall(c_minus),
+        "the ±h neighbourhood of the banked iterate hit the wall — cannot FD-check"
+    );
+    let fd = (c_plus - c_minus) / (2.0 * h);
+    let tol = 0.1 * scale + 0.1 * analytic.abs();
+    assert!(
+        (analytic - fd).abs() < tol,
+        "block gradient desync at the banked iterate log λ_1 = {banked_ll:.3}: \
+         analytic ½·R̃_1 − n·p_1/2 = {analytic:.4} vs central-difference of eval_cost = \
+         {fd:.4} (|Δ| = {:.4}, tol = {tol:.4}) — the #2087 objective↔gradient pair is \
+         inconsistent",
+        (analytic - fd).abs()
     );
 }
 
