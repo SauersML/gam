@@ -5709,7 +5709,11 @@ impl SaeManifoldTerm {
                 let d_th_d = (directional_decrease - lm_ridge_b * step_norm_sq).max(0.0);
                 let predicted =
                     (alpha * directional_decrease - 0.5 * alpha * alpha * d_th_d).max(0.0);
-                let gain_ratio = if predicted > 0.0 { actual / predicted } else { 1.0 };
+                let gain_ratio = if predicted > 0.0 {
+                    actual / predicted
+                } else {
+                    1.0
+                };
                 if gain_ratio < LM_RATIO_LOW {
                     lm_ridge_t *= LM_RIDGE_FACTOR;
                     lm_ridge_b *= LM_RIDGE_FACTOR;

@@ -189,6 +189,594 @@ pub trait JetScalar<const K: usize>: Copy {
     }
 }
 
+/// A Taylor-jet scalar whose primary dimension is selected at runtime.
+///
+/// This is the dimensioned counterpart of [`JetScalar`].  Its algebra is the
+/// same; only the constructors receive the row's actual primary count.  The
+/// fixed-size scalar implementations below bridge to this trait as well, which
+/// lets one row program serve both the const-generic derivative oracles and the
+/// runtime-sized production backends without duplicating the expression.
+pub trait RuntimeJetScalar: Clone {
+    /// A constant in a `dimension`-primary algebra.
+    fn constant(c: f64, dimension: usize) -> Self;
+    /// A seeded variable in a `dimension`-primary algebra.
+    fn variable(x: f64, axis: usize, dimension: usize) -> Self;
+    /// Number of primary derivative axes carried by this scalar.
+    fn dimension(&self) -> usize;
+    /// Value channel.
+    fn value(&self) -> f64;
+    /// Exact truncated sum.
+    fn add(&self, o: &Self) -> Self;
+    /// Exact truncated difference.
+    fn sub(&self, o: &Self) -> Self;
+    /// Exact truncated product.
+    fn mul(&self, o: &Self) -> Self;
+    /// Negate every channel.
+    fn neg(&self) -> Self;
+    /// Scale every channel.
+    fn scale(&self, s: f64) -> Self;
+    /// Exact unary composition from the certified derivative stack.
+    fn compose_unary(&self, d: [f64; 5]) -> Self;
+
+    /// `e^self`.
+    fn exp(&self) -> Self {
+        let e = self.value().exp();
+        self.compose_unary([e, e, e, e, e])
+    }
+
+    /// `1/self`.
+    fn recip(&self) -> Self {
+        let r = 1.0 / self.value();
+        let r2 = r * r;
+        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+    }
+}
+
+/// Adapter that presents any const-generic [`JetScalar<K>`] through the
+/// runtime-dimension interface.  It is used by derivative oracles so the same
+/// row program can be instantiated at a fixed tower and at a dynamic packed
+/// scalar; production code unwraps the inner fixed tower after evaluation.
+#[derive(Clone, Copy, Debug)]
+pub struct FixedRuntimeJet<S, const K: usize> {
+    inner: S,
+}
+
+impl<S, const K: usize> FixedRuntimeJet<S, K> {
+    /// Recover the wrapped const-generic scalar.
+    #[must_use]
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: JetScalar<K>, const K: usize> RuntimeJetScalar for FixedRuntimeJet<S, K> {
+    fn constant(c: f64, dimension: usize) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        Self {
+            inner: S::constant(c),
+        }
+    }
+
+    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        Self {
+            inner: S::variable(x, axis),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        K
+    }
+
+    fn value(&self) -> f64 {
+        self.inner.value()
+    }
+
+    fn add(&self, o: &Self) -> Self {
+        Self {
+            inner: self.inner.add(&o.inner),
+        }
+    }
+
+    fn sub(&self, o: &Self) -> Self {
+        Self {
+            inner: self.inner.sub(&o.inner),
+        }
+    }
+
+    fn mul(&self, o: &Self) -> Self {
+        Self {
+            inner: self.inner.mul(&o.inner),
+        }
+    }
+
+    fn neg(&self) -> Self {
+        Self {
+            inner: self.inner.neg(),
+        }
+    }
+
+    fn scale(&self, s: f64) -> Self {
+        Self {
+            inner: self.inner.scale(s),
+        }
+    }
+
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        Self {
+            inner: self.inner.compose_unary(d),
+        }
+    }
+}
+
+/// Runtime-sized packed first-order scalar: value plus gradient.
+#[derive(Clone, Debug)]
+pub struct DynamicOrder1 {
+    /// Value channel.
+    pub v: f64,
+    /// Gradient channel, length [`Self::dimension`].
+    pub g: Vec<f64>,
+}
+
+impl DynamicOrder1 {
+    /// Gradient channel.
+    #[inline]
+    #[must_use]
+    pub fn g(&self) -> &[f64] {
+        &self.g
+    }
+
+    #[inline]
+    fn assert_compatible(&self, o: &Self) {
+        assert_eq!(
+            self.g.len(),
+            o.g.len(),
+            "dynamic first-order jet dimension mismatch"
+        );
+    }
+}
+
+impl RuntimeJetScalar for DynamicOrder1 {
+    fn constant(c: f64, dimension: usize) -> Self {
+        Self {
+            v: c,
+            g: vec![0.0; dimension],
+        }
+    }
+
+    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+        assert!(
+            axis < dimension,
+            "dynamic first-order jet axis out of bounds"
+        );
+        let mut out = Self::constant(x, dimension);
+        out.g[axis] = 1.0;
+        out
+    }
+
+    fn dimension(&self) -> usize {
+        self.g.len()
+    }
+
+    fn value(&self) -> f64 {
+        self.v
+    }
+
+    fn add(&self, o: &Self) -> Self {
+        self.assert_compatible(o);
+        let mut g = self.g.clone();
+        for (out, rhs) in g.iter_mut().zip(&o.g) {
+            *out += rhs;
+        }
+        Self { v: self.v + o.v, g }
+    }
+
+    fn sub(&self, o: &Self) -> Self {
+        self.add(&o.scale(-1.0))
+    }
+
+    fn mul(&self, o: &Self) -> Self {
+        self.assert_compatible(o);
+        let mut g = vec![0.0; self.dimension()];
+        for (i, out) in g.iter_mut().enumerate() {
+            *out = self.v * o.g[i] + self.g[i] * o.v;
+        }
+        Self { v: self.v * o.v, g }
+    }
+
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+
+    fn scale(&self, s: f64) -> Self {
+        let mut g = self.g.clone();
+        for out in &mut g {
+            *out *= s;
+        }
+        Self { v: self.v * s, g }
+    }
+
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        let mut g = vec![0.0; self.dimension()];
+        for (i, out) in g.iter_mut().enumerate() {
+            *out = d[1] * self.g[i];
+        }
+        Self { v: d[0], g }
+    }
+}
+
+/// Runtime-sized packed second-order scalar: value, gradient, and a row-major
+/// Hessian. Storage is `O(K^2)` in the row's actual primary dimension.
+#[derive(Clone, Debug)]
+pub struct DynamicOrder2 {
+    /// Value channel.
+    pub v: f64,
+    /// Gradient channel.
+    pub g: Vec<f64>,
+    /// Row-major Hessian channel.
+    pub h: Vec<f64>,
+}
+
+impl DynamicOrder2 {
+    /// Gradient channel.
+    #[inline]
+    #[must_use]
+    pub fn g(&self) -> &[f64] {
+        &self.g
+    }
+
+    /// Row-major Hessian channel.
+    #[inline]
+    #[must_use]
+    pub fn h(&self) -> &[f64] {
+        &self.h
+    }
+
+    /// Hessian entry `(row, col)`.
+    #[inline]
+    #[must_use]
+    pub fn h_at(&self, row: usize, col: usize) -> f64 {
+        self.h[row * self.dimension() + col]
+    }
+
+    #[inline]
+    fn assert_compatible(&self, o: &Self) {
+        assert_eq!(
+            self.g.len(),
+            o.g.len(),
+            "dynamic second-order jet dimension mismatch"
+        );
+        assert_eq!(
+            self.h.len(),
+            o.h.len(),
+            "dynamic second-order jet Hessian mismatch"
+        );
+    }
+}
+
+impl RuntimeJetScalar for DynamicOrder2 {
+    fn constant(c: f64, dimension: usize) -> Self {
+        Self {
+            v: c,
+            g: vec![0.0; dimension],
+            h: vec![0.0; dimension * dimension],
+        }
+    }
+
+    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+        assert!(
+            axis < dimension,
+            "dynamic second-order jet axis out of bounds"
+        );
+        let mut out = Self::constant(x, dimension);
+        out.g[axis] = 1.0;
+        out
+    }
+
+    fn dimension(&self) -> usize {
+        self.g.len()
+    }
+
+    fn value(&self) -> f64 {
+        self.v
+    }
+
+    fn add(&self, o: &Self) -> Self {
+        self.assert_compatible(o);
+        let mut g = self.g.clone();
+        let mut h = self.h.clone();
+        for (out, rhs) in g.iter_mut().zip(&o.g) {
+            *out += rhs;
+        }
+        for (out, rhs) in h.iter_mut().zip(&o.h) {
+            *out += rhs;
+        }
+        Self {
+            v: self.v + o.v,
+            g,
+            h,
+        }
+    }
+
+    fn sub(&self, o: &Self) -> Self {
+        self.add(&o.scale(-1.0))
+    }
+
+    fn mul(&self, o: &Self) -> Self {
+        self.assert_compatible(o);
+        let n = self.dimension();
+        let mut out = Self::constant(self.v * o.v, n);
+        for i in 0..n {
+            out.g[i] = self.v * o.g[i] + self.g[i] * o.v;
+        }
+        for i in 0..n {
+            for j in i..n {
+                let ij = i * n + j;
+                let hij =
+                    self.v * o.h[ij] + self.g[i] * o.g[j] + self.g[j] * o.g[i] + self.h[ij] * o.v;
+                out.h[ij] = hij;
+                out.h[j * n + i] = hij;
+            }
+        }
+        out
+    }
+
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+
+    fn scale(&self, s: f64) -> Self {
+        let mut out = self.clone();
+        out.v *= s;
+        for x in &mut out.g {
+            *x *= s;
+        }
+        for x in &mut out.h {
+            *x *= s;
+        }
+        out
+    }
+
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        let n = self.dimension();
+        let mut out = Self::constant(d[0], n);
+        for i in 0..n {
+            out.g[i] = d[1] * self.g[i];
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let ij = i * n + j;
+                out.h[ij] = d[1] * self.h[ij] + d[2] * self.g[i] * self.g[j];
+            }
+        }
+        out
+    }
+}
+
+/// Runtime-sized one-seed scalar for a Hessian-contracted third derivative.
+#[derive(Clone, Debug)]
+pub struct DynamicOneSeed {
+    /// Base value/gradient/Hessian channels.
+    pub base: DynamicOrder2,
+    /// Nilpotent `epsilon` coefficient.
+    pub eps: DynamicOrder2,
+}
+
+impl DynamicOneSeed {
+    /// Seed one primary with the supplied contraction direction component.
+    #[must_use]
+    pub fn seed_direction(x: f64, axis: usize, u_axis: f64, dimension: usize) -> Self {
+        Self {
+            base: DynamicOrder2::variable(x, axis, dimension),
+            eps: DynamicOrder2::constant(u_axis, dimension),
+        }
+    }
+
+    /// Row-major contracted-third matrix.
+    #[must_use]
+    pub fn contracted_third(&self) -> &[f64] {
+        self.eps.h()
+    }
+}
+
+impl RuntimeJetScalar for DynamicOneSeed {
+    fn constant(c: f64, dimension: usize) -> Self {
+        Self {
+            base: DynamicOrder2::constant(c, dimension),
+            eps: DynamicOrder2::constant(0.0, dimension),
+        }
+    }
+
+    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+        Self {
+            base: DynamicOrder2::variable(x, axis, dimension),
+            eps: DynamicOrder2::constant(0.0, dimension),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        self.base.dimension()
+    }
+
+    fn value(&self) -> f64 {
+        self.base.value()
+    }
+
+    fn add(&self, o: &Self) -> Self {
+        Self {
+            base: self.base.add(&o.base),
+            eps: self.eps.add(&o.eps),
+        }
+    }
+
+    fn sub(&self, o: &Self) -> Self {
+        Self {
+            base: self.base.sub(&o.base),
+            eps: self.eps.sub(&o.eps),
+        }
+    }
+
+    fn mul(&self, o: &Self) -> Self {
+        Self {
+            base: self.base.mul(&o.base),
+            eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
+        }
+    }
+
+    fn neg(&self) -> Self {
+        Self {
+            base: self.base.neg(),
+            eps: self.eps.neg(),
+        }
+    }
+
+    fn scale(&self, s: f64) -> Self {
+        Self {
+            base: self.base.scale(s),
+            eps: self.eps.scale(s),
+        }
+    }
+
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        let base = self.base.compose_unary(d);
+        let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
+        let eps = fprime.mul(&self.eps);
+        Self { base, eps }
+    }
+}
+
+/// Runtime-sized two-seed scalar for a Hessian-contracted fourth derivative.
+#[derive(Clone, Debug)]
+pub struct DynamicTwoSeed {
+    /// Base value/gradient/Hessian channels.
+    pub base: DynamicOrder2,
+    /// Nilpotent `epsilon` coefficient.
+    pub eps: DynamicOrder2,
+    /// Nilpotent `delta` coefficient.
+    pub del: DynamicOrder2,
+    /// Mixed `epsilon delta` coefficient.
+    pub eps_del: DynamicOrder2,
+}
+
+impl DynamicTwoSeed {
+    /// Seed one primary with both contraction direction components.
+    #[must_use]
+    pub fn seed(x: f64, axis: usize, u_axis: f64, v_axis: f64, dimension: usize) -> Self {
+        Self {
+            base: DynamicOrder2::variable(x, axis, dimension),
+            eps: DynamicOrder2::constant(u_axis, dimension),
+            del: DynamicOrder2::constant(v_axis, dimension),
+            eps_del: DynamicOrder2::constant(0.0, dimension),
+        }
+    }
+
+    /// Row-major contracted-fourth matrix.
+    #[must_use]
+    pub fn contracted_fourth(&self) -> &[f64] {
+        self.eps_del.h()
+    }
+}
+
+impl RuntimeJetScalar for DynamicTwoSeed {
+    fn constant(c: f64, dimension: usize) -> Self {
+        Self {
+            base: DynamicOrder2::constant(c, dimension),
+            eps: DynamicOrder2::constant(0.0, dimension),
+            del: DynamicOrder2::constant(0.0, dimension),
+            eps_del: DynamicOrder2::constant(0.0, dimension),
+        }
+    }
+
+    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+        Self {
+            base: DynamicOrder2::variable(x, axis, dimension),
+            eps: DynamicOrder2::constant(0.0, dimension),
+            del: DynamicOrder2::constant(0.0, dimension),
+            eps_del: DynamicOrder2::constant(0.0, dimension),
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        self.base.dimension()
+    }
+
+    fn value(&self) -> f64 {
+        self.base.value()
+    }
+
+    fn add(&self, o: &Self) -> Self {
+        Self {
+            base: self.base.add(&o.base),
+            eps: self.eps.add(&o.eps),
+            del: self.del.add(&o.del),
+            eps_del: self.eps_del.add(&o.eps_del),
+        }
+    }
+
+    fn sub(&self, o: &Self) -> Self {
+        Self {
+            base: self.base.sub(&o.base),
+            eps: self.eps.sub(&o.eps),
+            del: self.del.sub(&o.del),
+            eps_del: self.eps_del.sub(&o.eps_del),
+        }
+    }
+
+    fn mul(&self, o: &Self) -> Self {
+        let base = self.base.mul(&o.base);
+        let eps = self.base.mul(&o.eps).add(&self.eps.mul(&o.base));
+        let del = self.base.mul(&o.del).add(&self.del.mul(&o.base));
+        let eps_del = self
+            .base
+            .mul(&o.eps_del)
+            .add(&self.eps.mul(&o.del))
+            .add(&self.del.mul(&o.eps))
+            .add(&self.eps_del.mul(&o.base));
+        Self {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+
+    fn neg(&self) -> Self {
+        Self {
+            base: self.base.neg(),
+            eps: self.eps.neg(),
+            del: self.del.neg(),
+            eps_del: self.eps_del.neg(),
+        }
+    }
+
+    fn scale(&self, s: f64) -> Self {
+        Self {
+            base: self.base.scale(s),
+            eps: self.eps.scale(s),
+            del: self.del.scale(s),
+            eps_del: self.eps_del.scale(s),
+        }
+    }
+
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        let base = self.base.compose_unary(d);
+        let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
+        let fsecond = self.base.compose_unary([d[2], d[3], d[4], d[4], d[4]]);
+        let eps = fprime.mul(&self.eps);
+        let del = fprime.mul(&self.del);
+        let eps_del = fsecond
+            .mul(&self.eps)
+            .mul(&self.del)
+            .add(&fprime.mul(&self.eps_del));
+        Self {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+}
+
 // ── Order2<K> ergonomic operator overloads (doc §A.1) ───────────────────
 //
 // The dispersion-family row NLLs are written with `+`/`-`/`*` operators over

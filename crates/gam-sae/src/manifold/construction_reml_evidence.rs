@@ -183,12 +183,10 @@ impl SaeManifoldTerm {
     }
 
     /// [`Self::reml_criterion_with_cache`] priced with the Theorem K WBIC SOFT rank
-    /// charge instead of the hard MP count — the OPT-IN unified running-complexity
-    /// ledger `Σ_k λ_k(N_eff,k)·ln N_eff,k`, `λ_k = ½·rank_soft_k·basis_edf_k`. Only
-    /// changes the value when `rank_charge_evidence` is already on (the soft coefficient
-    /// substitutes for the hard one INSIDE that branch); with the flag off it is
-    /// bit-identical to the historical path. Convenience wrapper that evaluates the
-    /// soft ledger for THIS call only, restoring the persisted `soft_rank_charge` flag
+    /// charge instead of the hard MP count — the unified running-complexity ledger
+    /// `Σ_k λ_k(N_eff,k)·ln N_eff,k`, `λ_k = ½·rank_soft_k·basis_edf_k`.
+    /// Convenience wrapper that evaluates the soft ledger for this call only,
+    /// restoring the persisted `soft_rank_charge` flag
     /// afterward (use [`Self::set_soft_rank_charge`] to make it stick across a whole
     /// fit / its clones). Reduces to `reml_criterion_with_cache` away from the MP edge
     /// (soft→hard) and is strictly smaller for atoms near it (soft<hard) — the finite-n

@@ -38,8 +38,8 @@ use gam::inference::residual_factor::{ResidualFactorInput, StructuredResidualMod
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::solver::arrow_schur::ArrowSchurSystem;
 use gam::terms::{
-    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho,
-    sae::manifold::SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 
 /// Deterministic standard-normal-ish draw via Box–Muller on an LCG uniform.

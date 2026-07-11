@@ -39,8 +39,11 @@ use ndarray::{Array1, Array2};
 
 use gam::solver::arrow_schur::ArrowFactorCache;
 use gam::terms::{
-    sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
-    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldLoss, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
+    latent::LatentManifold, sae::manifold::AssignmentMode,
+    sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
+    sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldLoss, sae::manifold::SaeManifoldRho,
+    sae::manifold::SaeManifoldTerm,
 };
 
 struct Fixture {

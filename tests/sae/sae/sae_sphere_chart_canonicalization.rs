@@ -30,7 +30,8 @@ use gam::terms::latent::LatentManifold;
 use gam::terms::sae::chart_canonicalization::sphere_chart_isometry_defect;
 use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::{
-    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
+    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
     sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2, Array3};

@@ -31,8 +31,10 @@ use gam::solver::arrow_schur::ArrowSolverMode;
 use gam::solver::rho_optimizer::OuterProblem;
 use gam::solver::seeding::SeedConfig;
 use gam::terms::{
-    AnalyticPenaltyRegistry, sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::PeriodicHarmonicEvaluator,
-    sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldOuterObjective,
+    AnalyticPenaltyRegistry, latent::LatentManifold, sae::manifold::AssignmentMode,
+    sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
+    sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldOuterObjective,
     sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use gam_sae::manifold::StagewiseConfig;

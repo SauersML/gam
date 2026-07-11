@@ -39,11 +39,7 @@ use crate::manifold::{
 /// adds an order-9 orthogonal component outside the fitted harmonic basis: it
 /// keeps the behavior RSS positive (so λ_y is identifiable) while the fitted
 /// decoder remains the clean constant-speed circle.
-fn sphere_circle_probabilities(
-    angle: f64,
-    base_angle: f64,
-    residual_amp: f64,
-) -> [f64; 4] {
+fn sphere_circle_probabilities(angle: f64, base_angle: f64, residual_amp: f64) -> [f64; 4] {
     let inv_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
     let b = [0.5_f64; 4];
     let e1 = [inv_sqrt_two, -inv_sqrt_two, 0.0, 0.0];

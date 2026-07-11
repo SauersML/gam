@@ -4,8 +4,11 @@ use gam::solver::{rho_optimizer::OuterProblem, seeding::SeedConfig};
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::manifold::sae_pca_seed_initial_coords;
 use gam::terms::{
-    sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
-    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldOuterObjective, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator,
+    sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldOuterObjective, sae::manifold::SaeManifoldRho,
+    sae::manifold::SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;

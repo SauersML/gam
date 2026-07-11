@@ -29,7 +29,13 @@ use std::sync::Arc;
 
 /// Build a hand-specified period-1 circle atom whose `(sin 2πt, cos 2πt)`
 /// harmonics decode into ambient columns `col_sin` and `col_cos` of `R^p`.
-fn circle_atom(name: &str, p: usize, col_sin: usize, col_cos: usize, coords: &Array2<f64>) -> SaeManifoldAtom {
+fn circle_atom(
+    name: &str,
+    p: usize,
+    col_sin: usize,
+    col_cos: usize,
+    coords: &Array2<f64>,
+) -> SaeManifoldAtom {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     // PeriodicHarmonicEvaluator(3) emits [1, sin(2πt), cos(2πt)].

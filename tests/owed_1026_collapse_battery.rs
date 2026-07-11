@@ -30,8 +30,10 @@ use ndarray::{Array1, Array2, Array3, ArrayView2, array};
 
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
-    sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
-    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator,
+    sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 
 // ---------------------------------------------------------------------------

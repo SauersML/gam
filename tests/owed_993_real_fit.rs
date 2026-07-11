@@ -39,8 +39,10 @@ use gam::solver::structure_search::StructureMove;
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::structure_harvest::{HarvestParams, harvest_move_proposals};
 use gam::terms::{
-    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
-    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm, sae::manifold::TorusHarmonicEvaluator,
+    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
+    sae::manifold::TorusHarmonicEvaluator,
 };
 
 const N_HARMONICS: usize = 2;

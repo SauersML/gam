@@ -42,7 +42,9 @@ use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::steer_delta;
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
-    sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldTerm,
+    sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
+    sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldTerm,
 };
 
 const R: f64 = 1.3;

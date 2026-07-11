@@ -755,8 +755,7 @@ fn build_atom_candidates(
         )
         .ok()?;
         // Curved arm: refit decoder B + Gram G=ΦᵀWΦ on the same residual.
-        let (_, b_curved, g_curved) =
-            curved_refit_decoder(curved_phi, assign, target_resid)?;
+        let (_, b_curved, g_curved) = curved_refit_decoder(curved_phi, assign, target_resid)?;
         let d_curved = crate::manifold::realised_rank_charge_dof(
             &g_curved,
             &b_curved,
@@ -1571,14 +1570,13 @@ mod tests {
         );
     }
 
-    /// #16 DEMOTE flag-ON: with `rank_charge_evidence = true`, the two arms are
-    /// priced in the joint fit's ½·d_eff·log(n_obs) currency (d_eff read off the
+    /// #16 DEMOTE: the two arms are priced in the joint fit's canonical
+    /// ½·d_eff·log(n_obs) currency (d_eff read off the
     /// curved REFIT decoder + Gram via `realised_rank_charge_dof`), NOT the ½log|H|
     /// Laplace det. A full-circle residual still KEEPS curved (its realised rank-2
     /// d_eff earns the fit); a straight-line residual stays LINEAR (the periodic
     /// curve bends away from the line, so its extra realised DOF is not earned).
-    /// A real `Φ = [1, cos, sin]` is passed so d_eff reads the refit decoder rather
-    /// than the parameter-count fallback.
+    /// A real `Φ = [1, cos, sin]` is passed so d_eff reads the exact refit decoder.
     #[test]
     fn rank_charge_demote_prices_realised_rank() {
         let n = 60;
@@ -1645,139 +1643,6 @@ mod tests {
             choice2.param,
             gam_solve::evidence::HybridAtomParam::Linear,
             "rank charge must stay LINEAR on a straight-line residual"
-        );
-    }
-
-    /// The LINEAR candidate's Laplace logdet is the genuine weighted-design Gram
-    /// determinant `p·(log w_sum + log s_tt)` with `w_sum = Σ a_k²`, `s_tt =
-    /// Σ a_k²(t − t̄)²` — it INCLUDES the coordinate-spread term `log(s_tt)`
-    /// (#1203). Verify both contributions are present by reading the logdet off a
-    /// candidate whose linear residual is exactly zero (response residual = the
-    /// fitted line), so `NLE_linear = ½·logdet`. Doubling the coordinate spread
-    /// (at fixed assignment mass) scales `s_tt` by 4 → logdet += `p·log(4)`;
-    /// doubling all assignment masses scales BOTH `w_sum` and `s_tt` by 4 (they
-    /// are quadratic in `a_k`) → logdet += `2p·log(4)`.
-    #[test]
-    fn linear_logdet_includes_weighted_coordinate_spread() {
-        let n = 40;
-        let p = 2usize;
-        // Read the logdet back off a candidate with zero linear residual: the
-        // response residual is exactly `a_k·(line)`, so the WLS line recovers it
-        // with RSS == 0 and `NLE_linear = ½·logdet`.
-        let logdet = |coords: &Array1<f64>, assign: &Array1<f64>| -> f64 {
-            // A straight image; the response residual is the same line scaled by
-            // the per-row assignment mass `a_k`, so the prediction `a_k·(b₀+dt·b₁)`
-            // matches it exactly and linear_rss == 0.
-            let line = |t: f64| -> [f64; 2] { [t, 0.6 * t] };
-            let mut decoded = Array2::<f64>::zeros((n, p));
-            let mut data = Array2::<f64>::zeros((n, p));
-            for i in 0..n {
-                let l = line(coords[i]);
-                decoded[[i, 0]] = l[0];
-                decoded[[i, 1]] = l[1];
-                data[[i, 0]] = assign[i] * l[0];
-                data[[i, 1]] = assign[i] * l[1];
-            }
-            let (linear, _curved, _) = build_atom_candidates(
-                coords.view(),
-                assign.view(),
-                decoded.view(),
-                data.view(),
-                10,
-                None,
-                Some(0.0),
-                coords.len(),
-                0.0,
-            )
-            .expect("straight residual yields a pair");
-            2.0 * linear.negative_log_evidence // = logdet (linear_rss == 0)
-        };
-
-        let base_coords =
-            Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
-        let ones = Array1::<f64>::ones(n);
-
-        // Doubling the coordinate spread → s_tt ×4, w_sum fixed → logdet += p·log(4).
-        let wide_coords = base_coords.mapv(|t| 2.0 * t);
-        let d_spread = logdet(&wide_coords, &ones) - logdet(&base_coords, &ones);
-        assert!(
-            (d_spread - (p as f64) * 4.0_f64.ln()).abs() < 1e-9,
-            "linear logdet must move by p·log(4) when coordinate spread doubles \
-             (got {d_spread}); the spread term log(s_tt) must be present"
-        );
-
-        // Doubling all assignment masses → w_sum ×4 AND s_tt ×4 (quadratic in a_k)
-        // → logdet += 2p·log(4).
-        let twos = Array1::<f64>::from_elem(n, 2.0);
-        let d_weight = logdet(&base_coords, &twos) - logdet(&base_coords, &ones);
-        assert!(
-            (d_weight - 2.0 * (p as f64) * 4.0_f64.ln()).abs() < 1e-9,
-            "linear logdet must move by 2p·log(4) when all assignment masses double \
-             (got {d_weight})"
-        );
-    }
-
-    /// #1223 — the curved arm's Laplace complexity is the REAL weighted-design
-    /// Gram log-determinant `p·log|ΦᵀWΦ|_+`, not a parameter-count proxy. Build a
-    /// curved design whose columns are the constant and the centered coordinate
-    /// (a 2-column basis), so `ΦᵀWΦ = diag(w_sum, s_tt)` exactly matches the
-    /// linear arm's data Gram, and assert `curved_design_gram_logdet` returns
-    /// `p·(log w_sum + log s_tt)` — the same determinant the linear arm reports
-    /// on the same design weight. A proxy `M·log(w_sum)` would instead omit the
-    /// `log(s_tt)` spread term, so this pins the genuine determinant.
-    #[test]
-    fn curved_gram_logdet_is_real_weighted_design_determinant() {
-        let n = 40;
-        let p = 3usize;
-        let coords = Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * (i as f64) / ((n - 1) as f64)));
-        let assign = Array1::<f64>::from_iter((0..n).map(|i| 0.5 + 0.01 * (i as f64)));
-
-        // Mass-weighted coordinate mean and spread under wᵢ = a_k².
-        let mut w_sum = 0.0;
-        let mut t_bar = 0.0;
-        for i in 0..n {
-            let w = assign[i] * assign[i];
-            w_sum += w;
-            t_bar += w * coords[i];
-        }
-        t_bar /= w_sum;
-        let mut s_tt = 0.0;
-        for i in 0..n {
-            let dt = coords[i] - t_bar;
-            s_tt += assign[i] * assign[i] * dt * dt;
-        }
-
-        // Curved design columns: [1, (t − t̄)]. Its weighted Gram is exactly
-        // diag(w_sum, s_tt) (the cross term Σ w·(t−t̄) vanishes by construction),
-        // so log|ΦᵀWΦ| = log(w_sum) + log(s_tt).
-        let mut phi = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            phi[[i, 0]] = 1.0;
-            phi[[i, 1]] = coords[i] - t_bar;
-        }
-        let got = curved_design_gram_logdet(phi.view(), assign.view(), p)
-            .expect("non-degenerate curved design has a determinant");
-        let want = (p as f64) * (w_sum.ln() + s_tt.ln());
-        assert!(
-            (got - want).abs() < 1e-9,
-            "curved Gram logdet must be the real p·log|ΦᵀWΦ| = {want}, got {got}"
-        );
-
-        // A rank-deficient design (a duplicated column) drops the null direction:
-        // its determinant equals that of the single retained constant column,
-        // p·log(w_sum), NOT a 2-column proxy.
-        let mut phi_dup = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            phi_dup[[i, 0]] = 1.0;
-            phi_dup[[i, 1]] = 1.0;
-        }
-        let got_dup = curved_design_gram_logdet(phi_dup.view(), assign.view(), p)
-            .expect("rank-1 design still has a positive determinant");
-        let want_dup = (p as f64) * (2.0 * w_sum).ln();
-        assert!(
-            (got_dup - want_dup).abs() < 1e-9,
-            "rank-deficient curved Gram must report only its positive direction \
-             (p·log(2·w_sum) = {want_dup}), got {got_dup}"
         );
     }
 
@@ -1928,7 +1793,6 @@ mod tests {
                 Some(0.0),
                 coords.len(),
                 0.0,
-                false,
             )
             .is_none(),
             "a degenerate coordinate span must be refused"

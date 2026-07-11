@@ -28,8 +28,8 @@ use std::time::Instant;
 
 use gam::solver::arrow_schur::ArrowSolveOptions;
 use gam::terms::{
-    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho,
-    sae::manifold::SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 
 /// Bench configuration: `(k_atoms, basis_size, latent_dim, n_obs, p_out)`.

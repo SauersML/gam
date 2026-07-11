@@ -19,9 +19,11 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use gam::terms::{
-    sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
-    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm, sae::manifold::SphereChartEvaluator,
-    sae::manifold::TorusHarmonicEvaluator,
+    latent::LatentManifold, sae::manifold::AssignmentMode,
+    sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
+    sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
+    sae::manifold::SphereChartEvaluator, sae::manifold::TorusHarmonicEvaluator,
 };
 
 /// Newton loop driver shared by both topology tests. Mirrors the inner loop

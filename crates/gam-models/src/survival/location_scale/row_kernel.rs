@@ -2,7 +2,8 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    JetScalar, OneSeed, OneSeedBatch, OneSeedLane, Order2, Order2Lane, TwoSeed,
+    DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeed, OneSeedBatch,
+    OneSeedLane, Order2, Order2Lane, RuntimeJetScalar, TwoSeed,
 };
 use wide::f64x4;
 
@@ -310,25 +311,6 @@ pub(crate) fn split_survival_psi_design(
 /// equivalence test). Indices `i ∈ {u0,u1,g}` are functionally independent so
 /// the index-space derivative tensors are diagonal in `i`.
 pub(crate) const SLS_ROW_K: usize = 9;
-
-/// Highest concrete `KW = SLS_ROW_K + pw` the link-wiggle jet dispatch ladders
-/// (`survival_ls_wiggle_joint_hessian_dense`,
-/// `survival_ls_wiggle_directional_derivative_dense`, and
-/// `survival_ls_wiggle_second_directional_derivative_dense`) monomorphize. The
-/// row kernel tower is const-generic, so `KW` must be a compile-time literal;
-/// the ladders cover `KW ∈ 10..=20`. Widening past this requires a matching
-/// literal arm to be added to each ladder (and a recompile of the new
-/// monomorphization). Keep this in sync with the ladder arms — the
-/// `link_wiggle_width_within_dispatch_ladder` prepare test pins the agreement.
-pub(crate) const SLS_WIGGLE_KW_MAX: usize = 20;
-
-/// Maximum runtime link-wiggle basis width `pw` the const-generic jet ladder
-/// supports (`SLS_WIGGLE_KW_MAX − SLS_ROW_K`). Model preparation validates the
-/// prepared wiggle design against this so a wider otherwise-valid spline is
-/// rejected up front with a precise typed error naming this limit and #932,
-/// instead of hard-erroring deep in the Hessian / directional-derivative
-/// assembly (#932 gap 5).
-pub(crate) const SLS_MAX_LINK_WIGGLE_COLS: usize = SLS_WIGGLE_KW_MAX - SLS_ROW_K;
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
@@ -641,12 +623,13 @@ pub(crate) struct SlsWiggleRowBasis<'b> {
     pub(crate) b_u1: [&'b [f64]; 4],
 }
 
-pub(crate) fn sls_row_nll_wiggle<const KW: usize, S: JetScalar<KW>>(
-    vars: &[S; KW],
+pub(crate) fn sls_row_nll_wiggle<S: RuntimeJetScalar>(
+    vars: &[S],
     kernel: &SurvivalExactRowKernel,
     pw: usize,
     basis: &SlsWiggleRowBasis<'_>,
 ) -> S {
+    assert_eq!(vars.len(), SLS_ROW_K + pw, "link-wiggle row primary layout mismatch");
     let [b0e, b1e, b2e, b3e] = basis.b_u0;
     let [b0x, b1x, b2x, b3x] = basis.b_u1;
     let inv_sigma_entry = vars[7].neg().exp();
@@ -656,9 +639,9 @@ pub(crate) fn sls_row_nll_wiggle<const KW: usize, S: JetScalar<KW>>(
     let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
     let mut u0w = u0;
     let mut u1w = u1;
-    let mut m1 = S::constant(1.0);
+    let mut m1 = S::constant(1.0, vars.len());
     for j in 0..pw {
-        let bw = vars[SLS_ROW_K + j];
+        let bw = &vars[SLS_ROW_K + j];
         u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], b3e[j], 0.0])));
         u1w = u1w.add(&bw.mul(&u1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
         m1 = m1.add(&bw.mul(&u1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));

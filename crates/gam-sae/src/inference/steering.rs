@@ -1019,7 +1019,10 @@ pub fn collateral_curve(
     }
 
     let efficiency = |pts: &[CollateralPoint]| -> f64 {
-        let eff_sq: f64 = pts.iter().map(|q| q.on_target_effect * q.on_target_effect).sum();
+        let eff_sq: f64 = pts
+            .iter()
+            .map(|q| q.on_target_effect * q.on_target_effect)
+            .sum();
         let col_sq: f64 = pts.iter().map(|q| q.collateral * q.collateral).sum();
         if eff_sq > 0.0 {
             (col_sq / eff_sq).sqrt()
