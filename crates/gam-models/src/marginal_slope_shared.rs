@@ -2110,6 +2110,21 @@ mod tests {
             phase_counter.load(std::sync::atomic::Ordering::SeqCst),
             phase_budget + 1
         );
+
+        // Exact boundary regression: `counter == budget` is still the state
+        // immediately after the last sampled point, not proof that a full-data
+        // derivative has run. It must request one exact-polish continuation.
+        let boundary_counter = Arc::new(std::sync::atomic::AtomicUsize::new(phase_budget));
+        let boundary_schedule = crate::custom_family::OuterDerivativePilotSchedule::new(
+            Arc::clone(&boundary_counter),
+            phase_budget,
+        );
+        assert!(boundary_schedule.enter_exact_phase());
+        assert_eq!(
+            boundary_counter.load(std::sync::atomic::Ordering::SeqCst),
+            phase_budget + 1
+        );
+        assert!(!boundary_schedule.enter_exact_phase());
         assert!(
             maybe_install_auto_outer_subsample(
                 &options,
