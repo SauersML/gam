@@ -156,8 +156,7 @@ def main():
                 "wall_s": wall,
             }
             for attr in ["k", "reconstruction_ev", "births_accepted", "births_rejected",
-                         "stopped_reason", "ev_trace",
-                         "rank_charge_evidence_used"]:
+                         "stopped_reason", "ev_trace"]:
                 try: srec[attr] = _jsonable(getattr(sw, attr))
                 except Exception as e: srec[attr] = f"<err {e}>"
             # per-atom curvature Theta (which atoms are genuinely curved)

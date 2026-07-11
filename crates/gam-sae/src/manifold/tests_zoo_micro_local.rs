@@ -148,20 +148,14 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
     );
 }
 
-/// #2022 rank-charge A/B on the zoo-micro battery. Fits the SAME m12 configuration
-/// twice — `rank_charge_evidence` OFF (the current shipped default, the
-/// `½·log(a²‖B‖²)` coordinate-block complexity) then ON (the scale-insensitive
-/// `½·d_eff·ln N_eff` charge + `rank_eff==0 ⇒ v→+∞` veto) — and reports the
-/// births/deaths, co-collapse incidence, reconstruction quality, criterion, and
-/// wall-clock for each arm. This is the EVIDENCE the team-lead's Option-A
-/// default-flip decision is gated on: ON must not regress quality or re-admit
-/// co-collapse. This is an ordinary named measurement test because ignored
-/// tests are forbidden; focused runs select it by its `zz_rank_charge` name.
-/// It decides pass/fail only from finiteness + signal-floor engagement
-/// (zz_measure discipline); the A/B numbers are eprintln.
+/// #2022 canonical rank-charge zoo-micro measurement. Fits the m12 configuration
+/// once under the scale-insensitive `½·d_eff·ln N_eff` charge and
+/// `rank_eff==0 ⇒ v→+∞` veto, reporting births/deaths, co-collapse incidence,
+/// reconstruction quality, criterion, and wall-clock. This is an ordinary named
+/// measurement test because ignored tests are forbidden; focused runs select it
+/// by its `zz_rank_charge` name. Pass/fail uses finiteness plus signal engagement.
 #[derive(Debug)]
 struct RankChargeArm {
-    rank_charge: bool,
     fit_secs: f64,
     final_value: f64,
     converged: bool,
@@ -177,21 +171,13 @@ struct RankChargeArm {
     evidence_reanchors: usize,
 }
 
-fn rank_charge_zoo_arm(
-    train: &Array2<f64>,
-    test: &Array2<f64>,
-    rank_charge: bool,
-) -> RankChargeArm {
+fn rank_charge_zoo_arm(train: &Array2<f64>, test: &Array2<f64>) -> RankChargeArm {
     let (mut objective, seed) = objective_and_seed(
         train.view(),
         12,
         Topo::Circle,
         crate::assignment::AssignmentMode::softmax(1.0),
     );
-    // The flag rides the term through every internal clone (stagewise per-birth,
-    // rayon workers) via the `Clone` impl, so setting it on the seed term before
-    // the cascade is the single source of truth for the whole fit.
-    objective.term.set_rank_charge_evidence(rank_charge);
     let n_params = seed.len();
     let t0 = Instant::now();
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
@@ -202,11 +188,11 @@ fn rank_charge_zoo_arm(
             ..Default::default()
         })
         .run(&mut objective, "SAE manifold")
-        .expect("zoo-micro A/B fit must not abort");
+        .expect("zoo-micro rank-charge fit must not abort");
     let fit_secs = t0.elapsed().as_secs_f64();
     objective
         .certify_outer_result(&result)
-        .expect("zoo A/B outer result certifies the installed state");
+        .expect("zoo rank-charge outer result certifies the installed state");
     let grad_norm = result
         .criterion_certificate
         .as_ref()
@@ -216,7 +202,6 @@ fn rank_charge_zoo_arm(
     let cold_train_ev = cold_oos_ev(&fitted.term, &fitted.rho, train, "re-encode(train)");
     let cold_test_ev = cold_oos_ev(&fitted.term, &fitted.rho, test, "encode(test)");
     RankChargeArm {
-        rank_charge,
         fit_secs,
         final_value: result.final_value,
         converged: result.converged,
@@ -234,63 +219,38 @@ fn rank_charge_zoo_arm(
 }
 
 #[test]
-// zz_measure A/B: two full outer fits; focused runs select it by its zz_ name
-// for the #2022 rank-charge default-flip decision.
-fn zz_rank_charge_ab_zoo_micro_2022() {
+// zz_measure: one full outer fit; focused runs select it by its zz_ name.
+fn zz_rank_charge_zoo_micro_2022() {
     let train = zoo_fixture("train_3000x48_f64le.bin", 3000, 48);
     let test = zoo_fixture("test_1500x48_f64le.bin", 1500, 48);
 
-    let off = rank_charge_zoo_arm(&train, &test, false);
-    let on = rank_charge_zoo_arm(&train, &test, true);
-
-    for arm in [&off, &on] {
-        eprintln!(
-            "[#2022 A/B zoo] rank_charge={} | fit={:.1}s conv={} iters={} \
+    let arm = rank_charge_zoo_arm(&train, &test);
+    eprintln!(
+        "[#2022 rank-charge zoo] fit={:.1}s conv={} iters={} \
              grad={:?} | native_ev={:.4} cold_train={:.4} cold_test={:.4} | \
              K={} deaths={} dict_reseed={} struct_reseed={} reanchor={} | crit={:.6e}",
-            arm.rank_charge,
-            arm.fit_secs,
-            arm.converged,
-            arm.iterations,
-            arm.grad_norm,
-            arm.native_ev,
-            arm.cold_train_ev,
-            arm.cold_test_ev,
-            arm.k_atoms,
-            arm.collapse_events,
-            arm.dict_cocollapse_reseeds,
-            arm.struct_cocollapse_reseeds,
-            arm.evidence_reanchors,
-            arm.final_value,
-        );
-    }
-    eprintln!(
-        "[#2022 A/B zoo] DELTA(on-off): native_ev={:+.4} cold_test={:+.4} \
-         deaths={:+} dict_reseed={:+} struct_reseed={:+} reanchor={:+}",
-        on.native_ev - off.native_ev,
-        on.cold_test_ev - off.cold_test_ev,
-        on.collapse_events as isize - off.collapse_events as isize,
-        on.dict_cocollapse_reseeds as isize - off.dict_cocollapse_reseeds as isize,
-        on.struct_cocollapse_reseeds as isize - off.struct_cocollapse_reseeds as isize,
-        on.evidence_reanchors as isize - off.evidence_reanchors as isize,
+        arm.fit_secs,
+        arm.converged,
+        arm.iterations,
+        arm.grad_norm,
+        arm.native_ev,
+        arm.cold_train_ev,
+        arm.cold_test_ev,
+        arm.k_atoms,
+        arm.collapse_events,
+        arm.dict_cocollapse_reseeds,
+        arm.struct_cocollapse_reseeds,
+        arm.evidence_reanchors,
+        arm.final_value,
     );
 
-    // zz_measure discipline: the pass/fail bar is only that BOTH arms ran to a
-    // real reconstruction that engaged the planted mixture (signal floor, not a
-    // quality bar). The flip decision reads the eprintln'd A/B numbers.
-    for arm in [&off, &on] {
-        assert!(
-            arm.native_ev.is_finite()
-                && arm.cold_train_ev.is_finite()
-                && arm.cold_test_ev.is_finite(),
-            "rank_charge={} arm produced a non-finite EV",
-            arm.rank_charge
-        );
-        assert!(
-            arm.native_ev > 0.3,
-            "rank_charge={} native EV {:.4} below signal floor — fit did not engage",
-            arm.rank_charge,
-            arm.native_ev
-        );
-    }
+    assert!(
+        arm.native_ev.is_finite() && arm.cold_train_ev.is_finite() && arm.cold_test_ev.is_finite(),
+        "rank-charge fit produced a non-finite EV"
+    );
+    assert!(
+        arm.native_ev > 0.3,
+        "rank-charge native EV {:.4} below signal floor — fit did not engage",
+        arm.native_ev
+    );
 }

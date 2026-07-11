@@ -180,10 +180,7 @@ fn seed_term(coords0: &Array2<f64>, p: usize) -> (SaeManifoldTerm, SaeManifoldRh
     // clean rank-2 circle that lifts EV 0.27→0.43 raised REML by +391 purely
     // through +598 of uncompensated ½log|H_tt|). The rank charge is the honest,
     // rotation-invariant Laplace complexity for a realised-rank decoder and is
-    // exactly the decoder-scale-mispricing remedy this path documents. The flag
-    // propagates to every fit_stagewise clone (see term-clone), so setting it on
-    // the seed engages it for the whole forward-birth sweep.
-    term.set_rank_charge_evidence(true);
+    // exactly the decoder-scale-mispricing remedy this path documents.
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
     (term, rho)
 }

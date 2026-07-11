@@ -124,7 +124,6 @@ fn seed_term(turns0: &Array2<f64>, p: usize) -> (SaeManifoldTerm, SaeManifoldRho
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
     term.set_guards_enabled(false);
-    term.set_rank_charge_evidence(true);
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
     (term, rho)
 }
