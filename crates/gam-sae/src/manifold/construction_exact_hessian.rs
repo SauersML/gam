@@ -97,7 +97,23 @@ where
         if !mu.is_finite() {
             return Err("solve_exact_stationarity: non-finite generalized curvature".into());
         }
-        if mu >= rank_floor {
+        // #2253 — accept the solve when the solution's generalized curvature is
+        // RESOLVED, i.e. `|μ| >= rank_floor`, NOT only when `μ >= rank_floor`.
+        // `μ(x) ≈ μ_min` (the smallest-magnitude pencil eigenvalue excited by the
+        // rhs), so `μ < 0` with `|μ|` well above the floor is a genuinely
+        // NEGATIVE-curvature but fully IDENTIFIED direction (the exact Hessian
+        // `A = B + ΔC` is marginally indefinite at a nonzero-residual fit — the
+        // measured K=1-circle μ = −1.66e-3). Its `A⁻¹` response is a REAL, finite
+        // part of `dθ̂/dρ = −A⁻¹ λSθ̂`, and the criterion VALUE's undamped inner
+        // solve moves θ̂ along it identically — so the θ-adjoint −½Γᵀθ̂_ρ MUST keep
+        // it or the analytic outer gradient desyncs from d(value)/dρ (the #2253
+        // non-stationary stall: the adjoint collapsed ~19×, so steepest descent
+        // could not decrease the criterion at its own minimum). Only a genuinely
+        // SINGULAR direction (`|μ| < rank_floor`, spurious `1/μ` amplification of
+        // an unidentified near-null) is deflated below — that one the evidence
+        // factor also stiffens to unit curvature, so its outer-gradient
+        // contribution is ρ-independent and must be projected out.
+        if mu.abs() >= rank_floor {
             return Ok(x);
         }
         // #2253 — a NON-POSITIVE μ is NOT a fatal "not a stable minimum". The
