@@ -1019,19 +1019,20 @@ impl SaeManifoldTerm {
                 // window of the same size and keep refining. The ordinary
                 // nonstationary lane retains that single-window hang bound.
                 //
-                // DELETED (#2234→stage-1 hooks): the former
-                // `stationary_window_paid` arm granted UNBOUNDED further windows
-                // to a coarse-KKT-but-non-idempotent state — machinery that
-                // existed to grind out state motion injected by the unguarded
-                // post-accept reseed/polish hooks at a near-stationary iterate.
-                // Those hooks are now quiescent inside the KKT band (see the
-                // guard quiescence in `run_joint_fit_arrow_schur_with_
-                // termination_policy`) and the reseed ledger persists across
-                // refine rounds, so a KKT-band state recurs exactly on its next
-                // evidence re-entry and is accepted; a state that STILL moves
-                // there is genuinely non-idempotent and takes the typed refusal
-                // below immediately instead of after grinding extra windows.
-                if saw_refine_progress && budget_escalation_extra == 0 {
+                // The former UNBOUNDED `stationary_window_paid` grind (which
+                // chased hook-injected motion) stays deleted; hooks are
+                // quiescent inside the KKT band. But the sweep-first engine is
+                // a NEW legitimate mover: an evidence re-entry at a KKT-band
+                // iterate may commit one more strict (t, B) sweep decrease
+                // before the joint sweep∘walk fixed point is reached, and
+                // refusing at first budget exhaustion there refused genuinely
+                // convergent fits (tier-0 K=2 fixtures: band entered, refused
+                // at 512). A KKT-band state therefore earns the SAME single
+                // bounded window a measurably-descending solve gets — one
+                // window, once, so the joint fixed point can complete; a state
+                // still moving after that is genuinely non-idempotent and
+                // takes the typed refusal.
+                if (saw_refine_progress || gradient_stationary) && budget_escalation_extra == 0 {
                     let escalation_window = refine_limit.max(1);
                     // `refine_iteration_limit` is dynamic and may return a
                     // ceiling below the iterations already consumed.  Carry
