@@ -2232,7 +2232,7 @@ impl SaeManifoldTerm {
         }
         let beta_base = n * q + beta_offsets[atom_idx];
         let delta_border = match atom.decoder_frame.as_ref() {
-            Some(frame) => delta_b.dot(frame.frame()),
+            Some(frame) => delta_b.dot(&frame.frame()),
             None => delta_b,
         };
         let border_rank = delta_border.ncols();
