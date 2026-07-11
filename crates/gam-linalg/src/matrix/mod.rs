@@ -2410,7 +2410,13 @@ impl DesignBlock {
             Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_xtw_x(weights),
             Self::RandomEffect(op) => op.diag_xtw_x(weights),
             Self::Intercept(_) => {
-                let sum: f64 = weights.iter().map(|w| w.max(0.0)).sum();
+                // Signed w: diag_xtw_x is the sign-honest XᵀWX assembler (see
+                // the `LinearOperator::diag_xtw_x` contract), used for
+                // observed-Hessian curvature on non-canonical links where
+                // negative working weights are the normal case. Clamping here
+                // would silently corrupt the intercept row/column whenever any
+                // weight is negative.
+                let sum: f64 = weights.iter().sum();
                 Ok(Array2::from_elem((1, 1), sum))
             }
         }
@@ -2422,7 +2428,10 @@ impl DesignBlock {
             Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_gram(weights),
             Self::RandomEffect(op) => op.diag_gram(weights),
             Self::Intercept(_) => {
-                let sum: f64 = weights.iter().map(|w| w.max(0.0)).sum();
+                // Signed w, matching diag_xtw_x above (the default
+                // `LinearOperator::diag_gram` is literally `diag_xtw_x`'s
+                // diagonal).
+                let sum: f64 = weights.iter().sum();
                 Ok(Array1::from_vec(vec![sum]))
             }
         }
@@ -2593,18 +2602,18 @@ impl BlockDesignOperator {
             // ── Intercept × anything ────────────────────────────────────
             // 1'·diag(w)·B_j  →  (1 × p_j) where entry [0,c] = Σ_i w[i] * B_j[i,c]
             (DesignBlock::Intercept(_), other) => {
+                // Signed w (no `.max(0.0)`) — see the sign-honest `diag_xtw_x`
+                // contract; this cross term feeds the same XᵀWX assembly.
                 let pj = other.ncols();
                 let mut cross = Array2::<f64>::zeros((1, pj));
-                let weighted = Array1::from_shape_fn(self.n, |idx| weights[idx].max(0.0));
-                let row = other.apply_transpose(&weighted);
+                let row = other.apply_transpose(weights);
                 cross.row_mut(0).assign(&row);
                 Ok(cross)
             }
             (other, DesignBlock::Intercept(_)) => {
                 let pi = other.ncols();
                 let mut cross = Array2::<f64>::zeros((pi, 1));
-                let weighted = Array1::from_shape_fn(self.n, |idx| weights[idx].max(0.0));
-                let col = other.apply_transpose(&weighted);
+                let col = other.apply_transpose(weights);
                 cross.column_mut(0).assign(&col);
                 Ok(cross)
             }
@@ -6549,6 +6558,52 @@ mod tests {
             max_diff < 1e-10,
             "fused block Dense×Dense Gram mismatch: max_diff={max_diff}"
         );
+    }
+
+    #[test]
+    fn block_design_intercept_cross_and_diag_are_sign_honest() {
+        // Regression for the Intercept arms of `DesignBlock::diag_xtw_x` /
+        // `diag_gram` and `BlockDesignOperator::cross_block` silently
+        // clamping signed working weights to `w.max(0.0)`, corrupting the
+        // intercept row/column of the observed-Hessian Gram whenever any
+        // weight is negative (the normal case for non-canonical-link
+        // observed-Hessian IRLS, e.g. binomial+cloglog, Gamma+identity).
+        let x = array![[2.0], [5.0], [-1.0], [3.0]];
+        let mut stacked = Array2::<f64>::zeros((4, 2));
+        stacked.column_mut(0).fill(1.0);
+        stacked.slice_mut(s![.., 1..2]).assign(&x);
+
+        let blocks = vec![
+            DesignBlock::Intercept(4),
+            DesignBlock::Dense(DenseDesignMatrix::from(x)),
+        ];
+        let op = BlockDesignOperator::new(blocks).expect("block design");
+
+        let weights = array![3.0, -1.0, 2.0, -0.5];
+        let weighted = stacked.clone() * weights.view().insert_axis(Axis(1));
+        let expected = stacked.t().dot(&weighted);
+
+        let got = op.diag_xtw_x(&weights).expect("block fused xtwx");
+        assert_eq!(got.dim(), (2, 2));
+        let max_diff = (&got - &expected)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-10,
+            "intercept-block Gram mismatch: got={got:?} expected={expected:?} max_diff={max_diff}"
+        );
+
+        // The intercept's own diagonal entry (Σw, signed) must match too.
+        let intercept_block = &op.blocks[0];
+        let diag = intercept_block
+            .diag_xtw_x(&weights)
+            .expect("intercept diag_xtw_x");
+        assert!((diag[[0, 0]] - weights.sum()).abs() < 1e-12);
+        let gram = intercept_block
+            .diag_gram(&weights)
+            .expect("intercept diag_gram");
+        assert!((gram[0] - weights.sum()).abs() < 1e-12);
     }
 
     #[test]
