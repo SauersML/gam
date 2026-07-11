@@ -3843,6 +3843,41 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 self.term = converged;
                 self.seeded_beta = None;
                 true
+            } else if !self.basin_bundle.is_empty() {
+                // #2087/#2253 envelope-consistency — the value lanes price the
+                // basin lower envelope min_b V_b(ρ); the gradient lane used to
+                // inherit the argmin basin ONLY through the bitwise-ρ handoff.
+                // On a handoff miss (e.g. the bridge's value-probe cache served
+                // the repeated ρ without touching this objective) this lane
+                // silently re-converged the single accepted-trajectory basin —
+                // returning a (value, gradient) pair from a DIFFERENT function
+                // than the envelope the line search accepted at the same ρ.
+                // Run the envelope at this exact ρ (it installs the argmin
+                // basin's converged state as the handoff), then consume it, so
+                // value and gradient always price one basin. With an empty
+                // bundle no envelope has ever been evaluated and the historical
+                // single-trajectory path below is already consistent.
+                match self.value_probe_with_budget_rescue(
+                    rho.view(),
+                    ProbeInnerDrive::Criterion {
+                        refine_progress_extension: true,
+                    },
+                ) {
+                    Ok(_) => {}
+                    Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
+                        self.probe_telemetry.record_refusal_kind(&err);
+                        self.probe_telemetry.infeasible_criterion_evals += 1;
+                        return Ok(OuterEval::infeasible(rho.len()));
+                    }
+                    Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
+                }
+                if let Some(converged) = self.take_probe_converged_handoff(rho.view()) {
+                    self.term = converged;
+                    self.seeded_beta = None;
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             };
