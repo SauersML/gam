@@ -5310,6 +5310,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         kronecker_penalty_system: None,
         kronecker_factored: None,
         persist_warm_start_disk: false,
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let joint_x_for_fit = joint_x.clone();
     let fit = detach_estimation_result(py, "gaussian_reml_fit_blocks_forward", move || {
