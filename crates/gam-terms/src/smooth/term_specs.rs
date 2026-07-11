@@ -6081,6 +6081,7 @@ pub fn build_tensor_bspline_basis(
 #[cfg(test)]
 mod tensor_function_space_runtime_tests {
     use super::*;
+    use crate::basis::{BSplineBoundaryConditions, OneDimensionalBoundary};
     use ndarray::array;
 
     fn marginal() -> BSplineBasisSpec {

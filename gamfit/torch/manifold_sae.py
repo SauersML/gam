@@ -248,11 +248,10 @@ class ManifoldSAEConfig:
     sparsity: SparsityConfig = field(default_factory=SparsityConfig)
     decoder: DecoderConfig = field(default_factory=DecoderConfig)
     reml: RemlConfig = field(default_factory=RemlConfig)
-    # Default to the direct linear encoder used by the closed-form/Rust SAE
-    # family. A positive value is an explicit opt-in to an extra nonlinear
-    # PyTorch-only mixer, which can reconstruct well while hiding feature
-    # presence from per-atom amplitudes in routing diagnostics.
-    encoder_hidden: int = 0
+    # A nonlinear encoder is required for periodic charts: a single affine map
+    # followed by the chart projection cannot represent global angular phase.
+    # The direct linear encoder remains available explicitly with zero width.
+    encoder_hidden: int = 16
     init_scale: float = 0.05
     dtype: Any = field(default=None)
     # ``K`` is constructor sugar for ``n_atoms`` (the spelling the docs and the

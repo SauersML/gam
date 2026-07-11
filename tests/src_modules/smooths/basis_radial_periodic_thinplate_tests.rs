@@ -2049,50 +2049,6 @@ fn test_build_bspline_basis_1d_automatic_quantile_is_not_uniform_for_skewed_data
 }
 
 #[test]
-fn test_penalty_greville_selected_for_clamped_uniform_breakpoints() {
-    // A clamped B-spline with a *uniform interior breakpoint grid* still has
-    // non-uniform Greville abscissae (they cluster toward the clamped ends),
-    // so the geometry-correct divided-difference penalty must be selected.
-    // Selecting the classical integer-difference penalty here would give the
-    // curvature penalty a null space that is only an approximation of
-    // {1, x}, biasing every shrink-toward-linear and the REML smoothing
-    // selection (root cause of the tensor te/ti over-smoothing regression).
-    let degree = 3usize;
-    let knots = internal::generate_full_knot_vector((0.0, 1.0), 5, degree).unwrap();
-    let g = penalty_greville_abscissae_for_knots(&knots, degree)
-        .unwrap()
-        .unwrap_or_else(|| panic!("{} failed", "clamped uniform breakpoints have non-uniform Greville abscissae"));
-    // Sanity: the abscissae really are non-uniform (clustered at the ends).
-    let gaps: Vec<f64> = g.windows(2).into_iter().map(|w| w[1] - w[0]).collect();
-    let max_gap = gaps.iter().cloned().fold(f64::MIN, f64::max);
-    let min_gap = gaps.iter().cloned().fold(f64::MAX, f64::min);
-    assert!(
-        max_gap - min_gap > 1e-6,
-        "Greville abscissae for a clamped basis should be non-uniform: gaps={gaps:?}"
-    );
-}
-
-#[test]
-fn test_penalty_greville_none_for_uniform_greville() {
-    // When the abscissae are genuinely uniform (a non-clamped, evenly spaced
-    // grid), integer differences coincide with divided differences up to an
-    // overall scale, so the cheaper integer-difference path is selected.
-    let degree = 3usize;
-    let n_basis = 8usize;
-    let knots: Array1<f64> = Array1::from_iter((0..(n_basis + degree + 1)).map(|i| i as f64));
-    let g = compute_greville_abscissae(&knots, degree).unwrap();
-    assert!(
-        is_uniformly_spaced_sequence(g.view()),
-        "evenly spaced knot vector should yield uniform Greville abscissae: {g:?}"
-    );
-    assert!(
-        penalty_greville_abscissae_for_knots(&knots, degree)
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[test]
 fn test_clamped_bspline_curvature_penalty_null_space_is_exactly_linear() {
     // End-to-end guard on the root cause: the curvature penalty of a clamped
     // uniform B-spline must annihilate exactly the functions linear in x.

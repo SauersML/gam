@@ -273,8 +273,8 @@ mod exact_bspline_shape_tests {
         assert_eq!(convex.a.dim(), (p - 2, p));
         assert_eq!(decreasing.a, -&increasing.a);
         assert_eq!(concave.a, -&convex.a);
-        assert_eq!(increasing.b, Array1::zeros(p - 1));
-        assert_eq!(convex.b, Array1::zeros(p - 2));
+        assert_eq!(increasing.b, Array1::<f64>::zeros(p - 1));
+        assert_eq!(convex.b, Array1::<f64>::zeros(p - 2));
 
         let spans = bspline_first_derivative_control_spans(knots.view(), 3).unwrap();
         for row in 0..convex.a.nrows() {
