@@ -5604,8 +5604,13 @@ mod tests {
             let (sin_angle, cos_angle) = angle.sin_cos();
             for sample in 0..per_cluster {
                 let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
-                let radial_noise = 0.035 * phase.cos();
-                let tangent_noise = 0.035 * phase.sin();
+                // Vary the within-cluster radius while preserving its angular
+                // symmetry. A literal constant-radius micro-circle makes the
+                // Gaussian scale score identically zero and its empirical
+                // Fisher singular, which is not a Gaussian-cluster fixture.
+                let local_radius = 0.035 * (1.0 + 0.3 * (3.0 * phase).cos());
+                let radial_noise = local_radius * phase.cos();
+                let tangent_noise = local_radius * phase.sin();
                 let radius = 2.0 + radial_noise;
                 let row = cluster * per_cluster + sample;
                 data[[row, 0]] = 0.4 + radius * cos_angle - tangent_noise * sin_angle;

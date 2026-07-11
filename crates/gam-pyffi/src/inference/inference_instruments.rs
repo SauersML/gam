@@ -1173,8 +1173,12 @@ mod tests {
             let (sin_angle, cos_angle) = angle.sin_cos();
             for sample in 0..per_cluster {
                 let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
-                let radial_noise = 0.04 * phase.cos();
-                let tangent_noise = 0.04 * phase.sin();
+                // This is a cloud, not a constant-radius micro-circle: the
+                // varying local radius keeps the Gaussian scale direction
+                // identifiable in the empirical-Fisher evidence calculation.
+                let local_radius = 0.04 * (1.0 + 0.3 * (3.0 * phase).cos());
+                let radial_noise = local_radius * phase.cos();
+                let tangent_noise = local_radius * phase.sin();
                 let radius = 2.0 + radial_noise;
                 let row = cluster * per_cluster + sample;
                 coords[[row, 0]] = 0.5 + radius * cos_angle - tangent_noise * sin_angle;
