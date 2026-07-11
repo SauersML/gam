@@ -5754,7 +5754,7 @@ impl SaeManifoldTerm {
         // coupling + KKT gate) instead of as the bulk workhorse. Frames-active
         // fits skip inside the helper (the LSQ writes full-B), and the
         // max_iter == 0 freeze already returned above.
-        if self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties)? {
+        if self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties, allow_heuristic_termination)? {
             state_moved = true;
         }
         for outer_iteration in 0..max_iter {
@@ -6581,7 +6581,7 @@ impl SaeManifoldTerm {
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
         if max_iter > 0
-            && self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties)?
+            && self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties, allow_heuristic_termination)?
         {
             state_moved = true;
         }
@@ -6686,11 +6686,25 @@ impl SaeManifoldTerm {
     /// do in O(1) exact block solves what the majorized joint Newton needs
     /// O(10²–10³) linear-rate iterations for. Returns whether any round was
     /// committed.
+    /// `gate_ownership_stage` — whether the logit-block ownership rounds run.
+    /// The #2082 anchor is a CONSTANT nudge (±1 temperature unit toward the
+    /// owning atom), not a fixed-point iteration: every invocation that finds
+    /// a strict decrease moves the state again, so it is non-idempotent BY
+    /// DESIGN. On EVIDENCE lanes (`allow_heuristic_termination == false`) the
+    /// #2253 idempotence certificate demands that a re-entry at the converged
+    /// state recur exactly — an anchor commit there is a fresh strict move on
+    /// every re-entry and the fit is refused as a non-idempotent inner map
+    /// (measured: KKT band entered, refused after 512 granted iterations on
+    /// the tier-0 K=2 fixtures). Gate ownership is DISCOVERY, certification
+    /// is exact: ordinary fits get the EM gate stage, evidence lanes get the
+    /// pure (t, B) sweeps, whose loop-until-no-strict-decrease IS idempotent
+    /// (at the fixed point the next round reverts and reports no move).
     pub(crate) fn sweep_blocks_to_objective_fixed_point(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        gate_ownership_stage: bool,
     ) -> Result<bool, String> {
         let mut best_objective =
             self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
@@ -6755,8 +6769,9 @@ impl SaeManifoldTerm {
         // coordinates; the objective gate makes it monotone rather than
         // heuristic, and the bound (2) exists only because each committed
         // anchor changes the ownership pattern it would recompute — two dry
-        // rounds prove the pattern is stable.
-        for _ in 0..2 {
+        // rounds prove the pattern is stable. Discovery lanes only (see the
+        // `gate_ownership_stage` doc): evidence re-entries must be idempotent.
+        for _ in 0..(if gate_ownership_stage { 2 } else { 0 }) {
             let snapshot = self.snapshot_mutable_state();
             let round = self
                 .anchor_logits_to_residual_ownership(target)
