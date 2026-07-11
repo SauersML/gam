@@ -136,20 +136,7 @@ def _rust_descriptor_class(name: str) -> type[Any]:
     existing consumer.
     """
     module = _rust_module()
-    rust_cls = getattr(module, name, None)
-    if rust_cls is None:
-
-        class _MissingRustDescriptor:
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                del args, kwargs
-                raise AttributeError(
-                    f"gamfit._rust does not expose {name}; rebuild the local Rust extension"
-                )
-
-        _MissingRustDescriptor.__name__ = name
-        _MissingRustDescriptor.__qualname__ = name
-        return _MissingRustDescriptor
-
+    rust_cls = getattr(module, name)
     wrapper = _build_penalty_wrapper(name, rust_cls)
     return wrapper
 
