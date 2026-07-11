@@ -3485,10 +3485,7 @@ impl OuterObjective for ReactiveDomainObjective {
         Ok(())
     }
 
-    fn commit_reactive_domain_waypoint(
-        &mut self,
-        _: &Array1<f64>,
-    ) -> Result<(), EstimationError> {
+    fn commit_reactive_domain_waypoint(&mut self, _: &Array1<f64>) -> Result<(), EstimationError> {
         self.checkpoint_domain_open.take().ok_or_else(|| {
             EstimationError::RemlOptimizationFailed(
                 "reactive test commit without checkpoint".to_string(),
@@ -3653,7 +3650,10 @@ fn reactive_domain_entry_keeps_unrepairable_seed_as_typed_refusal() {
         objective.derivative_evals, 0,
         "the outer solver must not start without finite exact-seed evidence"
     );
-    assert!(!objective.domain_open, "failed entry must roll back full state");
+    assert!(
+        !objective.domain_open,
+        "failed entry must roll back full state"
+    );
     assert!(
         objective.checkpoint_domain_open.is_none(),
         "typed refusal must not leak an active waypoint transaction"

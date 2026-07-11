@@ -42,7 +42,10 @@
 //! consistent.
 
 use super::BlockSparseConfig;
-use super::block::{gram_schmidt_rows, route_and_code_all, seed_frames, stable_rank_symmetric};
+use super::block::{
+    gram_schmidt_rows, reconstruct_stored_code_row, route_and_code_all, seed_frames,
+    stable_rank_symmetric,
+};
 use super::update::DecoderSolveStats;
 use crate::frames::GrassmannFrame;
 use ndarray::{Array2, ArrayView2};
@@ -72,13 +75,15 @@ pub struct BlockEpochStats {
     /// Explained variance `1 − RSS/TSS` of the frames routed against this epoch
     /// (the pre-refresh frames), from the streamed TSS/RSS moments.
     pub explained_variance: f64,
-    /// Dead blocks revived onto worst-reconstructed residual rows this epoch.
-    pub revived: usize,
+    /// Residual-row block births accepted after a complete candidate-vs-baseline
+    /// streaming pass proved strict RSS improvement.
+    pub accepted_births: usize,
     /// Dead blocks detected this epoch (fired for no row before revival).
     pub dead: usize,
     /// Refreshed shared tied scalar γ after this epoch.
     pub gamma: f32,
-    /// Whether the EV-improvement tolerance was met AND no block was revived.
+    /// Whether the EV-improvement tolerance was met with no accepted or pending
+    /// block birth.
     pub converged: bool,
     /// Epochs completed so far (this one inclusive).
     pub epoch: usize,
@@ -127,6 +132,21 @@ impl PartialOrd for ResidRow {
 struct ResidualReservoir {
     cap: usize,
     heap: BinaryHeap<ResidRow>,
+}
+
+/// A streaming birth is a two-pass transaction. The candidate frame is active
+/// for the next streamed pass while this object retains the complete pre-birth
+/// decoder/gamma and accumulates the exact baseline RSS on the same rows. At
+/// `end_epoch` the candidate commits only if it was selected and strictly lowers
+/// full-pass RSS; otherwise the retained state is restored byte-for-byte.
+struct PendingBlockBirth {
+    block: usize,
+    baseline_decoder: Array2<f32>,
+    baseline_gamma: f32,
+    baseline_rss: f64,
+    baseline_rows: usize,
+    baseline_usage: Vec<usize>,
+    baseline_second: Vec<Array2<f64>>,
 }
 
 impl ResidualReservoir {
@@ -206,7 +226,7 @@ pub struct BlockSparseStreamState {
     last_ev: f64,
     last_ev_residual: f64,
     epochs_run: usize,
-    last_revived: usize,
+    last_accepted_births: usize,
     converged: bool,
     last_util: Vec<f32>,
     last_stable: Vec<f32>,
@@ -219,6 +239,7 @@ pub struct BlockSparseStreamState {
     last_usage: Vec<usize>,
     last_rss: f64,
     last_rows: usize,
+    pending_birth: Option<PendingBlockBirth>,
 }
 
 /// Per-block honest-charge ledger over the last closed epoch, as parallel
@@ -306,7 +327,7 @@ impl BlockSparseStreamState {
             last_ev: f64::NEG_INFINITY,
             last_ev_residual: f64::INFINITY,
             epochs_run: 0,
-            last_revived: 0,
+            last_accepted_births: 0,
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
@@ -315,6 +336,7 @@ impl BlockSparseStreamState {
             last_usage: vec![0; g],
             last_rss: 0.0,
             last_rows: 0,
+            pending_birth: None,
         })
     }
 
@@ -376,7 +398,7 @@ impl BlockSparseStreamState {
             last_ev: f64::NEG_INFINITY,
             last_ev_residual: f64::INFINITY,
             epochs_run: 0,
-            last_revived: 0,
+            last_accepted_births: 0,
             converged: false,
             last_util: vec![0.0; g],
             last_stable: vec![0.0; g],
@@ -385,6 +407,7 @@ impl BlockSparseStreamState {
             last_usage: vec![0; g],
             last_rss: 0.0,
             last_rows: 0,
+            pending_birth: None,
         })
     }
 
@@ -434,6 +457,24 @@ impl BlockSparseStreamState {
             self.config.minibatch,
             self.config.block_tile,
         )?;
+        // A staged birth is evaluated against the COMPLETE pre-birth model on
+        // exactly the same shards. This shadow route is the information a true
+        // streaming transaction needs: the corpus is unavailable at end_epoch,
+        // so deciding from the residual reservoir alone would be a surrogate,
+        // not the exact training criterion.
+        let baseline_codes = match self.pending_birth.as_ref() {
+            Some(pending) => Some(route_and_code_all(
+                shard,
+                pending.baseline_decoder.view(),
+                pending.baseline_gamma,
+                self.g,
+                b,
+                self.k,
+                self.config.minibatch,
+                self.config.block_tile,
+            )?),
+            None => None,
+        };
         let base_index = self.row_count as u64;
         let mut shard_rss = 0.0f64;
         for (r, code) in codes.iter().enumerate() {
@@ -531,6 +572,37 @@ impl BlockSparseStreamState {
                     }
                 }
             }
+        }
+
+        if let (Some(pending), Some(baseline_codes)) =
+            (self.pending_birth.as_mut(), baseline_codes.as_ref())
+        {
+            for (row, code) in baseline_codes.iter().enumerate() {
+                let reconstruction = reconstruct_stored_code_row(
+                    code,
+                    pending.baseline_decoder.view(),
+                    b,
+                );
+                for column in 0..p {
+                    let residual = shard[[row, column]] - reconstruction[column];
+                    pending.baseline_rss += residual as f64 * residual as f64;
+                }
+                for (slot, &block) in code.blocks.iter().enumerate() {
+                    if code.gates[slot] == 0.0 {
+                        continue;
+                    }
+                    let block = block as usize;
+                    pending.baseline_usage[block] += 1;
+                    let z = &code.codes[slot * b..slot * b + b];
+                    for left in 0..b {
+                        for right in 0..b {
+                            pending.baseline_second[block][[left, right]] +=
+                                z[left] as f64 * z[right] as f64;
+                        }
+                    }
+                }
+            }
+            pending.baseline_rows += baseline_codes.len();
         }
 
         self.rss += shard_rss;

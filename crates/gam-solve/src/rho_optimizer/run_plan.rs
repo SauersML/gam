@@ -326,10 +326,6 @@ pub(crate) fn run_outer_with_plan(
     // therefore stay on the zero-heavy-entry path.
     let reactive_domain_scalar_contract = obj.reactive_domain_scalar_contract()?;
     let reactive_domain_entry_available = reactive_domain_scalar_contract.is_some();
-    let mut last_continuation_regime: Option<crate::continuation_path::PathRegime> = None;
-    // Refinement ledger: record each structural defect with the last accepted
-    // regime that was retained while the next attempted distance was reduced.
-    let mut path_refinements: Vec<PathRefinementRecord> = Vec::new();
     // Accumulate every per-seed rejection with its 0-based seed index and the
     // phase that rejected it (validation vs solver run). When all seeds fail
     // systematically (bad analytic gradient, rank-deficient penalty, etc.) the
@@ -700,34 +696,13 @@ pub(crate) fn run_outer_with_plan(
                             // The accepted waypoint remains unchanged while the
                             // next attempted distance is refined. Consume the
                             // reason for diagnostics, then continue.
-                            match reason {
-                                RefinementReason::WaypointStruggled(failure) => {
-                                    log::info!(
-                                        "[OUTER] {context}: continuation seed {seed_idx} coupled \
-                                         waypoint struggled below s={s:.4} ({}); refining from regime {:?}",
-                                        failure.message(),
-                                        path.current_regime(),
-                                    );
-                                }
-                                RefinementReason::MassFloorBreached(breach) => {
-                                    // Record the breach against the last accepted
-                                    // full state. The path already refined the
-                                    // next distance; resetting here would destroy
-                                    // that accepted state while leaving `s`
-                                    // advanced.
-                                    let regime = path.current_regime();
-                                    path_refinements.push(PathRefinementRecord {
-                                        seed_idx,
-                                        regime,
-                                        reason: format!(
-                                            "active-mass breach (observed mean {:.4} < floor \
-                                             {:.4}); retained the accepted full state and refined \
-                                             the next attempted distance",
-                                            breach.observed_mean_mass, breach.floor,
-                                        ),
-                                    });
-                                }
-                            }
+                            let RefinementReason::WaypointStruggled(failure) = reason;
+                            log::info!(
+                                "[OUTER] {context}: continuation seed {seed_idx} coupled \
+                                 waypoint struggled below accepted s={s:.4} ({}); refining the \
+                                 next attempted distance",
+                                failure.message(),
+                            );
                         }
                     }
                 }

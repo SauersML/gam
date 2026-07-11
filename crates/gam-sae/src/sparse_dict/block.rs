@@ -817,7 +817,7 @@ fn projection_sum_row(
 /// Keeping the alternation and its certificate on the stored code values avoids
 /// certifying a freshly re-derived tied projection while returning different
 /// arrays.
-fn reconstruct_stored_code_row(
+pub(super) fn reconstruct_stored_code_row(
     code: &RowBlockCode,
     decoder: ArrayView2<'_, f32>,
     b: usize,
@@ -980,20 +980,23 @@ fn refresh_frames(
 /// the AuxK auxiliary-reconstruction loss, but installs a genuine `St(b, P)` frame
 /// spanning the directions the model most fails to explain.
 ///
-/// Returns the block indices whose residual-row birth proposals were installed.
-struct RevivedBlockProposal {
+/// A residual-row birth candidate. Constructing a candidate never mutates the
+/// live dictionary: [`advance_block_sparse_state`] installs one candidate at a
+/// time and commits it only after a full reroute proves a strict improvement of
+/// the exact training criterion.
+struct BlockBirthProposal {
     block: usize,
-    previous_frame: Array2<f32>,
+    proposed_frame: Array2<f32>,
 }
 
-fn revive_dead_blocks(
+fn dead_block_birth_proposals(
     x: ArrayView2<'_, f32>,
     codes: &[RowBlockCode],
-    decoder: &mut Array2<f32>,
+    decoder: ArrayView2<'_, f32>,
     n_blocks: usize,
     b: usize,
     aux_k: usize,
-) -> Vec<RevivedBlockProposal> {
+) -> Vec<BlockBirthProposal> {
     if aux_k == 0 {
         return Vec::new();
     }
@@ -1067,15 +1070,9 @@ fn revive_dead_blocks(
             }
         }
         gram_schmidt_rows(&mut seed);
-        let previous_frame = decoder.slice(ndarray::s![g * b..g * b + b, ..]).to_owned();
-        for r in 0..b {
-            for c in 0..p {
-                decoder[[g * b + r, c]] = seed[[r, c]];
-            }
-        }
-        revived.push(RevivedBlockProposal {
+        revived.push(BlockBirthProposal {
             block: g,
-            previous_frame,
+            proposed_frame: seed,
         });
     }
     revived
@@ -1734,58 +1731,69 @@ fn advance_block_sparse_state(
         b,
         config.frame_ridge,
     );
-    let proposals = revive_dead_blocks(
+    let proposals = dead_block_birth_proposals(
         x,
         &codes_for_refresh,
-        &mut decoder,
+        decoder.view(),
         config.n_blocks,
         b,
         config.aux_k,
     );
 
-    // A residual-row frame is a proposal, not a model parameter. Re-route after
-    // installing all proposals, restore every proposal that did not receive a
-    // nonzero tied code, and repeat because one restoration can displace another
-    // marginal proposal. At least one proposal is removed on every repeat.
-    let mut retained = vec![true; proposals.len()];
-    let mut gamma_seed = gamma_for_refresh;
-    let (gamma, codes) = loop {
-        let (candidate_gamma, candidate_codes) =
-            route_and_close_gamma(x, decoder.view(), gamma_seed, config, k)?;
-        let rejected: Vec<usize> = proposals
-            .iter()
-            .enumerate()
-            .filter(|(proposal_index, proposal)| {
-                retained[*proposal_index]
-                    && !proposal_is_selected(&candidate_codes, proposal.block, b)
-            })
-            .map(|(proposal_index, _)| proposal_index)
-            .collect();
-        if rejected.is_empty() {
-            break (candidate_gamma, candidate_codes);
-        }
-        for proposal_index in rejected {
-            let proposal = &proposals[proposal_index];
-            for row in 0..b {
-                for column in 0..decoder.ncols() {
-                    decoder[[proposal.block * b + row, column]] =
-                        proposal.previous_frame[[row, column]];
-                }
-            }
-            retained[proposal_index] = false;
-        }
-        gamma_seed = candidate_gamma;
-    };
-    let accepted_births = retained.into_iter().filter(|&accepted| accepted).count();
-    let explained_variance = explained_variance(x, &codes, decoder.view(), b);
-    if !explained_variance.is_finite() {
+    // Close the ordinary gamma/frame alternation before considering births. A
+    // dead block is a quiescent part of this baseline model, not an instruction
+    // to mutate it. Each residual-row frame is then tried as an isolated
+    // transaction: install, reroute the complete corpus, and commit only when
+    // the block receives a nonzero tied code AND the exact training EV strictly
+    // improves. Rejection restores the frame byte-for-byte; gamma, routing, and
+    // criterion were kept in locals and therefore never leave the prior state.
+    let (mut gamma, mut codes) =
+        route_and_close_gamma(x, decoder.view(), gamma_for_refresh, config, k)?;
+    let mut criterion = explained_variance(x, &codes, decoder.view(), b);
+    if !criterion.is_finite() {
         return Err("fit_block_sparse_dictionary produced non-finite explained variance".into());
+    }
+    let mut accepted_births = 0usize;
+    for proposal in proposals {
+        // An earlier accepted birth can alter TopK routing enough to make a
+        // later candidate live already. Replacing that now-live frame would no
+        // longer be a dead-block birth.
+        if proposal_is_selected(&codes, proposal.block, b) {
+            continue;
+        }
+        let previous_frame = decoder
+            .slice(ndarray::s![proposal.block * b..proposal.block * b + b, ..])
+            .to_owned();
+        decoder
+            .slice_mut(ndarray::s![proposal.block * b..proposal.block * b + b, ..])
+            .assign(&proposal.proposed_frame);
+        let (candidate_gamma, candidate_codes) =
+            route_and_close_gamma(x, decoder.view(), gamma, config, k)?;
+        let candidate_criterion = explained_variance(x, &candidate_codes, decoder.view(), b);
+        if !candidate_criterion.is_finite() {
+            return Err(
+                "fit_block_sparse_dictionary birth proposal produced non-finite explained variance"
+                    .into(),
+            );
+        }
+        if proposal_is_selected(&candidate_codes, proposal.block, b)
+            && candidate_criterion > criterion
+        {
+            gamma = candidate_gamma;
+            codes = candidate_codes;
+            criterion = candidate_criterion;
+            accepted_births += 1;
+        } else {
+            decoder
+                .slice_mut(ndarray::s![proposal.block * b..proposal.block * b + b, ..])
+                .assign(&previous_frame);
+        }
     }
     let mut next = BlockSparseState {
         decoder,
         codes,
         gamma,
-        explained_variance,
+        explained_variance: criterion,
     };
     canonicalize_matryoshka_state(&mut next, config);
 

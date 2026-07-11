@@ -41,7 +41,7 @@
 //! produce a strictly smaller representable waypoint, [`ContinuationPath::step`]
 //! returns a typed non-convergence error.
 //!
-//! # How this absorbs #969 (warm-invariance) and #976 (hardening)
+//! # Warm-invariance
 //!
 //! * **#969 — warm-invariance.** A cold entry (no warm β) and a warm entry
 //!   (β carried from a previous fit / cache) both enter at `s = 1`, where the
@@ -52,21 +52,11 @@
 //!   already near the `s = 1` fixed point); it cannot change the destination.
 //!   The path therefore makes "cold and warm reach the same criterion" a
 //!   structural property rather than a tolerance the caller must check.
-//! * **#976 — hardening.** Two hooks the wiring agent (editing
-//!   `rho_optimizer.rs` / `atom_selection.rs`) calls per inner iteration:
-//!   a **trust-region cap on the assignment logits**
-//!   ([`LogitTrustRegion`]) so a single Newton step can never fling the
-//!   relaxed assignment across the argmax cliff; and an **active-mass-floor
-//!   breach signal** ([`ActiveMassFloor`] / [`MassFloorBreach`]) that, when the
-//!   per-row active mass collapses toward the uniform saddle, triggers a
-//!   *re-seed from the scaffold* (the pristine seeded geometry) — recorded in
-//!   the [`ReseedLedger`], **never fatal**. A breach is a ledger entry and a
-//!   smaller next attempted distance, not an error return.
 //!
-//! This module owns the coupling object and the hook *interfaces / return
-//! types*. The wiring agent implements the call sites against these types.
+//! Full objective checkpoints, rather than coefficient-only fallback state,
+//! make each accepted waypoint independent of mutations from refused trials.
 
-use ndarray::{Array1, ArrayView2};
+use ndarray::Array1;
 
 use crate::estimate::reml::continuation::{ContinuationState, eval_step};
 use crate::inner_status::InnerFailure;
@@ -267,173 +257,6 @@ impl CoupledSchedules {
     }
 }
 
-/// The lockstep target values of the two scalar legs at a given `s`. Handed to
-/// the wiring agent so it can install τ on the SAE term and the isometry weight
-/// on the gauge penalty before the spine pass at this waypoint.
-// ─────────────────────────────────────────────────────────────────────────
-//  Hardening hook interfaces (#976). Defined here; implemented at the call
-//  sites by the wiring agent (rho_optimizer.rs / atom_selection.rs).
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Per-iteration trust-region cap on the assignment logits.
-///
-/// The wiring agent calls [`LogitTrustRegion::cap_step`] on each candidate
-/// Newton step in assignment-logit space before it is applied, so a single
-/// step can never fling the relaxed assignment across the argmax cliff (the
-/// discontinuity the τ anneal exists to avoid). The cap is an ∞-norm radius on
-/// the logit increment, tied to the current τ: hotter τ (diffuse) tolerates a
-/// larger logit move; colder τ (sharp) clamps tighter, because near the cliff a
-/// small logit change is a large assignment change.
-#[derive(Debug, Clone, Copy)]
-pub struct LogitTrustRegion {
-    /// ∞-norm radius on the logit increment at the current waypoint.
-    pub radius: f64,
-}
-
-/// Outcome of applying the logit trust-region cap to a proposed step. The
-/// wiring agent applies the returned (possibly shrunk) step. There is no
-/// "reject" outcome — the cap only *scales* the step.
-#[derive(Debug, Clone, Copy)]
-pub enum LogitStepCap {
-    /// The proposed step was within the radius; apply it unchanged.
-    Within,
-    /// The proposed step exceeded the radius; scale it by `scale ∈ (0, 1)` so
-    /// its ∞-norm equals `radius`, then apply.
-    Scaled { scale: f64 },
-}
-
-impl LogitTrustRegion {
-    /// Build the per-waypoint logit trust region from the current τ. Hotter τ
-    /// ⇒ larger radius (the assignment map is gentle); colder τ ⇒ tighter
-    /// radius (near the argmax cliff). The radius is `τ · LOGIT_TR_TAU_GAIN`
-    /// clamped to `[LOGIT_TR_MIN, LOGIT_TR_MAX]`.
-    #[must_use]
-    pub fn for_tau(tau: f64) -> Self {
-        const LOGIT_TR_TAU_GAIN: f64 = 4.0;
-        const LOGIT_TR_MIN: f64 = 1.0e-2;
-        const LOGIT_TR_MAX: f64 = 8.0;
-        let radius = (tau * LOGIT_TR_TAU_GAIN).clamp(LOGIT_TR_MIN, LOGIT_TR_MAX);
-        Self { radius }
-    }
-
-    /// Decide how to cap a proposed logit increment given its ∞-norm. The
-    /// wiring agent passes the step's ∞-norm; this returns whether to apply it
-    /// unchanged or scaled to the radius. Never rejects.
-    #[must_use]
-    pub fn cap_step(&self, step_inf_norm: f64) -> LogitStepCap {
-        if !step_inf_norm.is_finite() || step_inf_norm <= self.radius || step_inf_norm == 0.0 {
-            LogitStepCap::Within
-        } else {
-            LogitStepCap::Scaled {
-                scale: self.radius / step_inf_norm,
-            }
-        }
-    }
-}
-
-/// Active-mass-floor watcher (#976). The wiring agent calls
-/// [`ActiveMassFloor::check`] with the per-row mean active assignment mass each
-/// inner iteration. When the mass collapses toward the uniform saddle (below
-/// the floor), `check` returns a [`MassFloorBreach`] the caller records in the
-/// [`ReseedLedger`] and acts on by re-seeding from the scaffold. A breach is
-/// **never fatal** — there is no error return.
-#[derive(Debug, Clone, Copy)]
-pub struct ActiveMassFloor {
-    /// Mean active mass below which the assignment is judged to have collapsed
-    /// toward the near-uniform saddle and a scaffold re-seed is triggered.
-    pub floor: f64,
-}
-
-impl ActiveMassFloor {
-    /// Default floor: the **failure boundary**, not the healthy operating
-    /// point. The SAE routing-collapse quality oracle plants a healthy
-    /// codes'-units active mass of ~`0.2` and asserts recovery of at least
-    /// half of it; the floor therefore sits at `0.5 × 0.2 = 0.1` — breach
-    /// exactly when the fit enters the region the quality assertion already
-    /// calls collapsed. Placing the floor *at* the healthy operating mass
-    /// (the previous `0.2`) made a healthy converging IBP-MAP fit oscillate
-    /// across the floor, and every spurious breach re-seeds from the scaffold
-    /// (`obj.reset()`) — re-seed thrash that discards converged routing mass and
-    /// pins the fit near the cold seed: itself a collapse mechanism. Genuine saddle collapse
-    /// (~`0.03` observed mass) is still far below this floor.
-    pub const DEFAULT_FLOOR: f64 = 0.1;
-
-    #[must_use]
-    pub fn default_floor() -> Self {
-        Self {
-            floor: Self::DEFAULT_FLOOR,
-        }
-    }
-
-    /// Check the observed mean active mass against the floor. Returns
-    /// `Some(MassFloorBreach)` when collapsed (caller re-seeds from scaffold +
-    /// logs to the ledger), `None` when healthy. Never an error.
-    #[must_use]
-    pub fn check(&self, mean_active_mass: f64) -> Option<MassFloorBreach> {
-        if mean_active_mass.is_finite() && mean_active_mass >= self.floor {
-            None
-        } else {
-            Some(MassFloorBreach {
-                observed_mean_mass: mean_active_mass,
-                floor: self.floor,
-            })
-        }
-    }
-}
-
-/// A recorded active-mass-floor breach. Carries the observed mass and the floor
-/// it fell below. The wiring agent's response is a re-seed-from-scaffold plus a
-/// smaller next attempted path distance: the event is appended to the
-/// [`ReseedLedger`] without moving the last accepted waypoint.
-#[derive(Debug, Clone, Copy)]
-pub struct MassFloorBreach {
-    pub observed_mean_mass: f64,
-    pub floor: f64,
-}
-
-/// Append-only ledger of scaffold re-seeds triggered by active-mass-floor
-/// breaches. Non-fatal by construction: the ledger only *records*; it never
-/// holds a terminal/abort state. The wiring agent threads one ledger through
-/// the joint fit and queries [`ReseedLedger::reseed_count`] for diagnostics.
-#[derive(Debug, Clone, Default)]
-pub struct ReseedLedger {
-    entries: Vec<ReseedEvent>,
-}
-
-/// One scaffold re-seed event: the path parameter `s` at which the breach was
-/// observed and the breach payload. Lets diagnostics see whether re-seeds
-/// cluster at sharp-τ waypoints (the expected near-cliff regime).
-#[derive(Debug, Clone, Copy)]
-pub struct ReseedEvent {
-    pub s: f64,
-    pub breach: MassFloorBreach,
-}
-
-impl ReseedLedger {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Record a scaffold re-seed triggered at path parameter `s`. Returns
-    /// nothing fatal — recording a breach is routine homotopy bookkeeping.
-    pub fn record(&mut self, s: f64, breach: MassFloorBreach) {
-        self.entries.push(ReseedEvent { s, breach });
-    }
-
-    #[must_use]
-    pub fn reseed_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[must_use]
-    pub fn events(&self) -> &[ReseedEvent] {
-        &self.entries
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  Coarse diagnostic view of the last accepted scalar regime.
 //
@@ -510,25 +333,19 @@ pub(crate) enum RefinementReason {
     /// failure is kept for logging; the path retries from the last accepted
     /// state with a smaller attempted distance.
     WaypointStruggled(InnerFailure),
-    /// The active-mass floor was breached at this waypoint; a scaffold re-seed
-    /// was recorded and the next attempted distance is refined.
-    MassFloorBreached(MassFloorBreach),
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 //  The ContinuationPath object.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Object 1 — the coupled continuation path. Owns the three schedules and the
-/// scalar path parameter `s`, and drives the K≥2 SAE joint fit down the coupled
+/// Coupled continuation path. Owns the three endpoint legs and the scalar path
+/// parameter `s`, and drives the K≥2 SAE joint fit down the coupled
 /// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime), and
 /// only a solved literal target can produce arrival.
 ///
-/// The outer driver advances the path one waypoint at a time:
-/// `let step = path.step(obj, &warm_beta)?;` and, per [`ContinuationStep`],
-/// installs the next waypoint's [`ContinuationScalarState`] (τ on the SAE term,
-/// one weight per isometry penalty) and applies the [`LogitTrustRegion`] /
-/// [`ActiveMassFloor`] hooks inside the inner solve.
+/// [`ContinuationPath::step`] transactionally installs and evaluates one exact
+/// waypoint at a time. The path itself owns the accepted warm trajectory.
 #[derive(Debug, Clone)]
 pub struct ContinuationPath {
     schedules: CoupledSchedules,
@@ -540,20 +357,9 @@ pub struct ContinuationPath {
     /// no numeric floor: inability to form a strictly smaller representable
     /// waypoint is a typed non-convergence result.
     s_step: f64,
-    /// Logit trust region and active-mass floor recomputed per waypoint from
-    /// the current τ.
-    logit_tr: LogitTrustRegion,
-    mass_floor: ActiveMassFloor,
-    /// Path-owned re-seed ledger for breaches reported through the bare,
-    /// no-ledger hardening hook ([`ContinuationPath::note_active_mass_breach`]).
-    /// The richer ledger-threading API ([`ContinuationPath::note_mass_breach`])
-    /// is unchanged; this internal ledger backs the inner-loop call site that
-    /// does not thread its own ledger. Append-only, never fatal.
-    reseed_ledger: ReseedLedger,
     /// The most recent converged waypoint state. `None` until the first leg
-    /// converges (that leg runs the full cold spine); every later waypoint is
-    /// a WARM leg from here — the structural fix for the per-waypoint
-    /// cold-spine cost blowup. A failed attempted waypoint never overwrites it.
+    /// converges; every later waypoint starts from this accepted full objective
+    /// state and beta hint. A failed attempted waypoint never overwrites it.
     warm: Option<ContinuationState>,
 }
 
@@ -565,28 +371,18 @@ impl ContinuationPath {
     /// entry, warm or cold, funnels through the `s = 1` contraction fixed point.
     #[must_use]
     pub fn enter(schedules: CoupledSchedules) -> Self {
-        let entry_targets = schedules.scalar_targets_at(1.0);
-        let logit_tr = LogitTrustRegion::for_tau(entry_targets.assignment_temperature);
         Self {
             schedules,
             s: 1.0,
             s_step: 1.0,
-            logit_tr,
-            mass_floor: ActiveMassFloor::default_floor(),
-            reseed_ledger: ReseedLedger::new(),
             warm: None,
         }
     }
 
-    /// Heavy-smoothing entry coupled to a CONCRETE ρ target and legal box. The
-    /// seed cascade rebuilds the path per-seed with this once it knows the
-    /// objective's real ρ dimension (the no-argument [`ContinuationPath::heavy_entry`]
-    /// is a dimension-1 placeholder used only before the seed is in hand). The
-    /// ρ leg rides the spine from the spine's own oversmoothed ρ₀ down to
-    /// `rho_target` (the real objective ρ\*); `bounds_upper` is the legal ρ box.
-    /// The scalar legs use the typed entry/target contract supplied by the
-    /// objective; no private default may replace its literal target. Enters at
-    /// `s = 1`. `rho_target` and `bounds_upper` must share length.
+    /// Build from a concrete log-ρ target and the objective's legal upper box.
+    /// The upper box is the heavy entry endpoint; the scalar endpoints come
+    /// from the typed objective contract. Every endpoint must be finite, and
+    /// each upper entry must be at least its target.
     pub fn heavy_entry_for_rho(
         rho_target: Array1<f64>,
         bounds_upper: Array1<f64>,
@@ -631,54 +427,6 @@ impl ContinuationPath {
         PathRegime::from_s(self.s)
     }
 
-    /// The base radius the per-iteration assignment-logit trust region is built
-    /// from (`rho_optimizer.rs` / `atom_selection.rs` hardening hook). This is
-    /// the ∞-norm logit step radius at the current waypoint; larger accepted
-    /// `s` values cool τ and hand back a tighter radius.
-    #[must_use]
-    pub fn logit_step_radius(&self) -> f64 {
-        self.logit_tr.radius
-    }
-
-    /// Bare active-mass-floor breach hook for the inner-loop call site that does
-    /// not thread its own [`ReseedLedger`]. Records the breach in the
-    /// path-owned ledger at the current `s` and refines the next distance —
-    /// the same non-fatal response as [`ContinuationPath::note_mass_breach`],
-    /// without requiring the caller to carry a ledger. Returns the unchanged
-    /// accepted [`PathRegime`] so the call site can report it.
-    pub fn note_active_mass_breach(&mut self) -> PathRegime {
-        let breach = MassFloorBreach {
-            observed_mean_mass: self.mass_floor.floor,
-            floor: self.mass_floor.floor,
-        };
-        // Single source of truth for the breach response: route through
-        // `note_mass_breach` so the record-then-refine logic is not
-        // duplicated. The bare hook differs only in *which* ledger it threads —
-        // the path-owned one — so we lend that ledger to the shared driver and
-        // hand it back afterwards.
-        let mut owned = std::mem::take(&mut self.reseed_ledger);
-        let step = self.note_mass_breach(breach, &mut owned);
-        self.reseed_ledger = owned;
-        // The shared driver retains the last accepted waypoint and refines the
-        // attempted distance. Match the
-        // step exhaustively so the outcome is observed (no silent discard) and
-        // the "every breach is progress" invariant is documented at the use
-        // site: every arm resolves to the accepted live regime.
-        match step {
-            ContinuationStep::Refined { .. }
-            | ContinuationStep::Entered { .. }
-            | ContinuationStep::Descended { .. }
-            | ContinuationStep::Arrived { .. } => self.current_regime(),
-        }
-    }
-
-    /// Number of scaffold re-seeds recorded through the bare
-    /// [`ContinuationPath::note_active_mass_breach`] hook (diagnostics).
-    #[must_use]
-    pub fn reseed_count(&self) -> usize {
-        self.reseed_ledger.reseed_count()
-    }
-
     /// Current path parameter `s ∈ [0, 1]`.
     #[must_use]
     pub fn s(&self) -> f64 {
@@ -698,49 +446,11 @@ impl ContinuationPath {
         self.schedules.rho_target_at(self.s)
     }
 
-    /// The per-waypoint logit trust region (from the current τ). The wiring
-    /// agent caps each assignment-logit Newton step with this.
-    #[must_use]
-    pub fn logit_trust_region(&self) -> LogitTrustRegion {
-        self.logit_tr
-    }
-
-    /// The active-mass floor for this path. The wiring agent calls
-    /// [`ActiveMassFloor::check`] with the observed mean active mass each inner
-    /// iteration and, on breach, records a scaffold re-seed in the ledger and
-    /// reports it back via [`ContinuationPath::note_mass_breach`].
-    #[must_use]
-    pub fn active_mass_floor(&self) -> ActiveMassFloor {
-        self.mass_floor
-    }
-
-    /// Record an active-mass-floor breach into the ledger and refine the next
-    /// attempted distance. Returns the [`ContinuationStep::Refined`] the wiring
-    /// agent should act on. This is the hook the wiring agent calls when
-    /// [`ActiveMassFloor::check`] returns `Some` from inside the inner solve.
-    pub(crate) fn note_mass_breach(
-        &mut self,
-        breach: MassFloorBreach,
-        ledger: &mut ReseedLedger,
-    ) -> ContinuationStep {
-        ledger.record(self.s, breach);
-        self.refine_step();
-        ContinuationStep::Refined {
-            s: self.s,
-            reason: RefinementReason::MassFloorBreached(breach),
-        }
-    }
-
     /// Refine the next descent after a failed attempted waypoint. `s` remains
     /// the last successfully solved waypoint; only the attempted distance is
     /// halved, so the accepted path is monotone and never fabricates progress.
     fn refine_step(&mut self) {
         self.s_step *= 0.5;
-        self.logit_tr = LogitTrustRegion::for_tau(
-            self.schedules
-                .scalar_targets_at(self.s)
-                .assignment_temperature,
-        );
     }
 
     /// Take one waypoint step down the coupled homotopy.
@@ -794,7 +504,6 @@ impl ContinuationPath {
                 ),
             };
         }
-        self.logit_tr = LogitTrustRegion::for_tau(scalar_state.assignment_temperature);
 
         // One path attempt is exactly one objective evaluation at the shared
         // `(rho(s), scalar(s))` waypoint. There is no nested rho scheduler: its
@@ -853,11 +562,6 @@ impl ContinuationPath {
                 // Successful progress permits a naturally larger next step,
                 // bounded only by the distance remaining to the literal target.
                 self.s_step = (self.s_step * 2.0).min(self.s);
-                self.logit_tr = LogitTrustRegion::for_tau(
-                    self.schedules
-                        .scalar_targets_at(self.s)
-                        .assignment_temperature,
-                );
                 if entering {
                     ContinuationStep::Entered { state }
                 } else if self.s <= 0.0 {
@@ -922,27 +626,6 @@ pub fn couple_schedules(
     }
 }
 
-/// View helper: the wiring agent passes the SAE assignment matrix (rows ×
-/// atoms) to compute the mean active mass for the [`ActiveMassFloor`] check.
-/// Defined here so the floor's input convention has one owner.
-#[must_use]
-pub fn mean_active_mass(assignments: ArrayView2<'_, f64>) -> f64 {
-    let n = assignments.nrows();
-    if n == 0 {
-        return 0.0;
-    }
-    // Per-row active mass = max assignment weight in the row (how concentrated
-    // the routing is); the saddle is uniform (~1/K), a routed fit is ~1.
-    let mut acc = 0.0;
-    for row in assignments.rows() {
-        let row_max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        if row_max.is_finite() {
-            acc += row_max;
-        }
-    }
-    acc / n as f64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,114 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn logit_trust_region_tightens_as_tau_cools() {
-        let hot = LogitTrustRegion::for_tau(2.0);
-        let cold = LogitTrustRegion::for_tau(0.05);
-        assert!(
-            cold.radius < hot.radius,
-            "colder τ must give a tighter logit trust region"
-        );
-        // A step within the radius is applied unchanged.
-        assert!(matches!(
-            cold.cap_step(cold.radius * 0.5),
-            LogitStepCap::Within
-        ));
-        // A step past the radius is scaled down, never rejected.
-        match cold.cap_step(cold.radius * 4.0) {
-            LogitStepCap::Scaled { scale } => {
-                assert!(scale > 0.0 && scale < 1.0);
-                assert!((scale - 0.25).abs() < 1e-12);
-            }
-            LogitStepCap::Within => panic!("expected the over-radius step to be scaled"),
-        }
-    }
-
-    #[test]
-    fn active_mass_floor_breach_is_recorded_never_fatal() {
-        let floor = ActiveMassFloor::default_floor();
-        assert!(floor.check(0.9).is_none(), "healthy routing → no breach");
-        let breach = floor.check(0.05).expect("collapsed routing → breach");
-        let mut ledger = ReseedLedger::new();
-        ledger.record(0.3, breach);
-        assert_eq!(ledger.reseed_count(), 1);
-        assert!((ledger.events()[0].s - 0.3).abs() < 1e-12);
-    }
-
-    #[test]
-    fn note_mass_breach_refines_distance_without_moving_accepted_waypoint() {
-        let mut path = ContinuationPath::enter(schedules());
-        path.s = 0.5;
-        path.s_step = 0.25;
-        let accepted_before = path.s;
-        let distance_before = path.s_step;
-        let mut ledger = ReseedLedger::new();
-        let breach = MassFloorBreach {
-            observed_mean_mass: 0.05,
-            floor: ActiveMassFloor::DEFAULT_FLOOR,
-        };
-        let step = path.note_mass_breach(breach, &mut ledger);
-        assert!(matches!(
-            step,
-            ContinuationStep::Refined {
-                reason: RefinementReason::MassFloorBreached(_),
-                ..
-            }
-        ));
-        assert_eq!(
-            path.s().to_bits(),
-            accepted_before.to_bits(),
-            "a failed attempt must retain the last accepted waypoint"
-        );
-        assert_eq!(
-            path.s_step.to_bits(),
-            (distance_before * 0.5).to_bits(),
-            "a mass breach must halve only the next attempted distance"
-        );
-        assert_eq!(ledger.reseed_count(), 1);
-    }
-
-    #[test]
-    fn continuation_step_has_no_reject_arm() {
-        // Compile-time + exhaustiveness witness: successful target arrival is
-        // distinct from refinement and carries its solved state. Typed
-        // non-convergence is returned outside this enum.
-        fn is_progress(step: &ContinuationStep) -> bool {
-            match step {
-                ContinuationStep::Entered { .. }
-                | ContinuationStep::Descended { .. }
-                | ContinuationStep::Arrived { .. }
-                | ContinuationStep::Refined { .. } => true,
-            }
-        }
-        let breach = MassFloorBreach {
-            observed_mean_mass: 0.0,
-            floor: 0.2,
-        };
-        assert!(is_progress(&ContinuationStep::Refined {
-            s: 1.0,
-            reason: RefinementReason::MassFloorBreached(breach),
-        }));
-    }
-
-    #[test]
-    fn mean_active_mass_distinguishes_routed_from_saddle() {
-        use ndarray::array;
-        // Two rows, K=2. Routed: one weight near 1. Saddle: uniform 0.5.
-        let routed = array![[0.95, 0.05], [0.9, 0.1]];
-        let saddle = array![[0.5, 0.5], [0.5, 0.5]];
-        assert!(mean_active_mass(routed.view()) > 0.85);
-        assert!((mean_active_mass(saddle.view()) - 0.5).abs() < 1e-12);
-        assert!(
-            ActiveMassFloor::default_floor()
-                .check(mean_active_mass(saddle.view()))
-                .is_none(),
-            "uniform 0.5 is above the floor — saddle detection is about \
-             collapse below the failure boundary (0.5× the planted healthy \
-             mass), not the healthy operating point"
-        );
-    }
-
-    #[test]
     fn heavy_entry_starts_in_the_heavy_regime() {
         let path = ContinuationPath::heavy_entry_for_rho(
             Array1::zeros(1),
@@ -1125,10 +700,6 @@ mod tests {
             path.current_regime(),
             PathRegime::Heavy,
             "a fresh heavy_entry is in the heavy-smoothing regime"
-        );
-        assert!(
-            path.logit_step_radius().is_finite() && path.logit_step_radius() > 0.0,
-            "logit step radius must be finite and positive at entry"
         );
     }
 
@@ -1149,33 +720,6 @@ mod tests {
         )
         .expect_err("entry below target must be typed refusal");
         assert!(reversed.to_string().contains("entry >= target"));
-    }
-
-    #[test]
-    fn bare_active_mass_breach_records_and_refines() {
-        let mut path = ContinuationPath::enter(schedules());
-        path.s = 0.4;
-        path.s_step = 0.2;
-        assert_eq!(path.reseed_count(), 0);
-        let accepted_before = path.s;
-        let distance_before = path.s_step;
-        let regime = path.note_active_mass_breach();
-        assert_eq!(
-            path.reseed_count(),
-            1,
-            "breach must be recorded in the path ledger"
-        );
-        assert_eq!(
-            path.s.to_bits(),
-            accepted_before.to_bits(),
-            "breach must retain the accepted waypoint"
-        );
-        assert_eq!(
-            path.s_step.to_bits(),
-            (distance_before * 0.5).to_bits(),
-            "breach must refine the next attempted distance"
-        );
-        assert_eq!(regime, path.current_regime());
     }
 
     #[test]
