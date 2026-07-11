@@ -5024,7 +5024,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
-        self.run_joint_fit_arrow_schur_with_kkt_policy(
+        self.run_joint_fit_arrow_schur_with_termination_policy(
             target,
             rho,
             analytic_penalties,
@@ -5040,10 +5040,14 @@ impl SaeManifoldTerm {
     /// coarse KKT band immediately; a Laplace value paired with an implicit
     /// derivative cannot do that, because the resulting warm-start map is flat
     /// inside the band while the analytic adjoint differentiates the exact root.
-    /// Keep the same KKT tolerance as an admission certificate, but bypass its
-    /// loop-top early exit and let the existing Armijo / directional-decrease /
-    /// objective-stall terminators drive the state to an idempotent numerical
-    /// fixed point before the undamped evidence cache is formed (#2253).
+    /// Keep the same KKT tolerance as an admission certificate, but bypass both
+    /// its loop-top early exit and the approximate objective-stall shortcut. The
+    /// latter deliberately stops ordinary fits after a few sufficiently small
+    /// but still STRICT decreases; re-entering from that state continues moving,
+    /// so it is not an idempotent root and cannot define the state response used
+    /// by an implicit evidence derivative. Evidence therefore retains only the
+    /// actual no-descent / proximal-no-strict-decrease termination routes before
+    /// the undamped cache is formed (#2253).
     pub(crate) fn run_joint_fit_arrow_schur_for_evidence(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -5054,7 +5058,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
-        self.run_joint_fit_arrow_schur_with_kkt_policy(
+        self.run_joint_fit_arrow_schur_with_termination_policy(
             target,
             rho,
             analytic_penalties,
@@ -5066,7 +5070,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    fn run_joint_fit_arrow_schur_with_kkt_policy(
+    fn run_joint_fit_arrow_schur_with_termination_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &mut SaeManifoldRho,
@@ -5075,7 +5079,7 @@ impl SaeManifoldTerm {
         step_size: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-        allow_coarse_kkt_termination: bool,
+        allow_heuristic_termination: bool,
     ) -> Result<SaeManifoldLoss, String> {
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
@@ -5311,7 +5315,9 @@ impl SaeManifoldTerm {
         // criterion there is correct. Break after
         // `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` CONSECUTIVE stalled
         // iterations (a single flat step can be a benign saddle crossing; a run of
-        // them is the fixed point). `previous_full_iterate_objective` is the
+        // them is sufficient for the ordinary bounded-fit shortcut). Evidence
+        // disables this heuristic because a still-strict decrease is not an
+        // idempotent root. `previous_full_iterate_objective` is the
         // loop-top objective, which already reflects the PRIOR iteration's step,
         // guards, retraction and canonicalization, so the measured decrease is the
         // TOTAL per-iteration progress. Reuses the existing derived stall constants
@@ -5553,7 +5559,7 @@ impl SaeManifoldTerm {
             // quotient. A tiny quotient Newton step is a globalization diagnostic,
             // not a KKT certificate: on K=1 near-isotropic clouds it can be tiny
             // along the chart gauge while the outer residual remains large.
-            if allow_coarse_kkt_termination
+            if allow_heuristic_termination
                 && (grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance)
             {
                 self.reclaim_arrow_assembly_workspace(&mut sys);
@@ -5629,7 +5635,8 @@ impl SaeManifoldTerm {
                 self.reclaim_arrow_assembly_workspace(&mut sys);
                 break;
             }
-            // #2100/#1117 objective-stagnation gate (see the locals above). The
+            // #2100/#1117 ordinary-fit objective-stagnation shortcut (see the
+            // locals above). The
             // loop-top `pre_step_total` already carries the full effect of the
             // previous iteration, so a relative decrease below the derived stall
             // tolerance means that whole iteration (Newton step + guards +
@@ -5638,7 +5645,9 @@ impl SaeManifoldTerm {
             // immediately (constant EV ⇒ vanishing objective decrease); on a healthy
             // fit the grad gate above breaks first. Counting CONSECUTIVE stalls
             // tolerates a lone flat step; `MIN_ROUNDS` in a row is the fixed point.
-            if previous_full_iterate_objective.is_finite() {
+            if allow_heuristic_termination
+                && previous_full_iterate_objective.is_finite()
+            {
                 let round_improvement = (previous_full_iterate_objective - pre_step_total).max(0.0);
                 let objective_scale = previous_full_iterate_objective
                     .abs()
@@ -5649,9 +5658,10 @@ impl SaeManifoldTerm {
                     consecutive_objective_stalls += 1;
                     if consecutive_objective_stalls >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
                     {
-                        // Converged on the quotient — the objective is at its
-                        // numerical fixed point. The pre-step state is unperturbed
-                        // (the snapshot was taken from it), so no restore is needed.
+                        // The ordinary bounded fit has reached its documented
+                        // objective-stall approximation. The pre-step state is
+                        // unperturbed (the snapshot was taken from it), so no
+                        // restore is needed.
                         self.reclaim_arrow_assembly_workspace(&mut sys);
                         break;
                     }

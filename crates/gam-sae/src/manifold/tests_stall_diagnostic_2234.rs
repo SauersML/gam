@@ -295,7 +295,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     let h = 1.0e-4;
     let mut failures = Vec::new();
     for inner_max_iter in [40usize, 200usize] {
-        let mut center = logdet_audit_point(
+        let center = logdet_audit_point(
             center_term.clone(),
             z.view(),
             &center_rho,
@@ -303,41 +303,6 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
             inner_max_iter,
         )
         .expect("single-emission audit at the center rho");
-        eprintln!(
-            "[2253-REPEAT] budget={inner_max_iter} repeat=0 objective={:+.12e} \
-             logdet={:+.12e} kkt={:+.12e} quotient_kkt={:+.12e}",
-            center.criterion.value(),
-            center.log_det,
-            center.kkt_grad_norm,
-            center.quotient_kkt_grad_norm,
-        );
-        // Discriminate a truncated whole-evaluation fixed point from an
-        // incorrect implicit derivative.  Each repetition starts at the exact
-        // state returned by the preceding production evidence evaluation and
-        // uses the identical rho.  The +/- h lanes below then start from the
-        // fully repeated center, so their FD witnesses differentiate the same
-        // fixed-point map used by the center's analytic gradient.
-        for repeat in 1..=8 {
-            let previous_objective = center.criterion.value();
-            center = logdet_audit_point(
-                center.term.clone(),
-                z.view(),
-                &center_rho,
-                objective.registry.as_ref(),
-                inner_max_iter,
-            )
-            .expect("repeated single-emission audit at the center rho");
-            eprintln!(
-                "[2253-REPEAT] budget={inner_max_iter} repeat={repeat} \
-                 objective={:+.12e} objective_delta={:+.12e} \
-                 logdet={:+.12e} kkt={:+.12e} quotient_kkt={:+.12e}",
-                center.criterion.value(),
-                center.criterion.value() - previous_objective,
-                center.log_det,
-                center.kkt_grad_norm,
-                center.quotient_kkt_grad_norm,
-            );
-        }
         let center_components = &center.components;
         let center_logdet = center.log_det;
         let grad = center.criterion.gradient();
