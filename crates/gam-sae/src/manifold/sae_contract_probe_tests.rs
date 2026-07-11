@@ -606,22 +606,21 @@ fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
     }
 }
 
-/// #795 — the end-to-end joint `(t, β)` fit with the isometry gauge ENABLED must
-/// CONVERGE at every decoder scale, not just hold the scale-invariance property of
-/// a single assembled step.
+/// #2099 — the end-to-end joint `(t, β)` fit with the dimensionless isometry
+/// gauge is equivariant under a change of physical output units.
 ///
-/// This is the user-visible symptom the issue reports: with the un-normalized
-/// ‖B‖⁴ curvature, a large planted decoder makes the isometry Gauss-Newton block
-/// dominate the well-conditioned data-fit block by orders of magnitude, the
-/// arrow-Schur row blocks lose positive-definiteness, and the proximal ridge
-/// escalates to its 1e15 saturation without ever taking a productive Newton step —
-/// the fit stalls far from stationarity. With the `1/gbar²` fold the isometry
-/// block tracks the (scale-free) gradient, so the same handful of full-Newton
-/// steps reach the planted circle at λ=1 AND at λ=25. We assert a finite converged
-/// loss and a SCALE-INVARIANT reconstruction error (the fit recovers the same
-/// circle regardless of decoder magnitude) across scales.
+/// Co-scaling the physical target and decoder by `c` makes every data/smoothness
+/// energy and Hessian block scale by `c²`. The dimensionless isometry residual
+/// itself does not change, so its dimensional coefficient and the two numerical
+/// ridge curvatures must co-scale by `c²` as well. Under that complete physical
+/// co-scale, the normalized reconstruction `f/c` and normalized penalized
+/// criterion `V/c²` must agree with the unit-scale fit. This is the actual
+/// gauge-invariant fit property. Requiring each penalized optimum to have nearly
+/// zero data residual was invalid: nonzero smoothness/isometry deliberately trade
+/// data fit for regularity, and absolute planted-circle recovery is already owned
+/// by `sae_single_planted_circle_embedded_isometry_fit_converges_795` below.
 #[test]
-fn sae_isometry_joint_fit_converges_across_decoder_scales() {
+fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
     use gam_terms::analytic_penalties::{
         AnalyticPenaltyKind, AnalyticPenaltyRegistry, IsometryPenalty, PsiSlice,
     };
@@ -635,9 +634,13 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
         scale * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
     });
 
-    // Returns the converged relative reconstruction error ‖Φ(t̂)·B̂ − target‖/‖target‖
-    // for a joint fit run with the isometry gauge ON at the given decoder scale.
-    let converged_recon_rel = |lambda: f64| -> f64 {
+    struct ScaleFit {
+        normalized_reconstruction: Array2<f64>,
+        normalized_criterion: f64,
+    }
+
+    let fit_at_scale = |lambda: f64| -> ScaleFit {
+        let scale_sq = lambda * lambda;
         let decoder = &base_decoder * lambda;
         let atom = SaeManifoldAtom::new(
             "iso_converge",
@@ -661,9 +664,9 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
         let mut registry = AnalyticPenaltyRegistry::new();
-        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
-            IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1),
-        )));
+        let mut isometry = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1);
+        isometry.scalar_weight = scale_sq;
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(isometry)));
         let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
 
         let loss = term
@@ -673,8 +676,8 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
                 Some(&registry),
                 12,
                 1.0,
-                1.0e-4,
-                1.0e-4,
+                1.0e-4 * scale_sq,
+                1.0e-4 * scale_sq,
             )
             .expect("joint fit with isometry gauge ON must converge at every decoder scale");
         assert!(
@@ -686,30 +689,61 @@ fn sae_isometry_joint_fit_converges_across_decoder_scales() {
         let recon = term
             .try_fitted_for_rho(&rho)
             .expect("fitted reconstruction exists");
-        let mut num = 0.0_f64;
-        let mut den = 0.0_f64;
-        for (r, t) in recon.iter().zip(target.iter()) {
-            num += (r - t) * (r - t);
-            den += t * t;
+        let criterion = term
+            .penalized_objective_total(target.view(), &rho, Some(&registry), 1.0)
+            .expect("co-scaled penalized criterion is defined");
+        assert!(
+            criterion.is_finite(),
+            "penalized criterion must be finite at λ={lambda}, got {criterion}"
+        );
+        ScaleFit {
+            normalized_reconstruction: recon.mapv(|value| value / lambda),
+            normalized_criterion: criterion / scale_sq,
         }
-        (num / den).sqrt()
     };
 
-    let base = converged_recon_rel(1.0);
+    let base = fit_at_scale(1.0);
+    let base_image_norm_sq = base
+        .normalized_reconstruction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>();
     assert!(
-        base < 1.0e-3,
-        "the joint fit must recover the planted circle at unit scale; rel recon {base:.3e}"
+        base_image_norm_sq.is_finite() && base_image_norm_sq > 0.0,
+        "unit-scale fitted image must be finite and nonzero"
     );
-    // The un-normalized curvature would make the larger-decoder fits stall (the
-    // ridge saturates and the recon error stays O(1)); the fix keeps the recovered
-    // circle scale-invariant.
     for &lambda in &[5.0_f64, 25.0] {
-        let scaled = converged_recon_rel(lambda);
+        let scaled = fit_at_scale(lambda);
+        let image_defect = base
+            .normalized_reconstruction
+            .iter()
+            .zip(scaled.normalized_reconstruction.iter())
+            .map(|(unit, rescaled)| {
+                let delta = unit - rescaled;
+                delta * delta
+            })
+            .sum::<f64>()
+            .sqrt()
+            / base_image_norm_sq.sqrt();
+        let criterion_defect = (scaled.normalized_criterion - base.normalized_criterion).abs()
+            / (1.0
+                + scaled
+                    .normalized_criterion
+                    .abs()
+                    .max(base.normalized_criterion.abs()));
+        eprintln!(
+            "[#2099 fit co-scale] λ={lambda}: image_defect={image_defect:.3e} \
+             criterion_defect={criterion_defect:.3e}"
+        );
         assert!(
-            scaled < 1.0e-3,
-            "joint fit with isometry ON must converge to the planted circle at \
-             λ={lambda} (rel recon {scaled:.3e}); a non-converging fit is the #795 \
-             ridge-saturation symptom of the un-normalized ‖B‖⁴ curvature."
+            image_defect < 1.0e-3,
+            "normalized fitted reconstruction changed under physical co-scale λ={lambda}: \
+             relative image defect {image_defect:.3e}"
+        );
+        assert!(
+            criterion_defect < 1.0e-3,
+            "normalized penalized criterion changed under physical co-scale λ={lambda}: \
+             relative criterion defect {criterion_defect:.3e}"
         );
     }
 }
