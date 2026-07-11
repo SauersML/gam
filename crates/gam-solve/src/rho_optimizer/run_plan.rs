@@ -645,12 +645,29 @@ pub(crate) fn run_outer_with_plan(
                     };
                     match step {
                         crate::continuation_path::ContinuationStep::Entered { state } => {
-                            debug_assert!(state.last_eval.cost.is_finite());
+                            if !state.last_eval.cost.is_finite() {
+                                continuation_arrival_refusal = Some(format!(
+                                    "reactive domain entry committed a non-finite entry-waypoint cost {}",
+                                    state.last_eval.cost
+                                ));
+                                break;
+                            }
                             legs_descended += 1;
                         }
                         crate::continuation_path::ContinuationStep::Descended { s, state } => {
-                            debug_assert!(state.last_eval.cost.is_finite());
-                            debug_assert!(s > 0.0);
+                            if !state.last_eval.cost.is_finite() {
+                                continuation_arrival_refusal = Some(format!(
+                                    "reactive domain entry committed a non-finite waypoint cost {} at s={s}",
+                                    state.last_eval.cost
+                                ));
+                                break;
+                            }
+                            if !(s.is_finite() && s > 0.0) {
+                                continuation_arrival_refusal = Some(format!(
+                                    "reactive domain entry reported an invalid descended waypoint s={s}"
+                                ));
+                                break;
+                            }
                             legs_descended += 1;
                         }
                         crate::continuation_path::ContinuationStep::Arrived { state } => {
