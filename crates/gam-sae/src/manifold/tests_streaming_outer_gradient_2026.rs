@@ -391,14 +391,14 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     // production criterion admits.  The old unrelated synthetic target made
     // both decoders fall below the hard MP edge, so the canonical complete
     // gradient correctly refused the rank-zero branch before this test could
-    // reach its dense-vs-probe identity.  A small deterministic residual around
+    // reach its dense-vs-probe identity.  A deterministic residual around
     // this term's own nonzero reconstruction exercises the identical trace and
     // IFT seams without relying on a value-invalid atom.
     let fitted = term
         .try_fitted_for_rho(&rho)
         .expect("softmax positive-rank fixture reconstruction");
     let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
-        fitted[[row, col]] + 1.0e-3 * ((row + 2 * col) as f64 * 0.17).sin()
+        fitted[[row, col]] + 0.05 * ((row + 2 * col) as f64 * 0.17).sin()
     });
     let system = term
         .assemble_arrow_schur(target.view(), &rho, None)

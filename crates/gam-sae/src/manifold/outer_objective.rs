@@ -3765,6 +3765,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                         self.probe_telemetry.record_refusal_kind(&err);
                         self.probe_telemetry.infeasible_criterion_evals += 1;
+                        // A reactive waypoint is a typed domain transaction,
+                        // not an opaque line-search comparison. Preserve the
+                        // objective's exact refusal reason so continuation can
+                        // report why the legal entry or a refined waypoint was
+                        // undefined. The surrounding transaction still rolls
+                        // the complete objective state back before refinement.
+                        if self.reactive_waypoint_checkpoint.is_some() {
+                            return Err(EstimationError::RemlOptimizationFailed(format!(
+                                "reactive coupled waypoint has undefined REML evidence: {err}"
+                            )));
+                        }
                         return Ok(OuterEval::infeasible(rho.len()));
                     }
                     Err(err) => return Err(EstimationError::RemlOptimizationFailed(err)),
