@@ -467,9 +467,18 @@ fn reconstruction_r2(target: &Array2<f64>, fitted: &Array2<f64>) -> Result<f64, 
     // poison the serde-serialized wire report (serde_json writes non-finite
     // floats as null). A non-zero residual against a constant target has no
     // variance to explain and stays NaN by design.
+    //
+    // The perfect-fit threshold is RELATIVE to the target's own magnitude, not
+    // an absolute `EPSILON·n·p`: a machine-perfect fit of a large constant
+    // layer (target ≈ 1e3 everywhere) leaves `rss ≈ 1e-6` in absolute terms —
+    // still numerically perfect, but far above any fixed absolute floor. Scale
+    // the tolerance by the target's total energy so the verdict is
+    // magnitude-invariant.
+    let target_energy: f64 = target.iter().map(|&v| v * v).sum();
+    let perfect_tol = f64::EPSILON * (n * p) as f64 * target_energy.max(1.0);
     Ok(if tss > 0.0 {
         1.0 - rss / tss
-    } else if rss <= f64::EPSILON * (n * p) as f64 {
+    } else if rss <= perfect_tol {
         1.0
     } else {
         f64::NAN
