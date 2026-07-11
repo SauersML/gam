@@ -1554,7 +1554,19 @@ impl SaeManifoldTerm {
             let pre_obj = self
                 .penalized_objective_total(target, rho_fixed, registry, 1.0)
                 .map_err(|err| format!("SaeManifoldTerm::terminal_exact_newton_polish: {err}"))?;
-            let obj_rise_budget = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * objective_scale;
+            // Rise budget: the stall band PLUS the quadratic model's own
+            // predicted change magnitude ½|λ²| = ½|gᵀΔ|. At an INDEFINITE
+            // stationary point (the measured K=1-circle μ < 0 class) the
+            // Newton root sits slightly UP in objective along the
+            // negative-curvature direction — root-finding must be allowed the
+            // rise its own model predicts, or every step is rejected and the
+            // fit parks 1.3× above tolerance (measured on the tier-0 fixtures:
+            // ‖g‖ 8.0e-5 vs tol 6.1e-5, refused at budget). The gradient-norm
+            // contraction below remains the sole merit; this budget only stops
+            // objective blow-ups, not model-consistent saddle approaches.
+            let model_predicted_change = 0.5 * sae_inner(&rhs, &newton).abs();
+            let obj_rise_budget = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * objective_scale
+                + model_predicted_change;
             let snapshot = self.snapshot_mutable_state();
             let mut accepted = false;
             let mut alpha = 1.0_f64;
