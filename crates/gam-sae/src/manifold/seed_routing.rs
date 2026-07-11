@@ -570,7 +570,7 @@ pub fn sae_decoder_lsq_init(
     assignment_kind: &str,
     alpha: f64,
     tau: f64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     top_k: Option<usize>,
 ) -> Result<Array3<f64>, String> {
     let k_atoms = basis_sizes.len();
@@ -681,13 +681,14 @@ pub fn sae_decoder_lsq_init(
         }
         // #1777 canonical token for the hard-sigmoid gate.
         "threshold_gate" => {
-            if !jumprelu_threshold.is_finite() {
+            if !threshold_gate_threshold.is_finite() {
                 return Err(format!(
-                    "sae_decoder_lsq_init: jumprelu_threshold must be finite; got {jumprelu_threshold}"
+                    "sae_decoder_lsq_init: threshold_gate_threshold must be finite; got {threshold_gate_threshold}"
                 ));
             }
             for row in 0..n_obs {
-                let weights = threshold_gate_row(initial_logits.row(row), tau, jumprelu_threshold);
+                let weights =
+                    threshold_gate_row(initial_logits.row(row), tau, threshold_gate_threshold);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -862,7 +863,7 @@ pub fn sae_em_refine_routing_seed(
     assignment_kind: &str,
     alpha: f64,
     tau: f64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     random_state: u64,
     top_k: Option<usize>,
 ) -> Result<(), String> {
@@ -915,7 +916,7 @@ pub fn sae_em_refine_routing_seed(
             assignment_kind,
             alpha,
             tau,
-            jumprelu_threshold,
+            threshold_gate_threshold,
             top_k,
         )?;
         for atom_idx in 0..k_atoms {
@@ -1072,7 +1073,7 @@ mod tests {
             "ordered_beta_bernoulli",
             1.0, // alpha (ordered Beta--Bernoulli concentration; canonical default)
             0.7, // tau
-            0.0, // jumprelu_threshold (unused for ordered_beta_bernoulli)
+            0.0, // threshold_gate_threshold (unused for ordered_beta_bernoulli)
             None,
         )
         .expect("LSQ seed must succeed");

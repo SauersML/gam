@@ -295,7 +295,7 @@ struct StagewisePayloadConfig {
     learning_rate: f64,
     max_iter: i64,
     random_state: i64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
 }
 
 fn require_matrix_shape(
@@ -445,7 +445,7 @@ fn build_stagewise_manifold_sae_payload(
         max_iter: cfg.max_iter,
         random_state: cfg.random_state,
         top_k: None,
-        jumprelu_threshold: cfg.jumprelu_threshold,
+        threshold_gate_threshold: cfg.threshold_gate_threshold,
         oos_projection_top1: false,
         dispersion: 1.0,
         penalized_loss_score: None,
@@ -497,7 +497,7 @@ fn build_stagewise_manifold_sae_payload(
     atom_topologies, decoder_blocks, atom_dims, coords, assignments, fitted,
     logits, training, assignment, assignment_label, alpha, learnable_alpha, tau,
     sparsity_strength, smoothness, learning_rate, max_iter, random_state,
-    jumprelu_threshold, reconstruction_r2
+    threshold_gate_threshold, reconstruction_r2
 ))]
 pub(crate) fn sae_manifold_from_stagewise<'py>(
     py: Python<'py>,
@@ -519,7 +519,7 @@ pub(crate) fn sae_manifold_from_stagewise<'py>(
     learning_rate: f64,
     max_iter: i64,
     random_state: i64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     reconstruction_r2: f64,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     let assignment = canonical_assignment_kind(assignment)
@@ -548,7 +548,7 @@ pub(crate) fn sae_manifold_from_stagewise<'py>(
         learning_rate,
         max_iter,
         random_state,
-        jumprelu_threshold,
+        threshold_gate_threshold,
     };
     let payload = build_stagewise_manifold_sae_payload(
         basis_kinds,
@@ -688,7 +688,7 @@ pub(crate) struct FitConfig {
     pub(crate) max_iter: i64,
     pub(crate) random_state: i64,
     pub(crate) top_k: Option<i64>,
-    pub(crate) jumprelu_threshold: f64,
+    pub(crate) threshold_gate_threshold: f64,
     /// The retained WP-D output-Fisher shard `U` `(n, p, r)`; `None` for a
     /// Euclidean fit. When present, `metric_provenance` still comes from the raw
     /// solver payload (the Rust fit stamped `"OutputFisher"`).
@@ -978,7 +978,7 @@ pub(crate) fn build_manifold_sae_payload(
         max_iter: cfg.max_iter,
         random_state: cfg.random_state,
         top_k: cfg.top_k,
-        jumprelu_threshold: cfg.jumprelu_threshold,
+        threshold_gate_threshold: cfg.threshold_gate_threshold,
         oos_projection_top1: vbool(raw, "oos_projection_top1")?,
         dispersion: vf64(raw, "dispersion")?,
         penalized_loss_score: score,
@@ -1133,7 +1133,7 @@ mod manifold_sae_coercion_tests {
             learning_rate: 1.0,
             max_iter: 20,
             random_state: 7,
-            jumprelu_threshold: 0.0,
+            threshold_gate_threshold: 0.0,
         };
         let payload = build_stagewise_manifold_sae_payload(
             vec!["periodic".to_string(), "euclidean".to_string()],

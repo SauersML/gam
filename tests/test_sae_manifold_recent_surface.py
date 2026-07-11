@@ -84,7 +84,7 @@ class _CapturingRustModule:
         analytic_penalties=None,
         initial_logits=None,
         initial_coords=None,
-        jumprelu_threshold=0.0,
+        threshold_gate_threshold=0.0,
         **_forward_compat_kwargs,
     ):
         z = np.asarray(z, dtype=float)
@@ -108,7 +108,7 @@ class _CapturingRustModule:
                 "top_k": top_k,
                 "initial_logits": initial_logits,
                 "initial_coords": initial_coords,
-                "jumprelu_threshold": float(jumprelu_threshold),
+                "threshold_gate_threshold": float(threshold_gate_threshold),
             }
         )
 
@@ -219,7 +219,7 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.3,
-        gate_sparsity="scad",
+        coord_sparsity="scad",
         scad_mcp_gamma=4.2,
         nuclear_norm_weight=0.4,
         nuclear_norm_max_rank=1,
@@ -262,7 +262,7 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "gate_sparsity,gamma,expected_descriptor",
+    "coord_sparsity,gamma,expected_descriptor",
     [
         ("l1", None, None),
         (
@@ -289,9 +289,9 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
         ),
     ],
 )
-def test_gate_sparsity_variants_are_accepted_and_described(
+def test_coord_sparsity_variants_are_accepted_and_described(
     monkeypatch,
-    gate_sparsity,
+    coord_sparsity,
     gamma,
     expected_descriptor,
 ):
@@ -307,7 +307,7 @@ def test_gate_sparsity_variants_are_accepted_and_described(
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.25,
-        gate_sparsity=gate_sparsity,
+        coord_sparsity=coord_sparsity,
         scad_mcp_gamma=gamma,
         decoder_incoherence_weight=0.0,
         n_iter=1,
@@ -345,11 +345,11 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
         ard_per_atom=False,
         decoder_incoherence_weight=0.0,
         n_iter=1,
-        jumprelu_threshold=0.15,
+        threshold_gate_threshold=0.15,
     )
 
     assert fake.calls[-1]["assignment_kind"] == expected_kind
-    assert fake.calls[-1]["jumprelu_threshold"] == pytest.approx(0.15)
+    assert fake.calls[-1]["threshold_gate_threshold"] == pytest.approx(0.15)
     assert fit.assignment == expected_kind
     assert fit.assignment_label == assignment
     assert fit.assignments.shape == (x.shape[0], 2)
@@ -390,13 +390,13 @@ def test_sae_curvature_report_is_user_reachable_and_round_trips(monkeypatch):
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        ({"gate_sparsity": "elastic"}, "must be one of 'l1'"),
+        ({"coord_sparsity": "elastic"}, "must be one of 'l1'"),
         (
-            {"gate_sparsity": "scad", "scad_mcp_gamma": 2.0},
+            {"coord_sparsity": "scad", "scad_mcp_gamma": 2.0},
             "scad_mcp_gamma must be finite and > 2",
         ),
         (
-            {"gate_sparsity": "mcp", "scad_mcp_gamma": 1.0},
+            {"coord_sparsity": "mcp", "scad_mcp_gamma": 1.0},
             "scad_mcp_gamma must be finite and > 1",
         ),
         (

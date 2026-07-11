@@ -6,45 +6,39 @@ use super::*;
 /// This enum records the user-facing topology choice so downstream diagnostics
 /// and Python wrappers can round-trip whether the atom was a Duchon patch,
 /// periodic curve, sphere, or a caller-supplied precomputed basis.
-/// Integration measure `ω_i` for the intrinsic bending Gram
-/// [`SaeManifoldAtom::refresh_intrinsic_smooth_penalty`].
+/// Declared function-space seminorm used by one atom's smoothing prior.
 ///
-/// The bending penalty is a discrete quadrature of the total squared second
-/// fundamental form `∫_M ‖II‖²_g dμ` over the grid points `t_i`. The measure is
-/// the quadrature weight `ω_i` attached to each shape-band grid point:
-///
-/// * [`Self::Volume`] — `ω_i = √det g_i`, the Riemannian volume element. This
-///   is the DEFAULT: the penalty is the local-VOLUME-weighted bending sum
-///   `Σ_i √det g_i ‖II(t_i)‖²_g`, weighting each sample's bending by the
-///   Riemannian volume its chart cell carries. Two consequences, stated
-///   honestly:
-///   * A region the chart barely covers (small `√det g`) is CHEAP to bend, not
-///     expensive — its contribution `ω_i ‖II_i‖²` is scaled toward zero. That
-///     is the INTENDED prior: do not spend penalty budget keeping flat a region
-///     that carries little volume (hence little data); reserve the roughness
-///     budget for the high-volume, data-rich part of the manifold. (The volume
-///     weight also bounds the cost of the near-boundary chart blow-ups the
-///     raw-`t` measure would over-count.)
-///   * This sum is NOT sampling-density invariant on its own: it approximates
-///     `∫_M ‖II‖²_g dV_g` only up to the density `q(t_i)` of the grid points —
-///     an unbiased estimate would need an importance weight `1/q(t_i)` or
-///     explicit quadrature-cell widths. In practice the grid points ARE the
-///     fitting-data locations, so `√det g` measures bending relative to the
-///     data density: a deliberate data-adaptive prior, not a chart-independent
-///     invariant.
-/// * [`Self::Data`] — `ω_i = 1`, the raw counting measure over the sample
-///   rows. Because `‖II(t_i)‖²_g` is a POINTWISE chart-invariant scalar (a
-///   full `g`-contraction of a normal-bundle-valued `(0,2)`-tensor), summing it
-///   with unit weights over *matched material points* is EXACTLY invariant
-///   under any reparameterisation that keeps those same physical points — this
-///   is the measure the gauge-invariance test uses. Offered as an option for
-///   callers that supply their own (already volume-weighted or
-///   importance-sampled) grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SaeBendingMeasure {
-    Volume,
-    Data,
+/// The declaration is consumed once, at atom construction or an explicit
+/// structural reparameterization boundary, and materialized as a fixed
+/// coefficient Gram `S_ref`. It is never inferred from the decoder and is never
+/// refreshed during an inner or outer optimization step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaeReferenceRoughness {
+    /// A caller/topology supplied basis representation of a declared
+    /// final-function seminorm:
+    ///
+    /// `S_ref[i,j] = <L phi_i, L phi_j>_(nu_ref)`.
+    ///
+    /// The matrix is validated as finite, symmetric, and positive
+    /// semidefinite before it is installed. This is not a coefficient-size
+    /// fallback: the caller is explicitly declaring the reference measure
+    /// `nu_ref` and differential operator `L` represented by the matrix.
+    ProvidedFunctionGram(Array2<f64>),
+    /// Hyperbolic Dirichlet seminorm evaluated at a fixed set of Poincare
+    /// tangent-chart reference coordinates. The coordinates are part of the
+    /// declaration, not the fitted latent state. Construction fails if their
+    /// shape or values are invalid or if the analytic geometry builder fails.
+    PoincareConformalDirichlet { reference_coords: Array2<f64> },
 }
+
+/// Provenance of the frozen reference-function Gram retained by an atom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaeReferenceRoughnessKind {
+    ProvidedFunctionGram,
+    PoincareConformalDirichlet,
+}
+
+const POINCARE_REFERENCE_CURVATURE: f64 = -1.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaeAtomBasisKind {
@@ -424,39 +418,21 @@ pub struct SaeManifoldAtom {
     pub basis_values: Array2<f64>,
     pub basis_jacobian: Array3<f64>,
     pub decoder_coefficients: Array2<f64>,
-    /// Effective (intrinsic) roughness Gram `S̃_k` that every consumer reads
-    /// (smoothness value, gradient, Kronecker Hessian op, REML rank/log-det).
+    /// Frozen reference-function Gram `S_ref` read by every smoothing consumer
+    /// (value, gradient, Kronecker Hessian, rank, and log determinant).
     ///
-    /// `S̃_k` is the raw coefficient-space Gram [`Self::smooth_penalty_raw`]
-    /// reparameterized by the decoder pullback metric so the roughness — and
-    /// hence the topology evidence — is gauge-invariant under reparameterization
-    /// of the latent coordinate `t` (issue #673). It is recomputed from the
-    /// current basis Jacobian and decoder coefficients by
-    /// [`Self::refresh_intrinsic_smooth_penalty`] at an explicit initialization
-    /// or structural-reparameterization boundary.  It remains frozen throughout
-    /// each fitted objective, so its quadratic value, gradient, Hessian, and
-    /// Occam term describe one function. The metric weight is centered (geometric mean 1),
-    /// so for constant-speed atoms (the periodic sin/cos basis on `S¹`) every
-    /// weight is exactly `1` and `S̃_k = S_k` — periodic atoms are untouched
-    /// and no overall magnitude leaks into the penalty.
+    /// If `f_B(t) = B^T phi(t)` and the declared seminorm has
+    /// `S_ref[i,j] = <L phi_i,L phi_j>_(nu_ref)`, bilinearity gives
+    ///
+    /// `||L f_B||^2_(nu_ref) = sum_c b_c^T S_ref b_c = tr(B^T S_ref B)`.
+    ///
+    /// Therefore the implemented `0.5 * lambda * tr(B^T S_ref B)` is exactly
+    /// the declared final-function seminorm, with exact gradient
+    /// `lambda * S_ref * B` and Hessian `lambda * (S_ref tensor I)`. It is not
+    /// the moving intrinsic bending energy of the current decoder.
     pub smooth_penalty: Array2<f64>,
-    /// Canonical raw roughness Gram `S_k` in raw coefficient/`t` space (the
-    /// finite-/cyclic-difference Reinsch Gram or the Duchon RKHS Gram). Never
-    /// mutated after construction; [`Self::smooth_penalty`] is derived from it
-    /// each assembly via the pullback-metric reweighting.
-    pub smooth_penalty_raw: Array2<f64>,
-    /// Roughness operator order `r` of [`Self::smooth_penalty_raw`], recovered
-    /// once at construction as its null-space dimension (an order-`r`
-    /// difference / Duchon penalty annihilates the degree-`<r` polynomials, so
-    /// `nullity(S) = r`). `0` when the raw Gram is empty/zero.
-    ///
-    /// Provenance only: the effective [`Self::smooth_penalty`] is now the
-    /// intrinsic bending / conformal-Dirichlet Gram (whose rank and log-det every
-    /// REML consumer reads off the matrix directly), so this field no longer
-    /// drives any reweighting — the historical scalar-speed `β = ½ − r`
-    /// arc-length exponent was replaced by the reparameterisation-invariant
-    /// `∫κ²ds` bending Gram for `d = 1`.
-    pub smooth_penalty_order: usize,
+    /// Which explicit declaration produced [`Self::smooth_penalty`].
+    pub reference_roughness_kind: SaeReferenceRoughnessKind,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
     /// implementation provides a closed-form Hessian. `None` for
@@ -467,51 +443,6 @@ pub struct SaeManifoldAtom {
     /// the `H` cache on isometry penalties when the second jet is
     /// analytically available.
     pub basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,
-    /// Cached VALUES of the analytic second jet
-    /// `H[n, m, a, c] = ∂²Φ_m(t_n) / (∂t_a ∂t_c)`, shape `(N, M, d, d)`, at the
-    /// atom's CURRENT latent coordinates. The intrinsic bending Gram
-    /// ([`Self::refresh_intrinsic_smooth_penalty`], every latent dim `d ≥ 1`)
-    /// needs `∂²Φ` — which is NOT recoverable from `Φ` and `∂Φ` alone — but
-    /// `refresh_intrinsic_smooth_penalty` takes no coordinates, so the values are
-    /// cached here alongside `basis_values` / `basis_jacobian` and refreshed on
-    /// the same coordinate change. Populated by
-    /// [`Self::refresh_basis`] (from [`Self::basis_second_jet`]), transported by
-    /// [`Self::reduce_basis_to_subspace`] (the `M`-axis `Q` congruence), or
-    /// installed directly via [`Self::install_bending_second_jet`]. `None` ⇒ no
-    /// second jet available (a caller-managed or first-jet-only atom); the
-    /// bending path then falls back to the raw Gram, so no atom regresses
-    /// relative to the historical flat fallback. (Poincaré atoms use the
-    /// first-jet conformal-Dirichlet Gram instead and do not consult this cache.)
-    ///
-    /// Frozen at the current iterate (`∂²Φ` depends only on the coordinates, not
-    /// the decoder), so it obeys the same lagged-diffusivity contract as the
-    /// `(g, Γ)` metric freeze: constant within one inner solve, refreshed
-    /// between assemblies so the CONVERGED penalty is the true intrinsic bending
-    /// energy.
-    pub basis_second_jet_values: Option<Array4<f64>>,
-    /// Cached latent coordinates `t[n, a]` (shape `(N, d)`) at the atom's CURRENT
-    /// chart, populated by [`Self::refresh_basis`] on every coordinate change.
-    ///
-    /// Needed by the Poincaré branch of
-    /// [`Self::refresh_intrinsic_smooth_penalty`]: the hyperbolic conformal
-    /// Dirichlet roughness Gram
-    /// [`gam_geometry::manifolds::poincare::conformal_dirichlet_penalty`] is a
-    /// function of the latent `t` (through the exp-map pullback metric), which
-    /// `refresh_intrinsic_smooth_penalty` does not otherwise receive. Cached here
-    /// alongside `basis_values` / `basis_jacobian` and refreshed on the same
-    /// coordinate change (the lagged-diffusivity freeze). `None` for a
-    /// caller-managed / never-refreshed atom (the Poincaré branch then falls back
-    /// to the raw Gram). Unchanged by [`Self::reduce_basis_to_subspace`] (the
-    /// `M`-axis congruence leaves the `(N, d)` coordinates untouched).
-    pub latent_coords: Option<Array2<f64>>,
-    /// Quadrature measure `ω_i` for the intrinsic bending Gram (every latent
-    /// dim `d ≥ 1`); see [`SaeBendingMeasure`]. Default
-    /// [`SaeBendingMeasure::Volume`] (the Riemannian volume element `√det g_i`;
-    /// for `d = 1` this is the arc-length element `ds = ‖γ'‖ dt`, so the penalty
-    /// is `∫ κ² ds`). Ignored for Poincaré atoms (which use the conformal
-    /// Dirichlet Gram) and for atoms with no second-jet cache (raw-Gram
-    /// fallback).
-    pub bending_measure: SaeBendingMeasure,
     /// Profiled low-rank Grassmann decoder frame `U_k` (`p × r`), issue #972.
     ///
     /// `None` ⇒ the historical full-`B` path: the border carries the entire
@@ -555,17 +486,6 @@ pub struct SaeManifoldAtom {
     /// ever set for `latent_dim == 1` atoms and `latent_dim == 2` torus
     /// atoms; never a flag the user controls.
     pub chart_canonicalized: bool,
-    /// Row indices of the quadrature subsample the `d ≥ 2` bending Gram is
-    /// assembled from at scale. `None` ⇒ the Gram uses the full active set and
-    /// [`Self::basis_second_jet_values`] is the full `(n, M, d, d)` jet — the
-    /// bitwise-legacy path, taken whenever `n ≤ BENDING_QUADRATURE_CAP`.
-    /// `Some(rows)` ⇒ the second-jet cache is the COMPACT `(rows.len(), M, d, d)`
-    /// jet evaluated ONLY on these rows, and the Gram loop reweights each by
-    /// `n / rows.len()` so the penalty scale (hence λ selection) matches the
-    /// full-set penalty. This is the memory fix: a torus atom's full second jet
-    /// is ~1.5 GB at `n = 10⁶`; the `Q ≈ 4096` compact jet is ~6 MB and still
-    /// oversamples the `≤ M(M+1)/2 ≲ 1.2k`-dof Gram 3–6×.
-    pub bending_quadrature_rows: Option<Vec<usize>>,
     /// Orthonormal column map `Q` (`M × r`) frozen by the #1117 rank-revealing
     /// reduction [`Self::reduce_basis_to_subspace`]. `Some` iff this atom's
     /// fixed-width inner basis was reparametrized onto its data-supported
@@ -599,13 +519,6 @@ pub struct SaeManifoldAtom {
     pub ard_precisions: Option<Array1<f64>>,
 }
 
-/// Quadrature-subsample cap for the `d ≥ 2` bending Gram: above this many active
-/// rows the covariant Gram is assembled from a leverage-stratified subsample of
-/// this many rows rather than the full set (see
-/// [`SaeManifoldAtom::bending_quadrature_rows`]). Below it, the full-set legacy
-/// path is bitwise-preserved.
-pub const BENDING_QUADRATURE_CAP: usize = 4096;
-
 impl SaeManifoldAtom {
     #[must_use = "build error must be handled"]
     pub fn new(
@@ -615,7 +528,7 @@ impl SaeManifoldAtom {
         basis_values: Array2<f64>,
         basis_jacobian: Array3<f64>,
         decoder_coefficients: Array2<f64>,
-        smooth_penalty: Array2<f64>,
+        reference_roughness: SaeReferenceRoughness,
     ) -> Result<Self, String> {
         let n = basis_values.nrows();
         let m = basis_values.ncols();
@@ -632,52 +545,204 @@ impl SaeManifoldAtom {
                 decoder_coefficients.nrows()
             ));
         }
-        if smooth_penalty.dim() != (m, m) {
-            return Err(format!(
-                "SaeManifoldAtom::new: smooth penalty must be ({m}, {m}); got {:?}",
-                smooth_penalty.dim()
-            ));
+        if m == 0 {
+            return Err("SaeManifoldAtom::new: basis width must be positive".into());
         }
         if p == 0 {
             return Err("SaeManifoldAtom::new: decoder output dimension must be positive".into());
         }
-        // Recover the roughness operator order `r` from the raw Gram's
-        // null-space dimension (`nullity(S) = r` for an order-`r` difference /
-        // Duchon penalty). This pins the arc-length reweighting exponent
-        // `β = ½ − r` once, so the per-assembly reweighting needs no
-        // eigendecomposition in the hot loop.
-        let smooth_penalty_order = smooth_penalty_nullity(&smooth_penalty)?;
-        let mut atom = Self {
+        let (smooth_penalty, reference_roughness_kind) =
+            Self::materialize_reference_roughness(
+                &basis_kind,
+                latent_dim,
+                basis_jacobian.view(),
+                reference_roughness,
+            )?;
+        Ok(Self {
             name: name.into(),
             basis_kind,
             latent_dim,
             basis_values,
             decoder_coefficients,
-            smooth_penalty_raw: smooth_penalty.clone(),
             smooth_penalty,
-            smooth_penalty_order,
+            reference_roughness_kind,
             basis_jacobian,
             basis_evaluator: None,
             basis_second_jet: None,
-            basis_second_jet_values: None,
-            latent_coords: None,
-            bending_measure: SaeBendingMeasure::Volume,
             decoder_frame: None,
             homotopy_eta: 1.0,
             chart_canonicalized: false,
-            bending_quadrature_rows: None,
             // Set only by `reduce_basis_to_subspace`; a freshly-built atom is
             // full-width (its decoder is already the un-reduced `M × p` block).
             reduced_column_map: None,
             // Stamped from the terminal `rho.log_ard` at fit finalization; a
             // freshly-built atom carries no fitted coordinate prior yet.
             ard_precisions: None,
-        };
-        // Seed `smooth_penalty` with the intrinsic Gram at the initial
-        // decoder/coordinates so the very first assembly already reads the
-        // pullback-metric-reweighted penalty.
-        atom.refresh_intrinsic_smooth_penalty();
-        Ok(atom)
+        })
+    }
+
+    /// Construct an atom whose topology/caller already supplied the exact
+    /// basis Gram of its declared reference-function seminorm.
+    #[must_use = "build error must be handled"]
+    pub fn new_with_provided_function_gram(
+        name: impl Into<String>,
+        basis_kind: SaeAtomBasisKind,
+        latent_dim: usize,
+        basis_values: Array2<f64>,
+        basis_jacobian: Array3<f64>,
+        decoder_coefficients: Array2<f64>,
+        function_gram: Array2<f64>,
+    ) -> Result<Self, String> {
+        Self::new(
+            name,
+            basis_kind,
+            latent_dim,
+            basis_values,
+            basis_jacobian,
+            decoder_coefficients,
+            SaeReferenceRoughness::ProvidedFunctionGram(function_gram),
+        )
+    }
+
+    /// Replace the frozen reference seminorm at an explicit structural
+    /// reparameterization boundary. Ordinary parameter updates must not call
+    /// this method: the installed `S_ref` defines the objective being solved.
+    pub fn install_reference_roughness(
+        &mut self,
+        reference_roughness: SaeReferenceRoughness,
+    ) -> Result<(), String> {
+        let (gram, kind) = Self::materialize_reference_roughness(
+            &self.basis_kind,
+            self.latent_dim,
+            self.basis_jacobian.view(),
+            reference_roughness,
+        )?;
+        self.smooth_penalty = gram;
+        self.reference_roughness_kind = kind;
+        Ok(())
+    }
+
+    fn materialize_reference_roughness(
+        basis_kind: &SaeAtomBasisKind,
+        latent_dim: usize,
+        basis_jacobian: ArrayView3<'_, f64>,
+        reference_roughness: SaeReferenceRoughness,
+    ) -> Result<(Array2<f64>, SaeReferenceRoughnessKind), String> {
+        let (n, m, d) = basis_jacobian.dim();
+        if d != latent_dim {
+            return Err(format!(
+                "SaeManifoldAtom::materialize_reference_roughness: basis Jacobian latent dimension {d} != declared {latent_dim}"
+            ));
+        }
+        match reference_roughness {
+            SaeReferenceRoughness::ProvidedFunctionGram(gram) => Ok((
+                Self::validate_reference_function_gram(gram, m, false)?,
+                SaeReferenceRoughnessKind::ProvidedFunctionGram,
+            )),
+            SaeReferenceRoughness::PoincareConformalDirichlet { reference_coords } => {
+                if !matches!(basis_kind, SaeAtomBasisKind::Poincare) {
+                    return Err(
+                        "SaeManifoldAtom::materialize_reference_roughness: Poincare conformal-Dirichlet norm requires a Poincare atom"
+                            .into(),
+                    );
+                }
+                if n == 0 || latent_dim == 0 {
+                    return Err(
+                        "SaeManifoldAtom::materialize_reference_roughness: Poincare reference coordinates must be non-empty"
+                            .into(),
+                    );
+                }
+                if reference_coords.dim() != (n, latent_dim) {
+                    return Err(format!(
+                        "SaeManifoldAtom::materialize_reference_roughness: Poincare reference coordinates {:?}, expected ({n}, {latent_dim})",
+                        reference_coords.dim()
+                    ));
+                }
+                if reference_coords.iter().any(|value| !value.is_finite()) {
+                    return Err(
+                        "SaeManifoldAtom::materialize_reference_roughness: Poincare reference coordinates must be finite"
+                            .into(),
+                    );
+                }
+                let gram = gam_geometry::manifolds::poincare::conformal_dirichlet_penalty(
+                    reference_coords.view(),
+                    basis_jacobian,
+                    POINCARE_REFERENCE_CURVATURE,
+                )
+                .map_err(|error| {
+                    format!(
+                        "SaeManifoldAtom::materialize_reference_roughness: Poincare conformal-Dirichlet Gram failed: {error}"
+                    )
+                })?;
+                Ok((
+                    Self::validate_reference_function_gram(gram, m, true)?,
+                    SaeReferenceRoughnessKind::PoincareConformalDirichlet,
+                ))
+            }
+        }
+    }
+
+    fn validate_reference_function_gram(
+        gram: Array2<f64>,
+        m: usize,
+        require_positive_rank: bool,
+    ) -> Result<Array2<f64>, String> {
+        if gram.dim() != (m, m) {
+            return Err(format!(
+                "SaeManifoldAtom::validate_reference_function_gram: Gram {:?}, expected ({m}, {m})",
+                gram.dim()
+            ));
+        }
+        if gram.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "SaeManifoldAtom::validate_reference_function_gram: Gram must be finite".into(),
+            );
+        }
+        let scale = gram
+            .iter()
+            .fold(1.0_f64, |current, value| current.max(value.abs()));
+        let tolerance = f64::EPSILON.sqrt() * scale * m.max(1) as f64;
+        for i in 0..m {
+            for j in 0..m {
+                if (gram[[i, j]] - gram[[j, i]]).abs() > tolerance {
+                    return Err(format!(
+                        "SaeManifoldAtom::validate_reference_function_gram: Gram is not symmetric at ({i}, {j})"
+                    ));
+                }
+            }
+        }
+        let sym = (&gram + &gram.t()) * 0.5;
+        let (eigenvalues, eigenvectors) = sym
+            .eigh(Side::Lower)
+            .map_err(|error| {
+                format!(
+                    "SaeManifoldAtom::validate_reference_function_gram: eigendecomposition failed: {error}"
+                )
+            })?;
+        let min_eigenvalue = eigenvalues
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let max_eigenvalue = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
+        if min_eigenvalue < -tolerance {
+            return Err(format!(
+                "SaeManifoldAtom::validate_reference_function_gram: Gram is not positive semidefinite (minimum eigenvalue {min_eigenvalue})"
+            ));
+        }
+        if require_positive_rank && max_eigenvalue <= tolerance {
+            return Err(
+                "SaeManifoldAtom::validate_reference_function_gram: declared seminorm has zero numerical rank"
+                    .into(),
+            );
+        }
+        if min_eigenvalue >= 0.0 {
+            return Ok(sym);
+        }
+        // Roundoff-sized negative eigenvalues are projected to zero so the
+        // installed Hessian is genuinely PSD rather than merely PSD up to a
+        // tolerance. Larger negative directions were rejected above.
+        let clipped = Array2::from_diag(&eigenvalues.mapv(|value| value.max(0.0)));
+        Ok(eigenvectors.dot(&clipped).dot(&eigenvectors.t()))
     }
 
     pub fn with_basis_evaluator(mut self, evaluator: Arc<dyn SaeBasisEvaluator>) -> Self {
@@ -716,7 +781,8 @@ impl SaeManifoldAtom {
     /// * decoder `B̃ = Qᵀ B`  — the minimum-norm pre-image, dropping exactly the
     ///   data-null component that carries no curvature, so the reconstruction
     ///   `Φ̃ B̃ = Φ Q Qᵀ B = Φ B_range` is the rank-`r` oracle,
-    /// * roughness Gram `S̃ = Qᵀ S Q` (`smooth_penalty`, `smooth_penalty_raw`),
+    /// * frozen reference-function Gram `S̃_ref = Qᵀ S_ref Q`
+    ///   (`smooth_penalty`),
     /// * evaluator → `SubspaceReducedEvaluator(inner, Q)` so the reduction
     ///   *survives* every `refresh_basis` re-evaluation.
     ///
@@ -770,59 +836,25 @@ impl SaeManifoldAtom {
                 dec_red.dim()
             ));
         }
-        // S̃ = Qᵀ S Q  (r × r) on both the raw and the (re-derived) effective Gram.
-        let s_raw_red = q.t().dot(&self.smooth_penalty_raw).dot(q);
-        let order = smooth_penalty_nullity(&s_raw_red)?;
+        // S̃_ref = Qᵀ S_ref Q (r × r). This is the exact basis-change law for
+        // the already-declared function seminorm; no metric or decoder is
+        // re-estimated.
+        let s_ref_red = q.t().dot(&self.smooth_penalty).dot(q);
+        let s_ref_red = Self::validate_reference_function_gram(s_ref_red, r, false)?;
         let reduced_eval = SubspaceReducedEvaluator::new(inner, q.clone())?;
         let reduced_arc: Arc<dyn SaeBasisSecondJet> = Arc::new(reduced_eval);
         let base: Arc<dyn SaeBasisEvaluator> = reduced_arc.clone();
 
-        // Transport the cached second jet through the SAME `M`-axis congruence
-        // as `Φ` / `∂Φ`: `H̃[n, :, a, c] = H[n, :, a, c] · Q`, so the reduced
-        // atom carries the intrinsic bending penalty on the reduced basis
-        // immediately (before the next `refresh_basis`), matching the full-width
-        // path — otherwise the `(r, r)` `smooth_penalty` seeded below would be
-        // recomputed against a stale `(·, M, ·, ·)` cache. Dropped when absent.
-        let second_jet_red = self.basis_second_jet_values.as_ref().map(|hess| {
-            let mut reduced = Array4::<f64>::zeros((n, r, d, d));
-            for a in 0..d {
-                for c in 0..d {
-                    let slab = hess.slice(s![.., .., a, c]).dot(q);
-                    reduced.slice_mut(s![.., .., a, c]).assign(&slab);
-                }
-            }
-            reduced
-        });
-
         self.basis_values = phi_red;
         self.basis_jacobian = jac_red;
-        self.basis_second_jet_values = second_jet_red;
         self.decoder_coefficients = dec_red;
-        self.smooth_penalty_raw = s_raw_red.clone();
-        // Seed the effective penalty with the reduced raw Gram so the buffer is
-        // the right `(r, r)` shape; the arc-length refresh below overwrites it.
-        self.smooth_penalty = s_raw_red;
-        self.smooth_penalty_order = order;
+        self.smooth_penalty = s_ref_red;
         self.basis_evaluator = Some(base);
         self.basis_second_jet = Some(reduced_arc);
         // The decoder frame is a profiled representation of the *previous* M×p
         // decoder; the column count just changed, so drop it and let the joint
         // fit re-activate it for the reduced block if still profitable.
         self.decoder_frame = None;
-        // Re-derive the intrinsic (pullback-metric / arc-length) reweighted
-        // effective penalty on the REDUCED basis — exactly as the constructor
-        // does for the full-width atom. Without this the reduced atom would
-        // carry the bare `S̃ = Qᵀ S Q` while the full-width path carries the
-        // arc-length-reweighted `W^{½} S W^{½}`, so a `latent_dim == 1` atom
-        // with a genuine order-`r ≥ 1` (difference / Duchon) penalty would be
-        // smoothed under a DIFFERENT roughness metric after reduction than
-        // before — biasing exactly the rank-deficient circle #1117 targets.
-        // (For the constant-speed periodic basis and order-0 / `latent_dim != 1`
-        // atoms this is `S̃ = S̃_raw`, so the eye-penalty reductions are
-        // byte-for-byte unchanged.) All inputs the refresh reads
-        // (`basis_values`, `decoder_coefficients`, `smooth_penalty_raw`,
-        // `smooth_penalty_order`, `basis_kind`, `latent_dim`) are now set.
-        self.refresh_intrinsic_smooth_penalty();
         // Record the inner→reduced column map so the reduced frame can be
         // re-expanded at the emission boundary (#2135). If this atom was ALREADY
         // reduced (`prev`: `M × r_prev`) and is being reduced again against its

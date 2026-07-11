@@ -95,7 +95,7 @@ def test_builder_full_fit_equiv_and_kind_derivation(monkeypatch):
         int(fit.max_iter),
         int(fit.random_state),
         fit.top_k,
-        float(fit.jumprelu_threshold),
+        float(fit.threshold_gate_threshold),
     )
 
     old = fit.to_dict()
@@ -151,7 +151,7 @@ def test_builder_full_fit_equiv_and_kind_derivation(monkeypatch):
             int(fit.max_iter),
             int(fit.random_state),
             fit.top_k,
-            float(fit.jumprelu_threshold),
+            float(fit.threshold_gate_threshold),
             None,
             None,
             [declared_kind] * k_atoms,
@@ -198,7 +198,10 @@ def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
         list(fit.primitive_names[1:]),
         float(fit.alpha), bool(fit.learnable_alpha), float(fit.tau),
         float(fit.sparsity_strength), float(fit.smoothness), float(fit.learning_rate),
-        int(fit.max_iter), int(fit.random_state), fit.top_k, float(fit.jumprelu_threshold),
+        int(fit.max_iter),
+        int(fit.random_state),
+        fit.top_k,
+        float(fit.threshold_gate_threshold),
         np.ascontiguousarray(fit.fisher_factors), fit.fisher_provenance,
     )
     old = fit.to_dict()

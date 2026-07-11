@@ -2,7 +2,7 @@
 
 `gamfit.sae_manifold_fit(...)` fits a **sparse manifold dictionary**. The
 data matrix `Z` (shape `(N, p)`, one ambient vector per token) is
-reconstructed as a sparse mixture of `K` *atoms*. Each atom is a small,
+reconstructed as a sparse additive combination of `K` *atoms*. Each atom is a small,
 low-dimensional **typed shape** — a line, circle, sphere, torus, cylinder,
 hyperbolic patch, or flat Euclidean patch — carrying its own ambient
 embedding (a decoder block) and a
@@ -45,14 +45,14 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `K` | `None` | dictionary size (number of atoms) |
 | `d_atom` | `2` | intrinsic dim per atom (int, or per-atom list) |
 | `atom_topology` | `"circle"` | global topology string (see table) |
-| `assignment` | `"ordered_beta_bernoulli"` | gate kind: `ordered_beta_bernoulli` / `softmax` / `jumprelu` |
+| `assignment` | `"softmax"` | gate kind: `softmax` / `ordered_beta_bernoulli` / `threshold_gate` / `topk` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
 | `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
 | `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
 | `decoder_feature_sparsity_groups` | `None` | output-feature partition for decoder group-lasso |
 | `n_iter` | `50` | joint-solve iterations |
-| `sparsity_weight` | `1.0` | strength of the `gate_sparsity` coordinate-shrinkage penalty |
-| `gate_sparsity` | `"scad"` | coordinate (latent `t`-block) magnitude penalty: `scad` / `mcp` / `l1` (a more accurate name would be `coord_sparsity`) |
+| `sparsity_weight` | `1.0` | strength of the `coord_sparsity` coordinate-shrinkage penalty |
+| `coord_sparsity` | `"scad"` | coordinate (latent `t`-block) magnitude penalty: `scad` / `mcp` / `l1` |
 | `scad_mcp_gamma` | `None` | SCAD/MCP concavity (defaults SCAD 3.7, MCP 2.5) |
 | `smoothness_weight` | `1.0` | roughness penalty strength |
 | `alpha` | `1.0` | ARD/precision seed (`float` or a string policy) |
@@ -66,7 +66,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `t_init` | `None` | coordinate warm start `(K, N, D_max)` |
 | `a_init` | `None` | assignment-logit warm start `(N, K)` |
 | `tau` | `None` | Gumbel-softmax temperature |
-| `jumprelu_threshold` | `0.0` | hard-threshold cutoff for `jumprelu` |
+| `threshold_gate_threshold` | `0.0` | center of the smooth `threshold_gate` assignment |
 | `atom_basis` | `None` | per-atom topology list (overrides `atom_topology`) |
 | `fisher_factors` | `None` | per-token Fisher reweighting factors |
 | `weights` | `None` | per-row observation weights |
@@ -160,7 +160,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   reconstruction, so shrinkage is scored exactly once. `"softmax"` is a dense,
   simplex-normalized gate. `"threshold_gate"` is the smooth bounded gate
   `σ((ℓ−threshold)/τ)` with its exact logistic derivative; its threshold is
-  configured by `jumprelu_threshold=`. `top_k=` optionally caps
+  configured by `threshold_gate_threshold=`. `top_k=` optionally caps
   the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
 
   **Gumbel temperature schedules.** For the annealed gates, pass `schedule=`
@@ -228,7 +228,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   (lagged diffusivity). Each inner solve differentiates the frozen quadratic
   surrogate; it does not include derivatives of the geometry-dependent Gram.
 
-- **Coordinate-magnitude penalty** (`gate_sparsity="scad"` default; `"l1"` /
+- **Coordinate-magnitude penalty** (`coord_sparsity="scad"` default; `"l1"` /
   `"mcp"` alternatives). Despite the parameter name, `scad` and `mcp` do **not**
   penalize the gate/assignment: they emit a row-block `ScadMcpPenalty` on the
   latent coordinate (`"t"`) block — coordinate shrinkage *inside* an active atom
@@ -579,43 +579,11 @@ before generating the next instead of retaining both copies in memory.
 Everything that *established* circles on real LLM activations in the measured
 studies was fit-free or supervision-seeded: label-class-mean planes,
 circular-linear ordering against chart-rebuilt permutation nulls, per-label
-angular binding, and layer transport on those coordinates. The gradient fit
-is a reconstruction/decoder tool — its latent angle is not guaranteed to be a
-stable coordinate: on wider models, circle fits reaching EV ≈ 0.98 still
-produced seed-dependent orderings (0.67–0.97 across seeds) while the
-deterministic plane readout sat at 0.98–0.99, because a high-EV closed curve
-can wander through subspace dimensions outside the ordering plane.
-Reconstruction EV alone does not validate the latent coordinate; when the
-ordering matters, read it from a deterministic projection and use the fit for
-reconstruction.
-
-When the ordering plane is known, the gradient circle module can enforce that
-geometry directly. Pass its ambient row frame as `decoder_subspace`:
-
-```python
-from gamfit.torch import (
-    ManifoldSAE,
-    ManifoldSAEConfig,
-    circular_concordance,
-)
-
-cfg = ManifoldSAEConfig(
-    input_dim=activations.shape[1],
-    n_atoms=1,
-    intrinsic_rank=1,
-    atom_manifold="circle",
-    atom_basis="fourier",
-    sparsity={"kind": "softmax_topk", "target_k": 1},
-    decoder_subspace=class_mean_plane,  # shape (2, input_dim)
-)
-model = ManifoldSAE(cfg)
-```
-
-Rust canonicalizes and rank-checks the frame. The circle's DC coefficient stays
-ambient, so constant reconstruction may use every output dimension; every
-angle-bearing Fourier coefficient is stored only as live coordinates inside
-the frame. The optimizer therefore has `D + (K-1)r` decoder parameters per atom,
-not a full ambient decoder followed by a projection with dead parameters.
+angular binding, and layer transport on those coordinates. A manifold SAE is a
+reconstruction model; its latent angle is not guaranteed to be a stable
+ordering coordinate. Reconstruction EV alone does not validate that coordinate.
+When ordering matters, report the deterministic projection alongside the
+native fit and verify cross-seed concordance explicitly.
 
 Across seeds, stack corresponding fitted coordinates as `(replicates, rows)` and
 report their exact rotation/reflection-quotiented agreement:
@@ -697,62 +665,30 @@ ladder = gamfit.layer_transport_ladder(coords, topology="circle", layers=None)
 `gamfit.plot_atom(fit, k, ax=None)` draws one atom's fitted curve and band;
 `gamfit.plot_fit(fit)` draws the whole dictionary.
 
-## Torch-native SAE: `gamfit.torch.ManifoldSAE`
+## Frozen Torch adapter: `gamfit.torch.ManifoldSAE`
 
-A trainable `nn.Module` (differentiable, GPU-capable) mirror of the closed-form
-primitive lives in `gamfit.torch`. Each atom is a parametric curve in ambient
-`ℝ^D`; a shared encoder produces per-atom on-manifold coordinates and
-amplitudes from each input batch.
+The Torch surface wraps a converged native fit; it does not define or train a
+second SAE objective.
 
 ```python
 import torch
-from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
+import gamfit
+from gamfit.torch import ManifoldSAE
 
-cfg = ManifoldSAEConfig(
-    input_dim=D, n_atoms=F, intrinsic_rank=1,
-    atom_manifold="circle",                       # circle / cylinder / sphere / product
-    atom_basis="duchon",                          # duchon / bspline / fourier
-    basis_order=2, n_basis_per_atom=8,
+fit = gamfit.sae_manifold_fit(
+    X=activations,
+    K=F,
+    d_atom=1,
+    atom_topology="circle",
+    assignment="softmax",
 )
-sae = ManifoldSAE(cfg)
-out = sae(x)               # forward → ManifoldSAEOutput(z, x_hat, positions, ...)
-fitted = sae.fit(x, max_iter=None, random_state=0, learning_rate=None)
+module = ManifoldSAE(fit)
+out = module(torch.as_tensor(new_activations, dtype=torch.float64))
 ```
 
-For gradient training of the dense curved arm, use the exact PCA seed before
-creating the optimizer. This configuration has `target_k == n_atoms`, so the
-signed least-squares gate and each circle atom's constant Fourier coefficient
-contain the centered rank-`F` PCA model exactly:
-
-```python
-cfg = ManifoldSAEConfig(
-    input_dim=D,
-    n_atoms=F,
-    intrinsic_rank=1,
-    atom_manifold="circle",
-    atom_basis="fourier",
-    sparsity={"kind": "softmax_topk", "target_k": F},
-)
-sae = ManifoldSAE(cfg).to(x_train.device)
-sae.initialize_from_pca(x_train)  # Rust SVD over the full training corpus
-optimizer = torch.optim.Adam(sae.parameters(), lr=learning_rate)
-```
-
-At initialization, `sae(x_train).x_hat` is the centered rank-`F` PCA
-reconstruction. All harmonic decoder rows start at zero but retain nonzero
-gradients, so training can add curvature without first spending thousands of
-steps recovering the linear baseline. If the explicit call is omitted, the
-first eligible training forward seeds from that batch; the full-corpus call is
-preferred because it exactly matches the converged training-set PCA baseline.
-Sparse (`target_k < n_atoms`), top-1, overcomplete, and non-circle dictionaries
-are not mislabeled as PCA-equivalent; `initialize_from_pca` rejects them.
-
-`forward` returns a `ManifoldSAEOutput` dataclass with fields `z`, `x_hat`,
-`positions`, `amplitudes`, `curves`, `gate`, `assignments`, `reml_score`,
-`lambdas`, `raw_magnitudes`. `ManifoldSAE.fit(...)` delegates to
-`gamfit.sae_manifold_fit` and shares the Rust kernel, so the closed-form and
-torch paths return identical numerics on equivalent configs. The torch-interop
-details (config fields, the closed-form `.fit()` restrictions on cylinder /
-bspline / decoder penalties) are in the
-[manifold smooths gallery](manifold-smooths.md#torch-side-gamfittorchmanifoldsae)
-and [torch interop guide](torch.md).
+`out.reconstruction`, `out.codes`, and `out.coordinates` come from one native
+converged-latent solve. `out.penalized_loss_score` is a fit diagnostic, not an
+evidence value, and `out.selected_smooth_lambdas` reports the smoothing
+precisions selected by that fit. The adapter has no trainable parameters and
+rejects inputs requiring gradients. Its state dict serializes the complete
+native fit, so loading it restores the same inference model.

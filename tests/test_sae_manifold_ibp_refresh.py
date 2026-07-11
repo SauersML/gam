@@ -71,7 +71,7 @@ class _FakeRustModule:
         analytic_penalties=None,
         initial_logits=None,
         initial_coords=None,
-        jumprelu_threshold=0.0,
+        threshold_gate_threshold=0.0,
         **_forward_compat_kwargs,
     ):
         assert assignment_kind == "ordered_beta_bernoulli"

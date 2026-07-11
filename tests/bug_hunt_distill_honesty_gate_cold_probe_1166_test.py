@@ -36,7 +36,7 @@ class _FixedEncoder:
     assignment = "softmax"
     tau = 1.0
     alpha = 1.0
-    jumprelu_threshold = 0.0
+    threshold_gate_threshold = 0.0
     atom_dims = (1, 1)
     coord_periods = ((None,), (None,))
     assignment_tolerance = 0.05

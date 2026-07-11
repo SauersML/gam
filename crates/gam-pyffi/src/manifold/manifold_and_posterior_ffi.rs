@@ -6060,7 +6060,7 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
 #[pyfunction(signature = (
     raw_payload, x, topology_fallback, assignment, assignment_label, penalties,
     alpha, learnable_alpha, tau, sparsity_strength, smoothness, learning_rate,
-    max_iter, random_state, top_k, jumprelu_threshold,
+    max_iter, random_state, top_k, threshold_gate_threshold,
     fisher_factors=None, fisher_provenance=None, declared_bases=None
 ))]
 fn sae_manifold_from_fit_payload(
@@ -6080,7 +6080,7 @@ fn sae_manifold_from_fit_payload(
     max_iter: i64,
     random_state: i64,
     top_k: Option<i64>,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     fisher_factors: Option<PyReadonlyArray3<'_, f64>>,
     fisher_provenance: Option<String>,
     declared_bases: Option<Vec<String>>,
@@ -6111,7 +6111,7 @@ fn sae_manifold_from_fit_payload(
         max_iter,
         random_state,
         top_k,
-        jumprelu_threshold,
+        threshold_gate_threshold,
         fisher_factors: fisher_factors_nested,
         fisher_provenance,
         declared_bases,
@@ -6600,7 +6600,7 @@ impl ManifoldSaeCore {
             1.0e-6,
             None,
             None,
-            inner.jumprelu_threshold,
+            inner.threshold_gate_threshold,
             inner.top_k.map(|t| t.max(0) as usize),
             hybrid,
             inner.selected_log_lambda_sparse,
@@ -6930,7 +6930,7 @@ impl ManifoldSaeCore {
             top_k,
             inner.tau,
             inner.alpha,
-            inner.jumprelu_threshold,
+            inner.threshold_gate_threshold,
             self.fisher_metric.clone(),
         )?;
         steer_plan_to_pydict(py, plan)
@@ -7224,8 +7224,8 @@ impl ManifoldSaeCore {
         self.inner.top_k
     }
     #[getter]
-    fn jumprelu_threshold(&self) -> f64 {
-        self.inner.jumprelu_threshold
+    fn threshold_gate_threshold(&self) -> f64 {
+        self.inner.threshold_gate_threshold
     }
     #[getter]
     fn dispersion(&self) -> f64 {

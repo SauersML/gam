@@ -354,9 +354,9 @@ fn ordered_beta_bernoulli_value_is_exact_integrated_marginal() {
 }
 
 #[test]
-fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
+fn ordered_beta_bernoulli_cross_row_d_matches_full_off_diagonal_hessian() {
     // #1038: the exact ordered Beta--Bernoulli Hessian couples DIFFERENT rows within a column
-    // through the plug-in empirical mass `M_k = Σ_i z_ik`:
+    // through the integrated marginal's empirical mass `M_k = Σ_i z_ik`:
     //   ∂²(value)/∂ℓ_ik ∂ℓ_jk = w · s'_k · z'_ik · z'_jk   (the cross-row
     // rank-one block, including i=j). `cross_row_d[k] = w·s'_k` and
     // `z_jac[i*K+k] = z'_ik`, so the analytic product must reproduce the
@@ -402,8 +402,8 @@ fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
             }
         }
     }
-    // Distinct columns do NOT couple cross-row (independent stick-breaking
-    // masses): the analytic model predicts zero, and the FD must agree.
+    // Distinct columns do NOT couple cross-row because the column rates are
+    // independent: the analytic model predicts zero, and the FD must agree.
     // Pick row 0, col 0 vs row 1, col 1 (flat indices 0 and k + 1).
     let mixed_distinct = mixed_fd(0, k + 1);
     assert!(
@@ -417,7 +417,7 @@ fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
 }
 
 #[test]
-fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
+fn ordered_beta_bernoulli_cross_row_dd_and_logit_curvature_match_finite_difference() {
     // #1416: the θ-adjoint differentiates the cross-row Woodbury block
     //   W_k = d_k·u_k u_kᵀ,  u_k[i] = J_ik,  d_k = w·s'_k(M_k).
     // Its θ-derivative needs two new exact channels:
@@ -473,7 +473,7 @@ fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
 }
 
 #[test]
-fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
+fn ordered_beta_bernoulli_majorized_channels_match_fd_of_psd_majorized_operator() {
     // gam#2144 consistency: with `majorize = true` every third channel must be the
     // exact derivative of the PSD Loewner-majorized column block
     //   D_ik = max(w·s'_k, 0)·J_ik² + max(w·s_k·c_ik, 0),   d_k = max(w·s'_k, 0),
@@ -566,7 +566,7 @@ fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
 }
 
 #[test]
-fn ibp_cross_row_d_logalpha_matches_finite_difference() {
+fn ordered_beta_bernoulli_cross_row_d_logalpha_matches_finite_difference() {
     // #1417 fix: the cross-row rank-one coefficient's logα-derivative used by the
     // LEARNABLE-α log-det ρ-gradient. For learnable α, `α(ρ₀)=α_base·e^{ρ₀}` so
     // `∂logα/∂ρ₀=1`, hence `∂(cross_row_d[k])/∂ρ₀ = ∂d_k/∂logα = cross_row_d_logalpha[k]`.
@@ -617,7 +617,7 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
 }
 
 #[test]
-fn ibp_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
+fn ordered_beta_bernoulli_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
     // #2087/#1416 root cause guard: the ordered Beta--Bernoulli log-det θ-adjoint differentiates the
     // same cross-row rank-one coefficient `d_k = w·score'_k` that the Hessian
     // assembly puts into the Woodbury block. Its mass channel must therefore be
@@ -771,13 +771,13 @@ fn ordered_beta_bernoulli_assignment_high_k_prior_keeps_positive_gradient_path()
 }
 
 /// #991 design-honesty weighting of the ordered Beta--Bernoulli prior: every channel must be the
-/// exact derivative of the ONE weighted energy
-/// `F_w = w·[Σ_i w_i·bce(z_i; π̂) + beta_terms(π̂)]` with the weighted plug-in
-/// `π̂_k = (Σ_i w_i z_ik + a_k)/(Σ_i w_i + a_k + 1)`. This is the CI gate for
+/// exact derivative of the ONE weighted integrated energy
+/// `F_w = w·Σ_k[-log(a_k) - log B(M_k+a_k, N_eff-M_k+1)]`, where
+/// `M_k=Σ_i w_i z_ik` and `N_eff=Σ_i w_i`. This is the CI gate for
 /// value↔gradient↔Hessian↔ρ-channel consistency under nontrivial weights (the
 /// repo's banned desync class), plus the `None ⇒ bit-for-bit` contract.
 #[test]
-fn ibp_row_weighted_channels_are_one_operator_991() {
+fn ordered_beta_bernoulli_row_weighted_channels_are_one_operator_991() {
     let k = 3usize;
     // 4 rows, nontrivial mean-1 design weights.
     let w = [1.6_f64, 0.4, 1.2, 0.8];
@@ -921,7 +921,8 @@ fn learnable_weights_stay_finite_at_extreme_rho() {
         assert!(diag.iter().all(|entry| entry.is_finite()));
     }
 
-    let jump = SmoothThresholdPenalty::new(PsiSlice::full(2, Some(1)), array![1.0_f64], 0.5, 0.1).unwrap();
+    let jump =
+        SmoothThresholdPenalty::new(PsiSlice::full(2, Some(1)), array![1.0_f64], 0.5, 0.1).unwrap();
     let jump_target = array![0.0_f64, 0.2];
     for rho in [array![1000.0_f64], array![-1000.0_f64]] {
         let value = jump.value(jump_target.view(), rho.view());
@@ -1162,7 +1163,8 @@ fn smooth_threshold_sweep_fixture() -> (
 
 #[test]
 fn smooth_threshold_hessian_diag_is_exact_true_second_derivative() {
-    let (pen, target_values, rho, scaled_thresholds, eps, weight) = smooth_threshold_sweep_fixture();
+    let (pen, target_values, rho, scaled_thresholds, eps, weight) =
+        smooth_threshold_sweep_fixture();
     let latent_dim = scaled_thresholds.len();
     // `hessian_diag` must be the EXACT diagonal second derivative of the
     // smoothed jump penalty `P(z) = wτ·σ((z − τ)/ε)`:
@@ -1198,7 +1200,8 @@ fn smooth_threshold_hessian_diag_is_exact_true_second_derivative() {
 
 #[test]
 fn smooth_threshold_hvp_diagonal_matches_hessian_diag() {
-    let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) = smooth_threshold_sweep_fixture();
+    let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) =
+        smooth_threshold_sweep_fixture();
     // `hvp` and `hessian_diag` are the SAME true operator; probing `hvp`
     // with unit vectors must reproduce `hessian_diag` exactly.
     let diag = pen
@@ -1214,7 +1217,8 @@ fn smooth_threshold_hvp_diagonal_matches_hessian_diag() {
 
 #[test]
 fn smooth_threshold_psd_majorizer_diag_is_psd_over_logit_sweep() {
-    let (pen, target_values, rho, scaled_thresholds, eps, weight) = smooth_threshold_sweep_fixture();
+    let (pen, target_values, rho, scaled_thresholds, eps, weight) =
+        smooth_threshold_sweep_fixture();
     let latent_dim = scaled_thresholds.len();
     // The PSD majorizer is a DISTINCT operator from the true Hessian. The
     // bare re-weighted-ℓ₂ surrogate wτ·[g(1−g)]²/ε² is ≥ 0 but does NOT

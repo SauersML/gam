@@ -151,7 +151,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         affine atom ``{1, t}``; the same candidate is used by the hybrid-split
         LINEAR verdicts (see :attr:`ManifoldSAE.hybrid_split`).
     assignment
-        Assignment/gating family. ``"softmax"`` uses soft mixture masses and is
+        Assignment/gating family. ``"softmax"`` uses simplex-normalized additive
+        gates and is
         the production default; at large ``K`` the fit derives a train-time
         ``top_k`` cap from rows per atom when the caller leaves ``top_k`` unset.
         ``"ordered_beta_bernoulli"`` uses independent posterior-mean Bernoulli
@@ -270,7 +271,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``||B_j @ B_k.T||_F^2`` for stored ``(M_k, p_out)`` decoder blocks on
         co-firing atom pairs.
     top_k
-        Optional per-token active-set cap. ``None`` and ``0`` disable it;
+        Optional per-token active-set cap. ``None`` disables it;
         integers in ``[1, K]`` cap the number of atoms a token may activate. This
         is a TRAIN-TIME cap folded into the optimization (the engine builds the
         compact active×active solve over the capped support), not a cosmetic
@@ -446,7 +447,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # `sae_manifold_fit_inner`). The DIM-ADAPTIVE row-block penalties (native ARD,
     # SCAD-MCP coord sparsity, sparsity, isometry gauge) compose per atom over a
     # mixed "t" block and are ADMITTED; only the FIXED-`d` structural penalties
-    # (block-orthogonality, TopK/JumpReLU, row-precision) require a uniform
+    # (block orthogonality, fixed top-k support, row precision) require a uniform
     # atom_dim and are refused with a direct `ValueError` up front. The facade
     # stays thin and simply surfaces that engine decision rather than duplicating
     # the check here.
@@ -611,10 +612,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # the dense `K` working set would exceed the memory budget. The Rust kernel
     # owns the cap contract end to end — there is no Python-side mask. Any value
     # outside `[1, k_atoms]` is a caller error rather than a silent clamp/no-op.
-    # I: the docstring advertises that both ``None`` and ``0`` disable the
-    # active-set cap. Normalize ``0`` to ``None`` (disabled) BEFORE the
-    # ``[1, K]`` range check so ``top_k=0`` is accepted rather than rejected.
-    if top_k is None or int(top_k) == 0:
+    if top_k is None:
         top_k_arg = (
             _default_top_k_for_large_dictionary(n_obs, k_atoms)
             if kind == "softmax"
@@ -950,7 +948,7 @@ class StagewiseSAE:
             float(seed.learning_rate),
             int(seed.max_iter),
             int(seed.random_state),
-            float(seed.jumprelu_threshold),
+            float(seed.threshold_gate_threshold),
             float(self.reconstruction_ev()),
         )
 
@@ -1113,9 +1111,10 @@ def sae_manifold_fit_stagewise(
         precomputed stagewise FFI: ``"circle"`` (periodic) and ``"sphere"``.
     assignment
         Assignment/gate family, resolved through the shared public validator.
-        ``"softmax"`` is the default and carries posterior responsibility mass
-        through births and backfitting. ``"ordered_beta_bernoulli"`` remains an explicit MAP
-        opt-in; ``"threshold_gate"`` selects the hard threshold gate.
+        ``"softmax"`` is the default and carries normalized additive gate mass
+        through births and backfitting. ``"ordered_beta_bernoulli"`` uses
+        independent posterior-mean Bernoulli gates with an integrated ordered
+        Beta prior; ``"threshold_gate"`` selects the smooth threshold gate.
     structured_whitening
         Install the Σ-whitened per-row metric on each birth so the K=1 candidate
         fits run under the structured residual covariance from atom one (Σ is
@@ -1255,7 +1254,7 @@ def sae_manifold_fit_stagewise(
         smoothness_weight=smoothness_weight,
         n_iter=seed_iter,
         random_state=int(random_state),
-        alpha=(_ALPHA_UNSET if alpha is None else alpha),
+        alpha=alpha,
         tau=tau,
         weights=weights_arr,
         fisher_factors=(None if fisher_shard is None else fisher_factors),
@@ -1453,7 +1452,7 @@ def _build_analytic_penalties_payload(
     block_orthogonality_weight: float,
     d_max: int,
     p_out: int,
-    gate_sparsity: str = "l1",
+    coord_sparsity: str = "l1",
     sparsity_weight: float = 0.0,
     scad_mcp_gamma: float = 3.7,
     nuclear_norm_weight: float = 0.0,
@@ -1470,7 +1469,7 @@ def _build_analytic_penalties_payload(
     it routes to the native ``ArdAxisPrior`` via the ``native_ard_enabled`` FFI
     flag (see ``sae_manifold_fit``), since the registry ``ard`` penalty is
     intentionally skipped on every SAE path.
-    ``gate_sparsity="scad"`` or ``"mcp"`` emits the row-block
+    ``coord_sparsity="scad"`` or ``"mcp"`` emits the row-block
     ``scad_mcp`` descriptor on the same "t" block, using ``sparsity_weight`` as
     its non-convex sparsity strength. The default ``"l1"`` emits no analytic
     descriptor and preserves the existing assignment-prior sparsity path.
@@ -1500,12 +1499,12 @@ def _build_analytic_penalties_payload(
     # the FFI call (see `sae_manifold_fit`), which sizes / drops each atom's
     # `log_ard` precisions. Emitting a descriptor here would be a guaranteed
     # no-op (the exact issue-#240 silent-no-op anti-pattern).
-    if gate_sparsity in {"scad", "mcp"} and float(sparsity_weight) > 0.0:
-        _require_sae_row_block_penalty("scad_mcp", "gate_sparsity")
+    if coord_sparsity in {"scad", "mcp"} and float(sparsity_weight) > 0.0:
+        _require_sae_row_block_penalty("scad_mcp", "coord_sparsity")
         items.append({
             "kind": "scad_mcp",
             "target": "t",
-            "variant": str(gate_sparsity),
+            "variant": str(coord_sparsity),
             "gamma": float(scad_mcp_gamma),
             "weight": float(sparsity_weight),
         })

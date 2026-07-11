@@ -98,69 +98,33 @@ radial spike, fit via `gamfit.fit` directly) is in
 
 ## Torch-side: `gamfit.torch.ManifoldSAE`
 
-`gamfit.torch.ManifoldSAE(cfg)` is a trainable `nn.Module` mirror of the
-closed-form SAE manifold primitive. Atom *i* is a 1-D parametric curve in
-ambient `R^D`, parameterized by a manifold point and a decoder block; a shared
-encoder produces per-atom on-manifold coordinates and amplitudes from each
-input batch. The closed-form primitive itself — the objective, the typed
-topologies, posterior shape bands, and coordinate ranges — is documented in
-the [Manifold SAE dictionary guide](manifold-sae.md).
+The Torch class is a frozen tensor adapter for the converged object returned by
+`gamfit.sae_manifold_fit`. All model mathematics, topology choices, assignment,
+smoothing selection, and out-of-sample latent inference remain in the native
+fit.
 
 ```python
 import torch
-from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
+import gamfit
+from gamfit.torch import ManifoldSAE
 
-cfg = ManifoldSAEConfig(
-    input_dim=D, n_atoms=F, intrinsic_rank=1,
-    atom_manifold="circle",
-    atom_basis="fourier", basis_order=2, n_basis_per_atom=K,
-    sparsity={"kind": "ibp_gumbel", "init_alpha": 0.1,
-              "tau_schedule": "linear:4.0->1.0"},
-    decoder={"ortho_weight": 0.0, "monotonicity_weight": 0.0},
-    reml={"enabled": True, "select": ["lambda", "tau"]},
+fit = gamfit.sae_manifold_fit(
+    X=training_activations,
+    K=F,
+    d_atom=1,
+    atom_topology="circle",
+    assignment="softmax",
 )
-sae = ManifoldSAE(cfg)
-out = sae(x)               # ManifoldSAEOutput(z, x_hat, positions, ...)
-sae.fit(x)                 # delegates to gamfit.sae_manifold_fit
-sae.lock_snapshot()        # freeze REML-selected hypers
-curves = sae.extract_feature_curves(grid_size=128)   # {atom_idx -> Tensor(grid, D)}
+module = ManifoldSAE(fit)
+out = module(torch.as_tensor(test_activations, dtype=torch.float64))
 ```
 
-**Parity contract.** `ManifoldSAE.fit(...)` and `gamfit.sae_manifold_fit(...)`
-share a Rust kernel. Given equivalent configurations they return identical
-numerics on synthetic data for supported closed-form configurations (see
-`tests/torch/test_manifold_sae_parity.py`). Closed-form `.fit()` rejects
-nonzero decoder orthogonality / monotonicity penalties (those objectives are
-not represented by the Rust SAE primitive), the `bspline` basis (torch-only),
-and — at present — `cylinder` atoms: the closed-form bridge does not route the
-cylinder topology even though the Rust core has a genuine `cylinder` atom
-(`S¹ × ℝ`), so use a torch training loop for cylinder atoms here.
-
-Supported atom manifolds: `circle`, `cylinder`, `sphere`, `product`. Supported
-bases-on-manifold: `duchon`, `bspline`, `fourier`. Sparsity layers:
-`ibp_gumbel`, `softmax_topk`, `jumprelu`. In the closed-form `.fit()` path,
-`circle` maps to a periodic atom, `sphere` maps to a sphere atom, and `product`
-maps to a Duchon Euclidean patch; `bspline` remains a torch-training basis.
-
-The dense gradient-trained circle arm (`softmax_topk` with
-`target_k == n_atoms`) should call `sae.initialize_from_pca(x_train)` before
-the optimizer is created. Rust fits the centered principal frame, the frame is
-placed in the atoms' unit constant Fourier rows, and all harmonic rows start at
-zero. The step-zero reconstruction is therefore exactly the converged
-rank-`n_atoms` PCA reconstruction while curvature gradients remain live. An
-omitted explicit call uses the first eligible training batch; using the full
-training corpus explicitly gives the exact training-set baseline.
-
-For a circle whose meaningful ordering plane is already known, set
-`decoder_subspace=frame` on `ManifoldSAEConfig`. Rust converts the supplied
-`(rank, input_dim)` rows to a canonical orthonormal frame and rejects numerical
-rank deficiency. The DC decoder row remains ambient; all Fourier harmonics are
-stored as reduced coordinates in that frame, so angle-dependent motion cannot
-wander out of plane and no projected-away optimizer parameters exist. Use
-`gamfit.torch.circular_concordance` on aligned coordinate vectors from multiple
-seeds to report O(2)-quotiented angle stability alongside EV; collapsed
-replicates produce unavailable (`None`) agreement rather than a misleading
-score.
+The adapter has no trainable parameters and no `.fit()` method. Inputs that
+require gradients are rejected because inference crosses the Torch/native
+boundary. Its output exposes the native reconstruction, codes, per-atom
+coordinates, penalized-loss diagnostic, and selected smoothness precisions.
+Use `gamfit.torch.circular_concordance` on coordinate vectors from independent
+native fits to report O(2)-quotiented circle stability.
 
 ## Related reading
 

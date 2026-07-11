@@ -34,7 +34,7 @@
     top_k = None,
     initial_logits = None,
     initial_coords = None,
-    jumprelu_threshold = 0.0,
+    threshold_gate_threshold = 0.0,
     native_ard_enabled = true,
     fisher_factors = None,
     fisher_mass_residual = None,
@@ -71,7 +71,7 @@ fn sae_manifold_fit_minimal<'py>(
     top_k: Option<usize>,
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     native_ard_enabled: bool,
     // WP-D output-Fisher shard (#980). `(n, p, r)` f64 factors; presence activates
     // `RowMetric::OutputFisher`. This is the entry point the high-level Python
@@ -106,7 +106,7 @@ fn sae_manifold_fit_minimal<'py>(
         assignment_kind: assignment,
         alpha,
         tau,
-        threshold: jumprelu_threshold,
+        threshold: threshold_gate_threshold,
         top_k,
         ordered_beta_bernoulli_alpha_override,
         random_state,
@@ -156,7 +156,7 @@ fn sae_manifold_fit_minimal<'py>(
         gumbel_schedule,
         analytic_penalties,
         top_k,
-        jumprelu_threshold,
+        threshold_gate_threshold,
         native_ard_enabled,
         refine_routing,
         random_state,
@@ -212,7 +212,7 @@ fn sae_oos_request_from_arrays(
     ridge_ext_coord: f64,
     initial_logits: Option<ndarray::ArrayView2<'_, f64>>,
     initial_coords: Option<ndarray::ArrayView3<'_, f64>>,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     top_k: Option<usize>,
     hybrid_linear_images: Option<Vec<(usize, f64, Array1<f64>, Array1<f64>, Option<Array1<f64>>)>>,
     log_lambda_sparse: Option<f64>,
@@ -235,7 +235,7 @@ fn sae_oos_request_from_arrays(
         "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
         "ordered_beta_bernoulli" => gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha },
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
-            threshold: jumprelu_threshold,
+            threshold: threshold_gate_threshold,
         },
         "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
         _ => {
@@ -364,7 +364,7 @@ fn sae_oos_report_to_pydict<'py>(
     ridge_ext_coord = 1.0e-6,
     initial_logits = None,
     initial_coords = None,
-    jumprelu_threshold = 0.0,
+    threshold_gate_threshold = 0.0,
     top_k = None,
     hybrid_linear_images = None,
     log_lambda_sparse = None,
@@ -389,7 +389,7 @@ fn sae_manifold_predict_oos<'py>(
     ridge_ext_coord: f64,
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     top_k: Option<usize>,
     hybrid_linear_images: Option<
         Vec<(
@@ -443,7 +443,7 @@ fn sae_manifold_predict_oos<'py>(
         ridge_ext_coord,
         initial_logits_view,
         initial_coords_view,
-        jumprelu_threshold,
+        threshold_gate_threshold,
         top_k,
         hybrid_owned,
         log_lambda_sparse,
@@ -912,7 +912,7 @@ fn steer_delta_from_arrays(
     top_k: Option<usize>,
     tau: f64,
     alpha: f64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     fisher_factors: Option<ndarray::ArrayView3<'_, f64>>,
     fisher_mass_residual: Option<ndarray::ArrayView1<'_, f64>>,
     fisher_provenance: Option<&str>,
@@ -949,7 +949,7 @@ fn steer_delta_from_arrays(
         top_k,
         tau,
         alpha,
-        jumprelu_threshold,
+        threshold_gate_threshold,
         fisher_metric,
     )
 }
@@ -977,7 +977,7 @@ fn steer_delta_with_metric_from_arrays(
     top_k: Option<usize>,
     tau: f64,
     alpha: f64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     fisher_metric: Option<gam::inference::row_metric::RowMetric>,
 ) -> PyResult<gam::inference::steering::SteerPlan> {
     // Assignment tokens are strict: compatibility aliases are rejected.
@@ -1003,7 +1003,7 @@ fn steer_delta_with_metric_from_arrays(
             learnable_alpha: false,
         },
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
-            threshold: jumprelu_threshold,
+            threshold: threshold_gate_threshold,
         },
         "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
         _ => {
@@ -1105,7 +1105,7 @@ fn steer_plan_to_pydict(
     assignment_kind,
     tau,
     alpha = 1.0,
-    jumprelu_threshold = 0.0,
+    threshold_gate_threshold = 0.0,
     top_k = None,
     fisher_factors = None,
     fisher_mass_residual = None,
@@ -1131,7 +1131,7 @@ fn sae_steer_delta<'py>(
     assignment_kind: String,
     tau: f64,
     alpha: f64,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     top_k: Option<usize>,
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
@@ -1167,7 +1167,7 @@ fn sae_steer_delta<'py>(
         top_k,
         tau,
         alpha,
-        jumprelu_threshold,
+        threshold_gate_threshold,
         fisher_view,
         fisher_mass_view,
         fisher_provenance.as_deref(),

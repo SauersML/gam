@@ -1732,7 +1732,7 @@ fn structured_residual_pass_diagnostics_dict<'py>(
     gumbel_schedule = None,
     analytic_penalties = None,
     top_k = None,
-    jumprelu_threshold = 0.0,
+    threshold_gate_threshold = 0.0,
     fisher_factors = None,
     fisher_mass_residual = None,
     fisher_provenance = None,
@@ -1772,7 +1772,7 @@ fn sae_manifold_fit<'py>(
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     // WP-D output-Fisher shard (#980). `fisher_factors` is `(n, p, r)` f64 (the
     // harvest shard's `U`); its presence activates `RowMetric::OutputFisher`. No
     // flag — magic-by-default. `fisher_mass_residual` is the optional `(n,)`
@@ -1834,7 +1834,7 @@ fn sae_manifold_fit<'py>(
         gumbel_schedule,
         analytic_penalties,
         top_k,
-        jumprelu_threshold,
+        threshold_gate_threshold,
         true,
         // This precomputed-basis entry point hands the term verbatim seeds;
         // routing-seed refinement is owned by the higher-level `fit_minimal`
@@ -2278,7 +2278,7 @@ fn sae_manifold_fit_inner<'py>(
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
-    jumprelu_threshold: f64,
+    threshold_gate_threshold: f64,
     native_ard_enabled: bool,
     seed_refine_routing: bool,
     seed_refine_random_state: u64,
@@ -2378,7 +2378,7 @@ fn sae_manifold_fit_inner<'py>(
         ridge_ext_coord,
         ridge_beta,
         top_k,
-        threshold: jumprelu_threshold,
+        threshold: threshold_gate_threshold,
         native_ard_enabled,
         seed_refine_routing,
         seed_refine_random_state,

@@ -98,7 +98,7 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) random_state: i64,
     /// Required key, but nullable (`to_dict` always writes `top_k`, `None`→`null`).
     pub(crate) top_k: Option<i64>,
-    pub(crate) jumprelu_threshold: f64,
+    pub(crate) threshold_gate_threshold: f64,
     pub(crate) oos_projection_top1: bool,
     pub(crate) dispersion: f64,
 
@@ -182,7 +182,7 @@ impl ManifoldSaePayload {
         "max_iter",
         "random_state",
         "top_k",
-        "jumprelu_threshold",
+        "threshold_gate_threshold",
         "oos_projection_top1",
         "dispersion",
         "penalized_loss_score",

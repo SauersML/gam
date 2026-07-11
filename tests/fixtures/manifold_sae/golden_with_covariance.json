@@ -858,7 +858,7 @@
     ],
     "mu_hat": 0.31
   },
-  "jumprelu_threshold": 0.15,
+  "threshold_gate_threshold": 0.15,
   "learnable_alpha": true,
   "learning_rate": 0.03,
   "logits": [

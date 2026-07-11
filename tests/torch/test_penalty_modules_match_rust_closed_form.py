@@ -17,7 +17,13 @@ def test_penalty_modules_match_rust_closed_form() -> None:
     checks: list[tuple[str, torch.nn.Module, dict[str, Any]]] = [
         ("ARDPenalty", gt.ARDPenalty(weight=1.3), {}),
         ("IsometryPenalty", gt.IsometryPenalty(weight=0.8), {"basis": basis}),
-        ("JumpReLUPenalty", gt.JumpReLUPenalty(torch.full((3,), 0.05, dtype=torch.float64), weight=1.1), {}),
+        (
+            "SmoothThresholdPenalty",
+            gt.SmoothThresholdPenalty(
+                torch.full((3,), 0.05, dtype=torch.float64), weight=1.1
+            ),
+            {},
+        ),
     ]
 
     for name, module, kwargs in checks:

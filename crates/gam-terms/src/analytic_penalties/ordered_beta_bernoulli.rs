@@ -126,34 +126,25 @@ impl OrderedBetaBernoulliPenalty {
             .unwrap_or(false)
     }
 
-    /// Shapes of the independent `Beta(a_k, 1)` columns and their ordered means.
-    fn column_beta_shapes(&self, alpha: f64) -> (Array1<f64>, Array1<f64>) {
-        let ratio = alpha / (alpha + 1.0);
-        let log_ratio = if ratio < 1.0 {
-            ratio.ln()
-        } else {
-            // Preserve a strictly interior ordered mean when `alpha + 1` rounds
-            // to `alpha`; an exact mean of one would make `a_k` undefined.
-            (-1.0 / alpha).max(-1.0)
-        };
+    /// Shapes of the independent `Beta(a_k, 1)` columns. The stable identity
+    /// `a_k = 1 / expm1(-log(mu_k))` avoids subtracting an ordered mean rounded
+    /// to one at large concentration.
+    fn column_beta_shapes(&self, alpha: f64) -> Array1<f64> {
+        let log_ratio = -(1.0 / alpha).ln_1p();
         let mut a_col = Array1::<f64>::zeros(self.k_max);
-        let mut mu = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
-            let m = (((k + 1) as f64) * log_ratio)
-                .exp()
-                .clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
-            mu[k] = m;
-            a_col[k] = m / (1.0 - m);
+            let log_mu = ((k + 1) as f64) * log_ratio;
+            a_col[k] = (1.0 / (-log_mu).exp_m1().max(f64::MIN_POSITIVE))
+                .max(f64::MIN_POSITIVE);
         }
-        (a_col, mu)
+        a_col
     }
 
     /// `da_k/d rho` for `rho = log(alpha / alpha_base)`.
-    fn column_beta_shape_rho_deriv(&self, alpha: f64, mu: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn column_beta_shape_rho_deriv(&self, alpha: f64, a_col: ArrayView1<'_, f64>) -> Array1<f64> {
         Array1::from_shape_fn(self.k_max, |k| {
-            let m = mu[k];
-            let dmu = m * ((k + 1) as f64) / (alpha + 1.0);
-            dmu / ((1.0 - m) * (1.0 - m))
+            let a = a_col[k];
+            ((k + 1) as f64) * (a / (alpha + 1.0)) * (a + 1.0)
         })
     }
 
@@ -223,8 +214,8 @@ impl OrderedBetaBernoulliPenalty {
             return (d_score, d_score_derivative);
         }
         let alpha = self.resolved_alpha(rho);
-        let (a_col, mu) = self.column_beta_shapes(alpha);
-        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
+        let a_col = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, a_col.view());
         let z = self.concrete_logits(target);
         let (columns, _) = self.marginal_columns(z.view(), a_col.view());
         for (k, column) in columns.iter().enumerate() {
@@ -246,7 +237,7 @@ impl OrderedBetaBernoulliPenalty {
         majorize: bool,
     ) -> OrderedBetaBernoulliHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
-        let (a_col, _) = self.column_beta_shapes(alpha);
+        let a_col = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
         let (columns, _) = self.marginal_columns(z.view(), a_col.view());
         let n = z.len() / self.k_max;
@@ -423,7 +414,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.resolved_alpha(rho);
-        let (a_col, _) = self.column_beta_shapes(alpha);
+        let a_col = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
         let (columns, n_eff) = self.marginal_columns(z.view(), a_col.view());
         let mut value = 0.0;
@@ -441,7 +432,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         let alpha = self.resolved_alpha(rho);
-        let (a_col, _) = self.column_beta_shapes(alpha);
+        let a_col = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
         let (columns, _) = self.marginal_columns(z.view(), a_col.view());
         let n = z.len() / self.k_max;
@@ -466,7 +457,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
         let alpha = self.resolved_alpha(rho);
-        let (a_col, _) = self.column_beta_shapes(alpha);
+        let a_col = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
         let (columns, _) = self.marginal_columns(z.view(), a_col.view());
         let n = z.len() / self.k_max;
@@ -503,7 +494,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
             "OrderedBetaBernoulliPenalty::hvp dimension mismatch"
         );
         let alpha = self.resolved_alpha(rho);
-        let (a_col, _) = self.column_beta_shapes(alpha);
+        let a_col = self.column_beta_shapes(alpha);
         let z = self.concrete_logits(target);
         let (columns, _) = self.marginal_columns(z.view(), a_col.view());
         let n = z.len() / self.k_max;
@@ -545,8 +536,8 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
             return Array1::zeros(0);
         }
         let alpha = self.resolved_alpha(rho);
-        let (a_col, mu) = self.column_beta_shapes(alpha);
-        let da_col = self.column_beta_shape_rho_deriv(alpha, mu.view());
+        let a_col = self.column_beta_shapes(alpha);
+        let da_col = self.column_beta_shape_rho_deriv(alpha, a_col.view());
         let z = self.concrete_logits(target);
         let (columns, n_eff) = self.marginal_columns(z.view(), a_col.view());
         let mut gradient = 0.0;

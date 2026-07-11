@@ -88,11 +88,11 @@ def test_isometry_penalty_rust_value() -> None:
     )
 
 
-def test_jumprelu_penalty_rust_value() -> None:
+def test_smooth_threshold_penalty_rust_value() -> None:
     thresholds = torch.full((3,), 0.05, dtype=torch.float64)
     _check_rust_value_matches_forward(
-        "JumpReLUPenalty",
-        gt.JumpReLUPenalty(thresholds, weight=1.1),
+        "SmoothThresholdPenalty",
+        gt.SmoothThresholdPenalty(thresholds, weight=1.1),
         _latent(),
     )
 

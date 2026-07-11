@@ -1,4 +1,4 @@
-//! Bug hunt: `JumpReLUPenalty::psd_majorizer_diag` does **not** majorize the
+//! Regression: `SmoothThresholdPenalty::psd_majorizer_diag` majorizes the
 //! exact Hessian for any coordinate below (or just at) its threshold, violating
 //! the `AnalyticPenalty::psd_majorizer_diag` contract.
 //!
@@ -14,7 +14,7 @@
 //! dominates the true Hessian, which is what guarantees the monotone-decrease
 //! of majorization-minimization.
 //!
-//! For JumpReLU the two diagonal entries are (src/terms/analytic_penalties/mod.rs:
+//! For the smooth threshold prior the two diagonal entries are
 //! 3060-3068), with `g = sigmoid((x - tau)/eps)` and `C = weight*tau/eps² > 0`:
 //!
 //!     exact Hessian   h(g) = C · g(1-g)(1-2g)        (`true_hessian_diag_entry`)
@@ -32,7 +32,7 @@
 //! **less** than the positive exact Hessian (≈7× smaller at `g = 0.12`). There
 //! the MM surrogate *under*-estimates curvature, so it is not an upper bound and
 //! the majorization guarantee is lost for exactly the inactive latent
-//! coordinates JumpReLU is meant to keep suppressed.
+//! coordinates the smooth threshold prior is meant to keep suppressed.
 //!
 //! Reproduction is closed-form: pick `tau = 1`, `eps = 0.5`, and `x = 0`
 //! (`g ≈ 0.119`). The exact Hessian diagonal is positive (`≈ 0.416·weight`) but
@@ -46,7 +46,7 @@
 //! Related: #794 (sibling SAE-penalty curvature defect: MonotonicityPenalty::hvp
 //! magnitude), #793.
 
-use gam::terms::analytic_penalties::{AnalyticPenalty, JumpReLUPenalty, PsiSlice};
+use gam::terms::analytic_penalties::{AnalyticPenalty, PsiSlice, SmoothThresholdPenalty};
 use ndarray::Array1;
 
 fn sigmoid(z: f64) -> f64 {
@@ -54,29 +54,29 @@ fn sigmoid(z: f64) -> f64 {
 }
 
 #[test]
-fn jumprelu_psd_majorizer_dominates_exact_hessian_below_threshold() {
+fn smooth_threshold_psd_majorizer_dominates_exact_hessian_below_threshold() {
     let weight = 1.3_f64;
     let eps = 0.5_f64;
     let tau = 1.0_f64;
 
     // latent_dim = 1; four coordinates spanning below / at / above threshold.
-    let p = JumpReLUPenalty::new(
+    let p = SmoothThresholdPenalty::new(
         PsiSlice::full(4, Some(1)),
         Array1::from(vec![tau]),
         weight,
         eps,
     )
-    .expect("construct JumpReLU penalty");
+    .expect("construct smooth threshold penalty");
     // rho_count == latent_dim; rho = 0 keeps the threshold at its base `tau`.
     let rho = Array1::from(vec![0.0_f64]);
     let target = Array1::from(vec![0.0, 0.7, 1.0, 2.0]);
 
     let exact = p
         .hessian_diag(target.view(), rho.view())
-        .expect("JumpReLU has a closed-form diagonal Hessian");
+        .expect("smooth threshold has a closed-form diagonal Hessian");
     let majorizer = p
         .psd_majorizer_diag(target.view(), rho.view())
-        .expect("JumpReLU exposes a PSD majorizer diagonal");
+        .expect("smooth threshold exposes a PSD majorizer diagonal");
 
     // Contract: the majorizer must dominate the exact Hessian at EVERY
     // coordinate (B ⪰ ∂²P), and in particular wherever the exact curvature is

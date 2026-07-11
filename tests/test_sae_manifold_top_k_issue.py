@@ -60,32 +60,6 @@ def test_sae_manifold_fit_top_k_general(k: int) -> None:
     assert int(active_per_row.max()) <= k
 
 
-def test_manifold_sae_module_fit_respects_target_k() -> None:
-    """``ManifoldSAE.fit`` must honour ``cfg.sparsity.target_k``."""
-    torch = pytest.importorskip("torch")
-    gt = pytest.importorskip("gamfit.torch")
-
-    cfg = gt.ManifoldSAEConfig(
-        input_dim=6,
-        K=4,
-        intrinsic_rank=1,
-        atom_manifold="circle",
-        atom_basis="fourier",
-        sparsity={"kind": "softmax_topk", "target_k": 1},
-    )
-    sae = gt.ManifoldSAE(cfg).double()
-    rng = np.random.default_rng(1)
-    X = rng.standard_normal((16, 6))
-    fit = sae.fit(torch.tensor(X, dtype=torch.float64), n_iter=3, random_state=0)
-
-    A = np.asarray(fit.assignments)
-    active_per_row = (A > 1e-12).sum(axis=1)
-    assert int(active_per_row.max()) <= 1, (
-        f"sparsity.target_k=1 should leave at most 1 atom active in closed-form fit; got "
-        f"max={int(active_per_row.max())}"
-    )
-
-
 def _euclidean_data_fit(z: np.ndarray, fitted: np.ndarray) -> float:
     """Reconstruction data-fit ``0.5 * sum (z - fitted)**2`` (Euclidean, no row
     weights) — the exact term the Rust ``penalized_loss`` carries under the
@@ -117,7 +91,7 @@ def _raw_topk_payload(z: np.ndarray, *, K: int, top_k: int) -> dict:
         top_k=top_k,
         initial_logits=None,
         initial_coords=None,
-        jumprelu_threshold=0.0,
+        threshold_gate_threshold=0.0,
         fisher_factors=None,
         fisher_mass_residual=None,
         fisher_provenance=None,

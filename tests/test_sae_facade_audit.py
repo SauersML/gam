@@ -30,7 +30,7 @@ def _no_row_block_probe(monkeypatch):
 def test_isometry_weight_changes_payload(monkeypatch):
     _no_row_block_probe(monkeypatch)
     common = dict(
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         sparsity_weight=0.0,
         scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
@@ -62,7 +62,7 @@ def test_isometry_weight_zero_omits_descriptor(monkeypatch):
     _no_row_block_probe(monkeypatch)
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         sparsity_weight=0.0,
         scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
@@ -82,7 +82,7 @@ def test_decoder_incoherence_payload_builder_default_is_on_for_multi_atom(monkey
     _no_row_block_probe(monkeypatch)
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         sparsity_weight=0.0,
         scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
@@ -211,7 +211,7 @@ def _make_fit(
         "max_iter": 1,
         "random_state": 0,
         "top_k": None,
-        "jumprelu_threshold": 0.0,
+        "threshold_gate_threshold": 0.0,
         "oos_projection_top1": False,
         "dispersion": 1.0,
         "penalized_loss_score": 0.0,
@@ -356,7 +356,7 @@ class _FakeRustModule:
         analytic_penalties=None,
         initial_logits=None,
         initial_coords=None,
-        jumprelu_threshold=0.0,
+        threshold_gate_threshold=0.0,
         native_ard_enabled=True,
         **_forward_compat_kwargs,
     ):
@@ -448,11 +448,9 @@ def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
     assert callable(gamfit.atom_trust_scores)
 
     signature = inspect.signature(sae.sae_manifold_fit)
-    # #1777 — `coord_sparsity` is the primary coordinate-block penalty param and
-    # `gate_sparsity` is its deprecated alias; both default to the same unset
-    # sentinel (the effective default, "scad", is resolved inside the function).
-    assert signature.parameters["coord_sparsity"].default is sae._COORD_SPARSITY_UNSET
-    assert signature.parameters["gate_sparsity"].default is sae._COORD_SPARSITY_UNSET
+    assert signature.parameters["coord_sparsity"].default == "scad"
+    assert "gate_sparsity" not in signature.parameters
+    assert "n_atoms" not in signature.parameters
     assert signature.parameters["nuclear_norm_weight"].default == 1.0
     assert signature.parameters["decoder_incoherence_weight"].default == 1.0
 
@@ -515,7 +513,7 @@ def test_small_sae_fit_trust_diagnostics_round_trip_new_schema():
         random_state=0,
         isometry_weight=0.0,
         ard_per_atom=False,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         nuclear_norm_weight=0.0,
         decoder_incoherence_weight=0.0,
     )
@@ -661,7 +659,7 @@ def test_per_atom_topologies_preserved():
 
 
 # ---------------------------------------------------------------------------
-# #609 — top_k must be within [1, k_atoms]; 0/None disable it.
+# #609 — top_k must be within [1, k_atoms]; None disables it.
 # ---------------------------------------------------------------------------
 def test_top_k_too_large_raises(monkeypatch):
     # Force the analytic-penalty payload (which would touch Rust) to a no-op so
@@ -672,11 +670,12 @@ def test_top_k_too_large_raises(monkeypatch):
         sae.sae_manifold_fit(X=x, K=2, top_k=5)
 
 
-def test_top_k_negative_raises(monkeypatch):
+@pytest.mark.parametrize("invalid_top_k", [-3, 0])
+def test_top_k_nonpositive_raises(monkeypatch, invalid_top_k):
     _no_row_block_probe(monkeypatch)
     x = np.random.default_rng(0).standard_normal((20, 3))
     with pytest.raises(ValueError, match=r"top_k must be in \[1, K=2\]"):
-        sae.sae_manifold_fit(X=x, K=2, top_k=-3)
+        sae.sae_manifold_fit(X=x, K=2, top_k=invalid_top_k)
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +690,7 @@ def test_ordered_beta_bernoulli_metadata_e2e(monkeypatch):
     baseline = dict(
         isometry_weight=0.0,
         ard_per_atom=False,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         nuclear_norm_weight=0.0,
         decoder_incoherence_weight=0.0,
     )
@@ -713,7 +712,7 @@ def test_mixed_basis_topology_e2e(monkeypatch):
         n_iter=2,
         isometry_weight=0.0,
         ard_per_atom=False,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         nuclear_norm_weight=0.0,
         decoder_incoherence_weight=0.0,
     )
@@ -733,7 +732,7 @@ def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
         n_iter=2,
         isometry_weight=0.0,
         ard_per_atom=False,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         nuclear_norm_weight=0.0,
         decoder_incoherence_weight=0.0,
     )
@@ -746,7 +745,7 @@ def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
         n_iter=2,
         isometry_weight=0.0,
         ard_per_atom=True,
-        gate_sparsity="l1",
+        coord_sparsity="l1",
         nuclear_norm_weight=0.0,
         decoder_incoherence_weight=0.0,
     )

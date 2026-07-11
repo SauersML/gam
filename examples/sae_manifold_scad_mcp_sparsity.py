@@ -1,7 +1,7 @@
 """Compare SCAD and MCP non-convex gate sparsity in manifold SAE fitting.
 
 The synthetic data contain three local mechanisms but the model is given five
-candidate atoms. ``gate_sparsity="scad"`` and ``"mcp"`` route the SAE row-block
+candidate atoms. ``coord_sparsity="scad"`` and ``"mcp"`` route the SAE row-block
 ScadMcp penalty through ``sae_manifold_fit`` and should concentrate assignment
 mass on the useful atoms while leaving redundant atoms mostly inactive.
 """
@@ -41,7 +41,7 @@ def main() -> None:
             d_atom=1,
             atom_topology="euclidean",
             assignment="ordered_beta_bernoulli",
-            gate_sparsity="scad",
+            coord_sparsity="scad",
             scad_mcp_gamma=3.7,
             sparsity_weight=1.2,
             n_iter=20,
@@ -53,7 +53,7 @@ def main() -> None:
             d_atom=1,
             atom_topology="euclidean",
             assignment="ordered_beta_bernoulli",
-            gate_sparsity="mcp",
+            coord_sparsity="mcp",
             scad_mcp_gamma=2.5,
             sparsity_weight=1.2,
             n_iter=20,

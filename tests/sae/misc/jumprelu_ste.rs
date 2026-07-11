@@ -1,32 +1,35 @@
-//! JumpReLU STE (straight-through estimator) numeric-vs-analytic agreement.
+//! Smooth-threshold numeric-vs-analytic agreement.
 //!
 //! These tests pin down the analytic value / gradient / HVP of
-//! `JumpReLUPenalty` against central-difference numerical references, which is
+//! `SmoothThresholdPenalty` against central-difference numerical references,
+//! which is
 //! exactly what the gamfit composition engine needs to remain trustworthy as a
-//! drop-in for outer-loop REML. Companion to the Python-side
-//! `gamfit.torch.JumpReLUPenalty` whose backward uses the same smoothed gate.
-//!
-//! Reference: Paulo et al. "Transcoders Beat Sparse Autoencoders for
-//! Interpretability." arXiv:2501.18823, 2025 — eq. 3 for the per-axis STE.
+//! drop-in for outer-loop REML. The scalar, gradient, and Hessian all describe
+//! the same smooth logistic threshold objective.
 
 use gam::terms::PsiSlice;
-use gam::terms::analytic_penalties::{AnalyticPenalty, JumpReLUPenalty};
+use gam::terms::analytic_penalties::{AnalyticPenalty, SmoothThresholdPenalty};
 use ndarray::Array1;
 
-fn build(thresholds: Vec<f64>, weight: f64, eps: f64, n_obs: usize) -> JumpReLUPenalty {
+fn build(
+    thresholds: Vec<f64>,
+    weight: f64,
+    eps: f64,
+    n_obs: usize,
+) -> SmoothThresholdPenalty {
     let d = thresholds.len();
     let slice = PsiSlice {
         range: 0..(n_obs * d),
         latent_dim: Some(d),
     };
-    JumpReLUPenalty::new(slice, Array1::from(thresholds), weight, eps)
-        .expect("JumpReLUPenalty::new")
+    SmoothThresholdPenalty::new(slice, Array1::from(thresholds), weight, eps)
+        .expect("SmoothThresholdPenalty::new")
 }
 
 /// Test 1 — analytic grad vs central-difference numeric grad, over a grid
 /// that straddles the threshold (so the STE smoothing zone matters).
 #[test]
-fn jumprelu_ste_grad_matches_numeric_central_difference() {
+fn smooth_threshold_grad_matches_numeric_central_difference() {
     let thresholds = vec![0.10, 0.25, 0.50];
     let d = thresholds.len();
     let n_obs = 7;
@@ -65,7 +68,7 @@ fn jumprelu_ste_grad_matches_numeric_central_difference() {
 
 /// Test 2 — analytic HVP vs central-difference of the analytic gradient.
 #[test]
-fn jumprelu_ste_hvp_matches_numeric_grad_diff() {
+fn smooth_threshold_hvp_matches_numeric_grad_diff() {
     let thresholds = vec![0.20, 0.40];
     let d = thresholds.len();
     let n_obs = 5;
@@ -106,7 +109,7 @@ fn jumprelu_ste_hvp_matches_numeric_grad_diff() {
 /// Test 3 — `grad_rho` matches central-difference w.r.t. the log-threshold
 /// parameter, validating the threshold-learning path that REML uses.
 #[test]
-fn jumprelu_ste_grad_rho_matches_numeric_threshold_difference() {
+fn smooth_threshold_grad_rho_matches_numeric_threshold_difference() {
     let thresholds = vec![0.15, 0.30, 0.45];
     let d = thresholds.len();
     let n_obs = 6;
@@ -142,11 +145,11 @@ fn jumprelu_ste_grad_rho_matches_numeric_threshold_difference() {
     }
 }
 
-/// Test 4 — limiting behaviour: as ε → 0, JumpReLU value tends to the true
+/// Test 4 — limiting behaviour: as ε → 0, the smooth value tends to the
 /// hard-threshold ``Σ τ · 1[z > τ]`` weighted by ``weight``. This pins the
 /// STE smoothing to a meaningful zero-limit.
 #[test]
-fn jumprelu_ste_value_converges_to_hard_threshold_as_eps_shrinks() {
+fn smooth_threshold_value_converges_to_hard_threshold_as_eps_shrinks() {
     let thresholds = vec![0.2, 0.6];
     let d = thresholds.len();
     let n_obs = 100;

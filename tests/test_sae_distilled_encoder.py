@@ -77,7 +77,7 @@ class _FakeModel:
     assignment = "softmax"
     tau = 1.0
     alpha = 1.0
-    jumprelu_threshold = 0.0
+    threshold_gate_threshold = 0.0
     _atom_dims = [1]
     _basis_kinds = ["euclidean"]
 

@@ -156,7 +156,7 @@ def build_payload() -> dict[str, Any]:
         "top_k": 2,
         "top_k_projection": {"kind": "reconstruction", "k": 2, "residual_ev": 0.12},
         "pre_topk": {"active_fraction": 0.66, "note": "pre-projection gate"},
-        "jumprelu_threshold": 0.15,
+        "threshold_gate_threshold": 0.15,
         "solver_plan": {"stages": ["seed", "refine"], "max_outer": 3},
         "dispersion": 1.07,
         "metric_provenance": "OutputFisherDownstream",
