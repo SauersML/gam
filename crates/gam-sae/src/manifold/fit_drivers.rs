@@ -6422,7 +6422,7 @@ impl SaeManifoldTerm {
                 term.retract_unit_speed_charts_in_loop()?;
                 term.fix_decoder_scale_gauge()?;
                 if term.frames_active() {
-                    term.refresh_active_frames_from_data(target).map_err(|err| {
+                    term.refresh_active_frames_from_data(target).map(drop).map_err(|err| {
                         format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
                     })?;
                 }
@@ -6509,7 +6509,7 @@ impl SaeManifoldTerm {
                         analytic_penalties,
                         obj_scale,
                         |term| {
-                            term.refresh_active_frames_from_data(target).map_err(|err| {
+                            term.refresh_active_frames_from_data(target).map(drop).map_err(|err| {
                                 format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
                             })
                         },
@@ -6705,7 +6705,7 @@ impl SaeManifoldTerm {
                 .refit_decoder_least_squares_at_current_state(target, Some(rho))
                 .and_then(|()| {
                     if frames {
-                        self.refresh_active_frames_from_data(target)
+                        self.refresh_active_frames_from_data(target).map(drop)
                             .map_err(|err| format!("sweep frame re-polar: {err}"))
                     } else {
                         Ok(())
@@ -6717,7 +6717,7 @@ impl SaeManifoldTerm {
                 })
                 .and_then(|()| {
                     if frames {
-                        self.refresh_active_frames_from_data(target)
+                        self.refresh_active_frames_from_data(target).map(drop)
                             .map_err(|err| format!("sweep frame re-polar: {err}"))
                     } else {
                         Ok(())
