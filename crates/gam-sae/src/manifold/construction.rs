@@ -1449,9 +1449,7 @@ impl SaeManifoldTerm {
             residual_gauge,
             incoherence_report: match reconstruction_dispersion.or(self.certificate_dispersion) {
                 Some(dispersion) => Some(dictionary_incoherence_report_with_dispersion(
-                    self,
-                    dispersion,
-                    fitted,
+                    self, dispersion, fitted,
                 )?),
                 None => None,
             },
@@ -3275,8 +3273,7 @@ impl SaeManifoldTerm {
                     let coordinate = if image.is_collapse_rescued() {
                         self.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
                         for output in 0..p {
-                            residual[output] = target[[row, output]]
-                                - full_curved[[row, output]]
+                            residual[output] = target[[row, output]] - full_curved[[row, output]]
                                 + mass * decoded[output];
                         }
                         image.coordinate_from_residual(&residual).ok_or_else(|| {

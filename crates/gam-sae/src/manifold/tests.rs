@@ -2089,7 +2089,10 @@ pub(crate) fn collapse_rescue_projection_matches_train_and_oos_and_refuses_targe
          within tol; max gap {max_gap:e}"
     );
     let ev = global_ev(target.view(), oos_recon.view());
-    assert!(ev > 0.95, "residual projection must recover the ramp; EV={ev:.4}");
+    assert!(
+        ev > 0.95,
+        "residual projection must recover the ramp; EV={ev:.4}"
+    );
 }
 
 /// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the

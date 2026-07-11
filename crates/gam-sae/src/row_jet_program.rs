@@ -40,20 +40,18 @@
 //! correctness proof of the hand kernel; disagreement names a dropped or
 //! sign-flipped cross block loudly. That oracle is the riding test below.
 
-use gam_math::jet_scalar::{JetScalar, Order1, Order2};
+use gam_math::jet_scalar::{
+    DynamicJetArena, DynamicOrder1, DynamicOrder2, FixedRuntimeJet, JetScalar, Order1, Order2,
+    RuntimeJetScalar,
+};
 use gam_math::jet_tower::Tower4;
 
 /// `1/self` for any [`JetScalar`] via Faà di Bruno on `f(u) = 1/u`
 /// (stack `[1/u, -1/u², 2/u³, -6/u⁴, 24/u⁵]`). Caller guarantees `self.value()`
 /// is nonzero — softmax denominators are strictly positive sums of exponentials.
 #[inline]
-fn recip<const K: usize, S: JetScalar<K>>(s: &S) -> S {
-    let u = s.value();
-    let u2 = u * u;
-    let u3 = u2 * u;
-    let u4 = u3 * u;
-    let u5 = u4 * u;
-    s.compose_unary([1.0 / u, -1.0 / u2, 2.0 / u3, -6.0 / u4, 24.0 / u5])
+fn recip<'arena, S: RuntimeJetScalar<'arena>>(s: &S) -> S {
+    s.recip()
 }
 
 /// Sentinel in [`SaeReconstructionRowProgram::coord_slot`] for an atom
@@ -110,20 +108,22 @@ impl AtomRowBasisJet {
     /// `axis` of this atom). A constant value plus first/second jet
     /// contributions — exactly the local Taylor model the production assembly
     /// consumes.
-    fn basis_tower<const K: usize, S: JetScalar<K>>(
+    fn basis_tower<'arena, S: RuntimeJetScalar<'arena>>(
         &self,
         basis_col: usize,
         coord_slots: &[usize],
+        dimension: usize,
+        workspace: &'arena S::Workspace,
     ) -> S {
         // The latent coordinate increments enter as the seeded tower variables;
         // the basis value at the current point is the constant term.
-        let mut acc = S::constant(self.phi[basis_col]);
+        let mut acc = S::constant(self.phi[basis_col], dimension, workspace);
         for axis in 0..self.latent_dim {
             let slot = coord_slots[axis];
             let d1 = self.d_phi[basis_col][axis];
             if d1 != 0.0 {
                 if slot != SAE_FIXED_COORD_SLOT {
-                    acc = acc.add(&S::variable(0.0, slot).scale(d1));
+                    acc = acc.add(&S::variable(0.0, slot, dimension, workspace).scale(d1));
                 }
             }
         }
@@ -134,7 +134,7 @@ impl AtomRowBasisJet {
             if slot_a == SAE_FIXED_COORD_SLOT {
                 continue;
             }
-            let va = S::variable(0.0, slot_a);
+            let va = S::variable(0.0, slot_a, dimension, workspace);
             for axis_b in 0..self.latent_dim {
                 let d2 = self.d2_phi[basis_col][axis_a][axis_b];
                 if d2 == 0.0 {
@@ -144,7 +144,7 @@ impl AtomRowBasisJet {
                 if slot_b == SAE_FIXED_COORD_SLOT {
                     continue;
                 }
-                let vb = S::variable(0.0, slot_b);
+                let vb = S::variable(0.0, slot_b, dimension, workspace);
                 acc = acc.add(&va.mul(&vb).scale(0.5 * d2));
             }
         }
@@ -152,18 +152,24 @@ impl AtomRowBasisJet {
     }
 
     /// `decoded_{k,c}(t)` as a tower: `Σ_b Φ_b(t)·B_{b,c}`.
-    fn decoded_tower<const K: usize, S: JetScalar<K>>(
+    fn decoded_tower<'arena, S: RuntimeJetScalar<'arena>>(
         &self,
         out_col: usize,
         coord_slots: &[usize],
+        dimension: usize,
+        workspace: &'arena S::Workspace,
     ) -> S {
-        let mut acc = S::constant(0.0);
+        let mut acc = S::constant(0.0, dimension, workspace);
         for basis_col in 0..self.n_basis() {
             let b = self.decoder[basis_col][out_col];
             if b == 0.0 {
                 continue;
             }
-            acc = acc.add(&self.basis_tower::<K, S>(basis_col, coord_slots).scale(b));
+            acc = acc.add(
+                &self
+                    .basis_tower::<S>(basis_col, coord_slots, dimension, workspace)
+                    .scale(b),
+            );
         }
         acc
     }

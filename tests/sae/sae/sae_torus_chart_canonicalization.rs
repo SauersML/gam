@@ -456,8 +456,11 @@ fn certificate_reports_torus_chart_pinned_by_canonicalization() {
         .expect("canonicalization pass");
     assert!(term.atoms[0].chart_canonicalized);
 
+    let fitted = term
+        .try_fitted_target_aware(z.view(), Some(&rho))
+        .expect("target-aware reconstruction");
     let report = term
-        .fit_diagnostics_report(None, false, None, None)
+        .fit_diagnostics_report(None, false, None, fitted.view(), None)
         .expect("diagnostics")
         .residual_gauge;
     let chart = report

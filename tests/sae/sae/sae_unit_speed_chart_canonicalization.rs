@@ -350,8 +350,11 @@ fn certificate_reports_chart_pinned_by_canonicalization_with_finite_group() {
     // (c) The residual-gauge certificate downgrades the atom's chart freedom
     // to the finite isometry group, with the canonicalization provenance —
     // distinct from curvature/penalty pinning.
+    let fitted = term
+        .try_fitted_target_aware(z.view(), Some(&rho))
+        .expect("target-aware reconstruction");
     let report = term
-        .fit_diagnostics_report(None, false, None, None)
+        .fit_diagnostics_report(None, false, None, fitted.view(), None)
         .expect("diagnostics")
         .residual_gauge;
     let chart = report

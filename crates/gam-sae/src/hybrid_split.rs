@@ -68,7 +68,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::chart_canonicalization::d1_atom_fitted_turning;
 use crate::manifold::{SaeManifoldAtom, solve_design_least_squares};
-use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+use gam_linalg::faer_ndarray::FaerSvd;
 use gam_solve::evidence::{
     HybridAtomCandidate, HybridAtomChoice, HybridSplitSelection, select_hybrid_split,
 };
@@ -937,8 +937,8 @@ fn slot_delta(
     for i in 0..n {
         let a = assign[i];
         let coord = if image.is_collapse_rescued() {
-            let residual = target_resid
-                .row(i)
+            let residual_row = target_resid.row(i);
+            let residual = residual_row
                 .as_slice()
                 .expect("target_resid row must be contiguous");
             image.coordinate_from_residual(residual).ok_or_else(|| {

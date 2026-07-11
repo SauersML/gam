@@ -531,8 +531,11 @@ fn certificate_reports_sphere_chart_pinned_by_canonicalization() {
         "the warped sphere chart must be pinned before the certificate check"
     );
 
+    let fitted = term
+        .try_fitted_target_aware(z.view(), Some(&rho))
+        .expect("target-aware reconstruction");
     let report = term
-        .fit_diagnostics_report(None, false, None, None)
+        .fit_diagnostics_report(None, false, None, fitted.view(), None)
         .expect("diagnostics")
         .residual_gauge;
     let chart = report

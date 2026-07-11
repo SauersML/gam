@@ -307,12 +307,18 @@ fn replicate_fits_agree_up_to_exactly_the_reported_gauge() {
 
     // ---- residual-gauge certificates (production lowering, Euclidean, no
     // isometry pin: the smallest honest scope) ------------------------------
+    let fitted_a = term_a
+        .try_fitted_target_aware(z.view(), None)
+        .expect("replicate A target-aware reconstruction");
+    let fitted_b = term_b
+        .try_fitted_target_aware(z_b.view(), None)
+        .expect("replicate B target-aware reconstruction");
     let report_a = term_a
-        .fit_diagnostics_report(None, false, None, None)
+        .fit_diagnostics_report(None, false, None, fitted_a.view(), None)
         .expect("replicate A diagnostics")
         .residual_gauge;
     let report_b = term_b
-        .fit_diagnostics_report(None, false, None, None)
+        .fit_diagnostics_report(None, false, None, fitted_b.view(), None)
         .expect("replicate B diagnostics")
         .residual_gauge;
 

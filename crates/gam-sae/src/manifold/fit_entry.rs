@@ -1086,8 +1086,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             // Recompute `fitted` from the projected assignments through the
             // SHARED collapse-aware assembler so the hard top-k projection
             // composes with the #1026 hybrid collapse (#1233).
-            fitted = term
-                .reconstruct_from_assignments_target_aware(z.view(), assignments.view())?;
+            fitted =
+                term.reconstruct_from_assignments_target_aware(z.view(), assignments.view())?;
             // #1232 — projected-model penalized loss: the reconstruction data-fit
             // recomputed on the projected `fitted`, with the decoder/ρ penalties
             // carried over unchanged (the top-k gate touches assignments, not the
