@@ -57,7 +57,9 @@ pub struct RingClusterCheckpoint {
 
 #[derive(Clone, Debug)]
 pub enum RingClusterError {
-    InvalidInput { message: String },
+    InvalidInput {
+        message: String,
+    },
     NumericalFailure {
         message: String,
         checkpoint: Option<RingClusterCheckpoint>,
@@ -78,11 +80,18 @@ pub enum RingClusterError {
 impl std::fmt::Display for RingClusterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidInput { message } => write!(formatter, "invalid ring-cluster model: {message}"),
-            Self::NumericalFailure { message, checkpoint } => write!(
+            Self::InvalidInput { message } => {
+                write!(formatter, "invalid ring-cluster model: {message}")
+            }
+            Self::NumericalFailure {
+                message,
+                checkpoint,
+            } => write!(
                 formatter,
                 "ring-cluster numerical failure: {message} (checkpoint iterations {})",
-                checkpoint.as_ref().map_or(0, |state| state.completed_iterations)
+                checkpoint
+                    .as_ref()
+                    .map_or(0, |state| state.completed_iterations)
             ),
             Self::MonotonicityViolation {
                 previous_mean_log_likelihood,
@@ -171,10 +180,7 @@ impl RingClusterFit {
         component_means(self.center, self.radius, self.angles.view())
     }
 
-    pub fn per_point_log_density(
-        &self,
-        data: ArrayView2<'_, f64>,
-    ) -> Result<Array1<f64>, String> {
+    pub fn per_point_log_density(&self, data: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
         validate_scoring_data(data)?;
         let (mean_log_likelihood, _, per_point) = expectation(
             data,
@@ -193,10 +199,7 @@ impl RingClusterFit {
 
     /// Rank-aware Laplace negative log evidence using the observed empirical
     /// Fisher information at the certified constrained-mixture fixed point.
-    pub fn laplace_negative_log_evidence(
-        &self,
-        data: ArrayView2<'_, f64>,
-    ) -> Result<f64, String> {
+    pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
         if data.nrows() != self.n_obs || fingerprint(data) != self.data_fingerprint {
             return Err(
                 "ring-cluster Laplace evidence must be evaluated on the exact data whose certified EM fixed point is stored in this fit"
@@ -258,8 +261,7 @@ impl RingClusterFit {
         for row in 0..data.nrows() {
             score.fill(0.0);
             for component in 0..k.saturating_sub(1) {
-                score[component] =
-                    responsibilities[[row, component]] - self.weights[component];
+                score[component] = responsibilities[[row, component]] - self.weights[component];
             }
             let mut variance_score = 0.0_f64;
             for component in 0..k {
@@ -270,16 +272,12 @@ impl RingClusterFit {
                 score[center_base + 1] += responsibility * dy / self.variance;
                 let cosine = self.angles[component].cos();
                 let sine = self.angles[component].sin();
-                score[radius_index] += responsibility
-                    * self.radius
-                    * (dx * cosine + dy * sine)
-                    / self.variance;
-                score[angle_base + component] += responsibility
-                    * self.radius
-                    * (-dx * sine + dy * cosine)
-                    / self.variance;
-                variance_score += responsibility
-                    * (-1.0 + (dx * dx + dy * dy) / (2.0 * self.variance));
+                score[radius_index] +=
+                    responsibility * self.radius * (dx * cosine + dy * sine) / self.variance;
+                score[angle_base + component] +=
+                    responsibility * self.radius * (-dx * sine + dy * cosine) / self.variance;
+                variance_score +=
+                    responsibility * (-1.0 + (dx * dx + dy * dy) / (2.0 * self.variance));
             }
             score[variance_index] = variance_score;
             for a in 0..p {
@@ -401,16 +399,17 @@ fn run_em(
             message,
             checkpoint: Some(current.clone()),
         })?;
-        let responsibilities = responsibilities.ok_or_else(|| {
-            RingClusterError::NumericalFailure {
+        let responsibilities =
+            responsibilities.ok_or_else(|| RingClusterError::NumericalFailure {
                 message: "ring-cluster E-step did not return responsibilities".to_string(),
                 checkpoint: Some(current.clone()),
-            }
-        })?;
-        let mut proposal = maximization(data, responsibilities.view(), &current, config)
-            .map_err(|message| RingClusterError::NumericalFailure {
-                message,
-                checkpoint: Some(current.clone()),
+            })?;
+        let mut proposal =
+            maximization(data, responsibilities.view(), &current, config).map_err(|message| {
+                RingClusterError::NumericalFailure {
+                    message,
+                    checkpoint: Some(current.clone()),
+                }
             })?;
         let (next_mean_log_likelihood, _, _) = expectation(
             data,
@@ -454,9 +453,7 @@ fn run_em(
             parameter_residual,
             parameter_tolerance: config.parameter_tol,
         };
-        if objective_residual <= config.loglik_tol
-            && parameter_residual <= config.parameter_tol
-        {
+        if objective_residual <= config.loglik_tol && parameter_residual <= config.parameter_tol {
             return Ok(RingClusterFit {
                 weights: current.weights,
                 center: current.center,
@@ -513,8 +510,7 @@ fn maximization(
         config.parameter_tol,
         config.max_iter,
     )?;
-    let angles = angles_from_points(centroids.view(), center)
-        .map_err(|error| error.to_string())?;
+    let angles = angles_from_points(centroids.view(), center).map_err(|error| error.to_string())?;
     let means = component_means(center, radius, angles.view());
     let mut squared_error = 0.0_f64;
     for row in 0..n {
@@ -558,13 +554,16 @@ fn expectation(
     let weight_sum = weights.sum();
     if !weight_sum.is_finite()
         || (weight_sum - 1.0).abs() > f64::EPSILON.sqrt() * weights.len() as f64
-        || weights.iter().any(|weight| !weight.is_finite() || *weight <= 0.0)
+        || weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight <= 0.0)
     {
         return Err("ring-cluster weights must be a finite positive simplex".to_string());
     }
     let means = component_means(center, radius, angles);
     let k = weights.len();
-    let mut responsibilities = want_responsibilities.then(|| Array2::<f64>::zeros((data.nrows(), k)));
+    let mut responsibilities =
+        want_responsibilities.then(|| Array2::<f64>::zeros((data.nrows(), k)));
     let mut per_point = Array1::<f64>::zeros(data.nrows());
     let log_normalizer = -(LOG_TAU + variance.ln());
     let mut terms = vec![0.0_f64; k];
@@ -573,14 +572,19 @@ fn expectation(
         for component in 0..k {
             let dx = data[[row, 0]] - means[[component, 0]];
             let dy = data[[row, 1]] - means[[component, 1]];
-            terms[component] = weights[component].ln() + log_normalizer
-                - (dx * dx + dy * dy) / (2.0 * variance);
+            terms[component] =
+                weights[component].ln() + log_normalizer - (dx * dx + dy * dy) / (2.0 * variance);
             maximum = maximum.max(terms[component]);
         }
         if !maximum.is_finite() {
-            return Err(format!("ring-cluster row {row} has no finite component density"));
+            return Err(format!(
+                "ring-cluster row {row} has no finite component density"
+            ));
         }
-        let sum_exp = terms.iter().map(|term| (*term - maximum).exp()).sum::<f64>();
+        let sum_exp = terms
+            .iter()
+            .map(|term| (*term - maximum).exp())
+            .sum::<f64>();
         let log_density = maximum + sum_exp.ln();
         if !log_density.is_finite() {
             return Err(format!("ring-cluster row {row} log density is not finite"));
@@ -604,7 +608,9 @@ fn fit_weighted_circle(
     max_iterations: usize,
 ) -> Result<([f64; 2], f64), String> {
     if points.ncols() != 2 || points.nrows() < 3 || points.nrows() != weights.len() {
-        return Err("weighted circle fit requires matching k×2 points and k>=3 weights".to_string());
+        return Err(
+            "weighted circle fit requires matching k×2 points and k>=3 weights".to_string(),
+        );
     }
     let (mut center, mut radius) = match initial {
         Some(value) => value,
@@ -638,7 +644,11 @@ fn fit_weighted_circle(
                 }
             }
         }
-        let gradient_norm = gradient.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let gradient_norm = gradient
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
         if gradient_norm <= tolerance * gradient_scale {
             return Ok((center, radius));
         }
@@ -712,8 +722,7 @@ fn circle_objective(
 ) -> Result<f64, String> {
     let mut objective = 0.0_f64;
     for row in 0..points.nrows() {
-        let distance = (center[0] - points[[row, 0]])
-            .hypot(center[1] - points[[row, 1]]);
+        let distance = (center[0] - points[[row, 0]]).hypot(center[1] - points[[row, 1]]);
         let residual = distance - radius;
         objective += 0.5 * weights[row] * residual * residual;
     }
@@ -731,8 +740,7 @@ fn solve_three_by_three(matrix: [[f64; 3]; 3], rhs: [f64; 3]) -> Result<[f64; 3]
         .map(|value| value.abs())
         .fold(0.0_f64, f64::max)
         .max(1.0);
-    if !determinant.is_finite()
-        || determinant.abs() <= f64::EPSILON.sqrt() * scale * scale * scale
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON.sqrt() * scale * scale * scale
     {
         return Err("weighted circle normal matrix is rank deficient".to_string());
     }
@@ -775,11 +783,7 @@ fn angles_from_points(
     Ok(angles)
 }
 
-fn component_means(
-    center: [f64; 2],
-    radius: f64,
-    angles: ArrayView1<'_, f64>,
-) -> Array2<f64> {
+fn component_means(center: [f64; 2], radius: f64, angles: ArrayView1<'_, f64>) -> Array2<f64> {
     let mut means = Array2::<f64>::zeros((angles.len(), 2));
     for component in 0..angles.len() {
         means[[component, 0]] = center[0] + radius * angles[component].cos();
@@ -802,16 +806,13 @@ fn parameter_map_residual(
         );
         for dimension in 0..2 {
             residual = residual.max(
-                (proposal_means[[component, dimension]]
-                    - current_means[[component, dimension]])
+                (proposal_means[[component, dimension]] - current_means[[component, dimension]])
                     .abs()
                     / (1.0 + current_means[[component, dimension]].abs()),
             );
         }
     }
-    residual.max(
-        (proposal.variance - current.variance).abs() / (1.0 + current.variance.abs()),
-    )
+    residual.max((proposal.variance - current.variance).abs() / (1.0 + current.variance.abs()))
 }
 
 fn validate_problem(
@@ -819,8 +820,7 @@ fn validate_problem(
     k: usize,
     config: GaussianMixtureConfig,
 ) -> Result<(), RingClusterError> {
-    validate_scoring_data(data)
-        .map_err(|message| RingClusterError::InvalidInput { message })?;
+    validate_scoring_data(data).map_err(|message| RingClusterError::InvalidInput { message })?;
     if k < 3 || k > data.nrows() {
         return Err(RingClusterError::InvalidInput {
             message: format!("ring-cluster order must satisfy 3 <= k <= n; got k={k}"),
@@ -885,7 +885,9 @@ fn fingerprint(data: ArrayView2<'_, f64>) -> DataFingerprint {
     let mut lane_b = 0x1319_8A2E_0370_7344_u64;
     for (index, value) in data.iter().enumerate() {
         let bits = value.to_bits();
-        lane_a ^= bits.wrapping_add(index as u64).rotate_left((index % 63) as u32);
+        lane_a ^= bits
+            .wrapping_add(index as u64)
+            .rotate_left((index % 63) as u32);
         lane_a = lane_a.wrapping_mul(0x9E37_79B1_85EB_CA87);
         lane_b ^= bits.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         lane_b = lane_b.rotate_left(29).wrapping_add(lane_a);
@@ -898,12 +900,7 @@ fn fingerprint(data: ArrayView2<'_, f64>) -> DataFingerprint {
     }
 }
 
-fn likelihood_roundoff(
-    n: usize,
-    k: usize,
-    previous: f64,
-    next: f64,
-) -> f64 {
+fn likelihood_roundoff(n: usize, k: usize, previous: f64, next: f64) -> f64 {
     let operations = n.saturating_mul(k).saturating_mul(8).max(1) as f64;
     let product = operations * f64::EPSILON;
     let gamma = if product < 1.0 {
@@ -924,8 +921,8 @@ mod tests {
             let angle = std::f64::consts::TAU * component as f64 / k as f64;
             for within in 0..per_cluster {
                 let row = component * per_cluster + within;
-                let offset = (within as f64 - (per_cluster as f64 - 1.0) / 2.0)
-                    / per_cluster as f64;
+                let offset =
+                    (within as f64 - (per_cluster as f64 - 1.0) / 2.0) / per_cluster as f64;
                 data[[row, 0]] = 1.25 + 3.0 * angle.cos() + 0.08 * offset;
                 data[[row, 1]] = -0.75 + 3.0 * angle.sin() - 0.05 * offset;
             }
@@ -939,10 +936,18 @@ mod tests {
         let fit = fit_ring_cluster(data.view(), 7, GaussianMixtureConfig::default())
             .expect("ring-cluster fit");
         assert_eq!(fit.num_free_parameters(), 17);
-        assert!(fit.radius() > 2.9 && fit.radius() < 3.1, "radius={}", fit.radius());
+        assert!(
+            fit.radius() > 2.9 && fit.radius() < 3.1,
+            "radius={}",
+            fit.radius()
+        );
         assert!(fit.certificate().objective_residual <= fit.certificate().objective_tolerance);
         assert!(fit.certificate().parameter_residual <= fit.certificate().parameter_tolerance);
-        assert!(fit.laplace_negative_log_evidence(data.view()).unwrap().is_finite());
+        assert!(
+            fit.laplace_negative_log_evidence(data.view())
+                .unwrap()
+                .is_finite()
+        );
     }
 
     #[test]
@@ -955,8 +960,11 @@ mod tests {
             RingClusterError::DidNotConverge { checkpoint, .. } => checkpoint,
             other => panic!("expected typed exhaustion, got {other}"),
         };
-        let resumed = resume_ring_cluster(data.view(), GaussianMixtureConfig::default(), checkpoint)
-            .expect("resume reaches fixed point");
-        assert!(resumed.certificate().parameter_residual <= resumed.certificate().parameter_tolerance);
+        let resumed =
+            resume_ring_cluster(data.view(), GaussianMixtureConfig::default(), checkpoint)
+                .expect("resume reaches fixed point");
+        assert!(
+            resumed.certificate().parameter_residual <= resumed.certificate().parameter_tolerance
+        );
     }
 }

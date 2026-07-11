@@ -50,6 +50,7 @@ pub mod rho_prior_eval;
 pub mod residual_cascade;
 pub mod rho_optimizer;
 pub mod rho_uncertainty;
+pub mod ring_cluster;
 // The `#[macro_export]` error-bail macros live in `gam-problem` (its crate
 // root). Importing `bail_invalid_estim` here makes `crate::bail_invalid_estim!`
 // resolve at every gam-solve call site exactly as it did when these macros
@@ -83,6 +84,10 @@ pub use evidence::{
     fit_ring_gaussian_mixture, fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp,
     laplace_evidence, resume_gaussian_mixture, resume_stacking_weights, select_topology,
     solve_stacking_weights, union_per_point_log_density, union_responsibility_split,
+};
+pub use ring_cluster::{
+    RingClusterCertificate, RingClusterCheckpoint, RingClusterError, RingClusterFit,
+    fit_ring_cluster, resume_ring_cluster,
 };
 pub use topology_selector::{
     AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, EvidenceCertification, Headline,
