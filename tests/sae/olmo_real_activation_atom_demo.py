@@ -249,8 +249,13 @@ def main() -> int:
     # real-LLM verdict is trustworthy. Falls back to the local Python replica
     # only if an older wheel lacks the symbol (and says so loudly).
     if hasattr(gamfit, "adjudicate_atom_shape"):
+        assignments = np.asarray(fit.assignments, dtype=float)
+        mean_l0 = float(np.count_nonzero(assignments, axis=1).mean())
         v = gamfit.adjudicate_atom_shape(
-            np.ascontiguousarray(coords), folds=5, seed=args.seed + 11
+            np.ascontiguousarray(coords),
+            folds=5,
+            seed=args.seed + 11,
+            mean_l0=mean_l0,
         )
         winner = v["winner"]
         best_k = v["mixture_k"]

@@ -208,13 +208,19 @@ def group_coords_2d(codes: np.ndarray, members: np.ndarray, W_dec: np.ndarray,
 
 def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
     verdicts = []
+    mean_l0 = float(np.count_nonzero(codes, axis=1).mean())
     for gi, members in enumerate(groups):
         coords = group_coords_2d(codes, members, W_dec, max_rows, seed + gi)
         if coords is None:
             log(f"  group {gi:3d} ({members.size} feats): too few active rows, skipped")
             continue
         try:
-            v = gamfit.adjudicate_atom_shape(coords, folds=5, seed=seed + 11 + gi)
+            v = gamfit.adjudicate_atom_shape(
+                coords,
+                folds=5,
+                seed=seed + 11 + gi,
+                mean_l0=mean_l0,
+            )
         except Exception as exc:  # noqa: BLE001
             log(f"  group {gi:3d}: adjudication error: {exc}")
             continue
@@ -228,6 +234,17 @@ def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
             "mixture_k": int(v["mixture_k"]),
             "headline": v["headline"],
             "stacking_weights": dict(zip(v["candidate_names"], v["stacking_weights"])),
+            "dictionary_mean_l0": float(v["dictionary_mean_l0"]),
+            "control_false_circle_floor": float(v["control_false_circle_floor"]),
+            "matched_controls": {
+                name: {
+                    "winner": control["winner"],
+                    "circle_wins": bool(control["circle_wins"]),
+                    "circle_margin": float(control["circle_margin"]),
+                    "mixture_k": int(control["mixture_k"]),
+                }
+                for name, control in v["matched_controls"].items()
+            },
         }
         verdicts.append(rec)
         log(f"  group {gi:3d} ({members.size:3d} feats, {coords.shape[0]:4d} rows): "
@@ -358,6 +375,12 @@ def main() -> int:
     # --- Honest report ----------------------------------------------------
     n_adj = len(verdicts)
     n_circle = sum(1 for v in verdicts if v["circle_wins"])
+    control_verdicts = [
+        control
+        for verdict in verdicts
+        for control in verdict["matched_controls"].values()
+    ]
+    n_control_circle = sum(1 for control in control_verdicts if control["circle_wins"])
     n_curved_strong = sum(1 for v in verdicts if v["circle_wins"] and v["circle_margin"] > 0.05)
     from collections import Counter
     by_winner = Counter(v["winner"].split("(")[0].split("_k")[0] for v in verdicts)
@@ -366,6 +389,11 @@ def main() -> int:
         "n_candidate_groups": len(groups),
         "n_adjudicated": n_adj,
         "n_circle_wins": n_circle,
+        "n_control_circle_wins": n_control_circle,
+        "n_control_verdicts": len(control_verdicts),
+        "control_false_circle_rate": (
+            n_control_circle / len(control_verdicts) if control_verdicts else None
+        ),
         "n_curved_strong_margin>0.05": n_curved_strong,
         "winner_breakdown": dict(by_winner),
         "verdicts": verdicts,
@@ -380,6 +408,10 @@ def main() -> int:
     print(f"winner breakdown: {dict(by_winner)}")
     print(f"circle (curved) wins: {n_circle}/{n_adj}"
           + (f" ({100*n_circle/n_adj:.0f}%)" if n_adj else ""))
+    print(f"matched-control circle wins: {n_control_circle}/{len(control_verdicts)}"
+          + (f" ({100*n_control_circle/len(control_verdicts):.0f}%), "
+             f"dictionary mean_L0={sae_stats['mean_l0']:.1f}"
+             if control_verdicts else ""))
     print(f"strongly-curved (margin>0.05): {n_curved_strong}/{n_adj}")
     if n_adj == 0:
         print("FINDING: no group could be adjudicated (degenerate group geometry).")
