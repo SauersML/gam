@@ -246,23 +246,28 @@ pub fn measure_atom_transport_between(
 
     let m = physical_decoder.nrows();
     let n_harmonics = m.saturating_sub(1) / 2;
-    // The smooth alternative fits `K = 2H + 1` Fourier coefficients; it needs at
-    // least `K + 1` grid points to be determined (and the phase test needs a
-    // non-degenerate grid).
-    let k_smooth = 2 * (2 * n_harmonics + 1).max(grid_resolution / 16) + 1;
-    if grid_resolution < k_smooth + 1 {
-        return Err(format!(
-            "measure_atom_transport: grid_resolution {grid_resolution} is too small for a \
-             {n_harmonics}-harmonic smooth fit (need at least {} points)",
-            k_smooth + 1
-        ));
+    if grid_resolution == 0 {
+        return Err("measure_atom_transport: grid_resolution must be positive".to_string());
     }
 
-    // Evaluate the standard full-width harmonic basis at the requested SOURCE
-    // report samples.  These samples do not serve as target candidates.
+    // Reporting density and diagnostic-fit density are independent.  The
+    // caller may deliberately request a very coarse report, while the smooth
+    // alternative still needs more source evaluations than coefficients.  Use
+    // the smallest multiple of the requested density that identifies the fit;
+    // this keeps every requested report point exactly on the diagnostic grid.
+    let alt_harmonics = (2 * n_harmonics + 1).max(grid_resolution / 16);
+    let smooth_coefficient_count = 2 * alt_harmonics + 1;
+    let required_fit_samples = smooth_coefficient_count + 1;
+    let diagnostic_multiplier = required_fit_samples.div_ceil(grid_resolution).max(1);
+    let diagnostic_resolution = grid_resolution
+        .checked_mul(diagnostic_multiplier)
+        .ok_or_else(|| "measure_atom_transport: diagnostic grid size overflow".to_string())?;
+
+    // Evaluate the standard full-width harmonic basis on the diagnostic SOURCE
+    // grid.  These samples do not serve as target candidates.
     let basis = ChartBasisKind::Periodic { n_harmonics };
-    let grid = Array2::<f64>::from_shape_fn((grid_resolution, 1), |(g, _)| {
-        g as f64 / grid_resolution as f64
+    let grid = Array2::<f64>::from_shape_fn((diagnostic_resolution, 1), |(g, _)| {
+        g as f64 / diagnostic_resolution as f64
     });
     if basis.width() != m {
         return Err(format!(
@@ -270,9 +275,9 @@ pub fn measure_atom_transport_between(
             basis.width()
         ));
     }
-    let mut phi_grid = Array2::<f64>::zeros((grid_resolution, m));
+    let mut phi_grid = Array2::<f64>::zeros((diagnostic_resolution, m));
     let mut phi = vec![0.0; m];
-    for g in 0..grid_resolution {
+    for g in 0..diagnostic_resolution {
         basis.eval_into(grid[[g, 0]], &mut phi);
         for column in 0..m {
             phi_grid[[g, column]] = phi[column];
@@ -289,7 +294,7 @@ pub fn measure_atom_transport_between(
     // companion-eigenvalue projections are embarrassingly parallel.
     let linear_all = source_image.dot(&b_tgt.t()); // G × M
     use rayon::prelude::*;
-    let tprime: Vec<f64> = (0..grid_resolution)
+    let tprime: Vec<f64> = (0..diagnostic_resolution)
         .into_par_iter()
         .map(|g| {
             let linear = linear_all.row(g);
@@ -304,13 +309,14 @@ pub fn measure_atom_transport_between(
             Ok(projection.coordinate)
         })
         .collect::<Result<Vec<f64>, String>>()?;
-    let t_arr: Vec<f64> = (0..grid_resolution)
-        .map(|g| g as f64 / grid_resolution as f64)
+    let t_arr: Vec<f64> = (0..diagnostic_resolution)
+        .map(|g| g as f64 / diagnostic_resolution as f64)
         .collect();
-    let transport_grid: Vec<(f64, f64)> = t_arr
-        .iter()
-        .zip(tprime.iter())
-        .map(|(&t, &tp)| (t, tp))
+    let transport_grid: Vec<(f64, f64)> = (0..grid_resolution)
+        .map(|g| {
+            let diagnostic_index = g * diagnostic_multiplier;
+            (t_arr[diagnostic_index], tprime[diagnostic_index])
+        })
         .collect();
 
     // The smooth ALTERNATIVE's Fourier order is deliberately HIGHER than the
@@ -328,7 +334,6 @@ pub fn measure_atom_transport_between(
     // θ+0.8·sinθ arm: R² 0.86 at H=11, 0.90 at H=16, 0.95 at H=31), so the
     // alternative uses the larger of the curve-derived 2H+1 and grid/16 —
     // still ≥8× oversampled (K = 2·alt+1 coefficients vs grid points).
-    let alt_harmonics = (2 * n_harmonics + 1).max(grid_resolution / 16);
     let (phase_shift, phase_r2, smooth_r2) = fit_transport_law(&t_arr, &tprime, alt_harmonics);
     let drift = decoder_drift(&b_src, &b_tgt);
     let principal_angles = principal_angles_between_images(&b_src, &b_tgt)?;

@@ -1038,7 +1038,12 @@ impl SaeManifoldTerm {
                 grad_norm,
                 saw_refine_progress,
             );
-            if total_inner_iter >= refine_limit + budget_escalation_extra {
+            let effective_refine_limit = refine_limit
+                .checked_add(budget_escalation_extra)
+                .ok_or_else(|| {
+                    "SaeManifoldTerm::reml_criterion: inner-refinement budget overflow".to_string()
+                })?;
+            if total_inner_iter >= effective_refine_limit {
                 // #2234 stall synthesis — one PROGRESS-GATED budget escalation.
                 // Two prior designs collide here: the #2080 wide-p hang fix makes
                 // budget-limited solves refuse fast, and #2241 maps that refusal
@@ -1054,12 +1059,24 @@ impl SaeManifoldTerm {
                 // solve still refuses immediately — exactly the #2080 hang
                 // protection — and a second budget death refuses regardless.
                 if saw_refine_progress && budget_escalation_extra == 0 {
-                    budget_escalation_extra = refine_limit.max(1);
+                    let escalation_window = refine_limit.max(1);
+                    // `refine_iteration_limit` is dynamic and may return a
+                    // ceiling below the iterations already consumed.  Carry
+                    // that overshoot into the extension before adding the one
+                    // progress window; otherwise the subtraction below can
+                    // underflow immediately after escalation.
+                    budget_escalation_extra = total_inner_iter
+                        .saturating_sub(refine_limit)
+                        .checked_add(escalation_window)
+                        .ok_or_else(|| {
+                            "SaeManifoldTerm::reml_criterion: escalated inner-refinement budget overflow"
+                                .to_string()
+                        })?;
                     log::debug!(
                         "SaeManifoldTerm::reml_criterion: budget escalation at fixed ρ — \
                          ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) still descending after \
                          {total_inner_iter} inner iterations; granting one extra window of \
-                         {budget_escalation_extra} iterations"
+                         {escalation_window} iterations"
                     );
                 } else {
                     // Inner solve did not converge in reml_criterion; the returned
@@ -1080,8 +1097,17 @@ impl SaeManifoldTerm {
                     ));
                 }
             }
-            let refine_limit = refine_limit + budget_escalation_extra;
-            let remaining = refine_limit - total_inner_iter;
+            let refine_limit = refine_limit
+                .checked_add(budget_escalation_extra)
+                .ok_or_else(|| {
+                    "SaeManifoldTerm::reml_criterion: inner-refinement budget overflow".to_string()
+                })?;
+            let remaining = refine_limit.checked_sub(total_inner_iter).ok_or_else(|| {
+                format!(
+                    "SaeManifoldTerm::reml_criterion: inner-refinement accounting mismatch \
+                     ({total_inner_iter} iterations consumed past limit {refine_limit})"
+                )
+            })?;
             let refine_iter = inner_max_iter.max(1).min(remaining);
             saw_refine_progress |=
                 Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
