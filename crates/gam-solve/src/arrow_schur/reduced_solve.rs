@@ -4992,9 +4992,16 @@ pub(crate) fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         ));
     }
 
-    let mut maybe_device = a.clone();
-    if gam_gpu::try_cholesky_lower_inplace(&mut maybe_device).is_some() {
-        return Ok(maybe_device);
+    // Only clone for the device attempt when a GPU is actually selected;
+    // `try_cholesky_lower_inplace` returns `None` on every CPU-only host, so the
+    // former unconditional `k×k` clone (≈32 MB at the SAE border) was pure waste
+    // on the CPU path that now dominates. `cuda_selected()` is a cheap policy +
+    // runtime-presence probe.
+    if gam_gpu::cuda_selected() {
+        let mut maybe_device = a.clone();
+        if gam_gpu::try_cholesky_lower_inplace(&mut maybe_device).is_some() {
+            return Ok(maybe_device);
+        }
     }
 
     // CPU fast path (#1017): at the SAE border width the reduced Schur is a

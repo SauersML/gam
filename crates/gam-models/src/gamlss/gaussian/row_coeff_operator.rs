@@ -820,12 +820,13 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let xi_ls = fast_av(self.x_ls.as_ref(), &d_beta_flat.slice(s![pmu..total]));
         let directional = gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
         let c_mm = directional.0;
+        let c_ml = directional.1;
         let c_ll = directional.2;
-        // Fisher cross block ≡ 0 (μ ⊥ σ; #684), so its directional derivative is
-        // identically 0 — matching the dense
-        // `exact_newton_joint_hessian_directional_derivative_from_designs`, which
-        // likewise does not assemble `directional.1`.
-        let c_ml = Array1::<f64>::zeros(c_mm.len());
+        // The value workspace carries the observed cross block H_{μ,ls}=2κm.
+        // Its directional derivative is therefore the observed `directional.1`
+        // channel too. Dropping it here made the operator-valued outer gradient
+        // differentiate the old Fisher block (cross ≡ 0) while the LAML value
+        // factorized the observed Hessian — an objective/gradient split (#1561).
         Ok(Some(Arc::new(make_two_block_row_coeff_operator(
             self.xmu.clone(),
             self.x_ls.clone(),
@@ -881,11 +882,11 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let directional =
             gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximu_v, &xi_ls_v);
         let c_mm = directional.0;
+        let c_ml = directional.1;
         let c_ll = directional.2;
-        // Fisher cross block ≡ 0 (μ ⊥ σ; #684); its second directional
-        // derivative is identically 0 too — match the dense path (which does not
-        // assemble `directional.1`).
-        let c_ml = Array1::<f64>::zeros(c_mm.len());
+        // Same observed-curvature contract at fourth order: the operator must
+        // carry d²(2κm)[u,v], exactly as the dense path does. Otherwise the
+        // analytic outer Hessian is not the second derivative of its value.
         Ok(Some(Arc::new(make_two_block_row_coeff_operator(
             self.xmu.clone(),
             self.x_ls.clone(),
