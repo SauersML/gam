@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, overload
+from typing import Any, NamedTuple, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
@@ -24,10 +24,6 @@ from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
-
-if TYPE_CHECKING:
-    from ._sae_manifold import ManifoldSAE
-
 
 @dataclass(frozen=True, slots=True)
 class SharedPrecisionGroup:
@@ -689,15 +685,6 @@ def _suggest_kwarg_typo(fn: Any) -> Any:
 
 @overload
 def fit(
-    activations: Any,
-    formula: None = ...,
-    *,
-    config: Mapping[str, Any] | None = ...,
-) -> ManifoldSAE: ...
-
-
-@overload
-def fit(
     data: Any,
     formula: str,
     *,
@@ -782,7 +769,7 @@ def fit(
 
 def fit(
     data: Any,
-    formula: str | None = None,
+    formula: str,
     *,
     family: str = "auto",
     offset: str | None = None,
@@ -818,13 +805,13 @@ def fit(
     penalties: Sequence[Any] | None = None,
     smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
-) -> Model | ResponseGeometryModel | ManifoldSAE:
-    """Fit a GAM model, or fit SAE activations when ``formula`` is omitted.
+) -> Model | ResponseGeometryModel:
+    """Fit a GAM model from a formula and tabular data.
 
-    ``gamfit.fit(data, formula, ...)`` keeps the formula-first GAM API.
-    ``gamfit.fit(activations, config=...)`` dispatches to the SAE research-loop
-    API and returns an explicit :class:`ManifoldSAE` handle. New activations are
-    featurized with ``model.featurize(X)`` on that handle.
+    Manifold sparse autoencoders have their own explicit
+    :func:`gamfit.sae_manifold_fit` front door.  Keeping the two fit contracts
+    separate prevents a missing formula from silently selecting an unrelated
+    model family.
 
     Parameters
     ----------
@@ -1032,12 +1019,11 @@ def fit(
 
     Returns
     -------
-    Model or ResponseGeometryModel or MultinomialModel or ManifoldSAE
+    Model or ResponseGeometryModel or MultinomialModel
         A fitted scalar GAM :class:`Model` by default. When
         ``response_geometry`` is supplied, returns a
         :class:`ResponseGeometryModel`; when ``family`` requests the
-        multinomial/softmax path, returns a :class:`MultinomialModel`. When
-        ``formula`` is omitted, returns a model-scoped :class:`ManifoldSAE`.
+        multinomial/softmax path, returns a :class:`MultinomialModel`.
 
     Raises
     ------
@@ -1052,55 +1038,6 @@ def fit(
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
-    if formula is None:
-        formula_only = {
-            "family": family,
-            "offset": offset,
-            "weights": weights,
-            "transformation_normal": transformation_normal,
-            "transformation_normal_stage1": transformation_normal_stage1,
-            "survival_likelihood": survival_likelihood,
-            "baseline_target": baseline_target,
-            "baseline_scale": baseline_scale,
-            "baseline_shape": baseline_shape,
-            "baseline_rate": baseline_rate,
-            "baseline_makeham": baseline_makeham,
-            "z_column": z_column,
-            "link": link,
-            "logslope_formula": logslope_formula,
-            "frailty_kind": frailty_kind,
-            "frailty_sd": frailty_sd,
-            "hazard_loading": hazard_loading,
-            "scale_dimensions": scale_dimensions,
-            "adaptive_regularization": adaptive_regularization,
-            "firth": firth,
-            "noise_formula": noise_formula,
-            "noise_offset": noise_offset,
-            "flexible_link": flexible_link,
-            "precision_hyperpriors": precision_hyperpriors,
-            "constraints": constraints,
-            "response_geometry": response_geometry,
-            "response_columns": response_columns,
-            "response_coordinates": response_coordinates,
-            "response_reference": response_reference,
-            "fisher_rao_w": fisher_rao_w,
-            "latents": latents,
-            "penalties": penalties,
-            "smooths": smooths,
-        }
-        active_formula_kwargs = [
-            name for name, value in formula_only.items()
-            if value is not None and not (name == "family" and value == "auto")
-        ]
-        if active_formula_kwargs:
-            raise TypeError(
-                "gamfit.fit requires formula='...' when formula-model kwargs are supplied: "
-                + ", ".join(active_formula_kwargs)
-            )
-        from ._sae_manifold import fit as _sae_research_fit
-
-        return _sae_research_fit(data, config=config)
-
     if constraints:
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);

@@ -4740,7 +4740,8 @@ impl Default for CurlConfig {
 /// valid likelihood score and therefore aborts the search. The shard
 /// fold is a no-op: the candidate is fixed across the stream (a predictable
 /// plug-in), and each shard contributes its held-out reconstruction
-/// likelihood-ratio against the honestly-refit null sup.
+/// likelihood-ratio against the null state that `null_fit` independently refits
+/// on that shard to obtain the honest constrained supremum.
 pub fn run_structure_search_rounds(
     mut term: SaeManifoldTerm,
     mut rho: SaeManifoldRho,
@@ -4748,6 +4749,11 @@ pub fn run_structure_search_rounds(
     config: RoundDriverConfig,
     ledger: &mut StructureLedger,
     mut candidate_fit: impl FnMut(
+        SaeManifoldTerm,
+        SaeManifoldRho,
+        &[usize],
+    ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String>,
+    mut null_fit: impl FnMut(
         SaeManifoldTerm,
         SaeManifoldRho,
         &[usize],
@@ -4890,11 +4896,15 @@ pub fn run_structure_search_rounds(
                 // Refit the restructured candidate on the estimation rows only.
                 candidate_fit(cand_term, cand_rho, &estimation_rows)
             },
-            |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
+            |state: &State, shard: &RowBlockShard| {
+                let (null_term, _null_rho) =
+                    null_fit(state.0.clone(), state.1.clone(), &shard.rows)?;
+                eval_log_lik(&null_term, shard)
+            },
             |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
             // No-op fold: the candidate is the fixed predictable plug-in across
             // the held-out stream.
-            |state: State, _: &RowBlockShard| state,
+            |state: State, _: &RowBlockShard| Ok(state),
         )?;
 
         let (next_term, next_rho) = outcome.state;
@@ -5434,24 +5444,27 @@ fn flatten_candidates(term: &SaeManifoldTerm) -> Vec<usize> {
 /// Per-row Gaussian reconstruction log-likelihood of a shard under the current
 /// (restructured, possibly shard-refit) state. The gate's evaluation statistic;
 /// the engine guarantees a shard is evaluated strictly before it is folded in.
-fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
+fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Result<f64, String> {
     // The fitted reconstruction at the shard's held-out rows, scored against the
     // full target. The term's per-row routing/basis covers all N rows, so the
     // reconstruction at a held-out row is the model's prediction for it.
-    let fitted = match term.try_fitted_target_aware(shard.target.view(), None) {
-        Ok(f) => f,
-        Err(_) => return f64::NEG_INFINITY,
-    };
+    let fitted = term.try_fitted_target_aware(shard.target.view(), None)?;
     let n_full = fitted.nrows();
     let p = fitted.ncols();
     if p != shard.target.ncols() || n_full != shard.target.nrows() {
-        return f64::NEG_INFINITY;
+        return Err(format!(
+            "structure-search fitted shape {:?} does not match target {:?}",
+            fitted.dim(),
+            shard.target.dim()
+        ));
     }
     let mut sse = 0.0_f64;
     let mut count = 0usize;
     for &row in &shard.rows {
         if row >= n_full {
-            continue;
+            return Err(format!(
+                "structure-search evaluation row {row} is out of range for {n_full} rows"
+            ));
         }
         for out in 0..p {
             let d = fitted[[row, out]] - shard.target[[row, out]];
@@ -5460,7 +5473,7 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
         count += p;
     }
     if count == 0 {
-        return f64::NEG_INFINITY;
+        return Err("structure-search evaluation shard must contain rows".to_string());
     }
     // Gaussian log-lik up to the additive constant that cancels in every
     // e-value ratio: −½·SSE (unit dispersion). The gate forms differences of
@@ -5482,7 +5495,7 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
     // gate decision (the unit test alone never touched this path).
     let gate_evidence = gate_block_log_evidence(term, shard);
 
-    reconstruction + gate_evidence
+    Ok(reconstruction + gate_evidence?)
 }
 
 /// The deterministic Pólya–Gamma gate-block marginal log-evidence of the
@@ -5496,23 +5509,31 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
 /// `gam_inference::pg_gate_evidence::pg_gate_evidence`, summed over atoms,
 /// so the K-dependent `−½·d_g·log(2π)` normalizer enters the gate's split-LR.
 ///
-/// A degenerate/non-PD gate block contributes `0` (no gate evidence) rather than
-/// poisoning the reconstruction likelihood — a conservative, valid degradation.
-fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
+/// An undefined or non-PD gate block is a fit failure. It cannot be omitted
+/// without changing the model-selection scalar, so the error is propagated.
+fn gate_block_log_evidence(
+    term: &SaeManifoldTerm,
+    shard: &RowBlockShard,
+) -> Result<f64, String> {
     use gam_solve::inference::pg_gate_evidence::{GateBlock, pg_gate_evidence};
 
     let logits = &term.assignment.logits;
     let n_full = logits.nrows();
     let k = logits.ncols();
     if k == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     // Restrict to the shard's held-out rows; an empty / out-of-range shard
     // carries no gate evidence.
-    let rows: Vec<usize> = shard.rows.iter().copied().filter(|&r| r < n_full).collect();
+    if let Some(row) = shard.rows.iter().copied().find(|&row| row >= n_full) {
+        return Err(format!(
+            "gate-block evidence row {row} is out of range for {n_full} rows"
+        ));
+    }
+    let rows: Vec<usize> = shard.rows.clone();
     let m = rows.len();
     if m == 0 {
-        return 0.0;
+        return Err("gate-block evidence shard must contain rows".to_string());
     }
 
     // Unit gate design (one gate coordinate per atom) and a unit ridge gate
@@ -5528,7 +5549,9 @@ fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64
         for (i, &row) in rows.iter().enumerate() {
             let logit = logits[[row, atom]];
             if !logit.is_finite() {
-                return 0.0;
+                return Err(format!(
+                    "gate-block evidence encountered non-finite logit at row {row}, atom {atom}"
+                ));
             }
             psi[i] = logit;
             // Binarized activation: the gate is ON when its logit is positive.
@@ -5544,15 +5567,14 @@ fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64
             hess_rest: None,
             h_rest: None,
         };
-        match pg_gate_evidence(&block) {
-            // `neg_log_evidence` is `−log p(gate block)`; the log-likelihood the
-            // split-LR consumes is its negation.
-            Ok(ev) => total -= ev.neg_log_evidence,
-            // A non-PD / degenerate gate block contributes no evidence.
-            Err(_) => return 0.0,
-        }
+        let evidence = pg_gate_evidence(&block).map_err(|error| {
+            format!("gate-block evidence failed for atom {atom}: {error}")
+        })?;
+        // `neg_log_evidence` is `−log p(gate block)`; the log-likelihood the
+        // split-LR consumes is its negation.
+        total -= evidence.neg_log_evidence;
     }
-    total
+    Ok(total)
 }
 
 #[inline]
@@ -5634,7 +5656,11 @@ pub fn run_production_structure_search(
     };
     let full_iters = refit_params.inner_max_iter;
     let full_target_score = target.to_owned();
+    let full_target_null = target.to_owned();
     let full_target_polish = target.to_owned();
+    let candidate_refit = refit_at;
+    let null_refit = refit_at;
+    let final_refit = refit_at;
     run_structure_search_rounds(
         term,
         rho,
@@ -5644,11 +5670,23 @@ pub fn run_production_structure_search(
         // Per-candidate scoring refit. It must converge before the held-out
         // likelihood is evaluated.
         move |cand_term, cand_rho, estimation_rows| {
-            refit_at(
+            candidate_refit(
                 full_target_score.view(),
                 cand_term,
                 cand_rho,
                 estimation_rows,
+                full_iters,
+            )
+        },
+        // Honest constrained null supremum: refit the current K-atom state on
+        // exactly the shard being scored. Under-fitting this side would inflate
+        // the e-value.
+        move |null_term, null_rho, shard_rows| {
+            null_refit(
+                full_target_null.view(),
+                null_term,
+                null_rho,
+                shard_rows,
                 full_iters,
             )
         },
@@ -5669,7 +5707,7 @@ pub fn run_production_structure_search(
         // the RETURNED dictionary and must fit every row it will be evaluated on.
         move |adopted_term, adopted_rho, _estimation_rows| {
             let all_rows: Vec<usize> = (0..n).collect();
-            refit_at(
+            final_refit(
                 full_target_polish.view(),
                 adopted_term,
                 adopted_rho,
@@ -7304,6 +7342,7 @@ mod tests {
                 config,
                 &mut ledger,
                 |t, r, _| Ok((t, r)),
+                |t, r, _| Ok((t, r)),
                 // No-op polish: this determinism oracle scripts the gate and
                 // never runs the SAE inner solve.
                 |t, r, _| Ok((t, r)),
@@ -7601,8 +7640,8 @@ mod tests {
 
         // The gate-block contribution alone (private helper the live
         // `eval_log_lik` adds in): the corrected normalizer is reachable here.
-        let null_gate = gate_block_log_evidence(&null_term, &shard);
-        let cand_gate = gate_block_log_evidence(&cand_term, &shard);
+        let null_gate = gate_block_log_evidence(&null_term, &shard).unwrap();
+        let cand_gate = gate_block_log_evidence(&cand_term, &shard).unwrap();
         assert!(
             null_gate.is_finite() && cand_gate.is_finite(),
             "gate-block evidence must be finite on a well-posed gate block"
@@ -7628,7 +7667,7 @@ mod tests {
             // between candidate and null of THAT isolates everything except the
             // one extra normalizer.
             let dg = term.k_atoms() as f64; // one gate coordinate per atom
-            gate_block_log_evidence(term, &shard) + 0.5 * dg * log_2pi
+            gate_block_log_evidence(term, &shard).unwrap() + 0.5 * dg * log_2pi
         };
         let no_norm_delta = per_atom_no_norm(&cand_term) - per_atom_no_norm(&null_term);
         let normalizer_in_delta = gate_delta - no_norm_delta;
@@ -7645,7 +7684,7 @@ mod tests {
 
         // And the full production statistic carries it: the gate-block evidence
         // is a real, finite addend on top of the reconstruction likelihood.
-        let full = eval_log_lik(&cand_term, &shard);
+        let full = eval_log_lik(&cand_term, &shard).unwrap();
         let recon_only = {
             // Reconstruction-only baseline (what the path returned BEFORE the
             // wiring): −½·SSE over the shard rows.
@@ -8096,6 +8135,7 @@ mod tests {
                 target.view(),
                 config,
                 &mut ledger,
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| Ok((t, r)),
                 |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| Ok((t, r)),
                 |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| Ok((t, r)),
             )

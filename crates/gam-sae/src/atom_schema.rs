@@ -1,35 +1,52 @@
 //! Canonical SAE token schema (issue #2236): the vocabulary for basis kinds,
 //! topology labels, assignment families, and flat-block gating modes, plus the
-//! ingestion-time `n_harmonics` repair and the structural chart periods.
+//! strict harmonic metadata validation and the structural chart periods.
 //!
 //! Moved verbatim from `gam-pyffi`'s coercion module so the vocabulary is
 //! owned by the library: the CLI, Rust callers, and the Python binding all
 //! parse and emit the same tokens, and the binding is marshalling only.
 
-/// Repair stale/degenerate periodic `n_harmonics` at ingestion (#1132/N), the
-/// shared core of the `sae_canonical_n_harmonics` pyfunction and the
-/// `from_fit_payload` builder. A periodic-family atom's basis width is
-/// `M = 2H + 1` with `H >= 1`; a stored `H <= 0` is floored to `max(1, (M-1)/2)`
-/// from the trained decoder width. Non-periodic atoms (and periodic atoms whose
-/// `H` is already positive) pass through. Callers guarantee equal-length slices.
-pub fn canonical_n_harmonics(
+/// Validate harmonic metadata emitted by a native fit. A periodic atom has
+/// width `M = 2H + 1` with `H >= 1`; malformed metadata is an error rather than
+/// a load-time repair. Non-periodic atom metadata passes through unchanged.
+pub fn validated_n_harmonics(
     basis_kinds: &[String],
     raw_n_harmonics: &[i64],
     decoder_widths: &[i64],
-) -> Vec<i64> {
-    basis_kinds
+) -> Result<Vec<i64>, String> {
+    if basis_kinds.len() != raw_n_harmonics.len()
+        || basis_kinds.len() != decoder_widths.len()
+    {
+        return Err(format!(
+            "harmonic metadata length mismatch: basis_kinds={}, n_harmonics={}, decoder_widths={}",
+            basis_kinds.len(),
+            raw_n_harmonics.len(),
+            decoder_widths.len()
+        ));
+    }
+    let mut validated = Vec::with_capacity(basis_kinds.len());
+    for (atom, ((basis, &harmonics), &width)) in basis_kinds
         .iter()
         .zip(raw_n_harmonics)
         .zip(decoder_widths)
-        .map(|((bk, &h), &width)| {
-            let kind = canon_name(bk);
-            if matches!(kind.as_str(), "periodic" | "periodic_spline" | "circle") && h <= 0 {
-                ((width - 1) / 2).max(1)
-            } else {
-                h
+        .enumerate()
+    {
+        if canonical_basis_kind(basis) == "periodic" {
+            if harmonics < 1 {
+                return Err(format!(
+                    "periodic atom {atom} requires n_harmonics >= 1; got {harmonics}"
+                ));
             }
-        })
-        .collect()
+            let expected_width = 2 * harmonics + 1;
+            if width != expected_width {
+                return Err(format!(
+                    "periodic atom {atom} has decoder width {width}, but n_harmonics={harmonics} requires {expected_width}"
+                ));
+            }
+        }
+        validated.push(harmonics);
+    }
+    Ok(validated)
 }
 
 /// Case-insensitive, `-`/`_`-interchangeable SAE name normalizer.
@@ -163,5 +180,22 @@ pub fn topology_for_bases(bases: &[String]) -> Option<String> {
         Some(first.clone())
     } else {
         Some("mixed".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validated_n_harmonics;
+
+    #[test]
+    fn periodic_harmonic_metadata_is_strict() {
+        let basis = vec!["periodic".to_string()];
+        assert_eq!(
+            validated_n_harmonics(&basis, &[2], &[5]).expect("valid periodic metadata"),
+            vec![2]
+        );
+        assert!(validated_n_harmonics(&basis, &[0], &[5]).is_err());
+        assert!(validated_n_harmonics(&basis, &[2], &[7]).is_err());
+        assert!(validated_n_harmonics(&basis, &[2, 1], &[5]).is_err());
     }
 }

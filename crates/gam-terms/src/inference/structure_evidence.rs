@@ -468,8 +468,10 @@ impl AtomBirthGate {
 ///   null REFIT on this shard (any fitter; this side must genuinely
 ///   maximize over H0 on the shard, an under-maximized null inflates the
 ///   e-value and voids validity).
-/// - `refit_alternative(alt, shard)`: fold the shard into the alternative
-///   (warm-started production fit, GPU, anything — zero conditions).
+/// - `refit_alternative(alt, shard)`: fold the shard into the alternative.
+///
+/// All three operations are fallible. An undefined likelihood or non-converged
+/// refit aborts the gate; it is never converted into neutral evidence.
 ///
 /// `initial_alternative` is the K+1 fit from data BEFORE the stream (or a
 /// prior-driven init; validity never depends on its quality — a bad init
@@ -502,17 +504,17 @@ pub fn run_atom_birth_gate<S, A>(
     alpha: f64,
     initial_alternative: A,
     shards: impl IntoIterator<Item = S>,
-    mut alternative_log_lik: impl FnMut(&A, &S) -> f64,
-    mut null_sup_log_lik: impl FnMut(&S) -> f64,
-    mut refit_alternative: impl FnMut(A, &S) -> A,
+    mut alternative_log_lik: impl FnMut(&A, &S) -> Result<f64, String>,
+    mut null_sup_log_lik: impl FnMut(&S) -> Result<f64, String>,
+    mut refit_alternative: impl FnMut(A, &S) -> Result<A, String>,
 ) -> Result<(AtomBirthGate, A), String> {
     let mut gate = AtomBirthGate::new(alpha)?;
     let mut alt = initial_alternative;
     for shard in shards {
-        let log_lik_alt = alternative_log_lik(&alt, &shard);
-        let log_lik_null = null_sup_log_lik(&shard);
+        let log_lik_alt = alternative_log_lik(&alt, &shard)?;
+        let log_lik_null = null_sup_log_lik(&shard)?;
         gate.try_absorb_shard(log_lik_alt, log_lik_null)?;
-        alt = refit_alternative(alt, &shard);
+        alt = refit_alternative(alt, &shard)?;
     }
     Ok((gate, alt))
 }
@@ -1272,9 +1274,9 @@ mod tests {
             0.05,
             0usize, // alt state = number of shards folded into the fit
             0..n_shards,
-            |_, _| -99.5, // prefit alternative log-lik on the shard
-            |_| -100.0,   // honest null sup on the shard
-            |folded, _| folded + 1,
+            |_, _| Ok(-99.5), // prefit alternative log-lik on the shard
+            |_| Ok(-100.0),   // honest null sup on the shard
+            |folded, _| Ok(folded + 1),
         )
         .expect("valid alpha");
 

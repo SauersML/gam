@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use gam_math::probability::beta_quantile;
+use gam_problem::topology_certificates::CertificateLedger;
 use gam_problem::{EstimationError, MetricProvenance};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
@@ -42,8 +43,9 @@ use gam_terms::inference::structure_evidence::StructureLedger;
 use crate::structure_harvest;
 
 use super::{
-    AssignmentMode, SaeManifoldFitDiagnostics, SaeManifoldLoss, SaeManifoldOuterObjective,
-    SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty, SaeTrustDiagnostics,
+    AssignmentMode, CoordinateFidelityCertificate, SaeManifoldFitDiagnostics, SaeManifoldLoss,
+    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination,
+    SaeShapeUncertainty, SaeTrustDiagnostics, TopologyPersistenceCertificate,
 };
 
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.
@@ -211,6 +213,8 @@ pub struct SaeFitReport {
     pub fit_diagnostics: SaeManifoldFitDiagnostics,
     /// Consistency of the fitted native encoder with the converged latent solve.
     pub amortized_encoder_consistency: AmortizedEncoderConsistency,
+    /// Unified conservative certificate ledger assembled from this fit's reports.
+    pub certificate_ledger: CertificateLedger,
     /// Serialized per-round structure-search ledger (#997) as a JSON string;
     /// `None` when the search did not run (skipped by K ceiling or
     /// `run_structure_search == false`).
@@ -1065,6 +1069,17 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         Some(assignments.view()),
     )?;
     let amortized_encoder_consistency = term.amortized_encoder_consistency(z.view(), &rho)?;
+    let mut certificate_ledger = CertificateLedger::new();
+    certificate_ledger.record(&fit_diagnostics.residual_gauge);
+    certificate_ledger.record(&CoordinateFidelityCertificate::new(
+        &fit_diagnostics.coordinate_fidelity,
+    ));
+    certificate_ledger.record(&TopologyPersistenceCertificate::new(
+        &fit_diagnostics.topology_persistence,
+    ));
+    if let Some(report) = &fit_diagnostics.incoherence_report {
+        certificate_ledger.record(report);
+    }
 
     let active_mask: Vec<bool> = (0..k_atoms)
         .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
@@ -1120,6 +1135,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         trust_diagnostics,
         fit_diagnostics,
         amortized_encoder_consistency,
+        certificate_ledger,
         structure_search_json,
         structure_certificate_json,
         reported_log_alpha,

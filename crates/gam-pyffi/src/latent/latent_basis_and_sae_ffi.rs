@@ -1100,10 +1100,7 @@ fn multinomial_model_metadata_pyfunc<'py>(
     out.set_item("p_per_class", envelope.saved.p_per_class)?;
     out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
     out.set_item("training_headers", envelope.saved.training_headers.clone())?;
-    out.set_item(
-        "training_table_kind",
-        &envelope.saved.training_table_kind,
-    )?;
+    out.set_item("training_table_kind", &envelope.saved.training_table_kind)?;
     out.set_item("lambdas", envelope.saved.lambdas.clone())?;
     out.set_item(
         "lambdas_per_block",
@@ -1755,9 +1752,11 @@ fn sae_manifold_fit_inner<'py>(
     };
     let (n_obs, p_out) = z_view.dim();
     let k_atoms = atom_dim.len();
-    // Preserve the seed dictionary size for variable-K payload plan recovery.
-    let seed_k_atoms = k_atoms;
-
+    let max_atom_dim = atom_dim
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| py_value_error("sae_manifold_fit: atom_dim is empty".to_string()))?;
     // Registry descriptor parsing remains boundary marshalling because the JSON
     // descriptor builder lives above gam-sae. Every seed decision after this
     // point is owned by the typed gam-sae entry.
@@ -1765,7 +1764,7 @@ fn sae_manifold_fit_inner<'py>(
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
         "t".into(),
-        serde_json::json!({"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}),
+        serde_json::json!({"name": "t", "n": n_obs, "d": max_atom_dim}),
     );
     latent_blocks.insert(
         "beta".into(),
@@ -1882,6 +1881,7 @@ fn sae_manifold_fit_inner<'py>(
         trust_diagnostics,
         fit_diagnostics,
         amortized_encoder_consistency,
+        certificate_ledger,
         structure_search_json,
         structure_certificate_json,
         reported_log_alpha,
@@ -2029,7 +2029,10 @@ fn sae_manifold_fit_inner<'py>(
     // Distinct scalars with distinct semantics: the ordinary penalized loss and
     // the terminal penalized quasi-Laplace criterion are never conflated.
     sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
-    out.set_item("penalized_quasi_laplace_criterion", penalized_quasi_laplace_criterion)?;
+    out.set_item(
+        "penalized_quasi_laplace_criterion",
+        penalized_quasi_laplace_criterion,
+    )?;
     out.set_item("log_alpha", reported_log_alpha)?;
     // Persist the terminal native smoothing coordinates verbatim.
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth.clone())?;
@@ -2099,10 +2102,7 @@ fn sae_manifold_fit_inner<'py>(
         "unconverged_fraction",
         amortized_encoder_consistency.unconverged_fraction,
     )?;
-    cotrain.set_item(
-        "n_unconverged",
-        amortized_encoder_consistency.n_unconverged,
-    )?;
+    cotrain.set_item("n_unconverged", amortized_encoder_consistency.n_unconverged)?;
     cotrain.set_item("n_encodes", amortized_encoder_consistency.n_encodes)?;
     out.set_item("cotrain", cotrain)?;
     if let Some(report) = &fit_diagnostics.incoherence_report {
@@ -2137,149 +2137,22 @@ fn sae_manifold_fit_inner<'py>(
             &fit_diagnostics.topology_persistence,
         )?,
     )?;
-    // #16 — ONE coherent certificate ledger. Every certificate this fit produced
-    // implements the shared claim+evidence+conservative-verdict contract
-    // ([`gam::inference::certificates::Certificate`]); the ledger folds them into
-    // a single inspectable block keyed by claim id, with a top-level conservative
-    // `overall` roll-up (the weakest member). The detailed feature reports above
-    // remain first-class because they carry per-atom coordinates, generators,
-    // and measurements that the generic ledger intentionally does not encode;
-    // the ledger is the canonical cross-certificate verdict surface. Verdicts
-    // cannot read stronger than their evidence: an absent or below-margin
-    // certificate is `unavailable` / `insufficient`, never a silent pass.
-    {
-        use gam::inference::certificates::CertificateLedger;
-        let mut ledger = CertificateLedger::new();
-        ledger.record(&fit_diagnostics.residual_gauge);
-        let coordinate_fidelity_certificate =
-            gam::terms::sae::manifold::CoordinateFidelityCertificate::new(
-                &fit_diagnostics.coordinate_fidelity,
-            );
-        ledger.record(&coordinate_fidelity_certificate);
-        let topology_persistence_certificate =
-            gam::terms::sae::manifold::TopologyPersistenceCertificate::new(
-                &fit_diagnostics.topology_persistence,
-            );
-        ledger.record(&topology_persistence_certificate);
-        if let Some(report) = &fit_diagnostics.incoherence_report {
-            ledger.record(report);
-        }
-        out.set_item("certificates", certificate_ledger_dict(py, &ledger)?)?;
-    }
-    // #977 — VARIABLE-K `atom_plans`, emitted from the POST-search dictionary so
-    // its length matches the returned `atoms` exactly (the python `from_payload`
-    // boundary zips `payload["atoms"]` with `plans[atom_idx]`, so a length
-    // mismatch from a grown K would IndexError). Each plan is re-derived from the
-    // fitted atom: `kind` + `latent_dim` straight off the atom, `basis_size` from
-    // its Φ width, `n_harmonics` recovered from the basis size for the harmonic
-    // families, and `duchon_centers` inherited from the seed template (a
-    // structure-search-born atom clones atom 0's basis, so it carries the seed
-    // template's centers). This REPLACES the old post-hoc seed-K plan list that
-    // `sae_manifold_fit_minimal` attached after the fact — that list was pinned
-    // at the input K and was exactly the plumbing constraint the #997 comment
-    // cited for disabling births; emitting the plans here makes variable K
-    // first-class with no truncation or padding.
+    out.set_item(
+        "certificates",
+        certificate_ledger_dict(py, &certificate_ledger)?,
+    )?;
+    let fitted_atom_plans = sae_fitted_atom_plans(&term, atom_centers, seed_refine_random_state)
+        .map_err(py_value_error)?;
     let atom_plans_py = PyList::empty(py);
-    for (atom_idx, atom) in term.atoms.iter().enumerate() {
+    for plan in fitted_atom_plans {
         let entry = PyDict::new(py);
-        let kind = &atom.basis_kind;
-        let latent_dim = atom.latent_dim;
-        // #2135 — report the FULL inner-basis width `M` (== `basis_size` for an
-        // un-reduced atom, `Q.nrows()` for a #1117 rank-reduced one). This MUST
-        // match the re-expanded `M × p` decoder emitted above and the standard
-        // inner basis the OOS / reconstruct paths rebuild; emitting the reduced
-        // `r` here (with the full decoder) would desync the `n_harmonics` /
-        // `basis_size` round-trip from the decoder width.
-        let basis_size = atom.full_basis_size();
-        let kind_name = sae_atom_basis_kind_name(kind);
-        // Recover the per-(axis-)harmonic order from the fitted basis width for
-        // the harmonic families; 0 for the non-harmonic kinds (the python reader
-        // only consults `n_harmonics` for periodic/torus atoms). The harmonic
-        // order is floored at 1 for the harmonic kinds: a periodic/torus atom is
-        // by construction at least one harmonic (basis width 2H+1 with H>=1), and
-        // a degenerate collapse to a constant-only width (basis_size <= 2) would
-        // otherwise re-emit n_harmonics=0 — which the round-trip rebuild
-        // (`sae_build_periodic_atom`, `sae_build_torus_atom`) rejects as a
-        // non-positive harmonic order, breaking K>=4 reload/OOS reconstruct.
-        let n_harmonics = match kind {
-            SaeAtomBasisKind::Periodic => (basis_size.saturating_sub(1) / 2).max(1),
-            SaeAtomBasisKind::Torus => {
-                // basis_size = (2H+1)^latent_dim; recover the per-axis 2H+1, then H.
-                let axis_m = sae_torus_axis_basis_size(basis_size, latent_dim.max(1))
-                    .map_err(py_value_error)?;
-                (axis_m.saturating_sub(1) / 2).max(1)
-            }
-            _ => 0,
-        };
-        entry.set_item("kind", kind_name)?;
-        entry.set_item("latent_dim", latent_dim)?;
-        entry.set_item("n_harmonics", n_harmonics)?;
-        entry.set_item("basis_size", basis_size)?;
-        // Born atoms (index ≥ seed K) inherit atom 0's basis template, so they
-        // carry the seed template's Duchon centers (None for a periodic template).
-        let center_src = atom_idx.min(seed_k_atoms.saturating_sub(1));
-        match atom_centers.get(center_src).and_then(|c| c.as_ref()) {
-            Some(centers) => {
-                entry.set_item("duchon_centers", centers.clone().into_pyarray(py))?;
-            }
-            None => {
-                // #357 — a structure-search BIRTH races a heterogeneous topology
-                // (`race_birth_topology`): a circle seed can grow a EuclideanPatch
-                // (monomial-patch line) / Linear / Poincaré atom. When the SEED
-                // template carried no Duchon centers (periodic/sphere/torus seed),
-                // that born monomial atom would inherit `None` here and then the OOS
-                // round-trip (`sae_manifold_predict_oos`) would reject it with "atom
-                // N (Duchon-like) needs duchon_centers", breaking `converged_latents`,
-                // `project`, and `reconstruct` on any held-out matrix.
-                //
-                // A monomial-patch atom (EuclideanPatch / Linear / Poincaré) is
-                // CENTERLESS for the OOS rebuild: that path reads only
-                // `centers.ncols()` (the build dimension, equal to `latent_dim`) to
-                // recover the monomial degree from the trained decoder width — the
-                // center COORDINATES are never consulted (cf.
-                // `build_sae_basis_evaluators`, where only the genuine `Duchon` kernel
-                // reads center content). But the SAME `duchon_centers` field also
-                // feeds the python `_functional_basis_params` diagnostic, which builds
-                // a Duchon KERNEL design (`duchon_basis_with_jet`) that needs enough
-                // real center ROWS to leave a non-empty radial block — a 1-row
-                // placeholder degenerates it. So derive the centers from the atom's
-                // OWN converged on-atom coordinates (the honest analogue of the seed
-                // path, which subsamples the PCA-seeded coords): correct `ncols` for
-                // the OOS rebuild AND real rows for the kernel diagnostic. Births
-                // never produce a genuine Duchon kernel atom, so a Duchon-kind atom
-                // here keeps `None` and its missing-centers error still surfaces.
-                let needs_centerless_patch = matches!(
-                    kind,
-                    SaeAtomBasisKind::EuclideanPatch
-                        | SaeAtomBasisKind::Linear
-                        | SaeAtomBasisKind::Poincare
-                );
-                if needs_centerless_patch {
-                    let coords = term.assignment.coords[atom_idx].as_matrix();
-                    let n_rows = coords.nrows();
-                    let dim = latent_dim.max(1);
-                    // Mirror the seed-path center budget (`sae_build_atom_plans`):
-                    // a handful of rows is plenty for the monomial patch (ncols is
-                    // what the OOS rebuild reads) and gives the kernel diagnostic a
-                    // non-degenerate radial block. Deterministic subsample keyed by
-                    // the atom index so reloads are reproducible.
-                    let center_floor = (dim + 2).max(8);
-                    let n_centers = n_rows.min(center_floor.max(8)).max(dim + 1).min(n_rows);
-                    // No `random_state` in this entry point's scope (the precomputed-
-                    // basis fit takes its seed jitter elsewhere); key the deterministic
-                    // subsample purely on the atom index so a reload is reproducible.
-                    let idx = sae_pick_duchon_center_indices(n_rows, n_centers, atom_idx as u64);
-                    let mut centers = Array2::<f64>::zeros((idx.len().max(1), dim));
-                    for (out_row, src_row) in idx.iter().copied().enumerate() {
-                        for col in 0..dim.min(coords.ncols()) {
-                            centers[[out_row, col]] = coords[[src_row, col]];
-                        }
-                    }
-                    entry.set_item("duchon_centers", centers.into_pyarray(py))?;
-                } else {
-                    entry.set_item("duchon_centers", py.None())?;
-                }
-            }
+        entry.set_item("kind", sae_atom_basis_kind_name(&plan.kind))?;
+        entry.set_item("latent_dim", plan.latent_dim)?;
+        entry.set_item("n_harmonics", plan.n_harmonics)?;
+        entry.set_item("basis_size", plan.basis_size)?;
+        match plan.duchon_centers {
+            Some(centers) => entry.set_item("duchon_centers", centers.into_pyarray(py))?,
+            None => entry.set_item("duchon_centers", py.None())?,
         }
         atom_plans_py.append(entry)?;
     }
@@ -2342,9 +2215,8 @@ fn sae_trust_diagnostics_dict<'py>(
 
 /// Build the result-dict entry for the two-score per-atom lens
 /// ([`gam::inference::atom_lens::AtomTwoLensReport`]). Per-atom presence /
-/// coupling / discrepancy arrays plus the coupling provenance string. Coupling /
-/// coupling_normalized / discrepancy are `NaN` for atoms whose behavioral axis is
-/// unavailable (Euclidean / no-harvest provenance), mirroring the Rust `None`.
+/// coupling / discrepancy arrays plus the coupling provenance string. Optional
+/// native values remain Python ``None`` when the behavioral axis is unavailable.
 fn sae_atom_two_lens_dict<'py>(
     py: Python<'py>,
     report: &gam::inference::atom_lens::AtomTwoLensReport,
@@ -2360,9 +2232,9 @@ fn sae_atom_two_lens_dict<'py>(
         names.append(atom.name.clone())?;
         presence.push(atom.presence);
         presence_norm.push(atom.presence_normalized);
-        coupling.push(atom.coupling.unwrap_or(f64::NAN));
-        coupling_norm.push(atom.coupling_normalized.unwrap_or(f64::NAN));
-        discrepancy.push(atom.discrepancy.unwrap_or(f64::NAN));
+        coupling.push(atom.coupling);
+        coupling_norm.push(atom.coupling_normalized);
+        discrepancy.push(atom.discrepancy);
     }
     d.set_item("names", names)?;
     d.set_item("presence", Array1::from_vec(presence).into_pyarray(py))?;
@@ -2370,15 +2242,9 @@ fn sae_atom_two_lens_dict<'py>(
         "presence_normalized",
         Array1::from_vec(presence_norm).into_pyarray(py),
     )?;
-    d.set_item("coupling", Array1::from_vec(coupling).into_pyarray(py))?;
-    d.set_item(
-        "coupling_normalized",
-        Array1::from_vec(coupling_norm).into_pyarray(py),
-    )?;
-    d.set_item(
-        "discrepancy",
-        Array1::from_vec(discrepancy).into_pyarray(py),
-    )?;
+    d.set_item("coupling", coupling)?;
+    d.set_item("coupling_normalized", coupling_norm)?;
+    d.set_item("discrepancy", discrepancy)?;
     d.set_item("coupling_available", report.coupling_available())?;
     d.set_item(
         "coupling_provenance",

@@ -362,7 +362,9 @@ fn sae_manifold_fit_model<'py>(
     promote_from_residual: bool,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     if k_atoms == 0 {
-        return Err(py_value_error("sae_manifold_fit requires K >= 1".to_string()));
+        return Err(py_value_error(
+            "sae_manifold_fit requires K >= 1".to_string(),
+        ));
     }
     let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
@@ -376,8 +378,7 @@ fn sae_manifold_fit_model<'py>(
             "sae_manifold_fit response contains non-finite values".to_string(),
         ));
     }
-    let atom_dim = expand_public_fit_values(atom_dim, k_atoms, "d_atom")
-        .map_err(py_value_error)?;
+    let atom_dim = expand_public_fit_values(atom_dim, k_atoms, "d_atom").map_err(py_value_error)?;
     if atom_dim.iter().any(|&dimension| dimension == 0) {
         return Err(py_value_error(
             "sae_manifold_fit requires every d_atom >= 1".to_string(),
@@ -385,8 +386,9 @@ fn sae_manifold_fit_model<'py>(
     }
     let has_declared_bases = atom_basis.is_some();
     let basis_seed = match atom_basis {
-        Some(values) => expand_public_fit_values(values, k_atoms, "atom_basis")
-            .map_err(py_value_error)?,
+        Some(values) => {
+            expand_public_fit_values(values, k_atoms, "atom_basis").map_err(py_value_error)?
+        }
         None => vec![
             gam::terms::sae::atom_schema::basis_kind_for_topology(
                 atom_topology.as_deref().unwrap_or("auto"),
@@ -400,8 +402,10 @@ fn sae_manifold_fit_model<'py>(
         .collect::<Vec<_>>();
     let declared_bases = has_declared_bases.then(|| basis_seed.clone());
     if let (Some(topology), true) = (atom_topology.as_deref(), has_declared_bases) {
-        let resolved = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
-            .ok_or_else(|| py_value_error("sae_manifold_fit requires at least one atom".to_string()))?;
+        let resolved =
+            gam::terms::sae::atom_schema::topology_for_bases(&atom_basis).ok_or_else(|| {
+                py_value_error("sae_manifold_fit requires at least one atom".to_string())
+            })?;
         let requested = gam::terms::sae::atom_schema::canonical_topology(topology);
         if resolved != requested {
             return Err(py_value_error(format!(
@@ -410,9 +414,10 @@ fn sae_manifold_fit_model<'py>(
         }
     }
     let assignment = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
-    let schedule = gumbel_temperature_schedule_from_pydict(gumbel_schedule)
-        .map_err(py_value_error)?;
-    let resolved_tau = tau.unwrap_or_else(|| schedule.as_ref().map_or(0.5, |state| state.tau_start));
+    let schedule =
+        gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?;
+    let resolved_tau =
+        tau.unwrap_or_else(|| schedule.as_ref().map_or(0.5, |state| state.tau_start));
     let resolved_alpha = alpha.unwrap_or_else(|| {
         if assignment == "ordered_beta_bernoulli" && !learnable_alpha {
             gam::terms::sae::assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms(
@@ -477,9 +482,7 @@ fn sae_manifold_fit_model<'py>(
         separation_barrier_strength_override,
         promote_from_residual,
     )?;
-    let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(
-        raw.bind(py).as_any(),
-    )?;
+    let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw.bind(py).as_any())?;
     let fisher_nested = fisher_factors.map(|array| {
         array
             .as_array()
@@ -573,7 +576,11 @@ fn sae_oos_request_from_arrays(
     }
     let assignment = match assignment_kind.as_str() {
         "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
-        "ordered_beta_bernoulli" => gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha },
+        "ordered_beta_bernoulli" => {
+            gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli {
+                learnable_alpha,
+            }
+        }
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
             threshold: threshold_gate_threshold,
         },
@@ -941,9 +948,11 @@ fn steer_delta_with_metric_from_arrays(
     }
     let assignment = match assignment_kind.as_str() {
         "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
-        "ordered_beta_bernoulli" => gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli {
-            learnable_alpha: false,
-        },
+        "ordered_beta_bernoulli" => {
+            gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli {
+                learnable_alpha: false,
+            }
+        }
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
             threshold: threshold_gate_threshold,
         },
@@ -2179,7 +2188,10 @@ mod sae_assignment_kind_tests {
             "threshold_gate"
         );
         assert_eq!(canonicalize_assignment_kind("softmax").unwrap(), "softmax");
-        assert_eq!(canonicalize_assignment_kind("ordered_beta_bernoulli").unwrap(), "ordered_beta_bernoulli");
+        assert_eq!(
+            canonicalize_assignment_kind("ordered_beta_bernoulli").unwrap(),
+            "ordered_beta_bernoulli"
+        );
         assert_eq!(canonicalize_assignment_kind("topk").unwrap(), "topk");
         let removed = canonicalize_assignment_kind("jumprelu").unwrap_err();
         assert!(

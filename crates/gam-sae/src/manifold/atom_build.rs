@@ -805,6 +805,95 @@ pub fn sae_build_atom_plans(
     Ok(plans)
 }
 
+/// Persistable basis metadata derived from one converged fitted atom.
+#[derive(Clone, Debug)]
+pub struct SaeFittedAtomPlan {
+    pub kind: SaeAtomBasisKind,
+    pub latent_dim: usize,
+    pub n_harmonics: usize,
+    pub basis_size: usize,
+    pub duchon_centers: Option<Array2<f64>>,
+}
+
+/// Derive the complete OOS rebuild metadata from the converged dictionary.
+///
+/// This is model logic, so it lives beside native atom construction rather
+/// than in a language binding. Invalid harmonic widths and missing Duchon
+/// centers are errors; no metadata is guessed at the FFI boundary.
+pub fn sae_fitted_atom_plans(
+    term: &SaeManifoldTerm,
+    seed_duchon_centers: &[Option<Array2<f64>>],
+    random_state: u64,
+) -> Result<Vec<SaeFittedAtomPlan>, String> {
+    let mut plans = Vec::with_capacity(term.k_atoms());
+    for (atom_idx, atom) in term.atoms.iter().enumerate() {
+        let kind = atom.basis_kind.clone();
+        let latent_dim = atom.latent_dim;
+        let basis_size = atom.full_basis_size();
+        let n_harmonics = match &kind {
+            SaeAtomBasisKind::Periodic => {
+                if basis_size < 3 || basis_size % 2 == 0 {
+                    return Err(format!(
+                        "sae_fitted_atom_plans: periodic atom {atom_idx} has invalid odd basis width {basis_size}"
+                    ));
+                }
+                (basis_size - 1) / 2
+            }
+            SaeAtomBasisKind::Torus => {
+                let axis_size = sae_torus_axis_basis_size(basis_size, latent_dim)?;
+                (axis_size - 1) / 2
+            }
+            SaeAtomBasisKind::Cylinder => sae_cylinder_harmonics_degree(basis_size)?.0,
+            SaeAtomBasisKind::Mobius => SAE_MOBIUS_CIRCLE_HARMONICS,
+            _ => 0,
+        };
+        let duchon_centers = match &kind {
+            SaeAtomBasisKind::Duchon => Some(
+                seed_duchon_centers
+                    .get(atom_idx)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        format!("sae_fitted_atom_plans: Duchon atom {atom_idx} has no seed centers")
+                    })?
+                    .clone(),
+            ),
+            SaeAtomBasisKind::Linear
+            | SaeAtomBasisKind::EuclideanPatch
+            | SaeAtomBasisKind::Poincare => {
+                let coords = term.assignment.coords[atom_idx].as_matrix();
+                if coords.nrows() == 0 || coords.ncols() < latent_dim {
+                    return Err(format!(
+                        "sae_fitted_atom_plans: atom {atom_idx} has coordinate shape {:?}, expected non-empty rows and at least {latent_dim} columns",
+                        coords.dim()
+                    ));
+                }
+                let center_count = coords.nrows().min((latent_dim + 2).max(8));
+                let indices = sae_pick_duchon_center_indices(
+                    coords.nrows(),
+                    center_count,
+                    random_state.wrapping_add(atom_idx as u64),
+                );
+                let mut centers = Array2::<f64>::zeros((indices.len(), latent_dim));
+                for (out_row, src_row) in indices.into_iter().enumerate() {
+                    for col in 0..latent_dim {
+                        centers[[out_row, col]] = coords[[src_row, col]];
+                    }
+                }
+                Some(centers)
+            }
+            _ => None,
+        };
+        plans.push(SaeFittedAtomPlan {
+            kind,
+            latent_dim,
+            n_harmonics,
+            basis_size,
+            duchon_centers,
+        });
+    }
+    Ok(plans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

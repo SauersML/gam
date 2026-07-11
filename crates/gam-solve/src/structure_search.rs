@@ -327,8 +327,9 @@ pub fn canonical_order(proposals: &mut [MoveProposal]) {
 /// * `null_sup_log_lik(state, shard)` — the HONEST sup: the current structure
 ///   refit on the shard. Under-maximizing this side inflates every e-value
 ///   and voids validity; it is the one closure that must genuinely optimize.
-/// * `refit(candidate, shard)` — fold the shard into the candidate (any
-///   fitter, warm starts, GPU; no conditions).
+/// * `refit(candidate, shard)` — fold the shard into the candidate. Likelihood
+///   evaluation and refitting are fallible: undefined scores or non-convergence
+///   abort the round rather than becoming neutral evidence.
 pub fn search<S, Sh>(
     mut state: S,
     mut proposals: Vec<MoveProposal>,
@@ -336,9 +337,9 @@ pub fn search<S, Sh>(
     budget: &MoveBudget,
     ledger: &mut StructureLedger,
     mut apply_move: impl FnMut(&S, &StructureMove) -> Result<S, String>,
-    mut eval_log_lik: impl FnMut(&S, &Sh) -> f64,
-    mut null_sup_log_lik: impl FnMut(&S, &Sh) -> f64,
-    mut refit: impl FnMut(S, &Sh) -> S,
+    mut eval_log_lik: impl FnMut(&S, &Sh) -> Result<f64, String>,
+    mut null_sup_log_lik: impl FnMut(&S, &Sh) -> Result<f64, String>,
+    mut refit: impl FnMut(S, &Sh) -> Result<S, String>,
 ) -> Result<SearchOutcome<S>, String> {
     if !(budget.alpha > 0.0 && budget.alpha < 1.0) {
         return Err(format!(
@@ -520,9 +521,9 @@ mod tests {
             budget,
             ledger,
             apply,
-            |c, _sh| -100.0 + advantage(c),
-            |_s, _sh| -100.0,
-            |c, _sh| c,
+            |c, _sh| Ok(-100.0 + advantage(c)),
+            |_s, _sh| Ok(-100.0),
+            |c, _sh| Ok(c),
         )
         .expect("search runs")
     }
@@ -761,9 +762,9 @@ mod tests {
             },
             &mut ledger,
             apply,
-            |_c: &Dict, _sh| 0.0,
-            |_s, _sh| 0.0,
-            |c, _sh| c,
+            |_c: &Dict, _sh| Ok(0.0),
+            |_s, _sh| Ok(0.0),
+            |c, _sh| Ok(c),
         );
         assert!(bad_alpha.is_err());
 
@@ -777,10 +778,56 @@ mod tests {
             },
             &mut ledger,
             apply,
-            |_c: &Dict, _sh| 0.0,
-            |_s, _sh| 0.0,
-            |c, _sh| c,
+            |_c: &Dict, _sh| Ok(0.0),
+            |_s, _sh| Ok(0.0),
+            |c, _sh| Ok(c),
         );
         assert!(bad_trigger.is_err());
+    }
+
+    #[test]
+    fn likelihood_and_refit_failures_abort_the_search() {
+        let shards = vec![1.0_f64];
+        let budget = MoveBudget {
+            max_moves: 1,
+            alpha: 0.05,
+        };
+
+        for failing_stage in 0..3 {
+            let mut ledger = StructureLedger::new();
+            let result = search(
+                vec!["a"],
+                vec![birth(0, 1.0, 99)],
+                &shards,
+                &budget,
+                &mut ledger,
+                apply,
+                |_candidate, _shard| {
+                    if failing_stage == 0 {
+                        Err("candidate likelihood failed".to_string())
+                    } else {
+                        Ok(-1.0)
+                    }
+                },
+                |_null, _shard| {
+                    if failing_stage == 1 {
+                        Err("null fit failed".to_string())
+                    } else {
+                        Ok(-2.0)
+                    }
+                },
+                |state, _shard| {
+                    if failing_stage == 2 {
+                        Err("alternative refit failed".to_string())
+                    } else {
+                        Ok(state)
+                    }
+                },
+            );
+            assert!(
+                result.is_err(),
+                "failure stage {failing_stage} must abort rather than mint evidence"
+            );
+        }
     }
 }

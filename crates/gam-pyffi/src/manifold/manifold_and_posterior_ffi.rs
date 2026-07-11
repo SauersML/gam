@@ -5869,6 +5869,8 @@ fn matrix_to_nested(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
 
 fn matrices_to_nested(matrices: &[Array2<f64>]) -> Vec<Vec<Vec<f64>>> {
     matrices.iter().map(matrix_to_nested).collect()
+}
+
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
 /// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
 /// payload. The v3 boundary is exact: all fields are required, runtime

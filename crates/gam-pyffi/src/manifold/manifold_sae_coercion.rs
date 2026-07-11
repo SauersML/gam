@@ -22,8 +22,8 @@ use serde_json::Value;
 // `manifold_sae_coercion::X` path keeps resolving.
 pub(crate) use gam::terms::sae::atom_schema::{
     basis_kind_for_topology, basis_to_topology, canon_name, canonical_assignment_kind,
-    canonical_basis_kind, canonical_n_harmonics, canonical_topology, coordinate_periods_for_basis,
-    flat_block_assignment, topologies_for_bases, topology_for_bases,
+    canonical_basis_kind, canonical_topology, coordinate_periods_for_basis, flat_block_assignment,
+    topologies_for_bases, topology_for_bases, validated_n_harmonics,
 };
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector
@@ -80,17 +80,9 @@ pub(crate) fn channel_cov_factors(cov: ArrayView2<'_, f64>, m_basis: i64) -> Opt
 /// (Python `bool` subclasses `int`), and `int` before `float` so an integral
 /// value serializes as a JSON integer, matching `json.dumps`.
 ///
-/// NaN / +-Inf policy (explicit, #2091): a non-finite `f64` maps to
-/// `Value::Null`. `serde_json::Value` provably cannot represent non-finite
-/// numbers (`Number::from_f64` returns `None`), and the existing
-/// `ManifoldSaeCore::new` path (Python `json.dumps` -> `ManifoldSaePayload::from_json`)
-/// rejects the bare `NaN` / `Infinity` literals `json.dumps` emits (serde_json's
-/// parser errors), so a non-finite report value has never round-tripped through
-/// the Rust schema at all. Nulling it (rather than erroring) keeps a fit whose
-/// diagnostics carry a meaningless non-finite value loadable instead of failing
-/// the whole build; the `json_value_cannot_hold_nonfinite_*` test pins both the
-/// schema limitation and the parser rejection so the policy is asserted, not
-/// assumed.
+/// Non-finite floats are rejected. A converged fit artifact cannot silently
+/// replace a failed diagnostic with JSON `null`, and `serde_json::Value` cannot
+/// represent NaN or infinity in any case.
 pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
@@ -110,11 +102,12 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Number(i.into()));
     }
     if let Ok(f) = obj.extract::<f64>() {
-        // Non-finite (NaN / +-Inf) -> Null: `from_f64` returns `None`, matching
-        // the schema's inability to hold non-finite (see the fn doc-comment).
-        return Ok(serde_json::Number::from_f64(f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null));
+        let number = serde_json::Number::from_f64(f).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "SAE fit report contains a non-finite floating-point value",
+            )
+        })?;
+        return Ok(Value::Number(number));
     }
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Value::String(s));
@@ -435,9 +428,13 @@ pub(crate) fn build_manifold_sae_payload(
     let assignments = v_arr2(vget(raw, "assignments_z")?)?;
     let logits = v_arr2(vget(raw, "logits")?)?;
     for (name, arr) in [("assignments_z", &assignments), ("logits", &logits)] {
-        let cols = arr.first().map_or(0, Vec::len);
-        if cols != k {
-            return Err(format!("'{name}' must be (N, K={k}); got {cols} columns"));
+        for (row_index, row) in arr.iter().enumerate() {
+            if row.len() != k {
+                return Err(format!(
+                    "'{name}' must be rectangular with K={k} columns; row {row_index} has {}",
+                    row.len()
+                ));
+            }
         }
     }
 
@@ -462,7 +459,7 @@ pub(crate) fn build_manifold_sae_payload(
         .map(|a| v_arr2(vget(a, "decoder_B")?))
         .collect::<Result<_, _>>()?;
     let widths: Vec<i64> = decoder_blocks.iter().map(|b| b.len() as i64).collect();
-    let n_harmonics = canonical_n_harmonics(&kinds, &raw_nharm, &widths);
+    let n_harmonics = validated_n_harmonics(&kinds, &raw_nharm, &widths)?;
     let coords: Vec<Vec<Vec<f64>>> = atoms
         .iter()
         .map(|a| v_arr2(vget(a, "on_atom_coords_t")?))
@@ -480,10 +477,7 @@ pub(crate) fn build_manifold_sae_payload(
     for (idx, a) in atoms.iter().enumerate() {
         let decoder_coefficients = decoder_blocks[idx].clone();
         // Per-atom gate column = column idx of the top-level assignments_z.
-        let assignments_col: Vec<f64> = assignments
-            .iter()
-            .map(|row| row.get(idx).copied().unwrap_or(0.0))
-            .collect();
+        let assignments_col: Vec<f64> = assignments.iter().map(|row| row[idx]).collect();
         let coords_u_arc = match vopt(a, "on_atom_coords_u_arc") {
             None => None,
             Some(v) => Some(v_arr1(v)?),
@@ -853,11 +847,8 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn json_value_cannot_hold_nonfinite_and_parser_rejects_nan() {
-        // Pins the existing-path behavior py_any_to_json_value's NaN/Inf policy
-        // matches: serde_json::Value cannot represent non-finite numbers, and the
-        // json.dumps -> ManifoldSaePayload::from_json path rejects the bare
-        // `NaN` / `Infinity` literals json.dumps emits, so a non-finite report
-        // value never round-trips through the Rust schema -> the helper Nulls it.
+        // The binding rejects these values instead of manufacturing JSON nulls.
+        // Pin the underlying serde limitation that requires that policy.
         assert!(serde_json::Number::from_f64(f64::NAN).is_none());
         assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
         assert!(serde_json::Number::from_f64(f64::NEG_INFINITY).is_none());
