@@ -107,8 +107,7 @@ pub(crate) const SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM: usize = 4096;
 
 /// Relative spectral cutoff for counting the numerical rank / nullity of a
 /// symmetric penalty Gram: eigenvalues at or below `cutoff · λ_max` are treated
-/// as zero. Shared by [`SaeManifoldTerm::symmetric_rank`] and
-/// [`smooth_penalty_nullity`] so the two stay in lockstep.
+/// as zero. Used by [`SaeManifoldTerm::symmetric_rank`].
 pub(crate) const SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF: f64 = 1.0e-9;
 
 /// Floor on the Levenberg-Marquardt ridge added to a per-row Hessian before

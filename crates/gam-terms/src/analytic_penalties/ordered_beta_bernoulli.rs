@@ -559,7 +559,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
 
 /// Trigamma `psi_1(x)` for positive `x`.
 fn trigamma(mut x: f64) -> f64 {
-    debug_assert!(x > 0.0);
+    assert!(x > 0.0);
     let mut acc = 0.0;
     while x < 8.0 {
         acc += 1.0 / (x * x);
@@ -575,7 +575,7 @@ fn trigamma(mut x: f64) -> f64 {
 
 /// Tetragamma `psi_2(x)`, the derivative of [`trigamma`], for positive `x`.
 fn tetragamma(mut x: f64) -> f64 {
-    debug_assert!(x > 0.0);
+    assert!(x > 0.0);
     let mut acc = 0.0;
     while x < 8.0 {
         acc -= 2.0 / (x * x * x);
