@@ -1309,8 +1309,13 @@ fn sae_residual_em_score_vjp_cuda(
     nonneg: bool,
 ) -> PyResult<()> {
     let scalar_type = residual_em_cuda_dtype(dtype)?;
-    let (x_dev_ptr, recon_dev_ptr, g_code_dev_ptr, g_relative_residual_dev_ptr, grad_recon_dev_ptr) =
-        device_ptrs;
+    let (
+        x_dev_ptr,
+        recon_dev_ptr,
+        g_code_dev_ptr,
+        g_relative_residual_dev_ptr,
+        grad_recon_dev_ptr,
+    ) = device_ptrs;
     let (n, atoms, dim) = shape;
     py.detach(move || {
         gam::terms::sae::criterion_atoms_gpu::residual_em_score_vjp_device(
@@ -5096,7 +5101,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_from_fit_payload, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        sae_manifold_from_fit_payload,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;
     module.add_class::<ManifoldSaeCore>()?;
     module.add_class::<AtomCore>()?;
