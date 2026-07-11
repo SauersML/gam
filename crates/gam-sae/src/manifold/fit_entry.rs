@@ -30,12 +30,17 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use gam_math::probability::beta_quantile;
 use gam_problem::topology_certificates::CertificateLedger;
 use gam_problem::{EstimationError, MetricProvenance};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
 use gam_solve::seeding::SeedConfig;
+use gam_solve::structure_search::{MoveBudget, StructureMove};
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
+use gam_terms::inference::structure_evidence::StructureLedger;
+
+use crate::structure_harvest;
 
 use super::{
     AssignmentMode, CoordinateFidelityCertificate, SaeManifoldFitDiagnostics, SaeManifoldLoss,
@@ -73,6 +78,20 @@ pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 /// leaving every genuinely-structured residual (relative energy `≥ ~1e-8`, i.e. a
 /// fit that leaves `≥ 1e-4` RMS unexplained) to run the pass unchanged.
 pub(crate) const STRUCTURED_RESIDUAL_MIN_REL_ENERGY: f64 = 1.0e-10;
+
+/// #2071 residual-promotion alignment threshold under the random-direction
+/// null. Rank one has no informative angle, so its threshold is exactly one.
+/// Keeping this derivation in `gam-sae` makes the typed fit entry self-sufficient
+/// for Rust, CLI, and binding callers alike.
+fn promotion_alignment_threshold(factor_rank: usize) -> f64 {
+    if factor_rank <= 1 {
+        return 1.0;
+    }
+    let rank = factor_rank as f64;
+    beta_quantile(0.95, 0.5, (rank - 1.0) / 2.0)
+        .sqrt()
+        .clamp(0.0, 1.0)
+}
 
 /// One #2021 structured-residual outer-alternation pass's diagnostic record. The
 /// binding serializes a `&[StructuredResidualPassDiagnostic]` into the payload;
@@ -196,6 +215,12 @@ pub struct SaeFitReport {
     pub amortized_encoder_consistency: AmortizedEncoderConsistency,
     /// Unified conservative certificate ledger assembled from this fit's reports.
     pub certificate_ledger: CertificateLedger,
+    /// Serialized per-round structure-search ledger (#997) as a JSON string;
+    /// `None` when the search did not run (skipped by K ceiling or
+    /// `run_structure_search == false`).
+    pub structure_search_json: Option<String>,
+    /// The anytime-valid structure certificate (#1058/#984), serialized JSON.
+    pub structure_certificate_json: String,
     /// The reported `log_alpha` (ordered Beta--Bernoulli concentration or the caller's α fallback).
     pub reported_log_alpha: f64,
 }
