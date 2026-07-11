@@ -663,6 +663,47 @@ pub(crate) fn sae_norm(a: &SaeArrowVector) -> f64 {
     sae_inner(a, a).max(0.0).sqrt()
 }
 
+/// Largest Arnoldi basis admitted by the live cgroup-aware host budget.
+///
+/// A GMRES cycle owns `(m+1)` length-`dim` basis vectors, an
+/// `(m+1)×m` Hessenberg matrix, and the fixed work vectors. Choosing `m` from
+/// the memory ledger makes small/medium arrow systems full-memory (and hence
+/// exact in at most `dim` Krylov directions) without imposing a dimension or
+/// iteration constant; genuinely large systems use the largest restart that
+/// can be allocated without violating the process budget.
+fn admitted_gmres_restart(dim: usize) -> Result<usize, String> {
+    let (budget, available) = sae_host_in_core_budget_bytes();
+    let storage_bytes = |m: usize| -> Option<usize> {
+        let basis = m.checked_add(1)?.checked_mul(dim)?;
+        let hessenberg = m.checked_add(1)?.checked_mul(m)?;
+        let fixed = dim.checked_mul(6)?.checked_add(m.checked_mul(4)?)?;
+        basis
+            .checked_add(hessenberg)?
+            .checked_add(fixed)?
+            .checked_mul(std::mem::size_of::<f64>())
+    };
+    let minimum = storage_bytes(1).ok_or_else(|| {
+        format!("solve_b_preconditioned_gmres: storage size overflow for dimension {dim}")
+    })?;
+    if minimum > budget {
+        return Err(format!(
+            "solve_b_preconditioned_gmres: even one Arnoldi direction needs {minimum} bytes, \
+             exceeding the cgroup-aware Krylov budget {budget} (available {available})"
+        ));
+    }
+    let mut low = 1usize;
+    let mut high = dim;
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if storage_bytes(mid).is_some_and(|bytes| bytes <= budget) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(low)
+}
+
 /// Solve `A x = rhs` by left-preconditioned restarted GMRES.
 ///
 /// The exact stationarity Jacobian `A` contains residual and prior curvature and
@@ -699,13 +740,11 @@ where
     let b = flatten_arrow_parts(b.t.view(), b.beta.view());
     let b_norm = b.dot(&b).sqrt().max(1.0);
     let rel_tol = 1.0e-10;
-    // A Krylov space truncated below the system dimension stagnates on small
-    // indefinite systems (restarted GMRES loses superlinear convergence), so
-    // small systems get FULL-memory GMRES — exact termination within `dim`
-    // steps up to round-off — and only genuinely large systems restart. The
-    // iteration budget must exceed `dim` so a restarted cycle can recover.
-    let restart = dim.min(128);
-    let max_iters = (2 * dim).clamp(8, 512);
+    // Full-memory whenever the live memory ledger admits it. There is no
+    // iteration ceiling: each restarted cycle must make a strictly
+    // representable reduction in the preconditioned residual, and inability to
+    // do so is the typed numerical-stagnation certificate.
+    let restart = admitted_gmres_restart(dim)?;
     let mut iterations = 0usize;
     let mut x = Array1::<f64>::zeros(dim);
 
@@ -721,7 +760,7 @@ where
         Ok(flatten_arrow_parts(pav.t.view(), pav.beta.view()))
     };
 
-    while iterations < max_iters {
+    loop {
         let px = apply_preconditioned(&x)?;
         let mut residual = &b - &px;
         let residual_norm = residual.dot(&residual).sqrt();
@@ -744,7 +783,7 @@ where
         }
 
         residual.mapv_inplace(|value| value / residual_norm);
-        let cycle = restart.min(max_iters - iterations);
+        let cycle = restart;
         let mut basis: Vec<Array1<f64>> = Vec::with_capacity(cycle + 1);
         basis.push(residual);
         let mut h = Array2::<f64>::zeros((cycle + 1, cycle));
@@ -796,8 +835,10 @@ where
             g[j] = cosines[j] * gj;
             g[j + 1] = -sines[j] * gj;
             used = j + 1;
-            iterations += 1;
-            if g[j + 1].abs() <= rel_tol * b_norm || iterations >= max_iters {
+            iterations = iterations.checked_add(1).ok_or_else(|| {
+                "solve_b_preconditioned_gmres: iteration counter overflow".to_string()
+            })?;
+            if g[j + 1].abs() <= rel_tol * b_norm {
                 break;
             }
         }
@@ -821,32 +862,34 @@ where
                 x[slot] += y[i] * basis[i][slot];
             }
         }
-    }
 
-    let candidate = as_arrow(&x);
-    let ax = apply_a(&candidate)?;
-    let original = SaeArrowVector {
-        t: &rhs.t - &ax.t,
-        beta: &rhs.beta - &ax.beta,
-    };
-    let residual_norm = sae_norm(&original);
-    // Round-off-floor acceptance. Full-memory GMRES terminates exactly within
-    // `dim` steps UP TO ROUND-OFF; on a system with condition number kappa the
-    // attainable relative residual is O(kappa*eps), which for healthy but
-    // moderately conditioned Hessians (kappa ~ 1e6) sits ABOVE the 1e-10 target.
-    // A run that exhausted its budget with the true residual at or below sqrt(eps)
-    // IS the round-off-floor solution — rejecting it turned numerically exact
-    // adjoint solves into fit-wide seed refusals (2026-07-10: every plain-SAE fit
-    // failed with "failed to converge ... residual=4e-10"). Anything above sqrt(eps)
-    // remains the typed error — no last-iterate fallback for genuine failures.
-    let roundoff_floor = f64::EPSILON.sqrt() * rhs_norm;
-    if residual_norm <= roundoff_floor {
-        return Ok(candidate);
+        let candidate = as_arrow(&x);
+        let ax = apply_a(&candidate)?;
+        let original = SaeArrowVector {
+            t: &rhs.t - &ax.t,
+            beta: &rhs.beta - &ax.beta,
+        };
+        let original_norm = sae_norm(&original);
+        // Full-memory GMRES terminates within `dim` directions up to round-off.
+        // The attainable residual of a moderately conditioned system is
+        // O(kappa*eps), so sqrt(eps) is the scalar-type-derived certification
+        // floor rather than a last-iterate fallback.
+        let roundoff_floor = f64::EPSILON.sqrt() * rhs_norm;
+        if original_norm <= (rel_tol * rhs_norm).max(roundoff_floor) {
+            return Ok(candidate);
+        }
+        let next_px = apply_preconditioned(&x)?;
+        let next_residual = &b - &next_px;
+        let next_norm = next_residual.dot(&next_residual).sqrt();
+        if !(next_norm.is_finite() && next_norm < residual_norm) {
+            return Err(format!(
+                "solve_b_preconditioned_gmres: no representable residual reduction after \
+                 {iterations} iterations (restart {restart}, dimension {dim}); preconditioned \
+                 residual {residual_norm:.3e} -> {next_norm:.3e}, original relative residual \
+                 {:.3e}, round-off certification floor {:.3e}",
+                original_norm / rhs_norm,
+                roundoff_floor / rhs_norm,
+            ));
+        }
     }
-    Err(format!(
-        "solve_b_preconditioned_gmres: failed to converge in {iterations} iterations; \
-         original relative residual={:.3e} (round-off acceptance floor {:.3e})",
-        residual_norm / rhs_norm,
-        roundoff_floor / rhs_norm
-    ))
 }

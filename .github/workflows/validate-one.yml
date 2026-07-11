@@ -112,13 +112,29 @@ jobs:
           # or shell syntax.
           read -r -a filters <<< "$RUST_FILTER"
           for filter in "${filters[@]}"; do
+            # Reject nextest filter-expression DSL (gam#2268): plain `cargo test`
+            # treats `test(NAME)` as a literal substring, matches zero tests, and
+            # exits 0 -> a silent false green. Fail early with a clear message.
+            if [[ "$filter" == *"test("* ]]; then
+              echo "::error::rust_filter '${filter}' looks like nextest DSL 'test(...)'. validate-one runs plain 'cargo test'; pass a BARE substring (e.g. my_test_name), not test(my_test_name)."
+              exit 1
+            fi
             if [[ -n "$RUST_PACKAGE" ]]; then
               echo "cargo test -p ${RUST_PACKAGE} -- ${filter}"
-              cargo test -p "$RUST_PACKAGE" -- "${filter}" --nocapture
+              cargo test -p "$RUST_PACKAGE" -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
             else
               echo "cargo test --workspace --exclude gam-pyffi -- ${filter}"
-              cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture
+              cargo test --workspace --exclude gam-pyffi -- "${filter}" --nocapture 2>&1 | tee cargo_filter_out.log
             fi
+            # False-green guard (gam#2268): a filter that matches zero tests makes
+            # cargo exit 0 with nothing run. Require >=1 test actually executed,
+            # summing passed+failed across every binary's `test result:` line.
+            ran=$(awk '/test result:/ { for (i = 1; i < NF; i++) { if ($(i + 1) == "passed;") p += $i; if ($(i + 1) == "failed;") f += $i } } END { print p + f + 0 }' cargo_filter_out.log)
+            if [[ "${ran:-0}" -eq 0 ]]; then
+              echo "::error::rust_filter '${filter}' matched ZERO tests (all filtered out) -- this would be a false green. Use a bare substring that matches a real test name."
+              exit 1
+            fi
+            echo "rust_filter '${filter}' executed ${ran} test(s)."
           done
 
       # ---- Python/torch shared prerequisites (either filter needs the extension) ----
