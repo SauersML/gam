@@ -663,32 +663,17 @@ pub(crate) fn sae_norm(a: &SaeArrowVector) -> f64 {
     sae_inner(a, a).max(0.0).sqrt()
 }
 
-/// Solve `A x = rhs` by left-`B`-preconditioned restarted GMRES.
+/// Solve `A x = rhs` by left-preconditioned restarted GMRES.
 ///
 /// The exact stationarity Jacobian `A` contains residual and prior curvature and
-/// can be indefinite.  Conjugate gradients is therefore not admissible: its SPD
+/// can be indefinite. Conjugate gradients is therefore not admissible: its SPD
 /// recurrence can stop at negative curvature and silently return a non-solution.
-/// GMRES instead minimizes the residual of `B⁻¹ A x = B⁻¹ rhs` without an SPD
-/// assumption.  A candidate is returned only after the *original* residual
-/// `||rhs - A x||` meets tolerance; exhaustion or Arnoldi breakdown is a typed
-/// error, never a last-iterate fallback.
-pub(crate) fn solve_b_preconditioned_gmres<F>(
-    solver: &DeflatedArrowSolver<'_>,
-    rhs: &SaeArrowVector,
-    apply_a: F,
-) -> Result<SaeArrowVector, String>
-where
-    F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
-{
-    solve_b_preconditioned_gmres_with(rhs, apply_a, |vector| {
-        solver.solve(vector.t.view(), vector.beta.view())
-    })
-}
-
-/// Operator-generic core of [`solve_b_preconditioned_gmres`]. The
-/// preconditioner closure makes the exact-stationarity Krylov solve usable with
-/// either the dense factor cache or the matrix-free reduced-Schur inverse while
-/// retaining the same original-residual certificate.
+/// GMRES instead minimizes the preconditioned residual without an SPD assumption.
+/// A candidate is returned only after the *original* residual `||rhs - A x||`
+/// meets tolerance; exhaustion or Arnoldi breakdown is a typed error, never a
+/// last-iterate fallback. The preconditioner closure supports both the dense
+/// factor cache and the matrix-free reduced-Schur inverse through this one live
+/// implementation.
 pub(crate) fn solve_b_preconditioned_gmres_with<F, P>(
     rhs: &SaeArrowVector,
     apply_a: F,

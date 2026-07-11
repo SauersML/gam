@@ -552,9 +552,11 @@ mod exact_stationarity_solve_1418_tests {
 
         // Non-vacuity: the raw (undeflated) exact solve is dominated by the
         // saturated near-null direction.
-        let raw = solve_b_preconditioned_gmres(&solver, &rhs, |v| {
-            term.apply_exact_hessian(&rho, target.view(), &cache, v)
-        })
+        let raw = solve_b_preconditioned_gmres_with(
+            &rhs,
+            |v| term.apply_exact_hessian(&rho, target.view(), &cache, v),
+            |vector| solver.solve(vector.t.view(), vector.beta.view()),
+        )
         .expect("raw exact solve");
         let raw_mu = pencil_mu(&raw);
         assert!(

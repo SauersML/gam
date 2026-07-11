@@ -1782,7 +1782,11 @@ pub(crate) fn gauge_fixed_krylov_operator_matches_deflated_preconditioner_2253()
     // Raw A has the exact null q=e1 while rhs has q-mass, so A x = rhs is
     // inconsistent. A residual-checked solver must refuse it rather than return
     // the old CG path's arbitrary last iterate.
-    let raw = solve_b_preconditioned_gmres(&solver, &rhs, |v| raw_a(v));
+    let raw = solve_b_preconditioned_gmres_with(
+        &rhs,
+        |v| raw_a(v),
+        |vector| solver.solve(vector.t.view(), vector.beta.view()),
+    );
     assert!(
         raw.is_err(),
         "raw A with rhs mass on its exact gauge null must not pass the residual certificate"
@@ -1790,11 +1794,15 @@ pub(crate) fn gauge_fixed_krylov_operator_matches_deflated_preconditioner_2253()
 
     // The quotient operator uses the SAME κQQᵀ term as the preconditioner.
     // It is diag(2,2), so the exact gauge-fixed solution is (2, 1/2).
-    let solved = solve_b_preconditioned_gmres(&solver, &rhs, |v| {
-        let mut out = raw_a(v)?;
-        solver.add_gauge_stiffness(v, &mut out)?;
-        Ok(out)
-    })
+    let solved = solve_b_preconditioned_gmres_with(
+        &rhs,
+        |v| {
+            let mut out = raw_a(v)?;
+            solver.add_gauge_stiffness(v, &mut out)?;
+            Ok(out)
+        },
+        |vector| solver.solve(vector.t.view(), vector.beta.view()),
+    )
     .expect("gauge-fixed exact-stationarity solve");
     assert_abs_diff_eq!(solved.t[0], 2.0, epsilon = 1.0e-12);
     assert_abs_diff_eq!(solved.t[1], 0.5, epsilon = 1.0e-12);
