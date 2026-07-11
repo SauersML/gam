@@ -281,6 +281,7 @@ mod softmax_majorizer_active_entry_1410_tests {
 #[cfg(test)]
 mod exact_stationarity_solve_1418_tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
     use crate::manifold::tests::{diagonal_latent_cache, gamma_fd_tiny_fixture};
     use ndarray::Array1;
 
