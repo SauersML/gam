@@ -1845,33 +1845,6 @@ impl SaeManifoldTerm {
                         out.push(g);
                     }
                 }
-                // A circle (`Periodic`) chart carries the same continuous gauge
-                // the Cylinder arm deflates on its circle axis: a global phase
-                // shift of every angle, compensated in the decoder, leaves the
-                // criterion unchanged. A torus carries one such shift per
-                // periodic axis. These orbits were previously undeclared, so a
-                // K=1 circle fit's exact stationarity system was SINGULAR along
-                // the phase orbit at phase-symmetric iterates — measured on the
-                // #2253 repro as full-Krylov GMRES stagnating at a bit-identical
-                // 2.455e-7 residual and every seed dying "non-identifiable".
-                // The Rayleigh floor downstream still prunes any declared
-                // candidate that is not genuinely flat, so charts whose phase
-                // happens to be pinned by evidence are unaffected.
-                SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
-                    for axis in 0..d {
-                        let mut field = Array2::<f64>::zeros((n, d));
-                        field.column_mut(axis).fill(1.0);
-                        if let Some(g) = self.dense_step_gauge_vector_from_field(
-                            atom_idx,
-                            field.view(),
-                            &coord_offsets,
-                            &beta_offsets,
-                            total_len,
-                        )? {
-                            out.push(g);
-                        }
-                    }
-                }
                 _ => {}
             }
         }
