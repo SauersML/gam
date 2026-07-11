@@ -7,25 +7,10 @@
 //! invariant. The bar is truth-of-the-quotient: no criterion may read an absolute
 //! decoder magnitude.
 //!
-//! CAPABILITY NOTE (this HEAD): the `s_k = log_amplitude` split that makes the
-//! image invariant under `B ↦ c·B` (with `s` absorbing `−ln c`) is not present on
-//! this tree, so a raw decoder rescale scales the reconstruction rather than
-//! leaving it fixed. We therefore verify the two reachable, exact faces of the
-//! same quotient:
-//!
-//!  * ARM A (reachable, exact): under a JOINT rescale of the decoder and the
-//!    target by `c` — the honest stand-in for the physical redundancy on this
-//!    tree — the reconstruction scales by exactly `c`, while the reconstruction
-//!    criterion (EV) and the coordinate/occupancy diagnostics are BIT-invariant,
-//!    and the decoder DIRECTION `B/‖B‖` is unchanged. Scale is confined to the
-//!    magnitude and quotiented out of every reported number.
-//!  * ARM B (#[ignore], the strict closure bar): fitting the SAME latent structure
-//!    at two global data scales must return IDENTICAL latent coordinates and an
-//!    IDENTICAL criterion. This is capability-blocked on this HEAD because the
-//!    absolute smoothing/sparsity penalties are not yet priced on a unit-Frobenius
-//!    decoder, so the LS+penalty balance shifts with the data scale; it is the bar
-//!    that must flip green once the amplitude-gauge (`quotient_scale`) path lands.
-//!    Its bound is NOT weakened.
+//! The executable objective bar verifies the exact scale quotient used by the
+//! current representation: jointly rescaling decoder and target by `c` scales the
+//! reconstruction by `c`, while explained variance, coordinate diagnostics,
+//! occupancy diagnostics, and decoder direction remain invariant.
 
 use super::tests::{TestPeriodicEvaluator, periodic_basis};
 use crate::assignment::{AssignmentMode, SaeAssignment};

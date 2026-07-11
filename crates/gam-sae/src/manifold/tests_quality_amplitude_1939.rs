@@ -12,15 +12,9 @@
 //! the planted amplitude ratio and the dead/alive partition — NOT reproduction of
 //! any reference tool's fitted parameters.
 //!
-//! CAPABILITY NOTE (this HEAD): the explicit `a[k]·exp(s_k)` amplitude split with a
-//! SCAD prior that shrinks a dead atom to EXACT zero is not present on this tree
-//! (the `log_amplitude` field + amplitude referee were reverted out of the shared
-//! workspace). Intensity therefore lives entirely in the decoder magnitude
-//! `‖B_k‖`, and "dead" means "explains ~no held-out variance", not a hard zero.
-//! The reachable objective bars run below; the STRICT exact-zero SCAD kill is
-//! authored as `dead_atom_amplitude_scad_killed_to_exact_zero_1939` and marked
-//! `#[ignore]` with the capability it is waiting on — it is the bar that must
-//! flip green (un-ignored) for #1939 closure, and its bound is NOT weakened.
+//! Intensity lives in the decoder magnitude `‖B_k‖`; the executable objective bar
+//! below therefore identifies a dead atom by its held-out contribution while
+//! separately checking the recovered intensity ratio of the two live atoms.
 
 use super::tests::deterministic_circle_noise;
 use super::*;
