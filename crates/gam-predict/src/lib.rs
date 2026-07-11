@@ -1819,30 +1819,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     let quadctx = gam_solve::quadrature::QuadratureContext::new();
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
-        .map(|i| {
-            let pm = strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])?;
-            if pm.is_finite() {
-                return Ok(pm);
-            }
-            // #1515 (locked owner contract; see issue #2255): a fitted model the
-            // public API accepts must always yield a finite response mean. A
-            // pathological coefficient posterior — an all-zero-count Poisson/NB
-            // fit, whose flat-at-η→−∞ likelihood leaves the penalized Hessian
-            // near-singular with `se_eta` in the thousands — makes the
-            // Laplace-lognormal integral E[g⁻¹(η)] = exp(η + se_eta²/2) overflow
-            // f64. That astronomical value is not a meaningful posterior mean:
-            // it is dominated by the far upper tail of the Gaussian η-posterior,
-            // a region where the Gaussian (Laplace) approximation to the true
-            // log-concave, data-bounded posterior is invalid. It also serializes
-            // to JSON null across the gam-pyffi boundary and crashes the Python
-            // shaper with a `None` mean. Degrade to the plug-in / MAP mean
-            // g⁻¹(η̂): finite (exp(η̂) for the log link) and exactly consistent
-            // with the reported `linear_predictor`. The fallback fires ONLY on a
-            // non-finite exact integral — every well-posed fit still reports the
-            // exact posterior mean, so the honest-reporting contract holds
-            // wherever it does not collide with predictability.
-            strategy.inverse_link(eta[i])
-        })
+        .map(|i| strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i]))
         .collect();
 
     Ok(PredictPosteriorMeanResult {
@@ -2879,29 +2856,13 @@ where
                     )));
                 }
                 if meanvar == f64::INFINITY {
-                    // The exact response-variance integral E[g⁻¹(η)²]−E[g⁻¹(η)]²
-                    // overflowed f64. A degenerate fit — an all-zero-count
-                    // Poisson/NB whose likelihood is flat as η→−∞ — leaves the
-                    // penalized Hessian near-singular with se_eta in the
-                    // thousands, so the Laplace–lognormal moment integral is
-                    // dominated by the far Gaussian tail, a region where the
-                    // Gaussian (Laplace) approximation to the true log-concave,
-                    // data-bounded η-posterior is invalid. The +inf is a
-                    // numerical artifact of that invalid tail, not the fit's
-                    // actual spread: its plug-in rate g⁻¹(η̂) is ~0, so an
-                    // infinite-width response interval is exactly wrong, and it
-                    // serializes to JSON null and crashes the Python shaper —
-                    // breaking the locked #1515 contract that a fitted model
-                    // stay predictable. Degrade to the delta-method SE
-                    // |dμ/dη|·se_eta: the first-order posterior spread evaluated
-                    // AT the mode, where the Gaussian approximation IS valid.
-                    // This is the same finite fallback `enrich_posterior_mean_bounds`
-                    // applies and is self-consistent with the plug-in response
-                    // mean g⁻¹(η̂) the posterior-mean path reports. Fires ONLY on
-                    // a non-finite exact integral, so every well-posed fit still
-                    // reports the exact response SE.
-                    let dmu_deta = strategy.inverse_link_jet(eta[i])?.d1;
-                    return Ok(dmu_deta.abs() * se_i);
+                    // The exact response-variance integral overflowed. Preserve
+                    // the posterior estimand: replacing it with a delta-method
+                    // value would report a different, spuriously finite
+                    // uncertainty measure. Degenerate all-zero count responses
+                    // are rejected before fitting by the family-owned response
+                    // validation; any remaining overflow is reported honestly.
+                    return Ok(f64::INFINITY);
                 }
                 Ok(meanvar.max(0.0).sqrt())
             })
@@ -2926,34 +2887,19 @@ where
         MeanIntervalMethod::TransformEta => {
             let transformed_lower = apply_family_inverse_link(&eta_lower, &likelihood)?;
             let transformed_upper = apply_family_inverse_link(&eta_upper, &likelihood)?;
-            // #1515: on a degenerate fit (all-zero Poisson flat likelihood) the
-            // η-scale CI half-width z·se_eta is astronomically large, so the
-            // transformed endpoint g⁻¹(η ± z·se_eta) overflows to +inf — and the
-            // min/max against it produces a NaN that serializes to None and
-            // crashes the Python table shaper. When a transformed endpoint is not
-            // finite, fall back per-row to the delta-method bound
-            // mean ± z·mean_se, which is finite (mean is the plug-in inverse link
-            // and mean_se was delta-guarded above), so a fitted model always
-            // returns finite interval bounds.
-            // Check BOTH endpoints' finiteness (not the min/max result): Rust's
-            // f64::max/min return the non-NaN argument, so a single non-finite
-            // endpoint would otherwise slip through as a finite-but-wrong bound.
-            let lower = Array1::from_iter((0..mean.len()).map(|i| {
+            let mut lower = Array1::<f64>::zeros(mean.len());
+            let mut upper = Array1::<f64>::zeros(mean.len());
+            for i in 0..mean.len() {
                 let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
-                if lo.is_finite() && hi.is_finite() {
-                    lo.min(hi)
-                } else {
-                    mean[i] - z_lower_per_row[i] * mean_standard_error[i]
+                if !(lo.is_finite() && hi.is_finite()) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "response-scale interval transform is non-finite at row {i}: \
+                         lower={lo}, upper={hi}"
+                    )));
                 }
-            }));
-            let upper = Array1::from_iter((0..mean.len()).map(|i| {
-                let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
-                if lo.is_finite() && hi.is_finite() {
-                    lo.max(hi)
-                } else {
-                    mean[i] + z_upper_per_row[i] * mean_standard_error[i]
-                }
-            }));
+                lower[i] = lo.min(hi);
+                upper[i] = lo.max(hi);
+            }
             (lower, upper)
         }
     };
