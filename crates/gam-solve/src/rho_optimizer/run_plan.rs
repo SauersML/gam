@@ -294,7 +294,7 @@ pub(crate) fn run_outer_with_plan(
     // A reactive domain-entry path is created per seed only after the
     // objective's exact seed cost is non-finite. Keeping `None` here is the
     // zero-heavy-entry fast path for every already-feasible seed.
-    let reactive_domain_entry_available = obj.supports_reactive_domain_entry();
+    let _reactive_domain_entry_available = obj.supports_reactive_domain_entry();
     let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = None;
     // Demotion ledger: every structural defect that would historically have
     // rejected a seed (or short-circuited the cascade) is instead recorded
