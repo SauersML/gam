@@ -5124,13 +5124,25 @@ impl SaeManifoldTerm {
         }
         let entry_state_recurred = self.matches_mutable_state(&entry_state)
             && self.assignment.mode.temperature().to_bits() == entry_temperature.to_bits();
+        // `GumbelTemperatureSchedule::step` advances its counter even when the
+        // emitted temperature equals the currently installed value (notably its
+        // first `tau_start` step). Such a call has not reached an idempotent
+        // evidence map if the NEXT re-entry will anneal to a different objective.
+        // At the temperature floor `current_tau(iter_count)` stays bit-identical,
+        // so a genuinely settled schedule remains certifiable.
+        let temperature_stable_on_reentry =
+            self.temperature_schedule.as_ref().is_none_or(|schedule| {
+                schedule.current_tau(schedule.iter_count).to_bits()
+                    == self.assignment.mode.temperature().to_bits()
+            });
         Ok(EvidenceJointFitOutcome {
             loss: outcome.loss,
             fixed_point: matches!(
                 outcome.termination,
                 JointFitTermination::Frozen | JointFitTermination::NoStrictDecrease
             ) && !outcome.state_moved
-                && entry_state_recurred,
+                && entry_state_recurred
+                && temperature_stable_on_reentry,
         })
     }
 
