@@ -756,7 +756,7 @@ where
     // is the typed numerical-stagnation certificate.
     let restart = admitted_gmres_restart(dim)?;
     let mut iterations = 0usize;
-    let mut x = Array1::<f64>::zeros(dim);
+    let mut right_unknown = Array1::<f64>::zeros(dim);
 
     let as_arrow = |flat: &Array1<f64>| SaeArrowVector {
         t: flat.slice(s![..t_len]).to_owned(),
@@ -774,11 +774,11 @@ where
     };
 
     loop {
-        let px = apply_right_preconditioned(&x)?;
+        let px = apply_right_preconditioned(&right_unknown)?;
         let mut residual = &b - &px;
         let residual_norm = residual.dot(&residual).sqrt();
         if residual_norm <= relative_floor * b_norm {
-            let candidate = recover_solution(&x)?;
+            let candidate = recover_solution(&right_unknown)?;
             let ax = apply_a(&candidate)?;
             let original = SaeArrowVector {
                 t: &rhs.t - &ax.t,
@@ -870,11 +870,11 @@ where
         }
         for i in 0..used {
             for slot in 0..dim {
-                x[slot] += y[i] * basis[i][slot];
+                right_unknown[slot] += y[i] * basis[i][slot];
             }
         }
 
-        let candidate = recover_solution(&x)?;
+        let candidate = recover_solution(&right_unknown)?;
         let ax = apply_a(&candidate)?;
         let original = SaeArrowVector {
             t: &rhs.t - &ax.t,
@@ -889,7 +889,7 @@ where
         if original_norm <= roundoff_floor {
             return Ok(candidate);
         }
-        let next_px = apply_right_preconditioned(&x)?;
+        let next_px = apply_right_preconditioned(&right_unknown)?;
         let next_residual = &b - &next_px;
         let next_norm = next_residual.dot(&next_residual).sqrt();
         if !(next_norm.is_finite() && next_norm < residual_norm) {
