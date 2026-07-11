@@ -1,4 +1,4 @@
-## v0.3.149 — gam 0.3.149 / gamfit 0.1.252 (2026-07-09)
+## v0.3.149 — gam 0.3.149 / gamfit 0.1.253 (2026-07-09)
 
 This release makes `opt` the single optimization-mechanics authority for the
 Rust engine. The former `gam-optimize` crate and GAM's hand-written GPU REML
