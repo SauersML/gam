@@ -333,15 +333,27 @@ fn recovery_bc_anchored_left_endpoint_recovery() {
     // Evaluate fit at original training x.
     let test = predict_matrix(2, &[&x, &vec![0.0; n]]);
     let truth_arr: Array1<f64> = Array1::from(truth.clone());
-    let pred = fit_and_predict_eta(
-        "y ~ s(x, bc_left=anchored, anchor_left=0, k=10)",
-        &data,
-        &gaussian_cfg(),
-        &test,
-    );
+    let formula = "y ~ s(x, bc_left=anchored, anchor_left=0, k=10)";
+    let result = fit_from_formula(formula, &data, &gaussian_cfg()).expect("anchored fit succeeded");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard anchored Gaussian fit");
+    };
+    let test_design = build_term_collection_design(test.view(), &fit.resolvedspec)
+        .expect("rebuild anchored prediction design");
+    let pred = test_design.design.apply(&fit.fit.beta);
     let mse = mean_squared_error(&pred, &truth_arr);
     let tol = 1.2 * noise_var;
-    eprintln!("[recovery-bc-anchored] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}");
+    eprintln!(
+        "[recovery-bc-anchored] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} \
+         tol={tol:.5e} p={} edf_total={:.6} edf_by_block={:?} \
+         log_lambdas={:?} reml={:.6} outer_iters={}",
+        fit.fit.beta.len(),
+        fit.fit.edf_total().expect("Gaussian fit reports total EDF"),
+        fit.fit.edf_by_block(),
+        fit.fit.log_lambdas.to_vec(),
+        fit.fit.reml_score,
+        fit.fit.outer_iterations,
+    );
     assert!(
         mse <= tol,
         "bc-anchored MSPE {mse:.5e} > 1.2·σ² = {tol:.5e}"
