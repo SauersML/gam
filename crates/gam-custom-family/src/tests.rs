@@ -192,6 +192,19 @@ use gam_models::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggl
 use gam_test_support::binomial_location_scale_base_fixture;
 use ndarray::{Array1, Array2, array};
 
+#[test]
+pub(crate) fn joint_preconditioner_preserves_negative_observed_curvature_scale() {
+    let base_diagonal = array![-12.0, 3.0, 0.0];
+    let penalty = array![[2.0, -1.0], [-1.0, 2.0]];
+    let diagonal =
+        joint_penalty_preconditioner_diag(&base_diagonal, &[(0, 2), (2, 3)], &[penalty], 0.5, None);
+
+    // The penalty contributes its absolute row sum (3) to the first block;
+    // the ridge contributes 0.5 everywhere.  In particular, -12 is a
+    // magnitude-12 trust scale rather than a direction collapsed to the floor.
+    assert_eq!(diagonal, array![15.5, 6.5, 0.5]);
+}
+
 pub(crate) fn assert_kronecker_factored_matches_dense(
     left: Array2<f64>,
     right: Array2<f64>,

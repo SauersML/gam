@@ -179,7 +179,7 @@ pub(crate) fn apply_joint_block_penalty_into(
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
 /// in the inner coefficient solve.
 ///
-/// Builds `diag(H) + Σ_k gershgorin(S_k(λ)) + ridge`, clamped at 1e-10, where
+/// Builds `|diag(H)| + Σ_k gershgorin(S_k(λ)) + ridge`, clamped at 1e-10, where
 /// `gershgorin(S)[i] = Σ_j |S[i,j]|` is the absolute row-sum (Gershgorin
 /// radius) of each penalty block. This strictly dominates `diag(S)` for any
 /// penalty with off-diagonal mass — the high-order difference / thin-plate
@@ -187,6 +187,15 @@ pub(crate) fn apply_joint_block_penalty_into(
 /// [1,2,3] in `WigglePenaltyConfig::cubic_triple_operator_default`) are
 /// strongly off-diagonal-dominant, so `S[i,i]` alone understates the
 /// operator's true row scale by orders of magnitude there.
+///
+/// The absolute likelihood diagonal is essential for exact-Newton families:
+/// their observed Hessian may be indefinite away from the mode.  A negative
+/// diagonal is real curvature scale, not an absent direction.  Flooring it to
+/// `1e-10` makes the trust metric nearly singular, inflates the corresponding
+/// whitened eigenvalue, and can misclassify a resolvable direction as numerical
+/// null space.  `|diag(H)|` is the standard positive Jacobi scale for an
+/// indefinite operator; for Fisher/PIRLS Hessians (whose diagonal is already
+/// non-negative) it is exactly unchanged.
 ///
 /// Why the row-sum and not just the diagonal: a plain Jacobi (diagonal-only)
 /// preconditioner collapses to `diag(S_λ)` exactly in the saturated-softmax
@@ -225,7 +234,11 @@ pub(crate) fn joint_penalty_preconditioner_diag(
     joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> Array1<f64> {
     assert!(s_lambdas.len() <= ranges.len());
-    let mut diag = base_diagonal.clone();
+    // This diagonal is both the PCG preconditioner and the trust-region metric,
+    // so it must be positive while preserving the magnitude of negative
+    // observed curvature.  Do the absolute-value conversion once at this
+    // shared boundary before adding the positive penalty scales.
+    let mut diag = base_diagonal.mapv(f64::abs);
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];
         assert_eq!(s_lambda.nrows(), end - start);
