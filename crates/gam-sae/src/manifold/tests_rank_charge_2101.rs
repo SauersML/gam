@@ -605,3 +605,95 @@ fn unit_target(term: &SaeManifoldTerm) -> Array2<f64> {
     }
     x
 }
+
+/// (x) #2022/#2099 SCALE-INSENSITIVITY of the evidence, rebuilt against HEAD's
+/// architecture. The removed `fit_level_decoder_rescale_invariance_2099` gate held
+/// the reconstruction IMAGE fixed under `B↦cB` via a compensating `s↦s−ln c`
+/// amplitude — a symmetry that no longer exists on HEAD (the free amplitude dof was
+/// removed; the inner walk is `(δt, δβ)` with `‖B‖` data-pinned). What DOES survive
+/// as the evidence-side quotient is that the rank charge `½·d_eff·ln N_eff` is a
+/// scale-INSENSITIVE rank COUNT, not the scale-DEPENDENT `½·log(a²‖B‖²)` log-volume
+/// the flag-off default charges. Concretely `d_eff = rank_eff·basis_edf` is
+/// INVARIANT under a uniform decoder rescale `D↦cD` on the resolved-rank plateau:
+/// `basis_edf` reads only the (decoder-free) basis Gram, and `rank_eff` is the
+/// integer count of reconstruction modes above the fixed Marchenko–Pastur edge, so
+/// a uniform positive rescale moves every mode multiplicatively without reordering
+/// it across the edge. The old log-volume proxy `½·ln‖D‖²` shifts by `2·ln c` under
+/// the same rescale — the exact scale degeneracy #2022 wanted out of the evidence.
+/// As `c→0` every mode drops below the edge, `rank_eff→0`, `d_eff→0` (the veto
+/// regime): norm shrinkage is NEUTRALISED, never rewarded. Convergence-independent
+/// (prices the primitive directly, no fit).
+#[test]
+fn rank_charge_deff_scale_insensitive_under_decoder_rescale_2099() {
+    let (mut term, rho) = fitted_circle_term(80, 16);
+    let tgt = unit_target(&term);
+    let (_v, loss, cache) = term
+        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .unwrap();
+    let disp = term
+        .reconstruction_dispersion(&loss, &cache, &rho, None)
+        .unwrap();
+    drop((loss, cache));
+
+    let mut grams = term.empty_decoder_gram_accumulator();
+    term.accumulate_decoder_gram(&mut grams);
+    let n_eff: f64 = term
+        .assignment
+        .assignments()
+        .column(0)
+        .iter()
+        .map(|&a| a * a)
+        .sum();
+    let lam = rho.lambda_smooth_vec();
+    let p_out = term.output_dim() as f64;
+    let base_decoder = term.atoms[0].decoder_coefficients.clone();
+    let d_eff = |decoder: &Array2<f64>| -> f64 {
+        super::construction::realised_rank_charge_dof(
+            &grams[0],
+            decoder,
+            n_eff,
+            p_out,
+            disp,
+            lam.first().copied().unwrap_or(0.0),
+            Some(&term.atoms[0].smooth_penalty),
+        )
+        .unwrap()
+    };
+
+    let d0 = d_eff(&base_decoder);
+    assert!(
+        d0 > 0.0,
+        "resolved circle must carry positive rank charge; got {d0}"
+    );
+    // Plateau invariance: the rank charge is BIT-IDENTICAL under a uniform decoder
+    // rescale, while the log-volume proxy the flag-off default uses shifts by 2·ln c.
+    let n0: f64 = base_decoder.iter().map(|v| v * v).sum();
+    for &c in &[0.5_f64, 2.0, 4.0] {
+        let scaled = base_decoder.mapv(|v| c * v);
+        let d_c = d_eff(&scaled);
+        let nc: f64 = scaled.iter().map(|v| v * v).sum();
+        let old_proxy_shift = 0.5 * (nc.ln() - n0.ln()); // the ½log(a²‖B‖²) degeneracy
+        eprintln!(
+            "[#2099 scale] c={c:>4}: d_eff={d_c:.12} (Δ={:.2e}) | old ½log‖B‖² shift={old_proxy_shift:+.4}",
+            d_c - d0
+        );
+        assert_eq!(
+            d_c, d0,
+            "rank charge must be decoder-rescale INVARIANT on the resolved plateau \
+             (c={c}): got {d_c} vs {d0}"
+        );
+        assert!(
+            old_proxy_shift.abs() > 0.1,
+            "sanity: the old log-volume proxy MUST be scale-dependent (shift {old_proxy_shift})"
+        );
+    }
+    // Collapse endpoint: shrinking the decoder toward zero drives rank_eff→0 and the
+    // charge to exactly 0 (veto regime) — the opposite of the old ½log‖B‖²→−∞ reward.
+    let vanished = base_decoder.mapv(|v| 1e-10 * v);
+    let d_vanish = d_eff(&vanished);
+    eprintln!("[#2099 scale] c=1e-10: d_eff={d_vanish:.12} (veto regime)");
+    assert_eq!(
+        d_vanish, 0.0,
+        "a vanishing decoder must price to d_eff=0 (veto), not a divergent reward; got {d_vanish}"
+    );
+}
