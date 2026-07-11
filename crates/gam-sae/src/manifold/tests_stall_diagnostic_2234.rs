@@ -332,11 +332,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     let center_rho = objective.baseline_rho.from_flat(banked.view());
     let h = 1.0e-4;
     let mut failures = Vec::new();
-    // #2253: the highest inner budget in the sweep is treated as CONVERGED — the
-    // FD-vs-analytic identity is only asserted there (lower budgets are diagnostic
-    // measurements of inner under-convergence, not gradient bugs).
-    const CONVERGED_INNER_BUDGET: usize = 200;
-    for inner_max_iter in [40usize, CONVERGED_INNER_BUDGET] {
+    for inner_max_iter in [40usize, 200usize] {
         let center = logdet_audit_point(
             center_term.clone(),
             z.view(),
@@ -487,16 +483,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
                  eval_fd={:+.6e} |delta|={delta:.3e} tol={tolerance:.3e}",
                 grad[j], fd,
             );
-            // #2253: the central FD is a valid gradient check ONLY at a CONVERGED
-            // inner budget. The analytic outer gradient is budget-independent and
-            // matches the FD to ~2e-5 once the inner solve reaches stationarity
-            // (budget 200), but the LOW-budget FD is itself inaccurate — its
-            // re-converged θ̂(ρ±h) has not settled, so ∂(D+P)/∂θ̂ ≠ 0 and the
-            // envelope theorem the analytic gradient relies on is violated. That
-            // under-convergence (Δ≈0.09 at budget 40) is not a gradient bug and
-            // must not fail the gate; the lower-budget legs stay diagnostic-only.
-            // Assert the value/gradient identity solely at the converged budget.
-            if delta > tolerance && inner_max_iter >= CONVERGED_INNER_BUDGET {
+            if delta > tolerance {
                 failures.push(format!(
                     "budget {inner_max_iter}, rho coordinate {j}: analytic={:+.12e}, \
                      same-emission central FD={:+.12e}, delta={delta:.3e}, \
