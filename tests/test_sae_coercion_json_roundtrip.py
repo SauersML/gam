@@ -47,6 +47,8 @@ def _jsonable(value):
         {"a": 1, "b": [1.0, 2.0], "c": {"nested": "x"}},
         {"arr": np.array([1.0, 2.0, 3.0]), "flag": True, "n": 7},
         np.array([[1.0, 2.0], [3.0, 4.0]]),
+        np.array([[0.5]]),
+        [np.array([0.0]), np.array([1.0])],
         {"mixed": [np.array([1.0, 2.0]), {"k": np.float64(0.5)}]},
     ],
 )

@@ -11,7 +11,10 @@ passthroughs) surfaces as a dict mismatch. Three atom kinds are exercised
 
 MAINLINE only: no Fisher shard, no linear_block relabel (follow-up arms). The
 mainline fixture is asserted free of non-finite values so a future data change cannot
-silently exercise the Rust mapping-coercion rejection branch."""
+silently exercise the Rust mapping-coercion rejection branch. These fixtures disable
+the independent outer smoothing-parameter and structure searches: this contract
+starts at the raw live-fit payload boundary and must not inherit optimizer
+certification failures that occur before the builder is called."""
 from __future__ import annotations
 
 import math
@@ -69,7 +72,8 @@ def test_builder_full_fit_equiv(topology, d_atom, monkeypatch):
     x = _data_for(topology, n=60, p=5, seed=0)
     fit = gamfit.sae_manifold_fit(
         X=x, K=2, d_atom=d_atom, atom_topology=topology, assignment="softmax",
-        n_iter=8, random_state=0,
+        n_iter=8, random_state=0, _run_structure_search=False,
+        _run_outer_rho_search=False,
     )
     assert "raw" in captured, "raw sae_manifold_fit_minimal payload was not captured"
 
@@ -124,6 +128,7 @@ def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
     fit = gamfit.sae_manifold_fit(
         X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         n_iter=8, random_state=0, fisher_factors=u,
+        _run_structure_search=False, _run_outer_rho_search=False,
     )
     assert fit.metric_provenance == "OutputFisher"
     assert "raw" in captured
@@ -165,7 +170,8 @@ def test_builder_full_fit_equiv_linear_block(monkeypatch):
     x = _data_for("euclidean", n=60, p=5, seed=3)
     fit = gamfit.sae_manifold_fit(
         X=x, K=2, d_atom=1, atom_topology="linear_block", assignment="ibp_map",
-        n_iter=8, random_state=0,
+        n_iter=8, random_state=0, _run_structure_search=False,
+        _run_outer_rho_search=False,
     )
     assert "raw" in captured
     # What `_bases(...)` produces for atom_topology="linear_block": one per atom.

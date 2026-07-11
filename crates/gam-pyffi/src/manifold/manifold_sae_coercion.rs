@@ -107,6 +107,14 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(b) = obj.cast::<PyBool>() {
         return Ok(Value::Bool(b.is_true()));
     }
+    // NumPy arrays with a single element can be extracted as Rust scalars.
+    // Preserve their rank by applying numpy's own `.tolist()` conversion before
+    // the scalar extractors below. NumPy scalar objects also expose `.tolist()`;
+    // those correctly become native Python scalars and recurse once.
+    if obj.hasattr("tolist")? {
+        let listed = obj.call_method0("tolist")?;
+        return py_any_to_json_value(&listed);
+    }
     if let Ok(i) = obj.extract::<i64>() {
         return Ok(Value::Number(i.into()));
     }
@@ -131,12 +139,6 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
             map.insert(key, py_any_to_json_value(&v)?);
         }
         return Ok(Value::Object(map));
-    }
-    // A numpy array (or any object exposing `.tolist()`) flattens to native
-    // Python lists first, then recurse.
-    if obj.hasattr("tolist")? {
-        let listed = obj.call_method0("tolist")?;
-        return py_any_to_json_value(&listed);
     }
     if let Ok(seq) = obj.cast::<PyList>() {
         let mut arr = Vec::with_capacity(seq.len());
