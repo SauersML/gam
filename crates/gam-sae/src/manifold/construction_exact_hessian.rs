@@ -194,15 +194,14 @@ where
                  derived Krylov dimension {dim}"
             ));
         }
-        // #2253 — deflate the isolated direction when it is UNRESOLVED under the
-        // exact pencil: |μ| below the numerical-null floor (near-flat), OR
-        // non-positive (indefinite). Both are directions the evidence factor
-        // stiffens to unit curvature (`factor_spectral_deflated_evidence_row`
-        // deflates every non-positive eigenvalue), so their outer-gradient
-        // contribution is ρ-independent and the `1/μ`-amplified IFT response
-        // along them must be projected out for consistency. Only a RESOLVED
-        // positive direction (`v_mu >= rank_floor`) must never be removed — that
-        // would delete a genuine part of the response — so refuse to deflate it.
+        // #2253 — deflate the isolated direction only when it is UNRESOLVED under
+        // the exact pencil: `|μ|` below the numerical-null floor. A resolved
+        // direction of either sign is a genuine finite part of the IFT response.
+        // It can reach this branch when positive and negative resolved components
+        // cancel in the solution's aggregate Rayleigh quotient; inverse iteration
+        // then proves that no numerical null was present. In that case keep the
+        // original exact solve instead of either deleting the resolved component
+        // or turning benign Rayleigh cancellation into a typed failure.
         let av = apply_a_q(&v)?;
         let bv = apply_b_q(&v)?;
         let v_b_norm_sq = sae_inner(&v, &bv);
@@ -213,11 +212,14 @@ where
             ));
         }
         let v_mu = sae_inner(&v, &av) / v_b_norm_sq;
-        if !(v_mu.is_finite() && v_mu < rank_floor) {
+        if !v_mu.is_finite() {
             return Err(format!(
-                "solve_exact_stationarity: inverse power failed to isolate an unresolved \
-                 (near-null or indefinite) direction: μ={v_mu:.6e}, floor={rank_floor:.6e}"
+                "solve_exact_stationarity: inverse power produced non-finite \
+                 generalized curvature μ={v_mu:.6e}"
             ));
+        }
+        if v_mu.abs() >= rank_floor {
+            return Ok(x);
         }
         let proj = sae_inner(&v, &bx);
         if proj == 0.0 || !proj.is_finite() {

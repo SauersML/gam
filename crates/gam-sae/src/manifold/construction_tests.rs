@@ -470,6 +470,42 @@ mod exact_stationarity_solve_1418_tests {
         );
     }
 
+    /// #2253: a near-zero Rayleigh quotient of the complete response is not by
+    /// itself a numerical null. Resolved positive and negative pencil components
+    /// can cancel exactly. The inverse-power discriminator must recognize the
+    /// resolved negative direction and keep the full finite response.
+    #[test]
+    fn ift_solve_keeps_resolved_indefinite_rayleigh_cancellation_2253() {
+        // B=I, A=diag(-1/2, 2), x=(2,1), rhs=A x=(-1,2). Although
+        // x^T A x = 0 exactly, both pencil eigenvalues are far above the
+        // sqrt(epsilon) identifiability floor in magnitude.
+        let cache = diagonal_latent_cache(&[1.0_f64, 1.0]);
+        let solver = DeflatedArrowSolver::plain(&cache);
+        let rhs = SaeArrowVector {
+            t: Array1::from_vec(vec![-1.0_f64, 2.0]),
+            beta: Array1::zeros(0),
+        };
+        let apply_raw_a = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            Ok(SaeArrowVector {
+                t: Array1::from_vec(vec![-0.5 * v.t[0], 2.0 * v.t[1]]),
+                beta: Array1::zeros(0),
+            })
+        };
+        let apply_raw_b = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            Ok(v.clone())
+        };
+
+        let solved = solve_exact_stationarity_on_gauge_quotient(
+            &solver,
+            &rhs,
+            &apply_raw_a,
+            &apply_raw_b,
+        )
+        .expect("resolved indefinite response");
+        assert_abs_diff_eq!(solved.t[0], 2.0, epsilon = 1.0e-10);
+        assert_abs_diff_eq!(solved.t[1], 1.0, epsilon = 1.0e-10);
+    }
+
     /// #2080 defect 4 — with a SATURATED gate logit, the exact stationarity
     /// Jacobian `A` develops a near-null pencil direction (data curvature
     /// `∝ σ'(ℓ)² ≈ 0` against an O(1) majorizer entry in `B`), and the raw
