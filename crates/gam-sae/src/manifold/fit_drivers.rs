@@ -1433,7 +1433,11 @@ impl SaeManifoldTerm {
             let direction = evecs.column(eig_idx).to_owned();
             let applied = operator.dot(&direction);
             let rayleigh = direction.dot(&applied).abs();
-            let residual_norm = applied.iter().map(|value| value * value).sum::<f64>().sqrt();
+            let residual_norm = applied
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
             if rayleigh.is_finite()
                 && residual_norm.is_finite()
                 && rayleigh <= null_floor
@@ -1503,8 +1507,7 @@ impl SaeManifoldTerm {
                 let off = basis_offsets[atom_idx];
                 let weight = assignments[[row, atom_idx]];
                 for basis_col in 0..basis_sizes[atom_idx] {
-                    weighted_basis[off + basis_col] =
-                        weight * atom.basis_values[[row, basis_col]];
+                    weighted_basis[off + basis_col] = weight * atom.basis_values[[row, basis_col]];
                 }
             }
             for col in 0..basis_dim {
@@ -1600,12 +1603,11 @@ impl SaeManifoldTerm {
                                 continue;
                             }
                             for basis_col in 0..m {
-                                whitened_jacobian[[
-                                    metric_col,
-                                    border_off + basis_col * rank + frame_col,
-                                ]] = weight
-                                    * self.atoms[atom_idx].basis_values[[row, basis_col]]
-                                    * projected;
+                                whitened_jacobian
+                                    [[metric_col, border_off + basis_col * rank + frame_col]] =
+                                    weight
+                                        * self.atoms[atom_idx].basis_values[[row, basis_col]]
+                                        * projected;
                             }
                         }
                     }

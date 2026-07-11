@@ -70,7 +70,10 @@ fn joint_decoder_gauge_quotients_full_rank_atom_redistribution_2080() -> Result<
                 value * value
             })
             .sum::<f64>();
-        assert!(gram > 0.0, "atom {atom_idx} must have a full-rank scalar Gram");
+        assert!(
+            gram > 0.0,
+            "atom {atom_idx} must have a full-rank scalar Gram"
+        );
     }
 
     let gauges = term.joint_decoder_beta_null_directions(&[0.0, 0.0])?;
@@ -83,12 +86,8 @@ fn joint_decoder_gauge_quotients_full_rank_atom_redistribution_2080() -> Result<
     let delta_t = Array1::<f64>::zeros(coord_dim);
     let delta_beta = array![1.0_f64, -1.0];
     let raw = delta_beta.dot(&delta_beta);
-    let quotient = term.quotient_newton_step_norm_sq(
-        delta_t.view(),
-        delta_beta.view(),
-        raw,
-        &[0.0, 0.0],
-    )?;
+    let quotient =
+        term.quotient_newton_step_norm_sq(delta_t.view(), delta_beta.view(), raw, &[0.0, 0.0])?;
     assert!(
         quotient <= f64::EPSILON * (1.0 + raw),
         "joint redistribution must vanish on the identified quotient; raw={raw:.3e}, quotient={quotient:.3e}"
