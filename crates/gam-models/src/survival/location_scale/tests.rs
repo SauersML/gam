@@ -1267,7 +1267,6 @@ fn survival_ls_joint_jet_tower_oracle_body() {
             .expect("dynamic geometry");
         let kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
@@ -1419,7 +1418,6 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
             .expect("dynamic geometry");
         let kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
@@ -1601,7 +1599,6 @@ fn survival_ls_packed_directional_high_curvature_body() {
             .expect("dynamic geometry");
         let kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
@@ -1741,7 +1738,6 @@ fn survival_ls_joint_directional_derivative_time_varying_body() {
             .expect("dynamic geometry");
         let kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
@@ -1760,7 +1756,7 @@ fn survival_ls_joint_directional_derivative_time_varying_body() {
                     .expect("tower-certified directional derivative");
             let hand = family
                 .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
-                    &direction, &q, &dynamic, 0.0,
+                    &direction, &dynamic, 0.0,
                 )
                 .expect("hand directional derivative")
                 .expect("hand directional derivative present");
@@ -1823,7 +1819,6 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
         .expect("dynamic geometry");
     let kernel = SurvivalLsRowKernel {
         family: &family,
-        q: &q,
         dynamic: &dynamic,
         deriv_log_scale: 0.0,
         offsets: family.joint_block_offsets(),
@@ -2000,7 +1995,6 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
             .expect("dynamic geometry");
         let kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
@@ -2135,7 +2129,6 @@ fn survival_ls_block_gradient_tower_body() {
             .expect("dynamic geometry");
         let kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
@@ -6639,7 +6632,6 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         // Base-channel design rows via the production SurvivalLsRowKernel.
         let base_kernel = SurvivalLsRowKernel {
             family: &family,
-            q: &q,
             dynamic: &dynamic,
             deriv_log_scale: 0.0,
             offsets: offsets[0..4].to_vec(),
