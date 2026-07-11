@@ -7123,10 +7123,10 @@ impl ManifoldSaeCore {
             let atoms = raw
                 .get_item("atoms")?
                 .ok_or_else(|| py_value_error("OOS payload missing 'atoms'".to_string()))?;
-            let atoms = atoms.downcast::<PyList>()?;
+            let atoms = atoms.cast::<PyList>()?;
             let coords = PyList::empty(py);
             for atom in atoms.iter() {
-                let atom = atom.downcast::<PyDict>()?;
+                let atom = atom.cast::<PyDict>()?;
                 let block = atom.get_item("on_atom_coords_t")?.ok_or_else(|| {
                     py_value_error("OOS atom payload missing 'on_atom_coords_t'".to_string())
                 })?;
