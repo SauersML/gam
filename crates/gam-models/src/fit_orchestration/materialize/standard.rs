@@ -255,7 +255,7 @@ pub(crate) fn materialize_standard<'a>(
         }
     });
     let optimize_sas = sas_link.is_some();
-    let options = crate::fit_orchestration::canonical_standard_fit_options(
+    let mut options = crate::fit_orchestration::canonical_standard_fit_options(
         config,
         crate::fit_orchestration::StandardFitOptionsInputs {
             latent_cloglog,
@@ -268,6 +268,7 @@ pub(crate) fn materialize_standard<'a>(
             ..Default::default()
         },
     );
+    options.resource_policy = policy.clone();
     let kappa_options = config.spatial_optimization.clone();
 
     let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {

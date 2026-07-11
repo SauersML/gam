@@ -1272,8 +1272,31 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         rho_dim: usize,
         dims_per_term: Vec<usize>,
     ) -> Result<Self, String> {
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        Self::new_with_policy(
+            data,
+            spec,
+            design,
+            spatial_terms,
+            rho_dim,
+            dims_per_term,
+            &policy,
+        )
+    }
+
+    fn new_with_policy(
+        data: ArrayView2<'d, f64>,
+        spec: TermCollectionSpec,
+        design: TermCollectionDesign,
+        spatial_terms: Vec<usize>,
+        rho_dim: usize,
+        dims_per_term: Vec<usize>,
+        policy: &gam_runtime::resource::ResourcePolicy,
+    ) -> Result<Self, String> {
         Ok(Self {
-            realizer: FrozenTermCollectionIncrementalRealizer::new(data, spec, design)?,
+            realizer: FrozenTermCollectionIncrementalRealizer::new_with_policy(
+                data, spec, design, policy,
+            )?,
             current_theta: None,
             last_eval_theta: None,
             last_cost: None,
@@ -3647,13 +3670,14 @@ fn run_exact_joint_spatial_optimization(
         data,
         rho_dim,
         kind,
-        cache: SingleBlockExactJointDesignCache::new(
+        cache: SingleBlockExactJointDesignCache::new_with_policy(
             data,
             resolvedspec.clone(),
             baseline_design.clone(),
             spatial_terms.to_vec(),
             rho_dim,
             dims_per_term.to_vec(),
+            &options.resource_policy,
         )
         .map_err(EstimationError::InvalidInput)?,
         evaluator: gam_solve::estimate::ExternalJointHyperEvaluator::new(
@@ -4374,7 +4398,21 @@ fn build_single_smooth_term_realization(
     data: ArrayView2<'_, f64>,
     termspec: &SmoothTermSpec,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
-    let raw = build_smooth_design(data, std::slice::from_ref(termspec))?;
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    build_single_smooth_term_realization_with_policy(data, termspec, &policy)
+}
+
+fn build_single_smooth_term_realization_with_policy(
+    data: ArrayView2<'_, f64>,
+    termspec: &SmoothTermSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+) -> Result<SingleSmoothTermRealization, BasisError> {
+    let mut workspace = gam_terms::basis::BasisWorkspace::with_policy(policy.clone());
+    let raw = build_smooth_design_withworkspace(
+        data,
+        std::slice::from_ref(termspec),
+        &mut workspace,
+    )?;
     finish_single_smooth_term_realization(raw)
 }
 
@@ -4882,6 +4920,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         spec: TermCollectionSpec,
         design: TermCollectionDesign,
     ) -> Result<Self, String> {
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        Self::new_with_policy(data, spec, design, &policy)
+    }
+
+    fn new_with_policy(
+        data: ArrayView2<'d, f64>,
+        spec: TermCollectionSpec,
+        design: TermCollectionDesign,
+        policy: &gam_runtime::resource::ResourcePolicy,
+    ) -> Result<Self, String> {
         if spec.smooth_terms.len() != design.smooth.terms.len() {
             return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer smooth term mismatch: spec_terms={}, design_terms={}",
@@ -4923,8 +4971,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
 
         let mut dropped_penaltyinfo_by_term = Vec::with_capacity(spec.smooth_terms.len());
         for (term_idx, termspec) in spec.smooth_terms.iter().enumerate() {
-            let realization =
-                build_single_smooth_term_realization(data, termspec).map_err(|e| {
+            let realization = build_single_smooth_term_realization_with_policy(
+                data, termspec, policy,
+            )
+            .map_err(|e| {
                     format!(
                         "failed to build cached realization for smooth term '{}' (index {}): {e}",
                         termspec.name, term_idx
@@ -4963,7 +5013,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             dropped_penaltyinfo_by_term,
             smooth_penalty_ranges,
             full_penalty_ranges,
-            basisworkspace: gam_terms::basis::BasisWorkspace::new(),
+            basisworkspace: gam_terms::basis::BasisWorkspace::with_policy(policy.clone()),
             spatial_realization_geometry: vec![None; geometry_slots],
             design_revision: 0,
         })

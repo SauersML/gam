@@ -65,7 +65,7 @@ pub fn fit_term_collection_with_coefficient_groups(
     if groups.is_empty() {
         return fit_term_collection_forspec(data, y, weights, offset, spec, family, options);
     }
-    let design = build_term_collection_design(data, spec)?;
+    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
     let base_fit_opts = adaptive_fit_options_base(options, &design);
     let realized = design
         .realize_coefficient_groups(groups, &base_fit_opts.rho_prior)
@@ -103,7 +103,7 @@ pub fn fit_term_collection_with_penalty_block_gamma_prior_callback<F>(
 where
     F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
 {
-    let design = build_term_collection_design(data, spec)?;
+    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
     let mut fit_opts = adaptive_fit_options_base(options, &design);
     fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
         .map_err(EstimationError::BasisError)?;
@@ -135,7 +135,7 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
     family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
-    let design = build_term_collection_design(data, spec)?;
+    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
     let mut fit_opts = adaptive_fit_options_base(options, &design);
     fit_opts.rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
         .map_err(EstimationError::BasisError)?;
@@ -182,7 +182,7 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
     // The base design already emits one term-named function-space ridge per
     // recoverable linear effect, so keyed priors and coefficient groups address
     // the same authoritative λ coordinates as every other fit path.
-    let design = build_term_collection_design(data, spec)?;
+    let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
     let base_fit_opts = adaptive_fit_options_base(options, &design);
     let base_rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
         .map_err(EstimationError::BasisError)?;
@@ -227,7 +227,8 @@ fn fit_term_collection_forspecwith_heuristic_lambdas(
     } else {
         spec
     };
-    let base_design = build_term_collection_design(data, design_spec)?;
+    let base_design =
+        build_term_collection_design_with_policy(data, design_spec, &options.resource_policy)?;
     fit_term_collection_on_realized_design(
         y,
         weights,

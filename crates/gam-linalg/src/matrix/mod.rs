@@ -170,6 +170,64 @@ pub fn panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
     Ok(())
 }
 
+fn merge_operator_materialization_policies(
+    left: Option<MaterializationPolicy>,
+    right: Option<MaterializationPolicy>,
+) -> Option<MaterializationPolicy> {
+    match (left, right) {
+        (None, policy) | (policy, None) => policy,
+        (Some(left), Some(right)) => Some(MaterializationPolicy {
+            max_single_dense_bytes: left
+                .max_single_dense_bytes
+                .min(right.max_single_dense_bytes),
+            max_cached_dense_bytes: left
+                .max_cached_dense_bytes
+                .min(right.max_cached_dense_bytes),
+            row_chunk_target_bytes: left
+                .row_chunk_target_bytes
+                .min(right.row_chunk_target_bytes),
+            allow_operator_materialization: left.allow_operator_materialization
+                && right.allow_operator_materialization,
+            allow_diagnostic_materialization: left.allow_diagnostic_materialization
+                && right.allow_diagnostic_materialization,
+        }),
+    }
+}
+
+fn enforce_operator_materialization_policy(
+    op: &dyn DenseDesignOperator,
+    context: &str,
+) -> Result<(), String> {
+    let Some(policy) = op.materialization_policy() else {
+        return Ok(());
+    };
+    if !policy.allow_operator_materialization {
+        return Err(MatrixError::DensificationRefused {
+            reason: format!(
+                "{context}: refusing to densify {}x{} operator-backed design because its \
+                 construction policy requires streamed storage",
+                op.nrows(),
+                op.ncols(),
+            ),
+        }
+        .into());
+    }
+    let bytes = checked_dense_nbytes(op.nrows(), op.ncols(), context)?;
+    if bytes > policy.max_single_dense_bytes {
+        return Err(MatrixError::DensificationRefused {
+            reason: format!(
+                "{context}: refusing to densify {}x{} operator-backed design ({bytes} bytes); \
+                 its construction-policy limit is {} bytes",
+                op.nrows(),
+                op.ncols(),
+                policy.max_single_dense_bytes,
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn weighted_crossprod_dense(
     left: &Array2<f64>,
     weights: &Array1<f64>,
@@ -1049,6 +1107,14 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         None
     }
 
+    /// Materialization contract captured when this operator-backed design was
+    /// selected. Composite operators propagate the strictest contract of their
+    /// inputs so a later caller using a more permissive default cannot reverse
+    /// an upstream streamed-storage decision.
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        None
+    }
+
     /// Batched column extraction: returns an `nrows × cols.len()` dense block
     /// whose k-th column is `apply(e_{cols[k]})`.
     ///
@@ -1169,6 +1235,7 @@ impl LazyDense {
     /// refusal is typed evidence the dense copy does not fit jointly right
     /// now — fallible callers route to chunked/matrix-free strategies.
     fn try_governed_dense_arc(&self, context: &str) -> Result<Arc<Array2<f64>>, String> {
+        enforce_operator_materialization_policy(self.op.as_ref(), context)?;
         if let Some(governed) = self.dense_memo.get() {
             return Ok(Arc::clone(governed.as_ref()));
         }
@@ -1282,7 +1349,11 @@ impl DenseDesignMatrix {
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
             Self::Materialized(matrix) => Some(matrix.as_ref()),
-            Self::Lazy(op) => op.as_dense_ref(),
+            Self::Lazy(lazy) => lazy
+                .dense_memo
+                .get()
+                .map(|governed| governed.as_ref().as_ref())
+                .or_else(|| lazy.op.as_dense_ref()),
         }
     }
 
@@ -1304,6 +1375,11 @@ impl DenseDesignMatrix {
                     lazy.nrows(),
                     lazy.ncols(),
                     &policy,
+                )
+                .unwrap_or_else(|reason| std::panic::panic_any(reason));
+                enforce_operator_materialization_policy(
+                    lazy.op.as_ref(),
+                    "DenseDesignMatrix::to_dense",
                 )
                 .unwrap_or_else(|reason| std::panic::panic_any(reason));
                 if let Some(governed) = lazy.dense_memo.get() {
@@ -1711,6 +1787,13 @@ impl DenseDesignOperator for DenseDesignMatrix {
         DenseDesignMatrix::as_dense_ref(self)
     }
 
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        match self {
+            Self::Materialized(_) => None,
+            Self::Lazy(lazy) => lazy.op.materialization_policy(),
+        }
+    }
+
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
@@ -1890,6 +1973,10 @@ impl DenseDesignOperator for ReparamOperator {
 
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         None
+    }
+
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        self.x_original.materialization_policy()
     }
 
     fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
@@ -2269,6 +2356,13 @@ impl DesignBlock {
             Self::Sparse(s) => s.ncols(),
             Self::RandomEffect(op) => op.ncols(),
             Self::Intercept(_) => 1,
+        }
+    }
+
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        match self {
+            Self::Dense(design) => design.materialization_policy(),
+            Self::Sparse(_) | Self::RandomEffect(_) | Self::Intercept(_) => None,
         }
     }
 
@@ -2821,6 +2915,12 @@ impl LinearOperator for BlockDesignOperator {
 }
 
 impl DenseDesignOperator for BlockDesignOperator {
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        self.blocks.iter().fold(None, |policy, block| {
+            merge_operator_materialization_policies(policy, block.materialization_policy())
+        })
+    }
+
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.n || y.len() != self.n {
             return Err(format!(
@@ -3269,6 +3369,10 @@ impl DenseDesignOperator for CoefficientTransformOperator {
         self.materialized_combined()
     }
 
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        self.inner.materialization_policy()
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         if let Some(combined) = self.materialized_combined() {
             return combined.clone();
@@ -3543,6 +3647,18 @@ impl LinearOperator for ResidualisedDesignOperator {
 impl DenseDesignOperator for ResidualisedDesignOperator {
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         self.materialized_combined()
+    }
+
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        self.anchors.iter().fold(
+            self.inner.materialization_policy(),
+            |policy, (anchor, _)| {
+                merge_operator_materialization_policies(
+                    policy,
+                    anchor.materialization_policy(),
+                )
+            },
+        )
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -4348,6 +4464,13 @@ impl LinearOperator for DesignMatrix {
 }
 
 impl DenseDesignOperator for DesignMatrix {
+    fn materialization_policy(&self) -> Option<MaterializationPolicy> {
+        match self {
+            Self::Dense(design) => design.materialization_policy(),
+            Self::Sparse(_) => None,
+        }
+    }
+
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() || y.len() != self.nrows() {
             return Err(format!(

@@ -66,6 +66,20 @@ pub fn build_term_collection_design_inner(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
 ) -> Result<TermCollectionDesign, BasisError> {
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    build_term_collection_design_inner_with_policy(data, spec, &policy)
+}
+
+/// Build a planned term collection while preserving the caller's resource
+/// policy through the actual basis realization. The policy must reach the
+/// [`BasisWorkspace`]: using it only while lowering the formula spec leaves a
+/// later spatial build free to reverse the routing decision under the library
+/// default.
+pub fn build_term_collection_design_inner_with_policy(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+) -> Result<TermCollectionDesign, BasisError> {
     use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
@@ -78,7 +92,7 @@ pub fn build_term_collection_design_inner(
     // [intercept | linear | random_effects | smooth].
     let (smooth_raw_result, (random_blocks_result, linear_block_result)) = rayon::join(
         || {
-            let mut ws = crate::basis::BasisWorkspace::new();
+            let mut ws = crate::basis::BasisWorkspace::with_policy(policy.clone());
             build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
         },
         || {
@@ -473,6 +487,18 @@ pub fn build_term_collection_design(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
 ) -> Result<TermCollectionDesign, BasisError> {
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
+    build_term_collection_design_with_policy(data, spec, &policy)
+}
+
+/// Policy-aware counterpart to [`build_term_collection_design`]. Center
+/// planning is identical; only the basis workspace's materialization contract
+/// differs.
+pub fn build_term_collection_design_with_policy(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+) -> Result<TermCollectionDesign, BasisError> {
     validate_term_collection_finite_inputs(data, spec)?;
     let mut planned_specs =
         plan_joint_spatial_centers_for_term_blocks(data, &[spec.smooth_terms.clone()])?;
@@ -484,7 +510,7 @@ pub fn build_term_collection_design(
     })?;
     let mut planned_spec = spec.clone();
     planned_spec.smooth_terms = planned_smooth_terms;
-    build_term_collection_design_inner(data, &planned_spec)
+    build_term_collection_design_inner_with_policy(data, &planned_spec, policy)
 }
 
 /// Build the EXACT analytic average-derivative design `∂(design row)/∂x_c` of a

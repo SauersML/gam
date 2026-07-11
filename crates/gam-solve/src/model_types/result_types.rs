@@ -821,6 +821,11 @@ impl<'de> Deserialize<'de> for FitConvergenceEvidence {
 
 #[derive(Clone, Debug)]
 pub struct FitOptions {
+    /// Resource contract used by every basis realization and spatial
+    /// hyperparameter rebuild belonging to this fit. Keeping it on the fit
+    /// lifecycle prevents a policy used during formula lowering from being
+    /// silently replaced by the library default when the design is built.
+    pub resource_policy: gam_runtime::resource::ResourcePolicy,
     pub latent_cloglog: Option<LatentCLogLogState>,
     pub mixture_link: Option<MixtureLinkSpec>,
     pub optimize_mixture: bool,
@@ -882,6 +887,7 @@ pub struct FitOptions {
 impl Default for FitOptions {
     fn default() -> Self {
         Self {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
