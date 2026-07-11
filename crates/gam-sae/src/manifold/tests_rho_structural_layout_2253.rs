@@ -144,6 +144,32 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         &rho_state.lambda_smooth_vec(),
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
+    // Freeze one accepted base state for the fixed-theta derivative audit. Own
+    // every closure input so the live objective remains mutably available to
+    // the continuation probes below, and every directional/axis frozen FD is
+    // evaluated at this same base state rather than whichever probe ran last.
+    let frozen_anchor_term = gradient_objective.term.clone();
+    let frozen_baseline_rho = gradient_objective.baseline_rho.clone();
+    let frozen_target = gradient_objective.target.clone();
+    let frozen_registry = gradient_objective.registry.clone();
+    let frozen_learning_rate = gradient_objective.learning_rate;
+    let frozen_ridge_ext_coord = gradient_objective.ridge_ext_coord;
+    let frozen_ridge_beta = gradient_objective.ridge_beta;
+    let frozen_cost_at = |rho_flat: &Array1<f64>| {
+        let mut term = frozen_anchor_term.clone();
+        let rho = frozen_baseline_rho.from_flat(rho_flat.view());
+        term.reml_criterion_with_cache(
+            frozen_target.view(),
+            &rho,
+            frozen_registry.as_ref(),
+            0,
+            frozen_learning_rate,
+            frozen_ridge_ext_coord,
+            frozen_ridge_beta,
+        )
+        .expect("frozen-state directional value probe")
+        .0
+    };
 
     let direction = array![0.6_f64, -0.8_f64];
     let analytic = evaluation.gradient.dot(&direction);
@@ -162,21 +188,6 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .eval_cost(&minus)
         .expect("-h directional value probe must converge");
     let minus_telemetry = gradient_objective.probe_telemetry();
-    let frozen_cost_at = |rho_flat: &Array1<f64>| {
-        let mut term = gradient_objective.term.clone();
-        let rho = gradient_objective.baseline_rho.from_flat(rho_flat.view());
-        term.reml_criterion_with_cache(
-            gradient_objective.target.view(),
-            &rho,
-            gradient_objective.registry.as_ref(),
-            0,
-            gradient_objective.learning_rate,
-            gradient_objective.ridge_ext_coord,
-            gradient_objective.ridge_beta,
-        )
-        .expect("frozen-state directional value probe")
-        .0
-    };
     let frozen_plus_cost = frozen_cost_at(&plus);
     let frozen_minus_cost = frozen_cost_at(&minus);
     assert!(
