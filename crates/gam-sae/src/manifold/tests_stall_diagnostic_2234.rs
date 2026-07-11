@@ -60,17 +60,22 @@ fn logdet_audit_point(
     mut term: SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     rho: &SaeManifoldRho,
-    registry: &AnalyticPenaltyRegistry,
+    registry: Option<&AnalyticPenaltyRegistry>,
 ) -> Result<LogdetAuditPoint, String> {
     let criterion_result =
-        term.reml_criterion_with_cache(target, rho, Some(registry), 40, 0.05, 1.0e-6, 1.0e-6)?;
+        term.reml_criterion_with_cache(target, rho, registry, 40, 0.05, 1.0e-6, 1.0e-6)?;
     let loss = criterion_result.1;
     let cache = criterion_result.2;
     let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
         "logdet_audit_point: authoritative log determinant unavailable".to_string()
     })?;
     let occam = term.reml_occam_term(rho)?;
-    let extra_penalty_energy = term.reml_extra_penalty_value_total(registry)?;
+    let extra_penalty_energy = match registry {
+        Some(registry) => term
+            .reml_extra_penalty_value_total(registry)
+            .map_err(|err| err.to_string())?,
+        None => 0.0,
+    };
     let solver = term
         .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
         .map_err(|err| err.to_string())?;
