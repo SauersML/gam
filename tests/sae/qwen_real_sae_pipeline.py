@@ -412,18 +412,6 @@ def main() -> int:
              if control_verdicts else ""))
     if n_adj == 0:
         print("FINDING: no group could be adjudicated (degenerate group geometry).")
-    elif n_circle == 0:
-        print("FINDING: ZERO groups are genuinely curved — the real Qwen feature "
-              "groups adjudicate as cluster/euclidean. The curved-atom wager LOSES "
-              "measurably on this layer. That is the honest result.")
-    elif n_circle < 0.2 * n_adj:
-        print("FINDING: a SMALL minority of groups are genuinely curved; most are "
-              "cluster/euclidean. The wager partially holds — most structure is "
-              "discrete superposition, a few genuine curved atoms.")
-    else:
-        print("FINDING: a substantial fraction of groups are genuinely curved — "
-              "gam's un-forced judge confirms curved structure in the real "
-              "dictionary beyond the cluster null.")
 
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2, default=str))
