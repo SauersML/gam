@@ -7537,12 +7537,12 @@ pub fn fit_term_collectionwith_latent_coord_optimization(
 /// local joint `[rho, psi]` solve.
 ///
 /// The short/rich basin is represented by the ordinary cold fit at the
-/// center-density seed. The competing long-range basin has one canonical,
-/// data-derived representative: the lower end of the term's feasible
-/// `psi = log(kappa)` window, equivalently its largest well-conditioned length
-/// scale. Profile all smoothing parameters at that endpoint once, and retain it
-/// only when its certified REML objective is strictly lower. The subsequent
-/// joint optimizer therefore runs exactly once, from the winning basin.
+/// observation-density seed. The competing long-range basin has one canonical,
+/// data-derived representative: the rotation-invariant fill distance of the
+/// reduced-rank center set, `extent_rot / sqrt(k)`. Profile all smoothing
+/// parameters at that endpoint once, and retain it only when its certified REML
+/// objective is strictly lower. The subsequent joint optimizer therefore runs
+/// exactly once, from the winning basin.
 ///
 /// This is a closed endpoint comparison, not a lattice, sweep, or collection of
 /// joint restarts. Both profiles pass through `fit_term_collection_forspec`, so
@@ -7578,18 +7578,38 @@ fn select_isotropic_matern_range_basin(
     }
 
     for &term_idx in spatial_terms {
-        if !matches!(
-            resolvedspec
-                .smooth_terms
-                .get(term_idx)
-                .map(|term| &term.basis),
-            Some(SmoothBasisSpec::Matern { .. })
-        ) {
+        let Some(SmoothBasisSpec::Matern {
+            feature_cols,
+            spec: matern,
+            ..
+        }) = resolvedspec
+            .smooth_terms
+            .get(term_idx)
+            .map(|term| &term.basis)
+        else {
             continue;
-        }
-
-        let (psi_long, _psi_short) =
+        };
+        let num_centers =
+            gam_terms::basis::center_strategy_num_centers(&matern.center_strategy).ok_or_else(
+                || {
+                    EstimationError::InvalidInput(format!(
+                        "resolved isotropic Matérn term {term_idx} has no finite center count"
+                    ))
+                },
+            )?;
+        let companion_length_scale = matern_low_rank_center_resolution_length_scale(
+            data,
+            feature_cols,
+            num_centers,
+        )
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "resolved isotropic Matérn term {term_idx} has no finite center-resolution range"
+            ))
+        })?;
+        let (psi_long_bound, psi_short_bound) =
             spatial_term_psi_bounds(data, &resolvedspec, term_idx, kappa_options);
+        let psi_long = (-companion_length_scale.ln()).clamp(psi_long_bound, psi_short_bound);
         let long_length_scale = (-psi_long).exp();
         if !(long_length_scale.is_finite() && long_length_scale > 0.0) {
             crate::bail_invalid_estim!(
@@ -7608,11 +7628,10 @@ fn select_isotropic_matern_range_basin(
         // already certified incumbent rho. This is still a full standard REML
         // solve (including its ordinary seed certification), but it avoids
         // throwing away the exact smoothing optimum immediately before a
-        // deliberately large geometry move. In particular, the long-range
-        // endpoint can make the three Matérn operator blocks nearly collinear;
-        // the incumbent lambdas provide the well-scaled starting chart needed
-        // for that profile to reach its KKT certificate rather than exhausting
-        // its startup plans a few ulps above stationarity.
+        // deliberately coarser center-resolution geometry move. The incumbent
+        // lambdas provide the well-scaled starting chart needed for that profile
+        // to reach its KKT certificate rather than exhausting its startup plans
+        // a few ulps above stationarity.
         let endpoint = fit_term_collection_forspecwith_heuristic_lambdas(
             data,
             y,

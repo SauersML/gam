@@ -158,8 +158,15 @@ mod spatial_length_scale_monotone_tests {
         let spatial_terms = spatial_length_scale_term_indices(&resolved);
         assert_eq!(spatial_terms, vec![0]);
         let kappa_options = SpatialLengthScaleOptimizationOptions::default();
-        let (psi_long, _) =
+        let companion_length_scale = matern_low_rank_center_resolution_length_scale(
+            data.view(),
+            &[0],
+            num_centers,
+        )
+        .expect("center-resolution endpoint");
+        let (psi_long_bound, psi_short_bound) =
             spatial_term_psi_bounds(data.view(), &resolved, 0, &kappa_options);
+        let psi_long = (-companion_length_scale.ln()).clamp(psi_long_bound, psi_short_bound);
         let long_endpoint = (-psi_long).exp();
         let (selected_spec, _) = select_isotropic_matern_range_basin(
             data.view(),

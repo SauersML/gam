@@ -4842,6 +4842,32 @@ pub fn auto_initial_length_scale_for_centers(
     spacing.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
 }
 
+/// Rotation-invariant center-resolution range for the companion Matérn basin.
+///
+/// A reduced-rank Matérn basis has two distinct geometric resolutions: the
+/// observation fill distance used by the short/rich cold seed, and the coarser
+/// fill distance of its `k` retained centers. The latter is the canonical
+/// response-free representative of the overlapping, long-range basin:
+/// `sqrt(12 * lambda_max(cov(x))) / sqrt(k)`. It uses the same covariance
+/// extent as [`auto_initial_length_scale_for_centers`], so rigid rotations and
+/// row permutations leave it unchanged.
+pub fn matern_low_rank_center_resolution_length_scale(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    num_centers: usize,
+) -> Option<f64> {
+    if data.nrows() == 0 || feature_cols.is_empty() || num_centers == 0 {
+        return None;
+    }
+    let extent = feature_columns_rotation_invariant_range(data, feature_cols)?;
+    let length_scale = extent / (num_centers as f64).sqrt();
+    Some(
+        length_scale
+            .max(AUTO_LENGTH_SCALE_FLOOR)
+            .min(extent),
+    )
+}
+
 /// Low-rank radial-basis length-scale seed tied to the requested center spacing.
 ///
 /// Thin-plate regression splines with `k << n` represent the surface through a
