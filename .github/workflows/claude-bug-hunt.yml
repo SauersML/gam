@@ -99,6 +99,32 @@ jobs:
             A more common failure mode is under-ambition. Find more chains.
             Look in CI jobs for failures and inaccuracies. Get creative.
 
+            ## Figure it out MUCH more deeply — out-investigate the library
+
+            Do not stop at surface behaviour. For every candidate, trace the
+            mechanism through the WHOLE system until you can name the exact
+            code path and state, in one sentence, why the output is wrong
+            and what a correct implementation would produce. Read every lane,
+            branch, and caller the value flows through; diff against related
+            history; form a hypothesis and CONFIRM it empirically (a targeted
+            probe, a finite-difference check, a measured before/after) before
+            you commit a test or file an issue. A falsified hypothesis cheaply
+            killed is progress — re-diagnose rather than ship a vague issue.
+            The depth of your root-cause read is what makes the issue useful
+            to the fixer: point at the precise line and the precise reason.
+
+            ## Do not stop prematurely
+
+            Under-ambition is the failure mode. Before you end the run, make
+            sure you have (a) committed a well-posed failing test to `main`
+            AND filed a precise issue for every real defect you found, and
+            (b) actually exhausted the hunt — swept multiple subsystems, real
+            AND large-synthetic data, edge regimes, and CI-log failures. If
+            you are about to stop with nothing committed, that is a signal to
+            look HARDER in one more subsystem, not to wrap up — unless you
+            have genuinely and thoroughly searched and found nothing real, in
+            which case say exactly what you searched and why it's clean.
+
             Have fun with it.
     steps:
       - uses: actions/checkout@v4
