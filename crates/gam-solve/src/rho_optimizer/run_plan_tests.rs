@@ -337,6 +337,93 @@ fn certificate_certifies_kkt_stationary_railed_optimum() {
     );
 }
 
+/// Build an interior 1-coordinate objective `½·ρ₀²` (analytic gradient `[ρ₀]`,
+/// analytic Dense Hessian `[[1]]`) and certify at `theta_hat` with NO
+/// `operator_stop_reason` set — i.e. the non-flat-valley exit path a fit takes
+/// when it is already stationary at iteration 0. `objective_scale = 80` makes
+/// the absolute gradient floor `80·1e-9 = 8e-8`, mirroring the Gaussian-linear
+/// standard-REML fit.
+fn audit_interior_with_dense_curvature(
+    theta_hat: Array1<f64>,
+) -> Result<OuterCriterionCertificate, EstimationError> {
+    let config = OuterConfig {
+        objective_scale: Some(80.0),
+        ..OuterConfig::default()
+    };
+    let mut obj = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .build_objective(
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
+            move |_: &mut (), rho: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: 0.5 * rho[0] * rho[0],
+                    gradient: array![rho[0]],
+                    hessian: HessianValue::Dense(array![[1.0]]),
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+    let mut result = OuterResult::new(
+        theta_hat,
+        0.0,
+        1,
+        true,
+        OuterPlan {
+            solver: Solver::Bfgs,
+            hessian_source: HessianSource::BfgsApprox,
+        },
+    );
+    // `operator_stop_reason` is left None: this exercises the NON-flat-valley
+    // exit, proving the curvature-scaled widening is not gated to a specific
+    // stop reason (#2091/#2011).
+    certify_outer_optimality(&mut obj, &config, "curvature-widen-unit", &mut result)
+}
+
+/// The curvature-scaled widening is NOT gated to a `CostStallFlatValley` exit:
+/// a fit already stationary at iteration 0 (a 2-parameter Gaussian-linear REML
+/// with λ→0) reaches certification with `operator_stop_reason = None`, a
+/// projected gradient a hair ABOVE the absolute score·1e-9 floor, and a
+/// NEGLIGIBLE Newton decrement. The Newton decrement — not the exit reason — is
+/// the stationarity certificate, so the point must certify.
+#[test]
+fn curvature_widening_certifies_stationary_point_on_any_exit_reason() {
+    // |Pg| = 1.1e-7 > abs bound 8e-8, but ½·gᵀH⁻¹g = ½·(1.1e-7)² ≈ 6.0e-15,
+    // orders of magnitude below any outer objective tolerance: stationary to
+    // second order, must certify DESPITE operator_stop_reason = None.
+    let cert = audit_interior_with_dense_curvature(array![1.1e-7])
+        .expect("second-order-stationary point must certify via the curvature bound");
+    assert!(
+        cert.certifies(),
+        "curvature-stationary interior point was rejected: {}",
+        cert.summary(),
+    );
+    assert!(
+        cert.stationarity.projected_norm() > 8.0e-8,
+        "the test must exercise the ABOVE-solver-bound regime (else it proves \
+         nothing about the widening): {}",
+        cert.summary(),
+    );
+}
+
+/// The widening is direction/curvature-aware, not a blanket loosening: a
+/// genuinely non-stationary interior point (large Newton decrement) must still
+/// be rejected even though the same broadened gate is reached.
+#[test]
+fn curvature_widening_still_rejects_genuine_nonstationarity() {
+    // |Pg| = 1.0 with a unit Hessian → ½·gᵀH⁻¹g = 0.5 ≫ objective_tol, so the
+    // curvature bound ‖Pg‖·√(tol/Δpred) stays FAR below ‖Pg‖ and cannot rescue
+    // the point.
+    let outcome = audit_interior_with_dense_curvature(array![1.0]);
+    assert!(
+        outcome.is_err(),
+        "a genuinely non-stationary point must not be certified by the curvature bound",
+    );
+}
+
 /// The projection must NOT blunt the certificate's real job: genuine
 /// non-stationarity on a FREE (interior) coordinate must still reject the
 /// point even when a different coordinate is railed.
