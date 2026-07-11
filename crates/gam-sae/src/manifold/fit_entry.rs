@@ -672,21 +672,31 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
                 Some(banked) => ndarray::Array1::from(banked),
                 None => warm_flat,
             };
-            let problem = OuterProblem::new(search_init_rho.len())
-                .with_initial_rho(search_init_rho)
-                .with_seed_config(SeedConfig {
-                    max_seeds: 1,
-                    seed_budget: 1,
-                    ..Default::default()
-                });
             // #2138 — same shared cancel flag; each pass's objective polls it.
             objective.set_cancel_flag(Arc::clone(&cancel_flag));
-            // SPEC 20 — possession of the objective below is itself the
-            // convergence certificate: `certify_outer_stage` returns it only for
-            // `OuterResult.converged`, and drops it without removing its
-            // phase-scoped checkpoint for every typed failure.
-            let run_result = problem.run(&mut objective, "SAE manifold (structured)");
-            let mut objective = certify_outer_stage(objective, stage, run_result)?;
+            // Honor the same typed outer-search contract as pass 0. Structured
+            // residual alternation still runs when ρ search is disabled; only
+            // the hyperparameter walk is fixed at the warm ρ. The former
+            // unconditional `OuterProblem` silently re-enabled an outer search
+            // after a fixed-ρ primary fit.
+            let mut objective = if run_outer_rho_search {
+                let problem = OuterProblem::new(search_init_rho.len())
+                    .with_initial_rho(search_init_rho)
+                    .with_seed_config(SeedConfig {
+                        max_seeds: 1,
+                        seed_budget: 1,
+                        ..Default::default()
+                    });
+                // SPEC 20 — possession of the objective below is itself the
+                // convergence certificate: `certify_outer_stage` returns it only for
+                // `OuterResult.converged`, and drops it without removing its
+                // phase-scoped checkpoint for every typed failure.
+                let run_result = problem.run(&mut objective, "SAE manifold (structured)");
+                certify_outer_stage(objective, stage, run_result)?
+            } else {
+                objective.fit_at_fixed_rho(search_init_rho.view())?;
+                objective
+            };
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;

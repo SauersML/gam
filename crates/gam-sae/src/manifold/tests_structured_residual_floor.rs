@@ -23,8 +23,8 @@
 mod tests {
     use crate::manifold::{
         SaeFitAssignmentKind, SaeFitConfig, SaeFitReport, SaeFitRequest, SaeFitSeedReport,
-        SaeFitSeedRequest, SaeMinimalSeedReport, SaeMinimalSeedRequest, build_sae_fit_seed,
-        build_sae_minimal_seed, run_sae_manifold_fit,
+        SaeFitSeedRequest, SaeMinimalSeedReport, SaeMinimalSeedRequest, SaeOuterVerdict,
+        build_sae_fit_seed, build_sae_minimal_seed, run_sae_manifold_fit,
     };
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
     use ndarray::Array2;
@@ -195,6 +195,10 @@ mod tests {
             !report.structured_residual_diagnostics.is_empty(),
             "a fit that leaves real residual energy must RUN the structured-residual \
              pass (the degeneracy guard must not over-trigger)"
+        );
+        assert!(
+            matches!(report.outer_termination.verdict, SaeOuterVerdict::FixedRho),
+            "run_outer_rho_search=false must remain fixed-rho through structured passes"
         );
     }
 }
