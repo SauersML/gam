@@ -2312,7 +2312,7 @@ fn generalized_nullspace_basis(
         gam_linalg::triangular::forward_substitution_lower_matrix(lower.view(), left.t());
     let whitened = symmetrize_penalty(&whitened);
     let (evals, evecs) = FaerEigh::eigh(&whitened, Side::Lower).map_err(BasisError::LinalgError)?;
-    let tol = generalized_spectral_tolerance(&evals, p);
+    let tol = generalized_spectral_tolerance(&evals, &whitened);
     if let Some(&negative) = evals.iter().find(|&&value| value < -tol) {
         crate::bail_invalid_basis!(
             "{context}: generalized penalty is not positive semidefinite; eigenvalue {negative:.6e} is below the negative tolerance (magnitude {tol:.6e})"
@@ -2344,12 +2344,23 @@ fn generalized_nullspace_basis(
 /// decides a structural null space and must not erase genuine low-frequency
 /// modes merely because the largest generalized frequency grows with basis
 /// resolution.
-fn generalized_spectral_tolerance(evals: &Array1<f64>, dimension: usize) -> f64 {
-    let scale = evals
+fn generalized_spectral_tolerance(evals: &Array1<f64>, operator: &Array2<f64>) -> f64 {
+    let spectral_scale = evals
         .iter()
         .copied()
         .fold(0.0_f64, |largest, value| largest.max(value.abs()));
-    default_rrqr_rank_alpha() * f64::EPSILON * dimension.max(1) as f64 * scale
+    // Symmetric eigensolvers are backward stable in an operator norm, while the
+    // computed eigenvalues alone can slightly underestimate that norm after the
+    // two triangular whitening solves above. The maximum absolute row sum is a
+    // deterministic upper bound on ||A||₂, so this is the standard O(n·eps·||A||)
+    // roundoff envelope rather than a fitted absolute floor.
+    let operator_scale = operator
+        .rows()
+        .into_iter()
+        .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let scale = spectral_scale.max(operator_scale);
+    default_rrqr_rank_alpha() * f64::EPSILON * operator.nrows().max(1) as f64 * scale
 }
 
 /// `R = W (NᵀW)⁻¹ Wᵀ` for any full-column-rank null frame `N` and
@@ -2362,7 +2373,7 @@ fn ridge_from_null_metric_action(
 ) -> Result<Array2<f64>, BasisError> {
     let c_raw = n.t().dot(w);
     let (c_sym, evals, evecs) = spectral_summary(&c_raw)?;
-    let tol = generalized_spectral_tolerance(&evals, c_sym.nrows());
+    let tol = generalized_spectral_tolerance(&evals, &c_sym);
     if let Some(&invalid) = evals.iter().find(|&&value| value <= tol) {
         crate::bail_invalid_basis!(
             "function-space null metric is not strictly positive definite; eigenvalue {invalid:.6e} is at or below tolerance {tol:.6e}"
