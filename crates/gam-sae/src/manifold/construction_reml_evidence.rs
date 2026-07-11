@@ -1337,38 +1337,6 @@ impl SaeManifoldTerm {
             + sys.gb.iter().map(|&v| v * v).sum::<f64>()
     }
 
-    /// #2253/#2087 — the inner KKT residual `r = ∇_θ(D+P+extra)` at the current
-    /// (accepted) inner state, as a joint `(t, β)` [`SaeArrowVector`] on the same
-    /// layout the exact-stationarity solve consumes. Zero (to tolerance) at a KKT
-    /// optimum; nonzero at a #1051 objective-stagnation accept, where it feeds the
-    /// non-envelope correction `rᵀθ̂_ρ` in
-    /// [`Self::analytic_outer_rho_gradient_components_with_bundle`]. Assembling once
-    /// here (the same assembly `converge_inner_for_undamped_logdet` used) keeps the
-    /// residual exactly consistent with the criterion the gradient differentiates.
-    pub(crate) fn kkt_residual_vector(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        registry: Option<&AnalyticPenaltyRegistry>,
-    ) -> Result<SaeArrowVector, String> {
-        // Assemble on a clone: `assemble_arrow_schur` is `&mut self` (it scales the
-        // block design / fills buffers), and the outer-gradient caller must not
-        // have its accepted inner state mutated underneath it (same discipline as
-        // the stall-diagnostic audit).
-        let mut term = self.clone();
-        let sys = term.assemble_arrow_schur(target, rho, registry)?;
-        let total_t: usize = sys.rows.iter().map(|row| row.gt.len()).sum();
-        let mut t = Array1::<f64>::zeros(total_t);
-        let mut offset = 0usize;
-        for row in &sys.rows {
-            for &value in row.gt.iter() {
-                t[offset] = value;
-                offset += 1;
-            }
-        }
-        Ok(SaeArrowVector { t, beta: sys.gb })
-    }
-
     /// Install the per-row spectral deflation on an ACCEPTANCE system, take its
     /// undamped (ridge-0) evidence factorization, and read back both KKT residual
     /// norms (raw and quotient) off the SAME assembled system. This is the
