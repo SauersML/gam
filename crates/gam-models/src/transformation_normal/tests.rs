@@ -832,7 +832,9 @@ pub(crate) fn transformation_normal_full_outer_hessian_matches_resolved_objectiv
     let (_, _, _, base_spec) = toy_penalized_family_and_derivatives(&psi);
     let rho = base_spec.initial_log_lambdas;
 
-    let evaluate = |psi_value: &Array1<f64>, mode: gam_problem::EvalMode| {
+    let evaluate = |psi_value: &Array1<f64>,
+                    mode: gam_problem::EvalMode,
+                    warm_start: Option<&gam_custom_family::CustomFamilyWarmStart>| {
         let (family, derivative_blocks, _state, spec) =
             toy_penalized_family_and_derivatives(psi_value);
         evaluate_custom_family_joint_hyper(
@@ -841,13 +843,17 @@ pub(crate) fn transformation_normal_full_outer_hessian_matches_resolved_objectiv
             &options,
             &rho,
             &derivative_blocks,
-            None,
+            warm_start,
             mode,
         )
         .expect("CTN full joint-hyper evaluation")
     };
 
-    let analytic = evaluate(&psi, gam_problem::EvalMode::ValueGradientHessian);
+    let analytic = evaluate(
+        &psi,
+        gam_problem::EvalMode::ValueGradientHessian,
+        None,
+    );
     assert!(
         analytic.inner_converged,
         "base CTN inner solve must converge"
@@ -873,14 +879,22 @@ pub(crate) fn transformation_normal_full_outer_hessian_matches_resolved_objectiv
     for psi_axis in 0..psi.len() {
         let mut plus = psi.clone();
         plus[psi_axis] += step;
-        let plus_eval = evaluate(&plus, gam_problem::EvalMode::ValueAndGradient);
+        let plus_eval = evaluate(
+            &plus,
+            gam_problem::EvalMode::ValueAndGradient,
+            Some(&analytic.warm_start),
+        );
         assert!(
             plus_eval.inner_converged,
             "plus CTN inner solve must converge"
         );
         let mut minus = psi.clone();
         minus[psi_axis] -= step;
-        let minus_eval = evaluate(&minus, gam_problem::EvalMode::ValueAndGradient);
+        let minus_eval = evaluate(
+            &minus,
+            gam_problem::EvalMode::ValueAndGradient,
+            Some(&analytic.warm_start),
+        );
         assert!(
             minus_eval.inner_converged,
             "minus CTN inner solve must converge"
