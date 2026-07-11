@@ -2379,7 +2379,14 @@ fn remove_atoms(
     // only the surviving indices (descending removal on the Vecs would also work,
     // but the keep-mask keeps atoms/coords/logits/ρ provably in lock-step).
     term.atoms = keep.iter().map(|&j| term.atoms[j].clone()).collect();
-    term.assignment.logits = term.assignment.logits.select(Axis(1), &keep);
+    // `ndarray::select(Axis(1), ..)` may retain a column-major/non-standard
+    // stride layout. The Newton driver updates logits row-wise and requires each
+    // row to be a contiguous mutable slice, so materialize the compacted router
+    // explicitly in row-major order at this variable-K boundary.
+    let compacted_logits = Array2::from_shape_fn((n, keep.len()), |(row, new_atom)| {
+        term.assignment.logits[[row, keep[new_atom]]]
+    });
+    term.assignment.logits = compacted_logits;
     term.assignment.coords = keep
         .iter()
         .map(|&j| term.assignment.coords[j].clone())
@@ -6937,6 +6944,14 @@ mod tests {
             term.k_atoms(),
             2,
             "physical excision must reduce K from 4 to 2 (no active-mass resurrection)"
+        );
+        assert!(
+            term.assignment
+                .logits
+                .rows()
+                .into_iter()
+                .all(|row| row.as_slice().is_some()),
+            "compaction must materialize a row-contiguous router for the polish refit"
         );
         assert_eq!(
             rho.log_ard.len(),
