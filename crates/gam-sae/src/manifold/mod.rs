@@ -289,6 +289,9 @@ mod tests_steering_e4;
 mod tests_steering_crosscoder_2234;
 
 #[cfg(test)]
+mod tests_collateral_e2_2234;
+
+#[cfg(test)]
 mod tests_schur_seed_refusal_1782;
 
 #[cfg(test)]

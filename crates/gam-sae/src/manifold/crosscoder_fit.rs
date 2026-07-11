@@ -629,6 +629,21 @@ impl SaeCrosscoderFitReport {
             .steer_layer_decode(atom, self.layer_from_label(layer_label)?, rows, delta)
     }
 
+    /// The intrinsic collateral-damage curve (gam#2234 E2) for steering `atom`
+    /// along `axis`, measured against every OTHER fitted atom — the on-manifold
+    /// vs matched-norm-flat comparison in the fitted term's own representation,
+    /// with no model in the loop. Delegates to
+    /// [`crate::inference::steering::collateral_curve`].
+    pub fn collateral_curve(
+        &self,
+        atom: usize,
+        axis: usize,
+        doses: &[f64],
+    ) -> Result<crate::inference::steering::CollateralCurve, String> {
+        let others: Vec<usize> = (0..self.term.k_atoms()).filter(|&j| j != atom).collect();
+        crate::inference::steering::collateral_curve(&self.term, atom, axis, &others, doses)
+    }
+
     /// Materialize the stable report shared by bindings. The optional transport
     /// experiment is evaluated here, not in pyffi/CLI.
     pub fn wire_report(

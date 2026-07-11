@@ -74,6 +74,26 @@ impl ManifoldCrosscoderCore {
             .map_err(py_value_error)?;
         Ok(values.into_pyarray(py))
     }
+
+    /// The intrinsic collateral-damage curve (gam#2234 E2) for steering `atom`
+    /// along `axis` over `doses`, measured against every other fitted atom — the
+    /// on-manifold vs matched-norm-flat comparison rendered as the wire dict the
+    /// library owns (per-dose effect/collateral/cross-feature plus each arm's
+    /// efficiency and the dominance verdict). No model in the loop.
+    fn collateral_curve(
+        &self,
+        py: Python<'_>,
+        atom: usize,
+        axis: usize,
+        doses: Vec<f64>,
+    ) -> PyResult<PyObject> {
+        let curve = self
+            .inner
+            .collateral_curve(atom, axis, &doses)
+            .map_err(py_value_error)?;
+        let value = serde_json::to_value(&curve).map_err(|error| py_value_error(error.to_string()))?;
+        json_value_to_py(py, value)
+    }
 }
 
 #[pyfunction(signature = (

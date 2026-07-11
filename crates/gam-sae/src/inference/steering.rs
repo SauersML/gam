@@ -774,7 +774,7 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String
 /// effect and the off-target collateral of a single steering intervention,
 /// measured in the fitted dictionary's own representation, with no LLM in the
 /// loop.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CollateralPoint {
     /// The chart-coordinate dose applied to the target atom's steered axis
     /// (radians / fraction-of-period, per the atom's manifold).
@@ -784,16 +784,25 @@ pub struct CollateralPoint {
     /// frame `T_k = ∂g_k/∂t` at each row's fitted operating point. This is the
     /// intended landing — how loudly the knob turned the feature it names.
     pub on_target_effect: f64,
-    /// RMS-over-rows collateral: `sqrt(Σ_{j∈others} ‖proj_{T_j} Δ‖²)`, the energy
-    /// the SAME intervention leaks onto OTHER atoms' local frames. This is the
-    /// damage — how much turning atom `k`'s knob spuriously moves features the
-    /// intervention did not name.
+    /// RMS-over-rows collateral: `‖Δ − proj_{T_k} Δ‖`, the energy the SAME
+    /// intervention deposits OUTSIDE the target atom's own local frame — the total
+    /// damage. The on-manifold move is a chord of atom `k`'s decoder curve, so its
+    /// off-target component is only the second-order sagitta (`≈ 0`, growing with
+    /// dose-curvature); a fixed flat direction is off the rotating target frame at
+    /// most rows, so its off-target energy is immediate. This is the direct
+    /// generalization of the single-move [`SteerPlan::off_manifold_norm`] guard to
+    /// a swept intervention.
     pub collateral: f64,
+    /// RMS-over-rows CROSS-FEATURE leakage: `sqrt(Σ_{j∈others} ‖proj_{T_j} Δ‖²)`,
+    /// the part of the move that lands on OTHER named atoms' frames — the
+    /// interpretable "steering feature `k` spuriously moved feature `j`" damage, a
+    /// component of the total `collateral`.
+    pub cross_feature: f64,
 }
 
 /// One intervention family's swept collateral curve plus its aggregate
 /// collateral efficiency (collateral energy spent per unit on-target effect).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CollateralArm {
     /// Per-dose `(effect, collateral)` samples, in the order of the input doses.
     pub points: Vec<CollateralPoint>,
@@ -812,7 +821,7 @@ pub struct CollateralArm {
 /// coordinate to stay on the atom's decoded image. The thesis: at matched
 /// per-row norm the manifold arm spends strictly less collateral per unit
 /// on-target effect — curved features are the right control knobs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CollateralCurve {
     /// The steered (target) atom.
     pub atom: usize,
@@ -951,26 +960,37 @@ pub fn collateral_curve(
         w = next;
     }
 
-    // Decompose one per-row move field into (effect, collateral) RMS over rows.
+    // Decompose one per-row move field into (effect, off-target collateral,
+    // cross-feature leakage) RMS over rows.
     let decompose = |field: &Array2<f64>| -> CollateralPoint {
         let mut eff_sq = 0.0_f64;
         let mut col_sq = 0.0_f64;
+        let mut cross_sq = 0.0_f64;
         for row in 0..n {
             let delta = field.row(row);
-            let e = frame_landed_norm(&target_frames[row], delta);
-            eff_sq += e * e;
+            let on_target = project_onto_tangent_span(&target_frames[row], delta);
+            let mut e = 0.0_f64;
             let mut c = 0.0_f64;
+            for i in 0..p {
+                e += on_target[i] * on_target[i];
+                let residual = delta[i] - on_target[i];
+                c += residual * residual;
+            }
+            eff_sq += e;
+            col_sq += c;
+            let mut cross = 0.0_f64;
             for frames in &other_frames {
                 let l = frame_landed_norm(&frames[row], delta);
-                c += l * l;
+                cross += l * l;
             }
-            col_sq += c;
+            cross_sq += cross;
         }
         let denom = n.max(1) as f64;
         CollateralPoint {
             dose: 0.0,
             on_target_effect: (eff_sq / denom).sqrt(),
             collateral: (col_sq / denom).sqrt(),
+            cross_feature: (cross_sq / denom).sqrt(),
         }
     };
 
