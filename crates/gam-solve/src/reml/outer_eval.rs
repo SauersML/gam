@@ -1,9 +1,9 @@
-//! Outer REML runtime: runtime state + IFT/ALO caches, the analytic
+//! Outer REML runtime: runtime state + IFT caches, the analytic
 //! gradient/Hessian engine, and the outer objective evaluation, organized into
 //! real concern modules.
 //!
 //! - [`state_caches`]: the `RemlState`/`EvalShared` runtime state, the
-//!   process-wide IFT/ALO/hypergradient caches, and the fingerprinting and
+//!   process-wide IFT/hypergradient caches, and the fingerprinting and
 //!   spec helpers that feed them.
 //! - [`gradient_hessian`]: the analytic REML gradient + Hessian assembly,
 //!   Tierney–Kadane correction, mode-response, and IFT warm-start prediction.
@@ -24,10 +24,7 @@ pub(crate) use super::sparse_penalty_block_count_from_canonical;
 pub(crate) use gam_terms::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
-pub(crate) use gam_linalg::faer_ndarray::array2_to_matmut;
-pub(crate) use gam_linalg::utils::{
-    StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
-};
+pub(crate) use gam_linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
 pub(crate) use crate::pirls::PirlsWorkspace;
 use crate::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::persistent_warm_start::{
