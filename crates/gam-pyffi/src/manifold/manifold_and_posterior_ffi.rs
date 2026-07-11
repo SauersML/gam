@@ -6013,6 +6013,43 @@ fn manifold_sae_owned2(v: &[Vec<f64>]) -> PyResult<Array2<f64>> {
     Array2::from_shape_vec((rows, cols), flat).map_err(|e| py_value_error(e.to_string()))
 }
 
+/// Sparsity summary stats for an `(n_rows, K)` assignment matrix returned by
+/// `sae_manifold_fit*`. Returns `(avg_active_atoms, mean_assignment_mass)` where
+/// "active" is `assignment >= threshold`.
+fn manifold_assignment_summary_from_array(
+    assignments: ArrayView2<'_, f64>,
+    threshold: f64,
+) -> Result<(f64, f64), String> {
+    if !threshold.is_finite() {
+        return Err("assignment summary threshold must be finite".to_string());
+    }
+    let (n_rows, k) = assignments.dim();
+    if n_rows == 0 || k == 0 {
+        return Err("assignment summary requires a non-empty matrix".to_string());
+    }
+    let n_entries = n_rows
+        .checked_mul(k)
+        .ok_or_else(|| "assignment summary shape is too large".to_string())?;
+    let mut active_total = 0_usize;
+    let mut mass_total = 0.0_f64;
+    for &assignment in assignments.iter() {
+        if !assignment.is_finite() {
+            return Err("assignment summary contains a non-finite value".to_string());
+        }
+        mass_total += assignment;
+        if !mass_total.is_finite() {
+            return Err("assignment summary mass overflowed".to_string());
+        }
+        if assignment >= threshold {
+            active_total += 1;
+        }
+    }
+    Ok((
+        active_total as f64 / n_rows as f64,
+        mass_total / n_entries as f64,
+    ))
+}
+
 /// Build an owned `(D0, D1, D2)` ndarray from triply-nested `Vec`s.
 fn manifold_sae_owned3(v: &[Vec<Vec<f64>>]) -> PyResult<Array3<f64>> {
     let d0 = v.len();
