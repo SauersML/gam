@@ -3940,7 +3940,7 @@ pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
         assert_eq!(layout.row_q_active(row), 3);
     }
     let compact_work: usize = (0..n)
-        .map(|_| {
+        .map(|row| {
             let q = layout.row_q_active(row);
             q * q
         })

@@ -12,6 +12,7 @@ use super::derivative_oracle::{
 use super::dual::{Dual, DualKinkBranch};
 use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
 use super::*;
+use approx::assert_abs_diff_eq;
 
 #[derive(Clone, Copy)]
 struct TinyComplex {

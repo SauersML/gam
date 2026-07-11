@@ -317,7 +317,7 @@ impl SaeManifoldTerm {
     /// recovering the plain case. The softmax, ordered Beta--Bernoulli, and ARD
     /// deltas are logit/coord-space prior curvatures and carry no output metric,
     /// so they are path-independent.
-    fn apply_exact_hessian_minus_b(
+    pub(crate) fn apply_exact_hessian_minus_b(
         &self,
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,

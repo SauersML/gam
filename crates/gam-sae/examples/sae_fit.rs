@@ -33,7 +33,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tau: 1.0,
         threshold: 0.0,
         top_k: None,
-        ordered_beta_bernoulli_alpha_override: None,
         random_state: 0,
         initial_logits: None,
         initial_coords: None,

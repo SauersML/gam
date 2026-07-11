@@ -503,7 +503,6 @@ pub fn run_auto_sae_crosscoder_fit(
         tau: 1.0,
         threshold: 0.0,
         top_k: None,
-        ordered_beta_bernoulli_alpha_override: None,
         random_state: request.config.random_state,
         initial_logits: None,
         initial_coords: None,
