@@ -5,7 +5,7 @@
 //! continuation only changes *which* ρ the solver is asked about,
 //! not *how* it answers.
 //!
-//! `fit_with_continuation` calls the supplied `OuterObjective` for
+//! `fit_with_continuation_with_budget` calls the supplied `OuterObjective` for
 //! every step: `seed_inner_state` installs the warm-start β, then
 //! `eval_with_order` runs the inner P-IRLS. Returned errors flow
 //! through `inner_status::classify_inner_error` so the rollback
@@ -383,31 +383,10 @@ pub(crate) fn prime_outer_seed_with_budget(
 /// ρ₀ is in the strongly-convex regime). `bounds_upper` clamps ρ₀ to
 /// the legal box.
 ///
-/// # Callable ρ-anneal spine primitive
-///
-/// This is the **ρ-anneal spine entry**: the single callable that walks the
-/// oversmoothing→target ρ homotopy with the full retry/ρ₀-expansion decision
-/// tree (`run_path` is the per-offset inner pass). It was historically a
-/// private helper reachable only through `prime_outer_seed_with_budget` (the warm-start
-/// pre-screen fallback). It is now `pub(crate)` so the coupled
-/// [`crate::continuation_path::ContinuationPath`] can drive the ρ leg
-/// of the joint K≥2 SAE homotopy through the SAME spine rather than cloning a
-/// parallel ρ-anneal — there is no second implementation of the schedule.
-///
-/// Callers that only want the warm-start pre-screen keep using
-/// [`prime_outer_seed_with_budget`]; callers that own the coupled τ / isometry
-/// legs call this directly so the three schedules advance against one shared ρ
-/// walk.
-pub(crate) fn fit_with_continuation(
-    obj: &mut dyn OuterObjective,
-    target: &Array1<f64>,
-    bounds_upper: &Array1<f64>,
-    initial_beta: &Array1<f64>,
-    order: OuterEvalOrder,
-) -> ContinuationResult {
-    fit_with_continuation_with_budget(obj, target, bounds_upper, initial_beta, order, PATH_BUDGET)
-}
-
+/// Budgeted ρ-only pre-warm used by [`prime_outer_seed_with_budget`]. Reactive
+/// multi-leg domain entry is owned by [`crate::continuation_path::ContinuationPath`]
+/// and evaluates each coupled `(ρ, scalar)` waypoint transactionally instead of
+/// nesting this independent ρ scheduler inside another path.
 pub(crate) fn fit_with_continuation_with_budget(
     obj: &mut dyn OuterObjective,
     target: &Array1<f64>,
@@ -575,52 +554,9 @@ pub(crate) fn run_path(
     walk_state_toward(obj, state, target, order, path_budget, 1)
 }
 
-/// One **warm** continuation leg (the ContinuationPath waypoint primitive):
-/// walk from an existing converged state to `target` under the spine-owned
-/// [`PATH_BUDGET`]. Unlike [`fit_with_continuation`] this never restarts from
-/// the oversmoothed ρ₀; the coupled path retains its last accepted waypoint and
-/// refines the next attempted distance on failure. Stuck/ExpandRhoZero
-/// outcomes surface as [`ContinuationFailure::PathStuck`] with
-/// `rho_zero_offset = 0.0` (no oversmooth expansion is involved in a warm leg;
-/// `final_rho` reports the leg's target as the diagnostic anchor).
-pub(crate) fn continue_path_from(
-    obj: &mut dyn OuterObjective,
-    start: ContinuationState,
-    target: &Array1<f64>,
-    order: OuterEvalOrder,
-) -> ContinuationResult {
-    if reached_target(&start.last_rho, target) {
-        return Ok(start);
-    }
-    match walk_state_toward(obj, start, target, order, PATH_BUDGET, 0) {
-        Ok(state) => Ok(state),
-        Err(PathOutcome::PathBudgetExhausted {
-            last,
-            steps_taken,
-            final_rho,
-        }) => Err(ContinuationFailure::PathBudgetExhausted {
-            last,
-            steps_taken,
-            final_rho,
-        }),
-        Err(PathOutcome::ExpandRhoZero(last)) | Err(PathOutcome::Stuck(last)) => {
-            Err(ContinuationFailure::PathStuck {
-                last,
-                rho_zero_offset: 0.0,
-                final_rho: target.clone(),
-            })
-        }
-        Err(PathOutcome::Propagate(last)) | Err(PathOutcome::DomainAtStart(last)) => {
-            Err(ContinuationFailure::StructuralPropagate(last))
-        }
-    }
-}
-
 /// Walk an already-seeded continuation state toward `target`, spending eval
-/// slots `steps_taken_start..budget`. Extracted from [`run_path`] so the cold
-/// ρ₀ spine and the warm per-waypoint leg ([`continue_path_from`]) share ONE
-/// descent loop — the step/shrink/expand semantics cannot fork between the two
-/// entries (the objective↔gradient-desync lesson applied to control flow).
+/// slots `steps_taken_start..budget`. [`run_path`] owns entry-state evaluation;
+/// this helper owns the subsequent step/shrink/expand loop.
 pub(crate) fn walk_state_toward(
     obj: &mut dyn OuterObjective,
     mut state: ContinuationState,
