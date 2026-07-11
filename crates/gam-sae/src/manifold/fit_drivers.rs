@@ -5739,6 +5739,24 @@ impl SaeManifoldTerm {
         let mut lm_ridge_b = ridge_beta;
         let mut termination = JointFitTermination::IterationGrantExhausted;
         let mut state_moved = false;
+        // FIRST-PRINCIPLES ENGINE ORDER (#2228 stage 4, increment 1) — run the
+        // deterministic alternating block sweeps BEFORE the joint Newton walk,
+        // not only as a post-loop rescue. At fixed gates the problem is
+        // structurally easy in blocks: the decoder given coordinates is an
+        // EXACTLY solvable penalized linear LS, and the coordinates given the
+        // decoder decouple per row with globally enumerable solutions (the
+        // companion-matrix projector). Each sweep is objective-monotone by
+        // construction (same strict-decrease gate as the historical post-loop
+        // polish), deterministic given the seed, and does in O(1) exact block
+        // solves what the majorized joint Newton does in O(10²–10³) linear-rate
+        // iterations. The Newton walk below then starts inside the sweep fixed
+        // point's basin and serves as the joint certifier (logits + cross-block
+        // coupling + KKT gate) instead of as the bulk workhorse. Frames-active
+        // fits skip inside the helper (the LSQ writes full-B), and the
+        // max_iter == 0 freeze already returned above.
+        if self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties)? {
+            state_moved = true;
+        }
         for outer_iteration in 0..max_iter {
             let temperature_before = self.assignment.mode.temperature();
             if self
@@ -6585,44 +6603,10 @@ impl SaeManifoldTerm {
         // hint would always equal the cold LSQ decoder, never the seed). A freeze
         // is by definition not a convergence request, so there is no
         // under-converged decoder to rescue here.
-        if max_iter > 0 && !self.frames_active() {
-            let mut best_objective =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-            if best_objective.is_finite() {
-                // Alternate decoder-LSQ / coordinate reprojection to its
-                // objective fixed point. The strict decrease gate is the
-                // termination certificate; a workload-tuned round cap would
-                // return an under-converged fit on harder data.
-                loop {
-                    let snapshot = self.snapshot_mutable_state();
-                    let round = self
-                        .refit_decoder_least_squares_at_current_state(target, Some(rho))
-                        .and_then(|()| self.seed_coords_by_decoder_projection(target))
-                        .and_then(|()| {
-                            self.refit_decoder_least_squares_at_current_state(target, Some(rho))
-                        })
-                        .and_then(|()| {
-                            self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                        });
-                    // Commit only on a STRICT decrease of the penalized objective,
-                    // scaled by the objective magnitude so the test is meaningful at
-                    // any loss scale. Anything else (already-converged decoder, a
-                    // round that traded data-fit for penalty, or a refit/projection
-                    // failure) restores the pre-round state and stops.
-                    let accept_floor =
-                        SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + best_objective.abs());
-                    match round {
-                        Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
-                            best_objective = value;
-                            state_moved = true;
-                        }
-                        _ => {
-                            self.restore_mutable_state(&snapshot)?;
-                            break;
-                        }
-                    }
-                }
-            }
+        if max_iter > 0
+            && self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties)?
+        {
+            state_moved = true;
         }
         // Track an exact recurrence of the OBJECTIVE-keyed in-call restore.
         // This is convergence evidence only; it is never a cross-ρ state bank
