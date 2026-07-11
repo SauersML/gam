@@ -99,15 +99,26 @@ where
         if !mu.is_finite() {
             return Err("solve_exact_stationarity: non-finite generalized curvature".into());
         }
-        if mu <= 0.0 {
-            return Err(format!(
-                "solve_exact_stationarity: exact stationarity Hessian has non-positive \
-                 generalized curvature μ={mu:.6e}; the inner state is not a stable minimum"
-            ));
-        }
         if mu >= rank_floor {
             return Ok(x);
         }
+        // #2253 — a NON-POSITIVE μ is NOT a fatal "not a stable minimum". The
+        // exact Hessian `A = B + ΔC` carries the residual curvature ΔC, which can
+        // tip a weakly-identified inner direction (decoder amplitude / scale /
+        // residual gauge, off the exactly-projected rotational gauge) marginally
+        // indefinite even AT the Gauss-Newton minimum — a genuine feature of a
+        // nonzero-residual fit, not a convergence failure. The evidence factor
+        // this outer gradient differentiates already handles that direction the
+        // principled way: `factor_spectral_deflated_evidence_row` deflates EVERY
+        // non-positive eigenvalue to unit stiffness `+1` (a ρ-independent
+        // contribution). So the IFT response along it is spurious `1/μ`
+        // amplification of a direction the evidence stiffened away — it MUST be
+        // deflated here too, or the outer gradient differentiates a fictitious
+        // criterion (the old `μ ≤ 0` refusal aborted the whole fit — the
+        // measured 2026-07-11 #2253 residual μ=-1.66e-3 on a K=1 circle). Route
+        // it into the same inverse-power deflation as a small-positive near-null
+        // direction. A hard error survives only for a non-finite / un-isolatable
+        // pencil below.
         // Sharpen the offending direction by inverse power iteration on
         // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
         // already dominated by it, so it is the natural seed. Convergence
@@ -157,9 +168,15 @@ where
                  derived Krylov dimension {dim}"
             ));
         }
-        // Refuse to remove a resolved or non-positive direction. A stable
-        // converged inner minimum has positive exact curvature; a negative
-        // Ritz value is a second-order convergence failure, not a null gauge.
+        // #2253 — deflate the isolated direction when it is UNRESOLVED under the
+        // exact pencil: |μ| below the numerical-null floor (near-flat), OR
+        // non-positive (indefinite). Both are directions the evidence factor
+        // stiffens to unit curvature (`factor_spectral_deflated_evidence_row`
+        // deflates every non-positive eigenvalue), so their outer-gradient
+        // contribution is ρ-independent and the `1/μ`-amplified IFT response
+        // along them must be projected out for consistency. Only a RESOLVED
+        // positive direction (`v_mu >= rank_floor`) must never be removed — that
+        // would delete a genuine part of the response — so refuse to deflate it.
         let av = apply_a_q(&v)?;
         let bv = apply_b_q(&v)?;
         let v_b_norm_sq = sae_inner(&v, &bv);
@@ -170,10 +187,10 @@ where
             ));
         }
         let v_mu = sae_inner(&v, &av) / v_b_norm_sq;
-        if !(v_mu.is_finite() && v_mu > 0.0 && v_mu < rank_floor) {
+        if !(v_mu.is_finite() && v_mu < rank_floor) {
             return Err(format!(
-                "solve_exact_stationarity: inverse power failed to isolate a positive \
-                 numerical-null direction: μ={v_mu:.6e}, floor={rank_floor:.6e}"
+                "solve_exact_stationarity: inverse power failed to isolate an unresolved \
+                 (near-null or indefinite) direction: μ={v_mu:.6e}, floor={rank_floor:.6e}"
             ));
         }
         let proj = sae_inner(&v, &bx);
