@@ -181,7 +181,8 @@ fn build_softmax_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
     let coord_cols: Vec<Array2<f64>> = (0..k)
         .map(|i| {
             Array2::<f64>::from_shape_fn((n, 1), |(r, _)| {
-                (0.03 + 0.11 * i as f64 + 0.017 * r as f64).rem_euclid(1.0)
+                (0.03 + 0.11 * i as f64 + 0.017 * (i + 1) as f64 * r as f64)
+                    .rem_euclid(1.0)
             })
         })
         .collect();
@@ -397,7 +398,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
         .try_fitted_for_rho(&rho)
         .expect("softmax positive-rank fixture reconstruction");
     let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
-        fitted[[row, col]] + 1.0e-4 * ((row + 2 * col) as f64 * 0.17).sin()
+        fitted[[row, col]] + 1.0e-3 * ((row + 2 * col) as f64 * 0.17).sin()
     });
     let system = term
         .assemble_arrow_schur(target.view(), &rho, None)

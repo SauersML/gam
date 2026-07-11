@@ -89,9 +89,8 @@ jobs:
           # topological (deps-first): every normal/build path-dependency in
           # `gam`'s closure is published before `gam` itself, so cargo can
           # resolve each `=0.3.x` path-dep to a real registry version.
-          # Only the publish=false crates (gam-cli/gam-predict/gam-pyffi) are
-          # omitted — they are not in `gam`'s normal-dependency closure
-          # (gam-predict is only a dev-dependency, stripped on publish).
+          # Only the publish=false crates (gam-cli/gam-pyffi) are omitted —
+          # they are not in `gam`'s normal-dependency closure.
           publish_one() {
             local crate="$1"
             local out status
@@ -104,6 +103,6 @@ jobs:
               && { echo "$crate already on crates.io — skipping"; return 0; }
             echo "::error::failed to publish $crate"; return 1
           }
-          for crate in gam-data gam-math gam-report gam-runtime gam-linalg gam-geometry gam-gpu gam-spec gam-problem gam-identifiability gam-model-api gam-terms gam-solve gam-custom-family gam-model-kernels gam-models gam-sae gam-inference gam-config gam-test-support gam; do
+          for crate in gam-data gam-math gam-report gam-runtime gam-linalg gam-geometry gam-gpu gam-spec gam-problem gam-identifiability gam-model-api gam-terms gam-solve gam-custom-family gam-model-kernels gam-models gam-sae gam-inference gam-predict gam-config gam-test-support gam; do
             publish_one "$crate" || exit 1
           done
