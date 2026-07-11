@@ -837,8 +837,10 @@ pub struct GaussianMixtureCertificate {
     pub mean_log_likelihood: f64,
     /// Signed gain produced by one further EM map application from that state.
     pub mean_log_likelihood_gain: f64,
-    /// Absolute rounding uncertainty on the comparison of the two likelihoods.
-    pub monotonicity_roundoff: f64,
+    /// Absolute numerical uncertainty on the comparison of the two likelihoods.
+    /// This includes both the final likelihood-reduction error and the
+    /// scale-derived resolution floor of the composite EM map.
+    pub monotonicity_uncertainty: f64,
     pub objective_residual: f64,
     pub objective_tolerance: f64,
     pub parameter_residual: f64,
@@ -871,7 +873,7 @@ pub enum GaussianMixtureError {
     MonotonicityViolation {
         previous_mean_log_likelihood: f64,
         next_mean_log_likelihood: f64,
-        allowed_decrease: f64,
+        numerical_uncertainty: f64,
         checkpoint: GaussianMixtureCheckpoint,
     },
     DidNotConverge {
@@ -898,11 +900,11 @@ impl std::fmt::Display for GaussianMixtureError {
             Self::MonotonicityViolation {
                 previous_mean_log_likelihood,
                 next_mean_log_likelihood,
-                allowed_decrease,
+                numerical_uncertainty,
                 checkpoint,
             } => write!(
                 f,
-                "Gaussian-mixture EM violated monotone ascent at iteration {}: mean log likelihood {previous_mean_log_likelihood:.12e} -> {next_mean_log_likelihood:.12e} (allowed numerical decrease {allowed_decrease:.3e}); resume from the carried checkpoint only after diagnosing the numerical failure",
+                "Gaussian-mixture EM violated monotone ascent at iteration {}: mean log likelihood {previous_mean_log_likelihood:.12e} -> {next_mean_log_likelihood:.12e} (comparison uncertainty {numerical_uncertainty:.3e}); resume from the carried checkpoint only after diagnosing the numerical failure",
                 checkpoint.completed_iterations
             ),
             Self::DidNotConverge {
@@ -911,10 +913,10 @@ impl std::fmt::Display for GaussianMixtureError {
                 checkpoint,
             } => write!(
                 f,
-                "Gaussian-mixture EM did not certify after {max_iterations} additional iterations (total {}): signed mean-log-likelihood gain {:.6e} (roundoff {:.3e}), objective residual {:.6e}/{:.3e}, parameter-map residual {:.6e}/{:.3e}; resume from the carried checkpoint, which is not comparable evidence",
+                "Gaussian-mixture EM did not certify after {max_iterations} additional iterations (total {}): signed mean-log-likelihood gain {:.6e} (numerical uncertainty {:.3e}), objective residual {:.6e}/{:.3e}, parameter-map residual {:.6e}/{:.3e}; resume from the carried checkpoint, which is not comparable evidence",
                 checkpoint.completed_iterations,
                 certificate.mean_log_likelihood_gain,
-                certificate.monotonicity_roundoff,
+                certificate.monotonicity_uncertainty,
                 certificate.objective_residual,
                 certificate.objective_tolerance,
                 certificate.parameter_residual,
@@ -1536,22 +1538,25 @@ fn run_gaussian_mixture_em(
             &next_means,
             &next_covariances,
         );
-        let monotonicity_roundoff =
-            current.mean_log_likelihood_roundoff + next.mean_log_likelihood_roundoff;
+        let monotonicity_uncertainty = gaussian_mixture_monotonicity_uncertainty(
+            objective_scale,
+            current.mean_log_likelihood_roundoff,
+            next.mean_log_likelihood_roundoff,
+        );
         let certificate = GaussianMixtureCertificate {
             mean_log_likelihood: current.mean_log_likelihood,
             mean_log_likelihood_gain: objective_step,
-            monotonicity_roundoff,
+            monotonicity_uncertainty,
             objective_residual,
             objective_tolerance: config.loglik_tol,
             parameter_residual,
             parameter_tolerance: config.parameter_tol,
         };
-        if objective_step < -monotonicity_roundoff {
+        if objective_step < -monotonicity_uncertainty {
             return Err(GaussianMixtureError::MonotonicityViolation {
                 previous_mean_log_likelihood: current.mean_log_likelihood,
                 next_mean_log_likelihood: next.mean_log_likelihood,
-                allowed_decrease: monotonicity_roundoff,
+                numerical_uncertainty: monotonicity_uncertainty,
                 checkpoint,
             });
         }
@@ -1608,6 +1613,27 @@ struct GaussianMixtureEStep {
     responsibilities: Array2<f64>,
     mean_log_likelihood: f64,
     mean_log_likelihood_roundoff: f64,
+}
+
+/// Resolution of one observed EM likelihood comparison.
+///
+/// `pairwise_mean_with_roundoff` bounds only the final reduction of already
+/// rounded row log likelihoods. An EM comparison also traverses covariance
+/// eigendecompositions, precision quadratics, log-sum-exp, the M-step, and a
+/// second E-step. Treating the reduction bound as a bound for that whole map
+/// is false precision and turns cancellation at a stationary point into a
+/// spurious monotonicity violation. The square root of machine epsilon is the
+/// numerical resolution already required of every configured EM tolerance;
+/// scaling it by the observed objective magnitude makes the invariant
+/// independent of data units and of user-selected stopping knobs.
+fn gaussian_mixture_monotonicity_uncertainty(
+    objective_scale: f64,
+    current_reduction_roundoff: f64,
+    next_reduction_roundoff: f64,
+) -> f64 {
+    let reduction_roundoff = current_reduction_roundoff + next_reduction_roundoff;
+    let composite_map_resolution = f64::EPSILON.sqrt() * objective_scale;
+    reduction_roundoff.max(composite_map_resolution)
 }
 
 fn pairwise_sum_max_depth(term_count: usize) -> usize {
@@ -4693,6 +4719,25 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_mixture_monotonicity_resolves_composite_map_noise_2264() {
+        let objective_scale = 1.0;
+        let composite_resolution = f64::EPSILON.sqrt() * objective_scale;
+        let uncertainty = gaussian_mixture_monotonicity_uncertainty(objective_scale, 0.0, 0.0);
+        assert_eq!(uncertainty, composite_resolution);
+
+        let noise_scale_decrease = -0.5 * composite_resolution;
+        assert!(noise_scale_decrease >= -uncertainty);
+        let resolved_decrease = -2.0 * composite_resolution;
+        assert!(resolved_decrease < -uncertainty);
+
+        let larger_reduction_bound = 2.0 * composite_resolution;
+        assert_eq!(
+            gaussian_mixture_monotonicity_uncertainty(objective_scale, larger_reduction_bound, 0.0),
+            larger_reduction_bound,
+        );
+    }
+
+    #[test]
     fn gaussian_mixture_fit_certificate_describes_the_exact_returned_iterate() {
         let data = two_cluster_mixture_data();
         let config = GaussianMixtureConfig::default();
@@ -4739,8 +4784,16 @@ mod tests {
             next.mean_log_likelihood - current.mean_log_likelihood
         );
         assert_eq!(
-            certificate.monotonicity_roundoff,
-            current.mean_log_likelihood_roundoff + next.mean_log_likelihood_roundoff
+            certificate.monotonicity_uncertainty,
+            gaussian_mixture_monotonicity_uncertainty(
+                current
+                    .mean_log_likelihood
+                    .abs()
+                    .max(next.mean_log_likelihood.abs())
+                    .max(1.0),
+                current.mean_log_likelihood_roundoff,
+                next.mean_log_likelihood_roundoff,
+            )
         );
         assert_eq!(certificate.parameter_residual, residual);
         assert!(
