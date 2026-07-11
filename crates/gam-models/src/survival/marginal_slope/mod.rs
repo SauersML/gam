@@ -24,12 +24,14 @@ pub mod identifiability;
 
 pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
-    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace, FamilyEvaluation,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
+    fit_custom_family, fit_custom_family_fixed_log_lambda_warm_start,
+    joint_hyper_options_for_outer_tolerance,
+};
+pub(crate) use gam_problem::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
-    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
-    fit_custom_family_fixed_log_lambda_warm_start, joint_hyper_options_for_outer_tolerance,
 };
 
 pub(crate) use crate::model_types::UnifiedFitResult;

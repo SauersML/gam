@@ -1198,7 +1198,7 @@ impl GaussianLocationScaleWiggleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         let Some(dir_a) = self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -1319,7 +1319,7 @@ impl GaussianLocationScaleWiggleFamily {
         let h_ww_a1 = xt_diag_y_dense(&basis_a, &rows.w, &geom.basis)?;
         let h_ww = &h_ww_a1 + &h_ww_a1.t() + &xt_diag_x_dense(&geom.basis, &dw_a)?;
 
-        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+        Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi: gaussian_pack_wiggle_joint_symmetrichessian(
@@ -1337,7 +1337,7 @@ impl GaussianLocationScaleWiggleFamily {
         psi_j: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some(dir_a) = self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -1380,7 +1380,7 @@ impl GaussianLocationScaleWiggleFamily {
         dir_b: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
+    ) -> Result<gam_problem::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -1772,7 +1772,7 @@ impl GaussianLocationScaleWiggleFamily {
             + hww_jwi.t()
             + &xt_diag_x_dense(&geom.basis, &dw_ab)?;
 
-        Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+        Ok(gam_problem::ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi: gaussian_pack_wiggle_joint_symmetrichessian(
@@ -2041,7 +2041,7 @@ impl GaussianLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -2061,7 +2061,7 @@ impl GaussianLocationScaleWiggleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -2487,7 +2487,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
@@ -2503,7 +2503,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
             specs,

@@ -1324,7 +1324,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         validate_block_count::<GamlssError>("BinomialMeanWiggleFamily", 2, block_states.len())?;
         if derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
@@ -1504,7 +1504,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                     CustomFamilyJointDesignPairContribution::new(1, 2, zeros, coeff_ww_db.clone()),
                 ],
             );
-            return Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+            return Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
                 objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
@@ -1533,7 +1533,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
         let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + a_ww.t();
 
-        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+        Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi: binomial_pack_mean_wiggle_joint_symmetrichessian(

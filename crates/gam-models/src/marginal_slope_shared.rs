@@ -1479,13 +1479,13 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
     /// First-order joint-ψ terms for the σ-auxiliary parameter.
     fn sigma_first_order_terms(
         &self,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String>;
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String>;
 
     /// First-order joint-ψ terms for a non-σ derivative axis `psi_index`.
     fn psi_first_order_terms(
         &self,
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String>;
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String>;
 
     /// Batched first-order joint-ψ terms over all derivative axes (used by the
     /// outer score sweep). Returns `Ok(None)` when the batched fast path is
@@ -1493,7 +1493,7 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
     /// per-axis evaluation.
     fn psi_first_order_terms_all(
         &self,
-    ) -> Result<Option<Vec<crate::custom_family::ExactNewtonJointPsiTerms>>, String>;
+    ) -> Result<Option<Vec<gam_problem::ExactNewtonJointPsiTerms>>, String>;
 
     /// Whether the σ-aux second-order branch should treat `(psi_i, psi_j)` as a
     /// pure-σ pair (dispatching to [`sigma_second_order_terms`](Self::sigma_second_order_terms)).
@@ -1504,21 +1504,21 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
     /// Second-order joint-ψ terms for a pure σ / σ pair.
     fn sigma_second_order_terms(
         &self,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String>;
 
     /// Per-family policy for a mixed σ / non-σ second-order pair: one family
     /// rejects it (no cross auxiliary terms available), the other returns
     /// `Ok(None)`.
     fn mixed_sigma_aux_second_order(
         &self,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String>;
 
     /// Second-order joint-ψ terms for a non-σ derivative-axis pair.
     fn psi_second_order_terms(
         &self,
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String>;
 
     /// Direction-contracted second-order ψ terms over the non-σ derivative
     /// axes (#740). `alpha_psi` is the full ψ-block weight vector; the
@@ -1535,8 +1535,7 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
     fn psi_second_order_terms_contracted(
         &self,
         _: &[f64],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
-    {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderContracted>, String> {
         // Default implementation ignores this parameter.
         Ok(None)
     }
@@ -1572,13 +1571,13 @@ impl<F: MarginalSlopePsiFamily> MarginalSlopeExactNewtonPsiWorkspace<F> {
     }
 }
 
-impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspace
+impl<F: MarginalSlopePsiFamily> gam_problem::ExactNewtonJointPsiWorkspace
     for MarginalSlopeExactNewtonPsiWorkspace<F>
 {
     fn first_order_terms(
         &self,
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         if self.family.is_sigma_aux(psi_index) {
             return self.family.sigma_first_order_terms();
         }
@@ -1587,7 +1586,7 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
 
     fn first_order_terms_all(
         &self,
-    ) -> Result<Option<Vec<crate::custom_family::ExactNewtonJointPsiTerms>>, String> {
+    ) -> Result<Option<Vec<gam_problem::ExactNewtonJointPsiTerms>>, String> {
         self.family.psi_first_order_terms_all()
     }
 
@@ -1595,7 +1594,7 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
         &self,
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         if self.family.is_sigma_aux(psi_i) || self.family.is_sigma_aux(psi_j) {
             if self.family.both_sigma_aux_second_order(psi_i, psi_j) {
                 return self.family.sigma_second_order_terms();
@@ -1608,8 +1607,7 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
     fn second_order_terms_contracted(
         &self,
         alpha_psi: &[f64],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
-    {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderContracted>, String> {
         // The σ-auxiliary axes do not participate in the family's combined
         // non-σ row stream (their second-order terms come from a separate
         // σ/σ and mixed-σ path with no directional row kernel). If any

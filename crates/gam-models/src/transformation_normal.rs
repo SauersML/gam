@@ -37,10 +37,9 @@ pub(crate) use endpoint_normalizer::{
 pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
+    ExactNewtonJointHessianWorkspace, FamilyEvaluation, JointHessianSourcePreference,
+    MaterializablePsiDerivativeOperator, MaterializationIntent, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 pub(crate) use crate::fit_orchestration::drivers::{
@@ -58,6 +57,9 @@ pub(crate) use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 pub(crate) use gam_linalg::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
     dense_rowwise_kronecker,
+};
+pub(crate) use gam_problem::{
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
 };
 pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;

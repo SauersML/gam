@@ -37,7 +37,6 @@ use crate::custom_family::{
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactNewtonOuterCurvature, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_rowwise_kronecker_psi_operator,
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
@@ -45,7 +44,10 @@ use crate::custom_family::{
     weighted_crossprod_psi_maps,
 };
 
-use gam_problem::{DenseMatrixHyperOperator, HyperOperator};
+use gam_problem::{
+    DenseMatrixHyperOperator, ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms,
+    ExactNewtonJointPsiWorkspace, HyperOperator,
+};
 
 use gam_linalg::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,

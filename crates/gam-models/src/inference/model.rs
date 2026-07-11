@@ -54,7 +54,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 7;
+pub const MODEL_PAYLOAD_VERSION: u32 = 8;
 
 /// Schema-free saved-model metadata keyed by stable group id.
 ///
@@ -439,18 +439,11 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
     /// Container type of the table the model was fitted on, as detected by the
-    /// Python binding (`"pandas"`, `"polars"`, `"pyarrow"`, `"numpy"`, or an
-    /// ambiguous tag such as `"unknown"`). This is presentation provenance, not
-    /// math: `gamfit.Model.predict` uses it as the output-container fallback
-    /// when the *prediction input* is itself container-ambiguous (a `dict` of
-    /// columns or a `list` of record dicts). Persisting it in the model payload
-    /// makes the fallback survive `save`/`load` and `dumps`/`loads`, so a
-    /// reloaded model predicts into the same container as the in-memory one.
-    /// `None` for older payloads (and for fits that never recorded a kind), in
-    /// which case the fallback degrades to `"dict"`, matching pre-persistence
-    /// behaviour for unknown-kind training tables.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub training_table_kind: Option<String>,
+    /// active frontend (`"pandas"`, `"polars"`, `"pyarrow"`, `"numpy"`, or
+    /// `"unknown"` outside a typed table frontend). This presentation provenance
+    /// is required in the current schema so save/load cannot silently change an
+    /// ambiguous predict input's output container.
+    pub training_table_kind: String,
     /// Per-column (min, max) of the training input matrix, parallel to
     /// `training_headers`. At predict time, inputs are axis-clipped to these
     /// ranges so that out-of-distribution points evaluate at the nearest face
@@ -760,7 +753,7 @@ impl FittedModelPayload {
             survival_noise_projection_ridge_alpha: None,
             survival_distribution: None,
             training_headers: None,
-            training_table_kind: None,
+            training_table_kind: "unknown".to_string(),
             training_feature_ranges: None,
             group_metadata: None,
             deployment_extensions: Vec::new(),
@@ -4018,6 +4011,11 @@ impl FittedModel {
         // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
         // identically between writers and readers running the same schema.
         self.validate_payload_version()?;
+        if self.training_table_kind.trim().is_empty() {
+            return Err(FittedModelError::MissingField {
+                reason: "saved model training_table_kind must be non-empty".to_string(),
+            });
+        }
         if let Some(scan) = self.spline_scan.as_ref() {
             // Spline-scan representation (#1030/#1034): the smoother state IS
             // the fit. It is exclusive with the dense representation, only

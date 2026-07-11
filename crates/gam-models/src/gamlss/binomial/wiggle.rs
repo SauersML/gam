@@ -264,7 +264,7 @@ impl BinomialLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -284,7 +284,7 @@ impl BinomialLocationScaleWiggleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -389,7 +389,7 @@ impl BinomialLocationScaleWiggleFamily {
         psi_index: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         if self
             .exact_newton_joint_psi_direction(
                 block_states,
@@ -757,7 +757,7 @@ impl BinomialLocationScaleWiggleFamily {
                     CustomFamilyJointDesignPairContribution::new(2, 3, zeros, coeff_ww_db.clone()),
                 ],
             );
-            return Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+            return Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
                 objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
@@ -837,7 +837,7 @@ impl BinomialLocationScaleWiggleFamily {
             .assign(&h_ww);
         mirror_upper_to_lower(&mut hessian_psi);
 
-        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+        Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi,
@@ -853,7 +853,7 @@ impl BinomialLocationScaleWiggleFamily {
         psi_j: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         validate_block_count::<GamlssError>(
             "BinomialLocationScaleWiggleFamily",
             3,
@@ -907,7 +907,7 @@ impl BinomialLocationScaleWiggleFamily {
         dir_b: &LocationScaleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
+    ) -> Result<gam_problem::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -1626,7 +1626,7 @@ impl BinomialLocationScaleWiggleFamily {
             );
         }
 
-        Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+        Ok(gam_problem::ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,

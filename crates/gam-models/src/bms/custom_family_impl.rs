@@ -2817,8 +2817,7 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
     fn psi_second_order_terms_contracted(
         &self,
         alpha_psi: &[f64],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
-    {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderContracted>, String> {
         self.family
             .exact_newton_joint_psisecond_order_terms_contracted_from_cache_with_options(
                 &self.block_states,

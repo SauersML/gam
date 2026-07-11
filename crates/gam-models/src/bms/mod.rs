@@ -2,12 +2,10 @@ use crate::cubic_cell_kernel as exact_kernel;
 use crate::custom_family::{
     BatchedOuterGradientTerms, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
     CustomFamily, CustomFamilyWarmStart, EvalMode, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
-    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
-    joint_hyper_options_for_outer_tolerance,
+    ExactNewtonJointHessianWorkspace, FamilyEvaluation, FamilyLinearizationState,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
+    fit_custom_family, joint_hyper_options_for_outer_tolerance,
 };
 use crate::fit_orchestration::drivers::{
     ExactJointHyperSetup, apply_spatial_anisotropy_pilot_initializer,
@@ -39,8 +37,10 @@ use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::initializewiggle_knots_from_seed;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
 use gam_math::jet_partitions::MultiDirJet;
-use gam_problem::HyperOperator;
-use gam_problem::{InverseLink, StandardLink, WigglePenaltyConfig};
+use gam_problem::{
+    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+    HyperOperator, InverseLink, StandardLink, WigglePenaltyConfig,
+};
 use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianFactorization};
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::smooth::{

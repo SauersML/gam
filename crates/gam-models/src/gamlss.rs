@@ -39,13 +39,13 @@ use crate::custom_family::{
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
     CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiDirectCache, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiWorkspace, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
+    ExactNewtonJointPsiDirectCache, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
     shared_dense_arc, weighted_crossprod_psi_maps,
 };
+use gam_problem::{ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace};
 
 use crate::model_types::UnifiedFitResult;
 

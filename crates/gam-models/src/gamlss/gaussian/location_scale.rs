@@ -352,7 +352,7 @@ impl GaussianLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -373,7 +373,7 @@ impl GaussianLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -609,7 +609,7 @@ impl GaussianLocationScaleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         validate_block_count::<GamlssError>("GaussianLocationScaleFamily", 2, block_states.len())?;
         if specs.len() != 2 || derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
@@ -693,7 +693,7 @@ impl GaussianLocationScaleFamily {
             gaussian_joint_psihessian_fromweights(xmu, x_ls, xmu_map, x_ls_map, &weights_a)?
         };
 
-        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+        Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi,
@@ -709,7 +709,7 @@ impl GaussianLocationScaleFamily {
         psi_j: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some(dir_i) = self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -754,7 +754,7 @@ impl GaussianLocationScaleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
         subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
-    ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
+    ) -> Result<gam_problem::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -855,7 +855,7 @@ impl GaussianLocationScaleFamily {
             &secondweights,
         )?;
 
-        Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+        Ok(gam_problem::ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
@@ -1645,7 +1645,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
@@ -1661,7 +1661,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
             specs,

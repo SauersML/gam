@@ -1670,13 +1670,9 @@ mod observed_single_source_oracle_tests {
                     eta_ls,
                     a,
                 };
-                let jt = generic_fourth_contracted(
-                    &prog,
-                    0,
-                    &[xi_mu_u, xi_ls_u],
-                    &[xi_mu_v, xi_ls_v],
-                )
-                .expect("jet fourth");
+                let jt =
+                    generic_fourth_contracted(&prog, 0, &[xi_mu_u, xi_ls_u], &[xi_mu_v, xi_ls_v])
+                        .expect("jet fourth");
                 close(w_uv[0], jt[0][0], &format!("d²H_μμ μ={mu} η={eta_ls}"));
                 close(c_uv[0], jt[0][1], &format!("d²H_μls μ={mu} η={eta_ls}"));
                 close(c_uv[0], jt[1][0], &format!("d²H_lsμ μ={mu} η={eta_ls}"));

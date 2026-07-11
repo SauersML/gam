@@ -612,11 +612,10 @@ pub struct FitConfig {
     pub group_metadata: Option<BTreeMap<String, JsonValue>>,
 
     /// Container type of the caller's training table (`"pandas"`, `"polars"`,
-    /// `"pyarrow"`, `"numpy"`, or an ambiguous tag), as detected by the Python
-    /// binding. Fitting ignores this field; saved-model builders pass it
-    /// through to [`gam_models::inference::model::FittedModelPayload::training_table_kind`]
-    /// so the predict-time output-container fallback survives save/load (#394).
-    pub training_table_kind: Option<String>,
+    /// `"pyarrow"`, `"numpy"`, or `"unknown"` outside a typed table frontend).
+    /// Fitting ignores this field; saved-model builders persist it so every
+    /// current frontend writes the same complete model schema.
+    pub training_table_kind: String,
 
     /// Optional user-defined coefficient groups with separate precision
     /// parameters. Group-local priors, including catalog-metadata-informed
@@ -715,7 +714,7 @@ impl Default for FitConfig {
             gpu_policy: gam_gpu::GpuPolicy::Auto,
             resource_policy: None,
             group_metadata: None,
-            training_table_kind: None,
+            training_table_kind: "unknown".to_string(),
             coefficient_groups: Vec::new(),
             penalty_block_gamma_priors: Vec::new(),
             latents: None,

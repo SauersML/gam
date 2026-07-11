@@ -20,9 +20,9 @@ use gam_terms::basis::{
 use gam_custom_family::{
     BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet,
     BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart,
-    ExactNewtonJointPsiTerms, ExactNewtonOuterObjective, FamilyEvaluation,
-    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 
 use gam_solve::estimate::{
@@ -50,7 +50,7 @@ use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 
 use gam_linalg::matrix::{DesignBlock, DesignMatrix, RandomEffectOperator, SymmetricMatrix};
 
-use gam_problem::LinearInequalityConstraints;
+use gam_problem::{ExactNewtonJointPsiTerms, LinearInequalityConstraints};
 
 use gam_spec::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily,
@@ -161,9 +161,7 @@ mod test_support {
         ) -> Result<Self, String>;
     }
 
-    impl<'d> SingleBlockExactJointDesignCacheTestExt<'d>
-        for SingleBlockExactJointDesignCache<'d>
-    {
+    impl<'d> SingleBlockExactJointDesignCacheTestExt<'d> for SingleBlockExactJointDesignCache<'d> {
         fn new(
             data: ArrayView2<'d, f64>,
             spec: TermCollectionSpec,

@@ -221,7 +221,7 @@ pub struct ResponseGeometryMetadata {
     pub base_point: Array1<f64>,
     pub coordinates: String,
     pub reference: isize,
-    pub training_table_kind: Option<String>,
+    pub training_table_kind: String,
     pub curvature: Option<ResponseGeometryCurvature>,
 }
 
@@ -328,11 +328,9 @@ impl ResponseGeometryModel {
                 "base point must be non-empty and finite".to_string(),
             ));
         }
-        if let Some(kind) = self.metadata.training_table_kind.as_ref()
-            && kind.trim().is_empty()
-        {
+        if self.metadata.training_table_kind.trim().is_empty() {
             return Err(ResponseGeometryModelError::InvalidMetadata(
-                "training table kind must be absent or non-empty".to_string(),
+                "training table kind must be non-empty".to_string(),
             ));
         }
         if let Some(curvature) = self.metadata.curvature.as_ref() {

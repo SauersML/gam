@@ -42,10 +42,10 @@ use gam::custom_family::{
     ParameterBlockState, PenaltyMatrix,
 };
 use gam::families::custom_family::{
-    CustomFamilyBlockPsiDerivative, ExactNewtonJointPsiTerms, ExactNewtonOuterObjective,
-    evaluate_custom_family_joint_hyper,
+    CustomFamilyBlockPsiDerivative, ExactNewtonOuterObjective, evaluate_custom_family_joint_hyper,
 };
 use gam::matrix::SymmetricMatrix;
+use gam_problem::ExactNewtonJointPsiTerms;
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 

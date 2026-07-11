@@ -666,7 +666,7 @@ impl BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -687,7 +687,7 @@ impl BinomialLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
             return Ok(None);
         };
@@ -1219,7 +1219,7 @@ impl BinomialLocationScaleFamily {
         psi_index: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         validate_block_count::<GamlssError>("BinomialLocationScaleFamily", 2, block_states.len())?;
         if specs.len() != 2 || derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
@@ -1519,7 +1519,7 @@ impl BinomialLocationScaleFamily {
             hessian_psi
         };
 
-        Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
+        Ok(Some(gam_problem::ExactNewtonJointPsiTerms {
             objective_psi,
             score_psi,
             hessian_psi,
@@ -1535,7 +1535,7 @@ impl BinomialLocationScaleFamily {
         psi_j: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some(dir_i) = self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -1578,7 +1578,7 @@ impl BinomialLocationScaleFamily {
         dir_j: &LocationScaleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
+    ) -> Result<gam_problem::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -2030,7 +2030,7 @@ impl BinomialLocationScaleFamily {
             .assign(&h_ll_block);
         mirror_upper_to_lower(&mut hessian_psi_psi);
 
-        Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
+        Ok(gam_problem::ExactNewtonJointPsiSecondOrderTerms {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi,
@@ -2541,7 +2541,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         self.exact_newton_joint_psi_terms_for_specs(
             block_states,
             specs,
@@ -2557,7 +2557,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
             specs,

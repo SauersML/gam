@@ -922,7 +922,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
         // These three joint psi hooks are the wiggle family's exact
         // likelihood-side contribution to the unified full [rho, psi] outer
         // Hessian:
@@ -952,7 +952,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiSecondOrderTerms>, String> {
         self.exact_newton_joint_psisecond_order_terms_for_specs(
             block_states,
             specs,
