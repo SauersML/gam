@@ -150,7 +150,7 @@ pub(crate) use gam::transformation_normal::TransformationNormalConfig;
 
 pub(crate) use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
-    MixtureLinkSpec, ResponseColumnKind, ResponseFamily, SasLinkSpec, StandardLink,
+    MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
 };
 
 pub(crate) use gam::families::fit_orchestration::{
