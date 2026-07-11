@@ -43,9 +43,10 @@ use gam_terms::inference::structure_evidence::StructureLedger;
 use crate::structure_harvest;
 
 use super::{
-    AssignmentMode, CoordinateFidelityCertificate, SaeManifoldFitDiagnostics, SaeManifoldLoss,
-    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination,
-    SaeShapeUncertainty, SaeTrustDiagnostics, TopologyPersistenceCertificate,
+    AmortizedEncoderConsistency, AssignmentMode, CoordinateFidelityCertificate,
+    SaeManifoldFitDiagnostics, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
+    SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty, SaeTrustDiagnostics,
+    TopologyPersistenceCertificate,
 };
 
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.
@@ -590,20 +591,35 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // seed already installed on the term) with NO ρ-multistart. seed_budget=1 +
     // max_seeds=1 collapses the cascade to the single initial ρ.
     objective.set_cancel_flag(Arc::clone(&cancel_flag));
-    // Every minted fit runs the converged outer hyperparameter optimizer.
-    let search_init_rho = match objective.try_resume_from_checkpoint(n_params) {
-        Some(banked) => ndarray::Array1::from(banked),
-        None => init_rho_flat.clone(),
+    let mut objective = if run_outer_rho_search {
+        // #2241 — do not tune convergence to a workload's observed criterion
+        // creep and do not return merely because an iteration budget expired.
+        // SAE's Fellner–Schall lane carries a typed recurrent-incumbent
+        // certificate: two consecutive inner solves restoring the same banked
+        // model terminate the fixed-point walk directly. Gradient-based plans
+        // retain the shared solver's stationarity and cost-stall tests.
+        // SPEC wall-survival resume: if a checkpoint for this exact data
+        // fingerprint exists (a prior job died at its wall mid-search), install
+        // the banked incumbent as the warm start and open the ρ search at the
+        // banked coordinate. The resumed run must still CONVERGE on its own —
+        // a checkpoint never mints a fit, it only saves the work.
+        let search_init_rho = match objective.try_resume_from_checkpoint(n_params) {
+            Some(banked) => ndarray::Array1::from(banked),
+            None => init_rho_flat.clone(),
+        };
+        let problem = OuterProblem::new(n_params)
+            .with_initial_rho(search_init_rho)
+            .with_seed_config(SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                ..Default::default()
+            });
+        let run_result = problem.run(&mut objective, "SAE manifold");
+        certify_outer_stage(objective, SaeFitStage::Primary, run_result)?
+    } else {
+        objective.fit_at_fixed_rho(init_rho_flat.view())?;
+        objective
     };
-    let problem = OuterProblem::new(n_params)
-        .with_initial_rho(search_init_rho)
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
-    let run_result = problem.run(&mut objective, "SAE manifold");
-    let mut objective = certify_outer_stage(objective, SaeFitStage::Primary, run_result)?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
@@ -657,7 +673,43 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<StructuredResidualModel> = None;
-        let total_passes = structured_passes;
+        // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
+        // directions that PERSIST across passes (producer
+        // `StructuredResidualModel::promotion_candidates`: energy above the
+        // idiosyncratic-noise floor AND |cos|-alignment with the previous pass's
+        // Λ) and, once a lineage matures, promote it to a born atom so the NEXT
+        // pass refits with the discovered structure. A lineage that skips a pass
+        // loses its dwell; at most one birth per pass, and only when a later pass
+        // remains to refit the born atom, so K grows ≤ the pass budget and no
+        // born atom is left unrefit inside the alternation.
+        //
+        // #2239 evidence-driven pass extension: a live nursery lineage is itself
+        // the certificate that residual structure persists. When the planned
+        // budget would expire with lineages still maturing (or a matured lineage
+        // still owed its post-birth refit), the alternation grants itself one
+        // more pass, hard-capped at `STRUCTURED_RESIDUAL_PASSES_MAX`. Compute
+        // grows only while the certificate keeps firing; on structureless data
+        // the nursery stays empty and the planned budget is exact.
+        //
+        // PROMOTION_ENERGY_FLOOR_MULT — DERIVED (identity). The energy gate is
+        // "above the idiosyncratic-noise floor"; the floor is already the
+        // data-estimated detection threshold, so the canonical multiplier is 1.0.
+        const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
+        // PROMOTION_NURSERY_MIN_PASSES — DERIVED (minimal persistence). Two is the
+        // smallest dwell at which a direction has been re-observed across a refit,
+        // i.e. the minimal count that distinguishes a repeated structural signal
+        // from a one-pass artifact.
+        const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
+        // The #2071 per-pass alignment threshold `align_min(r)` is the
+        // Beta-quantile of the random-alignment null keyed to the residual factor
+        // rank `r`. It is derived here and used identically by the producer-side
+        // candidate gate and the nursery lineage-dedup below.
+        //
+        // `promote_from_residual` is the typed caller flag (default TRUE, #2239:
+        // magic-by-default — the evidence certificate above, not the flag, is the
+        // real gate). `false` pins the historical whitening-without-growth path.
+        let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
+        let mut total_passes = structured_passes;
         let mut pass = 0usize;
         while pass < total_passes {
             let Some(model) = sae_structured_residual_model(&term, z.view())? else {
