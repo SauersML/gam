@@ -465,17 +465,21 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
         A.train <- inla.spde.make.A(mesh = mesh, loc = loc.train)
         A.test  <- inla.spde.make.A(mesh = mesh, loc = loc.test)
         s.index <- inla.spde.make.index(name = "spatial", n.spde = spde$n.spde)
+        # INLA 24.5.10's stack parser pairs each projector with a named LIST of
+        # effects. The length-n intercept vector makes the scalar `A = 1` expand
+        # to the identity projector; a data.frame here enters its broken nested
+        # data-frame branch (`l[is.df]`) before any model fit.
         stk.train <- inla.stack(
           data = list(mag = train$mag),
           A = list(A.train, 1),
           effects = list(s.index,
-                         data.frame(intercept = rep(1, nrow(train)))),
+                         list(intercept = rep(1, nrow(train)))),
           tag = "train")
         stk.test <- inla.stack(
           data = list(mag = rep(NA, nrow(test))),
           A = list(A.test, 1),
           effects = list(s.index,
-                         data.frame(intercept = rep(1, nrow(test)))),
+                         list(intercept = rep(1, nrow(test)))),
           tag = "test")
         stk <- inla.stack(stk.train, stk.test)
         form <- mag ~ -1 + intercept + f(spatial, model = spde)
