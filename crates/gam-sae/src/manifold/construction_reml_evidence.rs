@@ -342,24 +342,17 @@ impl SaeManifoldTerm {
         //    streaming path so both rank the identical Laplace dimension count.
         let occam = self.reml_occam_term(rho)?;
 
-        // Decoder-block analytic-penalty energy (#671/#672). The inner solve
-        // descended this energy (it enters `gb`/`hbb`) but it had no native
-        // `loss.*` representative, so the Laplace criterion `v` was scoring a
-        // different objective than the one minimized. Add the converged
-        // decoder-penalty value so the ρ-sweep ranks the same penalized
-        // deviance. Excludes the Psi-tier ARD/assignment penalties already
-        // accounted for in `loss.total()` (see
-        // `analytic_decoder_penalty_value_total`).
-        // Extra analytic-penalty energy (#671/#737). Decoder-block penalties and
-        // coordinate-tier isometry enter the inner solve but have no `loss.*`
-        // representative, so the Laplace criterion must add them explicitly to
-        // rank the same penalized deviance the Newton solve descends.
-        let extra_penalty_energy = match registry {
-            Some(reg) => self
-                .reml_extra_penalty_value_total(reg)
-                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
-            None => 0.0,
-        };
+        // Extra penalized-objective energy with no native `loss.*` twin
+        // (#671/#737, and the full-objective completion): all registry analytic
+        // penalties (Isometry, SCAD/MCP, BlockOrthogonality, decoder-block
+        // set), the decoder repulsion conditioner, and the Jeffreys separation
+        // barrier. The inner solve descends all of them (they enter the KKT
+        // gradient), so the Laplace criterion must add them to rank the SAME
+        // penalized deviance — the envelope theorem the analytic outer gradient
+        // relies on holds only then. See `reml_extra_penalty_value_total`.
+        let extra_penalty_energy = self
+            .reml_extra_penalty_value_total(registry)
+            .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
 
         let v = {
             // #5/(B): replace the COORDINATE-block ½log|H_tt| in the Laplace
@@ -1865,15 +1858,13 @@ impl SaeManifoldTerm {
         converged_cache.joint_hessian_log_det = Some(log_det);
         converged_cache.schur_factor_is_undamped = true;
         let occam = self.reml_occam_term(rho)?;
-        // Extra analytic-penalty energy (#671/#737), matching the full-batch
-        // `reml_criterion_with_cache` path so streaming and dense criteria rank
-        // the identical penalized objective.
-        let extra_penalty_energy = match registry {
-            Some(reg) => self
-                .reml_extra_penalty_value_total(reg)
-                .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
-            None => 0.0,
-        };
+        // Extra penalized-objective energy (#671/#737 + full-objective
+        // completion: registry penalties + repulsion + separation barrier),
+        // matching the full-batch `reml_criterion_with_cache` path so streaming
+        // and dense criteria rank the identical penalized objective.
+        let extra_penalty_energy = self
+            .reml_extra_penalty_value_total(registry)
+            .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?;
         let v = {
             let ri = rank_inputs;
             // #9/#5 streaming rank charge: replace the coordinate-block ½log|H_tt|
@@ -4970,12 +4961,9 @@ impl SaeManifoldTerm {
         let laplace_complexity =
             rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
         let occam = self.reml_occam_term(rho)?;
-        let extra_penalty_energy = match registry {
-            Some(reg) => self
-                .reml_extra_penalty_value_total(reg)
-                .map_err(|err| format!("SaeManifoldTerm::criterion_as_atoms: {err}"))?,
-            None => 0.0,
-        };
+        let extra_penalty_energy = self
+            .reml_extra_penalty_value_total(registry)
+            .map_err(|err| format!("SaeManifoldTerm::criterion_as_atoms: {err}"))?;
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
 
         let solver = self.outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())?;

@@ -227,10 +227,9 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
                 frozen_ridge_beta,
             )
             .expect("frozen-state directional value probe");
-        let extra_penalty = frozen_registry.as_ref().map_or(Ok(0.0), |registry| {
-            term.reml_extra_penalty_value_total(registry)
-                .map_err(|error| error.to_string())
-        });
+        let extra_penalty = term
+            .reml_extra_penalty_value_total(frozen_registry.as_ref())
+            .map_err(|error| error.to_string());
         let data_and_priors = loss.total() + extra_penalty.expect("frozen extra penalty");
         let half_logdet =
             0.5 * arrow_log_det_from_cache(&cache).expect("frozen authoritative log determinant");

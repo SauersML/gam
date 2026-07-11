@@ -106,12 +106,9 @@ fn logdet_audit_point(
         &n_eff,
     )?;
     let occam = term.reml_occam_term(rho)?;
-    let extra_penalty_energy = match registry {
-        Some(registry) => term
-            .reml_extra_penalty_value_total(registry)
-            .map_err(|error| error.to_string())?,
-        None => 0.0,
-    };
+    let extra_penalty_energy = term
+        .reml_extra_penalty_value_total(registry)
+        .map_err(|error| error.to_string())?;
     let solver = term
         .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
         .map_err(|err| err.to_string())?;

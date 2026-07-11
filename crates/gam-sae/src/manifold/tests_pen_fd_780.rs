@@ -770,7 +770,7 @@ pub(crate) fn sae_reml_extra_penalty_energy_counts_live_isometry_once() {
     assert_abs_diff_eq!(decoder_energy, 0.0, epsilon = 1.0e-12);
 
     let extra_energy = term
-        .reml_extra_penalty_value_total(&registry)
+        .reml_extra_penalty_value_total(Some(&registry))
         .expect("REML extra penalty value");
     assert_abs_diff_eq!(extra_energy, isometry_energy, epsilon = 1.0e-12);
 }

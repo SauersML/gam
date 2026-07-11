@@ -4779,15 +4779,38 @@ impl SaeManifoldTerm {
                 .any(|coord| coord.manifold().preserves_isometry_cross_block_coherence())
     }
 
-    /// Extra analytic-penalty energy that has no native `SaeManifoldLoss`
-    /// component but is part of the penalized objective ranked by the SAE
-    /// Laplace/REML criterion.
+    /// Extra penalized-objective energy that has no native `SaeManifoldLoss`
+    /// component but is part of the objective the inner Newton solve descends,
+    /// and therefore of the penalized deviance the SAE Laplace/REML criterion
+    /// must rank.
+    ///
+    /// ENVELOPE CONTRACT: the criterion value `v = loss.total() + extra +
+    /// ½log|H| … − occam` is differentiated at the inner KKT root by the
+    /// envelope theorem, which cancels the fitted-state response ONLY when the
+    /// value's data+prior base is the SAME function whose gradient the KKT gate
+    /// certified. That gradient (assembled in `assemble_arrow_schur`) carries
+    /// every registry analytic penalty (Isometry, SCAD/MCP, BlockOrthogonality,
+    /// DecoderIncoherence, MechanismSparsity, NuclearNorm), the decoder
+    /// repulsion conditioner, and the Jeffreys separation barrier. The former
+    /// composition here (decoder-block + isometry only) omitted ScadMcp,
+    /// BlockOrthogonality, repulsion, and the barrier — a documented "residual
+    /// inconsistency" that is inert at K=1 but a live envelope violation
+    /// exactly in the K≥2 near-collinear / co-collapse regime where those
+    /// terms carry energy. The base is now exactly
+    /// `penalized_objective_total − loss.total()`: the full registry value
+    /// (ARD skipped inside, `loss.ard` already carries it) plus repulsion plus
+    /// the separation barrier. All of these have zero DIRECT ρ-derivative
+    /// (their weights are not ρ coordinates), so the analytic outer-gradient
+    /// channels are unchanged — this only restores value/gradient consistency.
     pub fn reml_extra_penalty_value_total(
         &self,
-        registry: &AnalyticPenaltyRegistry,
+        registry: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<f64, ArrowSchurError> {
-        Ok(self.analytic_decoder_penalty_value_total(registry)?
-            + self.isometry_penalty_value_total(registry)?)
+        let registry_energy = match registry {
+            Some(reg) => self.analytic_penalty_value_total(reg, 1.0)?,
+            None => 0.0,
+        };
+        Ok(registry_energy + self.decoder_repulsion_value(1.0) + self.separation_barrier_value(1.0))
     }
 
     pub fn penalized_objective_total(
