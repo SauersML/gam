@@ -9,6 +9,14 @@
 // from `construction.rs` so they keep the SAME module scope (`use super::*`),
 // the same `impl SaeManifoldTerm` surface, and full private-field access.
 
+thread_local! {
+    /// One reusable packed-jet arena per worker thread. Non-softmax row programs
+    /// copy their derivative channels into owned `SaeRowJets` before returning,
+    /// so the arena can be reset for the next row with no borrowed state escape.
+    static SAE_ROW_JET_ARENA: std::cell::RefCell<gam_math::jet_scalar::DynamicJetArena> =
+        std::cell::RefCell::new(gam_math::jet_scalar::DynamicJetArena::new());
+}
+
 impl SaeManifoldTerm {
     pub(crate) fn reconstruction_row_program_for_logdet(
         &self,
@@ -197,8 +205,9 @@ impl SaeManifoldTerm {
         })
     }
 
-    fn fill_reconstruction_channels_from_program<const K: usize>(
+    fn fill_reconstruction_channels_from_program_dynamic(
         program: &crate::row_jet_program::SaeReconstructionRowProgram,
+        arena: &gam_math::jet_scalar::DynamicJetArena,
         sqrt_row_w: f64,
         first: &mut [Vec<f64>],
         second: &mut [Vec<Vec<f64>>],
@@ -208,52 +217,23 @@ impl SaeManifoldTerm {
         // the basis jets are column-independent, so this removes the `out_dim×`
         // redundant recomputation the per-column path incurred (~9× faster at
         // K=8, out_dim=16). Bit-identical to per-column `_packed` assembly.
-        let columns = program.reconstruction_all_columns_packed::<K>();
+        let q = program.n_primaries;
+        let columns = program.reconstruction_all_columns_dynamic(arena);
         for (out_col, tower) in columns.iter().enumerate() {
             let g = tower.g();
             let h = tower.h();
-            for a in 0..K {
+            for a in 0..q {
                 first[a][out_col] = sqrt_row_w * g[a];
-                for b in 0..K {
-                    second[a][b][out_col] = sqrt_row_w * h[a][b];
+                for b in 0..q {
+                    second[a][b][out_col] = sqrt_row_w * h[a * q + b];
                 }
             }
         }
     }
 
-    fn fill_reconstruction_channels_from_program_dynamic(
+    fn fill_beta_border_channels_from_program_dynamic(
         program: &crate::row_jet_program::SaeReconstructionRowProgram,
-        sqrt_row_w: f64,
-        first: &mut [Vec<f64>],
-        second: &mut [Vec<Vec<f64>>],
-    ) -> Result<(), String> {
-        macro_rules! dispatch {
-            ($($k:literal),* $(,)?) => {
-                match program.n_primaries {
-                    $(
-                        $k => {
-                            Self::fill_reconstruction_channels_from_program::<$k>(
-                                program,
-                                sqrt_row_w,
-                                first,
-                                second,
-                            );
-                            Ok(())
-                        }
-                    )*
-                    q => Err(format!(
-                        "SAE row reconstruction Tower4 production path supports at most {} row primaries, got {q}; \
-                         widen the const-generic dispatch ladder or reduce the per-row active-atom arity (#932)",
-                        crate::row_jet_program::SAE_MAX_JET_ROW_PRIMARIES,
-                    )),
-                }
-            };
-        }
-        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
-    }
-
-    fn fill_beta_border_channels_from_program<const K: usize>(
-        program: &crate::row_jet_program::SaeReconstructionRowProgram,
+        arena: &gam_math::jet_scalar::DynamicJetArena,
         sqrt_row_w: f64,
         border: &[SaeBorderChannel],
         beta: &mut [Vec<f64>],
@@ -272,7 +252,8 @@ impl SaeManifoldTerm {
         // `Order2` path would compute and discard. `Order1`'s value/grad are
         // bit-identical to `Order2`'s (#1591 order1 oracle).
         let chans: Vec<(usize, usize)> = border.iter().map(|c| (c.atom, c.basis_col)).collect();
-        let sjets = program.beta_border_order1_packed::<K>(&chans);
+        let q = program.n_primaries;
+        let sjets = program.beta_border_order1_dynamic(&chans, arena);
         for (beta_pos, channel) in border.iter().enumerate() {
             let s = &sjets[beta_pos];
             let s_v = s.value();
@@ -280,7 +261,7 @@ impl SaeManifoldTerm {
             for out_col in 0..p {
                 let out_c = channel.output[out_col];
                 beta[beta_pos][out_col] = sqrt_row_w * s_v * out_c;
-                for a in 0..K {
+                for a in 0..q {
                     // Reconstruction is linear in β, so beta_deriv and
                     // beta_l_deriv are the identical mixed ∂²ẑ_c/∂β∂p_a channel.
                     let mixed = sqrt_row_w * s_g[a] * out_c;
@@ -289,41 +270,6 @@ impl SaeManifoldTerm {
                 }
             }
         }
-    }
-
-    fn fill_beta_border_channels_from_program_dynamic(
-        program: &crate::row_jet_program::SaeReconstructionRowProgram,
-        sqrt_row_w: f64,
-        border: &[SaeBorderChannel],
-        beta: &mut [Vec<f64>],
-        beta_deriv: &mut [Vec<Vec<f64>>],
-        beta_l_deriv: &mut [Vec<Vec<f64>>],
-    ) -> Result<(), String> {
-        macro_rules! dispatch {
-            ($($k:literal),* $(,)?) => {
-                match program.n_primaries {
-                    $(
-                        $k => {
-                            Self::fill_beta_border_channels_from_program::<$k>(
-                                program,
-                                sqrt_row_w,
-                                border,
-                                beta,
-                                beta_deriv,
-                                beta_l_deriv,
-                            );
-                            Ok(())
-                        }
-                    )*
-                    q => Err(format!(
-                        "SAE β border Tower4 production path supports at most {} row primaries, got {q}; \
-                         widen the const-generic dispatch ladder or reduce the per-row active-atom arity (#932)",
-                        crate::row_jet_program::SAE_MAX_JET_ROW_PRIMARIES,
-                    )),
-                }
-            };
-        }
-        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
     }
 
     /// `∂²g_k/∂t_{ik,axis_a}∂t_{ik,axis_b}` for one row/atom: the decoded second
@@ -666,20 +612,26 @@ impl SaeManifoldTerm {
                     assignments,
                     second_jets,
                 )?;
-                Self::fill_reconstruction_channels_from_program_dynamic(
-                    &program,
-                    sqrt_row_w,
-                    &mut first,
-                    &mut second,
-                )?;
-                Self::fill_beta_border_channels_from_program_dynamic(
-                    &program,
-                    sqrt_row_w,
-                    border,
-                    &mut beta,
-                    &mut beta_deriv,
-                    &mut beta_l_deriv,
-                )?;
+                SAE_ROW_JET_ARENA.with(|cell| {
+                    let mut arena = cell.borrow_mut();
+                    arena.reset();
+                    Self::fill_reconstruction_channels_from_program_dynamic(
+                        &program,
+                        &arena,
+                        sqrt_row_w,
+                        &mut first,
+                        &mut second,
+                    );
+                    Self::fill_beta_border_channels_from_program_dynamic(
+                        &program,
+                        &arena,
+                        sqrt_row_w,
+                        border,
+                        &mut beta,
+                        &mut beta_deriv,
+                        &mut beta_l_deriv,
+                    );
+                });
             }
         }
 

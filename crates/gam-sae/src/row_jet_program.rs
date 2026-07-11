@@ -215,21 +215,6 @@ pub struct SaeReconstructionRowProgram {
     pub n_primaries: usize,
 }
 
-/// Maximum number of per-row Newton primaries `n_primaries` the const-generic
-/// `Tower4<K>` reconstruction / β-border jet dispatch monomorphizes (issue
-/// #932). The tower is compile-time-sized, so `K` must be a literal drawn from
-/// the `fill_*_from_program_dynamic` ladders (`0..=SAE_MAX_JET_ROW_PRIMARIES`);
-/// a wider per-row block would otherwise route to the ladder's `unsupported`
-/// arm deep inside the streaming arrow log-det assembly. The per-atom
-/// assignment modes (IBP-MAP / ThresholdGate / TopK) route through this ladder,
-/// so their fits validate the finalized per-row arity against this limit up
-/// front (`SaeManifoldTerm::validate_jet_row_primary_arity`). The softmax mode
-/// uses the dynamically-sized hand path and is NOT bound by this cap.
-///
-/// Keep this in sync with the literal list in the `dispatch!` macros of
-/// `construction_row_jet_logdet_channels.rs`.
-pub const SAE_MAX_JET_ROW_PRIMARIES: usize = 16;
-
 impl SaeReconstructionRowProgram {
     /// The gate activation `ζ_k(ℓ)` as a `Tower4<K>` in the gate-logit
     /// primaries. Softmax is the shared composition `exp(ℓ_k·inv_tau) /
@@ -241,18 +226,27 @@ impl SaeReconstructionRowProgram {
     /// the pinned active-routing gate, all derivative channels zero — so ungated
     /// (#1026) and frozen-routing (#1033) atoms carry no logit sensitivity.
     #[inline]
-    fn fixed_gate<const K: usize, S: JetScalar<K>>(&self, atom: usize) -> Option<S> {
+    fn fixed_gate<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        atom: usize,
+        workspace: &'arena S::Workspace,
+    ) -> Option<S> {
         self.fixed_gate_value
             .get(atom)
             .copied()
             .flatten()
-            .map(S::constant)
+            .map(|value| S::constant(value, self.n_primaries, workspace))
     }
 
-    fn gate_tower<const K: usize, S: JetScalar<K>>(&self, atom: usize) -> S {
-        if let Some(fixed) = self.fixed_gate::<K, S>(atom) {
+    fn gate_tower<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        atom: usize,
+        workspace: &'arena S::Workspace,
+    ) -> S {
+        if let Some(fixed) = self.fixed_gate::<S>(atom, workspace) {
             return fixed;
         }
+        let dimension = self.n_primaries;
         match self.gate {
             RowGate::Softmax { inv_tau } => {
                 // Build exp(ℓ_j·inv_tau − shift) for every atom that has a free
@@ -274,18 +268,21 @@ impl SaeReconstructionRowProgram {
                     .copied()
                     .fold(f64::NEG_INFINITY, f64::max)
                     * inv_tau;
-                let mut denom = S::constant(0.0);
-                let mut numer = S::constant(0.0);
+                let mut denom = S::constant(0.0, dimension, workspace);
+                let mut numer = S::constant(0.0, dimension, workspace);
                 for j in 0..self.gate_value.len() {
                     let lj = match self.logit_slot[j] {
-                        Some(slot) => S::variable(self.logits[j], slot),
-                        None => S::constant(self.logits[j]),
+                        Some(slot) => S::variable(self.logits[j], slot, dimension, workspace),
+                        None => S::constant(self.logits[j], dimension, workspace),
                     };
                     // (ℓ_j·inv_tau − shift): subtracting a constant shifts only
                     // the value channel, leaving every gradient/Hessian/t3/t4
                     // channel of the exponent (hence of exp via the chain rule)
                     // identical to the unshifted form.
-                    let ej = lj.scale(inv_tau).sub(&S::constant(shift)).exp();
+                    let ej = lj
+                        .scale(inv_tau)
+                        .sub(&S::constant(shift, dimension, workspace))
+                        .exp();
                     if j == atom {
                         numer = ej;
                     }
@@ -295,11 +292,13 @@ impl SaeReconstructionRowProgram {
             }
             RowGate::PerAtomLogistic { inv_tau } => {
                 let l = match self.logit_slot[atom] {
-                    Some(slot) => S::variable(self.logits[atom], slot),
-                    None => S::constant(self.logits[atom]),
+                    Some(slot) => S::variable(self.logits[atom], slot, dimension, workspace),
+                    None => S::constant(self.logits[atom], dimension, workspace),
                 };
-                let x = l.sub(&S::constant(self.gate_shift[atom])).scale(inv_tau);
-                let one = S::constant(1.0);
+                let x = l
+                    .sub(&S::constant(self.gate_shift[atom], dimension, workspace))
+                    .scale(inv_tau);
+                let one = S::constant(1.0, dimension, workspace);
                 let sigma = if x.value() >= 0.0 {
                     one.mul(&recip(&one.add(&x.scale(-1.0).exp())))
                 } else {
@@ -323,8 +322,12 @@ impl SaeReconstructionRowProgram {
     /// `K=8` ⇒ 56 exps + 7 recips removed), and is **bit-identical** to the
     /// per-atom path (same `exp_k · recip(denom)` product, same Leibniz order).
     /// Pure [`JetScalar`] ops — single-source, exact, no softmax chain rule.
-    fn all_gates<const K: usize, S: JetScalar<K>>(&self) -> Vec<S> {
+    fn all_gates<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        workspace: &'arena S::Workspace,
+    ) -> Vec<S> {
         let n = self.gate_value.len();
+        let dimension = self.n_primaries;
         match self.gate {
             RowGate::Softmax { inv_tau } => {
                 let shift = self
@@ -335,13 +338,16 @@ impl SaeReconstructionRowProgram {
                     * inv_tau;
                 // The K exp-jets and the denominator, built ONCE and shared.
                 let mut exps: Vec<S> = Vec::with_capacity(n);
-                let mut denom = S::constant(0.0);
+                let mut denom = S::constant(0.0, dimension, workspace);
                 for j in 0..n {
                     let lj = match self.logit_slot[j] {
-                        Some(slot) => S::variable(self.logits[j], slot),
-                        None => S::constant(self.logits[j]),
+                        Some(slot) => S::variable(self.logits[j], slot, dimension, workspace),
+                        None => S::constant(self.logits[j], dimension, workspace),
                     };
-                    let ej = lj.scale(inv_tau).sub(&S::constant(shift)).exp();
+                    let ej = lj
+                        .scale(inv_tau)
+                        .sub(&S::constant(shift, dimension, workspace))
+                        .exp();
                     denom = denom.add(&ej);
                     exps.push(ej);
                 }
@@ -358,7 +364,7 @@ impl SaeReconstructionRowProgram {
                 // restores bit-identity for the pinned gates too.
                 (0..n)
                     .map(|atom| {
-                        self.fixed_gate::<K, S>(atom)
+                        self.fixed_gate::<S>(atom, workspace)
                             .unwrap_or_else(|| exps[atom].mul(&inv))
                     })
                     .collect()
@@ -366,9 +372,9 @@ impl SaeReconstructionRowProgram {
             // Per-atom logistic gates are independent (each depends only on its
             // own logit); there is no shared denominator to hoist, so this is the
             // same as calling `gate_tower` per atom.
-            RowGate::PerAtomLogistic { .. } => {
-                (0..n).map(|atom| self.gate_tower::<K, S>(atom)).collect()
-            }
+            RowGate::PerAtomLogistic { .. } => (0..n)
+                .map(|atom| self.gate_tower::<S>(atom, workspace))
+                .collect(),
         }
     }
 
@@ -377,16 +383,17 @@ impl SaeReconstructionRowProgram {
     /// reconstruction value, `.g[a]` is `∂ẑ_c/∂p_a`, `.h[a][b]` is
     /// `∂²ẑ_c/∂p_a∂p_b`, and the `t3`/`t4` channels are the exact higher-order
     /// derivatives — all from this ONE evaluation.
-    fn reconstruction_column_generic<const K: usize, S: JetScalar<K>>(&self, out_col: usize) -> S {
-        assert_eq!(
-            self.n_primaries, K,
-            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
-            self.n_primaries
-        );
-        let mut acc = S::constant(0.0);
+    fn reconstruction_column_generic<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        out_col: usize,
+        workspace: &'arena S::Workspace,
+    ) -> S {
+        let dimension = self.n_primaries;
+        let mut acc = S::constant(0.0, dimension, workspace);
         for (atom, atom_jet) in self.atoms.iter().enumerate() {
-            let gate = self.gate_tower::<K, S>(atom);
-            let decoded = atom_jet.decoded_tower::<K, S>(out_col, &self.coord_slot[atom]);
+            let gate = self.gate_tower::<S>(atom, workspace);
+            let decoded =
+                atom_jet.decoded_tower::<S>(out_col, &self.coord_slot[atom], dimension, workspace);
             acc = acc.add(&gate.mul(&decoded));
         }
         acc
@@ -408,7 +415,9 @@ impl SaeReconstructionRowProgram {
     /// tower's order-≤2 channels use); the t3/t4 oracle pins the dense path.
     #[must_use]
     pub fn reconstruction_column_packed<const K: usize>(&self, out_col: usize) -> Order2<K> {
-        self.reconstruction_column_generic::<K, Order2<K>>(out_col)
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.reconstruction_column_generic::<FixedRuntimeJet<Order2<K>, K>>(out_col, &())
+            .into_inner()
     }
 
     /// All `out_dim` reconstruction columns as packed [`Order2<K>`] jets, with
@@ -430,37 +439,37 @@ impl SaeReconstructionRowProgram {
     /// [`Self::reconstruction_column_packed`] per column (same Leibniz products in
     /// the same order) — only the redundant recomputation is removed — measured
     /// ~9× faster at `K=8, out_dim=16` on the per-row hot path.
-    #[must_use]
-    pub fn reconstruction_all_columns_packed<const K: usize>(&self) -> Vec<Order2<K>> {
-        assert_eq!(
-            self.n_primaries, K,
-            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
-            self.n_primaries
-        );
+    fn reconstruction_all_columns_generic<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        workspace: &'arena S::Workspace,
+    ) -> Vec<S> {
         let p = self.out_dim();
+        let dimension = self.n_primaries;
         // Hoist the per-atom gate jet (c-independent) and basis jets
         // (c-independent) out of the column loop. `all_gates` additionally shares
         // the softmax denominator / reciprocal across atoms (K exps + 1 recip,
         // not K² + K).
-        let gates: Vec<Order2<K>> = self.all_gates::<K, Order2<K>>();
-        let bases: Vec<Vec<Order2<K>>> = self
+        let gates: Vec<S> = self.all_gates::<S>(workspace);
+        let bases: Vec<Vec<S>> = self
             .atoms
             .iter()
             .enumerate()
             .map(|(atom, atom_jet)| {
                 (0..atom_jet.n_basis())
-                    .map(|b| atom_jet.basis_tower::<K, Order2<K>>(b, &self.coord_slot[atom]))
+                    .map(|b| {
+                        atom_jet.basis_tower::<S>(b, &self.coord_slot[atom], dimension, workspace)
+                    })
                     .collect()
             })
             .collect();
         (0..p)
             .map(|c| {
-                let mut acc = Order2::<K>::constant(0.0);
+                let mut acc = S::constant(0.0, dimension, workspace);
                 for (atom, atom_jet) in self.atoms.iter().enumerate() {
                     // decoded_{k,c} = Σ_b Φ_{k,b}·B_{b,c} from the hoisted basis
                     // jets — same per-basis sum `decoded_tower` forms, but the
                     // basis jets are reused across every column.
-                    let mut decoded = Order2::<K>::constant(0.0);
+                    let mut decoded = S::constant(0.0, dimension, workspace);
                     for basis_col in 0..atom_jet.n_basis() {
                         let coeff = atom_jet.decoder[basis_col][c];
                         if coeff == 0.0 {
@@ -475,6 +484,25 @@ impl SaeReconstructionRowProgram {
             .collect()
     }
 
+    /// Fixed-size packed order-2 oracle for one row.
+    #[must_use]
+    pub fn reconstruction_all_columns_packed<const K: usize>(&self) -> Vec<Order2<K>> {
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.reconstruction_all_columns_generic::<FixedRuntimeJet<Order2<K>, K>>(&())
+            .into_iter()
+            .map(FixedRuntimeJet::into_inner)
+            .collect()
+    }
+
+    /// Runtime-sized packed order-2 production backend for one row.
+    #[must_use]
+    pub fn reconstruction_all_columns_dynamic<'arena>(
+        &self,
+        arena: &'arena DynamicJetArena,
+    ) -> Vec<DynamicOrder2<'arena>> {
+        self.reconstruction_all_columns_generic::<DynamicOrder2<'arena>>(arena)
+    }
+
     /// The reconstruction output column as the full dense [`Tower4<K>`] carrying
     /// every value/gradient/Hessian/`t3`/`t4` channel. This is the #932 oracle
     /// ground truth: the production [`Self::reconstruction_column_packed`]
@@ -482,7 +510,9 @@ impl SaeReconstructionRowProgram {
     /// tests use its `t3`/`t4`. Not on the per-row hot path.
     #[must_use]
     pub fn reconstruction_column<const K: usize>(&self, out_col: usize) -> Tower4<K> {
-        self.reconstruction_column_generic::<K, Tower4<K>>(out_col)
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.reconstruction_column_generic::<FixedRuntimeJet<Tower4<K>, K>>(out_col, &())
+            .into_inner()
     }
 
     /// The β **border-channel** local-variable sub-jet: the scalar
@@ -506,18 +536,19 @@ impl SaeReconstructionRowProgram {
     /// path in `row_jets_for_logdet` packs these same `ζ_k·Φ_b` products (then
     /// multiplies by `channel.output`) term by term, and is pinned to this
     /// tower by the converged-cache oracle.
-    fn beta_border_generic<const K: usize, S: JetScalar<K>>(
+    fn beta_border_generic<'arena, S: RuntimeJetScalar<'arena>>(
         &self,
         atom: usize,
         basis_col: usize,
+        workspace: &'arena S::Workspace,
     ) -> S {
-        assert_eq!(
-            self.n_primaries, K,
-            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
-            self.n_primaries
+        let gate = self.gate_tower::<S>(atom, workspace);
+        let phi = self.atoms[atom].basis_tower::<S>(
+            basis_col,
+            &self.coord_slot[atom],
+            self.n_primaries,
+            workspace,
         );
-        let gate = self.gate_tower::<K, S>(atom);
-        let phi = self.atoms[atom].basis_tower::<K, S>(basis_col, &self.coord_slot[atom]);
         gate.mul(&phi)
     }
 
@@ -535,7 +566,9 @@ impl SaeReconstructionRowProgram {
         atom: usize,
         basis_col: usize,
     ) -> Order2<K> {
-        self.beta_border_generic::<K, Order2<K>>(atom, basis_col)
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.beta_border_generic::<FixedRuntimeJet<Order2<K>, K>>(atom, basis_col, &())
+            .into_inner()
     }
 
     /// The β border-channel sub-jet as the full dense [`Tower4<K>`] — the #932
@@ -543,7 +576,30 @@ impl SaeReconstructionRowProgram {
     /// pinned against. Not on the per-row hot path.
     #[must_use]
     pub fn beta_border_tower<const K: usize>(&self, atom: usize, basis_col: usize) -> Tower4<K> {
-        self.beta_border_generic::<K, Tower4<K>>(atom, basis_col)
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.beta_border_generic::<FixedRuntimeJet<Tower4<K>, K>>(atom, basis_col, &())
+            .into_inner()
+    }
+
+    fn beta_border_batch_generic<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        channels: &[(usize, usize)],
+        workspace: &'arena S::Workspace,
+    ) -> Vec<S> {
+        let dimension = self.n_primaries;
+        let gates: Vec<S> = self.all_gates::<S>(workspace);
+        channels
+            .iter()
+            .map(|&(atom, basis_col)| {
+                let phi = self.atoms[atom].basis_tower::<S>(
+                    basis_col,
+                    &self.coord_slot[atom],
+                    dimension,
+                    workspace,
+                );
+                gates[atom].mul(&phi)
+            })
+            .collect()
     }
 
     /// Packed β border-channel sub-jets for a batch of `(atom, basis_col)`
@@ -561,19 +617,10 @@ impl SaeReconstructionRowProgram {
         &self,
         channels: &[(usize, usize)],
     ) -> Vec<Order2<K>> {
-        assert_eq!(
-            self.n_primaries, K,
-            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
-            self.n_primaries
-        );
-        let gates: Vec<Order2<K>> = self.all_gates::<K, Order2<K>>();
-        channels
-            .iter()
-            .map(|&(atom, basis_col)| {
-                let phi =
-                    self.atoms[atom].basis_tower::<K, Order2<K>>(basis_col, &self.coord_slot[atom]);
-                gates[atom].mul(&phi)
-            })
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.beta_border_batch_generic::<FixedRuntimeJet<Order2<K>, K>>(channels, &())
+            .into_iter()
+            .map(FixedRuntimeJet::into_inner)
             .collect()
     }
 
@@ -597,20 +644,21 @@ impl SaeReconstructionRowProgram {
         &self,
         channels: &[(usize, usize)],
     ) -> Vec<Order1<K>> {
-        assert_eq!(
-            self.n_primaries, K,
-            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
-            self.n_primaries
-        );
-        let gates: Vec<Order1<K>> = self.all_gates::<K, Order1<K>>();
-        channels
-            .iter()
-            .map(|&(atom, basis_col)| {
-                let phi =
-                    self.atoms[atom].basis_tower::<K, Order1<K>>(basis_col, &self.coord_slot[atom]);
-                gates[atom].mul(&phi)
-            })
+        assert_eq!(self.n_primaries, K, "fixed jet dimension mismatch");
+        self.beta_border_batch_generic::<FixedRuntimeJet<Order1<K>, K>>(channels, &())
+            .into_iter()
+            .map(FixedRuntimeJet::into_inner)
             .collect()
+    }
+
+    /// Runtime-sized packed first-order β-border backend for one row.
+    #[must_use]
+    pub fn beta_border_order1_dynamic<'arena>(
+        &self,
+        channels: &[(usize, usize)],
+        arena: &'arena DynamicJetArena,
+    ) -> Vec<DynamicOrder1<'arena>> {
+        self.beta_border_batch_generic::<DynamicOrder1<'arena>>(channels, arena)
     }
 
     /// The number of reconstruction output columns.
