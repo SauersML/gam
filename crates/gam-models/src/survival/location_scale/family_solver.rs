@@ -1132,11 +1132,9 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         log_rescale: f64,
     ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
             d_beta_flat,
-            &q,
             &dynamic,
             log_rescale,
         )
@@ -1144,22 +1142,19 @@ impl SurvivalLocationScaleFamily {
 
     /// `_from_parts` variant of
     /// [`Self::exact_newton_joint_hessian_directional_derivative_rescaled`]
-    /// that receives the precomputed `q` and `dynamic` instead of recomputing
-    /// them on every call. This is the workspace-friendly entry point used by
+    /// that receives the precomputed dynamic geometry instead of recomputing it
+    /// on every call. This is the workspace-friendly entry point used by
     /// `SurvivalLocationScaleExactNewtonJointHessianWorkspace` to avoid the
-    /// ~300 redundant `collect_joint_quantities_rescaled` /
-    /// `build_dynamic_geometry` sweeps the outer Hessian pair loop would
+    /// ~300 redundant `build_dynamic_geometry` sweeps the outer Hessian pair loop would
     /// otherwise trigger per evaluation.
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
         &self,
         d_beta_flat: &Array1<f64>,
-        q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
         deriv_log_scale: f64,
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
             d_beta_flat,
-            q,
             dynamic,
             deriv_log_scale,
             None,
@@ -1174,7 +1169,6 @@ impl SurvivalLocationScaleFamily {
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
         &self,
         d_beta_flat: &Array1<f64>,
-        q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
         deriv_log_scale: f64,
         row_mask: Option<&Array1<f64>>,
@@ -1637,7 +1631,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             return Ok(None);
         }
         let log_rescale = self.hessian_deriv_log_rescale(block_states);
-        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
         // Base (non-wiggle) path: sweep every canonical axis through the batched
@@ -1667,7 +1660,6 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             e_a[a] = 1.0;
             match self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
                 &e_a,
-                &q,
                 &dynamic,
                 log_rescale,
             )? {
@@ -3197,7 +3189,6 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
 /// location-scale joint-Hessian directional derivative operators.
 pub(crate) struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
     pub(crate) family: SurvivalLocationScaleFamily,
-    pub(crate) q: SurvivalJointQuantities,
     pub(crate) dynamic: SurvivalDynamicGeometry,
     pub(crate) deriv_log_scale: f64,
     pub(crate) row_mask: Option<Arc<Array1<f64>>>,
@@ -3209,11 +3200,9 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
         block_states: Vec<ParameterBlockState>,
     ) -> Result<Self, String> {
         let log_rescale = family.hessian_deriv_log_rescale(&block_states);
-        let q = family.collect_joint_quantities_rescaled(&block_states, log_rescale)?;
         let dynamic = family.build_dynamic_geometry(&block_states)?;
         Ok(Self {
             family,
-            q,
             dynamic,
             deriv_log_scale: log_rescale,
             row_mask: None,
@@ -3258,7 +3247,6 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         self.family
             .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
                 d_beta_flat,
-                &self.q,
                 &self.dynamic,
                 self.deriv_log_scale,
                 self.row_mask.as_deref(),
@@ -3273,7 +3261,6 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             .family
             .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
                 d_beta_flat,
-                &self.q,
                 &self.dynamic,
                 self.deriv_log_scale,
                 self.row_mask.as_deref(),
@@ -3304,8 +3291,8 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         let rows = row_set_from_survival_mask(self.row_mask.as_deref(), self.family.n);
         if self.family.x_link_wiggle.is_some() {
             // #932: single-source the wiggle workspace SECOND directional
-            // derivative through the §13 warp kernel (`TwoSeed<KW>`) — `self.q`
-            // / `self.dynamic` already carry the wiggle geometry + βw, so no
+            // derivative through the §13 warp kernel (`TwoSeed<KW>`) — the
+            // cached dynamic geometry already carries the wiggle geometry + βw, so no
             // `block_states` re-thread is needed. Previously returned `None`.
             return Ok(Some(
                 super::row_kernel::survival_ls_wiggle_second_directional_derivative_dense(
