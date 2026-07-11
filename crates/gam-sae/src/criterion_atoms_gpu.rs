@@ -279,7 +279,7 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
         let ctx = gam_gpu::device_runtime::cuda_context_for(ordinal)
             .ok_or_else(|| format!("{operation}: no CUDA context for ordinal {ordinal}"))?;
         let stream = ctx.default_stream();
-        let nonneg_ll = i64::from(nonneg);
+        let nonneg_ll = if nonneg { 1_i64 } else { 0_i64 };
         let mut builder = stream.launch_builder(&func);
         builder.arg(&x_dev_ptr);
         builder.arg(&recon_dev_ptr);
@@ -341,7 +341,7 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
         let ctx = gam_gpu::device_runtime::cuda_context_for(ordinal)
             .ok_or_else(|| format!("{operation}: no CUDA context for ordinal {ordinal}"))?;
         let stream = ctx.default_stream();
-        let nonneg_ll = i64::from(nonneg);
+        let nonneg_ll = if nonneg { 1_i64 } else { 0_i64 };
         let mut builder = stream.launch_builder(&func);
         builder.arg(&x_dev_ptr);
         builder.arg(&recon_dev_ptr);
