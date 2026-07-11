@@ -117,6 +117,12 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
     let (mut term, mut rho) = build_k1(atom, cb);
     term.set_behavior_block(block).unwrap();
     term.set_guards_enabled(false);
+    // Match the production fit entry: seed the linear decoder conditionally at
+    // the planted chart before asking the joint nonlinear walk to move chart and
+    // decoder together. A cold decoder makes the coordinate Jacobian vanish and
+    // tests bootstrap behavior rather than the isometry statistic.
+    term.refit_decoder_least_squares_at_current_state(augmented.view(), Some(&rho))
+        .unwrap();
     term.run_joint_fit_arrow_schur(augmented.view(), &mut rho, None, 64, 1.0, 1e-6, 1e-6)
         .expect("two-block fit must complete");
 
@@ -257,6 +263,15 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
     let (mut term, mut rho) = build_k1(atom, cb);
     term.set_behavior_block(block).unwrap();
     term.set_guards_enabled(false);
+    // Seed at the declared starting coupling; each REML sweep then rebuilds the
+    // augmented target at its current λ_y through the production driver below.
+    let seed_target = term
+        .behavior_block()
+        .unwrap()
+        .augmented_target(z.view())
+        .unwrap();
+    term.refit_decoder_least_squares_at_current_state(seed_target.view(), Some(&rho))
+        .unwrap();
 
     // The correct seam: two-block joint fit with λ_y REML-selected, on the raw
     // activation Z (the augmented target is stacked internally at each sweep's
