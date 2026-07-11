@@ -183,28 +183,33 @@ mod tests {
             .clone();
         assert_eq!(mu.len(), 2, "μ must have one entry per output dim");
         for j in 0..2 {
+            // μ IS the target's column mean by construction (both are `mean_axis`),
+            // so this stays exact regardless of the noise.
             assert!(
                 (mu[j] - target_col_mean[j]).abs() < 1e-9,
                 "μ[{j}]={} must equal the target column mean {}",
                 mu[j],
                 target_col_mean[j]
             );
-            // The DC dominates the column mean (the 8 circle coords sum to 0 exactly),
-            // so μ ≈ OFFSET.
+            // The DC dominates the column mean (the evenly-spaced circle coords sum
+            // to 0), so μ ≈ OFFSET up to the noise's finite-sample column mean
+            // (std σ/√N = 0.05/8 ≈ 6.3e-3); 0.1 is a comfortable ~16σ/√N band.
             assert!(
-                (mu[j] - OFFSET).abs() < 1e-9,
-                "μ[{j}]={} must equal OFFSET={OFFSET} (circle coords are mean-zero)",
+                (mu[j] - OFFSET).abs() < 0.1,
+                "μ[{j}]={} must be ≈ OFFSET={OFFSET} within the finite-sample noise mean",
                 mu[j]
             );
         }
 
         // The reported reconstruction lives in RAW-target space: its column mean
         // tracks the target's (the DC is added back by Tier-0), not the de-meaned
-        // frame the atoms were fit in.
+        // frame the atoms were fit in. With observation noise the fit is no longer
+        // exact, so the add-back is checked within a finite-sample band rather than
+        // at machine precision.
         let recon_col_mean = report.fitted.mean_axis(Axis(0)).unwrap();
         for j in 0..2 {
             assert!(
-                (recon_col_mean[j] - target_col_mean[j]).abs() < 1e-6,
+                (recon_col_mean[j] - target_col_mean[j]).abs() < 5e-2,
                 "reconstruction column mean[{j}]={} must track the raw target mean {} \
                  (Tier-0 add-back), not the de-meaned 0",
                 recon_col_mean[j],
@@ -229,8 +234,11 @@ mod tests {
             .expect("Tier-0 is installed unconditionally (value ≈ 0 here)")
             .clone();
         for (j, &m) in mu.iter().enumerate() {
+            // μ is the target's column mean; with mean-zero circle coords it is just
+            // the noise's finite-sample column mean (std σ/√N ≈ 6.3e-3) — small, not
+            // a phantom DC. 0.1 is a comfortable ~16σ/√N band.
             assert!(
-                m.abs() < 1e-9,
+                m.abs() < 0.1,
                 "μ[{j}]={m} must be ≈ 0 on already-centered data (no phantom mean)"
             );
         }
