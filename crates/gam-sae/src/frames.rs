@@ -11,9 +11,7 @@ use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb};
 /// [`GrassmannFrame`]'s deterministic sign gauge. Rank is certified against the
 /// standard SVD backward-error scale `eps * max(r, p) * sigma_max`; a deficient
 /// request is rejected rather than completed with arbitrary orthogonal vectors.
-pub fn canonical_output_subspace_rows(
-    raw: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, String> {
+pub fn canonical_output_subspace_rows(raw: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     let (r, p) = raw.dim();
     if r == 0 || p == 0 {
         return Err("canonical_output_subspace_rows: frame must be non-empty".to_string());
