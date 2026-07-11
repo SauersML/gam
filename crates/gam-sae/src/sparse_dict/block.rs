@@ -40,11 +40,11 @@
 //! **Training** is alternating minimisation, mirroring [`super::update`]:
 //! encode+route every row → refresh the shared scalar `γ` in closed form → update
 //! each block frame by a method-of-optimal-directions cross-moment followed by a
-//! polar reprojection back onto the Stiefel manifold → revive dead blocks
-//! (AuxK-style, seeded from the worst-reconstructed residual ROWS — never PCs, the
-//! house rule) → re-encode and score EV for the stopping rule. No dense `N×K`
-//! object is ever formed: routing is block-tiled exactly as the atom lane tiles
-//! columns.
+//! polar reprojection back onto the Stiefel manifold → propose residual-row births
+//! for dead blocks (never PCs) → commit each only under strict full-corpus RSS
+//! improvement and a positive realised-rank evidence margin → re-encode and score
+//! EV for the stopping rule. No dense `N×K` object is ever formed: routing is
+//! block-tiled exactly as the atom lane tiles columns.
 
 use super::scoring::TopSSelector;
 use crate::frames::GrassmannFrame;
@@ -150,8 +150,10 @@ pub struct BlockSparseConfig {
     /// Ridge on the per-block frame cross-moment refresh (Tikhonov on the polar
     /// step's cross-moment); keeps a thinly-used block's polar well posed.
     pub frame_ridge: f64,
-    /// AuxK dead-block revival budget `k_aux`: at most this many worst-utilised
-    /// (effectively dead) blocks are reseeded per epoch onto worst-residual rows.
+    /// AuxK dead-block birth-proposal budget `k_aux`: at most this many dead
+    /// blocks are transactionally tested per epoch against worst-residual rows.
+    /// A proposal is not installed unless exact RSS and rank-charge evidence both
+    /// improve strictly.
     pub aux_k: usize,
     /// Flag-gated MATRYOSHKA-PREFIX readout. When enabled, the returned fit
     /// carries log-spaced prefix losses over the final block ordering so an
@@ -969,7 +971,7 @@ fn refresh_frames(
     polar_failures
 }
 
-/// AuxK-style dead-block revival (house rule: seed from residual ROWS, never PCs).
+/// AuxK-style dead-block birth proposals (seed from residual ROWS, never PCs).
 ///
 /// Identify the `k_aux` **worst-utilised** blocks (fewest rows selected this
 /// epoch); any that are effectively dead (utilisation below one row) are reseeded.
@@ -977,8 +979,9 @@ fn refresh_frames(
 /// the `b` worst-reconstructed residual ROWS (each dead block takes a distinct
 /// contiguous group of high-residual rows, so revived blocks do not duplicate).
 /// This is the block analogue of the atom lane's dead-feature resampling and of
-/// the AuxK auxiliary-reconstruction loss, but installs a genuine `St(b, P)` frame
-/// spanning the directions the model most fails to explain.
+/// the AuxK auxiliary-reconstruction loss, but only CONSTRUCTS a genuine
+/// `St(b, P)` candidate spanning the directions the model most fails to explain.
+/// Installation is owned by the exact transaction below.
 ///
 /// A residual-row birth candidate. Constructing a candidate never mutates the
 /// live dictionary: [`advance_block_sparse_state`] installs one candidate at a
@@ -2039,8 +2042,8 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), Bl
 
 /// Fit a block-sparse dictionary to `x` (`N×P`): `G` blocks of `b` orthonormal
 /// atoms, block-TopK routing by group ℓ₂ gate, tied signed codes with one shared
-/// scalar `γ`, Stiefel-constrained frames refreshed by polar steps, and AuxK
-/// dead-block revival. Never forms a dense `N×K` object.
+/// scalar `γ`, Stiefel-constrained frames refreshed by polar steps, and
+/// evidence-adjudicated AuxK dead-block births. Never forms a dense `N×K` object.
 ///
 /// # One-engine position (design gam#2232, Increment 5b)
 ///

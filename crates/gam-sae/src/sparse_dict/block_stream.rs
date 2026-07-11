@@ -10,7 +10,7 @@
 //! state = BlockSparseStreamState::new(seed, config)     // fit_begin
 //! for _epoch in 0..max_epochs {
 //!     for shard in shards { state.partial_fit(shard) }   // route + accumulate
-//!     state.end_epoch()                                  // γ + frames + revive
+//!     state.end_epoch()                                  // γ + frames + birth transaction
 //! }
 //! state.finalize()                                       // frames + metadata
 //! ```
@@ -19,7 +19,7 @@
 //! epoch's accumulated per-block MOD cross-moments (`M_g`, `P×b`), the streaming γ
 //! numerator/denominator, per-block usage + within-block code second moments (for
 //! the utilisation / stable-rank report), the streaming TSS/RSS moments, and the
-//! worst-reconstructed-row reservoir feeding AuxK dead-block revival. A shard
+//! worst-reconstructed-row reservoir feeding AuxK dead-block birth proposals. A shard
 //! round-trips only its own rows through Python — never the `K×P` frames or any
 //! `N×K` object — so per-shard overhead is `O(shard × P)`, independent of `K` and
 //! of the corpus length.
@@ -33,10 +33,10 @@
 //! update of `M_g`, the same one the one-shot lane runs — a block is a small `b×b`
 //! orthonormal frame, so this is exact and cheap (the matrix-free CG-default solver
 //! serves the atom/dict lane, whose co-firing graph percolates). As with the atom
-//! lane, revival residuals are
+//! lane, proposal residuals are
 //! measured under the decoder in force during the pass (the pre-refresh frames),
 //! the only deliberate difference from one-shot; the two coincide once the
-//! dictionary is populated and revival goes quiescent. Streaming even removes the
+//! dictionary is populated and birth arbitration goes quiescent. Streaming even removes the
 //! one-shot loop's slight γ mixing (it uses a single frozen γ for both the code and
 //! the reconstruction throughout the epoch), so its per-epoch step is internally
 //! consistent.
@@ -53,7 +53,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 /// A block that never fired this epoch has self-energy at or below this floor and
-/// keeps its current frame (mirrors the one-shot revival's dead threshold).
+/// keeps its current frame (mirrors the one-shot proposal's dead threshold).
 const DEAD_DENOM: f64 = 1.0e-12;
 
 /// Per-shard summary returned by [`BlockSparseStreamState::partial_fit`].
@@ -97,7 +97,7 @@ pub struct BlockEpochStats {
     pub decoder_solve_stats: DecoderSolveStats,
 }
 
-/// One candidate row for dead-block revival: its residual vector (under the
+/// One candidate row for a dead-block birth: its residual vector (under the
 /// pre-refresh frames) and the energy used to rank it. Ordered so the
 /// [`BinaryHeap`]'s max is the MOST-evictable entry (smallest energy, ties toward
 /// the larger global index), keeping the reservoir at the worst-reconstructed rows
@@ -129,8 +129,8 @@ impl PartialOrd for ResidRow {
 }
 
 /// Bounded reservoir of the worst-reconstructed rows seen this epoch. Capacity is
-/// `k_aux · b`: revival installs `b` orthonormal rows onto each of at most `k_aux`
-/// dead blocks, so the top-`k_aux·b` residual rows are all that can ever be needed.
+/// `k_aux · b`: birth proposals use `b` orthonormal rows for at most `k_aux`
+/// candidates, so the top-`k_aux·b` residual rows are all that can ever be needed.
 /// Peak memory is `k_aux·b·P` f32 — never `N×K`.
 struct ResidualReservoir {
     cap: usize,
@@ -185,7 +185,7 @@ impl ResidualReservoir {
         self.heap.clear();
     }
 
-    /// Rows ranked for revival: descending residual energy, ties by ascending
+    /// Rows ranked for birth proposals: descending residual energy, ties by ascending
     /// global index — the one-shot `revive_dead_blocks` order.
     fn ranked(&self) -> Vec<&ResidRow> {
         let mut rows: Vec<&ResidRow> = self.heap.iter().collect();
@@ -201,7 +201,7 @@ impl ResidualReservoir {
 /// Resumable state for a streaming block-sparse fit. Construct with [`Self::new`]
 /// (fit_begin), feed shards with [`Self::partial_fit`], close each epoch with
 /// [`Self::end_epoch`], and read the frames out with [`Self::finalize`]. The block
-/// frames, the shared scalar γ, and the revival state warm-start across every call.
+/// frames, the shared scalar γ, and any pending birth transaction warm-start across every call.
 pub struct BlockSparseStreamState {
     config: BlockSparseConfig,
     g: usize,
@@ -632,10 +632,10 @@ impl BlockSparseStreamState {
         })
     }
 
-    /// end_epoch: refresh γ from the accumulated least-squares, refresh frames
-    /// with the matrix-free sparse MOD solver, revive dead blocks onto
-    /// worst-reconstructed residual rows, capture the utilisation / stable-rank
-    /// report, then reset the epoch accumulators.
+    /// end_epoch: resolve any staged birth against candidate/baseline full-pass
+    /// RSS, refresh γ and frames for the admitted state, stage at most one next
+    /// residual-row proposal, capture the utilisation/stable-rank report, then
+    /// reset the epoch accumulators.
     pub fn end_epoch(&mut self) -> Result<BlockEpochStats, String> {
         if self.row_count == 0 {
             return Err(
