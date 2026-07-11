@@ -8,12 +8,13 @@ pub(crate) struct OuterConfig {
     pub(crate) tolerance: f64,
     /// Optional override for the *relative-cost-decrease* convergence stop,
     /// decoupled from `tolerance`. `outer_gradient_tolerance` normally derives
-    /// BOTH the absolute projected-gradient floor (`max(tolerance, scale·1e-9)`)
+    /// BOTH the absolute projected-gradient floor
+    /// (`max(tolerance, scale·√ε_machine)`)
     /// AND the relative-cost stop (`rel_cost = tolerance`) from the single
     /// `tolerance`. That conflation forces a caller who needs a *tight absolute
     /// floor* (to resolve λ to the genuine REML optimum at large `n`, where the
-    /// floor is `scale·1e-9`) to also accept a *tight rel-cost stop*, which on a
-    /// flat REML ridge never trips and grinds the optimizer to `max_iter` —
+    /// floor is `scale·√ε_machine`) to also accept a *tight rel-cost stop*,
+    /// which on a flat REML ridge never trips and grinds the optimizer to `max_iter` —
     /// dozens of surplus O(D·p³) Laplace-derivative outer iterations (the #1082
     /// multinomial smooth-by-factor wall-clock blow-up). When `Some(r)`, the
     /// rel-cost stop uses `r` while the absolute floor keeps using `tolerance`
@@ -373,7 +374,7 @@ impl OuterProblem {
 
     /// Set the objective's natural magnitude scale, used to derive an
     /// `n`-aware absolute gradient-norm floor. When set to `Some(s)`,
-    /// the runner uses `abs_floor = max(tol, s * 1e-9)` for the
+    /// the runner uses `abs_floor = max(tol, s * √ε_machine)` for the
     /// projected-gradient convergence check.
     ///
     /// Rationale: a fixed `abs = tol` (e.g. 1e-6) is appropriate when the
@@ -390,7 +391,7 @@ impl OuterProblem {
 
     /// Decouple the *relative-cost-decrease* convergence stop from the
     /// absolute projected-gradient floor. By default both are derived from the
-    /// single `with_tolerance` value (`abs = max(tol, scale·1e-9)`,
+    /// single `with_tolerance` value (`abs = max(tol, scale·√ε_machine)`,
     /// `rel_cost = tol`). Supplying `Some(r)` here makes the rel-cost stop use
     /// `r` while the absolute floor keeps using `tolerance` (so a caller can
     /// keep a tight absolute floor for accuracy at large `n` AND a loose
@@ -2463,7 +2464,13 @@ pub(crate) fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> 
 pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientTolerance {
     let abs = config
         .objective_scale
-        .map(|scale| config.tolerance.max(scale * 1.0e-9))
+        // A matrix-factorization REML/LAML score cannot resolve relative
+        // perturbations below the forward-error scale √ε. Requiring a smaller
+        // absolute residual made gradient-only / operator-curvature objectives
+        // impossible to certify unless an unrelated Hessian or probe-noise
+        // rescue happened to be available (#2269). This is the arithmetic
+        // resolution of the declared objective scale, not a fitted tolerance.
+        .map(|scale| config.tolerance.max(scale * f64::EPSILON.sqrt()))
         .unwrap_or(config.tolerance);
     GradientTolerance {
         abs,
