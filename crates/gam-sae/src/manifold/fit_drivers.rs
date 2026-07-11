@@ -5669,6 +5669,23 @@ impl SaeManifoldTerm {
             // prior (which pins t→±t+c) is enforced throughout the fit, not merely
             // post-fit. SEAM: this boundary overlaps seed-audit STEP2's reseed/refit
             // hooks — reconcile ordering there (retraction after guards/reseed).
+            // #2230 — the unit-speed retraction and the frame re-polar below are
+            // NON-monotone boundary hooks applied OUTSIDE the line search. The
+            // block-coordinate frame re-polar in particular can RAISE the penalized
+            // objective (it trades reconstruction residual for decoder-smoothness
+            // penalty). Left unguarded, that damage is banked by the #1026
+            // keep-best and then clawed back by the incumbent restore at loop exit
+            // — the accept/restore ALTERNATION that grinds for hours (the #2230
+            // hang). Guard the pair the way the affine-gauge canonicalization above
+            // is guarded: keep the re-gauged/re-polared state only when the SAME
+            // penalized scalar the line search descends does NOT increase; else
+            // revert. The frame U (`decoder_frame`) is not in
+            // `snapshot_mutable_state`, so capture/restore it alongside.
+            let pre_hook_obj =
+                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            let pre_hook_state = self.snapshot_mutable_state();
+            let pre_hook_frames: Vec<_> =
+                self.atoms.iter().map(|a| a.decoder_frame.clone()).collect();
             self.retract_unit_speed_charts_in_loop()?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
@@ -5684,6 +5701,15 @@ impl SaeManifoldTerm {
             if self.frames_active() {
                 self.refresh_active_frames_from_data(target)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            }
+            let post_hook_obj = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
+            if !(post_hook_obj.is_finite() && post_hook_obj <= pre_hook_obj) {
+                self.restore_mutable_state(&pre_hook_state)?;
+                for (atom, frame) in self.atoms.iter_mut().zip(pre_hook_frames) {
+                    atom.decoder_frame = frame;
+                }
             }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
