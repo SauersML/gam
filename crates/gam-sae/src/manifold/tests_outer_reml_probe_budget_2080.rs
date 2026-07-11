@@ -96,10 +96,32 @@ fn joint_decoder_gauge_quotients_full_rank_atom_redistribution_2080() -> Result<
 }
 
 /// Two planted circles on DISJOINT ambient column parities (circle A on the even
-/// output channels, circle B on the odd), driven by two incommensurate phases and
-/// per-column standardized. Together they span a rank-4 subspace of the whitened
-/// `p`-dim cloud, so an honest K=2 dictionary explains a materially positive
-/// fraction of the variance. `p` is the wide-`p` knob that drives the outer hang.
+/// output channels, circle B on the odd), driven by two independent phases on an
+/// exact Cartesian product grid and per-column standardized. Together they span a
+/// rank-4 subspace of the whitened `p`-dim cloud, so an honest K=2 dictionary
+/// explains a materially positive fraction of the variance. `p` is the wide-`p`
+/// knob that drives the outer hang.
+fn independent_two_circle_phases(n: usize, row: usize) -> (f64, f64) {
+    let mut n1 = 1usize;
+    let root = (n as f64).sqrt() as usize;
+    for d in 1..=root.max(1) {
+        if n % d == 0 {
+            n1 = d;
+        }
+    }
+    let n2 = n / n1.max(1);
+    assert!(
+        n1 > 1 && n2 > 1,
+        "two-circle fixture needs a nontrivial Cartesian phase grid, got {n1}x{n2}"
+    );
+    let i = row % n1;
+    let j = (row / n1) % n2;
+    (
+        std::f64::consts::TAU * (i as f64) / (n1 as f64),
+        std::f64::consts::TAU * (j as f64) / (n2 as f64),
+    )
+}
+
 fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     let mut fa = Array2::<f64>::zeros((2, p));
     let mut fb = Array2::<f64>::zeros((2, p));
@@ -122,8 +144,7 @@ fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     }
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
-        let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
-        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        let (ta, tb) = independent_two_circle_phases(n, row);
         let (ca, sa) = (ta.cos(), ta.sin());
         let (cb, sb) = (tb.cos(), tb.sin());
         for j in 0..p {
@@ -729,23 +750,12 @@ fn entangled_two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f6
     // with only ONE true latent factor — a K=2 fit then CORRECTLY leaves one atom
     // redundant, which no seed can split and which is not the co-collapse we are
     // testing. ISA separates independent subspaces, so the fixture must contain two.
-    // n1 = largest divisor of n at or below √n; (i = row mod n1, j = row / n1) is a
-    // bijection onto the n1×n2 grid, so (θ_a, θ_b) is jointly uniform ⇒ independent.
-    let mut n1 = 1usize;
-    let root = (n as f64).sqrt() as usize;
-    for d in 1..=root.max(1) {
-        if n % d == 0 {
-            n1 = d;
-        }
-    }
-    let n1 = n1.max(1);
-    let n2 = (n / n1).max(1);
+    // `independent_two_circle_phases` chooses the largest divisor of `n` at or
+    // below √n, so `(row mod n1, row / n1)` is a bijection onto the n1×n2 grid:
+    // `(θ_a, θ_b)` is jointly uniform and therefore independent.
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
-        let i = row % n1;
-        let j = (row / n1) % n2;
-        let ta = std::f64::consts::TAU * (i as f64) / (n1 as f64);
-        let tb = std::f64::consts::TAU * (j as f64) / (n2 as f64);
+        let (ta, tb) = independent_two_circle_phases(n, row);
         let (ca, sa) = (ta.cos(), ta.sin());
         let (cb, sb) = (tb.cos(), tb.sin());
         for jj in 0..p {
