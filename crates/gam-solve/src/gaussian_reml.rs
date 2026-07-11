@@ -1101,7 +1101,8 @@ fn block_orthogonal_profile_curvature(
     ranks: &[usize],
     nu: f64,
 ) -> Result<BlockOrthogonalProfileCurvature, EstimationError> {
-    let hessian = block_orthogonal_profile_hessian(evals, rhos, scale_precision, ranks, nu)?;
+    let hessian =
+        block_orthogonal_profile_hessian(evals, rhos, scale_precision, ranks, nu)?;
     let blocks = hessian.nrows();
     let eigenvalues = hessian
         .eigh(Side::Lower)
@@ -3993,18 +3994,9 @@ mod tests {
 
     #[test]
     fn block_orthogonal_profile_hessian_matches_the_profiled_objective() {
-        let grams = [
-            array![[3.0, 0.4], [0.4, 2.0]],
-            array![[2.5, -0.2], [-0.2, 1.8]],
-        ];
-        let rhs = [
-            array![[1.2, -0.3], [0.6, 0.9]],
-            array![[0.5, 0.8], [-0.4, 0.7]],
-        ];
-        let penalties = [
-            array![[1.0, 0.2], [0.2, 0.8]],
-            array![[0.9, -0.1], [-0.1, 1.1]],
-        ];
+        let grams = [array![[3.0, 0.4], [0.4, 2.0]], array![[2.5, -0.2], [-0.2, 1.8]]];
+        let rhs = [array![[1.2, -0.3], [0.6, 0.9]], array![[0.5, 0.8], [-0.4, 0.7]]];
+        let penalties = [array![[1.0, 0.2], [0.2, 0.8]], array![[0.9, -0.1], [-0.1, 1.1]]];
         let ranks = [2_usize, 2_usize];
         let ywy = array![8.0, 9.0];
         let nu = 7.0;
@@ -4028,20 +4020,32 @@ mod tests {
             let determinant_term = evals
                 .iter()
                 .enumerate()
-                .map(|(block, eval)| eval.logdet - ranks[block] as f64 * candidate_rhos[block])
+                .map(|(block, eval)| {
+                    eval.logdet - ranks[block] as f64 * candidate_rhos[block]
+                })
                 .sum::<f64>();
             0.5 * 2.0 * determinant_term + 0.5 * nu * q.iter().map(|value| value.ln()).sum::<f64>()
         };
         let evals = (0..2)
             .map(|block| {
-                block_orthogonal_eval(&grams[block], &rhs[block], &penalties[block], rhos[block])
-                    .unwrap()
+                block_orthogonal_eval(
+                    &grams[block],
+                    &rhs[block],
+                    &penalties[block],
+                    rhos[block],
+                )
+                .unwrap()
             })
             .collect::<Vec<_>>();
         let scale = block_orthogonal_conditional_scale(&evals, ywy.view(), nu).unwrap();
-        let analytic =
-            block_orthogonal_profile_hessian(&evals, rhos.view(), scale.view(), &ranks, nu)
-                .unwrap();
+        let analytic = block_orthogonal_profile_hessian(
+            &evals,
+            rhos.view(),
+            scale.view(),
+            &ranks,
+            nu,
+        )
+        .unwrap();
         let step = 1.0e-4;
         let center = profile_value(rhos.view());
         let mut numerical = Array2::<f64>::zeros((2, 2));
@@ -4050,9 +4054,9 @@ mod tests {
             let mut minus = rhos.clone();
             plus[coordinate] += step;
             minus[coordinate] -= step;
-            numerical[[coordinate, coordinate]] = (profile_value(plus.view()) - 2.0 * center
-                + profile_value(minus.view()))
-                / (step * step);
+            numerical[[coordinate, coordinate]] =
+                (profile_value(plus.view()) - 2.0 * center + profile_value(minus.view()))
+                    / (step * step);
         }
         let mut plus_plus = rhos.clone();
         let mut plus_minus = rhos.clone();

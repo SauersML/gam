@@ -18,11 +18,11 @@ use super::{
 };
 use super::{calculate_loglikelihood, computeworkingweight_derivatives_from_eta};
 use crate::estimate::EstimationError;
-use faer::sparse::SparseColMat;
 use gam_linalg::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
-use gam_linalg::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use gam_linalg::utils::{StableSolver, array_is_finite, inf_norm};
+use gam_linalg::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
 use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinkFunction};
+use faer::sparse::SparseColMat;
 use ndarray::{ArcArray1, Array1, Array2, ArrayView1, ShapeBuilder};
 use std::sync::Arc;
 

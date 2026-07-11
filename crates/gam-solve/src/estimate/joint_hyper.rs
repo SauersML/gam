@@ -128,7 +128,8 @@ pub struct ExternalJointHyperEvaluator<'a> {
     /// in the conditioned frame by `build_and_set_psi_gram_tensor` (the same
     /// fixed column transform the streamed Gram uses), so the installed
     /// statistics are frame-exact against the streamed ones.
-    pub(crate) psi_gram_tensor: Option<std::sync::Arc<crate::psi_gram_tensor::PsiGramTensor>>,
+    pub(crate) psi_gram_tensor:
+        Option<std::sync::Arc<crate::psi_gram_tensor::PsiGramTensor>>,
     /// Exact k-space correction from the slow-reset Gaussian cache at
     /// `last_reset_psi`: `(psi_ref, G_exact(ref)-G_tensor(ref),
     /// r_exact(ref)-r_tensor(ref))`. The initial slow path already paid the row
@@ -205,7 +206,8 @@ pub struct ExternalJointHyperEvaluator<'a> {
     /// synthesis shares its length-`n` placeholders O(1) instead of
     /// re-materialising them per trial. `None` until the first install (or when
     /// no tensor is armed for this fit).
-    pub(crate) psi_gram_frozen_rows: Option<std::sync::Arc<crate::pirls::GaussianFrozenRows>>,
+    pub(crate) psi_gram_frozen_rows:
+        Option<std::sync::Arc<crate::pirls::GaussianFrozenRows>>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -225,13 +227,12 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let p = x.ncols();
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
-        let (canonical, active_nullspace_dims) =
-            gam_terms::construction::canonicalize_penalty_specs(
-                &specs,
-                &opts.nullspace_dims,
-                p,
-                context,
-            )?;
+        let (canonical, active_nullspace_dims) = gam_terms::construction::canonicalize_penalty_specs(
+            &specs,
+            &opts.nullspace_dims,
+            p,
+            context,
+        )?;
         let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(x, &specs);
         let x_fit = conditioning.apply_to_design(x);
         let fit_linear_constraints =
@@ -371,7 +372,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     pub fn store_persistent_latent_values(&self, values: &Array2<f64>) {
-        crate::estimate::reml::RemlState::store_persistent_latent_values(&self.reml_state, values);
+        crate::estimate::reml::RemlState::store_persistent_latent_values(
+            &self.reml_state,
+            values,
+        );
     }
 
     /// Build and attach a certified ψ-Gram tensor (#1033b) for the single
@@ -903,13 +907,15 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                     let mut x_tau = dir.x_tau_dense();
                     self.conditioning
                         .transform_matrix_columnswith_a_inplace(&mut x_tau);
-                    dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
+                    dir.x_tau_original =
+                        crate::estimate::reml::HyperDesignDerivative::from(x_tau);
                     if let Some(rows) = dir.x_tau_tau_original.as_mut() {
                         for mat in rows.iter_mut().flatten() {
                             let mut dense = mat.materialize();
                             self.conditioning
                                 .transform_matrix_columnswith_a_inplace(&mut dense);
-                            *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
+                            *mat =
+                                crate::estimate::reml::HyperDesignDerivative::from(dense);
                         }
                     }
                 }
@@ -951,12 +957,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
         let (canonical, active_nullspace_dims) =
-            gam_terms::construction::canonicalize_penalty_specs(
-                &specs,
-                nullspace_dims,
-                p,
-                context,
-            )?;
+            gam_terms::construction::canonicalize_penalty_specs(&specs, nullspace_dims, p, context)?;
         validate_joint_hyper_direction_shapes(x, canonical.len(), theta, rho_dim, &hyper_dirs)?;
 
         let x_fit = self.conditioning.apply_to_design(x);
@@ -1086,12 +1087,13 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // Primitive B in the reduced Firth dense operator; the tau-tau
             // policy no longer needs the Firth+Logit gap downgrade.
             let firth_pair_terms_unavailable = false;
-            let tau_tau_policy = crate::estimate::reml::exact_tau_tau_hessian_policy_with_firth(
-                x.nrows(),
-                x.ncols(),
-                &hyper_dirs,
-                firth_pair_terms_unavailable,
-            );
+            let tau_tau_policy =
+                crate::estimate::reml::exact_tau_tau_hessian_policy_with_firth(
+                    x.nrows(),
+                    x.ncols(),
+                    &hyper_dirs,
+                    firth_pair_terms_unavailable,
+                );
             if tau_tau_policy.prefer_gradient_only() {
                 log::warn!(
                     "[OUTER] disabling exact tau Hessian before conditioning; using gradient-only outer eval \
@@ -1262,12 +1264,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
         let (canonical, active_nullspace_dims) =
-            gam_terms::construction::canonicalize_penalty_specs(
-                &specs,
-                nullspace_dims,
-                p,
-                context,
-            )?;
+            gam_terms::construction::canonicalize_penalty_specs(&specs, nullspace_dims, p, context)?;
 
         let x_fit = self.conditioning.apply_to_design(x);
         let fit_linear_constraints = self

@@ -31,11 +31,7 @@ fn absent_dense_beta_block_declines_not_fatal() {
     // slabs are allocated at `k` columns, and no `hbb_matvec` / `htbeta_matvec`
     // is installed.
     let sys = ArrowSchurSystem::new_with_empty_hbb_and_htbeta_cols(n, d, k, k);
-    assert_eq!(
-        sys.hbb.dim(),
-        (0, 0),
-        "fixture must have an absent dense β-block"
-    );
+    assert_eq!(sys.hbb.dim(), (0, 0), "fixture must have an absent dense β-block");
     assert!(sys.hbb_matvec.is_none() && sys.htbeta_matvec.is_none());
 
     match solve_arrow_newton_step(&sys, 1e-6, 1e-6) {
@@ -53,10 +49,12 @@ fn absent_dense_beta_block_declines_not_fatal() {
             "absent dense β-block must DECLINE, not report a numerical Schur \
              failure (this is the fatal-RemlConvergenceError bug); got reason={reason:?}"
         ),
-        Err(other) => {
-            panic!("absent dense β-block must decline with GpuRequiresDenseSystem; got {other:?}")
-        }
-        Ok(_) => panic!("absent dense β-block must decline, but the device solve returned Ok"),
+        Err(other) => panic!(
+            "absent dense β-block must decline with GpuRequiresDenseSystem; got {other:?}"
+        ),
+        Ok(_) => panic!(
+            "absent dense β-block must decline, but the device solve returned Ok"
+        ),
     }
 }
 
@@ -69,11 +67,7 @@ fn absent_dense_beta_block_declines_not_fatal() {
 fn present_dense_beta_block_is_not_declined_as_absent() {
     let (n, d, k) = (4usize, 2usize, 8usize);
     let sys = ArrowSchurSystem::new(n, d, k);
-    assert_eq!(
-        sys.hbb.dim(),
-        (k, k),
-        "fixture must supply a dense (k,k) β-block"
-    );
+    assert_eq!(sys.hbb.dim(), (k, k), "fixture must supply a dense (k,k) β-block");
 
     // Only the `Err` variants are `Debug`; match rather than format the whole
     // `Result` (the `Ok` solution type is intentionally not `Debug`).
@@ -129,9 +123,9 @@ fn present_but_stale_hbb_with_penalty_op_declines_not_wrong_step() {
             "a penalty_op system must DECLINE, not report a numerical Schur \
              failure; got reason={reason:?}"
         ),
-        Err(other) => {
-            panic!("a penalty_op system must decline with GpuRequiresDenseSystem; got {other:?}")
-        }
+        Err(other) => panic!(
+            "a penalty_op system must decline with GpuRequiresDenseSystem; got {other:?}"
+        ),
         Ok(_) => panic!(
             "a penalty_op system carries stale dense curvature — the device must \
              NOT proceed to compute a step from it"

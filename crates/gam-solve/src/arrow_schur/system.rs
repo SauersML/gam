@@ -4030,8 +4030,11 @@ impl ChunkSchurStack {
             .expect("ChunkSchurStack left buffer matches its recorded shape");
         let right = ndarray::ArrayView2::from_shape(shape, self.right.as_slice())
             .expect("ChunkSchurStack right buffer matches its recorded shape");
-        let product =
-            gam_linalg::faer_ndarray::fast_atb_with_parallelism(&left, &right, faer::Par::Seq);
+        let product = gam_linalg::faer_ndarray::fast_atb_with_parallelism(
+            &left,
+            &right,
+            faer::Par::Seq,
+        );
         *s_part -= &product;
         self.left.clear();
         self.right.clear();

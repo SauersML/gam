@@ -1001,7 +1001,9 @@ impl<'a> RemlState<'a> {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => r_t,
             pirls::PirlsCoordinateFrame::TransformedQs => pirls_result.reparam_result.qs.dot(&r_t),
         };
-        Some(crate::model_types::ProjectedKktResidual::from_active_projected(r_o))
+        Some(crate::model_types::ProjectedKktResidual::from_active_projected(
+            r_o,
+        ))
     }
 
     /// Pack a `DerivativeContext` plus backend-specific pieces into an

@@ -18,15 +18,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use ndarray::{Array1, Array2, ArrayView2};
 
+use gam_terms::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
 pub use gam_problem::LatentRetractionRegistry;
-use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
-use gam_terms::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use gam_terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
+use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;

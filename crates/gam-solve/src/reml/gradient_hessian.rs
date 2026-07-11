@@ -1212,11 +1212,7 @@ impl<'a> RemlState<'a> {
                 }
             }
             if !entries.is_empty() {
-                blocks.push(TkActiveBlock {
-                    start,
-                    end,
-                    entries,
-                });
+                blocks.push(TkActiveBlock { start, end, entries });
             }
         }
 
@@ -1579,8 +1575,7 @@ impl<'a> RemlState<'a> {
         // them once here so the O(k²) pair loop reuses them instead of rebuilding
         // an O(n·r²·p) reduced Hadamard-Gram for each pair. Exact / bit-identical
         // to per-pair hphisecond_direction_apply(.., &eye) (#1575).
-        let firth_second_eye_cache =
-            firth_op.map(|op| op.tk_second_direction_eye_cache(&firth_dir_i));
+        let firth_second_eye_cache = firth_op.map(|op| op.tk_second_direction_eye_cache(&firth_dir_i));
 
         let mut beta_ij: Vec<Vec<Array1<f64>>> = (0..k)
             .map(|_| (0..k).map(|_| Array1::<f64>::zeros(p)).collect())
@@ -1633,9 +1628,9 @@ impl<'a> RemlState<'a> {
                 // Reuse the per-penalty directions built once above and the
                 // single-index second-derivative sub-blocks cached once above,
                 // instead of rebuilding them per (i,j) pair (#1575).
-                let cache = firth_second_eye_cache
-                    .as_ref()
-                    .expect("firth second-direction eye cache present when firth_op is Some");
+                let cache = firth_second_eye_cache.as_ref().expect(
+                    "firth second-direction eye cache present when firth_op is Some",
+                );
                 h -= &op.hphisecond_direction_apply_eye_cached(cache, &firth_dir_i, i, j);
             }
             gam_linalg::matrix::symmetrize_in_place(&mut h);
@@ -2258,10 +2253,7 @@ impl<'a> RemlState<'a> {
                 .canonical_transformed
                 .iter()
                 .map(|cp| {
-                    gam_terms::construction::CanonicalPenalty::from_dense_root(
-                        cp.root.dot(z),
-                        p_eff,
-                    )
+                    gam_terms::construction::CanonicalPenalty::from_dense_root(cp.root.dot(z), p_eff)
                 })
                 .collect()
         } else {
@@ -2525,8 +2517,7 @@ impl<'a> RemlState<'a> {
         // Resolve the injected gam-inference sampler. When the sampler tier is
         // not linked / registered, decline the correction (zero contribution) —
         // the same safe no-op as every other decline branch here.
-        let Some(sampler) = gam_problem::laplace_sampler_contract::laplace_marginal_sampler()
-        else {
+        let Some(sampler) = gam_problem::laplace_sampler_contract::laplace_marginal_sampler() else {
             return Ok(zero());
         };
 
@@ -3334,11 +3325,13 @@ impl<'a> RemlState<'a> {
         // taken from the dedicated 5-jet (no variance-jet machinery).
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
-        let canonical_logit =
-            matches!(
-                reml_spec(&pirls_result.likelihood).response,
-                ResponseFamily::Binomial
-            ) && matches!(&inverse_link, InverseLink::Standard(StandardLink::Logit));
+        let canonical_logit = matches!(
+            reml_spec(&pirls_result.likelihood).response,
+            ResponseFamily::Binomial
+        ) && matches!(
+            &inverse_link,
+            InverseLink::Standard(StandardLink::Logit)
+        );
 
         if canonical_logit {
             // Canonical Logit fast path: per-row 5-jet evaluation, no
@@ -3900,10 +3893,7 @@ impl<'a> RemlState<'a> {
     /// link states) whose profiled ridge the closed form does not model, no
     /// penalties, or a sparse design (skipped rather than densified so a huge
     /// random-effects design never pays an `n×p` materialization).
-    pub(crate) fn analytic_gaussian_closed_form_rho(
-        &self,
-        bounds: (f64, f64),
-    ) -> Option<Array1<f64>> {
+    pub(crate) fn analytic_gaussian_closed_form_rho(&self, bounds: (f64, f64)) -> Option<Array1<f64>> {
         if !reml_is_gaussian_identity(&self.config.likelihood) {
             return None;
         }
@@ -5085,8 +5075,7 @@ impl<'a> RemlState<'a> {
         let mut gram_original = match pr.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => gram_transformed,
             pirls::PirlsCoordinateFrame::TransformedQs => {
-                let left =
-                    gam_linalg::faer_ndarray::fast_ab(&pr.reparam_result.qs, &gram_transformed);
+                let left = gam_linalg::faer_ndarray::fast_ab(&pr.reparam_result.qs, &gram_transformed);
                 gam_linalg::faer_ndarray::fast_ab(&left, &pr.reparam_result.qs.t().to_owned())
             }
         };
@@ -6669,7 +6658,8 @@ impl<'a> RemlState<'a> {
             }
             if pirls_config.max_iterations != original_cap
                 || (in_screening
-                    && pirls_config.convergence_tolerance > self.config.pirls_convergence_tolerance)
+                    && pirls_config.convergence_tolerance
+                        > self.config.pirls_convergence_tolerance)
             {
                 log::debug!(
                     "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={}) inner_tol={:.1e} (full_tol={:.1e})",
@@ -6960,8 +6950,7 @@ impl<'a> RemlState<'a> {
             && phi.is_finite()
             && phi > 0.0
         {
-            self.frozen_tweedie_phi
-                .store(phi.to_bits(), Ordering::Relaxed);
+            self.frozen_tweedie_phi.store(phi.to_bits(), Ordering::Relaxed);
             log::info!(
                 "[OUTER] tweedie λ-search φ frozen at {phi:.6e} (#1477); \
                  outer LAML criterion now stationary in ρ"
@@ -6987,8 +6976,7 @@ impl<'a> RemlState<'a> {
             && shape.is_finite()
             && shape > 0.0
         {
-            self.frozen_gamma_shape
-                .store(shape.to_bits(), Ordering::Relaxed);
+            self.frozen_gamma_shape.store(shape.to_bits(), Ordering::Relaxed);
             log::info!(
                 "[OUTER] gamma λ-search shape frozen at {shape:.6e} (#1074); \
                  outer REML criterion now stationary in ρ"
@@ -8243,15 +8231,7 @@ mod firth_hessian_direction_reuse_tests {
             Ok(sol)
         };
         RemlState::tk_hessian_rho_canonical_logit(
-            x,
-            &c_array,
-            &d_array,
-            &e_array,
-            &f_array,
-            penalties,
-            lambdas,
-            beta,
-            Some(op),
+            x, &c_array, &d_array, &e_array, &f_array, penalties, lambdas, beta, Some(op),
             &h_inv_solve,
         )
         .expect("tk hessian")
@@ -8369,7 +8349,8 @@ mod firth_hessian_direction_reuse_tests {
             x_vks.push(v);
         }
 
-        let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
+        let solve =
+            |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
         let shared = RemlState::tk_shared_intermediates(
             &x_dense,
             &z,
@@ -8415,11 +8396,7 @@ mod firth_hessian_direction_reuse_tests {
         )
         .expect("batched direct gradient");
 
-        assert_eq!(
-            batched.len(),
-            k,
-            "batched must return one value per direction"
-        );
+        assert_eq!(batched.len(), k, "batched must return one value per direction");
         for idx in 0..k {
             assert!(
                 reference[idx].is_finite() && reference[idx].abs() > 0.0,
@@ -8472,7 +8449,8 @@ mod firth_hessian_direction_reuse_tests {
             })
             .collect();
 
-        let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
+        let solve =
+            |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
         let shared =
             RemlState::tk_shared_intermediates(&x_dense, &z, &c_array, "perf test", &solve)
                 .expect("shared TK intermediates");

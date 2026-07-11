@@ -5124,11 +5124,7 @@ fn cholesky_lower_faer_path_matches_scalar_reference_on_wide_schur() {
     for i in 0..k {
         for j in 0..k {
             if j > i {
-                assert_eq!(
-                    l[[i, j]],
-                    0.0,
-                    "faer factor must be lower-triangular at ({i},{j})"
-                );
+                assert_eq!(l[[i, j]], 0.0, "faer factor must be lower-triangular at ({i},{j})");
             } else {
                 max_factor_diff = max_factor_diff.max((l[[i, j]] - ref_l[[i, j]]).abs());
             }
@@ -5919,33 +5915,46 @@ fn matrix_free_full_arrow_apply_and_inverse_match_dense_cache() {
         .expect("undamped dense oracle factorization");
 
     let t_len = cache.delta_t_len();
-    let vector_t =
-        Array1::<f64>::from_shape_fn(t_len, |index| 0.2 * ((index as f64 + 1.0) * 0.37).sin());
-    let vector_beta =
-        Array1::<f64>::from_shape_fn(k, |index| 0.15 * ((index as f64 + 2.0) * 0.23).cos());
-    let (dense_t, dense_beta) =
-        arrow_operator_apply(&sys, 0.0, 0.0, vector_t.view(), vector_beta.view());
-    let (matrix_free_t, matrix_free_beta) =
-        matrix_free_arrow_operator_apply(&sys, &cache, vector_t.view(), vector_beta.view())
-            .expect("matrix-free full-arrow apply");
+    let vector_t = Array1::<f64>::from_shape_fn(t_len, |index| {
+        0.2 * ((index as f64 + 1.0) * 0.37).sin()
+    });
+    let vector_beta = Array1::<f64>::from_shape_fn(k, |index| {
+        0.15 * ((index as f64 + 2.0) * 0.23).cos()
+    });
+    let (dense_t, dense_beta) = arrow_operator_apply(
+        &sys,
+        0.0,
+        0.0,
+        vector_t.view(),
+        vector_beta.view(),
+    );
+    let (matrix_free_t, matrix_free_beta) = matrix_free_arrow_operator_apply(
+        &sys,
+        &cache,
+        vector_t.view(),
+        vector_beta.view(),
+    )
+    .expect("matrix-free full-arrow apply");
     let apply_error = (&matrix_free_t - &dense_t)
         .mapv(|value| value * value)
         .sum()
         + (&matrix_free_beta - &dense_beta)
             .mapv(|value| value * value)
             .sum();
-    let apply_scale =
-        dense_t.mapv(|value| value * value).sum() + dense_beta.mapv(|value| value * value).sum();
+    let apply_scale = dense_t.mapv(|value| value * value).sum()
+        + dense_beta.mapv(|value| value * value).sum();
     assert!(
         apply_error.sqrt() <= 1.0e-11 * apply_scale.sqrt().max(1.0),
         "matrix-free Bv must match the dense assembled operator: rel={:.3e}",
         apply_error.sqrt() / apply_scale.sqrt().max(1.0)
     );
 
-    let rhs_t =
-        Array1::<f64>::from_shape_fn(t_len, |index| 0.1 * ((index as f64 + 3.0) * 0.41).cos());
-    let rhs_beta =
-        Array1::<f64>::from_shape_fn(k, |index| 0.12 * ((index as f64 + 4.0) * 0.19).sin());
+    let rhs_t = Array1::<f64>::from_shape_fn(t_len, |index| {
+        0.1 * ((index as f64 + 3.0) * 0.41).cos()
+    });
+    let rhs_beta = Array1::<f64>::from_shape_fn(k, |index| {
+        0.12 * ((index as f64 + 4.0) * 0.19).sin()
+    });
     let (dense_solved_t, dense_solved_beta) = cache
         .full_inverse_apply(rhs_t.view(), rhs_beta.view())
         .expect("dense full-arrow inverse");

@@ -4539,11 +4539,7 @@ mod tweedie_exact_series_tests {
         // the p>1.5 / α<1 spike at the origin is an integrable singularity that a
         // uniform trapezoid cannot resolve (its density VALUES are certified
         // exact by `series_matches_brute_force_across_regimes`).
-        for (mu, phi, p) in [
-            (2.0_f64, 0.6_f64, 1.5_f64),
-            (1.0, 0.1, 1.3),
-            (3.0, 0.4, 1.4),
-        ] {
+        for (mu, phi, p) in [(2.0_f64, 0.6_f64, 1.5_f64), (1.0, 0.1, 1.3), (3.0, 0.4, 1.4)] {
             let lambda = mu.powf(2.0 - p) / (phi * (2.0 - p));
             let mass0 = (-lambda).exp();
             let hi = mu * 30.0;

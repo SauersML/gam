@@ -43,10 +43,7 @@ pub(crate) fn estimate_gamma_shape_from_eta(
             let yi = y[i].max(EPS);
             let mui = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP).exp().max(EPS);
             let ratio = yi / mui;
-            (
-                target_acc + wi * (ratio - ratio.ln() - 1.0),
-                weight_acc + wi,
-            )
+            (target_acc + wi * (ratio - ratio.ln() - 1.0), weight_acc + wi)
         },
         |(t1, w1), (t2, w2)| (t1 + t2, w1 + w2),
     );

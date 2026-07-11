@@ -145,7 +145,8 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
             // GEMM floor the launch/staging tax loses to the CPU, so we keep the
             // deterministic CPU rayon fold there. Small K (e.g. K=8) never clears
             // the floor and stays on the CPU — magic-by-default crossover, no flag.
-            let engage = tiles.len() > 1 || assembly_work >= rt.policy().gemm_min_flops as u128;
+            let engage =
+                tiles.len() > 1 || assembly_work >= rt.policy().gemm_min_flops as u128;
             (engage && !tiles.is_empty()).then_some(tiles)
         })
     };
@@ -2383,7 +2384,9 @@ pub fn matrix_free_arrow_operator_apply(
         let mut cross = Array1::<f64>::zeros(dim);
         if !cache.apply_htbeta_row(row, vector_beta, &mut cross) {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!("matrix_free_arrow_operator_apply H_tbeta row {row} apply failed"),
+                reason: format!(
+                    "matrix_free_arrow_operator_apply H_tbeta row {row} apply failed"
+                ),
             });
         }
         for axis in 0..dim {
@@ -2391,7 +2394,9 @@ pub fn matrix_free_arrow_operator_apply(
         }
         if !cache.apply_htbeta_row_transpose(row, row_vector, &mut out_beta, None) {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!("matrix_free_arrow_operator_apply H_betat row {row} apply failed"),
+                reason: format!(
+                    "matrix_free_arrow_operator_apply H_betat row {row} apply failed"
+                ),
             });
         }
 
@@ -2463,7 +2468,9 @@ pub fn matrix_free_arrow_inverse_apply(
             && !cache.apply_htbeta_row_transpose(row, solved.view(), &mut eliminated, None)
         {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!("matrix_free_arrow_inverse_apply H_betat row {row} apply failed"),
+                reason: format!(
+                    "matrix_free_arrow_inverse_apply H_betat row {row} apply failed"
+                ),
             });
         }
     }
@@ -2505,7 +2512,9 @@ pub fn matrix_free_arrow_inverse_apply(
         let mut cross = Array1::<f64>::zeros(dim);
         if !cache.apply_htbeta_row(row, solved_beta.view(), &mut cross) {
             return Err(ArrowSchurError::SchurFactorFailed {
-                reason: format!("matrix_free_arrow_inverse_apply H_tbeta row {row} apply failed"),
+                reason: format!(
+                    "matrix_free_arrow_inverse_apply H_tbeta row {row} apply failed"
+                ),
             });
         }
         let correction = cholesky_solve_vector(cache.undamped_factor(row), cross.view());
@@ -5297,7 +5306,9 @@ pub(crate) fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     const FAER_CHOLESKY_MIN: usize = 128;
     if n >= FAER_CHOLESKY_MIN {
         let view = gam_linalg::faer_ndarray::FaerArrayView::new(a);
-        if let Ok(llt) = gam_linalg::faer_ndarray::FaerLlt::new(view.as_ref(), faer::Side::Lower) {
+        if let Ok(llt) =
+            gam_linalg::faer_ndarray::FaerLlt::new(view.as_ref(), faer::Side::Lower)
+        {
             let l_faer = llt.L();
             let mut l = Array2::<f64>::zeros((n, n));
             for i in 0..n {

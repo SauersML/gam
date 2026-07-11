@@ -959,9 +959,9 @@ impl<'a> RemlState<'a> {
                         x_tau_tau: x_tau_tau[i][j].clone(),
                         x_design: std::sync::Arc::clone(&x_design),
                         basis: basis.clone(),
-                        w_diag: gam_linalg::matrix::SignedWeightsArc::from_arc(
-                            std::sync::Arc::clone(&w_diag),
-                        ),
+                        w_diag: gam_linalg::matrix::SignedWeightsArc::from_arc(std::sync::Arc::clone(
+                            &w_diag,
+                        )),
                         c_x_tau_i_beta: (!is_gaussian_identity).then_some(c_x_tau_i_beta.clone()),
                         c_x_tau_j_beta,
                         d_cross,
@@ -1311,8 +1311,7 @@ impl<'a> RemlState<'a> {
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
 
         if let Some(z) = free_basis_opt.as_ref() {
-            beta_eval =
-                gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
+            beta_eval = gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
@@ -1973,8 +1972,7 @@ impl<'a> RemlState<'a> {
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         if let Some(z) = free_basis_opt.as_ref() {
-            beta_eval =
-                gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
+            beta_eval = gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
         }
 
         let x_design =
@@ -2080,8 +2078,7 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag =
-            gam_linalg::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.to_owned());
+        let w_diag = gam_linalg::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.to_owned());
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
@@ -2586,8 +2583,7 @@ impl<'a> RemlState<'a> {
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         if let Some(z) = free_basis_opt.as_ref() {
-            beta_eval =
-                gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
+            beta_eval = gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
         }
         let p_dim = beta_eval.len();
         let lambdas = rho.mapv(f64::exp);
@@ -2851,7 +2847,8 @@ impl<'a> RemlState<'a> {
             // different operator than the H whose log-det the ½tr(H⁻¹∂H/∂θ)
             // term inverts.
             let eta_raw = pirls_result.final_eta[i];
-            let eta_i = crate::pirls::eta_for_observed_hessian_jet(&self.config.link_kind, eta_raw);
+            let eta_i =
+                crate::pirls::eta_for_observed_hessian_jet(&self.config.link_kind, eta_raw);
             // #1876: PIRLS pins H to the floored weight `max(W_obs, floor(W_F))`
             // and computes it at the clamped η. On floored or clamped rows the
             // Hessian surface is CONSTANT in θ, so the explicit drift
@@ -3060,13 +3057,17 @@ impl<'a> RemlState<'a> {
             // exact H the log-det trace inverts (see
             // `outer_hessian_curvature_arrays`).
             let eta_raw = pirls_result.final_eta[i];
-            let eta_i = crate::pirls::eta_for_observed_hessian_jet(&self.config.link_kind, eta_raw);
+            let eta_i =
+                crate::pirls::eta_for_observed_hessian_jet(&self.config.link_kind, eta_raw);
             let w_obs = pirls_result.finalweights[i];
             let floor = crate::pirls::solver_hessian_weight_floor(pirls_result.solveweights[i]);
             let drift_masked = !(w_obs.is_finite() && w_obs > floor)
                 || crate::pirls::eta_clamp_active(&self.config.link_kind, eta_raw);
-            let jet =
-                mixture_inverse_link_jetwith_rho_partials_into(mix_state, eta_i, &mut mix_partials);
+            let jet = mixture_inverse_link_jetwith_rho_partials_into(
+                mix_state,
+                eta_i,
+                &mut mix_partials,
+            );
             let mu = jet.mu;
             let d1 = jet.d1;
             let yi = self.y[i];

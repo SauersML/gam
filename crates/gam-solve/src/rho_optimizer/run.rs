@@ -1122,7 +1122,10 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
 /// malformed, an entry is non-finite, the shifted factor is not PD, or the
 /// resulting quadratic form is negative (impossible for a PD factor, guarded
 /// against roundoff).
-pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64>) -> Option<f64> {
+pub(crate) fn newton_predicted_decrease(
+    hessian: &Array2<f64>,
+    grad: &Array1<f64>,
+) -> Option<f64> {
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || grad.len() != n {
         return None;
@@ -1496,8 +1499,7 @@ pub(crate) fn certify_outer_optimality(
     // stationarity certificate below, and the vector feeds the curvature-scaled
     // flat-valley Newton decrement (#2253/#2249/#2015) once the analytic Hessian
     // is in hand.
-    let projected_gradient =
-        project_gradient_vector(&result.rho, &evaluation.gradient, Some(&bounds));
+    let projected_gradient = project_gradient_vector(&result.rho, &evaluation.gradient, Some(&bounds));
     let projected_grad_norm = projected_gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
     let solver_bound = outer_gradient_tolerance(config).threshold(evaluation.cost, grad_norm);
     let mut stationarity_bound = if matches!(
@@ -1550,8 +1552,8 @@ pub(crate) fn certify_outer_optimality(
     const OUTER_WALL_SENTINEL_FLOOR: f64 = 1.0e10;
     let solver_is_wall =
         !solver_final_value.is_finite() || solver_final_value.abs() >= OUTER_WALL_SENTINEL_FLOOR;
-    let analytic_is_real =
-        result.final_value.is_finite() && result.final_value.abs() < OUTER_WALL_SENTINEL_FLOOR;
+    let analytic_is_real = result.final_value.is_finite()
+        && result.final_value.abs() < OUTER_WALL_SENTINEL_FLOOR;
     let transient_wall = solver_is_wall && analytic_is_real;
     if !transient_wall
         && (!solver_final_value.is_finite()
@@ -1651,7 +1653,8 @@ pub(crate) fn certify_outer_optimality(
     // `‖Pg‖·√(objective_tol/Δpred)`, which clears the actual ‖Pg‖ iff
     // `Δpred ≤ objective_tol`.
     if let Some(hessian) = analytic_hessian.as_ref()
-        && let Some(predicted_decrease) = newton_predicted_decrease(hessian, &projected_gradient)
+        && let Some(predicted_decrease) =
+            newton_predicted_decrease(hessian, &projected_gradient)
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
     {
@@ -2438,7 +2441,10 @@ fn install_objective_upper_domain(
             )));
         }
         upper[index] = upper[index].min(domain);
-        if !(lower[index].is_finite() && upper[index].is_finite() && lower[index] < upper[index]) {
+        if !(lower[index].is_finite()
+            && upper[index].is_finite()
+            && lower[index] < upper[index])
+        {
             return Err(EstimationError::InvalidInput(format!(
                 "outer objective-domain intersection is empty or non-finite at coordinate {index}: lower={}, upper={}",
                 lower[index], upper[index]
