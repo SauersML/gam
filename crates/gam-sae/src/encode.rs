@@ -4631,8 +4631,10 @@ mod encode_fix_tests {
         let jet = Array3::<f64>::zeros((m, m, latent_dim));
         let dec = Array2::<f64>::from_elem((m, 1), 0.5);
         let smooth = Array2::<f64>::eye(m);
-        SaeManifoldAtom::new_with_provided_function_gram("tiny", kind, latent_dim, phi, jet, dec, smooth)
-            .expect("tiny atom builds")
+        SaeManifoldAtom::new_with_provided_function_gram(
+            "tiny", kind, latent_dim, phi, jet, dec, smooth,
+        )
+        .expect("tiny atom builds")
     }
 
     #[test]

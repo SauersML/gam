@@ -1404,7 +1404,7 @@ impl SaeManifoldTerm {
 
     /// The iterate scale `1 + ‖(logits, coords, decoder)‖` used to make the
     /// inner KKT gradient and Newton-step tolerances relative. This is the
-    /// SINGLE source of truth for that scale: `penalized_laml_criterion`'s convergence
+    /// SINGLE source of truth for that scale: `penalized_quasi_laplace_criterion`'s convergence
     /// gate and `run_joint_fit_arrow_schur`'s non-descent stationarity gate
     /// must agree on it, or a point one of them calls converged is mid-flight
     /// to the other (the objective↔gradient desync class).
@@ -2976,7 +2976,7 @@ impl SaeManifoldTerm {
     /// decodes nothing, so the dictionary explains nothing (EV≈0) and every
     /// per-row coordinate Hessian `H_tt` — whose curvature is carried by `Φ·B`
     /// — goes rank-deficient at once, surfacing as the `0 → K·n` evidence
-    /// gauge-deflation jump that aborts `penalized_laml_criterion`. The decoder-norm guard
+    /// gauge-deflation jump that aborts `penalized_quasi_laplace_criterion`. The decoder-norm guard
     /// closes that blind spot.
     ///
     /// The collapse statistic is each atom's decoder Frobenius norm as a RATIO
@@ -3327,7 +3327,7 @@ impl SaeManifoldTerm {
             // grows geometrically and the "residual ≈ target" invariant every reseed
             // relies on (see the reseed rationale above) is violated — the bounded
             // multi-start degenerates into a runaway whose blown-up decoders also
-            // corrupt the outer penalized-LAML evidence, and the host process is SIGKILLed
+            // corrupt the outer penalized quasi-Laplace evidence, and the host process is SIGKILLed
             // (OOM / watchdog, exit 137) before any model or error is returned.
             //
             // A reseed is therefore RETAINED only when it is the new best basin under
@@ -5180,7 +5180,7 @@ impl SaeManifoldTerm {
     /// becomes full-rank by construction, the decoder is the rank-`r_k` oracle
     /// `B̃ = Q_kᵀ B`, the roughness Gram is `Q_kᵀ S Q_k`, and the evaluator is
     /// wrapped so the reduction survives every basis refresh. The inner solve no
-    /// longer descends a flat valley and the outer penalized-LAML log-det is well-posed —
+    /// longer descends a flat valley and the outer penalized quasi-Laplace log-det is well-posed —
     /// no step-time deflation, ridge floor, or post-fit projection needed for
     /// the deficiency. The depth decision is made ONCE here, before the outer
     /// loop, so it is held fixed across the inner Newton walk.
@@ -5437,8 +5437,8 @@ impl SaeManifoldTerm {
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
         // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
         // warm-started inner `(t, β)` state, a verbatim reuse and NOT a
-        // convergence request. The caller (`penalized_laml_criterion_with_cache_refine_policy`
-        // / `penalized_laml_criterion_streaming_exact`) runs this with `max_iter == 0`
+        // convergence request. The caller (`penalized_quasi_laplace_criterion_with_cache_refine_policy`
+        // / `penalized_quasi_laplace_criterion_streaming_exact`) runs this with `max_iter == 0`
         // precisely to hold β at the seed, then factors once at that frozen
         // iterate (`converge_inner_for_undamped_logdet`'s `inner_max_iter == 0`
         // branch). Everything below — the rank-reduction reparametrization, the
@@ -5472,19 +5472,19 @@ impl SaeManifoldTerm {
         // not the fitted `t`/assignment excite them; on a near-degenerate
         // checkpoint (OLMo `stage1-step0` PCA-32: data Gram rank `3/5`) the
         // unexcited columns make the decoder design rank-deficient BY
-        // CONSTRUCTION, flattening the outer penalized-LAML surface so BFGS stalls. We
+        // CONSTRUCTION, flattening the outer penalized quasi-Laplace surface so BFGS stalls. We
         // discover the data-supported subspace `Q_k = range(G_k)` ONCE here from
         // the bare data Gram and, for any rank-deficient atom, REPARAMETRIZE its
         // basis onto that subspace (`Φ̃ = Φ Q_k`, `B̃ = Q_kᵀ B`, `S̃ = Q_kᵀ S Q_k`,
         // and a `SubspaceReducedEvaluator` so the reduction survives every
         // refresh). The reduced design is full-rank, so the identifiability audit
         // passes, the frame profiles the reduced block, the inner solve needs no
-        // step-time deflation, and the outer penalized-LAML log-det is well-conditioned —
+        // step-time deflation, and the outer penalized quasi-Laplace log-det is well-conditioned —
         // this SUPERSEDES the prior data-null projector deflation + post-fit
         // range projection for the rank-deficiency case. The depth decision is
         // made once here and held FIXED across the inner Newton walk. A full-rank
         // atom (`base`/`step_2300`, `r_k == M_k`) is left untouched, so its
-        // design, decoder, and penalized LAML criterion are byte-for-byte the historical
+        // design, decoder, and penalized quasi-Laplace criterion are byte-for-byte the historical
         // full-`B` path.
         self.reduce_atoms_to_data_supported_rank()?;
         // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
@@ -5510,7 +5510,7 @@ impl SaeManifoldTerm {
         // `refine_round_made_progress`'s monotone-decrease requirement and
         // collapsing the 64× progress budget back to base. The evidence ledger
         // is therefore PER CRITERION EVALUATION: cleared once at the
-        // `penalized_laml_criterion*` entry, persistent across refine re-entries, so the
+        // `penalized_quasi_laplace_criterion*` entry, persistent across refine re-entries, so the
         // per-atom budget (`SAE_ATOM_COLLAPSE_RESEED_BUDGET`) genuinely bounds
         // reseeds over the whole converge-to-KKT drive.
         if allow_heuristic_termination {
@@ -5598,7 +5598,7 @@ impl SaeManifoldTerm {
         }
         // #1026/#2230 — keep the best state found inside this bounded inner
         // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
-        // the same scalar the Armijo lane descends and the outer penalized-LAML evidence
+        // the same scalar the Armijo lane descends and the outer penalized quasi-Laplace evidence
         // consumes. The incumbent exists to undo damage from the NON-monotone
         // boundary hooks (collapse reseeds, gauge retraction/pin, frame
         // refresh) — the Armijo walk itself is objective-monotone, so under
@@ -5755,7 +5755,7 @@ impl SaeManifoldTerm {
             // (t, β) Newton solve. The inner loop solves the joint manifold +
             // decoder system at the engine's current ρ; the engine alone
             // moves ρ by minimising the penalised quasi-Laplace evidence
-            // score (see `SaeManifoldTerm::penalized_laml_criterion`; #1421: NOT a
+            // score (see `SaeManifoldTerm::penalized_quasi_laplace_criterion`; #1421: NOT a
             // true normalized-prior REML — the improper softmax/ThresholdGate
             // assignment priors have no finite normalizer). The former in-loop
             // `update_ard_reml` rule (α = n / ‖t‖²) dropped the logdet /
@@ -5801,7 +5801,7 @@ impl SaeManifoldTerm {
             // radial null whose direction ROTATES per row (the null is the radial
             // unit vector `(cosθ_i, sinθ_i)`, distinct for every row — NOT a chart
             // axis, so no global/per-atom axis reduction can capture it). The
-            // undamped acceptance factorizations in `penalized_laml_criterion` already deflate
+            // undamped acceptance factorizations in `penalized_quasi_laplace_criterion` already deflate
             // that null to UNIT stiffness (`log 1 = 0`, ρ-independent) so the
             // evidence log-det is finite — but the coordinate SOLVE here does not:
             // `solve_with_lm_escalation_inner` LM-ridge-damps the near-null block,
@@ -6068,10 +6068,10 @@ impl SaeManifoldTerm {
             // with a near-zero pivot, the step is dominated by that near-null
             // direction, and `gᵀΔ/(‖g‖·‖Δ‖)` collapses while ‖g‖ is HUGE —
             // breaking there silently froze the iterate and let the
-            // `penalized_laml_criterion` refine loop re-measure the same point until its
+            // `penalized_quasi_laplace_criterion` refine loop re-measure the same point until its
             // budget died (the constant-‖g‖=1e12 signature). Gate the break on
             // genuine KKT stationarity — the SAME iterate-scaled tolerance
-            // `penalized_laml_criterion` uses — and otherwise fall through to the
+            // `penalized_quasi_laplace_criterion` uses — and otherwise fall through to the
             // proximal-correction ridge escalation below: heavier LM damping
             // bends the step toward steepest descent, which is always a
             // descent direction for a consistent gradient.
@@ -6346,7 +6346,7 @@ impl SaeManifoldTerm {
             // co-collapse for this input — every atom's decoder co-vanished and no
             // residual structure could anchor `K` distinct charts. The guard has
             // already restored the best basin it banked, so continuing the outer
-            // loop (and the outer-penalized-LAML ρ-search that drives it) only re-derives the
+            // loop (and the outer-penalized quasi-Laplace ρ-search that drives it) only re-derives the
             // same degenerate basin at cost. Return a typed error so the FFI raises
             // a diagnosable Python exception PROMPTLY instead of thrashing toward a
             // useless model. Gated to genuine, budget-exhausted TOTAL co-collapse:
@@ -6567,7 +6567,7 @@ impl SaeManifoldTerm {
         // never reached this polish before.
         //
         // CRITICAL: the gate is the PENALIZED objective total — the exact same
-        // scalar the inner Armijo line search and the outer penalized-LAML evidence engine
+        // scalar the inner Armijo line search and the outer penalized quasi-Laplace evidence engine
         // consume (`penalized_objective_total(target, rho, analytic_penalties, 1.0)`)
         // — NOT raw reconstruction EV. The decoder refit is an UNPENALIZED data-fit
         // least squares (and the coordinate re-projection is pure data-fit too), so a

@@ -818,7 +818,7 @@ pub(crate) fn penalized_objective_continuous_across_periodic_cut_with_registry_a
 /// line-search objective, that jump made a near-zero coordinate Newton step
 /// change the objective by an O(weight) amount, so Armijo rejected
 /// otherwise-valid steps and the inner joint solve never reached
-/// stationarity (`penalized_laml_criterion: inner solve did not converge`).
+/// stationarity (`penalized_quasi_laplace_criterion: inner solve did not converge`).
 ///
 /// The fix restricts the SCAD/MCP shrinkage to the Euclidean axes, so on a
 /// pure Circle atom it contributes nothing — the objective with the SCAD
@@ -2527,7 +2527,7 @@ pub(crate) fn planted_circle_focus_1744() {
                 for &smooth in &[-8.0_f64, -5.0, -3.0, -1.0, 0.0, 1.0, 3.0] {
                     let mut t = term.clone();
                     let r = SaeManifoldRho::new(sparse, smooth, vec![array![ard]]);
-                    match t.penalized_laml_criterion_with_cache(
+                    match t.penalized_quasi_laplace_criterion_with_cache(
                         z.view(),
                         &r,
                         None,
@@ -2667,24 +2667,24 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
 pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_laml_criterion: inner solve did not converge at fixed ρ"
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ"
         )
     );
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_laml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );
     // The generic "log-det unavailable" message (a real factorization defect, not
     // an infeasibility) stays FATAL — it is NOT in the recoverable set.
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_laml_criterion: arrow_log_det_from_cache returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: arrow_log_det_from_cache returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
         )
     );
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_laml_criterion: row-gauge evidence deflation count re-anchored \
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: row-gauge evidence deflation count re-anchored \
                  4 times within one optimization; the quotient dimension is not stabilizing"
         )
     );
@@ -2696,10 +2696,18 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
     let mut full = term0.clone();
     let mut streaming = term0;
     let (full_cost, full_loss, _cache) = full
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            2,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+        )
         .unwrap();
     let (stream_cost, stream_loss) = streaming
-        .penalized_laml_criterion_streaming_exact(
+        .penalized_quasi_laplace_criterion_streaming_exact(
             target.view(),
             &rho,
             None,
@@ -2716,7 +2724,8 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
 /// As [`small_two_atom_periodic_term`], but in ordered independent
 /// Beta--Bernoulli assignment mode. The full-batch and streaming paths must
 /// assemble the same shared-mass-dependent PSD curvature majorizer.
-pub(crate) fn small_two_atom_ordered_beta_bernoulli_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+pub(crate) fn small_two_atom_ordered_beta_bernoulli_term()
+-> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
     let (phi0, jet0) = periodic_basis(&coords0);
@@ -2777,13 +2786,21 @@ pub(crate) fn streaming_exact_laml_matches_full_batch_ordered_beta_bernoulli() {
     let (term0, target, rho) = small_two_atom_ordered_beta_bernoulli_term();
     let mut full = term0;
     let (_full_cost, _full_loss, cache) = full
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            2,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+        )
         .expect("dense ordered Beta--Bernoulli criterion must evaluate");
 
     // The streaming exact log determinant must reproduce dense `log|H|` at the same
     // converged state — `full` is already at its converged (t,β) after the dense
     // criterion. We compare the log-det DIRECTLY rather than re-fitting through
-    // `penalized_laml_criterion_streaming_exact`: a streaming RE-FIT runs a fresh inner solve
+    // `penalized_quasi_laplace_criterion_streaming_exact`: a streaming RE-FIT runs a fresh inner solve
     // whose faer parallel reduction is non-deterministic under thread contention
     // and intermittently surfaces the (recoverable) non-PD refusal — orthogonal to
     // this value-comparison test. `streaming_exact_arrow_log_det` reassembles
@@ -2809,7 +2826,7 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
     let mut full = term0.clone();
     let mut probe = term0;
     let (full_cost, full_loss) = full
-        .penalized_laml_criterion_with_refine_policy(
+        .penalized_quasi_laplace_criterion_with_refine_policy(
             target.view(),
             &rho,
             None,
@@ -2821,7 +2838,7 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
         )
         .expect("full-budget criterion must converge on the small fixture");
     let (probe_cost, probe_loss) = probe
-        .penalized_laml_criterion_with_refine_policy(
+        .penalized_quasi_laplace_criterion_with_refine_policy(
             target.view(),
             &rho,
             None,
@@ -2836,15 +2853,15 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
     assert_abs_diff_eq!(probe_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
-/// #1224 — every fitting/ranking lane must price the same penalized LAML criterion.
+/// #1224 — every fitting/ranking lane must price the same penalized quasi-Laplace criterion.
 ///
 /// The outer optimizer compares three lanes at a fixed ρ:
 ///   * `eval` (`OuterEvalOrder::ValueAndGradient`) returns the consistent
-///     gradient-lane pair `(f, ∇f)` — penalized LAML cost paired with the exact
+///     gradient-lane pair `(f, ∇f)` — penalized quasi-Laplace cost paired with the exact
 ///     REML λ-gradient.
 ///   * `eval_with_order(Value)` is the line-search probe: it accepts/rejects
 ///     steps whose DIRECTION came from `eval`'s `∇f`, so its cost must be the
-///     SAME penalized LAML `f`. Folding the gradient-free consistency penalty `c(ρ)`
+///     SAME penalized quasi-Laplace `f`. Folding the gradient-free consistency penalty `c(ρ)`
 ///     here while the direction is `∇f` mixes two functions in the Armijo test
 ///     (the objective↔gradient desync bug class). The fix threads
 ///     `fold_cotrain = false` into this lane.
@@ -2855,14 +2872,14 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
 /// The regression pins one invariant: gradient, line-search, and ranking costs
 /// agree at the same `ρ`.
 #[test]
-pub(crate) fn outer_value_and_ranking_lanes_share_pure_penalized_laml_criterion() {
+pub(crate) fn outer_value_and_ranking_lanes_share_pure_penalized_quasi_laplace_criterion() {
     use gam_solve::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
     // A fixed ρ at which all three lanes converge from the same fixture state.
     let rho_flat = warmstart_test_objective().baseline_rho.to_flat();
 
     // Gradient lane (ValueAndGradient): the consistent `(f, ∇f)` pair. Its cost
-    // is penalized LAML (+ the discrete collapse barrier, which stays on both lanes).
+    // is penalized quasi-Laplace (+ the discrete collapse barrier, which stays on both lanes).
     let mut grad_obj = warmstart_test_objective();
     let grad_cost = grad_obj
         .eval(&rho_flat)
@@ -2870,7 +2887,7 @@ pub(crate) fn outer_value_and_ranking_lanes_share_pure_penalized_laml_criterion(
         .cost;
 
     // Line-search lane (Value order): the BFGS/ARC probe. Post-fix this reports
-    // the SAME penalized LAML cost the gradient lane reports.
+    // the SAME penalized quasi-Laplace cost the gradient lane reports.
     let mut ls_obj = warmstart_test_objective();
     let ls_cost = ls_obj
         .eval_with_order(&rho_flat, OuterEvalOrder::Value)
@@ -3020,7 +3037,15 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     let mut full = term0.clone();
     let mut streaming = term0;
     let (full_cost, full_loss, cache) = full
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            1,
+            0.25,
+            1.0e-4,
+            1.0e-4,
+        )
         .expect("dense REML must refine through the cold non-PD evidence factor");
     let log_det = arrow_log_det_from_cache(&cache).expect("refined cache must carry log-det");
     assert!(full_cost.is_finite());
@@ -3028,7 +3053,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     assert!(log_det.is_finite());
 
     let (stream_cost, stream_loss) = streaming
-        .penalized_laml_criterion_streaming_exact(
+        .penalized_quasi_laplace_criterion_streaming_exact(
             target.view(),
             &rho,
             None,
@@ -3703,11 +3728,19 @@ pub(crate) fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
     // softmax negative-logit curvature is indefinite, so factoring there at
     // ridge 0 surfaces `PerRowFactorFailed` for BOTH the dense and streaming
     // paths. Converge the inner `(t, β)` state first (matching how
-    // `penalized_laml_criterion_with_cache` reaches a PD block), then compare the
+    // `penalized_quasi_laplace_criterion_with_cache` reaches a PD block), then compare the
     // streaming-vs-dense log-determinants of the SAME converged system —
     // which is the routing invariant this test pins (#847).
-    full.penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
-        .unwrap();
+    full.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        2,
+        0.25,
+        1.0e-4,
+        1.0e-4,
+    )
+    .unwrap();
     let sys = full
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap();
@@ -5352,7 +5385,7 @@ fn ard_atom_and_coord(
 /// F6 (fit-level composition): the native ARD energy on a coordinate-
 /// HETEROGENEOUS `{circle d=1, patch d=2, linear d=1}` dictionary is *exactly*
 /// the sum of the per-atom ARD energies — the same per-atom-additive
-/// decomposition the penalized LAML evidence sums over atoms — so admitting ARD on
+/// decomposition the penalized quasi-Laplace evidence sums over atoms — so admitting ARD on
 /// a mixed dictionary (the F6 composition) keeps the evidence exact with no
 /// padding or truncation. This is the concrete counterpart to the validator
 /// test: the gate opens (validator) AND the energy it lets through composes

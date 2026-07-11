@@ -1,14 +1,14 @@
-// [#780 line-count gate] The fixed-ρ quasi-Laplace evidence criterion and its
-// evidence-pricing machinery (penalized_laml_criterion* entries, rank-charge ledger,
-// deflated-factor evidence path) live in this sibling file as a second
+// The fixed-ρ custom quasi-Laplace criterion and its complexity-pricing
+// machinery (penalized_quasi_laplace_criterion* entries, rank-charge ledger,
+// deflated-factor path) live in this sibling file as a second
 // `impl SaeManifoldTerm` block, inlined via `include!` from construction.rs so
 // it keeps the SAME module scope and private-field access. Keeps the tracked
 // construction.rs under the 10k limit.
 
 impl SaeManifoldTerm {
-    /// Penalised quasi-Laplace evidence score for the SAE term at a FIXED ρ.
+    /// Custom penalized quasi-Laplace score for the SAE term at a fixed `ρ`.
     ///
-    /// #1421: this is NOT a true normalized-prior REML/evidence objective. The
+    /// This is not a normalized LAML, REML, or evidence objective. The
     /// assignment priors (softmax entropy, ThresholdGate) have NO finite normalizer:
     /// for softmax the reference-logit chart sends `P(ℓ)→0` as a free logit →±∞
     /// so `∫ e^{−λP} dℓ = ∞`, and ThresholdGate's bounded penalty `0<P<λ` keeps
@@ -21,16 +21,17 @@ impl SaeManifoldTerm {
     ///
     /// Runs the inner `(t, β)` arrow-Schur Newton solve to convergence at the
     /// supplied ρ (with NO in-loop ARD update — ρ is owned by the engine),
-    /// then forms the penalized LAML cost
+    /// then forms the custom penalized quasi-Laplace cost
     ///
     /// ```text
-    /// V(ρ) = ℓ_pen(t̂, β̂; ρ) + ½ log|H(t̂, β̂; ρ)|
+    /// V(ρ) = ℓ_pen(t̂, β̂; ρ) + ½ log|B(t̂, β̂; ρ)|
     ///        − ½ · p · (Σ_k rank S_k) · log λ_smooth
     /// ```
     ///
     /// where `ℓ_pen = loss.total()` is the penalised objective at the inner
-    /// optimum and `½ log|H|` is the Laplace normaliser. `H` is the joint
-    /// `(t, β)` Hessian assembled by the arrow-Schur system; its `H_tt` block
+    /// optimum and `½ log|B|` is the custom curvature charge. `B` is the PSD /
+    /// Gauss--Newton factor assembled by the arrow-Schur system, not the exact
+    /// stationarity Hessian; its `B_tt` block
     /// carries `α = exp(log_ard)` on its diagonal, so as α grows `½ log|H|`
     /// rises while the `−½·n·log α` already inside `loss.ard` falls — their
     /// balance IS the effective-dof term that the deleted `α = n/‖t‖²` rule
@@ -51,7 +52,7 @@ impl SaeManifoldTerm {
     ///
     /// Returns `(V, loss)` so the engine can both rank ρ and surface the inner
     /// loss breakdown.
-    pub fn penalized_laml_criterion(
+    pub fn penalized_quasi_laplace_criterion(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -61,7 +62,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
-        self.penalized_laml_criterion_with_refine_policy(
+        self.penalized_quasi_laplace_criterion_with_refine_policy(
             target,
             rho,
             registry,
@@ -73,7 +74,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    pub(crate) fn penalized_laml_criterion_with_refine_policy(
+    pub(crate) fn penalized_quasi_laplace_criterion_with_refine_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -84,7 +85,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss), String> {
-        self.penalized_laml_criterion_with_refine_policy_and_lane(
+        self.penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
             target,
             rho,
             registry,
@@ -97,11 +98,11 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// [`Self::penalized_laml_criterion_with_refine_policy`] with the #2080 surrogate lane
+    /// [`Self::penalized_quasi_laplace_criterion_with_refine_policy`] with the #2080 surrogate lane
     /// threaded to the streaming `log|S|` evidence term. `lane = None` is the
     /// bit-identical SLQ path; on the dense (non-streaming) branch the lane is
     /// unused (the dense evidence has its own factor-cache log-det).
-    pub(crate) fn penalized_laml_criterion_with_refine_policy_and_lane(
+    pub(crate) fn penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -127,17 +128,17 @@ impl SaeManifoldTerm {
         )?;
         if plan.streaming {
             // #1225: streaming and dense MUST optimize the SAME mathematical
-            // objective — the full penalized LAML criterion `loss.total() + extra_penalty +
+            // objective — the full penalized quasi-Laplace criterion `loss.total() + extra_penalty +
             // ½ log|H| − Occam`. The streaming branch previously returned only
             // `loss.total() + extra_penalty_energy`, dropping the Laplace
             // normalizer `½ log|H|` and the Occam term, so large shapes (exactly
             // where streaming is needed) were ranked by penalized loss rather than
-            // penalized LAML — and dense vs streaming disagreed on the objective. Route
+            // penalized quasi-Laplace — and dense vs streaming disagreed on the objective. Route
             // through the streaming exact-logdet path, which assembles the same
             // chunk-by-chunk-bit-identical `½ log|H|_stream` and the same
-            // `−Occam`/extra-penalty terms as the dense `penalized_laml_criterion_with_cache`
+            // `−Occam`/extra-penalty terms as the dense `penalized_quasi_laplace_criterion_with_cache`
             // (different memory strategy, same objective).
-            self.penalized_laml_criterion_streaming_exact_with_lane(
+            self.penalized_quasi_laplace_criterion_streaming_exact_with_lane(
                 target,
                 rho,
                 registry,
@@ -148,7 +149,7 @@ impl SaeManifoldTerm {
                 lane,
             )
         } else {
-            let (v, loss, _cache) = self.penalized_laml_criterion_with_cache_refine_policy(
+            let (v, loss, _cache) = self.penalized_quasi_laplace_criterion_with_cache_refine_policy(
                 target,
                 rho,
                 registry,
@@ -162,12 +163,12 @@ impl SaeManifoldTerm {
         }
     }
 
-    /// As [`Self::penalized_laml_criterion`], but also returns the converged undamped
+    /// As [`Self::penalized_quasi_laplace_criterion`], but also returns the converged undamped
     /// `ArrowFactorCache` so callers (the EFS fixed-point step) can read the
     /// selected-inverse traces `(H⁻¹)_tt` / `(H⁻¹)_ββ` without re-factoring.
     /// The cache is the single shared O(K³) Direct factor; both the
     /// log-determinant criterion and the Fellner-Schall ρ-step consume it.
-    pub fn penalized_laml_criterion_with_cache(
+    pub fn penalized_quasi_laplace_criterion_with_cache(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -177,7 +178,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
-        self.penalized_laml_criterion_with_cache_refine_policy(
+        self.penalized_quasi_laplace_criterion_with_cache_refine_policy(
             target,
             rho,
             registry,
@@ -189,7 +190,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    pub(crate) fn penalized_laml_criterion_with_cache_refine_policy(
+    pub(crate) fn penalized_quasi_laplace_criterion_with_cache_refine_policy(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -200,7 +201,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
-        // #976 evidence-ledger scope (see `penalized_laml_criterion_with_refine_policy_
+        // #976 evidence-ledger scope (see `penalized_quasi_laplace_criterion_with_refine_policy_
         // and_lane`): direct cache-lane callers also get a fresh per-evaluation
         // reseed budget here; the double clear when routed through the value
         // entry is an idempotent no-op.
@@ -211,7 +212,7 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if !admission_plan.direct_logdet_admitted() {
-            // The cache-returning penalized-LAML entry is used by the EFS/outer lanes that
+            // The cache-returning penalized quasi-Laplace entry is used by the EFS/outer lanes that
             // need selected-inverse traces in addition to the scalar evidence.
             // Large SAE fits cannot form the dense `N · q · border_dim`
             // evidence slab (`q = K(1+d)`, `border_dim = Σ_k M_k · p`), so the
@@ -221,7 +222,7 @@ impl SaeManifoldTerm {
             // cache for traces and recomputes the reduced-Schur logdet by
             // chunks / matrix-free matvecs, keeping peak memory at the admitted
             // streaming working set rather than the dense n·k·p floor.
-            return self.penalized_laml_criterion_streaming_exact_with_cache(
+            return self.penalized_quasi_laplace_criterion_streaming_exact_with_cache(
                 target,
                 rho,
                 registry,
@@ -254,7 +255,7 @@ impl SaeManifoldTerm {
         //    mode so `arrow_log_det_from_cache` returns the exact
         //    `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects damped
         //    factors and InexactPCG caches, which have no dense Schur factor).
-        //    This is the same evidence convention the main GAM penalized-LAML path uses.
+        //    This is the same evidence convention the main GAM penalized quasi-Laplace path uses.
         //    The shared `converge_inner_for_undamped_logdet` driver guarantees
         //    the per-row `H_tt^(i)` blocks are PD at the converged optimum so
         //    the undamped (`ridge = 0`) factorization succeeds — the streaming
@@ -311,7 +312,7 @@ impl SaeManifoldTerm {
         )?;
         loss.evidence_gauge_deflated_directions = cache.gauge_deflated_directions;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-            "SaeManifoldTerm::penalized_laml_criterion: arrow_log_det_from_cache returned None \
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: arrow_log_det_from_cache returned None \
              (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
                 .to_string()
         })?;
@@ -335,7 +336,7 @@ impl SaeManifoldTerm {
         // relies on holds only then. See `reml_extra_penalty_value_total`.
         let extra_penalty_energy = self
             .reml_extra_penalty_value_total(registry)
-            .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+            .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
 
         let v = {
             // #5/(B): replace the COORDINATE-block ½log|H_tt| in the Laplace
@@ -356,7 +357,7 @@ impl SaeManifoldTerm {
                 .reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))
                 .map_err(|e| {
                     format!(
-                        "SaeManifoldTerm::penalized_laml_criterion: rank-charge dispersion is required: {e}"
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: rank-charge dispersion is required: {e}"
                     )
                 })?;
             let d_eff = self.per_atom_realised_rank_dof(rho, disp)?;
@@ -528,7 +529,7 @@ impl SaeManifoldTerm {
                     .saturating_add(1);
                 if self.evidence_gauge_deflation_reanchors > reversal_budget {
                     return Err(format!(
-                        "SaeManifoldTerm::penalized_laml_criterion: row-gauge evidence deflation count \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: row-gauge evidence deflation count \
                          oscillated (reversed direction {} times, last {expected}->{count}) within \
                          one optimization, exceeding the {reversal_budget}-reversal budget for {} \
                          atoms; the quotient dimension is not stabilizing, refusing to compare \
@@ -538,7 +539,7 @@ impl SaeManifoldTerm {
                     ));
                 }
                 log::debug!(
-                    "SaeManifoldTerm::penalized_laml_criterion: per-row evidence deflation count changed \
+                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: per-row evidence deflation count changed \
                      {expected}->{count} (a benign per-row conditioning drift across the ρ-walk; \
                      reversal {}/{reversal_budget}); re-anchoring the Laplace normalizer comparison \
                      to the new dimension",
@@ -566,7 +567,7 @@ impl SaeManifoldTerm {
     /// Drive the inner `(t, β)` Newton solve to the KKT/step-converged optimum
     /// and return the final UNDAMPED (`ridge = 0`) joint-Hessian factor cache.
     ///
-    /// The Laplace normaliser `½log|H|` is only the correct penalized LAML criterion at
+    /// The Laplace normaliser `½log|H|` is only the correct penalized quasi-Laplace criterion at
     /// the inner optimum `(t̂, β̂)`, so the criterion must refine the inner state
     /// until either the KKT gradient or the undamped Newton step meets tolerance
     /// before factoring. Crucially, **at the converged optimum the per-row
@@ -576,8 +577,8 @@ impl SaeManifoldTerm {
     /// rank-deficient per-row block (`p_out = 1` → rank-1 `JᵀJ`, softmax
     /// assignment-sparsity negative logit curvature) that surfaces
     /// `PerRowFactorFailed` from the undamped `factor_one_row`. Both the dense
-    /// (`penalized_laml_criterion_with_cache`) and the streaming
-    /// (`penalized_laml_criterion_streaming_exact`) evidence paths route through this same
+    /// (`penalized_quasi_laplace_criterion_with_cache`) and the streaming
+    /// (`penalized_quasi_laplace_criterion_streaming_exact`) evidence paths route through this same
     /// driver, so they converge to the identical inner state and their
     /// `ridge = 0` log-determinants stay bit-identical (#847).
     pub(crate) fn converge_inner_for_undamped_logdet(
@@ -611,7 +612,7 @@ impl SaeManifoldTerm {
         if inner_max_iter == 0 {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
             // #1095/#2228 — same decoupling as the stall / gradient-stationary
             // acceptance paths. This frozen warm-start evidence log-det is read from
             // the ridge-0 factor below, which is non-PD BY CONSTRUCTION on an
@@ -625,7 +626,7 @@ impl SaeManifoldTerm {
             // reuse. A full-rank block has no sub-floor eigenvalue and is untouched.
             Self::ensure_row_gauge_deflation_for_evidence(&mut sys);
             let factored = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
             // The frozen-state Newton step (factored.0, factored.1) is discarded
             // — only the undamped factor cache (factored.2) is consumed for the
             // log-det / selected-inverse traces; β stays at the warm-start seed.
@@ -673,7 +674,7 @@ impl SaeManifoldTerm {
         // on the same function.
         let entry_loss_total = self
             .penalized_objective_total(target, rho, registry, 1.0)
-            .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+            .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
         let mut previous_loss_total = entry_loss_total;
         let mut refine_rounds: usize = 0;
         // Consecutive stall rounds. Once this reaches
@@ -695,7 +696,7 @@ impl SaeManifoldTerm {
         loop {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
             // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
             // and only the factor cache is consumed — the exact undamped log-det
             // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
@@ -729,13 +730,13 @@ impl SaeManifoldTerm {
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
             if !grad_norm_sq.is_finite() {
                 return Err(format!(
-                    "SaeManifoldTerm::penalized_laml_criterion: undamped inner KKT residual is non-finite \
+                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped inner KKT residual is non-finite \
                      at the inner optimum (‖g‖²={grad_norm_sq}); the joint Hessian \
                      factorisation is degenerate at this ρ"
                 ));
             }
             // #2080 criterion-cost restructure — the Laplace normaliser ½log|H|
-            // is the penalized LAML criterion ONLY at the inner KKT optimum, so the FULL
+            // is the penalized quasi-Laplace criterion ONLY at the inner KKT optimum, so the FULL
             // undamped Direct factorization (dense border β-Schur assembly
             // `O(n·q·k²)` plus the `O(k³)` border Cholesky / eigen-floor, with
             // `k = border_dim = Σ_k M_k·p`) is taken exactly ONCE — at the
@@ -827,7 +828,7 @@ impl SaeManifoldTerm {
                             // Laplace log-det) never sees, desyncing the outer
                             // line-search — the multi-atom non-convergence #1117 removes.
                             return Err(format!(
-                                "SaeManifoldTerm::penalized_laml_criterion: stationary undamped \
+                                "SaeManifoldTerm::penalized_quasi_laplace_criterion: stationary undamped \
                                  evidence factorization has a non-PD per-row H_tt block \
                                  that spectral unit-stiffness deflation could not \
                                  condition (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}); \
@@ -836,7 +837,7 @@ impl SaeManifoldTerm {
                         }
                         Err(err) => {
                             return Err(format!(
-                                "SaeManifoldTerm::penalized_laml_criterion: {err}"
+                                "SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"
                             ));
                         }
                     };
@@ -849,7 +850,7 @@ impl SaeManifoldTerm {
                     + delta_beta.iter().map(|&v| v * v).sum::<f64>();
                 if !step_norm_sq.is_finite() {
                     return Err(format!(
-                        "SaeManifoldTerm::penalized_laml_criterion: undamped inner residual is non-finite at \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped inner residual is non-finite at \
                          the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
                          Hessian factorisation is degenerate at this ρ"
                     ));
@@ -888,15 +889,15 @@ impl SaeManifoldTerm {
                         // inner solve to try to CROSS the indefinite basin is the
                         // accepted-iterate's job, not a probe's. Grinding the probe
                         // refine budget (up to `4×inner_max_iter`, and historically
-                        // the accepted `16×/64×` via `penalized_laml_criterion_with_cache`) on
+                        // the accepted `16×/64×` via `penalized_quasi_laplace_criterion_with_cache`) on
                         // every overshooting line-search / FD probe is exactly the
-                        // wide-`p` outer penalized-LAML hang (#2080). Return the typed refusal
+                        // wide-`p` outer penalized quasi-Laplace hang (#2080). Return the typed refusal
                         // after this single diagnostic factor pass;
                         // `is_recoverable_value_probe_refusal` maps it to the finite
                         // infeasibility wall.
                         if !refine_progress_extension {
                             return Err(format!(
-                                "SaeManifoldTerm::penalized_laml_criterion: undamped evidence \
+                                "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped evidence \
                              factorization hit a non-PD per-row H_tt block before KKT \
                              stationarity at an infeasible-ρ probe (‖g‖={grad_norm:.6e}, \
                              tol {grad_tolerance:.6e}); returning the typed infeasible \
@@ -942,7 +943,7 @@ impl SaeManifoldTerm {
                             // fix removes. K=1 (and any already-PD or spectral-deflatable
                             // K>1 row) never reaches this branch.
                             return Err(format!(
-                                "SaeManifoldTerm::penalized_laml_criterion: undamped evidence \
+                                "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped evidence \
                              factorization hit a non-PD per-row H_tt block before KKT \
                              stationarity (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) \
                              and the refinement budget was exhausted after \
@@ -969,7 +970,7 @@ impl SaeManifoldTerm {
                         continue;
                     }
                     Err(err) => {
-                        return Err(format!("SaeManifoldTerm::penalized_laml_criterion: {err}"));
+                        return Err(format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"));
                     }
                 }
             }
@@ -984,7 +985,7 @@ impl SaeManifoldTerm {
             let effective_refine_limit = refine_limit
                 .checked_add(budget_escalation_extra)
                 .ok_or_else(|| {
-                    "SaeManifoldTerm::penalized_laml_criterion: inner-refinement budget overflow"
+                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner-refinement budget overflow"
                         .to_string()
                 })?;
             if total_inner_iter >= effective_refine_limit {
@@ -1026,18 +1027,18 @@ impl SaeManifoldTerm {
                         .saturating_sub(refine_limit)
                         .checked_add(escalation_window)
                         .ok_or_else(|| {
-                            "SaeManifoldTerm::penalized_laml_criterion: escalated inner-refinement budget overflow"
+                            "SaeManifoldTerm::penalized_quasi_laplace_criterion: escalated inner-refinement budget overflow"
                                 .to_string()
                         })?;
                     log::debug!(
-                        "SaeManifoldTerm::penalized_laml_criterion: budget escalation at fixed ρ — \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: budget escalation at fixed ρ — \
                          ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) still descending after \
                          {total_inner_iter} inner iterations; granting a progress-paid window of \
                          {escalation_window} iterations"
                     );
                 } else if gradient_stationary {
                     return Err(format!(
-                        "SaeManifoldTerm::penalized_laml_criterion: inner solve did not converge at fixed ρ; \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; \
                          KKT entered its admission band (raw ‖g‖={grad_norm:.6e}, quotient \
                          ‖Π⊥gauge g‖={quotient_grad_norm:.6e}, tolerance {grad_tolerance:.6e}) \
                          but an evidence-only re-entry still made a strict state/objective move \
@@ -1045,7 +1046,7 @@ impl SaeManifoldTerm {
                          a non-idempotent inner map."
                     ));
                 } else {
-                    // Inner solve did not converge in penalized_laml_criterion; the returned
+                    // Inner solve did not converge in penalized_quasi_laplace_criterion; the returned
                     // Err below carries the non-convergence diagnostic (gradient /
                     // quotient-gradient norms and the tolerance) to the caller. The
                     // historical quotient-Newton-step figures are no longer printed:
@@ -1055,7 +1056,7 @@ impl SaeManifoldTerm {
                     // full dense factorization that produced it at non-stationary
                     // rounds.
                     return Err(format!(
-                        "SaeManifoldTerm::penalized_laml_criterion: inner solve did not converge at fixed ρ; \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; \
                          neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
                          ‖Π⊥gauge g‖={quotient_grad_norm:.6e} met tolerance {grad_tolerance:.6e} \
                          after {total_inner_iter} inner iterations. Refusing to rank an \
@@ -1066,12 +1067,12 @@ impl SaeManifoldTerm {
             let refine_limit = refine_limit
                 .checked_add(budget_escalation_extra)
                 .ok_or_else(|| {
-                    "SaeManifoldTerm::penalized_laml_criterion: inner-refinement budget overflow"
+                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner-refinement budget overflow"
                         .to_string()
                 })?;
             let remaining = refine_limit.checked_sub(total_inner_iter).ok_or_else(|| {
                 format!(
-                    "SaeManifoldTerm::penalized_laml_criterion: inner-refinement accounting mismatch \
+                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner-refinement accounting mismatch \
                      ({total_inner_iter} iterations consumed past limit {refine_limit})"
                 )
             })?;
@@ -1108,7 +1109,7 @@ impl SaeManifoldTerm {
             // descends, not the native-terms-only loss.
             let new_loss_total = self
                 .penalized_objective_total(target, rho, registry, 1.0)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
             // Two stagnation signals, both required: (1) the latest refine round
             // contributed a negligible FRACTION of the total objective reduction
             // achieved since entry — the fit has captured essentially all the
@@ -1140,7 +1141,7 @@ impl SaeManifoldTerm {
             {
                 let mut stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
-                    .map_err(|err| format!("SaeManifoldTerm::penalized_laml_criterion: {err}"))?;
+                    .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
                 // #1095/#2228 — diagnose the stalled state with the ridge-0
                 // deflated factor. Only the raw/quotient KKT residual can accept;
                 // the affine Newton decrement is reported but cannot mint an
@@ -1282,7 +1283,7 @@ impl SaeManifoldTerm {
                 consecutive_objective_stalls += 1;
                 if consecutive_objective_stalls >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
                     return Err(format!(
-                        "SaeManifoldTerm::penalized_laml_criterion: inner solve did not converge at fixed ρ; \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; \
                          objective stalled for {consecutive_objective_stalls} consecutive refine \
                          rounds, but neither the raw KKT gradient ‖g‖={grad_norm:.6e} nor its \
                          quotient met tolerance {grad_tolerance:.6e}. Objective stagnation and a \
@@ -1980,9 +1981,9 @@ impl SaeManifoldTerm {
     /// can take its matrix-free ARD / smoothness traces off this cache in the
     /// streaming regime instead of hard-erroring on the dense evidence path. The
     /// log-determinant is the chunked matrix-free `streaming_exact_arrow_log_det`.
-    /// Convenience over [`Self::penalized_laml_criterion_streaming_exact_with_cache_and_lane`]
+    /// Convenience over [`Self::penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane`]
     /// with no #2080 surrogate lane (bit-identical SLQ evidence).
-    pub fn penalized_laml_criterion_streaming_exact_with_cache(
+    pub fn penalized_quasi_laplace_criterion_streaming_exact_with_cache(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -1992,7 +1993,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
-        self.penalized_laml_criterion_streaming_exact_with_cache_and_lane(
+        self.penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane(
             target,
             rho,
             registry,
@@ -2004,9 +2005,9 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// [`Self::penalized_laml_criterion_streaming_exact_with_cache`] with the #2080 surrogate
+    /// [`Self::penalized_quasi_laplace_criterion_streaming_exact_with_cache`] with the #2080 surrogate
     /// lane threaded to the streaming `log|S|` term (`None` = bit-identical SLQ).
-    pub fn penalized_laml_criterion_streaming_exact_with_cache_and_lane(
+    pub fn penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -2030,7 +2031,7 @@ impl SaeManifoldTerm {
         let mut loss = initial_fit.loss;
         let mut evidence_fixed_point = initial_fit.fixed_point;
         // Drive the inner (t, β) state to the SAME KKT/step-converged optimum the
-        // dense `penalized_laml_criterion_with_cache` reaches before factoring. At that
+        // dense `penalized_quasi_laplace_criterion_with_cache` reaches before factoring. At that
         // optimum the per-row `H_tt^(i)` blocks are PD, so the undamped
         // (`ridge_t = 0`) streaming factorization in `streaming_exact_arrow_log_det`
         // succeeds — without this, a state stopped after only `inner_max_iter`
@@ -2081,12 +2082,12 @@ impl SaeManifoldTerm {
         let occam = self.reml_occam_term(rho)?;
         // Extra penalized-objective energy (#671/#737 + full-objective
         // completion: registry penalties + repulsion + separation barrier),
-        // matching the full-batch `penalized_laml_criterion_with_cache` path so streaming
+        // matching the full-batch `penalized_quasi_laplace_criterion_with_cache` path so streaming
         // and dense criteria rank the identical penalized objective.
         let extra_penalty_energy =
             self.reml_extra_penalty_value_total(registry)
                 .map_err(|err| {
-                    format!("SaeManifoldTerm::penalized_laml_criterion_streaming_exact: {err}")
+                    format!("SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact: {err}")
                 })?;
         let v = {
             let ri = rank_inputs;
@@ -2106,7 +2107,7 @@ impl SaeManifoldTerm {
                 )
                 .map_err(|e| {
                     format!(
-                        "SaeManifoldTerm::penalized_laml_criterion_streaming_exact: rank-charge dispersion is required: {e}"
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact: rank-charge dispersion is required: {e}"
                     )
                 })?;
             let d_eff = self.rank_dof_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
@@ -2114,7 +2115,7 @@ impl SaeManifoldTerm {
             // rank_eff==0 (d_eff==0) atom reconstructs nothing, so its evidence is
             // INVALID (degenerate β-mode / β-Schur log-det → −∞), not payable. Reject
             // categorically (v → +∞). Same guard as the dense path; see the dense
-            // penalized_laml_criterion for the full rationale + β-Schur-floor trailhead.
+            // penalized_quasi_laplace_criterion for the full rationale + β-Schur-floor trailhead.
             let laplace_complexity =
                 rank_adjusted_laplace_complexity(log_det, ri.log_det_tt, &d_eff, &ri.n_eff)?;
             loss.total() + extra_penalty_energy + laplace_complexity - occam
@@ -2123,8 +2124,8 @@ impl SaeManifoldTerm {
     }
 
     /// Value-only streaming criterion — the cache-returning
-    /// [`Self::penalized_laml_criterion_streaming_exact_with_cache`] with the cache dropped.
-    pub fn penalized_laml_criterion_streaming_exact(
+    /// [`Self::penalized_quasi_laplace_criterion_streaming_exact_with_cache`] with the cache dropped.
+    pub fn penalized_quasi_laplace_criterion_streaming_exact(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -2134,7 +2135,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
-        self.penalized_laml_criterion_streaming_exact_with_lane(
+        self.penalized_quasi_laplace_criterion_streaming_exact_with_lane(
             target,
             rho,
             registry,
@@ -2146,9 +2147,9 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// [`Self::penalized_laml_criterion_streaming_exact`] with the #2080 surrogate lane
+    /// [`Self::penalized_quasi_laplace_criterion_streaming_exact`] with the #2080 surrogate lane
     /// threaded to the streaming `log|S|` term (`None` = bit-identical SLQ).
-    pub fn penalized_laml_criterion_streaming_exact_with_lane(
+    pub fn penalized_quasi_laplace_criterion_streaming_exact_with_lane(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -2160,7 +2161,7 @@ impl SaeManifoldTerm {
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss), String> {
         let (cost, loss, _cache) = self
-            .penalized_laml_criterion_streaming_exact_with_cache_and_lane(
+            .penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane(
                 target,
                 rho,
                 registry,
@@ -4616,7 +4617,7 @@ impl SaeManifoldTerm {
     /// Public analytic outer-ρ gradient at a converged inner state, constructing
     /// the deflated arrow solver from the supplied cache. Use this seam from
     /// integration tests and external consumers that have a converged
-    /// `(loss, cache)` from [`Self::penalized_laml_criterion_with_cache`] but no access to
+    /// `(loss, cache)` from [`Self::penalized_quasi_laplace_criterion_with_cache`] but no access to
     /// the crate-private `DeflatedArrowSolver`.
     pub fn analytic_outer_rho_gradient_at_converged(
         &self,
@@ -4634,7 +4635,7 @@ impl SaeManifoldTerm {
     ///
     /// This is the single seam that establishes value↔gradient coherence for
     /// the SAE objective: it runs the inner solve once via
-    /// [`Self::penalized_laml_criterion_with_cache`], reads the value decomposition
+    /// [`Self::penalized_quasi_laplace_criterion_with_cache`], reads the value decomposition
     /// (`loss.total() + extra_penalty_energy`, the rank-adjusted Laplace
     /// complexity, `occam`) and the
     /// matching gradient channels (`SaeOuterRhoGradientComponents`) from the
@@ -4656,7 +4657,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeCriterion, String> {
-        let (production_value, loss, cache) = self.penalized_laml_criterion_with_cache(
+        let (production_value, loss, cache) = self.penalized_quasi_laplace_criterion_with_cache(
             target,
             rho,
             registry,

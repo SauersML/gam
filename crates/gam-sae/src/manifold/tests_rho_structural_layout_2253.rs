@@ -89,7 +89,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .expect("base value lane must converge");
     assert!(
         base_cost.is_finite(),
-        "the active-rho derivative witness must start at feasible penalized LAML evidence: \
+        "the active-rho derivative witness must start at feasible penalized quasi-Laplace evidence: \
          base={base_cost:.17e}"
     );
     let evaluation = gradient_objective
@@ -111,7 +111,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let mut audit_term = gradient_objective.term.clone();
     let mut atomized_audit_term = audit_term.clone();
     let (audit_value, audit_loss, audit_cache) = audit_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             gradient_objective.target.view(),
             &rho_state,
             gradient_objective.registry.as_ref(),
@@ -212,7 +212,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         let mut term = frozen_anchor_term.clone();
         let rho = frozen_baseline_rho.from_flat(rho_flat.view());
         let (criterion, loss, cache) = term
-            .penalized_laml_criterion_with_cache(
+            .penalized_quasi_laplace_criterion_with_cache(
                 frozen_target.view(),
                 &rho,
                 frozen_registry.as_ref(),
@@ -299,12 +299,12 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let frozen_minus_cost = frozen_cost_at(&minus);
     assert!(
         plus_cost.is_finite(),
-        "+h must evaluate feasible penalized LAML evidence: \
+        "+h must evaluate feasible penalized quasi-Laplace evidence: \
          cost={plus_cost:.17e}, telemetry={plus_telemetry:?}"
     );
     assert!(
         minus_cost.is_finite(),
-        "-h must evaluate feasible penalized LAML evidence: \
+        "-h must evaluate feasible penalized quasi-Laplace evidence: \
          cost={minus_cost:.17e}, telemetry={minus_telemetry:?}"
     );
     assert_eq!(
@@ -565,7 +565,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
     let rho_state = objective.baseline_rho.from_flat(base.view());
     let mut audit_term = objective.term.clone();
     let (_frozen_value, audit_loss, audit_cache) = audit_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             objective.target.view(),
             &rho_state,
             objective.registry.as_ref(),
@@ -592,7 +592,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
     let frozen_cost_at = |rho_flat: &Array1<f64>| -> f64 {
         let mut term = anchor_term.clone();
         let rho = objective.baseline_rho.from_flat(rho_flat.view());
-        term.penalized_laml_criterion_with_cache(
+        term.penalized_quasi_laplace_criterion_with_cache(
             objective.target.view(),
             &rho,
             objective.registry.as_ref(),

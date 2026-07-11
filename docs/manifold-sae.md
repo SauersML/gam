@@ -139,7 +139,10 @@ worth of independent signal in `Z`.
 ## The objective
 
 The fit minimizes reconstruction error plus a stack of penalties, with
-smoothing weights selected by the penalized-LAML objective. Each piece plays a distinct role
+smoothing weights selected by a custom penalized quasi-Laplace criterion. It
+uses the solver's PSD/Gauss--Newton factor and explicit rank charges around the
+converged penalized mode; because the smooth assignment priors are improper, it
+is not normalized LAML, REML, or model evidence. Each piece plays a distinct role
 (default state in parentheses):
 
 - **Reconstruction.** Squared error between `Z` and the sparse sum of
@@ -157,7 +160,8 @@ smoothing weights selected by the penalized-LAML objective. Each piece plays a d
   the columns do not share latent sticks and the model is therefore not an IBP.
   Integrating each nuisance rate exactly gives the per-column penalty
   `−log a_k − logΓ(M_k+a_k) − logΓ(N−M_k+1) + logΓ(N+a_k+1)`, where
-  `M_k = Σ_i z_ik`. Logit, concentration, Hessian, and penalized-LAML channels all
+  `M_k = Σ_i z_ik`. Logit, concentration, Hessian, and penalized
+  quasi-Laplace channels all
   differentiate this same scalar. The prior mean is not multiplied into the
   reconstruction, so shrinkage is scored exactly once. `"softmax"` is a dense,
   simplex-normalized gate. `"threshold_gate"` is the smooth bounded gate
@@ -363,7 +367,7 @@ the full surface):
 | `coords` | `[ (N, d_k) ]` per-atom per-token coordinates |
 | `decoder_blocks` | `[ (M_k, p) ]` per-atom decoder matrices |
 | `fitted` / `assignments` | `(N, p)` training reconstruction / `(N, K)` gates |
-| `reconstruction_r2` / `penalized_loss_score` / `penalized_laml_criterion` / `dispersion` | fit quality / negative penalized loss / certified full penalized-LAML value (including Laplace and Occam terms) / noise scale |
+| `reconstruction_r2` / `penalized_loss_score` / `penalized_quasi_laplace_criterion` / `dispersion` | fit quality / negative penalized loss / terminal custom quasi-Laplace value (PSD/Gauss--Newton factor plus rank charges; lower is better, not normalized evidence) / noise scale |
 
 Methods: `reconstruct_training()`, `predict(X)` / `reconstruct(X)`,
 `encode(X)`, `converged_latents(X)`, `reconstruct_from_assignments(codes)`,
@@ -674,8 +678,8 @@ out = module(torch.as_tensor(new_activations, dtype=torch.float64))
 
 `out.reconstruction`, `out.codes`, and `out.coordinates` come from one native
 converged-latent solve. `out.penalized_loss_score` is the inner fit diagnostic,
-while `out.penalized_laml_criterion` is the certified full native criterion;
-neither is relabeled as REML or generic evidence.
+while `out.penalized_quasi_laplace_criterion` is the terminal custom native
+quasi-Laplace criterion. It is not relabeled as LAML, REML, or model evidence.
 `out.selected_smooth_lambdas` reports the smoothing
 precisions selected by that fit. The adapter has no trainable parameters and
 rejects inputs requiring gradients. Its state dict serializes the complete

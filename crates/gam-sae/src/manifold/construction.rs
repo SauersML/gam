@@ -20,13 +20,13 @@ use super::*;
 //     is diagnostic, not an alternative production criterion.
 //   • RLCT (SINGULAR truth, a symmetry orbit or a null atom): λ drops below ½·d
 //     to the real log-canonical threshold. The null atom (truth B*=0) has λ=½ from
-//     the amplitude singularity of a²‖B‖² — see the veto in `penalized_laml_criterion`.
+//     the amplitude singularity of a²‖B‖² — see the veto in `penalized_quasi_laplace_criterion`.
 //
 // Soft → hard away from the edge (every sigmoid → 1) and soft → RLCT at singular
 // truths (sigmoids → 0), so the single ledger `λ(n_eff)·ln n_eff` interpolates all
 // three regimes continuously. The log-scale is the OCCUPANCY-corrected `ln n_eff`
 // (Fisher information actually accumulated by a gated atom), never the global row
-// count — see the #2a inert-row axiom in `penalized_laml_criterion`.
+// count — see the #2a inert-row axiom in `penalized_quasi_laplace_criterion`.
 //
 // The production criterion has one charge currency: the hard MP branch. Keeping
 // an un-differentiated soft alternative would make value and analytic gradient
@@ -477,7 +477,7 @@ impl SaeManifoldTerm {
         primary.barrier_coactivation_gate = None;
         // Evidence-gauge / co-collapse cluster — the canonical reset (mirrors
         // outer_objective.rs and the ctor) clears all FIVE fields together: the
-        // reanchor count and last-delta sign feed the penalized_laml_criterion reversal-
+        // reanchor count and last-delta sign feed the penalized_quasi_laplace_criterion reversal-
         // budget loop, so carrying `primary`'s stale tier-1 values would either
         // spuriously flag a reversal on the merged term's FIRST deflation step or
         // start the joint polish with a partially-consumed budget (erroring
@@ -2205,7 +2205,7 @@ impl SaeManifoldTerm {
     /// `d_k` (`ScadMcp`/`Sparsity` iterate the flat block element-wise; native
     /// ARD sums per atom over `d_k` axes with a per-atom `log_ard[k]`; isometry
     /// is rebuilt per atom by `corrected_isometry_penalty`), so the arrow-Schur
-    /// assembler dispatches them cleanly across mixed dims and the penalized LAML
+    /// assembler dispatches them cleanly across mixed dims and the penalized quasi-Laplace
     /// evidence — itself a per-atom sum — stays exact with no padding or
     /// truncation (see
     /// [`sae_row_block_penalty_composes_over_heterogeneous_coord_dims`]). The
@@ -2216,7 +2216,7 @@ impl SaeManifoldTerm {
     ///
     /// The engine self-protects here so a genuine incompatibility surfaces as a
     /// direct, actionable error at the FFI boundary rather than as a deep
-    /// `RemlConvergenceError` mid penalized-LAML solve (the failure mode
+    /// `RemlConvergenceError` mid penalized quasi-Laplace solve (the failure mode
     /// [`Self::validate_analytic_penalty_registry`] otherwise produces during
     /// `assemble_arrow_schur`).
     ///
@@ -3902,7 +3902,7 @@ impl SaeManifoldTerm {
 
     /// #1154 — amortized-encoder consistency of the CURRENT dictionary against
     /// its own fit-time target. This is the co-training signal of the joint
-    /// amortized-encoder + penalized-LAML loop (Design A): the amortized (one-mat-vec)
+    /// amortized-encoder + penalized quasi-Laplace loop (Design A): the amortized (one-mat-vec)
     /// encode is built from the *current* fitted decoder, run on `targets`, and
     /// scored on two principled axes —
     ///
@@ -3914,7 +3914,7 @@ impl SaeManifoldTerm {
     ///   to first order by the per-chart IFT predictor scores near zero; a
     ///   dictionary the amortized encoder *cannot* invert faithfully (sharp
     ///   curvature, poorly-charted regions) scores high. Minimising this jointly
-    ///   with penalized LAML steers the fit toward dictionaries that admit a fast,
+    ///   with penalized quasi-Laplace steers the fit toward dictionaries that admit a fast,
     ///   faithful amortized encode — the architectural co-adaptation #1154 adds.
     /// * `unconverged_fraction`: the share of rowwise joint shared-residual
     ///   solves that did not meet the first-order stationarity tolerance.
@@ -3989,14 +3989,14 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// #1154 — the co-trained penalized LAML criterion: the exact penalized LAML criterion at `rho`
+    /// #1154 — the co-trained penalized quasi-Laplace criterion: the exact penalized quasi-Laplace criterion at `rho`
     /// PLUS the amortized-encoder consistency penalty, so the outer optimizer
     /// co-adapts the dictionary + smoothing parameters λ toward a dictionary the
     /// fast initializer and joint refinement can faithfully invert.
     ///
     /// This is Design A of #1154. The inner solve still converges the `(t, β)`
     /// system to stationarity at the engine's current ρ (so the implicit-function
-    /// penalized-LAML λ-gradient `dβ̂/dλ = −(H+S_λ)⁻¹(dS_λ/dλ)β̂` stays exact — the encoder
+    /// penalized quasi-Laplace λ-gradient `dβ̂/dλ = −(H+S_λ)⁻¹(dS_λ/dλ)β̂` stays exact — the encoder
     /// only warm-starts/co-adapts, it never replaces the stationary point). The
     /// added term
     ///
@@ -4006,10 +4006,10 @@ impl SaeManifoldTerm {
     /// ```
     ///
     /// folds the post-fit amortized-encode quality into the ranked objective. The
-    /// weights are auto-scaled to the penalized LAML criterion magnitude (magic by default:
+    /// weights are auto-scaled to the penalized quasi-Laplace criterion magnitude (magic by default:
     /// no caller knob) so the consistency term is a meaningful but non-dominant
     /// fraction of the objective regardless of problem scale.
-    pub fn penalized_laml_criterion_cotrained(
+    pub fn penalized_quasi_laplace_criterion_cotrained(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -4020,51 +4020,52 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss, AmortizedEncoderConsistency), String> {
         // #1154: always attempt the amortized warm-start first inside
-        // `penalized_laml_criterion_cotrained` (the encode/warm path for the cotrained
+        // `penalized_quasi_laplace_criterion_cotrained` (the encode/warm path for the cotrained
         // objective). Good warm-starts from the running dictionary land the
         // inner solve closer to the stationary point used for the fold.
         // Advisory only (0 or err falls back to cold); telemetry recorded by
         // outer objective callers when present.
         self.warm_start_latents_from_amortized_encoder(target, rho)
             .unwrap_or(0);
-        let (penalized_laml, loss) = self.penalized_laml_criterion_with_refine_policy(
-            target,
-            rho,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-            true,
-        )?;
+        let (penalized_quasi_laplace, loss) = self
+            .penalized_quasi_laplace_criterion_with_refine_policy(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                true,
+            )?;
         let consistency = self.amortized_encoder_consistency(target, rho)?;
-        // Auto-scale the co-training weights to the penalized-LAML magnitude so the
+        // Auto-scale the co-training weights to the penalized quasi-Laplace magnitude so the
         // consistency penalty is a bounded, scale-free fraction of the objective
         // (magic by default: no caller knob). `criterion_scale` floors at 1 so a
         // near-zero criterion still admits a meaningful consistency contribution.
-        let cotrained = Self::fold_cotrain_consistency(penalized_laml, &consistency);
+        let cotrained = Self::fold_cotrain_consistency(penalized_quasi_laplace, &consistency);
         Ok((cotrained, loss, consistency))
     }
 
     /// #1154 — the single source of the co-training fold arithmetic: add the
     /// auto-scaled amortized-encoder consistency penalty to an already-computed
-    /// penalized LAML criterion at the converged dictionary. Both the public
-    /// [`Self::penalized_laml_criterion_cotrained`] entry point and the outer-loop value /
+    /// penalized quasi-Laplace criterion at the converged dictionary. Both the public
+    /// [`Self::penalized_quasi_laplace_criterion_cotrained`] entry point and the outer-loop value /
     /// gradient lanes (`SaeManifoldOuterObjective::fold_cotrain_consistency`)
     /// route through THIS function, so the folded objective cannot drift between
     /// the criterion and the cascade-ranked cost (the objective↔gradient desync
-    /// bug class). The weights are auto-scaled to the penalized-LAML magnitude
+    /// bug class). The weights are auto-scaled to the penalized quasi-Laplace magnitude
     /// (`max(|penalized_LAML|,
     /// 1)`) so the penalty is a bounded, scale-free fraction of the objective
     /// regardless of problem scale; the fold carries no analytic gradient (under
-    /// Design A the penalized-LAML λ-gradient stays the exact implicit-function path).
+    /// Design A the penalized quasi-Laplace λ-gradient stays the exact implicit-function path).
     #[must_use]
     pub fn fold_cotrain_consistency(
-        penalized_laml_cost: f64,
+        penalized_quasi_laplace_cost: f64,
         consistency: &AmortizedEncoderConsistency,
     ) -> f64 {
-        let criterion_scale = penalized_laml_cost.abs().max(1.0);
-        penalized_laml_cost
+        let criterion_scale = penalized_quasi_laplace_cost.abs().max(1.0);
+        penalized_quasi_laplace_cost
             + COTRAIN_RECON_WEIGHT * criterion_scale * consistency.recon_consistency
             + COTRAIN_CONVERGENCE_WEIGHT * criterion_scale * consistency.unconverged_fraction
     }
@@ -4076,7 +4077,7 @@ impl SaeManifoldTerm {
     /// stationarity. Unconverged rows are left at their current coordinates, so the
     /// warm-start can only help. The subsequent inner Newton refines from this seed to
     /// the SAME stationary point (the warm-start changes only the basin entry,
-    /// not the root), so the penalized-LAML λ-gradient stays exactly the implicit-function
+    /// not the root), so the penalized quasi-Laplace λ-gradient stays exactly the implicit-function
     /// path and the criterion is unchanged at convergence — the amortized encoder
     /// only accelerates/co-adapts the inner solve, it never replaces the
     /// stationary point.
@@ -4567,7 +4568,7 @@ impl SaeManifoldTerm {
     /// (`loss.assignment_sparsity`) energy, so adding the registry ARD /
     /// assignment value on top would double-count, and the gauge-only
     /// coordinate penalties are not part of the penalized deviance the
-    /// penalized LAML criterion scores. The decoder-block penalties, by contrast,
+    /// penalized quasi-Laplace criterion scores. The decoder-block penalties, by contrast,
     /// are real penalized-energy terms with no `loss.*` representative: the
     /// inner solve minimizes them (they enter `gb`/`hbb`) but they were absent
     /// from the criterion scalar `v`. This restores that consistency so the
@@ -4578,7 +4579,7 @@ impl SaeManifoldTerm {
     /// NOTE: the coordinate-block penalties with no native `loss.*` twin
     /// (`ScadMcp`, `BlockOrthogonality`) carry the same residual inconsistency
     /// (scored in the line search via `penalized_objective_total`, absent from
-    /// the penalized-LAML scalar). They are left out here because they share a registry
+    /// the penalized quasi-Laplace scalar). They are left out here because they share a registry
     /// dispatch with the always-on `Isometry` gauge, whose inclusion in the
     /// topology-comparison criterion is a separate design question (#673:
     /// topology evidence is gauge-conditional). Folding the coord-tier energy in
@@ -4625,7 +4626,7 @@ impl SaeManifoldTerm {
     /// summed over atoms, evaluated through `corrected_isometry_penalty` so the
     /// live decoder/coordinate caches drive the value exactly as the assemble
     /// path does. It has no `SaeManifoldLoss` twin (the loss carries only
-    /// data-fit / assignment / smoothness / ARD), so the penalized LAML criterion
+    /// data-fit / assignment / smoothness / ARD), so the penalized quasi-Laplace criterion
     /// must add it explicitly to score the same penalized objective the inner
     /// solve descends.
     pub fn isometry_penalty_value_total(
@@ -4681,7 +4682,7 @@ impl SaeManifoldTerm {
 
     /// Extra penalized-objective energy that has no native `SaeManifoldLoss`
     /// component but is part of the objective the inner Newton solve descends,
-    /// and therefore of the penalized deviance the SAE penalized LAML criterion
+    /// and therefore of the penalized deviance the SAE penalized quasi-Laplace criterion
     /// must rank.
     ///
     /// ENVELOPE CONTRACT: the criterion value `v = loss.total() + extra +
@@ -4951,7 +4952,7 @@ impl SaeManifoldTerm {
     /// relative spectral cutoff used elsewhere in the codebase).
     ///
     /// Used to count the penalised dimension of each atom's `smooth_penalty`
-    /// `S_k` so the penalized LAML criterion's `−½·p·rank(S)·log λ_smooth` Occam term
+    /// `S_k` so the penalized quasi-Laplace criterion's `−½·p·rank(S)·log λ_smooth` Occam term
     /// uses the *effective* penalty rank rather than the ambient basis size
     /// (a thin-plate / B-spline penalty has a non-trivial null space).
     pub(crate) fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
@@ -4983,11 +4984,11 @@ impl SaeManifoldTerm {
     }
 }
 
-// [#780 line-count gate] The quasi-Laplace evidence criterion (`penalized_laml_criterion*`)
+// [#780 line-count gate] The quasi-Laplace evidence criterion (`penalized_quasi_laplace_criterion*`)
 // and the evidence-pricing machinery around it live in the sibling
-// `construction_reml_evidence.rs` as a second `impl SaeManifoldTerm` block,
+// `construction_quasi_laplace.rs` as a second `impl SaeManifoldTerm` block,
 // inlined here so it keeps the SAME module scope and private-field access.
-include!("construction_reml_evidence.rs");
+include!("construction_quasi_laplace.rs");
 
 // [#780 line-count gate] Per-row jet / reconstruction-channel assembly for the
 // streaming-exact arrow log-det lives in a sibling file as a second

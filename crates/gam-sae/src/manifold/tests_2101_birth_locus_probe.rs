@@ -182,7 +182,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli() {
                 all_born_finite.set(false);
             }
             log.borrow_mut().push(format!(
-                "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} top2col={:.2} PR={:.2} ev={:?} penalized_laml_after={:?}",
+                "{:?} round={} sweep={} k={} born|B|={:.3e} rows={:?} top2col={:.2} PR={:.2} ev={:?} penalized_quasi_laplace_after={:?}",
                 pg.event,
                 pg.birth_round,
                 pg.backfit_sweep,
@@ -192,7 +192,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli() {
                 top2,
                 pr,
                 pg.ev.map(|e| (e * 10000.0).round() / 10000.0),
-                pg.joint_penalized_laml_after.map(|r| (r * 100.0).round() / 100.0),
+                pg.joint_penalized_quasi_laplace_after.map(|r| (r * 100.0).round() / 100.0),
             ));
             Ok(())
         };
@@ -213,7 +213,9 @@ fn probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli() {
             .push(format!("FINAL: k={k} births={births}"));
         (k, births)
     };
-    eprintln!("\n==== #2101 BIRTH LOCUS TRAJECTORY (disjoint 6-circle ordered_beta_bernoulli) ====");
+    eprintln!(
+        "\n==== #2101 BIRTH LOCUS TRAJECTORY (disjoint 6-circle ordered_beta_bernoulli) ===="
+    );
     for line in log.borrow().iter() {
         eprintln!("{line}");
     }

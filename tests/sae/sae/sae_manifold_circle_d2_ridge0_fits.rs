@@ -2,7 +2,7 @@
 //! Euclidean chart carrying intrinsically 1-D circular data) must FIT through the
 //! production outer engine at ridge-0, not error out.
 //!
-//! Root cause (perf1689): the inner `penalized_laml_criterion` accepts the converged inner
+//! Root cause (perf1689): the inner `penalized_quasi_laplace_criterion` accepts the converged inner
 //! `(t, β)` optimum through the stall-acceptance certificates (KKT grad-norm and
 //! the #2226 affine Newton-decrement ½λ²), but both were computed ONLY from the
 //! ridge-0 undamped factorization of the stationary system. A d=2 chart on
@@ -184,7 +184,7 @@ fn sae_manifold_circle_d2_ridge0_fits() {
     // itself (not just the optimizer's bookkeeping) must return a finite score for
     // this feasible over-parametrized fit.
     let (recheck_cost, _loss) = fitted_term
-        .penalized_laml_criterion(
+        .penalized_quasi_laplace_criterion(
             z.view(),
             &fitted.rho,
             None,

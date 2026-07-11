@@ -100,7 +100,7 @@ impl From<OuterGradientError> for String {
 pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
 
 /// #1154 — base co-training weight for the amortized-encoder reconstruction
-/// consistency penalty, as a fraction of the penalized LAML criterion magnitude. The
+/// consistency penalty, as a fraction of the penalized quasi-Laplace criterion magnitude. The
 /// effective weight is `COTRAIN_RECON_WEIGHT · max(|REML|, 1)`, so the penalty
 /// is a bounded, scale-free share of the objective and needs no caller knob.
 pub(crate) const COTRAIN_RECON_WEIGHT: f64 = 0.1;

@@ -139,7 +139,7 @@ fn evaluate(
 ) -> (SaeManifoldTerm, f64, SaeManifoldLoss, ArrowFactorCache) {
     let mut term = start.clone();
     let (value, loss, cache) = term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             rho,
             None,
@@ -302,7 +302,7 @@ fn sae_outer_rho_gradient_components_match_centered_fd_softmax() {
 #[test]
 fn sae_outer_rho_gradient_certificate_consistent_under_rank_deficient_k2() {
     // K=2 rank-deficient circle: the indefinite per-row H_tt must be spectral-
-    // deflated at unit stiffness, NOT ridge-damped, so the outer REML value and
+    // deflated at unit stiffness, NOT ridge-damped, so the outer quasi-Laplace value and
     // its analytic ρ-gradient stay consistent (grad·v ≈ fd·v). A ρ-dependent
     // ridge bias would break this certificate and is what stalled the outer BFGS
     // line-search for multi-atom fits (#1117).

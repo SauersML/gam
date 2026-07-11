@@ -1,4 +1,4 @@
-//! #2080 — the OUTER PENALIZED-LAML ρ-search must terminate in a BOUNDED number of
+//! #2080 — the outer penalized quasi-Laplace `ρ` search must terminate in a bounded number of
 //! criterion evaluations at wide output dimension (`p ≈ 96`), where the outer
 //! line search overshoots into the adjacent indefinite (non-PD Laplace) basin on
 //! nearly every probe.
@@ -431,7 +431,7 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
         .expect("finite entry must commit its full converged state");
 
     // Reassemble the exact committed entry and independently recheck the same
-    // strict raw-or-quotient KKT predicate that authorizes penalized LAML evidence. A
+    // strict raw-or-quotient KKT predicate that authorizes penalized quasi-Laplace evidence. A
     // finite value alone cannot satisfy this regression.
     let committed_rho = objective.current_rho.clone();
     let system = objective
@@ -479,10 +479,10 @@ fn run_wide_outer_fit(
             ..Default::default()
         })
         .run(&mut objective, "SAE manifold")
-        .expect("#2080 wide-p outer penalized-LAML fit must terminate, not hang / abort");
+        .expect("#2080 wide-p outer penalized quasi-Laplace fit must terminate, not hang / abort");
     assert!(
         result.converged,
-        "#2080 wide-p acceptance requires a CONVERGED outer penalized-LAML optimum, not a \
+        "#2080 wide-p acceptance requires a CONVERGED outer penalized quasi-Laplace optimum, not a \
          finite max-iteration/line-search incumbent: iterations={}, final_value={:.6e}, \
          final_grad_norm={:?}",
         result.iterations, result.final_value, result.final_grad_norm,
@@ -654,7 +654,7 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
         f64::NAN
     };
     let trial_cost = OuterObjective::eval_cost(&mut probe_objective, &trial)
-        .expect("#2156 instrument initial penalized LAML value probe must complete");
+        .expect("#2156 instrument initial penalized quasi-Laplace value probe must complete");
     let actual_decrease = initial.cost - trial_cost;
     let materialization_ratio = if predicted_decrease.is_finite()
         && predicted_decrease > f64::MIN_POSITIVE
@@ -741,7 +741,7 @@ fn run_ceiling_vs_pathology_instrument(cfg: CeilingPathologyConfig) -> CeilingPa
     }
 }
 
-/// #2080 — the wide-`p` (p=96) K=2 outer penalized-LAML fit must terminate in a bounded
+/// #2080 — the wide-`p` (p=96) K=2 outer penalized quasi-Laplace fit must terminate in a bounded
 /// number of criterion evaluations and recover a materially positive EV — even
 /// though the outer line search overshoots into the non-PD basin on many probes.
 #[test]
@@ -779,7 +779,7 @@ fn wide_p_outer_reml_terminates_within_probe_budget_2080() {
     // unbounded probe count, so this asserts the complementary invariant.
     assert!(
         telemetry.criterion_calls <= 64,
-        "outer penalized-LAML issued {} criterion calls; expected a bounded (<= 64) probe budget",
+        "outer penalized quasi-Laplace issued {} criterion calls; expected a bounded (<= 64) probe budget",
         telemetry.criterion_calls
     );
     assert!(
@@ -995,10 +995,10 @@ fn entangled_two_circle_outer_reml_separates_2080() {
             ..Default::default()
         })
         .run(&mut objective, "SAE manifold entangled two-circle")
-        .expect("#2080 entangled two-circle outer penalized-LAML fit must terminate, not abort");
+        .expect("#2080 entangled two-circle outer penalized quasi-Laplace fit must terminate, not abort");
     assert!(
         result.converged,
-        "#2080 entangled acceptance requires a converged outer penalized-LAML optimum: \
+        "#2080 entangled acceptance requires a converged outer penalized quasi-Laplace optimum: \
          iterations={}, final_value={:.6e}, final_grad_norm={:?}",
         result.iterations, result.final_value, result.final_grad_norm,
     );
@@ -1047,7 +1047,7 @@ fn entangled_two_circle_outer_reml_separates_2080() {
 /// lower rank + fixed smoothing); the inner joint fit's Armijo line search +
 /// proximal-correction LM ridge escalation keeps every step a descent step, so
 /// the fit reaches a finite, materially-positive-EV basin at every ρ instead of
-/// diverging. Each fixed-ρ evaluation must return `Ok` with a finite penalized LAML cost
+/// diverging. Each fixed-ρ evaluation must return `Ok` with a finite penalized quasi-Laplace cost
 /// and (for the feasible low-to-mid smoothing range) a materially positive EV.
 #[test]
 fn small_fold_high_rank_circle_inner_solve_converges_2138() {
@@ -1117,7 +1117,15 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         let mut t = base.clone();
         let r = SaeManifoldRho::new(0.02_f64.ln(), smooth, vec![array![0.0]]);
         let evaluated = t
-            .penalized_laml_criterion_with_cache(z.view(), &r, None, 60, 0.04, 1.0e-6, 1.0e-6)
+            .penalized_quasi_laplace_criterion_with_cache(
+                z.view(),
+                &r,
+                None,
+                60,
+                0.04,
+                1.0e-6,
+                1.0e-6,
+            )
             .unwrap_or_else(|err| {
                 panic!(
                     "#2138: high-working-rank (m={m}) circle inner solve must converge at a \
@@ -1136,7 +1144,7 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         );
         assert!(
             cost.is_finite(),
-            "#2138: inner solve returned a non-finite penalized LAML cost at smoothing={smooth}",
+            "#2138: inner solve returned a non-finite penalized quasi-Laplace cost at smoothing={smooth}",
         );
         assert!(
             ev.is_finite() && ev > 0.30,
@@ -1148,11 +1156,11 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
 }
 
 /// #2080 COST-LANE PROFILER + criterion-finiteness gate.
-/// Measures how a SINGLE outer penalized-LAML criterion evaluation scales in ambient width
+/// Measures how a SINGLE outer penalized quasi-Laplace criterion evaluation scales in ambient width
 /// `p` for the correctly-specified K=1 circle (no co-collapse). Splits the wall
 /// time into: (A) the damped inner (t,β) Newton solve `run_joint_fit_arrow_schur`
 /// and (B) the residual = the undamped-logdet re-converge + dense β-Schur factor
-/// that `penalized_laml_criterion_with_cache_refine_policy` adds on top. This localizes the
+/// that `penalized_quasi_laplace_criterion_with_cache_refine_policy` adds on top. This localizes the
 /// cubic-in-p term the issue tracks. Asserted invariant: the inner solve
 /// converges finitely and the full criterion is FINITE (rankable) at every
 /// width — a non-finite criterion on this correctly-specified probe is the
@@ -1184,7 +1192,7 @@ fn profile_wide_p_criterion_cost_2080() {
         let mut tb = term.clone();
         let b0 = std::time::Instant::now();
         let evaluated = tb
-            .penalized_laml_criterion_with_cache_refine_policy(
+            .penalized_quasi_laplace_criterion_with_cache_refine_policy(
                 z.view(),
                 &rho,
                 None,
@@ -1199,7 +1207,7 @@ fn profile_wide_p_criterion_cost_2080() {
         let dt_b = (dt_full - dt_a).max(0.0);
         assert!(
             evaluated.0.is_finite(),
-            "#2080/#1094: the outer penalized-LAML criterion must be RANKABLE (finite) on a \
+            "#2080/#1094: the outer penalized quasi-Laplace criterion must be RANKABLE (finite) on a \
              correctly-specified K=1 wide-p circle at p={p}; a non-finite value here \
              is the probe-refusal failure class (got {})",
             evaluated.0

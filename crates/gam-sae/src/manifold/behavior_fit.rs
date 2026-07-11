@@ -279,7 +279,7 @@ impl SaeManifoldTerm {
             let base_unscaled: Vec<f64> = (0..blocks.len())
                 .map(|i| base_scaled[i] / cur_log_lambda[i].exp())
                 .collect();
-            let baseline_crit = profiled_penalized_laml_criterion(
+            let baseline_crit = profiled_penalized_quasi_laplace_criterion(
                 n_obs,
                 px,
                 base_rx,
@@ -402,7 +402,7 @@ impl SaeManifoldTerm {
                     let trb_unscaled: Vec<f64> = (0..blocks.len())
                         .map(|i| trb_scaled[i] / trial_ll[i].exp())
                         .collect();
-                    let trial_crit = profiled_penalized_laml_criterion(
+                    let trial_crit = profiled_penalized_quasi_laplace_criterion(
                         n_obs,
                         px,
                         trx,

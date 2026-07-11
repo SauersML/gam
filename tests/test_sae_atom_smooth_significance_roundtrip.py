@@ -26,7 +26,7 @@ gamfit = pytest.importorskip("gamfit")
 # #1512 (OPEN BUG — these tests fail on purpose to flag it; SPEC.md forbids
 # xfail, so the failure stands as the signal): both tests drive a full
 # SAE-manifold atom-smooth REML fit that does not converge — RemlConvergenceError
-# ("SaeManifoldTerm::penalized_laml_criterion: inner solve did not converge at fixed ρ ...
+# ("SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ ...
 # after 3200 inner iterations" / "all 1 seed candidates failed (SAE manifold)").
 # Kept @slow (the fit is ~2-3 min) so it is excluded from the default CI run,
 # but NOT xfailed. Fix the SAE-REML convergence to green these.

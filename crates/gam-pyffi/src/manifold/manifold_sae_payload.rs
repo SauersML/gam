@@ -104,7 +104,7 @@ pub(crate) struct ManifoldSaePayload {
 
     // --- scores -----------------------------------------------------------
     pub(crate) penalized_loss_score: Option<f64>,
-    pub(crate) penalized_laml_criterion: f64,
+    pub(crate) penalized_quasi_laplace_criterion: f64,
     pub(crate) reconstruction_r2: f64,
 
     // --- B. string / int lists --------------------------------------------
@@ -185,7 +185,7 @@ impl ManifoldSaePayload {
         "oos_projection_top1",
         "dispersion",
         "penalized_loss_score",
-        "penalized_laml_criterion",
+        "penalized_quasi_laplace_criterion",
         "reconstruction_r2",
         "primitive_names",
         "basis_specs",

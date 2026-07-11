@@ -827,7 +827,7 @@
     0
   ],
   "oos_projection_top1": true,
-  "penalized_laml_criterion": 41.25,
+  "penalized_quasi_laplace_criterion": 41.25,
   "penalized_loss_score": -37.5,
   "primitive_names": [
     "circle_0",

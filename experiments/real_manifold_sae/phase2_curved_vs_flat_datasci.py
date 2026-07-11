@@ -128,7 +128,7 @@ def run_t2_arm(residual_reduced: np.ndarray, topo: str, args) -> dict:
             "stopped_reason",
             "ev_trace",
             "collapse_events",
-            "terminal_joint_penalized_laml",
+            "terminal_joint_penalized_quasi_laplace",
             "terminal_data_fit",
         ):
             try:

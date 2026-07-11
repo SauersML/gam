@@ -34,7 +34,7 @@
 //!
 //! **`λ_ℓ` independence.** The decoders are read in honest units (`B_k^(ℓ)`
 //! divides block `ℓ`'s columns by `√λ_ℓ`), so the per-block REML relevance weight
-//! `λ_ℓ` — the outer penalized-LAML coordinate that scales the stacked target — cancels and
+//! `λ_ℓ` — the outer penalized quasi-Laplace coordinate that scales the stacked target — cancels and
 //! never enters the drift. Re-weighting a block changes what the fit optimizes, not
 //! the geometry this statistic reports.
 

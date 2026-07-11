@@ -56,7 +56,15 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 .expect("set row loss weights");
         }
         let (_value, _loss, cache) = term
-            .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .penalized_quasi_laplace_criterion_with_cache(
+                target.view(),
+                &rho,
+                None,
+                5,
+                0.4,
+                1.0e-6,
+                1.0e-6,
+            )
             .expect("converged cache");
         let second_jets = term.atom_second_jets().expect("second jets");
         let border = term
@@ -384,7 +392,8 @@ pub(crate) fn frozen_ordered_beta_bernoulli_row_program_gates_on_frozen_not_free
 /// zero logit derivative (its coordinate derivative uses gate 1.0), while a
 /// sibling GATED atom keeps its free-logit gate and a nonzero logit derivative.
 #[test]
-pub(crate) fn ungated_ordered_beta_bernoulli_row_program_gates_at_unit_with_zero_logit_derivative() {
+pub(crate) fn ungated_ordered_beta_bernoulli_row_program_gates_at_unit_with_zero_logit_derivative()
+{
     use ndarray::{Array1, Array4};
     let mut term = fixed_gate_probe_term().0;
     // Atom 0 ungated (dense background tier), atom 1 gated. Not frozen. ordered Beta--Bernoulli

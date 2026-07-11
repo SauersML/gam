@@ -39,8 +39,8 @@ def test_adapter_output_is_one_native_converged_latent_state() -> None:
     assert len(out.coordinates) == len(expected["coords"])
     for actual, reference in zip(out.coordinates, expected["coords"]):
         np.testing.assert_allclose(actual.numpy(), reference)
-    assert out.penalized_laml_criterion.item() == pytest.approx(
-        native.penalized_laml_criterion
+    assert out.penalized_quasi_laplace_criterion.item() == pytest.approx(
+        native.penalized_quasi_laplace_criterion
     )
 
 

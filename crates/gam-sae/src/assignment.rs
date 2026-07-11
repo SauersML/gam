@@ -1116,51 +1116,6 @@ pub fn threshold_gate_row(
     out
 }
 
-/// Fitted-encoder gate activations `a = gate(logits)` for a full `(N, K)` logit
-/// matrix under the named assignment family.
-///
-/// This is the SINGLE SOURCE OF TRUTH for "turn a fitted model's routing logits
-/// into per-atom activations": the closed-form fitter (via [`softmax_row`] /
-/// [`ordered_beta_bernoulli_row`] / [`threshold_gate_row`]) and the post-hoc distilled-encoder path
-/// both read it, so a distilled encoder's activation is bit-identical to the
-/// model it distills. Formerly the Python `gamfit.distill` module re-derived
-/// this math and drifted (issue #2011: Python is a thin wrapper, no shadow math).
-///
-/// `kind` is the canonical assignment token (`"softmax"`, `"ordered_beta_bernoulli"`,
-/// or `"threshold_gate"`). `threshold` is read only for the gate family.
-/// Non-finite logits and unsupported kinds are surfaced as errors.
-pub fn activation_matrix_from_logits(
-    logits: ArrayView2<'_, f64>,
-    kind: &str,
-    temperature: f64,
-    threshold: f64,
-) -> Result<Array2<f64>, String> {
-    if !(temperature.is_finite() && temperature > 0.0) {
-        return Err(format!(
-            "activation_matrix_from_logits: temperature must be finite and positive; got {temperature}"
-        ));
-    }
-    let (n_rows, k_atoms) = logits.dim();
-    let mut out = Array2::<f64>::zeros((n_rows, k_atoms));
-    for row in 0..n_rows {
-        let row_logits = logits.row(row);
-        validate_finite_logits(row_logits, row)?;
-        let activation = match kind {
-            "softmax" => softmax_row(row_logits, temperature),
-            "ordered_beta_bernoulli" => ordered_beta_bernoulli_row(row_logits, temperature),
-            "threshold_gate" => threshold_gate_row(row_logits, temperature, threshold),
-            other => {
-                return Err(format!(
-                    "activation_matrix_from_logits: unsupported assignment kind {other:?} \
-                     (expected 'softmax', 'ordered_beta_bernoulli', or 'threshold_gate')"
-                ));
-            }
-        };
-        out.row_mut(row).assign(&activation);
-    }
-    Ok(out)
-}
-
 /// Hard top-`k` support row (the [`AssignmentMode::TopK`] gate): 1.0 for the
 /// `k` largest routing logits in the row, 0.0 elsewhere. Ties break toward the
 /// LOWER atom index so the support is deterministic. `k ≥ len` degenerates to
@@ -1454,11 +1409,11 @@ fn ordered_beta_bernoulli_prior_penalty(
             .unwrap_or(base_alpha)
     };
     // #991 design-honesty weights: the ordered Beta--Bernoulli prior is not row-separable (the
-    // plug-in π̂ couples rows through the column active mass), so the weights are
+    // exact integrated scalar couples rows through the column active mass), so the weights are
     // installed ON the penalty — its value/grad/hessian/hvp/ρ- and third
     // channels all fold them identically (weighted mass `M_k = Σ w_i z_ik` and
     // carrier `u = w·J`), keeping every channel the exact derivative of one
-    // weighted energy. `None` ⇒ bit-for-bit the historical unweighted path.
+    // weighted energy. `None` gives the unit-weight operator.
     let mut penalty =
         OrderedBetaBernoulliPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable)
             .with_row_weights(row_weights);
@@ -1474,6 +1429,120 @@ fn ordered_beta_bernoulli_prior_penalty(
         Array1::zeros(0)
     };
     (penalty, rho_view)
+}
+
+/// Apply the exact ordered Beta--Bernoulli logit Hessian minus the diagonal
+/// PSD majorizer installed in the Newton/Laplace operator.
+///
+/// The exact integrated marginal contributes a dense-within-column Hessian:
+/// a negative rank-one active-mass term plus a row-local concrete-Jacobian
+/// diagonal. The assembled operator keeps only the positive part of that
+/// diagonal, because zero is a PSD Loewner majorizer of the negative rank-one
+/// term. The stationarity IFT must nevertheless invert the exact scalar
+/// Hessian, so `A - B` is applied here analytically and matrix-free. No dense
+/// `N K × N K` matrix or persistent low-rank carrier is constructed.
+pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+    row_weights: Option<&[f64]>,
+    direction: ArrayView1<'_, f64>,
+) -> Result<Option<Array1<f64>>, String> {
+    let AssignmentMode::OrderedBetaBernoulli {
+        temperature, alpha, ..
+    } = assignment.mode
+    else {
+        return Ok(None);
+    };
+    let target = flat_logits(assignment.logits.view());
+    if direction.len() != target.len() {
+        return Err(format!(
+            "ordered Beta--Bernoulli exact-Hessian direction has length {}; expected {}",
+            direction.len(),
+            target.len()
+        ));
+    }
+    if !direction.iter().all(|value| value.is_finite()) {
+        return Err("ordered Beta--Bernoulli exact-Hessian direction must be finite".to_string());
+    }
+    if assignment.routing_is_frozen() {
+        return Ok(Some(Array1::<f64>::zeros(target.len())));
+    }
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)?;
+    }
+
+    let (penalty, rho_view) =
+        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+    let mut delta = penalty.hvp(target.view(), rho_view.view(), direction);
+    let channels = penalty.psd_majorizer_logit_third_channels(target.view(), rho_view.view());
+    for index in 0..delta.len() {
+        delta[index] -= channels.diagonal_term[index].max(0.0) * direction[index];
+    }
+    Ok(Some(delta))
+}
+
+#[cfg(test)]
+mod ordered_beta_bernoulli_exact_hessian_tests {
+    use super::*;
+
+    #[test]
+    fn exact_hessian_minus_majorizer_hvp_matches_gradient_fd_and_keeps_cross_row_term() {
+        let n = 4usize;
+        let k = 2usize;
+        let logits =
+            Array2::from_shape_vec((n, k), vec![0.2, -0.3, 0.7, -0.1, 0.4, 0.5, -0.2, 0.6])
+                .unwrap();
+        let coords = vec![Array2::<f64>::zeros((n, 1)); k];
+        let assignment = SaeAssignment::from_blocks_with_mode(
+            logits,
+            coords,
+            AssignmentMode::ordered_beta_bernoulli(0.8, 1.7, false),
+        )
+        .unwrap();
+        let rho = SaeManifoldRho::new(1.3_f64.ln(), 0.0, vec![Array1::zeros(1); k]);
+        // Excite one logit only. The exact integrated marginal must still
+        // produce nonzero output on other rows of the same atom column.
+        let mut direction = Array1::<f64>::zeros(n * k);
+        direction[0] = 0.7;
+        let analytic = ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
+            &assignment,
+            &rho,
+            None,
+            direction.view(),
+        )
+        .unwrap()
+        .unwrap();
+
+        let AssignmentMode::OrderedBetaBernoulli {
+            temperature, alpha, ..
+        } = assignment.mode
+        else {
+            unreachable!()
+        };
+        let (penalty, rho_view) =
+            ordered_beta_bernoulli_prior_penalty(&assignment, &rho, alpha, temperature, None);
+        let target = flat_logits(assignment.logits.view());
+        let step = 1.0e-6;
+        let plus = &target + &(step * &direction);
+        let minus = &target - &(step * &direction);
+        let gradient_plus = penalty.grad_target(plus.view(), rho_view.view());
+        let gradient_minus = penalty.grad_target(minus.view(), rho_view.view());
+        let channels = penalty.psd_majorizer_logit_third_channels(target.view(), rho_view.view());
+        for index in 0..analytic.len() {
+            let exact_fd = (gradient_plus[index] - gradient_minus[index]) / (2.0 * step);
+            let expected = exact_fd - channels.diagonal_term[index].max(0.0) * direction[index];
+            assert!(
+                (analytic[index] - expected).abs() <= 2.0e-7,
+                "index {index}: analytic A-B={} expected={} exact_fd={exact_fd}",
+                analytic[index],
+                expected,
+            );
+        }
+        assert!(
+            analytic[2].abs() > 1.0e-6 && analytic[4].abs() > 1.0e-6,
+            "a one-row direction must produce the exact cross-row rank-one action: {analytic:?}"
+        );
+    }
 }
 
 pub fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {

@@ -24,7 +24,15 @@ pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
     // small but live, and its log-α derivative is exactly what the trace and the
     // FD oracle both probe — with deflation active (5 directions).
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            5,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged cache");
     assert!(
         cache.gauge_deflated_directions > 0,
@@ -94,7 +102,7 @@ pub(crate) fn assignment_log_strength_trace_ignores_fixed_logit_bug4() {
             let mut rr = rho.clone();
             rr.log_lambda_sparse = r;
             if probe
-                .penalized_laml_criterion_with_cache(
+                .penalized_quasi_laplace_criterion_with_cache(
                     target.view(),
                     &rr,
                     None,
@@ -113,7 +121,15 @@ pub(crate) fn assignment_log_strength_trace_ignores_fixed_logit_bug4() {
             found.expect("no PD-region ρ found for the ungated fixed-logit fixture");
     }
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            5,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged cache at the PD ρ");
     let solver = DeflatedArrowSolver::plain(&cache);
 

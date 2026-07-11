@@ -108,11 +108,11 @@ pub(crate) use gam_solve::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp,
-    IdentityRightKroneckerPenaltyOp,
-    SparseBlockKroneckerPenaltyOp, SparseGBlock, SparseRankOnePenaltyOp, StreamingArrowSchur,
-    matrix_free_arrow_inverse_apply, matrix_free_arrow_operator_apply, prepare_sae_resident_frame,
-    row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction,
-    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
+    IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
+    SparseRankOnePenaltyOp, StreamingArrowSchur, matrix_free_arrow_inverse_apply,
+    matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions,
+    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
+    solve_with_lm_escalation_inner,
 };
 
 pub(crate) use gam_terms::analytic_penalties::{
@@ -271,7 +271,6 @@ mod tests_parallelism_invariance_1557;
 mod tests_olmo;
 
 #[cfg(test)]
-
 #[cfg(test)]
 mod tests_startup_validation_1782;
 
@@ -393,9 +392,8 @@ mod tests_cocollapse_disjoint_2027;
 mod tests_cocollapse_reseed_2089;
 
 #[cfg(test)]
-
 #[cfg(test)]
-mod tests_outer_reml_probe_budget_2080;
+mod tests_outer_quasi_laplace_probe_budget_2080;
 
 #[cfg(test)]
 #[cfg(test)]

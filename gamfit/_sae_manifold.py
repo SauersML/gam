@@ -76,13 +76,11 @@ def _optional_array(value: Any, *, dimensions: int) -> np.ndarray | None:
     return np.ascontiguousarray(array)
 
 
-def _atom_dimensions(value: Any) -> list[int] | None:
-    if value is None or value == "auto":
-        return None
+def _atom_dimensions(value: Any) -> list[int]:
+    if isinstance(value, str):
+        raise TypeError("d_atom must be an integer or a sequence of integers")
     if isinstance(value, (int, np.integer)):
         return [int(value)]
-    if isinstance(value, str):
-        raise TypeError("d_atom must be an integer, a sequence of integers, or 'auto'")
     return [int(dimension) for dimension in value]
 
 
@@ -162,7 +160,6 @@ def sae_manifold_fit(
     fisher_factors: Any = None,
     weights: Any = None,
     separation_barrier_strength: float | None = None,
-    ordered_beta_bernoulli_alpha: float | None = None,
     promote_from_residual: bool = True,
 ) -> ManifoldSAE:
     """Fit and return the immutable Rust-owned manifold-SAE model.
@@ -227,14 +224,7 @@ def sae_manifold_fit(
             if separation_barrier_strength is None
             else float(separation_barrier_strength)
         ),
-        ordered_beta_bernoulli_alpha_override=(
-            None
-            if ordered_beta_bernoulli_alpha is None
-            else float(ordered_beta_bernoulli_alpha)
-        ),
         promote_from_residual=bool(promote_from_residual),
-        run_structure_search=True,
-        run_outer_rho_search=True,
     )
 
 

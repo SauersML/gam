@@ -217,7 +217,7 @@ pub(crate) fn sequential_deflation_gives_both_atoms_material_norm_2027() {
 ///
 /// NOTE: this exercises the INNER joint solve (`run_joint_fit_arrow_schur` at a
 /// fixed ρ) — the co-collapse / structure-recovery layer the seeding + anchoring fix
-/// lives in — not the outer penalized-LAML ρ-search whose non-PD-Hessian retries are the
+/// lives in — not the outer penalized quasi-Laplace ρ-search whose non-PD-Hessian retries are the
 /// separate Python-side "hang" at wide `p`.
 #[test]
 pub(crate) fn two_circle_separates_at_narrow_and_wide_widths_2027() {

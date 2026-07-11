@@ -590,7 +590,9 @@ fn sae_manifold_joint_two_circle_recovery_ordered_beta_bernoulli() {
     let r2 = 1.0 - ssr / sst.max(1.0e-12);
 
     // ---- VERBATIM diagnostic dump -----------------------------------------
-    println!("=== SAE two-circle recovery (ordered independent Beta--Bernoulli, production cold driver) ===");
+    println!(
+        "=== SAE two-circle recovery (ordered independent Beta--Bernoulli, production cold driver) ==="
+    );
     println!(
         "signal_scale={signal_scale:.6}  noise_sigma={:.6}",
         0.04 * signal_scale

@@ -1,6 +1,6 @@
 use super::*;
 
-/// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED-LAML
+/// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED QUASI-LAPLACE
 /// optimizer.
 ///
 /// The term's inner solve always reads a full per-atom, per-axis precision
@@ -32,7 +32,7 @@ pub enum ArdSharing {
     Shared,
 }
 
-/// Whether assignment strength contributes an outer penalized-LAML coordinate.
+/// Whether assignment strength contributes an outer penalized quasi-Laplace coordinate.
 ///
 /// The stored [`SaeManifoldRho::log_lambda_sparse`] value remains available to
 /// the inner assignment prior, but the flat outer layout includes it only when
@@ -113,7 +113,7 @@ pub struct SaeManifoldRho {
     /// its closed-form REML variance ratio is
     /// [`crate::manifold::behavior::OutputBlock::reml_updated_log_lambda`] and its
     /// analytic outer gradient is
-    /// [`crate::manifold::behavior::profiled_penalized_laml_block_log_lambda_gradient`].
+    /// [`crate::manifold::behavior::profiled_penalized_quasi_laplace_block_log_lambda_gradient`].
     pub log_lambda_block: Vec<f64>,
 }
 

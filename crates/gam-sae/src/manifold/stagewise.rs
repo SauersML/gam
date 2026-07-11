@@ -13,7 +13,7 @@
 //! architectural response: retire the simultaneous cold-start joint fit from the
 //! training path and build `K` from proven K=1 fits (forward-stagewise fitting +
 //! backfitting — Hastie–Tibshirani — meets k-SVD, where the per-atom update is a
-//! certified 1-manifold penalized LAML fit rather than a rank-1 SVD). The joint solver
+//! certified 1-manifold penalized quasi-Laplace fit rather than a rank-1 SVD). The joint solver
 //! survives, demoted to a warm, guards-off polish and to evaluating the joint
 //! evidence once at a converged point.
 //!
@@ -29,7 +29,7 @@
 //! versus (B) *extending the previous atom's chart* — refitting the last atom so
 //! it can absorb the residual arc it left behind (stagewise arc-tiling, caught at
 //! birth rather than by post-hoc fusion). Acceptance is an EVIDENCE gate (the
-//! frozen joint penalized LAML criterion strictly improves) PLUS an explicit MINIMUM-EFFECT
+//! frozen joint penalized quasi-Laplace criterion strictly improves) PLUS an explicit MINIMUM-EFFECT
 //! floor ([`StagewiseConfig::min_effect_ev`]): with frontier-scale `n`, evidence
 //! alone keeps true-but-trivial wiggles forever, so salience is a separate,
 //! explicit dial (a config knob whose null-recovering default is `0.0`, never a
@@ -60,8 +60,8 @@
 //! [`SaeManifoldTerm::merge_tiers`] and runs a SINGLE frozen (`inner_max_iter ==
 //! 0`, the #850 freeze) arrow-Schur pass — evaluate-don't-optimize — to read the
 //! joint Laplace evidence at the converged point without moving β. That freeze is
-//! already exposed by [`SaeManifoldTerm::penalized_laml_criterion`] at `inner_max_iter ==
-//! 0`, so no new `frozen_evaluate` primitive is needed; [`frozen_joint_penalized_laml`]
+//! already exposed by [`SaeManifoldTerm::penalized_quasi_laplace_criterion`] at `inner_max_iter ==
+//! 0`, so no new `frozen_evaluate` primitive is needed; [`frozen_joint_penalized_quasi_laplace`]
 //! is the thin, named wrapper this module and its callers use.
 //!
 //! # Determinism & SPEC
@@ -69,8 +69,8 @@
 //! No RNG, no clock, no wall-clock budget, no grid search. Every threshold is a
 //! typed config knob (defaulting to the null-recovering value) or a data-derived
 //! quantity (the residual model's evidence-selected factor rank is the salience
-//! oracle). penalized LAML throughout (the inner fits and the frozen evidence pass are the
-//! same penalized LAML criterion every term is scored by).
+//! oracle). penalized quasi-Laplace throughout (the inner fits and the frozen evidence pass are the
+//! same penalized quasi-Laplace criterion every term is scored by).
 
 use ndarray::{Array1, Array2, ArrayView2};
 
@@ -170,11 +170,11 @@ pub struct BirthRecord {
     /// Explained residual energy `‖Λ_:,0‖²` of the top factor the seed came from
     /// — the birth's dose, reported so a trivial-but-real wiggle is visible.
     pub factor_energy: f64,
-    /// Frozen joint penalized LAML criterion before the round (lower is better evidence).
-    pub joint_penalized_laml_before: f64,
-    /// Frozen joint penalized LAML criterion of the winning candidate (or the unchanged
+    /// Frozen joint penalized quasi-Laplace criterion before the round (lower is better evidence).
+    pub joint_penalized_quasi_laplace_before: f64,
+    /// Frozen joint penalized quasi-Laplace criterion of the winning candidate (or the unchanged
     /// pre-round value when the round was rejected).
-    pub joint_penalized_laml_after: f64,
+    pub joint_penalized_quasi_laplace_after: f64,
     /// Whether a candidate cleared BOTH the evidence gate and the minimum-effect
     /// floor and was adopted.
     pub accepted: bool,
@@ -204,9 +204,9 @@ pub struct StagewiseReport {
     pub backfit_ev_trace: Vec<f64>,
     /// Why the forward-birth phase stopped.
     pub stopped_reason: StagewiseStop,
-    /// The frozen (evaluate-don't-optimize) joint penalized LAML criterion of the final
+    /// The frozen (evaluate-don't-optimize) joint penalized quasi-Laplace criterion of the final
     /// composed dictionary — the terminal Phase-3 evidence.
-    pub terminal_joint_penalized_laml: f64,
+    pub terminal_joint_penalized_quasi_laplace: f64,
     /// The loss breakdown at the frozen terminal state.
     pub terminal_joint_loss: SaeManifoldLoss,
 }
@@ -253,9 +253,9 @@ pub struct StagewiseProgress<'a> {
     pub births_rejected: usize,
     pub ev: Option<f64>,
     pub factor_energy: Option<f64>,
-    pub joint_penalized_laml_before: Option<f64>,
-    pub joint_penalized_laml_after: Option<f64>,
-    pub terminal_joint_penalized_laml: Option<f64>,
+    pub joint_penalized_quasi_laplace_before: Option<f64>,
+    pub joint_penalized_quasi_laplace_after: Option<f64>,
+    pub terminal_joint_penalized_quasi_laplace: Option<f64>,
     pub term: &'a SaeManifoldTerm,
     pub rho: &'a SaeManifoldRho,
 }
@@ -282,15 +282,15 @@ fn emit_stagewise_progress(
         StagewiseEventKind::BirthAccepted | StagewiseEventKind::BirthRejected => {
             let fmt = |v: Option<f64>| v.map_or_else(|| "-".to_string(), |x| format!("{x:.4}"));
             log::warn!(
-                "[stagewise] birth round {} {:?}: K={} accepted={} rejected={} ev={} penalized_laml {} -> {}",
+                "[stagewise] birth round {} {:?}: K={} accepted={} rejected={} ev={} penalized_quasi_laplace {} -> {}",
                 event.birth_round,
                 event.event,
                 event.k_atoms,
                 event.births_accepted,
                 event.births_rejected,
                 fmt(event.ev),
-                fmt(event.joint_penalized_laml_before),
-                fmt(event.joint_penalized_laml_after),
+                fmt(event.joint_penalized_quasi_laplace_before),
+                fmt(event.joint_penalized_quasi_laplace_after),
             );
         }
         _ => {}
@@ -309,7 +309,7 @@ fn current_residual(
     Ok(&target.to_owned() - &fitted)
 }
 
-/// Frozen (`inner_max_iter == 0`, the #850 freeze) joint penalized LAML criterion of a term
+/// Frozen (`inner_max_iter == 0`, the #850 freeze) joint penalized quasi-Laplace criterion of a term
 /// at its current `(t, β)` — evaluate-don't-optimize. This is the joint-Laplace
 /// evidence at a fixed converged state (`loss.total() + extra penalties + ½
 
@@ -348,14 +348,14 @@ fn refresh_terminal_row_metric(
 
 /// log|H| − Occam`), the quantity the birth evidence gate and the terminal
 /// assembly compare on. Lower is better evidence.
-pub fn frozen_joint_penalized_laml(
+pub fn frozen_joint_penalized_quasi_laplace(
     term: &mut SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     rho: &SaeManifoldRho,
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<(f64, SaeManifoldLoss), String> {
-    term.penalized_laml_criterion(
+    term.penalized_quasi_laplace_criterion(
         target,
         rho,
         registry,
@@ -1060,9 +1060,9 @@ pub fn fit_stagewise(
             births_rejected,
             ev: ev_trace.last().copied(),
             factor_energy: None,
-            joint_penalized_laml_before: None,
-            joint_penalized_laml_after: None,
-            terminal_joint_penalized_laml: None,
+            joint_penalized_quasi_laplace_before: None,
+            joint_penalized_quasi_laplace_after: None,
+            terminal_joint_penalized_quasi_laplace: None,
             term: &term,
             rho: &rho,
         },
@@ -1098,9 +1098,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(entry_ev),
                 factor_energy: None,
-                joint_penalized_laml_before: None,
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: None,
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1130,9 +1130,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(entry_ev),
                 factor_energy: None,
-                joint_penalized_laml_before: None,
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: None,
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1184,9 +1184,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(entry_ev),
                 factor_energy: Some(factor_energy),
-                joint_penalized_laml_before: None,
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: None,
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1205,15 +1205,15 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(entry_ev),
                 factor_energy: Some(factor_energy),
-                joint_penalized_laml_before: None,
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: None,
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
         )?;
-        let (current_penalized_laml, _) =
-            frozen_joint_penalized_laml(&mut term, target, &rho, registry, config)?;
+        let (current_penalized_quasi_laplace, _) =
+            frozen_joint_penalized_quasi_laplace(&mut term, target, &rho, registry, config)?;
         let cur_ev = ev_of(&term, target);
         emit_stagewise_progress(
             &mut progress,
@@ -1229,9 +1229,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(cur_ev),
                 factor_energy: Some(factor_energy),
-                joint_penalized_laml_before: Some(current_penalized_laml),
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1252,9 +1252,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(cur_ev),
                 factor_energy: Some(factor_energy),
-                joint_penalized_laml_before: Some(current_penalized_laml),
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1291,7 +1291,7 @@ pub fn fit_stagewise(
                     registry,
                     config,
                 )?;
-                let (penalized_laml, _) = frozen_joint_penalized_laml(
+                let (penalized_quasi_laplace, _) = frozen_joint_penalized_quasi_laplace(
                     &mut cand_term,
                     target,
                     &cand_rho,
@@ -1299,10 +1299,10 @@ pub fn fit_stagewise(
                     config,
                 )?;
                 let ev = ev_of(&cand_term, target);
-                Ok((cand_term, cand_rho, penalized_laml, ev))
+                Ok((cand_term, cand_rho, penalized_quasi_laplace, ev))
             })
             .ok();
-        if let Some((cand_term, cand_rho, penalized_laml, ev)) = cand_a.as_ref() {
+        if let Some((cand_term, cand_rho, penalized_quasi_laplace, ev)) = cand_a.as_ref() {
             emit_stagewise_progress(
                 &mut progress,
                 StagewiseProgress {
@@ -1317,9 +1317,9 @@ pub fn fit_stagewise(
                     births_rejected,
                     ev: Some(*ev),
                     factor_energy: Some(factor_energy),
-                    joint_penalized_laml_before: Some(current_penalized_laml),
-                    joint_penalized_laml_after: Some(*penalized_laml),
-                    terminal_joint_penalized_laml: None,
+                    joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                    joint_penalized_quasi_laplace_after: Some(*penalized_quasi_laplace),
+                    terminal_joint_penalized_quasi_laplace: None,
                     term: cand_term,
                     rho: cand_rho,
                 },
@@ -1339,9 +1339,9 @@ pub fn fit_stagewise(
                     births_rejected,
                     ev: Some(cur_ev),
                     factor_energy: Some(factor_energy),
-                    joint_penalized_laml_before: Some(current_penalized_laml),
-                    joint_penalized_laml_after: None,
-                    terminal_joint_penalized_laml: None,
+                    joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                    joint_penalized_quasi_laplace_after: None,
+                    terminal_joint_penalized_quasi_laplace: None,
                     term: &term,
                     rho: &rho,
                 },
@@ -1366,9 +1366,9 @@ pub fn fit_stagewise(
                     births_rejected,
                     ev: Some(cur_ev),
                     factor_energy: Some(factor_energy),
-                    joint_penalized_laml_before: Some(current_penalized_laml),
-                    joint_penalized_laml_after: None,
-                    terminal_joint_penalized_laml: None,
+                    joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                    joint_penalized_quasi_laplace_after: None,
+                    terminal_joint_penalized_quasi_laplace: None,
                     term: &term,
                     rho: &rho,
                 },
@@ -1395,7 +1395,7 @@ pub fn fit_stagewise(
                     config.ridge_ext_coord,
                     config.ridge_beta,
                 )?;
-                let (penalized_laml, _) = frozen_joint_penalized_laml(
+                let (penalized_quasi_laplace, _) = frozen_joint_penalized_quasi_laplace(
                     &mut cand_term,
                     target,
                     &cand_rho,
@@ -1403,10 +1403,10 @@ pub fn fit_stagewise(
                     config,
                 )?;
                 let ev = ev_of(&cand_term, target);
-                Ok((cand_term, cand_rho, penalized_laml, ev))
+                Ok((cand_term, cand_rho, penalized_quasi_laplace, ev))
             })();
             let out = built.ok();
-            if let Some((cand_term, cand_rho, penalized_laml, ev)) = out.as_ref() {
+            if let Some((cand_term, cand_rho, penalized_quasi_laplace, ev)) = out.as_ref() {
                 emit_stagewise_progress(
                     &mut progress,
                     StagewiseProgress {
@@ -1421,9 +1421,9 @@ pub fn fit_stagewise(
                         births_rejected,
                         ev: Some(*ev),
                         factor_energy: Some(factor_energy),
-                        joint_penalized_laml_before: Some(current_penalized_laml),
-                        joint_penalized_laml_after: Some(*penalized_laml),
-                        terminal_joint_penalized_laml: None,
+                        joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                        joint_penalized_quasi_laplace_after: Some(*penalized_quasi_laplace),
+                        terminal_joint_penalized_quasi_laplace: None,
                         term: cand_term,
                         rho: cand_rho,
                     },
@@ -1443,9 +1443,9 @@ pub fn fit_stagewise(
                         births_rejected,
                         ev: Some(cur_ev),
                         factor_energy: Some(factor_energy),
-                        joint_penalized_laml_before: Some(current_penalized_laml),
-                        joint_penalized_laml_after: None,
-                        terminal_joint_penalized_laml: None,
+                        joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                        joint_penalized_quasi_laplace_after: None,
+                        terminal_joint_penalized_quasi_laplace: None,
                         term: &term,
                         rho: &rho,
                     },
@@ -1462,10 +1462,10 @@ pub fn fit_stagewise(
         };
 
         // Gate: strictly-improved joint evidence AND ΔEV ≥ the minimum-effect
-        // floor. Among the candidates that clear both gates, the lower penalized LAML wins.
-        let passes = |penalized_laml: f64, ev: f64| -> bool {
-            penalized_laml.is_finite()
-                && penalized_laml < current_penalized_laml
+        // floor. Among the candidates that clear both gates, the lower penalized quasi-Laplace wins.
+        let passes = |penalized_quasi_laplace: f64, ev: f64| -> bool {
+            penalized_quasi_laplace.is_finite()
+                && penalized_quasi_laplace < current_penalized_quasi_laplace
                 && ev.is_finite()
                 && (ev - cur_ev) >= config.min_effect_ev
         };
@@ -1493,8 +1493,8 @@ pub fn fit_stagewise(
                     kind: BirthKind::NewAtom,
                     delta_ev: 0.0,
                     factor_energy,
-                    joint_penalized_laml_before: current_penalized_laml,
-                    joint_penalized_laml_after: current_penalized_laml,
+                    joint_penalized_quasi_laplace_before: current_penalized_quasi_laplace,
+                    joint_penalized_quasi_laplace_after: current_penalized_quasi_laplace,
                     accepted: false,
                 });
                 emit_stagewise_progress(
@@ -1511,9 +1511,9 @@ pub fn fit_stagewise(
                         births_rejected,
                         ev: Some(cur_ev),
                         factor_energy: Some(factor_energy),
-                        joint_penalized_laml_before: Some(current_penalized_laml),
-                        joint_penalized_laml_after: Some(current_penalized_laml),
-                        terminal_joint_penalized_laml: None,
+                        joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                        joint_penalized_quasi_laplace_after: Some(current_penalized_quasi_laplace),
+                        terminal_joint_penalized_quasi_laplace: None,
                         term: &term,
                         rho: &rho,
                     },
@@ -1522,7 +1522,7 @@ pub fn fit_stagewise(
             }
         };
 
-        let (kind, (cand_term, cand_rho, penalized_laml_after, ev_after)) = if choose_a {
+        let (kind, (cand_term, cand_rho, penalized_quasi_laplace_after, ev_after)) = if choose_a {
             (BirthKind::NewAtom, cand_a.take().unwrap())
         } else {
             (BirthKind::ChartExtension, cand_b.take().unwrap())
@@ -1535,8 +1535,8 @@ pub fn fit_stagewise(
             kind,
             delta_ev: ev_after - cur_ev,
             factor_energy,
-            joint_penalized_laml_before: current_penalized_laml,
-            joint_penalized_laml_after: penalized_laml_after,
+            joint_penalized_quasi_laplace_before: current_penalized_quasi_laplace,
+            joint_penalized_quasi_laplace_after: penalized_quasi_laplace_after,
             accepted: true,
         });
         ev_trace.push(ev_after);
@@ -1554,9 +1554,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(ev_after),
                 factor_energy: Some(factor_energy),
-                joint_penalized_laml_before: Some(current_penalized_laml),
-                joint_penalized_laml_after: Some(penalized_laml_after),
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: Some(current_penalized_quasi_laplace),
+                joint_penalized_quasi_laplace_after: Some(penalized_quasi_laplace_after),
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1594,9 +1594,9 @@ pub fn fit_stagewise(
                 births_rejected,
                 ev: Some(prev_ev),
                 factor_energy: None,
-                joint_penalized_laml_before: None,
-                joint_penalized_laml_after: None,
-                terminal_joint_penalized_laml: None,
+                joint_penalized_quasi_laplace_before: None,
+                joint_penalized_quasi_laplace_after: None,
+                terminal_joint_penalized_quasi_laplace: None,
                 term: &term,
                 rho: &rho,
             },
@@ -1622,9 +1622,9 @@ pub fn fit_stagewise(
                     births_rejected,
                     ev: Some(ev),
                     factor_energy: None,
-                    joint_penalized_laml_before: None,
-                    joint_penalized_laml_after: None,
-                    terminal_joint_penalized_laml: None,
+                    joint_penalized_quasi_laplace_before: None,
+                    joint_penalized_quasi_laplace_after: None,
+                    terminal_joint_penalized_quasi_laplace: None,
                     term: &term,
                     rho: &rho,
                 },
@@ -1646,9 +1646,9 @@ pub fn fit_stagewise(
                     births_rejected,
                     ev: Some(prev_ev),
                     factor_energy: None,
-                    joint_penalized_laml_before: None,
-                    joint_penalized_laml_after: None,
-                    terminal_joint_penalized_laml: None,
+                    joint_penalized_quasi_laplace_before: None,
+                    joint_penalized_quasi_laplace_after: None,
+                    terminal_joint_penalized_quasi_laplace: None,
                     term: &term,
                     rho: &rho,
                 },
@@ -1659,8 +1659,8 @@ pub fn fit_stagewise(
 
     // ── Phase 3 — terminal frozen joint evidence of the composed tier ──────────
     refresh_terminal_row_metric(&mut term, target, config)?;
-    let (terminal_joint_penalized_laml, terminal_joint_loss) =
-        frozen_joint_penalized_laml(&mut term, target, &rho, registry, config)?;
+    let (terminal_joint_penalized_quasi_laplace, terminal_joint_loss) =
+        frozen_joint_penalized_quasi_laplace(&mut term, target, &rho, registry, config)?;
 
     // Re-arm the collapse-guard stack before the composed dictionary escapes: the
     // guards-off lane is an INTERNAL economy for the K=1 / backfitting refits, but
@@ -1681,9 +1681,9 @@ pub fn fit_stagewise(
             births_rejected,
             ev: Some(prev_ev),
             factor_energy: None,
-            joint_penalized_laml_before: None,
-            joint_penalized_laml_after: Some(terminal_joint_penalized_laml),
-            terminal_joint_penalized_laml: Some(terminal_joint_penalized_laml),
+            joint_penalized_quasi_laplace_before: None,
+            joint_penalized_quasi_laplace_after: Some(terminal_joint_penalized_quasi_laplace),
+            terminal_joint_penalized_quasi_laplace: Some(terminal_joint_penalized_quasi_laplace),
             term: &term,
             rho: &rho,
         },
@@ -1699,7 +1699,7 @@ pub fn fit_stagewise(
             ev_trace,
             backfit_ev_trace,
             stopped_reason,
-            terminal_joint_penalized_laml,
+            terminal_joint_penalized_quasi_laplace,
             terminal_joint_loss,
         },
     })
@@ -1763,7 +1763,7 @@ pub fn fit_stagewise(
 //
 // EXACTLY (not up to tolerance — the off-block entries drop out of the sum
 // entirely), so the FIT and the per-birth reconstruction ΔEV charge are invariant
-// to acceptance order. (The RAW joint-penalized LAML VALUE does not decompose additively —
+// to acceptance order. (The RAW joint-penalized quasi-Laplace VALUE does not decompose additively —
 // its Laplace term carries a globally-pooled dispersion that couples all rows — but
 // the FIT, the accepted SET, and the ΔEV do, which is what parity needs.) This is
 // the parity license (see `tests_batched_parity_*`): batched must equal serial
@@ -1771,7 +1771,7 @@ pub fn fit_stagewise(
 //
 // Candidates that intersect an accepted atom on BOTH axes VIOLATE the orthogonality
 // condition, so we accept only the BEST of such an overlapping group (lowest joint
-// penalized LAML — the same keep-lowest tiebreak as the serial A-vs-B race) and REQUEUE the
+// penalized quasi-Laplace — the same keep-lowest tiebreak as the serial A-vs-B race) and REQUEUE the
 // rest: they are dropped this round and re-mined next round against the UPDATED
 // residual, recovering pure greedy on the conflicting part. No magic constant — the
 // criterion is per-pair support disjointness on either axis, and the per-round
@@ -1847,7 +1847,7 @@ struct RacedCandidate {
     /// planes). Co-acceptance holds when EITHER the rows OR the output dims are
     /// disjoint; the row-only test alone cannot co-accept a dense multi-circle image.
     out_support: Vec<usize>,
-    penalized_laml: f64,
+    penalized_quasi_laplace: f64,
     ev: f64,
     energy: f64,
 }
@@ -1915,8 +1915,8 @@ fn race_birth_seed(
         registry,
         config,
     )?;
-    let (penalized_laml, _) =
-        frozen_joint_penalized_laml(&mut cand_term, target, &cand_rho, registry, config)?;
+    let (penalized_quasi_laplace, _) =
+        frozen_joint_penalized_quasi_laplace(&mut cand_term, target, &cand_rho, registry, config)?;
     let ev = ev_of(&cand_term, target);
     // Support: a circle seed's own-presence gate marks the rows it can fire on
     // (finite gate); a shared-factor DC seed is global (all rows), which forces a
@@ -1958,7 +1958,7 @@ fn race_birth_seed(
         born_log_lambda_smooth: cand_rho.log_lambda_smooth[k],
         support,
         out_support,
-        penalized_laml,
+        penalized_quasi_laplace,
         ev,
         energy: seed.energy,
     })
@@ -2153,8 +2153,8 @@ pub fn fit_stagewise_batched(
 
         // Current joint evidence + EV (the birth gate's reference), computed once
         // before the parallel race so the closures borrow `term` immutably.
-        let (current_penalized_laml, _) =
-            frozen_joint_penalized_laml(&mut term, target, &rho, registry, base)?;
+        let (current_penalized_quasi_laplace, _) =
+            frozen_joint_penalized_quasi_laplace(&mut term, target, &rho, registry, base)?;
         let cur_ev = ev_of(&term, target);
 
         // ── PARALLEL racing: fit every candidate's K=1 sub-problem concurrently ──
@@ -2171,19 +2171,19 @@ pub fn fit_stagewise_batched(
         // Birth gate: strictly-improved joint evidence AND ΔEV ≥ the minimum-effect
         // floor — identical to the serial `passes` predicate.
         let passes = |c: &RacedCandidate| -> bool {
-            c.penalized_laml.is_finite()
-                && c.penalized_laml < current_penalized_laml
+            c.penalized_quasi_laplace.is_finite()
+                && c.penalized_quasi_laplace < current_penalized_quasi_laplace
                 && c.ev.is_finite()
                 && (c.ev - cur_ev) >= base.min_effect_ev
         };
         let mut order: Vec<usize> = (0..raced.len()).filter(|&i| passes(&raced[i])).collect();
         let candidates_passing_gate = order.len();
-        // Best (lowest joint penalized LAML) first — the same keep-lowest tiebreak the serial
+        // Best (lowest joint penalized quasi-Laplace) first — the same keep-lowest tiebreak the serial
         // A-vs-B race uses; ties fall to the earlier (higher-energy) harvest index.
         order.sort_by(|&a, &b| {
             raced[a]
-                .penalized_laml
-                .partial_cmp(&raced[b].penalized_laml)
+                .penalized_quasi_laplace
+                .partial_cmp(&raced[b].penalized_quasi_laplace)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cmp(&b))
         });
@@ -2219,8 +2219,8 @@ pub fn fit_stagewise_batched(
                 // across the disjoint batch).
                 delta_ev: c.ev - cur_ev,
                 factor_energy: c.energy,
-                joint_penalized_laml_before: current_penalized_laml,
-                joint_penalized_laml_after: c.penalized_laml,
+                joint_penalized_quasi_laplace_before: current_penalized_quasi_laplace,
+                joint_penalized_quasi_laplace_after: c.penalized_quasi_laplace,
                 accepted: true,
             });
             ev_trace.push(running_ev);
@@ -2240,8 +2240,8 @@ pub fn fit_stagewise_batched(
                 kind: BirthKind::NewAtom,
                 delta_ev: 0.0,
                 factor_energy: raced.first().map(|c| c.energy).unwrap_or(0.0),
-                joint_penalized_laml_before: current_penalized_laml,
-                joint_penalized_laml_after: current_penalized_laml,
+                joint_penalized_quasi_laplace_before: current_penalized_quasi_laplace,
+                joint_penalized_quasi_laplace_after: current_penalized_quasi_laplace,
                 accepted: false,
             });
         } else {
@@ -2270,8 +2270,8 @@ pub fn fit_stagewise_batched(
 
     // ── Phase 3 — terminal frozen joint evidence of the composed tier ───────────
     refresh_terminal_row_metric(&mut term, target, base)?;
-    let (terminal_joint_penalized_laml, terminal_joint_loss) =
-        frozen_joint_penalized_laml(&mut term, target, &rho, registry, base)?;
+    let (terminal_joint_penalized_quasi_laplace, terminal_joint_loss) =
+        frozen_joint_penalized_quasi_laplace(&mut term, target, &rho, registry, base)?;
     term.set_guards_enabled(true);
 
     Ok(BatchedStagewiseResult {
@@ -2284,7 +2284,7 @@ pub fn fit_stagewise_batched(
             ev_trace,
             backfit_ev_trace: Vec::new(),
             stopped_reason,
-            terminal_joint_penalized_laml,
+            terminal_joint_penalized_quasi_laplace,
             terminal_joint_loss,
         },
         batch_records,
@@ -2319,10 +2319,10 @@ pub fn terminal_joint_assembly(
     // any downstream non-frozen refit / FFI consumer of the returned dictionary
     // gets the normal supervision (a disarmed term would silently skip it).
     merged.set_guards_enabled(false);
-    let (penalized_laml, loss) =
-        frozen_joint_penalized_laml(&mut merged, target, &merged_rho, registry, config)?;
+    let (penalized_quasi_laplace, loss) =
+        frozen_joint_penalized_quasi_laplace(&mut merged, target, &merged_rho, registry, config)?;
     merged.set_guards_enabled(true);
-    Ok((merged, merged_rho, penalized_laml, loss))
+    Ok((merged, merged_rho, penalized_quasi_laplace, loss))
 }
 
 #[cfg(test)]
@@ -2513,8 +2513,11 @@ mod tests {
             result.report.ev_trace
         );
         assert!(
-            result.report.terminal_joint_penalized_laml.is_finite(),
-            "terminal frozen joint penalized LAML must be finite"
+            result
+                .report
+                .terminal_joint_penalized_quasi_laplace
+                .is_finite(),
+            "terminal frozen joint penalized quasi-Laplace must be finite"
         );
         // The final EV must be at least the seed EV (a birth can only be adopted if
         // it clears the ΔEV ≥ 0 floor).
@@ -3560,7 +3563,7 @@ mod tests {
              decoder L1 diff {decoder_diff}"
         );
         // The per-birth CHARGE that MUST be invariant to acceptance order is the
-        // reconstruction ΔEV, not the raw joint-penalized LAML delta. B touches only rows
+        // reconstruction ΔEV, not the raw joint-penalized quasi-Laplace delta. B touches only rows
         // `[h,n)` (its gate is 0 elsewhere), and the EV denominator `SS_tot` is fixed
         // by the target, so B's ΔEV = (SS_res reduction on B's rows)/SS_tot is
         // identical whether or not A — disjoint from B — is already present:
@@ -3568,9 +3571,9 @@ mod tests {
         //   batched:  EV(seed+B)   − EV(seed)     (A absent)
         //   serial:   EV(seed+A+B) − EV(seed+A)   (A present)
         //
-        // The RAW joint-penalized LAML delta does NOT decompose this way: the frozen Laplace
+        // The RAW joint-penalized quasi-Laplace delta does NOT decompose this way: the frozen Laplace
         // criterion carries a globally-pooled dispersion term that couples all rows,
-        // so adding A (which shrinks the residual on `[0,h)`) rescales B's penalized LAML
+        // so adding A (which shrinks the residual on `[0,h)`) rescales B's penalized quasi-Laplace
         // charge even though B's FIT is bit-identical (asserted above). Charging on
         // the additive quantity (ΔEV) is the honest disjoint-support parity claim.
         let seed_ev = ev_of(&seed, target.view());
@@ -3667,8 +3670,11 @@ mod tests {
             batched.report.ev_trace
         );
         assert!(
-            batched.report.terminal_joint_penalized_laml.is_finite(),
-            "batched terminal joint penalized LAML must be finite"
+            batched
+                .report
+                .terminal_joint_penalized_quasi_laplace
+                .is_finite(),
+            "batched terminal joint penalized quasi-Laplace must be finite"
         );
 
         let serial_k = serial.term.k_atoms() as i64;

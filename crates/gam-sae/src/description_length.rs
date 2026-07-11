@@ -11,7 +11,7 @@
 //! * **dictionary** bits — the effective-parameter term `½log|XᵀX + S| − occam`,
 //!   the amortised cost of storing the decoder.
 //!
-//! (`SaeManifoldTerm::penalized_laml_criterion` forms `v = loss.total + extra_penalty +
+//! (`SaeManifoldTerm::penalized_quasi_laplace_criterion` forms `v = loss.total + extra_penalty +
 //! ½log_det − occam`; construction.rs owns those internals — this module CONSUMES
 //! their outputs and never recomputes the fit.)
 //!
@@ -537,7 +537,7 @@ impl DescriptionLength {
 
     /// The no-parallel-accounting invariant: the decomposition sums to the total
     /// criterion nll `v` (nats) converted to bits, within `tol` bits. `v` is the
-    /// value `SaeManifoldTerm::penalized_laml_criterion` returns.
+    /// value `SaeManifoldTerm::penalized_quasi_laplace_criterion` returns.
     pub fn reconciles_with_criterion(&self, v_nats: f64, tol_bits: f64) -> bool {
         (self.total_bits - v_nats / LN_2).abs() <= tol_bits
     }

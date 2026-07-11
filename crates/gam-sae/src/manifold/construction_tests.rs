@@ -319,7 +319,7 @@ mod exact_stationarity_solve_1418_tests {
             }
         }
         let (_value, _loss, cache) = term
-            .penalized_laml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .penalized_quasi_laplace_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged cache with residual");
         (term, target, rho, cache)
     }
@@ -518,7 +518,7 @@ mod exact_stationarity_solve_1418_tests {
         }
         rho.log_lambda_sparse = -1.0;
         let (_value, _loss, cache) = term
-            .penalized_laml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .penalized_quasi_laplace_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged saturated-gate ordered Beta--Bernoulli cache");
         let solver = DeflatedArrowSolver::plain(&cache);
 
@@ -628,7 +628,7 @@ mod smoothness_dof_hutchinson_tests {
     fn hutchinson_smoothness_dof_matches_exact_and_is_deterministic() {
         let (mut term, target, rho) = small_two_atom_periodic_term();
         let (_value, _loss, cache) = term
-            .penalized_laml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .penalized_quasi_laplace_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged cache for the two-atom fixture");
         let lambda = rho.lambda_smooth_vec();
 
@@ -736,7 +736,7 @@ mod shape_uncertainty_joint_recompute_tests {
 
         // Reference joint bands via the direct Schur path.
         let (_c, loss, cache) = term
-            .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .penalized_quasi_laplace_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged joint cache");
         let dispersion = term
             .reconstruction_dispersion(&loss, &cache, &rho, None)

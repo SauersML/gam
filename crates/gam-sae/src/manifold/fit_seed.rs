@@ -57,11 +57,12 @@ impl SaeFitAssignmentKind {
         top_k: Option<usize>,
     ) -> Result<AssignmentMode, String> {
         match self {
-            Self::Softmax | Self::OrderedBetaBernoulli | Self::ThresholdGate
-                if top_k.is_some() => Err(format!(
+            Self::Softmax | Self::OrderedBetaBernoulli | Self::ThresholdGate if top_k.is_some() => {
+                Err(format!(
                     "top_k is valid only with assignment_kind 'topk'; got assignment_kind '{}'",
                     self.tag()
-                )),
+                ))
+            }
             Self::Softmax => Ok(AssignmentMode::softmax(tau)),
             Self::OrderedBetaBernoulli => Ok(AssignmentMode::ordered_beta_bernoulli(
                 tau,

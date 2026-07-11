@@ -88,7 +88,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     let (mut term, rho) = fitted_circle_term(80, 16);
     // Dispersion (noise floor R) from a reml pass.
     let (_v, loss, cache) = term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             unit_target(&term).view(),
             &rho,
             None,
@@ -209,7 +209,7 @@ fn rank_charge_healthy_k3_control_well_conditioned() {
         .expect("K=3 clean fit");
 
     let (criterion, loss, cache) = term
-        .penalized_laml_criterion_with_cache(x.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_with_cache(x.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     let disp = term
         .reconstruction_dispersion(&loss, &cache, &rho, None)
@@ -320,14 +320,22 @@ fn rank_charge_k3_accepts_clean_atoms() {
     let margins = || -> Vec<f64> {
         let (mut t3, r3) = fit_circle_subset(&x, &theta, &[0, 1, 2]);
         let (v3, _, _) = t3
-            .penalized_laml_criterion_with_cache(x.view(), &r3, None, 0, 1.0, 1e-6, 1e-6)
+            .penalized_quasi_laplace_criterion_with_cache(x.view(), &r3, None, 0, 1.0, 1e-6, 1e-6)
             .unwrap();
         (0..ncirc)
             .map(|drop| {
                 let keep: Vec<usize> = (0..ncirc).filter(|&c| c != drop).collect();
                 let (mut t2, r2) = fit_circle_subset(&x, &theta, &keep);
                 let (v2, _, _) = t2
-                    .penalized_laml_criterion_with_cache(x.view(), &r2, None, 0, 1.0, 1e-6, 1e-6)
+                    .penalized_quasi_laplace_criterion_with_cache(
+                        x.view(),
+                        &r2,
+                        None,
+                        0,
+                        1.0,
+                        1e-6,
+                        1e-6,
+                    )
                     .unwrap();
                 v3 - v2 // margin_drop: <0 ⇒ the dropped circle is worth KEEPING
             })
@@ -430,10 +438,18 @@ fn rank_charge_dense_streaming_parity() {
 
     // End-to-end canonical criterion parity: dense vs streaming to ε.
     let (v_dense, _, _) = term
-        .penalized_laml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     let (v_stream, _) = term
-        .penalized_laml_criterion_streaming_exact(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_streaming_exact(
+            tgt.view(),
+            &rho,
+            None,
+            0,
+            1.0,
+            1e-6,
+            1e-6,
+        )
         .unwrap();
     eprintln!("[#9 parity] criterion dense={v_dense:.6} stream={v_stream:.6}");
     assert!(
@@ -452,7 +468,7 @@ fn rank_charge_shared_primitive_parity() {
     let (mut term, rho) = fitted_circle_term(80, 16);
     let tgt = unit_target(&term);
     let (_v, loss, cache) = term
-        .penalized_laml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     let disp = term
         .reconstruction_dispersion(&loss, &cache, &rho, None)
@@ -507,7 +523,7 @@ fn rank_charge_vetoes_zero_realised_rank_atom() {
 
     // A real circle (rank_eff=2, d_eff≈5.5) remains finite.
     let (v_real, _, _) = term
-        .penalized_laml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     eprintln!("[#5 veto] real circle v={v_real:.4} (finite, accepted)");
     assert!(
@@ -518,7 +534,7 @@ fn rank_charge_vetoes_zero_realised_rank_atom() {
     // A vanishing decoder (×1e-6 → rank_eff=0, d_eff=0) is vetoed.
     term.atoms[0].decoder_coefficients.assign(&(&saved * 1e-6));
     let (v_vanish, _, _) = term
-        .penalized_laml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     eprintln!("[#5 veto] vanishing atom v={v_vanish} (must be +∞)");
     assert!(
@@ -570,7 +586,7 @@ fn rank_charge_deff_scale_insensitive_under_decoder_rescale_2099() {
     let (mut term, rho) = fitted_circle_term(80, 16);
     let tgt = unit_target(&term);
     let (_v, loss, cache) = term
-        .penalized_laml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
+        .penalized_quasi_laplace_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
         .unwrap();
     let disp = term
         .reconstruction_dispersion(&loss, &cache, &rho, None)

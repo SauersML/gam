@@ -904,7 +904,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     softmax_rho.log_lambda_sparse = 0.5;
     softmax_rho.log_lambda_smooth = vec![-1.7, -1.2];
     softmax_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &softmax_rho,
             None,
@@ -916,7 +916,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
         .expect("converged softmax parity cache");
     configure_decisive_softmax_logits_2156(&mut softmax_term);
     let (softmax_value, softmax_loss, softmax_cache) = softmax_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &softmax_rho,
             None,
@@ -956,7 +956,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     ordered_beta_bernoulli_rho.log_lambda_smooth = vec![-1.6, -1.1];
     let (ordered_beta_bernoulli_value, ordered_beta_bernoulli_loss, ordered_beta_bernoulli_cache) =
         ordered_beta_bernoulli_term
-            .penalized_laml_criterion_with_cache(
+            .penalized_quasi_laplace_criterion_with_cache(
                 ordered_beta_bernoulli_target.view(),
                 &ordered_beta_bernoulli_rho,
                 None,
@@ -1007,7 +1007,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     deflated_term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
     deflated_rho.log_lambda_sparse = 0.5;
     let (deflated_value, deflated_loss, deflated_cache) = deflated_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             deflated_target.view(),
             &deflated_rho,
             None,
@@ -1063,7 +1063,7 @@ pub(crate) fn branch_guarded_dual_oracle_pins_live_softmax_channels_2156() {
     let (mut softmax_term, target, mut softmax_rho) = gamma_fd_tiny_fixture();
     softmax_rho.log_lambda_sparse = 0.5;
     softmax_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &softmax_rho,
             None,
@@ -1075,7 +1075,7 @@ pub(crate) fn branch_guarded_dual_oracle_pins_live_softmax_channels_2156() {
         .expect("converged softmax cache");
     configure_decisive_softmax_logits_2156(&mut softmax_term);
     let (softmax_value, softmax_loss, softmax_cache) = softmax_term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &softmax_rho,
             None,
@@ -1169,11 +1169,27 @@ pub(crate) fn softmax_tt_weight_product_logit_adjoint_hits_both_factors_2156() {
 pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     rho.log_lambda_sparse = 0.5;
-    term.penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
+    term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        200,
+        0.4,
+        1.0e-6,
+        1.0e-6,
+    )
+    .expect("converged cache");
     configure_decisive_softmax_logits_2156(&mut term);
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("off-kink fixed-state cache");
 
     let row = 0usize;
@@ -1323,8 +1339,16 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     // row-varying logit margins keep the softmax away from that kink without
     // saturating the row to a near-boundary PD block, so the fixed-state central
     // difference below differentiates a locally smooth majorizer branch.
-    term.penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged cache");
+    term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        200,
+        0.4,
+        1.0e-6,
+        1.0e-6,
+    )
+    .expect("converged cache");
     for r in 0..term.n_obs() {
         let center = 0.05 * (r as f64);
         let margin = 1.55 + 0.04 * (r as f64);
@@ -1337,7 +1361,15 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
         }
     }
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("off-kink fixed-state cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1404,7 +1436,15 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli()
     // tolerance is weakened.
     rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1456,6 +1496,82 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli()
     }
 }
 
+#[test]
+pub(crate) fn exact_stationarity_a_minus_b_includes_ordered_beta_bernoulli_cross_row_hvp() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false);
+    rho.log_lambda_sparse = 0.5;
+    let (_value, _loss, cache) = term
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged ordered Beta--Bernoulli exact-stationarity cache");
+
+    let mut vector = SaeArrowVector {
+        t: Array1::<f64>::zeros(cache.delta_t_len()),
+        beta: Array1::<f64>::zeros(cache.k),
+    };
+    let mut flat_logit_direction = Array1::<f64>::zeros(term.n_obs() * term.k_atoms());
+    let row_zero_vars = term
+        .row_vars_for_cache_row(0, &cache)
+        .expect("row-zero variable layout");
+    let local = row_zero_vars
+        .iter()
+        .position(|var| matches!(var, SaeLocalRowVar::Logit { atom: 0 }))
+        .expect("ordered assignment must expose atom-zero logit");
+    vector.t[cache.row_offsets[0] + local] = 0.7;
+    flat_logit_direction[0] = 0.7;
+
+    let correction = term
+        .apply_exact_hessian_minus_b(&rho, target.view(), &cache, &vector)
+        .expect("base A-B apply");
+    let mut doubled_rho = rho.clone();
+    doubled_rho.log_lambda_sparse += 2.0_f64.ln();
+    let doubled_correction = term
+        .apply_exact_hessian_minus_b(&doubled_rho, target.view(), &cache, &vector)
+        .expect("doubled-strength A-B apply");
+    let expected =
+        crate::assignment::ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
+            &term.assignment,
+            &rho,
+            term.row_loss_weights.as_deref(),
+            flat_logit_direction.view(),
+        )
+        .expect("ordered exact-Hessian helper")
+        .expect("ordered mode");
+
+    let mut saw_cross_row = false;
+    for row in 0..term.n_obs() {
+        let vars = term
+            .row_vars_for_cache_row(row, &cache)
+            .expect("row variable layout");
+        for (local, var) in vars.iter().enumerate() {
+            let index = cache.row_offsets[row] + local;
+            let actual = doubled_correction.t[index] - correction.t[index];
+            let wanted = match *var {
+                SaeLocalRowVar::Logit { atom } => expected[row * term.k_atoms() + atom],
+                SaeLocalRowVar::Coord { .. } => 0.0,
+            };
+            assert!(
+                (actual - wanted).abs() <= 2.0e-9 * (1.0 + wanted.abs()),
+                "row {row} local {local}: scaled A-B difference={actual}, expected={wanted}"
+            );
+            if row > 0 && matches!(var, SaeLocalRowVar::Logit { atom: 0 }) {
+                saw_cross_row |= wanted.abs() > 1.0e-8;
+            }
+        }
+    }
+    for beta in 0..cache.k {
+        assert_abs_diff_eq!(
+            doubled_correction.beta[beta] - correction.beta[beta],
+            0.0,
+            epsilon = 2.0e-10
+        );
+    }
+    assert!(
+        saw_cross_row,
+        "the exact integrated marginal must couple the one-row probe into other rows"
+    );
+}
+
 /// The assembly PSD-majorizes the ordered Beta--Bernoulli curvature
 /// unconditionally, so the
 /// θ-adjoint must differentiate that SAME majorized operator. This is the
@@ -1502,7 +1618,15 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_l
     );
     rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged majorized cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1598,7 +1722,15 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144
     // what the fixed-state FD comparison pins).
     rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged full-rank whitened cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1654,7 +1786,15 @@ pub(crate) fn ordered_beta_bernoulli_sparse_strength_trace_matches_dense_fd() {
     // Keep a moderate prior strength so the retained diagonal majorizer is live.
     rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let analytic = term
@@ -1707,7 +1847,15 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_l
     // default 0.1 and rho0 <= -0.8 were poorly conditioned on this fixture).
     rho.log_lambda_sparse = 0.6;
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-8, 1.0e-8)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+        )
         .expect("converged learnable-α cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1819,7 +1967,15 @@ fn sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged softmax cache");
     assert_theta_adjoint_from_probes_matches_dense(&term, &rho, &cache);
 }
@@ -1832,7 +1988,15 @@ fn sae_logdet_theta_adjoint_from_probes_matches_ordered_beta_bernoulli() {
     term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false);
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged ordered Beta--Bernoulli cache");
     assert_theta_adjoint_from_probes_matches_dense(&term, &rho, &cache);
 }
@@ -1847,7 +2011,15 @@ fn sae_logdet_theta_adjoint_from_probes_refuses_deflated_rows_2080() {
     term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            5,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged learnable ordered Beta--Bernoulli cache");
     assert!(
         cache.deflated_row_directions.iter().any(|d| !d.is_empty()),

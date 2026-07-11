@@ -485,17 +485,10 @@ fn ordered_beta_bernoulli_majorizer_log_alpha_derivative_matches_fd() {
     }
 
     let step = 1.0e-6_f64;
-    let plus = pen.psd_majorizer_logit_third_channels(
-        target.view(),
-        array![rho[0] + step].view(),
-    );
-    let minus = pen.psd_majorizer_logit_third_channels(
-        target.view(),
-        array![rho[0] - step].view(),
-    );
+    let plus = pen.psd_majorizer_logit_third_channels(target.view(), array![rho[0] + step].view());
+    let minus = pen.psd_majorizer_logit_third_channels(target.view(), array![rho[0] - step].view());
     for index in 0..target.len() {
-        let fd = (plus.diagonal_term[index].max(0.0)
-            - minus.diagonal_term[index].max(0.0))
+        let fd = (plus.diagonal_term[index].max(0.0) - minus.diagonal_term[index].max(0.0))
             / (2.0 * step);
         assert_abs_diff_eq!(analytic[index], fd, epsilon = 2.0e-6);
     }

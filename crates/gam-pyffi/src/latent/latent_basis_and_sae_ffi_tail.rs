@@ -6,12 +6,9 @@
 /// `"atom_plans"`, holding the per-atom basis spec so OOS prediction can
 /// rebuild the design without going through Python.
 ///
-/// Warm starts (issue #357): `initial_logits` (N, K) and `initial_coords`
-/// (K, N, D_max) are optional caller-supplied seeds for the assignment logits
-/// and the per-atom on-manifold coordinates. When supplied they replace the
-/// internal PCA seed coords / zero-jitter logit init, so an amortized encoder
-/// can predict `(a_init, t_init)` and have the joint solver refine them for a
-/// bounded `max_iter` steps. The basis *design* (Duchon centers, harmonic
+/// `initial_logits` (N, K) and `initial_coords` (K, N, D_max) are optional
+/// native-solver warm starts. When supplied they replace the internal PCA seed
+/// coordinates / zero-jitter logit initialization. The basis *design* (Duchon centers, harmonic
 /// counts) is still derived from the PCA seed so the warm coordinates are
 /// evaluated against the same atom geometry the unconstrained fit would build.
 #[pyfunction(signature = (
@@ -54,7 +51,7 @@ fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
     atom_basis: Vec<String>,
-    atom_dim: Option<Vec<usize>>,
+    atom_dim: Vec<usize>,
     alpha: f64,
     tau: f64,
     learnable_alpha: bool,
@@ -372,10 +369,7 @@ fn public_fit_penalties(
     fisher_provenance=None,
     row_loss_weights=None,
     separation_barrier_strength_override=None,
-    ordered_beta_bernoulli_alpha_override=None,
     promote_from_residual=true,
-    run_structure_search=true,
-    run_outer_rho_search=true,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_model<'py>(
@@ -413,10 +407,7 @@ fn sae_manifold_fit_model<'py>(
     fisher_provenance: Option<String>,
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     separation_barrier_strength_override: Option<f64>,
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
     promote_from_residual: bool,
-    run_structure_search: bool,
-    run_outer_rho_search: bool,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     if k_atoms == 0 {
         return Err(py_value_error("sae_manifold_fit requires K >= 1".to_string()));
@@ -433,7 +424,7 @@ fn sae_manifold_fit_model<'py>(
             "sae_manifold_fit response contains non-finite values".to_string(),
         ));
     }
-    let atom_dim = expand_public_fit_values(atom_dim.unwrap_or_else(|| vec![2]), k_atoms, "d_atom")
+    let atom_dim = expand_public_fit_values(atom_dim, k_atoms, "d_atom")
         .map_err(py_value_error)?;
     if atom_dim.iter().any(|&dimension| dimension == 0) {
         return Err(py_value_error(
@@ -471,10 +462,7 @@ fn sae_manifold_fit_model<'py>(
         .map_err(py_value_error)?;
     let resolved_tau = tau.unwrap_or_else(|| schedule.as_ref().map_or(0.5, |state| state.tau_start));
     let resolved_alpha = alpha.unwrap_or_else(|| {
-        if assignment == "ordered_beta_bernoulli"
-            && ordered_beta_bernoulli_alpha_override.is_none()
-            && !learnable_alpha
-        {
+        if assignment == "ordered_beta_bernoulli" && !learnable_alpha {
             gam::terms::sae::assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms(
                 k_atoms,
             )
@@ -535,10 +523,10 @@ fn sae_manifold_fit_model<'py>(
         fisher_provenance.clone(),
         row_loss_weights,
         separation_barrier_strength_override,
-        ordered_beta_bernoulli_alpha_override,
+        None,
         promote_from_residual,
-        run_structure_search,
-        run_outer_rho_search,
+        true,
+        true,
         false,
     )?;
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(
@@ -595,10 +583,8 @@ fn sae_manifold_fit_model<'py>(
 /// converged per-token assignments `assignments_z` (N, K), per-atom
 /// on-manifold coordinates `on_atom_coords_t`, gating logits, and the
 /// reconstruction `fitted`. Downstream supervised heads consume the OOS
-/// assignments directly, and the amortized-encoder loop reads the converged
-/// coordinates as distillation targets. `initial_logits` (N, K) and
-/// `initial_coords` (K, N, D_max) optionally warm-start the OOS refinement
-/// from an encoder's per-token prediction.
+/// assignments directly. `initial_logits` (N, K) and `initial_coords`
+/// (K, N, D_max) optionally warm-start the native OOS refinement.
 // Convert borrowed FFI arrays into the owned typed library request. This helper
 // performs wire parsing and ownership transfer only; validation, basis rebuild,
 // seeding, inference, projection, and reporting live in gam-sae.

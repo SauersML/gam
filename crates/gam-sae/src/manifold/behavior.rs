@@ -613,18 +613,18 @@ impl BehaviorBlock {
         Ok(next)
     }
 
-    /// The profiled two-block penalized LAML criterion's dependence on `log(λ_y)` beyond
+    /// The profiled two-block penalized quasi-Laplace criterion's dependence on `log(λ_y)` beyond
     /// what the single-block engine sees: the change-of-variables Jacobian
     /// `−(n·p_y/2)·log λ_y` that the `√λ_y` target scaling introduces into the
     /// Gaussian negative-log-marginal-likelihood.
     ///
-    /// The engine's penalized LAML criterion is computed on the **scaled** augmented target
+    /// The engine's penalized quasi-Laplace criterion is computed on the **scaled** augmented target
     /// `[Z | √λ_y·Y]` and so treats all `p̃` output columns as one homoscedastic
     /// block with a single dispersion `φ̂`. But the honest two-block model has
     /// `φ_y = φ_x/λ_y`; writing the behavior likelihood in the scaled variable
     /// `Ỹ = √λ_y·Y` contributes a Jacobian `∏_i (√λ_y)^{p_y} = λ_y^{n p_y/2}`,
     /// whose negative log is this term. **Add it** to the engine criterion (a
-    /// quantity that is *minimised*) to obtain the two-block penalized LAML criterion whose
+    /// quantity that is *minimised*) to obtain the two-block penalized quasi-Laplace criterion whose
     /// minimiser over `log λ_y` is the variance-ratio REML estimate. Without it
     /// the criterion is monotone in `λ_y` — behavior residuals shrink for free in
     /// scaled units — and `λ_y` is unidentifiable.
@@ -637,7 +637,7 @@ impl BehaviorBlock {
     /// units the fit saw (columns `[0, p_x)` activation, `[p_x, p̃)` the
     /// `√λ_y`-scaled behavior).
     ///
-    /// The profiled two-block penalized LAML criterion (engine criterion `+`
+    /// The profiled two-block penalized quasi-Laplace criterion (engine criterion `+`
     /// [`Self::reml_log_lambda_jacobian`]) is stationary in `log λ_y` at
     ///
     /// ```text
@@ -1057,7 +1057,7 @@ pub fn stack_augmented_target(
     Ok(augmented)
 }
 
-/// The multi-block profiled penalized LAML criterion (the quantity minimised over the
+/// The multi-block profiled penalized quasi-Laplace criterion (the quantity minimised over the
 /// block weights), evaluated at a fitted state's UNSCALED residual sums of
 /// squares. Up to `log λ`-independent constants it is
 ///
@@ -1077,7 +1077,7 @@ pub fn stack_augmented_target(
 ///
 /// Returns `+∞` for a non-positive pooled residual (an invalid state a caller's
 /// line search should reject).
-pub fn profiled_penalized_laml_criterion(
+pub fn profiled_penalized_quasi_laplace_criterion(
     n_obs: usize,
     p_x: usize,
     rss_x: f64,
@@ -1104,7 +1104,7 @@ pub fn profiled_penalized_laml_criterion(
     0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac
 }
 
-/// The analytic outer gradient of [`profiled_penalized_laml_criterion`] with respect
+/// The analytic outer gradient of [`profiled_penalized_quasi_laplace_criterion`] with respect
 /// to each block weight `log λ_ℓ` (#2231 §2a), evaluated at a fitted state's
 /// UNSCALED per-block residual sums of squares. At the inner optimum the residual
 /// is stationary in `(t, β)` (the envelope theorem: `∂R/∂β · ∂β/∂λ` vanishes), so
@@ -1117,20 +1117,20 @@ pub fn profiled_penalized_laml_criterion(
 /// (`p̃ = p_x + Σ p_ℓ`), the exact derivative of the profiled Gaussian
 /// negative-log-marginal (`d pooled/d log λ_ℓ = λ_ℓ R_ℓ`) plus the `√λ_ℓ`
 /// target-scaling Jacobian (`d(−½ n Σ p_m log λ_m)/d log λ_ℓ = −½ n p_ℓ`). This is
-/// the desync-safe (#2087) partner of the value in [`profiled_penalized_laml_criterion`] —
+/// the desync-safe (#2087) partner of the value in [`profiled_penalized_quasi_laplace_criterion`] —
 /// they are a consistent `(value, gradient)` pair, FD-verified in
 /// `tests_crosscoder_block_fd_2231.rs`.
 ///
 /// The per-coordinate stationary point `λ_ℓ·R_ℓ = (p_ℓ/p̃)·pooled` is met exactly
 /// by the joint variance-ratio fixed point `λ_ℓ = (R_x/p_x)/(R_ℓ/p_ℓ)` (substitute
 /// and use `pooled = R_x·p̃/p_x` there), so the analytic gradient and the
-/// closed-form EFS step ([`profiled_penalized_laml_block_efs_log_lambda_steps`]) agree at the
+/// closed-form EFS step ([`profiled_penalized_quasi_laplace_block_efs_log_lambda_steps`]) agree at the
 /// optimum — the coherence the planted two-layer test pins.
 ///
 /// Returns all-zero for a non-positive pooled residual (the criterion is then
 /// `+∞`; a caller's line search rejects the value and must not consume a NaN
 /// direction).
-pub fn profiled_penalized_laml_block_log_lambda_gradient(
+pub fn profiled_penalized_quasi_laplace_block_log_lambda_gradient(
     n_obs: usize,
     p_x: usize,
     rss_x: f64,
@@ -1173,7 +1173,7 @@ pub fn profiled_penalized_laml_block_log_lambda_gradient(
 /// residual variance (`R_ℓ ≤ 0`, or a non-positive anchor variance) is
 /// unidentifiable and HELD (step 0), matching the M1 driver's `identifiable`
 /// gate.
-pub fn profiled_penalized_laml_block_efs_log_lambda_steps(
+pub fn profiled_penalized_quasi_laplace_block_efs_log_lambda_steps(
     p_x: usize,
     rss_x: f64,
     block_rss_unscaled: &[f64],

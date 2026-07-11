@@ -43,8 +43,7 @@ use crate::structure_harvest;
 
 use super::{
     AssignmentMode, SaeManifoldFitDiagnostics, SaeManifoldLoss, SaeManifoldOuterObjective,
-    SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty,
-    SaeTrustDiagnostics,
+    SaeManifoldRho, SaeManifoldTerm, SaeOuterTermination, SaeShapeUncertainty, SaeTrustDiagnostics,
 };
 
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.
@@ -64,7 +63,7 @@ pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 /// floor (`residual_factor` floors it at `1e-6 · mean_var`, still ~6 orders
 /// below a genuine noise scale on near-noiseless data),
 /// the whitening metric `1/D` becomes near-singular, and the whitened-residual
-/// penalized-LAML criterion the outer ρ-optimizer then descends is ill-conditioned with no interior
+/// penalized quasi-Laplace criterion the outer ρ-optimizer then descends is ill-conditioned with no interior
 /// stationary point. The outer correctly refuses to certify a non-stationary
 /// optimum, so a fit that SHOULD succeed (its iid pass-0 already certified)
 /// instead fails. Skipping the structured pass when there is nothing to model is
@@ -150,7 +149,7 @@ fn sae_structured_residual_model(
     // numerical precision, the residual is pure convergence noise with no
     // structured covariance to model. Fitting a residual-factor model on it
     // collapses the idiosyncratic diagonal `D → 0`, the whitening `1/D` goes
-    // near-singular, and the whitened-residual penalized-LAML criterion the outer optimizer descends
+    // near-singular, and the whitened-residual penalized quasi-Laplace criterion the outer optimizer descends
     // has no interior stationary point (a fit that SHOULD certify then refuses).
     // Degrade to the pass-0 iid fit (which already certified) instead. Scale-free:
     // the floor is on the residual energy RELATIVE to the target energy. See
@@ -194,11 +193,12 @@ pub struct SaeFitReport {
     pub rho: SaeManifoldRho,
     /// Penalized loss of the fitted model.
     pub loss: SaeManifoldLoss,
-    /// Certified full penalized-LAML criterion at the terminal outer stationary
-    /// state, including its Laplace and Occam terms and preceding any optional
-    /// image-frozen post-fit chart canonicalization. This is not
+    /// Terminal custom penalized quasi-Laplace criterion at the outer stationary
+    /// state, including its PSD/Gauss--Newton factor and rank charges and preceding any optional
+    /// image-frozen post-fit chart canonicalization. It is not normalized
+    /// LAML, REML, or model evidence, and it is not
     /// `-loss.total()`.
-    pub penalized_laml_criterion: f64,
+    pub penalized_quasi_laplace_criterion: f64,
     pub assignments: Array2<f64>,
     pub fitted: Array2<f64>,
     pub active_mask: Vec<bool>,
@@ -634,7 +634,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     let mut term = fitted_result.term;
     let mut rho = fitted_result.rho;
     let mut loss = fitted_result.loss;
-    let mut penalized_laml_criterion = fitted_result.penalized_laml_criterion;
+    let mut penalized_quasi_laplace_criterion = fitted_result.penalized_quasi_laplace_criterion;
 
     // #2021 (EXPERIMENT) — structured-residual OUTER ALTERNATION.
     // Pass 0 above is the iid fit (unchanged, bit-for-bit). When the caller's
@@ -655,7 +655,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // (or, on the first structured pass, the MEASURED iid anchor φ̂·I —
     // `isotropic_dispersion`, #2243 cap #2: a unit-I anchor assumed unit noise,
     // so near-noiseless factors were whitened ~1/φ̂ too coarsely and the
-    // unit-dispersion penalized LAML criterion over-penalized them; anchoring at the
+    // unit-dispersion penalized quasi-Laplace criterion over-penalized them; anchoring at the
     // measured scale prices the smoothing penalty against the real
     // dispersion). A small, increasing γ schedule
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
@@ -782,7 +782,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             term = fitted_result.term;
             rho = fitted_result.rho;
             loss = fitted_result.loss;
-            penalized_laml_criterion = fitted_result.penalized_laml_criterion;
+            penalized_quasi_laplace_criterion = fitted_result.penalized_quasi_laplace_criterion;
             structured_residual_diagnostics.push(StructuredResidualPassDiagnostic {
                 pass: pass + 1,
                 gamma,
@@ -1132,7 +1132,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         term,
         rho,
         loss,
-        penalized_laml_criterion,
+        penalized_quasi_laplace_criterion,
         assignments,
         fitted,
         active_mask,

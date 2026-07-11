@@ -47,7 +47,7 @@ fn qwen_real_activation_behavior_fit_selects_identifiable_lambda_y() {
 
     let mut config = SaeCrosscoderAutoFitConfig::standard(4, 3);
     config.max_iter = 30;
-    // Fixed-rho keeps the gate fast; lambda_y selection through the outer penalized-LAML
+    // Fixed-rho keeps the gate fast; lambda_y selection through the outer penalized quasi-Laplace
     // walk is exercised by the synthetic behavior tests and the full driver.
     config.run_outer_rho_search = false;
     let report = run_auto_sae_behavior_fit(SaeBehaviorAutoFitRequest {

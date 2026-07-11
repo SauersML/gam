@@ -5,7 +5,7 @@
 //! test (`tests_streaming_efs_cache_1026`) did NOT cover:
 //!
 //!  1. **Outer-gradient parity.** The #1026 test proved the cache returned by
-//!     `penalized_laml_criterion_streaming_exact_with_cache` is a drop-in for the EFS
+//!     `penalized_quasi_laplace_criterion_streaming_exact_with_cache` is a drop-in for the EFS
 //!     consumers (`ard_inverse_traces` / `reconstruction_dispersion`). But the
 //!     ANALYTIC OUTER ρ-GRADIENT lane (`outer_gradient_arrow_solver` →
 //!     `analytic_outer_rho_gradient_components`) also reads the returned cache,
@@ -20,7 +20,7 @@
 //!     metric) fit at K=32, p=128, n=500 — the composition regime whose predicted
 //!     dense evidence cache (`N·q·border_dim`, q=K(1+d), border_dim=Σ_k M_k·p)
 //!     exceeds the in-core budget — must ROUTE to the streaming criterion and
-//!     COMPLETE with a finite penalized LAML value rather than hard-erroring. We pin both
+//!     COMPLETE with a finite penalized quasi-Laplace value rather than hard-erroring. We pin both
 //!     halves deterministically: (a) the memory planner refuses the dense direct
 //!     plan at this shape but admits the matrix-free plan, so the auto-router
 //!     selects streaming; and (b) the streaming value path itself returns a finite
@@ -41,8 +41,8 @@ use super::tests::{
 use std::sync::Arc;
 
 /// The analytic outer ρ-gradient assembled off the STREAMING cache
-/// (`penalized_laml_criterion_streaming_exact_with_cache`) must be bit-identical to the one
-/// assembled off the DENSE cache (`penalized_laml_criterion_with_cache`). Both entries
+/// (`penalized_quasi_laplace_criterion_streaming_exact_with_cache`) must be bit-identical to the one
+/// assembled off the DENSE cache (`penalized_quasi_laplace_criterion_with_cache`). Both entries
 /// converge the inner (t, β) state through the SAME
 /// `converge_inner_for_undamped_logdet` driver with the SAME undamped Direct
 /// options, so the returned factor caches — and therefore the selected-inverse
@@ -73,7 +73,7 @@ fn streaming_cache_outer_gradient_matches_dense_cache() {
     let mut streaming = term0;
 
     let (dense_cost, dense_loss, dense_cache) = dense
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             &rho,
             None,
@@ -84,7 +84,7 @@ fn streaming_cache_outer_gradient_matches_dense_cache() {
         )
         .expect("dense cache criterion");
     let (stream_cost, stream_loss, stream_cache) = streaming
-        .penalized_laml_criterion_streaming_exact_with_cache(
+        .penalized_quasi_laplace_criterion_streaming_exact_with_cache(
             target.view(),
             &rho,
             None,
@@ -320,7 +320,7 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
 }
 
 /// Hybrid-EFS must replace the former held-zero non-ordered Beta--Bernoulli assignment coordinate
-/// with the exact penalized-LAML derivative and expose that same root-equivalent update to
+/// with the exact penalized quasi-Laplace derivative and expose that same root-equivalent update to
 /// the final fixed-point proof hook. This dense fixture exercises the exact dense
 /// sibling cheaply; the complete-gradient parity test below pins the matrix-free
 /// sibling to identical math.
@@ -528,7 +528,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
 }
 
-/// End-to-end: the whitened streaming penalized LAML criterion (`penalized_laml_criterion_streaming_
+/// End-to-end: the whitened streaming penalized quasi-Laplace criterion (`penalized_quasi_laplace_criterion_streaming_
 /// exact`) must COMPLETE with a finite value rather than surfacing the
 /// `cost-only streaming route is required` hard-error class. The streaming lane is
 /// size-INVARIANT — it runs the identical `converge_inner_for_undamped_logdet` +
@@ -564,7 +564,7 @@ fn whitened_streaming_criterion_completes() {
     );
 
     let (cost, loss) = term
-        .penalized_laml_criterion_streaming_exact(
+        .penalized_quasi_laplace_criterion_streaming_exact(
             target.view(),
             &rho,
             None,
@@ -576,7 +576,7 @@ fn whitened_streaming_criterion_completes() {
         .expect("whitened streaming criterion must complete, not hard-error");
     assert!(
         cost.is_finite(),
-        "streaming penalized LAML criterion must be finite; got {cost}"
+        "streaming penalized quasi-Laplace criterion must be finite; got {cost}"
     );
     assert!(
         loss.total().is_finite() && loss.data_fit.is_finite(),

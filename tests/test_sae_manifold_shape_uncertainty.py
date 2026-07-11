@@ -61,7 +61,7 @@ def test_shape_uncertainty_periodic_payload_decodes_ring_not_chord():
         "assignments_z": np.ones((n, 1)),
         "logits": np.ones((n, 1)),
         "fitted": x,
-        "penalized_laml_criterion": 0.0,
+        "penalized_quasi_laplace_criterion": 0.0,
         # #1512: the SAE facade now reads a penalized-loss score from the fit
         # payload (penalized_loss_score / oos_penalized_loss); the orphaned fake
         # predates it and tripped KeyError. Mirror the fitted criterion here.

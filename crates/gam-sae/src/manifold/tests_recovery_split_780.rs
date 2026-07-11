@@ -1275,7 +1275,7 @@ pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
     let source_rho = source.baseline_rho.clone();
     source
         .term
-        .penalized_laml_criterion_with_cache(
+        .penalized_quasi_laplace_criterion_with_cache(
             source.target.view(),
             &source_rho,
             source.registry.as_ref(),
@@ -1472,7 +1472,15 @@ pub(crate) fn fixed_state_logdet(
     rho: &SaeManifoldRho,
 ) -> f64 {
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            rho,
+            None,
+            0,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("fixed-state cache");
     arrow_log_det_from_cache(&cache).expect("fixed-state authoritative joint logdet")
 }

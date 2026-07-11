@@ -99,7 +99,7 @@ fn honest_argmin(feats: &Array2<f64>, y: &Array1<f64>) -> f64 {
 }
 
 #[test]
-fn honest_profiled_penalized_laml_criterion_identifies_curvature_sign() {
+fn honest_profiled_penalized_quasi_laplace_criterion_identifies_curvature_sign() {
     // Spherical mirror (κ⋆ = +2): argmin κ must be POSITIVE.
     let (sph_x, sph_y) = curved_dataset(2.0, 0x5151_0001);
     let sph_argmin = honest_argmin(&sph_x, &sph_y);

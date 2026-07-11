@@ -161,7 +161,7 @@ class _CapturingRustModule:
             "assignments_z": assignments,
             "logits": logits,
             "fitted": np.zeros_like(z),
-            "penalized_laml_criterion": 1.0,
+            "penalized_quasi_laplace_criterion": 1.0,
             "penalized_loss_score": -1.0,
             "chosen_k": k_atoms,
             "dispersion": 1.0,

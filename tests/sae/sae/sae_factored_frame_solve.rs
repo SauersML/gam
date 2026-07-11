@@ -20,7 +20,7 @@
 //!   3. handles a MIXED dictionary (one low-rank atom frames, one full-rank-ish
 //!      atom stays full-`B`) — the variable-`r` path;
 //!   4. keeps the evidence criterion consistent: at a FIXED smoothness
-//!      `log λ = 0` the framed and full-`B` `penalized_laml_criterion` agree to round-off
+//!      `log λ = 0` the framed and full-`B` `penalized_quasi_laplace_criterion` agree to round-off
 //!      (the only frame-dependent term — the Grassmann-dimension occam
 //!      normalizer — is linear in `log λ` and vanishes at `log λ = 0`; at the
 //!      optimized `λ ≠ 1` they correctly differ by that occam term).
@@ -751,7 +751,7 @@ fn evidence_consistency_at_fixed_lambda() {
     );
 
     let (v_full, _) = full
-        .penalized_laml_criterion(
+        .penalized_quasi_laplace_criterion(
             z.view(),
             &rho,
             None,
@@ -762,7 +762,7 @@ fn evidence_consistency_at_fixed_lambda() {
         )
         .expect("full-B criterion");
     let (v_framed, _) = framed
-        .penalized_laml_criterion(
+        .penalized_quasi_laplace_criterion(
             z.view(),
             &rho,
             None,

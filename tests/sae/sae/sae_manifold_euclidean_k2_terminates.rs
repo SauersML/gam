@@ -180,7 +180,7 @@ fn sae_manifold_euclidean_k2_fit_terminates() {
     let r2 = reconstruction_r2(&fitted_out, &z);
     // #1094 residual — evaluate the OUTER criterion DIRECTLY at the converged
     // optimum, on the fit's own settled ρ, through the same public
-    // `penalized_laml_criterion` path the outer cascade uses. The residual bug was the
+    // `penalized_quasi_laplace_criterion` path the outer cascade uses. The residual bug was the
     // criterion refusing a feasible euclidean K=2 fit to the infeasible sentinel
     // (`1e12`): at the rank-deficient optimum the KKT gradient parks in the
     // weakly-identified decoder/gauge directions, so no stationarity certificate
@@ -191,7 +191,7 @@ fn sae_manifold_euclidean_k2_fit_terminates() {
     // for a fit that reconstructs the two planted lines. A criterion that reports
     // infeasible for a demonstrably good fit poisons outer model comparison.
     let (recheck_cost, _loss) = fitted_term
-        .penalized_laml_criterion(
+        .penalized_quasi_laplace_criterion(
             z.view(),
             &fitted.rho,
             None,

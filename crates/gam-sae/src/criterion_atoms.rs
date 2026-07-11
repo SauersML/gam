@@ -1,4 +1,4 @@
-//! Criterion-as-atoms for the SAE LAML objective (issue #931, SAE pilot).
+//! Criterion-as-atoms for the custom SAE penalized quasi-Laplace objective.
 //!
 //! # The bug class this kills
 //!
@@ -13,14 +13,19 @@
 //!
 //! # The decomposition
 //!
-//! The SAE penalized LAML criterion the outer optimizer minimizes is, exactly as
-//! `SaeManifoldTerm::penalized_laml_criterion_with_cache` assembles it,
+//! The SAE penalized quasi-Laplace criterion the outer optimizer minimizes is, exactly as
+//! `SaeManifoldTerm::penalized_quasi_laplace_criterion_with_cache` assembles it,
 //!
 //! ```text
 //!   V(ρ) = [ loss.total() + extra_penalty_energy ]   (data-fit + priors)
-//!        + [½·log|H| − ½·log|H_tt| + rank_charge]   (Laplace complexity)
+//!        + [½·log|B| − ½·log|B_tt| + rank_charge]   (custom complexity)
 //!        − occam(ρ)                                   (smoothing Occam)
 //! ```
+//!
+//! This is a custom rank-adjusted quasi-Laplace scalar: `B` is the declared
+//! PSD/Gauss--Newton factor rather than the exact joint Hessian, and the smooth
+//! assignment priors are improper. It is not normalized LAML, REML, or model
+//! evidence.
 //!
 //! and its exact total ρ-derivative (the #1006 theorem, all coordinates at
 //! once) is
@@ -33,7 +38,7 @@
 //!                                   that accounts for θ̂(ρ) moving — #1006's Γ).
 //! ```
 //!
-//! #1418: the criterion's Laplace curvature term is `½log|B|`, where `B` is the
+//! #1418: the criterion's custom curvature term is `½log|B|`, where `B` is the
 //! curvature the inner solve factors (Gauss-Newton data curvature, softmax
 //! Fisher metric, `max(V'',0)` ARD majorizers), so `Γ = ½tr(B⁻¹ ∂B/∂ρ)` and
 //! `logdet_trace` contract `B`. But the implicit step `θ̂_ρ = −A⁻¹ g_ρ` is
@@ -49,7 +54,7 @@
 //! `(value, ρ-gradient)` **together** from the one cache the criterion forms.
 //! [`SaeCriterion::assemble`] is the only constructor: it runs the inner solve
 //! once, takes the single undamped factor, and hands every atom the SAME
-//! `loss`/Laplace-complexity/`cache`/`components` so value and gradient are projections
+//! `loss`/quasi-Laplace-complexity/`cache`/`components` so value and gradient are projections
 //! of one factorization — the outer optimizer (see
 //! [`SaeCriterion::value`] / [`SaeCriterion::gradient`]) can no longer call a
 //! value path and a gradient path that don't share state. The implicit-state

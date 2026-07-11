@@ -82,8 +82,8 @@ def test_deprecated_score_alias_is_rejected() -> None:
 def test_complete_native_criterion_is_required() -> None:
     golden = _load(GOLDEN_FULL)
     missing = dict(golden)
-    missing.pop("penalized_laml_criterion")
-    with pytest.raises(ValueError, match="missing field.*penalized_laml_criterion"):
+    missing.pop("penalized_quasi_laplace_criterion")
+    with pytest.raises(ValueError, match="missing field.*penalized_quasi_laplace_criterion"):
         ManifoldSAE.from_dict(missing)
 
 

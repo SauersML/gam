@@ -225,7 +225,7 @@ impl SaeManifoldTerm {
         }
         // `smooth_penalty` is the validated reference-function Gram and is fixed
         // for the lifetime of this objective. Basis reparameterizations
-        // transport it by congruence; ordinary Newton and penalized-LAML steps
+        // transport it by congruence; ordinary Newton and penalized quasi-Laplace steps
         // all differentiate the same declared quadratic form.
         // #1026 — freeze the decoder-repulsion collinearity gate at the SAME
         // assembly chokepoint as the smoothness Gram, so the repulsion's

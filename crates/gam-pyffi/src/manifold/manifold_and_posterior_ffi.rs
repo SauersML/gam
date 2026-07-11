@@ -5982,20 +5982,6 @@ fn sae_atom_topologies(bases: Vec<String>) -> (Option<String>, Vec<String>) {
     (scalar, per_atom)
 }
 
-/// Rust-owned training-mean `x.mean(axis=0)` -> `(P,)` (#2091). The gamfit SAC
-/// lift (`StagewiseSAE.to_manifold_sae`) marshals this rather than computing the
-/// centering vector in production Python (SPEC thin-wrapper rule); it is the same
-/// reduction (`column_mean`) the fit builder applies, so a lifted dictionary's
-/// `training_mean` matches the fit path.
-#[pyfunction(signature = (x))]
-fn sae_manifold_training_mean<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-) -> Bound<'py, PyArray1<f64>> {
-    let mean = crate::manifold::manifold_sae_coercion::column_mean(x.as_array());
-    manifold_sae_vec1(py, &mean)
-}
-
 /// Rust owner of the periodic shape-band reorder (#2091). Stably sorts a periodic
 /// atom's `(G, 1)` shape-band coordinates ascending and reindexes the ROWS of the
 /// amplitude-correct `(G, p)` mean and (optional) `(G, p)` sd to match, mirroring
@@ -6088,7 +6074,7 @@ fn sae_manifold_from_fit_payload(
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw_payload)?;
     let x_view = x.as_array();
     // training_mean = x.mean(axis=0) (n >= 2 in every real fit); shared reduction
-    // core so the SAC lift's `sae_manifold_training_mean` uses the identical math.
+    // shared native reduction used by every fitted artifact.
     let training_mean: Vec<f64> = crate::manifold::manifold_sae_coercion::column_mean(x_view);
     // (n, p, r) shard -> nested Vec (the ManifoldSaePayload / to_dict layout).
     let fisher_factors_nested: Option<Vec<Vec<Vec<f64>>>> = fisher_factors.map(|arr| {
@@ -6793,8 +6779,8 @@ impl ManifoldSaeCore {
         out.set_item("learnable_alpha", self.inner.learnable_alpha)?;
         out.set_item("penalized_loss_score", self.inner.penalized_loss_score)?;
         out.set_item(
-            "penalized_laml_criterion",
-            self.inner.penalized_laml_criterion,
+            "penalized_quasi_laplace_criterion",
+            self.inner.penalized_quasi_laplace_criterion,
         )?;
         out.set_item("reconstruction_r2", self.inner.reconstruction_r2)?;
         out.set_item("dispersion", self.inner.dispersion)?;
@@ -7436,10 +7422,10 @@ impl ManifoldSaeCore {
     fn penalized_loss_score(&self) -> Option<f64> {
         self.inner.penalized_loss_score
     }
-    /// Certified complete penalized-LAML scalar evaluated at the terminal fit.
+    /// Terminal custom penalized quasi-Laplace scalar; not normalized LAML/REML/evidence.
     #[getter]
-    fn penalized_laml_criterion(&self) -> f64 {
-        self.inner.penalized_laml_criterion
+    fn penalized_quasi_laplace_criterion(&self) -> f64 {
+        self.inner.penalized_quasi_laplace_criterion
     }
     #[getter]
     fn selected_log_lambda_sparse(&self) -> Option<f64> {

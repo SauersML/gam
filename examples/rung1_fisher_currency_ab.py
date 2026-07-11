@@ -114,7 +114,7 @@ def _fit_worker(
             "ok": True,
             "xhat": np.ascontiguousarray(model.fitted, dtype=np.float64),
             "k_final": int(model.k),
-            "terminal_joint_penalized_laml": float(model.terminal_joint_penalized_laml),
+            "terminal_joint_penalized_quasi_laplace": float(model.terminal_joint_penalized_quasi_laplace),
         })
     except Exception as exc:  # a genuine fit failure is recorded, not hidden
         out_q.put({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
@@ -250,7 +250,7 @@ def run_ab(
             "k_final": rec["k_final"],
             "euclidean_ev": euclidean_ev(x, xhat),
             "loss_recovered_nats": loss_recovered_nats(U, x, xhat),
-            "terminal_joint_penalized_laml": rec["terminal_joint_penalized_laml"],
+            "terminal_joint_penalized_quasi_laplace": rec["terminal_joint_penalized_quasi_laplace"],
         }
     # RAW-space reconstructions + the raw ablate mean for the TORCH fidelity harness
     # (CallableReconstructor(lambda a: xhat_raw, ablate_mean=tier0_mean)).
@@ -275,7 +275,7 @@ def _format_table(table: dict[str, Any]) -> str:
             continue
         lines.append(
             f"{name:>5} | {'ok':>8} | {a['euclidean_ev']:>10.4f} | "
-            f"{a['loss_recovered_nats']:>16.4f} | {a['k_final']:>3} | {a['terminal_joint_penalized_laml']:>10.2f}"
+            f"{a['loss_recovered_nats']:>16.4f} | {a['k_final']:>3} | {a['terminal_joint_penalized_quasi_laplace']:>10.2f}"
         )
     arms = table["arms"]
     if arms.get("iid", {}).get("status") == "ok" and arms.get("gls", {}).get("status") == "ok":

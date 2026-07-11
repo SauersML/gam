@@ -157,8 +157,8 @@ def test_report_block_getters() -> None:
     golden = _golden()
     core = ManifoldSAE(golden)
     assert core.diagnostics == golden["diagnostics"]
-    assert core.penalized_laml_criterion == pytest.approx(
-        golden["penalized_laml_criterion"]
+    assert core.penalized_quasi_laplace_criterion == pytest.approx(
+        golden["penalized_quasi_laplace_criterion"]
     )
     assert core.solver_plan == golden["solver_plan"]
     assert core.hybrid_split == golden["hybrid_split"]
@@ -178,8 +178,8 @@ def test_native_summary_and_description_length_use_the_fitted_artifact() -> None
     assert summary["K"] == len(golden["atoms"])
     assert summary["atom_topology"] == golden["atom_topology"]
     assert summary["penalized_loss_score"] == golden["penalized_loss_score"]
-    assert summary["penalized_laml_criterion"] == pytest.approx(
-        golden["penalized_laml_criterion"]
+    assert summary["penalized_quasi_laplace_criterion"] == pytest.approx(
+        golden["penalized_quasi_laplace_criterion"]
     )
     assert "reml_score" not in summary
     assert "evidence" not in summary

@@ -711,7 +711,7 @@ fn run(shape: Shape) -> Result<(), String> {
 
     let mut term_for_criterion = fixture.term.clone();
     let start = Instant::now();
-    let (criterion, loss) = term_for_criterion.penalized_laml_criterion(
+    let (criterion, loss) = term_for_criterion.penalized_quasi_laplace_criterion(
         fixture.target.view(),
         &fixture.rho,
         None,

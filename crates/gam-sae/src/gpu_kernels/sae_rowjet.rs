@@ -1,6 +1,6 @@
 //! SAE reconstruction row-jet on the GPU (#932 → A100 cutover).
 //!
-//! The exact-LAML SAE engine needs, per row, the order-2 derivative tower of the
+//! The SAE quasi-Laplace SAE engine needs, per row, the order-2 derivative tower of the
 //! reconstruction
 //!
 //! ```text

@@ -540,7 +540,7 @@ impl SaeManifoldTerm {
     /// finalization fallback swaps the settled basin / canonicalizes charts, that
     /// factor no longer describes the returned model. This rebuilds the undamped
     /// Direct joint-Hessian factor from THIS (final) term at `rho` — the exact
-    /// factor the penalized LAML criterion forms at the inner optimum — and reads the
+    /// factor the penalized quasi-Laplace criterion forms at the inner optimum — and reads the
     /// per-atom covariance and bands off its Schur factor, scaling by the
     /// reconstruction dispersion `φ̂`. The result is the DOCUMENTED joint
     /// covariance: it carries the cross-atom covariance and the decoder-coordinate
@@ -581,7 +581,7 @@ impl SaeManifoldTerm {
             let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
             return Ok(self.shape_uncertainty_without_decoder_covariance(dispersion));
         }
-        let (_cost, loss, cache) = self.penalized_laml_criterion_with_cache(
+        let (_cost, loss, cache) = self.penalized_quasi_laplace_criterion_with_cache(
             target,
             rho,
             registry,

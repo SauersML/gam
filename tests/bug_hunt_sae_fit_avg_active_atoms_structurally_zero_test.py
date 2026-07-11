@@ -48,7 +48,7 @@ def test_sae_fit_avg_active_atoms_is_consistent_with_reconstruction() -> None:
     labels = rng.integers(0, K, size=N)
     X = rng.uniform(1.0, 3.0, size=N)[:, None] * dirs[labels]
 
-    res = gamfit.sae_fit(X)
+    res = gamfit.sae_manifold_fit(X, K=K)
     s = res.summary()
     r2 = float(s["reconstruction_r2"])
     avg_active = float(s["avg_active_atoms"])

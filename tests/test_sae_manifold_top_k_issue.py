@@ -81,4 +81,4 @@ def test_topk_payload_is_one_unprojected_model() -> None:
     assert float(payload["penalized_loss_breakdown"]["data_fit"]) == pytest.approx(
         expected_data_fit
     )
-    assert np.isfinite(float(payload["penalized_laml_criterion"]))
+    assert np.isfinite(float(payload["penalized_quasi_laplace_criterion"]))

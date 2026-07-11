@@ -169,5 +169,7 @@ pub(crate) fn planted_circle_multi_atom_threshold_gate_clears_startup_validation
     }
     // The fit produced a result (converged or best-so-far); the startup
     // validation accepted the seed, which is the #1782 contract.
-    result.expect("#1782: multi-atom threshold-gate fit must run to a result, not a seed-cascade abort");
+    result.expect(
+        "#1782: multi-atom threshold-gate fit must run to a result, not a seed-cascade abort",
+    );
 }

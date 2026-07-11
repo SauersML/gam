@@ -2,7 +2,7 @@
 //! (issue #992, items 2 and 3).
 //!
 //! * **Evidence equality at small p** — a dictionary of truly low-rank atoms
-//!   evaluated through the SAME criterion entry (`penalized_laml_criterion`) twice: once
+//!   evaluated through the SAME criterion entry (`penalized_quasi_laplace_criterion`) twice: once
 //!   on the full-`B` border, once with the Grassmann frames activated. Frame
 //!   activation is an exact re-representation (the decoder matrix is
 //!   unchanged; only the border coordinates and the Laplace dimension
@@ -453,7 +453,7 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
             atom.maybe_activate_decoder_frame().expect("activate");
         }
         let (v_full, _) = full
-            .penalized_laml_criterion(
+            .penalized_quasi_laplace_criterion(
                 z.view(),
                 &rho,
                 None,
@@ -464,7 +464,7 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
             )
             .expect("full-B criterion");
         let (v_framed, _) = framed
-            .penalized_laml_criterion(
+            .penalized_quasi_laplace_criterion(
                 z.view(),
                 &rho,
                 None,

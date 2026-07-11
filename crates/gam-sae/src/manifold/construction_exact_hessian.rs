@@ -291,7 +291,7 @@ impl SaeManifoldTerm {
     /// to a joint `(t, β)` vector, matrix-free and per row.
     ///
     /// `A = ∇²_θθ L` is the true inner-fit Hessian; `B` is the assembled
-    /// evidence/Newton operator the solver factors. They differ ONLY by the three
+    /// evidence/Newton operator the solver factors. They differ only by the four
     /// curvature substitutions the assembly makes for stability:
     ///   1. data: `B` uses Gauss-Newton `J̃J̃ᵀ`, dropping the residual curvature
     ///      `R[a,b] = Σ_out r_out·∂²f_out/∂θ_a∂θ_b` (t–t via `jets.second`, t–β via
@@ -300,7 +300,10 @@ impl SaeManifoldTerm {
     ///      dropping `H_entropy − D` (#1419);
     ///   3. periodic ARD: `B` uses `max(V'',0)`, dropping the negative part
     ///      `min(V'',0)` (the indefinite tail past a quarter period).
-    /// `ΔC` is the sum of exactly these three deltas, each built from the SAME
+    ///   4. ordered Beta--Bernoulli: `B` uses the positive row-local diagonal
+    ///      majorizer and drops both the exact negative active-mass rank-one term
+    ///      and every nonpositive row-local diagonal contribution.
+    /// `ΔC` is the sum of exactly these four deltas, each built from the same
     /// jets / penalty curvatures the assembly and the θ-adjoint use, so
     /// `A = B + ΔC` is the one true Hessian. Exact on BOTH the isotropic and the
     /// whitened-metric paths: the data fit is `½ r_nᵀ M_n r_n`, so the residual
@@ -368,6 +371,16 @@ impl SaeManifoldTerm {
         let mut error = Array1::<f64>::zeros(p);
         // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        // Ordered Beta--Bernoulli's exact prior Hessian couples all rows within
+        // each atom column. Gather the logit slice of `v` while visiting the
+        // row-local cache layout, then apply the analytic column reductions once
+        // after the row loop. This remains O(NK) memory/time and constructs no
+        // dense cross-row matrix or persistent carrier.
+        let mut ordered_logit_direction = matches!(
+            self.assignment.mode,
+            AssignmentMode::OrderedBetaBernoulli { .. }
+        )
+        .then(|| Array1::<f64>::zeros(n * k_atoms));
         // #932 SIMD: jets are built in aligned 4-row SIMD batches through a
         // bounded (≤4-row) look-ahead window; unaligned / non-softmax / remainder
         // rows fall back to the scalar per-row path (bit-identical either way).
@@ -423,6 +436,13 @@ impl SaeManifoldTerm {
 
             // Local t-slice of `v` for this row.
             let v_t: Vec<f64> = (0..q).map(|c| v.t[base + c]).collect();
+            if let Some(direction) = ordered_logit_direction.as_mut() {
+                for (local, var) in jets.vars.iter().enumerate() {
+                    if let SaeLocalRowVar::Logit { atom } = *var {
+                        direction[row * k_atoms + atom] = v_t[local];
+                    }
+                }
+            }
 
             // (1a) residual curvature, t–t: ΔC_tt[a,b] = ⟨r, ∂²f_ab⟩.
             for a in 0..q {
@@ -525,6 +545,33 @@ impl SaeManifoldTerm {
                 }
             }
         }
+
+        // (4) ordered Beta--Bernoulli: exact integrated-marginal Hessian minus
+        // the diagonal PSD majorizer written into B. The helper evaluates the
+        // negative within-column rank-one action by column reductions and the
+        // row-local diagonal remainder directly, then we scatter its flat logit
+        // result back into the cache's row-local coordinates.
+        if let Some(direction) = ordered_logit_direction {
+            let delta = crate::assignment::ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
+                &self.assignment,
+                rho,
+                row_loss_w,
+                direction.view(),
+            )?
+            .ok_or_else(|| {
+                "ordered Beta--Bernoulli exact-Hessian correction unexpectedly unavailable"
+                    .to_string()
+            })?;
+            for row in 0..n {
+                let base = cache.row_offsets[row];
+                let vars = self.row_vars_for_cache_row(row, cache)?;
+                for (local, var) in vars.iter().enumerate() {
+                    if let SaeLocalRowVar::Logit { atom } = *var {
+                        out.t[base + local] += delta[row * k_atoms + atom];
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -570,7 +617,7 @@ impl SaeManifoldTerm {
         solve_exact_stationarity_on_gauge_quotient(solver, rhs, &apply_raw_a, &apply_raw_b)
     }
 
-    /// Matrix-free exact-stationarity sibling used by the wide-border penalized-LAML
+    /// Matrix-free exact-stationarity sibling used by the wide-border penalized quasi-Laplace
     /// assignment-strength residual. `system` is the reassembled undamped
     /// bordered operator at the converged inner state; `cache` supplies the same
     /// row factors and H_tbeta operator whose rational log-determinant and shared
@@ -708,7 +755,7 @@ impl SaeManifoldTerm {
         self.combine_assignment_strength_gradient(rho, logdet_trace, &gamma, &response, "dense")
     }
 
-    /// Exact non-ordered Beta--Bernoulli assignment-strength penalized-LAML gradient on the matrix-free
+    /// Exact non-ordered Beta--Bernoulli assignment-strength penalized quasi-Laplace gradient on the matrix-free
     /// evidence path. This is the one coordinate softmax entropy and gated L1
     /// cannot update through a Fellner-Schall equation:
     ///
@@ -779,7 +826,7 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// Analytic SAE penalized-LAML outer-ρ gradient components at the already converged
+    /// Analytic SAE penalized quasi-Laplace outer-ρ gradient components at the already converged
     /// inner state represented by `loss` and `cache`.
     ///
     /// The returned gradient is the assembled analytic outer derivative:
@@ -1005,9 +1052,11 @@ impl SaeManifoldTerm {
         // #1418: the implicit-function correction is `−½·Γᵀ·θ̂_ρ` with
         // `θ̂_ρ = −A⁻¹ g_ρ` (the code contracts `−½·⟨Γ, A⁻¹ g_ρ⟩` with rhs `= +∂g/∂ρ`, i.e. `+½·Γᵀθ̂_ρ` of the response — the sign lives in the −0.5 factor), where `A = ∇²_θθ L` is the EXACT stationarity
         // Jacobian of the inner fit — data residual curvature, exact softmax
-        // entropy Hessian, exact periodic ARD curvature. The matrix the `solver`
-        // factors is `B` (Gauss-Newton data curvature, softmax Fisher metric,
-        // `max(V'',0)` ARD majorizers): the `½log|B|` Laplace term is consistent
+        // entropy Hessian, exact ordered Beta--Bernoulli marginal curvature, and
+        // exact periodic ARD curvature. The matrix the `solver`
+        // factors is `B` (Gauss-Newton data curvature, the softmax Gershgorin
+        // majorizer, the ordered Beta--Bernoulli row-local PSD majorizer, and
+        // `max(V'',0)` ARD curvature): the `½log|B|` Laplace term is consistent
         // with `Γ = ½tr(B⁻¹ ∂B/∂θ)`, but the implicit step is governed by `A`.
         // `solve_exact_stationarity` applies the TRUE `A⁻¹` with left-`B`
         // preconditioned GMRES on `A = B + ΔC`, where

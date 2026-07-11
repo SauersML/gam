@@ -4774,15 +4774,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         crate::manifold::manifold_sae_coercion::sae_flat_block_assignment,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_activation_matrix_from_logits,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_manifold_from_stagewise,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -4985,7 +4976,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_eq4_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
     module.add_function(wrap_pyfunction!(
         sae_manifold_fit_ordered_beta_bernoulli,
         module

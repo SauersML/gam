@@ -543,7 +543,7 @@ fn matrix_free_pcg_curvature_floor_is_noop_on_healthy_system_1026() {
     }
 }
 
-/// #1026 — shared-hyperparameter ARD at large K. The OUTER REML optimizer
+/// #1026 — shared-hyperparameter ARD at large K. The outer quasi-Laplace optimizer
 /// searches over the flat `to_flat()` coordinate vector, so its dimension is
 /// what makes a large-K fit tractable or not.
 ///
@@ -637,7 +637,7 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
 /// only useful if the SHARED parameterization is still a VALID convergent outer
 /// coordinate — a smaller flat vector is worthless if the inner joint fit no
 /// longer converges under it. This drives the real production inner solve
-/// (`penalized_laml_criterion_with_cache`, the same entry the outer optimizer steps on)
+/// (`penalized_quasi_laplace_criterion_with_cache`, the same entry the outer optimizer steps on)
 /// at a `new_shared_ard` ρ and asserts:
 ///   1. the shared flat coordinate is strictly SHORTER than the per-atom one
 ///      (1 + K + max_d  <  1 + K + Σ_k d_k for K>1, since the ARD block
@@ -682,7 +682,15 @@ fn shared_ard_is_a_convergent_outer_coordinate_1026() {
 
     // Inner-solve knobs mirroring the production outer objective's defaults.
     let (cost, _loss, _cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &shared, None, 64, 1.0, 1.0e-8, 1.0e-8)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &shared,
+            None,
+            64,
+            1.0,
+            1.0e-8,
+            1.0e-8,
+        )
         .expect("inner joint fit must converge at the shared-ARD ρ");
     assert!(
         cost.is_finite(),

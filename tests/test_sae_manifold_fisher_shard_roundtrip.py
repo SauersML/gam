@@ -16,7 +16,7 @@ are bit-for-bit identical to the no-shard Euclidean fit. We assert exactly that:
 * its provenance is reported as ``"OutputFisher"`` (no-shard run reports
   ``"Euclidean"``);
 * the per-row ``mass_residual`` truncation diagnostic rides into the report;
-* the DATA-FIT (fitted reconstruction + penalized-LAML criterion) is identical to the no-shard
+* the DATA-FIT (fitted reconstruction + penalized quasi-Laplace criterion) is identical to the no-shard
   run -- the gauge/lens metric leaves the likelihood untouched.
 
 Fixed seeds throughout; no clock entropy. Requires torch (skipped otherwise).
@@ -139,7 +139,7 @@ def test_fisher_shard_roundtrip_installs_metric_without_touching_data_fit() -> N
     #    off by default, so the fitted reconstruction + REML score are bit-for-bit
     #    the same as the no-shard Euclidean fit.
     np.testing.assert_array_equal(fit_fisher.fitted, fit_base.fitted)
-    assert fit_fisher.penalized_laml_criterion == fit_base.penalized_laml_criterion
+    assert fit_fisher.penalized_quasi_laplace_criterion == fit_base.penalized_quasi_laplace_criterion
     assert fit_fisher.reconstruction_r2 == fit_base.reconstruction_r2
 
 
@@ -159,4 +159,4 @@ def test_fisher_shard_roundtrip_accepts_loaded_npz_dict(tmp_path) -> None:
     assert fit_dict.metric_provenance == "OutputFisher"
     assert fit_dict.fisher_mass_residual is not None
     np.testing.assert_array_equal(fit_dict.fitted, fit_base.fitted)
-    assert fit_dict.penalized_laml_criterion == fit_base.penalized_laml_criterion
+    assert fit_dict.penalized_quasi_laplace_criterion == fit_base.penalized_quasi_laplace_criterion

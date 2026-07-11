@@ -132,7 +132,7 @@ def build_payload() -> dict[str, Any]:
         "decoder_blocks": [b.tolist() for b in decoder_blocks],
         "basis_specs": ["periodic:H2", "euclidean:3", "duchon:4"],
         "penalized_loss_score": -37.5,
-        "penalized_laml_criterion": 41.25,
+        "penalized_quasi_laplace_criterion": 41.25,
         "reconstruction_r2": 0.8123,
         "training_mean": training_mean.tolist(),
         "logits": logits.tolist(),

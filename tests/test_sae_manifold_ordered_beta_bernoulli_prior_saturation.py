@@ -5,7 +5,7 @@ The ordered prior uses mean schedule
 covers K in {1,2,4,8} at the default ``alpha=1.0`` (ratio ~0.5, gentle
 decay). It never probes the pathological regime: high K (10-15) with low
 alpha (0.1), where the ratio ~0.091 drives ``pi_k`` below ~7e-4 by k=3 and
-~4e-10 by k=10. The open question this guards: can penalized-LAML capacity selection
+~4e-10 by k=10. The open question this guards: can penalized quasi-Laplace capacity selection
 still find the true K when the prior saturates and threatens to mask atoms
 that carry real signal?
 
@@ -65,8 +65,8 @@ def _multi_harmonic_data(
 
 
 def _criterion(fit) -> float:
-    """Certified penalized-LAML criterion (lower is better)."""
-    value = float(fit.penalized_laml_criterion)
+    """Certified penalized quasi-Laplace criterion (lower is better)."""
+    value = float(fit.penalized_quasi_laplace_criterion)
     assert np.isfinite(value)
     return value
 
@@ -90,15 +90,15 @@ def _select_k(z: np.ndarray, candidates: list[int], alpha: float) -> tuple[int, 
     return best_k, scores
 
 
-def test_penalized_laml_resolves_true_k_under_prior_saturation():
+def test_penalized_quasi_laplace_resolves_true_k_under_prior_saturation():
     """K_true=5 multi-harmonic data, fit over candidates up to K=15 at the
-    saturating alpha=0.1. Penalized LAML must select K near 5, not collapse
+    saturating alpha=0.1. Penalized quasi-Laplace must select K near 5, not collapse
     to K=1 because the ordered prior masks higher atoms."""
     z = _multi_harmonic_data(n=600, p=64, k_true=5, noise=0.04, seed=0)
     candidates = [1, 3, 5, 8, 15]
     best_k, scores = _select_k(z, candidates, alpha=0.1)
     assert 4 <= best_k <= 6, (
-        f"under prior saturation (alpha=0.1, K up to 15) penalized LAML failed to "
+        f"under prior saturation (alpha=0.1, K up to 15) penalized quasi-Laplace failed to "
         f"resolve K_true=5; winner K={best_k}, scores="
         f"{ {k: round(v, 6) for k, v in scores.items()} }. A winner of K=1 "
         f"would indicate the ordered prior collapse is masking atoms "
@@ -136,12 +136,12 @@ def test_ordered_beta_bernoulli_assignments_decay_not_truncate_under_saturation(
 
 def test_reml_keeps_k1_winner_under_saturation():
     """Control: with K_true=1 data, fitting up to K=10 at alpha=0.1 must
-    still leave K=1 the penalized-LAML winner. Saturation must not break the easy
+    still leave K=1 the penalized quasi-Laplace winner. Saturation must not break the easy
     case it makes 'easier' (the prior already favours small K)."""
     z = _circle_data(n=400, p=64, noise=0.04, seed=0)
     candidates = [1, 2, 5, 10]
     best_k, scores = _select_k(z, candidates, alpha=0.1)
     assert best_k == 1, (
-        f"with K_true=1 data and alpha=0.1, penalized-LAML winner should be K=1; got "
+        f"with K_true=1 data and alpha=0.1, penalized quasi-Laplace winner should be K=1; got "
         f"K={best_k}, scores={ {k: round(v, 6) for k, v in scores.items()} }."
     )

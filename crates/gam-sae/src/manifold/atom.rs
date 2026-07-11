@@ -749,7 +749,7 @@ impl SaeManifoldAtom {
     /// A fixed-depth decoder basis (e.g. [`PeriodicHarmonicEvaluator`]) emits
     /// `M` columns whether or not the data excites them; on a near-degenerate
     /// checkpoint the unexcited columns make the design rank-deficient by
-    /// construction, flattening the outer penalized-LAML surface and stalling the solve.
+    /// construction, flattening the outer penalized quasi-Laplace surface and stalling the solve.
     /// Here we replace the basis with its restriction to the data-identified
     /// subspace, so the design is **full-rank by construction** and the outer
     /// problem is well-posed. Everything transforms by the same `Q` congruence:

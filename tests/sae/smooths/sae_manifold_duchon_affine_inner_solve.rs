@@ -104,7 +104,7 @@ fn fit_euclidean_curve(kind: CurveKind) -> f64 {
         loss.total()
     );
     let (criterion, criterion_loss) = term
-        .penalized_laml_criterion(z.view(), &rho, None, 16, 1.0, ridge, ridge)
+        .penalized_quasi_laplace_criterion(z.view(), &rho, None, 16, 1.0, ridge, ridge)
         .expect("REML fixed-rho convergence check should accept the inner optimum");
     assert!(
         criterion.is_finite() && criterion_loss.total().is_finite(),
