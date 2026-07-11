@@ -649,11 +649,6 @@ pub struct SaeManifoldOuterObjective {
     /// early-return and every lane is byte-identical to the historical path.
     /// Installed by [`Self::with_crosscoder_blocks`].
     crosscoder_blocks: Option<CrosscoderBlockPricing>,
-    /// #2253: enable the expensive axis-aligned log-det finite-difference
-    /// diagnostic for one explicitly selected test evaluation. Disabled for
-    /// every ordinary lib test; absent from production builds.
-    #[cfg(test)]
-    pub(crate) logdet_fd_probe_enabled: bool,
 }
 
 /// #2230/#2087 exact basin-bundle memory admission.
@@ -775,8 +770,6 @@ impl SaeManifoldOuterObjective {
             checkpoint_fingerprint,
             checkpoint_path,
             crosscoder_blocks: None,
-            #[cfg(test)]
-            logdet_fd_probe_enabled: false,
         }
     }
 
@@ -3616,84 +3609,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 )
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
-        // #2253 test-only channel-isolation probe: axis-aligned FD of the
-        // criterion's log-det VALUE (arrow_log_det = log|B|) vs the analytic
-        // log-det gradient channel (logdet_trace + adjoint). If FD(½log|B|)
-        // matches (logdet_trace+adjoint) the log-det channel is consistent and
-        // the desync is in `explicit`/`occam`; if not, the log-det channel is
-        // the culprit. Also FD the total. Keyed by ρ.
-        #[cfg(test)]
-        if self.logdet_fd_probe_enabled {
-            let n_p = rho.len();
-            let h = 1.0e-5_f64;
-            let ld0 = crate::manifold::arrow_log_det_from_cache(&cache);
-            let mut fd_total = vec![f64::NAN; n_p];
-            let mut fd_half_logdet = vec![f64::NAN; n_p];
-            for k in 0..n_p {
-                let mut rp = rho.clone();
-                rp[k] += h;
-                let mut rm = rho.clone();
-                rm[k] -= h;
-                let sp = self.baseline_rho.from_flat(rp.view());
-                let sm = self.baseline_rho.from_flat(rm.view());
-                let ep = self.term.reml_criterion_with_cache(
-                    self.target.view(),
-                    &sp,
-                    self.registry.as_ref(),
-                    self.inner_max_iter,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                );
-                let em = self.term.reml_criterion_with_cache(
-                    self.target.view(),
-                    &sm,
-                    self.registry.as_ref(),
-                    self.inner_max_iter,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                );
-                if let (Ok((vp, _, cp)), Ok((vm, _, cm))) = (ep, em) {
-                    fd_total[k] = (vp - vm) / (2.0 * h);
-                    if let (Some(lp), Some(lm)) = (
-                        crate::manifold::arrow_log_det_from_cache(&cp),
-                        crate::manifold::arrow_log_det_from_cache(&cm),
-                    ) {
-                        fd_half_logdet[k] = 0.5 * (lp - lm) / (2.0 * h);
-                    }
-                }
-            }
-            let _ = self.term.reml_criterion_with_cache(
-                self.target.view(),
-                &rho_state,
-                self.registry.as_ref(),
-                self.inner_max_iter,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-            );
-            let logdet_channel: Vec<f64> = grad_components
-                .logdet_trace
-                .iter()
-                .zip(grad_components.third_order_correction.iter())
-                .map(|(t, a)| t + a)
-                .collect();
-            let ns = n_p.min(6);
-            // #[cfg(test)]-only probe: eprintln (not log::warn, which the test
-            // harness drops with no logger) so `[2253-CHAN]` reaches the test output.
-            eprintln!(
-                "[2253-CHAN] rho={rv:?} logdet0={ld0:?} g_an={ga:?} fd_total={ft:?} \
-                 explicit={ex:?} logdet_trace+adj={lc:?} fd_half_logdet={fl:?} occam={oc:?}",
-                rv = rho.to_vec(),
-                ga = grad_components.gradient().to_vec(),
-                ft = &fd_total[..ns],
-                ex = &grad_components.explicit.to_vec()[..ns],
-                lc = &logdet_channel[..ns],
-                fl = &fd_half_logdet[..ns],
-                oc = &grad_components.occam.to_vec()[..ns],
-            );
-        }
         let mut gradient = grad_components.gradient();
         // #2231 Inc-B (stage 2) — ADD the block-relevance tail's explicit data +
         // change-of-variables channels `½·R̃_ℓ − n·p_ℓ/2`

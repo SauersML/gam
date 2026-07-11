@@ -165,11 +165,9 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         .try_resume_from_checkpoint(n_params)
         .map(Array1::from)
         .unwrap_or(initial_flat);
-    objective.logdet_fd_probe_enabled = true;
     let audited = objective
         .eval(&banked)
         .expect("gradient eval at the audited rho");
-    objective.logdet_fd_probe_enabled = false;
     let grad = audited.gradient;
     assert!(
         objective.term.frames_active(),
@@ -177,6 +175,40 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     );
     let center_term = objective.term.clone();
     let center_rho = objective.baseline_rho.from_flat(banked.view());
+    let mut center_component_term = center_term.clone();
+    let (_, center_loss, center_cache) = center_component_term
+        .reml_criterion_with_cache(
+            z.view(),
+            &center_rho,
+            objective.registry.as_ref(),
+            40,
+            0.05,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("criterion cache at the audited rho");
+    let center_solver = center_component_term
+        .outer_gradient_arrow_solver(&center_cache, &center_rho.lambda_smooth_vec())
+        .expect("outer-gradient arrow solver at the audited rho");
+    let center_components = center_component_term
+        .analytic_outer_rho_gradient_components(
+            z.view(),
+            &center_rho,
+            &center_loss,
+            &center_cache,
+            &center_solver,
+        )
+        .expect("analytic gradient components at the audited rho");
+    let center_logdet =
+        arrow_log_det_from_cache(&center_cache).expect("finite log determinant at the audited rho");
+    eprintln!(
+        "[2253-CHAN] center logdet={center_logdet:+.6e} explicit={:?} trace={:?} \
+         adjoint={:?} occam={:?}",
+        center_components.explicit,
+        center_components.logdet_trace,
+        center_components.third_order_correction,
+        center_components.occam,
+    );
     let mut center_atom_term = center_term.clone();
     let center_atoms = center_atom_term
         .criterion_as_atoms(
@@ -229,6 +261,39 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
                 1.0e-6,
             )
             .expect("criterion atoms at -h");
+        let (_, _, plus_cache) = plus_term
+            .reml_criterion_with_cache(
+                z.view(),
+                &plus_rho,
+                objective.registry.as_ref(),
+                40,
+                0.05,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("criterion cache at +h");
+        let (_, _, minus_cache) = minus_term
+            .reml_criterion_with_cache(
+                z.view(),
+                &minus_rho,
+                objective.registry.as_ref(),
+                40,
+                0.05,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("criterion cache at -h");
+        let plus_logdet =
+            arrow_log_det_from_cache(&plus_cache).expect("finite log determinant at +h");
+        let minus_logdet =
+            arrow_log_det_from_cache(&minus_cache).expect("finite log determinant at -h");
+        let logdet_fd = 0.5 * (plus_logdet - minus_logdet) / (2.0 * h);
+        let logdet_analytic =
+            center_components.logdet_trace[j] + center_components.third_order_correction[j];
+        eprintln!(
+            "[2253-CHAN] coord {j}: analytic_logdet={logdet_analytic:+.6e} \
+             central_fd_half_logdet={logdet_fd:+.6e}"
+        );
         let c_plus = plus_atoms.value();
         let c_minus = minus_atoms.value();
         let fd = (c_plus - c_minus) / (2.0 * h);
