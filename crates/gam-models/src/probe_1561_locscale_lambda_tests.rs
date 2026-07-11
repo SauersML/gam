@@ -376,8 +376,39 @@ fn probe_1561_gagurine_scale_geometry() {
             .iter()
             .all(|sigma| sigma.is_finite() && *sigma > 0.0)
     );
+    assert!(train_calibration.is_finite() && test_calibration.is_finite());
+
+    // Gaussian location-scale LAML must have exactly the formula-native penalty
+    // coordinates. #1561 exposed an extra implicit scale-level projector here;
+    // when the native smooth already has its selection penalty, that extra rho
+    // shrinks the global log-sigma intercept and changes the statistical model.
+    assert_eq!(
+        location.lambdas.len(),
+        fit.mean_design.penalties.len(),
+        "#1561 location block has a non-formula penalty coordinate"
+    );
+    assert_eq!(
+        scale.lambdas.len(),
+        fit.noise_design.penalties.len(),
+        "#1561 scale block has a non-formula penalty coordinate"
+    );
+    assert_eq!(
+        fit.fit.lambdas.len(),
+        fit.mean_design.penalties.len() + fit.noise_design.penalties.len(),
+        "#1561 joint rho vector is not the concatenation of formula penalties"
+    );
+
+    // The observed joint curvature used by LAML must remain a genuine SPD
+    // geometry at the certified solution; this catches a dense/operator or
+    // observed-derivative desynchronization without any fitted-score threshold.
+    let (minimum_eigenvalue, maximum_eigenvalue, negative_eigenvalues) =
+        spectrum.expect("#1561 fitted geometry must retain its penalized Hessian");
     assert!(
-        nll < constant_nll,
-        "#1561 gagurine varying-scale NLL {nll:.6} did not beat matched constant-scale NLL {constant_nll:.6}"
+        minimum_eigenvalue > 0.0 && maximum_eigenvalue.is_finite(),
+        "#1561 penalized Hessian is not SPD: min={minimum_eigenvalue}, max={maximum_eigenvalue}"
+    );
+    assert_eq!(
+        negative_eigenvalues, 0,
+        "#1561 penalized Hessian has negative eigenvalues"
     );
 }

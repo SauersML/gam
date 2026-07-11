@@ -53,6 +53,30 @@ pub const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
 /// removed; every production fit starts with this evidence-refined budget.
 pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 
+/// Absolute precision floor on the RELATIVE post-dictionary residual energy
+/// `‖Z − Ẑ‖²_F / ‖Z‖²_F` below which the structured-residual pass is skipped and
+/// the fit degrades to the already-certified pass-0 iid model.
+///
+/// A dictionary that explains the target to within this bound leaves only the
+/// fit's own numerical-convergence noise as "residual": there is genuinely no
+/// structured covariance to whiten. Fitting a residual-covariance model on that
+/// noise is DEGENERATE — the idiosyncratic diagonal `D` collapses toward zero
+/// (it is floored only at `f64::MIN_POSITIVE` in `residual_factor::fit_fixed_rank`),
+/// the whitening metric `1/D` becomes near-singular, and the whitened-residual
+/// REML the outer ρ-optimizer then descends is ill-conditioned with NO interior
+/// stationary point. The outer correctly refuses to certify a non-stationary
+/// optimum, so a fit that SHOULD succeed (its iid pass-0 already certified)
+/// instead fails. Skipping the structured pass when there is nothing to model is
+/// the correct behavior, not a workaround.
+///
+/// DERIVED: the value `1e-10` on the relative *energy* corresponds to a residual
+/// RMS of `1e-5` relative to the target RMS — an order of magnitude below the
+/// inner SAE solve's own convergence scale (`SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL`
+/// `= 1e-8`), so it triggers only on numerically-exact reconstructions while
+/// leaving every genuinely-structured residual (relative energy `≥ ~1e-8`, i.e. a
+/// fit that leaves `≥ 1e-4` RMS unexplained) to run the pass unchanged.
+pub(crate) const STRUCTURED_RESIDUAL_MIN_REL_ENERGY: f64 = 1.0e-10;
+
 /// #2071 residual-promotion alignment threshold under the random-direction
 /// null. Rank one has no informative angle, so its threshold is exactly one.
 /// Keeping this derivation in `gam-sae` makes the typed fit entry self-sufficient
@@ -121,6 +145,20 @@ fn sae_structured_residual_model(
     // owned temporary outlives the in-place subtraction.
     let mut residuals = target.to_owned();
     residuals -= &fitted;
+    // Degeneracy guard: when the dictionary already explains the target to within
+    // numerical precision, the residual is pure convergence noise with no
+    // structured covariance to model. Fitting a residual-factor model on it
+    // collapses the idiosyncratic diagonal `D → 0`, the whitening `1/D` goes
+    // near-singular, and the whitened-residual REML the outer optimizer descends
+    // has no interior stationary point (a fit that SHOULD certify then refuses).
+    // Degrade to the pass-0 iid fit (which already certified) instead. Scale-free:
+    // the floor is on the residual energy RELATIVE to the target energy. See
+    // `STRUCTURED_RESIDUAL_MIN_REL_ENERGY`.
+    let target_energy: f64 = target.iter().map(|v| v * v).sum();
+    let residual_energy: f64 = residuals.iter().map(|v| v * v).sum();
+    if residual_energy <= STRUCTURED_RESIDUAL_MIN_REL_ENERGY * target_energy {
+        return Ok(None);
+    }
     // Activity = per-row total assignment mass (mirrors structure_harvest.rs and
     // the fit tail's own assignment read).
     let assignments = term.assignment.assignments();

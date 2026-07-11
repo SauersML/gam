@@ -3586,7 +3586,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is a typed `OuterGradientError`: it is not a usable derivative and must
         // terminate this evaluation instead of being hidden behind a plain inverse
         // or a differenced value path.
-        let mut gradient = self
+        let grad_components = self
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
@@ -3598,8 +3598,20 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     &solver,
                 )
             })
-            .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?
-            .gradient();
+            .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
+        // #2253 stall probe (temporary): the four separable per-ρ gradient terms
+        // (explicit data-fit, ½tr(H⁻¹∂H/∂ρ) logdet trace, −occam, −½Γᵀθ̂_ρ adjoint).
+        // Compared against a finite-difference of `cost` reconstructed offline from
+        // the ρ trajectory, this localizes WHICH term desyncs from the criterion.
+        log::warn!(
+            "[2253-TERMS] rho={rho_v:?} explicit={ex:?} logdet_trace={lt:?} occam={oc:?} adjoint={adj:?}",
+            rho_v = rho.to_vec(),
+            ex = grad_components.explicit.to_vec(),
+            lt = grad_components.logdet_trace.to_vec(),
+            oc = grad_components.occam.to_vec(),
+            adj = grad_components.third_order_correction.to_vec(),
+        );
+        let mut gradient = grad_components.gradient();
         // #2231 Inc-B (stage 2) — ADD the block-relevance tail's explicit data +
         // change-of-variables channels `½·R̃_ℓ − n·p_ℓ/2`
         // ([`Self::block_log_lambda_gradient`]) to the components assembler's
