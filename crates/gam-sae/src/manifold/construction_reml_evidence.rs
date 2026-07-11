@@ -1060,7 +1060,7 @@ impl SaeManifoldTerm {
                     "SaeManifoldTerm::reml_criterion: inner-refinement budget overflow".to_string()
                 })?;
             if total_inner_iter >= effective_refine_limit {
-                // #2234 stall synthesis — one PROGRESS-GATED budget escalation.
+                // #2234 stall synthesis — PROGRESS-GATED budget escalation.
                 // Two prior designs collide here: the #2080 wide-p hang fix makes
                 // budget-limited solves refuse fast — so at any ρ whose inner
                 // problem needs more than the budget, EVERY lane that lands here
@@ -1070,11 +1070,21 @@ impl SaeManifoldTerm {
                 // fleet-wide 2026-07-10: gam-sae 126 test failures, ten-orders
                 // cost-lane disagreement at one ρ). A solve that is MEASURABLY
                 // DESCENDING (`saw_refine_progress`) is an unfinished
-                // computation, not an infeasibility: grant it ONE additional
-                // window of the same size and keep refining. A non-progressing
-                // solve still refuses immediately — exactly the #2080 hang
-                // protection — and a second budget death refuses regardless.
-                if saw_refine_progress && budget_escalation_extra == 0 {
+                // computation, not an infeasibility: grant it one additional
+                // window of the same size and keep refining. The ordinary
+                // nonstationary lane retains that single-window hang bound. A
+                // coarse-KKT state that is still non-idempotent is different:
+                // returning it is the #2253 value/gradient mismatch, so every
+                // FURTHER window remains available only while the EXISTING
+                // round-to-round KKT predicate proves fresh progress. The first
+                // non-decreasing round reaches the typed refusal below; no new
+                // tolerance or fixed iteration budget is introduced.
+                let stationary_window_paid = gradient_stationary
+                    && budget_escalation_extra > 0
+                    && Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
+                if (saw_refine_progress && budget_escalation_extra == 0)
+                    || stationary_window_paid
+                {
                     let escalation_window = refine_limit.max(1);
                     // `refine_iteration_limit` is dynamic and may return a
                     // ceiling below the iterations already consumed.  Carry
@@ -1091,7 +1101,7 @@ impl SaeManifoldTerm {
                     log::debug!(
                         "SaeManifoldTerm::reml_criterion: budget escalation at fixed ρ — \
                          ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) still descending after \
-                         {total_inner_iter} inner iterations; granting one extra window of \
+                         {total_inner_iter} inner iterations; granting a progress-paid window of \
                          {escalation_window} iterations"
                     );
                 } else if gradient_stationary {
