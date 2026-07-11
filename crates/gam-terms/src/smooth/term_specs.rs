@@ -4599,8 +4599,7 @@ fn feature_columns_rotation_invariant_range(
         for row in 0..dimensions {
             let centered_row = point[row] - centroid[row];
             for column in 0..=row {
-                covariance[[row, column]] +=
-                    centered_row * (point[column] - centroid[column]);
+                covariance[[row, column]] += centered_row * (point[column] - centroid[column]);
             }
         }
     }
@@ -5133,13 +5132,12 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         identifiability_transform.map(|z| z.view()),
         aniso_log_scales,
     )?;
-    // Gate the operator dials on the Matérn-ν RKHS Sobolev order m = ν + d/2:
-    // mass (j=0) is always on, tension (j=1) is on for m > 1, stiffness (j=2)
-    // is on for m > 2. The threshold is strict so the roughest kernel ν=1/2 in
-    // d=1 (m=1, the exponential/OU H¹ process) sheds both higher operators —
-    // its kernel already encodes the H¹ control, so adding an extra tension
-    // dial over-smooths the oscillation it is meant to track (#707). The
-    // matching gate lives at `DuchonOperatorPenaltySpec::matern_for_smoothness`.
+    // Gate operator dials on the Matérn-ν RKHS Sobolev order m = ν + d/2.
+    // Derivative energies through j=m belong to H^m inclusively, so the 1-D
+    // ν=3/2 kernel (m=2) carries stiffness as well as mass+tension. The sole
+    // exception is ν=1/2: its center cusp makes collocated D1/D2 undefined and
+    // it therefore retains mass only (#707). The matching topology gate lives
+    // at `DuchonOperatorPenaltySpec::matern_for_smoothness`.
     const ORDER_EPS: f64 = 1e-9;
     let d = penalty_centers.ncols();
     let m = nu.half_integer_value() + 0.5 * d as f64;
@@ -5153,7 +5151,8 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
             2.0,
         ),
     ] {
-        if min_order > 0.0 && m <= min_order + ORDER_EPS {
+        let nondifferentiable_ou = matches!(nu, crate::basis::MaternNu::Half);
+        if min_order > 0.0 && (nondifferentiable_ou || m + ORDER_EPS < min_order) {
             continue;
         }
         let sym = (&raw + &raw.t()) * 0.5;

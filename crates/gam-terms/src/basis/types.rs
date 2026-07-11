@@ -1136,30 +1136,24 @@ impl DuchonOperatorPenaltySpec {
     /// true kernel does NOT — it over-smooths the reduced-rank fit relative to
     /// the exact GP (mgcv `bs="gp"`, GpGp).
     ///
-    /// Concretely the roughest Matérn, ν=1/2 in d=1 (`m = 1`), is the
-    /// Ornstein–Uhlenbeck/exponential kernel: an H¹ process whose sample paths
-    /// are continuous but non-differentiable. Although `∫(f')²` is finite on
-    /// its RKHS, the kernel itself already encodes the H¹ control; layering an
-    /// extra tension dial on top biases the reduced-rank fit toward the smooth
-    /// `C¹` functions the kernel does not favour (and stiffness `D2` toward
-    /// `C²`), collapsing held-out oscillation (#707). We therefore gate each
-    /// operator on `j < m` STRICTLY: mass (j=0) is always on, tension (j=1) is
-    /// on for `m > 1`, stiffness (j=2) is on for `m > 2`. For ν ≥ 3/2 (or any
-    /// d ≥ 2) every dial is active, recovering `all_active`; only the
-    /// genuinely rough ν=1/2 (d=1) kernel — where the Sobolev order sits
-    /// exactly on a derivative boundary — drops the higher operators.
+    /// The ν=1/2 Ornstein–Uhlenbeck kernel is the sole exception: its cusp at a
+    /// center makes the collocated gradient/Hessian undefined, so it retains
+    /// mass only (#707). Every differentiable order uses the inclusive Sobolev
+    /// boundary. In particular ν=3/2 in d=1 has `m=2`, and its finite `D2`
+    /// stiffness energy belongs to H². Omitting that block leaves the rough
+    /// kernel with only mass+tension, inflates EDF, and changes the REML model
+    /// class relative to its stated RKHS.
     pub fn matern_for_smoothness(nu: MaternNu, d: usize) -> Self {
         let m = nu.half_integer_value() + 0.5 * d as f64;
-        // Tolerance so an exact half-integer Sobolev order (e.g. m = 1.0 for
-        // ν=1/2, d=1) reliably DISABLES the matching-order operator instead
-        // of flipping on a float-equality knife-edge.
+        // Tolerance keeps the mathematically inclusive `j ≤ m` boundary stable
+        // under floating-point representation of half-integer orders.
         const ORDER_EPS: f64 = 1e-9;
         let active = || OperatorPenaltySpec::Active {
             initial_log_lambda: 0.0,
             prior: None,
         };
         let gate = |order: f64| {
-            if m > order + ORDER_EPS {
+            if !matches!(nu, MaternNu::Half) && m + ORDER_EPS >= order {
                 active()
             } else {
                 OperatorPenaltySpec::Disabled

@@ -440,10 +440,9 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     }
     let direct_dim = latent_coord_direct_hyper_count(latent.id_mode(), latent.latent_dim());
     if analytic_rho_count + direct_dim > 0 {
-        let zero_x = gam_solve::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
-            design.design.nrows(),
-            p_total,
-        )));
+        let zero_x = gam_solve::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros(
+            (design.design.nrows(), p_total),
+        ));
         for _ in 0..analytic_rho_count {
             hyper_dirs.push(
                 DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
@@ -630,7 +629,10 @@ fn latent_id_objective_contribution(
                 gradient[direct_start] += 0.5 * mu * q - 0.5 * k;
             }
         }
-        LatentIdMode::IsometryToReference { reference, strength } => {
+        LatentIdMode::IsometryToReference {
+            reference,
+            strength,
+        } => {
             // Fixed-reference anchor `½ μ ‖t − reference‖²` with REML-selectable
             // `μ`. Identical structure to `AuxPrior` except the target is a
             // constant configuration (independent of `t`), so the latent
@@ -738,11 +740,7 @@ fn add_latent_id_objective_to_eval(
     rho_dim: usize,
     analytic_rho_count: usize,
     latent: &gam_terms::latent::LatentCoordValues,
-    eval: &mut (
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    ),
+    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
 ) -> Result<(), EstimationError> {
     let contribution =
         latent_id_objective_contribution(theta, rho_dim, analytic_rho_count, latent)?;
@@ -823,11 +821,7 @@ fn add_analytic_penalty_hessian_to_eval(
     rho_dim: usize,
     latent: &gam_terms::latent::LatentCoordValues,
     registry: &gam_terms::AnalyticPenaltyRegistry,
-    eval: &mut (
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    ),
+    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
 ) -> Result<(), EstimationError> {
     let flat_len = latent.len();
     let t_start = rho_dim;
@@ -902,11 +896,7 @@ fn add_analytic_penalty_objective_to_eval(
     rho_dim: usize,
     latent: &gam_terms::latent::LatentCoordValues,
     registry: &gam_terms::AnalyticPenaltyRegistry,
-    eval: &mut (
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    ),
+    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
 ) -> Result<(), EstimationError> {
     let contribution = analytic_penalty_objective_contribution(theta, rho_dim, latent, registry)?;
     eval.0 += contribution.cost;
@@ -1032,81 +1022,82 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
         let mut penaltysecond_partner_indices: Option<Vec<usize>> = None;
-        let penaltysecond_component_provider =
-            if let (Some(provider), Some(gid)) = (aniso_cross_penalty_provider, aniso_group_id) {
-                let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
-                let axis_in_group =
-                    group_indices
-                        .iter()
-                        .position(|&idx| idx == i)
-                        .ok_or_else(|| {
-                            EstimationError::InvalidInput(format!(
-                                "missing spatial hyper axis {} in anisotropy group {}",
-                                i, gid
-                            ))
-                        })?;
-                penaltysecond_partner_indices = Some(
-                    group_indices
-                        .iter()
-                        .copied()
-                        .filter(|&idx| idx != i)
-                        .collect(),
-                );
-                let penalty_indices_inner = penalty_indices.clone();
-                let global_range_inner = global_range.clone();
-                let total_p_inner = total_p;
-                let group_indices_inner = group_indices;
-                Some(std::sync::Arc::new(
-                    move |j: usize| -> Result<
-                        Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
-                        EstimationError,
-                    > {
-                        let Some(other_axis_in_group) =
-                            group_indices_inner.iter().position(|&idx| idx == j)
-                        else {
-                            return Ok(None);
-                        };
-                        if other_axis_in_group == axis_in_group {
-                            return Ok(None);
-                        }
-                        let cross_pens = provider(other_axis_in_group)?;
-                        if cross_pens.is_empty() {
-                            return Ok(None);
-                        }
-                        Ok(Some(
-                            penalty_indices_inner
-                                .iter()
-                                .copied()
-                                .zip(cross_pens.into_iter().map(|local| {
-                                    gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
-                                        local,
-                                        global_range_inner.clone(),
-                                        total_p_inner,
-                                    )
-                                }))
-                                .map(|(penalty_index, matrix)| {
-                                    gam_solve::estimate::reml::PenaltyDerivativeComponent {
-                                        penalty_index,
-                                        matrix,
-                                    }
-                                })
-                                .collect(),
+        let penaltysecond_component_provider = if let (Some(provider), Some(gid)) =
+            (aniso_cross_penalty_provider, aniso_group_id)
+        {
+            let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
+            let axis_in_group =
+                group_indices
+                    .iter()
+                    .position(|&idx| idx == i)
+                    .ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "missing spatial hyper axis {} in anisotropy group {}",
+                            i, gid
                         ))
-                    },
-                )
-                    as std::sync::Arc<
-                        dyn Fn(
-                                usize,
-                            ) -> Result<
-                                Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
-                                EstimationError,
-                            > + Send
-                            + Sync
-                            + 'static,
-                    >)
-            } else {
-                None
-            };
+                    })?;
+            penaltysecond_partner_indices = Some(
+                group_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| idx != i)
+                    .collect(),
+            );
+            let penalty_indices_inner = penalty_indices.clone();
+            let global_range_inner = global_range.clone();
+            let total_p_inner = total_p;
+            let group_indices_inner = group_indices;
+            Some(std::sync::Arc::new(
+                move |j: usize| -> Result<
+                    Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
+                    EstimationError,
+                > {
+                    let Some(other_axis_in_group) =
+                        group_indices_inner.iter().position(|&idx| idx == j)
+                    else {
+                        return Ok(None);
+                    };
+                    if other_axis_in_group == axis_in_group {
+                        return Ok(None);
+                    }
+                    let cross_pens = provider(other_axis_in_group)?;
+                    if cross_pens.is_empty() {
+                        return Ok(None);
+                    }
+                    Ok(Some(
+                        penalty_indices_inner
+                            .iter()
+                            .copied()
+                            .zip(cross_pens.into_iter().map(|local| {
+                                gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                                    local,
+                                    global_range_inner.clone(),
+                                    total_p_inner,
+                                )
+                            }))
+                            .map(|(penalty_index, matrix)| {
+                                gam_solve::estimate::reml::PenaltyDerivativeComponent {
+                                    penalty_index,
+                                    matrix,
+                                }
+                            })
+                            .collect(),
+                    ))
+                },
+            )
+                as std::sync::Arc<
+                    dyn Fn(
+                            usize,
+                        ) -> Result<
+                            Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
+                            EstimationError,
+                        > + Send
+                        + Sync
+                        + 'static,
+                >)
+        } else {
+            None
+        };
         // First derivative: use implicit operator when available to avoid
         // storing dense (n x p) matrices for all D axes simultaneously.
         let x_first_hyper = if let Some(ref op) = implicit_operator {
@@ -1200,11 +1191,7 @@ macro_rules! impl_exact_joint_theta_memo {
         fn memoized_eval(
             &self,
             theta: &Array1<f64>,
-        ) -> Option<(
-            f64,
-            Array1<f64>,
-            gam_problem::HessianValue,
-        )> {
+        ) -> Option<(f64, Array1<f64>, gam_problem::HessianValue)> {
             if self
                 .current_theta
                 .as_ref()
@@ -1216,14 +1203,7 @@ macro_rules! impl_exact_joint_theta_memo {
             }
         }
 
-        fn store_eval(
-            &mut self,
-            eval: (
-                f64,
-                Array1<f64>,
-                gam_problem::HessianValue,
-            ),
-        ) {
+        fn store_eval(&mut self, eval: (f64, Array1<f64>, gam_problem::HessianValue)) {
             self.last_cost = Some(eval.0);
             self.last_eval = Some(eval);
         }
@@ -1241,11 +1221,7 @@ struct SingleBlockExactJointDesignCache<'d> {
     // ψ-skip from ever mis-associating one ψ's cost/eval with another ψ's key.
     last_eval_theta: Option<Array1<f64>>,
     last_cost: Option<f64>,
-    last_eval: Option<(
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    )>,
+    last_eval: Option<(f64, Array1<f64>, gam_problem::HessianValue)>,
     // #1033: ψ-invariant hyper-direction slab cache. The κ hyper_dirs (the n×k
     // ∂X/∂ψ design-derivative slabs + their k×k penalty derivatives) are a pure
     // function of (data, frozen spec, REALIZED column layout) — they do NOT
@@ -1436,11 +1412,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     fn memoized_eval(
         &self,
         theta: &Array1<f64>,
-    ) -> Option<(
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    )> {
+    ) -> Option<(f64, Array1<f64>, gam_problem::HessianValue)> {
         if self
             .last_eval_theta
             .as_ref()
@@ -1458,11 +1430,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     fn store_eval_at(
         &mut self,
         theta: &Array1<f64>,
-        eval: (
-            f64,
-            Array1<f64>,
-            gam_problem::HessianValue,
-        ),
+        eval: (f64, Array1<f64>, gam_problem::HessianValue),
     ) {
         self.last_eval_theta = Some(theta.clone());
         self.last_cost = Some(eval.0);
@@ -1535,11 +1503,7 @@ struct SingleBlockLatentCoordDesignCache {
     current_design_cache_id: Option<u64>,
     latent_design_cache: gam_solve::latent_cache::LatentDesignCache,
     last_cost: Option<f64>,
-    last_eval: Option<(
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    )>,
+    last_eval: Option<(f64, Array1<f64>, gam_problem::HessianValue)>,
     term_index: gam_problem::types::SmoothTermIdx,
     feature_cols: Vec<usize>,
     rho_dim: usize,
@@ -1746,41 +1710,35 @@ impl SingleBlockLatentCoordDesignCache {
                 // user-requested `spec.degree`.
                 let effective_degree = meta_degree.unwrap_or(spec.degree);
                 if let Some((domain_start, period, num_basis)) = periodic {
-                    Ok(
-                        gam_solve::latent_cache::LatentBasisKind::PeriodicBspline {
-                            domain_start: *domain_start,
-                            period: *period,
-                            degree: effective_degree,
-                            num_basis: *num_basis,
-                            chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
-                                self.n_obs, *num_basis,
-                            ),
-                        },
-                    )
+                    Ok(gam_solve::latent_cache::LatentBasisKind::PeriodicBspline {
+                        domain_start: *domain_start,
+                        period: *period,
+                        degree: effective_degree,
+                        num_basis: *num_basis,
+                        chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
+                            self.n_obs, *num_basis,
+                        ),
+                    })
                 } else {
                     let num_basis_est = knots.len().saturating_sub(effective_degree + 1);
-                    Ok(
-                        gam_solve::latent_cache::LatentBasisKind::TensorBspline {
-                            knots: vec![knots.clone()],
-                            degrees: vec![effective_degree],
-                            chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
-                                self.n_obs,
-                                num_basis_est,
-                            ),
-                        },
-                    )
+                    Ok(gam_solve::latent_cache::LatentBasisKind::TensorBspline {
+                        knots: vec![knots.clone()],
+                        degrees: vec![effective_degree],
+                        chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
+                            self.n_obs,
+                            num_basis_est,
+                        ),
+                    })
                 }
             }
             (
                 SmoothBasisSpec::TensorBSpline { .. },
                 BasisMetadata::TensorBSpline { knots, degrees, .. },
-            ) => Ok(
-                gam_solve::latent_cache::LatentBasisKind::TensorBspline {
-                    knots: knots.clone(),
-                    degrees: degrees.clone(),
-                    chunk_size: None,
-                },
-            ),
+            ) => Ok(gam_solve::latent_cache::LatentBasisKind::TensorBspline {
+                knots: knots.clone(),
+                degrees: degrees.clone(),
+                chunk_size: None,
+            }),
             (
                 SmoothBasisSpec::Pca { .. },
                 BasisMetadata::Pca {
@@ -1799,9 +1757,7 @@ impl SingleBlockLatentCoordDesignCache {
                             "latent-coordinate Pca cache key requires center_mean when centered",
                         )
                     })?;
-                    Some(gam_solve::latent_cache::pca_center_mean_fingerprint(
-                        mean,
-                    ))
+                    Some(gam_solve::latent_cache::pca_center_mean_fingerprint(mean))
                 } else {
                     None
                 };
@@ -1884,15 +1840,14 @@ impl SingleBlockLatentCoordDesignCache {
         let term_index = self.term_index;
         let analytic_rho_count = self.analytic_rho_count;
         let data = self.data.view();
-        let design_context_digest =
-            gam_solve::latent_cache::latent_design_context_cache_digest(
-                data,
-                &spec,
-                term_index,
-                analytic_rho_count,
-                &self.feature_cols,
-            )
-            .map_err(|e| e.to_string())?;
+        let design_context_digest = gam_solve::latent_cache::latent_design_context_cache_digest(
+            data,
+            &spec,
+            term_index,
+            analytic_rho_count,
+            &self.feature_cols,
+        )
+        .map_err(|e| e.to_string())?;
         let lookup = self
             .latent_design_cache
             .lookup_or_compute(latent.clone(), basis_kind, design_context_digest, || {
@@ -1968,11 +1923,7 @@ impl SingleBlockLatentCoordDesignCache {
     fn memoized_eval(
         &self,
         theta: &Array1<f64>,
-    ) -> Option<(
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    )> {
+    ) -> Option<(f64, Array1<f64>, gam_problem::HessianValue)> {
         if self
             .current_theta
             .as_ref()
@@ -1986,24 +1937,15 @@ impl SingleBlockLatentCoordDesignCache {
         }
     }
 
-    fn store_eval(
-        &mut self,
-        eval: (
-            f64,
-            Array1<f64>,
-            gam_problem::HessianValue,
-        ),
-    ) {
+    fn store_eval(&mut self, eval: (f64, Array1<f64>, gam_problem::HessianValue)) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
-        self.last_outer_iter =
-            Some(gam_solve::estimate::reml::outer_eval::current_outer_iter());
+        self.last_outer_iter = Some(gam_solve::estimate::reml::outer_eval::current_outer_iter());
     }
 
     fn store_cost(&mut self, cost: f64) {
         self.last_cost = Some(cost);
-        self.last_outer_iter =
-            Some(gam_solve::estimate::reml::outer_eval::current_outer_iter());
+        self.last_outer_iter = Some(gam_solve::estimate::reml::outer_eval::current_outer_iter());
     }
 
     fn reset(&mut self) {
@@ -2049,20 +1991,17 @@ pub fn fixed_kappa_profiled_reml_score(
     }
     // Resolve the constant-curvature term's feature columns and base spec so the
     // criterion is probed on the production constant-curvature design.
-    let (feature_cols, mut probe_basis) = match resolvedspec
-        .smooth_terms
-        .get(term_idx)
-        .map(|t| &t.basis)
-    {
-        Some(SmoothBasisSpec::ConstantCurvature {
-            feature_cols, spec, ..
-        }) => (feature_cols.clone(), spec.clone()),
-        _ => {
-            crate::bail_invalid_estim!(
-                "fixed-κ profiled score: term {term_idx} is not a constant-curvature smooth"
-            )
-        }
-    };
+    let (feature_cols, mut probe_basis) =
+        match resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis) {
+            Some(SmoothBasisSpec::ConstantCurvature {
+                feature_cols, spec, ..
+            }) => (feature_cols.clone(), spec.clone()),
+            _ => {
+                crate::bail_invalid_estim!(
+                    "fixed-κ profiled score: term {term_idx} is not a constant-curvature smooth"
+                )
+            }
+        };
     probe_basis.kappa = kappa;
 
     // #1464: the curvature κ criterion the CI/flatness oracle walks (and the
@@ -2088,13 +2027,16 @@ pub fn fixed_kappa_profiled_reml_score(
     let is_zero_offset = offset.iter().all(|&o| o.abs() <= 1e-12);
     if family == LikelihoodSpec::gaussian_identity() && is_unweighted && is_zero_offset {
         let x_term = select_columns(data, &feature_cols).map_err(EstimationError::from)?;
-        let score =
-            gam_terms::basis::constant_curvature_honest_profiled_reml_score(x_term.view(), y, &probe_basis)
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "fixed-κ honest profiled-REML score at κ={kappa} failed: {e}"
-                    ))
-                })?;
+        let score = gam_terms::basis::constant_curvature_honest_profiled_reml_score(
+            x_term.view(),
+            y,
+            &probe_basis,
+        )
+        .map_err(|e| {
+            EstimationError::InvalidInput(format!(
+                "fixed-κ honest profiled-REML score at κ={kappa} failed: {e}"
+            ))
+        })?;
         if !score.is_finite() {
             crate::bail_invalid_estim!(
                 "fixed-κ honest profiled-REML score at κ={kappa} is non-finite"
@@ -2105,7 +2047,11 @@ pub fn fixed_kappa_profiled_reml_score(
 
     // Fallback (weighted / offset / non-Gaussian): the production fixed-κ fit.
     let mut probe_spec = resolvedspec.clone();
-    match probe_spec.smooth_terms.get_mut(term_idx).map(|t| &mut t.basis) {
+    match probe_spec
+        .smooth_terms
+        .get_mut(term_idx)
+        .map(|t| &mut t.basis)
+    {
         Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
         _ => {
             crate::bail_invalid_estim!(
@@ -2150,9 +2096,7 @@ fn profiled_gaussian_reml_value_kappa_gradient(
         || penalty.dim() != (design.ncols(), design.ncols())
         || response.len() != design.nrows()
     {
-        crate::bail_invalid_estim!(
-            "constant-curvature profile value/gradient shape mismatch"
-        );
+        crate::bail_invalid_estim!("constant-curvature profile value/gradient shape mismatch");
     }
 
     let response_2d = response.insert_axis(ndarray::Axis(1));
@@ -2163,19 +2107,18 @@ fn profiled_gaussian_reml_value_kappa_gradient(
         None,
         None,
     )?;
-    let backward =
-        gam_solve::gaussian_reml::gaussian_reml_multi_closed_form_backward_from_fit(
-            design.view(),
-            response_2d.view(),
-            penalty.view(),
-            None,
-            &fit,
-            0.0,
-            None,
-            None,
-            1.0,
-            0.0,
-        )?;
+    let backward = gam_solve::gaussian_reml::gaussian_reml_multi_closed_form_backward_from_fit(
+        design.view(),
+        response_2d.view(),
+        penalty.view(),
+        None,
+        &fit,
+        0.0,
+        None,
+        None,
+        1.0,
+        0.0,
+    )?;
     let derivative = backward
         .grad_x
         .iter()
@@ -2208,10 +2151,7 @@ fn constant_curvature_radial_reference(
             "constant-curvature radial reference needs one non-empty response per row"
         );
     }
-    let radii: Array1<f64> = data
-        .outer_iter()
-        .map(|row| row.dot(&row).sqrt())
-        .collect();
+    let radii: Array1<f64> = data.outer_iter().map(|row| row.dot(&row).sqrt()).collect();
     let r_max = radii.iter().copied().fold(0.0_f64, f64::max);
     if r_max <= f64::MIN_POSITIVE {
         let mean = y.sum() / y.len() as f64;
@@ -2232,13 +2172,11 @@ fn constant_curvature_radial_reference(
     let means: Vec<f64> = sums
         .into_iter()
         .zip(counts)
-        .map(|(sum, count)| {
-            if count == 0 {
-                0.0
-            } else {
-                sum / count as f64
-            }
-        })
+        .map(
+            |(sum, count)| {
+                if count == 0 { 0.0 } else { sum / count as f64 }
+            },
+        )
         .collect();
     Ok(radii.mapv(|radius| means[bin_of(radius)]))
 }
@@ -2266,14 +2204,10 @@ fn constant_curvature_kappa_fair_profile_value_gradient(
     profile_spec.double_penalty = false;
     let basis = gam_terms::basis::build_constant_curvature_basis(data, &profile_spec)
         .map_err(EstimationError::from)?;
-    let derivatives = gam_terms::basis::build_constant_curvature_basis_kappa_derivatives(
-        data,
-        &profile_spec,
-    )
-    .map_err(EstimationError::from)?;
-    if basis.penalties.len() != 1
-        || derivatives.first.penalties_derivative.len() != 1
-    {
+    let derivatives =
+        gam_terms::basis::build_constant_curvature_basis_kappa_derivatives(data, &profile_spec)
+            .map_err(EstimationError::from)?;
+    if basis.penalties.len() != 1 || derivatives.first.penalties_derivative.len() != 1 {
         crate::bail_invalid_estim!(
             "constant-curvature fair profile expected one primary penalty; value blocks={}, derivative blocks={}",
             basis.penalties.len(),
@@ -2625,9 +2559,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     for &(slot, kappa) in &cc_profiled_values {
         log_kappa_lower.set_scalar_slot(slot, kappa);
         log_kappa_upper.set_scalar_slot(slot, kappa);
-        log::info!(
-            "[spatial-kappa] slot {slot}: profiling rho at certified kappa={kappa}"
-        );
+        log::info!("[spatial-kappa] slot {slot}: profiling rho at certified kappa={kappa}");
     }
     // Project seed onto data-derived bounds; spec.length_scale is a hint,
     // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
@@ -3129,14 +3061,7 @@ impl<'d> SpatialJointContext<'d> {
         theta: &Array1<f64>,
         order: gam_solve::rho_optimizer::OuterEvalOrder,
         analytic_outer_hessian_available: bool,
-    ) -> Result<
-        (
-            f64,
-            Array1<f64>,
-            gam_problem::HessianValue,
-        ),
-        EstimationError,
-    > {
+    ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
         use gam_solve::rho_optimizer::OuterEvalOrder;
         let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
             && analytic_outer_hessian_available;
@@ -3321,10 +3246,7 @@ impl<'d> SpatialJointContext<'d> {
         eval
     }
 
-    fn eval_efs(
-        &mut self,
-        theta: &Array1<f64>,
-    ) -> Result<gam_problem::EfsEval, EstimationError> {
+    fn eval_efs(&mut self, theta: &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError> {
         self.cache
             .ensure_theta(theta)
             .map_err(EstimationError::InvalidInput)?;
@@ -3589,14 +3511,7 @@ fn run_exact_joint_spatial_optimization(
     upper: &Array1<f64>,
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<
-    (
-        Array1<f64>,
-        f64,
-        SpatialLengthScaleOptimizationTiming,
-    ),
-    EstimationError,
-> {
+) -> Result<(Array1<f64>, f64, SpatialLengthScaleOptimizationTiming), EstimationError> {
     let label = kind.label();
     // Use bounds and design metadata for validation.
     assert!(
@@ -3612,8 +3527,8 @@ fn run_exact_joint_spatial_optimization(
         baseline_design.smooth.terms.len(),
         spatial_terms.len()
     );
-    use gam_solve::rho_optimizer::OuterEvalOrder;
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
+    use gam_solve::rho_optimizer::OuterEvalOrder;
 
     let theta_dim = theta0.len();
     // Directional-coordinate dimension: psi-per-axis (anisotropic) or
@@ -3741,9 +3656,8 @@ fn run_exact_joint_spatial_optimization(
     // ceiling keeps every trial inside the band. The κ-optimum lives well inside
     // it, so the clamp only excludes over-fit (too-short) length scales.
     let mut psi_rank_stable_ceiling: Option<f64> = None;
-    let nfree_penalty_capable = coord_dim == 1
-        && family.is_gaussian_identity()
-        && ctx.cache.supports_nfree_penalty_rekey();
+    let nfree_penalty_capable =
+        coord_dim == 1 && family.is_gaussian_identity() && ctx.cache.supports_nfree_penalty_rekey();
     if nfree_penalty_capable {
         let psi_lo = lower[rho_dim];
         let psi_hi = upper[rho_dim];
@@ -3913,11 +3827,12 @@ fn run_exact_joint_spatial_optimization(
         );
     }
 
-    let kphase_prime_order = if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
-        OuterEvalOrder::ValueGradientHessian
-    } else {
-        OuterEvalOrder::ValueAndGradient
-    };
+    let kphase_prime_order =
+        if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
+            OuterEvalOrder::ValueGradientHessian
+        } else {
+            OuterEvalOrder::ValueAndGradient
+        };
     let kphase_prime_start = std::time::Instant::now();
     drop(ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?);
     log::info!(
@@ -4375,7 +4290,6 @@ pub fn constant_curvature_term_indices(spec: &TermCollectionSpec) -> Vec<usize> 
         .collect()
 }
 
-
 #[derive(Debug, Clone)]
 struct SingleSmoothTermRealization {
     design_local: DesignMatrix,
@@ -4408,11 +4322,8 @@ fn build_single_smooth_term_realization_with_policy(
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
     let mut workspace = gam_terms::basis::BasisWorkspace::with_policy(policy.clone());
-    let raw = build_smooth_design_withworkspace(
-        data,
-        std::slice::from_ref(termspec),
-        &mut workspace,
-    )?;
+    let raw =
+        build_smooth_design_withworkspace(data, std::slice::from_ref(termspec), &mut workspace)?;
     finish_single_smooth_term_realization(raw)
 }
 
@@ -4500,7 +4411,8 @@ fn wrap_local_build_as_realization(
                     )
                 })?;
             let rotated = gam_linalg::faer_ndarray::fast_ab(&dense, q);
-            local.design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(rotated));
+            local.design =
+                DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(rotated));
             local.penalties = local
                 .penalties
                 .into_iter()
@@ -4975,11 +4887,11 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 data, termspec, policy,
             )
             .map_err(|e| {
-                    format!(
-                        "failed to build cached realization for smooth term '{}' (index {}): {e}",
-                        termspec.name, term_idx
-                    )
-                })?;
+                format!(
+                    "failed to build cached realization for smooth term '{}' (index {}): {e}",
+                    termspec.name, term_idx
+                )
+            })?;
             let expected_cols = design.smooth.terms[term_idx].coeff_range.len();
             if realization.design_local.ncols() != expected_cols {
                 return Err(SmoothError::dimension_mismatch(format!(
@@ -5406,19 +5318,22 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     Some(scales) => compensate_length_scale_for_standardization(ls, scales),
                     None => ls,
                 };
-                let penalty_centers =
-                    gam_terms::basis::expand_periodic_centers(&centers.to_owned(), periodic.as_deref())
-                        .map_err(|e| e.to_string())?;
-                let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
-                let (first, _second) = gam_terms::basis::build_matern_operator_penalty_psi_derivatives(
-                    penalty_centers.view(),
-                    effective_ls,
-                    *nu,
-                    *include_intercept,
-                    identifiability_transform.as_ref(),
-                    aniso_for_penalty,
+                let penalty_centers = gam_terms::basis::expand_periodic_centers(
+                    &centers.to_owned(),
+                    periodic.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
+                let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
+                let (first, _second) =
+                    gam_terms::basis::build_matern_operator_penalty_psi_derivatives(
+                        penalty_centers.view(),
+                        effective_ls,
+                        *nu,
+                        *include_intercept,
+                        identifiability_transform.as_ref(),
+                        aniso_for_penalty,
+                    )
+                    .map_err(|e| e.to_string())?;
                 first
             }
             BasisMetadata::ThinPlate {
@@ -5861,9 +5776,9 @@ fn build_term_collection_fixed_blocks(
                 .map_err(BasisError::InvalidInput)?;
             linear_block.column_mut(j).assign(&column);
         }
-        blocks.push(DesignBlock::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-            linear_block,
-        )));
+        blocks.push(DesignBlock::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(linear_block),
+        ));
     }
 
     for term in &spec.random_effect_terms {
@@ -6023,11 +5938,7 @@ struct ExactJointDesignCache<'d> {
     block_term_indices: Vec<Vec<usize>>,
     current_theta: Option<Array1<f64>>,
     last_cost: Option<f64>,
-    last_eval: Option<(
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    )>,
+    last_eval: Option<(f64, Array1<f64>, gam_problem::HessianValue)>,
     rho_dim: usize,
     all_dims: Vec<usize>,
     log_kappa_dim: usize,
@@ -6302,7 +6213,10 @@ mod wood_reference_df_tests {
             got >= tr - 1e-12,
             "edf1 must be floored at edf (=tr={tr}) even when tr(F^2) explodes, got {got}"
         );
-        assert!(got.is_finite() && got > 0.0, "edf1 must stay finite/positive");
+        assert!(
+            got.is_finite() && got > 0.0,
+            "edf1 must stay finite/positive"
+        );
     }
 
     #[test]
@@ -6488,21 +6402,13 @@ where
         &[TermCollectionDesign],
         gam_solve::estimate::reml::reml_outer_engine::EvalMode,
         &gam_problem::outer_subsample::RowSet,
-    ) -> Result<
-        (
-            f64,
-            Array1<f64>,
-            gam_problem::HessianValue,
-        ),
-        String,
-    >,
+    ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), String>,
     ExactEfsFn: FnMut(
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
     ) -> Result<gam_problem::EfsEval, String>,
-    SeedFn:
-        FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
+    SeedFn: FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {
@@ -6706,15 +6612,16 @@ where
         OuterScoreSubsample::from_uniform_inclusion_mask(mask, n_total, seed)
     }
 
-    let current_row_set: std::cell::RefCell<gam_problem::outer_subsample::RowSet> = if use_staged_kappa {
-        let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
-        std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::Subsample {
-            rows: std::sync::Arc::clone(&pilot.rows),
-            n_full: n_total,
-        })
-    } else {
-        std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::All)
-    };
+    let current_row_set: std::cell::RefCell<gam_problem::outer_subsample::RowSet> =
+        if use_staged_kappa {
+            let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
+            std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::Subsample {
+                rows: std::sync::Arc::clone(&pilot.rows),
+                n_full: n_total,
+            })
+        } else {
+            std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::All)
+        };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
     let exact_efs_fn_cell = std::cell::RefCell::new(&mut exact_efs_fn);
@@ -6753,8 +6660,8 @@ where
         (theta_norm, log_kappa_norm)
     };
 
-    use gam_solve::rho_optimizer::OuterEvalOrder;
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
+    use gam_solve::rho_optimizer::OuterEvalOrder;
 
     // Joint design width across blocks → the `p` reported to the outer solver's
     // operator-vs-dense Hessian crossover. `n_total` is the load-bearing
@@ -7187,8 +7094,8 @@ fn try_exact_joint_latent_coord_optimization(
     options: &FitOptions,
     latent: &StandardLatentCoordConfig,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    use gam_solve::rho_optimizer::OuterEvalOrder;
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
+    use gam_solve::rho_optimizer::OuterEvalOrder;
 
     let rho_dim = best.fit.lambdas.len();
     let latent_flat_dim = latent.values.len();
@@ -7243,14 +7150,7 @@ fn try_exact_joint_latent_coord_optimization(
             &mut self,
             theta: &Array1<f64>,
             order: OuterEvalOrder,
-        ) -> Result<
-            (
-                f64,
-                Array1<f64>,
-                gam_problem::HessianValue,
-            ),
-            EstimationError,
-        > {
+        ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
             if let Some(eval) = self.cache.memoized_eval(theta) {
                 return Ok(eval);
             }
@@ -7398,8 +7298,7 @@ fn try_exact_joint_latent_coord_optimization(
                     let cost = if let Some(registry) = registry_for_key {
                         let mut registry = registry.as_ref().clone();
                         registry.apply_weight_schedules(
-                            gam_solve::estimate::reml::outer_eval::current_outer_iter()
-                                as usize,
+                            gam_solve::estimate::reml::outer_eval::current_outer_iter() as usize,
                         );
                         match analytic_penalty_objective_contribution(
                             theta,
@@ -7613,6 +7512,114 @@ pub fn fit_term_collectionwith_latent_coord_optimization(
     )
 }
 
+/// Resolve the two physically distinct isotropic Matérn range basins before the
+/// local joint `[rho, psi]` solve.
+///
+/// The short/rich basin is represented by the ordinary cold fit at the
+/// center-density seed. The competing long-range basin has one canonical,
+/// data-derived representative: the lower end of the term's feasible
+/// `psi = log(kappa)` window, equivalently its largest well-conditioned length
+/// scale. Profile all smoothing parameters at that endpoint once, and retain it
+/// only when its certified REML objective is strictly lower. The subsequent
+/// joint optimizer therefore runs exactly once, from the winning basin.
+///
+/// This is a closed endpoint comparison, not a lattice, sweep, or collection of
+/// joint restarts. Both profiles pass through `fit_term_collection_forspec`, so
+/// either produces a fully certified fit or the error is surfaced; there is no
+/// best-effort fallback. Pairwise-distance bounds and the incumbent Matérn seed
+/// are Euclidean invariants, so the decision is unchanged by rigid rotations.
+fn select_isotropic_matern_range_basin(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    mut resolvedspec: TermCollectionSpec,
+    mut best: FittedTermCollection,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    spatial_terms: &[usize],
+) -> Result<(TermCollectionSpec, FittedTermCollection), EstimationError> {
+    // Per-axis anisotropy and signed curvature have dedicated geometry
+    // estimators. Their outer coordinates are not a scalar Matérn range and
+    // therefore do not participate in this two-basin decision.
+    if has_aniso_terms(&resolvedspec, spatial_terms)
+        || !constant_curvature_term_indices(&resolvedspec).is_empty()
+    {
+        return Ok((resolvedspec, best));
+    }
+
+    let mut best_score = fit_score(&best.fit);
+    if !best_score.is_finite() {
+        crate::bail_invalid_estim!(
+            "isotropic Matérn basin selection received a non-finite incumbent profile"
+        );
+    }
+
+    for &term_idx in spatial_terms {
+        if !matches!(
+            resolvedspec
+                .smooth_terms
+                .get(term_idx)
+                .map(|term| &term.basis),
+            Some(SmoothBasisSpec::Matern { .. })
+        ) {
+            continue;
+        }
+
+        let (psi_long, _psi_short) =
+            spatial_term_psi_bounds(data, &resolvedspec, term_idx, kappa_options);
+        let long_length_scale = (-psi_long).exp();
+        if !(long_length_scale.is_finite() && long_length_scale > 0.0) {
+            crate::bail_invalid_estim!(
+                "isotropic Matérn term {term_idx} produced an invalid long-range endpoint from psi={psi_long}"
+            );
+        }
+        if get_spatial_length_scale(&resolvedspec, term_idx)
+            .is_some_and(|current| current == long_length_scale)
+        {
+            continue;
+        }
+
+        let mut endpoint_spec = resolvedspec.clone();
+        set_spatial_length_scale(&mut endpoint_spec, term_idx, long_length_scale)?;
+        let endpoint = fit_term_collection_forspec(
+            data,
+            y,
+            weights,
+            offset,
+            &endpoint_spec,
+            family.clone(),
+            options,
+        )?;
+        let endpoint_score = fit_score(&endpoint.fit);
+        if !endpoint_score.is_finite() {
+            crate::bail_invalid_estim!(
+                "isotropic Matérn term {term_idx} long-range endpoint returned a non-finite profiled REML score"
+            );
+        }
+
+        if endpoint_score < best_score {
+            log::info!(
+                "[spatial-kappa] term {term_idx} selected certified long-range basin: \
+                 length_scale={long_length_scale:.6}, profiled REML {endpoint_score:.6} \
+                 < short-basin {best_score:.6}"
+            );
+            resolvedspec = freeze_term_collection_from_design(&endpoint_spec, &endpoint.design)?;
+            best = endpoint;
+            best_score = endpoint_score;
+        } else {
+            log::info!(
+                "[spatial-kappa] term {term_idx} retained certified short-range basin: \
+                 profiled REML {best_score:.6} <= long-endpoint {endpoint_score:.6} \
+                 at length_scale={long_length_scale:.6}"
+            );
+        }
+    }
+
+    Ok((resolvedspec, best))
+}
+
 pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: Array1<f64>,
@@ -7718,11 +7725,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         .filter(|&term_idx| !constant_curvature_kappa_is_fixed(&resolvedspec, term_idx))
         .collect();
     if !free_curvature_terms.is_empty() {
-        validate_constant_curvature_fair_profile_inputs(
-            weights.view(),
-            offset.view(),
-            &family,
-        )?;
+        validate_constant_curvature_fair_profile_inputs(weights.view(), offset.view(), &family)?;
     }
     for term_idx in free_curvature_terms {
         let kappa_hat = constant_curvature_kappa_fair_optimum(
@@ -7762,6 +7765,19 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // (which assumes hybrid Duchon for log-κ derivatives) errors out. Refresh
     // the index list so it reflects the post-freeze spec.
     let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
+    let (next_spec, best) = select_isotropic_matern_range_basin(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        resolvedspec,
+        best,
+        &family,
+        &baseline_options,
+        kappa_options,
+        &spatial_terms,
+    )?;
+    resolvedspec = next_spec;
     // Sync knot-cloud-derived aniso contrasts from the basis metadata back
     // into the spec so the optimizer starts from the geometry-informed η values
     // rather than the zero sentinel from --scale-dimensions.
@@ -8676,8 +8692,7 @@ fn wood_reference_df(influence: Option<&Array2<f64>>, coeff_range: &Range<usize>
     let block = f.slice(s![start..end, start..end]);
     let tr = (0..block.nrows()).map(|i| block[[i, i]]).sum::<f64>();
     let tr2 = block.dot(&block).diag().sum();
-    (tr.is_finite() && tr2.is_finite() && tr > 0.0)
-        .then(|| (2.0 * tr - tr2).max(tr).max(1e-12))
+    (tr.is_finite() && tr2.is_finite() && tr > 0.0).then(|| (2.0 * tr - tr2).max(tr).max(1e-12))
 }
 
 #[cfg(test)]
@@ -8705,9 +8720,8 @@ mod nfree_gate_tests {
 
     #[test]
     fn gradient_nfree_gate_still_requires_basis_skip_witness() {
-        let gate = nfree_skip_gate_status_from_parts(
-            true, true, false, true, true, true, false, true,
-        );
+        let gate =
+            nfree_skip_gate_status_from_parts(true, true, false, true, true, true, false, true);
         assert!(
             !gate.would_skip(true),
             "gradient probes return beta/gradient objects in a reduced basis and must not \
