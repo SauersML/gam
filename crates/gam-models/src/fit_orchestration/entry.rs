@@ -559,10 +559,15 @@ fn constant_gaussian_standard_fit(
                 reason: "constant Gaussian shortcut could not identify a penalized direction"
                     .to_string(),
             })?;
+        // The induced infinity norm bounds the spectral norm of symmetric
+        // X'WX. A diagonal-only scale can underestimate a highly correlated
+        // design by O(p), leaving some data-informed direction insufficiently
+        // constrained at the purported λ→∞ boundary.
         let information_scale = xtwx
-            .diag()
-            .iter()
-            .fold(0.0_f64, |largest, &value| largest.max(value.abs()))
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+            .fold(0.0_f64, f64::max)
             .max(f64::MIN_POSITIVE);
         let lambda = information_scale / (f64::EPSILON.sqrt() * weakest_penalty);
         if !(lambda.is_finite() && lambda > 0.0) {
