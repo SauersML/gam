@@ -860,23 +860,21 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
     }
 
     #[inline]
-    fn row_vars<'arena, S: RuntimeJetScalar<'arena>>(
+    fn row_vars<'arena, S: RuntimeJetScalar<'arena, Workspace = DynamicJetArena>>(
         &self,
         row: usize,
-        arena: &'arena S::Workspace,
-        seed: impl Fn(f64, usize, usize, &'arena S::Workspace) -> S,
-    ) -> Vec<S> {
+        arena: &'arena DynamicJetArena,
+        seed: impl Fn(f64, usize, usize, &'arena DynamicJetArena) -> S,
+    ) -> &'arena [S] {
         let p = self.base.row_primary_values(row);
         let dimension = self.primary_dimension();
-        (0..dimension)
-            .map(|a| {
-                if a < SLS_ROW_K {
-                    seed(p[a], a, dimension, arena)
-                } else {
-                    seed(self.betaw[a - SLS_ROW_K], a, dimension, arena)
-                }
-            })
-            .collect()
+        arena.alloc_slice_fill_with(dimension, |a| {
+            if a < SLS_ROW_K {
+                seed(p[a], a, dimension, arena)
+            } else {
+                seed(self.betaw[a - SLS_ROW_K], a, dimension, arena)
+            }
+        })
     }
 
     #[inline]
@@ -886,17 +884,27 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         vars: &[S],
     ) -> Result<S, String> {
         let kernel = self.base.row_nll_inputs(row)?.1;
-        let r_u0_0 = self.b_u0_0.row(row).to_vec();
-        let r_u0_1 = self.b_u0_1.row(row).to_vec();
-        let r_u0_2 = self.b_u0_2.row(row).to_vec();
-        let r_u0_3 = self.b_u0_3.row(row).to_vec();
-        let r_u1_0 = self.b_u1_0.row(row).to_vec();
-        let r_u1_1 = self.b_u1_1.row(row).to_vec();
-        let r_u1_2 = self.b_u1_2.row(row).to_vec();
-        let r_u1_3 = self.b_u1_3.row(row).to_vec();
+        let r_u0_0 = self.b_u0_0.row(row);
+        let r_u0_1 = self.b_u0_1.row(row);
+        let r_u0_2 = self.b_u0_2.row(row);
+        let r_u0_3 = self.b_u0_3.row(row);
+        let r_u1_0 = self.b_u1_0.row(row);
+        let r_u1_1 = self.b_u1_1.row(row);
+        let r_u1_2 = self.b_u1_2.row(row);
+        let r_u1_3 = self.b_u1_3.row(row);
         let basis = SlsWiggleRowBasis {
-            b_u0: [&r_u0_0, &r_u0_1, &r_u0_2, &r_u0_3],
-            b_u1: [&r_u1_0, &r_u1_1, &r_u1_2, &r_u1_3],
+            b_u0: [
+                r_u0_0.as_slice().ok_or("non-contiguous wiggle basis row")?,
+                r_u0_1.as_slice().ok_or("non-contiguous wiggle basis row")?,
+                r_u0_2.as_slice().ok_or("non-contiguous wiggle basis row")?,
+                r_u0_3.as_slice().ok_or("non-contiguous wiggle basis row")?,
+            ],
+            b_u1: [
+                r_u1_0.as_slice().ok_or("non-contiguous wiggle basis row")?,
+                r_u1_1.as_slice().ok_or("non-contiguous wiggle basis row")?,
+                r_u1_2.as_slice().ok_or("non-contiguous wiggle basis row")?,
+                r_u1_3.as_slice().ok_or("non-contiguous wiggle basis row")?,
+            ],
         };
         Ok(sls_row_nll_wiggle(vars, &kernel, self.pw, &basis))
     }

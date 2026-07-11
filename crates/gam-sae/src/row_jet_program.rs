@@ -378,6 +378,21 @@ impl SaeReconstructionRowProgram {
         }
     }
 
+    /// Arena-backed gate array for the runtime production scalars. Per-atom
+    /// assignment modes (the production users of dynamic jets) have independent
+    /// gates, so this evaluates the same [`Self::gate_tower`] expression once per
+    /// atom and stores the handles in the row workspace. Softmax uses the same
+    /// path only as a dynamic correctness oracle; production softmax remains the
+    /// closed-form hand kernel.
+    fn all_gates_dynamic<'arena, S>(&self, arena: &'arena DynamicJetArena) -> &'arena [S]
+    where
+        S: RuntimeJetScalar<'arena, Workspace = DynamicJetArena>,
+    {
+        arena.alloc_slice_fill_with(self.gate_value.len(), |atom| {
+            self.gate_tower::<S>(atom, arena)
+        })
+    }
+
     /// The reconstruction output column `c` as a single jet:
     /// `ẑ_c(p) = Σ_k ζ_k(ℓ) · decoded_{k,c}(t_k)`. Its `.v` is the production
     /// reconstruction value, `.g[a]` is `∂ẑ_c/∂p_a`, `.h[a][b]` is
@@ -499,8 +514,42 @@ impl SaeReconstructionRowProgram {
     pub fn reconstruction_all_columns_dynamic<'arena>(
         &self,
         arena: &'arena DynamicJetArena,
-    ) -> Vec<DynamicOrder2<'arena>> {
-        self.reconstruction_all_columns_generic::<DynamicOrder2<'arena>>(arena)
+    ) -> &'arena [DynamicOrder2<'arena>] {
+        let dimension = self.n_primaries;
+        let gates = self.all_gates_dynamic::<DynamicOrder2<'arena>>(arena);
+        let total_basis: usize = self.atoms.iter().map(AtomRowBasisJet::n_basis).sum();
+        let mut atom_cursor = 0usize;
+        let mut basis_cursor = 0usize;
+        let bases = arena.alloc_slice_fill_with(total_basis, |_| {
+            while basis_cursor == self.atoms[atom_cursor].n_basis() {
+                atom_cursor += 1;
+                basis_cursor = 0;
+            }
+            let basis = self.atoms[atom_cursor].basis_tower::<DynamicOrder2<'arena>>(
+                basis_cursor,
+                &self.coord_slot[atom_cursor],
+                dimension,
+                arena,
+            );
+            basis_cursor += 1;
+            basis
+        });
+        arena.alloc_slice_fill_with(self.out_dim(), |out_col| {
+            let mut acc = DynamicOrder2::constant(0.0, dimension, arena);
+            let mut basis_offset = 0usize;
+            for (atom, atom_jet) in self.atoms.iter().enumerate() {
+                let mut decoded = DynamicOrder2::constant(0.0, dimension, arena);
+                for basis_col in 0..atom_jet.n_basis() {
+                    let coefficient = atom_jet.decoder[basis_col][out_col];
+                    if coefficient != 0.0 {
+                        decoded = decoded.add(&bases[basis_offset + basis_col].scale(coefficient));
+                    }
+                }
+                basis_offset += atom_jet.n_basis();
+                acc = acc.add(&gates[atom].mul(&decoded));
+            }
+            acc
+        })
     }
 
     /// The reconstruction output column as the full dense [`Tower4<K>`] carrying
@@ -657,8 +706,19 @@ impl SaeReconstructionRowProgram {
         &self,
         channels: &[(usize, usize)],
         arena: &'arena DynamicJetArena,
-    ) -> Vec<DynamicOrder1<'arena>> {
-        self.beta_border_batch_generic::<DynamicOrder1<'arena>>(channels, arena)
+    ) -> &'arena [DynamicOrder1<'arena>] {
+        let dimension = self.n_primaries;
+        let gates = self.all_gates_dynamic::<DynamicOrder1<'arena>>(arena);
+        arena.alloc_slice_fill_with(channels.len(), |channel| {
+            let (atom, basis_col) = channels[channel];
+            let phi = self.atoms[atom].basis_tower::<DynamicOrder1<'arena>>(
+                basis_col,
+                &self.coord_slot[atom],
+                dimension,
+                arena,
+            );
+            gates[atom].mul(&phi)
+        })
     }
 
     /// The number of reconstruction output columns.
@@ -2022,7 +2082,9 @@ mod tests {
         let (prog, inv_tau) = softmax_fixture(0.9);
         let (dz, d2z) = softmax_gate_derivs(&prog.gate_value, inv_tau);
         for atom in 0..prog.atoms.len() {
-            let gate = prog.gate_tower::<6, Tower4<6>>(atom);
+            let gate = prog
+                .gate_tower::<FixedRuntimeJet<Tower4<6>, 6>>(atom, &())
+                .into_inner();
             // ζ_atom value.
             assert!((gate.v - prog.gate_value[atom]).abs() < 1e-12);
             // ∂ζ_atom/∂ℓ_j == dz[j][atom].
@@ -2078,7 +2140,9 @@ mod tests {
             fixed_gate_value: Vec::new(),
             n_primaries: 2,
         };
-        let gate = prog.gate_tower::<2, Tower4<2>>(0);
+        let gate = prog
+            .gate_tower::<FixedRuntimeJet<Tower4<2>, 2>>(0, &())
+            .into_inner();
         assert!((gate.v - sigma).abs() < 1e-12);
         let d1 = sigma * (1.0 - sigma) * inv_tau;
         let d2 = sigma * (1.0 - sigma) * (1.0 - 2.0 * sigma) * inv_tau * inv_tau;
@@ -2135,7 +2199,9 @@ mod tests {
 
         // Atom 0's gate is a CONSTANT equal to the pinned value: value == fixed,
         // and every gradient / Hessian channel is exactly zero.
-        let g0 = prog.gate_tower::<K, Tower4<K>>(0);
+        let g0 = prog
+            .gate_tower::<FixedRuntimeJet<Tower4<K>, K>>(0, &())
+            .into_inner();
         assert!(
             (g0.v - fixed_val).abs() < 1e-15,
             "fixed gate value {}",
@@ -2150,7 +2216,9 @@ mod tests {
 
         // Atom 1 (free) is unchanged: it reproduces the logistic gate and its own
         // logit derivative is nonzero.
-        let g1 = prog.gate_tower::<K, Tower4<K>>(1);
+        let g1 = prog
+            .gate_tower::<FixedRuntimeJet<Tower4<K>, K>>(1, &())
+            .into_inner();
         assert!((g1.v - sigma_free).abs() < 1e-12, "free gate value");
         let d1 = sigma_free * (1.0 - sigma_free) * inv_tau;
         assert!((g1.g[1] - d1).abs() < 1e-9, "free gate σ'");
@@ -2259,10 +2327,16 @@ mod tests {
     fn shared_all_gates_bit_identical_to_per_atom_gate_tower() {
         for tau in [0.9_f64, 1.3, 2.1] {
             let (prog, _inv_tau) = softmax_fixture(tau);
-            let all = prog.all_gates::<6, Order2<6>>();
+            let all: Vec<Order2<6>> = prog
+                .all_gates::<FixedRuntimeJet<Order2<6>, 6>>(&())
+                .into_iter()
+                .map(FixedRuntimeJet::into_inner)
+                .collect();
             assert_eq!(all.len(), prog.gate_value.len());
             for atom in 0..prog.gate_value.len() {
-                let per = prog.gate_tower::<6, Order2<6>>(atom);
+                let per = prog
+                    .gate_tower::<FixedRuntimeJet<Order2<6>, 6>>(atom, &())
+                    .into_inner();
                 assert_eq!(all[atom].value(), per.value(), "atom {atom} value");
                 for a in 0..6 {
                     assert_eq!(all[atom].g()[a], per.g()[a], "atom {atom} g[{a}]");

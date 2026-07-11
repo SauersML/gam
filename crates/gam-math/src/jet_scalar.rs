@@ -354,6 +354,17 @@ impl DynamicJetArena {
     fn zeros(&self, len: usize) -> &mut [f64] {
         self.bump.alloc_slice_fill_copy(len, 0.0)
     }
+
+    /// Allocate and initialize a runtime-sized slice in the arena. Row programs
+    /// use this for their primary-scalar arrays so those arrays share the same
+    /// reusable workspace as derivative channels.
+    pub fn alloc_slice_fill_with<T>(
+        &self,
+        len: usize,
+        fill: impl FnMut(usize) -> T,
+    ) -> &mut [T] {
+        self.bump.alloc_slice_fill_with(len, fill)
+    }
 }
 
 impl Default for DynamicJetArena {

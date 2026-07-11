@@ -251,9 +251,12 @@ impl SaeManifoldTerm {
         // first-order `Order1<K>` (value + grad), skipping the K×K Hessian the
         // `Order2` path would compute and discard. `Order1`'s value/grad are
         // bit-identical to `Order2`'s (#1591 order1 oracle).
-        let chans: Vec<(usize, usize)> = border.iter().map(|c| (c.atom, c.basis_col)).collect();
+        let chans = arena.alloc_slice_fill_with(border.len(), |index| {
+            let channel = &border[index];
+            (channel.atom, channel.basis_col)
+        });
         let q = program.n_primaries;
-        let sjets = program.beta_border_order1_dynamic(&chans, arena);
+        let sjets = program.beta_border_order1_dynamic(chans, arena);
         for (beta_pos, channel) in border.iter().enumerate() {
             let s = &sjets[beta_pos];
             let s_v = s.value();
