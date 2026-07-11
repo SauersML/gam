@@ -109,9 +109,10 @@ pub(crate) use gam_solve::arrow_schur::{
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, DeviceSaePcgData,
     DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IbpCrossRowSource,
     IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
-    SparseRankOnePenaltyOp, StreamingArrowSchur, prepare_sae_resident_frame,
-    row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction,
-    solve_streaming_reduced_beta, solve_with_lm_escalation_inner,
+    SparseRankOnePenaltyOp, StreamingArrowSchur, matrix_free_arrow_inverse_apply,
+    matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions,
+    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
+    solve_with_lm_escalation_inner,
     streaming_cross_row_woodbury_log_det,
 };
 

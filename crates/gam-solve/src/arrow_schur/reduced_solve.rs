@@ -2239,6 +2239,291 @@ pub fn reduced_schur_inverse_apply<B: BatchedBlockSolver + Sync>(
     )
 }
 
+fn matrix_free_cache_factor_slab(cache: &ArrowFactorCache) -> &ArrowFactorSlab {
+    match &cache.htt_factors_undamped {
+        ArrowUndampedFactors::SameAsDamped => &cache.htt_factors,
+        ArrowUndampedFactors::Owned(factors) => factors,
+    }
+}
+
+fn validate_matrix_free_arrow_pair(
+    sys: &ArrowSchurSystem,
+    cache: &ArrowFactorCache,
+    operation: &str,
+) -> Result<(), ArrowSchurError> {
+    if cache.ridge_t != 0.0 || cache.ridge_beta != 0.0 || !cache.schur_factor_is_undamped {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "{operation} requires an undamped evidence cache; got ridge_t={}, \
+                 ridge_beta={}, schur_factor_is_undamped={}",
+                cache.ridge_t, cache.ridge_beta, cache.schur_factor_is_undamped
+            ),
+        });
+    }
+    if sys.k != cache.k
+        || sys.rows.len() != cache.n_rows()
+        || sys.row_dims.as_ref() != cache.row_dims.as_ref()
+        || sys.row_offsets.as_ref() != cache.row_offsets.as_ref()
+    {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "{operation} system/cache layout mismatch: system (rows={}, k={}, offsets={:?}) \
+                 vs cache (rows={}, k={}, offsets={:?})",
+                sys.rows.len(),
+                sys.k,
+                sys.row_offsets,
+                cache.n_rows(),
+                cache.k,
+                cache.row_offsets,
+            ),
+        });
+    }
+    if sys.row_hessian_fingerprint != cache.row_hessian_fingerprint
+        || sys.manifold_mode_fingerprint != cache.manifold_mode_fingerprint
+    {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "{operation} refuses a stale matrix-free system/cache pair \
+                 (row fingerprint {} vs {}, manifold fingerprint {} vs {})",
+                sys.row_hessian_fingerprint,
+                cache.row_hessian_fingerprint,
+                sys.manifold_mode_fingerprint,
+                cache.manifold_mode_fingerprint,
+            ),
+        });
+    }
+    if !sys.cross_row_penalties.is_empty()
+        || sys.ibp_cross_row.is_some()
+        || cache.cross_row_woodbury.is_some()
+    {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "{operation} supports the row-block bordered arrow only; cross-row latent or \
+                 IBP-Woodbury curvature requires its own matrix-free inverse carrier"
+            ),
+        });
+    }
+    if !cache.htbeta_available() && cache.k > 0 {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!("{operation} requires the cached H_tbeta operator"),
+        });
+    }
+    Ok(())
+}
+
+fn cholesky_factor_operator_apply(
+    factor: ArrayView2<'_, f64>,
+    vector: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let n = factor.nrows();
+    let mut transposed = Array1::<f64>::zeros(n);
+    for col in 0..n {
+        let mut value = 0.0_f64;
+        for row in col..n {
+            value += factor[[row, col]] * vector[row];
+        }
+        transposed[col] = value;
+    }
+    let mut out = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let mut value = 0.0_f64;
+        for col in 0..=row {
+            value += factor[[row, col]] * transposed[col];
+        }
+        out[row] = value;
+    }
+    out
+}
+
+/// Apply the undamped full bordered-arrow evidence operator without forming its
+/// dense reduced Schur complement.
+///
+/// The cache supplies the authoritative conditioned row factors and `H_tbeta`
+/// operator. The system supplies the matrix-free shared block. Rather than read
+/// raw `H_betabeta` directly, this reconstructs it from
+/// `S + H_betat A^-1 H_tbeta`, where `S` is applied through the same quotient-
+/// aware reduced operator used by the matrix-free log-determinant. Value,
+/// selected-inverse traces, and this IFT operator therefore describe one `B`.
+pub fn matrix_free_arrow_operator_apply(
+    sys: &ArrowSchurSystem,
+    cache: &ArrowFactorCache,
+    vector_t: ArrayView1<'_, f64>,
+    vector_beta: ArrayView1<'_, f64>,
+) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    validate_matrix_free_arrow_pair(sys, cache, "matrix_free_arrow_operator_apply")?;
+    if vector_t.len() != cache.delta_t_len() || vector_beta.len() != cache.k {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "matrix_free_arrow_operator_apply vector shapes (t={}, beta={}) != ({}, {})",
+                vector_t.len(),
+                vector_beta.len(),
+                cache.delta_t_len(),
+                cache.k,
+            ),
+        });
+    }
+
+    let factors = matrix_free_cache_factor_slab(cache);
+    let backend = CpuBatchedBlockSolver;
+    let reduced = ReducedSchurOperator::new(sys, factors, 0.0, &backend, None);
+    let mut out_beta = reduced.apply(vector_beta);
+    let mut out_t = Array1::<f64>::zeros(cache.delta_t_len());
+    for row in 0..cache.n_rows() {
+        let dim = cache.row_dims[row];
+        let start = cache.row_offsets[row];
+        let row_vector = vector_t.slice(ndarray::s![start..start + dim]);
+        let factor = cache.undamped_factor(row);
+        let row_applied = cholesky_factor_operator_apply(factor, row_vector);
+        for axis in 0..dim {
+            out_t[start + axis] = row_applied[axis];
+        }
+
+        if cache.k == 0 {
+            continue;
+        }
+        let mut cross = Array1::<f64>::zeros(dim);
+        if !cache.apply_htbeta_row(row, vector_beta, &mut cross) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "matrix_free_arrow_operator_apply H_tbeta row {row} apply failed"
+                ),
+            });
+        }
+        for axis in 0..dim {
+            out_t[start + axis] += cross[axis];
+        }
+        if !cache.apply_htbeta_row_transpose(row, row_vector, &mut out_beta, None) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "matrix_free_arrow_operator_apply H_betat row {row} apply failed"
+                ),
+            });
+        }
+
+        // `out_beta` already contains `S * vector_beta`; add the eliminated
+        // `H_betat A^-1 H_tbeta * vector_beta` term to recover H_betabeta.
+        let solved_cross = cholesky_solve_vector(factor, cross.view());
+        if !cache.apply_htbeta_row_transpose(row, solved_cross.view(), &mut out_beta, None) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "matrix_free_arrow_operator_apply Schur reconstruction row {row} failed"
+                ),
+            });
+        }
+    }
+    Ok((out_t, out_beta))
+}
+
+/// Solve the undamped full bordered-arrow evidence system for an arbitrary RHS
+/// using the matrix-free reduced-Schur CG primitive and exact row backsolves.
+///
+/// This is the matrix-free sibling of `ArrowFactorCache::full_inverse_apply`.
+/// It never materializes `S` or `S^-1`; the beta solve uses the same
+/// quotient-aware `S` operator as the rational log-determinant, then the latent
+/// block is recovered by standard arrow back-substitution.
+pub fn matrix_free_arrow_inverse_apply(
+    sys: &ArrowSchurSystem,
+    cache: &ArrowFactorCache,
+    rhs_t: ArrayView1<'_, f64>,
+    rhs_beta: ArrayView1<'_, f64>,
+    cg_rel_tol: f64,
+    cg_max_iters: usize,
+) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    validate_matrix_free_arrow_pair(sys, cache, "matrix_free_arrow_inverse_apply")?;
+    if rhs_t.len() != cache.delta_t_len() || rhs_beta.len() != cache.k {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "matrix_free_arrow_inverse_apply rhs shapes (t={}, beta={}) != ({}, {})",
+                rhs_t.len(),
+                rhs_beta.len(),
+                cache.delta_t_len(),
+                cache.k,
+            ),
+        });
+    }
+    if !(cg_rel_tol.is_finite() && cg_rel_tol > 0.0) || cg_max_iters == 0 {
+        return Err(ArrowSchurError::PcgFailed {
+            reason: format!(
+                "matrix_free_arrow_inverse_apply requires positive finite CG tolerance and \
+                 iteration count; got rel_tol={cg_rel_tol}, max_iters={cg_max_iters}"
+            ),
+        });
+    }
+
+    let factors = matrix_free_cache_factor_slab(cache);
+    let backend = CpuBatchedBlockSolver;
+    let mut latent_forward = Array1::<f64>::zeros(cache.delta_t_len());
+    let mut eliminated = Array1::<f64>::zeros(cache.k);
+    for row in 0..cache.n_rows() {
+        let dim = cache.row_dims[row];
+        let start = cache.row_offsets[row];
+        let solved = cholesky_solve_vector(
+            cache.undamped_factor(row),
+            rhs_t.slice(ndarray::s![start..start + dim]),
+        );
+        for axis in 0..dim {
+            latent_forward[start + axis] = solved[axis];
+        }
+        if cache.k > 0
+            && !cache.apply_htbeta_row_transpose(row, solved.view(), &mut eliminated, None)
+        {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "matrix_free_arrow_inverse_apply H_betat row {row} apply failed"
+                ),
+            });
+        }
+    }
+    // The transpose helper accumulates the eliminated term positively.
+    let reduced_rhs = rhs_beta - &eliminated;
+
+    let solved_beta = if cache.k == 0 {
+        Array1::<f64>::zeros(0)
+    } else {
+        reduced_schur_inverse_apply(
+            sys,
+            factors,
+            0.0,
+            &backend,
+            None,
+            None,
+            &reduced_rhs,
+            None,
+            cg_rel_tol,
+            cg_max_iters,
+        )
+        .ok_or_else(|| ArrowSchurError::PcgFailed {
+            reason: format!(
+                "matrix_free_arrow_inverse_apply reduced-Schur solve failed \
+                 (dim={}, rel_tol={cg_rel_tol}, max_iters={cg_max_iters})",
+                cache.k
+            ),
+        })?
+    };
+
+    let mut solved_t = latent_forward;
+    for row in 0..cache.n_rows() {
+        let dim = cache.row_dims[row];
+        let start = cache.row_offsets[row];
+        if cache.k == 0 {
+            continue;
+        }
+        let mut cross = Array1::<f64>::zeros(dim);
+        if !cache.apply_htbeta_row(row, solved_beta.view(), &mut cross) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "matrix_free_arrow_inverse_apply H_tbeta row {row} apply failed"
+                ),
+            });
+        }
+        let correction = cholesky_solve_vector(cache.undamped_factor(row), cross.view());
+        for axis in 0..dim {
+            solved_t[start + axis] -= correction[axis];
+        }
+    }
+    Ok((solved_t, solved_beta))
+}
+
 /// The `S⁻¹ v_j` bundle for a fixed probe set: solves `S y_j = v_j` (`t = 0`) on
 /// the matrix-free reduced Schur for each probe `v_j`, warm-started per-probe
 /// from `warm` when supplied (e.g. the surrogate's smallest-shift solves, which

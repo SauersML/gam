@@ -680,6 +680,24 @@ pub(crate) fn solve_b_preconditioned_gmres<F>(
 where
     F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
 {
+    solve_b_preconditioned_gmres_with(rhs, apply_a, |vector| {
+        solver.solve(vector.t.view(), vector.beta.view())
+    })
+}
+
+/// Operator-generic core of [`solve_b_preconditioned_gmres`]. The
+/// preconditioner closure makes the exact-stationarity Krylov solve usable with
+/// either the dense factor cache or the matrix-free reduced-Schur inverse while
+/// retaining the same original-residual certificate.
+pub(crate) fn solve_b_preconditioned_gmres_with<F, P>(
+    rhs: &SaeArrowVector,
+    apply_a: F,
+    precondition: P,
+) -> Result<SaeArrowVector, String>
+where
+    F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
     let t_len = rhs.t.len();
     let beta_len = rhs.beta.len();
     let dim = t_len + beta_len;
@@ -691,8 +709,7 @@ where
     }
     let rhs_flat = flatten_arrow_parts(rhs.t.view(), rhs.beta.view());
     let rhs_norm = rhs_flat.dot(&rhs_flat).sqrt().max(1.0);
-    let b = solver
-        .solve(rhs.t.view(), rhs.beta.view())
+    let b = precondition(rhs)
         .map_err(|err| format!("solve_b_preconditioned_gmres: B inverse: {err}"))?;
     let b = flatten_arrow_parts(b.t.view(), b.beta.view());
     let b_norm = b.dot(&b).sqrt().max(1.0);
@@ -714,8 +731,7 @@ where
     let apply_preconditioned = |flat: &Array1<f64>| -> Result<Array1<f64>, String> {
         let v = as_arrow(flat);
         let av = apply_a(&v)?;
-        let pav = solver
-            .solve(av.t.view(), av.beta.view())
+        let pav = precondition(&av)
             .map_err(|err| format!("solve_b_preconditioned_gmres: B preconditioner: {err}"))?;
         Ok(flatten_arrow_parts(pav.t.view(), pav.beta.view()))
     };

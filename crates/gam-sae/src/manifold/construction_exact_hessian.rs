@@ -62,7 +62,27 @@ where
 {
     let apply_a_q = |v: &SaeArrowVector| apply_gauge_fixed_arrow_operator(solver, v, apply_raw_a);
     let apply_b_q = |v: &SaeArrowVector| apply_gauge_fixed_arrow_operator(solver, v, apply_raw_b);
-    let mut x = solve_b_preconditioned_gmres(solver, rhs, |v| apply_a_q(v))?;
+    solve_exact_stationarity_preconditioned(rhs, &apply_a_q, &apply_b_q, |vector| {
+        solver.solve(vector.t.view(), vector.beta.view())
+    })
+}
+
+/// Shared exact-stationarity solve on an already identified operator. Dense
+/// evidence supplies a gauge-fixed direct inverse; matrix-free evidence supplies
+/// a quotient-aware reduced-Schur inverse. Both paths run the identical GMRES,
+/// generalized-Rayleigh, and numerical-null certificate below.
+fn solve_exact_stationarity_preconditioned<A, B, P>(
+    rhs: &SaeArrowVector,
+    apply_a: &A,
+    apply_b: &B,
+    precondition: P,
+) -> Result<SaeArrowVector, String>
+where
+    A: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    B: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
+    let mut x = solve_b_preconditioned_gmres_with(rhs, |v| apply_a(v), |v| precondition(v))?;
     // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
     //
     // The generalized Rayleigh quotient `μ(x) = xᵀAx / xᵀBx` of the
@@ -82,8 +102,8 @@ where
     let dim = x.t.len() + x.beta.len();
     let rank_floor = sae_ift_min_curvature_fraction();
     for _ in 0..dim {
-        let ax = apply_a_q(&x)?;
-        let bx = apply_b_q(&x)?;
+        let ax = apply_a(&x)?;
+        let bx = apply_b(&x)?;
         let x_b_norm_sq = sae_inner(&x, &bx);
         if x_b_norm_sq == 0.0 && sae_inner(&x, &x) == 0.0 {
             return Ok(x);
@@ -136,7 +156,7 @@ where
         // projecting with `v=x` (which would delete the entire response).
         let mut v = x.clone();
         let normalize_b = |v: &mut SaeArrowVector| -> Result<(), String> {
-            let bv = apply_b_q(v)?;
+            let bv = apply_b(v)?;
             let norm_sq = sae_inner(v, &bv);
             if !(norm_sq.is_finite() && norm_sq > 0.0) {
                 return Err(format!(
@@ -152,7 +172,7 @@ where
         normalize_b(&mut v)?;
         let mut direction_converged = false;
         for _ in 0..dim {
-            let bv = apply_b_q(&v)?;
+            let bv = apply_b(&v)?;
             // #2253 — A⁻¹(Bv) is ILL-POSED along a near-null/indefinite pencil
             // direction (that is exactly the direction we are isolating), so the
             // refinement GMRES can legitimately exhaust its budget without
@@ -161,7 +181,11 @@ where
             // μ(x) collapsed onto μ_min — is ALREADY aligned with the offending
             // direction. Keep the best `v` and let the alignment/μ checks below
             // decide, instead of aborting the whole outer gradient.
-            let refined = match solve_b_preconditioned_gmres(solver, &bv, |w| apply_a_q(w)) {
+            let refined = match solve_b_preconditioned_gmres_with(
+                &bv,
+                |w| apply_a(w),
+                |w| precondition(w),
+            ) {
                 Ok(mut refined) => {
                     normalize_b(&mut refined)?;
                     refined
@@ -172,7 +196,7 @@ where
                     break;
                 }
             };
-            let b_refined = apply_b_q(&refined)?;
+            let b_refined = apply_b(&refined)?;
             let alignment = sae_inner(&v, &b_refined).abs();
             if !alignment.is_finite() {
                 return Err("solve_exact_stationarity: non-finite inverse-power alignment".into());
@@ -187,8 +211,8 @@ where
             // eigenvector alignment before keeping the original finite response.
             // Strict alignment remains mandatory below before a direction may be
             // projected as a numerical null.
-            let av = apply_a_q(&v)?;
-            let bv = apply_b_q(&v)?;
+            let av = apply_a(&v)?;
+            let bv = apply_b(&v)?;
             let norm_sq = sae_inner(&v, &bv);
             if !(norm_sq.is_finite() && norm_sq > 0.0) {
                 return Err(format!(
@@ -226,8 +250,8 @@ where
         // then proves that no numerical null was present. In that case keep the
         // original exact solve instead of either deleting the resolved component
         // or turning benign Rayleigh cancellation into a typed failure.
-        let av = apply_a_q(&v)?;
-        let bv = apply_b_q(&v)?;
+        let av = apply_a(&v)?;
+        let bv = apply_b(&v)?;
         let v_b_norm_sq = sae_inner(&v, &bv);
         if !(v_b_norm_sq.is_finite() && v_b_norm_sq > 0.0) {
             return Err(format!(
