@@ -455,6 +455,12 @@ pub struct OuterProbeTelemetry {
     pub basin_envelope_rescues: usize,
     pub basin_max_members: usize,
     pub basin_member_capacity: usize,
+    /// Scalar continuation waypoints installed before their rho-spine solve.
+    /// Already-finite literal seeds must leave this at zero.
+    pub reactive_scalar_installs: usize,
+    /// Installed waypoints that were bit-identical to the objective's literal
+    /// target scalar state.
+    pub reactive_target_restores: usize,
 }
 
 impl OuterProbeTelemetry {
@@ -564,6 +570,10 @@ pub struct SaeManifoldOuterObjective {
     pub(crate) baseline_term: SaeManifoldTerm,
     pub(crate) target: Array2<f64>,
     pub(crate) registry: Option<AnalyticPenaltyRegistry>,
+    /// Literal isometry weights owned by the real objective. Reactive scalar
+    /// continuation may temporarily loosen them, and every reset restores this
+    /// exact vector.
+    baseline_isometry_weights: Vec<f64>,
     /// ρ template carrying the per-atom ARD dims; `from_flat` reads its
     /// layout. Updated to each evaluated ρ so `into_fitted` can report the
     /// last ρ the engine settled on.
@@ -756,6 +766,10 @@ impl SaeManifoldOuterObjective {
         term.structural_cocollapse_reseeds = 0;
         let baseline_term = term.clone();
         let baseline_rho = init_rho.clone();
+        let baseline_isometry_weights = registry
+            .as_ref()
+            .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
+            .unwrap_or_default();
         let term_k_atoms = term.k_atoms();
         let basin_member_capacity = basin_bundle_member_capacity(&term);
         // SPEC wall-survival fingerprint on the full-data target.
@@ -768,6 +782,7 @@ impl SaeManifoldOuterObjective {
             baseline_term,
             target,
             registry,
+            baseline_isometry_weights,
             current_rho: init_rho,
             baseline_rho,
             inner_max_iter,
@@ -3621,16 +3636,36 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is a typed `OuterGradientError`: it is not a usable derivative and must
         // terminate this evaluation instead of being hidden behind a plain inverse
         // or a differenced value path.
+        // #2253/#2087 — the inner KKT residual at the accepted θ̂. Within tolerance
+        // when the inner reached KKT-stationarity (envelope holds, no correction);
+        // NONZERO when the ill-conditioned n≈p fit accepted a #1051 objective-
+        // stagnation point, where the outer gradient must add back the dropped
+        // `rᵀθ̂_ρ` term or it desyncs from d(value)/dρ (the |g|≈1.09 stall).
+        let kkt_residual = self
+            .term
+            .kkt_residual_vector(self.target.view(), &rho_state, self.registry.as_ref())
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let kkt_norm = (kkt_residual.t.iter().map(|v| v * v).sum::<f64>()
+            + kkt_residual.beta.iter().map(|v| v * v).sum::<f64>())
+        .sqrt();
+        let kkt_tol = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
+        let kkt_opt = if kkt_norm > kkt_tol {
+            Some(&kkt_residual)
+        } else {
+            None
+        };
         let grad_components = self
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
-                self.term.analytic_outer_rho_gradient_components(
+                self.term.analytic_outer_rho_gradient_components_with_bundle(
                     self.target.view(),
                     &rho_state,
                     &loss,
                     &cache,
                     &solver,
+                    None,
+                    kkt_opt,
                 )
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
@@ -3786,6 +3821,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn reset(&mut self) {
         self.fit_verdict = None;
         self.term = self.baseline_term.clone();
+        if let Some(registry) = self.registry.as_mut() {
+            registry.set_isometry_scalar_weights(&self.baseline_isometry_weights);
+        }
         self.current_rho = self.baseline_rho.clone();
         self.last_loss = None;
         self.seeded_beta = None;
@@ -3833,18 +3871,115 @@ impl OuterObjective for SaeManifoldOuterObjective {
         Ok(SeedOutcome::Installed)
     }
 
-    /// Dense K≥2 joint fits may have an undefined Laplace evidence at the cold
-    /// PCA seed even though a finite basin is connected to it from the
-    /// heavy-smoothing contraction regime. Advertise that domain-entry
-    /// capability without imposing its historical fixed cost on already-finite
-    /// seeds. The shared runner probes the exact seed first and drives the
-    /// continuation only after a non-finite result.
-    ///
-    /// Matrix-free fits cannot use this dense-factor continuation and remain a
-    /// typed refusal if their streaming seed is infeasible. K=1 has no
-    /// inter-atom routing active set and needs no coupled entry.
-    fn supports_reactive_domain_entry(&self) -> bool {
-        self.term.k_atoms() >= 2 && self.term.streaming_plan().direct_logdet_admitted()
+    /// Dense K≥2 joint fits may have undefined Laplace evidence at the literal
+    /// cold seed even though a finite basin is connected from a diffuse routing
+    /// state. The entry temperature is derived from the objective's own routing
+    /// logits: it is the smallest temperature that puts every active logit on
+    /// unit scale. Isometry entry weights are zero, while the target retains the
+    /// literal per-penalty vector (including heterogeneous weights).
+    fn reactive_domain_scalar_contract(
+        &self,
+    ) -> Result<
+        Option<gam_solve::continuation_path::ContinuationScalarContract>,
+        EstimationError,
+    > {
+        if self.baseline_term.k_atoms() < 2
+            || !self
+                .baseline_term
+                .streaming_plan()
+                .direct_logdet_admitted()
+        {
+            return Ok(None);
+        }
+
+        let target_temperature = self.baseline_term.assignment.mode.temperature();
+        let routing_logits = self
+            .baseline_term
+            .assignment
+            .frozen_logits
+            .as_ref()
+            .unwrap_or(&self.baseline_term.assignment.logits);
+        let threshold = match self.baseline_term.assignment.mode {
+            AssignmentMode::ThresholdGate { threshold, .. } => threshold,
+            _ => 0.0,
+        };
+        let mut routing_scale = 0.0_f64;
+        for &logit in routing_logits {
+            let centered = logit - threshold;
+            if !centered.is_finite() {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "reactive scalar continuation found a non-finite literal routing logit"
+                        .to_string(),
+                ));
+            }
+            routing_scale = routing_scale.max(centered.abs());
+        }
+        let entry = gam_solve::continuation_path::ContinuationScalarState::new(
+            target_temperature.max(routing_scale),
+            vec![0.0; self.baseline_isometry_weights.len()],
+        )
+        .map_err(EstimationError::RemlOptimizationFailed)?;
+        let target = gam_solve::continuation_path::ContinuationScalarState::new(
+            target_temperature,
+            self.baseline_isometry_weights.clone(),
+        )
+        .map_err(EstimationError::RemlOptimizationFailed)?;
+        gam_solve::continuation_path::ContinuationScalarContract::new(entry, target)
+            .map(Some)
+            .map_err(EstimationError::RemlOptimizationFailed)
+    }
+
+    fn install_reactive_domain_scalar_state(
+        &mut self,
+        state: &gam_solve::continuation_path::ContinuationScalarState,
+    ) -> Result<(), EstimationError> {
+        let contract = self
+            .reactive_domain_scalar_contract()?
+            .ok_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "reactive scalar waypoint requested from an objective without a dense K>=2 contract"
+                        .to_string(),
+                )
+            })?;
+        if state.isometry_weights.len() != self.baseline_isometry_weights.len() {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "reactive scalar waypoint isometry dimension {} != literal target dimension {}",
+                state.isometry_weights.len(),
+                self.baseline_isometry_weights.len(),
+            )));
+        }
+
+        self.fit_verdict = None;
+        self.term
+            .assignment
+            .mode
+            .set_temperature(state.assignment_temperature)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        let restoring_target = state.bitwise_eq(contract.target());
+        if restoring_target {
+            self.term.temperature_schedule = self.baseline_term.temperature_schedule.clone();
+            // Preserve the contract's literal temperature even when the saved
+            // schedule cursor was created before the baseline term was cloned.
+            self.term
+                .assignment
+                .mode
+                .set_temperature(contract.target().assignment_temperature)
+                .map_err(EstimationError::RemlOptimizationFailed)?;
+        } else {
+            // A private inner schedule must not advance or overwrite the scalar
+            // waypoint selected by the coupled outer path.
+            self.term.temperature_schedule = None;
+        }
+        if let Some(registry) = self.registry.as_mut() {
+            registry.set_isometry_scalar_weights(&state.isometry_weights);
+        }
+        self.probe_converged_handoff = None;
+        self.basin_bundle.clear();
+        self.probe_telemetry.reactive_scalar_installs += 1;
+        if restoring_target {
+            self.probe_telemetry.reactive_target_restores += 1;
+        }
+        Ok(())
     }
 }
 

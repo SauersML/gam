@@ -403,47 +403,14 @@ impl SaeManifoldTerm {
             // from a real one AT the singular point. The categorical veto (v→+∞ when
             // rank_eff==0) is therefore the only valid way to keep the degenerate class
             // unbirthable; a finite penalty could not.
-            if d_eff.iter().any(|&de| de == 0.0) {
-                f64::INFINITY
-            } else {
-                // #2a — occupancy-aware BIC/Laplace scale. The per-atom charge is
-                // ½·d_eff,k·ln(N_eff,k), NOT ½·d_eff,k·ln(n_obs): N_eff,k = Σ_i a_{ik}²
-                // is the Fisher information a GATED atom actually accumulates, so it is
-                // the honest effective sample size for atom k's Laplace volume. Using
-                // the global n_obs over-charges atom k by ½·d_eff,k·ln(n_obs/N_eff,k)
-                // — biased worst against the sparse, selective atoms an SAE exists to
-                // find, and it manufactures a spurious asymmetry in fusion/fission.
-                // AXIOM (inert-row invariance): appending rows on which atom k's gate is
-                // OFF changes neither its likelihood nor its curvature, so it must not
-                // change atom k's charge. ln(N_eff,k) satisfies this (those rows add 0
-                // to Σa²); ln(n_obs) violates it. The ln floor at N_eff,k=1 keeps the
-                // log non-negative for a barely-occupied atom (rank_eff>0 ⇒ N_eff,k>0,
-                // and the d_eff==0 veto above already removes the empty case).
-                //
-                // The hard MP branch is the one production charge currency; its
-                // integer rank count is locally constant between edge crossings,
-                // while `basis_edf` and `N_eff` carry the analytic differential.
-                let rank_charge: f64 = d_eff
-                    .iter()
-                    .zip(n_eff.iter())
-                    .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
-                    .sum();
-                // htt_half = the coordinate-block part of ½log|H| = Σ_i Σ_j ln diag(L_i)
-                // (= ½·Σ_i log|H_tt^(i)|; `arrow_log_det_from_cache` doubles this into
-                // `log_det`). Subtracting it removes the per-row coordinate log-det.
-                let mut htt_half = 0.0_f64;
-                for row in 0..cache.undamped_factor_count() {
-                    let l = cache.undamped_factor(row);
-                    for i in 0..l.nrows() {
-                        let d = l[[i, i]];
-                        if d > 0.0 {
-                            htt_half += d.ln();
-                        }
-                    }
-                }
-                loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
-                    - occam
-            }
+            // #2a — occupancy-aware BIC/Laplace scale. The shared scalar helper
+            // owns both the rank-zero veto and the exact replacement
+            // `0.5 log|H| - 0.5 log|H_tt| + rank_charge`; dense, streaming, and
+            // criterion-as-atoms assembly therefore cannot drift apart.
+            let log_det_tt = coordinate_block_log_det(&cache)?;
+            let laplace_complexity =
+                rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
+            loss.total() + extra_penalty_energy + laplace_complexity - occam
         };
         Ok((v, loss, cache))
     }
@@ -1370,6 +1337,38 @@ impl SaeManifoldTerm {
             + sys.gb.iter().map(|&v| v * v).sum::<f64>()
     }
 
+    /// #2253/#2087 — the inner KKT residual `r = ∇_θ(D+P+extra)` at the current
+    /// (accepted) inner state, as a joint `(t, β)` [`SaeArrowVector`] on the same
+    /// layout the exact-stationarity solve consumes. Zero (to tolerance) at a KKT
+    /// optimum; nonzero at a #1051 objective-stagnation accept, where it feeds the
+    /// non-envelope correction `rᵀθ̂_ρ` in
+    /// [`Self::analytic_outer_rho_gradient_components_with_bundle`]. Assembling once
+    /// here (the same assembly `converge_inner_for_undamped_logdet` used) keeps the
+    /// residual exactly consistent with the criterion the gradient differentiates.
+    pub(crate) fn kkt_residual_vector(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<SaeArrowVector, String> {
+        // Assemble on a clone: `assemble_arrow_schur` is `&mut self` (it scales the
+        // block design / fills buffers), and the outer-gradient caller must not
+        // have its accepted inner state mutated underneath it (same discipline as
+        // the stall-diagnostic audit).
+        let mut term = self.clone();
+        let sys = term.assemble_arrow_schur(target, rho, registry)?;
+        let total_t: usize = sys.rows.iter().map(|row| row.gt.len()).sum();
+        let mut t = Array1::<f64>::zeros(total_t);
+        let mut offset = 0usize;
+        for row in &sys.rows {
+            for &value in row.gt.iter() {
+                t[offset] = value;
+                offset += 1;
+            }
+        }
+        Ok(SaeArrowVector { t, beta: sys.gb })
+    }
+
     /// Install the per-row spectral deflation on an ACCEPTANCE system, take its
     /// undamped (ridge-0) evidence factorization, and read back both KKT residual
     /// norms (raw and quotient) off the SAME assembled system. This is the
@@ -1944,23 +1943,9 @@ impl SaeManifoldTerm {
             // INVALID (degenerate β-mode / β-Schur log-det → −∞), not payable. Reject
             // categorically (v → +∞). Same guard as the dense path; see the dense
             // reml_criterion for the full rationale + β-Schur-floor trailhead.
-            if d_eff.iter().any(|&de| de == 0.0) {
-                f64::INFINITY
-            } else {
-                // #2a occupancy-aware scale (see the dense `reml_criterion` for the full
-                // rationale + inert-row axiom + RLCT veto justification): charge atom k
-                // ½·d_eff,k·ln(N_eff,k), N_eff,k = Σ_i a_{ik}² (here `ri.n_eff`, the same
-                // effective sample size chunk-accumulated for the MP edge), NOT the
-                // global n_obs. Bit-identical to the dense hard-MP path.
-                let rank_charge: f64 = d_eff
-                    .iter()
-                    .zip(ri.n_eff.iter())
-                    .map(|(&de, &ne)| 0.5 * de * ne.max(1.0).ln())
-                    .sum();
-                let htt_half = 0.5 * ri.log_det_tt;
-                loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
-                    - occam
-            }
+            let laplace_complexity =
+                rank_adjusted_laplace_complexity(log_det, ri.log_det_tt, &d_eff, &ri.n_eff)?;
+            loss.total() + extra_penalty_energy + laplace_complexity - occam
         };
         Ok((v, loss, converged_cache))
     }
@@ -4975,7 +4960,8 @@ impl SaeManifoldTerm {
     /// This is the single seam that establishes value↔gradient coherence for
     /// the SAE objective: it runs the inner solve once via
     /// [`Self::reml_criterion_with_cache`], reads the value decomposition
-    /// (`loss.total() + extra_penalty_energy`, `log|H|`, `occam`) and the
+    /// (`loss.total() + extra_penalty_energy`, the rank-adjusted Laplace
+    /// complexity, `occam`) and the
     /// matching gradient channels (`SaeOuterRhoGradientComponents`) from the
     /// SAME converged cache, and hands them to [`SaeCriterion::assemble`]. The
     /// returned criterion's [`SaeCriterion::value`] and
@@ -4995,7 +4981,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeCriterion, String> {
-        let (_v, loss, cache) = self.reml_criterion_with_cache(
+        let (production_value, loss, cache) = self.reml_criterion_with_cache(
             target,
             rho,
             registry,
@@ -5007,6 +4993,18 @@ impl SaeManifoldTerm {
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             "criterion_as_atoms: arrow_log_det_from_cache returned None".to_string()
         })?;
+        let residual = self.reconstruction_residual(target, rho)?;
+        let dispersion = self.reconstruction_dispersion(
+            &loss,
+            &cache,
+            rho,
+            Some(residual.view()),
+        )?;
+        let d_eff = self.per_atom_realised_rank_dof(rho, dispersion)?;
+        let n_eff = self.per_atom_effective_sample_size();
+        let log_det_tt = coordinate_block_log_det(&cache)?;
+        let laplace_complexity =
+            rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
         let occam = self.reml_occam_term(rho)?;
         let extra_penalty_energy = match registry {
             Some(reg) => self
@@ -5019,15 +5017,27 @@ impl SaeManifoldTerm {
         let solver = self.outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())?;
         let components =
             self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
-        Ok(SaeCriterion::assemble(
+        let criterion = SaeCriterion::assemble(
             data_fit_priors_value,
-            log_det,
+            laplace_complexity,
             occam,
             components.explicit,
             components.logdet_trace,
             components.occam,
             components.third_order_correction,
-        ))
+        );
+        let assembled_value = criterion.value();
+        let identity_roundoff = 64.0
+            * f64::EPSILON
+            * (1.0 + production_value.abs().max(assembled_value.abs()));
+        if (assembled_value - production_value).abs() > identity_roundoff {
+            return Err(format!(
+                "criterion_as_atoms: assembled value {assembled_value:.17e} does not equal \
+                 production value {production_value:.17e} from the same cache \
+                 (roundoff={identity_roundoff:.3e})"
+            ));
+        }
+        Ok(criterion)
     }
 
     // [#780 line-count gate] reconstruction_dispersion + assemble_shape_uncertainty

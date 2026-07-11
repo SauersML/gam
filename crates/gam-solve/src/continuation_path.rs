@@ -40,17 +40,15 @@
 //! / tight-isometry along a continuous descent from a regime where convergence
 //! is guaranteed.
 //!
-//! # The tail is a homotopy FLOOR, not a gate
+//! # The accepted path is monotone; failed attempts refine their distance
 //!
-//! If a downward step's inner solve struggles, the path does **not** reject:
-//! it re-enters a heavier regime (raises `s` back toward 1 by a back-off
-//! fraction) and re-descends with a finer step. This is a *floor* the iterate
-//! bounces off, never a trapdoor it falls through. The structural guarantee is
-//! encoded in the type: [`ContinuationStep`] — the per-step outcome enum — has
-//! **no `Reject` / `Failed` / `NoUsableSeed` arm**. The worst a step can report
-//! is [`ContinuationStep::Reentered`] (bounced off the floor, re-descending),
-//! which is progress toward, not abandonment of, the fit. There is no value of
-//! the outcome type that means "give up".
+//! If a downward step's inner solve struggles, the last accepted waypoint is
+//! retained and only the next attempted distance is halved. No independent
+//! waypoint count, wall-clock deadline, or evaluation ceiling can fabricate an
+//! arrival. A successful solve at the literal `s = 0` target is the only
+//! [`ContinuationStep::Arrived`] value. If repeated refinement can no longer
+//! produce a strictly smaller representable waypoint, [`ContinuationPath::step`]
+//! returns a typed non-convergence error.
 //!
 //! # How this absorbs #969 (warm-invariance) and #976 (hardening)
 //!
@@ -132,10 +130,7 @@ pub struct ContinuationScalarState {
 }
 
 impl ContinuationScalarState {
-    pub fn new(
-        assignment_temperature: f64,
-        isometry_weights: Vec<f64>,
-    ) -> Result<Self, String> {
+    pub fn new(assignment_temperature: f64, isometry_weights: Vec<f64>) -> Result<Self, String> {
         if !(assignment_temperature.is_finite() && assignment_temperature > 0.0) {
             return Err(format!(
                 "continuation assignment temperature must be finite and positive; got \
@@ -361,9 +356,8 @@ impl ActiveMassFloor {
     /// calls collapsed. Placing the floor *at* the healthy operating mass
     /// (the previous `0.2`) made a healthy converging IBP-MAP fit oscillate
     /// across the floor, and every spurious breach re-seeds from the scaffold
-    /// (`obj.reset()`) and re-enters a heavier regime — re-seed thrash that
-    /// discards converged routing mass each bounce and pins the fit near the
-    /// cold seed: itself a collapse mechanism. Genuine saddle collapse
+    /// (`obj.reset()`) — re-seed thrash that discards converged routing mass and
+    /// pins the fit near the cold seed: itself a collapse mechanism. Genuine saddle collapse
     /// (~`0.03` observed mass) is still far below this floor.
     pub const DEFAULT_FLOOR: f64 = 0.1;
 
@@ -391,9 +385,9 @@ impl ActiveMassFloor {
 }
 
 /// A recorded active-mass-floor breach. Carries the observed mass and the floor
-/// it fell below. The wiring agent's response is a re-seed-from-scaffold, not a
-/// failure: this is appended to the [`ReseedLedger`] and the path re-enters a
-/// heavier regime.
+/// it fell below. The wiring agent's response is a re-seed-from-scaffold plus a
+/// smaller next attempted path distance: the event is appended to the
+/// [`ReseedLedger`] without moving the last accepted waypoint.
 #[derive(Debug, Clone, Copy)]
 pub struct MassFloorBreach {
     pub observed_mean_mass: f64,
@@ -444,7 +438,7 @@ impl ReseedLedger {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  Regime-escalation view of re-entry (#969 seed-cascade demotion).
+//  Coarse diagnostic view of the last accepted scalar regime.
 //
 //  The seed cascade in `rho_optimizer.rs` observes the path through a coarser
 //  lens than the per-waypoint `s`: it only needs to know which scalar regime
@@ -452,11 +446,8 @@ impl ReseedLedger {
 //  the path parameter `s`.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// The coarse "which heavy-smoothing regime is the path currently entering at"
-/// view the seed cascade reports against. Banded from the live path parameter
-/// `s ∈ [0, 1]`: heavier regime ⇒ larger `s` ⇒ deeper into the contraction
-/// basin. Every variant is a *re-entry* the cascade re-evaluates a seed at;
-/// none of them is a rejection.
+/// Coarse band of the last accepted path parameter. Banded from
+/// `s ∈ [0, 1]`: larger `s` means deeper in the contraction basin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathRegime {
     /// `s` near the real objective (`s ≤ 1/4`): the path is at or close to ρ*,
@@ -467,7 +458,7 @@ pub enum PathRegime {
     Annealing,
     /// Heavy-smoothing entry band (`s > 3/4`): the deepest contraction regime,
     /// where the joint inner solve is provably a contraction. The band a fresh
-    /// `heavy_entry` starts in and the band repeated demotions converge toward.
+    /// `heavy_entry` starts in.
     Heavy,
 }
 
@@ -488,14 +479,14 @@ impl PathRegime {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  The per-step outcome enum. Note: NO Reject / Failed / NoUsableSeed arm.
+//  Typed outcomes for accepted progress and attempted-distance refinement.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Outcome of one [`ContinuationPath`] waypoint step. The defining structural
-/// property: **there is no rejection arm.** A step either descends, arrives, or
-/// bounces off the homotopy floor back into a heavier regime. None of these
-/// means "give up"; the tail is a floor, not a gate. The absence of a `Reject`
-/// variant is the whole point — the type cannot represent "no usable seed".
+/// property: **there is no false-arrival arm.** A successful step enters,
+/// descends, arrives with its solved target state, or reports that the next
+/// attempted distance was refined. Non-convergence is returned by
+/// [`ContinuationPath::step`] as a typed error rather than encoded as arrival.
 #[derive(Debug, Clone)]
 pub(crate) enum ContinuationStep {
     /// The objective installed and solved the literal heavy scalar entry at
@@ -507,30 +498,24 @@ pub(crate) enum ContinuationStep {
     /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
     /// tight isometry). Terminal-but-successful; the criterion is the real
     /// objective's, identical for cold and warm entry (#969).
-    Arrived,
-    /// The inner solve at the attempted waypoint struggled, so the path
-    /// re-entered a heavier regime (`s` raised back toward `1` by the back-off
-    /// fraction) and will re-descend with a finer step. This is the homotopy
-    /// floor in action — progress toward the fit, never abandonment. Carries
-    /// the heavier `s` to descend from next and the underlying spine signal
-    /// that prompted the back-off (for diagnostics only; it is **not** an
-    /// error the path surfaces upward).
-    Reentered { s: f64, reason: ReentryReason },
+    Arrived { state: ContinuationState },
+    /// The attempted waypoint did not solve, so the accepted `s` remains
+    /// unchanged and the next attempted distance is smaller. Carries the last
+    /// accepted `s` and the evidence that requested refinement.
+    Refined { s: f64, reason: RefinementReason },
 }
 
-/// Why a waypoint re-entered a heavier regime. Purely diagnostic — every
-/// variant resolves to "re-descend from a heavier `s`", never to a rejection.
+/// Why the next waypoint distance was refined. Purely diagnostic: the last
+/// accepted waypoint remains installed and no progress is fabricated.
 #[derive(Debug, Clone)]
-pub(crate) enum ReentryReason {
+pub(crate) enum RefinementReason {
     /// The ρ-anneal spine could not complete the descent to this waypoint's ρ
     /// target from the current regime. The underlying `ContinuationFailure` is
-    /// kept for logging; the path's response is unconditionally to re-enter a
-    /// heavier regime, because at the heaviest regime the inner solve is a
-    /// contraction and *must* converge.
+    /// kept for logging; the path's response is to retry from the last accepted
+    /// state with a smaller attempted distance.
     SpineStruggled(ContinuationFailure),
     /// The active-mass floor was breached at this waypoint; a scaffold re-seed
-    /// was recorded and the path re-enters a heavier regime to let τ re-diffuse
-    /// the assignment before re-sharpening.
+    /// was recorded and the next attempted distance is refined.
     MassFloorBreached(MassFloorBreach),
 }
 
@@ -540,8 +525,8 @@ pub(crate) enum ReentryReason {
 
 /// Object 1 — the coupled continuation path. Owns the three schedules and the
 /// scalar path parameter `s`, and drives the K≥2 SAE joint fit down the coupled
-/// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime); the
-/// tail is a homotopy floor with no rejection exit.
+/// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime), and
+/// only a solved literal target can produce arrival.
 ///
 /// The wiring agent drives the path one waypoint at a time:
 /// `let step = path.step(obj, &mut ledger);` and, per [`ContinuationStep`],
@@ -622,28 +607,21 @@ impl ContinuationPath {
         // internally and anneals down), while the path simply rides at `s` along
         // ρ*. This keeps a single source of truth for the ρ anneal — the spine —
         // and the path couples the τ / isometry legs against that shared walk.
-        let schedules = couple_schedules(
-            rho_target.clone(),
-            rho_target,
-            bounds_upper,
-            scalars,
-        );
+        let schedules = couple_schedules(rho_target.clone(), rho_target, bounds_upper, scalars);
         Self::enter(schedules)
     }
 
-    /// The coarse heavy-smoothing regime the path is currently entering at. The
-    /// seed cascade reports this in its demotion ledger and final diagnosis. A
-    /// fresh path is in [`PathRegime::Heavy`].
+    /// Coarse diagnostic band of the last successfully solved waypoint. A fresh
+    /// path is in [`PathRegime::Heavy`].
     #[must_use]
-    pub fn enter_regime(&self) -> PathRegime {
+    pub fn current_regime(&self) -> PathRegime {
         PathRegime::from_s(self.s)
     }
 
     /// The base radius the per-iteration assignment-logit trust region is built
     /// from (`rho_optimizer.rs` / `atom_selection.rs` hardening hook). This is
-    /// the ∞-norm logit step radius at the current waypoint; heavier regimes
-    /// (after a demotion / re-entry) cool τ and so hand back a tighter radius,
-    /// shrinking every atom's logit cap with no separate knob.
+    /// the ∞-norm logit step radius at the current waypoint; larger accepted
+    /// `s` values cool τ and hand back a tighter radius.
     #[must_use]
     pub fn logit_step_radius(&self) -> f64 {
         self.logit_tr.radius
@@ -651,34 +629,33 @@ impl ContinuationPath {
 
     /// Bare active-mass-floor breach hook for the inner-loop call site that does
     /// not thread its own [`ReseedLedger`]. Records the breach in the
-    /// path-owned ledger at the current `s` and re-enters a heavier regime —
+    /// path-owned ledger at the current `s` and refines the next distance —
     /// the same non-fatal response as [`ContinuationPath::note_mass_breach`],
-    /// without requiring the caller to carry a ledger. Returns the heavier
-    /// [`PathRegime`] re-entered at so the call site can report it. **Never
-    /// fatal** — a breach is a re-entry, never a rejection.
+    /// without requiring the caller to carry a ledger. Returns the unchanged
+    /// accepted [`PathRegime`] so the call site can report it.
     pub fn note_active_mass_breach(&mut self) -> PathRegime {
         let breach = MassFloorBreach {
             observed_mean_mass: self.mass_floor.floor,
             floor: self.mass_floor.floor,
         };
         // Single source of truth for the breach response: route through
-        // `note_mass_breach` so the record-then-re-enter logic is not
+        // `note_mass_breach` so the record-then-refine logic is not
         // duplicated. The bare hook differs only in *which* ledger it threads —
         // the path-owned one — so we lend that ledger to the shared driver and
         // hand it back afterwards.
         let mut owned = std::mem::take(&mut self.reseed_ledger);
         let step = self.note_mass_breach(breach, &mut owned);
         self.reseed_ledger = owned;
-        // The shared driver always re-enters a heavier regime (never rejects);
-        // the bare hook's contract is the coarse regime it landed in. Match the
+        // The shared driver retains the last accepted waypoint and refines the
+        // attempted distance. Match the
         // step exhaustively so the outcome is observed (no silent discard) and
         // the "every breach is progress" invariant is documented at the use
-        // site: every arm resolves to the heavier live regime.
+        // site: every arm resolves to the accepted live regime.
         match step {
-            ContinuationStep::Reentered { .. }
+            ContinuationStep::Refined { .. }
             | ContinuationStep::Entered { .. }
             | ContinuationStep::Descended { .. }
-            | ContinuationStep::Arrived => self.enter_regime(),
+            | ContinuationStep::Arrived { .. } => self.current_regime(),
         }
     }
 
@@ -724,10 +701,9 @@ impl ContinuationPath {
         self.mass_floor
     }
 
-    /// Record an active-mass-floor breach into the ledger and re-enter a
-    /// heavier regime. Returns the [`ContinuationStep::Reentered`] the wiring
-    /// agent should act on. **Never fatal** — a breach is a re-entry, never a
-    /// rejection. This is the hook the wiring agent calls when
+    /// Record an active-mass-floor breach into the ledger and refine the next
+    /// attempted distance. Returns the [`ContinuationStep::Refined`] the wiring
+    /// agent should act on. This is the hook the wiring agent calls when
     /// [`ActiveMassFloor::check`] returns `Some` from inside the inner solve.
     pub(crate) fn note_mass_breach(
         &mut self,
@@ -736,9 +712,9 @@ impl ContinuationPath {
     ) -> ContinuationStep {
         ledger.record(self.s, breach);
         self.refine_step();
-        ContinuationStep::Reentered {
+        ContinuationStep::Refined {
             s: self.s,
-            reason: ReentryReason::MassFloorBreached(breach),
+            reason: RefinementReason::MassFloorBreached(breach),
         }
     }
 
@@ -752,22 +728,6 @@ impl ContinuationPath {
                 .scalar_targets_at(self.s)
                 .assignment_temperature,
         );
-    }
-
-    /// Whether the path has arrived at (or below) the real objective `s = 0`.
-    /// The outer driver stops driving [`ContinuationPath::step`] once this is
-    /// true and hands the warm iterate to the normal optimizer at ρ\*.
-    #[must_use]
-    pub fn arrived(&self) -> bool {
-        self.s <= 0.0
-    }
-
-    /// Most recent successfully solved waypoint. At a reported arrival this is
-    /// the exact `s = 0` state; it is intentionally retained by the path rather
-    /// than copied into the terminal enum payload.
-    #[must_use]
-    pub(crate) fn arrival_state(&self) -> Option<&ContinuationState> {
-        self.warm.as_ref().filter(|_| self.arrived())
     }
 
     /// Take one waypoint step down the coupled homotopy.
@@ -830,23 +790,15 @@ impl ContinuationPath {
                 // the real outer optimizer asks for the gradient once after the
                 // path arrives.  `Value` preserves the same inner solve and warm
                 // beta propagation while removing that redundant derivative work.
-                continue_path_from(
-                    obj,
-                    start,
-                    &rho_target,
-                    OuterEvalOrder::Value,
-                    PATH_BUDGET,
-                )
+                continue_path_from(obj, start, &rho_target, OuterEvalOrder::Value, PATH_BUDGET)
             }
-            None => {
-                fit_with_continuation(
-                    obj,
-                    &rho_target,
-                    &self.schedules.rho_bounds_upper,
-                    initial_beta,
-                    OuterEvalOrder::Value,
-                )
-            }
+            None => fit_with_continuation(
+                obj,
+                &rho_target,
+                &self.schedules.rho_bounds_upper,
+                initial_beta,
+                OuterEvalOrder::Value,
+            ),
         };
 
         Ok(match spine {
@@ -864,7 +816,7 @@ impl ContinuationPath {
                 if entering {
                     ContinuationStep::Entered { state }
                 } else if self.s <= 0.0 {
-                    ContinuationStep::Arrived
+                    ContinuationStep::Arrived { state }
                 } else {
                     ContinuationStep::Descended { s: self.s, state }
                 }
@@ -890,9 +842,9 @@ impl ContinuationPath {
                         ),
                     ));
                 }
-                ContinuationStep::Reentered {
+                ContinuationStep::Refined {
                     s: self.s,
-                    reason: ReentryReason::SpineStruggled(failure),
+                    reason: RefinementReason::SpineStruggled(failure),
                 }
             }
         })
@@ -946,14 +898,12 @@ pub fn mean_active_mass(assignments: ArrayView2<'_, f64>) -> f64 {
 mod tests {
     use super::*;
 
-    fn lin_temp() -> GumbelTemperatureSchedule {
-        GumbelTemperatureSchedule::new(2.0, 0.1, ScheduleKind::Linear { steps: 8 })
-            .expect("valid temperature schedule")
-    }
-
-    fn lin_iso() -> ScalarWeightSchedule {
-        ScalarWeightSchedule::new(0.01, 1.0, ScheduleKind::Linear { steps: 8 })
-            .expect("valid isometry schedule")
+    fn scalar_contract() -> ContinuationScalarContract {
+        ContinuationScalarContract::new(
+            ContinuationScalarState::new(2.0, vec![0.01, 0.02]).expect("valid entry"),
+            ContinuationScalarState::new(0.1, vec![1.0, 2.0]).expect("valid target"),
+        )
+        .expect("matching scalar dimensions")
     }
 
     fn schedules() -> CoupledSchedules {
@@ -961,8 +911,7 @@ mod tests {
             Array1::from_vec(vec![5.0, 5.0]),
             Array1::from_vec(vec![0.0, 0.0]),
             Array1::from_vec(vec![10.0, 10.0]),
-            lin_temp(),
-            lin_iso(),
+            scalar_contract(),
         )
     }
 
@@ -975,13 +924,8 @@ mod tests {
             "entry must be s = 1 (heavy-smoothing regime)"
         );
         let targets = path.current_scalar_targets();
-        // τ at entry is the diffuse extreme (tau_start), isometry is loose
-        // (w_start).
-        assert!((targets.tau - 2.0).abs() < 1e-12, "entry τ = tau_start");
-        assert!(
-            (targets.isometry_weight - 0.01).abs() < 1e-12,
-            "entry isometry = w_start"
-        );
+        assert_eq!(targets.assignment_temperature.to_bits(), 2.0_f64.to_bits());
+        assert_eq!(targets.isometry_weights, vec![0.01, 0.02]);
         // ρ target at s = 1 is the oversmoothed entry ρ₀.
         let rho = path.current_rho_target();
         assert!((rho[0] - 5.0).abs() < 1e-12 && (rho[1] - 5.0).abs() < 1e-12);
@@ -991,14 +935,7 @@ mod tests {
     fn target_endpoint_is_the_real_objective() {
         let sch = schedules();
         let targets0 = sch.scalar_targets_at(0.0);
-        assert!(
-            (targets0.tau - 0.1).abs() < 1e-12,
-            "s=0 τ = tau_min (sharp)"
-        );
-        assert!(
-            (targets0.isometry_weight - 1.0).abs() < 1e-12,
-            "s=0 isometry = w_end (tight)"
-        );
+        assert!(targets0.bitwise_eq(scalar_contract().target()));
         let rho0 = sch.rho_target_at(0.0);
         assert!(
             (rho0[0]).abs() < 1e-12 && (rho0[1]).abs() < 1e-12,
@@ -1012,8 +949,9 @@ mod tests {
         // Halfway down the path, every leg is halfway (in its natural coord)
         // between entry and target.
         let mid = sch.scalar_targets_at(0.5);
-        assert!((mid.tau - (0.1 + 0.5 * (2.0 - 0.1))).abs() < 1e-12);
-        assert!((mid.isometry_weight - (0.01 + 0.5 * (1.0 - 0.01))).abs() < 1e-12);
+        assert!((mid.assignment_temperature - (0.1 + 0.5 * (2.0 - 0.1))).abs() < 1e-12);
+        assert!((mid.isometry_weights[0] - (1.0 + 0.5 * (0.01 - 1.0))).abs() < 1e-12);
+        assert!((mid.isometry_weights[1] - (2.0 + 0.5 * (0.02 - 2.0))).abs() < 1e-12);
         let rho_mid = sch.rho_target_at(0.5);
         assert!((rho_mid[0] - 2.5).abs() < 1e-12);
     }
@@ -1053,10 +991,12 @@ mod tests {
     }
 
     #[test]
-    fn note_mass_breach_reenters_heavier_and_logs() {
+    fn note_mass_breach_refines_distance_without_moving_accepted_waypoint() {
         let mut path = ContinuationPath::enter(schedules());
-        // Walk s down a bit first so a re-entry visibly raises it.
         path.s = 0.5;
+        path.s_step = 0.25;
+        let accepted_before = path.s;
+        let distance_before = path.s_step;
         let mut ledger = ReseedLedger::new();
         let breach = MassFloorBreach {
             observed_mean_mass: 0.05,
@@ -1065,43 +1005,44 @@ mod tests {
         let step = path.note_mass_breach(breach, &mut ledger);
         assert!(matches!(
             step,
-            ContinuationStep::Reentered {
-                reason: ReentryReason::MassFloorBreached(_),
+            ContinuationStep::Refined {
+                reason: RefinementReason::MassFloorBreached(_),
                 ..
             }
         ));
-        assert!(
-            path.s() > 0.5,
-            "re-entry must raise s toward the entry regime"
+        assert_eq!(
+            path.s().to_bits(),
+            accepted_before.to_bits(),
+            "a failed attempt must retain the last accepted waypoint"
+        );
+        assert_eq!(
+            path.s_step.to_bits(),
+            (distance_before * 0.5).to_bits(),
+            "a mass breach must halve only the next attempted distance"
         );
         assert_eq!(ledger.reseed_count(), 1);
     }
 
     #[test]
     fn continuation_step_has_no_reject_arm() {
-        // Compile-time + exhaustiveness witness: every ContinuationStep value
-        // resolves to a heavier-regime re-entry. There is no rejection arm, so a
-        // `match` over the enum cannot bind a "give up" case. If a Reject variant
-        // were ever added, this match would fail to compile against the
-        // documented invariant.
+        // Compile-time + exhaustiveness witness: successful target arrival is
+        // distinct from refinement and carries its solved state. Typed
+        // non-convergence is returned outside this enum.
         fn is_progress(step: &ContinuationStep) -> bool {
             match step {
-                ContinuationStep::Descended { .. }
+                ContinuationStep::Entered { .. }
+                | ContinuationStep::Descended { .. }
                 | ContinuationStep::Arrived { .. }
-                | ContinuationStep::Reentered { .. } => true,
+                | ContinuationStep::Refined { .. } => true,
             }
         }
         let breach = MassFloorBreach {
             observed_mean_mass: 0.0,
             floor: 0.2,
         };
-        assert!(is_progress(&ContinuationStep::Reentered {
+        assert!(is_progress(&ContinuationStep::Refined {
             s: 1.0,
-            reason: ReentryReason::MassFloorBreached(breach),
-        }));
-        assert!(is_progress(&ContinuationStep::Reentered {
-            s: 1.0,
-            reason: ReentryReason::StepUnderflow,
+            reason: RefinementReason::MassFloorBreached(breach),
         }));
     }
 
@@ -1125,10 +1066,14 @@ mod tests {
 
     #[test]
     fn heavy_entry_starts_in_the_heavy_regime() {
-        let path = ContinuationPath::heavy_entry();
+        let path = ContinuationPath::heavy_entry_for_rho(
+            Array1::zeros(1),
+            Array1::from_elem(1, 10.0),
+            scalar_contract(),
+        );
         assert_eq!(path.s(), 1.0, "heavy_entry must enter at s = 1");
         assert_eq!(
-            path.enter_regime(),
+            path.current_regime(),
             PathRegime::Heavy,
             "a fresh heavy_entry is in the heavy-smoothing regime"
         );
@@ -1139,39 +1084,30 @@ mod tests {
     }
 
     #[test]
-    fn demote_with_reason_reenters_heavier_never_rejects() {
-        let mut path = ContinuationPath::heavy_entry();
-        // Walk down so a demotion visibly raises s back toward the entry regime.
-        path.s = 0.3;
-        path.s_step = 0.1;
-        let before = path.s;
-        let regime = path.demote_with_reason(PathDemotionReason::UniformStructural);
-        assert!(
-            path.s > before,
-            "demotion must raise s toward the entry regime"
-        );
-        // The returned regime is the coarse band of the (heavier) live s.
-        assert_eq!(regime, path.enter_regime());
-        // A second reason demotes the same way — reason-agnostic escalation.
-        let regime2 = path.demote_with_reason(PathDemotionReason::PrewarmStructural);
-        assert_eq!(regime2, path.enter_regime());
-        assert!(path.s >= before, "repeated demotions never lower s");
-    }
-
-    #[test]
-    fn bare_active_mass_breach_records_and_reenters() {
-        let mut path = ContinuationPath::heavy_entry();
+    fn bare_active_mass_breach_records_and_refines() {
+        let mut path = ContinuationPath::enter(schedules());
         path.s = 0.4;
+        path.s_step = 0.2;
         assert_eq!(path.reseed_count(), 0);
-        let before = path.s;
+        let accepted_before = path.s;
+        let distance_before = path.s_step;
         let regime = path.note_active_mass_breach();
         assert_eq!(
             path.reseed_count(),
             1,
             "breach must be recorded in the path ledger"
         );
-        assert!(path.s > before, "breach must re-enter a heavier regime");
-        assert_eq!(regime, path.enter_regime());
+        assert_eq!(
+            path.s.to_bits(),
+            accepted_before.to_bits(),
+            "breach must retain the accepted waypoint"
+        );
+        assert_eq!(
+            path.s_step.to_bits(),
+            (distance_before * 0.5).to_bits(),
+            "breach must refine the next attempted distance"
+        );
+        assert_eq!(regime, path.current_regime());
     }
 
     #[test]
@@ -1187,6 +1123,7 @@ mod tests {
     struct RecordingObjective {
         orders: Vec<OuterEvalOrder>,
         seed_count: usize,
+        installed: Vec<ContinuationScalarState>,
     }
 
     impl OuterObjective for RecordingObjective {
@@ -1246,6 +1183,20 @@ mod tests {
             self.seed_count += beta.len().max(1);
             Ok(crate::rho_optimizer::SeedOutcome::Installed)
         }
+
+        fn reactive_domain_scalar_contract(
+            &self,
+        ) -> Result<Option<ContinuationScalarContract>, crate::model_types::EstimationError> {
+            Ok(Some(scalar_contract()))
+        }
+
+        fn install_reactive_domain_scalar_state(
+            &mut self,
+            state: &ContinuationScalarState,
+        ) -> Result<(), crate::model_types::EstimationError> {
+            self.installed.push(state.clone());
+            Ok(())
+        }
     }
 
     #[test]
@@ -1254,13 +1205,18 @@ mod tests {
         let mut obj = RecordingObjective::default();
         let initial_beta = Array1::zeros(0);
 
-        let step = path.step(&mut obj, &initial_beta);
+        let step = path
+            .step(&mut obj, &initial_beta)
+            .expect("the entry contraction must solve");
         assert!(
-            matches!(
-                step,
-                ContinuationStep::Descended { .. } | ContinuationStep::Arrived { .. }
-            ),
-            "recording objective should accept the first coupled-path waypoint"
+            matches!(step, ContinuationStep::Entered { .. }),
+            "the first coupled-path call must solve the literal entry waypoint"
+        );
+        assert!(
+            obj.installed
+                .first()
+                .expect("entry installation")
+                .bitwise_eq(scalar_contract().entry())
         );
         assert!(
             !obj.orders.is_empty(),
@@ -1276,15 +1232,38 @@ mod tests {
     }
 
     #[test]
-    fn reentry_floors_step_but_never_exits() {
+    fn refinement_halves_distance_without_moving_the_accepted_waypoint() {
         let mut path = ContinuationPath::enter(schedules());
         path.s = 0.5;
-        // Force many re-entries; s_step must floor, s stays in [0,1], and the
-        // path never produces a non-progress outcome.
-        for _ in 0..50 {
-            path.reenter_heavier();
-            assert!(path.s_step >= S_STEP_FLOOR);
-            assert!((0.0..=1.0).contains(&path.s));
-        }
+        path.s_step = 0.25;
+        path.refine_step();
+        assert_eq!(path.s.to_bits(), 0.5_f64.to_bits());
+        assert_eq!(path.s_step.to_bits(), 0.125_f64.to_bits());
+    }
+
+    #[test]
+    fn arrival_is_a_successful_literal_target_solve() {
+        let mut path = ContinuationPath::enter(schedules());
+        let mut obj = RecordingObjective::default();
+        let initial_beta = Array1::zeros(0);
+        assert!(matches!(
+            path.step(&mut obj, &initial_beta).expect("entry solve"),
+            ContinuationStep::Entered { .. }
+        ));
+        let arrived = path
+            .step(&mut obj, &initial_beta)
+            .expect("literal target solve");
+        let state = match arrived {
+            ContinuationStep::Arrived { state } => state,
+            other => panic!("expected exact-target arrival, got {other:?}"),
+        };
+        assert_eq!(path.s().to_bits(), 0.0_f64.to_bits());
+        assert!(state.last_eval.cost.is_finite());
+        assert!(
+            obj.installed
+                .last()
+                .expect("target installation")
+                .bitwise_eq(scalar_contract().target())
+        );
     }
 }

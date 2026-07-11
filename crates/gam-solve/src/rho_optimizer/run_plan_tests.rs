@@ -3359,9 +3359,9 @@ enum ReactiveDomainMode {
 
 /// Analytic one-dimensional objective used to pin the reactive domain-entry
 /// contract. Its real optimum is the literal seed. In the repair fixture the
-/// exact seed starts outside the domain, while any heavier-smoothing (larger
-/// rho) value probe opens a connected finite branch that remains defined when
-/// the path returns to the seed.
+/// exact seed starts outside the domain, while installation of the objective's
+/// smoother scalar entry opens a connected finite branch that remains defined
+/// when the coupled path returns to its literal scalar target.
 struct ReactiveDomainObjective {
     seed: f64,
     mode: ReactiveDomainMode,
@@ -3369,6 +3369,7 @@ struct ReactiveDomainObjective {
     exact_seed_value_evals: usize,
     off_seed_value_evals: usize,
     derivative_evals: usize,
+    installed_scalar_states: Vec<crate::continuation_path::ContinuationScalarState>,
 }
 
 impl ReactiveDomainObjective {
@@ -3380,6 +3381,7 @@ impl ReactiveDomainObjective {
             exact_seed_value_evals: 0,
             off_seed_value_evals: 0,
             derivative_evals: 0,
+            installed_scalar_states: Vec::new(),
         }
     }
 
@@ -3390,6 +3392,16 @@ impl ReactiveDomainObjective {
     fn finite_cost(&self, rho: &Array1<f64>) -> f64 {
         let delta = rho[0] - self.seed;
         0.5 * delta * delta
+    }
+
+    fn scalar_contract() -> crate::continuation_path::ContinuationScalarContract {
+        crate::continuation_path::ContinuationScalarContract::new(
+            crate::continuation_path::ContinuationScalarState::new(4.0, vec![0.0])
+                .expect("valid reactive entry"),
+            crate::continuation_path::ContinuationScalarState::new(0.75, vec![2.0])
+                .expect("valid literal target"),
+        )
+        .expect("matching scalar dimensions")
     }
 }
 
@@ -3412,9 +3424,6 @@ impl OuterObjective for ReactiveDomainObjective {
             self.exact_seed_value_evals += 1;
         } else {
             self.off_seed_value_evals += 1;
-            if matches!(self.mode, ReactiveDomainMode::OpensFromHeavySide) {
-                self.domain_open = true;
-            }
         }
         if self.domain_open {
             Ok(self.finite_cost(rho))
@@ -3445,8 +3454,26 @@ impl OuterObjective for ReactiveDomainObjective {
         Ok(SeedOutcome::NoSlot)
     }
 
-    fn supports_reactive_domain_entry(&self) -> bool {
-        true
+    fn reactive_domain_scalar_contract(
+        &self,
+    ) -> Result<
+        Option<crate::continuation_path::ContinuationScalarContract>,
+        EstimationError,
+    > {
+        Ok(Some(Self::scalar_contract()))
+    }
+
+    fn install_reactive_domain_scalar_state(
+        &mut self,
+        state: &crate::continuation_path::ContinuationScalarState,
+    ) -> Result<(), EstimationError> {
+        self.installed_scalar_states.push(state.clone());
+        if matches!(self.mode, ReactiveDomainMode::OpensFromHeavySide)
+            && !state.bitwise_eq(Self::scalar_contract().target())
+        {
+            self.domain_open = true;
+        }
+        Ok(())
     }
 }
 
@@ -3528,6 +3555,10 @@ fn reactive_domain_entry_leaves_finite_seed_on_zero_heavy_work_path() {
     let (result, objective) = run_reactive_domain_fixture(ReactiveDomainMode::FiniteAtColdSeed);
     let result = result.expect("a finite exact seed must optimize and certify directly");
     assert_eq!(result.rho, array![0.125]);
+    assert!(
+        objective.installed_scalar_states.is_empty(),
+        "a finite literal seed must install no continuation scalar state"
+    );
     assert_eq!(
         objective.off_seed_value_evals, 0,
         "a finite literal seed must not evaluate a heavy continuation waypoint"
@@ -3541,6 +3572,22 @@ fn reactive_domain_entry_repairs_nonfinite_seed_from_heavy_side() {
     let (result, objective) = run_reactive_domain_fixture(ReactiveDomainMode::OpensFromHeavySide);
     let result = result.expect("the connected heavy-side branch must reach a finite exact seed");
     assert_eq!(result.rho, array![0.125]);
+    assert!(
+        objective
+            .installed_scalar_states
+            .first()
+            .expect("scalar entry installation")
+            .bitwise_eq(ReactiveDomainObjective::scalar_contract().entry()),
+        "the first installed waypoint must be the objective-owned literal entry"
+    );
+    assert!(
+        objective
+            .installed_scalar_states
+            .last()
+            .expect("scalar target installation")
+            .bitwise_eq(ReactiveDomainObjective::scalar_contract().target()),
+        "successful arrival must install the literal scalar target"
+    );
     assert!(
         objective.off_seed_value_evals > 0,
         "the initially undefined seed must activate heavy continuation work"
@@ -3561,8 +3608,8 @@ fn reactive_domain_entry_keeps_unrepairable_seed_as_typed_refusal() {
         "unexpected refusal: {error}"
     );
     assert!(
-        objective.off_seed_value_evals > 0,
-        "an undefined capable seed must attempt the certified heavy path"
+        !objective.installed_scalar_states.is_empty(),
+        "an undefined capable seed must install the certified scalar entry"
     );
     assert_eq!(
         objective.derivative_evals, 0,

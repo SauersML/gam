@@ -327,12 +327,9 @@ pub(crate) fn run_outer_with_plan(
     let reactive_domain_scalar_contract = obj.reactive_domain_scalar_contract()?;
     let reactive_domain_entry_available = reactive_domain_scalar_contract.is_some();
     let mut last_continuation_regime: Option<crate::continuation_path::PathRegime> = None;
-    // Demotion ledger: every structural defect that would historically have
-    // rejected a seed (or short-circuited the cascade) is instead recorded
-    // here with its reason and the regime it was demoted to, so the
-    // `SearchLedger` / startup stats surface a heavier-regime re-entry rather
-    // than a vanished candidate. Non-fatal by construction.
-    let mut path_demotions: Vec<PathDemotionRecord> = Vec::new();
+    // Refinement ledger: record each structural defect with the last accepted
+    // regime that was retained while the next attempted distance was reduced.
+    let mut path_refinements: Vec<PathRefinementRecord> = Vec::new();
     // Accumulate every per-seed rejection with its 0-based seed index and the
     // phase that rejected it (validation vs solver run). When all seeds fail
     // systematically (bad analytic gradient, rank-deficient penalty, etc.) the
@@ -664,8 +661,8 @@ pub(crate) fn run_outer_with_plan(
                             // Warm-start the next leg from this leg's converged
                             // inner β. `NoSlot` is fine (the objective simply
                             // starts the next spine pass cold); a genuine
-                            // dimension error resets to a clean baseline and the
-                            // walk re-enters heavier on the next iteration.
+                            // dimension error resets to a clean baseline before
+                            // the next path attempt.
                             warm_beta = state.last_beta.clone();
                             if let Err(err) = obj.seed_inner_state(&warm_beta) {
                                 log::warn!(
@@ -677,52 +674,49 @@ pub(crate) fn run_outer_with_plan(
                             }
                             legs_descended += 1;
                         }
-                        crate::continuation_path::ContinuationStep::Arrived => {
+                        crate::continuation_path::ContinuationStep::Arrived { state } => {
                             // Leave the objective in the path-warmed state.
                             // The exact-value verification below owns the
                             // full-state handoff; replacing it with a copied
                             // coefficient-only seed here would discard it.
                             legs_descended += 1;
-                            let state = path.arrival_state().expect(
-                                "ContinuationStep::Arrived requires a solved target state",
-                            );
-                            match reactive_arrival_postcondition(state, seed) {
+                            match reactive_arrival_postcondition(&state, seed) {
                                 Ok(()) => continuation_arrived = true,
                                 Err(reason) => continuation_arrival_refusal = Some(reason),
                             }
                             break;
                         }
-                        crate::continuation_path::ContinuationStep::Reentered { s, reason } => {
-                            use crate::continuation_path::ReentryReason;
+                        crate::continuation_path::ContinuationStep::Refined { s, reason } => {
+                            use crate::continuation_path::RefinementReason;
                             // The accepted waypoint remains unchanged while the
                             // next attempted distance is refined. Consume the
                             // reason for diagnostics, then continue.
                             match reason {
-                                ReentryReason::SpineStruggled(failure) => {
+                                RefinementReason::SpineStruggled(failure) => {
                                     log::info!(
                                         "[OUTER] {context}: continuation seed {seed_idx} spine \
                                          struggled below s={s:.4} ({}); refining from regime {:?}",
                                         failure.message(),
-                                        path.enter_regime(),
+                                        path.current_regime(),
                                     );
                                 }
-                                ReentryReason::MassFloorBreached(breach) => {
+                                RefinementReason::MassFloorBreached(breach) => {
                                     // Active-mass collapse toward the uniform
                                     // saddle: reset to the pristine seeded
                                     // baseline (the scaffold) so the assignment
                                     // re-diffuses, and record the breach with its
-                                    // observed mass / floor in the demotion
+                                    // observed mass / floor in the refinement
                                     // ledger. Never fatal.
                                     obj.reset();
                                     warm_beta = Array1::zeros(0);
-                                    let regime = path.enter_regime();
-                                    path_demotions.push(PathDemotionRecord {
+                                    let regime = path.current_regime();
+                                    path_refinements.push(PathRefinementRecord {
                                         seed_idx,
                                         regime,
                                         reason: format!(
                                             "active-mass breach (observed mean {:.4} < floor \
-                                             {:.4}); re-seeded from scaffold, re-entered heavier \
-                                             regime",
+                                             {:.4}); re-seeded from scaffold and refined the next \
+                                             attempted distance",
                                             breach.observed_mean_mass, breach.floor,
                                         ),
                                     });
@@ -737,7 +731,7 @@ pub(crate) fn run_outer_with_plan(
                     path.reseed_count(),
                     walk_start.elapsed().as_secs_f64(),
                 );
-                last_continuation_regime = Some(path.enter_regime());
+                last_continuation_regime = Some(path.current_regime());
             }
         }
         if reactive_domain_entry_requested {
@@ -2155,10 +2149,10 @@ pub(crate) fn run_outer_with_plan(
         } else {
             String::new()
         };
-        // Surface any heavier-regime re-entries encountered inside an activated
+        // Surface attempted-distance refinements encountered inside an activated
         // reactive path. These are path diagnostics; failure to arrive or to
         // establish finite exact-seed evidence is still recorded as a refusal.
-        if !path_demotions.is_empty() {
+        if !path_refinements.is_empty() {
             if !early_exit_note.is_empty() {
                 early_exit_note.push_str("; ");
             }
@@ -2167,10 +2161,10 @@ pub(crate) fn run_outer_with_plan(
                 .map(|regime| format!("{regime:?}"))
                 .unwrap_or_else(|| "<none>".to_string());
             early_exit_note.push_str(&format!(
-                "continuation-path: {} structural defect(s) DEMOTED to heavier regime(s) \
-                 (never rejected); final regime={final_regime}; reasons: [{}]",
-                path_demotions.len(),
-                path_demotions
+                "continuation-path: {} structural defect(s) refined the next attempted distance; \
+                 final accepted regime={final_regime}; reasons: [{}]",
+                path_refinements.len(),
+                path_refinements
                     .iter()
                     .map(|d| format!("seed {} -> {:?}: {}", d.seed_idx, d.regime, d.reason))
                     .collect::<Vec<_>>()

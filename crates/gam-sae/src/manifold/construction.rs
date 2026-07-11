@@ -116,6 +116,84 @@ pub(crate) fn realised_rank_charge_dof(
     Ok(rank_eff * basis_edf)
 }
 
+/// Coordinate-block log-determinant `log|H_tt|` carried by an exact dense
+/// arrow cache. The undamped row factors are the value operator used by the
+/// rank-adjusted Laplace criterion, so a non-positive or non-finite diagonal is
+/// an invalid factorization, not a term to skip.
+pub(crate) fn coordinate_block_log_det(cache: &ArrowFactorCache) -> Result<f64, String> {
+    let mut log_det_tt = 0.0_f64;
+    for row in 0..cache.undamped_factor_count() {
+        let factor = cache.undamped_factor(row);
+        for diagonal in 0..factor.nrows() {
+            let value = factor[[diagonal, diagonal]];
+            if !(value.is_finite() && value > 0.0) {
+                return Err(format!(
+                    "coordinate_block_log_det: row {row} diagonal {diagonal} is {value}; \
+                     the undamped coordinate factor is invalid"
+                ));
+            }
+            log_det_tt += 2.0 * value.ln();
+        }
+    }
+    Ok(log_det_tt)
+}
+
+/// The one production Laplace-complexity scalar:
+///
+/// `0.5 * log|H| - 0.5 * log|H_tt| +
+///  sum_k 0.5 * d_eff_k * log(max(N_eff_k, 1))`.
+///
+/// Dense, streaming, and criterion-as-atoms assembly all call this function so
+/// the value cannot retain the full coordinate logdet after the analytic
+/// gradient has switched to the realised-rank charge. A zero realised rank is
+/// the categorical Laplace-invalid branch and therefore yields positive
+/// infinity, matching the production criterion contract.
+pub(crate) fn rank_adjusted_laplace_complexity(
+    log_det: f64,
+    log_det_tt: f64,
+    d_eff: &[f64],
+    n_eff: &[f64],
+) -> Result<f64, String> {
+    if d_eff.len() != n_eff.len() {
+        return Err(format!(
+            "rank_adjusted_laplace_complexity: d_eff length {} does not match N_eff length {}",
+            d_eff.len(),
+            n_eff.len()
+        ));
+    }
+    if d_eff.iter().any(|&value| value == 0.0) {
+        return Ok(f64::INFINITY);
+    }
+    if !(log_det.is_finite() && log_det_tt.is_finite()) {
+        return Err(format!(
+            "rank_adjusted_laplace_complexity: non-finite logdet input \
+             (joint={log_det}, coordinate={log_det_tt})"
+        ));
+    }
+    let mut rank_charge = 0.0_f64;
+    for (atom, (&dof, &occupancy)) in d_eff.iter().zip(n_eff.iter()).enumerate() {
+        if !(dof.is_finite() && dof > 0.0) {
+            return Err(format!(
+                "rank_adjusted_laplace_complexity: atom {atom} has invalid positive realised DOF {dof}"
+            ));
+        }
+        if !(occupancy.is_finite() && occupancy >= 0.0) {
+            return Err(format!(
+                "rank_adjusted_laplace_complexity: atom {atom} has invalid effective sample size {occupancy}"
+            ));
+        }
+        rank_charge += 0.5 * dof * occupancy.max(1.0).ln();
+    }
+    let value = 0.5 * (log_det - log_det_tt) + rank_charge;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!(
+            "rank_adjusted_laplace_complexity: assembled non-finite value {value}"
+        ))
+    }
+}
+
 // [#780] Softmax-entropy Gershgorin majorizer leaf helpers live in a sibling
 // cohesive module, inlined here so they share this module scope.
 include!("softmax_entropy_majorizer.rs");

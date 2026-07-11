@@ -93,7 +93,21 @@ fn logdet_audit_point(
     let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
         "logdet_audit_point: authoritative log determinant unavailable".to_string()
     })?;
+    let residual = term.reconstruction_residual(target, rho)?;
+    let dispersion =
+        term.reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))?;
+    let d_eff = term.per_atom_realised_rank_dof(rho, dispersion)?;
+    let n_eff = term.per_atom_effective_sample_size();
+    let log_det_tt = coordinate_block_log_det(&cache)?;
+    let laplace_complexity =
+        rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
     let occam = term.reml_occam_term(rho)?;
+    let extra_penalty_energy = match registry {
+        Some(registry) => term
+            .reml_extra_penalty_value_total(registry)
+            .map_err(|error| error.to_string())?,
+        None => 0.0,
+    };
     let solver = term
         .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
         .map_err(|err| err.to_string())?;
@@ -110,16 +124,9 @@ fn logdet_audit_point(
     let raw_cache_components = term
         .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &raw_cache_solver)
         .map_err(|err| err.to_string());
-    // `SaeCriterion::assemble` represents `base + ½logdet - occam`. The
-    // authoritative production scalar additionally replaces the coordinate
-    // `½log|H_tt|` with the hard rank charge. Anchor the diagnostic base to the
-    // already-priced scalar so the atomized view differentiates the same
-    // Schur-plus-rank objective as `components`, rather than reconstructing the
-    // retired full-Laplace value from `loss` alone.
-    let criterion_base = criterion_value - 0.5 * log_det + occam;
     let criterion = SaeCriterion::assemble(
-        criterion_base,
-        log_det,
+        loss.total() + extra_penalty_energy,
+        laplace_complexity,
         occam,
         components.explicit.clone(),
         components.logdet_trace.clone(),

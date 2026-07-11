@@ -1,15 +1,13 @@
 use super::*;
 
-/// One recorded ContinuationPath demotion: a structural defect that, for a
-/// continuation-entry objective, routes a seed to a heavier path regime instead
-/// of disqualifying it. Carried in the seed-loop ledger so the startup stats
-/// surface a heavier-regime re-entry (with its reason) rather than a vanished
-/// candidate. Never fatal.
+/// One recorded ContinuationPath refinement. A structural defect retains the
+/// last accepted waypoint and reduces the next attempted distance instead of
+/// fabricating progress. Carried in the seed-loop ledger for startup diagnostics.
 #[derive(Clone, Debug)]
-pub(crate) struct PathDemotionRecord {
-    /// 0-based seed index whose structural defect triggered the demotion.
+pub(crate) struct PathRefinementRecord {
+    /// 0-based seed index whose structural defect triggered the refinement.
     pub(crate) seed_idx: usize,
-    /// The path regime the seed was re-entered at after the demotion.
+    /// The last successfully solved path regime retained by the refinement.
     pub(crate) regime: crate::continuation_path::PathRegime,
     /// Human-readable reason (the underlying structural diagnosis message).
     pub(crate) reason: String,
