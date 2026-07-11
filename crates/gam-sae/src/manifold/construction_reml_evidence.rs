@@ -688,6 +688,12 @@ impl SaeManifoldTerm {
         // factor failed and the loop kept extending via `saw_refine_progress`
         // from earlier rounds, accumulating minutes of wasted work (#1094).
         let mut consecutive_objective_stalls: usize = 0;
+        // #2228 Stage-2 — terminal exact-Newton invocations remaining for this
+        // criterion evaluation. Each invocation runs a bounded superlinear
+        // polish (`terminal_exact_newton_polish`) from the objective-stall
+        // plateau; two invocations of ≤12 steps bound the extra cost while
+        // covering a re-stall after an intervening refine round.
+        let mut terminal_newton_rounds: usize = 2;
         loop {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -1234,6 +1240,34 @@ impl SaeManifoldTerm {
                     // poison the outer BFGS line search with a false value-probe
                     // refusal.
                 }
+                // #2228 Stage-2 — the objective has stalled but the KKT gate is
+                // unmet: this is exactly the linear-rate crawl regime where the
+                // MM/GN phase needs ~10³ more iterations it does not have. Hand
+                // the iterate to the exact-Hessian terminal Newton phase; a
+                // committed step strictly contracts ‖g‖, so the refine loop
+                // resumes with fresh progress instead of refusing. The phase
+                // mints nothing — acceptance stays with the loop-top KKT gate
+                // and the idempotence certificate (the state moved, so
+                // `evidence_fixed_point` is cleared and one evidence re-entry
+                // must recur exactly before acceptance, same as any hook move).
+                if terminal_newton_rounds > 0 {
+                    terminal_newton_rounds -= 1;
+                    if self.terminal_exact_newton_polish(
+                        target,
+                        rho_fixed,
+                        registry,
+                        &lambda_smooth,
+                        grad_tolerance,
+                        objective_scale,
+                        options,
+                        12,
+                    )? {
+                        *evidence_fixed_point = false;
+                        consecutive_objective_stalls = 0;
+                        saw_refine_progress = true;
+                        continue;
+                    }
+                }
                 // Persistent objective-stall fixed point (`STALL_MIN_ROUNDS`
                 // consecutive stalled rounds) without KKT stationarity. Surface
                 // the typed refusal that the outer bridge treats as an infeasible
@@ -1397,6 +1431,149 @@ impl SaeManifoldTerm {
     ) -> bool {
         previous_grad_norm
             .is_some_and(|prev| prev.is_finite() && grad_norm.is_finite() && grad_norm < prev)
+    }
+
+    /// #2228 Stage-2 TERMINAL NEWTON PHASE — the superlinear tail the majorized
+    /// Gauss–Newton inner loop is missing.
+    ///
+    /// The MM/GN inner solver is guaranteed descent but converges LINEARLY with
+    /// contraction rate → 1 exactly where real data puts it: high residual (the
+    /// GN data block drops first-order residual curvature) and huge near-flat
+    /// bands (t-reparameterization, penalty-flat frame orientation). Measured
+    /// stable-tail contraction on the production repro is 0.9965–0.9979 per
+    /// iteration, i.e. ~1,800–3,000 uninterrupted iterations to close the gap
+    /// from the objective-stall plateau (‖g‖ ≈ 1.4) to the KKT band — against a
+    /// ~1e3 refine budget. The stall detector fires precisely when the MM phase
+    /// has entered that crawl (gain ratio ≈ 1, relative decrease below the
+    /// stall floor): from there, Newton on the EXACT Hessian is locally
+    /// quadratic and closes the same gap in O(10) steps, making the strict KKT
+    /// contract REACHABLE instead of loosened.
+    ///
+    /// Everything here reuses machinery that already exists for the outer IFT:
+    /// the exact joint Hessian apply `A·v = B·v + ΔC·v`
+    /// ([`Self::apply_exact_hessian`]) and its B-preconditioned, gauge-fixed
+    /// quotient GMRES ([`Self::solve_exact_stationarity`], via the same
+    /// [`Self::outer_gradient_arrow_solver`] quotient the ρ-gradient adjoint
+    /// uses). Indefiniteness of `A` (measured K=1-circle μ = −1.66e-3) is
+    /// handled by the acceptance test, not the solve: GMRES does not require
+    /// SPD, and a step is committed ONLY when it strictly contracts the joint
+    /// KKT residual while holding the penalized objective within the same
+    /// no-meaningful-change band the stall detector just certified
+    /// (`SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL × objective_scale`). A step
+    /// failing that after backtracking restores the snapshot bit-for-bit, so
+    /// this phase can never worsen the state the refine loop would otherwise
+    /// have refused; every internal failure degrades to `Ok(false)` (fall
+    /// through to the historical stall accounting), never to a new error class.
+    ///
+    /// Returns `Ok(true)` when at least one Newton step was committed (the
+    /// caller re-enters the refine loop, whose existing raw/quotient KKT gate +
+    /// idempotence certificate remain the SOLE acceptance authority — this
+    /// phase mints nothing).
+    fn terminal_exact_newton_polish(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho_fixed: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        lambda_smooth: &[f64],
+        grad_tolerance: f64,
+        objective_scale: f64,
+        options: &ArrowSolveOptions,
+        max_steps: usize,
+    ) -> Result<bool, String> {
+        let mut made_progress = false;
+        let mut prev_grad_norm = f64::INFINITY;
+        for _ in 0..max_steps {
+            let mut sys = self
+                .assemble_arrow_schur(target, rho_fixed, registry)
+                .map_err(|err| format!("SaeManifoldTerm::terminal_exact_newton_polish: {err}"))?;
+            let grad_norm_sq = Self::system_grad_norm_sq(&sys);
+            if !grad_norm_sq.is_finite() {
+                break;
+            }
+            let grad_norm = grad_norm_sq.sqrt();
+            let quotient_grad_norm =
+                self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, lambda_smooth);
+            if Self::evidence_kkt_stationary(grad_norm, quotient_grad_norm, grad_tolerance) {
+                // In the band: hand back to the refine loop, whose gate +
+                // idempotence certificate decide acceptance.
+                return Ok(true);
+            }
+            if !(grad_norm < prev_grad_norm) {
+                break;
+            }
+            prev_grad_norm = grad_norm;
+            // Ridge-0 deflated evidence factor = the B-preconditioner for the
+            // exact-pencil GMRES (identical to the outer IFT's preconditioner).
+            let Ok(factor) =
+                self.factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options)
+            else {
+                break;
+            };
+            let cache = factor.cache;
+            let Ok(solver) = self.outer_gradient_arrow_solver(&cache, lambda_smooth) else {
+                break;
+            };
+            // Newton step on the exact Hessian: A Δ = −g on the gauge quotient.
+            let mut rhs_t = Array1::<f64>::zeros(cache.delta_t_len());
+            let mut offset = 0usize;
+            for row in &sys.rows {
+                for (axis, &g) in row.gt.iter().enumerate() {
+                    rhs_t[offset + axis] = -g;
+                }
+                offset += row.gt.len();
+            }
+            let rhs = SaeArrowVector {
+                t: rhs_t,
+                beta: sys.gb.mapv(|v| -v),
+            };
+            let Ok(newton) = self.solve_exact_stationarity(rho_fixed, target, &cache, &solver, &rhs)
+            else {
+                break;
+            };
+            let pre_obj = self
+                .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                .map_err(|err| format!("SaeManifoldTerm::terminal_exact_newton_polish: {err}"))?;
+            let obj_rise_budget = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * objective_scale;
+            let snapshot = self.snapshot_mutable_state();
+            let mut accepted = false;
+            let mut alpha = 1.0_f64;
+            for _ in 0..8 {
+                if self
+                    .apply_newton_step(newton.t.view(), newton.beta.view(), alpha)
+                    .is_err()
+                {
+                    self.restore_mutable_state(&snapshot)?;
+                    break;
+                }
+                let trial_obj = self
+                    .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                    .unwrap_or(f64::INFINITY);
+                let trial_grad = self
+                    .assemble_arrow_schur(target, rho_fixed, registry)
+                    .ok()
+                    .map(|trial_sys| Self::system_grad_norm_sq(&trial_sys).sqrt());
+                // Gradient-norm merit (this is root-finding at a stalled
+                // objective, so ‖g‖ is the monotone quantity) with the
+                // objective held to the stall detector's own no-change band.
+                let obj_ok = trial_obj.is_finite() && trial_obj <= pre_obj + obj_rise_budget;
+                let grad_ok = trial_grad.is_some_and(|g| g.is_finite() && g < grad_norm);
+                if obj_ok && grad_ok {
+                    accepted = true;
+                    made_progress = true;
+                    break;
+                }
+                self.restore_mutable_state(&snapshot)?;
+                alpha *= 0.5;
+            }
+            if !accepted {
+                break;
+            }
+            log::debug!(
+                "SAE terminal Newton step committed: ‖g‖ {grad_norm:.6e} → next round \
+                 (α={alpha:.3e}, tol {grad_tolerance:.6e})"
+            );
+        }
+        Ok(made_progress)
     }
 
     pub(crate) fn outer_gradient_arrow_solver<'a>(
