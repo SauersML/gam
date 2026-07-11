@@ -291,6 +291,14 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) time_wiggle_d3_exit: Option<Array1<f64>>,
     pub(crate) eta_ls_exit: Array1<f64>,
     pub(crate) eta_ls_entry: Array1<f64>,
+    /// Unwarped AFT index `q0 = -eta_t exp(-eta_ls)` at exit/entry. Link-wiggle
+    /// row jets compose the warp from these bases; `q_exit`/`q_entry` below are
+    /// the already-warped criterion values.
+    pub(crate) q_base_exit: Array1<f64>,
+    pub(crate) q_base_entry: Array1<f64>,
+    /// Linear-predictor time derivatives before the link wiggle is composed.
+    pub(crate) eta_t_deriv_exit: Array1<f64>,
+    pub(crate) eta_ls_deriv_exit: Array1<f64>,
     pub(crate) q_exit: Array1<f64>,
     pub(crate) q_entry: Array1<f64>,
     pub(crate) qdot_exit: Array1<f64>,
@@ -342,6 +350,21 @@ impl SurvivalDynamicGeometry {
                 "survival dynamic geometry derivative length mismatch: base_derivative={}, rows={n}",
                 self.time_base_derivative_exit.len()
             ) }.into());
+        }
+        for (channel, len) in [
+            ("q_base_exit", self.q_base_exit.len()),
+            ("q_base_entry", self.q_base_entry.len()),
+            ("eta_t_deriv_exit", self.eta_t_deriv_exit.len()),
+            ("eta_ls_deriv_exit", self.eta_ls_deriv_exit.len()),
+        ] {
+            if len != n {
+                return Err(SurvivalLocationScaleError::DimensionMismatch {
+                    reason: format!(
+                        "survival dynamic geometry {channel} length mismatch: len={len}, expected {n}"
+                    ),
+                }
+                .into());
+            }
         }
         if let Some(basis) = self.time_wiggle_basis_d1_entry.as_ref()
             && basis.nrows() != n
@@ -860,6 +883,10 @@ impl SurvivalLocationScaleFamily {
             time_wiggle_d3_exit,
             eta_ls_exit: eta_ls_exit.to_owned(),
             eta_ls_entry: eta_ls_entry.to_owned(),
+            q_base_exit: q0_exit,
+            q_base_entry: q0_entry,
+            eta_t_deriv_exit,
+            eta_ls_deriv_exit,
             q_exit,
             q_entry,
             qdot_exit,

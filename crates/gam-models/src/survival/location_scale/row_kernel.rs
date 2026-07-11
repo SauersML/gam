@@ -407,19 +407,17 @@ impl SurvivalLsRowKernel<'_> {
 
     pub(crate) fn row_primary_values(&self, row: usize) -> [f64; SLS_ROW_K] {
         let inv_sigma_exit = self.dynamic.inv_sigma_exit[row];
-        let eta_t_exit = -self.dynamic.q_exit[row] / inv_sigma_exit;
-        let eta_ls_deriv = self.q.dqdot_t[row] / inv_sigma_exit;
-        let eta_t_deriv = eta_t_exit * eta_ls_deriv - self.dynamic.qdot_exit[row] / inv_sigma_exit;
+        let eta_t_exit = -self.dynamic.q_base_exit[row] / inv_sigma_exit;
         [
             self.dynamic.h_entry[row],
             self.dynamic.h_exit[row],
             self.dynamic.hdot_exit[row],
             eta_t_exit,
-            -self.dynamic.q_entry[row] / self.dynamic.inv_sigma_entry[row],
-            eta_t_deriv,
+            -self.dynamic.q_base_entry[row] / self.dynamic.inv_sigma_entry[row],
+            self.dynamic.eta_t_deriv_exit[row],
             self.dynamic.eta_ls_exit[row],
             self.dynamic.eta_ls_entry[row],
-            eta_ls_deriv,
+            self.dynamic.eta_ls_deriv_exit[row],
         ]
     }
 
@@ -637,20 +635,22 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
     let [b0e, b1e, b2e, b3e] = basis.b_u0;
     let [b0x, b1x, b2x, b3x] = basis.b_u1;
     let inv_sigma_entry = vars[7].neg().exp();
-    let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+    let q0 = vars[4].mul(&inv_sigma_entry).neg();
     let inv_sigma_exit = vars[6].neg().exp();
-    let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
-    let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
-    let mut u0w = u0.clone();
-    let mut u1w = u1.clone();
+    let q1 = vars[3].mul(&inv_sigma_exit).neg();
+    let qdot0 = inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5]));
+    let mut q0w = q0.clone();
+    let mut q1w = q1.clone();
     let mut m1 = vars[0].compose_unary([1.0, 0.0, 0.0, 0.0, 0.0]);
     for j in 0..pw {
         let bw = &vars[SLS_ROW_K + j];
-        u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], b3e[j], 0.0])));
-        u1w = u1w.add(&bw.mul(&u1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
-        m1 = m1.add(&bw.mul(&u1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
+        q0w = q0w.add(&bw.mul(&q0.compose_unary([b0e[j], b1e[j], b2e[j], b3e[j], 0.0])));
+        q1w = q1w.add(&bw.mul(&q1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
+        m1 = m1.add(&bw.mul(&q1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
     }
-    let g = m1.mul(&g0);
+    let u0w = vars[0].add(&q0w);
+    let u1w = vars[1].add(&q1w);
+    let g = vars[2].add(&m1.mul(&qdot0));
     let mut nll = u0w
         .compose_unary([
             kernel.log_s0,
@@ -756,19 +756,14 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         let degree = family
             .wiggle_degree
             .ok_or("link-wiggle kernel: missing wiggle degree")?;
-        // Indices where the warp basis derivative stacks are evaluated.
-        // `sls_row_nll_wiggle` composes each stack ONTO the residual jets
-        // `u1 = h_exit + q_exit` and `u0 = h_entry + q_entry`
-        // (`u1.compose_unary([b0x, b1x, ..])`); `compose_unary` requires the stack
-        // evaluated AT `value(u1)`/`value(u0)`, i.e. the FULL residual with the
-        // baseline hazard `h` included. Evaluating at `q_exit`/`q_entry` alone
-        // drops the `h` shift — correct only in the `h ≡ 0` reduced-AFT regime,
-        // wrong by ~O(h·B') otherwise. This matches the FD-verified §13 program
-        // (`survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932`, whose
-        // `WiggleProg` evaluates the basis at `value(u1)`), and is pinned by
-        // `survival_ls_wiggle_joint_hessian_matches_assembler_932`. (#932)
-        let q_exit = &dynamic.h_exit + &dynamic.q_exit;
-        let q_entry = &dynamic.h_entry + &dynamic.q_entry;
+        // The link warp is defined on the unwarped AFT index
+        // `q = q0 + Σ βw_j B_j(q0)`, then the baseline hazard is added:
+        // `u = h + q`. `dynamic.q_*` already contains the warp, so composing at
+        // either that value or `h + q` would apply βB a second time. The base
+        // indices persisted by `build_dynamic_geometry` are the unique centers
+        // shared by fit, prediction, and this derivative program.
+        let q_exit = &dynamic.q_base_exit;
+        let q_entry = &dynamic.q_base_entry;
         let b_u0_0 = survival_wiggle_basis_with_options(
             q_entry.view(),
             knots,
