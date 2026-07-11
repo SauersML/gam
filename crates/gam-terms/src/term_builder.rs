@@ -3103,11 +3103,7 @@ pub fn build_smooth_basis(
             if !centers_explicit && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 centers = centers.max(polynomial_cols + 4);
             }
-            let center_strategy = if centers_explicit {
-                spatial_center_strategy_for_dimension(centers, cols.len())
-            } else {
-                auto_spatial_center_strategy(centers, cols.len())
-            };
+            let center_strategy = duchon_center_strategy(centers, cols.len(), !centers_explicit);
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
             } else {
@@ -3760,6 +3756,36 @@ pub fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> Ce
         CenterStrategy::FarthestPoint { num_centers }
     } else {
         default_spatial_center_strategy(num_centers, d)
+    }
+}
+
+/// Center geometry for a non-periodic Duchon smooth.
+///
+/// In one dimension the represented domain is the interval between the observed
+/// extrema.  Equally spaced centers are the exact minimax design for that
+/// interval: among all `k`-point center sets they minimize the largest uncovered
+/// gap.  Greedy farthest-point sampling instead produces a dyadic mesh whose
+/// partially filled final level clusters centers and leaves wider holes whenever
+/// `k` is not a power-of-two refinement.  Those holes reduce the effective
+/// resolution of an explicit `k` and caused the low-noise k=20 Duchon fit to miss
+/// the mature-smoother accuracy bar despite having the same basis dimension.
+///
+/// Multidimensional Duchon terms keep the rotation-equivariant farthest-point /
+/// equal-mass strategies, where there is no canonical coordinate-aligned grid.
+/// The `Auto` wrapper is retained for inferred 1-D counts so adaptive resolution
+/// can still resize the interval grid before freezing its realized centers.
+fn duchon_center_strategy(num_centers: usize, d: usize, automatic: bool) -> CenterStrategy {
+    let realized = if d == 1 {
+        CenterStrategy::UniformGrid {
+            points_per_dim: num_centers,
+        }
+    } else {
+        spatial_center_strategy_for_dimension(num_centers, d)
+    };
+    if automatic {
+        CenterStrategy::Auto(Box::new(realized))
+    } else {
+        realized
     }
 }
 
@@ -5932,6 +5958,14 @@ mod tests {
             panic!("expected Duchon term");
         };
         assert_eq!(spec.length_scale, None);
+        assert!(matches!(
+            spec.center_strategy,
+            CenterStrategy::Auto(ref inner)
+                if matches!(
+                    inner.as_ref(),
+                    CenterStrategy::UniformGrid { .. }
+                )
+        ));
     }
 
     #[test]
@@ -7017,7 +7051,7 @@ mod tests {
         };
         assert!(matches!(
             spec.center_strategy,
-            CenterStrategy::FarthestPoint { num_centers: 3 }
+            CenterStrategy::UniformGrid { points_per_dim: 3 }
         ));
     }
 

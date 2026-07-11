@@ -2313,16 +2313,38 @@ fn generalized_nullspace_basis(
     let whitened = symmetrize_penalty(&whitened);
     let (evals, evecs) = FaerEigh::eigh(&whitened, Side::Lower).map_err(BasisError::LinalgError)?;
     let tol = generalized_spectral_tolerance(&evals, &whitened);
-    if let Some(&negative) = evals.iter().find(|&&value| value < -tol) {
-        crate::bail_invalid_basis!(
-            "{context}: generalized penalty is not positive semidefinite; eigenvalue {negative:.6e} is below the negative tolerance (magnitude {tol:.6e})"
+    let penalty_scale = max_abs_row_sum(&penalty_sym);
+    let mut zero_idx = Vec::new();
+    for (index, &value) in evals.iter().enumerate() {
+        if value.abs() <= tol {
+            zero_idx.push(index);
+            continue;
+        }
+        // Whitening by L^{-1} can amplify roundoff when the function metric is
+        // ill-conditioned. Adjudicate every questionable eigenpair in the
+        // original PSD quadratic: v=L^{-T}u and μ=vᵀSv because vᵀHv=1. The
+        // O(n·eps·||S||∞·||v||²) envelope is a backward-error test on the source
+        // penalty, so it accepts only curvature numerically indistinguishable
+        // from zero rather than widening a global generalized-eigenvalue floor.
+        let generalized = gam_linalg::triangular::back_substitution_lower_transpose(
+            lower.view(),
+            evecs.column(index),
         );
+        let coefficient_norm_squared = generalized.dot(&generalized);
+        let source_quadratic = generalized.dot(&penalty_sym.dot(&generalized));
+        let source_tol = default_rrqr_rank_alpha()
+            * f64::EPSILON
+            * p.max(1) as f64
+            * penalty_scale
+            * coefficient_norm_squared;
+        if source_quadratic.abs() <= source_tol {
+            zero_idx.push(index);
+        } else if source_quadratic < -source_tol {
+            crate::bail_invalid_basis!(
+                "{context}: generalized penalty is not positive semidefinite; eigenvalue {value:.6e} has source quadratic {source_quadratic:.6e} outside its backward-error envelope {source_tol:.6e}"
+            );
+        }
     }
-    let zero_idx: Vec<usize> = evals
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &value)| (value.abs() <= tol).then_some(index))
-        .collect();
     if zero_idx.is_empty() {
         return Ok(None);
     }
@@ -2354,13 +2376,17 @@ fn generalized_spectral_tolerance(evals: &Array1<f64>, operator: &Array2<f64>) -
     // two triangular whitening solves above. The maximum absolute row sum is a
     // deterministic upper bound on ||A||₂, so this is the standard O(n·eps·||A||)
     // roundoff envelope rather than a fitted absolute floor.
-    let operator_scale = operator
+    let operator_scale = max_abs_row_sum(operator);
+    let scale = spectral_scale.max(operator_scale);
+    default_rrqr_rank_alpha() * f64::EPSILON * operator.nrows().max(1) as f64 * scale
+}
+
+fn max_abs_row_sum(matrix: &Array2<f64>) -> f64 {
+    matrix
         .rows()
         .into_iter()
         .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
-        .fold(0.0_f64, f64::max);
-    let scale = spectral_scale.max(operator_scale);
-    default_rrqr_rank_alpha() * f64::EPSILON * operator.nrows().max(1) as f64 * scale
+        .fold(0.0_f64, f64::max)
 }
 
 /// `R = W (NᵀW)⁻¹ Wᵀ` for any full-column-rank null frame `N` and

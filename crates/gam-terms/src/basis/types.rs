@@ -747,14 +747,16 @@ pub fn center_strategy_num_centers(strategy: &CenterStrategy) -> Option<usize> {
 pub fn center_strategy_with_num_centers(
     strategy: &CenterStrategy,
     num_centers: usize,
+    d: usize,
 ) -> Result<CenterStrategy, BasisError> {
     validate_center_count(num_centers)?;
     fn rebuild_inner(
         strategy: &CenterStrategy,
         num_centers: usize,
+        d: usize,
     ) -> Result<CenterStrategy, BasisError> {
         match strategy {
-            CenterStrategy::Auto(inner) => rebuild_inner(inner.as_ref(), num_centers),
+            CenterStrategy::Auto(inner) => rebuild_inner(inner.as_ref(), num_centers, d),
             CenterStrategy::EqualMass { .. } => Ok(CenterStrategy::EqualMass { num_centers }),
             CenterStrategy::EqualMassCovarRepresentative { .. } => {
                 Ok(CenterStrategy::EqualMassCovarRepresentative { num_centers })
@@ -766,6 +768,9 @@ pub fn center_strategy_with_num_centers(
                 num_centers,
                 max_iter: *max_iter,
             }),
+            CenterStrategy::UniformGrid { .. } if d == 1 => Ok(CenterStrategy::UniformGrid {
+                points_per_dim: num_centers,
+            }),
             CenterStrategy::UserProvided(_) | CenterStrategy::UniformGrid { .. } => {
                 Err(BasisError::InvalidInput(format!(
                     "cannot replace center count for {:?} strategy",
@@ -774,7 +779,7 @@ pub fn center_strategy_with_num_centers(
             }
         }
     }
-    let rebuilt = rebuild_inner(strategy, num_centers)?;
+    let rebuilt = rebuild_inner(strategy, num_centers, d)?;
     Ok(match strategy {
         CenterStrategy::Auto(_) => CenterStrategy::Auto(Box::new(rebuilt)),
         _ => rebuilt,

@@ -4328,7 +4328,7 @@ pub fn spatial_term_group_key(term: &SmoothTermSpec) -> Option<JointSpatialCente
         feature_cols: feature_cols.clone(),
         strategy_kind,
         strategy_aux,
-        requested_num_centers: center_strategy_num_centers(strategy)?,
+        requested_num_centers: strategy.planned_num_centers(feature_cols.len()),
         input_scale_bits: input_scales
             .map(|values| values.iter().map(|value| value.to_bits()).collect()),
     })
@@ -4425,10 +4425,8 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
                     | CenterStrategyKind::EqualMassCovarRepresentative
                     | CenterStrategyKind::FarthestPoint
                     | CenterStrategyKind::KMeans
+                    | CenterStrategyKind::UniformGrid
             ) {
-                continue;
-            }
-            if center_strategy_num_centers(strategy).is_none() {
                 continue;
             }
             groups
@@ -4462,7 +4460,11 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
                 prototype.name
             ))
         })?;
-        let joint_strategy = center_strategy_with_num_centers(strategy, joint_centers)?;
+        let joint_strategy = center_strategy_with_num_centers(
+            strategy,
+            joint_centers,
+            group_key.feature_cols.len(),
+        )?;
         let shared_centers = select_centers_by_strategy(standardized.view(), &joint_strategy)?;
         log::info!(
             "sharing {} spatial centers across {} smooth terms over columns {:?} (requested {} centers)",

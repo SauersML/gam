@@ -7,8 +7,8 @@ use crate::basis::{
     build_bspline_basis_1d, build_constant_curvature_basis, build_duchon_basiswithworkspace,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_measure_jet_basis, build_spherical_spline_basis, build_thin_plate_basis,
-    center_strategy_is_auto, center_strategy_kind, center_strategy_num_centers,
-    center_strategy_with_num_centers, filter_active_penalty_candidates,
+    center_strategy_is_auto, center_strategy_kind, center_strategy_with_num_centers,
+    filter_active_penalty_candidates,
     filter_active_penalty_candidates_with_ops, pairwise_distance_bounds,
     pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
 };

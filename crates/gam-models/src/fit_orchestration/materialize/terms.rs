@@ -91,7 +91,7 @@ fn apply_adaptive_spatial_center_counts(
             })
             .max(structural_minimum)
             .min(n);
-        *strategy = center_strategy_with_num_centers(strategy, target).map_err(|error| {
+        *strategy = center_strategy_with_num_centers(strategy, target, d).map_err(|error| {
             WorkflowError::InvalidConfig {
                 reason: format!(
                     "failed to set adaptive center count for spatial term '{}': {error}",
