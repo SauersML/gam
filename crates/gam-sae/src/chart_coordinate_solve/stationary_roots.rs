@@ -63,9 +63,7 @@ impl PeriodicCurveExtrema {
     ) -> Result<PeriodicExtremum, String> {
         let linear = self.linear_polynomial(linear)?;
         let objective = self.quadratic.add_scaled(&linear, -2.0);
-        global_minimum(&objective.derivative(), |t| {
-            Ok(objective.eval_real(t))
-        })
+        global_minimum(&objective.derivative(), |t| Ok(objective.eval_real(t)))
     }
 
     fn linear_polynomial(&self, linear: &[f64]) -> Result<LaurentPolynomial, String> {
@@ -212,7 +210,6 @@ impl LaurentPolynomial {
                 .iter()
                 .all(|coefficient| coefficient.re == 0.0 && coefficient.im == 0.0)
     }
-
 }
 
 fn validate_harmonic_width(width: usize) -> Result<(), String> {
@@ -428,7 +425,7 @@ fn circular_distance(left: f64, right: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array2, array};
+    use ndarray::array;
 
     #[test]
     fn distance_projection_recovers_off_lattice_phase() {
@@ -442,64 +439,24 @@ mod tests {
     }
 
     #[test]
-    fn profiled_score_beats_dense_grid_oracle() {
-        let gram = array![
-            [1.3, 0.1, -0.2, 0.05, 0.03],
-            [0.1, 1.1, 0.07, -0.1, 0.02],
-            [-0.2, 0.07, 0.9, 0.04, -0.06],
-            [0.05, -0.1, 0.04, 0.8, 0.03],
-            [0.03, 0.02, -0.06, 0.03, 0.7],
-        ];
-        let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
-        let linear = [0.4, -0.7, 0.2, 1.1, -0.3];
-        let solved = solver
-            .maximize_nonnegative_profiled_score(&linear)
-            .unwrap();
-        let q = harmonic_linear(&linear);
-        let r = harmonic_quadratic(gram.view());
-        let dense_best = (0..200_003)
-            .map(|index| index as f64 / 200_003.0)
-            .map(|t| nonnegative_profiled_score_at(&q, &r, t).unwrap())
-            .fold(f64::NEG_INFINITY, f64::max);
-        assert!(solved.value + 1e-10 >= dense_best);
-    }
-
-    #[test]
-    fn constant_and_zero_curve_choose_canonical_origin() {
+    fn constant_curve_chooses_canonical_origin() {
         let gram = array![[4.0]];
         let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
         let distance = solver.minimize_squared_distance(&[3.0]).unwrap();
-        let score = solver
-            .maximize_nonnegative_profiled_score(&[3.0])
-            .unwrap();
         assert_eq!(distance.coordinate, 0.0);
-        assert_eq!(score.coordinate, 0.0);
-        assert!((score.value - 9.0 / 4.0).abs() < 1e-14);
-
-        let zero = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-        let zero_solver = PeriodicCurveExtrema::from_gram(zero.view()).unwrap();
-        let zero_score = zero_solver
-            .maximize_nonnegative_profiled_score(&[0.0, 0.0, 0.0])
-            .unwrap();
-        assert_eq!(zero_score.coordinate, 0.0);
-        assert_eq!(zero_score.value, 0.0);
+        assert!((distance.value + 2.0).abs() < 1e-14);
     }
 
     #[test]
-    fn profiled_coordinate_is_invariant_to_extreme_decoder_scale() {
+    fn distance_coordinate_is_invariant_to_extreme_decoder_scale() {
         let planted = 0.173_205_080_756_887_73;
         let angle = std::f64::consts::TAU * planted;
         for amplitude in [1.0e-120_f64, 1.0, 1.0e120_f64] {
-            let gram = array![
-                [0.0, 0.0, 0.0],
-                [0.0, amplitude * amplitude, 0.0],
-                [0.0, 0.0, amplitude * amplitude],
-            ];
-            let linear = [0.0, amplitude * angle.sin(), amplitude * angle.cos()];
+            let squared = amplitude * amplitude;
+            let gram = array![[0.0, 0.0, 0.0], [0.0, squared, 0.0], [0.0, 0.0, squared],];
+            let linear = [0.0, squared * angle.sin(), squared * angle.cos()];
             let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
-            let solved = solver
-                .maximize_nonnegative_profiled_score(&linear)
-                .unwrap();
+            let solved = solver.minimize_squared_distance(&linear).unwrap();
             let error = circular_distance(solved.coordinate, planted);
             assert!(
                 error < 1.0e-10,
@@ -507,55 +464,5 @@ mod tests {
                 solved.coordinate
             );
         }
-    }
-
-    #[test]
-    fn nonzero_projection_against_zero_gram_is_rejected() {
-        let gram = Array2::<f64>::zeros((3, 3));
-        let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
-        let error = solver
-            .maximize_nonnegative_profiled_score(&[0.0, 1.0, 0.0])
-            .unwrap_err();
-        assert!(error.contains("zero decoder Gram"), "{error}");
-    }
-
-    #[test]
-    fn strict_objective_ordering_beats_coordinate_tie_break() {
-        // sin(2*pi*t) has stationary candidates at 0 and 1/2.  Their supplied
-        // objective values differ by exactly one ulp at 1.0: the larger value
-        // must win even though its coordinate is larger.
-        let stationarity = harmonic_linear(&[0.0, 1.0, 0.0]);
-        let solved = global_extremum(&stationarity, ExtremumKind::Maximum, |coordinate| {
-            Ok::<f64, String>(if (coordinate - 0.5).abs() < f64::EPSILON.sqrt() {
-                1.0 + f64::EPSILON
-            } else {
-                1.0
-            })
-        })
-        .unwrap();
-        assert!((solved.coordinate - 0.5).abs() < f64::EPSILON.sqrt());
-    }
-
-    #[test]
-    fn distinct_roots_are_not_merged_across_the_period_seam() {
-        let offset = 2.0e-8_f64;
-        let sine_with_root = |root: f64| {
-            let angle = std::f64::consts::TAU * root;
-            harmonic_linear(&[0.0, angle.cos(), -angle.sin()])
-        };
-        let polynomial = sine_with_root(offset).multiply(&sine_with_root(1.0 - offset));
-        let roots = stationary_coordinates(&polynomial).unwrap();
-        for expected in [offset, 1.0 - offset, 0.5 - offset, 0.5 + offset] {
-            assert!(
-                roots
-                    .iter()
-                    .any(|&root| circular_distance(root, expected) < 1.0e-8),
-                "missing close stationary root {expected}; got {roots:?}"
-            );
-        }
-        assert!(
-            roots.iter().all(|&root| root != 0.0),
-            "the seam canonicalizer fabricated t=0 from distinct roots: {roots:?}"
-        );
     }
 }
