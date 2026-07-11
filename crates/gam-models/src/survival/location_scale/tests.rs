@@ -1259,9 +1259,6 @@ fn survival_ls_joint_jet_tower_oracle_body() {
         let inverse_link = residual_distribution_inverse_link(distribution);
         let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
         let states = survival_ls_joint_oracle_states(&primaries);
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("collect joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -1410,9 +1407,6 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
         let inverse_link = residual_distribution_inverse_link(distribution);
         let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
         let states = survival_ls_joint_oracle_states(&primaries);
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("collect joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -1591,9 +1585,6 @@ fn survival_ls_packed_directional_high_curvature_body() {
         let inverse_link = residual_distribution_inverse_link(distribution);
         let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
         let states = survival_ls_joint_oracle_states(&primaries);
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("collect joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -1730,9 +1721,6 @@ fn survival_ls_joint_directional_derivative_time_varying_body() {
         let inverse_link = residual_distribution_inverse_link(distribution);
         let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
         let states = survival_ls_joint_oracle_states(&primaries);
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("collect joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -2121,9 +2109,6 @@ fn survival_ls_block_gradient_tower_body() {
         let states = survival_ls_joint_oracle_states(&primaries);
 
         // Single-sourced tower gradient (∇nll = −∇ℓ).
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("collect joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -6564,9 +6549,6 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
             eta: etaw,
         });
 
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -6796,9 +6778,6 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
         beta: betaw.clone(),
         eta: xwiggle.dot(&betaw),
     });
-    let q = family
-        .collect_joint_quantities(&states)
-        .expect("wide joint quantities");
     let dynamic = family
         .build_dynamic_geometry(&states)
         .expect("wide dynamic geometry");
@@ -6907,7 +6886,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
         family.wiggle_knots = Some(knots.clone());
         family.wiggle_degree = Some(degree);
 
-        // Build (q, dynamic) at the perturbed coefficient vector `β + δ`. The
+        // Build dynamic geometry at the perturbed coefficient vector `β + δ`. The
         // oracle-family eta vectors are the raw primary channels at β = 1, so a
         // base-block coefficient `1 + δ_k` scales that block's eta linearly; the
         // wiggle block re-forms `etaw = X·(βw + δw)`.
@@ -6924,13 +6903,10 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
                 beta: bw.clone(),
                 eta: etaw,
             });
-            let q = family
-                .collect_joint_quantities(&states)
-                .expect("joint quantities");
             let dynamic = family
                 .build_dynamic_geometry(&states)
                 .expect("dynamic geometry");
-            (q, dynamic)
+            dynamic
         };
 
         // Coefficient vector `β + s·dir` split back into per-block pieces.
@@ -6944,14 +6920,14 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
         let hessian_at = |s: f64, dir: &[f64]| {
             let mut bw = betaw.clone();
             let (bt, bthr, bls) = perturbed(s, dir, &mut bw);
-            let (q, dynamic) = build(bt, bthr, bls, &bw);
+            let dynamic = build(bt, bthr, bls, &bw);
             survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
                 .expect("§13 dense wiggle Hessian")
         };
         let directional_at = |s: f64, dir_v: &[f64], dir_u: &[f64]| {
             let mut bw = betaw.clone();
             let (bt, bthr, bls) = perturbed(s, dir_v, &mut bw);
-            let (q, dynamic) = build(bt, bthr, bls, &bw);
+            let dynamic = build(bt, bthr, bls, &bw);
             survival_ls_wiggle_directional_derivative_dense(
                 &family,
                 &dynamic,
@@ -6971,7 +6947,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             (fp2h.mapv(|x| -x) + fph.mapv(|x| 8.0 * x) - fmh.mapv(|x| 8.0 * x) + fm2h) / (12.0 * h)
         };
 
-        let (q0, dynamic0) = build(1.0, 1.0, 1.0, &betaw);
+        let dynamic0 = build(1.0, 1.0, 1.0, &betaw);
 
         // DIAGNOSTIC (#932): report max relative error per direction family to
         // localize the coeff-space FD vs analytic pullback convention gap.
