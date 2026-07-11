@@ -191,7 +191,7 @@ def main(argv: list[str] | None = None) -> None:
         ep = stream.end_epoch()
         print(f"[t1 epoch {ep['epoch']:>2}] rows={rows} EV={ep['explained_variance']:.4f} "
               f"gamma={ep['gamma']:.3f} dead={ep['dead']} "
-              f"accepted_births={ep['accepted_births']} "
+              f"accepted_births={ep['accepted_births']} pending={ep['birth_pending']} "
               f"converged={ep['converged']} t={time.time()-t0:.0f}s", flush=True)
         if ep["converged"]:
             break

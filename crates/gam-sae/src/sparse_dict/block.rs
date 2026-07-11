@@ -1716,6 +1716,176 @@ fn proposal_is_selected(codes: &[RowBlockCode], block: usize, b: usize) -> bool 
     })
 }
 
+fn block_code_gram(codes: &[RowBlockCode], block: usize, b: usize) -> (usize, Array2<f64>) {
+    let mut usage = 0usize;
+    let mut gram = Array2::<f64>::zeros((b, b));
+    for code in codes {
+        for (slot, &candidate) in code.blocks.iter().enumerate() {
+            if candidate as usize != block || code.gates[slot] == 0.0 {
+                continue;
+            }
+            usage += 1;
+            let z = &code.codes[slot * b..slot * b + b];
+            for left in 0..b {
+                for right in 0..b {
+                    gram[[left, right]] += z[left] as f64 * z[right] as f64;
+                }
+            }
+        }
+    }
+    (usage, gram)
+}
+
+/// Exact evidence admission for a residual-row block birth. `improvement_rss`
+/// is the full-pass baseline RSS minus candidate RSS on identical rows. The
+/// candidate is admissible only when this is strictly positive and its
+/// incremental Gaussian deviance gain exceeds the SAME realised-rank charge
+/// used by the Tier-1 certification ledger.
+///
+/// `None` is a categorical certificate refusal: zero/tied usage, non-positive
+/// improvement, rank-zero reconstruction, or a singular code Gram provides no
+/// Laplace-valid birth. It is not replaced by a numerical surrogate.
+pub(super) fn block_birth_evidence_margin(
+    block: usize,
+    improvement_rss: f64,
+    candidate_rss: f64,
+    usage: usize,
+    code_gram: &Array2<f64>,
+    decoder: ArrayView2<'_, f32>,
+    n_rows: usize,
+    output_dim: usize,
+    b: usize,
+) -> Result<Option<f64>, String> {
+    if !(improvement_rss.is_finite() && improvement_rss > 0.0)
+        || !(candidate_rss.is_finite() && candidate_rss >= 0.0)
+        || usage == 0
+    {
+        return Ok(None);
+    }
+    if code_gram.dim() != (b, b) || block * b + b > decoder.nrows() {
+        return Err(format!(
+            "block birth certificate shape mismatch: block={block}, b={b}, Gram={:?}, decoder={:?}",
+            code_gram.dim(),
+            decoder.dim(),
+        ));
+    }
+    let frame = decoder
+        .slice(ndarray::s![block * b..block * b + b, ..])
+        .mapv(f64::from);
+    let dispersion = candidate_rss / (n_rows * output_dim) as f64;
+    let d_eff = match crate::manifold::realised_rank_charge_dof(
+        code_gram,
+        &frame,
+        usage as f64,
+        output_dim as f64,
+        dispersion,
+        0.0,
+        None,
+    ) {
+        Ok(value) if value.is_finite() && value > 0.0 => value,
+        Ok(_) => return Ok(None),
+        Err(error) => {
+            log::debug!(
+                "block birth {block} has no positive-definite evidence certificate: {error}"
+            );
+            return Ok(None);
+        }
+    };
+    let deviance_gain = if dispersion == 0.0 {
+        f64::INFINITY
+    } else {
+        0.5 * improvement_rss / dispersion
+    };
+    let charge = 0.5 * d_eff * (n_rows.max(2) as f64).ln();
+    Ok(Some(deviance_gain - charge))
+}
+
+/// Install one birth candidate transactionally. Every live field is passed by
+/// mutable reference so the commit point is explicit; until both the exact RSS
+/// comparison and rank-charge certificate pass, only the decoder frame is
+/// tentatively changed. Every rejection or evaluation error restores that frame
+/// before returning.
+fn try_commit_block_birth(
+    x: ArrayView2<'_, f32>,
+    decoder: &mut Array2<f32>,
+    gamma: &mut f32,
+    codes: &mut Vec<RowBlockCode>,
+    rss: &mut f64,
+    criterion: &mut f64,
+    tss: f64,
+    proposal: &BlockBirthProposal,
+    config: &BlockSparseConfig,
+    k: usize,
+) -> Result<bool, String> {
+    let b = config.block_size;
+    if proposal_is_selected(codes, proposal.block, b) {
+        return Ok(false);
+    }
+    let start = proposal.block * b;
+    let end = start + b;
+    let previous_frame = decoder.slice(ndarray::s![start..end, ..]).to_owned();
+    decoder
+        .slice_mut(ndarray::s![start..end, ..])
+        .assign(&proposal.proposed_frame);
+
+    let candidate = route_and_close_gamma(x, decoder.view(), *gamma, config, k);
+    let (candidate_gamma, candidate_codes) = match candidate {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            decoder
+                .slice_mut(ndarray::s![start..end, ..])
+                .assign(&previous_frame);
+            return Err(error);
+        }
+    };
+    let candidate_rss = reconstruction_rss(x, &candidate_codes, decoder.view(), b);
+    let candidate_criterion = explained_variance_from_rss(candidate_rss, tss);
+    if !candidate_criterion.is_finite() {
+        decoder
+            .slice_mut(ndarray::s![start..end, ..])
+            .assign(&previous_frame);
+        return Err(
+            "fit_block_sparse_dictionary birth proposal produced non-finite explained variance"
+                .to_string(),
+        );
+    }
+    let improvement_rss = *rss - candidate_rss;
+    let (usage, code_gram) = block_code_gram(&candidate_codes, proposal.block, b);
+    let evidence_margin = match block_birth_evidence_margin(
+        proposal.block,
+        improvement_rss,
+        candidate_rss,
+        usage,
+        &code_gram,
+        decoder.view(),
+        x.nrows(),
+        x.ncols(),
+        b,
+    ) {
+        Ok(margin) => margin,
+        Err(error) => {
+            decoder
+                .slice_mut(ndarray::s![start..end, ..])
+                .assign(&previous_frame);
+            return Err(error);
+        }
+    };
+    if proposal_is_selected(&candidate_codes, proposal.block, b)
+        && evidence_margin.is_some_and(|margin| margin > 0.0)
+    {
+        *gamma = candidate_gamma;
+        *codes = candidate_codes;
+        *rss = candidate_rss;
+        *criterion = candidate_criterion;
+        Ok(true)
+    } else {
+        decoder
+            .slice_mut(ndarray::s![start..end, ..])
+            .assign(&previous_frame);
+        Ok(false)
+    }
+}
+
 /// Replay one complete deterministic alternation from `current`. The caller
 /// compares `current` with the returned image and, on convergence, returns
 /// `current`: the model API therefore exposes exactly the state whose full-step
@@ -1771,44 +1941,27 @@ fn advance_block_sparse_state(
     // criterion were kept in locals and therefore never leave the prior state.
     let (mut gamma, mut codes) =
         route_and_close_gamma(x, decoder.view(), gamma_for_refresh, config, k)?;
-    let mut criterion = explained_variance(x, &codes, decoder.view(), b);
+    let tss = centered_total_sum_squares(x);
+    let mut rss = reconstruction_rss(x, &codes, decoder.view(), b);
+    let mut criterion = explained_variance_from_rss(rss, tss);
     if !criterion.is_finite() {
         return Err("fit_block_sparse_dictionary produced non-finite explained variance".into());
     }
     let mut accepted_births = 0usize;
     for proposal in proposals {
-        // An earlier accepted birth can alter TopK routing enough to make a
-        // later candidate live already. Replacing that now-live frame would no
-        // longer be a dead-block birth.
-        if proposal_is_selected(&codes, proposal.block, b) {
-            continue;
-        }
-        let previous_frame = decoder
-            .slice(ndarray::s![proposal.block * b..proposal.block * b + b, ..])
-            .to_owned();
-        decoder
-            .slice_mut(ndarray::s![proposal.block * b..proposal.block * b + b, ..])
-            .assign(&proposal.proposed_frame);
-        let (candidate_gamma, candidate_codes) =
-            route_and_close_gamma(x, decoder.view(), gamma, config, k)?;
-        let candidate_criterion = explained_variance(x, &candidate_codes, decoder.view(), b);
-        if !candidate_criterion.is_finite() {
-            return Err(
-                "fit_block_sparse_dictionary birth proposal produced non-finite explained variance"
-                    .into(),
-            );
-        }
-        if proposal_is_selected(&candidate_codes, proposal.block, b)
-            && candidate_criterion > criterion
-        {
-            gamma = candidate_gamma;
-            codes = candidate_codes;
-            criterion = candidate_criterion;
+        if try_commit_block_birth(
+            x,
+            &mut decoder,
+            &mut gamma,
+            &mut codes,
+            &mut rss,
+            &mut criterion,
+            tss,
+            &proposal,
+            config,
+            k,
+        )? {
             accepted_births += 1;
-        } else {
-            decoder
-                .slice_mut(ndarray::s![proposal.block * b..proposal.block * b + b, ..])
-                .assign(&previous_frame);
         }
     }
     let mut next = BlockSparseState {

@@ -1064,7 +1064,8 @@ class BlockSparseDictStream:
     def end_epoch(self) -> dict[str, Any]:
         """Close the epoch: refresh γ + block frames and advance the exact
         residual-row birth transaction. Returns
-        ``{explained_variance, accepted_births, dead, gamma, converged, epoch}``."""
+        ``{explained_variance, accepted_births, birth_pending, dead, gamma,
+        converged, epoch}``."""
         return dict(self._handle.end_epoch())
 
     def block_rank_charges(self, n_obs: int) -> dict[str, Any]:

@@ -81,6 +81,119 @@ fn make_decoder(n_blocks: usize, b: usize, p: usize, seed: u64) -> Array2<f32> {
     d
 }
 
+#[test]
+fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
+    // Block 1 already reconstructs every row exactly. A duplicate frame in the
+    // lower-index dead block 0 wins the deterministic TopK tie, so it is
+    // SELECTED — the historical selection-only gate committed it forever even
+    // though it changed no objective value. The transaction must reject on the
+    // strict RSS/evidence gate and restore every live field.
+    let x = Array2::<f32>::from_shape_fn((16, 2), |(_, column)| {
+        if column == 0 { 1.0 } else { 0.0 }
+    });
+    let config = BlockSparseConfig {
+        n_blocks: 2,
+        block_size: 1,
+        block_topk: 1,
+        max_epochs: 4,
+        minibatch: 16,
+        block_tile: 2,
+        frame_ridge: 0.0,
+        aux_k: 1,
+        matryoshka_prefix: false,
+        tolerance: 0.0,
+    };
+    let mut decoder = Array2::<f32>::zeros((2, 2));
+    decoder[[1, 0]] = 1.0;
+    let mut gamma = 1.0_f32;
+    let mut codes = route_and_code_all(
+        x.view(),
+        decoder.view(),
+        gamma,
+        2,
+        1,
+        1,
+        16,
+        2,
+    )
+    .expect("baseline route");
+    let mut rss = reconstruction_rss(x.view(), &codes, decoder.view(), 1);
+    let tss = centered_total_sum_squares(x.view());
+    let mut criterion = explained_variance_from_rss(rss, tss);
+    let proposal = BlockBirthProposal {
+        block: 0,
+        proposed_frame: ndarray::array![[1.0_f32, 0.0_f32]],
+    };
+
+    let mut candidate_decoder = decoder.clone();
+    candidate_decoder.row_mut(0).assign(&proposal.proposed_frame.row(0));
+    let (_, candidate_codes) = route_and_close_gamma(
+        x.view(),
+        candidate_decoder.view(),
+        gamma,
+        &config,
+        1,
+    )
+    .expect("candidate route");
+    assert!(
+        proposal_is_selected(&candidate_codes, 0, 1),
+        "fixture must defeat a selection-only birth gate"
+    );
+
+    let decoder_before = decoder.clone();
+    let gamma_before = gamma;
+    let codes_before = codes.clone();
+    let rss_before = rss;
+    let criterion_before = criterion;
+    let accepted = try_commit_block_birth(
+        x.view(),
+        &mut decoder,
+        &mut gamma,
+        &mut codes,
+        &mut rss,
+        &mut criterion,
+        tss,
+        &proposal,
+        &config,
+        1,
+    )
+    .expect("birth transaction");
+
+    assert!(!accepted, "a zero-improvement selected birth must be rejected");
+    assert_eq!(decoder, decoder_before, "decoder frame was not restored");
+    assert_eq!(gamma.to_bits(), gamma_before.to_bits());
+    assert_eq!(rss.to_bits(), rss_before.to_bits());
+    assert_eq!(criterion.to_bits(), criterion_before.to_bits());
+    for (after, before) in codes.iter().zip(codes_before.iter()) {
+        assert_eq!(after.blocks, before.blocks);
+        assert_eq!(after.gates, before.gates);
+        assert_eq!(after.codes, before.codes);
+    }
+}
+
+#[test]
+fn positive_rss_noise_birth_still_fails_rank_charge_2023() {
+    let decoder = ndarray::array![[1.0_f32, 0.0_f32]];
+    let gram = ndarray::array![[100.0_f64]];
+    let margin = block_birth_evidence_margin(
+        0,
+        1.0e-2,
+        100.0,
+        100,
+        &gram,
+        decoder.view(),
+        100,
+        2,
+        1,
+    )
+    .expect("birth evidence calculation")
+    .expect("fixture has positive realised rank");
+    assert!(
+        margin < 0.0,
+        "a representable but sub-charge RSS gain must not birth a noise specialist: margin={margin}"
+    );
+}
+
 /// `K×P` planted orthonormal atoms from a fixed symmetric matrix's eigenvectors
 /// (distinct columns are orthonormal, so every block spans a distinct rank-`b`
 /// subspace of `ℝ^P`).

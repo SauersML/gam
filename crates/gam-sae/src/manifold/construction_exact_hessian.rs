@@ -797,7 +797,7 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         self.analytic_outer_rho_gradient_components_with_bundle(
-            target, rho, loss, cache, solver, None,
+            target, rho, loss, cache, solver, None, None,
         )
     }
 
@@ -833,6 +833,16 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
         inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
+        // #2253/#2087 NON-ENVELOPE correction. The implicit-state (`third_order`)
+        // term assumes the inner state is KKT-stationary, so it drops
+        // `(∂(D+P)/∂θ̂)ᵀ θ̂_ρ = rᵀθ̂_ρ` (zero at a KKT optimum). At a #1051 objective-
+        // stagnation accept (an ill-conditioned n≈p fit whose inner genuinely
+        // cannot reach KKT) `r ≠ 0`, and dropping the term desyncs the gradient
+        // from `d(value)/dρ`. When the caller supplies the inner KKT residual
+        // `r = ∇_θ(D+P+extra)` at the accepted θ̂ (and it exceeds the KKT tolerance),
+        // add `rᵀθ̂_ρ` back per coordinate. `None` (or an in-tolerance `r`) is a
+        // byte-identical no-op — the envelope already holds.
+        kkt_residual: Option<&SaeArrowVector>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
@@ -1068,7 +1078,23 @@ impl SaeManifoldTerm {
             for idx in 0..gamma.beta.len() {
                 dot += gamma.beta[idx] * solved.beta[idx];
             }
-            third_order_correction[coord] = -0.5 * dot;
+            let mut correction = -0.5 * dot;
+            // #2253/#2087 non-envelope term. `θ̂_ρ = −solved` (solved = A⁻¹ ∂g/∂ρ),
+            // and the dropped envelope contribution is `(∂(D+P)/∂θ̂)ᵀ θ̂_ρ = rᵀ(−solved)
+            // = −⟨r, solved⟩`. Zero at a KKT optimum (the caller passes `None` there);
+            // at a #1051 stagnation accept it is the real correction that keeps the
+            // outer gradient equal to `d(value)/dρ`.
+            if let Some(r) = kkt_residual {
+                let mut r_dot = 0.0_f64;
+                for idx in 0..r.t.len().min(solved.t.len()) {
+                    r_dot += r.t[idx] * solved.t[idx];
+                }
+                for idx in 0..r.beta.len().min(solved.beta.len()) {
+                    r_dot += r.beta[idx] * solved.beta[idx];
+                }
+                correction -= r_dot;
+            }
+            third_order_correction[coord] = correction;
         }
 
         Ok(SaeOuterRhoGradientComponents {

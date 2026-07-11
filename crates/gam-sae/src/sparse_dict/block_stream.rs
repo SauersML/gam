@@ -43,8 +43,8 @@
 
 use super::BlockSparseConfig;
 use super::block::{
-    gram_schmidt_rows, reconstruct_stored_code_row, route_and_code_all, seed_frames,
-    stable_rank_symmetric,
+    block_birth_evidence_margin, gram_schmidt_rows, reconstruct_stored_code_row,
+    route_and_code_all, seed_frames, stable_rank_symmetric,
 };
 use super::update::DecoderSolveStats;
 use crate::frames::GrassmannFrame;
@@ -78,6 +78,9 @@ pub struct BlockEpochStats {
     /// Residual-row block births accepted after a complete candidate-vs-baseline
     /// streaming pass proved strict RSS improvement.
     pub accepted_births: usize,
+    /// Whether one candidate frame is staged for exact candidate-vs-baseline
+    /// adjudication on the next streamed pass.
+    pub birth_pending: bool,
     /// Dead blocks detected this epoch (fired for no row before revival).
     pub dead: usize,
     /// Refreshed shared tied scalar γ after this epoch.
@@ -666,8 +669,19 @@ impl BlockSparseStreamState {
                 ));
             }
             let selected = self.usage[pending.block] > 0;
-            let strictly_improves = self.rss < pending.baseline_rss;
-            if selected && strictly_improves {
+            let improvement_rss = pending.baseline_rss - self.rss;
+            let evidence_margin = block_birth_evidence_margin(
+                pending.block,
+                improvement_rss,
+                self.rss,
+                self.usage[pending.block],
+                &self.second[pending.block],
+                self.decoder.view(),
+                self.row_count,
+                self.p,
+                self.b,
+            )?;
+            if selected && evidence_margin.is_some_and(|margin| margin > 0.0) {
                 accepted_births = 1;
             } else {
                 self.decoder = pending.baseline_decoder;
@@ -774,6 +788,7 @@ impl BlockSparseStreamState {
         Ok(BlockEpochStats {
             explained_variance: ev,
             accepted_births,
+            birth_pending,
             dead,
             gamma: self.gamma,
             converged,

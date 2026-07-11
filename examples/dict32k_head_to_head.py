@@ -154,7 +154,7 @@ def run_arm_a(reader, test: np.ndarray, sample: np.ndarray, cfg: dict, out_prefi
         ep = stream.end_epoch()
         print(f"[A] epoch {ep['epoch']} rows={rows} EV={ep['explained_variance']:.4f} "
               f"gamma={ep['gamma']:.3f} dead={ep['dead']} "
-              f"accepted_births={ep['accepted_births']}", flush=True)
+              f"accepted_births={ep['accepted_births']} pending={ep['birth_pending']}", flush=True)
         if ep["converged"]:
             break
     art = stream.finalize()
