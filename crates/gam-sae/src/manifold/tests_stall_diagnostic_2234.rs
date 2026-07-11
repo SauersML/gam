@@ -42,6 +42,65 @@ fn planted_circle_cloud() -> (Array2<f64>, usize) {
     (z, p)
 }
 
+struct LogdetAuditPoint {
+    term: SaeManifoldTerm,
+    criterion: SaeCriterion,
+    components: SaeOuterRhoGradientComponents,
+    log_det: f64,
+    solver_gauge_count: usize,
+    cache_beta_quotient_dim: usize,
+}
+
+/// Emit every value/gradient channel for one rho from exactly one converged
+/// inner fit and one authoritative factor cache. The #2253 discriminator used
+/// to call `criterion_as_atoms` and then refit the already-mutated term again to
+/// obtain `arrow_log_det_from_cache`; center components came from yet another
+/// fit. That measured refinement-path drift, not a derivative identity.
+fn logdet_audit_point(
+    mut term: SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    rho: &SaeManifoldRho,
+    registry: &AnalyticPenaltyRegistry,
+) -> Result<LogdetAuditPoint, String> {
+    let criterion_result =
+        term.reml_criterion_with_cache(target, rho, Some(registry), 40, 0.05, 1.0e-6, 1.0e-6)?;
+    let loss = criterion_result.1;
+    let cache = criterion_result.2;
+    let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
+        "logdet_audit_point: authoritative log determinant unavailable".to_string()
+    })?;
+    let occam = term.reml_occam_term(rho)?;
+    let extra_penalty_energy = term.reml_extra_penalty_value_total(registry)?;
+    let solver = term
+        .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+        .map_err(|err| err.to_string())?;
+    let solver_gauge_count = solver.gauge_basis.len();
+    let cache_beta_quotient_dim = cache
+        .beta_gauge_quotient
+        .as_ref()
+        .map_or(0, |quotient| quotient.dimension());
+    let components = term
+        .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)
+        .map_err(|err| err.to_string())?;
+    let criterion = SaeCriterion::assemble(
+        loss.total() + extra_penalty_energy,
+        log_det,
+        occam,
+        components.explicit.clone(),
+        components.logdet_trace.clone(),
+        components.occam.clone(),
+        components.third_order_correction.clone(),
+    );
+    Ok(LogdetAuditPoint {
+        term,
+        criterion,
+        components,
+        log_det,
+        solver_gauge_count,
+        cache_beta_quotient_dim,
+    })
+}
+
 #[test]
 fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     use gam_solve::rho_optimizer::OuterProblem;
@@ -165,63 +224,41 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         .try_resume_from_checkpoint(n_params)
         .map(Array1::from)
         .unwrap_or(initial_flat);
-    let audited = objective
-        .eval(&banked)
-        .expect("gradient eval at the audited rho");
-    let grad = audited.gradient;
+    // Align the mutable objective term with the banked rho. The actual audit
+    // below deliberately ignores this eval's separately-emitted gradient and
+    // obtains value + gradient from one fresh cache emission.
+    drop(
+        objective
+            .eval(&banked)
+            .expect("state-alignment eval at the audited rho"),
+    );
     assert!(
         objective.term.frames_active(),
         "the #2253 discriminator must exercise the profiled Grassmann-frame path"
     );
     let center_term = objective.term.clone();
     let center_rho = objective.baseline_rho.from_flat(banked.view());
-    let mut center_component_term = center_term.clone();
-    let (_, center_loss, center_cache) = center_component_term
-        .reml_criterion_with_cache(
-            z.view(),
-            &center_rho,
-            objective.registry.as_ref(),
-            40,
-            0.05,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("criterion cache at the audited rho");
-    let center_solver = center_component_term
-        .outer_gradient_arrow_solver(&center_cache, &center_rho.lambda_smooth_vec())
-        .expect("outer-gradient arrow solver at the audited rho");
-    let center_components = center_component_term
-        .analytic_outer_rho_gradient_components(
-            z.view(),
-            &center_rho,
-            &center_loss,
-            &center_cache,
-            &center_solver,
-        )
-        .expect("analytic gradient components at the audited rho");
-    let center_logdet =
-        arrow_log_det_from_cache(&center_cache).expect("finite log determinant at the audited rho");
+    let center = logdet_audit_point(
+        center_term.clone(),
+        z.view(),
+        &center_rho,
+        objective.registry.as_ref(),
+    )
+    .expect("single-emission audit at the center rho");
+    let center_components = &center.components;
+    let center_logdet = center.log_det;
+    let grad = center.criterion.gradient();
     eprintln!(
         "[2253-CHAN] center logdet={center_logdet:+.6e} explicit={:?} trace={:?} \
-         adjoint={:?} occam={:?}",
+         adjoint={:?} occam={:?} solver_gauges={} cache_beta_quotient={}",
         center_components.explicit,
         center_components.logdet_trace,
         center_components.third_order_correction,
         center_components.occam,
+        center.solver_gauge_count,
+        center.cache_beta_quotient_dim,
     );
-    let mut center_atom_term = center_term.clone();
-    let center_atoms = center_atom_term
-        .criterion_as_atoms(
-            z.view(),
-            &center_rho,
-            objective.registry.as_ref(),
-            40,
-            0.05,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("criterion atoms at the audited rho");
-    for atom in center_atoms.atoms() {
+    for atom in center.criterion.atoms() {
         eprintln!(
             "[zz2234] center atom {}: value={:+.6e} grad={:?}",
             atom.label(),
@@ -230,6 +267,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         );
     }
     let h = 1.0e-4;
+    let mut failures = Vec::new();
     for j in 0..n_params {
         let mut plus = banked.clone();
         plus[j] += h;
@@ -237,56 +275,22 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         minus[j] -= h;
         let plus_rho = objective.baseline_rho.from_flat(plus.view());
         let minus_rho = objective.baseline_rho.from_flat(minus.view());
-        let mut plus_term = center_term.clone();
-        let mut minus_term = center_term.clone();
-        let plus_atoms = plus_term
-            .criterion_as_atoms(
-                z.view(),
-                &plus_rho,
-                objective.registry.as_ref(),
-                40,
-                0.05,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("criterion atoms at +h");
-        let minus_atoms = minus_term
-            .criterion_as_atoms(
-                z.view(),
-                &minus_rho,
-                objective.registry.as_ref(),
-                40,
-                0.05,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("criterion atoms at -h");
-        let (_, _, plus_cache) = plus_term
-            .reml_criterion_with_cache(
-                z.view(),
-                &plus_rho,
-                objective.registry.as_ref(),
-                40,
-                0.05,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("criterion cache at +h");
-        let (_, _, minus_cache) = minus_term
-            .reml_criterion_with_cache(
-                z.view(),
-                &minus_rho,
-                objective.registry.as_ref(),
-                40,
-                0.05,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("criterion cache at -h");
-        let plus_logdet =
-            arrow_log_det_from_cache(&plus_cache).expect("finite log determinant at +h");
-        let minus_logdet =
-            arrow_log_det_from_cache(&minus_cache).expect("finite log determinant at -h");
+        let plus = logdet_audit_point(
+            center.term.clone(),
+            z.view(),
+            &plus_rho,
+            objective.registry.as_ref(),
+        )
+        .expect("single-emission audit at +h");
+        let minus = logdet_audit_point(
+            center.term.clone(),
+            z.view(),
+            &minus_rho,
+            objective.registry.as_ref(),
+        )
+        .expect("single-emission audit at -h");
+        let plus_logdet = plus.log_det;
+        let minus_logdet = minus.log_det;
         let logdet_fd = 0.5 * (plus_logdet - minus_logdet) / (2.0 * h);
         let logdet_analytic =
             center_components.logdet_trace[j] + center_components.third_order_correction[j];
@@ -294,15 +298,16 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
             "[2253-CHAN] coord {j}: analytic_logdet={logdet_analytic:+.6e} \
              central_fd_half_logdet={logdet_fd:+.6e}"
         );
-        let c_plus = plus_atoms.value();
-        let c_minus = minus_atoms.value();
+        let c_plus = plus.criterion.value();
+        let c_minus = minus.criterion.value();
         let fd = (c_plus - c_minus) / (2.0 * h);
-        for (plus_atom, minus_atom) in plus_atoms.atoms().iter().zip(minus_atoms.atoms()) {
+        for (plus_atom, minus_atom) in plus.criterion.atoms().iter().zip(minus.criterion.atoms()) {
             let atom_fd = (plus_atom.value() - minus_atom.value()) / (2.0 * h);
             eprintln!(
                 "[zz2234] coord {j} atom {}: analytic={:+.6e} central_fd={:+.6e}",
                 plus_atom.label(),
-                center_atoms
+                center
+                    .criterion
                     .atoms()
                     .iter()
                     .find(|atom| atom.label() == plus_atom.label())
@@ -317,12 +322,17 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
             "[zz2234] coord {j}: analytic={:+.6e} eval_fd={:+.6e} |delta|={delta:.3e} tol={tolerance:.3e}",
             grad[j], fd,
         );
-        assert!(
-            delta <= tolerance,
-            "#2253 eval value/gradient desync at rho coordinate {j}: analytic={:+.12e}, \
-             same-lane central FD={:+.12e}, delta={delta:.3e}, tolerance={tolerance:.3e}",
-            grad[j],
-            fd,
-        );
+        if delta > tolerance {
+            failures.push(format!(
+                "rho coordinate {j}: analytic={:+.12e}, same-emission central FD={:+.12e}, \
+                 delta={delta:.3e}, tolerance={tolerance:.3e}",
+                grad[j], fd,
+            ));
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "#2253 eval value/gradient desync(s):\n{}",
+        failures.join("\n")
+    );
 }
