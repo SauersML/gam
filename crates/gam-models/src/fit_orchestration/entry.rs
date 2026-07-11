@@ -779,8 +779,13 @@ fn adaptive_spatial_candidates(
                     ),
                 });
             }
-            let ceiling_centers =
-                gam_terms::basis::default_num_centers(n_rows, spatial_dimension);
+            // Tiny samples can force the materializer's exact polynomial floor
+            // above the generic `n / 4` conditioning ceiling. The realized
+            // request is already the smallest admissible basis in that case, so
+            // it is also the ceiling; never report a nonsensical attempted
+            // center count below the basis that just converged.
+            let ceiling_centers = gam_terms::basis::default_num_centers(n_rows, spatial_dimension)
+                .max(current_centers);
             let global_range = (smooth_offset + realized.coeff_range.start)
                 ..(smooth_offset + realized.coeff_range.end);
             let edf = result
