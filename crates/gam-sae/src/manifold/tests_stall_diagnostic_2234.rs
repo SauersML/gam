@@ -46,6 +46,7 @@ struct LogdetAuditPoint {
     term: SaeManifoldTerm,
     criterion: SaeCriterion,
     components: SaeOuterRhoGradientComponents,
+    raw_cache_components: Result<SaeOuterRhoGradientComponents, String>,
     log_det: f64,
     kkt_grad_norm: f64,
     quotient_kkt_grad_norm: f64,
@@ -101,6 +102,10 @@ fn logdet_audit_point(
     let components = term
         .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)
         .map_err(|err| err.to_string())?;
+    let raw_cache_solver = DeflatedArrowSolver::plain(&cache);
+    let raw_cache_components = term
+        .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &raw_cache_solver)
+        .map_err(|err| err.to_string());
     let criterion = SaeCriterion::assemble(
         loss.total() + extra_penalty_energy,
         log_det,
@@ -126,6 +131,7 @@ fn logdet_audit_point(
         term,
         criterion,
         components,
+        raw_cache_components,
         log_det,
         kkt_grad_norm,
         quotient_kkt_grad_norm,
@@ -135,6 +141,18 @@ fn logdet_audit_point(
         solver_gauge_count,
         cache_beta_quotient_dim,
     })
+}
+
+fn frozen_raw_logdet(
+    mut term: SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    rho: &SaeManifoldRho,
+    registry: Option<&AnalyticPenaltyRegistry>,
+) -> Result<f64, String> {
+    let criterion_result =
+        term.reml_criterion_with_cache(target, rho, registry, 0, 0.05, 1.0e-6, 1.0e-6)?;
+    arrow_log_det_from_cache(&criterion_result.2)
+        .ok_or_else(|| "frozen_raw_logdet: authoritative log determinant unavailable".to_string())
 }
 
 #[test]
@@ -344,10 +362,39 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
             let logdet_fd = 0.5 * (plus_logdet - minus_logdet) / (2.0 * h);
             let logdet_analytic =
                 center_components.logdet_trace[j] + center_components.third_order_correction[j];
+            let raw_cache_analytic = center.raw_cache_components.as_ref().map(|components| {
+                components.logdet_trace[j] + components.third_order_correction[j]
+            });
             eprintln!(
                 "[2253-CHAN] budget={inner_max_iter} coord {j}: \
                  analytic_logdet={logdet_analytic:+.6e} \
+                 raw_cache_analytic={raw_cache_analytic:?} \
                  central_fd_half_logdet={logdet_fd:+.6e}"
+            );
+            let frozen_plus = frozen_raw_logdet(
+                center.term.clone(),
+                z.view(),
+                &plus_rho,
+                objective.registry.as_ref(),
+            )
+            .expect("frozen raw logdet at +h");
+            let frozen_minus = frozen_raw_logdet(
+                center.term.clone(),
+                z.view(),
+                &minus_rho,
+                objective.registry.as_ref(),
+            )
+            .expect("frozen raw logdet at -h");
+            let frozen_raw_logdet_fd = 0.5 * (frozen_plus - frozen_minus) / (2.0 * h);
+            let raw_cache_direct = center
+                .raw_cache_components
+                .as_ref()
+                .map(|components| components.logdet_trace[j]);
+            eprintln!(
+                "[2253-FIXED] budget={inner_max_iter} coord {j}: \
+                 deflated_direct={:+.6e} raw_cache_direct={raw_cache_direct:?} \
+                 frozen_raw_half_logdet_fd={frozen_raw_logdet_fd:+.6e}",
+                center_components.logdet_trace[j],
             );
             let c_plus = plus.criterion.value();
             let c_minus = minus.criterion.value();
