@@ -91,6 +91,28 @@ workloads, prefer `gamfit.torch.fit` or the batched and additive primitives
 (`gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`,
 `gaussian_reml_fit_blocks`) over per-feature Python iteration.
 
+## Output-Fisher harvesting and attention backends
+
+`harvest_output_fisher_factors` and
+`harvest_downstream_output_fisher_factors` apply the output-Fisher pullback
+matrix-free with both JVPs and VJPs. PyTorch SDPA and flash-attention operators
+can support reverse AD while lacking the forward-mode JVP these two harvests
+require. For Hugging Face models, select the differentiable attention path when
+the model is loaded:
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    attn_implementation="eager",
+)
+```
+
+If an unsupported attention operator is reached, gamfit raises an actionable
+error at the JVP boundary. It does not mutate an already-loaded model or change
+the estimator. `harvest_behavioral_fisher_probes` is VJP-only, but it emits the
+distinct likelihood-weighting `behavioral_fisher` sketch; it is not a silent
+replacement for either top-eigenfactor/dosimetry harvest.
+
 ## Public API
 
 | Group | Symbols |

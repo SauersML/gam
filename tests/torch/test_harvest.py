@@ -135,6 +135,41 @@ def test_harvest_matches_closed_form_linear_head() -> None:
     assert max_residual_err < 1e-3, f"mass_residual error {max_residual_err}"
 
 
+@pytest.mark.parametrize(
+    "harvest",
+    [harvest_output_fisher_factors, harvest_downstream_output_fisher_factors],
+)
+def test_attention_forward_ad_failure_names_eager_reload_2265(
+    monkeypatch: pytest.MonkeyPatch,
+    harvest,
+) -> None:
+    weight = torch.eye(2, dtype=torch.float64)
+    model = _LinearHead(weight).to(torch.float64)
+    inputs = torch.ones((1, 2), dtype=torch.float64)
+
+    def unsupported_attention_jvp(*_args, **_kwargs):
+        raise RuntimeError(
+            "Trying to use forward AD with "
+            "aten::_scaled_dot_product_flash_attention that does not support it"
+        )
+
+    monkeypatch.setattr(torch.func, "jvp", unsupported_attention_jvp)
+    with pytest.raises(RuntimeError) as caught:
+        harvest(
+            model,
+            model.feature,
+            inputs,
+            rank=1,
+            oversample=0,
+            n_iter=0,
+            trace_probes=1,
+        )
+    message = str(caught.value)
+    assert 'attn_implementation="eager"' in message
+    assert "will not mutate the attention backend" in message
+    assert "_scaled_dot_product_flash_attention" in message
+
+
 def test_behavioral_fisher_probe_sketch_converges_to_pullback() -> None:
     """Rung 1: the s-probe sketch ``M_n = U_n U_nᵀ`` is an unbiased estimate of
     the *full* output-Fisher pullback ``G_n = Wᵀ F_n W`` (not a rank-r

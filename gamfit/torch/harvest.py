@@ -75,6 +75,48 @@ _HARVEST_PROVENANCES = frozenset(
     {"output_fisher", "output_fisher_downstream", "behavioral_fisher"}
 )
 
+_ATTENTION_FORWARD_AD_MARKERS = (
+    "scaled_dot_product",
+    "flash_attention",
+    "efficient_attention",
+    "memory_efficient_attention",
+    "sdpa",
+)
+
+
+def _jvp_with_attention_diagnostic(
+    function: Callable[[torch.Tensor], torch.Tensor],
+    primal: torch.Tensor,
+    tangent: torch.Tensor,
+    *,
+    harvest_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one JVP, translating only attention forward-AD failures.
+
+    PyTorch attention backends may implement reverse AD while lacking the JVP
+    needed by the matrix-free top-eigenfactor harvest. Mutating a loaded model's
+    attention configuration is not a valid backend switch, and substituting the
+    VJP-only behavioral sketch would change the statistical contract. Preserve
+    every unrelated torch error verbatim; only a failing attention operator at
+    this JVP boundary receives the actionable eager-attention diagnosis.
+    """
+    try:
+        return torch.func.jvp(function, (primal,), (tangent,))
+    except (RuntimeError, NotImplementedError) as error:
+        message = str(error).lower()
+        if any(marker in message for marker in _ATTENTION_FORWARD_AD_MARKERS):
+            raise RuntimeError(
+                f"{harvest_name} requires torch forward-mode AD through the "
+                "downstream model, but the active SDPA/flash-attention operator "
+                "has no JVP. Reload the model with "
+                'attn_implementation="eager" (for Hugging Face: '
+                'from_pretrained(..., attn_implementation="eager")) before '
+                "harvesting. gamfit will not mutate the attention backend or "
+                "replace this top-eigenfactor contract with a different Fisher "
+                f"estimator. Original torch error: {error}"
+            ) from error
+        raise
+
 
 # ---------------------------------------------------------------------------
 # Shard container — the (X, U, mass_residual) contract
@@ -423,6 +465,9 @@ def harvest_output_fisher_factors(
     model
         The torch model. Called as ``model(inputs)`` and assumed to return
         logits of shape ``(..., C)`` (the leading axes are flattened to tokens).
+        The downstream stack must support forward-mode AD. Hugging Face models
+        using SDPA/flash attention must be loaded with
+        ``attn_implementation="eager"`` for this JVP-based harvest.
     hook_module
         A submodule of ``model`` whose *output* is the hook-site activation
         ``x_n``. Its forward output's last axis is the activation dimension ``p``.
@@ -482,7 +527,12 @@ def harvest_output_fisher_factors(
         def jvp_fn(V: torch.Tensor, _f=f_row, _x=x_row) -> torch.Tensor:
             cols = []
             for j in range(V.shape[1]):
-                _out, jv = torch.func.jvp(_f, (_x,), (V[:, j].contiguous(),))
+                _out, jv = _jvp_with_attention_diagnostic(
+                    _f,
+                    _x,
+                    V[:, j].contiguous(),
+                    harvest_name="harvest_output_fisher_factors",
+                )
                 cols.append(jv)
             return torch.stack(cols, dim=1)  # (C, m)
 
@@ -688,6 +738,11 @@ def harvest_downstream_output_fisher_factors(
     feature whose entire causal effect lands many tokens later has same-position
     Fisher ≈ 0 (the same-position lens reports it represented-but-not-driving),
     but registers nonzero downstream coupling here.
+
+    This top-eigenfactor path requires forward-mode AD through every downstream
+    attention block. Load Hugging Face models with
+    ``attn_implementation="eager"``; unsupported SDPA/flash operators raise an
+    actionable error at the JVP boundary and are never silently replaced.
     """
     if rank < 1:
         raise ValueError(f"rank must be >= 1; got {rank}")
@@ -726,7 +781,12 @@ def harvest_downstream_output_fisher_factors(
         def jvp_fn(V: torch.Tensor, _f=f_future, _x=x_row) -> torch.Tensor:
             cols = []
             for j in range(V.shape[1]):
-                _out, jv = torch.func.jvp(_f, (_x,), (V[:, j].contiguous(),))
+                _out, jv = _jvp_with_attention_diagnostic(
+                    _f,
+                    _x,
+                    V[:, j].contiguous(),
+                    harvest_name="harvest_downstream_output_fisher_factors",
+                )
                 cols.append(jv)  # (T, C)
             return torch.stack(cols, dim=2)  # (T, C, m)
 
