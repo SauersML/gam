@@ -214,16 +214,16 @@ fn bench_assembly_softmax(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_assembly_jumprelu(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sae_arrow_schur_assembly_jumprelu");
+fn bench_assembly_threshold_gate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sae_arrow_schur_assembly_threshold_gate");
     group.sample_size(10);
 
     for cfg in CONFIGS_CI {
-        // JumpReLU at threshold=0.0 → ~50% active fraction (sigmoid(0)=0.5).
-        let mode = AssignmentMode::jumprelu(1.0, 0.0);
+        // Threshold gate at threshold=0.0 → ~50% active fraction (sigmoid(0)=0.5).
+        let mode = AssignmentMode::threshold_gate(1.0, 0.0);
         let (mut term, target) = build_term(cfg, mode);
         let rho = build_rho(cfg);
-        let id = BenchmarkId::new("assemble", label(cfg, "jumprelu"));
+        let id = BenchmarkId::new("assemble", label(cfg, "threshold_gate"));
 
         group.bench_with_input(id, &(), |b, ()| {
             b.iter_custom(|iters| {
@@ -348,7 +348,7 @@ fn bench_large_scale_assembly(c: &mut Criterion) {
     for cfg in CONFIGS_LARGE_SCALE {
         for (variant, mode) in [
             ("softmax", AssignmentMode::softmax(1.0)),
-            ("jumprelu", AssignmentMode::jumprelu(1.0, 0.0)),
+            ("threshold_gate", AssignmentMode::threshold_gate(1.0, 0.0)),
         ] {
             let (mut term, target) = build_term(cfg, mode);
             let rho = build_rho(cfg);
@@ -375,7 +375,7 @@ fn bench_large_scale_assembly(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_assembly_softmax,
-    bench_assembly_jumprelu,
+    bench_assembly_threshold_gate,
     bench_solve_direct,
     bench_solve_pcg,
     bench_full_newton_step,
