@@ -26,21 +26,44 @@ mod tests {
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
     use ndarray::{Array2, Axis};
 
-    /// Eight points on the unit circle, plus a per-dim constant `offset` (the global
-    /// DC Tier-0 must carry).
+    /// `N_CIRCLE` evenly-spaced points on the unit circle, plus a per-dim constant
+    /// `offset` (the global DC Tier-0 must carry) plus small deterministic iid
+    /// observation noise.
+    ///
+    /// The noise is load-bearing for identifiability, NOT decoration. A K=1
+    /// Periodic atom with harmonics reconstructs a clean circle `[cosθ, sinθ]` to
+    /// machine precision, so the primary fit's pass-0 residual would be ≈0. The
+    /// always-on structured-residual pass (`fit_entry.rs`, magic-by-default) then
+    /// fits a residual-covariance model on that ≈0 residual: its idiosyncratic
+    /// diagonal collapses to the denormal floor, whitening by ~1/D is near-singular,
+    /// and the whitened-residual REML over the smoothing ρ has NO interior
+    /// stationary point — so the outer optimizer CORRECTLY refuses to certify (a
+    /// genuinely non-identifiable structured problem, confirmed by the outer-cert
+    /// owner). Genuine above-floor residual energy makes that pass well-posed. The
+    /// evenly-spaced angles sum to zero, so μ stays ≈ OFFSET up to the noise's
+    /// finite-sample column mean (std `σ/√N`), which the tolerances below reflect.
+    const N_CIRCLE: usize = 64;
+    const NOISE_SIGMA: f64 = 0.05;
+
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+    fn lcg_normal(state: &mut u64) -> f64 {
+        let u1 = lcg(state).max(1e-12);
+        let u2 = lcg(state);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
     fn circle_target(offset: f64) -> Array2<f64> {
-        let s = std::f64::consts::FRAC_1_SQRT_2;
-        let base = [
-            [1.0, 0.0],
-            [s, s],
-            [0.0, 1.0],
-            [-s, s],
-            [-1.0, 0.0],
-            [-s, -s],
-            [0.0, -1.0],
-            [s, -s],
-        ];
-        Array2::from_shape_fn((8, 2), |(i, j)| base[i][j] + offset)
+        let mut state = 0x2023_0000_0000_0007u64 ^ offset.to_bits();
+        Array2::from_shape_fn((N_CIRCLE, 2), |(i, j)| {
+            let theta = std::f64::consts::TAU * (i as f64) / (N_CIRCLE as f64);
+            let clean = if j == 0 { theta.cos() } else { theta.sin() };
+            clean + offset + NOISE_SIGMA * lcg_normal(&mut state)
+        })
     }
 
     /// Drive the full typed pipeline (`build_sae_minimal_seed` →
