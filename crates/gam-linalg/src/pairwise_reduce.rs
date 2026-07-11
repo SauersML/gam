@@ -390,6 +390,54 @@ where
     Some(par_block_fold_range(0, n, &base, &combine))
 }
 
+/// Fallible variant of [`par_deterministic_block_fold`]: `base` and `combine`
+/// may fail, and the first error (in tree order) is returned. The association
+/// tree is identical, so a fully-successful run is bit-identical to the
+/// infallible version. Returns `Ok(None)` for `n == 0`.
+///
+/// This replaces the nondeterministic rayon
+/// `try_fold(zero, ..).try_reduce(zero, ..)` pattern.
+pub fn par_deterministic_try_block_fold<T, E, B, F>(
+    n: usize,
+    base: B,
+    combine: F,
+) -> Result<Option<T>, E>
+where
+    T: Send,
+    E: Send,
+    B: Fn(core::ops::Range<usize>) -> Result<T, E> + Sync,
+    F: Fn(T, T) -> Result<T, E> + Sync,
+{
+    if n == 0 {
+        return Ok(None);
+    }
+    par_try_block_fold_range(0, n, &base, &combine).map(Some)
+}
+
+fn par_try_block_fold_range<T, E, B, F>(
+    lo: usize,
+    hi: usize,
+    base: &B,
+    combine: &F,
+) -> Result<T, E>
+where
+    T: Send,
+    E: Send,
+    B: Fn(core::ops::Range<usize>) -> Result<T, E> + Sync,
+    F: Fn(T, T) -> Result<T, E> + Sync,
+{
+    let len = hi - lo;
+    if len <= BASE_CHUNK {
+        return base(lo..hi);
+    }
+    let mid = lo + left_split(len);
+    let (left, right) = rayon::join(
+        || par_try_block_fold_range(lo, mid, base, combine),
+        || par_try_block_fold_range(mid, hi, base, combine),
+    );
+    combine(left?, right?)
+}
+
 fn par_block_fold_range<T, B, F>(lo: usize, hi: usize, base: &B, combine: &F) -> T
 where
     T: Send,
@@ -620,5 +668,42 @@ mod tests {
             }
         }
         assert!(par_deterministic_block_fold(0, |_| vec![0.0f64; 1], |a, _b| a).is_none());
+    }
+
+    #[test]
+    fn par_deterministic_try_block_fold_matches_infallible_and_propagates_errors() {
+        let n = 5 * BASE_CHUNK + 7;
+        let base = |range: core::ops::Range<usize>| -> f64 {
+            range.map(|i| ((i as f64) * 0.317).sin()).sum()
+        };
+        let infallible =
+            par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
+        let fallible = par_deterministic_try_block_fold(
+            n,
+            |range| Ok::<f64, String>(base(range)),
+            |a, b| Ok(a + b),
+        )
+        .expect("no error")
+        .expect("n > 0");
+        assert_eq!(fallible.to_bits(), infallible.to_bits());
+
+        let err = par_deterministic_try_block_fold(
+            n,
+            |range| {
+                if range.contains(&(3 * BASE_CHUNK)) {
+                    Err("boom".to_string())
+                } else {
+                    Ok(0.0f64)
+                }
+            },
+            |a, b| Ok(a + b),
+        )
+        .unwrap_err();
+        assert_eq!(err, "boom");
+        assert!(
+            par_deterministic_try_block_fold(0, |_| Ok::<f64, String>(0.0), |a, b| Ok(a + b))
+                .expect("no error")
+                .is_none()
+        );
     }
 }
