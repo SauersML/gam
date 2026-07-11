@@ -447,10 +447,10 @@ struct PenaltySpectrum {
 
 /// Fit a shared-smoothing multi-output Gaussian model by exact profiled REML.
 pub fn fit_shared_tangent_reml(
-    request: SharedTangentRemlRequest,
+    mut request: SharedTangentRemlRequest,
 ) -> Result<SharedTangentRemlFit, EstimationError> {
     let requested_penalty_count = request.penalties.len();
-    let initial_log_lambdas = request.initial_log_lambdas.clone();
+    let initial_log_lambdas = request.initial_log_lambdas.take();
     let prepared = PreparedSharedTangent::from_request(request)?;
     let n_outer = prepared.penalties.len();
     if let Some(initial) = initial_log_lambdas.as_ref() {
@@ -556,7 +556,8 @@ pub fn fit_shared_tangent_reml(
     let effective_joint_rows = prepared
         .effective_observations
         .checked_mul(prepared.n_outputs)
-        .ok_or_else(|| invalid("effective joint row count overflow"))? as f64;
+        .ok_or_else(|| invalid("effective joint row count overflow"))?
+        as f64;
     let residual_df = effective_joint_rows - edf_total;
     if !(residual_df.is_finite() && residual_df > 0.0) {
         return Err(invalid(format!(
@@ -679,6 +680,16 @@ impl PreparedSharedTangent {
                 metric.dim()
             )));
         }
+        let fisher_metric = if let Some(metric) = fisher_metric {
+            let mut validated = Array3::<f64>::zeros(metric.dim());
+            for row in 0..n {
+                let row_metric = validated_metric(metric.slice(s![row, .., ..]).to_owned(), row)?;
+                validated.slice_mut(s![row, .., ..]).assign(&row_metric);
+            }
+            Some(validated)
+        } else {
+            None
+        };
 
         let penalties = prepare_penalties(&requested_penalties, k)?;
         let output_penalty_slots = requested_penalties.len();
@@ -717,9 +728,7 @@ impl PreparedSharedTangent {
             SufficientStatistics::Isotropic { gram, cross } => {
                 self.evaluate_isotropic(rho, gram, cross)
             }
-            SufficientStatistics::Fisher { gram, cross } => {
-                self.evaluate_fisher(rho, gram, cross)
-            }
+            SufficientStatistics::Fisher { gram, cross } => self.evaluate_fisher(rho, gram, cross),
         }
     }
 
@@ -823,6 +832,14 @@ impl PreparedSharedTangent {
         add_base_penalty_to_joint(&mut penalized, &penalty, d);
         let (inverse, log_determinant) = spd_inverse_and_logdet(&penalized)?;
         let beta = inverse.dot(cross);
+        let mut coefficients = Array2::<f64>::zeros((k, d));
+        for basis in 0..k {
+            for output in 0..d {
+                coefficients[[basis, output]] = beta[basis * d + output];
+            }
+        }
+        let profiled_deviance = self.profiled_deviance(&coefficients)?;
+        validate_profiled_deviance(profiled_deviance)?;
         let residual_degrees_of_freedom = self.residual_degrees_of_freedom(spectrum.rank)?;
 
         let m = self.penalties.len();
@@ -871,14 +888,6 @@ impl PreparedSharedTangent {
                 hessian[[kk, j]] = value;
             }
         }
-        let mut coefficients = Array2::<f64>::zeros((k, d));
-        for basis in 0..k {
-            for output in 0..d {
-                coefficients[[basis, output]] = beta[basis * d + output];
-            }
-        }
-        let profiled_deviance = self.profiled_deviance(&coefficients)?;
-        validate_profiled_deviance(profiled_deviance)?;
         let cost = 0.5
             * (log_determinant - d as f64 * spectrum.log_pseudo_determinant
                 + residual_degrees_of_freedom
@@ -899,6 +908,63 @@ impl PreparedSharedTangent {
             residual_degrees_of_freedom,
             penalty_traces,
         })
+    }
+
+    /// Evaluate the fitted weighted residual quadratic directly from row
+    /// chunks.  Forming it as `y'Wy - (X'Wy)' beta` catastrophically cancels
+    /// on near-interpolating fits; the resulting few ulps are large relative to
+    /// the residual itself and can move a flat REML optimum by many nats under
+    /// an otherwise harmless rotation of the tangent frame.
+    fn profiled_deviance(&self, coefficients: &Array2<f64>) -> Result<f64, EstimationError> {
+        let n = self.design.nrows();
+        let k = self.design.ncols();
+        let d = self.response.ncols();
+        if coefficients.dim() != (k, d) {
+            return Err(invalid(format!(
+                "shared-tangent coefficient shape {:?} does not match ({k}, {d})",
+                coefficients.dim()
+            )));
+        }
+        let mut quadratic = KahanSum::default();
+        let chunk_rows = gam_linalg::utils::row_chunk_for_byte_budget(n, k);
+        for start in (0..n).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(n);
+            let x_chunk = self
+                .design
+                .try_row_chunk(start..end)
+                .map_err(|error| invalid(format!("failed to read design row chunk: {error}")))?;
+            validate_design_chunk(&x_chunk)?;
+            let fitted = x_chunk.dot(coefficients);
+            for local_row in 0..x_chunk.nrows() {
+                let row = start + local_row;
+                let weight = self.weights[row];
+                if weight == 0.0 {
+                    continue;
+                }
+                if let Some(metric) = self.fisher_metric.as_ref() {
+                    for output_a in 0..d {
+                        let residual_a =
+                            self.response[[row, output_a]] - fitted[[local_row, output_a]];
+                        for output_b in 0..d {
+                            let residual_b =
+                                self.response[[row, output_b]] - fitted[[local_row, output_b]];
+                            quadratic.add(
+                                weight
+                                    * residual_a
+                                    * metric[[row, output_a, output_b]]
+                                    * residual_b,
+                            );
+                        }
+                    }
+                } else {
+                    for output in 0..d {
+                        let residual = self.response[[row, output]] - fitted[[local_row, output]];
+                        quadratic.add(weight * residual * residual);
+                    }
+                }
+            }
+        }
+        Ok(quadratic.sum())
     }
 
     fn combined_penalty(
@@ -1006,7 +1072,6 @@ fn assemble_isotropic_statistics(
     let d = response.ncols();
     let mut gram = Array2::<f64>::zeros((k, k));
     let mut cross = Array2::<f64>::zeros((k, d));
-    let mut response_quadratic = 0.0;
     let chunk_rows = gam_linalg::utils::row_chunk_for_byte_budget(n, k);
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
@@ -1018,16 +1083,8 @@ fn assemble_isotropic_statistics(
         let response_chunk = response.slice(s![start..end, ..]);
         gram += &fast_xt_diag_x(&x_chunk, &weight_chunk);
         cross += &fast_xt_diag_y(&x_chunk, &weight_chunk, &response_chunk);
-        for local_row in 0..x_chunk.nrows() {
-            let row = start + local_row;
-            response_quadratic += weights[row] * response.row(row).dot(&response.row(row));
-        }
     }
-    Ok(SufficientStatistics::Isotropic {
-        gram,
-        cross,
-        response_quadratic,
-    })
+    Ok(SufficientStatistics::Isotropic { gram, cross })
 }
 
 fn assemble_fisher_statistics(
@@ -1044,7 +1101,6 @@ fn assemble_fisher_statistics(
         .ok_or_else(|| invalid("joint coefficient dimension overflow"))?;
     let mut gram = Array2::<f64>::zeros((q, q));
     let mut cross = Array1::<f64>::zeros(q);
-    let mut response_quadratic = 0.0;
     let chunk_rows = gam_linalg::utils::row_chunk_for_byte_budget(n, k);
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
@@ -1054,11 +1110,10 @@ fn assemble_fisher_statistics(
         validate_design_chunk(&x_chunk)?;
         for local_row in 0..x_chunk.nrows() {
             let row = start + local_row;
-            let metric = validated_metric(fisher_metric.slice(s![row, .., ..]).to_owned(), row)?;
+            let metric = fisher_metric.slice(s![row, .., ..]);
             let y = response.row(row);
             let metric_y = metric.dot(&y);
             let weight = weights[row];
-            response_quadratic += weight * y.dot(&metric_y);
             for basis_a in 0..k {
                 let x_a = x_chunk[[local_row, basis_a]];
                 for output in 0..d {
@@ -1079,11 +1134,7 @@ fn assemble_fisher_statistics(
             }
         }
     }
-    Ok(SufficientStatistics::Fisher {
-        gram,
-        cross,
-        response_quadratic,
-    })
+    Ok(SufficientStatistics::Fisher { gram, cross })
 }
 
 fn validated_metric(mut metric: Array2<f64>, row: usize) -> Result<Array2<f64>, EstimationError> {
@@ -1554,9 +1605,9 @@ mod tests {
             }
         }
         let fisher_request = fixture_request(Some(identity_metric));
-        let isotropic = PreparedSharedTangent::from_request(&isotropic_request)
+        let isotropic = PreparedSharedTangent::from_request(isotropic_request)
             .expect("prepare isotropic without densifying");
-        let fisher = PreparedSharedTangent::from_request(&fisher_request)
+        let fisher = PreparedSharedTangent::from_request(fisher_request)
             .expect("prepare Fisher without densifying");
         let rho = array![-0.4, 0.7];
         let left = isotropic.evaluate(&rho).expect("isotropic eval");
@@ -1570,7 +1621,7 @@ mod tests {
     #[test]
     fn analytic_gradient_and_hessian_match_test_only_finite_differences() {
         let request = fixture_request(None);
-        let prepared = PreparedSharedTangent::from_request(&request).expect("prepare");
+        let prepared = PreparedSharedTangent::from_request(request).expect("prepare");
         let rho = array![-0.2, 0.35];
         let exact = prepared.evaluate(&rho).expect("exact eval");
         let step = f64::EPSILON.cbrt();
@@ -1604,13 +1655,9 @@ mod tests {
             metric[[row, 1, 1]] = 0.9 + 0.05 * row as f64;
         }
         let request = fixture_request(Some(metric.clone()));
-        let prepared = PreparedSharedTangent::from_request(&request).expect("prepare Fisher");
-        let SufficientStatistics::Fisher {
-            gram,
-            cross,
-            response_quadratic,
-        } = &prepared.statistics
-        else {
+        let prepared =
+            PreparedSharedTangent::from_request(request.clone()).expect("prepare Fisher");
+        let SufficientStatistics::Fisher { gram, cross } = &prepared.statistics else {
             panic!("expected Fisher statistics")
         };
         let x = base.design.try_row_chunk(0..n).expect("test design rows");
@@ -1644,7 +1691,11 @@ mod tests {
         }
         assert_array2_close(gram, &oracle_gram, 2.0e-12);
         assert_array1_close(cross, &oracle_cross, 2.0e-12);
-        assert_close(*response_quadratic, oracle_response, 2.0e-12);
+        let zero_coefficients = Array2::<f64>::zeros((k, d));
+        let direct_response_quadratic = prepared
+            .profiled_deviance(&zero_coefficients)
+            .expect("direct zero-fit quadratic");
+        assert_close(direct_response_quadratic, oracle_response, 2.0e-12);
     }
 
     #[test]
