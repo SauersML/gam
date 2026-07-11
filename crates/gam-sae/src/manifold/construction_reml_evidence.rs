@@ -1878,7 +1878,7 @@ impl SaeManifoldTerm {
         // matrix-free ARD/smoothness traces off it. The log-determinant itself is
         // recomputed chunk-by-chunk in `streaming_exact_arrow_log_det` to bound
         // peak memory (bit-identical to the dense path, #847).
-        let converged_cache = self.converge_inner_for_undamped_logdet(
+        let mut converged_cache = self.converge_inner_for_undamped_logdet(
             target,
             rho,
             &mut rho_fixed,
@@ -1901,6 +1901,13 @@ impl SaeManifoldTerm {
             Some(&mut rank_inputs),
             lane,
         )?;
+        // The returned row-factor cache and the external matrix-free log|S|
+        // estimate are one evidence operator. Stamp the authoritative joint
+        // value onto the cache so from-probes theta-adjoint consumers can verify
+        // that their selected-inverse bundle differentiates a live log-det,
+        // exactly as dense caches do through their Schur-factor path.
+        converged_cache.joint_hessian_log_det = Some(log_det);
+        converged_cache.schur_factor_is_undamped = true;
         let occam = self.reml_occam_term(rho)?;
         // Extra analytic-penalty energy (#671/#737), matching the full-batch
         // `reml_criterion_with_cache` path so streaming and dense criteria rank
@@ -2035,6 +2042,53 @@ impl SaeManifoldTerm {
         self.streaming_exact_arrow_log_det_with_lane(target, rho, registry, rank_inputs, None)
     }
 
+    /// Assemble the one whole-row matrix-free evidence system at the current
+    /// fitted state. The dense reduced Schur is never formed: the returned
+    /// system retains only the structured shared-block and row-cross operators.
+    ///
+    /// This single source of truth is consumed both by the rational
+    /// log-determinant and by #2230's exact-stationarity IFT solve, ensuring the
+    /// value and assignment-strength residual cannot reassemble different
+    /// operators. Optional rank inputs are accumulated from the same full chunk.
+    pub(crate) fn assemble_full_matrix_free_evidence_system(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        mut rank_inputs: Option<&mut StreamingRankInputs>,
+    ) -> Result<ArrowSchurSystem, String> {
+        let n_total = self.n_obs();
+        let full_logits = self.assignment.logits.slice(s![0..n_total, ..]).to_owned();
+        let full_coords: Vec<Array2<f64>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.as_matrix().slice(s![0..n_total, ..]).to_owned())
+            .collect();
+        let mut full_chunk = self.materialize_chunk(
+            full_logits,
+            full_coords,
+            self.chunk_frozen_logits(0, n_total),
+        )?;
+        if let Some(weights) = self.row_loss_weights.as_deref() {
+            full_chunk.row_loss_weights = Some(weights[0..n_total].to_vec());
+        }
+        if let Some(inputs) = rank_inputs.as_deref_mut() {
+            full_chunk.accumulate_decoder_gram(&mut inputs.grams);
+            let assignments = full_chunk.assignment.assignments();
+            for atom in 0..inputs.n_eff.len() {
+                let support = SupportMeasure::from_assignment_matrix(assignments.view(), atom)
+                    .expect("streaming full-rank chunk assignment shape must match atoms");
+                inputs.n_eff[atom] += support.fisher_n();
+            }
+        }
+        full_chunk
+            .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
+            .map_err(|error| {
+                format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {error}")
+            })
+    }
+
     /// Streaming reduced-Schur evidence `log|H| = Σ log|H_tt| + log|S|` with the
     /// #2080 surrogate lane threaded to the `log|S|` term. `lane = None` runs the
     /// bit-identical SLQ path; `lane = Some(state)` builds-or-reuses the frozen
@@ -2099,42 +2153,18 @@ impl SaeManifoldTerm {
                     plan.estimated_dense_schur_bytes, plan.in_core_budget_bytes
                 ));
             }
-            let n_total = self.n_obs();
             let options = ArrowSolveOptions::direct()
                 .with_ill_conditioning_tolerated()
                 .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
             // Assemble the WHOLE system once (a single "chunk" over all rows) so the
             // matrix-free reduced-Schur apply `v ↦ S·v` can iterate every row; the
             // per-row block storage is exactly what the inner solve already holds.
-            let full_logits = self.assignment.logits.slice(s![0..n_total, ..]).to_owned();
-            let full_coords: Vec<Array2<f64>> = self
-                .assignment
-                .coords
-                .iter()
-                .map(|coord| coord.as_matrix().slice(s![0..n_total, ..]).to_owned())
-                .collect();
-            let mut full_chunk = self.materialize_chunk(
-                full_logits,
-                full_coords,
-                self.chunk_frozen_logits(0, n_total),
+            let sys = self.assemble_full_matrix_free_evidence_system(
+                target,
+                rho,
+                registry,
+                rank_inputs.as_deref_mut(),
             )?;
-            if let Some(w) = self.row_loss_weights.as_deref() {
-                full_chunk.row_loss_weights = Some(w[0..n_total].to_vec());
-            }
-            if let Some(ri) = rank_inputs.as_deref_mut() {
-                full_chunk.accumulate_decoder_gram(&mut ri.grams);
-                let asg = full_chunk.assignment.assignments();
-                for k in 0..ri.n_eff.len() {
-                    let support = SupportMeasure::from_assignment_matrix(asg.view(), k)
-                        .expect("streaming full-rank chunk assignment shape must match atoms");
-                    ri.n_eff[k] += support.fisher_n();
-                }
-            }
-            // Full penalty (`penalty_scale = 1.0`): one chunk carries the whole
-            // objective, matching the summed per-chunk `(end-start)/n_total` scale.
-            let sys = full_chunk
-                .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
-                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             // #2080: the reduced-Schur `log|S|` term. `lane = None` runs the
             // bit-identical SLQ estimate; `lane = Some(state)` swaps in the frozen
             // derived-rank rational surrogate (matrix-free, value+ρ-gradient one

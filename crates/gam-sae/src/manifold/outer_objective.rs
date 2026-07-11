@@ -685,6 +685,27 @@ pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivativ
     }
 }
 
+/// The one active outer coordinate that is neither a Gaussian/Fellner-Schall
+/// precision nor an IBP occupancy fixed point on the matrix-free path. Softmax
+/// entropy and threshold-gated L1 have a true REML derivative but no EFS root;
+/// Hybrid-EFS therefore treats this coordinate as its analytic-gradient block
+/// while all smoothness/ARD coordinates retain simultaneous EFS updates.
+pub(crate) fn matrix_free_assignment_gradient_coordinate(
+    plan: SaeStreamingPlan,
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+) -> Option<usize> {
+    if plan.direct_logdet_admitted()
+        || !matches!(
+            term.assignment.mode,
+            AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. }
+        )
+    {
+        return None;
+    }
+    rho.sparse_flat_index()
+}
+
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
 /// surrogate that supersedes SLQ on the matrix-free massive-K evidence path.
 /// Probe count and seed mirror the SLQ lane it replaces; the deflation target is
@@ -2949,6 +2970,8 @@ impl SaeManifoldOuterObjective {
                 ))
             })
             .collect::<Vec<_>>();
+        let mut assignment_psi_gradient: Option<Array1<f64>> = None;
+        let mut assignment_psi_indices: Option<Vec<usize>> = None;
 
         // λ_sparse (when present): the ordered-IBP concentration α is the ONE sparsity
         // prior with a closed-form empirical-Bayes marginal M-step (the
@@ -2980,10 +3003,61 @@ impl SaeManifoldOuterObjective {
                         );
                 }
                 None => {
-                    fixed_point_coordinates[sparse_index] =
-                        FixedPointCoordinateCertificate::uncovered(
-                            "assignment sparsity coordinate has no root-equivalent fixed-point equation",
-                        );
+                    if matrix_free_assignment_gradient_coordinate(
+                        self.term.streaming_plan(),
+                        &self.term,
+                        &rho,
+                    ) == Some(sparse_index)
+                    {
+                        let (probes, inverse_probes) = inverse_probe_bundle
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "SaeManifoldOuterObjective::efs_step: matrix-free assignment \
+                                 gradient requires the value lane's inverse-probe bundle"
+                                    .to_string()
+                            })?;
+                        let system = self.term.assemble_full_matrix_free_evidence_system(
+                            self.target.view(),
+                            &rho,
+                            self.registry.as_ref(),
+                            None,
+                        )?;
+                        let gradient = self
+                            .term
+                            .analytic_assignment_strength_gradient_matrix_free(
+                                self.target.view(),
+                                &rho,
+                                &cache,
+                                &system,
+                                probes,
+                                inverse_probes,
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "SaeManifoldOuterObjective::efs_step: matrix-free \
+                                     assignment-strength gradient: {error}"
+                                )
+                            })?;
+                        // A normalized negative gradient is a bounded feasible-
+                        // descent update whose zero is EXACTLY the REML root.
+                        // `max(|g|, 1)` is the coordinate's natural unit-gradient
+                        // scale in dimensionless log-strength space: it caps a
+                        // remote step at one log unit and becomes the raw Newton-
+                        // local residual unchanged once |g| < 1. The shared EFS
+                        // cost backtracking still adjudicates every nonlocal move.
+                        let gradient_scale = gradient.abs().max(1.0);
+                        let step = -gradient / gradient_scale;
+                        steps[sparse_index] = step;
+                        fixed_point_coordinates[sparse_index] =
+                            FixedPointCoordinateCertificate::covered(step, 1.0);
+                        assignment_psi_gradient = Some(Array1::from_vec(vec![gradient]));
+                        assignment_psi_indices = Some(vec![sparse_index]);
+                    } else {
+                        fixed_point_coordinates[sparse_index] =
+                            FixedPointCoordinateCertificate::uncovered(
+                                "assignment sparsity coordinate has no root-equivalent fixed-point equation",
+                            );
+                    }
                 }
             }
         }
@@ -3263,8 +3337,8 @@ impl SaeManifoldOuterObjective {
                 cost,
                 steps,
                 beta: Some(beta_hat),
-                psi_gradient: None,
-                psi_indices: None,
+                psi_gradient: assignment_psi_gradient,
+                psi_indices: assignment_psi_indices,
                 inner_hessian_scale: None,
                 logdet_enclosure_gap: None,
                 consecutive_restored_incumbents,
@@ -3346,6 +3420,14 @@ fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
+        let matrix_free_assignment_gradient_dim = usize::from(
+            matrix_free_assignment_gradient_coordinate(
+                streaming_plan,
+                &self.term,
+                &self.baseline_rho,
+            )
+            .is_some(),
+        );
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
@@ -3360,9 +3442,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
             gradient: sae_outer_gradient_capability(streaming_plan),
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
-            // ρ are all penalty-like / τ coordinates: precisions and
-            // log-smoothing strengths. No design-moving ψ coordinates.
-            psi_dim: 0,
+            // Matrix-free softmax/threshold fits have one non-FS coordinate:
+            // assignment strength. Mark it as the Hybrid-EFS analytic-gradient
+            // block so the scalable EFS updates still own smoothness/ARD while
+            // this coordinate moves by its exact REML gradient. Dense fits keep
+            // the ordinary full-gradient/BFGS declaration.
+            psi_dim: matrix_free_assignment_gradient_dim,
             // SPEC: "REML or LAML is used for fitting." The Fellner–Schall
             // fixed point is the canonical REML method and needs ONLY the traces
             // tr(H⁻¹ S_c) (decoder_smoothness_effective_dof + ard_inverse_traces),

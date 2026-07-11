@@ -573,6 +573,128 @@ impl SaeManifoldTerm {
         solve_exact_stationarity_on_gauge_quotient(solver, rhs, &apply_raw_a, &apply_raw_b)
     }
 
+    /// Matrix-free exact-stationarity sibling used by the wide-border REML
+    /// assignment-strength residual. `system` is the reassembled undamped
+    /// bordered operator at the converged inner state; `cache` supplies the same
+    /// row factors and H_tbeta operator whose rational log-determinant and shared
+    /// inverse-probe bundle were consumed by the value/trace lanes.
+    ///
+    /// The reduced beta solve is quotient-aware and matrix-free. Per-row
+    /// spectral deflation is refused by the selected-inverse channels before
+    /// this seam is reached: a border-only probe bundle cannot differentiate
+    /// the Daleckii-Krein deflation map, so proceeding would be a false exactness
+    /// claim rather than a usable fallback.
+    fn solve_exact_stationarity_matrix_free(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        system: &ArrowSchurSystem,
+        rhs: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let apply_b = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            let (t, beta) = matrix_free_arrow_operator_apply(
+                system,
+                cache,
+                vector.t.view(),
+                vector.beta.view(),
+            )
+            .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
+            Ok(SaeArrowVector { t, beta })
+        };
+        let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            let base = apply_b(vector)?;
+            let correction = self.apply_exact_hessian_minus_b(rho, target, cache, vector)?;
+            Ok(SaeArrowVector {
+                t: &base.t + &correction.t,
+                beta: &base.beta + &correction.beta,
+            })
+        };
+        let precondition = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
+            // The outer exact-stationarity residual is certified to 1e-10 in
+            // `solve_b_preconditioned_gmres`; drive its deterministic SPD
+            // reduced preconditioner to the same relative accuracy. In exact
+            // arithmetic CG terminates in at most the reduced dimension, so the
+            // dimension itself is the non-arbitrary iteration bound.
+            let (t, beta) = matrix_free_arrow_inverse_apply(
+                system,
+                cache,
+                vector.t.view(),
+                vector.beta.view(),
+                1.0e-10,
+                cache.k.max(1),
+            )
+            .map_err(|error| format!("matrix-free evidence inverse: {error}"))?;
+            Ok(SaeArrowVector { t, beta })
+        };
+        solve_exact_stationarity_preconditioned(rhs, &apply_a, &apply_b, precondition)
+    }
+
+    /// Exact non-IBP assignment-strength REML gradient on the matrix-free
+    /// evidence path. This is the one coordinate softmax entropy and gated L1
+    /// cannot update through a Fellner-Schall equation:
+    ///
+    /// `dV/drho_sparse = explicit_prior + 0.5 tr(B^-1 dB/drho_sparse)
+    ///                    - 0.5 Gamma^T A^-1 dg/drho_sparse`.
+    ///
+    /// Every selected-inverse contraction uses the same `(z, S^-1 z)` bundle
+    /// the rational log-determinant emitted, and the implicit response uses the
+    /// matrix-free exact-stationarity solve above. No dense Schur, finite
+    /// difference, held-zero surrogate, or degraded derivative is involved.
+    pub(crate) fn analytic_assignment_strength_gradient_matrix_free(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        system: &ArrowSchurSystem,
+        probes: &[Array1<f64>],
+        inverse_probes: &[Array1<f64>],
+    ) -> Result<f64, OuterGradientError> {
+        let sparse_index = rho.sparse_flat_index().ok_or_else(|| {
+            OuterGradientError::internal(
+                "matrix-free assignment-strength gradient requested for a rho with no sparse coordinate",
+            )
+        })?;
+        let explicit = crate::assignment::assignment_prior_log_strength_derivative_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        );
+        let logdet_trace = self
+            .assignment_log_strength_hessian_trace_from_probes(
+                rho,
+                cache,
+                probes,
+                inverse_probes,
+            )
+            .map_err(OuterGradientError::internal)?;
+        let gamma = self
+            .logdet_theta_adjoint_from_probes(rho, cache, probes, inverse_probes)
+            .map_err(OuterGradientError::internal)?;
+        let rhs = self
+            .outer_rho_gradient_ift_rhs(rho, sparse_index, cache)
+            .map_err(OuterGradientError::internal)?;
+        let response = self
+            .solve_exact_stationarity_matrix_free(rho, target, cache, system, &rhs)
+            .map_err(|error| {
+                OuterGradientError::classify_arrow_solver_error(
+                    &error,
+                    OuterGradientError::NonIdentifiable {
+                        reason: error.clone(),
+                    },
+                )
+            })?;
+        let correction = -0.5 * sae_inner(&gamma, &response);
+        let gradient = explicit + logdet_trace + correction;
+        if !gradient.is_finite() {
+            return Err(OuterGradientError::internal(format!(
+                "matrix-free assignment-strength gradient is non-finite: explicit={explicit}, \
+                 logdet_trace={logdet_trace}, IFT_correction={correction}"
+            )));
+        }
+        Ok(gradient)
+    }
+
     /// Analytic SAE REML outer-ρ gradient components at the already converged
     /// inner state represented by `loss` and `cache`.
     ///
