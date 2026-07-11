@@ -681,7 +681,25 @@ pub(crate) fn run_outer_with_plan(
                             // coefficient-only seed here would discard it.
                             legs_descended += 1;
                             match reactive_arrival_postcondition(&state, seed) {
-                                Ok(()) => continuation_arrived = true,
+                                Ok(()) => {
+                                    // The successful target solve may have
+                                    // advanced objective-owned inner schedules.
+                                    // Reinstall the literal scalar target before
+                                    // the independent exact-value verification.
+                                    let target = reactive_domain_scalar_contract
+                                        .as_ref()
+                                        .expect("reactive scalar contract checked above")
+                                        .target();
+                                    match obj.install_reactive_domain_scalar_state(target) {
+                                        Ok(()) => continuation_arrived = true,
+                                        Err(err) => {
+                                            continuation_arrival_refusal = Some(format!(
+                                                "reactive domain entry could not restore the \
+                                                 literal scalar target before verification: {err}"
+                                            ));
+                                        }
+                                    }
+                                }
                                 Err(reason) => continuation_arrival_refusal = Some(reason),
                             }
                             break;

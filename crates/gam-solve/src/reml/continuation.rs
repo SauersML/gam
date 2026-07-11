@@ -34,11 +34,11 @@
 
 use ndarray::Array1;
 
-use gam_problem::diagnostics::KktRefusalDiagnosis;
 use crate::estimate::EstimationError;
 use crate::inner_status::{InnerFailure, classify_inner_error};
 use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
 use gam_problem::OuterEval;
+use gam_problem::diagnostics::KktRefusalDiagnosis;
 
 /// Hard ceiling on the number of ρ steps along a single continuation
 /// path. Past this we surface the last `InnerFailure` rather than the
@@ -576,10 +576,10 @@ pub(crate) fn run_path(
 }
 
 /// One **warm** continuation leg (the ContinuationPath waypoint primitive):
-/// walk from an existing converged state to `target` under a small eval
-/// budget. Unlike [`fit_with_continuation`] this never re-enters from the
-/// oversmoothed ρ₀ — the caller owns the heavier-regime fallback (the coupled
-/// path re-enters a heavier waypoint on failure) — so Stuck/ExpandRhoZero
+/// walk from an existing converged state to `target` under the spine-owned
+/// [`PATH_BUDGET`]. Unlike [`fit_with_continuation`] this never restarts from
+/// the oversmoothed ρ₀; the coupled path retains its last accepted waypoint and
+/// refines the next attempted distance on failure. Stuck/ExpandRhoZero
 /// outcomes surface as [`ContinuationFailure::PathStuck`] with
 /// `rho_zero_offset = 0.0` (no oversmooth expansion is involved in a warm leg;
 /// `final_rho` reports the leg's target as the diagnostic anchor).
@@ -588,12 +588,11 @@ pub(crate) fn continue_path_from(
     start: ContinuationState,
     target: &Array1<f64>,
     order: OuterEvalOrder,
-    leg_budget: usize,
 ) -> ContinuationResult {
     if reached_target(&start.last_rho, target) {
         return Ok(start);
     }
-    match walk_state_toward(obj, start, target, order, leg_budget, 0) {
+    match walk_state_toward(obj, start, target, order, PATH_BUDGET, 0) {
         Ok(state) => Ok(state),
         Err(PathOutcome::PathBudgetExhausted {
             last,
@@ -1277,8 +1276,7 @@ mod tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                )
-                    -> Result<crate::rho_optimizer::SeedOutcome, EstimationError>,
+                ) -> Result<crate::rho_optimizer::SeedOutcome, EstimationError>,
             >,
             continuation_prewarm: true,
         };
@@ -1348,8 +1346,7 @@ mod tests {
                 fn(
                     &mut (),
                     &Array1<f64>,
-                )
-                    -> Result<crate::rho_optimizer::SeedOutcome, EstimationError>,
+                ) -> Result<crate::rho_optimizer::SeedOutcome, EstimationError>,
             >,
             continuation_prewarm: true,
         };

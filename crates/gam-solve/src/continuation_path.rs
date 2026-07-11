@@ -70,7 +70,7 @@
 //!   per-row active mass collapses toward the uniform saddle, triggers a
 //!   *re-seed from the scaffold* (the pristine seeded geometry) — recorded in
 //!   the [`ReseedLedger`], **never fatal**. A breach is a ledger entry and a
-//!   regime re-entry, not an error return.
+//!   smaller next attempted distance, not an error return.
 //!
 //! This module owns the coupling object and the hook *interfaces / return
 //! types*. The wiring agent implements the call sites against these types.
@@ -78,7 +78,7 @@
 use ndarray::{Array1, ArrayView2};
 
 use crate::estimate::reml::continuation::{
-    ContinuationFailure, ContinuationState, PATH_BUDGET, continue_path_from, fit_with_continuation,
+    ContinuationFailure, ContinuationState, continue_path_from, fit_with_continuation,
 };
 use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
@@ -528,8 +528,8 @@ pub(crate) enum RefinementReason {
 /// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime), and
 /// only a solved literal target can produce arrival.
 ///
-/// The wiring agent drives the path one waypoint at a time:
-/// `let step = path.step(obj, &mut ledger);` and, per [`ContinuationStep`],
+/// The outer driver advances the path one waypoint at a time:
+/// `let step = path.step(obj, &warm_beta)?;` and, per [`ContinuationStep`],
 /// installs the next waypoint's [`ContinuationScalarState`] (τ on the SAE term,
 /// one weight per isometry penalty) and applies the [`LogitTrustRegion`] /
 /// [`ActiveMassFloor`] hooks inside the inner solve.
@@ -790,7 +790,7 @@ impl ContinuationPath {
                 // the real outer optimizer asks for the gradient once after the
                 // path arrives.  `Value` preserves the same inner solve and warm
                 // beta propagation while removing that redundant derivative work.
-                continue_path_from(obj, start, &rho_target, OuterEvalOrder::Value, PATH_BUDGET)
+                continue_path_from(obj, start, &rho_target, OuterEvalOrder::Value)
             }
             None => fit_with_continuation(
                 obj,
@@ -1186,7 +1186,8 @@ mod tests {
 
         fn reactive_domain_scalar_contract(
             &self,
-        ) -> Result<Option<ContinuationScalarContract>, crate::model_types::EstimationError> {
+        ) -> Result<Option<ContinuationScalarContract>, crate::model_types::EstimationError>
+        {
             Ok(Some(scalar_contract()))
         }
 
