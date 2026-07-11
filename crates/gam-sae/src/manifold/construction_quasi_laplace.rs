@@ -596,6 +596,62 @@ impl SaeManifoldTerm {
         options: &ArrowSolveOptions,
         refine_progress_extension: bool,
     ) -> Result<ArrowFactorCache, String> {
+        // ONE CRITERION EVALUATION = ONE OBJECTIVE (#2228 Zeno ratchet). The
+        // collapse-prevention gates (decoder repulsion, barrier coactivation)
+        // historically re-froze at EVERY assembly, so each accepted refine /
+        // terminal-Newton move slightly changed the objective being priced —
+        // the stationary point walked away from the solver ~1.5% in ‖g‖ per
+        // polish∘re-entry cycle (measured on the tier-0 fixtures: 54
+        // consecutive committed Newton steps with monotonically RISING entry
+        // ‖g‖ 1.01e-4 → 1.16e-4 against a 6.07e-5 band, then budget
+        // refusal). Freezing the gates ONCE for the whole evaluation is the
+        // same discipline the streaming fit already trusts
+        // (`streaming_gates_frozen`, chunk-size-invariance pinned) and is
+        // exactly what value/gradient consistency (#1026/#1625) wants at the
+        // evaluation scope rather than per assembly. A NEW evaluation (new ρ,
+        // or an evidence re-entry) still re-freezes from its own entry state,
+        // so a settled state re-prices identically — the #2253 idempotence
+        // certificate is preserved, and V(ρ) still tracks routing changes
+        // across ρ moves.
+        let gates_were_frozen = self.streaming_gates_frozen;
+        if !gates_were_frozen {
+            self.refresh_decoder_repulsion_gate();
+            self.refresh_barrier_coactivation_gate();
+            self.streaming_gates_frozen = true;
+        }
+        let out = self.converge_inner_for_undamped_logdet_gate_frozen(
+            target,
+            rho,
+            rho_fixed,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            loss,
+            criterion_fixed_point,
+            options,
+            refine_progress_extension,
+        );
+        self.streaming_gates_frozen = gates_were_frozen;
+        out
+    }
+
+    fn converge_inner_for_undamped_logdet_gate_frozen(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        rho_fixed: &mut SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        loss: &mut SaeManifoldLoss,
+        criterion_fixed_point: &mut bool,
+        options: &ArrowSolveOptions,
+        refine_progress_extension: bool,
+    ) -> Result<ArrowFactorCache, String> {
         // `inner_max_iter == 0` is a genuine FREEZE of the inner `(t, β)` state
         // — a verbatim warm-start reuse, not a convergence request (gam#577/#579,
         // #850). The convergence/refinement loop below MUST NOT run even one
