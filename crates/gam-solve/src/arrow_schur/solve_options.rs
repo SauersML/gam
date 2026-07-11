@@ -282,7 +282,7 @@ pub struct ArrowSolveOptions {
     /// The inner Newton then makes a real descent step rather than crawling
     /// behind an inflated global ridge. Mirrors the per-row spectral floor the
     /// evidence path uses for #1377/#1117/#1118
-    /// ([`super::factorization::factor_spectral_deflated_evidence_row`]); the
+    /// ([`super::factorization::factor_spectral_deflated_criterion_row`]); the
     /// difference is the floored value — a small positive `floor·max λ`
     /// (Tikhonov) for the solve, vs unit stiffness `+1` (`log 1 = 0`) for the
     /// evidence log-det.

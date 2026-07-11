@@ -493,7 +493,7 @@ pub(crate) fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
 /// caller keeps the strict refusal.
 ///
 /// Mirrors the per-row evidence floor
-/// [`super::factorization::factor_spectral_deflated_evidence_row`]; the only
+/// [`super::factorization::factor_spectral_deflated_criterion_row`]; the only
 /// difference is the floored VALUE — a small positive `floor·max λ` (Tikhonov,
 /// for an accurate solve) here, vs unit stiffness `+1` (`log 1 = 0`) there (for
 /// the quotient log-det).

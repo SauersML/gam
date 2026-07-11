@@ -59,7 +59,7 @@
 //! optional Tier-1 bulk term with the SAC-composed atoms via
 //! [`SaeManifoldTerm::merge_tiers`] and runs a SINGLE frozen (`inner_max_iter ==
 //! 0`, the #850 freeze) arrow-Schur pass — evaluate-don't-optimize — to read the
-//! joint Laplace evidence at the converged point without moving β. That freeze is
+//! joint quasi-Laplace score at the converged point without moving β. That freeze is
 //! already exposed by [`SaeManifoldTerm::penalized_quasi_laplace_criterion`] at `inner_max_iter ==
 //! 0`, so no new `frozen_evaluate` primitive is needed; [`frozen_joint_penalized_quasi_laplace`]
 //! is the thin, named wrapper this module and its callers use.
@@ -69,7 +69,7 @@
 //! No RNG, no clock, no wall-clock budget, no grid search. Every threshold is a
 //! typed config knob (defaulting to the null-recovering value) or a data-derived
 //! quantity (the residual model's evidence-selected factor rank is the salience
-//! oracle). penalized quasi-Laplace throughout (the inner fits and the frozen evidence pass are the
+//! oracle). penalized quasi-Laplace throughout (the inner fits and the frozen criterion pass are the
 //! same penalized quasi-Laplace criterion every term is scored by).
 
 use ndarray::{Array1, Array2, ArrayView2};
@@ -170,7 +170,7 @@ pub struct BirthRecord {
     /// Explained residual energy `‖Λ_:,0‖²` of the top factor the seed came from
     /// — the birth's dose, reported so a trivial-but-real wiggle is visible.
     pub factor_energy: f64,
-    /// Frozen joint penalized quasi-Laplace criterion before the round (lower is better evidence).
+    /// Frozen joint penalized quasi-Laplace criterion before the round (lower is better).
     pub joint_penalized_quasi_laplace_before: f64,
     /// Frozen joint penalized quasi-Laplace criterion of the winning candidate (or the unchanged
     /// pre-round value when the round was rejected).
@@ -347,7 +347,7 @@ fn refresh_terminal_row_metric(
 }
 
 /// log|H| − Occam`), the quantity the birth evidence gate and the terminal
-/// assembly compare on. Lower is better evidence.
+/// assembly compare on. Lower is better.
 pub fn frozen_joint_penalized_quasi_laplace(
     term: &mut SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
@@ -2294,7 +2294,7 @@ pub fn fit_stagewise_batched(
 /// Phase 3 — terminal joint assembly. Merge a Tier-1 bulk term (`primary`) with
 /// the SAC-composed curved tier (`secondary`) via [`SaeManifoldTerm::merge_tiers`]
 /// and run a SINGLE frozen (evaluate-don't-optimize, `inner_max_iter == 0`)
-/// arrow-Schur pass over the merged dictionary to read its joint Laplace evidence
+/// arrow-Schur pass over the merged dictionary to read its joint quasi-Laplace score
 /// WITHOUT moving β. Returns the merged term + ρ and the frozen joint evidence.
 ///
 /// Nothing the simultaneous joint fit uniquely provided is lost: simultaneous

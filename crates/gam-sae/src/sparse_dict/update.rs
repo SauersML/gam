@@ -2749,7 +2749,7 @@ mod exact_solve_tests {
     }
 
     #[test]
-    fn shared_rho_fs_step_matches_closed_form_evidence_fixed_point() {
+    fn shared_rho_fs_step_matches_closed_form_criterion_fixed_point() {
         // Plug point 4 math (design gam#2232, Increment 2): the shared-ρ
         // Fellner–Schall / MacKay evidence fixed point is pure arithmetic over the
         // pooled linear-block aggregates. Pin it against a hand-computed value.

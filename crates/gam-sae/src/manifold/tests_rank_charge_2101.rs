@@ -511,7 +511,7 @@ fn rank_charge_shared_primitive_parity() {
 
 /// (vii) #5 VETO — the blend-null null-license fix (recov matrix 12484591). A
 /// zero-realised-rank atom (rank_eff==0 ⟺ d_eff==0) reconstructs nothing, so
-/// its Laplace evidence is invalid (the β-Schur log-det → −∞ was letting
+/// its quasi-Laplace score is invalid (the β-Schur log-det → −∞ was letting
 /// zero-‖B‖ atoms get born on a featureless residual), so the criterion must reject
 /// it categorically (v → +∞) — not merely neutralise its charge. A real circle is
 /// untouched (rank_eff=2).

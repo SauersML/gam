@@ -527,7 +527,7 @@ fn sae_direct_mode_device_engages_on_gpu_1551() {
          branch declined instead of running on GPU"
     );
 
-    // The joint-Hessian log-det the Laplace evidence consumes must be present +
+    // The joint-Hessian log-det the quasi-Laplace score consumes must be present +
     // finite (the device branch is responsible for emitting the reduced-Schur
     // factor on the device-success path).
     let log_det = cache

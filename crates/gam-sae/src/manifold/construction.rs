@@ -214,7 +214,7 @@ include!("construction_rank_charge_derivative.rs");
 // under the per-file line-count gate. They re-enter this module's scope via the
 // parent's glob re-export (`use super::*;` above).
 
-/// The undamped (ridge-0) deflated evidence factorization at an acceptance
+/// The undamped (ridge-0) deflated criterion factorization at an acceptance
 /// iterate, packaged with the factorisation-independent KKT residual norms read
 /// off the SAME assembled system. Produced by
 /// [`SaeManifoldTerm::factor_deflated_evidence_with_grad_norms`] at the
@@ -287,9 +287,9 @@ impl SaeManifoldTerm {
             arrow_assembly_workspace: SaeArrowAssemblyWorkspace::default(),
             certificate_dispersion: None,
             curvature_walk_report: None,
-            expected_evidence_gauge_deflated_directions: None,
-            evidence_gauge_deflation_reanchors: 0,
-            evidence_gauge_deflation_last_delta_sign: 0,
+            expected_criterion_gauge_deflated_directions: None,
+            criterion_gauge_deflation_reanchors: 0,
+            criterion_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
             best_cocollapse_incumbent: None,
             best_fit_incumbent: None,
@@ -482,9 +482,9 @@ impl SaeManifoldTerm {
         // spuriously flag a reversal on the merged term's FIRST deflation step or
         // start the joint polish with a partially-consumed budget (erroring
         // earlier than a fresh fit on an ill-conditioned tier-1).
-        primary.expected_evidence_gauge_deflated_directions = None;
-        primary.evidence_gauge_deflation_reanchors = 0;
-        primary.evidence_gauge_deflation_last_delta_sign = 0;
+        primary.expected_criterion_gauge_deflated_directions = None;
+        primary.criterion_gauge_deflation_reanchors = 0;
+        primary.criterion_gauge_deflation_last_delta_sign = 0;
         primary.dictionary_cocollapse_reseeds = 0;
         primary.best_cocollapse_incumbent = None;
         primary.best_fit_incumbent = None;
@@ -2283,7 +2283,7 @@ impl SaeManifoldTerm {
     /// ANY rank. Drives whitening of the log-det row jets so they differentiate
     /// the SAME whitened operator (`JᵀU UᵀJ`) the assembly builds. Independent of
     /// the ordered Beta--Bernoulli PSD majorization, which (#2144/#1038) is UNCONDITIONAL — the
-    /// assembly, evidence log-det, ρ-trace, and θ-adjoint all carry the majorized
+    /// assembly, criterion log-det, ρ-trace, and θ-adjoint all carry the majorized
     /// ordered Beta--Bernoulli curvature on every path, whitened or not, so there is no rank-gated
     /// majorization predicate anymore. `false` for the identity metric or no
     /// metric.
@@ -2353,7 +2353,7 @@ impl SaeManifoldTerm {
     /// number of decoder coordinates the border actually carries once the
     /// low-rank Grassmann frames are profiled out. Atoms with no active frame
     /// contribute their full `M_k · p` (`r_k == p`), so on the all-full-`B` path
-    /// this equals [`Self::beta_dim`]. The border Cholesky / evidence log-det
+    /// this equals [`Self::beta_dim`]. The border Cholesky / criterion log-det
     /// scale with THIS count, not `beta_dim`.
     pub fn factored_border_dim(&self) -> usize {
         self.atoms.iter().map(|a| a.border_coeff_count()).sum()
@@ -2362,7 +2362,7 @@ impl SaeManifoldTerm {
     /// Total profiled-out Grassmann manifold dimension `Σ_k r_k·(p − r_k)` across
     /// all active frames (issue #972). This is the count of decoder-frame degrees
     /// of freedom estimated OUTSIDE the border by closed-form polar steps, and it
-    /// must enter the Laplace evidence dimension accounting (evidence honesty):
+    /// must enter the quasi-Laplace score dimension accounting (evidence honesty):
     /// the profiled frame is a MAP point on `∏_k Gr(r_k, p)`, contributing this
     /// many free dimensions to the model. `0` when every atom is on the full-`B`
     /// path. Counted (unscaled by `log λ`) in the effective decoder-parameter dof
@@ -3428,7 +3428,7 @@ impl SaeManifoldTerm {
 
     /// Build the #1026 curved-vs-linear hybrid-split report by adjudicating each
     /// eligible `d = 1` atom's fitted curved image against its straight (linear
-    /// special-case) sub-model on the common rank-aware Laplace evidence scale.
+    /// special-case) sub-model on the common rank-aware quasi-Laplace score scale.
     ///
     /// Both candidates are scored against the SAME data — the atom's
     /// leave-this-atom-out response residual `y_resp = target − (full − a_k·γ_k)`
@@ -4394,7 +4394,7 @@ impl SaeManifoldTerm {
             assignment_sparsity,
             smoothness,
             ard,
-            evidence_gauge_deflated_directions: 0,
+            criterion_gauge_deflated_directions: 0,
         })
     }
 
@@ -4984,7 +4984,7 @@ impl SaeManifoldTerm {
     }
 }
 
-// [#780 line-count gate] The quasi-Laplace evidence criterion (`penalized_quasi_laplace_criterion*`)
+// [#780 line-count gate] The quasi-Laplace criterion (`penalized_quasi_laplace_criterion*`)
 // and the evidence-pricing machinery around it live in the sibling
 // `construction_quasi_laplace.rs` as a second `impl SaeManifoldTerm` block,
 // inlined here so it keeps the SAME module scope and private-field access.

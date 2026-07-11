@@ -91,7 +91,7 @@ pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
 /// inner solve is accepted as numerically converged. At `1e-4` the inner fit has
 /// captured ≥ 99.99% of the achievable penalised-objective reduction before the
 /// criterion is ranked — far past the point where further crawl can change the
-/// Laplace evidence, yet strict enough that a materially-improving fit refines on.
+/// quasi-Laplace score, yet strict enough that a materially-improving fit refines on.
 pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION: f64 = 1.0e-4;
 
 /// Minimum completed refine rounds before the objective-stagnation fixed point
@@ -248,7 +248,7 @@ pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 // The SEPARATION barrier has NO strength scalar `μ_C` at all: it is the SAE decoder
 // Jeffreys prior `−½ log det F` (see [`super::penalties::BarrierComponent`]), whose
 // exponent `½` is fixed by the prior (`π(B) ∝ √det F`) and is the exact
-// reparametrization-invariant counter-term to the Laplace evidence's `+½ log(volume)`
+// reparametrization-invariant counter-term to the quasi-Laplace score's `+½ log(volume)`
 // collapse reward — so a per-pair strength is neither present nor needed. The
 // historical `μ_jk = γ_jk/(1−γ_jk)` (data-fit inseparability, see
 // [`super::penalties::SaeManifoldTerm::barrier_pair_strength_with_gates`]) survives
@@ -430,17 +430,17 @@ pub struct SaeManifoldTerm {
     /// the objective's `reset` so each seed's walk reports only its own run.
     pub(crate) curvature_walk_report: Option<CurvatureWalkReport>,
     /// Deflated row-gauge direction count established by the first undamped
-    /// evidence factorization in the current optimization. A later change means
+    /// criterion factorization in the current optimization. A later change means
     /// the quotient dimension changed mid-solve, which is a structural event and
     /// must not be hidden inside the Laplace normalizer.
-    pub(crate) expected_evidence_gauge_deflated_directions: Option<usize>,
+    pub(crate) expected_criterion_gauge_deflated_directions: Option<usize>,
     /// #1037 re-anchor counter: how many times the quotient (gauge-deflation)
     /// dimension has been re-anchored within the current optimization. A
     /// legitimate quotient-dimension change (an atom born / reseeded /
     /// rank-reduced) re-anchors the comparison once; an unbounded churn that
     /// never settles is the genuine pathology the guard must still catch. Reset
-    /// to `0` alongside `expected_evidence_gauge_deflated_directions`.
-    pub(crate) evidence_gauge_deflation_reanchors: usize,
+    /// to `0` alongside `expected_criterion_gauge_deflated_directions`.
+    pub(crate) criterion_gauge_deflation_reanchors: usize,
     /// #1217 oscillation detector: the sign of the most recent change in the
     /// gauge-deflation count (`+1` when it last increased, `−1` when it last
     /// decreased, `0` before the first change). The deflation count is a
@@ -451,11 +451,11 @@ pub struct SaeManifoldTerm {
     /// OSCILLATING count (repeated direction reversals that never settle), so
     /// the re-anchor budget is charged only on a direction REVERSAL, not on
     /// every monotone drift step. Reset to `0` alongside the re-anchor counter.
-    pub(crate) evidence_gauge_deflation_last_delta_sign: i8,
+    pub(crate) criterion_gauge_deflation_last_delta_sign: i8,
     /// #976 / #1117 K>1 robustness: how many full-dictionary co-collapse
     /// multi-starts the decoder-norm guard has already spent in the current
     /// optimization. Bounded by [`SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`];
-    /// reset to `0` alongside [`Self::evidence_gauge_deflation_reanchors`] at the
+    /// reset to `0` alongside [`Self::criterion_gauge_deflation_reanchors`] at the
     /// start of each outer optimization. Distinct from the per-atom reseed
     /// ledger in [`Self::collapse_events`] because a co-collapse reseed is a
     /// whole-dictionary multi-start, not a per-atom second chance.
@@ -558,7 +558,7 @@ pub struct SaeManifoldTerm {
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
     /// against its straight (linear special-case) sub-model on the common
-    /// rank-aware Laplace evidence scale. `None` until the post-fit pass runs (or
+    /// rank-aware quasi-Laplace score scale. `None` until the post-fit pass runs (or
     /// when no atom is eligible). Surfaced in the Python model output so a user
     /// sees which atoms genuinely earn their curvature and which collapse to the
     /// linear tail. Read via [`Self::hybrid_split_report`].
@@ -688,10 +688,10 @@ impl Clone for SaeManifoldTerm {
             arrow_assembly_workspace: SaeArrowAssemblyWorkspace::default(),
             certificate_dispersion: self.certificate_dispersion,
             curvature_walk_report: self.curvature_walk_report.clone(),
-            expected_evidence_gauge_deflated_directions: self
-                .expected_evidence_gauge_deflated_directions,
-            evidence_gauge_deflation_reanchors: self.evidence_gauge_deflation_reanchors,
-            evidence_gauge_deflation_last_delta_sign: self.evidence_gauge_deflation_last_delta_sign,
+            expected_criterion_gauge_deflated_directions: self
+                .expected_criterion_gauge_deflated_directions,
+            criterion_gauge_deflation_reanchors: self.criterion_gauge_deflation_reanchors,
+            criterion_gauge_deflation_last_delta_sign: self.criterion_gauge_deflation_last_delta_sign,
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             // Transient in-fit multi-start incumbent — not part of the persisted
             // term identity (like `border_hbb_workspace`); a fresh clone starts

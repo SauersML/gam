@@ -7,7 +7,7 @@ pub struct SaeManifoldLoss {
     pub assignment_sparsity: f64,
     pub smoothness: f64,
     pub ard: f64,
-    pub evidence_gauge_deflated_directions: usize,
+    pub criterion_gauge_deflated_directions: usize,
 }
 
 impl SaeManifoldLoss {
@@ -41,7 +41,7 @@ impl SaeManifoldLoss {
             ard: self.ard,
             total_penalized_loss: self.total(),
             penalized_loss_score: self.penalized_loss_score(),
-            evidence_gauge_deflated_directions: self.evidence_gauge_deflated_directions,
+            criterion_gauge_deflated_directions: self.criterion_gauge_deflated_directions,
         }
     }
 }
@@ -62,7 +62,7 @@ pub struct SaeManifoldLossBreakdown {
     /// `−total_penalized_loss` (larger = less penalized loss).
     pub penalized_loss_score: f64,
     /// Count of evidence-gauge-deflated directions recorded on the loss.
-    pub evidence_gauge_deflated_directions: usize,
+    pub criterion_gauge_deflated_directions: usize,
 }
 
 /// Componentized analytic derivative of the SAE penalized quasi-Laplace criterion with respect to
@@ -108,7 +108,7 @@ mod tests {
             assignment_sparsity: 0.25,
             smoothness: 0.5,
             ard: 0.75,
-            evidence_gauge_deflated_directions: 3,
+            criterion_gauge_deflated_directions: 3,
         };
         let total = 1.5 + 0.25 + 0.5 + 0.75;
         assert!((loss.total() - total).abs() < 1e-12);
@@ -126,6 +126,6 @@ mod tests {
         // evidence pieces folded into it.
         let summed = b.data_fit + b.assignment_sparsity + b.smoothness + b.ard;
         assert!((summed - b.total_penalized_loss).abs() < 1e-12);
-        assert_eq!(b.evidence_gauge_deflated_directions, 3);
+        assert_eq!(b.criterion_gauge_deflated_directions, 3);
     }
 }

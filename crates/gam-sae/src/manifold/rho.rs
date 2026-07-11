@@ -357,7 +357,7 @@ impl SaeManifoldRho {
         // shift `ln φ_seed` WEAKENS the decoder-smoothness / ARD seed toward
         // zero. That hands the coupled `(coords, decoders)` block enough slack to
         // overfit AT THE SEED, driving the undamped per-row / cross-row joint
-        // Hessian indefinite — a non-PD seed whose Laplace evidence log-det is
+        // Hessian indefinite — a non-PD seed whose quasi-Laplace score log-det is
         // undefined. Because the SAE fit runs a single seed (`max_seeds = 1`),
         // the EFS startup validation then rejects it with "no candidate seeds
         // passed outer startup validation" (the #1782 softmax / threshold-gate failure),

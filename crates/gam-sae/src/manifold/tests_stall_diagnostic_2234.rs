@@ -150,7 +150,7 @@ fn logdet_audit_point(
         &rho.lambda_smooth_vec(),
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
-    if !SaeManifoldTerm::evidence_kkt_stationary(
+    if !SaeManifoldTerm::quasi_laplace_kkt_stationary(
         kkt_grad_norm,
         quotient_kkt_grad_norm,
         kkt_tolerance,
@@ -175,7 +175,7 @@ fn logdet_audit_point(
         .map(|atom| atom.decoder_frame.clone())
         .collect();
     let mut recurrence_rho = rho.clone();
-    let recurrence = recurrence_term.run_joint_fit_arrow_schur_for_evidence(
+    let recurrence = recurrence_term.run_joint_fit_arrow_schur_for_quasi_laplace(
         target,
         &mut recurrence_rho,
         registry,

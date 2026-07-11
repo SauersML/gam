@@ -194,7 +194,7 @@ impl<'a> DeflatedArrowSolver<'a> {
     ///
     /// [`Self::latent_inverse_diagonal`] returns the diagonal of the DEFLATED
     /// inverse, which assigns `1/λ̃ = 1` to every per-row direction `vᵢ` that the
-    /// undamped evidence factor stiffened to unit curvature; a `½ tr(H⁻¹ ∂H/∂ρ)`
+    /// undamped criterion factor stiffened to unit curvature; a `½ tr(H⁻¹ ∂H/∂ρ)`
     /// diagonal contraction against it therefore spuriously includes
     /// `Σ_i vᵢ[s]²` at slot `s`, a ρ/θ-independent contribution that must be 0.
     /// This variant subtracts the per-row deflated outer-product diagonal

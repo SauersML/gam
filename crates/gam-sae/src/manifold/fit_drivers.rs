@@ -923,7 +923,7 @@ impl SaeManifoldTerm {
         // #1026 — make the curved-vs-linear split LOAD-BEARING. The Θ log above
         // is the read-only diagnostic; here we adjudicate, per eligible d = 1
         // atom, the fitted curved image against its straight (linear
-        // special-case) sub-model on the common rank-aware Laplace evidence
+        // special-case) sub-model on the common rank-aware quasi-Laplace score
         // scale and record the verdict. This is closed-form per atom (the
         // collapsed linear lane — exact penalized LS through the fitted decoded
         // points), so it does NOT re-enter the broken euclidean outer fit path
@@ -2560,7 +2560,7 @@ impl SaeManifoldTerm {
     /// with `∂Φ^η/∂η` the raw curved-column basis (zero on base columns) and
     /// `∂r_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η) · B_{k'}`. The smoothness and
     /// ARD penalties do not depend on `η`, so they contribute nothing. The
-    /// predictor solves `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor.
+    /// predictor solves `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached criterion factor.
     pub(crate) fn curvature_beta_gradient_eta_derivative(
         &self,
         target: ArrayView2<'_, f64>,
@@ -3327,7 +3327,7 @@ impl SaeManifoldTerm {
             // grows geometrically and the "residual ≈ target" invariant every reseed
             // relies on (see the reseed rationale above) is violated — the bounded
             // multi-start degenerates into a runaway whose blown-up decoders also
-            // corrupt the outer penalized quasi-Laplace evidence, and the host process is SIGKILLed
+            // corrupt the outer penalized quasi-Laplace score, and the host process is SIGKILLed
             // (OOM / watchdog, exit 137) before any model or error is returned.
             //
             // A reseed is therefore RETAINED only when it is the new best basin under
@@ -3726,7 +3726,7 @@ impl SaeManifoldTerm {
                 // A gated design `D_k = diag(a_·k)·Φ_k` that is all-zero means atom
                 // `k` is gated OFF at every row: its reconstruction is identically
                 // zero for ANY decoder, so the reduced joint problem this seed ρ
-                // presents is rank-deficient and its closed-form Laplace evidence is
+                // presents is rank-deficient and its closed-form quasi-Laplace score is
                 // undefined — the SAME infeasible-ρ class as the non-PD Schur /
                 // per-row Hessian refusals (#1782). It arises for a legitimate seed
                 // state (a threshold gate that numerically underflows on every row at an
@@ -5330,7 +5330,7 @@ impl SaeManifoldTerm {
     /// by an implicit evidence derivative. Evidence therefore retains only the
     /// actual no-descent / proximal-no-strict-decrease termination routes before
     /// the undamped cache is formed (#2253).
-    pub(crate) fn run_joint_fit_arrow_schur_for_evidence(
+    pub(crate) fn run_joint_fit_arrow_schur_for_quasi_laplace(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &mut SaeManifoldRho,
@@ -5361,7 +5361,7 @@ impl SaeManifoldTerm {
         )?;
         if matches!(outcome.termination, JointFitTermination::Heuristic) {
             return Err(
-                "SaeManifoldTerm::run_joint_fit_arrow_schur_for_evidence: heuristic \
+                "SaeManifoldTerm::run_joint_fit_arrow_schur_for_quasi_laplace: heuristic \
                  termination escaped the evidence policy"
                     .to_string(),
             );
@@ -5598,7 +5598,7 @@ impl SaeManifoldTerm {
         }
         // #1026/#2230 — keep the best state found inside this bounded inner
         // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
-        // the same scalar the Armijo lane descends and the outer penalized quasi-Laplace evidence
+        // the same scalar the Armijo lane descends and the outer penalized quasi-Laplace score
         // consumes. The incumbent exists to undo damage from the NON-monotone
         // boundary hooks (collapse reseeds, gauge retraction/pin, frame
         // refresh) — the Armijo walk itself is objective-monotone, so under
@@ -5754,7 +5754,7 @@ impl SaeManifoldTerm {
             // (`SaeManifoldOuterObjective`) and held FIXED across this inner
             // (t, β) Newton solve. The inner loop solves the joint manifold +
             // decoder system at the engine's current ρ; the engine alone
-            // moves ρ by minimising the penalised quasi-Laplace evidence
+            // moves ρ by minimising the penalised quasi-Laplace score
             // score (see `SaeManifoldTerm::penalized_quasi_laplace_criterion`; #1421: NOT a
             // true normalized-prior REML — the improper softmax/ThresholdGate
             // assignment priors have no finite normalizer). The former in-loop
@@ -5803,7 +5803,7 @@ impl SaeManifoldTerm {
             // axis, so no global/per-atom axis reduction can capture it). The
             // undamped acceptance factorizations in `penalized_quasi_laplace_criterion` already deflate
             // that null to UNIT stiffness (`log 1 = 0`, ρ-independent) so the
-            // evidence log-det is finite — but the coordinate SOLVE here does not:
+            // criterion log-det is finite — but the coordinate SOLVE here does not:
             // `solve_with_lm_escalation_inner` LM-ridge-damps the near-null block,
             // leaving a small-but-nonzero step along the radial null (the data is
             // radially FLAT, not absent, so `g_null ≠ 0` at finite noise). Those
@@ -5816,7 +5816,7 @@ impl SaeManifoldTerm {
             // direction from that row's coordinate step so there is ZERO motion along
             // a deflated direction, period, while the identifiable (angular)
             // complement keeps the exact LM/Newton step. `row_sub_floor_null_directions`
-            // uses the IDENTICAL spectral floor + hysteresis the evidence deflation
+            // uses the IDENTICAL spectral floor + hysteresis the criterion deflation
             // uses, so the step freezes exactly what the log-det deflated. It returns
             // EMPTY for a genuinely full-rank row (a well-conditioned block, or a
             // merely-ill-conditioned NON-null K>1 block whose weak but data-supported
@@ -6567,7 +6567,7 @@ impl SaeManifoldTerm {
         // never reached this polish before.
         //
         // CRITICAL: the gate is the PENALIZED objective total — the exact same
-        // scalar the inner Armijo line search and the outer penalized quasi-Laplace evidence engine
+        // scalar the inner Armijo line search and the outer penalized quasi-Laplace score engine
         // consume (`penalized_objective_total(target, rho, analytic_penalties, 1.0)`)
         // — NOT raw reconstruction EV. The decoder refit is an UNPENALIZED data-fit
         // least squares (and the coordinate re-projection is pure data-fit too), so a
@@ -7397,7 +7397,7 @@ impl SaeManifoldTerm {
             assignment_sparsity: 0.0,
             smoothness: 0.0,
             ard: 0.0,
-            evidence_gauge_deflated_directions: 0,
+            criterion_gauge_deflated_directions: 0,
         };
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
@@ -7585,7 +7585,7 @@ impl SaeManifoldTerm {
     /// In-memory driver for [`Self::run_joint_fit_arrow_schur_streaming`]: build
     /// the `chunk_init` seeder by slicing the resident `target`, `self.assignment`
     /// logits and `self.assignment` coords per row-range — the identical chunking
-    /// [`Self::streaming_exact_arrow_log_det`] already uses for the evidence pass.
+    /// [`Self::streaming_exact_arrow_log_det`] already uses for the criterion pass.
     ///
     /// This is the streaming fit's wiring for data that is already resident: it
     /// bounds the Newton solve's peak memory to one chunk (no `(N × M)` /
@@ -7801,7 +7801,7 @@ impl SaeManifoldTerm {
             assignment_sparsity,
             smoothness,
             ard,
-            evidence_gauge_deflated_directions: 0,
+            criterion_gauge_deflated_directions: 0,
         })
     }
 
@@ -7850,7 +7850,7 @@ impl SaeManifoldTerm {
                 assignment_sparsity,
                 smoothness,
                 ard,
-                evidence_gauge_deflated_directions: 0,
+                criterion_gauge_deflated_directions: 0,
             },
             total,
         ))

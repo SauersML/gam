@@ -14,7 +14,7 @@
 //! `sae_manifold_fit` K=1 circle returned a `GamError` at every N.
 //!
 //! The fix routes the stall-acceptance factorization through the SAME per-row
-//! spectral-deflation the evidence log-det uses (the radial null is unit-stiffness
+//! spectral-deflation the criterion log-det uses (the radial null is unit-stiffness
 //! deflated → `log 1 = 0`, ρ-independent), so acceptance is REACHABLE and the
 //! affine ½λ² is measured on the identifiable (tangent) subspace. An
 //! over-parametrized latent is a legitimate configuration: the fit must land the

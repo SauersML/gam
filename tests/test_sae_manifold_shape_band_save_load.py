@@ -45,7 +45,11 @@ def test_shape_band_survives_save_load_to_tight_tolerance(tmp_path: Path):
     atom = fit.atoms[0]
     assert atom.decoder_covariance is not None, "fresh fit must expose decoder_covariance"
 
-    before = fit.shape_uncertainty(0)
+    before = {
+        "coords": np.asarray(atom.shape_band_coords),
+        "mean": np.asarray(atom.shape_band_mean),
+        "sd": np.asarray(atom.shape_band_sd),
+    }
     decoder_before = np.asarray(atom.decoder_coefficients, dtype=float).copy()
     coords_before = np.asarray(atom.coords, dtype=float).copy()
     rendered_before = np.asarray(fit.reconstruct_training(), dtype=float).copy()
@@ -54,7 +58,12 @@ def test_shape_band_survives_save_load_to_tight_tolerance(tmp_path: Path):
     path = tmp_path / "sae_band.json"
     fit.save(path)
     restored = gamfit.ManifoldSAE.load(path)
-    after = restored.shape_uncertainty(0)
+    restored_atom = restored.atoms[0]
+    after = {
+        "coords": np.asarray(restored_atom.shape_band_coords),
+        "mean": np.asarray(restored_atom.shape_band_mean),
+        "sd": np.asarray(restored_atom.shape_band_sd),
+    }
 
     np.testing.assert_array_equal(
         np.asarray(restored.atoms[0].decoder_coefficients), decoder_before
@@ -65,7 +74,7 @@ def test_shape_band_survives_save_load_to_tight_tolerance(tmp_path: Path):
     )
     assert (restored.atom_topology, tuple(restored.atom_topologies)) == topology_before
 
-    for key in ("coords", "mean", "sd", "lower", "upper"):
+    for key in ("coords", "mean", "sd"):
         np.testing.assert_allclose(
             after[key], before[key], rtol=1e-10, atol=1e-12,
             err_msg=f"shape band '{key}' did not survive save/load",
@@ -89,8 +98,9 @@ def test_restored_covariance_reproduces_analytic_band(tmp_path: Path):
     cov_after = np.asarray(restored.atoms[0].decoder_covariance, dtype=float)
     assert cov_after.shape == (m * p, m * p)
 
-    band = restored.shape_uncertainty(0)
-    coords = band["coords"]
+    restored_atom = restored.atoms[0]
+    coords = np.asarray(restored_atom.shape_band_coords)
+    band_sd = np.asarray(restored_atom.shape_band_sd)
     phi, _jet, _pen = rust_module().basis_with_jet(
         "periodic", np.ascontiguousarray(coords.reshape(-1, 1)), {"n_harmonics": 1}
     )
@@ -107,7 +117,7 @@ def test_restored_covariance_reproduces_analytic_band(tmp_path: Path):
             np.testing.assert_allclose(sub_after, sub_before, rtol=1e-10, atol=1e-12)
             var = float(phi[gi] @ sub_after @ phi[gi])
             np.testing.assert_allclose(
-                band["sd"][gi, c], np.sqrt(max(var, 0.0)), rtol=1e-6, atol=1e-9,
+                band_sd[gi, c], np.sqrt(max(var, 0.0)), rtol=1e-6, atol=1e-9,
                 err_msg=f"restored covariance band mismatch at coord {gi}, channel {c}",
             )
 

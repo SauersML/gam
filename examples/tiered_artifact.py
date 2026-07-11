@@ -338,59 +338,6 @@ def load_tier1_artifact(source: Any) -> tuple[np.ndarray, dict[str, Any] | None]
     raise TypeError(f"cannot load T1 from {type(source)!r}")
 
 
-def load_sac_result(source: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any]]:
-    """T2 from WS-A SAC output (``examples/sac_results/`` or a ``SacResult``).
-
-    Returns ``(manifold_payload_or_None, atom_specs, meta)`` where ``atom_specs`` is
-    the list of ``{"topology","frame","residual_gauge"}`` the T2 hash needs and
-    ``meta`` carries ``ev_trace`` / ``birth_log`` / EVs. Reads either a single
-    assembled ``ManifoldSAE.to_dict()`` payload or the per-atom
-    ``atom_<k>.json`` + ``sac_meta.json`` interim form (see ARTIFACT_SCHEMA.md).
-    """
-    # In-memory SacResult (examples/sac_prototype.py).
-    if hasattr(source, "atoms") and hasattr(source, "ev_trace"):
-        specs = []
-        for a in source.atoms:
-            frames = a.fit.get_decoder() if hasattr(a.fit, "get_decoder") else []
-            frame = np.atleast_2d(np.asarray(frames[0])) if frames else np.zeros((1, 1))
-            specs.append({"topology": a.topology, "frame": frame,
-                          "residual_gauge": a.hybrid_verdict})
-        meta = {"ev_trace": list(source.ev_trace), "birth_log": list(source.birth_log),
-                "t1_ev": source.t1_ev, "combined_ev": source.combined_ev, "k": source.k}
-        return None, specs, meta
-
-    if not isinstance(source, str):
-        raise TypeError(f"cannot load SAC result from {type(source)!r}")
-
-    # Single assembled ManifoldSAE payload.
-    if source.endswith(".json") and os.path.isfile(source):
-        with open(source) as f:
-            payload = json.load(f)
-        return payload, [], {}
-
-    # Directory: atom_<k>.json + sac_meta.json interim form.
-    meta = {}
-    meta_path = os.path.join(source, "sac_meta.json")
-    if os.path.exists(meta_path):
-        with open(meta_path) as f:
-            meta = json.load(f)
-    specs = []
-    atom_files = sorted(fn for fn in os.listdir(source)
-                        if fn.startswith("atom_") and fn.endswith(".json"))
-    for fn in atom_files:
-        with open(os.path.join(source, fn)) as f:
-            atom_payload = json.load(f)
-        atoms = atom_payload.get("atoms", [atom_payload])
-        for atom in atoms:
-            frame = atom.get("frame") or atom.get("decoder_block") or atom.get("B")
-            if frame is None:
-                continue
-            specs.append({"topology": atom.get("topology", meta.get("atom_topology", "circle")),
-                          "frame": np.atleast_2d(np.asarray(frame, dtype=np.float64)),
-                          "residual_gauge": atom.get("residual_finite_gauge", "")})
-    return None, specs, meta
-
-
 # --------------------------------------------------------------------------- #
 # JSON coercion helpers.                                                        #
 # --------------------------------------------------------------------------- #

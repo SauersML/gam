@@ -146,7 +146,7 @@ where
         // row` — which only stiffens non-PD PER-ROW blocks — never fired), so the
         // value genuinely depends on that direction and its `A⁻¹` IFT response is
         // a real part of the θ-adjoint. Only the singular direction handled below
-        // is one the evidence factor would stiffen to unit curvature, so only its
+        // is one the criterion factor would stiffen to unit curvature, so only its
         // response is spurious and must be projected out.
         // Sharpen the offending direction by inverse power iteration on
         // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
@@ -756,7 +756,7 @@ impl SaeManifoldTerm {
     }
 
     /// Exact non-ordered Beta--Bernoulli assignment-strength penalized quasi-Laplace gradient on the matrix-free
-    /// evidence path. This is the one coordinate softmax entropy and gated L1
+    /// criterion path. This is the one coordinate softmax entropy and gated L1
     /// cannot update through a Fellner-Schall equation:
     ///
     /// `dV/drho_sparse = explicit_prior + 0.5 tr(B^-1 dB/drho_sparse)

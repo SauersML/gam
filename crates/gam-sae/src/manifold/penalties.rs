@@ -22,7 +22,7 @@ use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 /// pairwise barrier `−μ·q·w(o)·log(1−o+ε)` was only the `K = 2` shadow
 /// (`det[[1,r],[r,1]] = 1 − r²`, `r = q·o`): the Jeffreys exponent `½` is fixed —
 /// there is no free strength `μ_C` — and it is the exact reparametrization-
-/// invariant counter-term to the Laplace evidence's `+½·log(volume)` collapse
+/// invariant counter-term to the quasi-Laplace score's `+½·log(volume)` collapse
 /// reward. Because a pair that never co-fires has `q_jk = 0`, `Q` is block
 /// diagonal across co-firing components and `det F` factorizes over them: atoms
 /// that never fire together contribute a determinant factor of exactly `1` (zero
@@ -2488,7 +2488,7 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
 /// single registry entry dispatches cleanly across atoms whose coordinate dims
 /// differ (issue F6). For these the assembled value / gradient / curvature is
 /// *exactly* the sum of the per-atom energies — the same additive
-/// decomposition the penalized quasi-Laplace evidence log-det already sums per atom — so
+/// decomposition the penalized quasi-Laplace score log-det already sums per atom — so
 /// admitting them on a mixed `{d=1 circle, d=2 patch, linear}` dictionary keeps
 /// the evidence exact with zero padding or truncation.
 ///

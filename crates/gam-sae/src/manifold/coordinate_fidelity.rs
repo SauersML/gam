@@ -468,7 +468,7 @@ impl OccupancyLaw {
 /// normalized — both handled by [`coordinate_uniformity`]'s mapping) by a BIC
 /// comparison across the fixed model-class enumeration `{uniform, one wrapped
 /// Gaussian, k-anchor wrapped-Gaussian mixture for k on the anchor ladder}`. The
-/// class with the lowest BIC (= highest rank-aware Laplace evidence) is the law:
+/// class with the lowest BIC (= highest rank-aware quasi-Laplace score) is the law:
 /// a `k ≥ 2` anchor model ⟹ [`OccupancyLaw::Discrete`], a single wrapped Gaussian
 /// ⟹ [`OccupancyLaw::Continuous`], the uniform density ⟹ [`OccupancyLaw::Uniform`].
 pub fn classify_occupancy(u: &[f64]) -> OccupancyLaw {
@@ -1372,7 +1372,7 @@ pub fn prefer_candidate_basin(
 
 /// #2230 — ONE-referee state preference for the inner-fit keep-best incumbent,
 /// keyed on the PENALIZED OBJECTIVE (the exact scalar the inner Armijo lane
-/// descends and the outer penalized quasi-Laplace evidence consumes), with the #2081
+/// descends and the outer penalized quasi-Laplace score consumes), with the #2081
 /// EV-then-uniformity ordering ([`prefer_candidate_basin`]) demoted to a
 /// tie-break at (near-)equal objective.
 ///

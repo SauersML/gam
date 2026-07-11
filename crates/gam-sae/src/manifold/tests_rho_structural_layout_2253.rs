@@ -89,7 +89,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .expect("base value lane must converge");
     assert!(
         base_cost.is_finite(),
-        "the active-rho derivative witness must start at feasible penalized quasi-Laplace evidence: \
+        "the active-rho derivative witness must start at feasible penalized quasi-Laplace score: \
          base={base_cost:.17e}"
     );
     let evaluation = gradient_objective
@@ -192,7 +192,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
     assert!(
-        SaeManifoldTerm::evidence_kkt_stationary(kkt_norm, quotient_kkt_norm, kkt_tolerance,),
+        SaeManifoldTerm::quasi_laplace_kkt_stationary(kkt_norm, quotient_kkt_norm, kkt_tolerance,),
         "an off-KKT state cannot emit or certify the analytic envelope gradient: \
          raw={kkt_norm:.9e}, quotient={quotient_kkt_norm:.9e}, \
          tolerance={kkt_tolerance:.9e}"
@@ -299,12 +299,12 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let frozen_minus_cost = frozen_cost_at(&minus);
     assert!(
         plus_cost.is_finite(),
-        "+h must evaluate feasible penalized quasi-Laplace evidence: \
+        "+h must evaluate feasible penalized quasi-Laplace score: \
          cost={plus_cost:.17e}, telemetry={plus_telemetry:?}"
     );
     assert!(
         minus_cost.is_finite(),
-        "-h must evaluate feasible penalized quasi-Laplace evidence: \
+        "-h must evaluate feasible penalized quasi-Laplace score: \
          cost={minus_cost:.17e}, telemetry={minus_telemetry:?}"
     );
     assert_eq!(

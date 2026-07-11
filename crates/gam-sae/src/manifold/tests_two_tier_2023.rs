@@ -155,8 +155,8 @@ mod tests {
         // values on primary BEFORE the merge so the reset assertion is non-vacuous.
         let (mut a_term, _at, a_rho) = small_two_atom_periodic_term();
         let (b_term, _bt, b_rho) = small_two_atom_periodic_term();
-        a_term.evidence_gauge_deflation_reanchors = 3;
-        a_term.evidence_gauge_deflation_last_delta_sign = -1;
+        a_term.criterion_gauge_deflation_reanchors = 3;
+        a_term.criterion_gauge_deflation_last_delta_sign = -1;
         a_term.dictionary_cocollapse_reseeds = 2;
 
         let (merged, _merged_rho) =
@@ -164,11 +164,11 @@ mod tests {
                 .expect("merge two compatible tiers");
 
         assert_eq!(
-            merged.evidence_gauge_deflation_reanchors, 0,
+            merged.criterion_gauge_deflation_reanchors, 0,
             "reanchor count must reset to 0 on merge"
         );
         assert_eq!(
-            merged.evidence_gauge_deflation_last_delta_sign, 0,
+            merged.criterion_gauge_deflation_last_delta_sign, 0,
             "last-delta sign must reset to 0 on merge"
         );
         assert_eq!(

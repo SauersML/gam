@@ -1497,12 +1497,20 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli()
 }
 
 #[test]
-pub(crate) fn exact_stationarity_a_minus_b_includes_ordered_beta_bernoulli_cross_row_hvp() {
+pub(crate) fn exact_stationarity_a_minus_b_includes_ordered_beta_bernoulli_shared_mass_hvp() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false);
     rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
-        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            200,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
         .expect("converged ordered Beta--Bernoulli exact-stationarity cache");
 
     let mut vector = SaeArrowVector {
@@ -1580,7 +1588,7 @@ pub(crate) fn exact_stationarity_a_minus_b_includes_ordered_beta_bernoulli_cross
 /// fixture and check the analytic `Γ` matches the fixed-state dense FD of `log|H|`
 /// — both flow through the majorized assembly (`fixed_state_logdet` rebuilds the
 /// SAME majorized `H`). This guards the majorized θ-adjoint channels against the
-/// majorized evidence log-det in the whitened+rank-deficient regime, where the
+/// majorized criterion log-det in the whitened+rank-deficient regime, where the
 /// whitened data curvature cannot dominate the raw indefinite prior pieces.
 #[test]
 pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_low_rank_metric_2144()

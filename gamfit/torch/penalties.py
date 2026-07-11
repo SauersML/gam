@@ -409,18 +409,19 @@ class MonotonicityPenalty(_RustPenaltyModule):
 
 
 class HarmonicRoughnessPenalty(_RustPenaltyModule):
-    """Graduated periodic-basis roughness prior over a decoder block (#1282).
+    """Thin descriptor for graduated periodic-basis decoder roughness.
 
     Routes through the Rust ``harmonic_roughness`` analytic-penalty descriptor,
-    which evaluates ``weight · Σ_r row_weights[r mod period] · Σ_j target[r,j]²``
-    on a row-major ``(n_eff, d)`` block. ``row_weights`` is one atom's per-basis
-    weight vector (``h⁴`` on harmonic rows ``h ≥ 2``, ``0`` on DC / fundamental)
-    and is tiled across the ``F`` atoms of a stacked ``(F·K, D)`` decoder.
+    which evaluates
+    ``0.5 · weight · Σ_r row_weights[r mod period] · Σ_j target[r,j]²`` on a
+    row-major ``(n_eff, d)`` block. ``row_weights`` is one atom's per-basis
+    weight vector (``h⁴`` on harmonic rows ``h ≥ 2``, zero on DC/fundamental)
+    and is tiled across the atoms of a stacked decoder.
 
-    ``weight`` is the evidence-optimal roughness precision refreshed from the
-    Rust REML machinery during training (see
-    :func:`ManifoldSAE.decoder_harmonic_penalty`); it is a plain float held off
-    the autograd tape, so mutating it between forwards is safe.
+    ``weight`` is the fixed base precision. With ``learnable=True``, the module
+    supplies a log-precision rho coordinate and the Rust registry evaluates the
+    same scalar with ``weight · exp(rho)``. This wrapper does not perform or
+    claim an evidence/REML refresh.
     """
 
     def __init__(
@@ -446,6 +447,8 @@ class HarmonicRoughnessPenalty(_RustPenaltyModule):
             raise ValueError(
                 "HarmonicRoughnessPenalty.n_eff must be a multiple of len(row_weights)"
             )
+        if not (np.isfinite(weight) and weight > 0.0):
+            raise ValueError("HarmonicRoughnessPenalty.weight must be finite and > 0")
         self.row_weights = rows
         self.n_eff = int(n_eff)
         self.weight = float(weight)

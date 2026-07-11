@@ -168,11 +168,11 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
             .expect("a bounded low-amplitude flicker must re-anchor, never abort");
     }
     assert_eq!(
-        term.evidence_gauge_deflation_reanchors, 0,
+        term.criterion_gauge_deflation_reanchors, 0,
         "a flicker inside the relative jitter band charges no reversals"
     );
     assert_eq!(
-        term.expected_evidence_gauge_deflated_directions,
+        term.expected_criterion_gauge_deflated_directions,
         Some(150),
         "the comparison re-anchors to the latest observed count"
     );
@@ -214,18 +214,18 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
 #[test]
 pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runaway() {
     let mut term = trivial_k1_euclidean_term();
-    assert!(term.expected_evidence_gauge_deflated_directions.is_none());
+    assert!(term.expected_criterion_gauge_deflated_directions.is_none());
 
     // First observation pins the expected count (high, like a real K=2 walk
     // that starts with many near-null evidence directions).
     term.record_evidence_gauge_deflation_count(60, true)
         .unwrap();
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
+    assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(60));
 
     // A matching later observation is a no-op (still Ok, count unchanged).
     term.record_evidence_gauge_deflation_count(60, true)
         .unwrap();
-    assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
+    assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(60));
 
     // A MONOTONE drift (the #1217 benign case — a per-row conditioning count
     // shrinking across the ρ-walk) re-anchors freely without charging the budget,
@@ -233,10 +233,10 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     // signature (171→…→113) that the old `k`-event budget wrongly tripped on.
     for c in [50usize, 40, 33, 21, 12, 9, 6, 4, 3, 2] {
         term.record_evidence_gauge_deflation_count(c, true).unwrap();
-        assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(c));
+        assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(c));
     }
     assert_eq!(
-        term.evidence_gauge_deflation_reanchors, 0,
+        term.criterion_gauge_deflation_reanchors, 0,
         "monotone drift charges no reversals"
     );
 
@@ -258,7 +258,7 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
                 );
                 // On the refusal the expected count is NOT re-anchored.
                 assert_eq!(
-                    term.expected_evidence_gauge_deflated_directions,
+                    term.expected_criterion_gauge_deflated_directions,
                     Some(last_ok)
                 );
                 errored = true;
@@ -2672,7 +2672,7 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     );
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped criterion factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );
     // The generic "log-det unavailable" message (a real factorization defect, not
@@ -2684,7 +2684,7 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     );
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_quasi_laplace_criterion: row-gauge evidence deflation count re-anchored \
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: row-gauge criterion deflation count re-anchored \
                  4 times within one optimization; the quotient dimension is not stabilizing"
         )
     );
@@ -2973,22 +2973,22 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
 #[test]
 pub(crate) fn objective_stall_cannot_substitute_for_kkt_envelope_2253() {
     let tolerance = 1.0e-4;
-    assert!(!SaeManifoldTerm::evidence_kkt_stationary(
+    assert!(!SaeManifoldTerm::quasi_laplace_kkt_stationary(
         2.0 * tolerance,
         3.0 * tolerance,
         tolerance,
     ));
-    assert!(SaeManifoldTerm::evidence_kkt_stationary(
+    assert!(SaeManifoldTerm::quasi_laplace_kkt_stationary(
         tolerance,
         3.0 * tolerance,
         tolerance,
     ));
-    assert!(SaeManifoldTerm::evidence_kkt_stationary(
+    assert!(SaeManifoldTerm::quasi_laplace_kkt_stationary(
         2.0 * tolerance,
         tolerance,
         tolerance,
     ));
-    assert!(!SaeManifoldTerm::evidence_kkt_stationary(
+    assert!(!SaeManifoldTerm::quasi_laplace_kkt_stationary(
         f64::NAN,
         f64::INFINITY,
         tolerance,
@@ -3007,7 +3007,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     // opposite directions, so the logit-block Schur complement goes indefinite).
     // Before #1117 the undamped (`ridge = 0`) factor REFUSED this with
     // `PerRowFactorFailed` and the criterion recovered by refining the inner
-    // state. #1117 (`factor_spectral_deflated_evidence_row`) now conditions the
+    // state. #1117 (`factor_spectral_deflated_criterion_row`) now conditions the
     // block the principled way at the COLD state too: it discovers the
     // negative/flat eigen-direction and stiffens it to UNIT curvature (eigenvalue
     // → +1, contributing a ρ-independent log 1 = 0), so the undamped solve returns
@@ -3019,7 +3019,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     // indefinite AND that the #1117 deflation engaged).
     let (.., cold_cache) = solve_arrow_newton_step_with_options(&cold_sys, 0.0, 0.0, &options)
         .expect(
-            "cold undamped evidence factor must be spectrally conditioned (#1117), not refused",
+            "cold undamped criterion factor must be spectrally conditioned (#1117), not refused",
         );
     let cold_deflated_rows = cold_cache
         .deflation_row_spectra
@@ -3046,7 +3046,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
             1.0e-4,
             1.0e-4,
         )
-        .expect("dense REML must refine through the cold non-PD evidence factor");
+        .expect("dense REML must refine through the cold non-PD criterion factor");
     let log_det = arrow_log_det_from_cache(&cache).expect("refined cache must carry log-det");
     assert!(full_cost.is_finite());
     assert!(full_loss.total().is_finite());
@@ -4085,7 +4085,7 @@ pub(crate) fn run_joint_fit_arrow_schur_escalates_ridge_on_non_pd_row_block() {
 /// collapses so basis columns are linearly dependent IN THE DATA — the bare
 /// data Gram `G_k` is rank-deficient (`[SAE-AUDIT]` `rank r/M`). The deep fix
 /// discovers that dead subspace `N_k` from `G_k` and returns a projector
-/// `Π_k = N_k N_kᵀ` (a) so the inner solve & evidence log-det deflate the dead
+/// `Π_k = N_k N_kᵀ` (a) so the inner solve & criterion log-det deflate the dead
 /// directions at unit stiffness (no ρ-dependent flat valley), and (b) so the
 /// converged decoder is projected onto `range(G_k)` (the rank-`r` oracle).
 ///
@@ -5385,7 +5385,7 @@ fn ard_atom_and_coord(
 /// F6 (fit-level composition): the native ARD energy on a coordinate-
 /// HETEROGENEOUS `{circle d=1, patch d=2, linear d=1}` dictionary is *exactly*
 /// the sum of the per-atom ARD energies — the same per-atom-additive
-/// decomposition the penalized quasi-Laplace evidence sums over atoms — so admitting ARD on
+/// decomposition the penalized quasi-Laplace score sums over atoms — so admitting ARD on
 /// a mixed dictionary (the F6 composition) keeps the evidence exact with no
 /// padding or truncation. This is the concrete counterpart to the validator
 /// test: the gate opens (validator) AND the energy it lets through composes

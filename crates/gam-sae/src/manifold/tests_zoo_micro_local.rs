@@ -214,7 +214,7 @@ fn rank_charge_zoo_arm(train: &Array2<f64>, test: &Array2<f64>) -> RankChargeArm
         collapse_events: fitted.term.collapse_events().len(),
         dict_cocollapse_reseeds: fitted.term.dictionary_cocollapse_reseeds,
         struct_cocollapse_reseeds: fitted.term.structural_cocollapse_reseeds,
-        evidence_reanchors: fitted.term.evidence_gauge_deflation_reanchors,
+        evidence_reanchors: fitted.term.criterion_gauge_deflation_reanchors,
     }
 }
 

@@ -1165,7 +1165,7 @@ pub(crate) fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
 /// #1117/#1118: a per-row `H_tt` that is gauge-flat AND genuinely indefinite
 /// off the gauge orbit (the K>1 ordered-Beta--Bernoulli/softmax row-sharing state) must be
 /// conditioned by the undamped evidence factor through **unit-stiffness
-/// spectral deflation** — `factor_spectral_deflated_evidence_row` discovers
+/// spectral deflation** — `factor_spectral_deflated_criterion_row` discovers
 /// the negative/flat eigen-direction the closed-form gauge deflation cannot
 /// rescue and stiffens it to eigenvalue `+1` (a ρ-independent `log 1 = 0`
 /// evidence contribution), NOT a ρ-dependent `+ridge·I` bias. And the
@@ -1205,7 +1205,7 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
     // producing an SPD block. The two sub-floor eigenvalues (−1.0 and 1e-10
     // vs floor = 1e-8·4) are counted; the genuine e_0 (eigenvalue 4.0) is
     // preserved exactly.
-    let spectral = factor_spectral_deflated_evidence_row(&indef, d)
+    let spectral = factor_spectral_deflated_criterion_row(&indef, d)
         .expect("spectral deflation must condition the indefinite non-gauge block");
     assert_eq!(
         spectral.gauge_deflated_directions, 2,
@@ -1446,9 +1446,9 @@ pub(crate) fn evidence_row_spectral_deflation_count_is_stable_across_the_cutoff(
     let mut block_hi = block_lo.clone();
     block_hi.htt[[1, 1]] = near_floor_hi;
 
-    let lo = factor_spectral_deflated_evidence_row(&block_lo, d)
+    let lo = factor_spectral_deflated_criterion_row(&block_lo, d)
         .expect("indefinite block must spectrally deflate (lo iterate)");
-    let hi = factor_spectral_deflated_evidence_row(&block_hi, d)
+    let hi = factor_spectral_deflated_criterion_row(&block_hi, d)
         .expect("indefinite block must spectrally deflate (hi iterate)");
 
     // The genuine −1.0 quotient direction is deflated on both sides; the

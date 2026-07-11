@@ -387,7 +387,7 @@ impl AmortizedWarmStartTelemetry {
 /// main GAM penalized quasi-Laplace path uses, instead of the SAE's deleted forked
 /// `update_ard_reml` fixed-point rule. Each outer eval runs the inner
 /// `(t, β)` arrow-Schur Newton solve at the engine's current ρ and returns
-/// the penalised quasi-Laplace evidence score (see
+/// the penalised quasi-Laplace score score (see
 /// [`SaeManifoldTerm::penalized_quasi_laplace_criterion`]). #1421: this is NOT a true
 /// normalized-prior REML/evidence objective — the softmax-entropy and
 /// threshold-gate assignment priors have no finite normalizer, so there is no
@@ -425,7 +425,7 @@ pub struct OuterProbeTelemetry {
     /// Probes refused because the inner solve did not converge at fixed ρ.
     pub infeasible_inner_not_converged: usize,
     /// Outer criterion evaluations that returned the optimizer's conventional
-    /// infeasible value (`+inf`) because the Laplace evidence was undefined or
+    /// infeasible value (`+inf`) because the quasi-Laplace score was undefined or
     /// the fixed-ρ inner solve refused. A finite, data-collapsed fit is not an
     /// infeasible objective value: collapse remains a structural ledger verdict
     /// while penalized quasi-Laplace remains the sole optimized criterion.
@@ -575,7 +575,7 @@ struct ReactiveWaypointCheckpoint {
     registry_isometry_weights: Vec<f64>,
     current_rho: SaeManifoldRho,
     last_loss: Option<SaeManifoldLoss>,
-    certified_penalized_quasi_laplace_criterion: Option<f64>,
+    terminal_penalized_quasi_laplace_criterion: Option<f64>,
     seeded_beta: Option<Array1<f64>>,
     probe_converged_handoff: Option<ProbeConvergedHandoff>,
     basin_bundle: BasinBundle<SaeManifoldTerm>,
@@ -608,7 +608,7 @@ pub struct SaeManifoldOuterObjective {
     pub(crate) last_loss: Option<SaeManifoldLoss>,
     /// Full criterion value is stamped only by a fixed-rho certificate or a
     /// certified outer result; ordinary diagnostic evaluations do not mint it.
-    pub(crate) certified_penalized_quasi_laplace_criterion: Option<f64>,
+    pub(crate) terminal_penalized_quasi_laplace_criterion: Option<f64>,
     /// Optional warm-start β slot. When the cache / continuation walk seeds a
     /// β, the next inner solve opens from it instead of cold.
     pub(crate) seeded_beta: Option<Array1<f64>>,
@@ -734,7 +734,7 @@ pub(crate) fn assignment_strength_gradient_coordinate(rho: &SaeManifoldRho) -> O
 }
 
 /// #2080 surrogate-lane policy (SAE side) for the derived-rank rational `log|S|`
-/// surrogate that supersedes SLQ on the matrix-free massive-K evidence path.
+/// surrogate that supersedes SLQ on the matrix-free massive-K criterion path.
 /// Probe count and seed mirror the SLQ lane it replaces; the deflation target is
 /// one order under the inner-objective stall tolerance — `log|S|` is the
 /// criterion's dominant term at wide `k`, so the Hutchinson error bar must sit
@@ -775,9 +775,9 @@ impl SaeManifoldOuterObjective {
         // presence to the actual term so K=1 Softmax and hard TopK cannot enter
         // as held/frozen rho coordinates through a manually constructed seed.
         let init_rho = init_rho.for_assignment(term.assignment.mode);
-        term.expected_evidence_gauge_deflated_directions = None;
-        term.evidence_gauge_deflation_reanchors = 0;
-        term.evidence_gauge_deflation_last_delta_sign = 0;
+        term.expected_criterion_gauge_deflated_directions = None;
+        term.criterion_gauge_deflation_reanchors = 0;
+        term.criterion_gauge_deflation_last_delta_sign = 0;
         term.dictionary_cocollapse_reseeds = 0;
         term.best_cocollapse_incumbent = None;
         term.structural_cocollapse_reseeds = 0;
@@ -807,7 +807,7 @@ impl SaeManifoldOuterObjective {
             ridge_ext_coord,
             ridge_beta,
             last_loss: None,
-            certified_penalized_quasi_laplace_criterion: None,
+            terminal_penalized_quasi_laplace_criterion: None,
             seeded_beta: None,
             warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
             routing_frozen: false,
@@ -1303,7 +1303,7 @@ impl SaeManifoldOuterObjective {
     /// verdict as `FixedRho`.
     pub fn certify_outer_result(&mut self, result: &OuterResult) -> Result<(), String> {
         self.fit_verdict = None;
-        self.certified_penalized_quasi_laplace_criterion = None;
+        self.terminal_penalized_quasi_laplace_criterion = None;
         if !result.converged {
             return Err("outer result is not converged".to_string());
         }
@@ -1337,7 +1337,7 @@ impl SaeManifoldOuterObjective {
         if !result.final_value.is_finite() {
             return Err("converged outer result has a non-finite final criterion value".into());
         }
-        self.certified_penalized_quasi_laplace_criterion = Some(result.final_value);
+        self.terminal_penalized_quasi_laplace_criterion = Some(result.final_value);
         self.fit_verdict = Some(SaeOuterVerdict::Search(via));
         Ok(())
     }
@@ -1359,7 +1359,7 @@ impl SaeManifoldOuterObjective {
             registry,
             current_rho,
             last_loss,
-            certified_penalized_quasi_laplace_criterion,
+            terminal_penalized_quasi_laplace_criterion,
             ..
         } = self;
         let mut fitted_rho = current_rho;
@@ -1370,8 +1370,8 @@ impl SaeManifoldOuterObjective {
                     .to_string(),
             );
         }
-        let penalized_quasi_laplace_criterion = certified_penalized_quasi_laplace_criterion.ok_or_else(|| {
-            "SaeManifoldOuterObjective::into_fitted: certified state has no certified penalized quasi-Laplace criterion value"
+        let penalized_quasi_laplace_criterion = terminal_penalized_quasi_laplace_criterion.ok_or_else(|| {
+            "SaeManifoldOuterObjective::into_fitted: terminal state has no penalized quasi-Laplace criterion value"
                 .to_string()
         })?;
 
@@ -1530,7 +1530,7 @@ impl SaeManifoldOuterObjective {
     ///    a failed relaxation solve) returns `Ok(false)` — the caller falls back
     ///    to the cascade.
     /// 2. **Walk `η: 0 → 1`.** Each waypoint: a *predictor* applies the IFT step
-    ///    `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor
+    ///    `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached criterion factor
     ///    ([`ArrowFactorCache::full_inverse_apply`], β-channel; the t / gate
     ///    blocks are re-converged by the corrector), then the *corrector* (the
     ///    damped joint Newton in `penalized_quasi_laplace_criterion_with_cache`) re-converges at
@@ -2096,7 +2096,7 @@ impl SaeManifoldOuterObjective {
         Ok(())
     }
 
-    /// Whether a value probe has no defined penalized quasi-Laplace evidence. Such a state is
+    /// Whether a value probe has no defined penalized quasi-Laplace score. Such a state is
     /// not admitted to the handoff or basin bundle. Finite collapsed fits remain
     /// ordinary penalized quasi-Laplace values; their separate structural verdict is recorded above.
     fn probe_value_is_infeasible(value: f64) -> bool {
@@ -2106,7 +2106,7 @@ impl SaeManifoldOuterObjective {
     pub(crate) fn is_recoverable_value_probe_refusal(err: &str) -> bool {
         err.contains("inner solve did not converge at fixed ρ")
             || err.contains(
-                "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
+                "undamped criterion factorization hit a non-PD per-row H_tt block before KKT",
             )
             // #1782 — at a seed ρ, a K>1 threshold-gate/softmax (or a rank-deficient
             // euclidean/linear) fit's OFF-OPTIMUM inner state can leave the
@@ -2133,7 +2133,7 @@ impl SaeManifoldOuterObjective {
             // #2087 — at a seed ρ a K>1 threshold-gate assignment can give an
             // atom OFF at every row, so the sequential-deflation refit's gated design
             // `diag(a_·k)·Φ_k` is all-zero and the reduced joint problem is
-            // rank-deficient with an undefined Laplace evidence — the SAME infeasible-ρ
+            // rank-deficient with an undefined quasi-Laplace score — the SAME infeasible-ρ
             // class as the non-PD Schur / Hessian refusals above. `run_joint_fit_arrow_schur`
             // → `enforce_decoder_norm_guard` → `refit_decoder_sequential_deflation`
             // surfaces the DISTINCT "gated off at every row (all-zero gated design)"
@@ -2430,7 +2430,7 @@ impl SaeManifoldOuterObjective {
             // objective; an inexact inner solve would make Armijo/Wolfe compare
             // unlike values and can reject a real descent step (#2253).
             let gate = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
-            if SaeManifoldTerm::evidence_kkt_stationary(grad_norm, quotient_grad_norm, gate) {
+            if SaeManifoldTerm::quasi_laplace_kkt_stationary(grad_norm, quotient_grad_norm, gate) {
                 // Price the criterion at the stationary iterate through the
                 // sanctioned FREEZE evaluation (`inner_max_iter == 0`): one
                 // undamped factorization at the frozen state, the same evidence
@@ -2481,7 +2481,7 @@ impl SaeManifoldOuterObjective {
     /// lanes.
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
         self.fit_verdict = None;
-        self.certified_penalized_quasi_laplace_criterion = None;
+        self.terminal_penalized_quasi_laplace_criterion = None;
         let rho_state = self.baseline_rho.from_flat(rho_flat.clone());
         let (cost, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
         let cost = cost + self.block_jacobian(&rho_state);
@@ -2491,7 +2491,7 @@ impl SaeManifoldOuterObjective {
                     .to_string(),
             );
         }
-        self.certified_penalized_quasi_laplace_criterion = Some(cost);
+        self.terminal_penalized_quasi_laplace_criterion = Some(cost);
         self.fit_verdict = Some(SaeOuterVerdict::FixedRho);
         Ok(())
     }
@@ -2519,7 +2519,7 @@ impl SaeManifoldOuterObjective {
         // accept pattern re-evaluates the accepted point at the ρ of its last
         // successful value probe. Only a genuinely converged finite value is
         // worth handing off; a refused or non-finite probe never defines usable
-        // penalized quasi-Laplace evidence.
+        // penalized quasi-Laplace score.
         match &result {
             Ok((cost, _beta)) if !Self::probe_value_is_infeasible(*cost) => {
                 let converged = std::mem::replace(&mut self.term, saved_term);
@@ -2570,7 +2570,7 @@ impl SaeManifoldOuterObjective {
     /// per-eval cost is `len(bundle) + 1` cheap inner solves. Retention is bounded
     /// only by memory admission; a work-count cap would make the envelope inexact.
     /// #2234 stall fix — a cost-only probe whose inner solve exhausts its CAPPED
-    /// budget is an UNFINISHED COMPUTATION, not undefined Laplace evidence.
+    /// budget is an UNFINISHED COMPUTATION, not undefined quasi-Laplace score.
     /// The same is true when the cheap CROSS-SEED/RANKING drive sees a non-PD
     /// per-row factor BEFORE inner KKT stationarity: that factor describes the
     /// current warm-start iterate, not the probed ρ. The full accepted-point
@@ -2592,7 +2592,7 @@ impl SaeManifoldOuterObjective {
             Err(err)
                 if err.contains("inner solve did not converge at fixed ρ")
                     || err.contains(
-                        "undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity",
+                        "undamped criterion factorization hit a non-PD per-row H_tt block before KKT stationarity",
                     ) =>
             {
                 self.probe_telemetry.budget_rescued_value_probes += 1;
@@ -2909,7 +2909,7 @@ impl SaeManifoldOuterObjective {
             // Laplace factorization refuses ("Schur complement Cholesky failed:
             // … not positive definite"), and any other infeasible-ρ-probe class
             // (non-PD per-row / cross-row joint Hessian, inner non-convergence).
-            // A recoverable refusal means the Laplace evidence is undefined at
+            // A recoverable refusal means the quasi-Laplace score is undefined at
             // this ρ. It is an infeasible fixed-point evaluation, not a finite
             // pseudo-objective with zero updates. Returning `+inf` and uncovered
             // coordinates lets the fixed-point runner reject/backtrack without
@@ -2919,7 +2919,7 @@ impl SaeManifoldOuterObjective {
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
                 return Ok(infeasible_evaluation(
-                    "infeasible penalized quasi-Laplace evidence",
+                    "infeasible penalized quasi-Laplace score",
                 ));
             }
             Err(err) => return Err(err),
@@ -3670,7 +3670,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             //  * Dense-admitted: the exact analytic outer gradient is assembled
             //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
             //    every assignment mode, including ordered Beta--Bernoulli (#1006).
-            //  * Matrix-free (dense evidence factor exceeds the in-core budget,
+            //  * Matrix-free (dense criterion factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): no dense cache exists for the
             //    IFT solve, so the fixed-point lane updates covered ρ coordinates
             //    from analytic inverse traces in one pass. It explicitly declares
@@ -3744,7 +3744,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 }
                 Ok(cost)
             }
-            // A recoverable fixed-ρ refusal means the Laplace evidence is
+            // A recoverable fixed-ρ refusal means the quasi-Laplace score is
             // undefined. Cost-only objectives use `+inf` as their conventional
             // infeasible result; no finite pseudo-objective is introduced.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
@@ -3773,7 +3773,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // generic seed startup-VALIDATION still probes this gradient lane, and its
         // hard error rejects EVERY seed ("no candidate seeds passed outer startup
         // validation") for any large-K / wide-border (duchon) fit whose dense
-        // evidence factor exceeds the in-core budget. Route it to the SAME streaming
+        // criterion factor exceeds the in-core budget. Route it to the SAME streaming
         // value path the `Value` order uses: validation then gets a finite streaming
         // penalized quasi-Laplace cost (paired with a zero gradient it never consumes) and the fit
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
@@ -3781,7 +3781,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         if !self.term.streaming_plan().direct_logdet_admitted() {
             let (cost, _beta_hat) = match self.evaluate_with_refine_policy(rho.view(), false) {
                 Ok(evaluated) => evaluated,
-                // A recoverable refusal means the streaming Laplace evidence is
+                // A recoverable refusal means the streaming quasi-Laplace score is
                 // undefined at this ρ. Return the objective contract's typed
                 // infeasible evaluation, never a finite surrogate value.
                 Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
@@ -3890,7 +3890,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // Fellner–Schall fixed point (`Solver::Efs` → `eval_efs`/`efs_step`), which
         // needs only the analytic traces `tr(H⁻¹ S_c)` — no gradient, and (per
         // SPEC) no finite differences. So this dense-cache path is reached only
-        // when the dense evidence factor is admitted.
+        // when the dense criterion factor is admitted.
         // #1782 — a RECOVERABLE inner-solve refusal (a probed ρ whose undamped
         // joint Hessian is non-PD / whose inner solve cannot converge at that ρ)
         // is an INFEASIBLE-ρ signal, NOT a fatal defect: the value-only lanes
@@ -4039,7 +4039,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 {
                     Ok(evaluated) => evaluated,
                     // A recoverable non-PD/non-converged probe has undefined
-                    // Laplace evidence. `OuterEval::infeasible` is the
+                    // quasi-Laplace score. `OuterEval::infeasible` is the
                     // line-search contract for rejection/backtracking and carries
                     // no derivative.
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
@@ -4053,7 +4053,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         // the complete objective state back before refinement.
                         if self.reactive_waypoint_checkpoint.is_some() {
                             return Err(EstimationError::RemlOptimizationFailed(format!(
-                                "reactive coupled waypoint has undefined penalized quasi-Laplace evidence: {err}"
+                                "reactive coupled waypoint has undefined penalized quasi-Laplace score: {err}"
                             )));
                         }
                         return Ok(OuterEval::infeasible(rho.len()));
@@ -4123,7 +4123,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         }
         self.current_rho = self.baseline_rho.clone();
         self.last_loss = None;
-        self.certified_penalized_quasi_laplace_criterion = None;
+        self.terminal_penalized_quasi_laplace_criterion = None;
         self.seeded_beta = None;
         // #2080 (a) — a reset replaces the accepted basin; a probe handoff from
         // the previous seed's basin must not warm-start the new one.
@@ -4202,7 +4202,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         .map_err(EstimationError::RemlOptimizationFailed)
     }
 
-    /// Dense K≥2 joint fits may have undefined Laplace evidence at the literal
+    /// Dense K≥2 joint fits may have undefined quasi-Laplace score at the literal
     /// cold seed even though a finite basin is connected from a diffuse routing
     /// state. The entry temperature is derived from the objective's own routing
     /// logits: it is the smallest temperature that puts every active logit on
@@ -4298,7 +4298,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 ));
             }
             // The literal seed was already evaluated before the runner opened
-            // this repair path and its penalized quasi-Laplace evidence was undefined. Do not carry
+            // this repair path and its penalized quasi-Laplace score was undefined. Do not carry
             // that invalid basin into the supposedly legal entry merely because
             // its decoder coefficients are nonzero: a common cold seed fits every
             // atom independently to the full target, so summing those decoders is
@@ -4374,8 +4374,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             registry_isometry_weights,
             current_rho: self.current_rho.clone(),
             last_loss: self.last_loss.clone(),
-            certified_penalized_quasi_laplace_criterion: self
-                .certified_penalized_quasi_laplace_criterion,
+            terminal_penalized_quasi_laplace_criterion: self
+                .terminal_penalized_quasi_laplace_criterion,
             seeded_beta: self.seeded_beta.clone(),
             probe_converged_handoff: self.probe_converged_handoff.take(),
             basin_bundle,
@@ -4436,7 +4436,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.last_loss = Some(loss);
         self.seeded_beta = None;
         self.fit_verdict = None;
-        self.certified_penalized_quasi_laplace_criterion = None;
+        self.terminal_penalized_quasi_laplace_criterion = None;
         self.reactive_waypoint_checkpoint = None;
         Ok(())
     }
@@ -4454,8 +4454,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
         }
         self.current_rho = checkpoint.current_rho;
         self.last_loss = checkpoint.last_loss;
-        self.certified_penalized_quasi_laplace_criterion =
-            checkpoint.certified_penalized_quasi_laplace_criterion;
+        self.terminal_penalized_quasi_laplace_criterion =
+            checkpoint.terminal_penalized_quasi_laplace_criterion;
         self.seeded_beta = checkpoint.seeded_beta;
         self.probe_converged_handoff = checkpoint.probe_converged_handoff;
         self.basin_bundle = checkpoint.basin_bundle;

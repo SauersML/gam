@@ -50,7 +50,7 @@ const PERIODIC_BASIS_WIDTH: usize = 3;
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
 const GATE_TEMPERATURE: f64 = 0.5;
-const IBP_CONCENTRATION: f64 = 1.0;
+const ORDERED_BETA_BERNOULLI_CONCENTRATION: f64 = 1.0;
 
 struct Lcg {
     state: u64,
@@ -140,7 +140,11 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
         vec![LatentManifold::Circle { period: 1.0 }],
         // Match the #1017 production color-arm gate exactly; this explicit
         // diagnostic fixture does not alter the library's default assignment.
-        AssignmentMode::ordered_beta_bernoulli(GATE_TEMPERATURE, IBP_CONCENTRATION, false),
+        AssignmentMode::ordered_beta_bernoulli(
+            GATE_TEMPERATURE,
+            ORDERED_BETA_BERNOULLI_CONCENTRATION,
+            false,
+        ),
     )?;
     let term = SaeManifoldTerm::new(vec![atom], assignment)?;
     let target = term.fitted();

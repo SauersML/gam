@@ -186,7 +186,7 @@ fn sae_manifold_euclidean_k2_fit_terminates() {
     // weakly-identified decoder/gauge directions, so no stationarity certificate
     // fires even though the penalised objective is at its numerical floor, and the
     // driver returned the "did not converge" refusal instead of ranking the finite
-    // deflated Laplace evidence. This recheck pins the criterion PATH itself — not
+    // deflated quasi-Laplace score. This recheck pins the criterion PATH itself — not
     // just the optimizer's reported bookkeeping value — returning a FINITE score
     // for a fit that reconstructs the two planted lines. A criterion that reports
     // infeasible for a demonstrably good fit poisons outer model comparison.

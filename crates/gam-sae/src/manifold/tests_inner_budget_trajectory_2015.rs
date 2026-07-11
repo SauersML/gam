@@ -154,7 +154,7 @@ fn inner_gnorm_vs_budget_trajectory_2015() {
         let mut term = base.clone();
         let mut rho_fixed = rho.clone();
         let outcome = term
-            .run_joint_fit_arrow_schur_for_evidence(
+            .run_joint_fit_arrow_schur_for_quasi_laplace(
                 target.view(),
                 &mut rho_fixed,
                 None,
@@ -229,7 +229,7 @@ fn inner_gradient_matches_penalized_objective_fd_2015() {
     // iterate the trajectory probe stalls on.
     let mut term = base;
     let mut rho_fixed = rho.clone();
-    term.run_joint_fit_arrow_schur_for_evidence(
+    term.run_joint_fit_arrow_schur_for_quasi_laplace(
         target.view(),
         &mut rho_fixed,
         None,

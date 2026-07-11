@@ -370,7 +370,7 @@ Focused demos live under `examples/`:
 
 | Area | Examples |
 | --- | --- |
-| Manifold / SAE | `sae_manifold_demo.py`, `sae_manifold_uncertainty.py`, `sae_manifold_ibp_topology_atoms.py`, `topology_selection_demo.py` |
+| Manifold / SAE | `sae_manifold_demo.py`, `sae_manifold_uncertainty.py`, `sae_manifold_ordered_beta_bernoulli_topology_atoms.py`, `topology_selection_demo.py` |
 | Torch | `torch_autograd_sae_training_demo.py` and the `gamfit.torch` tests for REML primitives, smooth APIs, and manifold SAE parity |
 | Streaming / scale | `streaming_bspline_demo.py`, `streaming_matern_demo.py`, `streaming_arrow_schur_k100k_demo.py` |
 | Response geometry / topology | `sphere_optimization_demo.py`, `product_torus_demo.py`, `grassmann_subspace_demo.py`, `spd_metric_learning_demo.py` |

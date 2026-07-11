@@ -1412,7 +1412,7 @@ fn ordered_beta_bernoulli_prior_penalty(
     // exact integrated scalar couples rows through the column active mass), so the weights are
     // installed ON the penalty — its value/grad/hessian/hvp/ρ- and third
     // channels all fold them identically (weighted mass `M_k = Σ w_i z_ik` and
-    // carrier `u = w·J`), keeping every channel the exact derivative of one
+    // active-mass Jacobian `u = w·J`), keeping every channel the exact derivative of one
     // weighted energy. `None` gives the unit-weight operator.
     let mut penalty =
         OrderedBetaBernoulliPenalty::new(assignment.k_atoms(), alpha_eff, temperature, learnable)
@@ -1554,10 +1554,9 @@ pub fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) 
 /// per-row latent prior's analog of the `√w_i`-weighted data likelihood and the
 /// `w_i`-weighted `ard_value` — each retained row of a design-honest subsample
 /// stands in for `w_i` population rows, so its routing prior carries `w_i` too.
-/// `None` ⇒ the unweighted path, bit-for-bit. Softmax/threshold gate are row-separable
-/// and fully weighted here; the ordered Beta--Bernoulli prior lives in the un-owned `ordered_beta_bernoulli.rs` penalty
-/// and is left unweighted (self-consistent) until that penalty gains a per-row
-/// weight hook — see the module note on `assignment_prior_grad_hdiag`.
+/// `None` gives the unit-weight path. Softmax/threshold gate are row-separable;
+/// ordered Beta--Bernoulli instead forms weighted active mass and effective row
+/// count inside its integrated scalar. Every derivative uses that same measure.
 pub(crate) fn assignment_prior_value_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -1634,9 +1633,8 @@ pub fn assignment_prior_log_strength_derivative(
     assignment_prior_log_strength_derivative_weighted(assignment, rho, None)
 }
 
-/// #991-weighted [`assignment_prior_log_strength_derivative`]. Softmax/threshold gate
-/// route through the `w_i`-weighted value; ordered Beta--Bernoulli stays unweighted (un-owned
-/// `ordered_beta_bernoulli.rs`).
+/// #991-weighted [`assignment_prior_log_strength_derivative`]. Every assignment
+/// mode differentiates the same weighted scalar used by its value path.
 pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -1688,8 +1686,8 @@ pub fn assignment_prior_log_strength_hdiag(
     assignment_prior_log_strength_hdiag_weighted(assignment, rho, None)
 }
 
-/// #991-weighted [`assignment_prior_log_strength_hdiag`]. Softmax/threshold gate carry
-/// `w_i` per row; ordered Beta--Bernoulli stays unweighted (un-owned `ordered_beta_bernoulli.rs`).
+/// #991-weighted [`assignment_prior_log_strength_hdiag`]. Every assignment mode
+/// differentiates the same weighted scalar used by its value path.
 pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -1804,7 +1802,7 @@ pub fn assignment_prior_log_strength_target_mixed(
 
 /// #991-weighted [`assignment_prior_log_strength_target_mixed`]. The fixed-α
 /// fall-through reuses the `w_i`-weighted gradient; the learnable-α ordered Beta--Bernoulli branch
-/// lives in the un-owned `ordered_beta_bernoulli.rs` penalty and stays unweighted.
+/// uses the same weighted active mass as the value, gradient, and Hessian.
 pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,

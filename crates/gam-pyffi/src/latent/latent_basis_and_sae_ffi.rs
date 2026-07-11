@@ -356,8 +356,8 @@ fn sae_set_penalized_loss_items(
     breakdown.set_item("smoothness", b.smoothness)?;
     breakdown.set_item("ard", b.ard)?;
     breakdown.set_item(
-        "evidence_gauge_deflated_directions",
-        b.evidence_gauge_deflated_directions,
+        "criterion_gauge_deflated_directions",
+        b.criterion_gauge_deflated_directions,
     )?;
     // Honesty markers: this score is NOT a REML criterion; these evidence pieces
     // are deliberately absent (#1231). Surfaced as `None` so a consumer that
@@ -2189,7 +2189,7 @@ fn sae_manifold_fit_inner<'py>(
         out.set_item("termination", termination)?;
     }
     // Distinct scalars with distinct semantics: the ordinary penalized loss and
-    // the certified penalized quasi-Laplace criterion are never conflated.
+    // the terminal penalized quasi-Laplace criterion are never conflated.
     sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
     out.set_item("penalized_quasi_laplace_criterion", penalized_quasi_laplace_criterion)?;
     out.set_item("log_alpha", reported_log_alpha)?;

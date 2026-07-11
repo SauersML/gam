@@ -152,8 +152,8 @@ fn planted_circle_fit_returns_with_analytic_certificate() {
     assert_eq!(fitted.loss.smoothness, recomputed_loss.smoothness);
     assert_eq!(fitted.loss.ard, recomputed_loss.ard);
     assert_eq!(
-        fitted.loss.evidence_gauge_deflated_directions,
-        recomputed_loss.evidence_gauge_deflated_directions,
+        fitted.loss.criterion_gauge_deflated_directions,
+        recomputed_loss.criterion_gauge_deflated_directions,
         "reported loss must describe the exact fitted state/rho pair"
     );
     let ev = global_ev(z.view(), fitted.term.fitted().view());

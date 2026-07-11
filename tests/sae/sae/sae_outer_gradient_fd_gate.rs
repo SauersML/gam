@@ -201,7 +201,7 @@ fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
 /// barely excited and the bare data Gram `G_k = D_kᵀ D_k` drops rank. Under K=2
 /// the shared-row logit×coordinate Gauss-Newton cross term then drives a per-row
 /// `H_tt` block genuinely indefinite at/near the stationary point, so the
-/// undamped evidence factor must condition it by unit-stiffness SPECTRAL
+/// undamped criterion factor must condition it by unit-stiffness SPECTRAL
 /// deflation (eigenvalue → +1, ρ-independent log 1 = 0). This is precisely the
 /// branch whose former ridge-damped fallback injected a ρ-dependent evidence
 /// bias and desynced the outer value from the analytic ρ-gradient (#1117). The
@@ -221,7 +221,7 @@ fn rank_deficient_fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixtu
     // unexcited, so the bare data Gram `G_k = D_kᵀ D_k` drops rank (the #1117
     // OLMo-circle degeneracy). Under K=2 the shared-row logit×coordinate
     // Gauss-Newton cross term drives a per-row `H_tt` block indefinite at/near
-    // the optimum, forcing the undamped evidence factor down the spectral
+    // the optimum, forcing the undamped criterion factor down the spectral
     // unit-stiffness deflation path this fix installs.
     let mut coords = vec![Array2::<f64>::zeros((n, 1)), Array2::<f64>::zeros((n, 1))];
     let mut target = Array2::<f64>::zeros((n, p));

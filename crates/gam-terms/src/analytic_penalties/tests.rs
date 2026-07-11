@@ -589,6 +589,21 @@ fn ordered_beta_bernoulli_row_weighted_channels_are_one_operator_991() {
         let fd = (gp[i] - gm[i]) / (2.0 * step);
         assert_abs_diff_eq!(hv[i], fd, epsilon = 1.0e-5);
     }
+    // Isolate one row/column direction: the exact integrated marginal couples
+    // it into every other row of the same column through M_k, while leaving
+    // other columns exactly untouched.
+    let mut one_site = Array1::<f64>::zeros(t.len());
+    one_site[0] = 1.0;
+    let cross_row = pen.hvp(t.view(), rho.view(), one_site.view());
+    assert!(
+        cross_row[k].abs() > 1.0e-6 && cross_row[2 * k].abs() > 1.0e-6,
+        "same-column cross-row Hessian action must be nonzero: {cross_row:?}"
+    );
+    for row in 0..w.len() {
+        for col in 1..k {
+            assert_abs_diff_eq!(cross_row[row * k + col], 0.0, epsilon = 0.0);
+        }
+    }
 
     // (c) hessian_diag == the diagonal of the weighted operator (FD of grad).
     let hd = pen
@@ -1165,7 +1180,7 @@ fn block_ortho_test_target() -> Array1<f64> {
 }
 
 #[test]
-fn block_orthogonality_value_matches_offdiag_gram_frobenius() {
+fn block_orthogonality_value_is_half_weight_per_unordered_pair() {
     let t = block_ortho_test_target();
     let target = PsiSlice::full(t.len(), Some(4));
     let pen =
@@ -1173,7 +1188,8 @@ fn block_orthogonality_value_matches_offdiag_gram_frobenius() {
             .expect("valid block orthogonality penalty");
     let rho = array![0.0_f64];
     let v = pen.value(t.view(), rho.view());
-    // value = 0.5 · w · 3.0 = 0.5 · 2.5 · 3.0 = 3.75
+    // Public normalization: 0.5 · w · Σ_{g<h} ||T_g^T T_h||²_F.
+    // There is one unordered pair here, with squared Frobenius norm 3.
     assert!(v.is_finite(), "block-orthogonality value must be finite");
     assert_abs_diff_eq!(v, 3.75, epsilon = 1e-12);
 }

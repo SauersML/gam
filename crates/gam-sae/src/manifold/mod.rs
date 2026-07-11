@@ -143,7 +143,7 @@ pub(crate) use gam_solve::arrow_schur::{
     solve_arrow_newton_step_with_options,
 };
 
-// #988 memory-matrix-free evidence log-det: the reduced-Schur SLQ entry point
+// #988 memory-matrix-free criterion log-det: the reduced-Schur SLQ entry point
 // and its shared tuning constants, used when the dense k×k Schur exceeds budget.
 pub(crate) use gam_solve::arrow_schur::{
     SCHUR_SLQ_LOGDET_LANCZOS_STEPS, SCHUR_SLQ_LOGDET_PROBES, SCHUR_SLQ_LOGDET_SEED,

@@ -1042,7 +1042,7 @@ pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching
         .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec())
     {
         Err(err) => err,
-        Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
+        Ok(..) => panic!("near-singular criterion factor without a matching gauge must reject"),
     };
     assert!(
         matches!(err, OuterGradientError::NonIdentifiable { .. }),
@@ -1268,7 +1268,7 @@ pub(crate) fn seed_inner_state_accepts_empty_beta_as_noslot() {
 /// converged evidence solve—the state a real continuation step supplies—then run
 /// one eval with zero inner Newton iterations and confirm the published
 /// `inner_beta_hint` is exactly that seed. An arbitrary off-optimum β can have no
-/// defined frozen Laplace evidence and is not a valid continuation witness.
+/// defined frozen quasi-Laplace score and is not a valid continuation witness.
 #[test]
 pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
     let mut source = warmstart_test_objective();

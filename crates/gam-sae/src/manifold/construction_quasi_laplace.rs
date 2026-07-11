@@ -237,7 +237,7 @@ impl SaeManifoldTerm {
         //    at the first coarse-KKT-band hit: the value and its implicit
         //    derivative must describe the same differentiable root (#2253).
         let mut rho_fixed = rho.clone();
-        let initial_fit = self.run_joint_fit_arrow_schur_for_evidence(
+        let initial_fit = self.run_joint_fit_arrow_schur_for_quasi_laplace(
             target,
             &mut rho_fixed,
             registry,
@@ -247,7 +247,7 @@ impl SaeManifoldTerm {
             ridge_beta,
         )?;
         let mut loss = initial_fit.loss;
-        let mut evidence_fixed_point = initial_fit.fixed_point;
+        let mut criterion_fixed_point = initial_fit.fixed_point;
 
         // 2. Drive the inner (t, β) solve to the KKT/step-converged optimum and
         //    take one final UNDAMPED factor there to obtain the joint Hessian
@@ -302,7 +302,7 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
             &mut loss,
-            &mut evidence_fixed_point,
+            &mut criterion_fixed_point,
             &options,
             refine_progress_extension,
         )?;
@@ -310,7 +310,7 @@ impl SaeManifoldTerm {
             cache.gauge_deflated_directions,
             refine_progress_extension,
         )?;
-        loss.evidence_gauge_deflated_directions = cache.gauge_deflated_directions;
+        loss.criterion_gauge_deflated_directions = cache.gauge_deflated_directions;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             "SaeManifoldTerm::penalized_quasi_laplace_criterion: arrow_log_det_from_cache returned None \
              (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
@@ -368,7 +368,7 @@ impl SaeManifoldTerm {
             let n_eff = self.per_atom_effective_sample_size();
             // #5 VETO — categorical Laplace-VALIDITY condition (blend-null null-license
             // fix, recov matrix 12484591): an atom with rank_eff==0 (⟺ d_eff==0)
-            // reconstructs NOTHING. Its Laplace evidence is not "small" — it is INVALID:
+            // reconstructs NOTHING. Its quasi-Laplace score is not "small" — it is INVALID:
             // the vanishing decoder makes the β-mode degenerate, and the β-Schur log-det
             // → −∞ is the approximation BREAKING DOWN, not a real reward (which is why a
             // zero-‖B‖ atom got "born" on a featureless blend-null residual while the
@@ -441,7 +441,7 @@ impl SaeManifoldTerm {
         if !re_anchor {
             return Ok(());
         }
-        match self.expected_evidence_gauge_deflated_directions {
+        match self.expected_criterion_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
             Some(expected) => {
                 // A change in the gauge-deflation count between two evidence
@@ -491,9 +491,9 @@ impl SaeManifoldTerm {
                 // re-anchored and evidence-neutral); a genuinely oscillating count
                 // exhausts the reversal budget and refuses loudly.
                 let delta_sign: i8 = if count > expected { 1 } else { -1 };
-                let is_reversal = self.evidence_gauge_deflation_last_delta_sign != 0
-                    && delta_sign != self.evidence_gauge_deflation_last_delta_sign;
-                self.evidence_gauge_deflation_last_delta_sign = delta_sign;
+                let is_reversal = self.criterion_gauge_deflation_last_delta_sign != 0
+                    && delta_sign != self.criterion_gauge_deflation_last_delta_sign;
+                self.criterion_gauge_deflation_last_delta_sign = delta_sign;
                 // A reversal alone is NOT the pathology — a BOUNDED flicker of a
                 // few rows crossing the near-null deflation floor reverses
                 // direction every step yet is the discretization jitter of a
@@ -517,7 +517,7 @@ impl SaeManifoldTerm {
                 let level = expected.max(count);
                 let jitter_band = (level / 4).max(2);
                 if is_reversal && amplitude > jitter_band {
-                    self.evidence_gauge_deflation_reanchors += 1;
+                    self.criterion_gauge_deflation_reanchors += 1;
                 }
                 let reversal_budget = self
                     .k_atoms()
@@ -527,29 +527,29 @@ impl SaeManifoldTerm {
                             + 1,
                     )
                     .saturating_add(1);
-                if self.evidence_gauge_deflation_reanchors > reversal_budget {
+                if self.criterion_gauge_deflation_reanchors > reversal_budget {
                     return Err(format!(
-                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: row-gauge evidence deflation count \
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: row-gauge criterion deflation count \
                          oscillated (reversed direction {} times, last {expected}->{count}) within \
                          one optimization, exceeding the {reversal_budget}-reversal budget for {} \
                          atoms; the quotient dimension is not stabilizing, refusing to compare \
                          Laplace normalizers",
-                        self.evidence_gauge_deflation_reanchors,
+                        self.criterion_gauge_deflation_reanchors,
                         self.k_atoms()
                     ));
                 }
                 log::debug!(
-                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: per-row evidence deflation count changed \
+                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: per-row criterion deflation count changed \
                      {expected}->{count} (a benign per-row conditioning drift across the ρ-walk; \
                      reversal {}/{reversal_budget}); re-anchoring the Laplace normalizer comparison \
                      to the new dimension",
-                    self.evidence_gauge_deflation_reanchors
+                    self.criterion_gauge_deflation_reanchors
                 );
-                self.expected_evidence_gauge_deflated_directions = Some(count);
+                self.expected_criterion_gauge_deflated_directions = Some(count);
                 Ok(())
             }
             None => {
-                self.expected_evidence_gauge_deflated_directions = Some(count);
+                self.expected_criterion_gauge_deflated_directions = Some(count);
                 Ok(())
             }
         }
@@ -578,7 +578,7 @@ impl SaeManifoldTerm {
     /// assignment-sparsity negative logit curvature) that surfaces
     /// `PerRowFactorFailed` from the undamped `factor_one_row`. Both the dense
     /// (`penalized_quasi_laplace_criterion_with_cache`) and the streaming
-    /// (`penalized_quasi_laplace_criterion_streaming_exact`) evidence paths route through this same
+    /// (`penalized_quasi_laplace_criterion_streaming_exact`) criterion paths route through this same
     /// driver, so they converge to the identical inner state and their
     /// `ridge = 0` log-determinants stay bit-identical (#847).
     pub(crate) fn converge_inner_for_undamped_logdet(
@@ -592,7 +592,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         loss: &mut SaeManifoldLoss,
-        evidence_fixed_point: &mut bool,
+        criterion_fixed_point: &mut bool,
         options: &ArrowSolveOptions,
         refine_progress_extension: bool,
     ) -> Result<ArrowFactorCache, String> {
@@ -603,7 +603,7 @@ impl SaeManifoldTerm {
         // β off the seed), so we factor exactly once at the frozen iterate and
         // return that undamped cache without invoking the stationarity gate.
         // The caller has already run
-        // `run_joint_fit_arrow_schur_for_evidence(..., 0, ...)`,
+        // `run_joint_fit_arrow_schur_for_quasi_laplace(..., 0, ...)`,
         // which under the `max_iter == 0` freeze (gam#577/#579, #850) runs ONLY
         // the β-neutral basis refresh and returns the loss without touching β —
         // it skips the rank-reduction, frame activation, re-seed guards, and the
@@ -614,7 +614,7 @@ impl SaeManifoldTerm {
                 .assemble_arrow_schur(target, rho, registry)
                 .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
             // #1095/#2228 — same decoupling as the stall / gradient-stationary
-            // acceptance paths. This frozen warm-start evidence log-det is read from
+            // acceptance paths. This frozen warm-start criterion log-det is read from
             // the ridge-0 factor below, which is non-PD BY CONSTRUCTION on an
             // over-parametrized chart (a rank-1 radial null per row). Per-row
             // spectral deflation only fires when `row_gauge_deflation.is_some()`, and
@@ -624,7 +624,7 @@ impl SaeManifoldTerm {
             // null is unit-stiffness deflated (`log 1 = 0`, ρ-independent) and the
             // frozen log-det is finite, instead of refusing a rescuable warm-start
             // reuse. A full-rank block has no sub-floor eigenvalue and is untouched.
-            Self::ensure_row_gauge_deflation_for_evidence(&mut sys);
+            Self::ensure_row_gauge_deflation_for_quasi_laplace(&mut sys);
             let factored = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
                 .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
             // The frozen-state Newton step (factored.0, factored.1) is discarded
@@ -766,7 +766,7 @@ impl SaeManifoldTerm {
             // so the criterion VALUE is untouched. Only work whose result was
             // provably discarded is removed.
             let gradient_stationary =
-                Self::evidence_kkt_stationary(grad_norm, quotient_grad_norm, grad_tolerance);
+                Self::quasi_laplace_kkt_stationary(grad_norm, quotient_grad_norm, grad_tolerance);
             // #2253 — a coarse KKT-band hit is only an admission signal, not the
             // differentiable root the IFT gradient assumes. A bounded evidence
             // chunk reports `fixed_point` only when a whole re-entry accepted no
@@ -777,7 +777,7 @@ impl SaeManifoldTerm {
             // No new tolerance or work budget is introduced: either the existing
             // progress-paid grant reaches the true no-descent recurrence, or the
             // existing non-convergence refusal wins.
-            if gradient_stationary && *evidence_fixed_point {
+            if gradient_stationary && *criterion_fixed_point {
                 // #1095/#2228 — decouple this ACCEPT from undamped-factor success,
                 // the same acceptance-local pattern as the stall path below. A
                 // cleanly-fit over-parametrized chart (d_atom=2 on intrinsic 1-D
@@ -786,12 +786,12 @@ impl SaeManifoldTerm {
                 // than the objective-stall path, yet its ridge-0 per-row H_tt is
                 // non-PD by construction. Force the acceptance factor to opt into
                 // per-row spectral discovery so the null is unit-stiffness deflated
-                // (`log 1 = 0`, ρ-independent) and the evidence log-det is finite.
+                // (`log 1 = 0`, ρ-independent) and the criterion log-det is finite.
                 // This does NOT touch the undamped #2080 probe: the probe runs only
                 // in the non-stationary branch below, which THIS block never reaches
                 // (every arm returns), and a non-stationary iteration never installs
                 // this deflation — so `sys` stays undamped for the probe.
-                Self::ensure_row_gauge_deflation_for_evidence(&mut sys);
+                Self::ensure_row_gauge_deflation_for_quasi_laplace(&mut sys);
                 let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
                     match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
                         Ok(factored) => factored,
@@ -804,10 +804,10 @@ impl SaeManifoldTerm {
                             // Schur complement of the logit block goes negative even
                             // though the priors and the full-joint GN term are PSD.
                             //
-                            // The undamped evidence factor conditions that block the
+                            // The undamped criterion factor conditions that block the
                             // PRINCIPLED way: with per-row spectral discovery now
                             // force-enabled above (`row_gauge_deflation` installed),
-                            // `factor_spectral_deflated_evidence_row` discovers the
+                            // `factor_spectral_deflated_criterion_row` discovers the
                             // negative/flat eigen-direction — including the #1095/#2228
                             // radial null the decoded-derivative gauge floor
                             // (`tangent·tangent > 1e-24`) would otherwise have excluded
@@ -829,7 +829,7 @@ impl SaeManifoldTerm {
                             // line-search — the multi-atom non-convergence #1117 removes.
                             return Err(format!(
                                 "SaeManifoldTerm::penalized_quasi_laplace_criterion: stationary undamped \
-                                 evidence factorization has a non-PD per-row H_tt block \
+                                 criterion factorization has a non-PD per-row H_tt block \
                                  that spectral unit-stiffness deflation could not \
                                  condition (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}); \
                                  {err}"
@@ -862,7 +862,7 @@ impl SaeManifoldTerm {
                     &lambda_smooth,
                 )?;
                 log::debug!(
-                    "SAE evidence factor accepted at KKT stationarity: ‖g‖={grad_norm:.6e} \
+                    "SAE criterion factor accepted at KKT stationarity: ‖g‖={grad_norm:.6e} \
                      ‖Π⊥gauge g‖={quotient_grad_norm:.6e} tol={grad_tolerance:.6e} \
                      ‖Δ‖={:.6e} ‖Π⊥gauge Δ‖={:.6e} after {total_inner_iter} inner iterations",
                     step_norm_sq.sqrt(),
@@ -921,11 +921,11 @@ impl SaeManifoldTerm {
                             // always cross the indefinite basin into the PD region within
                             // the descent-extended budget.
                             //
-                            // The undamped (ridge=0) evidence factor already conditions
+                            // The undamped (ridge=0) criterion factor already conditions
                             // that block the PRINCIPLED way: `factor_spectral_deflated_
                             // evidence_row` discovers the negative/flat eigen-direction
                             // and stiffens it to UNIT curvature (eigenvalue → +1), a
-                            // ρ-INDEPENDENT log 1 = 0 evidence contribution — so a
+                            // ρ-independent `log 1 = 0` criterion contribution — so a
                             // spectral-deflatable indefinite block factors fine (both
                             // here and in the stationary factorization above) and
                             // returns a finite, monotone-comparable value to the outer
@@ -955,7 +955,7 @@ impl SaeManifoldTerm {
                         saw_refine_progress |=
                             Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                         previous_refine_grad_norm = Some(grad_norm);
-                        let refine = self.run_joint_fit_arrow_schur_for_evidence(
+                        let refine = self.run_joint_fit_arrow_schur_for_quasi_laplace(
                             target,
                             rho_fixed,
                             registry,
@@ -965,7 +965,7 @@ impl SaeManifoldTerm {
                             ridge_beta,
                         )?;
                         *loss = refine.loss;
-                        *evidence_fixed_point = refine.fixed_point;
+                        *criterion_fixed_point = refine.fixed_point;
                         total_inner_iter += refine_iter;
                         continue;
                     }
@@ -1080,7 +1080,7 @@ impl SaeManifoldTerm {
             saw_refine_progress |=
                 Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);
-            let refine = self.run_joint_fit_arrow_schur_for_evidence(
+            let refine = self.run_joint_fit_arrow_schur_for_quasi_laplace(
                 target,
                 rho_fixed,
                 registry,
@@ -1090,7 +1090,7 @@ impl SaeManifoldTerm {
                 ridge_beta,
             )?;
             *loss = refine.loss;
-            *evidence_fixed_point = refine.fixed_point;
+            *criterion_fixed_point = refine.fixed_point;
             total_inner_iter += refine_iter;
             refine_rounds += 1;
             // #1051 — objective-stagnation fixed point. A whole refine round that
@@ -1137,7 +1137,7 @@ impl SaeManifoldTerm {
             previous_loss_total = new_loss_total;
             if stalled
                 && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
-                && *evidence_fixed_point
+                && *criterion_fixed_point
             {
                 let mut stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
@@ -1181,7 +1181,7 @@ impl SaeManifoldTerm {
                     &lambda_smooth,
                     options,
                 ) {
-                    if Self::evidence_kkt_stationary(
+                    if Self::quasi_laplace_kkt_stationary(
                         stationary_grad_norm,
                         stationary_quotient_grad_norm,
                         grad_tolerance,
@@ -1254,7 +1254,7 @@ impl SaeManifoldTerm {
                 // resumes with fresh progress instead of refusing. The phase
                 // mints nothing — acceptance stays with the loop-top KKT gate
                 // and the idempotence certificate (the state moved, so
-                // `evidence_fixed_point` is cleared and one evidence re-entry
+                // `criterion_fixed_point` is cleared and one evidence re-entry
                 // must recur exactly before acceptance, same as any hook move).
                 if terminal_newton_rounds > 0 {
                     terminal_newton_rounds -= 1;
@@ -1268,7 +1268,7 @@ impl SaeManifoldTerm {
                         options,
                         12,
                     )? {
-                        *evidence_fixed_point = false;
+                        *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
                         saw_refine_progress = true;
                         continue;
@@ -1303,11 +1303,11 @@ impl SaeManifoldTerm {
     /// spectral discovery (the #974 low-rank-whiten seam). An intrinsic flat /
     /// indefinite `H_tt` direction is then deflated to UNIT stiffness
     /// (`log 1 = 0`, ρ-independent, the quotient pseudo-determinant convention),
-    /// so the ridge-0 factor is PD-by-deflation and the evidence log-det finite;
+    /// so the ridge-0 factor is PD-by-deflation and the criterion log-det finite;
     /// a full-rank block has no sub-floor eigenvalue and is untouched.
     ///
     /// Shared by the acceptance-site installer
-    /// [`Self::ensure_row_gauge_deflation_for_evidence`] and by the two
+    /// [`Self::ensure_row_gauge_deflation_for_quasi_laplace`] and by the two
     /// fixed-decoder assembler `.or_else` fallbacks in
     /// `construction_arrow_schur_assembly`, which keep their `low_rank_whiten`
     /// gate (this fn only mints the value they conditionally install).
@@ -1322,10 +1322,10 @@ impl SaeManifoldTerm {
     /// system (rotation/phase gauge, #1273/#974 metric-null) is left untouched.
     ///
     /// CRITICAL INVARIANT: this MUST only ever run on a system that is about to
-    /// be FACTORED for an accepted evidence log-det, never on the loop `sys` fed
+    /// be FACTORED for an accepted criterion log-det, never on the loop `sys` fed
     /// to `probe_undamped_evidence_row_factors` — the #2080 infeasible-ρ probe is
     /// contractually the UNDAMPED (non-deflated) per-row verdict (#2080/#2228).
-    pub(crate) fn ensure_row_gauge_deflation_for_evidence(sys: &mut ArrowSchurSystem) {
+    pub(crate) fn ensure_row_gauge_deflation_for_quasi_laplace(sys: &mut ArrowSchurSystem) {
         if sys.row_gauge_deflation.is_none() {
             let n_rows = sys.rows.len();
             sys.set_row_gauge_deflation(Self::empty_row_gauge_deflation(n_rows));
@@ -1349,7 +1349,7 @@ impl SaeManifoldTerm {
     /// Objective stagnation, a finite deflated factor, or a small Newton
     /// decrement may diagnose conditioning but cannot substitute for raw or
     /// quotient KKT stationarity.
-    pub(crate) fn evidence_kkt_stationary(
+    pub(crate) fn quasi_laplace_kkt_stationary(
         grad_norm: f64,
         quotient_grad_norm: f64,
         tolerance: f64,
@@ -1361,7 +1361,7 @@ impl SaeManifoldTerm {
     }
 
     /// Install the per-row spectral deflation on an ACCEPTANCE system, take its
-    /// undamped (ridge-0) evidence factorization, and read back both KKT residual
+    /// undamped (ridge-0) criterion factorization, and read back both KKT residual
     /// norms (raw and quotient) off the SAME assembled system. This is the
     /// objective-stall diagnostic factorization (#1095/#2228/#1094): the returned
     /// [`DeflatedEvidenceFactor`] carries the finite deflated cache plus the
@@ -1375,7 +1375,7 @@ impl SaeManifoldTerm {
         lambda_smooth: &[f64],
         options: &ArrowSolveOptions,
     ) -> Result<DeflatedEvidenceFactor, String> {
-        Self::ensure_row_gauge_deflation_for_evidence(sys);
+        Self::ensure_row_gauge_deflation_for_quasi_laplace(sys);
         let (delta_t, delta_beta, cache) =
             solve_arrow_newton_step_with_options(sys, 0.0, 0.0, options)
                 .map_err(|err| err.to_string())?;
@@ -1500,7 +1500,7 @@ impl SaeManifoldTerm {
             let grad_norm = grad_norm_sq.sqrt();
             let quotient_grad_norm =
                 self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, lambda_smooth);
-            if Self::evidence_kkt_stationary(grad_norm, quotient_grad_norm, grad_tolerance) {
+            if Self::quasi_laplace_kkt_stationary(grad_norm, quotient_grad_norm, grad_tolerance) {
                 // In the band: hand back to the refine loop, whose gate +
                 // idempotence certificate decide acceptance.
                 return Ok(true);
@@ -1512,7 +1512,7 @@ impl SaeManifoldTerm {
                 break;
             }
             prev_grad_norm = grad_norm;
-            // Ridge-0 deflated evidence factor = the B-preconditioner for the
+            // Ridge-0 deflated criterion factor = the B-preconditioner for the
             // exact-pencil GMRES (identical to the outer IFT's preconditioner).
             let factor = match self
                 .factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options)
@@ -1520,7 +1520,7 @@ impl SaeManifoldTerm {
                 Ok(factor) => factor,
                 Err(err) => {
                     log::debug!(
-                        "terminal Newton bail: deflated evidence factor at ‖g‖={grad_norm:.6e}: {err}"
+                        "terminal Newton bail: deflated criterion factor at ‖g‖={grad_norm:.6e}: {err}"
                     );
                     break;
                 }
@@ -1979,7 +1979,7 @@ impl SaeManifoldTerm {
     /// per-row factored Hessian (matrix-free, feasible at massive K; the dense
     /// `border_dim²` Schur is NEVER formed here), so the EFS hyperparameter lane
     /// can take its matrix-free ARD / smoothness traces off this cache in the
-    /// streaming regime instead of hard-erroring on the dense evidence path. The
+    /// streaming regime instead of hard-erroring on the dense criterion path. The
     /// log-determinant is the chunked matrix-free `streaming_exact_arrow_log_det`.
     /// Convenience over [`Self::penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane`]
     /// with no #2080 surrogate lane (bit-identical SLQ evidence).
@@ -2019,7 +2019,7 @@ impl SaeManifoldTerm {
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         let mut rho_fixed = rho.clone();
-        let initial_fit = self.run_joint_fit_arrow_schur_for_evidence(
+        let initial_fit = self.run_joint_fit_arrow_schur_for_quasi_laplace(
             target,
             &mut rho_fixed,
             registry,
@@ -2029,7 +2029,7 @@ impl SaeManifoldTerm {
             ridge_beta,
         )?;
         let mut loss = initial_fit.loss;
-        let mut evidence_fixed_point = initial_fit.fixed_point;
+        let mut criterion_fixed_point = initial_fit.fixed_point;
         // Drive the inner (t, β) state to the SAME KKT/step-converged optimum the
         // dense `penalized_quasi_laplace_criterion_with_cache` reaches before factoring. At that
         // optimum the per-row `H_tt^(i)` blocks are PD, so the undamped
@@ -2058,7 +2058,7 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
             &mut loss,
-            &mut evidence_fixed_point,
+            &mut criterion_fixed_point,
             &options,
             true,
         )?;
@@ -2174,7 +2174,7 @@ impl SaeManifoldTerm {
         Ok((cost, loss))
     }
 
-    /// Value-only streaming reduced-Schur evidence log-det via the historical SLQ
+    /// Value-only streaming reduced-Schur criterion log-det via the historical SLQ
     /// lane — convenience over [`Self::streaming_exact_arrow_log_det_with_lane`]
     /// with `lane = None` (bit-identical to the pre-#2080 SLQ path).
     pub fn streaming_exact_arrow_log_det(
@@ -2310,7 +2310,7 @@ impl SaeManifoldTerm {
             )
             .map_err(|err| {
                 format!(
-                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free evidence log-det: {err:?}"
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free criterion log-det: {err:?}"
                 )
             })?;
             if !log_det_schur.is_finite() {
@@ -3844,7 +3844,7 @@ impl SaeManifoldTerm {
         joint_block: bool,
     ) -> Result<SaeArrowVector, String> {
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
-        // the SAME object the evidence factor builds — Gauss-Newton data
+        // the SAME object the criterion factor builds — Gauss-Newton data
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
         // Newton/Schur Cholesky factorizes — so each block's θ-derivative channel
         // is differentiated on the criterion's own branch (no value/gradient

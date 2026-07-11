@@ -5,7 +5,7 @@ dispatches into a Rust fitter or a frozen-artifact reader; the only Python logic
 is argument routing and the canonical-hash / subspace-diff serialization glue,
 which lives in ``tiered_artifact.py``).
 
-    fit     drive the tiered pipeline (T1 → SAC T2 → assemble) → write artifact dir
+    fit     drive the tiered pipeline (T1 → native manifold T2 → assemble) → artifact
     steer   dose-calibrated chart move on one atom; predicted_nats before the edit
     diff    compare two artifacts: atom matching, subspace angles, per-tier hash deltas
 
@@ -26,7 +26,6 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tiered_artifact import (  # noqa: E402
     TieredArtifact,
-    load_sac_result,
     load_t0_from_manifest,
     load_tier1_artifact,
     t2_dictionary_hash,
@@ -42,26 +41,24 @@ def fit_artifact(
     out_dir: str,
     k1: int = 16,
     k2: int = 8,
-    use_sac: bool = True,
     d_atom: int = 2,
     atom_topology: str = "circle",
     t0: dict[str, Any] | None = None,
     random_state: int = 0,
-    **kwargs: Any,
 ) -> TieredArtifact:
-    """Fit T1 (+ SAC T2) on ``X`` and serialize the union artifact.
-
-    ``use_sac=True`` runs the stagewise K=1 composition (``sac_prototype.sac_fit``,
-    the SAC_PLAN Part-2 path that avoids the joint co-collapse); ``False`` selects
-    the joint ``compose_tiers`` path. Heavy math is entirely in the Rust
-    fitters underneath both.
-    """
-    import gamfit
+    """Fit T1 plus one converged native manifold T2 and serialize the artifact."""
+    from compose_tiers import compose_tiers
 
     x = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-    t1 = gamfit.sparse_dictionary_fit(x, K=k1, active=kwargs.get("t1_active", 4),
-                                      max_epochs=kwargs.get("t1_max_epochs", 30))
-    t1_recon = t1.fitted
+    comp = compose_tiers(
+        x,
+        k1=k1,
+        k2=k2,
+        d_atom=d_atom,
+        atom_topology=atom_topology,
+        random_state=random_state,
+    )
+    t1 = comp.t1
 
     art = TieredArtifact(t0=t0)
     art.t1_decoder = np.ascontiguousarray(t1.decoder, dtype=np.float32)
@@ -69,24 +66,14 @@ def fit_artifact(
         art.t1_indices = np.asarray(t1.indices)
         art.t1_codes = np.asarray(t1.codes, dtype=np.float32)
 
-    if use_sac:
-        from sac_prototype import sac_fit
-        sac = sac_fit(x, t1_recon=t1_recon, max_atoms=k2, d_atom=d_atom,
-                      atom_topology=atom_topology, random_state=random_state,
-                      verbose=kwargs.get("verbose", False))
-        _, specs, meta = load_sac_result(sac)
-        art.t2_atoms = specs
-        art.t2_meta = meta
-    else:
-        from compose_tiers import compose_tiers
-        comp = compose_tiers(x, k1=k1, k2=k2, d_atom=d_atom,
-                             atom_topology=atom_topology, random_state=random_state)
-        if hasattr(comp.t2, "to_dict"):
-            art.t2_manifold_payload = comp.t2.to_dict()
-        art.t2_meta = {"t1_ev": comp.t1_ev, "combined_ev": comp.combined_ev,
-                       "ev_gain": comp.ev_gain}
+    art.t2_manifold_payload = comp.t2.to_dict()
+    art.t2_meta = {
+        "t1_ev": comp.t1_ev,
+        "combined_ev": comp.combined_ev,
+        "ev_gain": comp.ev_gain,
+    }
 
-    art.provenance = {"fitter": "sac" if use_sac else "compose_tiers",
+    art.provenance = {"fitter": "native_joint_manifold_sae",
                       "n": int(x.shape[0]), "p": int(x.shape[1]),
                       "k1": k1, "k2": k2, "random_state": random_state}
     content_hash = art.save(out_dir)
@@ -235,9 +222,9 @@ def _cmd_fit(a: argparse.Namespace) -> None:
         decoder, baked_t0 = load_tier1_artifact(a.t1_source)
         t0 = t0 or baked_t0
     X = _load_X(a.data)
-    art = fit_artifact(X, out_dir=a.out, k1=a.k1, k2=a.k2, use_sac=not a.joint,
+    art = fit_artifact(X, out_dir=a.out, k1=a.k1, k2=a.k2,
                        d_atom=a.d_atom, atom_topology=a.atom_topology, t0=t0,
-                       random_state=a.random_state, verbose=a.verbose)
+                       random_state=a.random_state)
     print(json.dumps({"content_hash": art.content_hash(),
                       "out": a.out, "provenance": art.provenance}, indent=2))
 
@@ -268,9 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--k2", type=int, default=8)
     f.add_argument("--d-atom", type=int, default=2)
     f.add_argument("--atom-topology", default="circle")
-    f.add_argument("--joint", action="store_true", help="use joint compose_tiers instead of SAC")
     f.add_argument("--random-state", type=int, default=0)
-    f.add_argument("--verbose", action="store_true")
     f.set_defaults(func=_cmd_fit)
 
     d = sub.add_parser("diff", help="compare two artifacts")

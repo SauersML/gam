@@ -25,7 +25,7 @@
 //!       NOT a 1-D ring — a chord through the origin, not a circle).
 //! and asserts the adjudicator awards the headline to the Euclidean/Gaussian
 //! candidate, never to the circle, BOTH on held-out predictive density and on
-//! the rank-aware Laplace evidence — across several fixed integer seeds.
+//! the rank-aware quasi-Laplace score — across several fixed integer seeds.
 //!
 //! All assertions are against the PLANTED TRUTH (which generator produced the
 //! data), never against a reference tool's output. All randomness is a fixed

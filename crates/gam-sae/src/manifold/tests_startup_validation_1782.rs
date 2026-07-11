@@ -271,7 +271,7 @@ fn run_full_fit(
             // softmax "BFGS aborted: globally infeasible neighbourhood at seed
             // (probe-refusal guard)" abort — both are the emptied / globally-refused
             // seed cascade the fit must avoid by entering a basin with defined
-            // Laplace evidence; infeasible probes remain `+∞` and cannot certify.
+            // quasi-Laplace score; infeasible probes remain `+∞` and cannot certify.
             panic!("#1782 {label} fit must not abort at startup / in the outer solver, got: {e}")
         });
     objective
@@ -302,7 +302,7 @@ fn run_full_fit(
 /// neighbourhood to a FATAL seed rejection ("BFGS aborted: globally infeasible
 /// neighbourhood at seed (probe-refusal guard)"). `ordered_beta_bernoulli`+`circle` lands in
 /// the PD region and never trips it — RED before the fix on `softmax`, GREEN
-/// after (the entry path now reaches a basin with defined Laplace evidence).
+/// after (the entry path now reaches a basin with defined quasi-Laplace score).
 #[test]
 fn assignment_kinds_fit_on_circle_1782() {
     let z = planted_circle_embedded(48, 6, 0.03);
@@ -403,7 +403,7 @@ fn cocollapse_startup_frontier_1026() {
 
 /// WIN artifact (#1026 / #1610). A PRINCIPLED joint manifold SAE — curved 1-D
 /// circle fibers, smooth logistic gate (`threshold_gate`, the per-row
-/// streaming assignment whose evidence log-det takes the matrix-free SLQ route)
+/// streaming assignment whose criterion log-det takes the matrix-free SLQ route)
 /// — fit end-to-end by the real outer penalized quasi-Laplace
 /// cascade must MATCH-OR-BEAT a traditional linear SAE (`fit_sparse_dictionary`,
 /// the "large linear SAE" of #1026) at matched, OVERCOMPLETE dictionary size K on
@@ -414,7 +414,7 @@ fn cocollapse_startup_frontier_1026() {
 /// diversification and the spectral Schur PD-floor that keep the overcomplete
 /// (K > true-rank) joint block PD instead of co-collapsing. K is kept box-safe
 /// here; the per-row work is `top_k`-bounded, so it is the same solve at larger
-/// K (the streaming matrix-free evidence log-det, exercised by the outer penalized quasi-Laplace
+/// K (the streaming matrix-free criterion log-det, exercised by the outer penalized quasi-Laplace
 /// cascade, is what carries it to K=32,000).
 #[test]
 fn manifold_beats_linear_joint_streaming_1026() {
@@ -430,7 +430,7 @@ fn manifold_beats_linear_joint_streaming_1026() {
         // solved directly by the coupled inner arrow-Schur joint Newton over the
         // (coords t, decoders β) block — the exact joint solve the outer penalized quasi-Laplace
         // cascade drives, run here at a fixed penalty seed so the comparison is a
-        // fast, deterministic reconstruction check (no per-step evidence log-det).
+        // fast, deterministic reconstruction check (no per-step criterion log-det).
         let mode = AssignmentMode::threshold_gate(1.0, 0.0);
         let (mut term, _disp) = build_term(z.view(), k, Topo::Circle, mode);
         let mut rho = SaeManifoldRho::new(

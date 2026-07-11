@@ -453,7 +453,7 @@ pub struct SaeManifoldAtom {
     /// polar steps. [`Self::decoder_coefficients`] stays the authoritative
     /// reconstructed `B_k` (so every existing consumer is unchanged); the frame
     /// is the *representation* that shrinks the border and contributes the
-    /// `r·(p − r)` Grassmann dimensions to the Laplace evidence normalizer.
+    /// `r·(p − r)` Grassmann dimensions to the quasi-Laplace score normalizer.
     /// Activated automatically by [`Self::maybe_activate_decoder_frame`] when the
     /// decoder's effective column rank is materially below `p`; never a flag.
     pub decoder_frame: Option<GrassmannFrame>,
@@ -1023,7 +1023,7 @@ impl SaeManifoldAtom {
 
     /// Grassmann manifold dimension `r·(p − r)` profiled OUT of the border for
     /// this atom (issue #972). `0` when no frame is active. This is the number
-    /// of frame degrees of freedom that must enter the Laplace evidence
+    /// of frame degrees of freedom that must enter the quasi-Laplace score
     /// dimension accounting (evidence honesty).
     pub fn frame_manifold_dimension(&self) -> usize {
         match &self.decoder_frame {

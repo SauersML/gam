@@ -431,7 +431,7 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
         .expect("finite entry must commit its full converged state");
 
     // Reassemble the exact committed entry and independently recheck the same
-    // strict raw-or-quotient KKT predicate that authorizes penalized quasi-Laplace evidence. A
+    // strict raw-or-quotient KKT predicate that authorizes penalized quasi-Laplace score. A
     // finite value alone cannot satisfy this regression.
     let committed_rho = objective.current_rho.clone();
     let system = objective
@@ -447,7 +447,7 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
     );
     let tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * objective.term.inner_iterate_scale();
     assert!(
-        SaeManifoldTerm::evidence_kkt_stationary(raw_kkt, quotient_kkt, tolerance),
+        SaeManifoldTerm::quasi_laplace_kkt_stationary(raw_kkt, quotient_kkt, tolerance),
         "committed legal entry is not a strict envelope root: raw KKT={raw_kkt:.6e}, quotient KKT={quotient_kkt:.6e}, tolerance={tolerance:.6e}"
     );
 }

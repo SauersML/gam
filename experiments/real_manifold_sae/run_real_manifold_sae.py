@@ -1,7 +1,7 @@
 """Real gamfit ManifoldSAE fit on REAL Qwen3-8B L18 activations (pos0 sink-peeled).
 
-This is the actual product path -- gamfit.sae_manifold_fit / sae_manifold_fit_stagewise
-on the SAME pos0-null-gated peeled input as curved_vs_linear.py Run-2 -- NOT the
+This is the actual product path -- ``gamfit.sae_manifold_fit`` on the SAME
+pos0-null-gated peeled input as curved_vs_linear.py Run-2 -- NOT the
 numpy kmeans+PCA proxy atlas. We compare the real fitter's reconstruction EV to the
 Run-2 references at matched capacity (linear PCA d=1, proxy atlas K32 d=1).
 
@@ -171,7 +171,6 @@ def main():
     ap.add_argument("--K", type=int, nargs="+", default=[32])
     ap.add_argument("--d-atom", type=int, default=1)
     ap.add_argument("--n-iter", type=int, default=50)
-    ap.add_argument("--stagewise", action="store_true")
     ap.add_argument("--smoke", action="store_true", help="tiny run to validate API")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -252,42 +251,6 @@ def main():
             import traceback
             traceback.print_exc()
             results["real_fits"].append({"fit": f"sae_manifold_fit K={K}", "error": str(e),
-                                         "wall_s": time.time() - t0})
-
-    if args.stagewise:
-        print("=== REAL sae_manifold_fit_stagewise ===", flush=True)
-        t0 = time.time()
-        try:
-            sw = gamfit.sae_manifold_fit_stagewise(Xp, d_atom=args.d_atom, n_iter=n_iter, random_state=0)
-            wall = time.time() - t0
-            recon = np.asarray(sw.reconstruct(Xp), dtype=np.float64)
-            srec = {
-                "fit": "sae_manifold_fit_stagewise",
-                "ev_reconstruct": ev_of(Xp, recon, tot),
-                "wall_s": wall,
-                "d_atom": args.d_atom,
-            }
-            for attr in ["k", "reconstruction_ev", "births_accepted", "births_rejected",
-                         "stopped_reason", "ev_trace", "backfit_ev_trace"]:
-                try:
-                    srec[attr] = _jsonable(getattr(sw, attr))
-                except Exception as e:
-                    srec[attr] = f"<err {e}>"
-            try:
-                atoms = list(sw.atoms)
-                from collections import Counter
-                tops = [str(getattr(a, "topology", getattr(a, "atom_topology", type(a).__name__))) for a in atoms]
-                srec["atom_topology_counts"] = dict(Counter(tops))
-                srec["n_atoms"] = len(atoms)
-            except Exception as e:
-                srec["atom_topologies"] = f"<err {e}>"
-            print(f"  stagewise EV={srec['ev_reconstruct']:.4f} k={srec.get('k')} "
-                  f"topo={srec.get('atom_topology_counts')} wall={wall:.1f}s", flush=True)
-            results["real_fits"].append(srec)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            results["real_fits"].append({"fit": "sae_manifold_fit_stagewise", "error": str(e),
                                          "wall_s": time.time() - t0})
 
     with open(os.path.join(args.out, "numbers.json"), "w") as f:
