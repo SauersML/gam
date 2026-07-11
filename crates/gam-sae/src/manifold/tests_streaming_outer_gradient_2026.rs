@@ -381,7 +381,7 @@ fn fixed_point_certificate_covers_non_ibp_exact_gradient() {
 #[test]
 fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     let (n, p, k) = (24usize, 2usize, 2usize);
-    let mut term = build_softmax_term(n, p, k);
+    let term = build_softmax_term(n, p, k);
     let rho = SaeManifoldRho::new(
         0.7_f64.ln(),
         0.8_f64.ln(),
