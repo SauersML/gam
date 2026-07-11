@@ -3660,24 +3660,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is a typed `OuterGradientError`: it is not a usable derivative and must
         // terminate this evaluation instead of being hidden behind a plain inverse
         // or a differenced value path.
-        // #2253/#2087 — the inner KKT residual at the accepted θ̂. Within tolerance
-        // when the inner reached KKT-stationarity (envelope holds, no correction);
-        // NONZERO when the ill-conditioned n≈p fit accepted a #1051 objective-
-        // stagnation point, where the outer gradient must add back the dropped
-        // `rᵀθ̂_ρ` term or it desyncs from d(value)/dρ (the |g|≈1.09 stall).
-        let kkt_residual = self
-            .term
-            .kkt_residual_vector(self.target.view(), &rho_state, self.registry.as_ref())
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let kkt_norm = (kkt_residual.t.iter().map(|v| v * v).sum::<f64>()
-            + kkt_residual.beta.iter().map(|v| v * v).sum::<f64>())
-        .sqrt();
-        let kkt_tol = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
-        let kkt_opt = if kkt_norm > kkt_tol {
-            Some(&kkt_residual)
-        } else {
-            None
-        };
         let grad_components = self
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
@@ -3689,7 +3671,6 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     &cache,
                     &solver,
                     None,
-                    kkt_opt,
                 )
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
