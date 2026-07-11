@@ -662,6 +662,12 @@ pub struct SaeManifoldTerm {
     /// DC-constant decoder is then EV-invisible BY CONSTRUCTION — the mean it would
     /// chase is already gone. Carried across clones like the other persisted config.
     pub(crate) tier0_mean: Option<Array1<f64>>,
+    /// Tier-0 per-column scale σ (input standardization): the fit ran on
+    /// `(Z − μ)/σ` and every reconstruction lifts back `μ + σ ⊙ x̂`. `None` on
+    /// the historical (unstandardized) path. Persisted configuration like
+    /// `tier0_mean`, carried across clones so a cloned candidate standardizes
+    /// identically.
+    pub(crate) tier0_scale: Option<Array1<f64>>,
 }
 
 /// Per-fit SAE configuration consumed by the Python/FFI layer. Build it, then
@@ -740,6 +746,7 @@ impl Clone for SaeManifoldTerm {
             // #2023 C4 — persisted Tier-0 shared mean, carried across clones like
             // the assignment mode so a cloned candidate de-means identically.
             tier0_mean: self.tier0_mean.clone(),
+            tier0_scale: self.tier0_scale.clone(),
         }
     }
 }

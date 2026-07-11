@@ -2564,6 +2564,15 @@ fn sae_manifold_fit_inner<'py>(
         Some(mean) => out.set_item("tier0_mean", mean.clone().into_pyarray(py))?,
         None => out.set_item("tier0_mean", py.None())?,
     }
+    // Tier-0 per-column scale σ (input standardization): the fit ran on
+    // `(Z − μ)/σ`, so a Python consumer reconstructing from the per-atom
+    // `decoder_B` must lift back `μ + σ ⊙ x̂`; `fitted` above already includes
+    // it. `None` on the unstandardized path (behavior/crosscoder fits,
+    // caller-centered targets).
+    match term.tier0_scale() {
+        Some(scale) => out.set_item("tier0_scale", scale.clone().into_pyarray(py))?,
+        None => out.set_item("tier0_scale", py.None())?,
+    }
     // #2235 — outer-search accounting for the CONVERGED fit (the only kind
     // that exists: non-convergence raises a typed error before a fit is
     // minted — the forcing-function contract, see SPEC).

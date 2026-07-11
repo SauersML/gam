@@ -431,26 +431,81 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitReport, 
     for mut row in request.target.rows_mut() {
         row -= &mu;
     }
+    // Tier-0 INPUT STANDARDIZATION — the conditioning half of the peel. There is
+    // no column equilibration anywhere else in the fit path, so a raw activation
+    // target's column-norm spread (measured ~1.3e4, joint Hessian κ ≈ 1e8 on
+    // #2015) directly sets the linear contraction rate of the majorized inner
+    // solver — the driver of the "~1e3 iterations then refusal" wall. Fit on
+    // `(Z − μ)/σ` with σ_c the per-column RMS of the centered target; the term
+    // stores σ next to μ and every reconstruction lifts back exactly
+    // (`μ + σ ⊙ x̂` in `add_tier0_mean_inplace`), so the model is self-contained
+    // in raw units and reconstruction is exact by construction — only the
+    // optimization geometry (and the equal-column-weight penalty pricing, the
+    // intended modeling change) differs.
+    //
+    // Gates: (a) a column whose centered RMS is below `√ε · max σ` is
+    // numerically empty — standardizing it would amplify representation noise,
+    // so it keeps unit scale (the scalar-type-derived floor, no tuning);
+    // (b) behavior / crosscoder fits are excluded: their targets carry the
+    // `√λ_y`-scaled block-encoding whose column magnitudes ARE the model (the
+    // λ_y Jacobian identity), not conditioning noise.
+    let standardizable = request.base_term.behavior.is_none()
+        && request.base_term.crosscoder_layout.is_none()
+        && request.target.nrows() > 0;
+    let sigma = if standardizable {
+        let n = request.target.nrows() as f64;
+        let mut sigma = Array1::<f64>::zeros(request.target.ncols());
+        for (col_idx, col) in request.target.columns().into_iter().enumerate() {
+            sigma[col_idx] = (col.iter().map(|v| v * v).sum::<f64>() / n).sqrt();
+        }
+        let sigma_max = sigma.iter().cloned().fold(0.0_f64, f64::max);
+        if sigma_max.is_finite() && sigma_max > 0.0 {
+            let floor = sigma_max * f64::EPSILON.sqrt();
+            for s in sigma.iter_mut() {
+                if !(*s > floor) {
+                    *s = 1.0;
+                }
+            }
+            for mut row in request.target.rows_mut() {
+                row /= &sigma;
+            }
+            Some(sigma)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut report = run_sae_manifold_fit_on_target(request)?;
     report
         .term
         .set_tier0_mean(mu.clone())
         .map_err(SaeFitError::Fit)?;
+    if let Some(sigma) = sigma.as_ref() {
+        report
+            .term
+            .set_tier0_scale(sigma.clone())
+            .map_err(SaeFitError::Fit)?;
+    }
     // Lift the reported reconstructions back to raw-target space (the fit produced
-    // them against `Z − μ`); assignment masses carry no mean and are untouched.
-    add_tier0_mean_rows(&mut report.fitted, &mu);
+    // them against `(Z − μ)/σ`); assignment masses carry no mean/scale and are
+    // untouched.
+    lift_tier0_rows(&mut report.fitted, &mu, sigma.as_ref());
     if let Some(pre_topk) = report.pre_topk_fitted.as_mut() {
-        add_tier0_mean_rows(pre_topk, &mu);
+        lift_tier0_rows(pre_topk, &mu, sigma.as_ref());
     }
     Ok(report)
 }
 
-/// Add the Tier-0 shared mean `mu` (length `p`) to every row of an `N×p`
-/// reconstruction produced against the de-meaned target, lifting it back to
-/// raw-target space. Mirrors [`SaeManifoldTerm::add_tier0_mean_inplace`] for the
-/// report's standalone reconstruction arrays.
-fn add_tier0_mean_rows(recon: &mut Array2<f64>, mu: &Array1<f64>) {
+/// Lift an `N×p` reconstruction produced against the standardized de-meaned
+/// target back to raw-target space: `x̂ ← μ + σ ⊙ x̂`. Mirrors
+/// [`SaeManifoldTerm::add_tier0_mean_inplace`] for the report's standalone
+/// reconstruction arrays.
+fn lift_tier0_rows(recon: &mut Array2<f64>, mu: &Array1<f64>, sigma: Option<&Array1<f64>>) {
     for mut row in recon.rows_mut() {
+        if let Some(sigma) = sigma {
+            row *= sigma;
+        }
         row += mu;
     }
 }

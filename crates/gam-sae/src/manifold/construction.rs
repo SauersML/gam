@@ -316,6 +316,7 @@ impl SaeManifoldTerm {
             // historical path is bit-for-bit). Installed via `set_tier0_mean` /
             // `fit_tier0_mean`.
             tier0_mean: None,
+            tier0_scale: None,
         })
     }
 
@@ -1078,11 +1079,52 @@ impl SaeManifoldTerm {
         self.tier0_mean.as_ref()
     }
 
-    /// #2023 C4 — add the Tier-0 shared mean μ back (row-broadcast) to an assembled
-    /// `Σ_k a_k g_k` reconstruction, in place. A strict no-op on the historical
-    /// path (`tier0_mean == None`), so every reconstruction entry point can call it
-    /// unconditionally and stay bit-for-bit unchanged when Tier-0 is inactive.
+    /// Tier-0 per-column scale σ (input standardization). The fit runs on
+    /// `(Z − μ)/σ`; every reconstruction lifts back `x̂ = μ + σ ⊙ x̂_internal`.
+    /// Standardization is a CONDITIONING fix at the model level: with no column
+    /// equilibration anywhere in the fit path, raw activation targets carry
+    /// measured column-norm spreads of ~1e4 (joint Hessian κ ≈ 1e8, #2015),
+    /// which sets the linear contraction rate of the majorized inner solver —
+    /// the direct driver of the "~1e3 iterations then refusal" wall. Each σ_c
+    /// must be finite and positive.
+    pub fn set_tier0_scale(&mut self, scale: Array1<f64>) -> Result<(), String> {
+        let p = self.output_dim();
+        if scale.len() != p {
+            return Err(format!(
+                "SaeManifoldTerm::set_tier0_scale: scale length {} must equal output_dim {p}",
+                scale.len()
+            ));
+        }
+        if !scale.iter().all(|v| v.is_finite() && *v > 0.0) {
+            return Err(
+                "SaeManifoldTerm::set_tier0_scale: scale must be finite and positive".to_string(),
+            );
+        }
+        self.tier0_scale = Some(scale);
+        Ok(())
+    }
+
+    /// The installed Tier-0 per-column scale, or `None` on the historical
+    /// (unstandardized) path. Round-trips with [`Self::set_tier0_scale`].
+    pub fn tier0_scale(&self) -> Option<&Array1<f64>> {
+        self.tier0_scale.as_ref()
+    }
+
+    /// #2023 C4 — lift an assembled `Σ_k a_k g_k` reconstruction from the
+    /// internal (standardized, de-meaned) frame back to raw-target space, in
+    /// place: `x̂ ← μ + σ ⊙ x̂`. A strict no-op on the historical path
+    /// (`tier0_mean == None`, `tier0_scale == None`), so every reconstruction
+    /// entry point can call it unconditionally and stay bit-for-bit unchanged
+    /// when Tier-0 is inactive. The scale multiplies BEFORE the mean adds —
+    /// the fit frame is `(Z − μ)/σ`, so the inverse is `σ·x̂ + μ`.
     pub(crate) fn add_tier0_mean_inplace(&self, out: &mut Array2<f64>) {
+        if let Some(scale) = self.tier0_scale.as_ref() {
+            for mut out_row in out.rows_mut() {
+                for (out_col, s) in out_row.iter_mut().zip(scale.iter()) {
+                    *out_col *= *s;
+                }
+            }
+        }
         if let Some(mean) = self.tier0_mean.as_ref() {
             for mut out_row in out.rows_mut() {
                 for (out_col, m) in out_row.iter_mut().zip(mean.iter()) {
