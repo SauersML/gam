@@ -503,6 +503,9 @@ Returns a dict:
 | `negative_log_evidence` | per-candidate rank-aware negative log evidence |
 | `headline` | `"stacking"` or `"evidence"` — which criterion produced the verdict |
 | `is_cross_class` | bool, the race crossed shape classes |
+| `matched_controls` | full verdicts after shuffling these supplied coordinates and replacing them by a covariance-matched Gaussian |
+| `control_false_circle_floor` | circular-win fraction across those two adjudicator-input controls |
+| `dictionary_mean_l0` | the dictionary sparsity supplied alongside the rate |
 
 Either mixture EM can refuse to certify convergence (a `GamError`). That is a
 typed missing adjudication, not a negative topology verdict; record it as such
@@ -546,6 +549,24 @@ rules keep the verdict rates meaningful:
   and a covariance-matched Gaussian copy of the same matrix through the
   byte-identical pipeline, and report verdict rates against that per-run
   false-circle floor (measured floors reached double digits), never raw.
+
+The controls embedded in `adjudicate_atom_shape` begin at its 2-D coordinate
+input, so they isolate the adjudicator's own false-circle floor. A full census
+must also catch artifacts introduced by SAE training, co-activation grouping,
+and PCA. Generate those controls one at a time at the census pipeline entry and
+rerun every stage:
+
+```python
+for kind in ("per_dimension_shuffle", "covariance_matched_gaussian"):
+    controlled_activations = gamfit.shape_matched_control(
+        activations_float64, kind=kind, seed=11
+    )
+    # Re-run the identical SAE -> grouping -> PCA -> adjudication pipeline.
+    run_census(controlled_activations, control_kind=kind)
+```
+
+One control is returned per call so corpus-scale workflows can release it
+before generating the next instead of retaining both copies in memory.
 
 `examples/topology_census_recipe.py` documents the full validated recipe.
 

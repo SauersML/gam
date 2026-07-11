@@ -1656,6 +1656,37 @@ fn atom_shape_verdict_dict<'py>(
     Ok(out)
 }
 
+/// Generate one seeded structureless control for a topology census (#2262).
+///
+/// Call this at the entry of the pipeline being audited, then rerun the same
+/// SAE training, co-activation grouping, projection, and adjudication steps.
+/// Returning one control per call lets callers release it before generating the
+/// other control instead of materializing two corpus-sized copies at once.
+#[pyfunction]
+#[pyo3(signature = (data, kind, seed = 11))]
+pub(crate) fn shape_matched_control<'py>(
+    py: Python<'py>,
+    data: numpy::PyReadonlyArray2<'py, f64>,
+    kind: &str,
+    seed: u64,
+) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
+    use gam::terms::sae::null_battery::{
+        covariance_matched_gaussian_null, per_dimension_shuffle_null,
+    };
+    use numpy::IntoPyArray;
+
+    let data = data.as_array();
+    let control = match kind {
+        "per_dimension_shuffle" => per_dimension_shuffle_null(data, seed),
+        "covariance_matched_gaussian" => covariance_matched_gaussian_null(data, seed),
+        other => Err(format!(
+            "shape_matched_control: kind must be per_dimension_shuffle or covariance_matched_gaussian; got {other:?}"
+        )),
+    }
+    .map_err(py_value_error)?;
+    Ok(control.into_pyarray(py))
+}
+
 /// Adjudicate the representational SHAPE of a recovered atom's intrinsic 2-D
 /// coordinates (issue #977 / #907 / #2262): race a smooth S¹ ring against a
 /// Euclidean Gaussian, the best free k-cluster mixture, and a constrained
@@ -1668,11 +1699,12 @@ fn atom_shape_verdict_dict<'py>(
 /// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
 /// of the held-out density table. By default, the identical race also runs on
-/// an independent per-dimension shuffle and a covariance-matched Gaussian null;
-/// `mean_l0` is then required and is emitted beside the resulting control
-/// false-circle floor, because a verdict rate without dictionary sparsity is
-/// not interpretable (#2262). Non-dictionary callers can explicitly disable
-/// `matched_controls` and receive no control-rate claim.
+/// an independent per-dimension shuffle and a covariance-matched Gaussian of
+/// these supplied coordinates; `mean_l0` is then required and is emitted beside
+/// this adjudicator-input false-circle floor. To audit artifacts introduced by
+/// earlier SAE/grouping/PCA stages, generate each control at the pipeline entry
+/// with [`shape_matched_control`] and rerun every stage. Non-dictionary callers
+/// can explicitly disable `matched_controls` and receive no control-rate claim.
 #[pyfunction]
 #[pyo3(signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true))]
 pub(crate) fn adjudicate_atom_shape<'py>(
@@ -1817,6 +1849,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(skovgaard_r_star, module)?)?;
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
+    module.add_function(wrap_pyfunction!(shape_matched_control, module)?)?;
     module.add_function(wrap_pyfunction!(adjudicate_atom_shape, module)?)?;
     module.add_function(wrap_pyfunction!(sweep_color_arm_throughput, module)?)?;
     Ok(())
