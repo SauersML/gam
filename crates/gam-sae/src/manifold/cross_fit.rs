@@ -204,13 +204,26 @@ where
     })
 }
 
-/// The top-`q` right-singular subspace of the selected rows of `data`, centered
-/// by the per-column mean of those rows — the honest minimal linear "dictionary"
-/// whose optimism the cross-fit removes.
+/// Fit the top-`q` principal subspace of every row in `data`.
 ///
 /// Returns `(mean, basis)` where `mean` is the length-`p` column mean over the
-/// selected rows and `basis` is `(q × p)` orthonormal rows spanning the top-`q`
-/// principal subspace. `q` is capped at `min(#rows, p)`.
+/// data and `basis` is `(q × p)` with orthonormal rows spanning the centered
+/// top-`q` right-singular subspace. `q` is capped at `min(n, p)`. This is the
+/// linear model nested inside the curved torch SAE: its constant decoder rows
+/// reproduce the PCA projection exactly before any harmonic curvature is fit.
+pub fn fit_principal_subspace(
+    data: ArrayView2<'_, f64>,
+    q: usize,
+) -> Result<(Array1<f64>, Array2<f64>), String> {
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err("fit_principal_subspace: data must be finite".to_string());
+    }
+    let rows = (0..data.nrows()).collect::<Vec<_>>();
+    fit_subspace(data, &rows, q)
+}
+
+/// Row-subset implementation shared by the public full-data PCA seed and the
+/// honest cross-fit scorer below.
 pub(crate) fn fit_subspace(
     data: ArrayView2<'_, f64>,
     rows: &[usize],
