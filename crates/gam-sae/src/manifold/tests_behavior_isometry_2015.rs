@@ -208,6 +208,9 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
 fn isometry_defect_separates_isometric_from_broken() {
     let (defect_iso, _scale_iso, _nats_iso) = fitted_defect(false);
     let (defect_broken, _scale_broken, _nats_broken) = fitted_defect(true);
+    eprintln!(
+        "[#2015 fixed coupling] isometric_defect={defect_iso:.6e}, broken_defect={defect_broken:.6e}"
+    );
 
     // The scaled-isometric atom reports a small defect: the two induced metrics
     // are proportional along the shared coordinate.
@@ -358,6 +361,17 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
         (installed - report.log_lambda_y).abs() < 1e-12,
         "installed λ_y {installed} disagrees with report {}",
         report.log_lambda_y
+    );
+    eprintln!(
+        "[#2015 REML {}] defect={:.6e}, activation_ev={ev_act:.6}, behavior_ev={ev_beh:.6}, \
+         converged={}, identifiable={}, sweeps={}, log_lambda={:.6e}, trajectory={:?}",
+        if uneven { "broken" } else { "isometric" },
+        cert.defect_cv,
+        report.converged,
+        report.lambda_identifiable,
+        report.sweeps,
+        report.log_lambda_y,
+        report.log_lambda_trajectory,
     );
     (
         cert.defect_cv,
