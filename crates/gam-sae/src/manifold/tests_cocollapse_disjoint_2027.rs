@@ -295,7 +295,7 @@ pub(crate) fn two_circle_separates_at_narrow_and_wide_widths_2027() {
 ///      phases) → the atoms decode DIFFERENT rows, so their gated contributions
 ///      `Y_k = diag(a)ΦB` are NOT collinear → benign, NOT flagged. This is the
 ///      over-complete (`K > rank`) regime the old frame-coherence detector
-///      false-positived on (the `ibp_default_alpha` regression: healthy EV≈0.99,
+///      false-positived on (the `ordered_beta_default_alpha` regression: healthy EV≈0.99,
 ///      frame coherence ≈1, contribution cosine ≈ the independence null): several
 ///      curved atoms MUST share the ≤`p`-dim output space while encoding distinct
 ///      structure.
@@ -349,7 +349,7 @@ pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_20
             .unwrap()
             .is_none(),
         "same output subspace with DIFFERENT charts is benign over-completeness and \
-         must NOT be flagged (the ibp_default_alpha false positive)"
+         must NOT be flagged (the ordered_beta_default_alpha false positive)"
     );
 
     // (3) TRUE DUPLICATE: identical decoder AND identical chart (copy atom 0's

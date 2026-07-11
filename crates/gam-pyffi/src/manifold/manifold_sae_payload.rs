@@ -104,6 +104,7 @@ pub(crate) struct ManifoldSaePayload {
 
     // --- scores -----------------------------------------------------------
     pub(crate) penalized_loss_score: Option<f64>,
+    pub(crate) penalized_laml_criterion: f64,
     pub(crate) reconstruction_r2: f64,
 
     // --- B. string / int lists --------------------------------------------
@@ -133,8 +134,6 @@ pub(crate) struct ManifoldSaePayload {
 
     // --- diagnostics / report blocks (opaque, always emitted) -------------
     pub(crate) diagnostics: Value,
-    pub(crate) top_k_projection: Option<Value>,
-    pub(crate) pre_topk: Option<Value>,
     pub(crate) solver_plan: Option<Value>,
     pub(crate) atom_two_lens: Option<Value>,
     pub(crate) residual_gauge: Option<Value>,
@@ -186,6 +185,7 @@ impl ManifoldSaePayload {
         "oos_projection_top1",
         "dispersion",
         "penalized_loss_score",
+        "penalized_laml_criterion",
         "reconstruction_r2",
         "primitive_names",
         "basis_specs",
@@ -203,8 +203,6 @@ impl ManifoldSaePayload {
         "crosscoder",
         "atoms",
         "diagnostics",
-        "top_k_projection",
-        "pre_topk",
         "solver_plan",
         "atom_two_lens",
         "residual_gauge",

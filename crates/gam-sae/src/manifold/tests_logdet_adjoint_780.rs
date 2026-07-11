@@ -367,11 +367,8 @@ fn ordered_beta_bernoulli_sparse_rho_derivative_matrix_2156(
     let k_atoms = term.k_atoms();
     let mut hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho)
         .expect("ordered Beta--Bernoulli hdiag");
-    let mut channels = ordered_beta_bernoulli_psd_majorizer_third_channels(
-        &term.assignment,
-        rho,
-        false,
-    )
+    let channels =
+        ordered_beta_bernoulli_psd_majorizer_third_channels(&term.assignment, rho)
     .expect("ordered Beta--Bernoulli channels")
     .expect("ordered Beta--Bernoulli sparse derivative requires ordered Beta--Bernoulli channels");
     // #2144/#1038: the production assembly PSD-majorizes the ordered Beta--Bernoulli curvature
@@ -388,48 +385,19 @@ fn ordered_beta_bernoulli_sparse_rho_derivative_matrix_2156(
             );
         }
     }
-    for atom in 0..k_atoms {
-        if channels.cross_row_d[atom] < 0.0 {
-            channels.cross_row_d[atom] = 0.0;
-        }
-    }
-
-    let mut sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
     for row in 0..term.n_obs() {
         let vars = term
             .row_vars_for_cache_row(row, cache)
             .expect("ordered Beta--Bernoulli row vars");
-        let mut row_no_self = Array2::<f64>::zeros((cache.row_dims[row], cache.row_dims[row]));
-        let mut row_self = Array2::<f64>::zeros((cache.row_dims[row], cache.row_dims[row]));
+        let mut row_derivative = Array2::<f64>::zeros((cache.row_dims[row], cache.row_dims[row]));
         for (pos, var) in vars.iter().enumerate() {
             if let SaeLocalRowVar::Logit { atom } = *var {
                 let slot = row * k_atoms + atom;
-                let j = channels.z_jac[slot];
-                let self_curv = channels.cross_row_d[atom] * j * j;
-                row_no_self[[pos, pos]] = hdiag[slot] - self_curv;
-                row_self[[pos, pos]] = self_curv;
-                sites[atom].push((row, cache.row_offsets[row] + pos));
+                row_derivative[[pos, pos]] = hdiag[slot];
             }
         }
-        let pushed = row_deflation_pushforward_2156(cache, row, &row_no_self);
+        let pushed = row_deflation_pushforward_2156(cache, row, &row_derivative);
         add_row_block_2156(&mut dh, cache, row, &pushed);
-        add_row_block_2156(&mut dh, cache, row, &row_self);
-    }
-
-    for (atom, atom_sites) in sites.iter().enumerate() {
-        let d_k = channels.cross_row_d[atom];
-        if d_k == 0.0 {
-            continue;
-        }
-        for &(row_i, idx_i) in atom_sites {
-            let j_i = channels.z_jac[row_i * k_atoms + atom];
-            for &(row_j, idx_j) in atom_sites {
-                if row_i != row_j {
-                    let j_j = channels.z_jac[row_j * k_atoms + atom];
-                    dh[[idx_i, idx_j]] += d_k * j_i * j_j;
-                }
-            }
-        }
     }
     dh
 }
@@ -714,11 +682,12 @@ fn ordered_beta_bernoulli_majorized_hdiag_2156(
     atom: usize,
     raw_hdiag: f64,
 ) -> f64 {
-    let j = channels.z_jac[row * k_atoms + atom];
-    let d = channels.cross_row_d[atom];
-    let self_term = d * j * j;
-    let diag_score_c = raw_hdiag - self_term;
-    d.max(0.0) * j * j + diag_score_c.max(0.0)
+    let index = row * k_atoms + atom;
+    if channels.diagonal_term[index] <= 0.0 {
+        return 0.0;
+    }
+    let j = channels.z_jac[index];
+    raw_hdiag - channels.mass_hessian_coefficient[atom] * j * j
 }
 
 fn dense_trace_hinv_dh_2156(h: &Array2<f64>, dh: &Array2<f64>) -> f64 {
@@ -1009,8 +978,8 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
             .row_metric()
             .is_some_and(|m| m.whitens_likelihood()
                 && m.metric_rank() < ordered_beta_bernoulli_term.output_dim())
-            && low_rank_certificate.cross_row_woodbury_rank > 0,
-        "ordered Beta--Bernoulli parity fixture must exercise the low-rank metric and ordered Beta--Bernoulli Woodbury branch; \
+            ,
+        "ordered Beta--Bernoulli parity fixture must exercise the low-rank metric branch; \
          certificate={low_rank_certificate:?}"
     );
     let ordered_beta_bernoulli_theta_probes: Vec<(usize, usize)> = (0

@@ -2616,7 +2616,7 @@ mod tests {
         let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
 
         // Helper: build a 1-atom ordered Beta--Bernoulli term from a per-row logit column.
-        let build_ibp = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
+        let build_ordered_beta = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
             let mut logits = Array2::<f64>::zeros((n, 1));
             for row in 0..n {
                 logits[[row, 0]] = logit(row);
@@ -2633,7 +2633,7 @@ mod tests {
 
         // CONTESTED-vs-ANCHOR routing: existing atom ACTIVE on [0,h) (high logit),
         // INACTIVE on [h,n) (low logit) — so [h,n) are the uncontested anchor rows.
-        let contrast_term = build_ibp(&|row| if row < h { 3.0 } else { -3.0 });
+        let contrast_term = build_ordered_beta(&|row| if row < h { 3.0 } else { -3.0 });
         let act = activity_of(&contrast_term);
         assert!(
             act[0] > act[n - 1] + 1e-6,
@@ -2655,7 +2655,7 @@ mod tests {
 
         // FALLBACK: uniform routing ⇒ no anchor contrast ⇒ dominant-energy column 0
         // (channel 0, the higher-variance planted factor).
-        let uniform_term = build_ibp(&|_| 0.5);
+        let uniform_term = build_ordered_beta(&|_| 0.5);
         let decoder_u = top_factor_birth_decoder(&uniform_term, &model, residual.view())
             .unwrap()
             .decoder;

@@ -375,7 +375,7 @@ fn cocollapse_startup_frontier_1026() {
         ("thresh_gate", || AssignmentMode::threshold_gate(1.0, 0.5)),
         ("softmax    ", || AssignmentMode::softmax(1.0)),
     ];
-    let mut ibp_frontier = 0usize;
+    let mut ordered_beta_frontier = 0usize;
     for (label, mk) in modes {
         let mut frontier = 0usize;
         for &k in &ks {
@@ -392,12 +392,12 @@ fn cocollapse_startup_frontier_1026() {
         }
         eprintln!("FRONTIER1026 {label}: largest passing K = {frontier}");
         if label.trim() == "ordered_beta_bernoulli" {
-            ibp_frontier = frontier;
+            ordered_beta_frontier = frontier;
         }
     }
     assert!(
-        ibp_frontier >= 4,
-        "startup validation must hold at least to K=4 (got frontier {ibp_frontier})"
+        ordered_beta_frontier >= 4,
+        "startup validation must hold at least to K=4 (got frontier {ordered_beta_frontier})"
     );
 }
 

@@ -319,7 +319,7 @@ fn fixed_gate_probe_term() -> (SaeManifoldTerm, SaeManifoldRho) {
 /// must read the frozen (not the free) logits. The coordinate derivatives use
 /// the frozen gate, never the stale free-logit gate.
 #[test]
-pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
+pub(crate) fn frozen_ordered_beta_row_program_gates_on_frozen_not_free_logit() {
     use ndarray::{Array1, Array4};
     let mut term = fixed_gate_probe_term().0;
     // Frozen routing = OPPOSITE extreme of the free logits [5, -5].
@@ -384,7 +384,7 @@ pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
 /// zero logit derivative (its coordinate derivative uses gate 1.0), while a
 /// sibling GATED atom keeps its free-logit gate and a nonzero logit derivative.
 #[test]
-pub(crate) fn ungated_ibp_row_program_gates_at_unit_with_zero_logit_derivative() {
+pub(crate) fn ungated_ordered_beta_row_program_gates_at_unit_with_zero_logit_derivative() {
     use ndarray::{Array1, Array4};
     let mut term = fixed_gate_probe_term().0;
     // Atom 0 ungated (dense background tier), atom 1 gated. Not frozen. ordered Beta--Bernoulli-MAP

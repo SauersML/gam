@@ -4921,43 +4921,18 @@ impl SaeManifoldTerm {
 
     /// Build the compact-layout ext-coord product manifold and point for one row.
     ///
-    /// The dense `ext_coord_manifold()` is keyed to the full-`q` block ordering
-    /// `[assignment parts (all Euclidean for ordered Beta--Bernoulli-MAP / JumpReLU), then per-atom
-    /// coord blocks in atom order]`. A compact active-set row instead lays its
-    /// `q_active` columns out as `[one Euclidean logit slot per active atom,
-    /// then each active atom's coord block in `active` order]` (see
-    /// [`SaeRowLayout::from_active_atoms`] / `coord_starts`). To reuse the exact
-    /// per-row Riemannian projector on the compact block we rebuild a product
-    /// manifold and the matching ext-coord point in that compact order: the
-    /// `active.len()` logit slots are `Euclidean` (the assignment channel is
-    /// always Euclidean for the modes that engage sparsity — `assignment_coord_dim
-    /// == k_atoms`), and each active atom contributes its own coordinate
-    /// manifold. On the shared active support this is byte-identical to slicing
-    /// the dense full-`q` product manifold, so the compact projection matches the
-    /// dense path exactly — it only drops the inactive atoms' (negligible-mass)
-    /// coordinate blocks the compact layout already excludes from curvature.
-    ///
-    /// Returns `(manifold, t_compact)` where `t_compact` has length `q_active`.
-    /// The logit-slot entries of `t_compact` are filled from the row logits (the
-    /// Euclidean projector ignores the point, so any finite value is equivalent;
-    /// using the true logits keeps the point well-defined and finite).
+    /// TopK has no free gate coordinates, so a compact row is exactly the
+    /// product of its selected atoms' coordinate manifolds in support order.
+    /// On that support this is identical to slicing the full product manifold.
     pub(crate) fn compact_row_ext_manifold_and_point(
         &self,
         row: usize,
         layout: &SaeRowLayout,
     ) -> (LatentManifold, Array1<f64>) {
         let active = &layout.active_atoms[row];
-        let logit_atoms = &layout.logit_atoms[row];
         let q_active = layout.row_q_active(row);
-        let mut parts: Vec<LatentManifold> = Vec::with_capacity(logit_atoms.len() + active.len());
+        let mut parts: Vec<LatentManifold> = Vec::with_capacity(active.len());
         let mut point = Array1::<f64>::zeros(q_active);
-        // Logit slots: one Euclidean part per FREE-logit atom (softmax's reference
-        // atom has coords but no logit slot; `logit_atoms == active` otherwise). (#Bug1)
-        let logits_row = self.assignment.logits.row(row);
-        for (j, &k) in logit_atoms.iter().enumerate() {
-            parts.push(LatentManifold::Euclidean);
-            point[j] = logits_row[k];
-        }
         // Coordinate blocks: each active atom's coordinate manifold + point, at
         // the compact coord start the layout assigned it.
         for (j, &k) in active.iter().enumerate() {

@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(dense.frozen_logits, back.frozen_logits, "frozen routing");
         assert_eq!(
             dense.ordered_beta_bernoulli_alpha_override, back.ordered_beta_bernoulli_alpha_override,
-            "ibp alpha override"
+            "ordered_beta alpha override"
         );
         // Coordinates bit-for-bit, including stable identity and geometry.
         assert_eq!(dense.coords.len(), back.coords.len(), "coord block count");

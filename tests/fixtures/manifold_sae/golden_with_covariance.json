@@ -896,11 +896,8 @@
     0
   ],
   "oos_projection_top1": true,
+  "penalized_laml_criterion": 41.25,
   "penalized_loss_score": -37.5,
-  "pre_topk": {
-    "active_fraction": 0.66,
-    "note": "pre-projection gate"
-  },
   "primitive_names": [
     "circle_0",
     "line_1",
@@ -945,11 +942,6 @@
   "structured_residual_diagnostics": [],
   "tau": 0.4,
   "top_k": 2,
-  "top_k_projection": {
-    "k": 2,
-    "kind": "reconstruction",
-    "residual_ev": 0.12
-  },
   "topology_persistence": {
     "atoms": [
       {

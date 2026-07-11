@@ -87,7 +87,6 @@ pub struct BranchCertificate {
     pub deflated_rank: usize,
     pub deflated_per_row: Vec<usize>,
     pub spectral_deflated_rows: Vec<bool>,
-    pub cross_row_woodbury_rank: usize,
     pub min_row_pivot_branch: PivotBranch,
     pub min_schur_pivot_branch: PivotBranch,
     pub min_pivot_branch: PivotBranch,
@@ -117,11 +116,6 @@ impl BranchCertificate {
                 .iter()
                 .map(Option::is_some)
                 .collect(),
-            cross_row_woodbury_rank: cache
-                .cross_row_woodbury
-                .as_ref()
-                .map(|woodbury| woodbury.d.len())
-                .unwrap_or(0),
             min_row_pivot_branch: PivotBranch::classify(min_pivot.min_row_pivot),
             min_schur_pivot_branch: PivotBranch::classify(min_pivot.min_schur_pivot),
             min_pivot_branch: PivotBranch::classify(min_pivot.min_pivot),
@@ -219,9 +213,6 @@ impl BranchCertificate {
         }
         if self.spectral_deflated_rows != probe.spectral_deflated_rows {
             changed_fields.push("spectral_deflated_rows".to_string());
-        }
-        if self.cross_row_woodbury_rank != probe.cross_row_woodbury_rank {
-            changed_fields.push("cross_row_woodbury_rank".to_string());
         }
         if self.min_row_pivot_branch != probe.min_row_pivot_branch {
             changed_fields.push("min_row_pivot_branch".to_string());
@@ -427,7 +418,6 @@ mod tests {
             deflated_rank: 0,
             deflated_per_row: vec![0],
             spectral_deflated_rows: vec![false],
-            cross_row_woodbury_rank: 0,
             min_row_pivot_branch: PivotBranch::Positive,
             min_schur_pivot_branch: PivotBranch::Positive,
             min_pivot_branch: PivotBranch::Positive,

@@ -296,6 +296,7 @@ struct StagewisePayloadConfig {
     max_iter: i64,
     random_state: i64,
     threshold_gate_threshold: f64,
+    penalized_laml_criterion: f64,
 }
 
 fn require_matrix_shape(
@@ -389,6 +390,12 @@ fn build_stagewise_manifold_sae_payload(
             "sae_manifold_core_from_stagewise: reconstruction_r2 must be finite; got {reconstruction_r2}"
         ));
     }
+    if !cfg.penalized_laml_criterion.is_finite() {
+        return Err(format!(
+            "sae_manifold_core_from_stagewise: penalized_laml_criterion must be finite; got {}",
+            cfg.penalized_laml_criterion
+        ));
+    }
 
     let basis_sizes: Vec<i64> = decoder_blocks
         .iter()
@@ -449,6 +456,7 @@ fn build_stagewise_manifold_sae_payload(
         oos_projection_top1: false,
         dispersion: 1.0,
         penalized_loss_score: None,
+        penalized_laml_criterion: cfg.penalized_laml_criterion,
         reconstruction_r2,
         primitive_names: vec!["sae_manifold_fit_stagewise".to_string()],
         basis_specs: basis_kinds.clone(),
@@ -466,8 +474,6 @@ fn build_stagewise_manifold_sae_payload(
         crosscoder: None,
         atoms,
         diagnostics: serde_json::json!({"atom_trust": [], "atoms": []}),
-        top_k_projection: None,
-        pre_topk: None,
         solver_plan: None,
         atom_two_lens: None,
         residual_gauge: None,
@@ -497,7 +503,7 @@ fn build_stagewise_manifold_sae_payload(
     atom_topologies, decoder_blocks, atom_dims, coords, assignments, fitted,
     logits, training, assignment, assignment_label, alpha, learnable_alpha, tau,
     sparsity_strength, smoothness, learning_rate, max_iter, random_state,
-    threshold_gate_threshold, reconstruction_r2
+    threshold_gate_threshold, penalized_laml_criterion, reconstruction_r2
 ))]
 pub(crate) fn sae_manifold_from_stagewise<'py>(
     py: Python<'py>,
@@ -520,6 +526,7 @@ pub(crate) fn sae_manifold_from_stagewise<'py>(
     max_iter: i64,
     random_state: i64,
     threshold_gate_threshold: f64,
+    penalized_laml_criterion: f64,
     reconstruction_r2: f64,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     let assignment = canonical_assignment_kind(assignment)
@@ -549,6 +556,7 @@ pub(crate) fn sae_manifold_from_stagewise<'py>(
         max_iter,
         random_state,
         threshold_gate_threshold,
+        penalized_laml_criterion,
     };
     let payload = build_stagewise_manifold_sae_payload(
         basis_kinds,
@@ -982,6 +990,7 @@ pub(crate) fn build_manifold_sae_payload(
         oos_projection_top1: vbool(raw, "oos_projection_top1")?,
         dispersion: vf64(raw, "dispersion")?,
         penalized_loss_score: score,
+        penalized_laml_criterion: vf64(raw, "penalized_laml_criterion")?,
         reconstruction_r2: vf64(raw, "reconstruction_r2")?,
         primitive_names,
         // basis_specs = fitted kinds (unpatched); basis_kinds = post-relabel.
@@ -1000,8 +1009,6 @@ pub(crate) fn build_manifold_sae_payload(
         crosscoder,
         atoms: atom_payloads,
         diagnostics: vget(raw, "diagnostics")?.clone(),
-        top_k_projection: report("top_k_projection"),
-        pre_topk: report("pre_topk"),
         solver_plan: report("solver_plan"),
         atom_two_lens: report("atom_two_lens"),
         residual_gauge: report("residual_gauge"),

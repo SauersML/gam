@@ -69,7 +69,7 @@
 //! circular template by fiat), it fits every topology whose intrinsic
 //! dimension matches the candidate atom (line vs circle at `d = 1`; torus vs
 //! sphere vs cylinder vs flat patch at `d = 2`) and lets the data's own
-//! curvature evidence — TK-normalized REML, the same gauge-invariant scale the
+//! curvature evidence — the same declared reference-function scale the
 //! smooth-term topology race uses — pick the winner. A curved winner is not
 //! merely a nicer-looking basis: it is the SPECIFIC configuration whose
 //! rigidity is what makes the born atom identifiable at all. The race is
@@ -90,8 +90,9 @@ use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, AtlasSeamKind, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw,
-    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SphereChartTransition,
-    UnitSpeedChartTransition, amplitude_concentration_certificate, classify_occupancy_interval,
+    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceRoughness,
+    SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate,
+    classify_occupancy_interval,
 };
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
@@ -4445,7 +4446,7 @@ pub(crate) fn born_circle_atom(
         }
         // #2101/#2109 PRESENCE-PROPORTIONAL gate seed. The flat weak BIRTH_SEED_LOGIT
         // (−4) is fatal under ordered Beta--Bernoulli — the born circle starts nearly OFF (σ(−4)≈0.018) and
-        // the sub-fit collapses it (measured: ibp logit −4 collapses ‖B‖ 1.41→1e-4,
+        // the sub-fit collapses it (measured: ordered_beta logit −4 collapses ‖B‖ 1.41→1e-4,
         // logit +3 survives). On a row where the born circle is PRESENT (`circle_gate`
         // finite: its 2-plane energy cleared the derived MP floor), route it at the
         // STRONGER of two derived scales: (a) CO-ACTIVE with the incumbent dictionary

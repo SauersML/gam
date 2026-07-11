@@ -6531,6 +6531,55 @@ impl ManifoldSaeCore {
         })
     }
 
+    fn description_length_report(
+        &self,
+        l_param_bits: Option<f64>,
+    ) -> PyResult<Option<gam::terms::sae::description_length::ManifoldFitDl>> {
+        if self.inner.atoms.is_empty() || self.inner.fitted.is_empty() {
+            return Ok(None);
+        }
+        if l_param_bits.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            return Err(py_value_error(
+                "ManifoldSAE.description_length: l_param_bits must be finite and non-negative"
+                    .to_string(),
+            ));
+        }
+        let assignments = manifold_sae_owned2(&self.inner.assignments)?;
+        let coords = self
+            .inner
+            .coords
+            .iter()
+            .map(|block| manifold_sae_owned2(block))
+            .collect::<PyResult<Vec<_>>>()?;
+        let coord_views = coords.iter().map(Array2::view).collect::<Vec<_>>();
+        let n_params = self
+            .inner
+            .decoder_blocks
+            .iter()
+            .try_fold(0_usize, |total, block| {
+                let block_size = block.iter().try_fold(0_usize, |rows, row| {
+                    rows.checked_add(row.len())
+                })?;
+                total.checked_add(block_size)
+            })
+            .ok_or_else(|| {
+                py_value_error("ManifoldSAE decoder parameter count overflowed".to_string())
+            })?;
+        let n_params = i64::try_from(n_params).map_err(|_| {
+            py_value_error("ManifoldSAE decoder parameter count exceeds i64".to_string())
+        })?;
+        manifold_description_length_from_arrays(
+            assignments.view(),
+            &coord_views,
+            self.inner.reconstruction_r2,
+            n_params,
+            l_param_bits,
+            1.0e-8,
+        )
+        .map(Some)
+        .map_err(py_value_error)
+    }
+
     /// Build the OOS argument bundle from this handle's state and run the
     /// frozen-decoder Newton solve, returning the full payload dict
     /// (`assignments_z`, `on_atom_coords_t`, `logits`, `fitted`). The Rust-owned
@@ -6681,6 +6730,83 @@ impl ManifoldSaeCore {
             self.inner.assignment,
             self.inner.reconstruction_r2,
         )
+    }
+
+    /// Fit-level code length from the native manifold-SAE description-length
+    /// kernel. Every input is read from this immutable fitted artifact.
+    #[pyo3(signature = (*, l_param_bits=None))]
+    fn description_length(
+        &self,
+        py: Python<'_>,
+        l_param_bits: Option<f64>,
+    ) -> PyResult<Option<PyObject>> {
+        self.description_length_report(l_param_bits)?
+            .as_ref()
+            .map(|report| manifold_description_length_to_pydict(py, report))
+            .transpose()
+    }
+
+    /// Compact fitted-model report assembled from persisted native fields and
+    /// the same Rust description-length/assignment-summary kernels used by the
+    /// standalone FFI functions.
+    fn summary(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let description = self.description_length_report(None)?;
+        let description_py = description
+            .as_ref()
+            .map(|report| manifold_description_length_to_pydict(py, report))
+            .transpose()?;
+        let assignments = manifold_sae_owned2(&self.inner.assignments)?;
+        let (avg_active_atoms, mean_assignment_mass) =
+            manifold_assignment_summary_from_array(assignments.view(), 1.0e-8)
+                .map_err(py_value_error)?;
+        let common_dim = self.inner.atom_dims.first().copied().filter(|first| {
+            self.inner.atom_dims.iter().all(|dimension| dimension == first)
+        });
+
+        let active_dims = self
+            .inner
+            .atoms
+            .iter()
+            .map(|atom| atom.active_dim)
+            .collect::<Vec<_>>();
+        let atom_functionals = PyList::empty(py);
+        for atom in &self.inner.atoms {
+            atom_functionals.append(manifold_sae_report(py, &atom.functional_evidence)?)?;
+        }
+
+        let selected_smooth = self.inner.selected_log_lambda_smooth.as_ref().map(|values| {
+            values.iter().map(|value| value.exp()).collect::<Vec<_>>()
+        });
+        let out = PyDict::new(py);
+        out.set_item(
+            "bits_per_token",
+            description.as_ref().map(|report| report.bits_per_token),
+        )?;
+        out.set_item("description_length", description_py)?;
+        out.set_item("K", self.inner.atoms.len())?;
+        out.set_item("d_atom", common_dim)?;
+        out.set_item("atom_dims", self.inner.atom_dims.clone())?;
+        out.set_item("atom_topology", self.inner.atom_topology.clone())?;
+        out.set_item("atom_topologies", self.inner.atom_topologies.clone())?;
+        out.set_item("assignment", self.inner.assignment.clone())?;
+        out.set_item("alpha", self.inner.alpha)?;
+        out.set_item("learnable_alpha", self.inner.learnable_alpha)?;
+        out.set_item("penalized_loss_score", self.inner.penalized_loss_score)?;
+        out.set_item(
+            "penalized_laml_criterion",
+            self.inner.penalized_laml_criterion,
+        )?;
+        out.set_item("reconstruction_r2", self.inner.reconstruction_r2)?;
+        out.set_item("dispersion", self.inner.dispersion)?;
+        out.set_item("avg_active_atoms", avg_active_atoms)?;
+        out.set_item("mean_assignment_mass", mean_assignment_mass)?;
+        out.set_item("active_dims", active_dims)?;
+        out.set_item("atom_functionals", atom_functionals)?;
+        out.set_item("diagnostics", json_value_to_py(py, self.inner.diagnostics.clone())?)?;
+        out.set_item("cotrain", manifold_sae_report(py, &self.inner.cotrain)?)?;
+        out.set_item("primitives", self.inner.primitive_names.clone())?;
+        out.set_item("selected_smooth_lambdas", selected_smooth)?;
+        Ok(out.unbind())
     }
 
     /// In-sample dense reconstruction `(N, p)` rebuilt from the stored per-atom
@@ -6984,13 +7110,17 @@ impl ManifoldSaeCore {
     ) -> PyResult<Py<PyDict>> {
         if let Some(values) = x_new {
             let payload = self.oos_payload_dict(py, values)?;
-            let out = payload.bind(py);
-            let assignments = out
+            let raw = payload.bind(py);
+            let assignments = raw
                 .get_item("assignments_z")?
                 .ok_or_else(|| py_value_error("OOS payload missing 'assignments_z'".to_string()))?;
-            out.set_item("assignments", assignments)?;
-
-            let atoms = out
+            let fitted = raw
+                .get_item("fitted")?
+                .ok_or_else(|| py_value_error("OOS payload missing 'fitted'".to_string()))?;
+            let logits = raw
+                .get_item("logits")?
+                .ok_or_else(|| py_value_error("OOS payload missing 'logits'".to_string()))?;
+            let atoms = raw
                 .get_item("atoms")?
                 .ok_or_else(|| py_value_error("OOS payload missing 'atoms'".to_string()))?;
             let atoms = atoms.downcast::<PyList>()?;
@@ -7002,8 +7132,12 @@ impl ManifoldSaeCore {
                 })?;
                 coords.append(block)?;
             }
+            let out = PyDict::new(py);
+            out.set_item("fitted", fitted)?;
+            out.set_item("assignments", assignments)?;
+            out.set_item("logits", logits)?;
             out.set_item("coords", coords)?;
-            return Ok(payload);
+            return Ok(out.unbind());
         }
 
         let out = PyDict::new(py);
@@ -7302,6 +7436,11 @@ impl ManifoldSaeCore {
     fn penalized_loss_score(&self) -> Option<f64> {
         self.inner.penalized_loss_score
     }
+    /// Certified complete penalized-LAML scalar evaluated at the terminal fit.
+    #[getter]
+    fn penalized_laml_criterion(&self) -> f64 {
+        self.inner.penalized_laml_criterion
+    }
     #[getter]
     fn selected_log_lambda_sparse(&self) -> Option<f64> {
         self.inner.selected_log_lambda_sparse
@@ -7346,14 +7485,6 @@ impl ManifoldSaeCore {
     #[getter]
     fn diagnostics(&self, py: Python<'_>) -> PyResult<PyObject> {
         json_value_to_py(py, self.inner.diagnostics.clone())
-    }
-    #[getter]
-    fn top_k_projection(&self, py: Python<'_>) -> PyResult<PyObject> {
-        manifold_sae_report(py, &self.inner.top_k_projection)
-    }
-    #[getter]
-    fn pre_topk(&self, py: Python<'_>) -> PyResult<PyObject> {
-        manifold_sae_report(py, &self.inner.pre_topk)
     }
     #[getter]
     fn solver_plan(&self, py: Python<'_>) -> PyResult<PyObject> {

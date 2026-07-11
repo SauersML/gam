@@ -102,7 +102,7 @@ pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782(
     let z = planted_circle_embedded(n, 6, 0.03);
     let p = z.ncols();
     // K>1 euclidean (constant+linear) atoms sharing one 1-D coordinate, with a
-    // jumprelu (threshold-gate) assignment — the non-ibp assignment / non-circle
+    // jumprelu (threshold-gate) assignment — the non-ordered_beta assignment / non-circle
     // topology combination the issue reports as failing.
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| (row as f64 / n as f64) - 0.5);
     let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 1).unwrap());

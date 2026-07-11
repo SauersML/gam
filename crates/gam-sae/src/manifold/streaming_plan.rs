@@ -26,8 +26,7 @@ pub(crate) const SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 
 /// Conservative lower bound on the pooled device in-core budget any probed CUDA
 /// runtime can report (`Σ memory_budget_for(ordinal) / 4`), used by the
-/// pre-probe size gates in [`sae_streaming_plan_for_shape`] and
-/// `SaeManifoldTerm::sparse_active_plan`.
+/// pre-probe size gates in [`sae_streaming_plan_for_shape`].
 ///
 /// Working sets at or below this figure are admitted identically whether the
 /// budget comes from the host or from ANY device pool: the smallest CUDA device

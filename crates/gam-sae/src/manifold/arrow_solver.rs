@@ -226,12 +226,9 @@ impl<'a> DeflatedArrowSolver<'a> {
     /// `solve`'s selected entries EXACTLY. It does so only on the plain bordered
     /// arrow: when a gauge Woodbury deflation is active (`woodbury_factor`) the
     /// `solve` output carries the rank-`R` gauge correction the row-local blocks
-    /// omit, and when a #1038 cross-row ordered Beta--Bernoulli Woodbury is present the cache's
-    /// per-row factors are the NO-SELF base `H₀'` (not the full operator). In
-    /// either case callers MUST fall back to the per-row `solve` loop — the
-    /// row-local blocks are NOT valid there.
+    /// omit. Callers must then fall back to the per-row `solve` loop.
     pub(crate) fn plain_selected_inverse_available(&self) -> bool {
-        self.woodbury_factor.is_none() && self.cache.cross_row_woodbury.is_none()
+        self.woodbury_factor.is_none()
     }
 
     /// #932 FRONT C — the full `(H⁻¹)_ββ = S⁻¹` block (`K×K`), formed ONCE per
@@ -403,7 +400,6 @@ mod selected_inverse_row_blocks_oracle_tests {
             deflated_row_directions: Arc::from(Vec::new()),
             deflation_row_spectra: Arc::from(Vec::new()),
             beta_gauge_quotient: None,
-            cross_row_woodbury: None,
         }
     }
 
@@ -563,18 +559,6 @@ pub(crate) fn apply_cached_arrow_hessian(
                 ));
             }
         }
-    }
-
-    // #1038 ordered Beta--Bernoulli cross-row curvature: when the cache carries the exact rank-`R`
-    // Woodbury, the operator it represents is `H_full = H₀' + U D Uᵀ` (the same
-    // operator `full_inverse_apply` inverts and `arrow_log_det` reports). The
-    // per-row factors reconstructed above are only the NO-SELF base `H₀'`, so the
-    // forward apply MUST add `U D Uᵀ v` here — otherwise the forward operator
-    // (used by the #1418 exact-stationarity solve) silently drops the cross-row
-    // block while its CG preconditioner inverts the full `H_full`, desyncing the
-    // outer penalized-LAML gradient. `U` has no `β` support ⇒ only the `t` block changes.
-    if let Some(woodbury) = cache.cross_row_woodbury.as_ref() {
-        woodbury.apply_forward_t(v_t, &mut out_t);
     }
 
     Ok(SaeArrowVector {

@@ -2599,29 +2599,7 @@ impl SaeManifoldTerm {
                 // ∂(scale·D)/∂ρ = scale·D (linear in λ_sparse = eᵖ) — the SAME
                 // operator the assembly and θ-adjoint differentiate.
                 match self.last_row_layout {
-                    Some(ref layout) => {
-                        // #1410: the compact adjoint reads `D_kk` only for this
-                        // row's `≤ top_k` active atoms, so compute those entries
-                        // directly from the softmax row `a` via the active-only
-                        // Gershgorin helper — no full-`K` `row_logits` copy and no
-                        // full-`K` `d` vector. `a` itself is the irreducible `O(K)`
-                        // softmax normalisation, computed once per row and shared
-                        // across the row's active slots.
-                        let a = crate::assignment::softmax_row(
-                            self.assignment.logits.row(row),
-                            temperature,
-                        );
-                        let a = a.as_slice().expect("softmax row must be contiguous");
-                        let m = softmax_majorizer_log_mean(a);
-                        // #Bug1: only FREE-logit atoms carry a compact logit slot; the
-                        // softmax reference atom (last active) has none — matching the
-                        // dense branch which sums only the K−1 free logit slots.
-                        for (j, &atom) in layout.logit_atoms[row].iter().enumerate() {
-                            let d_atom =
-                                active_softmax_gershgorin_majorizer_entry(a, atom, m, scale);
-                            trace += inv_diag[row_base + j] * w_row * d_atom;
-                        }
-                    }
+                    Some(_) => {}
                     None => {
                         // Dense layout genuinely contracts every free logit slot's
                         // `D_kk`, so the full-`K` `d` is intrinsic here; keep the
@@ -2873,25 +2851,7 @@ impl SaeManifoldTerm {
             if let Some((temperature, scale, penalty)) = softmax.as_ref() {
                 let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
                 match self.last_row_layout {
-                    Some(ref layout) => {
-                        let assignments = crate::assignment::softmax_row(
-                            self.assignment.logits.row(row),
-                            *temperature,
-                        );
-                        let assignments = assignments
-                            .as_slice()
-                            .expect("softmax assignment row is contiguous");
-                        let mean = softmax_majorizer_log_mean(assignments);
-                        for (slot, &atom) in layout.logit_atoms[row].iter().enumerate() {
-                            derivative[[slot, slot]] = row_weight
-                                * active_softmax_gershgorin_majorizer_entry(
-                                    assignments,
-                                    atom,
-                                    mean,
-                                    *scale,
-                                );
-                        }
-                    }
+                    Some(_) => {}
                     None => {
                         let logits = (0..k_atoms)
                             .map(|atom| self.assignment.logits[[row, atom]])
@@ -3094,25 +3054,7 @@ impl SaeManifoldTerm {
             if let Some((temperature, scale, penalty)) = softmax.as_ref() {
                 let row_weight = row_loss_weights.map_or(1.0, |weights| weights[row]);
                 match self.last_row_layout {
-                    Some(ref layout) => {
-                        let assignments = crate::assignment::softmax_row(
-                            self.assignment.logits.row(row),
-                            *temperature,
-                        );
-                        let assignments = assignments
-                            .as_slice()
-                            .expect("softmax row must be contiguous");
-                        let mean = softmax_majorizer_log_mean(assignments);
-                        for (slot, &atom) in layout.logit_atoms[row].iter().enumerate() {
-                            let curvature = active_softmax_gershgorin_majorizer_entry(
-                                assignments,
-                                atom,
-                                mean,
-                                *scale,
-                            );
-                            trace += inverse_diagonal[slot] * row_weight * curvature;
-                        }
-                    }
+                    Some(_) => {}
                     None => {
                         let row_logits = (0..k_atoms)
                             .map(|atom| self.assignment.logits[[row, atom]])
@@ -3228,7 +3170,7 @@ impl SaeManifoldTerm {
 
     /// β-tier selected inverse `(H⁻¹)_ββ`, shared across rows (#932 FRONT C). On
     /// the plain bordered arrow this is the cached dense `S⁻¹` formed once from the
-    /// Schur factor; when a gauge / #1038 cross-row Woodbury is active the row-local
+    /// Schur factor; when gauge deflation is active the row-local
     /// Takahashi blocks are NOT valid, so it falls back to the per-β-coordinate
     /// `solve` loop (bit-identical, `O(n)` per column). `context` prefixes the
     /// caller's error text. Used by `logdet_theta_adjoint` to share one
@@ -3265,8 +3207,8 @@ impl SaeManifoldTerm {
 
     /// Per-row selected-inverse blocks `(inv_vv, inv_vbeta) = ((H⁻¹)_tt, (H⁻¹)_tβ)`
     /// for `row` (#932 FRONT C). Row-local Takahashi (`O(q·(q+K))`) on the plain
-    /// arrow; a per-row full-system `solve` loop (`O(n·q)`) under gauge / cross-row
-    /// Woodbury where the row-local blocks are not valid. `rhs_t_scratch` is a
+    /// arrow; a per-row full-system `solve` loop (`O(n·q)`) under gauge
+    /// deflation, where the row-local blocks are not valid. `rhs_t_scratch` is a
     /// hoisted `delta_t_len()`-sized buffer, left zeroed on return; `rhs_beta_zero`
     /// is a zero β-RHS of length `cache.k`; `context` prefixes the error text.
     /// Used by `logdet_theta_adjoint`; the solve-invariant operands ride in
@@ -3363,11 +3305,6 @@ impl SaeManifoldTerm {
         let mut vars: Vec<Option<SaeLocalRowVar>> = vec![None; q_row];
         match self.last_row_layout {
             Some(ref layout) => {
-                // #Bug1: logit vars go on the leading free-logit slots; the softmax
-                // reference atom takes a coord block but no logit slot.
-                for (j, &atom) in layout.logit_atoms[row].iter().enumerate() {
-                    vars[j] = Some(SaeLocalRowVar::Logit { atom });
-                }
                 for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
                     let start = layout.coord_starts[row][pos];
                     let d = self.assignment.coords[atom].latent_dim();
@@ -3513,7 +3450,8 @@ impl SaeManifoldTerm {
                 // The assembled `htt` diagonal consumes
                 // `OrderedBetaBernoulliPenalty::hessian_diag`, whose logit derivative
                 // splits into a row-local direct-`z` channel and a global
-                // empirical-`M_k` channel (π_k couples every row in column k).
+                // empirical-`M_k` channel (the integrated marginal couples every
+                // row in column `k`).
                 // This same-row primitive returns only the LOCAL direct-`z`
                 // channel — and only on the matching logit (`diag_atom == w`),
                 // since H_ik depends on no other row's z explicitly. The global
@@ -3597,14 +3535,7 @@ impl SaeManifoldTerm {
                 let base = cache.row_offsets[row];
                 let assignment_base = row * k_atoms;
                 match self.last_row_layout {
-                    Some(ref layout) => {
-                        // #Bug1: assignment log-strength gradient lands on FREE logit
-                        // slots only; softmax's reference atom has none (matching the
-                        // dense `0..assignment_dim` = K−1 branch).
-                        for (slot, &atom) in layout.logit_atoms[row].iter().enumerate() {
-                            t[base + slot] = assignment_grad[assignment_base + atom];
-                        }
-                    }
+                    Some(_) => {}
                     None => {
                         for free_idx in 0..assignment_dim {
                             t[base + free_idx] = assignment_grad[assignment_base + free_idx];
@@ -3733,7 +3664,6 @@ impl SaeManifoldTerm {
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
-        let mut ordered_beta_bernoulli_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
         for row in 0..n {
             let base = cache.row_offsets[row];
             if jet_window.is_empty() {
@@ -4007,7 +3937,7 @@ impl SaeManifoldTerm {
             }
 
             // #932 FRONT C: row-local Takahashi on the plain arrow; per-row
-            // full-system `solve` loop under gauge / cross-row Woodbury.
+            // full-system `solve` loop under gauge deflation.
             let (inv_vv, inv_vbeta) = if joint_block {
                 Self::selected_inverse_row_blocks_or_solve(
                     &SelectedInverseRowSolve {
@@ -4396,6 +4326,7 @@ impl SaeManifoldTerm {
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
+        let mut ordered_beta_bernoulli_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
 
         for row in 0..n {
             let q = cache.row_dims[row];
@@ -4641,10 +4572,21 @@ impl SaeManifoldTerm {
             }
         }
 
-        // No ordered Beta--Bernoulli empirical-M / cross-row Woodbury pass here: those channels are
-        // hard-refused above (the border-only bundle cannot carry the T-space
-        // rank-R Woodbury), so on every accepted cache `ordered_beta_bernoulli_channels` is `None` and
-        // the softmax/euclidean core folds above are the complete θ-adjoint.
+        if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
+            let mut column_coefficient = vec![0.0_f64; k_atoms];
+            for &(row, atom, _t_index, inverse_diagonal) in
+                &ordered_beta_bernoulli_logit_sites
+            {
+                let index = row * k_atoms + atom;
+                column_coefficient[atom] += inverse_diagonal * channels.m_channel[index];
+            }
+            for &(row, atom, t_index, _inverse_diagonal) in
+                &ordered_beta_bernoulli_logit_sites
+            {
+                let index = row * k_atoms + atom;
+                gamma_t[t_index] += column_coefficient[atom] * channels.z_jac[index];
+            }
+        }
 
         Ok(SaeArrowVector {
             t: gamma_t,

@@ -239,7 +239,7 @@ fn existence_and_intensity_are_separately_identified_1939() {
     let (strong, weak, dead) = (order[0], order[1], order[2]);
 
     // (b) INTENSITY RECOVERY — the two live atoms carry the planted amplitude
-    // ratio. The gate weight is common (uniform-ish ibp gate), so the ratio of
+    // ratio. The gate weight is common (uniform-ish ordered_beta gate), so the ratio of
     // decoded contribution RMS tracks amp_a/amp_b; allow a generous factor since
     // fit noise and the shared gate perturb the absolute scale but not the order.
     let planted_ratio = amp_a / amp_b;

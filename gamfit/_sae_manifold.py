@@ -918,6 +918,7 @@ class StagewiseSAE:
             int(seed.max_iter),
             int(seed.random_state),
             float(seed.threshold_gate_threshold),
+            float(self.terminal_joint_penalized_laml),
             float(self.reconstruction_ev()),
         )
 

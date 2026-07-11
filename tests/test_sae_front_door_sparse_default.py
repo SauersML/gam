@@ -31,14 +31,8 @@ class _AdmissionRust:
         mapping = {
             "softmax": "softmax",
             "topk": "topk",
-            "top_k": "topk",
-            "ibp": "ordered_beta_bernoulli",
-            "ibp-map": "ordered_beta_bernoulli",
             "ordered_beta_bernoulli": "ordered_beta_bernoulli",
             "threshold_gate": "threshold_gate",
-            "gated": "threshold_gate",
-            "jump_relu": "threshold_gate",
-            "jumprelu": "threshold_gate",
         }
         key = str(kind).strip().lower()
         if key not in mapping:

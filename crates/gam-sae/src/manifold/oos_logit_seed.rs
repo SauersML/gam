@@ -56,7 +56,7 @@ impl SaeManifoldTerm {
     /// in `[0,1]`; the seeded logit is their temperature-scaled inverse sigmoid.
     /// Ordered shrinkage is applied by the ordered Beta--Bernoulli prior during fitting, not as a
     /// second cap in this reconstruction seed.
-    pub fn seed_oos_ibp_logits_from_projected_decoder_lsq(
+    pub fn seed_oos_ordered_beta_logits_from_projected_decoder_lsq(
         &mut self,
         target: ArrayView2<'_, f64>,
         tau: f64,

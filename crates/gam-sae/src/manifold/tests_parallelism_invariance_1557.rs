@@ -216,22 +216,23 @@ pub(crate) fn newton_trial_state_is_rayon_thread_count_invariant_2242() {
     let k = serial.k_atoms();
     assert!(k > 1);
 
-    // Exercise the variable-stride compact expansion as well as the common
-    // row/atom update machinery: each row keeps one rotating free atom plus the
-    // softmax reference atom. Both carry their real periodic coordinate block.
-    let active_atoms: Vec<Vec<usize>> = (0..n).map(|row| vec![row % (k - 1), k - 1]).collect();
+    // Exercise exact TopK compact expansion as well as the common row/atom
+    // update machinery.
+    serial.assignment.mode = AssignmentMode::top_k_support(2);
+    parallel.assignment.mode = AssignmentMode::top_k_support(2);
     let coord_dims: Vec<usize> = serial
         .assignment
         .coords
         .iter()
         .map(LatentCoordValues::latent_dim)
         .collect();
-    let layout = SaeRowLayout::from_active_atoms_with_reference(
-        active_atoms,
+    let layout = SaeRowLayout::from_topk_gates(
+        &serial.assignments_all_parallel(n).unwrap(),
+        2,
         coord_dims,
         serial.assignment.coord_offsets(),
-        Some(k - 1),
-    );
+    )
+    .unwrap();
     let delta_ext_coord_len: usize = (0..n).map(|row| layout.row_q_active(row)).sum();
     serial.last_row_layout = Some(layout.clone());
     parallel.last_row_layout = Some(layout);

@@ -234,8 +234,8 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// normalization gives EVERY atom a tiny but strictly nonzero tail mass: a plain
 /// `a ≠ 0` test would mark all `K` atoms co-active on every row and collapse the
 /// scan to the dense `O(N·K²)` all-pairs cost (minutes at `K = 10⁴`). Matches the
-/// `1e-3` relative cutoff the compact row layout uses (`from_dense_weights`), so
-/// the penalty support and the assembled Newton support stay consistent.
+/// This threshold is only an anti-collapse diagnostic/conditioning definition;
+/// it never truncates the reconstruction or its derivatives.
 pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
 
 // ── #1026 / #1522 interior-point COLLAPSE-PREVENTION barriers ────────────────

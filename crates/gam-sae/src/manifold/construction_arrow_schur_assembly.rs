@@ -9,9 +9,6 @@
 //! `build_factored_beta_penalty_curvature`, `add_factored_repulsion_curvature`)
 //! fold the analytic decoder penalties into that same arrow structure.
 use super::*;
-// cd0639e4a moved this assembly out of the construction module; the softmax-entropy
-// Gershgorin majorizer helpers it calls are include!'d into construction, so import them.
-use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_majorizer_log_mean};
 
 /// #2144 — PSD Loewner majorizer of the raw ordered Beta--Bernoulli assignment-prior diagonal
 /// curvature `raw = w·(s'·J² + s·c)` at one logit slot, for the low-rank-metric
@@ -169,12 +166,12 @@ impl SaeManifoldTerm {
         )
     }
 
-    /// Innermost assembly entry. `forced_layout` overrides the budget-derived
-    /// active-set layout so a caller can pin the dense (`Forced(None)`) or a
+    /// Innermost assembly entry. `forced_layout` overrides the TopK-derived
+    /// active-set layout so a test can pin the dense (`Forced(None)`) or a
     /// specific compact (`Forced(Some(layout))`) path — used by the
     /// compact-vs-dense Riemannian-geometry equality regression test to drive
-    /// both layouts on identical data. `Computed` is the production path:
-    /// the layout is derived from the assignment mode + `sparse_active_plan`.
+    /// both layouts on identical data. The production layout is exact TopK
+    /// support; smooth modes never use a compact layout.
     pub(crate) fn assemble_arrow_schur_inner(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -564,24 +561,12 @@ impl SaeManifoldTerm {
         // (`rank == p`) and no-metric paths keep `low_rank_whiten == false` and
         // are bit-for-bit unchanged.
         let low_rank_whiten = whitens_likelihood && w_dim < p;
-        // #2144/#1038 — PSD-majorize the ordered Beta--Bernoulli assignment-prior curvature
-        // UNCONDITIONALLY (see `ordered_beta_bernoulli_psd_majorized_hdiag`), exactly as softmax's
-        // Gershgorin majorizer (#1419) and ARD's `max(V'',0)` already are. The raw
-        // ordered Beta--Bernoulli pieces (`w·s'` rank-one, `w·s·c` diagonal) are not sign-definite, so
-        // the raw operator's cross-row capacitance `C = I + D·M` goes indefinite by
-        // design on weakly-identified fits — `log|H|` is then not a Laplace
-        // normalizer at all (det H < 0), the outer-ρ criterion is undefined along
-        // parts of the ρ-path, and the FD gates measure a desync (#2087). The
-        // majorized operator keeps `D ⪰ 0` hence `det C ≥ 1` — the evidence is
-        // defined EVERYWHERE — and the Newton metric is PSD, which removes the
-        // undamped step-divergence mode on indefinite fixtures. The prior's exact
-        // GRADIENT is untouched, so stationary points do not move; the ρ-trace and
-        // θ-adjoint differentiate this SAME majorized operator (their sites clamp
-        // identically), keeping value/trace/adjoint on one branch. `None` on every
-        // non-ordered Beta--Bernoulli mode (the third channels only exist for ordered Beta--Bernoulli-MAP).
-        // RAW channels: `ordered_beta_bernoulli_psd_majorized_hdiag` and the source-`d` clamp below do
-        // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
-        // un-majorized channel set.
+        // PSD-majorize the ordered Beta--Bernoulli prior curvature on every
+        // path. Its exact mass rank-one coefficient is strictly negative, so
+        // zero is its PSD Loewner majorizer; the row-local concrete-Jacobian
+        // term is replaced by its positive part. The exact prior gradient is
+        // untouched, while assembly, rho traces, and theta adjoints all
+        // differentiate this same declared curvature operator.
         let ordered_beta_bernoulli_majorizer =
             ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
                 &self.assignment,
@@ -674,20 +659,9 @@ impl SaeManifoldTerm {
         // are addressed by COMPACT SLOT in the compact branch below (the dense
         // branch keeps global-atom rows), so the row count is the max active set.
         //
-        // #1410/#1408/#1409: SOFTMAX now ALSO takes the `Some(layout)` branch
-        // whenever a `top_k` cap (`set_softmax_active_cap`) or an in-core memory
-        // breach engages `softmax_active_plan` → `from_dense_weights`, so its
-        // per-worker `decoded`/`jac_white` scratch is the COMPACT
-        // `max_active`/`max_q_row` size too — no longer the full `(k_atoms·p)` /
-        // `(q·max(w_dim,p))` blow-up. JumpReLU / ordered Beta--Bernoulli-MAP likewise pay only
-        // `max_active`. The remaining `None` (full-`K`) branch is the UNCAPPED
-        // softmax / no-budget-breach case, which genuinely assembles the dense
-        // entropy block over all `K`; capping it (the compact contract) removes
-        // the per-worker `O(K)` footprint entirely. (#1410: the residual per-row
-        // `O(K)` softmax-majorizer scratch — a `row_logits` copy and the full-`K`
-        // `d`/`H_entropy` blocks — is removed separately; see the active-only
-        // `active_softmax_gershgorin_majorizer_entry` /
-        // `softmax_dense_entropy_hessian_entry` helpers below.)
+        // The compact branch is exclusively the exact TopK support. Smooth
+        // assignment modes use the full dimensions and have already passed the
+        // exact-memory admission check above.
         let (decoded_rows, scratch_q) = match row_layout.as_ref() {
             Some(layout) => {
                 let max_active = (0..n)
@@ -876,34 +850,9 @@ impl SaeManifoldTerm {
                         //   * Otherwise (small K): the dense uniform-q layout.
                         let (q_row, mut local_jac_row) = if let Some(layout) = row_layout.as_ref() {
                             let active = &layout.active_atoms[row];
-                            let logit_atoms = &layout.logit_atoms[row];
                             let starts = &layout.coord_starts[row];
                             let q_active = layout.row_q_active(row);
                             let mut jac_compact = Array2::<f64>::zeros((q_active, p));
-                            // Logit JVP rows for the FREE-logit atoms only. Softmax's
-                            // reference atom (K−1, always last) has coords but no logit
-                            // slot; `logit_atoms == active` for the column-separable
-                            // modes, and the logit slot `j` still coincides with the
-                            // active-set position, so `decoded.row(j)` is correct. (#Bug1)
-                            let logits_row = self.assignment.logits.row(row);
-                            for (j, &k) in logit_atoms.iter().enumerate() {
-                                fill_active_atom_logit_jvp(
-                                    ActiveAtomLogitJvp {
-                                        mode: self.assignment.mode,
-                                        logit_k: logits_row[k],
-                                        a_k: assignments[k],
-                                        // #1410: compact slot `j`, not global atom `k`.
-                                        decoded_k: decoded.row(j),
-                                        fitted: fitted.view(),
-                                        compact_index: j,
-                                        // #1026/#1033: a FIXED logit (ungated, or every
-                                        // atom under frozen routing) has a constant gate
-                                        // ⇒ zero logit-JVP.
-                                        ungated: self.assignment.logit_is_fixed(k),
-                                    },
-                                    &mut jac_compact,
-                                );
-                            }
                             // Coordinate JVP rows for active atoms only.
                             for (j, &k) in active.iter().enumerate() {
                                 let d = self.atoms[k].latent_dim;
@@ -1047,74 +996,7 @@ impl SaeManifoldTerm {
                         //     isolated and clamped by
                         //     `ordered_beta_bernoulli_psd_majorized_hdiag`.
                         let assignment_base = row * k_atoms;
-                        if let Some(layout) = row_layout.as_ref() {
-                            // #Bug1: iterate FREE-logit atoms — softmax's reference
-                            // atom has no logit gt/htt slot (matching the dense K−1
-                            // chart); `logit_atoms == active` for separable modes.
-                            let active = &layout.logit_atoms[row];
-                            // #1408/#1409 softmax compact curvature: the entropy
-                            // Hessian diagonal in `assignment_hdiag` is INDEFINITE,
-                            // so on a compact softmax layout write the Gershgorin
-                            // Loewner majorizer `D_kk = Σ_j|H_kj|` (#1419) — the same
-                            // PSD operator the dense softmax branch writes — at each
-                            // active logit slot. `D` is diagonal, so its active
-                            // principal sub-block is `diag(D_kk : k ∈ active)`; each
-                            // `D_kk` is the FULL-`K` abs-row-sum, so it still
-                            // dominates the active principal sub-block of `H_entropy`
-                            // (a genuine majorizer on the retained support). The
-                            // gradient stays the EXACT entropy gradient (it sets the
-                            // fixed point), so majorizing only conditions the Newton
-                            // step. JumpReLU/ordered Beta--Bernoulli keep their (exact) diagonal.
-                            //
-                            // #1410: compute only the active `D_kk` directly from this
-                            // row's softmax assignments `a` (= `assignments`, already
-                            // in hand), via `active_softmax_gershgorin_majorizer_entry`.
-                            // The previous `psd_majorizer_abs_row_sums(&row_logits, ..)`
-                            // call allocated TWO length-`K` per-row scratch vectors (a
-                            // fresh `row_logits` copy and the full-`K` returned `d`)
-                            // only to read `d[k]` for the `≤ top_k` active `k` — an
-                            // `O(K)` per-row allocation on the path the compact
-                            // contract keeps `K`-free. The shared `m = Σ_j a_j l_j` is
-                            // the one irreducible `O(K)` pass, computed once per row.
-                            let assignments_slice = assignments
-                                .as_slice()
-                                .expect("softmax assignments row must be contiguous");
-                            let majorizer_log_mean: Option<f64> = softmax_dense
-                                .as_ref()
-                                .map(|_| softmax_majorizer_log_mean(assignments_slice));
-                            // #991 — the softmax majorizer curvature is a per-row
-                            // BLOCK (not sourced from the design-weighted
-                            // `assignment_hdiag` array), so fold this row's design
-                            // weight into its `scale` here; `gt` uses the already
-                            // `w`-weighted `assignment_grad`, so it is not touched.
-                            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-                            for (j, &k) in active.iter().enumerate() {
-                                block.gt[j] += assignment_grad[assignment_base + k];
-                                match (softmax_dense.as_ref(), majorizer_log_mean) {
-                                    (Some((_penalty, scale)), Some(m)) => {
-                                        block.htt[[j, j]] += w_row
-                                            * active_softmax_gershgorin_majorizer_entry(
-                                                assignments_slice,
-                                                k,
-                                                m,
-                                                *scale,
-                                            );
-                                    }
-                                    _ => {
-                                        let raw = assignment_hdiag[assignment_base + k];
-                                        // #2144: PSD-majorize the ordered Beta--Bernoulli diagonal under a
-                                        // low-rank whitening metric (no-op otherwise).
-                                        let val = match ordered_beta_bernoulli_majorizer.as_ref() {
-                                            Some(ch) => {
-                                                ordered_beta_bernoulli_psd_majorized_hdiag(ch, row, k_atoms, k, raw)
-                                            }
-                                            None => raw,
-                                        };
-                                        block.htt[[j, j]] += val;
-                                    }
-                                }
-                            }
-                        } else {
+                        if row_layout.is_none() {
                             for free_idx in 0..assignment_dim {
                                 block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
                             }
@@ -1628,12 +1510,9 @@ impl SaeManifoldTerm {
         // `apply_riemannian_latent_geometry` does to `row.htbeta`, applied
         // here to the (q × p) kron_jac so the Kronecker htbeta_matvec uses
         // the Riemannian-projected form.
-        // Apply Riemannian geometry only for the dense uniform-q layout. Any
-        // compact active-set layout (JumpReLU gate or large-K softmax/ordered Beta--Bernoulli
-        // truncation) has heterogeneous q_i; the Riemannian projector path
-        // requires a uniform latent dimension. The sparse plan only engages on
-        // Euclidean ext-coord manifolds (see `sparse_active_plan`), so skipping
-        // the projector here is correct — there is nothing to project.
+        // Dense rows share one product manifold. Exact TopK rows may have
+        // heterogeneous supports, so the compact arm rebuilds the corresponding
+        // per-row product manifold before applying the same geometry.
         match row_layout.as_ref() {
             None => {
                 let raw_gt_rows: Vec<Array1<f64>> =
@@ -1717,9 +1596,7 @@ impl SaeManifoldTerm {
                 // and the column tangent projection of `htbeta` — plus the
                 // identical Kronecker `kron_jac` column projection. On the shared
                 // active support this is byte-identical to slicing the dense
-                // product manifold, so engaging the sparse plan on a non-Euclidean
-                // ext manifold is now correct (the former
-                // `is_euclidean()`-only guard in `sparse_active_plan` is lifted).
+                // product manifold.
                 //
                 // Euclidean ext manifolds still skip all of this (every
                 // per-row manifold is a product of Euclidean parts whose

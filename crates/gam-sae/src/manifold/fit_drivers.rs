@@ -274,7 +274,6 @@ impl SaeManifoldTerm {
         let row_layout_matches = match (&self.last_row_layout, &snapshot.last_row_layout) {
             (Some(current), Some(expected)) => {
                 current.active_atoms == expected.active_atoms
-                    && current.logit_atoms == expected.logit_atoms
                     && current.coord_starts == expected.coord_starts
                     && current.coord_offsets_full == expected.coord_offsets_full
                     && current.coord_dims == expected.coord_dims
@@ -3878,7 +3877,7 @@ impl SaeManifoldTerm {
         let frames = (0..k)
             .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
             .collect::<Result<Vec<_>, String>>()?;
-        // OVERCOMPLETE GATE (ibp_default_alpha false-positive root cause). A shared
+        // OVERCOMPLETE GATE (ordered_beta_default_alpha false-positive root cause). A shared
         // output subspace is evidence of a REDUNDANT atom only when the dictionary is
         // NOT overcomplete relative to the output space it actually occupies. Let
         // `R = dim(⋃_k col Q_k)` be the effective output rank — the dimension spanned
@@ -3886,7 +3885,7 @@ impl SaeManifoldTerm {
         // FORCES output-frame sharing: `K` curved atoms cannot each claim a private
         // output direction inside an `R < K`-dim space, so every co-firing pair MUST
         // overlap while encoding DISTINCT charts/phases — benign over-completeness, not
-        // duplication (measured on `ibp_default_alpha`: 8 curved atoms in a ~6-dim
+        // duplication (measured on `ordered_beta_default_alpha`: 8 curved atoms in a ~6-dim
         // output, every frame-coherent pair reconstructs EV≈0.99 with contribution
         // cosine at the independence null; firing the reseed here burns the iteration
         // budget — guards-on 12-iter EV 0.697 vs guards-off 0.990). Restrict the whole
@@ -3937,7 +3936,7 @@ impl SaeManifoldTerm {
         // (n×p) are collinear over the rows — NOT merely when they share an output
         // subspace. Two curved atoms sharing a decoder frame at DIFFERENT charts
         // (phases) reconstruct DIFFERENT rows, so `Y_j ≠ Y_k`: benign, healthy,
-        // must not be reseeded (measured on `ibp_default_alpha`: every frame-coherent
+        // must not be reseeded (measured on `ordered_beta_default_alpha`: every frame-coherent
         // pair reconstructs EV≈0.99 with contribution cosine ≤0.27, right at the
         // independence null, while the frame coherence reads ≈1). Confirm each
         // candidate on the Frobenius cosine of its contributions against a bar

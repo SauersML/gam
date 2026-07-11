@@ -237,8 +237,6 @@ def _make_fit(
         "diagnostics": sae._json_ready(
             _diagnostics(n_atoms) if diagnostics is None else diagnostics
         ),
-        "top_k_projection": None,
-        "pre_topk": None,
         "solver_plan": None,
         "atom_two_lens": None,
         "residual_gauge": None,

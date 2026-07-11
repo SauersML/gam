@@ -92,12 +92,11 @@ impl From<OuterGradientError> for String {
 
 /// Active-set layout override for [`SaeManifoldTerm::assemble_arrow_schur_inner`].
 ///
-/// `None` is the production path: the layout is derived from the assignment mode
-/// and `sparse_active_plan`. `Some(layout_opt)` pins a specific layout — dense
+/// `None` is the production path: TopK derives its exact support layout and all
+/// smooth modes remain dense. `Some(layout_opt)` pins a specific layout — dense
 /// (`Some(None)`) or a chosen compact `SaeRowLayout` (`Some(Some(..))`) — so the
 /// compact-vs-dense Riemannian-geometry equality regression can drive both code
-/// paths on identical data without depending on the host/device memory budget
-/// that gates the compact path in production.
+/// paths on identical data.
 pub(crate) type ForcedRowLayout = Option<Option<SaeRowLayout>>;
 
 /// #1154 — base co-training weight for the amortized-encoder reconstruction

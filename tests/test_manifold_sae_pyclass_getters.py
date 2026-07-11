@@ -156,7 +156,9 @@ def test_report_block_getters() -> None:
     golden = _golden()
     core = ManifoldSAE(golden)
     assert core.diagnostics == golden["diagnostics"]
-    assert core.top_k_projection == golden["top_k_projection"]
+    assert core.penalized_laml_criterion == pytest.approx(
+        golden["penalized_laml_criterion"]
+    )
     assert core.solver_plan == golden["solver_plan"]
     assert core.hybrid_split == golden["hybrid_split"]
     assert core.certificates == golden["certificates"]
