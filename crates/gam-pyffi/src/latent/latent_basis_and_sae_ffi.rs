@@ -1101,6 +1101,10 @@ fn multinomial_model_metadata_pyfunc<'py>(
     out.set_item("p_per_class", envelope.saved.p_per_class)?;
     out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
     out.set_item("training_headers", envelope.saved.training_headers.clone())?;
+    out.set_item(
+        "training_table_kind",
+        &envelope.saved.training_table_kind,
+    )?;
     out.set_item("lambdas", envelope.saved.lambdas.clone())?;
     out.set_item(
         "lambdas_per_block",

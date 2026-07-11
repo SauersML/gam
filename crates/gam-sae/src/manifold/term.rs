@@ -628,22 +628,10 @@ pub struct SaeManifoldTerm {
     /// the FFI through [`SaeManifoldTerm::set_fit_config`]. Carried across clones
     /// (persisted configuration, like the assignment mode).
     pub(crate) separation_barrier_strength_override: Option<f64>,
-    /// #5/(B) — persisted per-fit opt-in (default false ⇒ bit-for-bit historical
-    /// path) for the RANK-CHARGE evidence criterion. When true, the Laplace
-    /// complexity's per-atom COORDINATE-block term ½log|H_tt| — which mis-prices
-    /// with the `log(a²‖B‖²)` scale (over-charging real atoms, rewarding
-    /// a²‖B‖²→0) — is replaced by the honest BIC ½·d_eff·log n on the atom's
-    /// realised decoder RANK: d_eff_k = rank_eff_k · basis_edf_k, rank_eff_k =
-    /// Σ_i s_i²/(s_i²+R) over the decoder singular values with a FIXED dictionary-
-    /// relative floor R (so a vanishing atom → rank→0 → charge 0 → neutral, the
-    /// co-collapse fix). Rotation-invariant; it does NOT distinguish a clean
-    /// circle from a blend (both rank-2) — that is the producer's job. Carried
-    /// across clones like the other per-fit config.
-    pub(crate) rank_charge_evidence: bool,
-    /// Theorem K — persisted per-fit opt-in (default false ⇒ bit-for-bit historical
-    /// path) for the WBIC SOFT rank-charge ledger. Only has effect when
-    /// `rank_charge_evidence` is also on: inside that branch the per-atom coefficient
-    /// of the occupancy log-scale `ln N_eff,k` becomes the finite-n WBIC learning
+    /// Theorem K — persisted per-fit opt-in for the WBIC SOFT rank-charge ledger.
+    /// The canonical evidence criterion always uses a scale-invariant realised-rank
+    /// charge; this flag changes only the per-atom coefficient of the occupancy
+    /// log-scale `ln N_eff,k` to the finite-n WBIC learning
     /// coefficient `λ_k = ½·rank_soft_k·basis_edf_k` (the β=1/log n_eff likelihood-tempered, prior-untempered count on
     /// the occupancy-corrected reconstruction spectrum) instead of the hard limit
     /// `½·d_eff,k`. The two coincide away from the Marchenko–Pastur edge (soft→hard)
@@ -770,7 +758,6 @@ impl Clone for SaeManifoldTerm {
             // #1777 — persisted per-fit config, carried across clones like the
             // assignment mode so a cloned term keeps the same barrier override.
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            rank_charge_evidence: self.rank_charge_evidence,
             soft_rank_charge: self.soft_rank_charge,
             data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,

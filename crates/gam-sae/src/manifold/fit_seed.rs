@@ -324,7 +324,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         &evaluators,
     )?;
     base_term.set_data_row_reseed(request.data_row_reseed);
-    base_term.set_rank_charge_evidence(true);
     base_term.set_fit_config(request.fit_config);
     if let Some(schedule) = request.temperature_schedule {
         base_term.set_temperature_schedule(schedule)?;

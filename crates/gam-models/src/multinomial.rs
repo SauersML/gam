@@ -1445,6 +1445,10 @@ pub struct MultinomialSavedModel {
     /// predict time so the FFI can align a fresh `Dataset` to the training
     /// schema before evaluating the basis.
     pub training_headers: Vec<String>,
+    /// Container type of the training table. `"unknown"` is the explicit value
+    /// for Rust/CLI callers without a typed table container; the field is always
+    /// present so persistence never invents presentation state while loading.
+    pub training_table_kind: String,
     /// REML/LAML-selected smoothing parameters, one per `(active class, smooth
     /// term)`, flattened in block-major order: all of class 0's per-term λ,
     /// then class 1's, and so on. Per-term penalties (#561) mean each active
@@ -1519,9 +1523,8 @@ pub struct MultinomialSavedModel {
     /// wiggliness λ labelled `s(x)` and a null-space shrinkage λ labelled
     /// `s(x) [null space]`. The summary renderer pairs `lambdas` with these
     /// labels component-for-component so no λ is ever dropped (#1544). Built from
-    /// the per-component term name + penalty role at fit time; empty for a
-    /// wholly parametric model or a model serialized before this field existed.
-    #[serde(default)]
+    /// the per-component term name + penalty role at fit time; empty only for a
+    /// wholly parametric model.
     pub lambda_labels: Vec<String>,
 }
 
@@ -1614,6 +1617,47 @@ impl MultinomialSavedModel {
                 "multinomial saved model has {} coefficient values, expected {d}",
                 self.coefficients_flat.len(),
             );
+        }
+        if self.training_table_kind.trim().is_empty() {
+            crate::bail_invalid_estim!(
+                "multinomial saved model training_table_kind must be non-empty"
+            );
+        }
+        if self.lambdas_per_block.len() != self.n_active_classes {
+            crate::bail_invalid_estim!(
+                "multinomial saved model has {} lambda blocks, expected {}",
+                self.lambdas_per_block.len(),
+                self.n_active_classes,
+            );
+        }
+        let lambda_count = self
+            .lambdas_per_block
+            .iter()
+            .try_fold(0usize, |total, &count| total.checked_add(count))
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "multinomial saved lambda count overflowed usize".to_string(),
+                )
+            })?;
+        if lambda_count != self.lambdas.len() {
+            crate::bail_invalid_estim!(
+                "multinomial saved model has {} lambdas but its blocks require {lambda_count}",
+                self.lambdas.len(),
+            );
+        }
+        if self
+            .lambdas_per_block
+            .iter()
+            .any(|&count| count != self.lambda_labels.len())
+        {
+            crate::bail_invalid_estim!(
+                "multinomial saved model has {} lambda labels but block sizes {:?}",
+                self.lambda_labels.len(),
+                self.lambdas_per_block,
+            );
+        }
+        if self.lambda_labels.iter().any(|label| label.trim().is_empty()) {
+            crate::bail_invalid_estim!("multinomial saved model lambda labels must be non-empty");
         }
         let covariance_len = d.checked_mul(d).ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -1849,12 +1893,10 @@ impl MultinomialSavedModel {
 /// as a single constant so every producer / consumer of the envelope agrees on
 /// the tag without a scattered string literal.
 pub const MULTINOMIAL_MODEL_CLASS: &str = "multinomial";
-/// Exact multinomial persistence schema. Older payloads carried a public
-/// `converged` flag alongside usable coefficients; accepting one with
-/// `converged=false` violated the convergence-only model contract. Version 1
-/// removes that state entirely: successful deserialization itself means the
-/// payload was minted by the convergence-only constructor.
-pub const MULTINOMIAL_MODEL_FORMAT_VERSION: u32 = 1;
+/// Exact multinomial persistence schema. Version 2 requires the canonical
+/// per-component lambda labels and training-table provenance; successful
+/// deserialization therefore yields a complete current model without repair.
+pub const MULTINOMIAL_MODEL_FORMAT_VERSION: u32 = 2;
 
 /// Round-trip persistence envelope for a fitted multinomial model. The
 /// `model_class` discriminator lets a loader tell a multinomial payload apart
@@ -1918,21 +1960,6 @@ impl MultinomialModelEnvelope {
 #[cfg(test)]
 mod multinomial_persistence_contract_tests {
     use super::*;
-
-    #[test]
-    fn payload_with_nonconverged_model_flag_is_rejected() {
-        let payload = br#"{
-            "model_class": "multinomial",
-            "format_version": 1,
-            "saved": {"converged": false}
-        }"#;
-        let error = MultinomialModelEnvelope::from_json_bytes(payload)
-            .expect_err("a payload carrying an inspectable non-converged model must be rejected");
-        assert!(
-            error.to_string().contains("unknown field `converged`"),
-            "unexpected persistence error: {error}"
-        );
-    }
 
     #[test]
     fn unversioned_payload_is_rejected() {
@@ -3038,6 +3065,7 @@ pub fn fit_penalized_multinomial_formula(
         p_per_class,
         n_active_classes: m,
         training_headers: data.headers.clone(),
+        training_table_kind: config.training_table_kind.clone(),
         lambdas: lambdas_flat,
         lambdas_per_block,
         iterations: fit.inner_cycles,

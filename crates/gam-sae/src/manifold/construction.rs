@@ -15,7 +15,7 @@ use gam_math::jet_scalar::JetScalar;
 //
 //   • HARD rank (n → ∞ limit, atom well above the noise edge): every resolved
 //     decoder direction is a regular parameter, λ → ½·rank_eff·basis_edf = ½·d_eff.
-//     This is the shipped default (`rank_charge_evidence`, hard MP count).
+//     This is the canonical criterion (hard MP count).
 //   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): a direction
 //     only fractionally resolved contributes a fraction of ½, λ = ½·rank_soft·basis_edf
 //     with rank_soft = Σ_j μ_j/(μ_j+e·log n_eff) the tempered (β=1/log n_eff) count. This is the
@@ -36,12 +36,11 @@ use gam_math::jet_scalar::JetScalar;
 // of truth: it is carried across clones (including stagewise per-birth clones) and
 // therefore propagates correctly into rayon worker threads during parallel folds —
 // a thread-local scope would silently fail to apply in worker threads, so it is
-// deliberately NOT used. Effect only when `rank_charge_evidence` is also on (the
-// soft coefficient substitutes for the hard one INSIDE that branch).
+// deliberately NOT used.
 
 /// #9 streaming rank-charge inputs, accumulated in a SINGLE pass through
-/// [`SaeManifoldTerm::streaming_exact_arrow_log_det`] when `rank_charge_evidence`
-/// is on: the coordinate-block log-det `log_det_tt` (= 2·`htt_half`; the part the
+/// [`SaeManifoldTerm::streaming_exact_arrow_log_det`]: the coordinate-block
+/// log-det `log_det_tt` (= 2·`htt_half`; the part the
 /// rank charge replaces), plus the per-atom decoder Grams `G_k =
 /// Φ_kᵀdiag(a_k²)Φ_k` and the effective sample sizes `N_eff,k = Σ_row a_k²`.
 /// Both are chunk-additive, so accumulating them over the streaming chunks equals
@@ -200,7 +199,6 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
-            rank_charge_evidence: false,
             soft_rank_charge: false,
             data_row_reseed: false,
             // SAC — the collapse-guard stack is armed by default; the stagewise
@@ -975,22 +973,9 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// #5/(B) — set the per-fit rank-charge evidence opt-in (typed kwarg, no env
-    /// lever). Default false ⇒ historical path bit-for-bit. Replaces the
-    /// coordinate-block ½log|H_tt| with the honest BIC ½·d_eff·log n on the
-    /// realised decoder rank (over-charge + co-collapse fix).
-    pub fn set_rank_charge_evidence(&mut self, enabled: bool) {
-        self.rank_charge_evidence = enabled;
-    }
-
-    /// #5/(B) — read the per-fit rank-charge evidence opt-in.
-    pub fn rank_charge_evidence(&self) -> bool {
-        self.rank_charge_evidence
-    }
-
     /// Theorem K — set the per-fit WBIC SOFT rank-charge ledger opt-in (typed kwarg,
-    /// no env lever). Default false ⇒ historical hard path bit-for-bit. Only has
-    /// effect when `rank_charge_evidence` is also on. Persisted per-fit config,
+    /// no env lever). Default false selects the hard realised-rank coefficient.
+    /// Persisted per-fit config,
     /// carried across clones (including stagewise per-birth clones) and across rayon
     /// worker threads — the field is the single source of truth.
     pub fn set_soft_rank_charge(&mut self, enabled: bool) {
