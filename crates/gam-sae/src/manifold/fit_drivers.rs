@@ -6150,7 +6150,27 @@ impl SaeManifoldTerm {
                     |trial_step_size, post_step_total| {
                         let armijo_bound = pre_step_total
                             - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
-                        post_step_total.is_finite() && post_step_total <= armijo_bound
+                        // #2253 idempotence — EVIDENCE lanes additionally require
+                        // the decrease to clear the stall detector's own
+                        // resolution: a sub-resolution "strict" decrease (the
+                        // ε-harvest of per-assembly gate-freeze drift at a
+                        // KKT-band iterate) is not measurable progress, but each
+                        // such accept was a fresh state move that kept the inner
+                        // map non-idempotent forever (tier-0 K=2 fixtures:
+                        // refused at 512 granted iterations with ‖g‖ 300× inside
+                        // the band). Rejecting it routes to the proximal path
+                        // and then to the NoStrictDecrease termination — exactly
+                        // the recurrence the certificate needs. Discovery lanes
+                        // (floor 0) are byte-identical to the historical gate.
+                        let material_floor = if allow_heuristic_termination {
+                            0.0
+                        } else {
+                            SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                                * (1.0 + pre_step_total.abs())
+                        };
+                        post_step_total.is_finite()
+                            && post_step_total <= armijo_bound
+                            && pre_step_total - post_step_total >= material_floor
                     },
                 )?
             } else {
@@ -6269,8 +6289,18 @@ impl SaeManifoldTerm {
                         break;
                     }
                 };
+                // Same #2253 evidence-lane material floor as the Armijo gate
+                // above: a sub-stall-resolution proximal decrease is the same
+                // ε-harvest, and accepting it here would just move the
+                // non-idempotence from the line search to the fallback.
+                let proximal_material_floor = if allow_heuristic_termination {
+                    0.0
+                } else {
+                    SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + pre_step_total.abs())
+                };
                 if !(accepted_step.trial_objective_value.is_finite()
-                    && accepted_step.trial_objective_value < pre_step_total)
+                    && pre_step_total - accepted_step.trial_objective_value
+                        > proximal_material_floor)
                 {
                     log::debug!(
                         "run_joint_fit_arrow_schur: proximal correction made no decrease at \
