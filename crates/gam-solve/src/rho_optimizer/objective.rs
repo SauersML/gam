@@ -237,26 +237,16 @@ pub trait OuterObjective {
         None
     }
 
-    /// Whether every joint fit of this objective must ENTER through the
-    /// [`crate::continuation_path::ContinuationPath`] (heavy-smoothing
-    /// entry) rather than being solved cold at the seed ρ*.
+    /// Whether a non-finite cost at the literal outer seed may be repaired by
+    /// the certified heavy-smoothing [`crate::continuation_path::ContinuationPath`].
     ///
-    /// The SAE-manifold joint objective overrides this to `true`: its joint
-    /// `(logits, t, β)` block has a combinatorial active-set component that a
-    /// cold solve can collapse, so it is entered at a heavy-smoothing regime
-    /// and annealed down. Crucially, this flips the seed cascade's structural
-    /// failure handling from REJECT to **DEMOTE-WITH-REASON**: a "cold"
-    /// structural defect (rank/alias/active-set diagnosis from the seed
-    /// pre-warm or the uniform-structural early-exit) is not a disqualification
-    /// but a signal to RE-ENTER the same seed at a *heavier* ContinuationPath
-    /// regime. The candidate set therefore never empties on a structural
-    /// diagnosis — every demotion is recorded with its reason and routed to a
-    /// heavier regime.
-    ///
-    /// The default `false` preserves the existing contract for every other
-    /// objective: pre-warm stays an optimization (never a feasibility gate),
-    /// and a uniform structural rejection still short-circuits the cascade.
-    fn requires_continuation_path_entry(&self) -> bool {
+    /// This is a typed domain-entry capability, not a fallback objective. The
+    /// runner always probes the real seed first. A finite seed proceeds without
+    /// a continuation walk; only an undefined seed criterion activates the
+    /// heavy-to-real homotopy, whose arrival is re-evaluated at the exact seed.
+    /// If that exact value remains undefined, the seed stays refused. No finite
+    /// sentinel or zero derivative is manufactured.
+    fn supports_reactive_domain_entry(&self) -> bool {
         false
     }
 
@@ -698,8 +688,8 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.allow_continuation_prewarm()
     }
 
-    fn requires_continuation_path_entry(&self) -> bool {
-        self.inner.requires_continuation_path_entry()
+    fn supports_reactive_domain_entry(&self) -> bool {
+        self.inner.supports_reactive_domain_entry()
     }
 
     fn reset(&mut self) {
@@ -1248,8 +1238,8 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         self.inner.allow_continuation_prewarm()
     }
 
-    fn requires_continuation_path_entry(&self) -> bool {
-        self.inner.requires_continuation_path_entry()
+    fn supports_reactive_domain_entry(&self) -> bool {
+        self.inner.supports_reactive_domain_entry()
     }
 
     fn accept_seed_without_outer_iterations(

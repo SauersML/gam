@@ -291,18 +291,11 @@ pub(crate) fn run_outer_with_plan(
 
     let mut best: Option<CertifiedOuterCandidate> = None;
     let mut best_checkpoint: Option<OuterResult> = None;
-    // Object 1 — ContinuationPath. Every SAE-manifold joint fit ENTERS through
-    // the continuation path at a heavy-smoothing regime. When the objective
-    // declares this requirement the seed cascade's structural-failure handling
-    // flips from REJECT (which can empty the candidate set and fall through to
-    // the fatal `format_no_seeds_passed`) to DEMOTE-WITH-REASON: a "cold"
-    // structural diagnosis becomes a heavier-regime RE-ENTRY of the same seed,
-    // recorded on the path, never a disqualification. Objectives that do not
-    // require continuation entry keep `None` and the legacy reject/early-exit
-    // contract is unchanged.
-    let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = obj
-        .requires_continuation_path_entry()
-        .then(crate::continuation_path::ContinuationPath::heavy_entry);
+    // A reactive domain-entry path is created per seed only after the
+    // objective's exact seed cost is non-finite. Keeping `None` here is the
+    // zero-heavy-entry fast path for every already-feasible seed.
+    let reactive_domain_entry_available = obj.supports_reactive_domain_entry();
+    let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = None;
     // Demotion ledger: every structural defect that would historically have
     // rejected a seed (or short-circuited the cascade) is instead recorded
     // here with its reason and the regime it was demoted to, so the

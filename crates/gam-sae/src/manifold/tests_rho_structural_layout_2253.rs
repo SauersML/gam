@@ -103,6 +103,32 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     );
     assert_eq!(evaluation.gradient.len(), 2);
 
+    let rho_state = gradient_objective.baseline_rho.from_flat(base.view());
+    let mut audit_term = gradient_objective.term.clone();
+    let (_, audit_loss, audit_cache) = audit_term
+        .reml_criterion_with_cache(
+            gradient_objective.target.view(),
+            &rho_state,
+            gradient_objective.registry.as_ref(),
+            0,
+            gradient_objective.learning_rate,
+            gradient_objective.ridge_ext_coord,
+            gradient_objective.ridge_beta,
+        )
+        .expect("frozen accepted-state evidence audit must evaluate");
+    let audit_solver = audit_term
+        .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec())
+        .expect("frozen accepted-state outer solver");
+    let audit_components = audit_term
+        .analytic_outer_rho_gradient_components(
+            gradient_objective.target.view(),
+            &rho_state,
+            &audit_loss,
+            &audit_cache,
+            &audit_solver,
+        )
+        .expect("frozen accepted-state gradient components");
+
     let direction = array![0.6_f64, -0.8_f64];
     let analytic = evaluation.gradient.dot(&direction);
     let h = 1.0e-3_f64;
@@ -120,6 +146,23 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .eval_cost(&minus)
         .expect("-h directional value probe must converge");
     let minus_telemetry = gradient_objective.probe_telemetry();
+    let frozen_cost_at = |rho_flat: &Array1<f64>| {
+        let mut term = gradient_objective.term.clone();
+        let rho = gradient_objective.baseline_rho.from_flat(rho_flat.view());
+        term.reml_criterion_with_cache(
+            gradient_objective.target.view(),
+            &rho,
+            gradient_objective.registry.as_ref(),
+            0,
+            gradient_objective.learning_rate,
+            gradient_objective.ridge_ext_coord,
+            gradient_objective.ridge_beta,
+        )
+        .expect("frozen-state directional value probe")
+        .0
+    };
+    let frozen_plus_cost = frozen_cost_at(&plus);
+    let frozen_minus_cost = frozen_cost_at(&minus);
     assert!(
         plus_cost.is_finite(),
         "+h must evaluate feasible REML evidence: \
@@ -146,6 +189,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          plus_telemetry={plus_telemetry:?}, minus_telemetry={minus_telemetry:?}"
     );
     let finite_difference = (plus_cost - minus_cost) / (2.0 * h);
+    let frozen_finite_difference = (frozen_plus_cost - frozen_minus_cost) / (2.0 * h);
     let mut coordinate_fd = Array1::<f64>::zeros(base.len());
     for coordinate in 0..base.len() {
         let mut axis = Array1::<f64>::zeros(base.len());
@@ -166,9 +210,15 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         "K=1 Softmax active-coordinate derivative mismatch: analytic direction={analytic:.9e}, \
          central FD={finite_difference:.9e}, error={:.3e}, scale={scale:.3e}, \
          gradient={:?}, coordinate_fd={coordinate_fd:?}, \
+         explicit={:?}, trace={:?}, occam={:?}, adjoint={:?}, \
+         frozen_fd={frozen_finite_difference:.9e}, \
          base_cost={base_cost:.17e}, plus_cost={plus_cost:.17e}, \
          minus_cost={minus_cost:.17e}",
         (analytic - finite_difference).abs(),
-        evaluation.gradient
+        evaluation.gradient,
+        audit_components.explicit,
+        audit_components.logdet_trace,
+        audit_components.occam,
+        audit_components.third_order_correction
     );
 }

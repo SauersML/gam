@@ -3833,83 +3833,18 @@ impl OuterObjective for SaeManifoldOuterObjective {
         Ok(SeedOutcome::Installed)
     }
 
-    /// The SAE-manifold joint fit enters through the heavy-smoothing
-    /// [`gam_solve::continuation_path::ContinuationPath`] WHEN there is a
-    /// combinatorial inter-atom routing active-set to protect: the joint
-    /// `(logits, t, β)` block has a routing component that a cold solve at ρ*
-    /// can collapse — but that failure class is specifically the **K ≥ 2**
-    /// routing collapse (atoms competing for assignment mass). A single-atom
-    /// (`K = 1`) fit has no inter-atom routing, so the coupled ρ / τ / isometry
-    /// walk has nothing to prevent and is pure overhead: the cold direct cascade
-    /// solves it directly (an order of magnitude faster on tiny fixtures). Gate
-    /// the walk on `K ≥ 2`. When it returns `true` every seed routes through the
-    /// homotopy walk (Object 1) and the seed cascade's structural-failure
-    /// handling flips from REJECT to DEMOTE-WITH-REASON so the candidate set
-    /// never empties on a structural diagnosis.
-    fn requires_continuation_path_entry(&self) -> bool {
-        // The continuation-path predictor-corrector is a DENSE-factor algorithm:
-        // its predictor takes the joint-Hessian IFT step
-        // (`ArrowFactorCache::full_inverse_apply`) and its corrector re-converges
-        // through the dense `reml_criterion_with_cache`. Neither exists in the
-        // matrix-free (streaming) regime — there the dense evidence factor
-        // exceeds the in-core budget, so `reml_criterion_with_cache` returns the
-        // `cost-only streaming route is required` error on EVERY spine eval. With
-        // the walk still requested, each error surfaces as `SpineStruggled`, the
-        // path re-enters the heavier (dense) regime, and re-fails identically —
-        // an unbounded livelock that times out (the K≥256 32K-dictionary hang).
-        // In the streaming regime the entry of record is the streaming-aware
-        // value cascade (`eval_cost` → `reml_criterion_streaming_exact`), so skip
-        // the continuation walk entirely. Dense-admitted fits are unchanged.
-        if !self.term.streaming_plan().direct_logdet_admitted() {
-            return false;
-        }
-        // #1026 — the curvature-homotopy predictor-corrector ENTRY walk is the
-        // GAM-inherited expensive entry: it runs many dense joint-Hessian spine
-        // solves before the outer loop even starts. Empirically this fixed
-        // overhead alone times out even a well-posed K=8 fit (`n_iter`/refine
-        // budget makes no difference — saelowi: K=8 n_iter=1 KILLED), so a
-        // "normal SAE" entry (PCA decoder-projection seed → short outer loop)
-        // is the right strategy: skip the certified walk and let the cheap
-        // seeded cascade enter. The PCA seed already lands each row in the
-        // decisive basin; the walk's multimodality insurance is not worth its
-        // per-fit cost for the dictionary-fit use case.
-        false
-    }
-
-    /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
-    /// base-topology relaxation is convex, with a genuine low-rank (Eckart-Young)
-    /// residual ceiling certified by [`linear_span_anchor`] — the endpoint itself
-    /// is not linear for curved bases. Run the predictor-corrector `η`-walk from that
-    /// anchor before blind multistart. On arrival the inner state is warm
-    /// at the certified `η = 1` solution for the active seed; on a
-    /// degenerate anchor or a detected bifurcation the term is left at the full
-    /// basis (`η = 1`) and the documented cascade takes over — the outcome is
-    /// recorded on the fit payload either way.
+    /// Dense K≥2 joint fits may have an undefined Laplace evidence at the cold
+    /// PCA seed even though a finite basin is connected to it from the
+    /// heavy-smoothing contraction regime. Advertise that domain-entry
+    /// capability without imposing its historical fixed cost on already-finite
+    /// seeds. The shared runner probes the exact seed first and drives the
+    /// continuation only after a non-finite result.
     ///
-    /// For objectives that don't require continuation entry (K=1 periodic atoms
-    /// whose topology is baked into the basis), return `None` so the standard
-    /// seed cascade is used directly without the curvature walk.
-    fn curvature_homotopy_entry(
-        &mut self,
-        rho: &Array1<f64>,
-    ) -> Option<Result<bool, EstimationError>> {
-        // K=1 periodic atoms don't need the curvature walk: their circular
-        // topology is baked into the basis, so the linear basin is not an
-        // attractor and the walk would just add overhead / potential failure.
-        // Return `None` to use the standard seed cascade directly.
-        if !self.requires_continuation_path_entry() {
-            return None;
-        }
-        let rho_state = self.baseline_rho.from_flat(rho.view());
-        // #2231 Inc-B — the curvature-homotopy seed entry solves against
-        // `self.target`; scale its block columns for this ρ too so the seed is
-        // built on the coherently scaled target (idempotent; no-op for a plain
-        // SAE, and at the seed ρ typically λ_ℓ = 1 so a true no-op).
-        self.apply_block_scaling(&rho_state);
-        Some(
-            self.run_curvature_homotopy_entry_at_rho(&rho_state)
-                .map_err(EstimationError::RemlOptimizationFailed),
-        )
+    /// Matrix-free fits cannot use this dense-factor continuation and remain a
+    /// typed refusal if their streaming seed is infeasible. K=1 has no
+    /// inter-atom routing active set and needs no coupled entry.
+    fn supports_reactive_domain_entry(&self) -> bool {
+        self.term.k_atoms() >= 2 && self.term.streaming_plan().direct_logdet_admitted()
     }
 }
 
