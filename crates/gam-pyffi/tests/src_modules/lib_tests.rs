@@ -871,6 +871,7 @@ fn gaussian_reml_fit_blocks_forward_native(
         .collect::<Vec<_>>();
     let heuristic_lambdas = init_rhos.iter().map(|rho| rho.exp()).collect::<Vec<_>>();
     let opts = gam::solver::estimate::FitOptions {
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,
