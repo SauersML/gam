@@ -3493,7 +3493,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(f64::INFINITY);
                 }
-                if self.termination.record(cost) {
+                if self.reactive_waypoint_checkpoint.is_none()
+                    && self.termination.record(cost)
+                {
                     self.bank_checkpoint(rho);
                 }
                 Ok(cost)
@@ -3774,7 +3776,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
-                if self.termination.record(cost) {
+                if self.reactive_waypoint_checkpoint.is_none()
+                    && self.termination.record(cost)
+                {
                     self.bank_checkpoint(rho);
                 }
                 Ok(OuterEval {
@@ -3960,20 +3964,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .set_temperature(state.assignment_temperature)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         let restoring_target = state.bitwise_eq(contract.target());
-        if restoring_target {
-            self.term.temperature_schedule = self.baseline_term.temperature_schedule.clone();
-            // Preserve the contract's literal temperature even when the saved
-            // schedule cursor was created before the baseline term was cloned.
-            self.term
-                .assignment
-                .mode
-                .set_temperature(contract.target().assignment_temperature)
-                .map_err(EstimationError::RemlOptimizationFailed)?;
-        } else {
-            // A private inner schedule must not advance or overwrite the scalar
-            // waypoint selected by the coupled outer path.
-            self.term.temperature_schedule = None;
-        }
+        // A private inner schedule must not advance or overwrite any coupled
+        // waypoint, including the exact s=0 solve. The literal baseline schedule
+        // is restored atomically only after that target solve commits.
+        self.term.temperature_schedule = None;
         if let Some(registry) = self.registry.as_mut() {
             registry.set_isometry_scalar_weights(&state.isometry_weights);
         }
@@ -4037,10 +4031,36 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 )
             })?;
         let rho_state = self.baseline_rho.from_flat(rho.view());
+        let target_contract = self
+            .reactive_domain_scalar_contract()?
+            .ok_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "active reactive waypoint lost its scalar contract before commit".to_string(),
+                )
+            })?;
+        let committed_isometry_weights = self
+            .registry
+            .as_ref()
+            .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
+            .unwrap_or_default();
+        let committed_scalar = gam_solve::continuation_path::ContinuationScalarState::new(
+            converged_term.assignment.mode.temperature(),
+            committed_isometry_weights,
+        )
+        .map_err(EstimationError::RemlOptimizationFailed)?;
+        let committed_literal_target = committed_scalar.bitwise_eq(target_contract.target());
         let loss = converged_term
             .loss(self.target.view(), &rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;
         self.term = converged_term;
+        if committed_literal_target {
+            self.term.temperature_schedule = self.baseline_term.temperature_schedule.clone();
+            self.term
+                .assignment
+                .mode
+                .set_temperature(target_contract.target().assignment_temperature)
+                .map_err(EstimationError::RemlOptimizationFailed)?;
+        }
         self.current_rho = rho_state;
         self.last_loss = Some(loss);
         self.seeded_beta = None;
