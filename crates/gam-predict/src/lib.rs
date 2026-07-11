@@ -5003,18 +5003,25 @@ mod tests {
         }
     }
 
-    /// Test 8: pathological β̂ (NaN/Inf entries) must not panic. NaNs
-    /// propagate into η rather than triggering an unwrap.
+    /// Test 8: a pathological plug-in β̂ (NaN/Inf entries) must not panic —
+    /// it is refused with a typed error, not silently propagated as a
+    /// non-finite prediction.
+    ///
+    /// `beta` here is the plug-in coefficient vector passed directly to
+    /// `predict_gamwith_uncertainty` (the argument under test), which is
+    /// independent of the fixture `fit`'s own stored coefficients and
+    /// bias-correction vector — those must stay finite since
+    /// `UnifiedFitResult::try_from_parts` validates them at construction.
     #[test]
     fn test_bias_correction_finite_for_pathological_inputs() {
         let beta = array![1.0_f64, f64::NAN, 0.5];
-        let bc = array![0.1_f64, 0.2, f64::INFINITY];
+        let bc = array![0.1_f64, 0.2, 0.3];
         let cov = Array2::<f64>::eye(3);
-        let fit = test_fit_with_bias_correction(beta.clone(), cov, Some(bc));
+        let fit = test_fit_with_bias_correction(Array1::<f64>::zeros(3), cov, Some(bc));
 
         let x = array![[1.0_f64, 1.0, 1.0]];
         let offset = array![0.0_f64];
-        let pred = predict_gamwith_uncertainty(
+        let error = predict_gamwith_uncertainty(
             x,
             beta.view(),
             offset.view(),
@@ -5022,11 +5029,10 @@ mod tests {
             &fit,
             &bc_options(true),
         )
-        .expect("pathological predict should not error, only propagate NaN/Inf");
+        .expect_err("a non-finite plug-in η must be a typed error, not a silent NaN prediction");
         assert!(
-            !pred.eta[0].is_finite(),
-            "expected non-finite η to propagate; got η = {}",
-            pred.eta[0]
+            matches!(error, EstimationError::InvalidInput(_)),
+            "expected a typed InvalidInput error, got {error:?}"
         );
     }
 
