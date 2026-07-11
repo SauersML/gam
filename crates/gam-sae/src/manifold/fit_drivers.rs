@@ -5068,6 +5068,28 @@ impl SaeManifoldTerm {
         // unchanged.
         let warm_growth = 1.0 / BacktrackConfig::default().contraction;
         let mut warm_step = step_size;
+        // #2015 Levenberg–Marquardt ridge, adapted across iterates. The primary
+        // solve (`solve_with_lm_escalation_inner`) escalates the ridge only when
+        // the factorization FAILS, so on a well-conditioned-but-nonlinear system
+        // it returns the undamped Gauss–Newton step — whose 1-D minimum along the
+        // step is a tiny fraction of the full step on a high-residual / ill-posed
+        // shape (the GN Hessian mismodels curvature because the dropped
+        // residual·∇²r term is large), so Armijo backtracks to ~0.05 every iterate
+        // and the KKT residual crawls. Carry an LM ridge that GROWS when the step
+        // overshoots (the line search had to backtrack — the observed gain-ratio
+        // signal: backtracking depth = ⌈log₂ overshoot⌉) and SHRINKS back toward
+        // Gauss–Newton on a clean full-step acceptance. Growing the ridge bends
+        // the step from GN toward gradient descent (shorter, better-scaled) so the
+        // full step is accepted and real progress resumes; shrinking recovers GN's
+        // quadratic convergence as the fit enters its local quadratic basin. Uses
+        // ONLY the existing ridge parameters and `SAE_MANIFOLD_ROW_RIDGE_GROWTH`
+        // (no new tuning knob), floored at the caller's ridges, and reset to them
+        // on a proximal-correction fallback (which runs its own escalation).
+        // Armijo still refereed the true objective, so descent — and the
+        // #2235/#2241 certified-termination / typed-exhaustion contract — is
+        // unchanged; only the trajectory to the same certified optimum is.
+        let mut lm_ridge_t = ridge_ext_coord;
+        let mut lm_ridge_b = ridge_beta;
         for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
@@ -5113,7 +5135,7 @@ impl SaeManifoldTerm {
             // errors (PCG divergence with no factor failure, adaptive-step
             // exhaustion, …) still surface immediately.
             let (mut delta_ext_coord, mut delta_beta, _diag) =
-                solve_with_lm_escalation_inner(&sys, ridge_ext_coord, ridge_beta, &solve_options)
+                solve_with_lm_escalation_inner(&sys, lm_ridge_t, lm_ridge_b, &solve_options)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             // #1095/#2228 (second root) — per-row STEP gauge fixing. On a chart
             // over-parametrized for its intrinsic data dimension (d=2 chart on an

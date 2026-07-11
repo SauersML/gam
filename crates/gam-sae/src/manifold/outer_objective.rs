@@ -3640,6 +3640,66 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // half of that gradient entry, and the scaled-block residual carries the
         // `½·R̃_ℓ` half through the data term.
         let cost = cost + self.block_jacobian(&rho_state);
+        // #2253 DIAGNOSTIC (temporary): central finite-difference of the REML
+        // criterion value vs the analytic outer gradient at this ρ, to localize
+        // the near-optimum objective↔gradient desync driving the K=1 circle
+        // stall. FD probes reconverge the inner state from the warm start, so a
+        // final probe at `rho_state` restores it. Cheap on the tiny (42×41)
+        // repro; delete once the desync is pinned.
+        {
+            let eps = 1.0e-5_f64;
+            let n_p = rho.len();
+            let g_an = gradient.to_vec();
+            let g_norm = g_an.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let mut g_fd = vec![f64::NAN; n_p];
+            let ld_here = crate::manifold::arrow_log_det_from_cache(&cache);
+            for k in 0..n_p {
+                let mut rp = rho.clone();
+                rp[k] += eps;
+                let mut rm = rho.clone();
+                rm[k] -= eps;
+                let sp = self.baseline_rho.from_flat(rp.view());
+                let sm = self.baseline_rho.from_flat(rm.view());
+                let vp = self.term.reml_criterion_with_cache(
+                    self.target.view(),
+                    &sp,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                );
+                let vm = self.term.reml_criterion_with_cache(
+                    self.target.view(),
+                    &sm,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                );
+                if let (Ok((cp, _, _)), Ok((cm, _, _))) = (vp, vm) {
+                    g_fd[k] = (cp - cm) / (2.0 * eps);
+                }
+            }
+            let _ = self.term.reml_criterion_with_cache(
+                self.target.view(),
+                &rho_state,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            );
+            let n_show = n_p.min(8);
+            log::warn!(
+                "[2253-FD] cost={cost:.8e} logdet={ld_here:?} defl={defl} |g_an|={g_norm:.4e} \
+                 g_an={g_an_s:?} g_fd={g_fd_s:?}",
+                defl = cache.gauge_deflated_directions,
+                g_an_s = &g_an[..n_show],
+                g_fd_s = &g_fd[..n_show],
+            );
+        }
         // The gradient is the EXACT implicit derivative: `outer_gradient_arrow_
         // solver` solves the implicit-function system through the rank-revealing
         // gauge/decoder-null deflation (Rayleigh-band + Faddeev–Popov stiffness),
