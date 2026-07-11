@@ -472,15 +472,7 @@ fn smooth_basis_has_one_sided_anchored_bspline(basis: &SmoothBasisSpec) -> bool 
 fn bspline_conditions_have_one_sided_anchor(
     conditions: &crate::basis::BSplineBoundaryConditions,
 ) -> bool {
-    let left_anchored = matches!(
-        conditions.left,
-        crate::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
-    );
-    let right_anchored = matches!(
-        conditions.right,
-        crate::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
-    );
-    left_anchored != right_anchored
+    conditions.has_one_sided_anchor()
 }
 
 pub fn build_term_collection_design(

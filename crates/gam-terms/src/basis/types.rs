@@ -297,6 +297,21 @@ impl BSplineBoundaryConditions {
         matches!(self.left, BSplineEndpointBoundaryCondition::Free)
             && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
     }
+
+    /// Whether exactly one endpoint fixes the function's absolute level.
+    ///
+    /// A one-sided anchor replaces the global intercept as the level-setting
+    /// constraint. Centering that same smooth to zero would impose a second,
+    /// incompatible level constraint and exclude every non-zero-mean anchored
+    /// function from the model space.
+    pub const fn has_one_sided_anchor(&self) -> bool {
+        let left = matches!(self.left, BSplineEndpointBoundaryCondition::Anchored { .. });
+        let right = matches!(
+            self.right,
+            BSplineEndpointBoundaryCondition::Anchored { .. }
+        );
+        left != right
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.

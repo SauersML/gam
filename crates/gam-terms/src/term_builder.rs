@@ -2316,6 +2316,18 @@ pub fn build_smooth_basis(
                 } else {
                     parse_bspline_boundary_conditions(options).map_err(|e| e.to_string())?
                 };
+            // A one-sided anchor is already the model's level-setting gauge:
+            // term-design construction suppresses the global intercept so the
+            // fitted function itself, rather than only a centered deviation,
+            // obeys the endpoint pin. Applying the ordinary sum-to-zero chart
+            // as well would force the entire anchored function to have sample
+            // mean zero. In #1867 that made a positive anchored bump
+            // mathematically unrecoverable before REML was even evaluated.
+            let identifiability = if boundary_conditions.has_one_sided_anchor() {
+                BSplineIdentifiability::None
+            } else {
+                BSplineIdentifiability::default()
+            };
             let periods = parse_periods(options, &periodic_axes).map_err(|e| e.to_string())?;
             let origins =
                 parse_period_origins(options, &periodic_axes).map_err(|e| e.to_string())?;
@@ -2408,7 +2420,7 @@ pub fn build_smooth_basis(
                     penalty_order,
                     knotspec,
                     double_penalty,
-                    identifiability: BSplineIdentifiability::default(),
+                    identifiability,
                     boundary,
                     boundary_conditions,
                 },
@@ -7213,6 +7225,48 @@ mod tests {
         assert!(matches!(
             parsed.right,
             BSplineEndpointBoundaryCondition::Anchored { value } if value.abs() < 1e-12
+        ));
+    }
+
+    #[test]
+    fn one_sided_anchor_owns_level_without_sum_to_zero_constraint_1867() {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    vec![x * (1.0 - x), x]
+                })
+                .collect(),
+        );
+        let col_map = ds.column_map();
+
+        let build = |formula: &str| {
+            let parsed = parse_formula(formula).expect("parse anchored smooth");
+            let mut notes = Vec::new();
+            build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &ResourcePolicy::default_library(),
+            )
+            .expect("build anchored smooth")
+        };
+
+        let one_sided = build("y ~ s(x, bc_left=anchored, anchor_left=0, k=10)");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &one_sided.smooth_terms[0].basis else {
+            panic!("expected one-dimensional B-spline");
+        };
+        assert!(matches!(spec.identifiability, BSplineIdentifiability::None));
+
+        let two_sided = build("y ~ s(x, bc_left=anchored, bc_right=anchored, k=10)");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &two_sided.smooth_terms[0].basis else {
+            panic!("expected one-dimensional B-spline");
+        };
+        assert!(matches!(
+            spec.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
         ));
     }
 
