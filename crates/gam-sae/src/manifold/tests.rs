@@ -155,7 +155,7 @@ pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
 pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() {
     let mut term = trivial_k1_euclidean_term();
     // Pin the expected count at a realistic large level (like the circle fit).
-    term.record_evidence_gauge_deflation_count(150).unwrap();
+    term.record_evidence_gauge_deflation_count(150, true).unwrap();
     // A sustained 150<->147 flicker reverses direction on EVERY step — far more
     // reversals than the K=1 budget of 6 — yet the amplitude (3) is well inside
     // the relative jitter band (150/4 = 37), so none charge the budget.
@@ -163,7 +163,7 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
         147usize, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150,
     ];
     for &c in &flicker {
-        term.record_evidence_gauge_deflation_count(c)
+        term.record_evidence_gauge_deflation_count(c, true)
             .expect("a bounded low-amplitude flicker must re-anchor, never abort");
     }
     assert_eq!(
@@ -179,12 +179,12 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
     // But a WIDE-amplitude oscillation at the SAME level is still the runaway
     // pathology and must still be refused: 150<->40 swings ~73% of the level.
     let mut term2 = trivial_k1_euclidean_term();
-    term2.record_evidence_gauge_deflation_count(150).unwrap();
+    term2.record_evidence_gauge_deflation_count(150, true).unwrap();
     let mut errored = false;
     for &c in &[
         40usize, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150,
     ] {
-        if term2.record_evidence_gauge_deflation_count(c).is_err() {
+        if term2.record_evidence_gauge_deflation_count(c, true).is_err() {
             errored = true;
             break;
         }
@@ -212,11 +212,11 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
 
     // First observation pins the expected count (high, like a real K=2 walk
     // that starts with many near-null evidence directions).
-    term.record_evidence_gauge_deflation_count(60).unwrap();
+    term.record_evidence_gauge_deflation_count(60, true).unwrap();
     assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
 
     // A matching later observation is a no-op (still Ok, count unchanged).
-    term.record_evidence_gauge_deflation_count(60).unwrap();
+    term.record_evidence_gauge_deflation_count(60, true).unwrap();
     assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(60));
 
     // A MONOTONE drift (the #1217 benign case — a per-row conditioning count
@@ -224,7 +224,7 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     // no matter how many steps it takes. This is exactly the real-OLMo K=2
     // signature (171→…→113) that the old `k`-event budget wrongly tripped on.
     for c in [50usize, 40, 33, 21, 12, 9, 6, 4, 3, 2] {
-        term.record_evidence_gauge_deflation_count(c).unwrap();
+        term.record_evidence_gauge_deflation_count(c, true).unwrap();
         assert_eq!(term.expected_evidence_gauge_deflated_directions, Some(c));
     }
     assert_eq!(
@@ -239,7 +239,7 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     let oscillation = [9usize, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2];
     let mut errored = false;
     for &c in &oscillation {
-        match term.record_evidence_gauge_deflation_count(c) {
+        match term.record_evidence_gauge_deflation_count(c, true) {
             Ok(()) => {
                 last_ok = c;
             }

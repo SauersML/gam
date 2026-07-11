@@ -305,7 +305,10 @@ impl SaeManifoldTerm {
             &options,
             refine_progress_extension,
         )?;
-        self.record_evidence_gauge_deflation_count(cache.gauge_deflated_directions)?;
+        self.record_evidence_gauge_deflation_count(
+            cache.gauge_deflated_directions,
+            refine_progress_extension,
+        )?;
         loss.evidence_gauge_deflated_directions = cache.gauge_deflated_directions;
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             // Distinguish a GENUINE infeasibility — a probed ρ where the joint
@@ -438,10 +441,25 @@ impl SaeManifoldTerm {
     /// bound refuses loudly. This supersedes the prior strict-constant guard and
     /// its ±1 flicker band (#1117) at root — the band was masking exactly the
     /// legitimate K>1 dimension changes this re-anchoring now handles.
+    /// `re_anchor == false` (value-probe / line-search lanes): the transient
+    /// count is READ-ONLY — the anchor, the drift-direction memory, and the
+    /// reversal budget are all left untouched. #2253/#1037: the criterion's
+    /// quotient dimension may only move at ACCEPTED iterates; a probe that
+    /// re-anchored mid-line-search let the bookkeeping dimension flicker inside
+    /// a Wolfe bracket (a live discontinuity generator between two probes of
+    /// the same search), and a bracket of probes could burn the reversal budget
+    /// that exists to catch a genuinely oscillating ACCEPTED trajectory. Each
+    /// deflated direction contributes the ρ-independent `log 1 = 0` to
+    /// `½log|H|`, so skipping the probe-lane anchor move never changes any
+    /// probe's value.
     pub(crate) fn record_evidence_gauge_deflation_count(
         &mut self,
         count: usize,
+        re_anchor: bool,
     ) -> Result<(), String> {
+        if !re_anchor {
+            return Ok(());
+        }
         match self.expected_evidence_gauge_deflated_directions {
             Some(expected) if expected == count => Ok(()),
             Some(expected) => {
