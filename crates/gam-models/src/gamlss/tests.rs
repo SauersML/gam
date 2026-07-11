@@ -4027,6 +4027,22 @@ pub(crate) fn simple_matern_term_collection(
     }
 }
 
+/// Direct `TermCollectionSpec` counterpart of a formula with its ordinary
+/// intercept retained. The low-level term API does not synthesize formula
+/// intercepts, so tests of a location-scale null need to request the constant
+/// column explicitly in both parameter blocks.
+pub(crate) fn simple_matern_term_collection_with_intercept(
+    feature_cols: &[usize],
+    length_scale: f64,
+) -> TermCollectionSpec {
+    let mut collection = simple_matern_term_collection(feature_cols, length_scale);
+    match &mut collection.smooth_terms[0].basis {
+        SmoothBasisSpec::Matern { spec, .. } => spec.include_intercept = true,
+        _ => unreachable!("simple_matern_term_collection always constructs a Matérn basis"),
+    }
+    collection
+}
+
 pub(crate) fn empty_term_collection() -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: Vec::new(),
@@ -4975,10 +4991,13 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     let spec = GaussianLocationScaleTermSpec {
         y,
         weights,
-        // Smooth mean AND smooth log-σ block: this is the exact
-        // configuration that broke in #365 (linear noise terms were fine).
-        meanspec: simple_matern_term_collection(&[0], 0.6),
-        log_sigmaspec: simple_matern_term_collection(&[0], 0.6),
+        // Smooth mean AND smooth log-σ block with the ordinary formula
+        // intercept in each block. The direct TermSpec API does not add these
+        // implicitly; omitting them removes both the constant mean and the
+        // homoscedastic constant-log-σ null, so that fixture cannot test the
+        // stated `y ~ 1 + s(x)`, `noise ~ 1 + s(x)` contract at all.
+        meanspec: simple_matern_term_collection_with_intercept(&[0], 0.6),
+        log_sigmaspec: simple_matern_term_collection_with_intercept(&[0], 0.6),
         mean_offset: Array1::zeros(n),
         log_sigma_offset: Array1::zeros(n),
     };
