@@ -686,7 +686,17 @@ fn issue_1561_locscale_large_scale_basis_does_not_crash_joint_newton() {
 
 #[test]
 fn issue_1561_secondary_smooth_retains_null_recovery_default() {
-    let data = workflow_test_dataset();
+    let mut data = workflow_test_dataset();
+    data.values = Array2::from_shape_fn((12, 5), |(row, col)| {
+        let z = -1.0 + 2.0 * row as f64 / 11.0;
+        [
+            40.0 + row as f64,
+            43.0 + row as f64,
+            (row % 2) as f64,
+            24.0 + z,
+            z,
+        ][col]
+    });
     for (noise_formula, expected_double_penalty) in [
         ("1 + s(z, bs='tp')", true),
         ("1 + s(z, bs='tp', double_penalty=false)", false),
