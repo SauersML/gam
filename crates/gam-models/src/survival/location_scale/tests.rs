@@ -6749,10 +6749,12 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
     let q0_exit = Array1::from_shape_fn(primaries.len(), |i| {
         primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
     });
-    // Cubic clamping (four repeated endpoints) plus eight interior knots gives
-    // twelve basis columns: one beyond the retired pw<=11 production ceiling.
+    // Cubic clamping (four repeated endpoints) plus nine interior knots gives
+    // thirteen cubic B-splines and therefore twelve I-spline columns (the
+    // cumulative construction drops one column): one beyond the retired
+    // pw<=11 production ceiling.
     let knots = Array1::from_vec(vec![
-        -2.5, -2.5, -2.5, -2.5, -2.0, -1.4, -0.8, -0.2, 0.4, 1.0, 1.6, 2.2, 3.2, 3.2, 3.2, 3.2,
+        -2.5, -2.5, -2.5, -2.5, -2.0, -1.4, -0.8, -0.2, 0.4, 1.0, 1.6, 2.2, 2.7, 3.2, 3.2, 3.2, 3.2,
     ]);
     let degree = 3usize;
     let xwiggle =
