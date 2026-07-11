@@ -477,24 +477,106 @@ fn constant_gaussian_standard_fit(
     let x_dense = design.design.to_dense();
     let weights = request.weights.as_ref().clone();
     let xtwx = gam_linalg::faer_ndarray::fast_xt_diag_x(&x_dense, &weights);
-    // Fully-smoothed λ: scaled to dominate the data information in every
-    // penalized direction so the reported EDF collapses onto the penalty null
-    // space (the honest complexity of a fit that carries no wiggle). β is
-    // λ-invariant here, so this only shapes the reported geometry, not the fit.
-    let info_scale = xtwx.diag().iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
-    let lambda_full = 1.0e10 * info_scale;
-    let mut penalized_hessian = xtwx.clone();
-    for block in &design.penalties {
+    let n_penalties = design.penalties.len();
+    let mut unit_penalty = Array2::<f64>::zeros((p, p));
+    for (penalty_index, block) in design.penalties.iter().enumerate() {
         let r = block.col_range.clone();
-        if r.end <= p && block.local.nrows() == r.len() && block.local.ncols() == r.len() {
-            penalized_hessian
-                .slice_mut(ndarray::s![r.clone(), r])
-                .scaled_add(lambda_full, &block.local);
+        if r.is_empty()
+            || r.end > p
+            || block.local.nrows() != r.len()
+            || block.local.ncols() != r.len()
+        {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "constant Gaussian shortcut received malformed penalty {penalty_index}: \
+                     range={r:?}, local={}x{}, design width={p}",
+                    block.local.nrows(),
+                    block.local.ncols()
+                ),
+            });
         }
+        if block.local.iter().any(|value| !value.is_finite()) {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "constant Gaussian shortcut received non-finite penalty {penalty_index}"
+                ),
+            });
+        }
+        unit_penalty
+            .slice_mut(ndarray::s![r.clone(), r])
+            .scaled_add(1.0, &block.local);
     }
+
+    // This fit is the analytic λ→∞ boundary: every direction in range(S) is a
+    // hard constraint and only null(S) carries EDF. Arrays cannot store an
+    // infinite precision because `∞·0` is NaN, so represent that boundary at
+    // floating-point resolution. Choose λ from the ACTUAL penalty spectrum:
+    // the weakest numerically non-null penalty direction must dominate the
+    // largest data-information scale by 1/sqrt(ε). Unlike the former `1e10`
+    // multiplier, this is invariant to rescaling either X'WX or S and contains
+    // no model-specific tuning knob.
+    let lambda_full = if n_penalties == 0 {
+        0.0
+    } else {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let symmetric_penalty = (&unit_penalty + &unit_penalty.t().to_owned()) * 0.5;
+        let (penalty_eigenvalues, _) = symmetric_penalty
+            .eigh(faer::Side::Lower)
+            .map_err(|error| WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "constant Gaussian shortcut could not resolve the penalty spectrum: {error}"
+                ),
+            })?;
+        let largest_penalty = penalty_eigenvalues
+            .iter()
+            .fold(0.0_f64, |largest, &value| largest.max(value.abs()));
+        if !(largest_penalty.is_finite() && largest_penalty > 0.0) {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: "constant Gaussian shortcut received penalties with zero numerical rank"
+                    .to_string(),
+            });
+        }
+        let rank_floor = f64::EPSILON * (p.max(1) as f64) * largest_penalty;
+        if let Some(&negative) = penalty_eigenvalues
+            .iter()
+            .filter(|&&value| value < -rank_floor)
+            .min_by(|left, right| left.total_cmp(right))
+        {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "constant Gaussian shortcut received a non-PSD penalty \
+                     (minimum eigenvalue {negative:.6e}, numerical floor {rank_floor:.6e})"
+                ),
+            });
+        }
+        let weakest_penalty = penalty_eigenvalues
+            .iter()
+            .copied()
+            .filter(|&value| value > rank_floor)
+            .min_by(|left, right| left.total_cmp(right))
+            .ok_or_else(|| WorkflowError::IntegrationFailed {
+                reason: "constant Gaussian shortcut could not identify a penalized direction"
+                    .to_string(),
+            })?;
+        let information_scale = xtwx
+            .diag()
+            .iter()
+            .fold(0.0_f64, |largest, &value| largest.max(value.abs()))
+            .max(f64::MIN_POSITIVE);
+        let lambda = information_scale / (f64::EPSILON.sqrt() * weakest_penalty);
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "constant Gaussian shortcut produced invalid boundary precision {lambda}"
+                ),
+            });
+        }
+        lambda
+    };
+    let mut penalized_hessian = xtwx.clone();
+    penalized_hessian.scaled_add(lambda_full, &unit_penalty);
     // Symmetrize defensively against accumulated round-off before the Cholesky.
     penalized_hessian = (&penalized_hessian + &penalized_hessian.t()) * 0.5;
-    let n_penalties = design.penalties.len();
     // Effective degrees of freedom from the influence matrix `F = H⁻¹ XᵀWX`,
     // decomposed per penalty by the SAME trace formula the standard REML path
     // (`estimate.rs`) and the survival fast-path (`survival_transformation_edf`)
@@ -510,8 +592,14 @@ fn constant_gaussian_standard_fit(
     // near-constant fit that already works.
     let (edf_total, edf_by_block, penalty_block_trace, coefficient_influence) = {
         use gam_linalg::faer_ndarray::FaerCholesky;
-        match penalized_hessian.cholesky(faer::Side::Lower) {
-            Ok(chol) => {
+        let chol = penalized_hessian
+            .cholesky(faer::Side::Lower)
+            .map_err(|error| WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "constant Gaussian boundary precision is not positive definite: {error}"
+                ),
+            })?;
+        {
                 // F = H⁻¹ XᵀWX. Generally NOT symmetric (a product of two
                 // symmetric matrices); it must be stored as-is so `H·F = XᵀWX`
                 // and per-term `tr(F_jj)` stay exact (see estimate.rs / #1027).
@@ -521,17 +609,6 @@ fn constant_gaussian_standard_fit(
                 for (kk, block) in design.penalties.iter().enumerate() {
                     let r = block.col_range.clone();
                     let block_cols = r.len();
-                    // Skip a block the design left inconsistent (same guard the
-                    // Hessian-assembly loop above uses): its penalty never entered
-                    // `H`, so its penalized EDF is 0 and its full column count is
-                    // unpenalized d.f. accounted for in `edf_total = tr(F)`.
-                    if block_cols == 0
-                        || r.end > p
-                        || block.local.nrows() != block_cols
-                        || block.local.ncols() != block_cols
-                    {
-                        continue;
-                    }
                     // tr(H⁻¹ S_k): solve `H Z = S_k` (embedded in the full p×block
                     // layout) and read the block diagonal of the solution.
                     let mut rhs = Array2::<f64>::zeros((p, block_cols));
@@ -557,28 +634,6 @@ fn constant_gaussian_standard_fit(
                     .sum::<f64>()
                     .clamp(0.0, p as f64);
                 (edf_total, edf_by_block, penalty_block_trace, Some(influence))
-            }
-            // A design left rank-deficient upstream still has a well-defined
-            // null-space EDF. Report each penalty's structural null-space dim (the
-            // λ→∞ limit of `edf_by_block`) when the term planner recorded it, else
-            // 0 — either way the length matches `lambdas`, so the fit still mints
-            // and stays predictable rather than hard-failing downstream.
-            Err(_) => {
-                let edf_by_block: Vec<f64> = if design.nullspace_dims.len() == n_penalties {
-                    design
-                        .penalties
-                        .iter()
-                        .zip(&design.nullspace_dims)
-                        .map(|(b, &ns)| (ns as f64).min(b.col_range.len() as f64))
-                        .collect()
-                } else {
-                    vec![0.0_f64; n_penalties]
-                };
-                let edf_total = (design.intercept_range.len() as f64
-                    + edf_by_block.iter().sum::<f64>())
-                .clamp(0.0, p as f64);
-                (edf_total, edf_by_block, vec![0.0_f64; n_penalties], None)
-            }
         }
     };
     // IRLS working response for the identity link is the raw response y (η
@@ -693,17 +748,21 @@ fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
     if request.y.len() != request.offset.len() {
         return false;
     }
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for (&yi, &oi) in request.y.iter().zip(request.offset.iter()) {
+    let mut adjusted = request.y.iter().zip(request.offset.iter());
+    let Some((&first_y, &first_offset)) = adjusted.next() else {
+        return false;
+    };
+    let first = first_y - first_offset;
+    if !first.is_finite() {
+        return false;
+    }
+    for (&yi, &oi) in adjusted {
         let value = yi - oi;
-        if !value.is_finite() {
+        if !value.is_finite() || value != first {
             return false;
         }
-        lo = lo.min(value);
-        hi = hi.max(value);
     }
-    (hi - lo).abs() <= 1.0e-12 * hi.abs().max(lo.abs()).max(1.0)
+    true
 }
 
 pub fn fit_from_formula(
