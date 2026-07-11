@@ -861,45 +861,38 @@ impl<'a> RemlState<'a> {
             .and(c_array)
             .and(&x_y)
             .par_for_each(|o, &d, &h, &c, &xy| *o = d * h - c * xy);
-        let chunk_len = (n
-            / (rayon::current_num_threads()
-                .saturating_mul(TK_CHUNK_OVERSUBSCRIBE)
-                .max(1)))
-        .clamp(TK_BLOCK_SIZE, TK_CHUNK_MAX_ROWS);
-        let chunks = n.div_ceil(chunk_len);
-        let mut p_total = (0..chunks)
-            .into_par_iter()
-            .fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut local, chunk_idx| {
-                    let i0 = chunk_idx * chunk_len;
-                    let i1 = (i0 + chunk_len).min(n);
-                    for i in i0..i1 {
-                        let wi = diag_combined[i];
-                        if wi == 0.0 {
-                            continue;
-                        }
-                        for a in 0..p {
-                            let wa = wi * z[[a, i]];
-                            for b in a..p {
-                                let val = wa * z[[b, i]];
-                                local[[a, b]] += val;
-                                if a != b {
-                                    local[[b, a]] += val;
-                                }
+        // Deterministic parallel row reduction: length-only pairwise tree so
+        // the accumulated float result never depends on thread count or work
+        // stealing (#2228 determinism probe — rayon fold/reduce grouping is
+        // demand-driven and made this sum nondeterministic run-to-run).
+        let mut p_total = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range: core::ops::Range<usize>| {
+                let mut local = Array2::<f64>::zeros((p, p));
+                for i in range {
+                    let wi = diag_combined[i];
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for a in 0..p {
+                        let wa = wi * z[[a, i]];
+                        for b in a..p {
+                            let val = wa * z[[b, i]];
+                            local[[a, b]] += val;
+                            if a != b {
+                                local[[b, a]] += val;
                             }
                         }
                     }
-                    local
-                },
-            )
-            .reduce(
-                || Array2::<f64>::zeros((p, p)),
-                |mut left, right| {
-                    left += &right;
-                    left
-                },
-            );
+                }
+                local
+            },
+            |mut left, right| {
+                left += &right;
+                left
+            },
+        )
+        .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
         p_total.mapv_inplace(|v| 0.25 * v);
         for a in 0..p {
             for b in 0..p {
@@ -912,11 +905,13 @@ impl<'a> RemlState<'a> {
                 (0..=j_block_idx).map(move |i_block_idx| (i_block_idx, j_block_idx))
             })
             .collect();
-        let active_total = active_pairs
-            .par_iter()
-            .fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut local, &(i_block_idx, j_block_idx)| {
+        // Same deterministic tree over the active block-pair list (order is
+        // the deterministic `active_pairs` construction above).
+        let active_total = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            active_pairs.len(),
+            |pair_range: core::ops::Range<usize>| {
+                let mut local = Array2::<f64>::zeros((p, p));
+                for &(i_block_idx, j_block_idx) in &active_pairs[pair_range] {
                     let i_block = &shared.active_blocks[i_block_idx];
                     let j_block = &shared.active_blocks[j_block_idx];
                     let sym_factor = if i_block_idx == j_block_idx { 1.0 } else { 2.0 };
@@ -953,16 +948,15 @@ impl<'a> RemlState<'a> {
                             }
                         }
                     }
-                    local
-                },
-            )
-            .reduce(
-                || Array2::<f64>::zeros((p, p)),
-                |mut left, right| {
-                    left += &right;
-                    left
-                },
-            );
+                }
+                local
+            },
+            |mut left, right| {
+                left += &right;
+                left
+            },
+        )
+        .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
         p_total += &active_total;
 
         let xp = gam_linalg::faer_ndarray::fast_ab(x_dense, &p_total);

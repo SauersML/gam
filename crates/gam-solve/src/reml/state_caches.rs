@@ -2,15 +2,6 @@ use super::*;
 
 pub(crate) const TK_BLOCK_SIZE: usize = 128;
 
-/// Upper bound on the parallel row-chunk length for the TK accumulation, so a
-/// large `n / (4·threads)` split does not produce chunks so coarse that load
-/// balancing across rayon workers suffers. Pairs with the [`TK_BLOCK_SIZE`]
-/// lower bound. The `4×` oversubscription on the thread count keeps each worker
-/// fed with several chunks for work stealing.
-pub(crate) const TK_CHUNK_MAX_ROWS: usize = 2048;
-
-pub(crate) const TK_CHUNK_OVERSUBSCRIBE: usize = 4;
-
 pub(crate) const TK_MAX_OBSERVATIONS: usize = 20_000;
 
 pub(crate) const TK_MAX_COEFFICIENTS: usize = 2_000;

@@ -240,11 +240,10 @@ pub(crate) fn negbin_theta_score_and_info(
             let info_row = -trigamma(yi + theta) + trigamma_theta - inv_theta + 2.0 / theta_plus_mu
                 - theta_plus_y / (theta_plus_mu * theta_plus_mu);
             (wi * s, wi * info_row)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(s1, i1), (s2, i2)| (s1 + s2, i1 + i2),
-        );
+        },
+        |(s1, i1), (s2, i2)| (s1 + s2, i1 + i2),
+        (0.0_f64, 0.0_f64),
+    );
     (score, info)
 }
 
@@ -275,15 +274,13 @@ pub(crate) fn estimate_negbin_theta_from_eta(
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
 ) -> f64 {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
     // Method-of-moments seed from the Poisson-Pearson overdispersion ratio
     // `D = Σ wᵢ (yᵢ−μᵢ)²/μᵢ / Σ wᵢ`. With `Var/μ = 1 + μ/θ`, matching the
     // weighted-mean `μ̄` gives `θ₀ = μ̄/(D−1)`; if `D ≤ 1` the data is not
     // overdispersed and we start at the Poisson-limit clamp.
-    let (wsum, wmu, wpearson) = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
+    let (wsum, wmu, wpearson) = gam_linalg::pairwise_reduce::par_pairwise_map_reduce(
+        eta.len(),
+        |i| {
             let wi = priorweights[i].max(0.0);
             if wi == 0.0 {
                 return (0.0_f64, 0.0_f64, 0.0_f64);
@@ -291,11 +288,10 @@ pub(crate) fn estimate_negbin_theta_from_eta(
             let mui = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP).exp().max(1e-300);
             let resid = y[i] - mui;
             (wi, wi * mui, wi * resid * resid / mui)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64, 0.0_f64),
-            |(a1, b1, c1), (a2, b2, c2)| (a1 + a2, b1 + b2, c1 + c2),
-        );
+        },
+        |(a1, b1, c1), (a2, b2, c2)| (a1 + a2, b1 + b2, c1 + c2),
+        (0.0_f64, 0.0_f64, 0.0_f64),
+    );
     if wsum <= 0.0 {
         return 1.0;
     }

@@ -17,7 +17,7 @@ use gam_linalg::faer_ndarray::fast_xt_diag_y;
 use crate::model_types::ProjectedKktResidual;
 use ndarray::{Array1, Array2};
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 use rayon::slice::ParallelSliceMut;
 use std::sync::Arc;
@@ -37,15 +37,6 @@ pub(crate) const DENSE_ROW_SCALE_PAR_CELLS: usize = 64 * 1024;
 pub(crate) enum DenseRowScaleMode {
     Direct,
     InversePositiveOrZero,
-}
-
-#[inline]
-pub(crate) fn dense_weighted_chunk_rows(cols: usize) -> usize {
-    const TARGET_BYTES: usize = 2 * 1024 * 1024;
-    const MIN_ROWS: usize = 256;
-    const MAX_ROWS: usize = 4096;
-    let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
-    (TARGET_BYTES / bytes_per_row).clamp(MIN_ROWS, MAX_ROWS)
 }
 
 /// Write `diag(scale) · x` into `out`, preserving `out`'s allocation when its
@@ -223,32 +214,24 @@ pub(crate) fn weighted_cross_dense(
         return fast_xt_diag_y(left, weights, right);
     }
 
-    let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+    // Deterministic parallel row reduction: the association tree is a pure
+    // function of `n` (length-only pairwise tree over 128-row base blocks),
+    // never of thread count or work stealing — a rayon `fold(..).reduce(..)`
+    // here groups partials by demand-driven splits, which made the accumulated
+    // float result nondeterministic run-to-run (#2228 determinism probe).
+    gam_linalg::pairwise_reduce::par_deterministic_block_fold(
         n,
-        p.saturating_mul(q),
-        p.saturating_mul(q),
-        DENSE_WEIGHTED_PRODUCT_PAR_FLOPS,
+        |range: core::ops::Range<usize>| {
+            let mut local = Array2::<f64>::zeros((p, q));
+            accumulate_weighted_cross_rows(&mut local, left, right, weights, range.start, range.end);
+            local
+        },
+        |mut a, b| {
+            a += &b;
+            a
+        },
     )
-    .unwrap_or_else(|| dense_weighted_chunk_rows(p + q).min(n));
-    let chunks = n.div_ceil(chunk_rows);
-    (0..chunks)
-        .into_par_iter()
-        .fold(
-            || Array2::<f64>::zeros((p, q)),
-            |mut local, chunk| {
-                let start = chunk * chunk_rows;
-                let end = (start + chunk_rows).min(n);
-                accumulate_weighted_cross_rows(&mut local, left, right, weights, start, end);
-                local
-            },
-        )
-        .reduce(
-            || Array2::<f64>::zeros((p, q)),
-            |mut a, b| {
-                a += &b;
-                a
-            },
-        )
+    .unwrap_or_else(|| Array2::<f64>::zeros((p, q)))
 }
 
 /// Compute `xᵀ diag(diag) x`. For small products this reuses `weighted` as an
@@ -272,32 +255,22 @@ pub(crate) fn xt_diag_x_dense_into(
         return gam_linalg::faer_ndarray::fast_atb(x, weighted);
     }
 
-    let chunk_rows = crate::parallel_strategy::row_reduction_chunk_rows(
+    // Deterministic parallel row reduction (length-only pairwise tree; see
+    // `weighted_cross_dense` above for why a rayon fold/reduce is not usable
+    // here).
+    let mut out = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
         n,
-        p.saturating_mul(p),
-        p.saturating_mul(p),
-        DENSE_WEIGHTED_PRODUCT_PAR_FLOPS,
+        |range: core::ops::Range<usize>| {
+            let mut local = Array2::<f64>::zeros((p, p));
+            accumulate_xt_diag_x_upper_rows(&mut local, x, diag, range.start, range.end);
+            local
+        },
+        |mut a, b| {
+            a += &b;
+            a
+        },
     )
-    .unwrap_or_else(|| dense_weighted_chunk_rows(p).min(n));
-    let chunks = n.div_ceil(chunk_rows);
-    let mut out = (0..chunks)
-        .into_par_iter()
-        .fold(
-            || Array2::<f64>::zeros((p, p)),
-            |mut local, chunk| {
-                let start = chunk * chunk_rows;
-                let end = (start + chunk_rows).min(n);
-                accumulate_xt_diag_x_upper_rows(&mut local, x, diag, start, end);
-                local
-            },
-        )
-        .reduce(
-            || Array2::<f64>::zeros((p, p)),
-            |mut a, b| {
-                a += &b;
-                a
-            },
-        );
+    .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
     for a in 0..p {
         for b in 0..a {
             out[[a, b]] = out[[b, a]];

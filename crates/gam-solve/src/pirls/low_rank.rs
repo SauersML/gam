@@ -94,9 +94,9 @@ pub fn dense_block_xtwx(
     // rebuilt at every inner Newton cycle of every outer smoothing-parameter
     // trial, so its `O(n · M² · k²)` accumulation is the dominant inner cost
     // (#722). The per-row contributions are an independent sum, so fan the row
-    // loop across the rayon pool with per-thread dense accumulators reduced by
-    // addition — the arithmetic is identical to the serial accumulation,
-    // bit-for-bit up to the associativity of the row partition.
+    // loop across the rayon pool over the deterministic length-only pairwise
+    // tree — the association is a pure function of `n`, so the result is
+    // bit-stable across thread counts and runs.
     //
     // Finiteness is validated up front in a cheap `O(n · M²)` parallel scan so
     // the hot accumulation stays branch-light and the error is reported with
@@ -119,11 +119,15 @@ pub fn dense_block_xtwx(
     if let Some((row, a, b)) = nonfinite {
         crate::bail_invalid_estim!("dense block Fisher entry ({row},{a},{b}) is not finite");
     }
-    let mut out = (0..n)
-        .into_par_iter()
-        .fold(
-            || Array2::<f64>::zeros((dim, dim)),
-            |mut acc, row| {
+    // Deterministic parallel row reduction: length-only pairwise tree, so the
+    // accumulated float result is a pure function of the row order — never of
+    // thread count or rayon's demand-driven fold/reduce grouping (#2228
+    // determinism probe).
+    let mut out = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+        n,
+        |range: core::ops::Range<usize>| {
+            let mut acc = Array2::<f64>::zeros((dim, dim));
+            for row in range {
                 let rw = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);
                 for a in 0..p_out {
                     for b in 0..p_out {
@@ -145,16 +149,15 @@ pub fn dense_block_xtwx(
                         }
                     }
                 }
-                acc
-            },
-        )
-        .reduce(
-            || Array2::<f64>::zeros((dim, dim)),
-            |mut a, b| {
-                a += &b;
-                a
-            },
-        );
+            }
+            acc
+        },
+        |mut a, b| {
+            a += &b;
+            a
+        },
+    )
+    .unwrap_or_else(|| Array2::<f64>::zeros((dim, dim)));
     for i in 0..dim {
         for j in (i + 1)..dim {
             let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
