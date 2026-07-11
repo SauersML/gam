@@ -799,10 +799,7 @@ impl ResponseFamily {
                     Ok(())
                 }
             }
-            Self::Tweedie { .. }
-            | Self::Beta { .. }
-            | Self::Gamma
-            | Self::RoystonParmar => Ok(()),
+            Self::Tweedie { .. } | Self::Beta { .. } | Self::Gamma | Self::RoystonParmar => Ok(()),
         }
     }
 
@@ -2883,8 +2880,15 @@ mod tests {
         let error = ResponseFamily::Poisson
             .validate_response_degeneracy(y.view())
             .expect_err("an all-zero Poisson response has no finite log-rate optimum");
-        assert!(matches!(error.kind, ResponseDegeneracyKind::PoissonAllZeros));
-        assert!(error.message_for("count").contains("at least one positive count"));
+        assert!(matches!(
+            error.kind,
+            ResponseDegeneracyKind::PoissonAllZeros
+        ));
+        assert!(
+            error
+                .message_for("count")
+                .contains("at least one positive count")
+        );
     }
 
     #[test]
@@ -2906,7 +2910,11 @@ mod tests {
     #[test]
     fn count_degeneracy_with_positive_event_is_valid() {
         let y = arr1(&[0.0_f64, 0.0, 2.0]);
-        assert!(ResponseFamily::Poisson.validate_response_degeneracy(y.view()).is_ok());
+        assert!(
+            ResponseFamily::Poisson
+                .validate_response_degeneracy(y.view())
+                .is_ok()
+        );
         assert!(
             ResponseFamily::NegativeBinomial {
                 theta: 1.0,
