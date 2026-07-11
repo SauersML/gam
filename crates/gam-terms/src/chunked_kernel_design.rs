@@ -8,7 +8,7 @@ use gam_linalg::matrix::{DenseDesignOperator, LinearOperator};
 use gam_problem::Gauge;
 use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use std::ops::Range;
 use std::sync::Arc;
@@ -224,11 +224,14 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
             return Ok(Array2::<f64>::zeros((p, p)));
         }
         let chunk_starts: Vec<usize> = (0..n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE).collect();
-        let xtwx = chunk_starts
-            .into_par_iter()
-            .fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut acc, start| {
+        // Deterministic parallel reduction over the row chunks: length-only
+        // pairwise tree, so the accumulated XᵀWX never depends on thread count
+        // or rayon's demand-driven fold/reduce grouping (#2228).
+        let xtwx = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            chunk_starts.len(),
+            |idx_range: core::ops::Range<usize>| {
+                let mut acc = Array2::<f64>::zeros((p, p));
+                for &start in &chunk_starts[idx_range] {
                     let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(n);
                     let chunk = self.row_chunk_combined(start..end);
                     let mut wchunk = chunk.clone();
@@ -247,16 +250,15 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
                         1.0,
                         Par::Seq,
                     );
-                    acc
-                },
-            )
-            .reduce(
-                || Array2::<f64>::zeros((p, p)),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            );
+                }
+                acc
+            },
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        )
+        .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
         Ok(xtwx)
     }
 }

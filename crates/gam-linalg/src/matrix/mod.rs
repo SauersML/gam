@@ -512,11 +512,14 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: PsdWeightsView<'_>) -> Ar
         && let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice())
     {
         if parallel {
-            return (0..n)
-                .into_par_iter()
-                .fold(
-                    || vec![0.0_f64; p],
-                    |mut acc, i| {
+            // Deterministic parallel row reduction: length-only pairwise tree
+            // so the accumulated float result never depends on thread count or
+            // rayon's demand-driven fold/reduce grouping (#2228).
+            return crate::pairwise_reduce::par_deterministic_block_fold(
+                n,
+                |range: core::ops::Range<usize>| {
+                    let mut acc = vec![0.0_f64; p];
+                    for i in range {
                         let wi = w[i];
                         if wi != 0.0 {
                             let row = &x[i * p..i * p + p];
@@ -525,19 +528,18 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: PsdWeightsView<'_>) -> Ar
                                 acc[j] += wi * xij * xij;
                             }
                         }
-                        acc
-                    },
-                )
-                .reduce(
-                    || vec![0.0_f64; p],
-                    |mut a, b| {
-                        for (av, bv) in a.iter_mut().zip(b) {
-                            *av += bv;
-                        }
-                        a
-                    },
-                )
-                .into();
+                    }
+                    acc
+                },
+                |mut a, b| {
+                    for (av, bv) in a.iter_mut().zip(b) {
+                        *av += bv;
+                    }
+                    a
+                },
+            )
+            .unwrap_or_else(|| vec![0.0_f64; p])
+            .into();
         }
         let mut diag = Array1::<f64>::zeros(p);
         let diag_slice = diag.as_slice_mut().expect("zeros are contiguous");
@@ -1593,11 +1595,13 @@ impl LinearOperator for DenseDesignMatrix {
                     }
                     return Ok(diag);
                 }
-                let diag = (0..n)
-                    .into_par_iter()
-                    .fold(
-                        || Array1::<f64>::zeros(p),
-                        |mut acc, i| {
+                // Deterministic parallel row reduction (length-only pairwise
+                // tree; see the standard-layout path above).
+                let diag = crate::pairwise_reduce::par_deterministic_block_fold(
+                    n,
+                    |range: core::ops::Range<usize>| {
+                        let mut acc = Array1::<f64>::zeros(p);
+                        for i in range {
                             let wi = weights[i];
                             if wi != 0.0 {
                                 for j in 0..p {
@@ -1605,16 +1609,15 @@ impl LinearOperator for DenseDesignMatrix {
                                     acc[j] += wi * xij * xij;
                                 }
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || Array1::<f64>::zeros(p),
-                        |mut a, b| {
-                            a += &b;
-                            a
-                        },
-                    );
+                        }
+                        acc
+                    },
+                    |mut a, b| {
+                        a += &b;
+                        a
+                    },
+                )
+                .unwrap_or_else(|| Array1::<f64>::zeros(p));
                 Ok(diag)
             }
             Self::Lazy(op) => op.diag_gram(weights),
@@ -1667,11 +1670,13 @@ impl LinearOperator for DenseDesignMatrix {
                     }
                     out
                 } else {
-                    (0..n)
-                        .into_par_iter()
-                        .fold(
-                            || Array1::<f64>::zeros(p),
-                            |mut acc, i| {
+                    // Deterministic parallel row reduction (length-only
+                    // pairwise tree; see diag_gram above).
+                    crate::pairwise_reduce::par_deterministic_block_fold(
+                        n,
+                        |range: core::ops::Range<usize>| {
+                            let mut acc = Array1::<f64>::zeros(p);
+                            for i in range {
                                 let wi = weights[i];
                                 if wi != 0.0 {
                                     let mut row_dot = 0.0_f64;
@@ -1685,16 +1690,15 @@ impl LinearOperator for DenseDesignMatrix {
                                         }
                                     }
                                 }
-                                acc
-                            },
-                        )
-                        .reduce(
-                            || Array1::<f64>::zeros(p),
-                            |mut a, b| {
-                                a += &b;
-                                a
-                            },
-                        )
+                            }
+                            acc
+                        },
+                        |mut a, b| {
+                            a += &b;
+                            a
+                        },
+                    )
+                    .unwrap_or_else(|| Array1::<f64>::zeros(p))
                 };
                 if let Some(pen) = penalty {
                     out += &fast_av(pen, vector);
