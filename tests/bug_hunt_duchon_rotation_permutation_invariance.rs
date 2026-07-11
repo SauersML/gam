@@ -260,8 +260,7 @@ fn duchon_smooth_is_permutation_invariant() {
 /// elongated cloud, where the per-axis scheme shears hardest, and asserts every
 /// basis stays invariant. It also guards the companion round-off-robust knot
 /// selector, since the elongated cloud has many near-tied maximin candidates.
-#[test]
-fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
+fn assert_spatial_formulas_rotation_invariant_on_anisotropic_cloud(formulas: &[&str]) {
     init_parallelism();
     // Elongated cloud: x spans [0, 3], z spans [0, 1] (≈3:1 anisotropy), so the
     // per-axis standard deviations differ by ≈3× and rotate strongly with angle.
@@ -301,11 +300,7 @@ fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
     // round-off-robust knots), and `matern` additionally via the #2252
     // rotation-invariant length-scale seed (its enrolled κ/range solve is
     // seed-sensitive, so a rotation-variant seed drifted the fit ~1.6%).
-    for formula in [
-        "y ~ duchon(x, z)",
-        "y ~ thinplate(x, z)",
-        "y ~ matern(x, z)",
-    ] {
+    for &formula in formulas {
         let (edf0, pred0) = fit_and_predict_formula(formula, &x, &z, &y, &gx, &gz);
         let sr = signal_range(&pred0);
         let mut worst_pred = 0.0_f64;
@@ -343,4 +338,22 @@ fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
             "{formula} EDF not rotation-invariant on an anisotropic cloud: {worst_edf:.3e}"
         );
     }
+}
+
+#[test]
+fn spatial_smooths_rotation_invariant_on_anisotropic_cloud_1818() {
+    assert_spatial_formulas_rotation_invariant_on_anisotropic_cloud(&[
+        "y ~ duchon(x, z)",
+        "y ~ thinplate(x, z)",
+        "y ~ matern(x, z)",
+    ]);
+}
+
+/// #2252 slice of the shared #1818 harness. The full all-basis gate above is
+/// intentionally unchanged; this focused entry point lets the Matérn
+/// covariance seed and certified range-basin decision be verified even while a
+/// distinct thin-plate regression is being repaired.
+#[test]
+fn matern_smooth_rotation_invariant_after_range_basin_selection_2252() {
+    assert_spatial_formulas_rotation_invariant_on_anisotropic_cloud(&["y ~ matern(x, z)"]);
 }
