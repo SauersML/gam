@@ -635,6 +635,9 @@ impl OuterProblem {
         context: &str,
     ) -> Result<OuterResult, EstimationError> {
         let mut config = self.config();
+        if let Some(objective_upper) = obj.outer_domain_upper_bound()? {
+            install_objective_upper_domain(&mut config, self.n_params, objective_upper)?;
+        }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
         };
@@ -2406,6 +2409,50 @@ pub(crate) fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f
             Array1::<f64>::from_elem(n, config.rho_bound),
         )
     })
+}
+
+/// Intersect a typed objective-domain upper face with the caller's configured
+/// search box. The resulting box is stored back on `config`, making it the one
+/// source consumed by seed projection, continuation entry, every solver, and
+/// terminal projected-stationarity certification.
+fn install_objective_upper_domain(
+    config: &mut OuterConfig,
+    n_params: usize,
+    objective_upper: Array1<f64>,
+) -> Result<(), EstimationError> {
+    let (lower, configured_upper) = outer_bounds_template(config, n_params);
+    if lower.len() != n_params
+        || configured_upper.len() != n_params
+        || objective_upper.len() != n_params
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "outer objective-domain bounds dimension mismatch: parameters={n_params}, lower={}, configured_upper={}, objective_upper={}",
+            lower.len(),
+            configured_upper.len(),
+            objective_upper.len(),
+        )));
+    }
+    let mut upper = configured_upper;
+    for index in 0..n_params {
+        let domain = objective_upper[index];
+        if !domain.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "outer objective-domain upper bound[{index}] must be finite; got {domain}"
+            )));
+        }
+        upper[index] = upper[index].min(domain);
+        if !(lower[index].is_finite()
+            && upper[index].is_finite()
+            && lower[index] < upper[index])
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "outer objective-domain intersection is empty or non-finite at coordinate {index}: lower={}, upper={}",
+                lower[index], upper[index]
+            )));
+        }
+    }
+    config.bounds = Some((lower, upper));
+    Ok(())
 }
 
 pub(crate) fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> {

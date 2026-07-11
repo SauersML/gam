@@ -34,7 +34,10 @@ use gam_solve::rho_optimizer::{FixedPointCoordinateCertificate, OuterObjective};
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2};
 
-use super::tests::{TestPeriodicEvaluator, periodic_basis, small_two_atom_periodic_term};
+use super::tests::{
+    PlantedCircleAssignmentMode, TestPeriodicEvaluator, periodic_basis, planted_circle_embedded,
+    planted_circle_seed_term, small_two_atom_periodic_term,
+};
 use std::sync::Arc;
 
 /// The analytic outer ρ-gradient assembled off the STREAMING cache
@@ -52,48 +55,44 @@ use std::sync::Arc;
 /// EFS-trace drop-in contract.
 #[test]
 fn streaming_cache_outer_gradient_matches_dense_cache() {
-    let (n, p, k) = (24usize, 2usize, 2usize);
-    let mut term0 = build_softmax_term(n, p, k);
-    // Keep both charts load-bearing throughout the inner solve: atom 0 owns the
-    // first output axis and atom 1 the second, with disjoint row territories.
-    // The former five-row scalar target could only support one chart and was
-    // correctly refused by the production total-co-collapse veto before either
-    // dense/streaming cache route was compared.
-    term0.atoms[0].decoder_coefficients =
-        ndarray::array![[0.20, 0.00], [1.10, 0.00], [0.45, 0.00]];
-    term0.atoms[1].decoder_coefficients =
-        ndarray::array![[0.00, -0.15], [0.00, 0.40], [0.00, 1.20]];
-    for row in 0..n {
-        let first_territory = row < n / 2;
-        term0.assignment.logits[[row, 0]] = if first_territory { 2.0 } else { -2.0 };
-        term0.assignment.logits[[row, 1]] = if first_territory { -2.0 } else { 2.0 };
-    }
-    let rho = SaeManifoldRho::new(
-        0.7_f64.ln(),
-        0.8_f64.ln(),
-        vec![Array1::from_elem(1, 1.2_f64.ln()); k],
-    );
-    let fitted = term0
-        .try_fitted_for_rho(&rho)
-        .expect("resolved two-chart fixture reconstruction");
-    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
-        fitted[[row, col]] + 1.0e-3 * ((row + 3 * col) as f64 * 0.19).sin()
-    });
+    // Reuse the exact-recurrence K=1 planted circle from the decisive #2253
+    // value/gradient identity. Cache-route parity needs nontrivial smoothness
+    // and ARD channels, not a second chart; the former K=2 fixture exercised an
+    // unrelated non-idempotent inner map and was correctly refused before cache
+    // comparison. This branch is already certified KKT-stationary and recurrent.
+    let target = planted_circle_embedded(32, 4, 0.02);
+    let mut term0 =
+        planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
+    term0.atoms[0].basis_second_jet = Some(Arc::new(
+        PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
+    ));
+    let rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    let inner_max_iter = 40;
+    let learning_rate = 1.0;
+    let ridge = 1.0e-6;
     let mut dense = term0.clone();
     let mut streaming = term0;
 
     let (dense_cost, dense_loss, dense_cache) = dense
-        .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .reml_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            inner_max_iter,
+            learning_rate,
+            ridge,
+            ridge,
+        )
         .expect("dense cache criterion");
     let (stream_cost, stream_loss, stream_cache) = streaming
         .reml_criterion_streaming_exact_with_cache(
             target.view(),
             &rho,
             None,
-            2,
-            0.25,
-            1.0e-4,
-            1.0e-4,
+            inner_max_iter,
+            learning_rate,
+            ridge,
+            ridge,
         )
         .expect("streaming cache criterion");
 
