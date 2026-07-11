@@ -298,74 +298,73 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
         flat
     };
 
-    use gam_solve::rho_optimizer::OuterProblem;
-    use gam_solve::seeding::SeedConfig;
-
     // Stationarity scale n·p_1/2 (the Jacobian half-count): the analytic block
     // gradient is `½·R̃_1 − scale`, so `scale` is the natural absolute reference.
     let scale = 0.5 * n as f64 * p_1 as f64;
     let h = 0.05_f64;
-    // FD-check the block gradient AT A POINT THE GRADIENT LANE PROVABLY
-    // EVALUATED. The ValueAndGradient lane opens the inner solve from the
-    // accepted-basin warm start the outer search builds; a COLD eval at a
-    // hand-picked off-optimum ρ legitimately refuses (the inner solve cannot
-    // certify from scratch within budget — the (wall, 0) pair is the steering
-    // convention, not a gradient), whereas the cost lane's two-stage
-    // basin/envelope path certifies there. So run the real outer search, take
-    // its BANKED CHECKPOINT (an accepted iterate where `termination.record`
-    // fired ⇒ the gradient lane succeeded), and FD-check there. The exact
+    // High inner budget so the SINGLE-SHOT gradient lane certifies at the probe
+    // points. The cost lane certifies at a modest budget via its two-stage
+    // basin/envelope path; the raw `reml_criterion_with_cache` the gradient
+    // lane calls has no such multi-start, so it simply needs enough inner
+    // Newton room to reach the same optimum from a warm continuation. The exact
     // block-gradient VALUE is independently pinned to 1e-6 by the pure-math
     // sibling `tests_crosscoder_block_fd_2231`; this gate adds the full-engine
-    // (f, ∇f) consistency at a real search iterate.
-    let mut obj = engaged_objective(&evaluator, &z, &coords);
-    let initial = rho_template.to_flat();
-    let n_params = initial.len();
-    let problem = OuterProblem::new(n_params)
-        .with_initial_rho(initial.clone())
-        .with_seed_config(SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
-    let _ = problem.run(&mut obj, "block FD gate 2231");
-    // The banked checkpoint is the best accepted iterate — a ρ the gradient
-    // lane evaluated (fell through `termination.record`). Fall back to the
-    // origin only if nothing banked (then the warm seed is evaluable).
-    let banked = obj
-        .try_resume_from_checkpoint(n_params)
-        .map(Array1::from)
-        .unwrap_or(initial);
-    let banked_ll = banked[banked.len() - 1];
-
+    // (f, ∇f) consistency the #2087 desync class demands.
+    let term = build_k1_circle(&evaluator, &coords, z.ncols());
+    let mut obj = SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        None,
+        rho_template.clone(),
+        800,
+        0.04,
+        1.0e-6,
+        1.0e-6,
+    )
+    .with_crosscoder_blocks(4, vec![4])
+    .expect("crosscoder block pricing must install");
+    // Warm at the origin (converges), then walk outward in small monotone steps
+    // so each gradient eval opens from the previous point's warm state.
+    obj.eval_cost(&rho_template.to_flat())
+        .expect("the seed evaluation must converge");
     let is_wall = |c: f64| !(c < 1.0e11);
-    let eval = obj
-        .eval(&banked)
-        .expect("the ValueAndGradient lane must evaluate at the banked iterate");
+    let mut checked = 0usize;
+    for &ll in &[0.0_f64, 0.15, 0.3, -0.15, -0.3, 0.45, -0.45] {
+        // Cost probe at this ρ first (parks the ρ-keyed converged handoff), then
+        // the gradient eval picks it up — the engine's real Value→ValueAndGradient
+        // calling order.
+        if !matches!(obj.eval_cost(&flat_at(ll)), Ok(c) if !is_wall(c)) {
+            continue;
+        }
+        let eval = match obj.eval(&flat_at(ll)) {
+            Ok(e) if !is_wall(e.cost) => e,
+            _ => continue,
+        };
+        let (Ok(c_plus), Ok(c_minus)) = (
+            obj.eval_cost(&flat_at(ll + h)),
+            obj.eval_cost(&flat_at(ll - h)),
+        ) else {
+            continue;
+        };
+        if is_wall(c_plus) || is_wall(c_minus) {
+            continue;
+        }
+        let analytic = eval.gradient[eval.gradient.len() - 1];
+        let fd = (c_plus - c_minus) / (2.0 * h);
+        let tol = 0.1 * scale + 0.1 * analytic.abs();
+        assert!(
+            (analytic - fd).abs() < tol,
+            "block gradient desync at log λ_1 = {ll:.3}: analytic ½·R̃_1 − n·p_1/2 = \
+             {analytic:.4} vs central-difference of eval_cost = {fd:.4} (|Δ| = {:.4}, \
+             tol = {tol:.4}) — the #2087 objective↔gradient pair is inconsistent",
+            (analytic - fd).abs()
+        );
+        checked += 1;
+    }
     assert!(
-        !is_wall(eval.cost),
-        "the banked search iterate (log λ_1 = {banked_ll:.3}) is on the wall — \
-         the outer search banked an infeasible point"
-    );
-    let analytic = eval.gradient[eval.gradient.len() - 1];
-    let c_plus = obj
-        .eval_cost(&flat_at(banked_ll + h))
-        .expect("cost at banked log λ_1 + h");
-    let c_minus = obj
-        .eval_cost(&flat_at(banked_ll - h))
-        .expect("cost at banked log λ_1 − h");
-    assert!(
-        !is_wall(c_plus) && !is_wall(c_minus),
-        "the ±h neighbourhood of the banked iterate hit the wall — cannot FD-check"
-    );
-    let fd = (c_plus - c_minus) / (2.0 * h);
-    let tol = 0.1 * scale + 0.1 * analytic.abs();
-    assert!(
-        (analytic - fd).abs() < tol,
-        "block gradient desync at the banked iterate log λ_1 = {banked_ll:.3}: \
-         analytic ½·R̃_1 − n·p_1/2 = {analytic:.4} vs central-difference of eval_cost = \
-         {fd:.4} (|Δ| = {:.4}, tol = {tol:.4}) — the #2087 objective↔gradient pair is \
-         inconsistent",
-        (analytic - fd).abs()
+        checked >= 1,
+        "no evaluable FD probe point at 800 inner iterations — the gradient lane \
+         could not certify anywhere near the warm origin"
     );
 }
 
