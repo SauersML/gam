@@ -695,6 +695,17 @@ impl GaussianLocationScaleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace {
+    fn warm_up_outer_caches_for_mode(
+        &self,
+        eval_mode: gam_problem::EvalMode,
+    ) -> Result<(), String> {
+        match eval_mode {
+            gam_problem::EvalMode::ValueOnly
+            | gam_problem::EvalMode::ValueAndGradient
+            | gam_problem::EvalMode::ValueGradientHessian => Ok(()),
+        }
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // Same Hv structure as `hessian_matvec`, but built once via 3 GEMMs
         // (`Xᵀ diag(W) X` per block) instead of letting

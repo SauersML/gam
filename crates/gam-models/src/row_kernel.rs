@@ -1924,8 +1924,9 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
     /// gradient/Hessian evaluations and never touches `row_third_contracted`,
     /// so priming at construction would burn ~3 s × n / scale on every
     /// PIRLS cycle for a cache the gradient path never reads. Outer-eval
-    /// entry points instead call `warm_up_outer_caches` on the workspace
-    /// trait once, at top-level rayon, before the ext-coord `par_iter`.
+    /// entry points instead call `warm_up_outer_caches_for_mode` on the
+    /// workspace trait once, at top-level rayon, before the ext-coord
+    /// `par_iter`.
     pub fn with_rows(kern: T, rows: RowSet) -> Result<Self, String> {
         let kern = Arc::new(kern);
         let cache = build_row_kernel_cache(&*kern, &rows)?;
@@ -1934,8 +1935,9 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
         // gradient/Hessian evaluations and never touches `row_third_contracted`,
         // so priming at construction would burn ~3 s × n / scale on every
         // PIRLS cycle for a cache the gradient path never reads. Outer-eval
-        // entry points instead call `warm_up_outer_caches` on the workspace
-        // trait once, at top-level rayon, before the ext-coord `par_iter`.
+        // entry points instead call `warm_up_outer_caches_for_mode` on the
+        // workspace trait once, at top-level rayon, before the ext-coord
+        // `par_iter`.
         Ok(Self { kern, cache, rows })
     }
 }
@@ -1958,14 +1960,6 @@ impl<const K: usize, T: RowKernel<K> + 'static> ExactNewtonJointHessianWorkspace
         // the fourth-derivative outer-Hessian cache that only `ValueGradientHessian`
         // reads. At biobank scale this is the dominant per-eval `O(n)` jet pass.
         self.kern.warm_up_directional_caches(eval_mode)
-    }
-
-    fn warm_up_outer_caches(&self) -> Result<(), String> {
-        // Mode-blind back-compat entry: prime every directional cache the
-        // kernel keeps (legacy contract). Mode-aware callers route through
-        // `warm_up_outer_caches_for_mode` instead.
-        self.kern
-            .warm_up_directional_caches(EvalMode::ValueGradientHessian)
     }
 
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {

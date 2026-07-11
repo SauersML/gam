@@ -1569,6 +1569,17 @@ impl BinomialMeanWiggleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
+    fn warm_up_outer_caches_for_mode(
+        &self,
+        eval_mode: gam_problem::EvalMode,
+    ) -> Result<(), String> {
+        match eval_mode {
+            gam_problem::EvalMode::ValueOnly
+            | gam_problem::EvalMode::ValueAndGradient
+            | gam_problem::EvalMode::ValueGradientHessian => Ok(()),
+        }
+    }
+
     fn hessian_matvec_available(&self) -> bool {
         true
     }
