@@ -256,16 +256,14 @@ impl<S, const K: usize> FixedRuntimeJet<S, K> {
 impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for FixedRuntimeJet<S, K> {
     type Workspace = ();
 
-    fn constant(c: f64, dimension: usize, workspace: &'arena Self::Workspace) -> Self {
-        debug_assert_eq!(core::mem::size_of_val(workspace), 0);
+    fn constant(c: f64, dimension: usize, &(): &'arena Self::Workspace) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::constant(c),
         }
     }
 
-    fn variable(x: f64, axis: usize, dimension: usize, workspace: &'arena Self::Workspace) -> Self {
-        debug_assert_eq!(core::mem::size_of_val(workspace), 0);
+    fn variable(x: f64, axis: usize, dimension: usize, &(): &'arena Self::Workspace) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::variable(x, axis),

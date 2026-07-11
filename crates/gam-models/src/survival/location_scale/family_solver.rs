@@ -1194,7 +1194,7 @@ impl SurvivalLocationScaleFamily {
         }
 
         if self.row_kernel_directional_supported() {
-            let kernel = self.survival_ls_row_kernel_rescaled(q, dynamic, deriv_log_scale);
+            let kernel = self.survival_ls_row_kernel_rescaled(dynamic, deriv_log_scale);
             let rows = row_set_from_survival_mask(row_mask, self.n);
             return crate::row_kernel::row_kernel_directional_derivative(
                 &kernel,
@@ -1654,7 +1654,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // branch keeps the bespoke per-axis dense path the dispatcher does not
         // cover.
         if self.row_kernel_directional_supported() {
-            let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
+            let kernel = self.survival_ls_row_kernel_rescaled(&dynamic, log_rescale);
             let rows = crate::row_kernel::RowSet::All;
             let axes =
                 crate::row_kernel::row_kernel_directional_derivative_all_axes(&kernel, &rows)?;
@@ -2219,7 +2219,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 )?,
             ));
         }
-        let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
+        let kernel = self.survival_ls_row_kernel_rescaled(&dynamic, log_rescale);
         crate::row_kernel::row_kernel_second_directional_derivative(
             &kernel,
             &crate::row_kernel::RowSet::All,
@@ -3325,7 +3325,6 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             ));
         }
         let kernel = self.family.survival_ls_row_kernel_rescaled(
-            &self.q,
             &self.dynamic,
             self.deriv_log_scale,
         );

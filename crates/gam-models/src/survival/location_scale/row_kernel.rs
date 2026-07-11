@@ -1785,7 +1785,6 @@ impl SurvivalLocationScaleFamily {
 
     pub(crate) fn survival_ls_row_kernel_rescaled<'a>(
         &'a self,
-        q: &'a SurvivalJointQuantities,
         dynamic: &'a SurvivalDynamicGeometry,
         deriv_log_scale: f64,
     ) -> SurvivalLsRowKernel<'a> {
