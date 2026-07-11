@@ -471,7 +471,6 @@ fn build_stagewise_manifold_sae_payload(
         oos_projection_top1: false,
         dispersion: 1.0,
         penalized_loss_score: None,
-        reml_score: None,
         reconstruction_r2,
         primitive_names: vec!["sae_manifold_fit_stagewise".to_string()],
         basis_specs: basis_kinds.clone(),
@@ -480,8 +479,6 @@ fn build_stagewise_manifold_sae_payload(
         basis_sizes,
         n_harmonics,
         training_mean: column_mean(training.view()),
-        training_data: None,
-        training_data_retained: false,
         fitted: array2_to_nested(&fitted),
         assignments: assignments_nested,
         low_level_logits: array2_to_nested(&logits),
@@ -963,10 +960,7 @@ pub(crate) fn build_manifold_sae_payload(
     }
     let atom_topology =
         topology_for_bases(&basis_kinds).unwrap_or_else(|| cfg.topology_fallback.clone());
-    let metric_provenance = vopt(raw, "metric_provenance")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| "Euclidean".to_string());
+    let metric_provenance = vstr(raw, "metric_provenance")?;
     let fisher_mass_residual = vopt(raw, "fisher_mass_residual").map(v_arr1).transpose()?;
     let selected_log_lambda_sparse = match vopt(raw, "log_lambda_sparse") {
         None => None,
@@ -1007,9 +1001,6 @@ pub(crate) fn build_manifold_sae_payload(
         oos_projection_top1: vbool(raw, "oos_projection_top1")?,
         dispersion: vf64(raw, "dispersion")?,
         penalized_loss_score: score,
-        // Duplicate write-alias re-derived in `to_json`; the field value here is
-        // irrelevant to the serialized output.
-        reml_score: None,
         reconstruction_r2: vf64(raw, "reconstruction_r2")?,
         primitive_names,
         // basis_specs = fitted kinds (unpatched); basis_kinds = post-relabel.
@@ -1019,8 +1010,6 @@ pub(crate) fn build_manifold_sae_payload(
         basis_sizes: sizes,
         n_harmonics,
         training_mean,
-        training_data: None,
-        training_data_retained: false,
         fitted: v_arr2(vget(raw, "fitted")?)?,
         assignments,
         low_level_logits: logits,

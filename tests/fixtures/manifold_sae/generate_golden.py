@@ -1,13 +1,12 @@
-"""Generate the canonical v1 ``ManifoldSAE`` serialization fixtures (#2091).
+"""Generate the canonical v3 ``ManifoldSAE`` serialization fixtures (#2091).
 
 The fixtures pin the JSON contract owned by Rust's ``ManifoldSaePayload``. The
 representative payload exercises every optional surface: mixed atom topologies,
 TopK routing, a JumpReLU threshold, output-Fisher steering state, the selected
 ``ρ*`` fields, and every diagnostic/certificate report block.
 
-The fitted Python facade is now only a wrapper over ``ManifoldSaeCore``; the
-legacy Python fit dataclasses and keyword-heavy ``ManifoldSAE`` constructor no
-longer exist. Accordingly this generator builds the JSON-compatible v1 payload
+The fitted model is the Rust-owned ``ManifoldSAE`` PyO3 class. Accordingly this
+generator builds the JSON-compatible v3 payload
 directly, so fixture generation needs neither a fit nor a compiled extension.
 
 The covariance fixture persists the compact per-channel factors consumed by the
@@ -120,7 +119,7 @@ def build_payload() -> dict[str, Any]:
     selected_log_ard = [np.array([0.1]), np.array([0.2, -0.3]), np.array([0.4, 0.5])]
 
     return {
-        "schema": "gamfit.ManifoldSAE/v2",
+        "schema": "gamfit.ManifoldSAE/v3",
         "atoms": atoms,
         "atom_topology": "mixed",
         "atom_topologies": list(kinds),
@@ -133,11 +132,8 @@ def build_payload() -> dict[str, Any]:
         "decoder_blocks": [b.tolist() for b in decoder_blocks],
         "basis_specs": ["periodic:H2", "euclidean:3", "duchon:4"],
         "penalized_loss_score": -37.5,
-        "reml_score": -37.5,
         "reconstruction_r2": 0.8123,
         "training_mean": training_mean.tolist(),
-        "training_data": None,
-        "training_data_retained": False,
         "logits": logits.tolist(),
         "diagnostics": diagnostics,
         "basis_kinds": list(kinds),
@@ -163,7 +159,7 @@ def build_payload() -> dict[str, Any]:
         "jumprelu_threshold": 0.15,
         "solver_plan": {"stages": ["seed", "refine"], "max_outer": 3},
         "dispersion": 1.07,
-        "metric_provenance": "OutputFisher",
+        "metric_provenance": "OutputFisherDownstream",
         "fisher_mass_residual": fisher_mass_residual.tolist(),
         "atom_two_lens": {
             "presence": [0.1, 0.2, 0.3],
@@ -250,6 +246,8 @@ def build_payload() -> dict[str, Any]:
         "selected_log_lambda_sparse": -0.6,
         "selected_log_lambda_smooth": selected_log_lambda_smooth.tolist(),
         "selected_log_ard": [values.tolist() for values in selected_log_ard],
+        "structured_residual_diagnostics": [],
+        "termination": None,
     }
 
 
@@ -283,15 +281,6 @@ def main() -> None:
         json.dumps(covariance_payload, indent=2, sort_keys=True) + "\n"
     )
     print(f"wrote {COVARIANCE} ({COVARIANCE.stat().st_size} bytes)")
-
-    # Assert the write-drop / read-tolerate asymmetry is captured faithfully:
-    # structured_residual_diagnostics is runtime-only, so the canonical payload
-    # omits it even though the Rust reader tolerates the key on input.
-    assert "structured_residual_diagnostics" not in payload, (
-        "to_dict unexpectedly emitted structured_residual_diagnostics"
-    )
-    # reml_score is written as a duplicate of penalized_loss_score.
-    assert payload["reml_score"] == payload["penalized_loss_score"]
 
     assert covariance_payload["atoms"][1][
         "decoder_covariance_channel_factors"

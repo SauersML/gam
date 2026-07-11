@@ -2137,13 +2137,7 @@ pub fn apply_structure_move(
                         AtlasSeamKind::Regular,
                     )?;
                     fold_atom_into(&mut child, *a, *b)?;
-                    transplant_glued_coords(
-                        &mut child,
-                        *a,
-                        *b,
-                        &transition,
-                        &seam.rows_b,
-                    )?;
+                    transplant_glued_coords(&mut child, *a, *b, &transition, &seam.rows_b)?;
                 }
                 ChartGlueOutcome::RegisterAtlas => {
                     if seam.sign != -1.0 {
@@ -2440,24 +2434,25 @@ fn remove_atoms(
     Ok(())
 }
 
-/// Round-boundary TRUE-FUSION compaction (#1890). Every glue the round's e-gate
-/// ACCEPTED folded its partner atom in place and DEMOTED it (index-stable for the
-/// search's within-round proposal chain, which references harvested indices); here
-/// — once, after the search's chaining is done and before the polish refit — we
-/// excise those atoms for real so the effective (and raw) dictionary size falls.
+/// Round-boundary chart-glue adoption (#1890).  A glue is a harvest-certified
+/// equivalence move, not a likelihood-scored numerical candidate: the exact seam
+/// transition which earned its e-value is carried in `certified_glues`, and the
+/// search defers materializing the move until its index-sensitive proposal chain
+/// is complete.  This boundary then applies every accepted certificate exactly
+/// once: an orientation-preserving seam folds/transplants/removes B, while an
+/// irreducible reversing or pole seam registers both charts as one atlas atom.
 ///
-/// The search-time scoring refit resurrects the demoted partner (the very
-/// active-mass guard this lane fights), so before excising we RE-ASSERT each
-/// survivor's hold on its partner's mass and chart (fold + seam transplant) on the
-/// adopted state, then drop every folded partner in one pass. No zero-mass zombie
-/// then reaches the polish refit's guard, and each survivor is forced to cover its
-/// absorbed arc. The `touched` guard in [`gam_solve::structure_search::search`]
-/// guarantees the accepted glues share no atom, so the survivors (the `a`s) and
-/// the removed partners (the `b`s) are disjoint. No accepted glue ⇒ a no-op.
+/// The whole accepted matching and all proposal/certificate pairings are checked
+/// before mutation.  Materialization runs on a cloned child and commits only on
+/// success, so malformed resumed/direct ledgers cannot leave half-folded state.
+/// The search engine's `touched` guard guarantees accepted glues share no atom;
+/// checking it again here makes that adoption contract explicit.  No accepted
+/// glue is a no-op.
 fn compact_glued_atoms(
     term: &mut SaeManifoldTerm,
     rho: &mut SaeManifoldRho,
     round_ledger: &SearchLedger,
+    certified_glues: &[CertifiedGlue],
 ) -> Result<usize, String> {
     use gam_solve::structure_search::MoveVerdict;
     let accepted_glues: Vec<(usize, usize, ChartGlueOutcome)> = round_ledger
@@ -2473,6 +2468,9 @@ fn compact_glued_atoms(
             }
         })
         .collect();
+    if accepted_glues.is_empty() {
+        return Ok(0);
+    }
     // Validate the whole accepted matching before the first fold.  The search
     // engine enforces this through its `touched` set; checking again here keeps
     // the variable-K boundary transactional even for resumed/deserialized or
@@ -2492,85 +2490,80 @@ fn compact_glued_atoms(
             ));
         }
     }
-    // Fit every seam while both partners still carry their live supports.  A
-    // fold demotes `b`; fitting after that mutation sees no active B rows and
-    // silently skips the coordinate transplant the true fusion requires.
-    // Precomputing the disjoint matching also keeps one pair's fold from
-    // changing another pair's softmax support before its seam is measured.
-    let seams: Vec<Option<SeamTransition>> = accepted_glues
-        .iter()
-        .map(|&(a, b, _)| fit_seam_transition(term, a, b))
-        .collect();
-    let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for ((a, b, outcome), seam) in accepted_glues.into_iter().zip(seams) {
-        // Sphere pole seam: register the ambient rotation, remove nothing (both
-        // charts are kept as one atlas atom). The 1-D seam fit is `None` here.
-        if is_sphere_pair(term, a, b) {
-            if !matches!(outcome, ChartGlueOutcome::RegisterAtlas) {
-                return Err(format!(
-                    "compact_glued_atoms: sphere pole seam ({a},{b}) cannot be destructively fused"
-                ));
-            }
-            // The proposal already classified this as a POLE seam (the sole sphere
-            // register trigger), so the topology is decided; the scoring refit can
-            // blur the pole-interior test on the perturbed intermediate charts, so
-            // trust the accepted classification and only refresh the fitted
-            // rotation. If the seam is momentarily unidentifiable (a partner the
-            // scoring refit demoted), keep the apply-time registration rather than
-            // dropping the atlas.
-            if let Some(sphere) = fit_sphere_seam_transition(term, a, b) {
-                let transition =
-                    SphereChartTransition::new(b, a, sphere.rotation, AtlasSeamKind::Pole)?;
-                if term.charts_share_atlas(a, b) {
-                    term.refresh_sphere_chart_transition(transition)?;
-                } else {
-                    term.register_sphere_chart_transition(transition)?;
-                }
-            } else if !term.charts_share_atlas(a, b) {
-                return Err(format!(
-                    "compact_glued_atoms: accepted sphere seam ({a},{b}) is no longer identifiable \
-                     and was never registered"
-                ));
-            }
-            continue;
-        }
-        let seam = seam.ok_or_else(|| {
-            format!("compact_glued_atoms: accepted seam ({a},{b}) is no longer identifiable")
+
+    // Pair every accepted ledger record with exactly one harvest certificate.
+    // A proposal without its geometric object cannot be adopted: trying to
+    // reconstruct it here from a scoring/polish-mutated state is precisely the
+    // ordering bug this boundary forbids.
+    let mut adopted: Vec<CertifiedGlue> = Vec::with_capacity(accepted_glues.len());
+    for &(a, b, outcome) in &accepted_glues {
+        let mut matches = certified_glues
+            .iter()
+            .filter(|certificate| certificate.a == a && certificate.b == b);
+        let certificate = matches.next().ok_or_else(|| {
+            format!("compact_glued_atoms: accepted glue ({a},{b}) has no harvest-time certificate")
         })?;
-        match outcome {
-            ChartGlueOutcome::Fuse => {
-                if seam.sign != 1.0 {
-                    return Err(format!(
-                        "compact_glued_atoms: refusing to compact orientation-reversing seam ({a},{b})"
-                    ));
-                }
-                fold_atom_into(term, a, b)?;
-                transplant_glued_coords(term, a, b, &seam);
+        if matches.next().is_some() {
+            return Err(format!(
+                "compact_glued_atoms: accepted glue ({a},{b}) has duplicate harvest-time certificates"
+            ));
+        }
+        if certificate.outcome != outcome {
+            return Err(format!(
+                "compact_glued_atoms: accepted glue ({a},{b}) outcome {outcome:?} does not match certified {:?}",
+                certificate.outcome
+            ));
+        }
+        match (&certificate.transition, outcome) {
+            (CertifiedGlueTransition::UnitSpeed { transition, .. }, ChartGlueOutcome::Fuse)
+                if transition.from_chart == b
+                    && transition.to_chart == a
+                    && transition.sign == 1
+                    && matches!(transition.seam_kind, AtlasSeamKind::Regular) => {}
+            (
+                CertifiedGlueTransition::UnitSpeed { transition, .. },
+                ChartGlueOutcome::RegisterAtlas,
+            ) if transition.from_chart == b
+                && transition.to_chart == a
+                && transition.sign == -1
+                && matches!(transition.seam_kind, AtlasSeamKind::Regular) => {}
+            (CertifiedGlueTransition::Sphere(transition), ChartGlueOutcome::RegisterAtlas)
+                if transition.from_chart == b
+                    && transition.to_chart == a
+                    && matches!(transition.seam_kind, AtlasSeamKind::Pole) => {}
+            _ => {
+                return Err(format!(
+                    "compact_glued_atoms: accepted glue ({a},{b}) is incompatible with its certified transition"
+                ));
+            }
+        }
+        adopted.push(certificate.clone());
+    }
+
+    let mut child_term = term.clone();
+    let mut child_rho = rho.clone();
+    let mut to_remove: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for certificate in adopted {
+        let (a, b) = (certificate.a, certificate.b);
+        match certificate.transition {
+            CertifiedGlueTransition::UnitSpeed { transition, rows_b }
+                if matches!(certificate.outcome, ChartGlueOutcome::Fuse) =>
+            {
+                fold_atom_into(&mut child_term, a, b)?;
+                transplant_glued_coords(&mut child_term, a, b, &transition, &rows_b)?;
                 to_remove.insert(b);
             }
-            ChartGlueOutcome::RegisterAtlas => {
-                if seam.sign != -1.0 {
-                    return Err(format!(
-                        "compact_glued_atoms: registered seam ({a},{b}) lost its orientation reversal"
-                    ));
-                }
-                let transition = UnitSpeedChartTransition::new(
-                    b,
-                    a,
-                    -1,
-                    seam.offset,
-                    seam.period,
-                    AtlasSeamKind::Regular,
-                )?;
-                if term.charts_share_atlas(a, b) {
-                    term.refresh_chart_transition(transition)?;
-                } else {
-                    term.register_chart_transition(transition)?;
-                }
+            CertifiedGlueTransition::UnitSpeed { transition, .. } => {
+                child_term.register_chart_transition(transition)?;
+            }
+            CertifiedGlueTransition::Sphere(transition) => {
+                child_term.register_sphere_chart_transition(transition)?;
             }
         }
     }
-    remove_atoms(term, rho, &to_remove)?;
+    remove_atoms(&mut child_term, &mut child_rho, &to_remove)?;
+    *term = child_term;
+    *rho = child_rho;
     Ok(to_remove.len())
 }
 
@@ -4867,20 +4860,29 @@ pub fn run_structure_search_rounds(
             break;
         }
 
-        // The search state threads (term, rho) together. apply_move restructures
-        // both AND refits the candidate on the estimation rows so it is the
-        // predictable plug-in the held-out shards are evaluated against.
+        // The search state threads (term, rho) together. Numerical moves are
+        // restructured and refit on the estimation rows so they are predictable
+        // plug-ins for held-out scoring. Glue is different: its trigger already
+        // IS the sample-split equivalence e-value, and the engine never consults
+        // a fit-improvement score for that arm. Keep its state index-stable and
+        // materialize the harvest-certified transition exactly once at the round
+        // boundary after the proposal chain is complete.
         type State = (SaeManifoldTerm, SaeManifoldRho);
         let collapse_events = term.collapse_events().to_vec();
         let decoders = birth_seeds;
         let estimation_rows = split.estimation_rows.clone();
+        let certified_glues = std::mem::take(&mut report.certified_glues);
+        let proposals = std::mem::take(&mut report.proposals);
         let outcome: SearchOutcome<State> = search(
             (term, rho),
-            report.proposals,
+            proposals,
             &split.shards,
             &budget,
             ledger,
             |state: &State, mv: &StructureMove| {
+                if matches!(mv, StructureMove::Glue { .. }) {
+                    return Ok(state.clone());
+                }
                 let (cand_term, cand_rho) =
                     apply_structure_move_seeded(&state.0, &state.1, mv, &decoders)?;
                 // Refit the restructured candidate on the estimation rows only.
@@ -4902,6 +4904,25 @@ pub fn run_structure_search_rounds(
                 gam_solve::structure_search::MoveVerdict::Accepted { .. }
                     | gam_solve::structure_search::MoveVerdict::Demoted { .. }
             )
+        });
+        // Atlas registration is an exact algebraic quotient: it changes only
+        // semantic/transition state and must not perturb the represented image.
+        // A round containing no numerical move therefore needs no optimizer
+        // polish. Destructive glues and every ordinary accepted/demoted move do.
+        let requires_polish = round_ledger.moves.iter().any(|record| {
+            let fired = matches!(
+                record.verdict,
+                gam_solve::structure_search::MoveVerdict::Accepted { .. }
+                    | gam_solve::structure_search::MoveVerdict::Demoted { .. }
+            );
+            fired
+                && !matches!(
+                    record.mv,
+                    StructureMove::Glue {
+                        outcome: ChartGlueOutcome::RegisterAtlas,
+                        ..
+                    }
+                )
         });
         // Record the atom-sets any APPLIED curl / flatten move fired on into the
         // cooldown ledger, then advance one round — so the inverse move cannot
@@ -4934,34 +4955,33 @@ pub fn run_structure_search_rounds(
         round_predictions.push(birth_predictions);
 
         if applied {
-            // #1890 — TRUE-FUSION compaction. Every glue the round ACCEPTED folded
-            // its partner in place and demoted it (index-stable for the search's
-            // within-round chain); excise those partners NOW, before the polish
-            // refit, so the fusion actually reduces the dictionary and no zero-mass
-            // zombie reaches the refit's active-mass guard (which would otherwise
-            // reseed it back to routing parity and undo the glue). Done once per
-            // round on the adopted state, after the search's index-sensitive
-            // chaining is complete; the next round re-harvests fresh indices.
+            // #1890 — adopt each accepted harvest certificate exactly once, now
+            // that the search's index-sensitive chain is complete. Destructive
+            // glues physically compact their partner before polish; atlas glues
+            // register an image-exact quotient and retain both numerical charts.
             let (mut next_term, mut next_rho) = (next_term, next_rho);
             compact_glued_atoms(
                 &mut next_term,
                 &mut next_rho,
                 rounds.last().expect("round ledger pushed above"),
+                &certified_glues,
             )?;
-            // The adopted winner reached its restructured form through the cheap
-            // capped-iteration SCORING refit; re-refit it at the full inner
-            // budget (same estimation-row weighting) before it becomes the next
-            // round's parent and the returned dictionary, so the cap is a
-            // scoring-only economy and the adopted state matches a direct
-            // full-iter refit (the inner solve is convergent; the capped score
-            // was only a worse starting iterate). When no move landed, the state
-            // is byte-identical to the unrefit pre-search parent and needs no
-            // polish.
-            let (mut polished_term, polished_rho) =
-                finalize_round(next_term, next_rho, &split.estimation_rows);
-            refresh_registered_atlas_transitions(&mut polished_term)?;
-            term = polished_term;
-            rho = polished_rho;
+            if requires_polish {
+                // Numerical winners reached their restructured form through the
+                // cheap capped scoring refit. Refit at the full inner budget and
+                // then refresh any registered regular seams against that terminal
+                // numerical state.
+                let (mut polished_term, polished_rho) =
+                    finalize_round(next_term, next_rho, &split.estimation_rows);
+                refresh_registered_atlas_transitions(&mut polished_term)?;
+                term = polished_term;
+                rho = polished_rho;
+            } else {
+                // A pure RegisterAtlas round is already terminal: optimizer work
+                // here would violate registration's image-exact quotient contract.
+                term = next_term;
+                rho = next_rho;
+            }
         } else {
             term = next_term;
             rho = next_rho;
@@ -6888,7 +6908,8 @@ mod tests {
             moves: vec![accepted_glue(0, 1), accepted_glue(2, 3)],
             collapse_events: Vec::new(),
         };
-        let removed = compact_glued_atoms(&mut term, &mut rho, &ledger).unwrap();
+        let removed =
+            compact_glued_atoms(&mut term, &mut rho, &ledger, &report0.certified_glues).unwrap();
         assert_eq!(
             removed, 2,
             "both folded partners must be physically excised"
@@ -6953,9 +6974,10 @@ mod tests {
         }
     }
 
-    /// The compactor must measure the transition while the retired chart still
-    /// has live support.  Folding first demotes B and makes seam fitting return
-    /// `None`, leaving A's coordinates on B's rows at an arbitrary stale value.
+    /// The compactor must adopt the transition measured while the retired chart
+    /// still had live support. Folding first demotes B and makes seam fitting
+    /// impossible, so the harvest certificate carries both the transition and
+    /// B's certified support rows to the round boundary.
     #[test]
     fn physical_excision_transplants_coords_from_the_live_seam() {
         use gam_solve::structure_search::{MoveRecord, MoveVerdict};
@@ -6963,6 +6985,9 @@ mod tests {
         let (mut term, mut rho) = tiled_circle_term(32, 2, &[1.0; 2]);
         assert!(term.assignment.frozen_logits.is_none());
         let seam = fit_seam_transition(&term, 0, 1).expect("live pair has a seam");
+        let residuals = Array2::<f64>::zeros((32, 4));
+        let (_, certificate) = unit_speed_glue_certificate(&term, residuals.view(), 0, 1)
+            .expect("live pair has a harvest-time glue certificate");
         let da = term.assignment.coords[0].latent_dim();
         let db = term.assignment.coords[1].latent_dim();
         let flat_b = term.assignment.coords[1].as_flat().to_owned();
@@ -6999,7 +7024,7 @@ mod tests {
             }],
             collapse_events: Vec::new(),
         };
-        compact_glued_atoms(&mut term, &mut rho, &ledger).unwrap();
+        compact_glued_atoms(&mut term, &mut rho, &ledger, &[certificate]).unwrap();
 
         assert_eq!(term.k_atoms(), 1);
         let survivor = term.assignment.coords[0].as_flat();
@@ -7054,7 +7079,7 @@ mod tests {
             moves: vec![accepted(0, 1), accepted(1, 2)],
             collapse_events: Vec::new(),
         };
-        let err = compact_glued_atoms(&mut term, &mut rho, &overlapping).unwrap_err();
+        let err = compact_glued_atoms(&mut term, &mut rho, &overlapping, &[]).unwrap_err();
         assert!(
             err.contains("not an atom-disjoint matching"),
             "unexpected error: {err}"

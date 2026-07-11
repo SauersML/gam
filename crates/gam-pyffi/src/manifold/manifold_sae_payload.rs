@@ -1,7 +1,7 @@
 //! Rust-owned serde schema for the fitted `ManifoldSAE` model artifact (#2091).
 //!
 //! The fitted SAE-manifold model is serialized to a JSON payload tagged
-//! `"gamfit.ManifoldSAE/v2"` schema. Version 2 is deliberately breaking: it
+//! `"gamfit.ManifoldSAE/v3"` schema. Version 3 is deliberately breaking: it
 //! makes the optional crosscoder layout a first-class typed field instead of
 //! accepting legacy payloads that cannot say whether decoder columns are one
 //! ambient or a stack of relevance-weighted layers. Historically the
@@ -22,26 +22,16 @@
 //! * **Report / certificate blocks are opaque `serde_json::Value`.** They are all
 //!   produced by the Rust fit and only read/filtered downstream; holding them
 //!   losslessly avoids mirroring ~14 sub-schemas that no consumer computes over.
-//! * **Two contract asymmetries the Python facade encodes are reproduced here:**
-//!   1. `reml_score` is a duplicate write-alias of `penalized_loss_score`
-//!      (`to_dict` writes both from one value; `from_dict` reads
-//!      `penalized_loss_score` and falls back to `reml_score`). See
-//!      [`ManifoldSaePayload::normalize_after_load`] / [`ManifoldSaePayload::to_json`].
-//!   2. `structured_residual_diagnostics` is **write-dropped, read-tolerated**:
-//!      `to_dict` never emits it, `from_dict` reads it with a `[]` default. The
-//!      field here is `skip_serializing` + `default`, retained (for the eventual
-//!      `#[pyclass]`) but never re-emitted.
+//! * **Strict schema.** Every field is required, unknown fields are rejected,
+//!   and runtime diagnostics serialize with the rest of the model.  There are
+//!   no deprecated aliases, missing-field defaults, or load-time repairs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The on-disk schema tag. `from_json` rejects any other value, matching the
 /// Python `from_dict` guard.
-pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v2";
-
-fn default_metric_provenance() -> String {
-    "Euclidean".to_string()
-}
+pub(crate) const SCHEMA_TAG: &str = "gamfit.ManifoldSAE/v3";
 
 /// Per-atom payload (`atoms[k]`), one per `SaeManifoldAtomFit`.
 ///
@@ -52,6 +42,7 @@ fn default_metric_provenance() -> String {
 /// The `#[serde(default)]` on the read-tolerant ones lets a legacy dict that
 /// omits a newer key still deserialize.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AtomPayload {
     pub(crate) basis: String,
     /// Gauge-free physical decoder `exp(s_k) B_k`. The fit-internal scale
@@ -60,27 +51,22 @@ pub(crate) struct AtomPayload {
     pub(crate) decoder_coefficients: Vec<Vec<f64>>,
     pub(crate) assignments: Vec<f64>,
     pub(crate) coords: Vec<Vec<f64>>,
-    #[serde(default)]
     pub(crate) coords_u_arc: Option<Vec<f64>>,
     pub(crate) evidence: Option<f64>,
     pub(crate) active_dim: i64,
     /// Compact per-channel factor `(p, M_k, M_k)`; the dense `(M_k·p)²` joint is
     /// never stored on disk (see `decoder_channel_cov_factors`, #2091 slice 1).
-    #[serde(default)]
     pub(crate) decoder_covariance_channel_factors: Option<Vec<Vec<Vec<f64>>>>,
-    #[serde(default)]
     pub(crate) shape_band_coords: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
     pub(crate) shape_band_mean: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
     pub(crate) shape_band_sd: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
     pub(crate) functional_evidence: Option<Value>,
 }
 
 /// Stacked-column metadata required to interpret a manifold crosscoder's
 /// decoder blocks in honest per-layer units. `None` on an ordinary SAE.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CrosscoderPayload {
     pub(crate) anchor_label: String,
     pub(crate) anchor_dim: i64,
@@ -98,6 +84,7 @@ pub(crate) struct CrosscoderPayload {
 /// emits exactly (the two `#[serde(rename)]`s bridge the Python attribute name
 /// to the on-disk key).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ManifoldSaePayload {
     pub(crate) schema: String,
 
@@ -120,11 +107,8 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) oos_projection_top1: bool,
     pub(crate) dispersion: f64,
 
-    // --- scores (with the reml_score write-alias, handled in to_json) -----
-    #[serde(default)]
+    // --- scores -----------------------------------------------------------
     pub(crate) penalized_loss_score: Option<f64>,
-    #[serde(default)]
-    pub(crate) reml_score: Option<f64>,
     pub(crate) reconstruction_r2: f64,
 
     // --- B. string / int lists --------------------------------------------
@@ -137,11 +121,6 @@ pub(crate) struct ManifoldSaePayload {
 
     // --- C. dense numeric -------------------------------------------------
     pub(crate) training_mean: Vec<f64>,
-    /// Always written as `null` by `to_dict` (new fits do not retain X).
-    #[serde(default)]
-    pub(crate) training_data: Option<Value>,
-    #[serde(default)]
-    pub(crate) training_data_retained: bool,
     pub(crate) fitted: Vec<Vec<f64>>,
     pub(crate) assignments: Vec<Vec<f64>>,
     #[serde(rename = "logits")]
@@ -160,121 +139,155 @@ pub(crate) struct ManifoldSaePayload {
 
     // --- diagnostics / report blocks (opaque, always emitted) -------------
     pub(crate) diagnostics: Value,
-    #[serde(default)]
     pub(crate) top_k_projection: Option<Value>,
-    #[serde(default)]
     pub(crate) pre_topk: Option<Value>,
-    #[serde(default)]
     pub(crate) solver_plan: Option<Value>,
-    #[serde(default)]
     pub(crate) atom_two_lens: Option<Value>,
-    #[serde(default)]
     pub(crate) residual_gauge: Option<Value>,
-    #[serde(default)]
     pub(crate) incoherence_report: Option<Value>,
-    #[serde(default)]
     pub(crate) curvature_report: Option<Value>,
-    #[serde(default)]
     pub(crate) coordinate_fidelity: Option<Value>,
-    #[serde(default)]
     pub(crate) topology_persistence: Option<Value>,
-    #[serde(default)]
     pub(crate) atom_inference: Option<Value>,
-    #[serde(default)]
     pub(crate) certificates: Option<Value>,
     /// A JSON *string* (the Rust core's serialized `StructureCertificate`), or null.
-    #[serde(default)]
     pub(crate) structure_certificate: Option<String>,
-    #[serde(default)]
     pub(crate) cotrain: Option<Value>,
-    #[serde(default)]
     pub(crate) hybrid_split: Option<Value>,
 
     // --- D. Fisher steering ----------------------------------------------
-    #[serde(default)]
     pub(crate) fisher_factors: Option<Vec<Vec<Vec<f64>>>>,
-    #[serde(default)]
     pub(crate) fisher_provenance: Option<String>,
-    #[serde(default = "default_metric_provenance")]
     pub(crate) metric_provenance: String,
-    #[serde(default)]
     pub(crate) fisher_mass_residual: Option<Vec<f64>>,
-    #[serde(default)]
     pub(crate) selected_log_lambda_sparse: Option<f64>,
-    #[serde(default)]
     pub(crate) selected_log_lambda_smooth: Option<Vec<f64>>,
-    #[serde(default)]
     pub(crate) selected_log_ard: Option<Vec<Vec<f64>>>,
 
-    // --- write-dropped, read-tolerated (schema asymmetry) -----------------
-    /// `to_dict` never emits this; `from_dict` reads it with a `[]` default. We
-    /// accept it (so a dict that carries it still loads) and retain it for the
-    /// eventual `#[pyclass]`, but never re-serialize it.
-    #[serde(default, skip_serializing)]
+    // --- runtime diagnostics persisted by v3 -----------------------------
     pub(crate) structured_residual_diagnostics: Vec<Value>,
     /// #2235 — the outer-ρ termination verdict/ledger the fit emitted
     /// (`{"verdict", "evals", "evals_since_improvement", "wall_seconds"}`). Like
-    /// `structured_residual_diagnostics` this is a runtime-only field: `to_dict`
-    /// never emitted it (it is not part of the persisted v1 schema), so it is
-    /// `skip_serializing` here and populated only by the fit-path builder from the
-    /// raw `sae_manifold_fit_minimal` payload. `None` on payloads predating the
-    /// termination ledger, matching the legacy dataclass `termination` field.
-    #[serde(default, skip_serializing)]
+    /// Persisted with v3 so save/load never drops a live convergence verdict.
     pub(crate) termination: Option<Value>,
 }
 
 impl ManifoldSaePayload {
-    /// Parse a `to_dict` payload, enforcing the schema tag and the
-    /// `penalized_loss_score` / `reml_score` fallback, mirroring `from_dict`.
+    const REQUIRED_FIELDS: &'static [&'static str] = &[
+        "schema",
+        "atom_topology",
+        "atom_topologies",
+        "assignment",
+        "assignment_label",
+        "alpha",
+        "learnable_alpha",
+        "tau",
+        "sparsity_strength",
+        "smoothness",
+        "learning_rate",
+        "max_iter",
+        "random_state",
+        "top_k",
+        "jumprelu_threshold",
+        "oos_projection_top1",
+        "dispersion",
+        "penalized_loss_score",
+        "reconstruction_r2",
+        "primitive_names",
+        "basis_specs",
+        "basis_kinds",
+        "atom_dims",
+        "basis_sizes",
+        "n_harmonics",
+        "training_mean",
+        "fitted",
+        "assignments",
+        "logits",
+        "coords",
+        "decoder_blocks",
+        "duchon_centers",
+        "crosscoder",
+        "atoms",
+        "diagnostics",
+        "top_k_projection",
+        "pre_topk",
+        "solver_plan",
+        "atom_two_lens",
+        "residual_gauge",
+        "incoherence_report",
+        "curvature_report",
+        "coordinate_fidelity",
+        "topology_persistence",
+        "atom_inference",
+        "certificates",
+        "structure_certificate",
+        "cotrain",
+        "hybrid_split",
+        "fisher_factors",
+        "fisher_provenance",
+        "metric_provenance",
+        "fisher_mass_residual",
+        "selected_log_lambda_sparse",
+        "selected_log_lambda_smooth",
+        "selected_log_ard",
+        "structured_residual_diagnostics",
+        "termination",
+    ];
+
+    const REQUIRED_ATOM_FIELDS: &'static [&'static str] = &[
+        "basis",
+        "decoder_coefficients",
+        "assignments",
+        "coords",
+        "coords_u_arc",
+        "evidence",
+        "active_dim",
+        "decoder_covariance_channel_factors",
+        "shape_band_coords",
+        "shape_band_mean",
+        "shape_band_sd",
+        "functional_evidence",
+    ];
+
+    /// Parse the exact v3 artifact schema. Missing optional-valued fields are
+    /// still errors: `null` is the explicit absence representation.
     pub(crate) fn from_json(json: &str) -> Result<Self, String> {
-        let mut payload: ManifoldSaePayload =
+        let value: Value =
             serde_json::from_str(json).map_err(|e| format!("ManifoldSAE.from_json: {e}"))?;
-        if payload.schema != SCHEMA_TAG {
+        let object = value.as_object().ok_or_else(|| {
+            "ManifoldSAE.from_json: model artifact must be a JSON object".to_string()
+        })?;
+        for field in Self::REQUIRED_FIELDS {
+            if !object.contains_key(*field) {
+                return Err(format!("ManifoldSAE.from_json: missing field {field:?}"));
+            }
+        }
+        let schema = object.get("schema").and_then(Value::as_str);
+        if schema != Some(SCHEMA_TAG) {
             return Err(format!(
                 "ManifoldSAE.from_json: unsupported schema {:?}",
-                payload.schema
+                schema
             ));
         }
-        payload.normalize_after_load();
-        Ok(payload)
+        if let Some(atoms) = object.get("atoms").and_then(Value::as_array) {
+            for (index, atom) in atoms.iter().enumerate() {
+                let atom = atom.as_object().ok_or_else(|| {
+                    format!("ManifoldSAE.from_json: atoms[{index}] must be an object")
+                })?;
+                for field in Self::REQUIRED_ATOM_FIELDS {
+                    if !atom.contains_key(*field) {
+                        return Err(format!(
+                            "ManifoldSAE.from_json: atoms[{index}] missing field {field:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        serde_json::from_value(value).map_err(|e| format!("ManifoldSAE.from_json: {e}"))
     }
 
-    /// `penalized_loss_score = payload.get("penalized_loss_score",
-    /// payload.get("reml_score"))` — the primary key wins, the deprecated alias
-    /// is the fallback for dicts written by older versions.
-    fn normalize_after_load(&mut self) {
-        if self.penalized_loss_score.is_none() {
-            self.penalized_loss_score = self.reml_score;
-        }
-        // Repair stale/degenerate periodic `n_harmonics` on load, matching the
-        // legacy Python `ManifoldSAE.from_dict` (which canonicalized `H<=0` from
-        // the trained decoder width via `_canonical_n_harmonics`) and the fit-path
-        // builder (`build_manifold_sae_payload`). Without this the from_dict/load
-        // path (`ManifoldSaeCore(dict)`) would drive OOS reconstruct/steer off a
-        // different periodic basis than the fit/save path for an older saved model
-        // carrying a stale `H`. Idempotent (canonical∘canonical == canonical), so a
-        // payload already carrying positive `H` — e.g. the golden fixture
-        // `n_harmonics=[2,0,0]` — is unchanged. Guarded on equal lengths so a
-        // malformed payload never silently truncates `n_harmonics`.
-        if self.basis_kinds.len() == self.n_harmonics.len()
-            && self.decoder_blocks.len() == self.n_harmonics.len()
-        {
-            let decoder_widths: Vec<i64> =
-                self.decoder_blocks.iter().map(|b| b.len() as i64).collect();
-            self.n_harmonics = crate::manifold::manifold_sae_coercion::canonical_n_harmonics(
-                &self.basis_kinds,
-                &self.n_harmonics,
-                &decoder_widths,
-            );
-        }
-    }
-
-    /// Serialize to the `to_dict` schema, writing `reml_score` as the duplicate
-    /// alias of `penalized_loss_score`.
     pub(crate) fn to_json(&self) -> Result<String, String> {
-        let mut out = self.clone();
-        out.reml_score = out.penalized_loss_score;
-        serde_json::to_string(&out).map_err(|e| format!("ManifoldSAE.to_json: {e}"))
+        serde_json::to_string(self).map_err(|e| format!("ManifoldSAE.to_json: {e}"))
     }
 }
 
@@ -318,45 +331,28 @@ mod manifold_sae_payload_serde_tests {
         );
     }
 
-    /// `reml_score` is a duplicate alias; a legacy dict carrying only `reml_score`
-    /// recovers `penalized_loss_score` from it, and the re-serialized payload
-    /// emits both keys with the same value.
     #[test]
-    fn reml_score_alias_falls_back_and_is_reduplicated() {
+    fn missing_optional_valued_field_is_rejected() {
         let mut golden = load_value("golden_full.json");
-        let obj = golden.as_object_mut().unwrap();
-        let score = obj.get("penalized_loss_score").cloned().unwrap();
-        assert!(!score.is_null(), "fixture must carry a non-null score");
-        obj.remove("penalized_loss_score");
-        let raw = serde_json::to_string(&golden).unwrap();
-        let out: Value = serde_json::from_str(&roundtrip_json(&raw).unwrap()).unwrap();
-        assert_eq!(out["penalized_loss_score"], score);
-        assert_eq!(out["reml_score"], score);
+        golden.as_object_mut().unwrap().remove("fisher_factors");
+        let error = roundtrip_json(&serde_json::to_string(&golden).unwrap()).unwrap_err();
+        assert!(error.contains("missing field \"fisher_factors\""), "{error}");
     }
 
-    /// `structured_residual_diagnostics` is write-dropped: a payload that carries
-    /// it still loads, but the re-serialized payload never emits it.
     #[test]
-    fn structured_residual_diagnostics_is_write_dropped_read_tolerated() {
+    fn runtime_diagnostics_round_trip_in_schema() {
         let mut golden = load_value("golden_full.json");
-        assert!(
-            golden.get("structured_residual_diagnostics").is_none(),
-            "golden fixture must not carry the write-dropped key"
-        );
         golden.as_object_mut().unwrap().insert(
             "structured_residual_diagnostics".to_string(),
             serde_json::json!([{"pass": 0, "lambda_hat": 0.5}]),
         );
         let raw = serde_json::to_string(&golden).unwrap();
         let out: Value = serde_json::from_str(&roundtrip_json(&raw).unwrap()).unwrap();
-        assert!(
-            out.get("structured_residual_diagnostics").is_none(),
-            "round-trip must not re-emit the write-dropped key"
-        );
+        assert_eq!(out["structured_residual_diagnostics"], golden["structured_residual_diagnostics"]);
     }
 
     #[test]
-    fn crosscoder_layout_and_reports_round_trip_in_v2() {
+    fn crosscoder_layout_and_reports_round_trip_in_v3() {
         let mut payload = load_value("golden_full.json");
         payload.as_object_mut().unwrap().insert(
             "crosscoder".to_string(),
@@ -376,8 +372,6 @@ mod manifold_sae_payload_serde_tests {
         assert_eq!(round_tripped["crosscoder"], payload["crosscoder"]);
     }
 
-    /// A non-`v1` schema tag is rejected with the same message shape as the
-    /// Python `from_dict` guard.
     #[test]
     fn wrong_schema_tag_is_rejected() {
         let mut golden = load_value("golden_full.json");
@@ -391,6 +385,17 @@ mod manifold_sae_payload_serde_tests {
             err.contains("unsupported schema"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        let mut golden = load_value("golden_full.json");
+        golden
+            .as_object_mut()
+            .unwrap()
+            .insert("legacy_alias".to_string(), Value::Null);
+        let error = roundtrip_json(&serde_json::to_string(&golden).unwrap()).unwrap_err();
+        assert!(error.contains("unknown field"), "{error}");
     }
 
     #[test]

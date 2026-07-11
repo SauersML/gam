@@ -6568,12 +6568,8 @@ fn sae_manifold_from_fit_payload(
 
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
 /// serde schema (`ManifoldSaePayload`, issue #2091) and return the re-serialized
-/// payload. This is the load-bearing `to_dict`/`from_dict` seam moving into Rust:
-/// it enforces the `"gamfit.ManifoldSAE/v2"` schema tag, the
-/// `penalized_loss_score`/`reml_score` write-alias, and the write-dropped
-/// `structured_residual_diagnostics` asymmetry. The Python facade will delegate
-/// its save/load round-trip here at cutover; an unsupported schema or malformed
-/// payload raises `ValueError` with the same message the Python guard produced.
+/// payload. The v3 boundary is exact: all fields are required, runtime
+/// diagnostics are persisted, and unknown/deprecated keys are rejected.
 #[pyfunction(signature = (payload_json))]
 fn sae_manifold_payload_roundtrip(payload_json: &str) -> PyResult<String> {
     crate::manifold::manifold_sae_payload::roundtrip_json(payload_json).map_err(py_value_error)
@@ -7068,8 +7064,7 @@ impl ManifoldSaeCore {
 impl ManifoldSaeCore {
     /// Construct from a `ManifoldSAE.to_dict()` payload dict. The dict is
     /// serialized (it is already JSON-able — lists, not numpy) and validated
-    /// through `ManifoldSaePayload::from_json`, enforcing the schema tag and the
-    /// `penalized_loss_score`/`reml_score` fallback.
+    /// through the strict `ManifoldSaePayload::from_json` schema.
     #[new]
     fn new(py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<Self> {
         let json_mod = py.import("json")?;
@@ -7103,9 +7098,7 @@ impl ManifoldSaeCore {
         Self::from_json(py, &payload_json)
     }
 
-    /// Re-serialize to the `to_dict` schema as a Python dict (through the serde
-    /// round-trip: `reml_score` re-duplicated, `structured_residual_diagnostics`
-    /// dropped).
+    /// Re-serialize the complete v3 artifact as a Python dict.
     fn to_dict(&self, py: Python<'_>) -> PyResult<PyObject> {
         let json_str = self.inner.to_json().map_err(py_value_error)?;
         let value: serde_json::Value =
@@ -7680,11 +7673,6 @@ impl ManifoldSaeCore {
     /// The honest penalized-loss score (`None` for closed-form payloads).
     #[getter]
     fn penalized_loss_score(&self) -> Option<f64> {
-        self.inner.penalized_loss_score
-    }
-    /// Deprecated read alias for [`Self::penalized_loss_score`] (#1231).
-    #[getter]
-    fn reml_score(&self) -> Option<f64> {
         self.inner.penalized_loss_score
     }
     #[getter]

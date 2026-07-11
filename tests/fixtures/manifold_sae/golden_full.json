@@ -820,7 +820,7 @@
     ]
   ],
   "max_iter": 42,
-  "metric_provenance": "OutputFisher",
+  "metric_provenance": "OutputFisherDownstream",
   "n_harmonics": [
     2,
     0,
@@ -839,12 +839,11 @@
   ],
   "random_state": 7,
   "reconstruction_r2": 0.8123,
-  "reml_score": -37.5,
   "residual_gauge": {
     "generators": [],
     "group_signature": "SO(2)"
   },
-  "schema": "gamfit.ManifoldSAE/v2",
+  "schema": "gamfit.ManifoldSAE/v3",
   "selected_log_ard": [
     [
       0.1
@@ -874,6 +873,7 @@
   },
   "sparsity_strength": 1.3,
   "structure_certificate": "{\"alpha\": 0.1, \"entries\": [{\"kind\": \"NonConstant\", \"log_e\": 3.4, \"steps\": 2, \"confirmed\": true}]}",
+  "structured_residual_diagnostics": [],
   "tau": 0.4,
   "top_k": 2,
   "top_k_projection": {
@@ -893,8 +893,7 @@
       }
     ]
   },
-  "training_data": null,
-  "training_data_retained": false,
+  "termination": null,
   "training_mean": [
     0.4,
     0.65,
