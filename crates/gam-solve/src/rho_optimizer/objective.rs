@@ -284,12 +284,13 @@ pub trait OuterObjective {
     /// accepted waypoint.
     fn commit_reactive_domain_waypoint(
         &mut self,
-        _rho: &Array1<f64>,
+        rho: &Array1<f64>,
     ) -> Result<(), EstimationError> {
-        Err(EstimationError::RemlOptimizationFailed(
-            "objective supplied a reactive-domain scalar contract but cannot commit a waypoint"
-                .to_string(),
-        ))
+        Err(EstimationError::RemlOptimizationFailed(format!(
+            "objective supplied a reactive-domain scalar contract but cannot commit a waypoint \
+             (rho_dim={})",
+            rho.len(),
+        )))
     }
 
     /// Restore the full accepted state saved by
