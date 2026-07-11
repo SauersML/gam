@@ -28,7 +28,7 @@ use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverag
 const N_TRAIN: usize = 150;
 const N_REPLICATIONS: usize = 200;
 const ALPHAS: [f64; 3] = [0.01, 0.05, 0.10];
-const SEED: u64 = 0x1891_5_M17_5_1_9E;
+const SEED: u64 = 0x1891_5A17_51A9_E;
 
 const CLASS_LO: &str = "lo";
 const CLASS_HI: &str = "hi";
