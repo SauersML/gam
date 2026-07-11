@@ -5467,18 +5467,37 @@ impl SaeManifoldTerm {
                 } else {
                     (step.step * warm_growth).min(step_size)
                 };
-                // LM ridge adaptation (see the loop-top note): a clean full-step
-                // acceptance means the (possibly damped) Gauss–Newton step did not
-                // overshoot, so relax the damping toward Gauss–Newton; a
-                // backtracked acceptance is direct overshoot evidence, so increase
-                // the damping for the next iterate. Geometric, floored at the
-                // caller's ridges, using the existing growth constant.
-                if clean_acceptance {
-                    lm_ridge_t = (lm_ridge_t / SAE_MANIFOLD_ROW_RIDGE_GROWTH).max(ridge_ext_coord);
-                    lm_ridge_b = (lm_ridge_b / SAE_MANIFOLD_ROW_RIDGE_GROWTH).max(ridge_beta);
-                } else {
-                    lm_ridge_t *= SAE_MANIFOLD_ROW_RIDGE_GROWTH;
-                    lm_ridge_b *= SAE_MANIFOLD_ROW_RIDGE_GROWTH;
+                // True Levenberg–Marquardt gain-ratio ridge adaptation (a
+                // trust-region on the RIDGE, not the step length). The gain ratio
+                //   ρ = actual decrease / model-predicted decrease
+                // measures how well the local quadratic model predicted the step:
+                // ρ ≈ 1 ⇒ the model is trustworthy ⇒ RELAX toward Gauss–Newton;
+                // ρ small ⇒ the GN step overshot the nonlinear objective ⇒ GROW the
+                // ridge to bend toward gradient descent. A middle HOLD band lets
+                // the ridge settle at the damping the problem needs instead of
+                // oscillating — the fixed-floor version un-damped on every clean
+                // step and re-overshot, so it only reduced the crawl. Predicted
+                // decrease along the accepted step α·Δ is α·d − ½α²·ΔᵀHΔ, with
+                // d = directional_decrease (= −gᵀΔ > 0) and, for the LM step
+                // (H+λI)Δ = −g, ΔᵀHΔ = d − λ‖Δ‖² (λ the β-block ridge). Standard
+                // 0.25/0.75 trust-region thresholds; factor 4 the standard
+                // aggressive LM step (Marquardt / Nocedal–Wright Alg. 4.1, inverted
+                // for the ridge↔radius reciprocal). Floored at the caller's ridges.
+                const LM_RATIO_LOW: f64 = 0.25;
+                const LM_RATIO_HIGH: f64 = 0.75;
+                const LM_RIDGE_FACTOR: f64 = 4.0;
+                let alpha = step.step;
+                let actual = pre_step_total - step.value;
+                let d_th_d = (directional_decrease - lm_ridge_b * step_norm_sq).max(0.0);
+                let predicted =
+                    (alpha * directional_decrease - 0.5 * alpha * alpha * d_th_d).max(0.0);
+                let gain_ratio = if predicted > 0.0 { actual / predicted } else { 1.0 };
+                if gain_ratio < LM_RATIO_LOW {
+                    lm_ridge_t *= LM_RIDGE_FACTOR;
+                    lm_ridge_b *= LM_RIDGE_FACTOR;
+                } else if gain_ratio > LM_RATIO_HIGH {
+                    lm_ridge_t = (lm_ridge_t / LM_RIDGE_FACTOR).max(ridge_ext_coord);
+                    lm_ridge_b = (lm_ridge_b / LM_RIDGE_FACTOR).max(ridge_beta);
                 }
             }
             if !accepted {
