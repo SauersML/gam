@@ -1505,6 +1505,16 @@ impl SaeManifoldTerm {
             }
             raw_gauges.push(gauge);
         }
+        // #2253: everything pushed above comes from `dense_step_gauge_vectors`
+        // — the closed-form CHART gauge orbit (circle/torus phase, and the
+        // translation/scale orbits of the linear/euclidean/duchon/poincaré
+        // patches). These are EXACT criterion symmetries (global motion +
+        // decoder compensation), flat by construction, unlike the empirical
+        // decoder-null candidates admitted below (which the Rayleigh floor
+        // exists to screen). Remember the boundary so the exact-gauge subspace
+        // can be deflated UNCONDITIONALLY, keeping the deflation COUNT stable
+        // across the ρ-walk.
+        let n_exact_raw = raw_gauges.len();
         // #1051/#1273: admit the penalty-aware decoder-β null directions as
         // additional deflation candidates. A rank-deficient decoder design
         // (e.g. a euclidean-1D line in a p=2 ambient: decoder column rank 1 of
@@ -1551,7 +1561,11 @@ impl SaeManifoldTerm {
         }
 
         let mut gauge_span: Vec<Array1<f64>> = Vec::new();
-        for mut gauge in raw_gauges {
+        // Exact chart gauges (raw indices `< n_exact_raw`) are processed first,
+        // so their Gram-Schmidt survivors occupy the FRONT of `gauge_span`;
+        // `exact_basis_count` records that contiguous prefix.
+        let mut exact_basis_count = 0usize;
+        for (raw_idx, mut gauge) in raw_gauges.into_iter().enumerate() {
             for basis in &gauge_span {
                 let coeff = gauge.dot(basis);
                 for i in 0..gauge.len() {
@@ -1565,6 +1579,9 @@ impl SaeManifoldTerm {
             let inv_norm = norm_sq.sqrt().recip();
             for value in gauge.iter_mut() {
                 *value *= inv_norm;
+            }
+            if raw_idx < n_exact_raw {
+                exact_basis_count += 1;
             }
             gauge_span.push(gauge);
         }
@@ -1631,6 +1648,36 @@ impl SaeManifoldTerm {
                 let coeff = evecs[[basis_idx, eig_idx]];
                 for row in 0..full_len {
                     direction[row] += coeff * gauge_span[basis_idx][row];
+                }
+            }
+            let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
+            if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
+                continue;
+            }
+            let inv_norm = norm_sq.sqrt().recip();
+            for value in direction.iter_mut() {
+                *value *= inv_norm;
+            }
+            orthonormal.push(direction);
+        }
+        // #2253: deflate the EXACT chart-gauge subspace unconditionally. A
+        // borderline gauge eigenvalue can flicker across `strict_gauge_floor`
+        // as ρ moves; for the empirical decoder-null candidates that screen is
+        // the point, but for the exact chart gauges (circle/torus phase orbit,
+        // patch translation/scale) it changes the deflation COUNT by ±1 and
+        // re-anchors ½log|H|, desyncing the fixed-ρ criterion gradient from the
+        // value (the K=1 circle non-stationary stall). The exact-gauge subspace
+        // is `gauge_span[0..exact_basis_count]` (flat by construction); add any
+        // of its directions the floor loop dropped, orthogonalized against what
+        // was already kept, so the deflation dimension is ρ-stable. When the
+        // floor already kept a gauge, its residual here is ~0 and it is not
+        // double-counted.
+        for exact_idx in 0..exact_basis_count {
+            let mut direction = gauge_span[exact_idx].clone();
+            for kept in &orthonormal {
+                let coeff = direction.dot(kept);
+                for row in 0..direction.len() {
+                    direction[row] -= coeff * kept[row];
                 }
             }
             let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
