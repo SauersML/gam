@@ -24,7 +24,7 @@ use super::tests::{deterministic_circle_noise, global_ev};
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
-use gam_solve::rho_optimizer::{OuterObjective, OuterProblem};
+use gam_solve::rho_optimizer::{OuterEvalOrder, OuterObjective, OuterProblem};
 use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
@@ -287,6 +287,114 @@ fn two_circle_periodic_term(
         SaeManifoldTerm::new(atoms, assignment).unwrap(),
         seed_dispersion,
     )
+}
+
+/// #2080 — a reactive legal entry must replace a nonzero but invalid cold
+/// dictionary with a separated data-derived basin before asking for evidence.
+/// The old zero-decoder gate skipped this production-shaped seed because both
+/// independently fitted decoders had material norm; the fixed-ρ entry then spent
+/// its whole refinement budget unwinding their double fit and never reached KKT.
+#[test]
+fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
+    let z = two_circle_wide_target(48, 24, 0.03);
+    let k = 2usize;
+    let (term, seed_dispersion) = two_circle_periodic_term(z.view(), k, 2);
+    let seed_norms: Vec<f64> = term
+        .atoms
+        .iter()
+        .map(|atom| {
+            atom.decoder_coefficients
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt()
+        })
+        .collect();
+    assert!(
+        seed_norms.iter().all(|norm| norm.is_finite() && *norm > 0.0),
+        "regression requires the nonzero decoder seed that bypassed the old cold-entry placement; norms={seed_norms:?}"
+    );
+
+    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+        .unwrap();
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, z.clone(), None, init_rho, 8, 0.04, 1.0e-6, 1.0e-6);
+    let contract = OuterObjective::reactive_domain_scalar_contract(&objective)
+        .expect("reactive scalar contract query")
+        .expect("dense K=2 objective must own a reactive scalar contract");
+    let entry_rho = OuterObjective::outer_domain_upper_bound(&objective)
+        .expect("reactive rho entry query")
+        .expect("dense K=2 objective must own a reactive rho entry");
+
+    OuterObjective::begin_reactive_domain_waypoint(&mut objective)
+        .expect("entry transaction must begin");
+    OuterObjective::install_reactive_domain_scalar_state(&mut objective, contract.entry())
+        .expect("separated legal entry must install");
+
+    // The target's two factors occupy disjoint output parities. The objective-
+    // owned entry placement may swap atom labels, but the two decoders must
+    // specialize to opposite parities instead of both carrying the full target.
+    let mut even_dominant = Vec::with_capacity(k);
+    for atom in &objective.term.atoms {
+        let mut even_energy = 0.0_f64;
+        let mut odd_energy = 0.0_f64;
+        for ((_, output), value) in atom.decoder_coefficients.indexed_iter() {
+            if output % 2 == 0 {
+                even_energy += value * value;
+            } else {
+                odd_energy += value * value;
+            }
+        }
+        assert!(
+            even_energy.is_finite()
+                && odd_energy.is_finite()
+                && (even_energy > 0.0 || odd_energy > 0.0)
+                && even_energy != odd_energy,
+            "entry decoder must carry a finite, parity-identifiable factor; even={even_energy:.6e}, odd={odd_energy:.6e}"
+        );
+        even_dominant.push(even_energy > odd_energy);
+    }
+    assert_ne!(
+        even_dominant[0], even_dominant[1],
+        "entry placement must put the two planted factors on distinct atoms; parity dominance={even_dominant:?}"
+    );
+
+    let entry_eval = OuterObjective::eval_with_order(
+        &mut objective,
+        &entry_rho,
+        OuterEvalOrder::Value,
+    )
+    .expect("separated legal entry must solve to finite evidence");
+    assert!(
+        entry_eval.cost.is_finite(),
+        "separated legal entry returned non-finite evidence {}",
+        entry_eval.cost
+    );
+    OuterObjective::commit_reactive_domain_waypoint(&mut objective, &entry_rho)
+        .expect("finite entry must commit its full converged state");
+
+    // Reassemble the exact committed entry and independently recheck the same
+    // strict raw-or-quotient KKT predicate that authorizes REML evidence. A
+    // finite value alone cannot satisfy this regression.
+    let committed_rho = objective.current_rho.clone();
+    let system = objective
+        .term
+        .assemble_arrow_schur(z.view(), &committed_rho, None)
+        .expect("committed entry KKT assembly");
+    let raw_kkt_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
+    let raw_kkt = raw_kkt_sq.sqrt();
+    let quotient_kkt = objective.term.quotient_gradient_norm_from_system(
+        &system,
+        raw_kkt_sq,
+        &committed_rho.lambda_smooth_vec(),
+    );
+    let tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * objective.term.inner_iterate_scale();
+    assert!(
+        SaeManifoldTerm::evidence_kkt_stationary(raw_kkt, quotient_kkt, tolerance),
+        "committed legal entry is not a strict envelope root: raw KKT={raw_kkt:.6e}, quotient KKT={quotient_kkt:.6e}, tolerance={tolerance:.6e}"
+    );
 }
 
 /// Drive the full outer `OuterProblem::run` path on a wide two-circle fixture and

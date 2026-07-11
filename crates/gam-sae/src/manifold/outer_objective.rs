@@ -4203,6 +4203,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .mode
             .set_temperature(state.assignment_temperature)
             .map_err(EstimationError::RemlOptimizationFailed)?;
+        let installing_entry = state.bitwise_eq(contract.entry());
         let restoring_target = state.bitwise_eq(contract.target());
         // A private inner schedule must not advance or overwrite any coupled
         // waypoint, including the exact s=0 solve. The literal baseline schedule
@@ -4210,6 +4211,36 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.term.temperature_schedule = None;
         if let Some(registry) = self.registry.as_mut() {
             registry.set_isometry_scalar_weights(&state.isometry_weights);
+        }
+        if installing_entry {
+            if self.reactive_waypoint_checkpoint.is_none() {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "reactive scalar entry placement requires an active full-state waypoint transaction"
+                        .to_string(),
+                ));
+            }
+            // The literal seed was already evaluated before the runner opened
+            // this repair path and its REML evidence was undefined. Do not carry
+            // that invalid basin into the supposedly legal entry merely because
+            // its decoder coefficients are nonzero: a common cold seed fits every
+            // atom independently to the full target, so summing those decoders is
+            // badly off-model and the ordinary zero-decoder cold-start detector
+            // cannot recognize it. At the exact diffuse/heavy-smoothing endpoint,
+            // install the objective's data-derived disjoint chart + sequential
+            // decoder placement. Periodic atoms use the certified joint ISA split
+            // when the measure supports it and the residual-PCA peel otherwise.
+            // This mutation is inside the waypoint's full-state transaction: a
+            // failed entry rolls back every coordinate, logit, decoder, frame, and
+            // scalar; an accepted entry commits the separated basin that warms the
+            // next coupled waypoint. Finite literal seeds never open this path,
+            // and later accepted warm waypoints are not reinitialized.
+            self.term
+                .seed_cold_start_disjoint_charts(self.target.view())
+                .map_err(|err| {
+                    EstimationError::RemlOptimizationFailed(format!(
+                        "reactive scalar entry could not install its separated legal basin: {err}"
+                    ))
+                })?;
         }
         self.probe_converged_handoff = None;
         self.basin_bundle.clear();

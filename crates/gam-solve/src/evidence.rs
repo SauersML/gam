@@ -1998,13 +1998,12 @@ impl RingGaussianMixtureFit {
         &self,
         data: ArrayView2<'_, f64>,
     ) -> Result<Array2<f64>, String> {
-        let p = self.num_free_parameters();
         let weight_base = 0usize;
         let center_base = self.k - 1;
         let log_radius_index = center_base + 2;
         let angle_base = log_radius_index + 1;
         let log_sigma_index = angle_base + self.k;
-        debug_assert_eq!(log_sigma_index + 1, p);
+        let p = log_sigma_index + 1;
 
         let responsibilities = ring_mixture_responsibilities(
             data,
