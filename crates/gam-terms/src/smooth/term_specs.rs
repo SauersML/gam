@@ -680,7 +680,6 @@ pub enum ByVariableSpec {
     Level { value_bits: u64, label: String },
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ByVarKind {
     Numeric {
@@ -881,10 +880,7 @@ impl SmoothTerm {
                 p_local,
             );
         }
-        Ok(gam_linalg::faer_ndarray::fast_ab(
-            &x_new_raw,
-            &rot.rotation,
-        ))
+        Ok(gam_linalg::faer_ndarray::fast_ab(&x_new_raw, &rot.rotation))
     }
 
     /// Dimension of the **joint** null space of this term's active penalties:
@@ -1973,10 +1969,7 @@ impl BlockwisePenalty {
         }
     }
 
-    pub fn with_prior_mean(
-        mut self,
-        prior_mean: gam_problem::CoefficientPriorMean,
-    ) -> Self {
+    pub fn with_prior_mean(mut self, prior_mean: gam_problem::CoefficientPriorMean) -> Self {
         self.prior_mean = prior_mean;
         self
     }
@@ -2044,10 +2037,7 @@ impl BlockwisePenalty {
 
     /// Convert into a blockwise [`gam_problem::PenaltyMatrix`] without
     /// expanding to full dimensions.
-    pub fn to_penalty_matrix(
-        &self,
-        total_dim: usize,
-    ) -> gam_problem::PenaltyMatrix {
+    pub fn to_penalty_matrix(&self, total_dim: usize) -> gam_problem::PenaltyMatrix {
         gam_problem::PenaltyMatrix::Blockwise {
             local: self.local.clone(),
             col_range: self.col_range.clone(),
@@ -2320,7 +2310,10 @@ mod joint_unpenalized_dim_tests {
             0
         );
         // With a single non-materialized penalty, fall back to its own null dim.
-        assert_eq!(joint_unpenalized_dim(4, std::slice::from_ref(&factor), &[2]), 2);
+        assert_eq!(
+            joint_unpenalized_dim(4, std::slice::from_ref(&factor), &[2]),
+            2
+        );
     }
 }
 
@@ -3099,7 +3092,10 @@ pub fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_id
         return false;
     }
     !matches!(
-        resolvedspec.smooth_terms.get(term_idx).map(|term| &term.basis),
+        resolvedspec
+            .smooth_terms
+            .get(term_idx)
+            .map(|term| &term.basis),
         Some(SmoothBasisSpec::Duchon { .. })
     )
 }
@@ -3143,7 +3139,10 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
         })
 }
 
-pub fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+pub fn spatial_term_supports_hyper_optimization(
+    spec: &TermCollectionSpec,
+    term_idx: usize,
+) -> bool {
     // Ordinary penalized thin-plate regression splines do not have an
     // identifiable kernel scale once REML is already learning the smoothing
     // penalty. Treat the resolved length scale as fixed geometry; enrolling a
@@ -3272,7 +3271,8 @@ pub const MEASURE_JET_PSI_LN_TAU_BOUNDS: (f64, f64) = (-18.420680743952367, 4.60
 /// only when the spec explicitly enrolls the learned representer range. Absolute
 /// (not seed-relative) so the bound producer needs no data view, matching the
 /// other dial boxes. `ln(1e-3) = -6.9077…`, `ln(1e2) = 4.6051…`.
-pub const MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS: (f64, f64) = (-6.907755278982137, 4.605170185988092);
+pub const MEASURE_JET_PSI_LN_LENGTH_SCALE_BOUNDS: (f64, f64) =
+    (-6.907755278982137, 4.605170185988092);
 
 /// Number of multiscale PENALTY dials (excluding the design-moving ℓ):
 /// multiscale (per-scale spectral) mode carries (α, lnτ) = 2 — the order is
@@ -3323,7 +3323,10 @@ pub fn measure_jet_psi_seed(mj: &crate::basis::MeasureJetBasisSpec) -> Vec<f64> 
 
 /// One end of the per-coordinate dial boxes, in producer coordinate order
 /// (ℓ first when enrolled, then the multiscale penalty dials).
-pub fn measure_jet_psi_bound_values(mj: &crate::basis::MeasureJetBasisSpec, upper: bool) -> Vec<f64> {
+pub fn measure_jet_psi_bound_values(
+    mj: &crate::basis::MeasureJetBasisSpec,
+    upper: bool,
+) -> Vec<f64> {
     let pick = |b: (f64, f64)| if upper { b.1 } else { b.0 };
     let mut bounds = Vec::with_capacity(measure_jet_psi_dim(mj));
     if measure_jet_learns_length_scale(mj) {
@@ -3549,7 +3552,9 @@ pub fn all_spatial_terms_kappa_fixed(spec: &TermCollectionSpec) -> bool {
     })
 }
 
-pub fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {
+pub fn spatial_identifiability_policy(
+    termspec: &SmoothTermSpec,
+) -> Option<&SpatialIdentifiability> {
     match &termspec.basis {
         SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.identifiability),
         SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.identifiability),
@@ -3590,7 +3595,6 @@ pub const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 /// nearly collinear with the polynomial nullspace, so the kernel range is
 /// capped here to keep the basis geometry well-conditioned.
 pub const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
-
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
@@ -3931,10 +3935,7 @@ pub fn set_spatial_aniso_log_scales(
 /// Call this after building the smooth design but before initializing the
 /// optimizer's psi coordinates. For each spatial term whose metadata contains
 /// computed `aniso_log_scales`, this writes them into the spec.
-pub fn sync_aniso_contrasts_from_metadata(
-    spec: &mut TermCollectionSpec,
-    design: &SmoothDesign,
-) {
+pub fn sync_aniso_contrasts_from_metadata(spec: &mut TermCollectionSpec, design: &SmoothDesign) {
     for (term_idx, term) in design.terms.iter().enumerate() {
         let meta_aniso = match &term.metadata {
             BasisMetadata::Matern {
@@ -4190,12 +4191,15 @@ pub fn assemble_term_collection_design_matrix(
     let block_op = BlockDesignOperator::new(blocks).map_err(|e| {
         BasisError::InvalidInput(format!("failed to build block design operator: {e}"))
     })?;
-    Ok(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-        Arc::new(block_op),
-    )))
+    Ok(DesignMatrix::Dense(
+        gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(block_op)),
+    ))
 }
 
-pub fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f64>, BasisError> {
+pub fn select_columns(
+    data: ArrayView2<'_, f64>,
+    cols: &[usize],
+) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p = data.ncols();
     for &c in cols {
@@ -4564,7 +4568,12 @@ fn feature_columns_rotation_invariant_range(
     let centroid: Vec<f64> = cols
         .iter()
         .map(|&c| {
-            let mut vals: Vec<f64> = data.column(c).iter().copied().filter(|v| v.is_finite()).collect();
+            let mut vals: Vec<f64> = data
+                .column(c)
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .collect();
             vals.sort_by(f64::total_cmp);
             let m = vals.len().max(1) as f64;
             vals.iter().sum::<f64>() / m
@@ -5362,8 +5371,7 @@ pub fn build_tensor_bspline_basis(
     let mut marginal_degrees = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
-    let mut marginal_function_grams =
-        Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    let mut marginal_function_grams = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     // Per-margin effective period: either user-set via `spec.periods` or
     // implied by a `PeriodicUniform` marginal knotspec (which the 1D B-spline
@@ -6133,7 +6141,8 @@ pub fn build_random_effect_block(
     // is a legitimate absent column, so we do not gate that path. `frozen_levels`
     // presence marks the predict/frozen context; at fit the vocabulary is
     // derived from this very data, so no row is unseen.
-    let strict_unseen = !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
+    let strict_unseen =
+        !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
     for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);
@@ -6183,7 +6192,10 @@ mod random_effect_signed_zero_tests {
         // that single group column — the #2145 fit-side regression.
         let data = array![[-0.0_f64], [0.0], [1.0], [-0.0], [1.0]];
         let block = build_random_effect_block(data.view(), &spec()).unwrap();
-        assert_eq!(block.num_groups, 2, "0.0/-0.0 must not split into two groups");
+        assert_eq!(
+            block.num_groups, 2,
+            "0.0/-0.0 must not split into two groups"
+        );
         // Rows 0,1,3 are the same group; rows 2,4 the other.
         assert_eq!(block.group_ids[0], block.group_ids[1]);
         assert_eq!(block.group_ids[0], block.group_ids[3]);
@@ -6199,7 +6211,11 @@ mod random_effect_signed_zero_tests {
         s.frozen_levels = Some(vec![0.0_f64.to_bits(), 1.0_f64.to_bits()]);
         let data = array![[-0.0_f64], [1.0]];
         let block = build_random_effect_block(data.view(), &s).unwrap();
-        assert_eq!(block.group_ids[0], Some(0), "-0.0 must match the +0.0 column");
+        assert_eq!(
+            block.group_ids[0],
+            Some(0),
+            "-0.0 must match the +0.0 column"
+        );
         assert_eq!(block.group_ids[1], Some(1));
     }
 
@@ -6211,7 +6227,11 @@ mod random_effect_signed_zero_tests {
         s.frozen_levels = Some(vec![(-0.0_f64).to_bits(), 1.0_f64.to_bits()]);
         let data = array![[0.0_f64], [1.0]];
         let block = build_random_effect_block(data.view(), &s).unwrap();
-        assert_eq!(block.group_ids[0], Some(0), "+0.0 must match the -0.0 column");
+        assert_eq!(
+            block.group_ids[0],
+            Some(0),
+            "+0.0 must match the -0.0 column"
+        );
     }
 
     // ---- #2137: fixed factor (`factor(g)`) strict-unseen enforcement --------
@@ -6237,8 +6257,14 @@ mod random_effect_signed_zero_tests {
         let err = build_random_effect_block(data.view(), &s)
             .expect_err("an unseen fixed-factor level must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("unseen level"), "message must name the defect: {msg}");
-        assert!(msg.contains("1999"), "message must name the integer level (not 1999.0): {msg}");
+        assert!(
+            msg.contains("unseen level"),
+            "message must name the defect: {msg}"
+        );
+        assert!(
+            msg.contains("1999"),
+            "message must name the integer level (not 1999.0): {msg}"
+        );
         assert!(msg.contains("year"), "message must name the column: {msg}");
     }
 
@@ -6278,7 +6304,10 @@ mod random_effect_signed_zero_tests {
         let block = build_random_effect_block(data.view(), &s)
             .expect("a random effect tolerates unseen levels");
         assert_eq!(block.group_ids[0], Some(0));
-        assert_eq!(block.group_ids[1], None, "unseen level → population mean, not a reject");
+        assert_eq!(
+            block.group_ids[1], None,
+            "unseen level → population mean, not a reject"
+        );
     }
 }
 
@@ -7893,13 +7922,16 @@ pub fn build_single_local_smooth_term(
             let mut dense = Array2::<f64>::zeros((n, p * l_minus_one));
             for i in 0..n {
                 let bits = gam_data::canonical_level_bits(data[[i, *by_col]]);
-                let level_idx = canon_levels.iter().position(|b| *b == bits).ok_or_else(|| {
-                    BasisError::InvalidInput(format!(
-                        "sum-to-zero factor smooth term '{}' saw an unseen level at row {}",
-                        term.name,
-                        i + 1
-                    ))
-                })?;
+                let level_idx = canon_levels
+                    .iter()
+                    .position(|b| *b == bits)
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "sum-to-zero factor smooth term '{}' saw an unseen level at row {}",
+                            term.name,
+                            i + 1
+                        ))
+                    })?;
                 if level_idx < l_minus_one {
                     let start = level_idx * p;
                     dense
@@ -7962,25 +7994,26 @@ pub fn build_single_local_smooth_term(
             // `which_level ∈ 0..=l_minus_one`: `< l_minus_one` selects the single
             // free deviation block; `== l_minus_one` selects the reference-level
             // coupling block.
-            let stz_per_group_penalty = |s_inner: &Array2<f64>, which_level: usize| -> Array2<f64> {
-                let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
-                if which_level < l_minus_one {
-                    // (e_k e_kᵀ) ⊗ S: a single diagonal block.
-                    let k = which_level;
-                    let mut block = s_big.slice_mut(s![k * p..(k + 1) * p, k * p..(k + 1) * p]);
-                    block.assign(s_inner);
-                } else {
-                    // (11ᵀ) ⊗ S: every block (diagonal and off-diagonal) is S.
-                    for a in 0..l_minus_one {
-                        for b in 0..l_minus_one {
-                            let mut block =
-                                s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
-                            block.assign(s_inner);
+            let stz_per_group_penalty =
+                |s_inner: &Array2<f64>, which_level: usize| -> Array2<f64> {
+                    let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
+                    if which_level < l_minus_one {
+                        // (e_k e_kᵀ) ⊗ S: a single diagonal block.
+                        let k = which_level;
+                        let mut block = s_big.slice_mut(s![k * p..(k + 1) * p, k * p..(k + 1) * p]);
+                        block.assign(s_inner);
+                    } else {
+                        // (11ᵀ) ⊗ S: every block (diagonal and off-diagonal) is S.
+                        for a in 0..l_minus_one {
+                            for b in 0..l_minus_one {
+                                let mut block =
+                                    s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                                block.assign(s_inner);
+                            }
                         }
                     }
-                }
-                s_big
-            };
+                    s_big
+                };
             // One nullspace-dim entry per emitted penalty (must stay parallel to
             // `penalties`). Each per-group wiggliness block carries the marginal's
             // OWN nullity (a rank-`p` block touching a single level for the free
@@ -7990,7 +8023,11 @@ pub fn build_single_local_smooth_term(
             for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
                 let info_idx = active_penalty_indices[penalty_pos];
                 let base_info = inner_built.penaltyinfo[info_idx].clone();
-                let marginal_nullity = inner_built.nullspaces.get(penalty_pos).copied().unwrap_or(0);
+                let marginal_nullity = inner_built
+                    .nullspaces
+                    .get(penalty_pos)
+                    .copied()
+                    .unwrap_or(0);
                 // Emit `L` independent per-level blocks for this marginal penalty.
                 for which_level in 0..=l_minus_one {
                     let raw = stz_per_group_penalty(s_inner, which_level);
@@ -8090,7 +8127,8 @@ pub fn build_single_local_smooth_term(
                 }
             }
             inner_built.dim = p * l_minus_one;
-            inner_built.design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense));
+            inner_built.design =
+                DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense));
             inner_built.penalties = penalties;
             inner_built.ops = vec![None; inner_built.penalties.len()];
             inner_built.nullspaces = nullspaces;
@@ -8218,8 +8256,7 @@ pub fn build_single_local_smooth_term(
                     // standardization (`scales == None`) replay does not compensate,
                     // so the realized value is kept verbatim.
                     if let (Some(s), Some(realized)) = (scales.as_ref(), *length_scale) {
-                        let inv_sigma_geom =
-                            compensate_length_scale_for_standardization(1.0, s);
+                        let inv_sigma_geom = compensate_length_scale_for_standardization(1.0, s);
                         if inv_sigma_geom.is_finite() && inv_sigma_geom > 0.0 {
                             *length_scale = Some(realized / inv_sigma_geom);
                         }
@@ -8652,9 +8689,13 @@ pub fn build_single_local_smooth_term(
                     .map_err(BasisError::InvalidInput)?,
             ),
         };
-        let coeff_op = gam_linalg::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
-            .map_err(|e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")))?;
-        design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(coeff_op)));
+        let coeff_op =
+            gam_linalg::matrix::CoefficientTransformOperator::new(inner_dense, t.clone()).map_err(
+                |e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")),
+            )?;
+        design_t = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
+            coeff_op,
+        )));
         if penalties_t.len() != active_penaltyinfo_t.len() {
             crate::bail_invalid_basis!(
                 "internal box-reparam penalty/info mismatch for term '{}': penalties={}, infos={}",
@@ -8671,8 +8712,8 @@ pub fn build_single_local_smooth_term(
         // change and violate SPEC 5.
         let mut rebuilt = Vec::with_capacity(penalties_t.len());
         for s_local in &penalties_t {
-                let tt_s = fast_atb(&t, s_local);
-                rebuilt.push(fast_ab(&tt_s, &t));
+            let tt_s = fast_atb(&t, s_local);
+            rebuilt.push(fast_ab(&tt_s, &t));
         }
         penalties_t = rebuilt;
         // T^T S T (and the rebuilt γ-space ridge) invalidate op-form
@@ -8889,7 +8930,8 @@ pub fn build_smooth_design_withworkspace_unvalidated(
                     .try_to_dense_by_chunks("joint-null absorption rotation")
                     .map_err(BasisError::InvalidInput)?;
                 let rotated = gam_linalg::faer_ndarray::fast_ab(&dense, q);
-                built.design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(rotated));
+                built.design =
+                    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(rotated));
                 built.penalties = built
                     .penalties
                     .into_iter()

@@ -3,10 +3,7 @@
 use faer::Accum;
 use faer::Par;
 use faer::linalg::matmul::matmul;
-use gam_linalg::faer_ndarray::{
-    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut,
-    effective_global_parallelism, fast_atv, fast_av, stream_weighted_crossprod_into,
-};
+use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_atv, fast_av};
 use gam_linalg::matrix::{DenseDesignOperator, LinearOperator};
 use gam_problem::Gauge;
 use gam_runtime::resource::MatrixMaterializationError;
@@ -14,7 +11,7 @@ use ndarray::{Array1, Array2, ArrayViewMut2, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 
@@ -70,10 +67,6 @@ pub struct ChunkedKernelDesignOperator<K: SpatialKernelEvaluator> {
     poly_basis: Option<Arc<Array2<f64>>>,
     n: usize,
     total_cols: usize,
-    /// One-time-materialized [K_eff | poly] block, populated on first hot use.
-    /// Only allocated when the dense block fits within the materialization budget;
-    /// reused across all PIRLS iterations and outer-seed evaluations.
-    materialized: OnceLock<Option<Arc<Array2<f64>>>>,
 }
 
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
@@ -121,58 +114,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             poly_basis,
             n,
             total_cols: k_eff + poly_cols,
-            materialized: OnceLock::new(),
         })
-    }
-
-    /// Maximum bytes we are willing to spend on the one-shot materialized
-    /// [K_eff | poly] block. The lazy operator was originally selected because
-    /// the *initial* fit-time allocation budget was tight, but once PIRLS is
-    /// running we will pay the kernel-evaluation cost on every iteration unless
-    /// we cache the result. 1 GB is generous enough to cover large-scale
-    /// dense Duchon / TPS (n = 320k, p = 117 → ~300 MiB) while still rejecting
-    /// pathological dense kernels.
-    const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
-
-    /// Get-or-build the materialized [K_eff | poly] dense block.  Returns
-    /// `None` when the block would exceed `MATERIALIZE_MAX_BYTES`; in that
-    /// case callers must fall back to row-chunked evaluation.
-    ///
-    /// Implementation note: the build path runs `par_chunks_mut` inside
-    /// `kernel_chunk`, so we deliberately compute *outside* the
-    /// `OnceLock`. Using `get_or_init` would hold the lock across that
-    /// nested rayon work, and any sibling rayon workers that reach
-    /// `get_or_init` while the build is in flight would park on the
-    /// `OnceLock`'s OS mutex — starving the build's nested `par_iter`
-    /// and deadlocking the whole pool (every worker in
-    /// `pthread_mutex_wait`, init thread in `pthread_cond_wait`,
-    /// 0% CPU). See `feedback_oncelock_rayon_deadlock`. Computing
-    /// without the lock costs at most one redundant build per racing
-    /// caller — `OnceLock::set` discards losers; `get` after `set`
-    /// always observes the winning value regardless of who won.
-    fn materialized_combined(&self) -> Option<&Array2<f64>> {
-        if let Some(slot) = self.materialized.get() {
-            return slot.as_ref().map(|a| a.as_ref());
-        }
-        let bytes = self
-            .n
-            .checked_mul(self.total_cols)
-            .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
-        let computed = match bytes {
-            Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                Some(Arc::new(self.build_row_chunk_combined(0..self.n)))
-            }
-            _ => None,
-        };
-        if self.materialized.set(computed).is_err() {
-            return self
-                .materialized
-                .get()
-                .and_then(|opt| opt.as_ref().map(|a| a.as_ref()));
-        }
-        self.materialized
-            .get()
-            .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
     }
 
     /// Evaluate kernel block for a range of rows, then restrict it through the
@@ -225,9 +167,6 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         self.total_cols
     }
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        if let Some(combined) = self.materialized_combined() {
-            return fast_av(combined, vector);
-        }
         let k_eff = self
             .kernel_gauge
             .as_ref()
@@ -249,9 +188,6 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         result
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        if let Some(combined) = self.materialized_combined() {
-            return fast_atv(combined, vector);
-        }
         let k_eff = self
             .kernel_gauge
             .as_ref()
@@ -274,25 +210,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
     }
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         let p = self.total_cols;
-        // [STAGE] kernel-xtwx: prefer the one-shot materialized [K_eff | poly]
-        // block + faer streaming GEMM.  This is the BLAS-3 path that beats
-        // the per-iteration kernel rebuild by an order of magnitude on dense
-        // Duchon / TPS designs.
-        if let Some(combined) = self.materialized_combined() {
-            let mut xtwx = Array2::<f64>::zeros((p, p));
-            stream_weighted_crossprod_into(
-                combined,
-                weights,
-                &mut xtwx,
-                CrossprodStructure::Full,
-                CrossprodAccum::Replace,
-                effective_global_parallelism(),
-            );
-            return Ok(xtwx);
-        }
-        // Fallback: design too large to materialize.  Run row chunks in
-        // parallel, each thread folding into its own p×p accumulator and
-        // performing one BLAS-3 GEMM (Xc^T·(W·Xc)) per chunk.
+        // The basis router chose this operator because the dense design was not
+        // admitted. Preserve that decision and accumulate XᵀWX from bounded
+        // row chunks instead of hiding a second, operator-local dense cache.
         let n = self.n;
         if n == 0 || p == 0 {
             return Ok(Array2::<f64>::zeros((p, p)));
@@ -336,19 +256,9 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
 }
 
 impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
-    /// Combined row chunk: [kernel_chunk | poly_chunk]. Reuses the cached
-    /// materialization when available to avoid recomputing kernel evaluations.
+    /// Build a combined row chunk `[kernel_chunk | poly_chunk]` without ever
+    /// materializing the full design.
     pub(crate) fn row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
-        if let Some(combined) = self.materialized_combined() {
-            return combined.slice(s![rows, ..]).to_owned();
-        }
-        self.build_row_chunk_combined(rows)
-    }
-
-    /// Build a combined row chunk from scratch, bypassing the cache. Used by
-    /// `row_chunk_combined` on a cache miss and by `materialized_combined`'s
-    /// initializer (which must avoid re-entering the OnceLock).
-    fn build_row_chunk_combined(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_eff = self
             .kernel_gauge
@@ -368,11 +278,11 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
 }
 
 impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOperator<K> {
-    /// Expose the cached [K_eff | poly] materialization so cross-block paths
-    /// can use the Dense × Dense BLAS-3 fast path instead of falling back to
-    /// chunked scalar accumulation.
+    /// A chunked kernel design never exposes an implicit full-design cache.
+    /// Callers that explicitly accept densification must go through the
+    /// governed `DenseDesignMatrix` materialization APIs.
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
-        self.materialized_combined()
+        None
     }
 
     fn row_chunk_into(
@@ -385,18 +295,11 @@ impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOpera
                 context: "ChunkedKernelDesignOperator::row_chunk_into shape mismatch",
             });
         }
-        if let Some(combined) = self.materialized_combined() {
-            out.assign(&combined.slice(s![rows, ..]));
-        } else {
-            out.assign(&self.row_chunk_combined(rows));
-        }
+        out.assign(&self.row_chunk_combined(rows));
         Ok(())
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        if let Some(combined) = self.materialized_combined() {
-            return combined.clone();
-        }
         self.row_chunk_combined(0..self.n)
     }
 }
@@ -471,7 +374,7 @@ mod chunked_kernel_operator_tests {
         assert_eq!(chunk[[1, 1]], 1.5);
     }
     #[test]
-    fn chunked_kernel_operator_exposes_cached_dense_to_block_dispatch() {
+    fn chunked_kernel_operator_never_exposes_an_implicit_dense_cache() {
         let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5], [2.0, -1.0]]);
         let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0]]);
         let kernel =
@@ -483,15 +386,11 @@ mod chunked_kernel_operator_tests {
         let dense_design = DenseDesignMatrix::from(Arc::new(op));
 
         let probe = Array1::from_elem(3, 1.0);
-        let warmed = dense_design.apply_transpose(&probe);
-        assert_eq!(warmed.len(), expected.ncols());
-
-        let dense_ref = dense_design
-            .as_dense_ref()
-            .expect("DenseDesignMatrix::as_dense_ref must reach the cached kernel block");
-        assert_eq!(dense_ref.dim(), expected.dim());
-        for ((r, c), v) in expected.indexed_iter() {
-            assert!((dense_ref[[r, c]] - v).abs() < 1e-12);
-        }
+        let applied = dense_design.apply_transpose(&probe);
+        assert_eq!(applied, expected.t().dot(&probe));
+        assert!(
+            dense_design.as_dense_ref().is_none(),
+            "chunked kernel operations must not warm a hidden full-design cache"
+        );
     }
 }

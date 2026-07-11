@@ -3103,7 +3103,6 @@ pub fn build_smooth_basis(
             if !centers_explicit && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 centers = centers.max(polynomial_cols + 4);
             }
-            let center_strategy = duchon_center_strategy(centers, cols.len(), !centers_explicit);
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
             } else {
@@ -3136,6 +3135,26 @@ pub fn build_smooth_basis(
                     axes[0] = Some(maxv - minv);
                 }
             }
+            let boundary = if cols.len() == 1 {
+                let c = cols[0];
+                let (minv, maxv) = col_minmax(ds.values.column(c))?;
+                parse_cyclic_boundary(options, minv, maxv)?
+            } else {
+                OneDimensionalBoundary::Open
+            };
+            let is_periodic = periodic
+                .as_ref()
+                .is_some_and(|axes| axes.iter().any(Option::is_some))
+                || matches!(boundary, OneDimensionalBoundary::Cyclic { .. });
+            let center_strategy = if is_periodic {
+                if centers_explicit {
+                    spatial_center_strategy_for_dimension(centers, cols.len())
+                } else {
+                    auto_spatial_center_strategy(centers, cols.len())
+                }
+            } else {
+                duchon_center_strategy(centers, cols.len(), !centers_explicit)
+            };
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
@@ -3148,13 +3167,7 @@ pub fn build_smooth_basis(
                         .map_err(|e| e.to_string())?,
                     aniso_log_scales,
                     operator_penalties,
-                    boundary: if cols.len() == 1 {
-                        let c = cols[0];
-                        let (minv, maxv) = col_minmax(ds.values.column(c))?;
-                        parse_cyclic_boundary(options, minv, maxv)?
-                    } else {
-                        OneDimensionalBoundary::Open
-                    },
+                    boundary,
                     radial_reparam: None,
                 },
                 input_scales: None,

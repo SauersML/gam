@@ -3145,21 +3145,15 @@ pub struct CoefficientTransformOperator {
     transform: Arc<Array2<f64>>,
     n: usize,
     p_out: usize,
-    /// One-time-materialized X · T dense block, populated on first hot use.
-    /// Only allocated when the n × p_out block fits within MATERIALIZE_MAX_BYTES;
-    /// reused across all PIRLS iterations and outer-seed evaluations. Without
-    /// this cache, `BlockDesignOperator::cross_block` (used by per-iter
-    /// curvature builds) calls `row_chunk_into` repeatedly, each time
-    /// re-running `fast_ab(inner_chunk, transform)` — measured ~3.7 s / iter
-    /// at large-scale duchon60 shape (n=320 K, p_out=42 effective) for a single
-    /// `update_with_curvature`, all of it allocations + chunked GEMM.
+    /// One-time-materialized X · T dense block for an already-materialized
+    /// inner design. An operator-backed inner has already been routed to a
+    /// bounded-memory representation, so it must never populate this cache.
     materialized: OnceLock<Option<Arc<Array2<f64>>>>,
 }
 
 impl CoefficientTransformOperator {
-    /// Maximum bytes for the one-shot X · T materialization. 1 GiB is generous
-    /// enough to cover large-scale (n = 320 K, p_out = 42 → ~107 MiB) and
-    /// rejects pathological designs. Matches ChunkedKernelDesignOperator.
+    /// Maximum bytes for the one-shot X · T materialization of an
+    /// already-materialized inner design.
     const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
     pub fn new(inner: DenseDesignMatrix, transform: Array2<f64>) -> Result<Self, String> {
@@ -3182,52 +3176,32 @@ impl CoefficientTransformOperator {
         })
     }
 
-    /// Get-or-build the materialized X · T dense block. Returns `None` when
-    /// either the X·T product exceeds the operator's local cap *or* when the
-    /// inner design refuses dense materialization under the cache-local
-    /// policy (the cache owns the densified block's lifetime, so it gates
-    /// the inner densification on the same `MATERIALIZE_MAX_BYTES` budget
-    /// rather than falling back to the conservative library default).  In
-    /// either case callers fall back to per-chunk evaluation; the cache is
-    /// best-effort optimization, not a hard requirement, so a refusal must
-    /// never panic — the streaming `row_chunk_into` / `apply` paths still
-    /// work.
-    /// Same OnceLock-under-rayon hazard as
-    /// `ChunkedKernelDesignOperator::materialized_combined`: the inner
-    /// `try_to_dense_arc_with_policy` may dispatch parallel work
-    /// (kernel-evaluation chunks, BLAS GEMM via faer's rayon pool, etc.),
-    /// so we compute outside the lock and write with `set`. See
-    /// `feedback_oncelock_rayon_deadlock`.
+    /// Get-or-build the materialized X · T dense block. Operator-backed
+    /// inputs return `None` unconditionally: a coefficient transform preserves
+    /// the inner design's lazy storage decision instead of bypassing it through
+    /// an unrelated local byte ceiling.
     fn materialized_combined(&self) -> Option<&Array2<f64>> {
         if let Some(slot) = self.materialized.get() {
             return slot.as_ref().map(|a| a.as_ref());
+        }
+        if self.inner.is_operator_backed() {
+            if self.materialized.set(None).is_err() {
+                return self
+                    .materialized
+                    .get()
+                    .and_then(|opt| opt.as_ref().map(|a| a.as_ref()));
+            }
+            return None;
         }
         let bytes = self
             .n
             .checked_mul(self.p_out)
             .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
         let computed = match bytes {
-            Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                // Auto-strict at large-scale shape: even though the cache's
-                // own MATERIALIZE_MAX_BYTES budget would admit this
-                // block, refuse densification when the operator's
-                // outer shape says we're in strict territory. Falls
-                // through to streaming row_chunk_into / apply paths.
-                let auto_policy =
-                    ResourcePolicy::for_problem(gam_runtime::resource::ProblemHints::default());
-                let cache_policy = ResourcePolicy {
-                    max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
-                    derivative_storage_mode: auto_policy.derivative_storage_mode,
-                    ..ResourcePolicy::default_library()
-                };
-                self.inner
-                    .try_to_dense_arc_with_policy(
-                        "CoefficientTransformOperator materialization",
-                        &cache_policy,
-                    )
-                    .ok()
-                    .map(|x| Arc::new(fast_ab(x.as_ref(), &self.transform)))
-            }
+            Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => self
+                .inner
+                .as_dense_ref()
+                .map(|x| Arc::new(fast_ab(x, &self.transform))),
             _ => None,
         };
         if self.materialized.set(computed).is_err() {
@@ -3333,8 +3307,8 @@ impl DenseDesignOperator for CoefficientTransformOperator {
 /// `inner_chunk · V_b` and then subtracts `anchor_chunk · r_block` for every
 /// anchor pair. The combined `n × kept` block is cached via `OnceLock` under
 /// the same `MATERIALIZE_MAX_BYTES = 1 GiB` ceiling as
-/// [`CoefficientTransformOperator`], so streaming consumers fall back to
-/// per-chunk evaluation when the materialisation would exceed budget.
+/// [`CoefficientTransformOperator`] only when every input is already
+/// materialized. Any operator-backed input keeps the result row-chunked.
 pub struct ResidualisedDesignOperator {
     inner: DenseDesignMatrix,
     transform: Arc<Array2<f64>>,
@@ -3345,9 +3319,8 @@ pub struct ResidualisedDesignOperator {
 }
 
 impl ResidualisedDesignOperator {
-    /// Matches `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`: 1 GiB
-    /// covers large-scale shapes (n=320 K, p_out≈40 → ~100 MiB) and rejects
-    /// pathological designs.
+    /// Matches `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES` for
+    /// already-materialized inputs.
     const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
     pub fn new(
@@ -3392,14 +3365,23 @@ impl ResidualisedDesignOperator {
         })
     }
 
-    /// Get-or-build the cached n × p_out materialised block. Mirrors
-    /// [`CoefficientTransformOperator::materialized_combined`]: computed
-    /// outside the lock to avoid the OnceLock+rayon deadlock pattern, with
-    /// the per-cache 1 GiB byte cap routed through a relaxed policy so the
-    /// inner densification is admitted on the cache's own budget.
+    /// Get-or-build the cached n × p_out materialised block. A lazy inner or
+    /// anchor returns `None` so residualisation cannot reverse an upstream
+    /// bounded-memory routing decision.
     fn materialized_combined(&self) -> Option<&Array2<f64>> {
         if let Some(slot) = self.materialized.get() {
             return slot.as_ref().map(|a| a.as_ref());
+        }
+        if self.inner.is_operator_backed()
+            || self.anchors.iter().any(|(anchor, _)| anchor.is_operator_backed())
+        {
+            if self.materialized.set(None).is_err() {
+                return self
+                    .materialized
+                    .get()
+                    .and_then(|opt| opt.as_ref().map(|a| a.as_ref()));
+            }
+            return None;
         }
         let bytes = self
             .n
@@ -6469,6 +6451,26 @@ mod tests {
     }
 
     #[test]
+    fn coefficient_transform_operator_preserves_lazy_inner_storage() {
+        let inner_values = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let transform = array![[0.5, -1.0], [1.0, 0.25]];
+        let expected = inner_values.dot(&transform);
+        let DesignMatrix::Dense(inner) = no_densify_design(inner_values) else {
+            panic!("no-densify fixture must be dense-operator-backed");
+        };
+        let op = CoefficientTransformOperator::new(inner, transform)
+            .expect("coefficient transform operator");
+        let dense_design = DenseDesignMatrix::from(Arc::new(op));
+
+        let probe = Array1::from_elem(2, 1.0);
+        assert_eq!(dense_design.apply(&probe), expected.dot(&probe));
+        assert!(
+            dense_design.as_dense_ref().is_none(),
+            "coefficient transform must not materialize an operator-backed inner design"
+        );
+    }
+
+    #[test]
     fn design_matrix_hstack_preserves_lazy_blocks() {
         let left_dense = array![[1.0, 2.0], [3.0, 4.0]];
         let right_dense = array![[5.0], [6.0]];
@@ -7140,6 +7142,27 @@ mod tests {
         for i in 0..3 {
             assert!((got[i] - expected[i]).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn residualised_design_operator_preserves_lazy_inner_storage() {
+        let inner_values = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let DesignMatrix::Dense(inner) = no_densify_design(inner_values.clone()) else {
+            panic!("no-densify fixture must be dense-operator-backed");
+        };
+        let transform = Array2::<f64>::eye(2);
+        let anchor = DesignMatrix::from(Array2::<f64>::zeros((3, 1)));
+        let r_block = Arc::new(Array2::<f64>::zeros((1, 2)));
+        let op = ResidualisedDesignOperator::new(inner, transform, vec![(anchor, r_block)])
+            .expect("residualised operator constructs");
+        let dense_design = DenseDesignMatrix::from(Arc::new(op));
+
+        let probe = array![0.25, -0.5];
+        assert_eq!(dense_design.apply(&probe), inner_values.dot(&probe));
+        assert!(
+            dense_design.as_dense_ref().is_none(),
+            "residualised transform must not materialize an operator-backed inner design"
+        );
     }
 
     /// Two-block case with a shared column: build raw A and B that overlap

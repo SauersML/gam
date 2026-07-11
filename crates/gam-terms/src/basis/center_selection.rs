@@ -527,6 +527,22 @@ pub(crate) fn select_uniform_grid_centers(
 mod tests {
     use super::*;
 
+    #[test]
+    fn one_dimensional_uniform_grid_is_the_interval_minimax_mesh() {
+        let data = Array2::from_shape_vec((5, 1), vec![-3.0, -2.4, -0.1, 1.7, 3.0])
+            .expect("one-dimensional fixture");
+        let centers = select_uniform_grid_centers(data.view(), 4).expect("uniform centers");
+
+        assert_eq!(centers.column(0).to_vec(), vec![-3.0, -1.0, 1.0, 3.0]);
+        let gaps: Vec<f64> = centers
+            .column(0)
+            .windows(2)
+            .into_iter()
+            .map(|window| window[1] - window[0])
+            .collect();
+        assert_eq!(gaps, vec![2.0, 2.0, 2.0]);
+    }
+
     /// Deterministic 2-D scatter with a clear, off-axis anisotropy so the
     /// principal axis is well separated from both coordinate axes. A small
     /// lattice perturbed by a reproducible pseudo-random jitter; no RNG crate
