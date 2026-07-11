@@ -60,7 +60,7 @@
 //! [`SaeManifoldTerm::merge_tiers`] and runs a SINGLE frozen (`inner_max_iter ==
 //! 0`, the #850 freeze) arrow-Schur pass — evaluate-don't-optimize — to read the
 //! joint Laplace evidence at the converged point without moving β. That freeze is
-//! already exposed by [`SaeManifoldTerm::reml_criterion`] at `inner_max_iter ==
+//! already exposed by [`SaeManifoldTerm::penalized_laml_criterion`] at `inner_max_iter ==
 //! 0`, so no new `frozen_evaluate` primitive is needed; [`frozen_joint_evidence`]
 //! is the thin, named wrapper this module and its callers use.
 //!
@@ -355,7 +355,7 @@ pub fn frozen_joint_evidence(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<(f64, SaeManifoldLoss), String> {
-    term.reml_criterion(
+    term.penalized_laml_criterion(
         target,
         rho,
         registry,

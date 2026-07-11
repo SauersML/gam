@@ -149,11 +149,7 @@ impl OrderedBetaBernoulliPenalty {
     }
 
     /// `da_k/d rho` for `rho = log(alpha / alpha_base)`.
-    fn column_beta_shape_rho_deriv(
-        &self,
-        alpha: f64,
-        mu: ArrayView1<'_, f64>,
-    ) -> Array1<f64> {
+    fn column_beta_shape_rho_deriv(&self, alpha: f64, mu: ArrayView1<'_, f64>) -> Array1<f64> {
         Array1::from_shape_fn(self.k_max, |k| {
             let m = mu[k];
             let dmu = m * ((k + 1) as f64) / (alpha + 1.0);
@@ -208,8 +204,7 @@ impl OrderedBetaBernoulliPenalty {
                     a,
                     score: -digamma(active_arg) + digamma(inactive_arg),
                     score_derivative: -trigamma(active_arg) - trigamma(inactive_arg),
-                    score_second_derivative: -tetragamma(active_arg)
-                        + tetragamma(inactive_arg),
+                    score_second_derivative: -tetragamma(active_arg) + tetragamma(inactive_arg),
                 }
             })
             .collect();
@@ -359,8 +354,7 @@ impl OrderedBetaBernoulliPenalty {
                     continue;
                 }
                 let zk = z[start + k];
-                out[start + k] =
-                    self.weight * d_score[k] * w_i * zk * (1.0 - zk) / self.tau;
+                out[start + k] = self.weight * d_score[k] * w_i * zk * (1.0 - zk) / self.tau;
             }
         }
         out
@@ -393,8 +387,8 @@ impl OrderedBetaBernoulliPenalty {
                 let jac = zk * (1.0 - zk) * inv_tau;
                 let u = w_i * jac;
                 let curvature = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
-                out[start + k] = self.weight
-                    * (d_score_derivative[k] * u * u + d_score[k] * w_i * curvature);
+                out[start + k] =
+                    self.weight * (d_score_derivative[k] * u * u + d_score[k] * w_i * curvature);
             }
         }
         out
@@ -460,12 +454,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
                     continue;
                 }
                 let zk = z[start + k];
-                out[start + k] = self.weight
-                    * columns[k].score
-                    * w_i
-                    * zk
-                    * (1.0 - zk)
-                    / self.tau;
+                out[start + k] = self.weight * columns[k].score * w_i * zk * (1.0 - zk) / self.tau;
             }
         }
         out
@@ -496,8 +485,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
                 let u = w_i * jac;
                 let curvature = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
                 out[start + k] = self.weight
-                    * (columns[k].score_derivative * u * u
-                        + columns[k].score * w_i * curvature);
+                    * (columns[k].score_derivative * u * u + columns[k].score * w_i * curvature);
             }
         }
         Some(out)
@@ -566,8 +554,8 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
             if self.column_is_fixed(k) {
                 continue;
             }
-            let d_l_da = -1.0 / column.a - digamma(column.mass + column.a)
-                + digamma(n_eff + column.a + 1.0);
+            let d_l_da =
+                -1.0 / column.a - digamma(column.mass + column.a) + digamma(n_eff + column.a + 1.0);
             gradient += d_l_da * da_col[k];
         }
         Array1::from_vec(vec![self.weight * gradient])
@@ -616,8 +604,7 @@ fn tetragamma(mut x: f64) -> f64 {
     }
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    acc - inv2 - inv2 * inv - 0.5 * inv2 * inv2 + inv2.powi(3) / 6.0
-        - inv2.powi(4) / 6.0
+    acc - inv2 - inv2 * inv - 0.5 * inv2 * inv2 + inv2.powi(3) / 6.0 - inv2.powi(4) / 6.0
         + 3.0 * inv2.powi(5) / 10.0
         - 5.0 * inv2.powi(6) / 6.0
 }

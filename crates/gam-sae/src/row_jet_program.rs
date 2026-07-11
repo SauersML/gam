@@ -62,7 +62,7 @@ pub const SAE_FIXED_COORD_SLOT: usize = usize::MAX;
 
 /// The gate nonlinearity `ζ(ℓ)` of the SAE assignment, as the row program sees
 /// it. The production term carries the same two smooth branches (softmax over a
-/// shared partition; per-atom IBP/JumpReLU sigmoid); the program reproduces the
+/// shared partition; per-atom independent sigmoid); the program reproduces the
 /// branch the criterion evaluates so the value channel is the production gate.
 #[derive(Debug, Clone, Copy)]
 pub enum RowGate {
@@ -70,8 +70,8 @@ pub enum RowGate {
     /// `ζ_k(ℓ) = softmax_k(ℓ · inv_tau)`.
     Softmax { inv_tau: f64 },
     /// Per-atom independent logistic gate `ζ_k(ℓ_k) = σ((ℓ_k − shift_k)·inv_tau)`
-    /// — the IBP-MAP / JumpReLU smooth activation (the per-atom `shift_k`
-    /// folds the IBP stick-breaking offset or the JumpReLU threshold). Each
+    /// — the ordered Beta--Bernoulli / threshold-gate activation (the per-atom
+    /// `shift_k` carries the threshold-gate center). Each
     /// gate depends only on its own logit, so the gate Hessian is diagonal.
     PerAtomLogistic { inv_tau: f64 },
 }
@@ -186,12 +186,8 @@ pub struct SaeReconstructionRowProgram {
     pub gate_value: Vec<f64>,
     /// Current gate logits `ℓ_k` at the row.
     pub logits: Vec<f64>,
-    /// Per-atom multiplicative scale for independent logistic gates. This is
-    /// the IBP stick-breaking prior `π_k` for IBP-MAP, `1` for active JumpReLU,
-    /// and `0` for JumpReLU rows at/below the hard threshold. Unused for
-    /// softmax.
-    pub gate_scale: Vec<f64>,
-    /// Per-atom logistic shift (IBP offset / JumpReLU threshold); unused for
+    /// Per-atom logistic shift (zero for ordered Beta--Bernoulli, the smooth
+    /// threshold center for threshold-gate); unused for
     /// softmax.
     pub gate_shift: Vec<f64>,
     /// The gate nonlinearity.
@@ -305,7 +301,7 @@ impl SaeReconstructionRowProgram {
                     let ex = x.exp();
                     ex.mul(&recip(&one.add(&ex)))
                 };
-                sigma.scale(self.gate_scale[atom])
+                sigma
             }
         }
     }
@@ -1586,7 +1582,6 @@ mod tests {
             atoms: vec![mk_atom(0.0), mk_atom(1.0)],
             gate_value,
             logits,
-            gate_scale: vec![1.0, 1.0],
             gate_shift: vec![0.0, 0.0],
             gate: RowGate::Softmax { inv_tau },
             logit_slot: vec![Some(0), Some(1)],
@@ -1672,7 +1667,6 @@ mod tests {
             atoms,
             gate_value,
             logits,
-            gate_scale: vec![1.0; n_atoms],
             gate_shift: vec![0.0; n_atoms],
             gate: RowGate::Softmax { inv_tau },
             logit_slot,
@@ -1713,7 +1707,6 @@ mod tests {
         let mut program = softmax_fixture_k(9, 1, 3, 5, 1.3);
         program.gate = RowGate::PerAtomLogistic { inv_tau: 1.3 };
         program.gate_shift.fill(0.0);
-        program.gate_scale.fill(1.0);
         for atom in 0..program.logits.len() {
             program.gate_value[atom] = 1.0 / (1.0 + (-1.3 * program.logits[atom]).exp());
         }
@@ -2139,7 +2132,6 @@ mod tests {
             }],
             gate_value: vec![sigma],
             logits: vec![logit],
-            gate_scale: vec![1.0],
             gate_shift: vec![shift],
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],
@@ -2194,7 +2186,6 @@ mod tests {
             // gate_value is the reported (active) gate: fixed for atom 0.
             gate_value: vec![fixed_val, sigma_free],
             logits: vec![3.0, free_logit],
-            gate_scale: vec![1.0, 1.0],
             gate_shift: vec![0.0, free_shift],
             gate: RowGate::PerAtomLogistic { inv_tau },
             // Layout: logit slots 0,1; coord slots 2,3.
@@ -2452,7 +2443,6 @@ mod tests {
                 atoms: vec![mk_atom(0.0), mk_atom(1.0)],
                 gate_value,
                 logits,
-                gate_scale: vec![1.0, 1.0],
                 gate_shift: vec![0.0, 0.0],
                 gate: RowGate::Softmax { inv_tau },
                 logit_slot: vec![Some(0), Some(1)],
@@ -2567,7 +2557,6 @@ mod tests {
             }],
             gate_value: vec![0.6],
             logits: vec![0.6],
-            gate_scale: vec![1.0],
             gate_shift: vec![0.2],
             gate: RowGate::PerAtomLogistic { inv_tau },
             logit_slot: vec![Some(0)],

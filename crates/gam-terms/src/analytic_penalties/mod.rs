@@ -99,7 +99,7 @@
 //! |-----------|-------------|----------------------|
 //! | Isometry  | ext-coord (latent t) | 1 (log μ_iso)        |
 //! | Sparsity  | β or ext-coord       | 1 (strength) [+1 ε]  |
-//! | IBP       | ext-coord (logits)   | 0 or 1 (log α)       |
+//! | Ordered Beta--Bernoulli | ext-coord (logits) | 0 or 1 (log α) |
 //! | ARD       | ext-coord (latent t) | d (one per axis)     |
 //! | TV        | ext-coord (latent t) | 0 or 1 (log μ_tv)    |
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |

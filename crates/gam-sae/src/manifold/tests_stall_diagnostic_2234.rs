@@ -72,7 +72,7 @@ fn logdet_audit_point(
     registry: Option<&AnalyticPenaltyRegistry>,
     inner_max_iter: usize,
 ) -> Result<LogdetAuditPoint, String> {
-    let (criterion_value, loss, cache) = term.reml_criterion_with_cache(
+    let (criterion_value, loss, cache) = term.penalized_laml_criterion_with_cache(
         target,
         rho,
         registry,
@@ -226,7 +226,7 @@ fn frozen_raw_logdet(
     registry: Option<&AnalyticPenaltyRegistry>,
 ) -> Result<f64, String> {
     let criterion_result =
-        term.reml_criterion_with_cache(target, rho, registry, 0, 0.05, 1.0e-6, 1.0e-6)?;
+        term.penalized_laml_criterion_with_cache(target, rho, registry, 0, 0.05, 1.0e-6, 1.0e-6)?;
     arrow_log_det_from_cache(&criterion_result.2)
         .ok_or_else(|| "frozen_raw_logdet: authoritative log determinant unavailable".to_string())
 }

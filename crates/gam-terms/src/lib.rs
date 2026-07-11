@@ -71,7 +71,7 @@ pub use analytic_penalties::{
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind,
     EdgeRestriction, FrozenAnalyticPenaltyOp, HarmonicRoughnessPenalty,
     IsometryDuchonRadialSource, IsometryPenalty, IsometryReference,
-    IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, NestedPrefixPenalty,
+    IvaeRidgeMeanGauge, MechanismSparsityPenalty, NestedPrefixPenalty, SmoothThresholdPenalty,
     NuclearNormPenalty, OrderedBetaBernoulliHessianDiagThirdChannels,
     OrderedBetaBernoulliPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyConcavity,

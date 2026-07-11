@@ -1063,8 +1063,8 @@ pub(crate) fn hash_analytic_penalty_kind(
             hasher.write_f64(p.weight);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
-        AnalyticPenaltyKind::JumpReLU(p) => {
-            hasher.write_str("jumprelu");
+        AnalyticPenaltyKind::SmoothThreshold(p) => {
+            hasher.write_str("smooth_threshold");
             hash_psi_slice(hasher, &p.target);
             hasher.write_usize(p.latent_dim);
             hash_array_view(hasher, p.thresholds.view());

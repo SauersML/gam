@@ -893,19 +893,19 @@ fn sae_single_planted_circle_embedded_isometry_fit_converges_795() {
     );
 }
 
-/// #2226 — `reml_criterion` must RANK the K=1 planted-circle inner fixed point
+/// #2226 — `penalized_laml_criterion` must RANK the K=1 planted-circle inner fixed point
 /// (return a finite Laplace value), not hard-refuse it. The inner solve reaches
 /// its numerical fixed point where the objective can no longer decrease, but the
 /// raw KKT gradient plateaus a couple of digits above the absolute iterate-scaled
 /// tolerance on some SIMD targets (NEON/arm64 vs AVX/x86 diverge on the float
 /// summation order). Before the affine-invariant Newton-decrement stationarity
 /// certificate, that plateau exhausted the refine budget and returned
-/// `reml_criterion: inner solve did not converge at fixed ρ` — the exact refusal
+/// `penalized_laml_criterion: inner solve did not converge at fixed ρ` — the exact refusal
 /// reported for `sae_manifold_fit(K=1, atom_topology="circle")` on macOS arm64.
 /// The Newton decrement ½λ² = −½gᵀΔ is affine-invariant, so the shared fixed
 /// point is accepted on both architectures.
 #[test]
-fn sae_k1_circle_reml_criterion_ranks_fixed_point_2226() {
+fn sae_k1_circle_penalized_laml_criterion_ranks_fixed_point_2226() {
     use super::tests::{
         PlantedCircleAssignmentMode, planted_circle_embedded, planted_circle_seed_term,
     };
@@ -922,7 +922,7 @@ fn sae_k1_circle_reml_criterion_ranks_fixed_point_2226() {
         planted_circle_seed_term(z.view(), PlantedCircleAssignmentMode::Softmax);
 
     // Isometry gauge ON — the same fixture as `..._795`, but exercised through
-    // the ρ-ranking `reml_criterion` (the path `sae_manifold_fit`'s outer BFGS
+    // the ρ-ranking `penalized_laml_criterion` (the path `sae_manifold_fit`'s outer BFGS
     // drives) rather than a single joint fit.
     let mut registry = AnalyticPenaltyRegistry::new();
     registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
@@ -935,10 +935,10 @@ fn sae_k1_circle_reml_criterion_ranks_fixed_point_2226() {
     // criterion must rank that stationary iterate instead of hard-refusing on an
     // absolute raw-gradient tolerance that is not reachable on every SIMD target.
     let (value, loss, _cache) = term
-        .reml_criterion_with_cache(z.view(), &rho, Some(&registry), 200, 0.04, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(z.view(), &rho, Some(&registry), 200, 0.04, 1.0e-6, 1.0e-6)
         .expect(
             "#2226: the K=1 planted-circle inner solve reaches a numerical fixed point; \
-             reml_criterion must rank that stationary iterate (affine-invariant Newton \
+             penalized_laml_criterion must rank that stationary iterate (affine-invariant Newton \
              decrement) instead of refusing on an unreachable absolute gradient tolerance",
         );
     assert!(
@@ -1000,7 +1000,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
             .ok();
         let (reml, _loss) = probe
             .term
-            .reml_criterion_with_refine_policy(
+            .penalized_laml_criterion_with_refine_policy(
                 target.view(),
                 &rho_state,
                 None,
@@ -1022,7 +1022,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
     );
 
     // Bare REML for the GRADIENT lane, computed on the SAME full-refine path
-    // (`reml_criterion_with_cache`, i.e. `refine_progress_extension = true`)
+    // (`penalized_laml_criterion_with_cache`, i.e. `refine_progress_extension = true`)
     // the gradient lane uses. The gradient lane must EQUAL this (it carries NO
     // consistency or collapse fold), so its (cost, ∇f) pair
     // describes one function — the #1206 contract for BFGS Armijo. (The
@@ -1039,7 +1039,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
             .ok();
         let (reml, _loss, _cache) = probe
             .term
-            .reml_criterion_with_cache(
+            .penalized_laml_criterion_with_cache(
                 target.view(),
                 &rho_state,
                 None,
@@ -1321,7 +1321,7 @@ fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() 
     for rho in &rho_grid {
         let mut probe = build_term();
         let Ok((reml, _loss)) =
-            probe.reml_criterion(target.view(), rho, None, 12, 1.0, 1.0e-4, 1.0e-4)
+            probe.penalized_laml_criterion(target.view(), rho, None, 12, 1.0, 1.0e-4, 1.0e-4)
         else {
             continue;
         };
@@ -1354,7 +1354,7 @@ fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() 
             .warm_start_latents_from_amortized_encoder(target.view(), rho)
             .ok();
         let Ok((cotrained, _loss, _consistency)) =
-            probe.reml_criterion_cotrained(target.view(), rho, None, 64, 1.0, 1.0e-4, 1.0e-4)
+            probe.penalized_laml_criterion_cotrained(target.view(), rho, None, 64, 1.0, 1.0e-4, 1.0e-4)
         else {
             continue;
         };
@@ -1940,20 +1940,14 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
         manifolds,
         AssignmentMode::threshold_gate(temperature, threshold),
     )
-    .expect("valid JumpReLU assignment");
+    .expect("valid smooth threshold assignment");
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
     let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
 
     let inv_tau = 1.0 / temperature;
     let sparsity = rho.log_lambda_sparse.exp();
-    let in_band = |logit: f64| {
-        crate::assignment::jumprelu_in_optimization_band(logit, threshold, temperature)
-    };
     // Exact, separately-certified Hessian diagonal P''(ℓ) as a function of ℓ.
     let p2 = |logit: f64| -> f64 {
-        if !in_band(logit) {
-            return 0.0;
-        }
         let a = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
         let s = a * (1.0 - a);
         sparsity * s * (1.0 - 2.0 * a) * inv_tau * inv_tau

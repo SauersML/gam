@@ -998,7 +998,7 @@ def fit(
         (:class:`gamfit.SoftmaxAssignmentSparsityPenalty`,
         :class:`gamfit.OrderedBetaBernoulliPenalty`,
         :class:`gamfit.TopKActivationPenalty`,
-        :class:`gamfit.JumpReLUPenalty`) and newer structured penalties such
+        :class:`gamfit.SmoothThresholdPenalty`) and newer structured penalties such
         as :class:`gamfit.ScadMcpPenalty` and
         :class:`gamfit.NuclearNormPenalty`. ``penalties=`` is not for smooth
         basis descriptors; pass those through ``smooths=``.

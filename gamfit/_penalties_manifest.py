@@ -37,9 +37,9 @@ PENALTY_MANIFEST = (
         "row_block_diagonal": True,
     },
     {
-        "kind": "jumprelu",
-        "rust": "JumpReLU:JumpReLUPenalty",
-        "python": "JumpReLUPenalty",
+        "kind": "smooth_threshold",
+        "rust": "SmoothThreshold:SmoothThresholdPenalty",
+        "python": "SmoothThresholdPenalty",
         "row_block_diagonal": True,
     },
     {

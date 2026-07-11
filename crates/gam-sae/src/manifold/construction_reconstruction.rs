@@ -581,7 +581,7 @@ impl SaeManifoldTerm {
             let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
             return Ok(self.shape_uncertainty_without_decoder_covariance(dispersion));
         }
-        let (_cost, loss, cache) = self.reml_criterion_with_cache(
+        let (_cost, loss, cache) = self.penalized_laml_criterion_with_cache(
             target,
             rho,
             registry,

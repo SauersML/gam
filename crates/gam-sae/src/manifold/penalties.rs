@@ -2474,7 +2474,7 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
         penalty,
         AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::TopKActivation(_)
-            | AnalyticPenaltyKind::JumpReLU(_)
+            | AnalyticPenaltyKind::SmoothThreshold(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::RowPrecisionPrior(_)
             | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
@@ -2513,7 +2513,7 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
 /// different dim (reshape to the wrong `(n_eff × d)`, index an out-of-range
 /// axis, or misalign a per-axis threshold / precision):
 /// [`AnalyticPenaltyKind::BlockOrthogonality`] (reshapes to `(n_eff × d)` and
-/// partitions a fixed axis set into groups), [`AnalyticPenaltyKind::JumpReLU`]
+/// partitions a fixed axis set into groups), [`AnalyticPenaltyKind::SmoothThreshold`]
 /// and [`AnalyticPenaltyKind::TopKActivation`] (per-axis thresholds / top-k
 /// across a fixed `latent_dim`), and the row-precision priors
 /// ([`AnalyticPenaltyKind::RowPrecisionPrior`],
@@ -2608,7 +2608,7 @@ pub fn sae_row_block_penalty_kinds() -> &'static [&'static str] {
     &[
         "ard",
         "top_k_activation",
-        "jumprelu",
+        "smooth_threshold",
         "sparsity",
         "row_precision_prior",
         "parametric_row_precision_prior",

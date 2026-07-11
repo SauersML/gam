@@ -5,28 +5,25 @@
 //! and routing admission, never reconstruction quality at a hand-selected alpha.
 
 use crate::assignment::{
-    AssignmentMode, AssignmentModeRequest, OrderedPriorSchedule, admit_assignment_mode_for_size,
-    default_ordered_beta_bernoulli_concentration_for_k_atoms, ordered_prior_means,
+    AssignmentMode, AssignmentModeRequest, admit_assignment_mode_for_size,
+    default_ordered_beta_bernoulli_concentration_for_k_atoms,
 };
 
 #[test]
 fn k_aware_ibp_prior_spans_large_dictionary_without_capping_forward_gate() {
     let k = 128usize;
     let alpha = default_ordered_beta_bernoulli_concentration_for_k_atoms(k);
-    let prior = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
+    let ratio = alpha / (alpha + 1.0);
 
     // The closed form chooses alpha so the final ordered prior mean is e^-1.
     let expected_tail = (-1.0_f64).exp();
-    assert!((prior[k - 1] - expected_tail).abs() <= 1.0e-12);
-    for atom in 1..k {
-        assert!(prior[atom - 1] > prior[atom]);
-    }
+    assert!((ratio.powi(k as i32) - expected_tail).abs() <= 1.0e-12);
+    assert!(ratio > 0.0 && ratio < 1.0);
 
     // This is a prior-strength invariant only. The reconstructed gate is the
     // independent posterior mean sigmoid(logit/tau), so no atom is structurally
     // unable to reach one because of its index.
-    let legacy = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha: 1.0 });
-    assert!(legacy[k - 1] < 1.0e-30);
+    assert!(0.5_f64.powi(k as i32) < 1.0e-30);
 }
 
 #[test]

@@ -14,7 +14,7 @@
 //! # The decomposition
 //!
 //! The SAE Laplace/REML criterion the outer optimizer minimizes is, exactly as
-//! `SaeManifoldTerm::reml_criterion_with_cache` assembles it,
+//! `SaeManifoldTerm::penalized_laml_criterion_with_cache` assembles it,
 //!
 //! ```text
 //!   V(ρ) = [ loss.total() + extra_penalty_energy ]   (data-fit + priors)

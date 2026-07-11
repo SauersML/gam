@@ -1077,7 +1077,7 @@ pub fn stack_augmented_target(
 ///
 /// Returns `+∞` for a non-positive pooled residual (an invalid state a caller's
 /// line search should reject).
-pub fn profiled_reml_criterion(
+pub fn profiled_penalized_laml_criterion(
     n_obs: usize,
     p_x: usize,
     rss_x: f64,
@@ -1104,7 +1104,7 @@ pub fn profiled_reml_criterion(
     0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac
 }
 
-/// The analytic outer-REML gradient of [`profiled_reml_criterion`] with respect
+/// The analytic outer-REML gradient of [`profiled_penalized_laml_criterion`] with respect
 /// to each block weight `log λ_ℓ` (#2231 §2a), evaluated at a fitted state's
 /// UNSCALED per-block residual sums of squares. At the inner optimum the residual
 /// is stationary in `(t, β)` (the envelope theorem: `∂R/∂β · ∂β/∂λ` vanishes), so
@@ -1117,7 +1117,7 @@ pub fn profiled_reml_criterion(
 /// (`p̃ = p_x + Σ p_ℓ`), the exact derivative of the profiled Gaussian
 /// negative-log-marginal (`d pooled/d log λ_ℓ = λ_ℓ R_ℓ`) plus the `√λ_ℓ`
 /// target-scaling Jacobian (`d(−½ n Σ p_m log λ_m)/d log λ_ℓ = −½ n p_ℓ`). This is
-/// the desync-safe (#2087) partner of the value in [`profiled_reml_criterion`] —
+/// the desync-safe (#2087) partner of the value in [`profiled_penalized_laml_criterion`] —
 /// they are a consistent `(value, gradient)` pair, FD-verified in
 /// `tests_crosscoder_block_fd_2231.rs`.
 ///

@@ -20,7 +20,7 @@ class CompositePenalty(PenaltyDescriptor):
     """Sum-composite of :class:`PenaltyDescriptor` instances.
 
     Equivalent to building a single multi-penalty registry, but composable
-    on the Python side so users can write ``ARDPenalty(...) + IBPPenalty(...)``
+    on the Python side so users can write ``ARDPenalty(...) + OrderedBetaBernoulliPenalty(...)``
     and pass the result anywhere a penalty descriptor is expected.
     """
 

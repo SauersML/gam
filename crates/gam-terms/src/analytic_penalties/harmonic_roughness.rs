@@ -4,28 +4,6 @@ use super::*;
 // Harmonic roughness penalty (graduated periodic-basis smoothness prior)
 // ---------------------------------------------------------------------------
 
-/// Default effective strength of the decoder-harmonic smoothness prior (#1282).
-///
-/// Provenance: introduced in `854319979` ("fix(#1282): suppress decoder
-/// harmonics to force circle-atom specialization"). A circle atom's decoder maps
-/// the periodic basis `[DC, cosθ, sinθ, cos2θ, sin2θ, …]` to `Rᴰ`; the harmonics
-/// `h ≥ 2` let its image leave the fundamental 2-plane and *snake* through space
-/// so one atom straddles two manifolds (routing collapses to chance while
-/// reconstruction stays R² ≈ 0.99). Penalizing those harmonics with the periodic
-/// basis's own `h⁴` roughness graduation confines each atom to a single 2-plane.
-///
-/// The torch training loss scales `regularization()` by a small coefficient
-/// (~1e-5), so this internal weight of `5e3` lifts the harmonic term to an
-/// effective magnitude (~5e-2) that actually suppresses snaking while leaving
-/// the fundamental ellipse free. It is a hand-tuned constant, NOT data-derived:
-/// the true manifolds are pure fundamental circles, so the prior is keyed on
-/// nothing about the data (there is no data-scale-relative default to prefer
-/// here the way `IsometryPenalty`'s `gbar` normalizer is). On the Rust REML lane
-/// this strength should be handed to the outer loop (`learnable_weight = true`,
-/// one owned ρ-axis) so the marginal likelihood selects it; the torch lane has
-/// no REML, so it pins the fixed default below.
-pub const DEFAULT_HARMONIC_ROUGHNESS_WEIGHT: f64 = 5.0e3;
-
 /// Graduated diagonal roughness prior on a row-major `(n_eff, d)` latent block
 /// whose leading axis is tiled by a fixed-length **period** of per-row weights.
 ///
@@ -204,61 +182,4 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
     }
 
     impl_scalar_apply_schedule!(weight);
-}
-
-/// Evidence-optimal roughness precision `λ⋆` for a periodic decoder block under
-/// the graduated Gaussian prior encoded by `row_weights` (the periodic penalty
-/// Gram's diagonal, `Sᵢᵢ = h⁴` on harmonic rows, `0` on DC / fundamental).
-///
-/// This is a direct-coefficient empirical-Bayes optimum, not REML: treating each
-/// penalized decoder coefficient `bᵢ` as a directly-observed draw of a zero-mean
-/// Gaussian random effect with precision `λ·Sᵢᵢ`, the marginal-likelihood
-/// stationary point is
-///
-/// ```text
-///   ∂/∂λ Σᵢ [ ½ ln(λ Sᵢᵢ) − ½ λ Sᵢᵢ bᵢ² ] = 0
-///     ⇒  λ⋆ = N_pen / Σᵢ Sᵢᵢ bᵢ²
-/// ```
-///
-/// where the sum runs only over coefficients with `Sᵢᵢ > 0` and `N_pen` counts
-/// them. It omits data curvature and effective degrees of freedom and therefore
-/// must not be presented as the model's REML/LAML update. The native model-fit
-/// lane uses the curvature-aware rank-minus-EDF update instead.
-///
-/// The target is the same row-major `(n_eff, d)` block the penalty consumes;
-/// `row_weights` is tiled over the leading axis with period `row_weights.len()`.
-/// Returns `0.0` when there is no defined penalized block (no positive Gram
-/// weight or a malformed shape). For a valid all-zero penalized block it returns
-/// `+∞`, the exact boundary optimum of the idealized direct-observation model;
-/// callers that require a finite precision must use a proper data-curvature
-/// model rather than imposing an arbitrary energy floor.
-#[must_use]
-pub fn harmonic_roughness_evidence_weight(
-    target: ArrayView1<'_, f64>,
-    n_eff: usize,
-    row_weights: ArrayView1<'_, f64>,
-) -> f64 {
-    let period = row_weights.len();
-    if n_eff == 0 || period == 0 || target.is_empty() || !target.len().is_multiple_of(n_eff) {
-        return 0.0;
-    }
-    let d = target.len() / n_eff;
-    let mut weighted_energy = 0.0_f64;
-    let mut n_penalized = 0.0_f64;
-    for r in 0..n_eff {
-        let w = row_weights[r % period];
-        if !(w > 0.0) {
-            continue;
-        }
-        let base = r * d;
-        for j in 0..d {
-            let x = target[base + j];
-            weighted_energy += w * x * x;
-            n_penalized += 1.0;
-        }
-    }
-    if n_penalized == 0.0 {
-        return 0.0;
-    }
-    n_penalized / weighted_energy
 }

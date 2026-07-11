@@ -430,8 +430,9 @@ impl SaeManifoldTerm {
     /// natural soft-vs-hard scale (a uniform `K`-way split gives `1/K` per atom, so
     /// a winner far above `1−1/K` is saturated); a fixed `0.9` is robust across `K`
     /// and conservative (it EXCLUDES ambiguous soft rows, never over-shooting). The
-    /// hard gate families (TopK / ThresholdGate / ordered Beta--Bernoulli-MAP) are discrete by
-    /// construction and bypass this threshold.
+    /// TopK is discrete by construction and bypasses this threshold. The
+    /// independent ordered Beta--Bernoulli and threshold-centered logistic
+    /// gates are smooth and therefore carry no selection-boundary charge.
     pub(crate) const SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT: f64 = 0.9;
 
     /// #2133 — basin-SELECTION (search) deflation dof: the second Stein term the
@@ -452,7 +453,7 @@ impl SaeManifoldTerm {
     /// `Δ_i = ‖δ‖²_M − 2⟨r, δ⟩_M`.
     ///
     /// The charge fires ONLY on effectively-discrete selection — TopK (the
-    /// `k`-th↔`(k+1)`-th support swap), ThresholdGate / ordered Beta--Bernoulli-MAP hard gates, and
+    /// `k`-th↔`(k+1)`-th support swap) and
     /// SATURATED softmax rows (`a_max ≥ SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT`);
     /// genuinely-soft softmax rows contribute 0 (their selection smoothness is
     /// already in the within-basin edf — charging them double-counts). It is also
@@ -571,15 +572,10 @@ impl SaeManifoldTerm {
                     }
                     (top, ranked[1], a_top)
                 }
-                // Per-atom hard gates (ordered Beta--Bernoulli-MAP indicator, ThresholdGate hard
-                // sigmoid): discrete by construction. Dominant-pair approximation —
-                // the top-mass gated atom vs its nearest competitor (the exact
-                // multi-gate boundary enumeration is the documented follow-up, and
-                // like the within-basin term this dominant piece never over-counts).
-                AssignmentMode::OrderedBetaBernoulli { .. } | AssignmentMode::ThresholdGate { .. } => {
-                    let top = ranked[0];
-                    (top, ranked[1], assignments[top])
-                }
+                // Independent logistic gates are smooth everywhere, so their
+                // within-basin Jacobian already carries the complete response.
+                AssignmentMode::OrderedBetaBernoulli { .. }
+                | AssignmentMode::ThresholdGate { .. } => continue,
             };
             if w == r || !(a_w > 0.0) {
                 continue;

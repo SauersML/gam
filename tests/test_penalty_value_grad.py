@@ -20,7 +20,7 @@ import gamfit
 from gamfit._penalty_descriptors import (
     ARDPenalty,
     BlockOrthogonalityDescriptor,
-    IBPPenalty,
+    OrderedBetaBernoulliPenalty,
 )
 
 
@@ -46,7 +46,7 @@ def _autograd_hvp(
     "penalty_factory",
     [
         lambda: ARDPenalty(weight=0.3),
-        lambda: IBPPenalty(alpha=1.0, tau=1.0),
+        lambda: OrderedBetaBernoulliPenalty(alpha=1.0, tau=1.0),
         lambda: BlockOrthogonalityDescriptor(groups=[[0, 1], [2, 3]], weight=0.5, n_eff=8),
     ],
 )
@@ -64,7 +64,7 @@ def test_value_grad_matches_autograd(penalty_factory) -> None:
     "penalty_factory",
     [
         lambda: ARDPenalty(weight=0.3),
-        lambda: IBPPenalty(alpha=1.0, tau=1.0),
+        lambda: OrderedBetaBernoulliPenalty(alpha=1.0, tau=1.0),
     ],
 )
 def test_hvp_matches_autograd(penalty_factory) -> None:
@@ -80,7 +80,7 @@ def test_hvp_matches_autograd(penalty_factory) -> None:
 
 def test_composite_hvp_equals_sum_of_parts() -> None:
     a = ARDPenalty(weight=0.2)
-    b = IBPPenalty(alpha=1.5, tau=0.8)
+    b = OrderedBetaBernoulliPenalty(alpha=1.5, tau=0.8)
     comp = a + b
     t = torch.randn(5, 3, dtype=torch.float64) * 0.3
     v = torch.randn_like(t)

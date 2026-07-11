@@ -1113,7 +1113,7 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
         let mut t = base.clone();
         let r = SaeManifoldRho::new(0.02_f64.ln(), smooth, vec![array![0.0]]);
         let evaluated = t
-            .reml_criterion_with_cache(z.view(), &r, None, 60, 0.04, 1.0e-6, 1.0e-6)
+            .penalized_laml_criterion_with_cache(z.view(), &r, None, 60, 0.04, 1.0e-6, 1.0e-6)
             .unwrap_or_else(|err| {
                 panic!(
                     "#2138: high-working-rank (m={m}) circle inner solve must converge at a \
@@ -1148,7 +1148,7 @@ fn small_fold_high_rank_circle_inner_solve_converges_2138() {
 /// `p` for the correctly-specified K=1 circle (no co-collapse). Splits the wall
 /// time into: (A) the damped inner (t,β) Newton solve `run_joint_fit_arrow_schur`
 /// and (B) the residual = the undamped-logdet re-converge + dense β-Schur factor
-/// that `reml_criterion_with_cache_refine_policy` adds on top. This localizes the
+/// that `penalized_laml_criterion_with_cache_refine_policy` adds on top. This localizes the
 /// cubic-in-p term the issue tracks. Asserted invariant: the inner solve
 /// converges finitely and the full criterion is FINITE (rankable) at every
 /// width — a non-finite criterion on this correctly-specified probe is the
@@ -1180,7 +1180,7 @@ fn profile_wide_p_criterion_cost_2080() {
         let mut tb = term.clone();
         let b0 = std::time::Instant::now();
         let evaluated = tb
-            .reml_criterion_with_cache_refine_policy(
+            .penalized_laml_criterion_with_cache_refine_policy(
                 z.view(),
                 &rho,
                 None,

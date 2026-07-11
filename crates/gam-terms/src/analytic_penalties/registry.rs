@@ -332,9 +332,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::TopKActivation(p) => p
                 .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("TopK activation diag"),
-            AnalyticPenaltyKind::JumpReLU(p) => p
+            AnalyticPenaltyKind::SmoothThreshold(p) => p
                 .psd_majorizer_diag(self.target.view(), self.rho.view())
-                .expect("JumpReLU majorizer diag"),
+                .expect("SmoothThreshold majorizer diag"),
             AnalyticPenaltyKind::TotalVariation(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
@@ -432,7 +432,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::TopKActivation(_)
-            | AnalyticPenaltyKind::JumpReLU(_)
+            | AnalyticPenaltyKind::SmoothThreshold(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::OrderedBetaBernoulli(_)
             | AnalyticPenaltyKind::HarmonicRoughness(_)

@@ -381,7 +381,7 @@ impl AmortizedWarmStartTelemetry {
 /// `update_ard_reml` fixed-point rule. Each outer eval runs the inner
 /// `(t, β)` arrow-Schur Newton solve at the engine's current ρ and returns
 /// the penalised quasi-Laplace evidence score (see
-/// [`SaeManifoldTerm::reml_criterion`]). #1421: this is NOT a true
+/// [`SaeManifoldTerm::penalized_laml_criterion`]). #1421: this is NOT a true
 /// normalized-prior REML/evidence objective — the softmax-entropy and
 /// JumpReLU assignment priors have no finite normalizer, so there is no
 /// ρ-independent prior constant to drop; only the proper-Gaussian
@@ -528,7 +528,7 @@ struct ProbeConvergedHandoff {
 #[derive(Clone, Copy)]
 enum ProbeInnerDrive {
     /// Historical path: hand the whole inner drive to
-    /// `reml_criterion_with_refine_policy` (accepted-basin evaluations, the
+    /// `penalized_laml_criterion_with_refine_policy` (accepted-basin evaluations, the
     /// cross-seed ranking / EFS value lane, streaming fits).
     Criterion { refine_progress_extension: bool },
     /// Exact line-search probe lane (`line_search_probe_criterion`): chunked
@@ -719,21 +719,14 @@ pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivativ
     }
 }
 
-/// The one active outer coordinate that is neither a Gaussian/Fellner-Schall
-/// precision nor an ordered Beta--Bernoulli occupancy fixed point. Softmax
-/// entropy and threshold-gated L1 have a true REML derivative but no EFS root;
-/// Hybrid-EFS therefore treats this coordinate as its analytic-gradient block
-/// while all smoothness/ARD coordinates retain simultaneous EFS updates.
-pub(crate) fn hybrid_assignment_gradient_coordinate(
-    term: &SaeManifoldTerm,
+/// The assignment-strength coordinate handled by Hybrid-EFS's full analytic
+/// criterion gradient. Every assignment family with a structurally present
+/// sparse coordinate uses this lane, including learnable ordered-Beta
+/// concentration: its prior value, inner-mode response, and log-determinant
+/// derivative must be differentiated as one penalized-LAML scalar.
+pub(crate) fn assignment_strength_gradient_coordinate(
     rho: &SaeManifoldRho,
 ) -> Option<usize> {
-    if !matches!(
-        term.assignment.mode,
-        AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. }
-    ) {
-        return None;
-    }
     rho.sparse_flat_index()
 }
 
@@ -1467,11 +1460,11 @@ impl SaeManifoldOuterObjective {
         // factor (the same recoverable "inner solve did not converge at fixed ρ"
         // class the value/gradient/EFS lanes map to an infeasible eval). This path is
         // optional — a recoverable refusal must degrade to no-covariance shape
-        // bands, NOT abort the public fit. `reml_criterion_with_cache` mutates
+        // bands, NOT abort the public fit. `penalized_laml_criterion_with_cache` mutates
         // `self.term` while re-solving, so snapshot and restore the fitted term
         // before falling back.
         let saved_term = self.term.clone();
-        let evaluated = self.term.reml_criterion_with_cache(
+        let evaluated = self.term.penalized_laml_criterion_with_cache(
             self.target.view(),
             &rho,
             self.registry.as_ref(),
@@ -1522,7 +1515,7 @@ impl SaeManifoldOuterObjective {
     ///    `Δβ = −H⁻¹ · ∂g_β/∂η · Δη` on the cached evidence factor
     ///    ([`ArrowFactorCache::full_inverse_apply`], β-channel; the t / gate
     ///    blocks are re-converged by the corrector), then the *corrector* (the
-    ///    damped joint Newton in `reml_criterion_with_cache`) re-converges at
+    ///    damped joint Newton in `penalized_laml_criterion_with_cache`) re-converges at
     ///    `η_next`. The invariant is that the arrow factor's smallest pivot stays
     ///    at or above the safe-SPD floor `√eps · max(diag_scale, 1)`; when it
     ///    shrinks the `η` step is halved and retried from the last converged
@@ -2044,7 +2037,7 @@ impl SaeManifoldOuterObjective {
     ) -> Result<(SaeManifoldLoss, ArrowFactorCache), String> {
         self.term.set_homotopy_eta(eta)?;
         self.set_isometry_homotopy_weight(eta, isometry_targets);
-        let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
+        let (_cost, loss, cache) = self.term.penalized_laml_criterion_with_cache(
             self.target.view(),
             rho,
             self.registry.as_ref(),
@@ -2276,7 +2269,7 @@ impl SaeManifoldOuterObjective {
         let (reml_cost, loss) = match drive {
             ProbeInnerDrive::Criterion {
                 refine_progress_extension,
-            } => self.term.reml_criterion_with_refine_policy_and_lane(
+            } => self.term.penalized_laml_criterion_with_refine_policy_and_lane(
                 self.target.view(),
                 &rho,
                 self.registry.as_ref(),
@@ -2300,7 +2293,7 @@ impl SaeManifoldOuterObjective {
         // that selected it — the objective↔gradient desync class (#931/#1206)
         // moved from the line search into selection. The fold is removed from
         // every fitting/ranking lane; encoder consistency remains available as
-        // a pure diagnostic (`reml_criterion_cotrained`). The fitted-data
+        // a pure diagnostic (`penalized_laml_criterion_cotrained`). The fitted-data
         // collapse detector is a structural ledger verdict, not an objective
         // fold: changing a finite REML value by a constant sentinel would pair
         // that post-hoc value with the bare analytic REML derivative (#2253).
@@ -2330,7 +2323,7 @@ impl SaeManifoldOuterObjective {
     /// Exact line-search value-probe criterion.
     ///
     /// Structure — a faithful, counted port of the historical probe drive
-    /// (`reml_criterion_with_cache_refine_policy` at
+    /// (`penalized_laml_criterion_with_cache_refine_policy` at
     /// `refine_progress_extension == false`):
     ///
     /// 1. Chunks of the SAME inner Newton driver
@@ -2364,7 +2357,7 @@ impl SaeManifoldOuterObjective {
             self.term.k_atoms(),
         )?;
         if self.inner_max_iter == 0 || admitted.streaming || !plan.direct_logdet_admitted() {
-            return self.term.reml_criterion_with_refine_policy_and_lane(
+            return self.term.penalized_laml_criterion_with_refine_policy_and_lane(
                 self.target.view(),
                 rho,
                 self.registry.as_ref(),
@@ -2377,7 +2370,7 @@ impl SaeManifoldOuterObjective {
             );
         }
         // Identical chunk width and total budget as the historical PROBE path:
-        // `reml_criterion_with_cache_refine_policy` grants `inner_max_iter`
+        // `penalized_laml_criterion_with_cache_refine_policy` grants `inner_max_iter`
         // up front, then refine rounds of `inner_max_iter` each, up to the
         // probe refine limit `value_probe_base_refine_iter =
         // max(4·inner_max_iter, 16)`.
@@ -2407,7 +2400,7 @@ impl SaeManifoldOuterObjective {
             let grad_norm_sq = Self::inner_kkt_grad_norm_sq(&sys);
             if !grad_norm_sq.is_finite() {
                 return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: undamped inner KKT residual is non-finite \
+                    "SaeManifoldTerm::penalized_laml_criterion: undamped inner KKT residual is non-finite \
                      at the line-search probe iterate (‖g‖²={grad_norm_sq}); the joint \
                      Hessian assembly is degenerate at this ρ"
                 ));
@@ -2430,7 +2423,7 @@ impl SaeManifoldOuterObjective {
                 // Its remaining refusal classes (border Schur non-PD, cross-row
                 // non-PD) are the typed recoverable probe refusals the outer
                 // bridge already maps to an infeasible trial.
-                return self.term.reml_criterion_with_refine_policy_and_lane(
+                return self.term.penalized_laml_criterion_with_refine_policy_and_lane(
                     self.target.view(),
                     rho,
                     self.registry.as_ref(),
@@ -2449,7 +2442,7 @@ impl SaeManifoldOuterObjective {
                 // "did not converge" refusal without KKT — warm from the current
                 // partially-refined state. This lane never mints a refusal of
                 // its own for this class.
-                return self.term.reml_criterion_with_refine_policy_and_lane(
+                return self.term.penalized_laml_criterion_with_refine_policy_and_lane(
                     self.target.view(),
                     rho,
                     self.registry.as_ref(),
@@ -2822,7 +2815,7 @@ impl SaeManifoldOuterObjective {
             self.term.set_flat_beta(beta.view())?;
         }
         // #1026 massive-K: in the streaming regime the dense evidence cache is
-        // infeasible (O((K·M·p)²)), so `reml_criterion_with_cache` hard-errors
+        // infeasible (O((K·M·p)²)), so `penalized_laml_criterion_with_cache` hard-errors
         // ("cost-only streaming route is required"). But the EFS lane IS the
         // intended streaming-regime descent, and its ARD/smoothness traces below
         // are already matrix-free-gated — they only need the per-row factored
@@ -2839,7 +2832,7 @@ impl SaeManifoldOuterObjective {
             lane.request_inverse_probes();
         }
         let criterion = if self.term.streaming_plan().direct_logdet_admitted() {
-            self.term.reml_criterion_with_cache(
+            self.term.penalized_laml_criterion_with_cache(
                 self.target.view(),
                 &rho,
                 self.registry.as_ref(),
@@ -2850,7 +2843,7 @@ impl SaeManifoldOuterObjective {
             )
         } else {
             self.term
-                .reml_criterion_streaming_exact_with_cache_and_lane(
+                .penalized_laml_criterion_streaming_exact_with_cache_and_lane(
                     self.target.view(),
                     &rho,
                     self.registry.as_ref(),
@@ -2956,107 +2949,74 @@ impl SaeManifoldOuterObjective {
         let mut assignment_psi_gradient: Option<Array1<f64>> = None;
         let mut assignment_psi_indices: Option<Vec<usize>> = None;
 
-        // λ_sparse (when present): the ordered-ordered Beta--Bernoulli concentration α is the ONE sparsity
-        // prior with a closed-form empirical-Bayes marginal M-step (the
-        // Beta–Bernoulli occupancy fixed point), so it gets a genuine
-        // Fellner–Schall-analog step here — this is what UNFREEZES λ_sparse at
-        // large K / streaming, where the value-lane gradient is identically zero
-        // (#F1). Every other sparsity prior (softmax entropy, gated L1, or a
-        // pinned α) is non-quadratic with no FS fixed point and keeps the
-        // historical zero step (`None` ⇒ 0.0). The step reads the fitted gates'
-        // occupancy at this ρ and is trust-region bounded inside the helper.
+        // Assignment strength (when present): use the COMPLETE analytic
+        // derivative of the same penalized-LAML scalar returned as `cost`.
+        // This includes the explicit assignment-prior derivative, the inner-mode
+        // response, and the log-determinant adjoint. In particular, learnable
+        // ordered-Beta concentration must not take a separate occupancy-only
+        // marginal fixed point: that root omits criterion terms and therefore
+        // does not share this objective's stationarity equation.
         if let Some(sparse_index) = rho.sparse_flat_index() {
-            let sparse_step = self
-                .term
-                .assignment
-                .ordered_beta_bernoulli_eb_log_alpha_step(&rho)
-                .map_err(|e| {
-                    format!("SaeManifoldOuterObjective::efs_step: ordered Beta--Bernoulli empirical-Bayes α step: {e}")
-                })?;
-            match sparse_step {
-                Some(step) if step.is_finite() => {
-                    steps[sparse_index] = step;
-                    fixed_point_coordinates[sparse_index] =
-                        FixedPointCoordinateCertificate::covered(step, 1.0);
-                }
-                Some(_) => {
-                    fixed_point_coordinates[sparse_index] =
-                        FixedPointCoordinateCertificate::uncovered(
-                            "ordered Beta--Bernoulli empirical-Bayes alpha equation returned a non-finite update",
-                        );
-                }
-                None => {
-                    if hybrid_assignment_gradient_coordinate(&self.term, &rho) == Some(sparse_index)
-                    {
-                        let gradient =
-                            if let Some((probes, inverse_probes)) = inverse_probe_bundle.as_ref() {
-                                let system = self.term.assemble_full_matrix_free_evidence_system(
-                                    self.target.view(),
-                                    &rho,
-                                    self.registry.as_ref(),
-                                    None,
-                                )?;
-                                self.term
-                                    .analytic_assignment_strength_gradient_matrix_free(
-                                        self.target.view(),
-                                        &rho,
-                                        &cache,
-                                        &system,
-                                        probes,
-                                        inverse_probes,
-                                    )
-                                    .map_err(|error| {
-                                        format!(
-                                            "SaeManifoldOuterObjective::efs_step: matrix-free \
-                                         assignment-strength gradient: {error}"
-                                        )
-                                    })?
-                            } else {
-                                let solver = self
-                                    .term
-                                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
-                                    .map_err(|error| {
-                                        format!(
-                                            "SaeManifoldOuterObjective::efs_step: dense assignment-\
-                                         strength solver: {error}"
-                                        )
-                                    })?;
-                                self.term
-                                    .analytic_assignment_strength_gradient_dense(
-                                        self.target.view(),
-                                        &rho,
-                                        &cache,
-                                        &solver,
-                                    )
-                                    .map_err(|error| {
-                                        format!(
-                                            "SaeManifoldOuterObjective::efs_step: dense assignment-\
-                                         strength gradient: {error}"
-                                        )
-                                    })?
-                            };
-                        // A normalized negative gradient is a bounded feasible-
-                        // descent update whose zero is EXACTLY the REML root.
-                        // `max(|g|, 1)` is the coordinate's natural unit-gradient
-                        // scale in dimensionless log-strength space: it caps a
-                        // remote step at one log unit and becomes the raw Newton-
-                        // local residual unchanged once |g| < 1. The shared EFS
-                        // cost backtracking still adjudicates every nonlocal move.
-                        let gradient_scale = gradient.abs().max(1.0);
-                        let step = -gradient / gradient_scale;
-                        steps[sparse_index] = step;
-                        fixed_point_coordinates[sparse_index] =
-                            FixedPointCoordinateCertificate::covered(step, 1.0);
-                        assignment_psi_gradient = Some(Array1::from_vec(vec![gradient]));
-                        assignment_psi_indices = Some(vec![sparse_index]);
-                    } else {
-                        fixed_point_coordinates[sparse_index] =
-                            FixedPointCoordinateCertificate::uncovered(
-                                "assignment sparsity coordinate has no root-equivalent fixed-point equation",
-                            );
-                    }
-                }
-            }
+            debug_assert_eq!(
+                assignment_strength_gradient_coordinate(&rho),
+                Some(sparse_index)
+            );
+            let gradient =
+                if let Some((probes, inverse_probes)) = inverse_probe_bundle.as_ref() {
+                    let system = self.term.assemble_full_matrix_free_evidence_system(
+                        self.target.view(),
+                        &rho,
+                        self.registry.as_ref(),
+                        None,
+                    )?;
+                    self.term
+                        .analytic_assignment_strength_gradient_matrix_free(
+                            self.target.view(),
+                            &rho,
+                            &cache,
+                            &system,
+                            probes,
+                            inverse_probes,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "SaeManifoldOuterObjective::efs_step: matrix-free \
+                                 assignment-strength gradient: {error}"
+                            )
+                        })?
+                } else {
+                    let solver = self
+                        .term
+                        .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+                        .map_err(|error| {
+                            format!(
+                                "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
+                                 solver: {error}"
+                            )
+                        })?;
+                    self.term
+                        .analytic_assignment_strength_gradient_dense(
+                            self.target.view(),
+                            &rho,
+                            &cache,
+                            &solver,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
+                                 gradient: {error}"
+                            )
+                        })?
+                };
+            // A normalized negative gradient is a bounded feasible-descent
+            // update whose zero is exactly the full criterion root.
+            let gradient_scale = gradient.abs().max(1.0);
+            let step = -gradient / gradient_scale;
+            steps[sparse_index] = step;
+            fixed_point_coordinates[sparse_index] =
+                FixedPointCoordinateCertificate::covered(step, 1.0);
+            assignment_psi_gradient = Some(Array1::from_vec(vec![gradient]));
+            assignment_psi_indices = Some(vec![sparse_index]);
         }
 
         // λ_smooth (layout-derived K-coordinate block): per-atom Wood-Fasiolo EFS multiplicative
@@ -3121,7 +3081,7 @@ impl SaeManifoldOuterObjective {
                 // #F1 — NO dispersion factor. The outer objective the value/gradient
                 // lanes minimize is the UNIT-dispersion penalized Laplace criterion
                 // `v = ½‖r‖² + ½Σ_k λ_k·B_kᵀS_kB_k + ½log|H| − ½Σ_k rank_k·log λ_k`
-                // (`reml_criterion_*`: `loss.data_fit` is the raw half-SSE, with no
+                // (`penalized_laml_criterion_*`: `loss.data_fit` is the raw half-SSE, with no
                 // `1/φ̂` on the data term and no `(np/2)·ln φ̂` scale term). Its
                 // stationarity in `ρ_k = log λ_k` — using `edof_k = tr(H⁻¹·λ_k S_k)`
                 // so `tr(H⁻¹S_k) = edof_k/λ_k` — is
@@ -3683,7 +3643,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
         let assignment_gradient_dim = usize::from(
-            hybrid_assignment_gradient_coordinate(&self.term, &self.baseline_rho).is_some(),
+            assignment_strength_gradient_coordinate(&self.baseline_rho).is_some(),
         );
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
@@ -3783,12 +3743,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.probe_telemetry.criterion_calls += 1;
         let rho_state = self.baseline_rho.from_flat(rho.view());
         // #2231 Inc-B — scale the block columns for this ρ before either the
-        // streaming value path or the dense `reml_criterion_with_cache` below
+        // streaming value path or the dense `penalized_laml_criterion_with_cache` below
         // reads `self.target` (idempotent; no-op for a plain SAE).
         self.apply_block_scaling(&rho_state);
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
         // cache does not exist, so the analytic gradient lane below
-        // (`reml_criterion_with_cache` → `outer_gradient_arrow_solver`) cannot run
+        // (`penalized_laml_criterion_with_cache` → `outer_gradient_arrow_solver`) cannot run
         // and hard-errors ("cost-only streaming route is required"). The outer plan
         // descends ρ via the value + Fellner–Schall (EFS) route
         // (`fixed_point_available`), which never consumes this gradient — but the
@@ -3926,7 +3886,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // while ordered_beta_bernoulli (whose seed happens to stay PD) survived. Treat it the
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
-        let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
+        let (cost, loss, cache) = match self.term.penalized_laml_criterion_with_cache(
             self.target.view(),
             &rho_state,
             self.registry.as_ref(),

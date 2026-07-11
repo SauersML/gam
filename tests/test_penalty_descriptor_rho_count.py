@@ -30,7 +30,7 @@ import gamfit
 from gamfit._penalty_descriptors import (
     ARDPenalty,
     BlockOrthogonalityDescriptor,
-    IBPPenalty,
+    OrderedBetaBernoulliPenalty,
     MechanismSparsityDescriptor,
 )
 
@@ -108,7 +108,7 @@ def test_ard_value_grad_vector_target() -> None:
 def test_ibp_value_grad_numpy_runs() -> None:
     rng = np.random.default_rng(2)
     t = rng.standard_normal((8, 4))
-    v, g = IBPPenalty(alpha=1.0, tau=1.0).value_grad(t)
+    v, g = OrderedBetaBernoulliPenalty(alpha=1.0, tau=1.0).value_grad(t)
     assert np.isfinite(float(v))
     assert g.shape == t.shape and np.all(np.isfinite(g))
 

@@ -5,7 +5,7 @@
 //! test (`tests_streaming_efs_cache_1026`) did NOT cover:
 //!
 //!  1. **Outer-gradient parity.** The #1026 test proved the cache returned by
-//!     `reml_criterion_streaming_exact_with_cache` is a drop-in for the EFS
+//!     `penalized_laml_criterion_streaming_exact_with_cache` is a drop-in for the EFS
 //!     consumers (`ard_inverse_traces` / `reconstruction_dispersion`). But the
 //!     ANALYTIC OUTER ρ-GRADIENT lane (`outer_gradient_arrow_solver` →
 //!     `analytic_outer_rho_gradient_components`) also reads the returned cache,
@@ -41,8 +41,8 @@ use super::tests::{
 use std::sync::Arc;
 
 /// The analytic outer ρ-gradient assembled off the STREAMING cache
-/// (`reml_criterion_streaming_exact_with_cache`) must be bit-identical to the one
-/// assembled off the DENSE cache (`reml_criterion_with_cache`). Both entries
+/// (`penalized_laml_criterion_streaming_exact_with_cache`) must be bit-identical to the one
+/// assembled off the DENSE cache (`penalized_laml_criterion_with_cache`). Both entries
 /// converge the inner (t, β) state through the SAME
 /// `converge_inner_for_undamped_logdet` driver with the SAME undamped Direct
 /// options, so the returned factor caches — and therefore the selected-inverse
@@ -74,7 +74,7 @@ fn streaming_cache_outer_gradient_matches_dense_cache() {
     let mut streaming = term0;
 
     let (dense_cost, dense_loss, dense_cache) = dense
-        .reml_criterion_with_cache(
+        .penalized_laml_criterion_with_cache(
             target.view(),
             &rho,
             None,
@@ -85,7 +85,7 @@ fn streaming_cache_outer_gradient_matches_dense_cache() {
         )
         .expect("dense cache criterion");
     let (stream_cost, stream_loss, stream_cache) = streaming
-        .reml_criterion_streaming_exact_with_cache(
+        .penalized_laml_criterion_streaming_exact_with_cache(
             target.view(),
             &rho,
             None,
@@ -307,11 +307,11 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
         Derivative::Analytic,
         "dense SAE retains its exact joint-Hessian IFT gradient"
     );
-    let (representative_term, _, representative_rho) = small_two_atom_periodic_term();
+    let (_representative_term, _, representative_rho) = small_two_atom_periodic_term();
     assert_eq!(
-        hybrid_assignment_gradient_coordinate(&representative_term, &representative_rho),
+        assignment_strength_gradient_coordinate(&representative_rho),
         representative_rho.sparse_flat_index(),
-        "a non-IBP fit must promote its active sparsity strength into Hybrid-EFS's \
+        "every active assignment strength must enter Hybrid-EFS's \
          exact-gradient block; the outer-plan crossover decides whether that block \
          is consumed, not whether the coordinate has an analytic root"
     );
@@ -484,7 +484,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
 }
 
-/// End-to-end: the whitened streaming REML criterion (`reml_criterion_streaming_
+/// End-to-end: the whitened streaming REML criterion (`penalized_laml_criterion_streaming_
 /// exact`) must COMPLETE with a finite value rather than surfacing the
 /// `cost-only streaming route is required` hard-error class. The streaming lane is
 /// size-INVARIANT — it runs the identical `converge_inner_for_undamped_logdet` +
@@ -520,7 +520,7 @@ fn whitened_streaming_criterion_completes() {
     );
 
     let (cost, loss) = term
-        .reml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .expect("whitened streaming criterion must complete, not hard-error");
     assert!(
         cost.is_finite(),

@@ -594,25 +594,18 @@ class IvaeRidgeMeanGauge(_RustPenaltyModule):
         )
 
 
-class JumpReLUPenalty(_RustPenaltyModule):
-    """JumpReLU SAE prior with hard-threshold gating + straight-through estimator.
+class SmoothThresholdPenalty(_RustPenaltyModule):
+    """Smooth threshold sparsity prior and activation.
 
-    Forward: ``φ(z) = z · 1[z > τ]`` per latent axis with per-axis learnable
-    thresholds ``τ_k = thresholds_k · exp(log_threshold_k)``. The hard-threshold
-    forward path has zero subgradient almost everywhere; the STE backward path
-    routes ``∂L/∂z = ∂L/∂φ · 1[|z − τ| < bandwidth]`` (rectangular kernel) plus
-    ``∂L/∂τ = −∂L/∂φ · φ̄`` evaluated by the gam Rust core's analytic
-    smoothed sigmoid (``smoothing_eps`` controls the smoothing scale).
-
-    Acts as a sparsity penalty when used as ``loss += w · jumprelu(z).sum()``;
-    acts as an activation function when used as ``z_active = jumprelu(z)``.
-    Both modes share the same parameters and STE backward.
+    The activation is ``φ(z)=z·σ((z−τ)/ε)`` with exact derivatives of that
+    same scalar. Per-axis thresholds are
+    ``τ_k = thresholds_k · exp(log_threshold_k)``.
 
     Parameters
     ----------
     thresholds: per-axis base thresholds (length F). Each entry must be > 0.
     weight: scalar prior weight (must be > 0).
-    smoothing_eps: bandwidth of the sigmoid-smoothed STE gate (default 1e-3).
+    smoothing_eps: bandwidth of the sigmoid gate (default 1e-3).
         Smaller → harder threshold (closer to true step), larger → smoother
         backward; numerics get hairy below 1e-5.
     learnable_threshold: if True, expose ``log_threshold`` as ``nn.Parameter``;
@@ -633,14 +626,14 @@ class JumpReLUPenalty(_RustPenaltyModule):
         super().__init__()
         thr = torch.as_tensor(thresholds, dtype=torch.float64).reshape(-1)
         if thr.numel() == 0:
-            raise ValueError("JumpReLUPenalty.thresholds must be non-empty")
+            raise ValueError("SmoothThresholdPenalty.thresholds must be non-empty")
         if not bool(torch.isfinite(thr).all()) or bool((thr <= 0).any()):
-            raise ValueError("JumpReLUPenalty.thresholds must be finite and > 0")
+            raise ValueError("SmoothThresholdPenalty.thresholds must be finite and > 0")
         if not (np.isfinite(weight) and weight > 0.0):
-            raise ValueError(f"JumpReLUPenalty.weight must be finite and > 0, got {weight}")
+            raise ValueError(f"SmoothThresholdPenalty.weight must be finite and > 0, got {weight}")
         if not (np.isfinite(smoothing_eps) and smoothing_eps > 0.0):
             raise ValueError(
-                f"JumpReLUPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
+                f"SmoothThresholdPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
             )
         self.register_buffer("thresholds", thr)
         self.weight = float(weight)
@@ -655,22 +648,22 @@ class JumpReLUPenalty(_RustPenaltyModule):
         return (self.thresholds.to(dtype) * torch.exp(self.log_threshold.to(dtype)))
 
     def gate(self, z: torch.Tensor) -> torch.Tensor:
-        """Hard-threshold forward with STE backward. Returns ``z · 1[z > τ]``."""
+        """Apply ``z·σ((z−τ)/ε)`` with its exact analytic derivative."""
         tau = self.effective_thresholds(z.dtype).to(z.device)
-        return _JumpReLUSTEFn.apply(z, tau, float(self.smoothing_eps))
+        return _SmoothThresholdFn.apply(z, tau, float(self.smoothing_eps))
 
     def _prepare(
         self, primary: torch.Tensor, basis: torch.Tensor | None = None
     ) -> _PenaltyCall:
         """Penalty value: ``weight · Σ τ · σ((z − τ)/ε)`` (smoothed L0).
 
-        Matches the Rust ``JumpReLUPenalty::value`` analytic formulation so
+        Matches the Rust ``SmoothThresholdPenalty::value`` analytic formulation so
         outer-loop REML can compose this term with other gam penalties.
         """
         del basis
         latent = _check_matrix(primary, "latent")
         descriptor = {
-            "kind": "jumprelu",
+            "kind": "smooth_threshold",
             "target": self.target,
             "thresholds": to_numpy_f64(self.thresholds).reshape(-1).tolist(),
             "weight": self.weight,
@@ -685,20 +678,12 @@ class JumpReLUPenalty(_RustPenaltyModule):
         )
 
 
-class _JumpReLUSTEFn(torch.autograd.Function):
-    """Hard-threshold JumpReLU gate backed by the Rust value/gradient kernel.
-
-    Forward returns the hard gate ``φ(z) = z · 1[z > τ]``; backward uses the
-    smooth surrogate ``φ̃(z) = z · σ((z − τ)/ε)`` so the activation keeps a usable
-    subgradient inside the smoothing band ``|z − τ| ≲ ε`` (a straight-through
-    estimator). Rust computes the value and both per-element derivatives through
-    ``jumprelu_gate_value_grad``; Python only caches those derivatives and applies
-    the upstream gradient on Torch's tape.
-    """
+class _SmoothThresholdFn(torch.autograd.Function):
+    """Smooth threshold activation backed by one Rust value/gradient kernel."""
 
     @staticmethod
     def forward(ctx: Any, z: torch.Tensor, tau: torch.Tensor, smoothing_eps: float) -> torch.Tensor:
-        value_np, dphi_dz_np, dphi_dtau_np = rust_module().jumprelu_gate_value_grad(
+        value_np, dphi_dz_np, dphi_dtau_np = rust_module().smooth_threshold_gate_value_grad(
             to_numpy_f64(z.reshape(z.shape[0], -1)),
             to_numpy_f64(tau.reshape(-1)),
             float(smoothing_eps),
@@ -717,7 +702,7 @@ class _JumpReLUSTEFn(torch.autograd.Function):
         return grad_z, grad_tau, None
 
 
-class RiemannianRetraction(Optimizer):
+class RiemannianGradientDescent(Optimizer):
     """One-step Riemannian gradient optimizer using the manifold metric."""
 
     def __init__(
@@ -801,9 +786,9 @@ __all__ = [
     "OrderedBetaBernoulliPenalty",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
-    "JumpReLUPenalty",
+    "SmoothThresholdPenalty",
     "LazyPcaBasis",
     "MechanismSparsityPenalty",
-    "RiemannianRetraction",
+    "RiemannianGradientDescent",
     "TopologyAutoSelector",
 ]

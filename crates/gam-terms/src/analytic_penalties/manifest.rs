@@ -74,9 +74,9 @@ impl PenaltyManifest for IvaeRidgeMeanGauge {
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
 
-impl PenaltyManifest for JumpReLUPenalty {
-    const KIND_TAG: &'static str = "jumprelu";
-    const PYTHON_WRAPPER: &'static str = "JumpReLUPenalty";
+impl PenaltyManifest for SmoothThresholdPenalty {
+    const KIND_TAG: &'static str = "smooth_threshold";
+    const PYTHON_WRAPPER: &'static str = "SmoothThresholdPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
 
@@ -168,7 +168,7 @@ macro_rules! analytic_penalty_registry {
             register!(OrderedBetaBernoulli, OrderedBetaBernoulliPenalty);
             register!(Ard, ARDPenalty);
             register!(TopKActivation, TopKActivationPenalty);
-            register!(JumpReLU, JumpReLUPenalty);
+            register!(SmoothThreshold, SmoothThresholdPenalty);
             register!(TotalVariation, TotalVariationPenalty);
             register!(HarmonicRoughness, HarmonicRoughnessPenalty);
             register!(NuclearNorm, NuclearNormPenalty);

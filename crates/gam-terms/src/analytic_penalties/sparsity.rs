@@ -1108,11 +1108,11 @@ impl AnalyticPenalty for TopKActivationPenalty {
 }
 
 // ---------------------------------------------------------------------------
-// JumpReLU penalty
+// Smooth threshold penalty
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct JumpReLUPenalty {
+pub struct SmoothThresholdPenalty {
     pub target: PsiSlice,
     pub latent_dim: usize,
     pub thresholds: Array1<f64>,
@@ -1121,7 +1121,7 @@ pub struct JumpReLUPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-impl JumpReLUPenalty {
+impl SmoothThresholdPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
         target: PsiSlice,
@@ -1131,31 +1131,31 @@ impl JumpReLUPenalty {
     ) -> Result<Self, String> {
         let latent_dim = target
             .latent_dim
-            .ok_or_else(|| "JumpReLUPenalty::new requires target.latent_dim".to_string())?;
+            .ok_or_else(|| "SmoothThresholdPenalty::new requires target.latent_dim".to_string())?;
         if latent_dim == 0 {
-            return Err("JumpReLUPenalty::new requires latent_dim > 0".to_string());
+            return Err("SmoothThresholdPenalty::new requires latent_dim > 0".to_string());
         }
         if thresholds.len() != latent_dim {
             return Err(format!(
-                "JumpReLUPenalty::new thresholds length {} does not match latent_dim {latent_dim}",
+                "SmoothThresholdPenalty::new thresholds length {} does not match latent_dim {latent_dim}",
                 thresholds.len()
             ));
         }
         for (idx, &tau) in thresholds.iter().enumerate() {
             if !(tau.is_finite() && tau > 0.0) {
                 return Err(format!(
-                    "JumpReLUPenalty::new thresholds[{idx}] must be finite and > 0, got {tau}"
+                    "SmoothThresholdPenalty::new thresholds[{idx}] must be finite and > 0, got {tau}"
                 ));
             }
         }
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!(
-                "JumpReLUPenalty::new requires finite weight > 0, got {weight}"
+                "SmoothThresholdPenalty::new requires finite weight > 0, got {weight}"
             ));
         }
         if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
             return Err(format!(
-                "JumpReLUPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+                "SmoothThresholdPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
             ));
         }
         Ok(Self {
@@ -1198,7 +1198,7 @@ impl JumpReLUPenalty {
         // dominates h in the concave region g > ½. For g < (3−√5)/2 ≈ 0.382 the
         // exact curvature is positive and strictly larger, so the square alone
         // is NOT an upper bound — the `B ⪰ ∂²P` contract is violated for exactly
-        // the comfortably-below-threshold (inactive) coordinates JumpReLU is
+        // the comfortably-below-threshold coordinates this penalty is
         // meant to suppress, costing the MM step its monotone-decrease guarantee.
         //
         // Take the elementwise max of that surrogate and the absolute exact
@@ -1214,31 +1214,28 @@ impl JumpReLUPenalty {
     }
 }
 
-/// JumpReLU activation gate `φ(z) = z · 1[z > τ]` together with the
-/// straight-through-estimator derivatives of its smooth surrogate
-/// `φ̃(z) = z · σ((z − τ)/ε)`. The forward value is the hard gate; the backward
-/// uses the surrogate's gradients so the activation has a usable subgradient in
-/// the smoothing band `|z − τ| ≲ ε`:
+/// Smooth threshold activation `φ(z) = z · σ((z − τ)/ε)` and its exact
+/// derivatives:
 ///
 ///   g       = σ((z − τ)/ε)
-///   φ        = z · 1[z > τ]                 (returned value)
-///   ∂φ̃/∂z   = g + z · g (1 − g) / ε          (`dphi_dz`)
-///   ∂φ̃/∂τ   = − z · g (1 − g) / ε            (`dphi_dtau`)
-///
-/// This is the single Rust source of truth that `gamfit.torch`'s
-/// `_JumpReLUSTEFn` consumes so the torch activation gate's backward matches the
-/// smoothed gate exactly instead of re-deriving it in Python.
+///   φ        = z · g
+///   ∂φ/∂z   = g + z · g (1 − g) / ε
+///   ∂φ/∂τ   = − z · g (1 − g) / ε
 #[must_use]
-pub fn jumprelu_gate_value_grad(z: f64, tau: f64, smoothing_eps: f64) -> (f64, f64, f64) {
+pub fn smooth_threshold_gate_value_grad(
+    z: f64,
+    tau: f64,
+    smoothing_eps: f64,
+) -> (f64, f64, f64) {
     let g = gam_linalg::utils::stable_logistic((z - tau) / smoothing_eps);
-    let value = if z > tau { z } else { 0.0 };
+    let value = z * g;
     let slope = z * g * (1.0 - g) / smoothing_eps;
     let dphi_dz = g + slope;
     let dphi_dtau = -slope;
     (value, dphi_dz, dphi_dtau)
 }
 
-impl AnalyticPenalty for JumpReLUPenalty {
+impl AnalyticPenalty for SmoothThresholdPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
     }
@@ -1318,7 +1315,7 @@ impl AnalyticPenalty for JumpReLUPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        // The smoothed JumpReLU surrogate's exact diagonal Hessian
+        // The smooth threshold penalty's exact diagonal Hessian
         //   λτ·g(1−g)(1−2g)/ε²
         // is indefinite (negative once the gate passes the inflection
         // g = ½). The Newton / PIRLS pipeline needs a PSD curvature block, so
@@ -1361,7 +1358,7 @@ impl AnalyticPenalty for JumpReLUPenalty {
     }
 
     fn name(&self) -> &str {
-        "jumprelu"
+        "smooth_threshold"
     }
 
     impl_scalar_apply_schedule!(weight);

@@ -274,7 +274,7 @@ pub trait AnalyticPenalty: Send + Sync {
     /// re-weighted-ℓ₂ / MM surrogate `diag(B(target; ρ))` with
     /// `B ⪰ ∂²P/∂target²` everywhere and `B ⪰ 0`. This is a *different*
     /// operator from [`Self::hessian_diag`]: for nonconvex penalties (log
-    /// sparsity, JumpReLU) the exact Hessian is indefinite, but the inner
+    /// sparsity, smooth-threshold) the exact Hessian is indefinite, but the inner
     /// Newton / PIRLS solve and the log-det / preconditioner pipeline require
     /// a PSD curvature block. For convex penalties the majorizer coincides
     /// with the exact Hessian, so the default simply delegates to

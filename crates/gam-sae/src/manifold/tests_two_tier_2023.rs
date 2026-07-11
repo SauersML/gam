@@ -151,7 +151,7 @@ mod tests {
         // The merged term begins a FRESH joint polish, so the evidence-gauge /
         // co-collapse reversal-budget ledger must start clean — carrying primary's
         // tier-1 reanchor count / last-delta sign would corrupt the merged term's
-        // first deflation step (reml_criterion reversal-budget loop). Seed nonzero
+        // first deflation step (penalized_laml_criterion reversal-budget loop). Seed nonzero
         // values on primary BEFORE the merge so the reset assertion is non-vacuous.
         let (mut a_term, _at, a_rho) = small_two_atom_periodic_term();
         let (b_term, _bt, b_rho) = small_two_atom_periodic_term();

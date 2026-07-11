@@ -1176,51 +1176,6 @@ pub fn ordered_beta_bernoulli_row(logits: ArrayView1<'_, f64>, temperature: f64)
     out
 }
 
-/// ordered Beta--Bernoulli activations together with the diagonal Jacobian `∂z_k/∂l_k`,
-/// shared with the torch autograd `Function` so the Python ordered Beta--Bernoulli-Gumbel path
-/// applies the same posterior-mean gate and temperature scaling as the Rust
-/// closed form. With `z_k = σ(l_k/τ)` the per-atom derivative is
-/// `σ(l_k/τ)(1 − σ(l_k/τ)) / τ`; the map is diagonal in `k`, so the
-/// Jacobian is returned as the per-atom diagonal vector.
-#[must_use]
-pub fn ordered_beta_bernoulli_row_value_grad(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-) -> (Array1<f64>, Array1<f64>) {
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array1::<f64>::zeros(logits.len());
-    let mut grad = Array1::<f64>::zeros(logits.len());
-    for i in 0..logits.len() {
-        let sig = gam_linalg::utils::stable_logistic(logits[i] * inv_tau);
-        value[i] = sig;
-        grad[i] = sig * (1.0 - sig) * inv_tau;
-    }
-    (value, grad)
-}
-
-/// Batched ordered Beta--Bernoulli value and diagonal logit Jacobian over an `(N, K)` logit
-/// matrix. This shares the per-element arithmetic of
-/// [`ordered_beta_bernoulli_row_value_grad`] while crossing the Rust/Python boundary once for
-/// the whole batch.
-#[must_use]
-pub fn ordered_beta_bernoulli_batch_value_grad(
-    logits: ArrayView2<'_, f64>,
-    temperature: f64,
-) -> (Array2<f64>, Array2<f64>) {
-    let (n, k) = logits.dim();
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array2::<f64>::zeros((n, k));
-    let mut grad = Array2::<f64>::zeros((n, k));
-    for i in 0..n {
-        for j in 0..k {
-            let sig = gam_linalg::utils::stable_logistic(logits[[i, j]] * inv_tau);
-            value[[i, j]] = sig;
-            grad[[i, j]] = sig * (1.0 - sig) * inv_tau;
-        }
-    }
-    (value, grad)
-}
-
 pub fn threshold_gate_row(
     logits: ArrayView1<'_, f64>,
     temperature: f64,
@@ -1316,74 +1271,10 @@ pub(crate) fn topk_row_into(logits: ArrayView1<'_, f64>, k: usize, out: &mut [f6
     }
 }
 
-/// Smooth bounded threshold-gate activations and their exact diagonal Jacobian.
-/// With `a_k = σ((l_k − θ_k)/τ)`, `∂a_k/∂l_k = a_k(1-a_k)/τ` and
-/// `∂a_k/∂θ_k = -∂a_k/∂l_k` on the entire real line.
-#[must_use]
-pub fn threshold_gate_row_value_grad(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-    thresholds: ArrayView1<'_, f64>,
-) -> (Array1<f64>, Array1<f64>) {
-    assert_eq!(
-        logits.len(),
-        thresholds.len(),
-        "threshold_gate_row_value_grad: logits/thresholds length mismatch"
-    );
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array1::<f64>::zeros(logits.len());
-    let mut grad = Array1::<f64>::zeros(logits.len());
-    for i in 0..logits.len() {
-        let sig = gam_linalg::utils::stable_logistic((logits[i] - thresholds[i]) * inv_tau);
-        value[i] = sig;
-        grad[i] = sig * (1.0 - sig) * inv_tau;
-    }
-    (value, grad)
-}
-
-/// Batched bounded threshold-gate value+grad over an `(N, K)` logit matrix,
-/// sharing the exact per-atom arithmetic of [`threshold_gate_row_value_grad`] so a
-/// single batched call is bit-identical to invoking the row kernel row-by-row.
-///
-/// `thresholds` is per-atom (length `K`, broadcast across the `N` rows). Returns
-/// `(value, grad)`, each `(N, K)`:
-///   * `value[i, k] = σ((l − θ)/τ)` — the bounded `(0, 1)` gate,
-///   * `grad[i, k]  = σ·(1 − σ)/τ` — its exact diagonal derivative.
-///
-/// This is the single source of truth for `gamfit.torch`'s bounded threshold_gate
-/// gate: the torch autograd `Function` crosses the FFI boundary ONCE with the
-/// whole matrix instead of once per row.
-#[must_use]
-pub fn threshold_gate_batch_value_grad(
-    logits: ArrayView2<'_, f64>,
-    temperature: f64,
-    thresholds: ArrayView1<'_, f64>,
-) -> (Array2<f64>, Array2<f64>) {
-    let (n, k) = logits.dim();
-    assert_eq!(
-        k,
-        thresholds.len(),
-        "threshold_gate_batch_value_grad: logits columns {k} != thresholds length {}",
-        thresholds.len()
-    );
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array2::<f64>::zeros((n, k));
-    let mut grad = Array2::<f64>::zeros((n, k));
-    for i in 0..n {
-        for j in 0..k {
-            let sig =
-                gam_linalg::utils::stable_logistic((logits[[i, j]] - thresholds[j]) * inv_tau);
-            value[[i, j]] = sig;
-            grad[[i, j]] = sig * (1.0 - sig) * inv_tau;
-        }
-    }
-    (value, grad)
-}
-
 /// Exact numerical inverse of the softplus link `softplus(x) = log(1 + eˣ)`
 /// (the forward direction is [`gam_linalg::utils::stable_softplus`], used by
-/// [`topk_activation_row_value_grad`] below). This is the single source of
-/// truth for the softplus⁻¹ reparameterization the SAE penalty FFI uses to map
+/// the penalty implementations). This is the single source of truth for the
+/// softplus⁻¹ reparameterization the SAE penalty FFI uses to map
 /// a positive scale hyperparameter `β > 0` back to its raw pre-softplus
 /// coordinate `raw = softplus⁻¹(β)` (the `raw_beta` of the parametric
 /// row-precision / aux-conditional priors). Moved out of the pyffi shim
@@ -1404,138 +1295,6 @@ pub fn inverse_softplus(value: f64) -> f64 {
         value + (-(-value).exp()).ln_1p()
     } else {
         value.exp_m1().ln()
-    }
-}
-
-/// Top-k SAE activation value+grad: the per-atom **independent**, strictly
-/// non-negative activation `a_k = τ · softplus(l_k / τ)` and its diagonal logit
-/// derivative `∂a_k/∂l_k = σ(l_k / τ)`.
-///
-/// This is the smooth, temperature-annealed activation the `softmax_topk` SAE
-/// gate scores atoms with (the hard top-k *selection* and its masked gradient
-/// stay on the torch tape — see `gamfit.torch`'s `_topk_gate`). `τ → 0` anneals
-/// it to a plain ReLU. The activation is computed independently per atom (no
-/// row-wise softmax competition), which is what lets an atom sit near zero when
-/// its feature is absent and rise on its own when present (issue #583).
-///
-/// Because `a = τ·softplus(l/τ)`, the chain rule gives
-/// `da/dl = τ · softplus'(l/τ) · (1/τ) = softplus'(l/τ) = σ(l/τ)`, so the
-/// temperature cancels out of the derivative. This is the single source of
-/// truth shared with `gamfit.torch`'s top-k activation so the torch lane's
-/// forward/backward match the Rust-defined family exactly (parity-pinned).
-#[must_use]
-pub fn topk_activation_row_value_grad(
-    logits: ArrayView1<'_, f64>,
-    temperature: f64,
-) -> (Array1<f64>, Array1<f64>) {
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array1::<f64>::zeros(logits.len());
-    let mut grad = Array1::<f64>::zeros(logits.len());
-    for i in 0..logits.len() {
-        let scaled = logits[i] * inv_tau;
-        value[i] = temperature * gam_linalg::utils::stable_softplus(scaled);
-        grad[i] = gam_linalg::utils::stable_logistic(scaled);
-    }
-    (value, grad)
-}
-
-/// Batched sibling of [`topk_activation_row_value_grad`] over an `(N, K)` logit
-/// matrix, sharing the EXACT per-atom arithmetic (same `stable_softplus`,
-/// `stable_logistic`, same `l * inv_tau` order) so a single batched call is
-/// bit-identical to invoking the row kernel row-by-row.
-///
-/// Returns `(value, grad)`, each `(N, K)`:
-///   * `value[i, k] = τ · softplus(l / τ)` — the non-negative activation,
-///   * `grad[i, k]  = σ(l / τ)` — the diagonal derivative `∂a/∂l`.
-#[must_use]
-pub fn topk_activation_batch_value_grad(
-    logits: ArrayView2<'_, f64>,
-    temperature: f64,
-) -> (Array2<f64>, Array2<f64>) {
-    let (n, k) = logits.dim();
-    let inv_tau = 1.0 / temperature;
-    let mut value = Array2::<f64>::zeros((n, k));
-    let mut grad = Array2::<f64>::zeros((n, k));
-    for i in 0..n {
-        for j in 0..k {
-            let scaled = logits[[i, j]] * inv_tau;
-            value[[i, j]] = temperature * gam_linalg::utils::stable_softplus(scaled);
-            grad[[i, j]] = gam_linalg::utils::stable_logistic(scaled);
-        }
-    }
-    (value, grad)
-}
-
-#[cfg(test)]
-mod ordered_beta_bernoulli_batch_tests {
-    use super::*;
-
-    #[test]
-    fn ordered_beta_bernoulli_batch_matches_row_kernel_bit_for_bit() {
-        let n = 5usize;
-        let k = 7usize;
-        let temperature = 0.41_f64;
-        let logits = Array2::from_shape_fn((n, k), |(i, j)| {
-            ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
-        });
-
-        let (value, grad) = ordered_beta_bernoulli_batch_value_grad(logits.view(), temperature);
-        assert_eq!(value.dim(), (n, k));
-        assert_eq!(grad.dim(), (n, k));
-
-        for i in 0..n {
-            let (rv, rg) = ordered_beta_bernoulli_row_value_grad(logits.row(i), temperature);
-            for j in 0..k {
-                assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
-                assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod topk_activation_tests {
-    use super::*;
-
-    #[test]
-    fn topk_activation_batch_matches_row_kernel_bit_for_bit() {
-        let n = 5usize;
-        let k = 7usize;
-        let temperature = 0.41_f64;
-        let logits = Array2::from_shape_fn((n, k), |(i, j)| {
-            ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
-        });
-
-        let (value, grad) = topk_activation_batch_value_grad(logits.view(), temperature);
-        assert_eq!(value.dim(), (n, k));
-        assert_eq!(grad.dim(), (n, k));
-
-        for i in 0..n {
-            let (rv, rg) = topk_activation_row_value_grad(logits.row(i), temperature);
-            for j in 0..k {
-                assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
-                assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
-            }
-        }
-    }
-
-    #[test]
-    fn topk_activation_is_nonnegative_and_grad_is_logistic() {
-        // Independent per-atom activation: strictly non-negative value, and the
-        // derivative equals σ(l/τ) exactly (temperature cancels in the chain).
-        let temperature = 0.7_f64;
-        let logits = Array1::from(vec![-4.0_f64, -0.5, 0.0, 0.5, 4.0]);
-        let (value, grad) = topk_activation_row_value_grad(logits.view(), temperature);
-        for (&v, &g) in value.iter().zip(grad.iter()) {
-            assert!(v >= 0.0, "activation must be non-negative, got {v}");
-            assert!(
-                (0.0..=1.0).contains(&g),
-                "grad must be a logistic in [0,1], got {g}"
-            );
-        }
-        // Spot-check the closed form at l = 0: τ·softplus(0) = τ·ln 2, σ(0) = 0.5.
-        assert!((value[2] - temperature * 2.0_f64.ln()).abs() < 1e-15);
-        assert!((grad[2] - 0.5).abs() < 1e-15);
     }
 }
 
@@ -1608,39 +1367,6 @@ mod topk_support_gate_tests {
             AssignmentMode::top_k_support(0).validate().is_err(),
             "k = 0 must be rejected"
         );
-    }
-}
-
-#[cfg(test)]
-mod threshold_gate_batch_tests {
-    use super::*;
-
-    #[test]
-    fn threshold_gate_batch_matches_row_kernel_bit_for_bit() {
-        // Deterministic (N, K) logit matrix with per-atom thresholds spanning
-        // both sides of the jump.
-        let n = 5usize;
-        let k = 7usize;
-        let temperature = 0.41_f64;
-        let logits = Array2::from_shape_fn((n, k), |(i, j)| {
-            ((i as f64) * 0.37 - (j as f64) * 0.19 + 0.11).sin()
-        });
-        let thresholds = Array1::from_shape_fn(k, |j| 0.2 - 0.05 * j as f64);
-
-        let (value, grad) =
-            threshold_gate_batch_value_grad(logits.view(), temperature, thresholds.view());
-        assert_eq!(value.dim(), (n, k));
-        assert_eq!(grad.dim(), (n, k));
-
-        // The batch kernel must reproduce the row kernel EXACTLY (same ops, same
-        // order) — bit-for-bit, not merely within a tolerance.
-        for i in 0..n {
-            let (rv, rg) = threshold_gate_row_value_grad(logits.row(i), temperature, thresholds.view());
-            for j in 0..k {
-                assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
-                assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
-            }
-        }
     }
 }
 

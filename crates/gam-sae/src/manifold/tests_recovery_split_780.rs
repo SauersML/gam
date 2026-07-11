@@ -563,7 +563,7 @@ pub(crate) fn jumprelu_assignment_value_matches_logit_gradient_fd() {
 }
 
 #[test]
-pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep() {
+pub(crate) fn threshold_gate_assignment_prior_hessian_diag_is_exact_over_logit_sweep() {
     let n = 6usize;
     let k = 2usize;
     let temperature = 0.35_f64;
@@ -583,10 +583,10 @@ pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep()
         manifolds,
         AssignmentMode::threshold_gate(temperature, threshold),
     )
-    .expect("valid JumpReLU assignment");
+    .expect("valid smooth threshold assignment");
     let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
     let (grad, diag) = assignment_prior_grad_hdiag(&assignment, &rho)
-        .expect("JumpReLU assignment prior hessian diag");
+        .expect("smooth threshold assignment prior hessian diag");
     let inv_tau = 1.0 / temperature;
     let inv_tau2 = inv_tau * inv_tau;
     let sparsity_strength = rho.log_lambda_sparse.exp();
@@ -597,25 +597,20 @@ pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep()
     for (idx, &entry) in diag.iter().enumerate() {
         let logit = logits[[idx / k, idx % k]];
         // Expected = exact second derivative of the threshold-centered
-        // surrogate σ((l−θ)/τ), using the same machine-precision support as
-        // the value and gradient paths.
-        let expected = if jumprelu_in_optimization_band(logit, threshold, temperature) {
-            let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
-            let slope = activation * (1.0 - activation);
-            sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2
-        } else {
-            0.0
-        };
+        // smooth gate σ((l−θ)/τ), with no hard support branch.
+        let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+        let slope = activation * (1.0 - activation);
+        let expected = sparsity_strength * slope * (1.0 - 2.0 * activation) * inv_tau2;
         assert!(
             entry.is_finite(),
-            "JumpReLU hessian_diag must be finite at index {idx}"
+            "threshold-gate hessian_diag must be finite at index {idx}"
         );
         saw_negative |= entry < 0.0;
         assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
     }
     assert!(
         saw_negative,
-        "exact JumpReLU hessian_diag must go negative above the threshold"
+        "exact threshold-gate hessian_diag must go negative above the threshold"
     );
 }
 
@@ -1433,7 +1428,7 @@ pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
     let source_rho = source.baseline_rho.clone();
     source
         .term
-        .reml_criterion_with_cache(
+        .penalized_laml_criterion_with_cache(
             source.target.view(),
             &source_rho,
             source.registry.as_ref(),
@@ -1864,7 +1859,7 @@ pub(crate) fn fixed_state_logdet(
     rho: &SaeManifoldRho,
 ) -> f64 {
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
         .expect("fixed-state cache");
     arrow_log_det_from_cache(&cache).expect("fixed-state authoritative joint logdet")
 }

@@ -3445,7 +3445,7 @@ fn sae_incoherence_report_dict<'py>(
     gumbel_schedule = None,
     analytic_penalties = None,
 ))]
-fn sae_manifold_fit_ibp<'py>(
+fn sae_manifold_fit_ordered_beta_bernoulli<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
     atom_basis: Vec<String>,

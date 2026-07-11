@@ -34,12 +34,11 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   depending on whether canonical-axis pruning or gauge fixing is also needed.
 * `SoftmaxAssignmentSparsityPenalty` and `OrderedBetaBernoulliPenalty` live on
   row-wise assignment logits. They serialize to the Rust assignment-prior
-  registry used by SAE-style latent blocks; the IBP wrapper canonicalizes to
-  the finite IBP-MAP descriptor on the Rust side.
-* `TopKActivationPenalty`, `JumpReLUPenalty`, and `GatedSAEDecoder` support
-  the newer SAE assignment family. `TopKActivationPenalty` / `JumpReLUPenalty`
+  registry used by SAE-style latent blocks.
+* `TopKActivationPenalty`, `SmoothThresholdPenalty`, and `GatedSAEDecoder` support
+  the newer SAE assignment family. `TopKActivationPenalty` / `SmoothThresholdPenalty`
   are Rust-backed analytic descriptors; `GatedSAEDecoder` is a config-only
-  descriptor that serializes to the Rust gated/JumpReLU decoder contract.
+  descriptor that serializes to the Rust gated decoder contract.
 * `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
   latent-axis blocks, shrinking whole groups rather than individual entries
   or single ARD axes.
@@ -94,7 +93,7 @@ __all__ = [
     "ScadMcpPenalty",
     "ARDPenalty",
     "TopKActivationPenalty",
-    "JumpReLUPenalty",
+    "SmoothThresholdPenalty",
     "GatedSAEDecoder",
     "TotalVariationPenalty",
     "NuclearNormPenalty",
@@ -350,7 +349,7 @@ class AnalyticPenaltyKind(str, Enum):
     ORDERED_BETA_BERNOULLI = "ordered_beta_bernoulli"
     ARD = "ard"
     TOPK_ACTIVATION = "topk_activation"
-    JUMPRELU = "jumprelu"
+    SMOOTH_THRESHOLD = "smooth_threshold"
     TOTAL_VARIATION = "total_variation"
     NUCLEAR_NORM = "nuclear_norm"
     BLOCK_SPARSITY = "block_sparsity"
@@ -593,7 +592,7 @@ def _target_descriptor(target: Any) -> str | int:
 
 ARDPenalty = _rust_descriptor_class("ARDPenalty")
 TopKActivationPenalty = _rust_descriptor_class("TopKActivationPenalty")
-JumpReLUPenalty = _rust_descriptor_class("JumpReLUPenalty")
+SmoothThresholdPenalty = _rust_descriptor_class("SmoothThresholdPenalty")
 
 
 SparsityPenalty = _rust_descriptor_class("SparsityPenalty")
@@ -617,10 +616,9 @@ Targets the row-wise activation/assignment block named by ``target`` and
 serializes to ``kind="topk_activation"``. Direct evaluation uses the same Rust
 ``value_grad`` / ``hvp`` kernels as the formula pipeline.
 """,
-    "JumpReLUPenalty": """Analytic JumpReLU SAE sparsity penalty descriptor.
+    "SmoothThresholdPenalty": """Analytic smooth-threshold sparsity penalty descriptor.
 
-Represents the hard-threshold SAE assignment family exposed by
-``sae_manifold_fit(..., assignment="threshold_gate")``. The Python wrapper forwards
+Represents a sigmoid-smoothed coordinate threshold. The Python wrapper forwards
 constructor arguments to the Rust descriptor and
 supports ``value_grad(t)`` / ``hvp(t, v)`` in NumPy, Torch, and JAX frames.
 """,
@@ -675,7 +673,7 @@ the Rust descriptor and applies it to the targeted latent block.
 
 The public Rust-backed wrapper accepts fields such as ``k_max``, ``alpha``,
 ``tau``, ``learnable``, and ``target`` where supported by the extension, then
-serializes to the finite IBP assignment descriptor.
+serializes to the ordered independent Beta--Bernoulli descriptor.
 """,
     "TotalVariationPenalty": """Smoothed total-variation penalty on ordered or graph-linked rows.
 
@@ -759,7 +757,7 @@ class GatedSAEDecoder:
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
-    "TopKActivationPenalty | JumpReLUPenalty | TotalVariationPenalty | "
+    "TopKActivationPenalty | SmoothThresholdPenalty | TotalVariationPenalty | "
     "NuclearNormPenalty | BlockSparsityPenalty | "
     "MechanismSparsityPenalty | AuxConditionalPriorPenalty | IvaeRidgeMeanGauge | "
     "ParametricAuxConditionalPriorPenalty | OrthogonalityPenalty | OrderedBetaBernoulliPenalty | "

@@ -56,7 +56,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 .expect("set row loss weights");
         }
         let (_value, _loss, cache) = term
-            .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+            .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged cache");
         let second_jets = term.atom_second_jets().expect("second jets");
         let border = term
@@ -140,7 +140,6 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 atoms,
                 gate_value: assignments.to_vec(),
                 logits: term.assignment.logits.row(row).to_vec(),
-                gate_scale: vec![1.0; k_atoms],
                 gate_shift: vec![0.0; k_atoms],
                 gate: RowGate::Softmax { inv_tau },
                 logit_slot,

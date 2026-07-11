@@ -115,7 +115,7 @@ def test_fourier_evaluate_matches_periodic_harmonic() -> None:
 
 def test_penalty_composition_hvp_is_sum_of_parts() -> None:
     pa = gamfit.ARDPenalty(weight=0.1)
-    pb = gamfit.IBPPenalty(alpha=1.0, tau=1.0)
+    pb = gamfit.OrderedBetaBernoulliPenalty(alpha=1.0, tau=1.0)
     composite = pa + pb
     from gamfit._composite_penalty import CompositePenalty
     assert isinstance(composite, CompositePenalty)

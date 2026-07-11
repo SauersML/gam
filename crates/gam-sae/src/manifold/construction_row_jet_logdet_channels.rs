@@ -153,20 +153,18 @@ impl SaeManifoldTerm {
                 }
             })
             .collect();
-        let (gate, gate_shift, gate_scale) = match self.assignment.mode {
+        let (gate, gate_shift) = match self.assignment.mode {
             AssignmentMode::Softmax { temperature, .. } => (
                 RowGate::Softmax {
                     inv_tau: 1.0 / temperature,
                 },
                 vec![0.0; k_atoms],
-                vec![1.0; k_atoms],
             ),
             AssignmentMode::OrderedBetaBernoulli { temperature, .. } => (
                 RowGate::PerAtomLogistic {
                     inv_tau: 1.0 / temperature,
                 },
                 vec![0.0; k_atoms],
-                vec![1.0; k_atoms],
             ),
             AssignmentMode::ThresholdGate {
                 temperature,
@@ -176,7 +174,6 @@ impl SaeManifoldTerm {
                     inv_tau: 1.0 / temperature,
                 },
                 vec![threshold; k_atoms],
-                vec![1.0; k_atoms],
             ),
             // TopK: every atom is `logit_is_fixed`, so `fixed_gate_value`
             // (= the exact {0, 1} support gates) overrides the gate machinery
@@ -184,7 +181,6 @@ impl SaeManifoldTerm {
             AssignmentMode::TopK { .. } => (
                 RowGate::PerAtomLogistic { inv_tau: 1.0 },
                 vec![0.0; k_atoms],
-                vec![1.0; k_atoms],
             ),
         };
 
@@ -192,7 +188,6 @@ impl SaeManifoldTerm {
             atoms,
             gate_value: assignments.to_vec(),
             logits,
-            gate_scale,
             gate_shift,
             gate,
             logit_slot,

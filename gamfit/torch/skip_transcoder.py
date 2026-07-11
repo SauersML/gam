@@ -8,7 +8,7 @@ Interpretability." arXiv:2501.18823, 2025.
 A skip-transcoder reconstructs the residual stream at layer L_out using a
 *sparse code computed from* layer L_in plus a *low-rank affine bypass* of L_in:
 
-    z       = JumpReLU(W_enc * x_in + b_enc)        # sparse code, F atoms
+    z       = SmoothThreshold(W_enc * x_in + b_enc) # sparse code, F atoms
     y_hat   = W_dec * z       + A_skip * x_in + b_out
               (sparse circuit)   (rank-r bypass)
 
@@ -22,13 +22,13 @@ This module is the *gamfit* end: a compositional Smooth that pairs an
 identity-basis sparse Smooth (the dictionary) with a rank-constrained
 linear Smooth (the bypass), sharing the design matrix on the input side
 and targeting a DIFFERENT layer's residual. It re-uses gamfit's existing
-JumpReLU penalty (already in the Rust core) and Pca-style low-rank smooth.
+smooth-threshold penalty (already in the Rust core) and Pca-style low-rank smooth.
 
 Outer-loop REML
 ---------------
 ``skip_transcoder`` builds exactly one explicitly configured module.
 ``select_skip_transcoder`` profiles ``log(lambda_sparse)`` and the shared
-``log(jumprelu_threshold)`` continuously from an analytic evidence/gradient
+``log(activation_threshold)`` continuously from an analytic evidence/gradient
 oracle supplied by the caller's PyTorch training loop. Rank remains genuinely
 discrete and is selected by evidence-priced sequential birth/death moves. The
 result carries the two-neighbour stop certificate; failed or non-stationary
@@ -44,7 +44,7 @@ from typing import Callable, Literal
 import torch
 from torch import nn
 
-from .penalties import JumpReLUPenalty
+from .penalties import SmoothThresholdPenalty
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ class SkipAffineSmooth(nn.Module):
 
     The two halves share the same design matrix on the input side (``x_in``)
     but their codomain is a DIFFERENT layer's residual (``y_out``). Sparse
-    encode/decode is a width-F atom dictionary gated by ``JumpReLUPenalty``;
+    encode/decode is a width-F atom dictionary gated by ``SmoothThresholdPenalty``;
     the bypass is ``A * x_in`` factored as ``U @ V^T`` with ``U`` in
     ``R^(d_out, r)`` and ``V`` in ``R^(d_in, r)``.
 
@@ -70,17 +70,17 @@ class SkipAffineSmooth(nn.Module):
     rank_skip:
         Rank of the affine bypass A. 0 disables the skip (degenerates to a
         plain transcoder).
-    jumprelu_threshold:
-        Base threshold tau_k for JumpReLU gating (scalar broadcast to F).
+    activation_threshold:
+        Base smooth activation threshold (scalar broadcast to F).
     lambda_sparse:
-        Weight on the JumpReLU sparsity penalty. This is the actual knob that
+        Weight on the smooth-threshold sparsity penalty. This is the actual knob that
         trades fidelity against sparsity in the user's training loss
-        (``loss += jumprelu.penalty(z_pre)``), so it must travel with the
+        (``loss += smooth_threshold(z_pre)``), so it must travel with the
         module — not just live in the outer-loop scoring metadata. Must be > 0.
     learnable_threshold:
         If True, REML can shift the threshold via ``log_threshold`` parameter.
     smoothing_eps:
-        STE bandwidth (passed through to ``JumpReLUPenalty``).
+        Sigmoid bandwidth (passed through to ``SmoothThresholdPenalty``).
     """
 
     def __init__(
@@ -89,7 +89,7 @@ class SkipAffineSmooth(nn.Module):
         out_dim: int,
         n_atoms: int,
         rank_skip: int,
-        jumprelu_threshold: float = 0.05,
+        activation_threshold: float = 0.05,
         lambda_sparse: float = 1.0,
         *,
         learnable_threshold: bool = False,
@@ -104,8 +104,8 @@ class SkipAffineSmooth(nn.Module):
             raise ValueError("SkipAffineSmooth dims must be > 0")
         if rank_skip < 0 or rank_skip > min(in_dim, out_dim):
             raise ValueError(f"rank_skip must be in [0, min(in, out)], got {rank_skip}")
-        if jumprelu_threshold <= 0.0:
-            raise ValueError("jumprelu_threshold must be > 0")
+        if activation_threshold <= 0.0:
+            raise ValueError("activation_threshold must be > 0")
         if lambda_sparse <= 0.0:
             raise ValueError("lambda_sparse must be > 0")
 
@@ -132,9 +132,9 @@ class SkipAffineSmooth(nn.Module):
             self.register_parameter("skip_U", None)
             self.register_parameter("skip_V", None)
 
-        # JumpReLU prior shared with the gamfit composition engine.
-        thresholds = torch.full((n_atoms,), float(jumprelu_threshold), dtype=torch.float64)
-        self.jumprelu = JumpReLUPenalty(
+        # Smooth-threshold prior shared with the gamfit composition engine.
+        thresholds = torch.full((n_atoms,), float(activation_threshold), dtype=torch.float64)
+        self.smooth_threshold = SmoothThresholdPenalty(
             thresholds=thresholds,
             weight=float(lambda_sparse),
             smoothing_eps=float(smoothing_eps),
@@ -167,8 +167,8 @@ class SkipAffineSmooth(nn.Module):
         return x_in @ self.W_enc + self.b_enc
 
     def code(self, x_in: torch.Tensor) -> torch.Tensor:
-        """Sparse code after JumpReLU gating."""
-        return self.jumprelu.gate(self.encode(x_in))
+        """Sparse code after smooth threshold gating."""
+        return self.smooth_threshold.gate(self.encode(x_in))
 
     def skip_projection(self, x_in: torch.Tensor) -> torch.Tensor | None:
         """Skip input projection ``XV = x_in @ skip_V``, shape ``(B, rank)``.
@@ -200,21 +200,21 @@ class SkipAffineSmooth(nn.Module):
         return y_hat, z
 
     def sparsity_penalty(self, x_in: torch.Tensor) -> torch.Tensor:
-        """JumpReLU sparsity penalty on the pre-activation latents.
+        """Smooth-threshold sparsity penalty on the pre-activation latents.
 
-        Evaluates ``JumpReLUPenalty`` (weight ``= lambda_sparse``) on the
+        Evaluates ``SmoothThresholdPenalty`` (weight ``= lambda_sparse``) on the
         pre-gate code ``z_pre = encode(x_in)``. This is the term that trades
         fidelity against sparsity in :meth:`loss`; its scale IS the module's
         ``lambda_sparse`` so different ``lambda_sparse`` give different values.
         """
         z_pre = self.encode(x_in)
-        return self.jumprelu(z_pre)
+        return self.smooth_threshold(z_pre)
 
     def loss(self, x_in: torch.Tensor, y_out: torch.Tensor) -> torch.Tensor:
         """Canonical training objective: reconstruction MSE + sparsity penalty.
 
-        ``loss = mean((y_hat - y_out) ** 2) + jumprelu_penalty(z_pre)`` where the
-        JumpReLU penalty already carries ``weight = lambda_sparse`` (set in
+        ``loss = mean((y_hat - y_out) ** 2) + smooth_threshold(z_pre)`` where the
+        smooth-threshold penalty carries ``weight = lambda_sparse`` (set in
         ``__init__``). The sparse weight is therefore genuinely in the objective:
         two modules built with different ``lambda_sparse`` produce different
         ``loss`` on the same ``(x_in, y_out)``.
@@ -224,7 +224,7 @@ class SkipAffineSmooth(nn.Module):
         return recon + self.sparsity_penalty(x_in)
 
     # --------------------------------------------------------------
-    # Convenience: attribution-graph edge weights at JumpReLU-active points
+    # Convenience: attribution-graph edge weights at active points
     # --------------------------------------------------------------
 
     @torch.no_grad()
@@ -240,7 +240,7 @@ class SkipAffineSmooth(nn.Module):
 
         The model output is ``y_hat = z @ W_dec + skip(x_in) + b_out`` (see
         :meth:`forward`), so the direct, linearized contribution of atom ``i``
-        to output coordinate ``j`` at the JumpReLU-active points is
+        to output coordinate ``j`` at the smooth-threshold active points is
 
             contrib_i = mean_b z_{b,i} * W_dec[i, j],
 
@@ -275,7 +275,7 @@ def skip_transcoder(
     out_dim: int,
     n_atoms: int,
     rank_skip: int,
-    jumprelu_threshold: float = 0.05,
+    activation_threshold: float = 0.05,
     lambda_sparse: float = 1e-3,
     *,
     learnable_threshold: bool = False,
@@ -291,11 +291,11 @@ def skip_transcoder(
     """
     if isinstance(rank_skip, bool) or not isinstance(rank_skip, Integral):
         raise TypeError("rank_skip must be one integer, not a candidate sequence")
-    if isinstance(jumprelu_threshold, bool) or not isinstance(
-        jumprelu_threshold, Real
+    if isinstance(activation_threshold, bool) or not isinstance(
+        activation_threshold, Real
     ):
         raise TypeError(
-            "jumprelu_threshold must be one real scalar, not a candidate sequence"
+            "activation_threshold must be one real scalar, not a candidate sequence"
         )
     if isinstance(lambda_sparse, bool) or not isinstance(lambda_sparse, Real):
         raise TypeError(
@@ -306,7 +306,7 @@ def skip_transcoder(
         out_dim=out_dim,
         n_atoms=n_atoms,
         rank_skip=int(rank_skip),
-        jumprelu_threshold=float(jumprelu_threshold),
+        activation_threshold=float(activation_threshold),
         lambda_sparse=float(lambda_sparse),
         learnable_threshold=learnable_threshold,
         smoothing_eps=smoothing_eps,
@@ -324,7 +324,7 @@ class SkipTranscoderTrial:
 
     rank_skip: int
     log_lambda_sparse: float
-    log_jumprelu_threshold: float
+    log_activation_threshold: float
     transition: TransitionKind
     warm_start: SkipAffineSmooth | None
 
@@ -342,7 +342,7 @@ class SkipTranscoderProfile:
     smooth: SkipAffineSmooth
     rank_skip: int
     log_lambda_sparse: float
-    log_jumprelu_threshold: float
+    log_activation_threshold: float
     negative_log_evidence: float
     gradient_log_hyperparameters: tuple[float, float]
     gradient_scale: float
@@ -350,7 +350,7 @@ class SkipTranscoderProfile:
     def __post_init__(self) -> None:
         values = (
             self.log_lambda_sparse,
-            self.log_jumprelu_threshold,
+            self.log_activation_threshold,
             self.negative_log_evidence,
             *self.gradient_log_hyperparameters,
             self.gradient_scale,
@@ -460,8 +460,8 @@ class SkipTranscoderSelectionResult:
         return math.exp(self.profile.log_lambda_sparse)
 
     @property
-    def jumprelu_threshold(self) -> float:
-        return math.exp(self.profile.log_jumprelu_threshold)
+    def activation_threshold(self) -> float:
+        return math.exp(self.profile.log_activation_threshold)
 
     @property
     def rank_skip(self) -> int:
@@ -497,9 +497,9 @@ def _evaluate_profile_trial(
             trial.log_lambda_sparse,
         ),
         (
-            "log_jumprelu_threshold",
-            outcome.log_jumprelu_threshold,
-            trial.log_jumprelu_threshold,
+            "log_activation_threshold",
+            outcome.log_activation_threshold,
+            trial.log_activation_threshold,
         ),
     ):
         if abs(actual - requested) > coordinate_tolerance * (1.0 + abs(requested)):
@@ -532,7 +532,7 @@ def _continuously_profile_rank(
             SkipTranscoderTrial(
                 rank_skip=rank_skip,
                 log_lambda_sparse=float(logs[0].detach()),
-                log_jumprelu_threshold=float(logs[1].detach()),
+                log_activation_threshold=float(logs[1].detach()),
                 transition=kind,
                 warm_start=seed,
             ),
@@ -618,7 +618,7 @@ def select_skip_transcoder(
     profile_trial: ProfileTrial,
     *,
     initial_lambda_sparse: float,
-    initial_jumprelu_threshold: float,
+    initial_activation_threshold: float,
     initial_rank: int = 0,
 ) -> SkipTranscoderSelectionResult:
     """Continuously profile lambda/threshold and sequentially select rank.
@@ -641,14 +641,14 @@ def select_skip_transcoder(
     if not math.isfinite(initial_lambda_sparse) or initial_lambda_sparse <= 0.0:
         raise ValueError("initial_lambda_sparse must be finite and > 0")
     if (
-        not math.isfinite(initial_jumprelu_threshold)
-        or initial_jumprelu_threshold <= 0.0
+        not math.isfinite(initial_activation_threshold)
+        or initial_activation_threshold <= 0.0
     ):
-        raise ValueError("initial_jumprelu_threshold must be finite and > 0")
+        raise ValueError("initial_activation_threshold must be finite and > 0")
 
     initial_logs = (
         math.log(initial_lambda_sparse),
-        math.log(initial_jumprelu_threshold),
+        math.log(initial_activation_threshold),
     )
     profiles: dict[int, SkipTranscoderProfile] = {}
     transitions: list[RankTransition] = []
@@ -676,7 +676,7 @@ def select_skip_transcoder(
                     candidate_rank,
                     (
                         current.log_lambda_sparse,
-                        current.log_jumprelu_threshold,
+                        current.log_activation_threshold,
                     ),
                     direction,
                     current.smooth,

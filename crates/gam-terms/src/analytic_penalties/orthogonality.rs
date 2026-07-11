@@ -1023,7 +1023,7 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
     /// products `JᵀJ` — and coincides with the exact Hessian as the cross-Gram
     /// `C → 0`. The inner Newton / PIRLS curvature block must stay
     /// positive-definite, so the GN block is the correct operator here, mirroring
-    /// the other nonconvex penalties (sparsity, JumpReLU, isometry) that override
+    /// the other nonconvex penalties (sparsity, smooth-threshold, isometry) that override
     /// the majorizer rather than hand back the indefinite true Hessian.
     fn psd_majorizer_hvp(
         &self,

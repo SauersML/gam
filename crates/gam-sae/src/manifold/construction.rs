@@ -20,13 +20,13 @@ use super::*;
 //     is diagnostic, not an alternative production criterion.
 //   • RLCT (SINGULAR truth, a symmetry orbit or a null atom): λ drops below ½·d
 //     to the real log-canonical threshold. The null atom (truth B*=0) has λ=½ from
-//     the amplitude singularity of a²‖B‖² — see the veto in `reml_criterion`.
+//     the amplitude singularity of a²‖B‖² — see the veto in `penalized_laml_criterion`.
 //
 // Soft → hard away from the edge (every sigmoid → 1) and soft → RLCT at singular
 // truths (sigmoids → 0), so the single ledger `λ(n_eff)·ln n_eff` interpolates all
 // three regimes continuously. The log-scale is the OCCUPANCY-corrected `ln n_eff`
 // (Fisher information actually accumulated by a gated atom), never the global row
-// count — see the #2a inert-row axiom in `reml_criterion`.
+// count — see the #2a inert-row axiom in `penalized_laml_criterion`.
 //
 // The production criterion has one charge currency: the hard MP branch. Keeping
 // an un-differentiated soft alternative would make value and analytic gradient
@@ -475,7 +475,7 @@ impl SaeManifoldTerm {
         primary.barrier_coactivation_gate = None;
         // Evidence-gauge / co-collapse cluster — the canonical reset (mirrors
         // outer_objective.rs and the ctor) clears all FIVE fields together: the
-        // reanchor count and last-delta sign feed the reml_criterion reversal-
+        // reanchor count and last-delta sign feed the penalized_laml_criterion reversal-
         // budget loop, so carrying `primary`'s stale tier-1 values would either
         // spuriously flag a reversal on the merged term's FIRST deflation step or
         // start the joint polish with a partially-consumed budget (erroring
@@ -4152,7 +4152,7 @@ impl SaeManifoldTerm {
     /// weights are auto-scaled to the REML criterion magnitude (magic by default:
     /// no caller knob) so the consistency term is a meaningful but non-dominant
     /// fraction of the objective regardless of problem scale.
-    pub fn reml_criterion_cotrained(
+    pub fn penalized_laml_criterion_cotrained(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
@@ -4163,14 +4163,14 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss, AmortizedEncoderConsistency), String> {
         // #1154: always attempt the amortized warm-start first inside
-        // `reml_criterion_cotrained` (the encode/warm path for the cotrained
+        // `penalized_laml_criterion_cotrained` (the encode/warm path for the cotrained
         // objective). Good warm-starts from the running dictionary land the
         // inner solve closer to the stationary point used for the fold.
         // Advisory only (0 or err falls back to cold); telemetry recorded by
         // outer objective callers when present.
         self.warm_start_latents_from_amortized_encoder(target, rho)
             .unwrap_or(0);
-        let (reml, loss) = self.reml_criterion_with_refine_policy(
+        let (reml, loss) = self.penalized_laml_criterion_with_refine_policy(
             target,
             rho,
             registry,
@@ -4192,7 +4192,7 @@ impl SaeManifoldTerm {
     /// #1154 — the single source of the co-training fold arithmetic: add the
     /// auto-scaled amortized-encoder consistency penalty to an already-computed
     /// REML criterion at the converged dictionary. Both the public
-    /// [`Self::reml_criterion_cotrained`] entry point and the outer-loop value /
+    /// [`Self::penalized_laml_criterion_cotrained`] entry point and the outer-loop value /
     /// gradient lanes (`SaeManifoldOuterObjective::fold_cotrain_consistency`)
     /// route through THIS function, so the folded objective cannot drift between
     /// the criterion and the cascade-ranked cost (the objective↔gradient desync
@@ -5146,7 +5146,7 @@ impl SaeManifoldTerm {
     }
 }
 
-// [#780 line-count gate] The quasi-Laplace evidence criterion (`reml_criterion*`)
+// [#780 line-count gate] The quasi-Laplace evidence criterion (`penalized_laml_criterion*`)
 // and the evidence-pricing machinery around it live in the sibling
 // `construction_reml_evidence.rs` as a second `impl SaeManifoldTerm` block,
 // inlined here so it keeps the SAME module scope and private-field access.

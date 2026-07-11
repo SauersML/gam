@@ -111,7 +111,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let mut audit_term = gradient_objective.term.clone();
     let mut atomized_audit_term = audit_term.clone();
     let (audit_value, audit_loss, audit_cache) = audit_term
-        .reml_criterion_with_cache(
+        .penalized_laml_criterion_with_cache(
             gradient_objective.target.view(),
             &rho_state,
             gradient_objective.registry.as_ref(),
@@ -217,7 +217,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         let mut term = frozen_anchor_term.clone();
         let rho = frozen_baseline_rho.from_flat(rho_flat.view());
         let (criterion, loss, cache) = term
-            .reml_criterion_with_cache(
+            .penalized_laml_criterion_with_cache(
                 frozen_target.view(),
                 &rho,
                 frozen_registry.as_ref(),
@@ -570,7 +570,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
     let rho_state = objective.baseline_rho.from_flat(base.view());
     let mut audit_term = objective.term.clone();
     let (_frozen_value, audit_loss, audit_cache) = audit_term
-        .reml_criterion_with_cache(
+        .penalized_laml_criterion_with_cache(
             objective.target.view(),
             &rho_state,
             objective.registry.as_ref(),
@@ -597,7 +597,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
     let frozen_cost_at = |rho_flat: &Array1<f64>| -> f64 {
         let mut term = anchor_term.clone();
         let rho = objective.baseline_rho.from_flat(rho_flat.view());
-        term.reml_criterion_with_cache(
+        term.penalized_laml_criterion_with_cache(
             objective.target.view(),
             &rho,
             objective.registry.as_ref(),

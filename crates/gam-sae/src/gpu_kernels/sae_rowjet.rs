@@ -263,7 +263,6 @@ fn softmax_program(
         atoms,
         gate_value,
         logits: inp.logits.clone(),
-        gate_scale: vec![1.0; k],
         gate_shift: vec![0.0; k],
         gate: RowGate::Softmax { inv_tau },
         logit_slot: (0..k).map(Some).collect(),

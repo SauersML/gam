@@ -275,14 +275,14 @@ class ARDPenalty(_RustPenaltyDescriptor):
         return f"ARDPenalty(weight={self.weight})"
 
 
-class IBPPenalty(_RustPenaltyDescriptor):
-    """Finite IBP prior over row-wise assignment logits."""
+class OrderedBetaBernoulliPenalty(_RustPenaltyDescriptor):
+    """Ordered independent Beta--Bernoulli prior over assignment logits."""
 
     def __init__(self, alpha: float = 1.0, *, tau: float = 1.0, k_max: int | None = None, target: str = "t") -> None:
         if float(alpha) <= 0.0:
-            raise ValueError("IBPPenalty.alpha must be > 0")
+            raise ValueError("OrderedBetaBernoulliPenalty.alpha must be > 0")
         if float(tau) <= 0.0:
-            raise ValueError("IBPPenalty.tau must be > 0")
+            raise ValueError("OrderedBetaBernoulliPenalty.tau must be > 0")
         self.alpha = float(alpha)
         self.tau = float(tau)
         self.k_max = None if k_max is None else int(k_max)
@@ -295,7 +295,7 @@ class IBPPenalty(_RustPenaltyDescriptor):
         )
 
     def __repr__(self) -> str:
-        return f"IBPPenalty(alpha={self.alpha}, tau={self.tau})"
+        return f"OrderedBetaBernoulliPenalty(alpha={self.alpha}, tau={self.tau})"
 
 
 class BlockOrthogonalityDescriptor(_RustPenaltyDescriptor):
@@ -354,7 +354,7 @@ class MechanismSparsityDescriptor(_RustPenaltyDescriptor):
 
 __all__ = [
     "ARDPenalty",
-    "IBPPenalty",
+    "OrderedBetaBernoulliPenalty",
     "BlockOrthogonalityDescriptor",
     "MechanismSparsityDescriptor",
 ]

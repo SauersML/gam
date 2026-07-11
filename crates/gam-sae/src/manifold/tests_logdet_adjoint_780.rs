@@ -921,11 +921,11 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     softmax_rho.log_lambda_sparse = 0.5;
     softmax_rho.log_lambda_smooth = vec![-1.7, -1.2];
     softmax_term
-        .reml_criterion_with_cache(target.view(), &softmax_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &softmax_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged softmax parity cache");
     configure_decisive_softmax_logits_2156(&mut softmax_term);
     let (softmax_value, softmax_loss, softmax_cache) = softmax_term
-        .reml_criterion_with_cache(target.view(), &softmax_rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &softmax_rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
         .expect("fixed-branch softmax parity cache");
     assert!(
         softmax_value.is_finite() && softmax_loss.total().is_finite(),
@@ -951,7 +951,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     ibp_rho.log_lambda_sparse = 0.6;
     ibp_rho.log_lambda_smooth = vec![-1.6, -1.1];
     let (ibp_value, ibp_loss, ibp_cache) = ibp_term
-        .reml_criterion_with_cache(ibp_target.view(), &ibp_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(ibp_target.view(), &ibp_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged low-rank-metric ordered Beta--Bernoulli parity cache");
     assert!(
         ibp_value.is_finite() && ibp_loss.total().is_finite(),
@@ -985,7 +985,7 @@ pub(crate) fn end_to_end_dual_vs_analytic_logdet_parity_battery_2156_2144() {
     deflated_term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
     deflated_rho.log_lambda_sparse = 0.5;
     let (deflated_value, deflated_loss, deflated_cache) = deflated_term
-        .reml_criterion_with_cache(
+        .penalized_laml_criterion_with_cache(
             deflated_target.view(),
             &deflated_rho,
             None,
@@ -1041,11 +1041,11 @@ pub(crate) fn branch_guarded_dual_oracle_pins_live_softmax_channels_2156() {
     let (mut softmax_term, target, mut softmax_rho) = gamma_fd_tiny_fixture();
     softmax_rho.log_lambda_sparse = 0.5;
     softmax_term
-        .reml_criterion_with_cache(target.view(), &softmax_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &softmax_rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged softmax cache");
     configure_decisive_softmax_logits_2156(&mut softmax_term);
     let (softmax_value, softmax_loss, softmax_cache) = softmax_term
-        .reml_criterion_with_cache(target.view(), &softmax_rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &softmax_rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
         .expect("fixed-state softmax cache");
     assert!(
         softmax_value.is_finite() && softmax_loss.total().is_finite(),
@@ -1131,11 +1131,11 @@ pub(crate) fn softmax_tt_weight_product_logit_adjoint_hits_both_factors_2156() {
 pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     rho.log_lambda_sparse = 0.5;
-    term.reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+    term.penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     configure_decisive_softmax_logits_2156(&mut term);
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
         .expect("off-kink fixed-state cache");
 
     let row = 0usize;
@@ -1549,7 +1549,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
     // row-varying logit margins keep the softmax away from that kink without
     // saturating the row to a near-boundary PD block, so the fixed-state central
     // difference below differentiates a locally smooth majorizer branch.
-    term.reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+    term.penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     for r in 0..term.n_obs() {
         let center = 0.05 * (r as f64);
@@ -1563,7 +1563,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_on_tiny_fixture() {
         }
     }
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 0, 0.4, 1.0e-6, 1.0e-6)
         .expect("off-kink fixed-state cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1630,7 +1630,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli()
     // tolerance is weakened.
     rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1733,7 +1733,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_low_rank_metric_2144
     );
     rho.log_lambda_sparse = 0.5;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged majorized cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1829,7 +1829,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_full_rank_whitening_2144
     // what the fixed-state FD comparison pins).
     rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged full-rank whitened cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -1900,7 +1900,7 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     // digits. Setup fix only — no tolerance weakened.
     rho.log_lambda_sparse = -0.8;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let analytic = term
@@ -1957,7 +1957,7 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ordered_beta_bernoulli_l
     // Woodbury source is genuinely live there.
     rho.log_lambda_sparse = 0.6;
     let (_value, _loss, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-8, 1.0e-8)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-8, 1.0e-8)
         .expect("converged learnable-α cache");
     let solver = DeflatedArrowSolver::plain(&cache);
     let gamma = term
@@ -2018,7 +2018,7 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_compact_layout_matches_dense_1416() {
     // budget, so production keeps the dense layout (`last_row_layout = None`);
     // this also mutates `term` to the converged (t, β, logit) state.
     let (_value, _loss, dense_cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("dense converged cache");
     let dense_solver = DeflatedArrowSolver::plain(&dense_cache);
     let analytic_dense = term
@@ -2154,7 +2154,7 @@ fn sae_logdet_theta_adjoint_from_probes_matches_dense_softmax_2080() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged softmax cache");
     assert_theta_adjoint_from_probes_matches_dense(&term, &rho, &cache);
 }
@@ -2170,7 +2170,7 @@ fn sae_logdet_theta_adjoint_from_probes_refuses_ibp_cross_row_2080() {
     term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false);
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged ibp-map cache");
     let k = cache.k;
     let sqrt_k = (k as f64).sqrt();
@@ -2206,7 +2206,7 @@ fn sae_logdet_theta_adjoint_from_probes_refuses_deflated_rows_2080() {
     term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
-        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
         .expect("converged learnable-ibp cache");
     assert!(
         cache.deflated_row_directions.iter().any(|d| !d.is_empty()),

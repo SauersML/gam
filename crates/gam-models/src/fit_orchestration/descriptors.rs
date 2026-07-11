@@ -21,7 +21,7 @@ use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
 use gam_terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, HarmonicRoughnessPenalty,
-    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, SmoothThresholdPenalty,
     MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
     OrderedBetaBernoulliPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
@@ -585,7 +585,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 };
                 registry.push(AnalyticPenaltyKind::TopKActivation(Arc::new(penalty)));
             }
-            "jumprelu" | "jump_relu" => {
+            "smooth_threshold" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
@@ -601,13 +601,13 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let thresholds = descriptor_array1_flat(descriptor, "thresholds", &context)?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
-                let penalty = JumpReLUPenalty::new(slice, thresholds, weight, smoothing_eps)
+                let penalty = SmoothThresholdPenalty::new(slice, thresholds, weight, smoothing_eps)
                     .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(AnalyticPenaltyKind::JumpReLU(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::SmoothThreshold(Arc::new(penalty)));
             }
             "orthogonality" => {
                 descriptor_no_unknown_keys(

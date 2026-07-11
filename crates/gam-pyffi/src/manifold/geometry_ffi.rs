@@ -1776,8 +1776,8 @@ impl PyTopKActivationPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "JumpReLUPenalty")]
-struct JumpReLUPenalty {
+#[pyclass(module = "gam_pyffi._rust", name = "SmoothThresholdPenalty")]
+struct SmoothThresholdPenalty {
     #[pyo3(get, set)]
     target: PyObject,
     #[pyo3(get, set)]
@@ -1791,7 +1791,7 @@ struct JumpReLUPenalty {
 }
 
 #[pymethods]
-impl JumpReLUPenalty {
+impl SmoothThresholdPenalty {
     #[new]
     #[pyo3(signature = (thresholds, weight = 1.0, smoothing_eps = 1.0e-3, *, target = None, weight_schedule = None))]
     fn new(
@@ -1813,7 +1813,7 @@ impl JumpReLUPenalty {
             .extract::<Vec<f64>>()?;
         if thresholds.is_empty() {
             return Err(PyValueError::new_err(
-                "JumpReLUPenalty.thresholds must be non-empty",
+                "SmoothThresholdPenalty.thresholds must be non-empty",
             ));
         }
         if thresholds
@@ -1821,17 +1821,17 @@ impl JumpReLUPenalty {
             .any(|threshold| !threshold.is_finite() || *threshold <= 0.0)
         {
             return Err(PyValueError::new_err(
-                "JumpReLUPenalty.thresholds must be finite and > 0",
+                "SmoothThresholdPenalty.thresholds must be finite and > 0",
             ));
         }
         if !(weight > 0.0) {
             return Err(PyValueError::new_err(format!(
-                "JumpReLUPenalty.weight must be finite and > 0, got {weight}"
+                "SmoothThresholdPenalty.weight must be finite and > 0, got {weight}"
             )));
         }
         if !(smoothing_eps > 0.0) {
             return Err(PyValueError::new_err(format!(
-                "JumpReLUPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
+                "SmoothThresholdPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
             )));
         }
         Ok(Self {
@@ -1844,7 +1844,7 @@ impl JumpReLUPenalty {
     }
 
     #[classattr]
-    const KIND_TAG: &'static str = "jumprelu";
+    const KIND_TAG: &'static str = "smooth_threshold";
 
     fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
         let payload = PyDict::new(py);
@@ -1869,7 +1869,7 @@ impl JumpReLUPenalty {
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "JumpReLUPenalty(thresholds={:?}, weight={}, smoothing_eps={}, target={}, weight_schedule={})",
+            "SmoothThresholdPenalty(thresholds={:?}, weight={}, smoothing_eps={}, target={}, weight_schedule={})",
             self.thresholds,
             self.weight,
             self.smoothing_eps,
@@ -4868,17 +4868,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        harmonic_roughness_evidence_weight,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_ordered_beta_bernoulli_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_ordered_beta_bernoulli_batch_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_threshold_gate_row_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_threshold_gate_batch_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_topk_activation_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(jumprelu_gate_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(smooth_threshold_gate_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_gradient_step, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_exp_map, module)?)?;
@@ -4986,7 +4977,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_eq4_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_stagewise, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        sae_manifold_fit_ordered_beta_bernoulli,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;
     module.add_function(wrap_pyfunction!(sae_crosscoder_fit, module)?)?;
     module.add_class::<ManifoldCrosscoderCore>()?;
@@ -5185,7 +5179,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<IsometryPenalty>()?;
     module.add_class::<SparsityPenalty>()?;
     module.add_class::<PyTopKActivationPenalty>()?;
-    module.add_class::<JumpReLUPenalty>()?;
+    module.add_class::<SmoothThresholdPenalty>()?;
     module.add_class::<ARDPenalty>()?;
     module.add_class::<AuxConditionalPriorPenalty>()?;
     module.add_class::<IvaeRidgeMeanGauge>()?;

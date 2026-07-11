@@ -2,7 +2,7 @@
 //! coordinate: value/gradient consistency and closed-form-fixed-point coherence.
 //!
 //! These are PURE-MATH gates on the block-criterion trio
-//! ([`profiled_reml_criterion`], [`profiled_reml_block_log_lambda_gradient`],
+//! ([`profiled_penalized_laml_criterion`], [`profiled_reml_block_log_lambda_gradient`],
 //! [`profiled_reml_block_efs_log_lambda_steps`]) — no fit is run, so they isolate
 //! the analytic derivative from the inner solve exactly as the FD-ban gate
 //! (#2087 objective↔gradient desync class) demands: the analytic block gradient
@@ -14,11 +14,11 @@
 
 use super::{
     ArdSharing, SaeManifoldRho, profiled_reml_block_efs_log_lambda_steps,
-    profiled_reml_block_log_lambda_gradient, profiled_reml_criterion,
+    profiled_reml_block_log_lambda_gradient, profiled_penalized_laml_criterion,
 };
 use ndarray::{Array1, arr1};
 
-/// Central-difference FD of [`profiled_reml_criterion`] with respect to each
+/// Central-difference FD of [`profiled_penalized_laml_criterion`] with respect to each
 /// block `log λ_ℓ` must match [`profiled_reml_block_log_lambda_gradient`] to high
 /// precision — the consistent-pair (#2087) requirement for the new coordinate.
 #[test]
@@ -40,8 +40,8 @@ fn block_log_lambda_gradient_matches_central_difference() {
         let mut minus = log_lambda;
         plus[l] += h;
         minus[l] -= h;
-        let c_plus = profiled_reml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &plus);
-        let c_minus = profiled_reml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &minus);
+        let c_plus = profiled_penalized_laml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &plus);
+        let c_minus = profiled_penalized_laml_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &minus);
         let fd = (c_plus - c_minus) / (2.0 * h);
         let tol = 1e-5 * (1.0 + analytic[l].abs());
         assert!(

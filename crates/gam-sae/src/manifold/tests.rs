@@ -468,7 +468,7 @@ pub(crate) fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius(
 
 /// `try_assignments_row` may only pin the K==1 assignment to `1.0` for
 /// Softmax, whose single simplex coordinate is genuinely fixed. For the
-/// independent gate modes (ordered Beta--Bernoulli-MAP, JumpReLU) the lone logit must drive the
+/// independent gate modes (ordered Beta--Bernoulli and smooth threshold) the lone logit must drive the
 /// gate; otherwise the reconstruction ignores a free parameter that the
 /// prior still penalizes (an invalid objective). Regression for the
 /// audit's K==1 special-case bug.
@@ -489,14 +489,18 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
         "K=1 ordered Beta--Bernoulli-MAP must not pin the gate to 1.0"
     );
 
-    // JumpReLU, K=1, logit below threshold: hard-gated off (not 1.0).
+    // Smooth threshold gate, K=1: the logit remains a live logistic coordinate.
     let jr = SaeAssignment::from_blocks_with_mode(
         array![[-1.0]],
         vec![array![[0.0]]],
         AssignmentMode::threshold_gate(1.0, 0.0),
     )
     .unwrap();
-    assert_abs_diff_eq!(jr.try_assignments_row(0).unwrap()[0], 0.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(
+        jr.try_assignments_row(0).unwrap()[0],
+        gam_linalg::utils::stable_logistic(-1.0),
+        epsilon = 1e-12
+    );
 
     // Softmax, K=1: still pinned to 1.0 (no free simplex coordinate).
     // The softmax logits matrix carries `K = k_atoms()` columns (one per
@@ -512,12 +516,11 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
     assert_abs_diff_eq!(sm.try_assignments_row(0).unwrap()[0], 1.0, epsilon = 1e-12);
 }
 
-/// The JumpReLU surrogate is centered at the threshold: just above the
+/// The smooth threshold gate is centered at the threshold: just above the
 /// threshold the gate is ≈ σ(0) = 0.5, not the uncentered σ(threshold/τ).
-/// Below the threshold the hard gate keeps the value at exactly zero.
 /// Regression for the audit's miscentered-threshold bug.
 #[test]
-pub(crate) fn jumprelu_surrogate_is_centered_at_threshold() {
+pub(crate) fn smooth_threshold_gate_is_centered_at_threshold() {
     let threshold = 2.0;
     let temperature = 1.0;
     let logits = array![2.0 + 1e-6, 1.0];
@@ -530,8 +533,12 @@ pub(crate) fn jumprelu_surrogate_is_centered_at_threshold() {
         "surrogate not centered at threshold: {}",
         gates[0]
     );
-    // Strictly below the threshold the gate is hard-zero.
-    assert_abs_diff_eq!(gates[1], 0.0, epsilon = 1e-12);
+    // Below threshold the same smooth scalar remains positive and exact.
+    assert_abs_diff_eq!(
+        gates[1],
+        gam_linalg::utils::stable_logistic(-1.0),
+        epsilon = 1e-12
+    );
 }
 
 pub(crate) fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
@@ -803,7 +810,7 @@ pub(crate) fn penalized_objective_continuous_across_periodic_cut_with_registry_a
 /// line-search objective, that jump made a near-zero coordinate Newton step
 /// change the objective by an O(weight) amount, so Armijo rejected
 /// otherwise-valid steps and the inner joint solve never reached
-/// stationarity (`reml_criterion: inner solve did not converge`).
+/// stationarity (`penalized_laml_criterion: inner solve did not converge`).
 ///
 /// The fix restricts the SCAD/MCP shrinkage to the Euclidean axes, so on a
 /// pure Circle atom it contributes nothing — the objective with the SCAD
@@ -2507,7 +2514,7 @@ pub(crate) fn planted_circle_focus_1744() {
                 for &smooth in &[-8.0_f64, -5.0, -3.0, -1.0, 0.0, 1.0, 3.0] {
                     let mut t = term.clone();
                     let r = SaeManifoldRho::new(sparse, smooth, vec![array![ard]]);
-                    match t.reml_criterion_with_cache(
+                    match t.penalized_laml_criterion_with_cache(
                         z.view(),
                         &r,
                         None,
@@ -2647,12 +2654,12 @@ pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionles
 pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ"
+            "SaeManifoldTerm::penalized_laml_criterion: inner solve did not converge at fixed ρ"
         )
     );
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
+            "SaeManifoldTerm::penalized_laml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );
     // A non-PD cross-row ordered Beta--Bernoulli joint Hessian at a probed ρ is genuine infeasibility
@@ -2661,19 +2668,19 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     // steers back into the PD region instead of aborting the whole fit.
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::reml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
+            "SaeManifoldTerm::penalized_laml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
         )
     );
     // The generic "log-det unavailable" message (a real factorization defect, not
     // an infeasibility) stays FATAL — it is NOT in the recoverable set.
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
+            "SaeManifoldTerm::penalized_laml_criterion: arrow_log_det_from_cache returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
         )
     );
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::reml_criterion: row-gauge evidence deflation count re-anchored \
+            "SaeManifoldTerm::penalized_laml_criterion: row-gauge evidence deflation count re-anchored \
                  4 times within one optimization; the quotient dimension is not stabilizing"
         )
     );
@@ -2685,10 +2692,10 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
     let mut full = term0.clone();
     let mut streaming = term0;
     let (full_cost, full_loss, _cache) = full
-        .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .unwrap();
     let (stream_cost, stream_loss) = streaming
-        .reml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .unwrap();
     assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
@@ -2760,7 +2767,7 @@ pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeMan
 ///
 /// Pre-fix the streaming path could not represent the rank-`R` cross-row block:
 /// `reduced_schur_and_log_det_tt` refused ordered Beta--Bernoulli-active systems outright, so
-/// `reml_criterion_streaming_exact` *errored* on this fixture — and if that
+/// `penalized_laml_criterion_streaming_exact` *errored* on this fixture — and if that
 /// refusal had instead silently returned `log_det_tt + log_det_schur`, the
 /// streaming criterion would have under-counted the dense criterion by exactly
 /// `½·log|C|` (the dropped capacitance term), violating the #1225 invariant
@@ -2777,7 +2784,7 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_ibp_woodbury() {
     let (term0, target, rho) = small_two_atom_ibp_term();
     let mut full = term0;
     let (_full_cost, _full_loss, cache) = full
-        .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .expect("dense ordered Beta--Bernoulli criterion must evaluate");
 
     // (1) The dense joint Hessian carries a genuine cross-row Woodbury block on
@@ -2796,7 +2803,7 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_ibp_woodbury() {
     // (2) The streaming exact LOG-DET must reproduce the dense `log|H|` at the SAME
     // converged state — `full` is already at its converged (t,β) after the dense
     // criterion. We compare the log-det DIRECTLY rather than re-fitting through
-    // `reml_criterion_streaming_exact`: a streaming RE-FIT runs a fresh inner solve
+    // `penalized_laml_criterion_streaming_exact`: a streaming RE-FIT runs a fresh inner solve
     // whose faer parallel reduction is non-deterministic under thread contention
     // and intermittently surfaces the (recoverable) non-PD refusal — orthogonal to
     // this Woodbury-correctness test. `streaming_exact_arrow_log_det` re-assembles
@@ -2825,10 +2832,10 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
     let mut full = term0.clone();
     let mut probe = term0;
     let (full_cost, full_loss) = full
-        .reml_criterion_with_refine_policy(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4, true)
+        .penalized_laml_criterion_with_refine_policy(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4, true)
         .expect("full-budget criterion must converge on the small fixture");
     let (probe_cost, probe_loss) = probe
-        .reml_criterion_with_refine_policy(
+        .penalized_laml_criterion_with_refine_policy(
             target.view(),
             &rho,
             None,
@@ -2862,7 +2869,7 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
 /// The regression pins one invariant: gradient, line-search, and ranking costs
 /// agree at the same `ρ`.
 #[test]
-pub(crate) fn outer_value_and_ranking_lanes_share_pure_reml_criterion() {
+pub(crate) fn outer_value_and_ranking_lanes_share_pure_penalized_laml_criterion() {
     use gam_solve::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
     // A fixed ρ at which all three lanes converge from the same fixture state.
@@ -3027,7 +3034,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     let mut full = term0.clone();
     let mut streaming = term0;
     let (full_cost, full_loss, cache) = full
-        .reml_criterion_with_cache(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
         .expect("dense REML must refine through the cold non-PD evidence factor");
     let log_det = arrow_log_det_from_cache(&cache).expect("refined cache must carry log-det");
     assert!(full_cost.is_finite());
@@ -3035,7 +3042,7 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     assert!(log_det.is_finite());
 
     let (stream_cost, stream_loss) = streaming
-        .reml_criterion_streaming_exact(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_streaming_exact(target.view(), &rho, None, 1, 0.25, 1.0e-4, 1.0e-4)
         .expect("streaming REML must share the dense refinement retry");
     assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
@@ -3702,10 +3709,10 @@ pub(crate) fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
     // softmax negative-logit curvature is indefinite, so factoring there at
     // ridge 0 surfaces `PerRowFactorFailed` for BOTH the dense and streaming
     // paths. Converge the inner `(t, β)` state first (matching how
-    // `reml_criterion_with_cache` reaches a PD block), then compare the
+    // `penalized_laml_criterion_with_cache` reaches a PD block), then compare the
     // streaming-vs-dense log-determinants of the SAME converged system —
     // which is the routing invariant this test pins (#847).
-    full.reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+    full.penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .unwrap();
     let sys = full
         .assemble_arrow_schur(target.view(), &rho, None)

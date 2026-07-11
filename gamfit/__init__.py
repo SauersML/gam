@@ -9,7 +9,7 @@ predictor spaces that wrap or close first-class.
 
 The public surface also includes latent-coordinate and SAE-manifold tools:
 analytic penalties such as ``ScadMcpPenalty`` and ``NuclearNormPenalty``;
-assignment-family descriptors for softmax / finite-IBP / top-k / JumpReLU
+assignment-family descriptors for softmax / ordered Beta--Bernoulli / top-k / smooth threshold
 SAE gates; topology selection helpers; and manifold-SAE result objects with
 per-row ``assignments`` plus per-atom decoder covariance / posterior shape
 bands when produced by the Rust fit.
@@ -168,7 +168,7 @@ from ._penalties import (
     OrderedBetaBernoulliPenalty,
     IsometryPenalty,
     IvaeRidgeMeanGauge,
-    JumpReLUPenalty,
+    SmoothThresholdPenalty,
     MechanismSparsityPenalty,
     NuclearNormPenalty,
     OrthogonalityPenalty,
@@ -248,12 +248,12 @@ from ._smooth import Smooth, SmoothSum  # compositional Smooth(latent=..., basis
 from ._penalty_descriptors import (
     ARDPenalty as _ARDPenaltyDescriptor,
     BlockOrthogonalityDescriptor,
-    IBPPenalty,
+    OrderedBetaBernoulliPenalty,
     MechanismSparsityDescriptor,
 )
 
 # Promote the torch-aware descriptor classes to the top-level penalty names so
-# `gamfit.ARDPenalty(0.1) + gamfit.IBPPenalty(1.0)` works uniformly through
+# `gamfit.ARDPenalty(0.1) + gamfit.OrderedBetaBernoulliPenalty(1.0)` works uniformly through
 # the new BasisDescriptor/PenaltyDescriptor protocol. The original
 # Rust-pyclass descriptors used by the formula pipeline remain reachable as
 # `gamfit._penalties.ARDPenalty`, `gamfit._penalties.BlockOrthogonalityPenalty`,

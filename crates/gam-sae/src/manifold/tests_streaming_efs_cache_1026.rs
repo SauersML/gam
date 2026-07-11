@@ -9,8 +9,8 @@ use approx::assert_abs_diff_eq;
 /// #1026: the massive-K EFS lane (`efs_step`) can no longer form the dense
 /// evidence cache, so when `!direct_logdet_admitted` it takes its ARD-trace and
 /// dispersion inputs off the cache RETURNED by
-/// `reml_criterion_streaming_exact_with_cache` instead of the dense
-/// `reml_criterion_with_cache`. The behavioural contract of that fix is that the
+/// `penalized_laml_criterion_streaming_exact_with_cache` instead of the dense
+/// `penalized_laml_criterion_with_cache`. The behavioural contract of that fix is that the
 /// streaming cache is a **drop-in** for those exact EFS consumers: at the shared
 /// converged optimum it must yield the SAME `ard_inverse_traces` and the SAME
 /// `reconstruction_dispersion` as the dense cache. `efs_step`'s routing branch is
@@ -27,10 +27,10 @@ fn streaming_cache_is_efs_dropin_for_dense_cache_1026() {
     let mut streaming = term0;
 
     let (dense_cost, dense_loss, dense_cache) = dense
-        .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+        .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .unwrap();
     let (stream_cost, stream_loss, stream_cache) = streaming
-        .reml_criterion_streaming_exact_with_cache(
+        .penalized_laml_criterion_streaming_exact_with_cache(
             target.view(),
             &rho,
             None,

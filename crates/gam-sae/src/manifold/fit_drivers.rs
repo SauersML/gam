@@ -1420,7 +1420,7 @@ impl SaeManifoldTerm {
 
     /// The iterate scale `1 + ‖(logits, coords, decoder)‖` used to make the
     /// inner KKT gradient and Newton-step tolerances relative. This is the
-    /// SINGLE source of truth for that scale: `reml_criterion`'s convergence
+    /// SINGLE source of truth for that scale: `penalized_laml_criterion`'s convergence
     /// gate and `run_joint_fit_arrow_schur`'s non-descent stationarity gate
     /// must agree on it, or a point one of them calls converged is mid-flight
     /// to the other (the objective↔gradient desync class).
@@ -2990,7 +2990,7 @@ impl SaeManifoldTerm {
     /// decodes nothing, so the dictionary explains nothing (EV≈0) and every
     /// per-row coordinate Hessian `H_tt` — whose curvature is carried by `Φ·B`
     /// — goes rank-deficient at once, surfacing as the `0 → K·n` evidence
-    /// gauge-deflation jump that aborts `reml_criterion`. The decoder-norm guard
+    /// gauge-deflation jump that aborts `penalized_laml_criterion`. The decoder-norm guard
     /// closes that blind spot.
     ///
     /// The collapse statistic is each atom's decoder Frobenius norm as a RATIO
@@ -5467,8 +5467,8 @@ impl SaeManifoldTerm {
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
         // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
         // warm-started inner `(t, β)` state, a verbatim reuse and NOT a
-        // convergence request. The caller (`reml_criterion_with_cache_refine_policy`
-        // / `reml_criterion_streaming_exact`) runs this with `max_iter == 0`
+        // convergence request. The caller (`penalized_laml_criterion_with_cache_refine_policy`
+        // / `penalized_laml_criterion_streaming_exact`) runs this with `max_iter == 0`
         // precisely to hold β at the seed, then factors once at that frozen
         // iterate (`converge_inner_for_undamped_logdet`'s `inner_max_iter == 0`
         // branch). Everything below — the rank-reduction reparametrization, the
@@ -5540,7 +5540,7 @@ impl SaeManifoldTerm {
         // `refine_round_made_progress`'s monotone-decrease requirement and
         // collapsing the 64× progress budget back to base. The evidence ledger
         // is therefore PER CRITERION EVALUATION: cleared once at the
-        // `reml_criterion*` entry, persistent across refine re-entries, so the
+        // `penalized_laml_criterion*` entry, persistent across refine re-entries, so the
         // per-atom budget (`SAE_ATOM_COLLAPSE_RESEED_BUDGET`) genuinely bounds
         // reseeds over the whole converge-to-KKT drive.
         if allow_heuristic_termination {
@@ -5785,7 +5785,7 @@ impl SaeManifoldTerm {
             // (t, β) Newton solve. The inner loop solves the joint manifold +
             // decoder system at the engine's current ρ; the engine alone
             // moves ρ by minimising the penalised quasi-Laplace evidence
-            // score (see `SaeManifoldTerm::reml_criterion`; #1421: NOT a
+            // score (see `SaeManifoldTerm::penalized_laml_criterion`; #1421: NOT a
             // true normalized-prior REML — the improper softmax/JumpReLU
             // assignment priors have no finite normalizer). The former in-loop
             // `update_ard_reml` rule (α = n / ‖t‖²) dropped the logdet /
@@ -5831,7 +5831,7 @@ impl SaeManifoldTerm {
             // radial null whose direction ROTATES per row (the null is the radial
             // unit vector `(cosθ_i, sinθ_i)`, distinct for every row — NOT a chart
             // axis, so no global/per-atom axis reduction can capture it). The
-            // undamped acceptance factorizations in `reml_criterion` already deflate
+            // undamped acceptance factorizations in `penalized_laml_criterion` already deflate
             // that null to UNIT stiffness (`log 1 = 0`, ρ-independent) so the
             // evidence log-det is finite — but the coordinate SOLVE here does not:
             // `solve_with_lm_escalation_inner` LM-ridge-damps the near-null block,
@@ -6098,10 +6098,10 @@ impl SaeManifoldTerm {
             // with a near-zero pivot, the step is dominated by that near-null
             // direction, and `gᵀΔ/(‖g‖·‖Δ‖)` collapses while ‖g‖ is HUGE —
             // breaking there silently froze the iterate and let the
-            // `reml_criterion` refine loop re-measure the same point until its
+            // `penalized_laml_criterion` refine loop re-measure the same point until its
             // budget died (the constant-‖g‖=1e12 signature). Gate the break on
             // genuine KKT stationarity — the SAME iterate-scaled tolerance
-            // `reml_criterion` uses — and otherwise fall through to the
+            // `penalized_laml_criterion` uses — and otherwise fall through to the
             // proximal-correction ridge escalation below: heavier LM damping
             // bends the step toward steepest descent, which is always a
             // descent direction for a consistent gradient.

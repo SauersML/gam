@@ -59,7 +59,7 @@ pub(crate) const SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 /// 256 MiB)` reserve so a LARGE allocation is never sized at ~100% of available
 /// and OOMs; but on a memory-starved box (available below the 256 MiB floor) that
 /// reserve underflows the budget to ~0, which then rejects even a trivially-small
-/// dense plan (e.g. an 18 KiB K=1 toy fit) — and `reml_criterion` has no streaming
+/// dense plan (e.g. an 18 KiB K=1 toy fit) — and `penalized_laml_criterion` has no streaming
 /// fallback for the direct logdet, so it hard-errors instead of running. A dense
 /// plan at or below this size cannot meaningfully OOM a box that reports at least
 /// this much available, so admitting it can never reintroduce the OOM the reserve
@@ -160,7 +160,7 @@ pub(crate) fn sae_streaming_plan_from_budget(
     // available memory. The second clause fixes the starved-box spurious rejection
     // (#1026): when `in_core_budget_bytes` underflows to ~0 (available below the
     // 256 MiB reserve floor) a trivially-small dense plan would otherwise be
-    // refused and hard-error in `reml_criterion` (no direct-logdet streaming
+    // refused and hard-error in `penalized_laml_criterion` (no direct-logdet streaming
     // fallback). It only ever admits plans too small to OOM, so large plans stay
     // gated on the real budget and still stream.
     let direct_fits_tiny = direct_peak_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES
@@ -866,7 +866,7 @@ mod host_in_core_budget_tests {
 
     /// #1026 regression: on a memory-starved box the in-core budget underflows to
     /// 0, but a trivially-small dense plan (e.g. a K=1 toy fit) must STILL be
-    /// direct-admitted — otherwise `reml_criterion` hard-errors with "cost-only
+    /// direct-admitted — otherwise `penalized_laml_criterion` hard-errors with "cost-only
     /// streaming route is required" for a working set of a few KiB. Conversely a
     /// large plan at budget 0 must still NOT be admitted (it streams).
     #[test]

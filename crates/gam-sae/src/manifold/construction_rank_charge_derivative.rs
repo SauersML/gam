@@ -15,7 +15,7 @@ struct HardRankChargeAtomDifferential {
 impl SaeManifoldTerm {
     fn rank_charge_assignment_derivative(
         &self,
-        row: usize,
+        _row: usize,
         wrt_atom: usize,
         atom: usize,
         assignments: &[f64],
@@ -35,8 +35,8 @@ impl SaeManifoldTerm {
             }
             AssignmentMode::ThresholdGate {
                 temperature,
-                threshold,
-            } if atom == wrt_atom && self.assignment.logits[[row, atom]] > threshold => {
+                ..
+            } if atom == wrt_atom => {
                 let a = assignments[atom];
                 a * (1.0 - a) / temperature
             }

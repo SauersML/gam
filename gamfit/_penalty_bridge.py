@@ -191,7 +191,7 @@ def ordered_beta_bernoulli_descriptor(
     *,
     learnable: bool = False,
 ) -> dict[str, Any]:
-    """Finite-IBP assignment-logit descriptor."""
+    """Ordered independent Beta--Bernoulli assignment-logit descriptor."""
     return {
         "kind": "ordered_beta_bernoulli",
         "target": str(target),

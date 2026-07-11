@@ -754,7 +754,10 @@ fn ordered_beta_bernoulli_assignment_high_k_prior_keeps_positive_gradient_path()
     let rho = Array1::<f64>::zeros(0);
 
     let value = pen.value(t.view(), rho.view());
-    assert!(value.is_finite(), "high-K ordered Beta--Bernoulli value must stay finite");
+    assert!(
+        value.is_finite(),
+        "high-K ordered Beta--Bernoulli value must stay finite"
+    );
     let grad = pen.grad_target(t.view(), rho.view());
     assert_eq!(grad.len(), k);
     assert!(
@@ -2509,35 +2512,4 @@ fn harmonic_roughness_value_grad_hessian_are_consistent() {
             assert_abs_diff_eq!(diag[r * d + j], weight * w, epsilon = 1e-12);
         }
     }
-}
-
-/// The evidence-optimal precision is the marginal-likelihood stationary point
-/// `λ⋆ = N_pen / Σ_i S_ii b_i²` over the penalized coefficients only.
-#[test]
-fn harmonic_roughness_evidence_weight_matches_closed_form() {
-    let row_weights = array![0.0, 0.0, 0.0, 16.0, 16.0];
-    let n_eff = 10;
-    let d = 3;
-    let target: Array1<f64> = (0..n_eff * d).map(|i| 0.05 * (i as f64) + 0.3).collect();
-
-    let mut energy = 0.0;
-    let mut n_pen = 0.0;
-    for r in 0..n_eff {
-        let w = row_weights[r % row_weights.len()];
-        if w > 0.0 {
-            for j in 0..d {
-                energy += w * target[r * d + j] * target[r * d + j];
-                n_pen += 1.0;
-            }
-        }
-    }
-    let expected = n_pen / energy;
-    let got = harmonic_roughness_evidence_weight(target.view(), n_eff, row_weights.view());
-    assert_abs_diff_eq!(got, expected, epsilon = 1e-10);
-
-    // The idealized direct-observation optimum is at the boundary λ → +∞ when
-    // the penalized energy is exactly zero.
-    let zeros = Array1::<f64>::zeros(n_eff * d);
-    let floored = harmonic_roughness_evidence_weight(zeros.view(), n_eff, row_weights.view());
-    assert_eq!(floored, f64::INFINITY);
 }
