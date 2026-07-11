@@ -255,17 +255,31 @@ def _torch_manifold_recon(x_tr, x_te, *, atoms, target_k, d, steps, lr, bs, seed
 
 
 def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
-               flat_steps, curved_steps, lr, bs, seed, manifold, basis, collect=None):
+               flat_steps, curved_steps, lr, bs, seed, manifold, basis,
+               k_flat=None, collect=None):
     """Flat TopK at reduced budget k_lin + torch manifold on the flat residual.
 
     Matched per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k.
+
+    ``k_flat`` (gam#2233 theorem-faithful config): the flat tier's ATOM COUNT.
+    When ``None`` it defaults to ``K`` — the legacy "stack curved atoms on the
+    full flat dictionary" arm, whose dictionary_params strictly EXCEED
+    external_topk's, so it carries an MDL surcharge and cannot win the
+    dict-dominated Eq-4 scoreboard regardless of its support/code/residual
+    savings. The crossover theorem's claim is that curvature buys FEWER atoms,
+    so a faithful test passes a REDUCED ``k_flat`` (curved atoms REPLACING flat
+    ones) such that ``k_flat·P + curved_atoms·b·P ≤ K·P``; the flat active
+    budget ``k_lin`` is a per-token quantity and does NOT change the dictionary
+    parameter count.
     """
+    k_flat = int(k_flat) if k_flat is not None else int(K)
     k_lin = top_k - curved_k * (1 + d)
     if k_lin < 1:
         raise SystemExit(f"hybrid budget infeasible: top_k={top_k} curved_k={curved_k} d={d}")
-    print(f"[hybrid] k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
+    print(f"[hybrid] k_flat={k_flat} (external ref K={K}); "
+          f"k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
     ev_flat, (encode, decode, dev) = fit_external_topk(
-        x_tr, x_te, mean_tr, K=K, top_k=k_lin, steps=flat_steps, lr=lr, bs=bs,
+        x_tr, x_te, mean_tr, K=k_flat, top_k=k_lin, steps=flat_steps, lr=lr, bs=bs,
         seed=seed, return_model=True, collect=collect)
     print(f"[hybrid] flat tier ev={ev_flat:.4f} (k_lin={k_lin})", flush=True)
     import torch
@@ -293,19 +307,25 @@ def fit_hybrid(x_tr, x_te, mean_tr, *, K, top_k, curved_atoms, curved_k, d,
 
 
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
-                    topology, max_epochs, curved_rows, seed, collect=None):
+                    topology, max_epochs, curved_rows, seed, k_flat=None, collect=None):
     """ALL-RUST hybrid: gam sae_manifold_fit sparse-code (linear) tier at reduced
     actives + gam sae_manifold_fit curved TopK tier on the linear residual. Matched
-    per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k."""
+    per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k.
+
+    ``k_flat`` (gam#2233 theorem-faithful config): the linear tier's ATOM COUNT,
+    defaulting to ``K``. See :func:`fit_hybrid` — a faithful crossover test
+    REDUCES it so ``k_flat·P + curved_K·b·P ≤ K·P``."""
     import gamfit
 
+    k_flat = int(k_flat) if k_flat is not None else int(K)
     k_lin = top_k - curved_k * (1 + d)
     if k_lin < 1:
         raise SystemExit(f"hybrid_rust budget infeasible: top_k={top_k} curved_k={curved_k} d={d}")
-    print(f"[hybrid_rust] k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
+    print(f"[hybrid_rust] k_flat={k_flat} (external ref K={K}); "
+          f"k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
     t0 = time.perf_counter()
     flat = gamfit.sae_manifold_fit(
-        x_tr, K=K, assignment="softmax", top_k=k_lin, n_iter=max_epochs)
+        x_tr, K=k_flat, assignment="softmax", top_k=k_lin, n_iter=max_epochs)
     tr_tr = flat.transform(x_tr)
     tr_te = flat.transform(x_te)
     flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
@@ -379,6 +399,18 @@ def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed):
     out = {f"bits_{k}": v for k, v in dl.items()}
     out["bits_scorer"] = bits_eq4.scorer_source()
     out["bits_rows"] = int(take)
+    # gam#2233 self-certification: the Eq-4 dictionary term is
+    # 0.5*dictionary_params/N*log2(N), ~95% of the score at K=32768, so the
+    # crossover verdict is meaningful ONLY when the hybrid's dictionary_params do
+    # not exceed the external flat bar's (K*P). Record the actual param count and
+    # the external reference so a reader can see, per row, whether curved atoms
+    # REPLACED flat ones (faithful) or were STACKED on top (surcharged).
+    p_out = int(x_bits.shape[1])
+    out["bits_dict_params"] = int(fitted.dictionary_params)
+    out["bits_dict_params_external_ref"] = int(collect.get("K_ext", 0)) * p_out
+    if out["bits_dict_params_external_ref"] > 0:
+        out["bits_dict_params_faithful"] = bool(
+            out["bits_dict_params"] <= out["bits_dict_params_external_ref"])
     return out
 
 
@@ -402,6 +434,14 @@ def main() -> int:
     ap.add_argument("--atom-manifold", default="product")
     ap.add_argument("--atom-basis", default="fourier")
     ap.add_argument("--curved-atoms", type=int, default=256)
+    ap.add_argument("--k-flat", type=int, default=None,
+                    help="gam#2233 theorem-faithful hybrid: flat-tier ATOM COUNT "
+                         "(default None == --K, the legacy stacked arm that "
+                         "SURCHARGES dict params). Set REDUCED so curved atoms "
+                         "REPLACE flat ones: k_flat*P + curved_atoms*b*P <= K*P, "
+                         "b = curved decoder-block width (2H+1 for an H-harmonic "
+                         "circle). Self-certified via dict_params_faithful in the "
+                         "result record.")
     ap.add_argument("--curved-k", type=int, default=2)
     ap.add_argument("--curved-steps", type=int, default=6000)
     ap.add_argument("--curved-rows", type=int, default=20000,
@@ -431,7 +471,7 @@ def main() -> int:
     extra: dict = {}
     # Handles for the Eq-4 bits scorer (gam#2233); only the four wired arms
     # populate it, and only when --bits is requested.
-    collect: dict | None = {} if args.bits else None
+    collect: dict | None = {"K_ext": int(args.K)} if args.bits else None
     if args.arm == "external_topk":
         ev = fit_external_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                steps=args.steps, lr=args.lr, bs=args.batch_size,
@@ -458,7 +498,7 @@ def main() -> int:
                                       d=args.d_atom, topology=args.atom_topology,
                                       max_epochs=args.max_epochs,
                                       curved_rows=args.curved_rows, seed=args.seed,
-                                      collect=collect)
+                                      k_flat=args.k_flat, collect=collect)
         extra["ev_flat_tier"] = ev_flat
     elif args.arm == "pca_bar":
         extra = fit_pca_bar(x_tr, x_te, mean_tr, ranks=[16, 32, 64, 128, 512])
@@ -470,7 +510,7 @@ def main() -> int:
                                  curved_steps=args.curved_steps, lr=args.lr,
                                  bs=args.batch_size, seed=args.seed,
                                  manifold=args.atom_manifold, basis=args.atom_basis,
-                                 collect=collect)
+                                 k_flat=args.k_flat, collect=collect)
         extra["ev_flat_tier"] = ev_flat
 
     if args.bits and collect is not None:
