@@ -630,6 +630,76 @@ impl SaeManifoldTerm {
         solve_exact_stationarity_preconditioned(rhs, &apply_a, &apply_b, precondition)
     }
 
+    fn combine_assignment_strength_gradient(
+        &self,
+        rho: &SaeManifoldRho,
+        logdet_trace: f64,
+        gamma: &SaeArrowVector,
+        response: &SaeArrowVector,
+        lane: &str,
+    ) -> Result<f64, OuterGradientError> {
+        let explicit = crate::assignment::assignment_prior_log_strength_derivative_weighted(
+            &self.assignment,
+            rho,
+            self.row_loss_weights.as_deref(),
+        );
+        let correction = -0.5 * sae_inner(gamma, response);
+        let gradient = explicit + logdet_trace + correction;
+        if !gradient.is_finite() {
+            return Err(OuterGradientError::internal(format!(
+                "{lane} assignment-strength gradient is non-finite: explicit={explicit}, \
+                 logdet_trace={logdet_trace}, IFT_correction={correction}"
+            )));
+        }
+        Ok(gradient)
+    }
+
+    /// Dense-cache sibling of
+    /// [`Self::analytic_assignment_strength_gradient_matrix_free`]. Hybrid-EFS
+    /// uses this when the full streaming working set is not resident but the
+    /// reduced Schur itself still fits and the returned cache therefore owns an
+    /// exact dense factor. Computing only this coordinate avoids the O(K) IFT
+    /// solves of the complete outer gradient while retaining identical math.
+    pub(crate) fn analytic_assignment_strength_gradient_dense(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+    ) -> Result<f64, OuterGradientError> {
+        let sparse_index = rho.sparse_flat_index().ok_or_else(|| {
+            OuterGradientError::internal(
+                "dense assignment-strength gradient requested for a rho with no sparse coordinate",
+            )
+        })?;
+        let logdet_trace = self
+            .assignment_log_strength_hessian_trace(rho, cache, solver)
+            .map_err(OuterGradientError::internal)?;
+        let gamma = self
+            .logdet_theta_adjoint(rho, cache, solver)
+            .map_err(OuterGradientError::internal)?;
+        let rhs = self
+            .outer_rho_gradient_ift_rhs(rho, sparse_index, cache)
+            .map_err(OuterGradientError::internal)?;
+        let response = self
+            .solve_exact_stationarity(rho, target, cache, solver, &rhs)
+            .map_err(|error| {
+                OuterGradientError::classify_arrow_solver_error(
+                    &error,
+                    OuterGradientError::NonIdentifiable {
+                        reason: error.clone(),
+                    },
+                )
+            })?;
+        self.combine_assignment_strength_gradient(
+            rho,
+            logdet_trace,
+            &gamma,
+            &response,
+            "dense",
+        )
+    }
+
     /// Exact non-IBP assignment-strength REML gradient on the matrix-free
     /// evidence path. This is the one coordinate softmax entropy and gated L1
     /// cannot update through a Fellner-Schall equation:
@@ -655,11 +725,6 @@ impl SaeManifoldTerm {
                 "matrix-free assignment-strength gradient requested for a rho with no sparse coordinate",
             )
         })?;
-        let explicit = crate::assignment::assignment_prior_log_strength_derivative_weighted(
-            &self.assignment,
-            rho,
-            self.row_loss_weights.as_deref(),
-        );
         let logdet_trace = self
             .assignment_log_strength_hessian_trace_from_probes(
                 rho,
@@ -684,15 +749,13 @@ impl SaeManifoldTerm {
                     },
                 )
             })?;
-        let correction = -0.5 * sae_inner(&gamma, &response);
-        let gradient = explicit + logdet_trace + correction;
-        if !gradient.is_finite() {
-            return Err(OuterGradientError::internal(format!(
-                "matrix-free assignment-strength gradient is non-finite: explicit={explicit}, \
-                 logdet_trace={logdet_trace}, IFT_correction={correction}"
-            )));
-        }
-        Ok(gradient)
+        self.combine_assignment_strength_gradient(
+            rho,
+            logdet_trace,
+            &gamma,
+            &response,
+            "matrix-free",
+        )
     }
 
     /// Analytic SAE REML outer-ρ gradient components at the already converged

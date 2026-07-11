@@ -418,9 +418,12 @@ pub struct OuterProbeTelemetry {
     pub infeasible_schur: usize,
     /// Probes refused because the inner solve did not converge at fixed ρ.
     pub infeasible_inner_not_converged: usize,
-    /// Value probes that resolved to the finite collapse/refusal wall
-    /// (`cost ≥ SAE_FIT_DATA_COLLAPSE_COST`) rather than a real REML value.
-    pub wall_cost_value_probes: usize,
+    /// Outer criterion evaluations that returned the optimizer's conventional
+    /// infeasible value (`+inf`) because the Laplace evidence was undefined or
+    /// the fixed-ρ inner solve refused. A finite, data-collapsed fit is not an
+    /// infeasible objective value: collapse remains a structural ledger verdict
+    /// while REML/LAML remains the sole optimized criterion.
+    pub infeasible_criterion_evals: usize,
     /// #2234 — cost-only probes whose capped/forced inner solve exhausted its
     /// budget and were RESCUED by a one-shot retry at the accepted-point drive
     /// (full budget) instead of being misclassified as the infeasibility wall.
@@ -686,20 +689,18 @@ pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivativ
 }
 
 /// The one active outer coordinate that is neither a Gaussian/Fellner-Schall
-/// precision nor an IBP occupancy fixed point on the matrix-free path. Softmax
+/// precision nor an IBP occupancy fixed point. Softmax
 /// entropy and threshold-gated L1 have a true REML derivative but no EFS root;
 /// Hybrid-EFS therefore treats this coordinate as its analytic-gradient block
 /// while all smoothness/ARD coordinates retain simultaneous EFS updates.
-pub(crate) fn matrix_free_assignment_gradient_coordinate(
-    plan: SaeStreamingPlan,
+pub(crate) fn hybrid_assignment_gradient_coordinate(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
 ) -> Option<usize> {
-    if plan.direct_logdet_admitted()
-        || !matches!(
-            term.assignment.mode,
-            AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. }
-        )
+    if !matches!(
+        term.assignment.mode,
+        AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. }
+    )
     {
         return None;
     }
@@ -2032,94 +2033,27 @@ impl SaeManifoldOuterObjective {
         }
     }
 
-    pub(crate) fn add_fit_data_collapse_penalty(
-        &mut self,
-        cost: f64,
-        rho: &SaeManifoldRho,
-    ) -> Result<f64, String> {
+    /// Record the discrete fitted-data collapse verdict without changing the
+    /// REML/LAML objective. The verdict feeds structure search and the final fit
+    /// ledger; it is not a smooth term and therefore cannot be added to a cost
+    /// that is paired with the bare analytic REML derivative (#2253).
+    fn record_fit_data_collapse_verdict(&mut self, rho: &SaeManifoldRho) -> Result<(), String> {
         let fitted = self.term.try_fitted_for_rho(rho)?;
         let assignments = self.term.assignment.try_assignments()?;
-        let collapsed = self.term.record_fit_data_collapse_if_needed(
+        self.term.record_fit_data_collapse_if_needed(
             self.target.view(),
             fitted.view(),
             assignments.view(),
             self.inner_max_iter,
         )?;
-        // #1217 — FINITE-GUARD the outer-REML cost handed to the BFGS line search
-        // (same class as the #1192 Poisson Armijo finite-floor). At a K≥2
-        // co-collapse cliff the Laplace normalizer `½log|H|` of a numerically
-        // singular joint Hessian can return `±∞`/`NaN`, so `reml_criterion`
-        // surfaces a non-finite `v` even when the discrete `record_fit_data_
-        // collapse_if_needed` detector has not (yet) classified the iterate as a
-        // collapse. The `opt` BFGS reports a non-finite probe as "Line search
-        // failed (nonfinite seen)" and ABORTS the whole outer solve at the
-        // current iterate (observed on real OLMo K=2: stall at iter 2, |g|≈65),
-        // rather than treating it as an infeasible step to backtrack from. A
-        // non-finite criterion is the STRONGEST infeasibility signal — it must
-        // present to the line search as the SAME finite wall a detected collapse
-        // does, so the search rejects the step and backtracks toward the feasible
-        // basin instead of giving up. We therefore floor any non-finite cost to
-        // the finite collapse wall `SAE_FIT_DATA_COLLAPSE_COST` (a rejectable
-        // barrier, not `∞`), then add the collapse penalty on top of the already
-        // finite base. The non-collapsed, finite-cost path is byte-for-byte
-        // unchanged.
-        let base = if cost.is_finite() {
-            cost
-        } else {
-            SAE_FIT_DATA_COLLAPSE_COST
-        };
-        if collapsed {
-            // The wall is itself finite, so a non-finite base already floored to
-            // the wall cannot be pushed back to `∞`; clamp the sum defensively in
-            // case the (finite) REML base is itself near `f64::MAX`.
-            Ok((base + SAE_FIT_DATA_COLLAPSE_COST).min(2.0 * SAE_FIT_DATA_COLLAPSE_COST))
-        } else {
-            Ok(base)
-        }
+        Ok(())
     }
 
-    /// #2080 — whether a probe value resolved to the finite collapse/refusal wall
-    /// (an infeasible ρ or a data-collapsed fit) rather than a real REML value.
-    /// A wall-valued probe's converged state is a degenerate basin, so the
-    /// handoff / basin-bundle lanes never admit it.
-    fn probe_value_is_wall(value: f64) -> bool {
-        !value.is_finite() || value >= SAE_FIT_DATA_COLLAPSE_COST
-    }
-
-    /// #1782 — the finite outer-cost a recoverable infeasible-ρ REFUSAL presents
-    /// to the outer solver's value / gradient lanes, matching the finite collapse
-    /// wall the EFS lane (`efs_step`) already returns for the same refusal class.
-    ///
-    /// The recoverable-refusal classes (non-PD per-row / cross-row joint Hessian,
-    /// non-PD reduced Schur complement, inner non-convergence) mark a ρ whose
-    /// closed-form Laplace evidence is undefined. Historically the value/gradient
-    /// lanes returned `OuterEval::infeasible` (cost `+∞`) so a line-search probe
-    /// that OVERSHOOTS into an adjacent indefinite basin is rejected and the search
-    /// steers back into the PD region. But when the SEED ρ itself (and its whole
-    /// neighbourhood) lands in that refusal class — which happens for softmax /
-    /// jumprelu over near-degenerate multi-atom decoders, and for euclidean/linear
-    /// rank-deficient seeds — EVERY outer probe returned `+∞`, BFGS never accepted
-    /// a gradient step, and the bridge's non-termination guard escalated the
-    /// "globally infeasible neighbourhood" to a FATAL seed rejection → "no
-    /// candidate seeds passed outer startup validation (SAE manifold)". `ibp_map`
-    /// + `circle`'s seed lands in the PD region and never trips it, which is
-    /// exactly why it converged on identical data.
-    ///
-    /// Returning the FINITE collapse wall (`SAE_FIT_DATA_COLLAPSE_COST = 1e12`)
-    /// instead of `+∞` keeps the SAME steering behaviour — the wall is
-    /// astronomically larger than any real REML cost, so the Armijo/Wolfe line
-    /// search still rejects any step into the infeasible basin and backtracks
-    /// toward the feasible region — while giving the outer solver a BOUNDED seed
-    /// sample. The neighbourhood is then a finite barrier rather than an unbounded
-    /// `+∞` desert, so the non-termination guard does not fire and the fit ships
-    /// the best-so-far (seed) dictionary rather than aborting the whole fit. This
-    /// unifies the value/gradient lanes with the EFS lane, which already returns
-    /// this exact finite wall for the identical refusal class (#1782), and with
-    /// the non-finite-Laplace floor `add_fit_data_collapse_penalty` uses (#1217).
-    /// Genuine (non-recoverable) defects still propagate as a hard error above the
-    /// call sites; only the recoverable infeasible-ρ probe reaches this wall.
-    const fn recoverable_refusal_wall_cost() -> f64 {
-        SAE_FIT_DATA_COLLAPSE_COST
+    /// Whether a value probe has no defined REML/LAML evidence. Such a state is
+    /// not admitted to the handoff or basin bundle. Finite collapsed fits remain
+    /// ordinary REML values; their separate structural verdict is recorded above.
+    fn probe_value_is_infeasible(value: f64) -> bool {
+        !value.is_finite()
     }
 
     pub(crate) fn is_recoverable_value_probe_refusal(err: &str) -> bool {
@@ -2237,7 +2171,7 @@ impl SaeManifoldOuterObjective {
     /// drive selected by [`ProbeInnerDrive`]: the historical criterion drive or
     /// the exact line-search probe lane ([`Self::line_search_probe_criterion`]).
     /// Everything around the inner drive — the probe handoff install, seeded-β
-    /// warm start, amortized latent warm start, and collapse wall — is shared.
+    /// warm start, amortized latent warm start, and collapse ledger — is shared.
     fn evaluate_with_inner_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2330,10 +2264,17 @@ impl SaeManifoldOuterObjective {
         // that selected it — the objective↔gradient desync class (#931/#1206)
         // moved from the line search into selection. The fold is removed from
         // every fitting/ranking lane; encoder consistency remains available as
-        // a pure diagnostic (`reml_criterion_cotrained`). The discrete collapse
-        // barrier stays on all lanes (an infeasibility wall the search rejects
-        // steps into, not a smooth fold).
-        let cost = self.add_fit_data_collapse_penalty(reml_cost, &rho)?;
+        // a pure diagnostic (`reml_criterion_cotrained`). The fitted-data
+        // collapse detector is a structural ledger verdict, not an objective
+        // fold: changing a finite REML value by a constant sentinel would pair
+        // that post-hoc value with the bare analytic REML derivative (#2253).
+        self.record_fit_data_collapse_verdict(&rho)?;
+        let cost = if reml_cost.is_finite() {
+            reml_cost
+        } else {
+            self.probe_telemetry.infeasible_criterion_evals += 1;
+            f64::INFINITY
+        };
         self.current_rho = rho;
         self.last_loss = Some(loss);
         Ok((cost, beta_hat))
@@ -3003,11 +2944,7 @@ impl SaeManifoldOuterObjective {
                         );
                 }
                 None => {
-                    if matrix_free_assignment_gradient_coordinate(
-                        self.term.streaming_plan(),
-                        &self.term,
-                        &rho,
-                    ) == Some(sparse_index)
+                    if hybrid_assignment_gradient_coordinate(&self.term, &rho) == Some(sparse_index)
                     {
                         let (probes, inverse_probes) = inverse_probe_bundle
                             .as_ref()
@@ -3420,13 +3357,9 @@ fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
-        let matrix_free_assignment_gradient_dim = usize::from(
-            matrix_free_assignment_gradient_coordinate(
-                streaming_plan,
-                &self.term,
-                &self.baseline_rho,
-            )
-            .is_some(),
+        let assignment_gradient_dim = usize::from(
+            hybrid_assignment_gradient_coordinate(&self.term, &self.baseline_rho)
+                .is_some(),
         );
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
@@ -3442,12 +3375,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
             gradient: sae_outer_gradient_capability(streaming_plan),
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
-            // Matrix-free softmax/threshold fits have one non-FS coordinate:
-            // assignment strength. Mark it as the Hybrid-EFS analytic-gradient
-            // block so the scalable EFS updates still own smoothness/ARD while
-            // this coordinate moves by its exact REML gradient. Dense fits keep
-            // the ordinary full-gradient/BFGS declaration.
-            psi_dim: matrix_free_assignment_gradient_dim,
+            // Softmax/threshold fits have one non-FS coordinate: assignment
+            // strength. Mark it as the Hybrid-EFS analytic-gradient block so
+            // scalable EFS updates still own smoothness/ARD while this coordinate
+            // moves by its exact REML gradient. Small dense fits still select the
+            // ordinary full-gradient BFGS plan at the existing crossover.
+            psi_dim: assignment_gradient_dim,
             // SPEC: "REML or LAML is used for fitting." The Fellner–Schall
             // fixed point is the canonical REML method and needs ONLY the traces
             // tr(H⁻¹ S_c) (decoder_smoothness_effective_dof + ard_inverse_traces),
