@@ -98,11 +98,11 @@ mod spatial_length_scale_monotone_tests {
         }
     }
 
-    /// Return `(short_seed, long_endpoint, selected)` for the certified
-    /// pre-joint Matérn range comparison on a deterministic sinusoid. Keeping
-    /// this at the profiler boundary isolates the global basin decision from
-    /// the subsequent local joint optimizer.
-    fn profiled_matern_basin_for_frequency(frequency: f64) -> (f64, f64, f64) {
+    /// Return `(short_seed, raw_long_endpoint, rank_stable_endpoint, selected)`
+    /// for the certified pre-joint Matérn range comparison on a deterministic
+    /// sinusoid. Keeping this at the profiler boundary isolates the global
+    /// basin decision from the subsequent local joint optimizer.
+    fn profiled_matern_basin_for_frequency(frequency: f64) -> (f64, f64, f64, f64) {
         let n = 120usize;
         let num_centers = 20usize;
         let mut data = Array2::<f64>::zeros((n, 1));
@@ -158,8 +158,17 @@ mod spatial_length_scale_monotone_tests {
         let spatial_terms = spatial_length_scale_term_indices(&resolved);
         assert_eq!(spatial_terms, vec![0]);
         let kappa_options = SpatialLengthScaleOptimizationOptions::default();
-        let (psi_long, _) =
+        let (raw_psi_long, _) =
             spatial_term_psi_bounds(data.view(), &resolved, 0, &kappa_options);
+        let psi_long = rank_stable_isotropic_matern_long_psi(
+            data.view(),
+            &resolved,
+            0,
+            raw_psi_long,
+            &options.resource_policy,
+        )
+        .expect("rank-stable long-range endpoint");
+        let raw_long_endpoint = (-raw_psi_long).exp();
         let long_endpoint = (-psi_long).exp();
         let (selected_spec, _) = select_isotropic_matern_range_basin(
             data.view(),
@@ -175,13 +184,17 @@ mod spatial_length_scale_monotone_tests {
         )
         .expect("certified endpoint profile comparison");
         let selected = get_spatial_length_scale(&selected_spec, 0).expect("selected Matérn range");
-        (short_seed, long_endpoint, selected)
+        (short_seed, raw_long_endpoint, long_endpoint, selected)
     }
 
     #[test]
     fn smooth_nu_five_halves_selects_certified_long_range_basin() {
-        let (short, long, selected) = profiled_matern_basin_for_frequency(1.0);
+        let (short, raw_long, long, selected) = profiled_matern_basin_for_frequency(1.0);
         assert!(long > short, "fixture must expose distinct range basins");
+        assert!(
+            raw_long > long,
+            "fixture must keep the rank-losing raw geometry endpoint out of the profile"
+        );
         assert_eq!(
             selected, long,
             "smooth ν=5/2 signal should enter the certified long-range basin"
@@ -190,8 +203,12 @@ mod spatial_length_scale_monotone_tests {
 
     #[test]
     fn sin8_nu_five_halves_retains_certified_short_range_basin() {
-        let (short, long, selected) = profiled_matern_basin_for_frequency(8.0);
+        let (short, raw_long, long, selected) = profiled_matern_basin_for_frequency(8.0);
         assert!(long > short, "fixture must expose distinct range basins");
+        assert!(
+            raw_long > long,
+            "fixture must keep the rank-losing raw geometry endpoint out of the profile"
+        );
         assert_eq!(
             selected, short,
             "sin8 ν=5/2 signal must retain the resolving short-range basin"
