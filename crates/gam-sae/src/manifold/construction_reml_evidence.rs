@@ -1982,11 +1982,17 @@ impl SaeManifoldTerm {
                 inputs.n_eff[atom] += support.fisher_n();
             }
         }
-        full_chunk
+        let mut system = full_chunk
             .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
             .map_err(|error| {
                 format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {error}")
-            })
+            })?;
+        // The exact-stationarity inverse consumes this system with the factor
+        // cache emitted from it. Persist the completed row/registry fingerprint
+        // now so the stale-pair guard compares two identities from the same
+        // assembled operator instead of the constructor sentinel `0`.
+        system.refresh_row_hessian_fingerprint();
+        Ok(system)
     }
 
     /// Streaming reduced-Schur evidence `log|H| = Σ log|H_tt| + log|S|` with the
