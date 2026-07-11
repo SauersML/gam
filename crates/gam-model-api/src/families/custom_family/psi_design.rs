@@ -17,10 +17,6 @@ pub use gam_problem::{
     JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
     SharedDerivativeBlocks,
 };
-use gam_problem::{
-    ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-};
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Pre-build any per-row jet caches the workspace will hand to the
@@ -53,28 +49,9 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Priming a cache the mode never reads is pure wasted O(n) work, so under-
     /// priming is always safe: every cache is a lazy `get_or_compute`, so a
     /// later consumer (if any) still builds it on demand — just without the
-    /// top-level-rayon fan-out this hook would have given it.
-    fn warm_up_outer_caches_for_mode(&self, eval_mode: EvalMode) -> Result<(), String> {
-        // Legacy default: prime everything (matches the historic
-        // `warm_up_outer_caches` contract) for any workspace that has not
-        // opted into mode-aware priming. Every mode falls through to the same
-        // mode-blind prime; mode-aware workspaces override this method to skip
-        // caches the requested mode never reads.
-        match eval_mode {
-            EvalMode::ValueOnly | EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian => {
-                self.warm_up_outer_caches()
-            }
-        }
-    }
-
-    /// Mode-blind warm-up retained for back-compat: primes every directional
-    /// cache the workspace keeps. Production call sites should prefer
-    /// [`Self::warm_up_outer_caches_for_mode`] so value-only probes skip the
-    /// prime entirely. Default impl is a no-op for workspaces with no per-row
-    /// jet cache.
-    fn warm_up_outer_caches(&self) -> Result<(), String> {
-        Ok(())
-    }
+    /// top-level-rayon fan-out this hook would have given it. Workspaces with no
+    /// directional caches implement this explicitly as a mode-exhaustive no-op.
+    fn warm_up_outer_caches_for_mode(&self, eval_mode: EvalMode) -> Result<(), String>;
 
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
