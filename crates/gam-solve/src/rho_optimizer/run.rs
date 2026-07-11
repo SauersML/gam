@@ -1614,35 +1614,39 @@ pub(crate) fn certify_outer_optimality(
         None
     };
 
-    // Curvature-scaled flat-valley stationarity (#2253/#2249/#2015). On a
-    // flat-valley cost-stall exit the criterion has provably stalled, but the
-    // re-measured projected gradient can sit modestly ABOVE the score-relative /
-    // probe-noise bands on a weakly-identified small-n fit even though NO step
-    // reduces the objective by more than the outer tolerance. Whether that
-    // residual is genuine descent is a second-order question the flat bands above
-    // cannot answer: they are gradient-magnitude tests, blind to how the local
-    // curvature maps a gradient to an objective change. The Newton decrement
-    // `½·gᵀH⁻¹g` (see `newton_predicted_decrease`) IS that map — the exact
-    // predicted improvement of a safeguarded second-order step. When it is below
-    // the outer objective tolerance, the point is stationary at the resolution
-    // the criterion can be optimized ("no further descent possible").
+    // Curvature-scaled stationarity (#2253/#2249/#2015/#2091). The re-measured
+    // projected gradient can sit modestly ABOVE the score-relative / probe-noise
+    // bands even though NO step reduces the objective by more than the outer
+    // tolerance — a weakly-identified small-n fit reaches this by a flat-valley
+    // cost-stall, and an *already-stationary* fit reaches it at iteration 0 when
+    // the plan search exhausts without stepping (a 2-parameter Gaussian-linear
+    // REML lands λ→0 at a genuine interior optimum whose |Pg|≈1e-7 sits just above
+    // an absolute score·1e-9 gradient floor tighter than the REML gradient's
+    // matrix-factorization round-off). Whether that residual is genuine descent is
+    // a second-order question the flat bands above cannot answer: they are
+    // gradient-magnitude tests, blind to how the local curvature maps a gradient
+    // to an objective change. The Newton decrement `½·gᵀH⁻¹g` (see
+    // `newton_predicted_decrease`) IS that map — the exact predicted improvement of
+    // a safeguarded second-order step. When it is below the outer objective
+    // tolerance, the point is stationary at the resolution the criterion can be
+    // optimized ("no further descent possible"), independent of HOW the solver
+    // stopped.
     //
-    // Gated to a flat-valley cost-stall exit with a PSD analytic Hessian in hand,
-    // so it can NEVER touch a well-identified fit (which certifies via
-    // `solver_bound` and never enters this branch) and never certifies a point
-    // with real available descent (a gradient aligned with a near-flat Hessian
-    // direction inflates the decrement and is rejected; an indefinite Hessian is
-    // rejected by the curvature gate below). The derived widening is a genuine,
-    // direction-aware curvature-scaled GRADIENT bound — the largest ‖Pg‖ that, in
-    // this gradient's direction under this curvature, still predicts a decrease of
-    // exactly `objective_tol` — not a constant bump: because the decrement scales
-    // quadratically with ‖g‖ at fixed direction, that bound is
+    // Applied whenever a PSD-along-gradient analytic Hessian is in hand (NOT gated
+    // to a specific exit reason: the decrement test is the certificate, the exit
+    // reason is not). It can NEVER wrongly certify a fit with real available
+    // descent: it only widens when `curvature_grad_bound > stationarity_bound`, so
+    // a well-identified fit that already clears `solver_bound` is untouched; a
+    // gradient aligned with a near-flat Hessian direction inflates the decrement
+    // and is rejected; a globally indefinite Hessian is rejected independently by
+    // the `hessian_psd` gate inside `certifies()`. The derived widening is a
+    // genuine, direction-aware curvature-scaled GRADIENT bound — the largest ‖Pg‖
+    // that, in this gradient's direction under this curvature, still predicts a
+    // decrease of exactly `objective_tol` — not a constant bump: because the
+    // decrement scales quadratically with ‖g‖ at fixed direction, that bound is
     // `‖Pg‖·√(objective_tol/Δpred)`, which clears the actual ‖Pg‖ iff
     // `Δpred ≤ objective_tol`.
-    if matches!(
-        result.operator_stop_reason,
-        Some(OperatorTrustRegionStopReason::CostStallFlatValley)
-    ) && let Some(hessian) = analytic_hessian.as_ref()
+    if let Some(hessian) = analytic_hessian.as_ref()
         && let Some(predicted_decrease) =
             newton_predicted_decrease(hessian, &projected_gradient)
         && predicted_decrease.is_finite()
@@ -2240,17 +2244,22 @@ pub(crate) fn run_outer_uncertified(
     }
 
     if let Some(checkpoint) = best_checkpoint {
-        let gradient_bound = outer_gradient_tolerance(config).threshold(
-            checkpoint.final_value,
-            checkpoint.final_grad_norm.unwrap_or(0.0),
-        );
-        return Err(outer_nonconvergence_error(
-            context,
-            "all declared solver plans exhausted without a stationary result",
-            &checkpoint,
-            checkpoint.final_grad_norm,
-            gradient_bound,
-        ));
+        // The solver ladder produced no result that its OWN internal
+        // (raw-gradient) convergence test accepted — but that test cannot see a
+        // railed or already-stationary optimum. At a smoothing parameter railed to
+        // the ρ box floor (λ→0, e.g. an exact linear fit or a separated smooth),
+        // the RAW gradient stays large along the railed axis — it "wants" to push
+        // past the boundary — so the solver reports non-convergence and can take
+        // zero steps, even though the KKT-PROJECTED gradient (which zeroes
+        // outward-railed axes) is stationary and no feasible step reduces the
+        // objective. Only the mandatory analytic certificate in `run_outer`
+        // computes that projected gradient AND the curvature-scaled flat-valley
+        // bound (½·gᵀH⁻¹g ≤ objective_tol), so IT, not this raw-gradient ladder, is
+        // the sole authority on stationarity. Hand it the best finite checkpoint:
+        // `certify_outer_optimality` mints iff the point is genuinely stationary
+        // (interior, railed, or flat-valley) and returns typed non-convergence
+        // otherwise, so a truly divergent fit is still rejected there.
+        return Ok(checkpoint);
     }
 
     Err(last_error.unwrap_or_else(|| {
