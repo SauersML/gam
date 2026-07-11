@@ -620,16 +620,24 @@ pub(crate) fn row_set_from_survival_mask(
 /// (`KW = SLS_ROW_K + pw`). `vars[0..9]` are the base channels (exactly
 /// [`sls_row_nll`]); `vars[9..9+pw]` are the wiggle amplitudes βw. The per-row
 /// basis stacks are evaluated at the BASE indices (the warp composes the basis
-/// onto the index jet): `b{0,1,2}e` = `B/B'/B''` at `q0_entry`, `b{0,1,2,3}x` =
-/// `B/B'/B''/B'''` at `q0_exit`. Bit-identical (modulo association) to the nested
+/// onto the index jet): `b{0,1,2,3}e` = `B/B'/B''/B'''` at `q0_entry`,
+/// `b{0,1,2,3}x` = `B/B'/B''/B'''` at `q0_exit`. Bit-identical (modulo association) to the nested
 /// witness in `survival_ls_wiggle_joint_hessian_matches_assembler_932`.
 /// Per-row warp basis stacks evaluated at the BASE indices. `b_u0` holds
-/// `[B, B', B'']` at `q0_entry` (entry warp `u0w`); `b_u1` holds
+/// `[B, B', B'', B''']` at `q0_entry` (entry warp `u0w`); `b_u1` holds
 /// `[B, B', B'', B''']` at `q0_exit` (exit warp `u1w` and the qdot slope `m1`).
+/// Both stacks must carry the basis through `B'''` — the highest derivative a
+/// cubic (degree-3) wiggle spline has that is nonzero within a knot span — so
+/// the composed jet is EXACT to 4th order (`B'''' ≡ 0` inside a span). Carrying
+/// the entry warp only to `B''` (as an earlier revision did) silently drops the
+/// entry `B'''` term: it is invisible to the 2nd-order Hessian (`Order2` never
+/// reads the 3rd compose slot) but leaves an O(1) error in `row_third_contracted`
+/// / `row_fourth_contracted`, which the FD oracle
+/// `survival_ls_wiggle_third_and_fourth_directional_match_fd_932` catches. (#932)
 /// Each inner slice has one entry per wiggle column (`pw` long). Bundling the
-/// seven slices keeps [`sls_row_nll_wiggle`] within the argument budget.
+/// eight slices keeps [`sls_row_nll_wiggle`] within the argument budget.
 pub(crate) struct SlsWiggleRowBasis<'b> {
-    pub(crate) b_u0: [&'b [f64]; 3],
+    pub(crate) b_u0: [&'b [f64]; 4],
     pub(crate) b_u1: [&'b [f64]; 4],
 }
 
@@ -639,7 +647,7 @@ pub(crate) fn sls_row_nll_wiggle<const KW: usize, S: JetScalar<KW>>(
     pw: usize,
     basis: &SlsWiggleRowBasis<'_>,
 ) -> S {
-    let [b0e, b1e, b2e] = basis.b_u0;
+    let [b0e, b1e, b2e, b3e] = basis.b_u0;
     let [b0x, b1x, b2x, b3x] = basis.b_u1;
     let inv_sigma_entry = vars[7].neg().exp();
     let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
@@ -651,7 +659,7 @@ pub(crate) fn sls_row_nll_wiggle<const KW: usize, S: JetScalar<KW>>(
     let mut m1 = S::constant(1.0);
     for j in 0..pw {
         let bw = vars[SLS_ROW_K + j];
-        u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], 0.0, 0.0])));
+        u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], b3e[j], 0.0])));
         u1w = u1w.add(&bw.mul(&u1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
         m1 = m1.add(&bw.mul(&u1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
     }
@@ -719,6 +727,7 @@ pub(crate) struct SurvivalLsWiggleRowKernel<'a, const KW: usize> {
     b_u0_0: Array2<f64>,
     b_u0_1: Array2<f64>,
     b_u0_2: Array2<f64>,
+    b_u0_3: Array2<f64>,
     b_u1_0: Array2<f64>,
     b_u1_1: Array2<f64>,
     b_u1_2: Array2<f64>,
@@ -777,6 +786,7 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
             degree,
             BasisOptions::second_derivative(),
         )?;
+        let b_u0_3 = survival_wiggle_third_basis(q_entry.view(), knots, degree)?;
         let b_u1_0 = survival_wiggle_basis_with_options(
             q_exit.view(),
             knots,
@@ -822,6 +832,7 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
             b_u0_0,
             b_u0_1,
             b_u0_2,
+            b_u0_3,
             b_u1_0,
             b_u1_1,
             b_u1_2,
@@ -847,12 +858,13 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
         let r_u0_0 = self.b_u0_0.row(row).to_vec();
         let r_u0_1 = self.b_u0_1.row(row).to_vec();
         let r_u0_2 = self.b_u0_2.row(row).to_vec();
+        let r_u0_3 = self.b_u0_3.row(row).to_vec();
         let r_u1_0 = self.b_u1_0.row(row).to_vec();
         let r_u1_1 = self.b_u1_1.row(row).to_vec();
         let r_u1_2 = self.b_u1_2.row(row).to_vec();
         let r_u1_3 = self.b_u1_3.row(row).to_vec();
         let basis = SlsWiggleRowBasis {
-            b_u0: [&r_u0_0, &r_u0_1, &r_u0_2],
+            b_u0: [&r_u0_0, &r_u0_1, &r_u0_2, &r_u0_3],
             b_u1: [&r_u1_0, &r_u1_1, &r_u1_2, &r_u1_3],
         };
         Ok(sls_row_nll_wiggle(vars, &kernel, self.pw, &basis))

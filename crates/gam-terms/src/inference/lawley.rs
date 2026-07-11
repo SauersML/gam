@@ -1437,6 +1437,48 @@ mod tests {
         );
     }
 
+    /// Closed form for an intercept-only Lawley model with log-smoothing
+    /// components `s_b = exp(rho_b) s_b^unit`. Every entry of
+    /// `E = X J^-1 X^T` and every leverage equals `1 / J`, hence
+    /// `epsilon(J) = A / J^2 + D / J^3`. Differentiating that identity gives an
+    /// independent exact oracle for every diagonal and cross-rho curvature.
+    fn intercept_lawley_value_and_rho_hessian(
+        kappas: &[RowKappas],
+        component_strengths: &[f64],
+    ) -> (f64, Array2<f64>) {
+        let information =
+            kappas.iter().map(|row| -row.k2).sum::<f64>() + component_strengths.iter().sum::<f64>();
+        let fourth_sum = kappas
+            .iter()
+            .map(|row| row.k4 / 4.0 - row.k3_1 + row.k2_11)
+            .sum::<f64>();
+        let mut sixth_sum = 0.0;
+        for row_i in kappas {
+            for row_j in kappas {
+                let cross = row_i.k3 * row_j.k3;
+                let mixed = -row_i.k3 * row_j.k2_1 + row_i.k2_1 * row_j.k2_1;
+                sixth_sum += cross / 6.0 + mixed + cross / 4.0 + mixed;
+            }
+        }
+        let value = fourth_sum / information.powi(2) + sixth_sum / information.powi(3);
+        let derivative_information =
+            -2.0 * fourth_sum / information.powi(3) - 3.0 * sixth_sum / information.powi(4);
+        let second_information =
+            6.0 * fourth_sum / information.powi(4) + 12.0 * sixth_sum / information.powi(5);
+        let hessian = Array2::from_shape_fn(
+            (component_strengths.len(), component_strengths.len()),
+            |(b, c)| {
+                let cross = second_information * component_strengths[b] * component_strengths[c];
+                if b == c {
+                    cross + derivative_information * component_strengths[b]
+                } else {
+                    cross
+                }
+            },
+        );
+        (value, hessian)
+    }
+
     /// DELIVERABLE (2), ρ̂-variation anchor — Gaussian known variance: `Δε ≡ 0`
     /// at every λ, so its ρ-curvature is identically zero and the ρ̂-variation
     /// correction is exactly 0 regardless of `Cov(ρ̂)`. The total shift must
@@ -1474,108 +1516,63 @@ mod tests {
         );
     }
 
-    /// DELIVERABLE (2), ρ̂-variation core — the correction is exactly
-    /// `½·Hᵨᵨ·Var(ρ̂)` for a single smoothing parameter, where `Hᵨᵨ = Δε''(ρ)`
-    /// is the second ρ-derivative of the deterministic conditional shift. This
-    /// test pins three things on a Poisson/log smooth (non-zero ε):
-    ///   (i)   the total = conditional + ½ H Var, with H matching an INDEPENDENT
-    ///         high-accuracy (Richardson-extrapolated) finite difference of
-    ///         `lawley_lr_mean_shift` in ρ — proving the internal stencil is the
-    ///         curvature it claims to be;
-    ///   (ii)  zero ρ-variance recovers the conditional shift exactly (the
-    ///         correction switches off as λ → fixed);
-    ///   (iii) the correction is genuinely non-zero (the curvature and variance
-    ///         are both non-zero), so the ρ̂-variation term is load-bearing.
+    /// The exact matrix derivative reduces to the independent scalar identity
+    /// `epsilon(J) = A/J^2 + D/J^3` for an intercept-only model. This pins the
+    /// diagonal rho curvature, its covariance contraction, and the zero-
+    /// variance limit without a numerical derivative oracle.
     #[test]
-    fn rho_variation_correction_matches_curvature_times_variance() {
-        let n = 50usize;
-        let mut x = Array2::<f64>::ones((n, 2));
+    fn rho_variation_hessian_matches_closed_form_intercept() {
+        let n = 31usize;
+        let x = Array2::<f64>::ones((n, 1));
         let mut kappas = Vec::with_capacity(n);
         for i in 0..n {
-            let z = i as f64 / n as f64 - 0.5;
-            x[[i, 1]] = z;
-            let eta = 0.3 + 0.6 * z;
+            let eta = -0.4 + 0.8 * i as f64 / (n - 1) as f64;
             kappas.push(
                 RowExpectedJets::poisson_log(eta)
                     .kappas()
                     .expect("poisson kappas"),
             );
         }
-        // One smoothing parameter (λ = 3) penalizing the second column.
-        let lambda = 3.0_f64;
-        let mut s_comp = Array2::<f64>::zeros((2, 2));
-        s_comp[[1, 1]] = lambda;
+        let strength = 3.25;
+        let s_comp = Array2::from_elem((1, 1), strength);
         let penalty = s_comp.clone();
         let components = vec![RhoPenaltyComponent {
-            s_component: s_comp.clone(),
+            s_component: s_comp,
         }];
-        let tested = 1..2;
+        let (expected_conditional, expected_hessian) =
+            intercept_lawley_value_and_rho_hessian(&kappas, &[strength]);
+        let (conditional, hessian) =
+            lawley_lr_mean_shift_rho_hessian(x.view(), &kappas, penalty.view(), 0..1, &components)
+                .expect("analytic rho Hessian");
+        assert!((conditional - expected_conditional).abs() < 1e-13);
+        assert!((hessian[[0, 0]] - expected_hessian[[0, 0]]).abs() < 1e-13);
+        assert!(expected_hessian[[0, 0]].abs() > 1e-9);
 
-        // Conditional (fixed-λ) shift.
-        let conditional =
-            lawley_lr_mean_shift(x.view(), &kappas, Some(penalty.view()), tested.clone())
-                .expect("conditional shift");
-
-        // INDEPENDENT curvature Δε''(ρ): scale the WHOLE block by e^{t} (ρ = log λ
-        // ⇒ S_λ(t) = e^{t}·λ·S_unit) and Richardson-combine two central
-        // differences for an O(h⁴)-accurate second derivative.
-        let de_at = |t: f64| {
-            let mut s = Array2::<f64>::zeros((2, 2));
-            s[[1, 1]] = lambda * t.exp();
-            lawley_lr_mean_shift(x.view(), &kappas, Some(s.view()), tested.clone())
-                .expect("perturbed shift")
-        };
-        let h = 0.05_f64;
-        let d2_h = (de_at(h) - 2.0 * conditional + de_at(-h)) / (h * h);
-        let d2_2h = (de_at(2.0 * h) - 2.0 * conditional + de_at(-2.0 * h)) / (4.0 * h * h);
-        // Richardson: (4·D(h) − D(2h))/3 cancels the O(h²) term.
-        let curvature = (4.0 * d2_h - d2_2h) / 3.0;
-        assert!(
-            curvature.abs() > 1e-9,
-            "fixture must have non-zero ρ-curvature; got {curvature}"
-        );
-
-        let var_rho = 0.8_f64; // Var(ρ̂) (an inverse-outer-Hessian magnitude)
+        let var_rho = 0.8;
         let rho_cov = Array2::from_shape_vec((1, 1), vec![var_rho]).unwrap();
         let total = lawley_lr_mean_shift_with_rho_variation(
             x.view(),
             &kappas,
             penalty.view(),
-            tested.clone(),
+            0..1,
             &components,
             rho_cov.view(),
         )
         .expect("rho-variation shift");
+        let expected_total = expected_conditional + 0.5 * expected_hessian[[0, 0]] * var_rho;
+        assert!((total - expected_total).abs() < 1e-13);
 
-        // (i) total = conditional + ½ H Var, H from the independent Richardson FD.
-        let expected = conditional + 0.5 * curvature * var_rho;
-        assert!(
-            (total - expected).abs() < 1e-6 * (1.0 + expected.abs()),
-            "ρ̂-variation total {total} must equal conditional + ½ H Var = {expected} \
-             (conditional={conditional}, H={curvature}, Var={var_rho})"
-        );
-        // (iii) the ρ̂-variation correction is genuinely non-zero.
-        assert!(
-            (total - conditional).abs() > 1e-9,
-            "ρ̂-variation correction must be non-zero (H={curvature}, Var={var_rho}); \
-             total={total} conditional={conditional}"
-        );
-
-        // (ii) zero variance recovers the conditional shift exactly.
         let zero_cov = Array2::from_shape_vec((1, 1), vec![0.0]).unwrap();
         let total_zero = lawley_lr_mean_shift_with_rho_variation(
             x.view(),
             &kappas,
             penalty.view(),
-            tested.clone(),
+            0..1,
             &components,
             zero_cov.view(),
         )
         .expect("zero-variance shift");
-        assert!(
-            (total_zero - conditional).abs() < 1e-12,
-            "zero ρ-variance must recover the conditional shift: {total_zero} vs {conditional}"
-        );
+        assert_eq!(total_zero.to_bits(), conditional.to_bits());
     }
 
     /// DELIVERABLE (2) — the ρ̂-variation **factor** entry point
@@ -1701,33 +1698,26 @@ mod tests {
         );
     }
 
-    /// DELIVERABLE (2), ρ̂-variation cross terms — for two smoothing parameters
-    /// the correction is `½ Σ_{b,b'} H_{bb'} Cov_{bb'}`, and the off-diagonal
-    /// (mixed-partial) stencil must match an independent product-of-steps FD.
-    /// Pins that the symmetric cross contribution `H_{01}Cov_{01}` is included
-    /// (a diagonal-only assembly would miss it).
+    /// Two log-smoothing components acting on one intercept have the exact
+    /// cross curvature `f''(J) s_0 s_1`. This verifies both that matrix cross
+    /// derivatives are assembled analytically and that the symmetric covariance
+    /// contraction includes them.
     #[test]
     fn rho_variation_includes_symmetric_cross_terms() {
-        let n = 40usize;
-        let mut x = Array2::<f64>::ones((n, 3));
+        let n = 37usize;
+        let x = Array2::<f64>::ones((n, 1));
         let mut kappas = Vec::with_capacity(n);
         for i in 0..n {
-            let z = i as f64 / n as f64 - 0.5;
-            x[[i, 1]] = z;
-            x[[i, 2]] = z * z - 0.1;
-            let eta = 0.2 + 0.5 * z - 0.3 * x[[i, 2]];
+            let eta = -0.7 + 1.1 * i as f64 / (n - 1) as f64;
             kappas.push(
                 RowExpectedJets::binomial_logit(eta)
                     .kappas()
                     .expect("binomial kappas"),
             );
         }
-        // Two smoothing parameters, one on column 1, one on column 2.
-        let (l1, l2) = (2.0_f64, 4.0_f64);
-        let mut s1 = Array2::<f64>::zeros((3, 3));
-        s1[[1, 1]] = l1;
-        let mut s2 = Array2::<f64>::zeros((3, 3));
-        s2[[2, 2]] = l2;
+        let (l1, l2) = (2.0, 4.0);
+        let s1 = Array2::from_elem((1, 1), l1);
+        let s2 = Array2::from_elem((1, 1), l2);
         let penalty = &s1 + &s2;
         let components = vec![
             RhoPenaltyComponent {
@@ -1737,25 +1727,18 @@ mod tests {
                 s_component: s2.clone(),
             },
         ];
-        // Test the joint nuisance/smooth block {1,2} against the intercept.
-        let tested = 1..3;
-        let conditional =
-            lawley_lr_mean_shift(x.view(), &kappas, Some(penalty.view()), tested.clone())
-                .expect("conditional");
-
-        // Independent Hessian by FD on the deterministic shift as a function of
-        // (t0, t1): block b scaled by e^{t_b}.
-        let de = |t0: f64, t1: f64| {
-            let mut s = Array2::<f64>::zeros((3, 3));
-            s[[1, 1]] = l1 * t0.exp();
-            s[[2, 2]] = l2 * t1.exp();
-            lawley_lr_mean_shift(x.view(), &kappas, Some(s.view()), tested.clone())
-                .expect("perturbed")
-        };
-        let h = 0.05_f64;
-        let h00 = (de(h, 0.0) - 2.0 * conditional + de(-h, 0.0)) / (h * h);
-        let h11 = (de(0.0, h) - 2.0 * conditional + de(0.0, -h)) / (h * h);
-        let h01 = (de(h, h) - de(h, -h) - de(-h, h) + de(-h, -h)) / (4.0 * h * h);
+        let (expected_conditional, expected_hessian) =
+            intercept_lawley_value_and_rho_hessian(&kappas, &[l1, l2]);
+        let (conditional, hessian) =
+            lawley_lr_mean_shift_rho_hessian(x.view(), &kappas, penalty.view(), 0..1, &components)
+                .expect("analytic cross-rho Hessian");
+        assert!((conditional - expected_conditional).abs() < 1e-13);
+        for b in 0..2 {
+            for c in 0..2 {
+                assert!((hessian[[b, c]] - expected_hessian[[b, c]]).abs() < 1e-13);
+            }
+        }
+        assert!(expected_hessian[[0, 1]].abs() > 1e-9);
 
         // A full (non-diagonal) ρ-covariance.
         let rho_cov = Array2::from_shape_vec((2, 2), vec![0.7, 0.2, 0.2, 0.5]).unwrap();
@@ -1763,27 +1746,25 @@ mod tests {
             x.view(),
             &kappas,
             penalty.view(),
-            tested.clone(),
+            0..1,
             &components,
             rho_cov.view(),
         )
         .expect("rho-variation shift");
 
-        // Expected = conditional + ½(H00 V00 + H11 V11) + H01 V01 (symmetric cross).
-        let expected = conditional
-            + 0.5 * (h00 * rho_cov[[0, 0]] + h11 * rho_cov[[1, 1]])
-            + h01 * rho_cov[[0, 1]];
-        assert!(
-            (total - expected).abs() < 1e-6 * (1.0 + expected.abs()),
-            "two-parameter ρ̂-variation {total} must equal {expected} \
-             (H00={h00}, H11={h11}, H01={h01})"
-        );
-        // The cross term is non-trivial — a diagonal-only assembly would differ.
-        let diag_only = conditional + 0.5 * (h00 * rho_cov[[0, 0]] + h11 * rho_cov[[1, 1]]);
+        let expected = expected_conditional
+            + 0.5
+                * (expected_hessian[[0, 0]] * rho_cov[[0, 0]]
+                    + expected_hessian[[1, 1]] * rho_cov[[1, 1]])
+            + expected_hessian[[0, 1]] * rho_cov[[0, 1]];
+        assert!((total - expected).abs() < 1e-13);
+        let diag_only = expected_conditional
+            + 0.5
+                * (expected_hessian[[0, 0]] * rho_cov[[0, 0]]
+                    + expected_hessian[[1, 1]] * rho_cov[[1, 1]]);
         assert!(
             (total - diag_only).abs() > 1e-9,
-            "cross term H01·Cov01 must be included (off-diagonal non-zero): \
-             total={total} diag_only={diag_only}"
+            "cross curvature must contribute to the total"
         );
     }
 
