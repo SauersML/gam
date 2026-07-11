@@ -229,8 +229,8 @@ fn hetero_multinomial_recovers_true_simplex_at_true_df_basis_1373() {
 
     eprintln!(
         "#1373 hetero multinomial (k=12 on x1): gam_RMSE_vs_truth={gam_err:.5} \
-         converged={} iters={}",
-        model.converged, model.iterations
+         iters={}",
+        model.iterations
     );
 
     // The absolute truth bar (0.10) is now REACHABLE because the basis can
