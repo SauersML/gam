@@ -177,10 +177,11 @@ where
     if m >= 4 {
         let full = 1usize << m;
         let mut block_val = [0.0f64; 1 << MAX_SLOTS];
-        // `submask` is both the loop value (bit-scanned below) and the
-        // `block_val` index, so a `.iter_mut()` rewrite doesn't apply here.
-        #[allow(clippy::needless_range_loop)]
-        for submask in 1..full {
+        // `submask` is both the bit-scanned value AND the `block_val` slot, so
+        // iterate the slot mutably while `enumerate()` recovers the index —
+        // `take(full).skip(1)` reproduces the `1..full` range without the
+        // needless_range_loop that a bare `block_val[submask]` write triggers.
+        for (submask, slot) in block_val.iter_mut().enumerate().take(full).skip(1) {
             labelled.len = 0;
             let mut bits = submask;
             while bits != 0 {
@@ -188,7 +189,7 @@ where
                 labelled.push(positions[bit]);
                 bits &= bits - 1;
             }
-            block_val[submask] = inner(labelled.as_slice());
+            *slot = inner(labelled.as_slice());
         }
         let mut total = 0.0;
         for part in table {
