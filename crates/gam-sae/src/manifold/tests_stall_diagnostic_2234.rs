@@ -72,7 +72,7 @@ fn logdet_audit_point(
     registry: Option<&AnalyticPenaltyRegistry>,
     inner_max_iter: usize,
 ) -> Result<LogdetAuditPoint, String> {
-    let criterion_result = term.reml_criterion_with_cache(
+    let (criterion_value, loss, cache) = term.reml_criterion_with_cache(
         target,
         rho,
         registry,
@@ -81,8 +81,6 @@ fn logdet_audit_point(
         1.0e-6,
         1.0e-6,
     )?;
-    let loss = criterion_result.1;
-    let cache = criterion_result.2;
     let raw_smoothness_sum: f64 = term
         .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec())
         .iter()
@@ -96,12 +94,6 @@ fn logdet_audit_point(
         "logdet_audit_point: authoritative log determinant unavailable".to_string()
     })?;
     let occam = term.reml_occam_term(rho)?;
-    let extra_penalty_energy = match registry {
-        Some(registry) => term
-            .reml_extra_penalty_value_total(registry)
-            .map_err(|err| err.to_string())?,
-        None => 0.0,
-    };
     let solver = term
         .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
         .map_err(|err| err.to_string())?;
@@ -118,8 +110,15 @@ fn logdet_audit_point(
     let raw_cache_components = term
         .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &raw_cache_solver)
         .map_err(|err| err.to_string());
+    // `SaeCriterion::assemble` represents `base + ½logdet - occam`. The
+    // authoritative production scalar additionally replaces the coordinate
+    // `½log|H_tt|` with the hard rank charge. Anchor the diagnostic base to the
+    // already-priced scalar so the atomized view differentiates the same
+    // Schur-plus-rank objective as `components`, rather than reconstructing the
+    // retired full-Laplace value from `loss` alone.
+    let criterion_base = criterion_value - 0.5 * log_det + occam;
     let criterion = SaeCriterion::assemble(
-        loss.total() + extra_penalty_energy,
+        criterion_base,
         log_det,
         occam,
         components.explicit.clone(),
@@ -127,6 +126,17 @@ fn logdet_audit_point(
         components.occam.clone(),
         components.third_order_correction.clone(),
     );
+    let criterion_roundoff =
+        64.0 * f64::EPSILON * (1.0 + criterion_value.abs().max(criterion.value().abs()));
+    if (criterion.value() - criterion_value).abs() > criterion_roundoff {
+        return Err(format!(
+            "logdet_audit_point: atomized criterion {} != authoritative value {} \
+             (roundoff {})",
+            criterion.value(),
+            criterion_value,
+            criterion_roundoff,
+        ));
+    }
     let mut kkt_term = term.clone();
     let kkt_system = kkt_term.assemble_arrow_schur(target, rho, registry)?;
     let kkt_grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&kkt_system);
