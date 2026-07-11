@@ -290,6 +290,18 @@ debug = "line-tables-only"
 # win that lets those solver-bound tests finish and self-report well inside the
 # per-test cap.
 opt-level = 2
+# Measured 2026-07-11 (A10 real-workload profile of the fd_2015 fit, 94K
+# samples): 50.4% of ALL cycles sat in an OUTLINED generic
+# `ndarray ArrayRef::index_mut` instantiation — the static `[[i, j]]`
+# element-access wrapper, instantiated INSIDE gam_sae's own codegen units but
+# split across CGUs, which blocks LLVM from inlining it into the hot per-row
+# assembly loops (release is unaffected: it already carries thin-LTO +
+# codegen-units = 1). One codegen unit lets those instantiations inline and
+# the bounds-check fold, reclaiming the outlined-call half of the test-lane
+# fit runtime. Codegen parallelism is lost, but test-lane iteration is
+# dominated by incremental rebuilds of one or two crates, where the tradeoff
+# measures in favor of runtime (solver-bound tests are the per-test-cap risk).
+codegen-units = 1
 
 # Dev/`maturin develop` profile — same rationale as [profile.test]. Cargo's
 # default dev profile emits full DWARF (`debug = 2`), which is what lets
