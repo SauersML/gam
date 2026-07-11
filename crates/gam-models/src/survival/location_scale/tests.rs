@@ -7073,6 +7073,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
 #[test]
 fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
     use super::row_kernel::{SurvivalExactRowKernel, SurvivalLsWiggleRowKernel};
+    use gam_math::jet_scalar::{DynamicJetArena, RuntimeJetScalar};
 
     // Reuse the directional oracle's regime: event rows, moderate-tail primaries
     // clear of the monotonicity guard, cubic wiggle with nonzero amplitudes so
@@ -7133,7 +7134,11 @@ fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
             .expect("wiggle row kernel");
 
         for row in 0..n {
-            let kernel_nll = kernel.row_nll_value(row).expect("wiggle kernel value");
+            let arena = DynamicJetArena::new();
+            let kernel_nll = kernel
+                .row_order2(row, &arena)
+                .expect("wiggle kernel value")
+                .value();
             // Direct single-warp objective: exactly `log_likelihood_only`'s per-row
             // body, reading the geometry's ONCE-warped index `dynamic.q_exit`.
             let state = family.row_predictor_state(
