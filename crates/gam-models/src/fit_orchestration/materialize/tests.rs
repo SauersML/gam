@@ -845,6 +845,123 @@ fn duchon_workflow_dataset() -> Dataset {
     }
 }
 
+fn univariate_radial_workflow_dataset() -> Dataset {
+    let n = 30usize;
+    let mut values = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let x = i as f64 / (n - 1) as f64;
+        values[[i, 0]] = (4.0 * std::f64::consts::PI * x).sin();
+        values[[i, 1]] = x;
+    }
+    Dataset {
+        headers: vec!["y".to_string(), "x".to_string()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+    }
+}
+
+fn planned_radial_centers(basis: &SmoothBasisSpec) -> (usize, bool) {
+    match basis {
+        SmoothBasisSpec::Matern {
+            feature_cols, spec, ..
+        } => (
+            spec.center_strategy.planned_num_centers(feature_cols.len()),
+            center_strategy_is_auto(&spec.center_strategy),
+        ),
+        SmoothBasisSpec::Duchon {
+            feature_cols, spec, ..
+        } => (
+            spec.center_strategy.planned_num_centers(feature_cols.len()),
+            center_strategy_is_auto(&spec.center_strategy),
+        ),
+        other => panic!("expected Matérn or Duchon basis, got {other:?}"),
+    }
+}
+
+#[test]
+fn adaptive_univariate_radial_start_preserves_formula_floor_and_applies_growth_1867() {
+    let data = univariate_radial_workflow_dataset();
+
+    for (label, formula) in [("Matérn", "y ~ matern(x)"), ("Duchon", "y ~ duchon(x)")] {
+        let raw = materialize(formula, &data, &FitConfig::default())
+            .unwrap_or_else(|error| panic!("raw {label} materialization failed: {error}"));
+        let FitRequest::Standard(raw_request) = raw.request else {
+            panic!("expected standard {label} request");
+        };
+        let (raw_centers, raw_is_auto) =
+            planned_radial_centers(&raw_request.spec.smooth_terms[0].basis);
+        assert!(
+            raw_is_auto,
+            "implicit {label} centers must retain Auto provenance"
+        );
+        assert!(
+            raw_centers > starting_num_centers(data.values.nrows(), 1),
+            "{label} formula default must retain its derived univariate resolution floor"
+        );
+
+        let initial_config = FitConfig {
+            spatial_center_counts: Some(Vec::new()),
+            ..FitConfig::default()
+        };
+        let initial = materialize(formula, &data, &initial_config).unwrap_or_else(|error| {
+            panic!("initial adaptive {label} materialization failed: {error}")
+        });
+        let FitRequest::Standard(initial_request) = initial.request else {
+            panic!("expected standard adaptive {label} request");
+        };
+        let (initial_centers, initial_is_auto) =
+            planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
+        assert_eq!(
+            initial_centers, raw_centers,
+            "an absent adaptive proposal must preserve the canonical 1-D {label} formula resolution"
+        );
+        assert!(
+            initial_is_auto,
+            "adaptive {label} centers must retain Auto provenance"
+        );
+
+        let proposed_centers = raw_centers.saturating_mul(2).min(data.values.nrows());
+        assert!(
+            proposed_centers > raw_centers,
+            "test data must leave room for a genuine {label} growth proposal"
+        );
+        let growth_config = FitConfig {
+            spatial_center_counts: Some(vec![Some(proposed_centers)]),
+            ..FitConfig::default()
+        };
+        let grown = materialize(formula, &data, &growth_config).unwrap_or_else(|error| {
+            panic!("grown adaptive {label} materialization failed: {error}")
+        });
+        let FitRequest::Standard(grown_request) = grown.request else {
+            panic!("expected grown standard {label} request");
+        };
+        let (grown_centers, grown_is_auto) =
+            planned_radial_centers(&grown_request.spec.smooth_terms[0].basis);
+        assert_eq!(
+            grown_centers, proposed_centers,
+            "an explicit adaptive {label} growth proposal must remain authoritative"
+        );
+        assert!(
+            grown_is_auto,
+            "grown {label} centers must retain Auto provenance"
+        );
+    }
+}
+
 #[test]
 fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     let data = duchon_workflow_dataset();

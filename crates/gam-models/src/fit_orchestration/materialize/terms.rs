@@ -23,10 +23,12 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
-    // The standard formula path starts every auto-sized radial spatial smooth at
-    // its structural minimum and threads per-term evidence-backed expansions
-    // back through this same materializer. Explicit formula counts are not
-    // `Auto`, and Python overrides apply afterward, so both remain authoritative.
+    // The standard formula path starts auto-sized multivariate radial smooths at
+    // their structural minimum. Univariate radial smooths retain the canonical
+    // formula resolution because that resolution is derived from the competing
+    // univariate spline basis. Per-term evidence-backed expansions return through
+    // this same materializer. Explicit formula counts are not `Auto`, and Python
+    // overrides apply afterward, so both remain authoritative.
     if let Some(counts) = spatial_center_counts {
         apply_adaptive_spatial_center_counts(&mut spec, data, counts)?;
     }
@@ -78,11 +80,15 @@ fn apply_adaptive_spatial_center_counts(
         if !center_strategy_is_auto(strategy) {
             continue;
         }
-        let target = requested_counts
-            .get(term_index)
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| starting_num_centers(n, d))
+        let proposed = requested_counts.get(term_index).copied().flatten();
+        let target = proposed
+            .unwrap_or_else(|| {
+                if d == 1 {
+                    strategy.planned_num_centers(d)
+                } else {
+                    starting_num_centers(n, d)
+                }
+            })
             .max(structural_minimum)
             .min(n);
         *strategy = center_strategy_with_num_centers(strategy, target).map_err(|error| {
