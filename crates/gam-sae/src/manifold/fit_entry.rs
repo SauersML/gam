@@ -358,10 +358,16 @@ pub struct SaeFitRequest {
     pub alpha: f64,
     pub isometry_pin_active: bool,
     pub metric_provenance: &'static str,
+    pub promote_from_residual: bool,
+    pub run_structure_search: bool,
+    pub run_outer_rho_search: bool,
     /// Number of structured-residual whitening passes (each installs a NEW
     /// row-metric likelihood and re-runs the entire outer ρ search). `None` =
     /// the historical default ([`STRUCTURED_RESIDUAL_PASSES_DEFAULT`] = 2);
-    /// `Some(0)` selects the direct iid-likelihood fit.
+    /// `Some(0)` = the UNBUNDLED direct path: seed → single certified fit on
+    /// the iid likelihood. Together with `promote_from_residual = false` and
+    /// `run_structure_search = false` this is the stage-5 "which path did my
+    /// fit take" answer: exactly one.
     pub structured_residual_passes: Option<usize>,
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -519,6 +525,9 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         alpha,
         isometry_pin_active,
         metric_provenance: metric_provenance_initial,
+        promote_from_residual,
+        run_structure_search,
+        run_outer_rho_search,
         structured_residual_passes,
         cancel,
     } = request;
