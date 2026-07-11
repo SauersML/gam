@@ -608,9 +608,12 @@ mod tests {
     #[test]
     fn exponential_cumulative_hazard_is_exact_where_survival_rounds_away() {
         // hazard * t = 1e-20: S rounds to 1.0, so -ln S is 0; the direct H is
-        // exact. hazard * t = 1000: S underflows to 0, so -ln S is +inf; the
-        // direct H is 1000.
-        assert_eq!(exponential_cumulative_hazard_at(1e-20, 1.0), 1e-20);
+        // exact. Keep the log-hazard parameter at exactly representable zero
+        // (hazard = exp(0) = 1) so this assertion isolates the H-vs-S access
+        // path instead of also testing the unrelated ln/exp round trip of a
+        // decimal hazard literal. hazard * t = 1000: S underflows to 0, so
+        // -ln S is +inf; the direct H is 1000.
+        assert_eq!(exponential_cumulative_hazard_at(1.0, 1e-20), 1e-20);
         assert_eq!(exponential_cumulative_hazard_at(1.0, 1000.0), 1000.0);
         assert_eq!(exponential_cumulative_hazard_at(1.0, 0.0), 0.0);
         assert_eq!(exponential_cumulative_hazard_at(1.0, -3.0), 0.0);
