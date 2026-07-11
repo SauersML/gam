@@ -418,12 +418,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
         .expect("dense complete outer gradient")
         .gradient()[rho.sparse_flat_index().expect("softmax sparse coordinate")];
     let dense_coordinate_gradient = term
-        .analytic_assignment_strength_gradient_dense(
-            target.view(),
-            &rho,
-            &cache,
-            &solver,
-        )
+        .analytic_assignment_strength_gradient_dense(target.view(), &rho, &cache, &solver)
         .expect("dense Hybrid-EFS assignment-strength gradient");
     let matrix_free_gradient = term
         .analytic_assignment_strength_gradient_matrix_free(

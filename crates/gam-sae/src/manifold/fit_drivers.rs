@@ -5645,9 +5645,7 @@ impl SaeManifoldTerm {
             // immediately (constant EV ⇒ vanishing objective decrease); on a healthy
             // fit the grad gate above breaks first. Counting CONSECUTIVE stalls
             // tolerates a lone flat step; `MIN_ROUNDS` in a row is the fixed point.
-            if allow_heuristic_termination
-                && previous_full_iterate_objective.is_finite()
-            {
+            if allow_heuristic_termination && previous_full_iterate_objective.is_finite() {
                 let round_improvement = (previous_full_iterate_objective - pre_step_total).max(0.0);
                 let objective_scale = previous_full_iterate_objective
                     .abs()

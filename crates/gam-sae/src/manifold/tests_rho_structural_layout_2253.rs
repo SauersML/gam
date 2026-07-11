@@ -22,12 +22,12 @@ use std::sync::Arc;
 /// witness; this fixture stays on a well-resolved noncollapsed branch.
 fn planted_periodic_outer_objective_2253() -> SaeManifoldOuterObjective {
     let target = planted_circle_embedded(32, 4, 0.02);
-    let mut term =
-        planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
+    let mut term = planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
     // `planted_circle_seed_term` installs the harmonic evaluator for basis
     // refresh. The analytic logdet-state adjoint also needs its second-jet view.
-    term.atoms[0].basis_second_jet =
-        Some(Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator")));
+    term.atoms[0].basis_second_jet = Some(Arc::new(
+        PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
+    ));
     let rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
     SaeManifoldOuterObjective::new(term, target, None, rho, 40, 1.0, 1.0e-6, 1.0e-6)
 }

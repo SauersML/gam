@@ -390,7 +390,6 @@ pub(crate) fn olmo_real_arrival_floor_tracks_data_ceiling() {
         "[#1026] the share floor reached/exceeded the full ceiling at large K \
          (K=8 {f8:.4} >= ceiling {k3_linear_ceiling:.4})."
     );
-
 }
 
 /// Resolve a committed OLMo `.npy` fixture by file name.

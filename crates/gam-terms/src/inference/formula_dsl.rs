@@ -2644,7 +2644,8 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     // "bounded linear term ... cannot also use double_penalty"),
                     // so the default must be `false`, not the `linear()`/`s()`
                     // convention of `true`.
-                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(false),
+                    double_penalty: option_bool_strict(&options, "double_penalty")?
+                        .unwrap_or(false),
                 });
             }
             "group" | "re" | "factor" => {

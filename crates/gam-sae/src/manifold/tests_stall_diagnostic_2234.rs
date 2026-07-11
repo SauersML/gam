@@ -344,13 +344,15 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         eprintln!(
             "[2253-SMOOTH] budget={inner_max_iter} loss_smoothness={:+.17e} \
              raw_smoothness_sum={:+.17e} renorm={:+.17e}",
-            center.loss_smoothness,
-            center.raw_smoothness_sum,
-            center.smooth_renorm,
+            center.loss_smoothness, center.raw_smoothness_sum, center.smooth_renorm,
         );
         let smooth_roundoff = 64.0
             * f64::EPSILON
-            * (1.0 + center.loss_smoothness.abs().max(center.raw_smoothness_sum.abs()));
+            * (1.0
+                + center
+                    .loss_smoothness
+                    .abs()
+                    .max(center.raw_smoothness_sum.abs()));
         assert!(
             (center.loss_smoothness - center.raw_smoothness_sum).abs() <= smooth_roundoff,
             "#2253 dense full-batch smoothness scale diverged between the returned loss and \

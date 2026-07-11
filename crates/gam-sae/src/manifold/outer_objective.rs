@@ -700,8 +700,7 @@ pub(crate) fn hybrid_assignment_gradient_coordinate(
     if !matches!(
         term.assignment.mode,
         AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. }
-    )
-    {
+    ) {
         return None;
     }
     rho.sparse_flat_index()
@@ -2952,57 +2951,53 @@ impl SaeManifoldOuterObjective {
                 None => {
                     if hybrid_assignment_gradient_coordinate(&self.term, &rho) == Some(sparse_index)
                     {
-                        let gradient = if let Some((probes, inverse_probes)) =
-                            inverse_probe_bundle.as_ref()
-                        {
-                            let system = self.term.assemble_full_matrix_free_evidence_system(
-                                self.target.view(),
-                                &rho,
-                                self.registry.as_ref(),
-                                None,
-                            )?;
-                            self.term
-                                .analytic_assignment_strength_gradient_matrix_free(
+                        let gradient =
+                            if let Some((probes, inverse_probes)) = inverse_probe_bundle.as_ref() {
+                                let system = self.term.assemble_full_matrix_free_evidence_system(
                                     self.target.view(),
                                     &rho,
-                                    &cache,
-                                    &system,
-                                    probes,
-                                    inverse_probes,
-                                )
-                                .map_err(|error| {
-                                    format!(
-                                        "SaeManifoldOuterObjective::efs_step: matrix-free \
+                                    self.registry.as_ref(),
+                                    None,
+                                )?;
+                                self.term
+                                    .analytic_assignment_strength_gradient_matrix_free(
+                                        self.target.view(),
+                                        &rho,
+                                        &cache,
+                                        &system,
+                                        probes,
+                                        inverse_probes,
+                                    )
+                                    .map_err(|error| {
+                                        format!(
+                                            "SaeManifoldOuterObjective::efs_step: matrix-free \
                                          assignment-strength gradient: {error}"
-                                    )
-                                })?
-                        } else {
-                            let solver = self
-                                .term
-                                .outer_gradient_arrow_solver(
-                                    &cache,
-                                    &rho.lambda_smooth_vec(),
-                                )
-                                .map_err(|error| {
-                                    format!(
-                                        "SaeManifoldOuterObjective::efs_step: dense assignment-\
+                                        )
+                                    })?
+                            } else {
+                                let solver = self
+                                    .term
+                                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+                                    .map_err(|error| {
+                                        format!(
+                                            "SaeManifoldOuterObjective::efs_step: dense assignment-\
                                          strength solver: {error}"
+                                        )
+                                    })?;
+                                self.term
+                                    .analytic_assignment_strength_gradient_dense(
+                                        self.target.view(),
+                                        &rho,
+                                        &cache,
+                                        &solver,
                                     )
-                                })?;
-                            self.term
-                                .analytic_assignment_strength_gradient_dense(
-                                    self.target.view(),
-                                    &rho,
-                                    &cache,
-                                    &solver,
-                                )
-                                .map_err(|error| {
-                                    format!(
-                                        "SaeManifoldOuterObjective::efs_step: dense assignment-\
+                                    .map_err(|error| {
+                                        format!(
+                                            "SaeManifoldOuterObjective::efs_step: dense assignment-\
                                          strength gradient: {error}"
-                                    )
-                                })?
-                        };
+                                        )
+                                    })?
+                            };
                         // A normalized negative gradient is a bounded feasible-
                         // descent update whose zero is EXACTLY the REML root.
                         // `max(|g|, 1)` is the coordinate's natural unit-gradient
@@ -3385,8 +3380,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
         let assignment_gradient_dim = usize::from(
-            hybrid_assignment_gradient_coordinate(&self.term, &self.baseline_rho)
-                .is_some(),
+            hybrid_assignment_gradient_coordinate(&self.term, &self.baseline_rho).is_some(),
         );
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
