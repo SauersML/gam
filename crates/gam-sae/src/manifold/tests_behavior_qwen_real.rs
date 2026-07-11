@@ -100,3 +100,41 @@ fn qwen_real_activation_behavior_fit_selects_identifiable_lambda_y() {
     assert_eq!(wire.fitted_probabilities.len(), GATE_ROWS);
     serde_json::to_string(&wire).expect("wire report must serialize");
 }
+
+/// #2015/#2228 FAST inner-crawl signal. Same fixed-rho (`run_outer_rho_search =
+/// false`) two-block behavior fit as the gate above — the wide p̃=127, K=4,
+/// high-residual shape that triggers the Gauss-Newton overshoot crawl in the
+/// inner Newton solve — but on only 48 real rows so every inner iterate is
+/// ~15× cheaper and the whole fit converges (or refuses) in seconds, not the
+/// gate's tens of minutes. The crawl's ill-conditioning is set by the per-row
+/// Hessian structure (roughly n-independent), so 48 rows exhibit it too. This
+/// is the fast tuning repro for the inner-solve globalization (LM damping): a
+/// converging inner solve returns Ok; a crawling one refuses with the typed
+/// RemlConvergenceError. Not a quality gate — purely "does the inner solve
+/// terminate".
+#[test]
+fn zz2015_tiny_inner_crawl_terminates() {
+    let activation_full = read_npy_f32_2d(&olmo_fixture_path("qwen35_9b_actsL21_pca64_2000.npy"));
+    let probabilities_full = renormalize_rows(read_npy_f32_2d(&olmo_fixture_path(
+        "qwen35_9b_behavior_probs64_2000.npy",
+    )));
+    const TINY_ROWS: usize = 48;
+    let activation = activation_full
+        .slice(ndarray::s![0..TINY_ROWS, ..])
+        .to_owned();
+    let probabilities = probabilities_full
+        .slice(ndarray::s![0..TINY_ROWS, ..])
+        .to_owned();
+    let mut config = SaeCrosscoderAutoFitConfig::standard(4, 3);
+    config.max_iter = 30;
+    config.run_outer_rho_search = false;
+    let report = run_auto_sae_behavior_fit(SaeBehaviorAutoFitRequest {
+        activation,
+        probabilities,
+        config,
+        cancel: None,
+    })
+    .expect("tiny inner-crawl repro: the inner solve must TERMINATE (converge), not refuse");
+    assert_eq!(report.crosscoder.layers.len(), 2);
+    assert!(report.behavior_block.log_lambda_y.is_finite());
+}
