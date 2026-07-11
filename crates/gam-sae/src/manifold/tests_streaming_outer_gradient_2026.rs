@@ -398,7 +398,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
         .try_fitted_for_rho(&rho)
         .expect("softmax positive-rank fixture reconstruction");
     let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
-        fitted[[row, col]] + 0.05 * ((row + 2 * col) as f64 * 0.17).sin()
+        fitted[[row, col]] + 1.0e-4 * ((row + 2 * col) as f64 * 0.17).sin()
     });
     let system = term
         .assemble_arrow_schur(target.view(), &rho, None)
