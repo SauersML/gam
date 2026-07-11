@@ -431,6 +431,51 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          analytic={rank_response_prediction:.17e}, central_fd={response_rank_charge_fd:.17e}, \
          h={h:.3e}, bound={rank_response_fd_bound:.3e}"
     );
+    let expected_explicit = &frozen_data_and_priors_fd + &frozen_rank_charge_fd;
+    let expected_schur_trace = &frozen_half_logdet_fd - &frozen_htt_half_fd;
+    for coordinate in 0..base.len() {
+        let explicit_scale = audit_components.explicit[coordinate]
+            .abs()
+            .max(expected_explicit[coordinate].abs())
+            .max(1.0);
+        assert!(
+            (audit_components.explicit[coordinate] - expected_explicit[coordinate]).abs()
+                <= 5.0e-5 * explicit_scale,
+            "criterion explicit derivative mismatch at rho[{coordinate}]: analytic={}, \
+             fixed loss+rank FD={}, loss FD={}, rank FD={}",
+            audit_components.explicit[coordinate],
+            expected_explicit[coordinate],
+            frozen_data_and_priors_fd[coordinate],
+            frozen_rank_charge_fd[coordinate],
+        );
+        let trace_scale = audit_components.logdet_trace[coordinate]
+            .abs()
+            .max(expected_schur_trace[coordinate].abs())
+            .max(1.0);
+        assert!(
+            (audit_components.logdet_trace[coordinate] - expected_schur_trace[coordinate]).abs()
+                <= 5.0e-5 * trace_scale,
+            "coordinate-logdet subtraction mismatch at rho[{coordinate}]: analytic={}, \
+             fixed full-H minus Htt FD={}, full-H FD={}, Htt FD={}",
+            audit_components.logdet_trace[coordinate],
+            expected_schur_trace[coordinate],
+            frozen_half_logdet_fd[coordinate],
+            frozen_htt_half_fd[coordinate],
+        );
+    }
+    let response_total_fd = (state_plus_parts.0 - state_minus_parts.0) / (2.0 * h);
+    let expected_implicit = response_total_fd - frozen_finite_difference;
+    let analytic_implicit = audit_components.third_order_correction.dot(&direction);
+    let implicit_scale = analytic_implicit
+        .abs()
+        .max(expected_implicit.abs())
+        .max(1.0);
+    assert!(
+        (analytic_implicit - expected_implicit).abs() <= 5.0e-3 * implicit_scale,
+        "Schur-plus-rank implicit derivative mismatch: analytic={analytic_implicit:.9e}, \
+         reoptimized-minus-frozen FD={expected_implicit:.9e}, \
+         response_total={response_total_fd:.9e}, frozen={frozen_finite_difference:.9e}"
+    );
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
         (analytic - finite_difference).abs() <= 5.0e-3 * scale,
