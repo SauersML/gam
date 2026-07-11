@@ -2990,8 +2990,10 @@ pub fn streaming_cross_row_woodbury_log_det(
         }
     }
     // Capacitance C = I_R + D·M (row k scaled by d_k), factored by partial-pivot
-    // LU (`d_k = w·s'_k` is not sign-definite, so C is generally non-symmetric /
-    // indefinite — exactly the dense carrier's factorization).
+    // LU. Since #2144 the source clamps `d_k = max(w·s'_k, 0)`, so `U D Uᵀ ⪰ 0`
+    // and `C ⪰ I` is PD; the LU (rather than a symmetric factorization) is
+    // retained because `D·M` is non-symmetric even with PSD `D`, and as
+    // belt-and-suspenders for any future non-clamped carrier.
     let mut c = Array2::<f64>::zeros((r, r));
     for a in 0..r {
         for b in 0..r {

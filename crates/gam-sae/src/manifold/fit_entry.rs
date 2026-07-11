@@ -60,8 +60,9 @@ pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 /// A dictionary that explains the target to within this bound leaves only the
 /// fit's own numerical-convergence noise as "residual": there is genuinely no
 /// structured covariance to whiten. Fitting a residual-covariance model on that
-/// noise is DEGENERATE — the idiosyncratic diagonal `D` collapses toward zero
-/// (it is floored only at `f64::MIN_POSITIVE` in `residual_factor::fit_fixed_rank`),
+/// noise is DEGENERATE — the idiosyncratic diagonal `D` collapses toward its
+/// floor (`residual_factor` floors it at `1e-6 · mean_var`, still ~6 orders
+/// below a genuine noise scale on near-noiseless data),
 /// the whitening metric `1/D` becomes near-singular, and the whitened-residual
 /// REML the outer ρ-optimizer then descends is ill-conditioned with NO interior
 /// stationary point. The outer correctly refuses to certify a non-stationary

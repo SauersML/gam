@@ -2549,9 +2549,10 @@ impl SaeManifoldTerm {
         //
         // The source is built from the SAME `ibp_assignment_third_channels`
         // operator the #1006 θ-adjoint consumes:
-        //   * `d[k] = cross_row_d[k] = w·s'_k = w·score_derivative_k` (the column
-        //     `D`-coefficient — NOT sign-definite, hence the consumer's
-        //     indefinite-capacitance LU);
+        //   * `d[k] = cross_row_d[k]` (the column `D`-coefficient — since #2144
+        //     clamped at the source to `max(w·s'_k, 0)`, so the capacitance
+        //     `C = I + D·UᵀH₀'⁻¹U` the consumer LU-factors is PD; the LU handles
+        //     the non-symmetric `D·M` product, not indefiniteness);
         //   * `entries[(i,k)] = (global_t_index, k, z'_ik)` with `z'_ik =
         //     z_jac[i·K + k]`. For the DENSE layout (`assignment_coord_dim() = K`,
         //     `last_row_layout = None`) atom `k`'s logit slot is local position `k`

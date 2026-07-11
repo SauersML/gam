@@ -769,10 +769,23 @@ pub(crate) fn sae_reml_extra_penalty_energy_counts_live_isometry_once() {
         .expect("decoder penalty value");
     assert_abs_diff_eq!(decoder_energy, 0.0, epsilon = 1.0e-12);
 
+    // Full-objective contract: `extra` is exactly `penalized_objective_total −
+    // loss.total()` — the complete registry value plus the decoder repulsion
+    // conditioner and the Jeffreys separation barrier. On this single-atom
+    // fixture repulsion and barrier are structurally zero (both are cross-atom
+    // terms) and the registry carries only the isometry penalty, so the total
+    // still equals the live isometry energy — asserted through the full
+    // composition rather than the historical decoder+isometry-only pair.
+    let repulsion_and_barrier =
+        term.decoder_repulsion_value(1.0) + term.separation_barrier_value(1.0);
     let extra_energy = term
         .reml_extra_penalty_value_total(Some(&registry))
         .expect("REML extra penalty value");
-    assert_abs_diff_eq!(extra_energy, isometry_energy, epsilon = 1.0e-12);
+    assert_abs_diff_eq!(
+        extra_energy,
+        isometry_energy + repulsion_and_barrier,
+        epsilon = 1.0e-12
+    );
 }
 
 #[test]
