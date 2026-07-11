@@ -2299,20 +2299,20 @@ fn criterion_flat_provenance_preserves_score_relative_certificate_1689() {
     let config = problem.config();
     let mut obj = problem.build_objective_with_eval_order(
         (),
-        move |_: &mut (), _: &Array1<f64>| Ok(score),
-        move |_: &mut (), _: &Array1<f64>| {
+        move |_: &mut (), rho: &Array1<f64>| Ok(score + residual * rho[0]),
+        move |_: &mut (), rho: &Array1<f64>| {
             Ok(OuterEval {
-                cost: score,
+                cost: score + residual * rho[0],
                 gradient: array![residual],
-                hessian: HessianValue::Dense(array![[1.0]]),
+                hessian: HessianValue::Dense(array![[0.0]]),
                 inner_beta_hint: None,
             })
         },
-        move |_: &mut (), _: &Array1<f64>, _: OuterEvalOrder| {
+        move |_: &mut (), rho: &Array1<f64>, _: OuterEvalOrder| {
             Ok(OuterEval {
-                cost: score,
+                cost: score + residual * rho[0],
                 gradient: array![residual],
-                hessian: HessianValue::Dense(array![[1.0]]),
+                hessian: HessianValue::Dense(array![[0.0]]),
                 inner_beta_hint: None,
             })
         },
