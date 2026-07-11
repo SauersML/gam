@@ -637,6 +637,7 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
     struct ScaleFit {
         normalized_reconstruction: Array2<f64>,
         normalized_criterion: f64,
+        normalized_components: [f64; 7],
     }
 
     let fit_at_scale = |lambda: f64| -> ScaleFit {
@@ -696,9 +697,26 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
             criterion.is_finite(),
             "penalized criterion must be finite at λ={lambda}, got {criterion}"
         );
+        let scored_loss = term
+            .loss_scaled(target.view(), &rho, 1.0)
+            .expect("co-scaled loss breakdown is defined");
+        let analytic = term
+            .analytic_penalty_value_total(&registry, 1.0)
+            .expect("co-scaled analytic-penalty value is defined");
+        let repulsion = term.decoder_repulsion_value(1.0);
+        let separation = term.separation_barrier_value(1.0);
         ScaleFit {
             normalized_reconstruction: recon.mapv(|value| value / lambda),
             normalized_criterion: criterion / scale_sq,
+            normalized_components: [
+                scored_loss.data_fit / scale_sq,
+                scored_loss.assignment_sparsity / scale_sq,
+                scored_loss.smoothness / scale_sq,
+                scored_loss.ard / scale_sq,
+                analytic / scale_sq,
+                repulsion / scale_sq,
+                separation / scale_sq,
+            ],
         }
     };
 
@@ -733,7 +751,9 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
                     .max(base.normalized_criterion.abs()));
         eprintln!(
             "[#2099 fit co-scale] λ={lambda}: image_defect={image_defect:.3e} \
-             criterion_defect={criterion_defect:.3e}"
+             criterion_defect={criterion_defect:.3e}; normalized components \
+             [data,assignment,smooth,ard,analytic,repulsion,separation] base={:?} scaled={:?}",
+            base.normalized_components, scaled.normalized_components,
         );
         assert!(
             image_defect < 1.0e-3,
