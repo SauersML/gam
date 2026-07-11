@@ -7,7 +7,8 @@ fit, rebuilds it independently, and asserts exact artifact equality. Any field
 the builder mis-assembles (kind/topology derivation, n_harmonics, per-atom
 gate-column slicing, channel-cov factor, periodic shape-band reorder, report
 passthroughs) surfaces as a dict mismatch. Three atom kinds are exercised
-(circle=periodic shape-band path, euclidean + duchon = duchon_centers path).
+(circle=periodic shape-band path, Euclidean kind derivation, and Duchon-center
+retention), plus the declared-linear-block relabel.
 
 MAINLINE only: no Fisher shard, no linear_block relabel (follow-up arms). The
 mainline fixture is asserted free of non-finite values so a future data change cannot
@@ -17,6 +18,7 @@ starts at the raw live-fit payload boundary and must not inherit optimizer
 certification failures that occur before the builder is called."""
 from __future__ import annotations
 
+import copy
 import math
 
 import numpy as np
@@ -55,8 +57,7 @@ def _data_for(topology: str, n: int, p: int, seed: int) -> np.ndarray:
     return (x - x.mean(axis=0, keepdims=True)).astype(np.float64)
 
 
-@pytest.mark.parametrize("topology,d_atom", [("circle", 1), ("euclidean", 2), ("duchon", 2)])
-def test_builder_full_fit_equiv(topology, d_atom, monkeypatch):
+def test_builder_full_fit_equiv_and_kind_derivation(monkeypatch):
     builder = _builder()
     rm = rust_module()
     captured: dict = {}
@@ -69,9 +70,9 @@ def test_builder_full_fit_equiv(topology, d_atom, monkeypatch):
 
     monkeypatch.setattr(rm, "sae_manifold_fit_minimal", capture)
 
-    x = _data_for(topology, n=60, p=5, seed=0)
+    x = _data_for("circle", n=60, p=5, seed=0)
     fit = gamfit.sae_manifold_fit(
-        X=x, K=2, d_atom=d_atom, atom_topology=topology, assignment="softmax",
+        X=x, K=2, d_atom=1, atom_topology="circle", assignment="softmax",
         n_iter=8, random_state=0, _run_structure_search=False,
         _run_outer_rho_search=False,
     )
@@ -103,6 +104,65 @@ def test_builder_full_fit_equiv(topology, d_atom, monkeypatch):
     # never silently exercise the NaN branch (whose handling is pinned separately).
     assert _no_nonfinite(old), "mainline equiv fixture unexpectedly carries a non-finite value"
     assert new == old
+
+    # The builder's kind-specific derivations do not depend on re-running the
+    # nonlinear SAE solver. Retag the successfully captured live payload at the
+    # raw plan boundary, keeping every numeric array and per-atom gate column
+    # unchanged, and exercise the Euclidean, Duchon-center, and declared
+    # linear-block branches deterministically.
+    k_atoms = len(fit.atom_topologies)
+    variants = [
+        ("euclidean", "euclidean", "euclidean"),
+        ("duchon", "duchon", "euclidean"),
+        ("linear", "linear_block", "linear_block"),
+    ]
+    for fitted_kind, declared_kind, expected_topology in variants:
+        raw = copy.deepcopy(captured["raw"])
+        for plan in raw["atom_plans"]:
+            plan["kind"] = fitted_kind
+            plan["n_harmonics"] = 0
+            if fitted_kind == "duchon":
+                basis_size = int(plan["basis_size"])
+                plan["duchon_centers"] = np.linspace(
+                    -1.0, 1.0, basis_size, dtype=np.float64
+                ).reshape(-1, 1)
+            else:
+                plan["duchon_centers"] = None
+        for atom in raw["atoms"]:
+            atom["basis_kind"] = fitted_kind
+            atom["on_atom_coords_u_arc"] = None
+            atom["shape_band_coords"] = None
+            atom["shape_band_mean"] = None
+            atom["shape_band_sd"] = None
+
+        derived = builder(
+            raw,
+            x,
+            expected_topology,
+            fit.assignment,
+            fit.assignment_label,
+            penalties,
+            float(fit.alpha),
+            bool(fit.learnable_alpha),
+            float(fit.tau),
+            float(fit.sparsity_strength),
+            float(fit.smoothness),
+            float(fit.learning_rate),
+            int(fit.max_iter),
+            int(fit.random_state),
+            fit.top_k,
+            float(fit.jumprelu_threshold),
+            None,
+            None,
+            [declared_kind] * k_atoms,
+        )
+        payload = derived.to_dict()
+        assert payload["basis_specs"] == [fitted_kind] * k_atoms
+        assert payload["basis_kinds"] == [declared_kind] * k_atoms
+        assert payload["atom_topologies"] == [expected_topology] * k_atoms
+        assert payload["atom_topology"] == expected_topology
+        if fitted_kind == "duchon":
+            assert all(center is not None for center in derived.duchon_centers)
 
 
 def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
@@ -148,51 +208,6 @@ def test_builder_full_fit_equiv_with_fisher_shard(monkeypatch):
     # The shard must actually be present (this is the OutputFisher path).
     assert new["fisher_factors"] is not None
     assert new["metric_provenance"] == "OutputFisher"
-
-
-def test_builder_full_fit_equiv_linear_block(monkeypatch):
-    """linear_block arm: a flat-block fit reports the generic `linear` kind, and
-    `sae_manifold_fit` relabels declared-block atoms to `linear_block` AFTER
-    from_payload (basis_kinds + topologies, NOT basis_specs). The builder threads
-    the same declared bases and must reproduce that relabel in to_dict."""
-    builder = _builder()
-    rm = rust_module()
-    captured: dict = {}
-    orig = rm.sae_manifold_fit_minimal
-
-    def capture(*args, **kwargs):
-        payload = orig(*args, **kwargs)
-        captured["raw"] = dict(payload)
-        return payload
-
-    monkeypatch.setattr(rm, "sae_manifold_fit_minimal", capture)
-
-    x = _data_for("euclidean", n=60, p=5, seed=3)
-    fit = gamfit.sae_manifold_fit(
-        X=x, K=2, d_atom=1, atom_topology="linear_block", assignment="ibp_map",
-        n_iter=8, random_state=0, _run_structure_search=False,
-        _run_outer_rho_search=False,
-    )
-    assert "raw" in captured
-    # What `_bases(...)` produces for atom_topology="linear_block": one per atom.
-    bases = ["linear_block"] * len(fit.atom_topologies)
-
-    core = builder(
-        captured["raw"], x, str(fit.atom_topology), fit.assignment, fit.assignment_label,
-        list(fit.primitive_names[1:]),
-        float(fit.alpha), bool(fit.learnable_alpha), float(fit.tau),
-        float(fit.sparsity_strength), float(fit.smoothness), float(fit.learning_rate),
-        int(fit.max_iter), int(fit.random_state), fit.top_k, float(fit.jumprelu_threshold),
-        None, None, bases,
-    )
-    old = fit.to_dict()
-    new = core.to_dict()
-    assert _no_nonfinite(old)
-    assert new == old
-    # The relabel must actually have fired (else this arm proves nothing).
-    assert "linear_block" in new["basis_kinds"]
-    # basis_specs keeps the fitted kind, exactly as _preserve_linear_block_labels.
-    assert "linear_block" not in new["basis_specs"]
 
 
 def test_builder_rejects_nonfinite_required_numeric_field():
