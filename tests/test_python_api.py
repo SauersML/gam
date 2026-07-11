@@ -762,6 +762,15 @@ def test_transformation_normal_pgs_conditional_mean_tracks_response(
     # Cov(E[Y|x], Y) = Var(E[Y|x]) ≥ 0: the fitted mean tracks the response.
     assert float(np.corrcoef(cond_mean, pgs)[0, 1]) > 0.05
 
+    # The observed-response latent is a separate typed operation.  It consumes
+    # PGS and returns the finite-support PIT score used by a downstream
+    # marginal-slope stage; ordinary predict must never be repurposed for it.
+    score = np.asarray(model.transformation_score(df), dtype=float)
+    assert score.shape == (len(df),)
+    assert np.all(np.isfinite(score))
+    assert abs(float(score.mean())) < 0.5
+    assert 0.3 < float(score.std(ddof=0)) < 2.0
+
 
 def test_transformation_normal_predicts_without_raw_pgs(
     synthetic_large_scale_factory: typing.Any,

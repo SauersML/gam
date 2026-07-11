@@ -456,6 +456,210 @@ fn transformation_normal_quantile_grid(
     Ok((grid_y, h_grid))
 }
 
+/// Evaluate the fitted CTM's calibrated latent score at one observed response
+/// per row.  This is deliberately separate from ordinary prediction:
+/// `predict` returns the response-scale conditional mean `E[Y|x]`, whereas an
+/// observed score is the labelled-data quantity
+/// `Phi^-1(F_hat(y_i | x_i))` consumed by a downstream marginal-slope model.
+fn transformation_normal_observed_scores(
+    model: &FittedModel,
+    design: &gam_terms::smooth::TermCollectionDesign,
+    response: &Array1<f64>,
+    offset: &Array1<f64>,
+) -> Result<Array1<f64>, PredictInputError> {
+    let n = response.len();
+    if design.design.nrows() != n || offset.len() != n {
+        return Err(PredictInputError::DimensionMismatch {
+            reason: format!(
+                "transformation-normal observed-score rows disagree: response={n}, design={}, offset={}",
+                design.design.nrows(),
+                offset.len()
+            ),
+        });
+    }
+    if response.iter().any(|value| !value.is_finite()) {
+        return Err(PredictInputError::InvalidInput {
+            reason: "transformation-normal observed responses must be finite".to_string(),
+        });
+    }
+
+    let payload = model.payload();
+    let response_knots = payload
+        .transformation_response_knots
+        .as_ref()
+        .ok_or_else(|| PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal model missing response_knots".to_string(),
+        })?;
+    let response_transform_vecs = payload
+        .transformation_response_transform
+        .as_ref()
+        .ok_or_else(|| PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal model missing response_transform".to_string(),
+        })?;
+    let response_degree = payload.transformation_response_degree.ok_or_else(|| {
+        PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal model missing response_degree".to_string(),
+        }
+    })?;
+    let response_median = payload.transformation_response_median.ok_or_else(|| {
+        PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal model missing response_median".to_string(),
+        }
+    })?;
+    let calibration = payload
+        .transformation_score_calibration
+        .as_ref()
+        .ok_or_else(|| PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal model missing score calibration".to_string(),
+        })?;
+    calibration.validate("saved transformation-normal score calibration")?;
+
+    if response_knots.is_empty() {
+        return Err(PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal response knots are empty".to_string(),
+        });
+    }
+    let y_lo = response_knots[0];
+    let y_hi = response_knots[response_knots.len() - 1];
+    if !(y_hi > y_lo) {
+        return Err(PredictInputError::InvalidInput {
+            reason: format!(
+                "transformation-normal response support is degenerate: lo={y_lo}, hi={y_hi}"
+            ),
+        });
+    }
+
+    let transform_rows = response_transform_vecs.len();
+    let transform_cols = response_transform_vecs.first().map_or(0, Vec::len);
+    if transform_rows == 0
+        || transform_cols == 0
+        || response_transform_vecs
+            .iter()
+            .any(|row| row.len() != transform_cols)
+    {
+        return Err(PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal response transform is empty or ragged".to_string(),
+        });
+    }
+    let mut response_transform = Array2::<f64>::zeros((transform_rows, transform_cols));
+    for (row_index, row) in response_transform_vecs.iter().enumerate() {
+        for (column_index, &value) in row.iter().enumerate() {
+            response_transform[[row_index, column_index]] = value;
+        }
+    }
+    let knots = Array1::from_vec(response_knots.clone());
+    let (observed_basis, _) = create_basis::<Dense>(
+        response.view(),
+        KnotSource::Provided(knots.view()),
+        response_degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|error| PredictInputError::InvalidInput {
+        reason: format!(
+            "failed to evaluate transformation-normal observed-response basis: {error}"
+        ),
+    })?;
+    let observed_raw = observed_basis.as_ref();
+    if observed_raw.ncols() != transform_rows {
+        return Err(PredictInputError::DimensionMismatch {
+            reason: format!(
+                "observed-response I-spline columns={} but saved response transform rows={transform_rows}",
+                observed_raw.ncols()
+            ),
+        });
+    }
+    let observed_shape = observed_raw.dot(&response_transform);
+
+    let endpoints = Array1::from_vec(vec![y_lo, y_hi]);
+    let (endpoint_basis, _) = create_basis::<Dense>(
+        endpoints.view(),
+        KnotSource::Provided(knots.view()),
+        response_degree,
+        BasisOptions::i_spline(),
+    )
+    .map_err(|error| PredictInputError::InvalidInput {
+        reason: format!("failed to evaluate transformation-normal support basis: {error}"),
+    })?;
+    let endpoint_raw = endpoint_basis.as_ref();
+    if endpoint_raw.ncols() != transform_rows {
+        return Err(PredictInputError::DimensionMismatch {
+            reason: format!(
+                "support I-spline columns={} but saved response transform rows={transform_rows}",
+                endpoint_raw.ncols()
+            ),
+        });
+    }
+    let endpoint_shape = endpoint_raw.dot(&response_transform);
+
+    let p_shape = transform_cols;
+    let p_response = 1 + p_shape;
+    let fit_saved = model
+        .unified()
+        .ok_or_else(|| PredictInputError::MissingMetadata {
+            reason: "saved transformation-normal model missing unified fit".to_string(),
+        })?;
+    let beta = &fit_saved.blocks[0].beta;
+    let p_covariate = design.design.ncols();
+    if beta.len() != p_response * p_covariate {
+        return Err(PredictInputError::DimensionMismatch {
+            reason: format!(
+                "beta length {} != p_response({p_response}) * p_covariate({p_covariate})",
+                beta.len()
+            ),
+        });
+    }
+    let beta_matrix = beta
+        .view()
+        .into_shape_with_order((p_response, p_covariate))
+        .map_err(|error| PredictInputError::DimensionMismatch {
+            reason: format!("beta reshape failed: {error}"),
+        })?;
+    let covariate_matrix =
+        design
+            .design
+            .try_row_chunk(0..n)
+            .map_err(|error| PredictInputError::InvalidInput {
+                reason: error.to_string(),
+            })?;
+    let clip_eps = calibration.clip_eps;
+
+    let rows: Vec<Result<f64, String>> = (0..n)
+        .into_par_iter()
+        .map(|row_index| {
+            let covariate_row = covariate_matrix.row(row_index);
+            let gamma0 = beta_matrix.row(0).dot(&covariate_row);
+            let gamma_squared: Vec<f64> = (1..p_response)
+                .map(|component| {
+                    let gamma = beta_matrix.row(component).dot(&covariate_row);
+                    gamma * gamma
+                })
+                .collect();
+            let raw_transform = |shape: ndarray::ArrayView1<'_, f64>, y: f64| {
+                gamma0
+                    + shape
+                        .iter()
+                        .zip(gamma_squared.iter())
+                        .map(|(basis, gamma_sq)| basis * gamma_sq)
+                        .sum::<f64>()
+                    + offset[row_index]
+                    + TRANSFORMATION_MONOTONICITY_EPS * (y - response_median)
+            };
+            let h = raw_transform(observed_shape.row(row_index), response[row_index]);
+            let lower = raw_transform(endpoint_shape.row(0), y_lo);
+            let upper = raw_transform(endpoint_shape.row(1), y_hi);
+            transformation_normal_pit_score(h, lower, upper, clip_eps).map_err(|error| {
+                format!("transformation-normal observed score failed at row {row_index}: {error}")
+            })
+        })
+        .collect();
+
+    let scores = rows
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|reason| PredictInputError::InvalidInput { reason })?;
+    Ok(Array1::from_vec(scores))
+}
+
 /// Invert a monotone increasing tabulated row `z = h_grid_row(grid_y)` at the
 /// latent value `target` by bracketing + linear interpolation; values outside
 /// the tabulated range clamp to the support endpoints. Shared by the CTM
@@ -609,6 +813,47 @@ pub fn build_transformation_normal_quantile_grid(
         h_grid,
         conditional_mean,
     })
+}
+
+/// Evaluate the calibrated CTM score `Phi^-1(F_hat(y_i | x_i))` at labelled
+/// rows.  Ordinary prediction intentionally returns `E[Y|x]`; callers that
+/// need the generated regressor for a marginal-slope stage must use this
+/// observed-response API so a response mean can never be mistaken for a
+/// latent score.
+pub fn build_transformation_normal_observed_scores(
+    model: &FittedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    response: &Array1<f64>,
+    offset: &Array1<f64>,
+) -> Result<Array1<f64>, String> {
+    if model.predict_model_class() != PredictModelClass::TransformationNormal {
+        return Err(
+            "build_transformation_normal_observed_scores called on a non-transformation-normal model"
+                .to_string(),
+        );
+    }
+    if response.len() != data.nrows() || offset.len() != data.nrows() {
+        return Err(format!(
+            "transformation-normal observed-score row mismatch: data={}, response={}, offset={}",
+            data.nrows(),
+            response.len(),
+            offset.len()
+        ));
+    }
+    let spec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )
+    .map_err(|error| String::from(PredictInputError::from(error)))?;
+    let clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let design_input = clipped.as_ref().map_or(data, |array| array.view());
+    let design = build_term_collection_design(design_input, &spec)
+        .map_err(|error| format!("failed to build observed-score design: {error}"))?;
+    transformation_normal_observed_scores(model, &design, response, offset).map_err(Into::into)
 }
 
 fn build_predict_input_for_model_inner(

@@ -73,7 +73,8 @@ pub(crate) use gam::inference::model_payload_builders::{
 };
 
 pub(crate) use gam_predict::input::{
-    build_predict_input_for_model, build_transformation_normal_quantile_grid,
+    build_predict_input_for_model, build_transformation_normal_observed_scores,
+    build_transformation_normal_quantile_grid,
 };
 
 pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
@@ -340,6 +341,9 @@ fn run() -> CliResult<()> {
         Command::Crosscoder(args) => run_crosscoder(args),
         Command::Report(args) => run_report(args).map_err(CliError::from),
         Command::Predict(args) => run_predict(args).map_err(CliError::from),
+        Command::TransformationScore(args) => {
+            run_transformation_score(args).map_err(CliError::from)
+        }
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
         Command::Generate(args) => run_generate(args).map_err(CliError::from),

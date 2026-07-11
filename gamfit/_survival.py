@@ -649,14 +649,6 @@ def numeric_matrix(values: Any, label: str) -> Any:
     return rust_module().numeric_matrix_validate(values, label)
 
 
-def transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:
-    if not isinstance(columns, dict):
-        raise TypeError("columns must be a dict")
-    return list(
-        rust_module().transformation_normal_z_from_columns(json.dumps(columns))
-    )
-
-
 def extract_row_ids(
     headers: list[str],
     rows: list[list[str]],
@@ -773,7 +765,6 @@ __all__ = [
     "ordered_prediction_columns",
     "survival_prediction_from_columns",
     "survival_prediction_from_ffi_payload",
-    "transformation_normal_z",
     "_MARGINAL_SLOPE_MODEL_CLASSES",
     "_SURVIVAL_MODEL_CLASSES",
     "_TRANSFORMATION_NORMAL_MODEL_CLASSES",

@@ -217,16 +217,18 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
         pairs
             .checked_mul(dim)
             .ok_or_else(|| format!("{operation}: n*atoms*dim overflows usize"))?;
-        let pairs_ll = i64::try_from(pairs)
-            .map_err(|_| format!("{operation}: n*atoms overflows i64"))?;
-        let atoms_ll = i64::try_from(atoms)
-            .map_err(|_| format!("{operation}: atoms overflows i64"))?;
-        let dim_ll =
-            i64::try_from(dim).map_err(|_| format!("{operation}: dim overflows i64"))?;
+        let pairs_ll =
+            i64::try_from(pairs).map_err(|_| format!("{operation}: n*atoms overflows i64"))?;
+        let atoms_ll =
+            i64::try_from(atoms).map_err(|_| format!("{operation}: atoms overflows i64"))?;
+        let dim_ll = i64::try_from(dim).map_err(|_| format!("{operation}: dim overflows i64"))?;
         Ok((pairs, pairs_ll, atoms_ll, dim_ll))
     }
 
-    fn launch_config(operation: &str, pairs: usize) -> Result<cudarc::driver::LaunchConfig, String> {
+    fn launch_config(
+        operation: &str,
+        pairs: usize,
+    ) -> Result<cudarc::driver::LaunchConfig, String> {
         let block = 256_u32;
         let grid = u32::try_from(pairs.div_ceil(block as usize))
             .map_err(|_| format!("{operation}: launch grid overflows u32"))?;
@@ -252,8 +254,7 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
         relative_residual_dev_ptr: u64,
     ) -> Result<(), String> {
         let operation = "sae_residual_em_score_device";
-        let (pairs, pairs_ll, atoms_ll, dim_ll) =
-            validated_launch_shape(operation, n, atoms, dim)?;
+        let (pairs, pairs_ll, atoms_ll, dim_ll) = validated_launch_shape(operation, n, atoms, dim)?;
         if pairs == 0 {
             return Ok(());
         }
@@ -314,8 +315,7 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
         grad_recon_dev_ptr: u64,
     ) -> Result<(), String> {
         let operation = "sae_residual_em_score_vjp_device";
-        let (pairs, pairs_ll, atoms_ll, dim_ll) =
-            validated_launch_shape(operation, n, atoms, dim)?;
+        let (pairs, pairs_ll, atoms_ll, dim_ll) = validated_launch_shape(operation, n, atoms, dim)?;
         if pairs == 0 {
             return Ok(());
         }

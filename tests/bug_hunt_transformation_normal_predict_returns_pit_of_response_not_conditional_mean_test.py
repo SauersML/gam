@@ -173,7 +173,29 @@ def test_transformation_normal_predict_returns_conditional_mean_not_pit() -> Non
                 f"covariate-only mean {a} != mean with y column {b} at same x"
             )
 
-        # (3) The conditional mean is a response-scale value inside the observed
+        # (3) The labelled-data transform is an explicit, separate command.
+        # It must move monotonically with the observed response at fixed x;
+        # accepting predict's y-independent `eta`/`mean` columns here was the
+        # large-scale marginal-slope benchmark's semantic corruption (#979).
+        score_lo_path = os.path.join(tmp, "score_lo.csv")
+        score_hi_path = os.path.join(tmp, "score_hi.csv")
+        score_lo_run = _run(
+            ["transformation-score", model, frame_lo, "--out", score_lo_path]
+        )
+        score_hi_run = _run(
+            ["transformation-score", model, frame_hi, "--out", score_hi_path]
+        )
+        assert score_lo_run.returncode == 0, score_lo_run.stderr
+        assert score_hi_run.returncode == 0, score_hi_run.stderr
+        score_lo = _read_col(score_lo_path, "score")
+        score_hi = _read_col(score_hi_path, "score")
+        assert all(math.isfinite(value) for value in [*score_lo, *score_hi])
+        assert all(high > low for low, high in zip(score_lo, score_hi)), (
+            score_lo,
+            score_hi,
+        )
+
+        # (4) The conditional mean is a response-scale value inside the observed
         # range, not a standardized z-score (which would routinely exceed [0,1]).
         lo_bound = y_min - 0.1 * (y_max - y_min)
         hi_bound = y_max + 0.1 * (y_max - y_min)

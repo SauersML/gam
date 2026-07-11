@@ -43,6 +43,8 @@ pub(crate) enum Command {
     Report(ReportArgs),
     /// Predict on a new dataset using a fitted model.
     Predict(PredictArgs),
+    /// Evaluate a fitted conditional transformation model at observed responses.
+    TransformationScore(TransformationScoreArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
@@ -401,6 +403,26 @@ pub(crate) struct PredictArgs {
     /// columns, so this flag never moves the standard point estimate.
     #[arg(long = "no-bias-correction", default_value_t = false)]
     pub(crate) no_bias_correction: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TransformationScoreArgs {
+    #[arg(
+        value_name = "MODEL",
+        help = "Fitted transformation-normal model file produced by `gam fit`"
+    )]
+    pub(crate) model: PathBuf,
+    #[arg(
+        value_name = "LABELLED_DATA",
+        help = "Dataset containing the fitted CTM covariates and observed response"
+    )]
+    pub(crate) labelled_data: PathBuf,
+    #[arg(long = "out", help = "Output CSV path for the per-row latent scores")]
+    pub(crate) out: PathBuf,
+    #[arg(long = "offset-column")]
+    pub(crate) offset_column: Option<String>,
+    #[arg(long = "id-column")]
+    pub(crate) id_column: Option<String>,
 }
 
 #[derive(Debug, Clone)]

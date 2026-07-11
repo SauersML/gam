@@ -519,8 +519,91 @@ class _BasisWithJetFn(torch.autograd.Function):
         return grad_t, None, None
 
 
+def _residual_em_input_shape(
+    x: torch.Tensor, per_atom_recon: torch.Tensor
+) -> tuple[int, int, int]:
+    """Validate the residual-EM bridge metadata before either FFI path."""
+    if x.layout != torch.strided or per_atom_recon.layout != torch.strided:
+        raise TypeError("residual-EM scoring requires dense strided tensors")
+    if x.dim() != 2:
+        raise ValueError(f"residual-EM x must have shape (N, D), got {tuple(x.shape)}")
+    if per_atom_recon.dim() != 3:
+        raise ValueError(
+            "residual-EM per_atom_recon must have shape (N, F, D), got "
+            f"{tuple(per_atom_recon.shape)}"
+        )
+    n, atoms, dim = (int(size) for size in per_atom_recon.shape)
+    if tuple(x.shape) != (n, dim):
+        raise ValueError(
+            f"residual-EM x has shape {tuple(x.shape)} but per_atom_recon has "
+            f"shape {(n, atoms, dim)}"
+        )
+    if atoms == 0 or dim == 0:
+        raise ValueError(
+            f"residual-EM atoms and feature dimension must be positive, got {(n, atoms, dim)}"
+        )
+    if x.device != per_atom_recon.device:
+        raise ValueError(
+            f"residual-EM tensors must share one device, got {x.device} and "
+            f"{per_atom_recon.device}"
+        )
+    if x.dtype != per_atom_recon.dtype:
+        raise TypeError(
+            f"residual-EM tensors must share one dtype, got {x.dtype} and "
+            f"{per_atom_recon.dtype}"
+        )
+    if x.is_cuda and x.dtype not in (torch.float32, torch.float64):
+        raise TypeError(
+            "residual-EM CUDA scoring supports exactly torch.float32 and "
+            f"torch.float64, got {x.dtype}"
+        )
+    return n, atoms, dim
+
+
+def _residual_em_cuda_dtype_name(dtype: torch.dtype) -> str:
+    if dtype == torch.float32:
+        return "float32"
+    if dtype == torch.float64:
+        return "float64"
+    raise TypeError(
+        "residual-EM CUDA scoring supports exactly torch.float32 and "
+        f"torch.float64, got {dtype}"
+    )
+
+
+def _validate_residual_em_cuda_buffer(
+    tensor: torch.Tensor,
+    name: str,
+    *,
+    ordinal: int,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    """Enforce the raw-pointer ownership contract immediately before FFI."""
+    if not tensor.is_cuda:
+        raise ValueError(f"residual-EM CUDA buffer {name} is on {tensor.device}")
+    if tensor.device.index is None or int(tensor.device.index) != ordinal:
+        raise ValueError(
+            f"residual-EM CUDA buffer {name} has device {tensor.device}; "
+            f"expected cuda:{ordinal}"
+        )
+    if tensor.dtype != dtype:
+        raise TypeError(
+            f"residual-EM CUDA buffer {name} has dtype {tensor.dtype}; expected {dtype}"
+        )
+    if tuple(tensor.shape) != shape:
+        raise ValueError(
+            f"residual-EM CUDA buffer {name} has shape {tuple(tensor.shape)}; "
+            f"expected {shape}"
+        )
+    if tensor.layout != torch.strided or not tensor.is_contiguous():
+        raise ValueError(f"residual-EM CUDA buffer {name} must be contiguous")
+    if tensor.numel() != 0 and tensor.data_ptr() == 0:
+        raise ValueError(f"residual-EM CUDA buffer {name} has a null device pointer")
+
+
 class _ResidualEmScoreFn(torch.autograd.Function):
-    """Residual-EM routing scores through Rust (issue #1282).
+    """Residual-EM routing scores through Rust (issues #1282, #1017, #2233).
 
     Forward calls ``sae_residual_em_score`` → the single-sourced criterion kernel
     ``gam::terms::sae::criterion_atoms::residual_em_score``: for every
@@ -530,7 +613,10 @@ class _ResidualEmScoreFn(torch.autograd.Function):
     selects the ``target_k == 1`` non-negative code vs. the ``target_k > 1``
     signed one.
 
-    Backward calls ``sae_residual_em_score_vjp`` → the paired analytic VJP
+    CUDA forward and backward call raw-pointer device kernels that write into
+    torch-owned buffers in place. CPU tensors keep using
+    ``sae_residual_em_score`` and ``sae_residual_em_score_vjp`` as the parity
+    oracle. The paired analytic VJP
     ``residual_em_score_vjp``: both outputs carry reconstruction gradient into the
     decoder (``code`` is the routed magnitude, ``relative_residual`` feeds the
     soft EM responsibilities), so this keeps the autograd tape continuous around
@@ -546,15 +632,72 @@ class _ResidualEmScoreFn(torch.autograd.Function):
         per_atom_recon: torch.Tensor,
         nonneg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        n, f = int(per_atom_recon.shape[0]), int(per_atom_recon.shape[1])
+        n, f, d = _residual_em_input_shape(x, per_atom_recon)
+        if x.is_cuda:
+            ordinal_value = x.device.index
+            if ordinal_value is None:
+                raise ValueError(
+                    "residual-EM CUDA tensor has no concrete device ordinal"
+                )
+            ordinal = int(ordinal_value)
+            dtype_name = _residual_em_cuda_dtype_name(x.dtype)
+            # A non-contiguous view is normalized with a device-to-device copy;
+            # there is still no CUDA→host transfer. Every raw pointer below is
+            # checked after normalization and immediately before entering FFI.
+            x_cuda = x.detach().contiguous()
+            recon_cuda = per_atom_recon.detach().contiguous()
+            code = torch.empty((n, f), dtype=x.dtype, device=x.device)
+            relres = torch.empty((n, f), dtype=x.dtype, device=x.device)
+            _validate_residual_em_cuda_buffer(
+                x_cuda, "x", ordinal=ordinal, dtype=x.dtype, shape=(n, d)
+            )
+            _validate_residual_em_cuda_buffer(
+                recon_cuda,
+                "per_atom_recon",
+                ordinal=ordinal,
+                dtype=x.dtype,
+                shape=(n, f, d),
+            )
+            _validate_residual_em_cuda_buffer(
+                code, "code", ordinal=ordinal, dtype=x.dtype, shape=(n, f)
+            )
+            _validate_residual_em_cuda_buffer(
+                relres,
+                "relative_residual",
+                ordinal=ordinal,
+                dtype=x.dtype,
+                shape=(n, f),
+            )
+            torch.cuda.synchronize(x.device)
+            rust_module().sae_residual_em_score_cuda(
+                ordinal,
+                dtype_name,
+                (
+                    x_cuda.data_ptr(),
+                    recon_cuda.data_ptr(),
+                    code.data_ptr(),
+                    relres.data_ptr(),
+                ),
+                (n, f, d),
+                bool(nonneg),
+            )
+            ctx.save_for_backward(x_cuda, recon_cuda)
+            ctx.cuda_lane = True
+            ctx.cuda_ordinal = ordinal
+            ctx.cuda_dtype_name = dtype_name
+            ctx.nonneg = bool(nonneg)
+            ctx.nfd = (n, f, d)
+            return code, relres
+
         code_np, relres_np = rust_module().sae_residual_em_score(
             to_numpy_f64(x),
             to_numpy_f64(per_atom_recon),
             bool(nonneg),
         )
         ctx.save_for_backward(x, per_atom_recon)
+        ctx.cuda_lane = False
         ctx.nonneg = bool(nonneg)
-        ctx.nf = (n, f)
+        ctx.nfd = (n, f, d)
         return (
             from_numpy_like(code_np, per_atom_recon),
             from_numpy_like(relres_np, per_atom_recon),
@@ -564,11 +707,65 @@ class _ResidualEmScoreFn(torch.autograd.Function):
     def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
         g_code, g_relres = grad_outputs
         x, per_atom_recon = ctx.saved_tensors
-        n, f = ctx.nf
+        n, f, d = ctx.nfd
         if g_code is None:
-            g_code = torch.zeros((n, f), dtype=x.dtype, device=x.device)
+            g_code = torch.zeros((n, f), dtype=per_atom_recon.dtype, device=x.device)
         if g_relres is None:
-            g_relres = torch.zeros((n, f), dtype=x.dtype, device=x.device)
+            g_relres = torch.zeros((n, f), dtype=per_atom_recon.dtype, device=x.device)
+        if ctx.cuda_lane:
+            ordinal = int(ctx.cuda_ordinal)
+            dtype = per_atom_recon.dtype
+            if (
+                g_code.device != per_atom_recon.device
+                or g_relres.device != per_atom_recon.device
+            ):
+                raise ValueError(
+                    "residual-EM CUDA cotangents must share the forward device"
+                )
+            if g_code.dtype != dtype or g_relres.dtype != dtype:
+                raise TypeError(
+                    "residual-EM CUDA cotangents must share the forward dtype"
+                )
+            if tuple(g_code.shape) != (n, f) or tuple(g_relres.shape) != (n, f):
+                raise ValueError(
+                    "residual-EM CUDA cotangents must both have shape "
+                    f"{(n, f)}, got {tuple(g_code.shape)} and {tuple(g_relres.shape)}"
+                )
+            g_code_cuda = g_code.detach().contiguous()
+            g_relres_cuda = g_relres.detach().contiguous()
+            grad_recon = torch.empty_like(
+                per_atom_recon, memory_format=torch.contiguous_format
+            )
+            for tensor, name, shape in (
+                (x, "x", (n, d)),
+                (per_atom_recon, "per_atom_recon", (n, f, d)),
+                (g_code_cuda, "g_code", (n, f)),
+                (g_relres_cuda, "g_relative_residual", (n, f)),
+                (grad_recon, "grad_per_atom_recon", (n, f, d)),
+            ):
+                _validate_residual_em_cuda_buffer(
+                    tensor,
+                    name,
+                    ordinal=ordinal,
+                    dtype=dtype,
+                    shape=shape,
+                )
+            torch.cuda.synchronize(per_atom_recon.device)
+            rust_module().sae_residual_em_score_vjp_cuda(
+                ordinal,
+                ctx.cuda_dtype_name,
+                (
+                    x.data_ptr(),
+                    per_atom_recon.data_ptr(),
+                    g_code_cuda.data_ptr(),
+                    g_relres_cuda.data_ptr(),
+                    grad_recon.data_ptr(),
+                ),
+                (n, f, d),
+                bool(ctx.nonneg),
+            )
+            return None, grad_recon, None
+
         grad_recon_np = rust_module().sae_residual_em_score_vjp(
             to_numpy_f64(x),
             to_numpy_f64(per_atom_recon),

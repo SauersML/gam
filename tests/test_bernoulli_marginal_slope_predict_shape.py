@@ -94,6 +94,29 @@ def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(
     np.testing.assert_allclose(arr, [0.2, 0.5, 0.8])
 
 
+def test_transformation_normal_predict_shapes_response_mean_not_latent_score(
+    monkeypatch: Any,
+) -> None:
+    """A CTM predict payload is response-scale ``E[Y|x]``.  Its linear
+    predictor slot is not an observed-response PIT score; labelled-data scores
+    are available only from ``Model.transformation_score``."""
+    raw = _payload(
+        "transformation-normal",
+        "transformation-normal",
+        {
+            "linear_predictor": [-3.0, 4.0],
+            "mean": [12.5, 18.25],
+        },
+    )
+
+    point = _dispatch(monkeypatch, raw)
+    np.testing.assert_allclose(np.asarray(point), [12.5, 18.25])
+
+    table = _dispatch(monkeypatch, raw, return_type="dict")
+    assert list(table) == ["mean"]
+    np.testing.assert_allclose(table["mean"], [12.5, 18.25])
+
+
 def test_bernoulli_marginal_slope_interval_carries_clipped_bounds(
     monkeypatch: Any,
 ) -> None:

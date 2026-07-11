@@ -103,7 +103,9 @@ pub(crate) use gam::inference::model_payload_builders::{
 pub(crate) use gam_predict::posterior_bands::{self, PosteriorPredictBandsPayload};
 
 pub(crate) use gam_predict::FittedModelPredictExt;
-pub(crate) use gam_predict::input::build_predict_input_for_model;
+pub(crate) use gam_predict::input::{
+    build_predict_input_for_model, build_transformation_normal_observed_scores,
+};
 
 pub(crate) use gam::geometry::sae_routing::apply_anchor_rule as sae_apply_anchor_rule_impl;
 pub(crate) use gam::geometry::sae_routing::assign_ema_update as sae_assign_ema_update_impl;

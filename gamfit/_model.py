@@ -274,6 +274,46 @@ class Model:
             restore=restore_output_table,
         )
 
+    def transformation_score(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate ``Phi^-1(F_hat(y|x))`` on labelled rows.
+
+        This method is defined only for conditional transformation-normal
+        models and requires both the fitted covariates and the observed
+        response column.  It is intentionally distinct from :meth:`predict`,
+        whose CTM point estimate is the response-scale conditional mean
+        ``E[Y|x]`` and therefore does not consume an observed response.
+
+        The returned score is the generated regressor used by a downstream
+        marginal-slope model.  By default this is a one-dimensional NumPy
+        array; ``return_type=`` or ``id_column=`` requests a one-column table
+        named ``score`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            scores = rust_module().transformation_score_table(
+                self._model_bytes, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if return_type is None and id_column is None:
+            return scores
+        columns: dict[str, list[Any]] = {"score": scores.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
     def predict_array(
         self,
         X: Any,

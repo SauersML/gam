@@ -28,6 +28,74 @@ use gam_solve::rho_optimizer::{OuterObjective, OuterProblem};
 use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
+/// #2080 — two atoms may each have a full-rank decoder design while their
+/// CONCATENATED design is rank-deficient. With identical weighted constant
+/// columns, `δB₀ = c, δB₁ = −c` leaves the reconstruction exactly unchanged;
+/// an atom-local `G_k + λS_k` audit sees two positive scalar Grams and misses
+/// this coupled redistribution gauge entirely.
+#[test]
+fn joint_decoder_gauge_quotients_full_rank_atom_redistribution_2080() -> Result<(), String> {
+    let n = 4usize;
+    let phi = Array2::<f64>::ones((n, 1));
+    let jet = ndarray::Array3::<f64>::zeros((n, 1, 1));
+    let make_atom = |name: &str, decoder: f64| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Linear,
+            1,
+            phi.clone(),
+            jet.clone(),
+            array![[decoder]],
+            Array2::<f64>::zeros((1, 1)),
+        )
+    };
+    let coords = Array2::<f64>::zeros((n, 1));
+    let assignment = SaeAssignment::from_blocks_with_mode(
+        Array2::<f64>::zeros((n, 2)),
+        vec![coords.clone(), coords],
+        AssignmentMode::softmax(1.0),
+    )?;
+    let term = SaeManifoldTerm::new(
+        vec![make_atom("shared-a", 1.0)?, make_atom("shared-b", -0.5)?],
+        assignment,
+    )?;
+
+    // Both atom-local weighted designs are individually rank one (their full
+    // possible rank), so the superseded per-atom eigensolves have no null.
+    let weights = term.assignment.assignments();
+    for atom_idx in 0..2 {
+        let gram = (0..n)
+            .map(|row| {
+                let value = weights[[row, atom_idx]] * phi[[row, 0]];
+                value * value
+            })
+            .sum::<f64>();
+        assert!(gram > 0.0, "atom {atom_idx} must have a full-rank scalar Gram");
+    }
+
+    let gauges = term.joint_decoder_beta_null_directions(&[0.0, 0.0])?;
+    assert_eq!(
+        gauges.len(),
+        1,
+        "the two identical scalar designs have exactly one coupled decoder gauge"
+    );
+    let coord_dim = n * term.assignment.row_block_dim();
+    let delta_t = Array1::<f64>::zeros(coord_dim);
+    let delta_beta = array![1.0_f64, -1.0];
+    let raw = delta_beta.dot(&delta_beta);
+    let quotient = term.quotient_newton_step_norm_sq(
+        delta_t.view(),
+        delta_beta.view(),
+        raw,
+        &[0.0, 0.0],
+    )?;
+    assert!(
+        quotient <= f64::EPSILON * (1.0 + raw),
+        "joint redistribution must vanish on the identified quotient; raw={raw:.3e}, quotient={quotient:.3e}"
+    );
+    Ok(())
+}
+
 /// Two planted circles on DISJOINT ambient column parities (circle A on the even
 /// output channels, circle B on the odd), driven by two incommensurate phases and
 /// per-column standardized. Together they span a rank-4 subspace of the whitened

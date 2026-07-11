@@ -1379,112 +1379,316 @@ impl SaeManifoldTerm {
         1.0 + iterate_norm_sq.sqrt()
     }
 
-    /// Full-length β-block flat directions left by a **rank-deficient decoder
-    /// design** (#1051).
+    /// Machine-null eigenspace of a finite symmetric PSD decoder operator.
     ///
-    /// The chart gauge orbit ([`Self::dense_step_gauge_vectors`]) only spans the
-    /// per-latent-axis reparametrisation freedom — it never reaches a decoder
-    /// column-space deficiency. A euclidean / Duchon patch fit to a shape that
-    /// does not excite every monomial column (e.g. a straight line under the
-    /// degree-2 patch `[1, t, t²]`: the `t²` column carries no signal) leaves a
-    /// genuine flat direction in the β block: a vector `v` with `vᵀG_kv ≈ 0`
-    /// **and** `vᵀS_kv ≈ 0`, where `G_k` is the weighted data Gram and `S_k` the
-    /// smoothing penalty. Along such a `v` the penalised joint objective has no
-    /// curvature, so the undamped Newton step there is unbounded — the inner
-    /// solve's raw KKT residual and step never settle, and `reml_criterion`
-    /// rejects an otherwise-stationary fit as non-converged (the 122 s line-fit
-    /// stall + `1e12` sentinel).
-    ///
-    /// We identify exactly those directions as the joint null of `G_k + S_k`
-    /// (penalty already carries the `λ_smooth` weight installed by
-    /// `assemble_arrow_schur`, so a column the penalty regularises is NOT
-    /// flagged — only the truly unidentified-and-unpenalised directions are).
-    /// Each `M_k`-vector null direction is replicated across the `p` output
-    /// channels via the decoder's `⊗ I_p` Kronecker structure and lifted into
-    /// the full `(n·q + β)` coordinate so it can be quotiented out of the inner
-    /// convergence measure and deflated in the outer gradient identically to a
-    /// chart gauge.
-    pub(crate) fn decoder_beta_null_directions(
-        &self,
-        penalized_gram_scale: &[f64],
+    /// The admissible floor is the standard floating-point dot-product backward
+    /// error `γ_d = d·ε/(1-d·ε)` times the operator norm. Candidates must pass
+    /// both the Rayleigh test and the stronger residual test `‖Hv‖₂ ≤ γ_d‖H‖₂`;
+    /// a merely small model direction is therefore never promoted to a gauge.
+    fn machine_null_eigenvectors(
+        mut operator: Array2<f64>,
+        context: &str,
     ) -> Result<Vec<Array1<f64>>, String> {
-        let p = self.output_dim();
-        let n = self.n_obs();
-        let q = self.assignment.row_block_dim();
-        let beta_dim = self.beta_dim();
-        let total_len = n * q + beta_dim;
-        if p == 0 || beta_dim == 0 {
+        let dim = operator.nrows();
+        if operator.ncols() != dim {
+            return Err(format!(
+                "{context}: decoder operator must be square, got {:?}",
+                operator.dim()
+            ));
+        }
+        if dim == 0 {
             return Ok(Vec::new());
         }
-        let mut grams = self.empty_decoder_gram_accumulator();
-        self.accumulate_decoder_gram(&mut grams);
-        let beta_offsets = self.beta_offsets();
+        for row in 0..dim {
+            for col in 0..row {
+                let sym = 0.5 * (operator[[row, col]] + operator[[col, row]]);
+                operator[[row, col]] = sym;
+                operator[[col, row]] = sym;
+            }
+        }
+        if !operator.iter().all(|value| value.is_finite()) {
+            return Err(format!("{context}: non-finite decoder operator entry"));
+        }
+        let (evals, evecs) = operator
+            .eigh(Side::Lower)
+            .map_err(|err| format!("{context}: eigh failed: {err}"))?;
+        let operator_norm = evals
+            .iter()
+            .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
+        let d_eps = dim as f64 * f64::EPSILON;
+        let gamma_d = if d_eps < 1.0 {
+            d_eps / (1.0 - d_eps)
+        } else {
+            return Err(format!(
+                "{context}: decoder operator dimension {dim} exceeds the f64 backward-error domain"
+            ));
+        };
+        let null_floor = gamma_d * operator_norm;
         let mut out = Vec::new();
-        for atom_idx in 0..self.k_atoms() {
-            let m = self.atoms[atom_idx].basis_size();
-            if m == 0 {
+        for eig_idx in 0..dim {
+            let eigenvalue = evals[eig_idx];
+            if !(eigenvalue.is_finite() && eigenvalue.abs() <= null_floor) {
                 continue;
             }
-            // Penalised β-curvature of this atom's data-channel: `G_k + S_k`.
-            // `accumulate_decoder_gram` returns the unweighted data Gram and
-            // `smooth_penalty` already carries `λ_smooth`-equivalent weighting at
-            // the assembled ρ; `penalized_gram_scale` lets the caller match the
-            // exact relative weighting the Schur factor used so the null test is
-            // computed against the SAME operator whose pivots went singular.
-            let gram = &grams[atom_idx];
-            let penalty = &self.atoms[atom_idx].smooth_penalty;
-            if penalty.dim() != (m, m) {
-                continue;
-            }
-            let scale = penalized_gram_scale[atom_idx];
-            let mut joint = Array2::<f64>::zeros((m, m));
-            for i in 0..m {
-                for j in 0..m {
-                    joint[[i, j]] = gram[[i, j]] + scale * penalty[[i, j]];
-                }
-            }
-            // Symmetrise defensively before the eigendecomposition.
-            for i in 0..m {
-                for j in 0..i {
-                    let sym = 0.5 * (joint[[i, j]] + joint[[j, i]]);
-                    joint[[i, j]] = sym;
-                    joint[[j, i]] = sym;
-                }
-            }
-            let (evals, evecs) = joint
-                .eigh(Side::Lower)
-                .map_err(|e| format!("decoder_beta_null_directions: eigh failed: {e}"))?;
-            let max_eig = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-            if !(max_eig > 0.0) {
-                continue;
-            }
-            // A direction is genuinely flat (unidentified by data AND
-            // unpenalised) when its penalised curvature is below the standard
-            // relative spectral cutoff used across the codebase.
-            let null_floor = SAE_DECODER_BETA_NULL_RELATIVE_FLOOR * max_eig;
-            let beta_base = n * q + beta_offsets[atom_idx];
-            for eig_idx in 0..evals.len() {
-                if !(evals[eig_idx].is_finite() && evals[eig_idx] <= null_floor) {
-                    continue;
-                }
-                // One full-length lift per output channel (the `⊗ I_p` replica).
-                for out_col in 0..p {
-                    let mut dir = Array1::<f64>::zeros(total_len);
-                    for col in 0..m {
-                        dir[beta_base + col * p + out_col] = evecs[[col, eig_idx]];
-                    }
-                    out.push(dir);
-                }
+            let direction = evecs.column(eig_idx).to_owned();
+            let applied = operator.dot(&direction);
+            let rayleigh = direction.dot(&applied).abs();
+            let residual_norm = applied.iter().map(|value| value * value).sum::<f64>().sqrt();
+            if rayleigh.is_finite()
+                && residual_norm.is_finite()
+                && rayleigh <= null_floor
+                && residual_norm <= null_floor
+            {
+                out.push(direction);
             }
         }
         Ok(out)
     }
 
+    /// Full-length decoder flat directions of the **joint** weighted dictionary
+    /// operator (#1051/#2080).
+    ///
+    /// Let `D_k = diag(a_·k) Φ_k`. The production decoder Hessian is not the
+    /// block-diagonal collection `D_kᵀD_k`: it contains every cross-atom block
+    /// `D_jᵀD_k`. Consequently two individually full-rank atoms can still carry
+    /// the exact redistribution gauge
+    ///
+    /// `D_j A_j = D_k A_k  ⇒  (δB_j, δB_k) = (A_j C, −A_k C)`.
+    ///
+    /// The former atom-local eigensolves could never emit that coupled vector,
+    /// which left the K≥2 shared-subspace Newton walk crawling along a flat
+    /// direction. This compiler diagonalizes the same joint weighted
+    /// decoder-plus-smoothness operator used by the β tier. On the full-`B`
+    /// isotropic path the output factor is `I_p`, so it diagonalizes the compact
+    /// joint basis operator once and tensors its machine-null space across output
+    /// channels. With active decoder frames it diagonalizes the exact factored
+    /// operator `G_jk ⊗ (U_jᵀU_k) + blockdiag(λ_k S_k ⊗ I_rk)`; under likelihood
+    /// whitening the per-row `U_jᵀM_nU_k` sandwich is accumulated exactly.
+    ///
+    /// Every returned vector lives in the CURRENT arrow border coordinate
+    /// (full `B` or factored `C`) and has passed the machine-scale Rayleigh and
+    /// null-residual certificates in [`Self::machine_null_eigenvectors`].
+    pub(crate) fn joint_decoder_beta_null_directions(
+        &self,
+        penalized_gram_scale: &[f64],
+    ) -> Result<Vec<Array1<f64>>, String> {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if penalized_gram_scale.len() != k_atoms {
+            return Err(format!(
+                "joint_decoder_beta_null_directions: {} smooth scales for {k_atoms} atoms",
+                penalized_gram_scale.len()
+            ));
+        }
+        let basis_sizes: Vec<usize> = self.atoms.iter().map(|atom| atom.basis_size()).collect();
+        let mut basis_offsets = Vec::with_capacity(k_atoms);
+        let mut basis_dim = 0usize;
+        for &m in &basis_sizes {
+            basis_offsets.push(basis_dim);
+            basis_dim += m;
+        }
+        let border_dim = self.factored_border_dim();
+        if p == 0 || basis_dim == 0 || border_dim == 0 {
+            return Ok(Vec::new());
+        }
+
+        let assignments = self.assignment.assignments();
+        let mut joint_basis = Array2::<f64>::zeros((basis_dim, basis_dim));
+        let mut weighted_basis = vec![0.0_f64; basis_dim];
+        for row in 0..n {
+            for atom_idx in 0..k_atoms {
+                let atom = &self.atoms[atom_idx];
+                let off = basis_offsets[atom_idx];
+                let weight = assignments[[row, atom_idx]];
+                for basis_col in 0..basis_sizes[atom_idx] {
+                    weighted_basis[off + basis_col] =
+                        weight * atom.basis_values[[row, basis_col]];
+                }
+            }
+            for col in 0..basis_dim {
+                let value = weighted_basis[col];
+                if value == 0.0 {
+                    continue;
+                }
+                for row_idx in 0..basis_dim {
+                    joint_basis[[row_idx, col]] += weighted_basis[row_idx] * value;
+                }
+            }
+        }
+        let joint_data_basis = joint_basis.clone();
+        for atom_idx in 0..k_atoms {
+            let m = basis_sizes[atom_idx];
+            let penalty = &self.atoms[atom_idx].smooth_penalty;
+            if penalty.dim() != (m, m) {
+                return Err(format!(
+                    "joint_decoder_beta_null_directions: atom {atom_idx} penalty shape {:?} != ({m}, {m})",
+                    penalty.dim()
+                ));
+            }
+            let off = basis_offsets[atom_idx];
+            let scale = penalized_gram_scale[atom_idx];
+            if !scale.is_finite() || scale < 0.0 {
+                return Err(format!(
+                    "joint_decoder_beta_null_directions: atom {atom_idx} smooth scale must be finite and nonnegative, got {scale}"
+                ));
+            }
+            for row in 0..m {
+                for col in 0..m {
+                    joint_basis[[off + row, off + col]] += scale * penalty[[row, col]];
+                }
+            }
+        }
+
+        let coord_base = n * q;
+        if !self.any_frame_active() {
+            let null_basis = Self::machine_null_eigenvectors(
+                joint_basis,
+                "joint_decoder_beta_null_directions(full-B)",
+            )?;
+            let mut out = Vec::with_capacity(null_basis.len() * p);
+            for basis_direction in null_basis {
+                for out_col in 0..p {
+                    let mut direction = Array1::<f64>::zeros(coord_base + border_dim);
+                    for basis_col in 0..basis_dim {
+                        direction[coord_base + basis_col * p + out_col] =
+                            basis_direction[basis_col];
+                    }
+                    out.push(direction);
+                }
+            }
+            return Ok(out);
+        }
+
+        let border_offsets = self.factored_border_offsets();
+        let frame_ranks: Vec<usize> = self
+            .atoms
+            .iter()
+            .map(SaeManifoldAtom::border_frame_rank)
+            .collect();
+        let mut joint_border = Array2::<f64>::zeros((border_dim, border_dim));
+        let whitens_likelihood = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        if whitens_likelihood {
+            let metric = self
+                .row_metric
+                .as_ref()
+                .expect("whitens_likelihood implies a row metric");
+            let metric_rank = metric.metric_rank();
+            let frames: Vec<Array2<f64>> = (0..k_atoms)
+                .map(|atom_idx| self.frame_output_matrix(atom_idx))
+                .collect();
+            let mut whitened_jacobian = Array2::<f64>::zeros((metric_rank, border_dim));
+            for row in 0..n {
+                whitened_jacobian.fill(0.0);
+                for atom_idx in 0..k_atoms {
+                    let m = basis_sizes[atom_idx];
+                    let rank = frame_ranks[atom_idx];
+                    let border_off = border_offsets[atom_idx];
+                    let weight = assignments[[row, atom_idx]];
+                    for frame_col in 0..rank {
+                        for metric_col in 0..metric_rank {
+                            let mut projected = 0.0_f64;
+                            for out_col in 0..p {
+                                projected += frames[atom_idx][[out_col, frame_col]]
+                                    * metric.factor_entry(row, out_col, metric_col);
+                            }
+                            if projected == 0.0 {
+                                continue;
+                            }
+                            for basis_col in 0..m {
+                                whitened_jacobian[[
+                                    metric_col,
+                                    border_off + basis_col * rank + frame_col,
+                                ]] = weight
+                                    * self.atoms[atom_idx].basis_values[[row, basis_col]]
+                                    * projected;
+                            }
+                        }
+                    }
+                }
+                for col in 0..border_dim {
+                    for row_idx in 0..border_dim {
+                        let mut value = 0.0_f64;
+                        for metric_col in 0..metric_rank {
+                            value += whitened_jacobian[[metric_col, row_idx]]
+                                * whitened_jacobian[[metric_col, col]];
+                        }
+                        joint_border[[row_idx, col]] += value;
+                    }
+                }
+            }
+        } else {
+            for atom_j in 0..k_atoms {
+                let mj = basis_sizes[atom_j];
+                let rj = frame_ranks[atom_j];
+                let basis_j = basis_offsets[atom_j];
+                let border_j = border_offsets[atom_j];
+                for atom_k in 0..k_atoms {
+                    let mk = basis_sizes[atom_k];
+                    let rk = frame_ranks[atom_k];
+                    let basis_k = basis_offsets[atom_k];
+                    let border_k = border_offsets[atom_k];
+                    let frame_overlap = self.frame_cross_factor(atom_j, atom_k);
+                    for col_j in 0..mj {
+                        for col_k in 0..mk {
+                            let gram = joint_data_basis[[basis_j + col_j, basis_k + col_k]];
+                            for channel_j in 0..rj {
+                                for channel_k in 0..rk {
+                                    joint_border[[
+                                        border_j + col_j * rj + channel_j,
+                                        border_k + col_k * rk + channel_k,
+                                    ]] += gram * frame_overlap[[channel_j, channel_k]];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for atom_idx in 0..k_atoms {
+            let m = basis_sizes[atom_idx];
+            let rank = frame_ranks[atom_idx];
+            let off = border_offsets[atom_idx];
+            let penalty = &self.atoms[atom_idx].smooth_penalty;
+            let scale = penalized_gram_scale[atom_idx];
+            for basis_row in 0..m {
+                for basis_col in 0..m {
+                    let value = scale * penalty[[basis_row, basis_col]];
+                    for channel in 0..rank {
+                        joint_border[[
+                            off + basis_row * rank + channel,
+                            off + basis_col * rank + channel,
+                        ]] += value;
+                    }
+                }
+            }
+        }
+        let null_border = Self::machine_null_eigenvectors(
+            joint_border,
+            "joint_decoder_beta_null_directions(factored)",
+        )?;
+        Ok(null_border
+            .into_iter()
+            .map(|beta_direction| {
+                let mut direction = Array1::<f64>::zeros(coord_base + border_dim);
+                direction
+                    .slice_mut(s![coord_base..])
+                    .assign(&beta_direction);
+                direction
+            })
+            .collect())
+    }
+
     /// Deflation candidates for a rank-deficient decoder **column span** (the
     /// ambient output-channel deficiency #1051/#1273 — distinct from the
-    /// basis-column deficiency [`Self::decoder_beta_null_directions`] handles).
+    /// basis-column deficiency [`Self::joint_decoder_beta_null_directions`] handles).
     ///
-    /// [`Self::decoder_beta_null_directions`] is channel-free: it replicates a
+    /// [`Self::joint_decoder_beta_null_directions`] is channel-free on the
+    /// unframed path: it replicates a
     /// single `M_k`-vector basis-null across all `p` output channels, so it can
     /// only see a basis column the data never excites (e.g. an unused `t²`
     /// monomial). It is structurally blind to a decoder whose `p` output
@@ -1508,15 +1712,22 @@ impl SaeManifoldTerm {
         let p = self.output_dim();
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
-        let beta_dim = self.beta_dim();
-        let total_len = n * q + beta_dim;
-        if p == 0 || beta_dim == 0 {
+        let border_dim = self.factored_border_dim();
+        let total_len = n * q + border_dim;
+        if p == 0 || border_dim == 0 {
             return Ok(Vec::new());
         }
-        let beta_offsets = self.beta_offsets();
+        let beta_offsets = self.factored_border_offsets();
         let mut out = Vec::new();
         for atom_idx in 0..self.k_atoms() {
             let atom = &self.atoms[atom_idx];
+            // A framed atom's border contains only its realised `C_k`
+            // coordinates. Ambient directions orthogonal to `U_k` are not
+            // decoder-border coordinates at all; frame orientation is handled
+            // by the separate Grassmann block update.
+            if atom.decoder_frame.is_some() {
+                continue;
+            }
             let m = atom.basis_size();
             if m == 0 {
                 continue;
@@ -1577,8 +1788,8 @@ impl SaeManifoldTerm {
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
-        let beta_dim = self.beta_dim();
-        if delta_ext_coord.len() != n * q || delta_beta.len() != beta_dim {
+        let border_dim = self.factored_border_dim();
+        if delta_ext_coord.len() != n * q || delta_beta.len() != border_dim {
             return Ok(raw_step_norm_sq);
         }
         let mut residual = Array1::<f64>::zeros(delta_ext_coord.len() + delta_beta.len());
@@ -1616,7 +1827,7 @@ impl SaeManifoldTerm {
         let gauges = self
             .dense_step_gauge_vectors()?
             .into_iter()
-            .chain(self.decoder_beta_null_directions(penalized_gram_scale)?)
+            .chain(self.joint_decoder_beta_null_directions(penalized_gram_scale)?)
             // #1051/#1273: project out the decoder column-span null too, so the
             // inner convergence measure and the outer-gradient deflation
             // quotient the SAME identified subspace — otherwise a rank-deficient
@@ -1668,8 +1879,8 @@ impl SaeManifoldTerm {
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
-        let beta_dim = self.beta_dim();
-        if grad_ext_coord.len() != n * q || grad_beta.len() != beta_dim {
+        let border_dim = self.factored_border_dim();
+        if grad_ext_coord.len() != n * q || grad_beta.len() != border_dim {
             return Ok(raw_grad_norm_sq);
         }
         let mut residual = Array1::<f64>::zeros(grad_ext_coord.len() + grad_beta.len());
@@ -1732,8 +1943,8 @@ impl SaeManifoldTerm {
         let q = self.assignment.row_block_dim();
         let p = self.output_dim();
         let coord_offsets = self.assignment.coord_offsets();
-        let beta_offsets = self.beta_offsets();
-        let total_len = n * q + self.beta_dim();
+        let beta_offsets = self.factored_border_offsets();
+        let total_len = n * q + self.factored_border_dim();
         let mut out = Vec::new();
         for atom_idx in 0..self.k_atoms() {
             let d = self.assignment.coords[atom_idx].latent_dim();
@@ -2018,9 +2229,14 @@ impl SaeManifoldTerm {
             }
         }
         let beta_base = n * q + beta_offsets[atom_idx];
+        let delta_border = match atom.decoder_frame.as_ref() {
+            Some(frame) => delta_b.dot(frame.frame()),
+            None => delta_b,
+        };
+        let border_rank = delta_border.ncols();
         for col in 0..m {
-            for out_col in 0..p {
-                gauge[beta_base + col * p + out_col] = delta_b[[col, out_col]];
+            for channel in 0..border_rank {
+                gauge[beta_base + col * border_rank + channel] = delta_border[[col, channel]];
             }
         }
         Ok(Some(gauge))

@@ -1309,13 +1309,8 @@ fn sae_residual_em_score_vjp_cuda(
     nonneg: bool,
 ) -> PyResult<()> {
     let scalar_type = residual_em_cuda_dtype(dtype)?;
-    let (
-        x_dev_ptr,
-        recon_dev_ptr,
-        g_code_dev_ptr,
-        g_relative_residual_dev_ptr,
-        grad_recon_dev_ptr,
-    ) = device_ptrs;
+    let (x_dev_ptr, recon_dev_ptr, g_code_dev_ptr, g_relative_residual_dev_ptr, grad_recon_dev_ptr) =
+        device_ptrs;
     let (n, atoms, dim) = shape;
     py.detach(move || {
         gam::terms::sae::criterion_atoms_gpu::residual_em_score_vjp_device(
@@ -4991,10 +4986,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(encoded_table_from_columns, module)?)?;
     module.add_function(wrap_pyfunction!(encoded_table_from_arrow, module)?)?;
     module.add_function(wrap_pyfunction!(marginal_slope_clip_probabilities, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        transformation_normal_z_from_columns,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(column_stack_f64, module)?)?;
     module.add_function(wrap_pyfunction!(
         survival_prediction_payload_from_json,
@@ -5032,6 +5023,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
+    module.add_function(wrap_pyfunction!(transformation_score_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
     // #1054: exact Gaussian jackknife+ conformal intervals (no calibration fold).
     module.add_function(wrap_pyfunction!(predict_table_jackknife_plus, module)?)?;
@@ -5104,10 +5096,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        sae_manifold_from_fit_payload,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_from_fit_payload, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;
     module.add_class::<ManifoldSaeCore>()?;
     module.add_class::<AtomCore>()?;

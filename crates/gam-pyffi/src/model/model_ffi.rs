@@ -476,6 +476,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "extend_with_group",
             "torch_from_fitted",
             "predict",
+            "transformation_score",
             "predict_array",
             "predict_conformal",
             "build_predict_payload_json",
@@ -1094,18 +1095,6 @@ fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
         .into_iter()
         .map(|value| value.clamp(0.0, 1.0))
         .collect())
-}
-
-#[pyfunction]
-fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>> {
-    let columns: BTreeMap<String, Vec<f64>> = serde_json::from_str(columns_json)
-        .map_err(|err| py_value_error(format!("invalid prediction columns json: {err}")))?;
-    if let Some(values) = columns.get("linear_predictor") {
-        return Ok(values.clone());
-    }
-    Err(PyKeyError::new_err(
-        "transformation-normal prediction payload is missing linear_predictor",
-    ))
 }
 
 #[pyfunction]
@@ -1971,6 +1960,64 @@ fn predict_table(
     detach_predict_result(py, "predict_table", move || {
         predict_encoded_table_impl(&model_bytes, dataset, options_json.as_deref())
     })
+}
+
+fn transformation_score_encoded_table_impl(
+    model_bytes: &[u8],
+    source: EncodedDataset,
+) -> Result<Array1<f64>, String> {
+    let model = load_model_impl(model_bytes).map_err(|error| error.to_string())?;
+    if model.predict_model_class() != PredictModelClass::TransformationNormal {
+        return Err(format!(
+            "transformation_score requires a transformation-normal model; got '{}'",
+            prediction_model_class_label(&model)
+        ));
+    }
+    let response_name =
+        response_column_name(model.payload().formula.as_str()).ok_or_else(|| {
+            "transformation-normal model formula has no plain observed-response column".to_string()
+        })?;
+    if !source.headers.iter().any(|header| header == &response_name) {
+        return Err(format!(
+            "transformation_score data must contain observed response column '{response_name}'"
+        ));
+    }
+    let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
+    let col_map = dataset.column_map();
+    let response_column = *col_map.get(&response_name).ok_or_else(|| {
+        format!(
+            "transformation_score projection dropped observed response column '{response_name}'"
+        )
+    })?;
+    let response = dataset.values.column(response_column).to_owned();
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    build_transformation_normal_observed_scores(
+        &model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &response,
+        &offset,
+    )
+}
+
+/// Evaluate the labelled-data CTM score `Phi^-1(F_hat(y_i | x_i))`.
+/// Ordinary `predict_table` remains response-scale `E[Y|x]`; keeping these as
+/// distinct typed entries prevents a conditional mean from being consumed as
+/// a generated marginal-slope regressor.
+#[pyfunction]
+fn transformation_score_table<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: PyRef<'_, PyEncodedTable>,
+) -> PyResult<Py<PyArray1<f64>>> {
+    rows.require_headers(&headers).map_err(py_value_error)?;
+    let dataset = rows.dataset.clone();
+    let scores = detach_py_result(py, "transformation_score_table", move || {
+        transformation_score_encoded_table_impl(&model_bytes, dataset)
+    })?;
+    Ok(scores.into_pyarray(py).unbind())
 }
 
 /// Distribution-free conformal prediction intervals (issue #310 family path).

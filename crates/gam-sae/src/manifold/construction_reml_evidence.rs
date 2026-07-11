@@ -1524,7 +1524,7 @@ impl SaeManifoldTerm {
         // true flat direction is the penalised null of `G_k + λ_smooth·S_k`,
         // not an axis-aligned coordinate, so the outer gate rejected trial ρ
         // with a pivot ratio (5.3e-16 < 1e-12) that the inner gate (which
-        // already uses `decoder_beta_null_directions(λ_smooth)`) accepts. Use
+        // already uses `joint_decoder_beta_null_directions(λ_smooth)`) accepts. Use
         // the SAME penalty-aware null directions here, evaluated at the smooth
         // scale the Schur factor used, so the outer and inner gates agree.
         // These full (n·q + beta_dim)-length vectors drop into the same
@@ -1532,7 +1532,7 @@ impl SaeManifoldTerm {
         // floor still keeps only genuinely flat (sub-floor) directions, so a
         // well-conditioned decoder is unaffected.
         for dir in self
-            .decoder_beta_null_directions(penalized_gram_scale)
+            .joint_decoder_beta_null_directions(penalized_gram_scale)
             .map_err(OuterGradientError::internal)?
         {
             if dir.len() == full_len {

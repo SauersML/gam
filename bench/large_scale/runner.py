@@ -649,16 +649,15 @@ def write_csv_rows(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]
         writer.writerows(rows)
 
 
-def _prediction_z_values(prediction_csv: Path) -> list[float]:
-    rows = read_csv_rows(prediction_csv)
+def _transformation_score_values(score_csv: Path) -> list[float]:
+    rows = read_csv_rows(score_csv)
     if not rows:
-        raise RuntimeError(f"empty transformation-normal prediction file: {prediction_csv}")
-    for key in ("z", "z_score", "transformed", "eta", "mean"):
-        if key in rows[0]:
-            return [float(row[key]) for row in rows]
-    raise RuntimeError(
-        f"transformation-normal prediction file {prediction_csv} is missing a z-score column"
-    )
+        raise RuntimeError(f"empty transformation-normal score file: {score_csv}")
+    if "score" not in rows[0]:
+        raise RuntimeError(
+            f"transformation-normal score file {score_csv} is missing its typed score column"
+        )
+    return [float(row["score"]) for row in rows]
 
 
 def _write_rows_like(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -816,8 +815,8 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     ctn_fit_input_path = out_dir / f"{spec.name}.pgs_ctn.fit_input.csv"
     ctn_train_input_path = out_dir / f"{spec.name}.pgs_ctn.train_input.csv"
     ctn_test_input_path = out_dir / f"{spec.name}.pgs_ctn.test_input.csv"
-    ctn_train_pred_path = out_dir / f"{spec.name}.pgs_ctn.train_pred.csv"
-    ctn_test_pred_path = out_dir / f"{spec.name}.pgs_ctn.test_pred.csv"
+    ctn_train_score_path = out_dir / f"{spec.name}.pgs_ctn.train_score.csv"
+    ctn_test_score_path = out_dir / f"{spec.name}.pgs_ctn.test_score.csv"
     formula = _ctn_formula(spec.pc_count, centers)
     ctn_columns = [PGS_RAW_COLUMN, *_pc_std_columns(spec.pc_count)]
     # Why this isn't a uniform random subsample any more:
@@ -993,18 +992,33 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
             err.strip() or out.strip() or f"{spec.name} conditional PGS CTN fit failed"
         )
     for input_path, output_path in (
-        (ctn_train_input_path, ctn_train_pred_path),
-        (ctn_test_input_path, ctn_test_pred_path),
+        (ctn_train_input_path, ctn_train_score_path),
+        (ctn_test_input_path, ctn_test_score_path),
     ):
-        pred_cmd = [str(rust_bin), "predict", str(ctn_model_path), str(input_path), "--out", str(output_path)]
-        rc, out, err = run_cmd_stream(pred_cmd, cwd=ROOT)
+        score_cmd = [
+            str(rust_bin),
+            "transformation-score",
+            str(ctn_model_path),
+            str(input_path),
+            "--out",
+            str(output_path),
+        ]
+        rc, out, err = run_cmd_stream(score_cmd, cwd=ROOT)
         if rc != 0:
             raise RuntimeError(
-                err.strip() or out.strip() or f"{spec.name} conditional PGS CTN prediction failed"
+                err.strip() or out.strip() or f"{spec.name} conditional PGS CTN scoring failed"
             )
 
-    train_aug = _attach_column(train_rows, PGS_CTN_Z_COLUMN, _prediction_z_values(ctn_train_pred_path))
-    test_aug = _attach_column(test_rows, PGS_CTN_Z_COLUMN, _prediction_z_values(ctn_test_pred_path))
+    train_aug = _attach_column(
+        train_rows,
+        PGS_CTN_Z_COLUMN,
+        _transformation_score_values(ctn_train_score_path),
+    )
+    test_aug = _attach_column(
+        test_rows,
+        PGS_CTN_Z_COLUMN,
+        _transformation_score_values(ctn_test_score_path),
+    )
     pc_cols = _pc_std_columns(spec.pc_count)
     diagnostics = [
         f"conditional PGS CTN formula: {formula}",

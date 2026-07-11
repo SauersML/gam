@@ -529,6 +529,77 @@ pub(crate) fn run_predict(args: PredictArgs) -> Result<(), String> {
     result
 }
 
+/// Evaluate the labelled-data CTM score used as a generated regressor by a
+/// downstream marginal-slope fit.  This is a distinct command from `predict`:
+/// ordinary CTM prediction is the response-scale conditional mean and does not
+/// consume the observed response.
+pub(crate) fn run_transformation_score(args: TransformationScoreArgs) -> Result<(), String> {
+    let model = SavedModel::load_from_path(&args.model)?;
+    if model.predict_model_class() != PredictModelClass::TransformationNormal {
+        return Err(format!(
+            "gam transformation-score requires a transformation-normal model; got {}",
+            pretty_predict_model_class(model.predict_model_class())
+        ));
+    }
+    let parsed =
+        parse_formula(model.payload().formula.as_str()).map_err(|error| error.to_string())?;
+    let response_column = parsed.response.trim();
+    if response_column.is_empty() || response_column.contains('(') {
+        return Err(format!(
+            "transformation-normal model formula '{}' has no plain observed-response column",
+            model.payload().formula
+        ));
+    }
+
+    let effective_offset_column = args
+        .offset_column
+        .as_deref()
+        .or(model.offset_column.as_deref());
+    let mut extras = vec![response_column.to_string()];
+    if let Some(offset_column) = effective_offset_column
+        && !extras.iter().any(|column| column == offset_column)
+    {
+        extras.push(offset_column.to_string());
+    }
+    let dataset = load_datasetwith_model_schema_extra(&args.labelled_data, &model, &extras)?;
+    require_dataset_rows(
+        "transformation-score",
+        &args.labelled_data,
+        dataset.values.nrows(),
+    )?;
+    let id_values = args
+        .id_column
+        .as_ref()
+        .map(|id_column| {
+            load_prediction_id_values(&args.labelled_data, id_column, dataset.values.nrows())
+                .map(|values| (id_column.clone(), values))
+        })
+        .transpose()?;
+    let col_map = dataset.column_map();
+    let response_index = resolve_role_col(&col_map, response_column, "observed response")?;
+    let response = dataset.values.column(response_index).to_owned();
+    let offset = resolve_offset_column(&dataset, &col_map, effective_offset_column)?;
+    let scores = build_transformation_normal_observed_scores(
+        &model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &response,
+        &offset,
+    )?;
+    let score_values = scores.to_vec();
+    write_prediction_csv_unified(&args.out, &[("score", &score_values)])?;
+    if let Some((id_column, values)) = id_values.as_ref() {
+        prepend_id_column_to_prediction_csv(&args.out, id_column, values)?;
+    }
+    cli_out!(
+        "wrote transformation scores: {} (rows={})",
+        args.out.display(),
+        scores.len()
+    );
+    Ok(())
+}
+
 pub(crate) struct LatentWindowPluginJet {
     survival: f64,
     score_mu: f64,

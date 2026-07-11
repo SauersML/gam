@@ -44,7 +44,6 @@ from ._survival import (
     competing_risks_prediction_from_ffi_payload,
     survival_prediction_from_columns,
     survival_prediction_from_ffi_payload,
-    transformation_normal_z,
 )
 
 
@@ -164,8 +163,9 @@ def _point_payload_spec(
     form when the caller opts into a table:
 
     * **transformation-normal** — the per-row response-scale conditional mean
-      ``E[Y|x]`` (issue #1612), read from the ``linear_predictor`` column by
-      ``transformation_normal_z``; table form is the single ``z`` column.
+      ``E[Y|x]`` (issue #1612), read from the ``mean`` column; table form is the
+      single ``mean`` column.  The labelled-data latent score is exposed only
+      by ``Model.transformation_score``.
     * **Bernoulli marginal-slope** — ``mean`` clipped back to ``(0, 1)`` as a
       probability; table form is the ``mean`` (probability) column, plus
       ``linear_predictor`` (the η-scale point) and the probability-scale
@@ -183,10 +183,10 @@ def _point_payload_spec(
     :func:`_shape_point_payload`; this function owns only the differences.
     """
     if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
-        z = rust_module().vec_to_array1_f64(
-            [float(value) for value in transformation_normal_z(columns)]
+        mean = rust_module().vec_to_array1_f64(
+            [float(value) for value in columns["mean"]]
         )
-        return z, {"z": z.tolist()}
+        return mean, {"mean": mean.tolist()}
 
     if _is_bernoulli_marginal_slope(model_class, family):
         # The Rust core may emit linear-predictor-scale values that need
