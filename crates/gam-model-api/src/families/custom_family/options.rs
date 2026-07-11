@@ -420,26 +420,6 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
     Arc::from(ranges.into_boxed_slice())
 }
 
-/// Bound first-order outer iterations when each analytic-gradient evaluation is
-/// already large-scale work. This is only applied after the planner has
-/// selected a gradient-only route; second-order/ARC plans keep their requested
-/// iteration budget.
-pub fn cost_gated_first_order_max_iter(
-    requested: usize,
-    coefficient_gradient_cost: u64,
-    has_outer_hessian: bool,
-) -> usize {
-    const FIRST_ORDER_OUTER_WORK_BUDGET: u64 = 80_000_000_000;
-    const MIN_FIRST_ORDER_ITERS: usize = 4;
-
-    if has_outer_hessian || requested <= 1 || coefficient_gradient_cost == 0 {
-        return requested;
-    }
-
-    let affordable = (FIRST_ORDER_OUTER_WORK_BUDGET / coefficient_gradient_cost) as usize;
-    requested.min(affordable.max(MIN_FIRST_ORDER_ITERS))
-}
-
 /// Local trust budget for first-order outer BFGS on log-smoothing parameters.
 ///
 /// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
@@ -820,47 +800,6 @@ mod tests {
     #[test]
     fn step_cap_with_outer_hessian_is_none() {
         assert_eq!(first_order_bfgs_loglambda_step_cap(true), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // cost_gated_first_order_max_iter
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn cost_gated_iter_passes_through_when_has_outer_hessian() {
-        assert_eq!(
-            cost_gated_first_order_max_iter(100, 1_000_000_000, true),
-            100
-        );
-    }
-
-    #[test]
-    fn cost_gated_iter_passes_through_at_one_iteration() {
-        assert_eq!(
-            cost_gated_first_order_max_iter(1, 1_000_000_000_000, false),
-            1
-        );
-    }
-
-    #[test]
-    fn cost_gated_iter_passes_through_zero_cost() {
-        assert_eq!(cost_gated_first_order_max_iter(200, 0, false), 200);
-    }
-
-    #[test]
-    fn cost_gated_iter_clamps_expensive_gradient() {
-        // Budget = 80_000_000_000. With cost = 1_000_000_000 the affordable
-        // count is 80. requested=200 should be clamped to 80.
-        let result = cost_gated_first_order_max_iter(200, 1_000_000_000, false);
-        assert!(result <= 80, "got {result}");
-        assert!(result >= 4, "got {result}");
-    }
-
-    #[test]
-    fn cost_gated_iter_enforces_minimum_four() {
-        // Cost so high only 1 iteration is affordable, but minimum is 4.
-        let result = cost_gated_first_order_max_iter(100, u64::MAX / 2, false);
-        assert_eq!(result, 4);
     }
 
     #[test]

@@ -948,19 +948,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.outer_hyper_hessian_hvp_available(specs),
         family.outer_hyper_hessian_dense_available(specs),
     );
-    let outer_max_iter = cost_gated_first_order_max_iter(
-        options.outer_max_iter,
-        family.coefficient_gradient_cost(specs),
-        need_outer_hessian,
-    );
     let bfgs_step_cap = first_order_bfgs_loglambda_step_cap(need_outer_hessian);
-    if outer_max_iter < options.outer_max_iter {
-        log::info!(
-            "[OUTER] custom family: first-order work gate reduced outer_max_iter {} -> {}",
-            options.outer_max_iter,
-            outer_max_iter,
-        );
-    }
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
     // families whose joint likelihood Hessian depends on β. Disable
@@ -998,7 +986,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
         .with_rel_cost_tolerance(options.outer_rel_cost_tol)
-        .with_max_iter(outer_max_iter)
+        .with_max_iter(options.outer_max_iter)
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_initial_rho(rho0.clone())

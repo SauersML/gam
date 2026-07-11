@@ -1764,22 +1764,6 @@ pub(crate) fn default_coefficient_gradient_cost_is_half_of_hessian_cost() {
 }
 
 #[test]
-pub(crate) fn first_order_outer_iter_gate_caps_expensive_gradient_paths() {
-    assert_eq!(
-        cost_gated_first_order_max_iter(60, 10_000_000_000, false),
-        8
-    );
-    assert_eq!(
-        cost_gated_first_order_max_iter(60, 100_000_000_000, false),
-        4
-    );
-    assert_eq!(
-        cost_gated_first_order_max_iter(60, 100_000_000_000, true),
-        60
-    );
-}
-
-#[test]
 pub(crate) fn custom_family_default_outer_seed_config_is_tightened_for_expensive_paths() {
     let family = OneBlockIdentityFamily;
 

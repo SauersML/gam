@@ -1987,18 +1987,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             && gam_custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
-    let outer_max_iter = gam_custom_family::cost_gated_first_order_max_iter(
-        options.max_iter,
-        base_family.coefficient_gradient_cost(std::slice::from_ref(&blockspec)),
-        analytic_outer_hessian_available,
-    );
-    if outer_max_iter < options.max_iter {
-        log::info!(
-            "[OUTER] exact spatial adaptive regularization: first-order work gate reduced outer_max_iter {} -> {}",
-            options.max_iter,
-            outer_max_iter,
-        );
-    }
     // Keep the exact outer Hessian whenever the adaptive family can provide it.
     // The Charbonnier pseudo-Laplace surface mixes ordinary log-lambda
     // coordinates with adaptive λ/ε coordinates; exact curvature is the best
@@ -2014,7 +2002,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
-        .with_max_iter(outer_max_iter)
+        .with_max_iter(options.max_iter)
         .with_seed_config(gam_problem::SeedConfig::default())
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(initial_theta.clone());
