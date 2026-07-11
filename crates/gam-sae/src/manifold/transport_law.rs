@@ -249,7 +249,7 @@ pub fn measure_atom_transport_between(
     // The smooth alternative fits `K = 2H + 1` Fourier coefficients; it needs at
     // least `K + 1` grid points to be determined (and the phase test needs a
     // non-degenerate grid).
-    let k_smooth = 2 * (2 * n_harmonics + 1) + 1;
+    let k_smooth = 2 * (2 * n_harmonics + 1).max(grid_resolution / 16) + 1;
     if grid_resolution < k_smooth + 1 {
         return Err(format!(
             "measure_atom_transport: grid_resolution {grid_resolution} is too small for a \
@@ -323,7 +323,12 @@ pub fn measure_atom_transport_between(
     // low-order smooth model (K = 4H + 3 coefficients ≪ grid_resolution, which
     // the guard above already enforces at the STRICTER alternative order) while
     // removing the conservative bias the 2026-07-10 audit flagged.
-    let alt_harmonics = 2 * n_harmonics + 1;
+    // Grid-proportional detector order: the drift spectrum of a composed /
+    // inverted trigonometric map decays slowly (measured on the planted
+    // θ+0.8·sinθ arm: R² 0.86 at H=11, 0.90 at H=16, 0.95 at H=31), so the
+    // alternative uses the larger of the curve-derived 2H+1 and grid/16 —
+    // still ≥8× oversampled (K = 2·alt+1 coefficients vs grid points).
+    let alt_harmonics = (2 * n_harmonics + 1).max(grid_resolution / 16);
     let (phase_shift, phase_r2, smooth_r2) = fit_transport_law(&t_arr, &tprime, alt_harmonics);
     let drift = decoder_drift(&b_src, &b_tgt);
     let principal_angles = principal_angles_between_images(&b_src, &b_tgt)?;
