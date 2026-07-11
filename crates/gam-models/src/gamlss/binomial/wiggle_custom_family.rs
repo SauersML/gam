@@ -616,9 +616,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let g4 = d4q;
         let (sigma, ds, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth_array(eta_ls.view());
 
-        let mut d2_h: Array2<f64> = (0..n)
-            .into_par_iter()
-            .map(|i| -> Result<Array2<f64>, String> {
+        let mut d2_h: Array2<f64> = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            n,
+            |range| -> Result<Array2<f64>, String> {
+            let mut acc = Array2::<f64>::zeros((total, total));
+            for i in range {
                 let mut row_h = Array2::<f64>::zeros((total, total));
                 // Per-row scalar objective derivatives for F_i(q).
                 let q_i = core0.q0[i] + etaw[i];
@@ -864,15 +866,16 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                     }
                 }
 
-                Ok(row_h)
-            })
-            .try_reduce(
-                || Array2::<f64>::zeros((total, total)),
-                |mut acc, row_h| {
-                    acc += &row_h;
-                    Ok(acc)
-                },
-            )?;
+                acc += &row_h;
+            }
+            Ok(acc)
+            },
+            |mut a, b| {
+                a += &b;
+                Ok(a)
+            },
+        )?
+        .unwrap_or_else(|| Array2::<f64>::zeros((total, total)));
 
         mirror_upper_to_lower(&mut d2_h);
         Ok(Some(d2_h))

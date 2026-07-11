@@ -168,42 +168,47 @@ impl SurvivalMarginalSlopeFamily {
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
-        let acc = row_iter
-            .into_par_iter()
-            .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
-                let (state, q_geom) = &mut acc;
-                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                let h_pi = self
-                    .compute_row_flex_primary_gradient_hessian_exact(
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            row_iter.len(),
+            |range| -> Result<_, String> {
+                let (mut state, mut q_geom) = make_acc_ws();
+                for idx in range {
+                    let row = row_iter[idx];
+                    self.row_dynamic_q_geometry_into(row, block_states, &mut q_geom)?;
+                    let h_pi = self
+                        .compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            &q_geom,
+                            &primary,
+                        )?
+                        .2;
+                    let u_d = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                         row,
                         block_states,
-                        q_geom,
-                        &primary,
-                    )?
-                    .2;
-                let u_d = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
-                    row,
-                    block_states,
-                    &slices,
-                    q_geom,
-                    d_beta_flat,
-                )?;
-                let mut t_ud =
-                    self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
-                let mut h_ud = h_pi.dot(&u_d);
-                let w = row_weights[row];
-                if w != 1.0 {
-                    h_ud.mapv_inplace(|v| v * w);
-                    t_ud.mapv_inplace(|v| v * w);
+                        &slices,
+                        &q_geom,
+                        d_beta_flat,
+                    )?;
+                    let mut t_ud =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
+                    let mut h_ud = h_pi.dot(&u_d);
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        h_ud.mapv_inplace(|v| v * w);
+                        t_ud.mapv_inplace(|v| v * w);
+                    }
+                    state.add_pullback_with_q_geometry(self, row, &q_geom, &h_ud, &t_ud)?;
                 }
-                state.add_pullback_with_q_geometry(self, row, q_geom, &h_ud, &t_ud)?;
-                Ok(acc)
-            })
-            .try_reduce(make_acc_ws, |mut a, b| -> Result<_, String> {
+                Ok((state, q_geom))
+            },
+            |mut a, b| -> Result<_, String> {
                 a.0.add(&b.0);
                 Ok(a)
-            })?
-            .0;
+            },
+        )?
+        .unwrap_or_else(make_acc_ws)
+        .0;
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 
@@ -236,42 +241,48 @@ impl SurvivalMarginalSlopeFamily {
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
-        let acc = row_iter
-            .into_par_iter()
-            .try_fold(make_acc_ws, |mut acc, row| -> Result<_, String> {
-                let (state, q_geom) = &mut acc;
-                self.row_dynamic_q_geometry_into(row, block_states, q_geom)?;
-                let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
-                    row,
-                    block_states,
-                    &slices,
-                    q_geom,
-                    d_u,
-                )?;
-                let ue = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
-                    row,
-                    block_states,
-                    &slices,
-                    q_geom,
-                    d_v,
-                )?;
-                let mut q_de =
-                    self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
-                let t_d = self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
-                let mut gamma = t_d.dot(&ue);
-                let w = row_weights[row];
-                if w != 1.0 {
-                    gamma.mapv_inplace(|v| v * w);
-                    q_de.mapv_inplace(|v| v * w);
+        let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            row_iter.len(),
+            |range| -> Result<_, String> {
+                let (mut state, mut q_geom) = make_acc_ws();
+                for idx in range {
+                    let row = row_iter[idx];
+                    self.row_dynamic_q_geometry_into(row, block_states, &mut q_geom)?;
+                    let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        d_u,
+                    )?;
+                    let ue = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        d_v,
+                    )?;
+                    let mut q_de = self
+                        .row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
+                    let t_d =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                    let mut gamma = t_d.dot(&ue);
+                    let w = row_weights[row];
+                    if w != 1.0 {
+                        gamma.mapv_inplace(|v| v * w);
+                        q_de.mapv_inplace(|v| v * w);
+                    }
+                    state.add_pullback_with_q_geometry(self, row, &q_geom, &gamma, &q_de)?;
                 }
-                state.add_pullback_with_q_geometry(self, row, q_geom, &gamma, &q_de)?;
-                Ok(acc)
-            })
-            .try_reduce(make_acc_ws, |mut a, b| -> Result<_, String> {
+                Ok((state, q_geom))
+            },
+            |mut a, b| -> Result<_, String> {
                 a.0.add(&b.0);
                 Ok(a)
-            })?
-            .0;
+            },
+        )?
+        .unwrap_or_else(make_acc_ws)
+        .0;
         Ok(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>)
     }
 }

@@ -3475,7 +3475,6 @@ impl TransformationNormalFamily {
             hppsi_psi_factor_dir: vec![0.0; p_resp],
         };
 
-        use rayon::prelude::*;
         let process_row = |scratch: &mut Scratch, i: usize| {
             let Scratch {
                 out,
@@ -3755,14 +3754,18 @@ impl TransformationNormalFamily {
         // into its own Scratch (out + scratch buffers); we then reduce the
         // per-thread `out` matrices by summation. Only `out` needs reducing —
         // the other scratch fields are temporaries.
-        let mut out: Array2<f64> = (0..n)
-            .into_par_iter()
-            .fold(init_scratch, |mut scratch, i| {
-                process_row(&mut scratch, i);
-                scratch
-            })
-            .map(|s| s.out)
-            .reduce(|| Array2::<f64>::zeros((p_total, p_total)), |a, b| a + b);
+        let mut out: Array2<f64> = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut scratch = init_scratch();
+                for i in range {
+                    process_row(&mut scratch, i);
+                }
+                scratch.out
+            },
+            |a, b| a + b,
+        )
+        .unwrap_or_else(|| Array2::<f64>::zeros((p_total, p_total)));
 
         // In-place symmetrization: avoid allocating an extra `p_total × p_total`
         // f64 matrix for `&out + &out.t()`. Mathematically identical to
@@ -3969,14 +3972,13 @@ impl TransformationNormalFamily {
             }
         };
 
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
-        let accum = (0..n)
-            .into_par_iter()
-            .fold(
-                || PsiDhTraceAccum::new(p_resp, rank),
-                |mut acc, local_i| {
+        let accum = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range| {
+                let mut acc = PsiDhTraceAccum::new(p_resp, rank);
+                for local_i in range {
                     let i = row_start + local_i;
                     let cov_row = cov.row(local_i);
                     let psi_row = cov_psi.row(local_i);
@@ -4149,13 +4151,12 @@ impl TransformationNormalFamily {
                             );
                         acc.value += wi * value;
                     }
-                    acc
-                },
-            )
-            .reduce(
-                || PsiDhTraceAccum::new(p_resp, rank),
-                |left, right| left.merge(right),
-            );
+                }
+                acc
+            },
+            |left, right| left.merge(right),
+        )
+        .unwrap_or_else(|| PsiDhTraceAccum::new(p_resp, rank));
         Ok(accum.value)
     }
 }

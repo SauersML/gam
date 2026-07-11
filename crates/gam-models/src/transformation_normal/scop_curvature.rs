@@ -1417,18 +1417,19 @@ impl TransformationNormalFamily {
             let mut scratch = DhTraceScratch::new(p_resp);
             Ok((0..n).map(|i| row_trace(i, &mut scratch)).sum())
         } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            Ok((0..n)
-                .into_par_iter()
-                .fold(
-                    || (DhTraceScratch::new(p_resp), 0.0),
-                    |(mut scratch, mut sum), i| {
+            Ok(gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+                n,
+                |range| {
+                    let mut scratch = DhTraceScratch::new(p_resp);
+                    let mut sum = 0.0;
+                    for i in range {
                         sum += row_trace(i, &mut scratch);
-                        (scratch, sum)
-                    },
-                )
-                .map(|(_, sum)| sum)
-                .sum())
+                    }
+                    sum
+                },
+                |a, b| a + b,
+            )
+            .unwrap_or(0.0))
         }
     }
 

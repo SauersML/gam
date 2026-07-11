@@ -5243,8 +5243,6 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            use rayon::prelude::*;
-
             let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row hvp hill-climb] no CUDA runtime — skipping V100 perf gate"
@@ -5380,11 +5378,11 @@ mod tests {
             const CHUNK_ROWS: usize = 4096;
             let cpu_hvp_parallel = || -> Vec<f64> {
                 let nchunks = n.div_ceil(CHUNK_ROWS);
-                (0..nchunks)
-                    .into_par_iter()
-                    .fold(
-                        || vec![0.0_f64; p_total],
-                        |mut acc, ci| {
+                gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+                    nchunks,
+                    |ci_range| {
+                        let mut acc = vec![0.0_f64; p_total];
+                        for ci in ci_range {
                             let lo = ci * CHUNK_ROWS;
                             let hi = (lo + CHUNK_ROWS).min(n);
                             let m = hi - lo;
@@ -5400,18 +5398,17 @@ mod tests {
                             for (a, &p) in acc.iter_mut().zip(partial.iter()) {
                                 *a += p;
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || vec![0.0_f64; p_total],
-                        |mut a, b| {
-                            for (ax, bx) in a.iter_mut().zip(b.iter()) {
-                                *ax += *bx;
-                            }
-                            a
-                        },
-                    )
+                        }
+                        acc
+                    },
+                    |mut a, b| {
+                        for (ax, bx) in a.iter_mut().zip(b.iter()) {
+                            *ax += *bx;
+                        }
+                        a
+                    },
+                )
+                .unwrap_or_else(|| vec![0.0_f64; p_total])
             };
             // Warmup once to populate L3 / steady-state Rayon thread pool.
             let warm = cpu_hvp_parallel();
@@ -5456,8 +5453,6 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            use rayon::prelude::*;
-
             let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
                 eprintln!(
                     "[bms_flex_row dense_block hill-climb] no CUDA runtime — skipping V100 perf gate"
@@ -5601,14 +5596,14 @@ mod tests {
             let w_primary_start = primary.w.as_ref().map(|r| r.start).unwrap_or(0);
             let cpu_build_parallel = || -> Vec<f64> {
                 let nchunks = n.div_ceil(CHUNK_ROWS);
-                (0..nchunks)
-                    .into_par_iter()
-                    .fold(
-                        || vec![0.0_f64; p_total * p_total],
-                        |mut acc, ci| {
+                gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+                    nchunks,
+                    |ci_range| {
+                        let mut acc = vec![0.0_f64; p_total * p_total];
+                        let mut phi: Vec<Vec<f64>> = vec![vec![0.0_f64; p_total]; r];
+                        for ci in ci_range {
                             let lo = ci * CHUNK_ROWS;
                             let hi = (lo + CHUNK_ROWS).min(n);
-                            let mut phi: Vec<Vec<f64>> = vec![vec![0.0_f64; p_total]; r];
                             for row in lo..hi {
                                 for col in phi.iter_mut() {
                                     col.iter_mut().for_each(|v| *v = 0.0);
@@ -5647,18 +5642,17 @@ mod tests {
                                     }
                                 }
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || vec![0.0_f64; p_total * p_total],
-                        |mut a, b| {
-                            for (ax, bx) in a.iter_mut().zip(b.iter()) {
-                                *ax += *bx;
-                            }
-                            a
-                        },
-                    )
+                        }
+                        acc
+                    },
+                    |mut a, b| {
+                        for (ax, bx) in a.iter_mut().zip(b.iter()) {
+                            *ax += *bx;
+                        }
+                        a
+                    },
+                )
+                .unwrap_or_else(|| vec![0.0_f64; p_total * p_total])
             };
             let warm_cpu = cpu_build_parallel();
             assert_eq!(warm_cpu.len(), p_total * p_total);

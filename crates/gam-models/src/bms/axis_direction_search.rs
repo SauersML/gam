@@ -43,10 +43,13 @@ impl BernoulliMarginalSlopeFamily {
             )
         };
         let row_chunk = bms_row_chunk_size(n);
-        let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w) = (0..n
-            .div_ceil(row_chunk))
-            .into_par_iter()
-            .try_fold(make_acc, |mut acc, chunk_idx| -> Result<_, String> {
+        let n_row_chunks = n.div_ceil(row_chunk);
+        let (log_likelihood, grad_marginal, grad_logslope, grad_h, grad_w) =
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                n_row_chunks,
+                |chunk_range| -> Result<_, String> {
+                    let mut acc = make_acc();
+                    for chunk_idx in chunk_range {
                 let start = chunk_idx * row_chunk;
                 let end = (start + row_chunk).min(n);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
@@ -104,20 +107,23 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                 }
-                Ok(acc)
-            })
-            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
-                left.0 += right.0;
-                left.1 += &right.1;
-                left.2 += &right.2;
-                if let (Some(lhs), Some(rhs)) = (left.3.as_mut(), right.3.as_ref()) {
-                    *lhs += rhs;
-                }
-                if let (Some(lhs), Some(rhs)) = (left.4.as_mut(), right.4.as_ref()) {
-                    *lhs += rhs;
-                }
-                Ok(left)
-            })?;
+                    }
+                    Ok(acc)
+                },
+                |mut left, right| -> Result<_, String> {
+                    left.0 += right.0;
+                    left.1 += &right.1;
+                    left.2 += &right.2;
+                    if let (Some(lhs), Some(rhs)) = (left.3.as_mut(), right.3.as_ref()) {
+                        *lhs += rhs;
+                    }
+                    if let (Some(lhs), Some(rhs)) = (left.4.as_mut(), right.4.as_ref()) {
+                        *lhs += rhs;
+                    }
+                    Ok(left)
+                },
+            )?
+            .unwrap_or_else(make_acc);
 
         let mut gradient = Array1::<f64>::zeros(slices.total);
         gradient
@@ -182,11 +188,12 @@ impl BernoulliMarginalSlopeFamily {
         // ── Rigid closed-form: scalar kernel + design row ops ────────
         if !self.effective_flex_active(block_states)? {
             let row_chunk = bms_row_chunk_size(n);
-            let partial = (0..n.div_ceil(row_chunk))
-                .into_par_iter()
-                .try_fold(
-                    || Array1::<f64>::zeros(slices.total),
-                    |mut chunk_out, chunk_idx| -> Result<_, String> {
+            let n_row_chunks = n.div_ceil(row_chunk);
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    n_row_chunks,
+                    |chunk_range| -> Result<_, String> {
+                        let mut chunk_out = Array1::<f64>::zeros(slices.total);
+                        for chunk_idx in chunk_range {
                         let start = chunk_idx * row_chunk;
                         let end = (start + row_chunk).min(n);
                         // The β-direction sub-views for the two design blocks are
@@ -216,16 +223,15 @@ impl BernoulliMarginalSlopeFamily {
                                 self.logslope_design.axpy_row_into(row, a_g, &mut l)?;
                             }
                         }
+                        }
                         Ok(chunk_out)
                     },
-                )
-                .try_reduce(
-                    || Array1::<f64>::zeros(slices.total),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             *out += &partial;
             return Ok(());
         }
@@ -378,16 +384,13 @@ impl BernoulliMarginalSlopeFamily {
             // serial single-buffer accumulation, with each worker owning its
             // own action scratch.
             let row_chunk = bms_row_chunk_size(n);
-            let partial = (0..n.div_ceil(row_chunk))
-                .into_par_iter()
-                .try_fold(
-                    || {
-                        (
-                            Array1::<f64>::zeros(slices.total),
-                            Array1::<f64>::zeros(r_pr),
-                        )
-                    },
-                    |(mut chunk_out, mut action_scratch), chunk_idx| -> Result<_, String> {
+            let n_row_chunks = n.div_ceil(row_chunk);
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    n_row_chunks,
+                    |chunk_range| -> Result<_, String> {
+                        let mut chunk_out = Array1::<f64>::zeros(slices.total);
+                        let mut action_scratch = Array1::<f64>::zeros(r_pr);
+                        for chunk_idx in chunk_range {
                         let start = chunk_idx * row_chunk;
                         let end = (start + row_chunk).min(n);
                         for row in start..end {
@@ -404,17 +407,15 @@ impl BernoulliMarginalSlopeFamily {
                                 &mut chunk_out,
                             )?;
                         }
-                        Ok((chunk_out, action_scratch))
+                        }
+                        Ok(chunk_out)
                     },
-                )
-                .map(|res| res.map(|(chunk_out, _)| chunk_out))
-                .try_reduce(
-                    || Array1::<f64>::zeros(slices.total),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             *out += &partial;
             return Ok(());
         }
@@ -449,12 +450,12 @@ impl BernoulliMarginalSlopeFamily {
             // action scratch, so there is no per-call `v_rows` allocation on a
             // shared path and no serial bottleneck across the ~`n/tile_rows`
             // tiles.
-            let partial = tiles
-                .tiles
-                .par_iter()
-                .try_fold(
-                    || (Array1::<f64>::zeros(slices.total), Array1::<f64>::zeros(r_pr)),
-                    |(mut tile_out, mut row_dir_scratch), tile| -> Result<_, String> {
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    tiles.tiles.len(),
+                    |tile_range| -> Result<_, String> {
+                        let mut tile_out = Array1::<f64>::zeros(slices.total);
+                        let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                        for tile in &tiles.tiles[tile_range] {
                         let tile_rows = tile.rows.hess().nrows();
                         let mut v_rows = vec![0.0_f64; tile_rows * r_pr];
                         for local in 0..tile_rows {
@@ -519,33 +520,32 @@ impl BernoulliMarginalSlopeFamily {
                                 &mut tile_out,
                             )?;
                         }
-                        Ok((tile_out, row_dir_scratch))
+                        }
+                        Ok(tile_out)
                     },
-                )
-                .map(|res| res.map(|(tile_out, _)| tile_out))
-                .try_reduce(
-                    || Array1::<f64>::zeros(slices.total),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             *out += &partial;
             return Ok(());
         }
 
         let row_chunk = bms_row_chunk_size(n);
-        let partial = (0..n.div_ceil(row_chunk))
-            .into_par_iter()
-            .try_fold(
-                || Array1::<f64>::zeros(slices.total),
-                |mut chunk_out, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * row_chunk;
-                    let end = (start + row_chunk).min(n);
+        let n_row_chunks = n.div_ceil(row_chunk);
+        let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                n_row_chunks,
+                |chunk_range| -> Result<_, String> {
+                    let mut chunk_out = Array1::<f64>::zeros(slices.total);
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     // Per-thread scratch for row direction — allocated once per
                     // chunk thread rather than once per row.
                     let mut row_dir = Array1::<f64>::zeros(primary.total);
+                    for chunk_idx in chunk_range {
+                    let start = chunk_idx * row_chunk;
+                    let end = (start + row_chunk).min(n);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
                         self.row_primary_direction_from_flat_into(
@@ -583,16 +583,15 @@ impl BernoulliMarginalSlopeFamily {
                             &mut chunk_out,
                         )?;
                     }
+                    }
                     Ok(chunk_out)
                 },
-            )
-            .try_reduce(
-                || Array1::<f64>::zeros(slices.total),
                 |mut left, right| -> Result<_, String> {
                     left += &right;
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
         *out += &partial;
         Ok(())
     }
@@ -663,18 +662,13 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(());
             }
             let r_pr = primary.total;
-            let partial = tiles
-                .tiles
-                .par_iter()
-                .try_fold(
-                    || {
-                        (
-                            Array2::<f64>::zeros((total, n_rhs)),
-                            Array1::<f64>::zeros(total),
-                            Array1::<f64>::zeros(r_pr),
-                        )
-                    },
-                    |(mut tile_out, mut col_scratch, mut row_dir_scratch), tile| -> Result<_, String> {
+            let partial = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    tiles.tiles.len(),
+                    |tile_range| -> Result<_, String> {
+                        let mut tile_out = Array2::<f64>::zeros((total, n_rhs));
+                        let mut col_scratch = Array1::<f64>::zeros(total);
+                        let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+                        for tile in &tiles.tiles[tile_range] {
                         let tile_rows = tile.rows.hess().nrows();
                         let h_rows_slice = tile.rows.hess().as_slice().expect(
                             "tiled row_primary_hessians.hess() is row-major contiguous",
@@ -749,17 +743,15 @@ impl BernoulliMarginalSlopeFamily {
                                 )?;
                             }
                         }
-                        Ok((tile_out, col_scratch, row_dir_scratch))
+                        }
+                        Ok(tile_out)
                     },
-                )
-                .map(|res| res.map(|(tile_out, _, _)| tile_out))
-                .try_reduce(
-                    || Array2::<f64>::zeros((total, n_rhs)),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array2::<f64>::zeros((total, n_rhs)));
             *out += &partial;
             return Ok(());
         }
@@ -793,11 +785,12 @@ impl BernoulliMarginalSlopeFamily {
         // ── Rigid closed-form: no jets, no row contexts ──────────────
         if !self.effective_flex_active(block_states)? {
             let row_chunk = bms_row_chunk_size(n);
-            let diagonal = (0..n.div_ceil(row_chunk))
-                .into_par_iter()
-                .try_fold(
-                    || Array1::<f64>::zeros(slices.total),
-                    |mut chunk_diag, chunk_idx| -> Result<_, String> {
+            let n_row_chunks = n.div_ceil(row_chunk);
+            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    n_row_chunks,
+                    |chunk_range| -> Result<_, String> {
+                        let mut chunk_diag = Array1::<f64>::zeros(slices.total);
+                        for chunk_idx in chunk_range {
                         let start = chunk_idx * row_chunk;
                         let end = (start + row_chunk).min(n);
                         for row in start..end {
@@ -816,16 +809,15 @@ impl BernoulliMarginalSlopeFamily {
                                     .squared_axpy_row_into(row, h[1][1], &mut l)?;
                             }
                         }
+                        }
                         Ok(chunk_diag)
                     },
-                )
-                .try_reduce(
-                    || Array1::<f64>::zeros(slices.total),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             return Ok(diagonal);
         }
 

@@ -325,29 +325,31 @@ pub(crate) fn binomial_location_scale_ll_only(
     let et_slice = eta_t.as_slice().expect("eta_t must be contiguous");
     let el_slice = eta_ls.as_slice().expect("eta_ls must be contiguous");
     let ew_slice = etawiggle.map(|w| w.as_slice().expect("etawiggle must be contiguous"));
-    (0..n)
-        .into_par_iter()
-        .try_fold(
-            || 0.0_f64,
-            |acc, i| -> Result<f64, String> {
+    Ok(gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        n,
+        |range| -> Result<f64, String> {
+            let mut acc = 0.0_f64;
+            for i in range {
                 let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(el_slice[i]);
                 let q0 = binomial_location_scale_q0(et_slice[i], sigma);
                 let q = q0 + ew_slice.map_or(0.0, |w| w[i]);
                 if matches!(link_kind, InverseLink::Standard(StandardLink::Probit)) {
-                    return Ok(acc
-                        + binomial_location_scale_log_likelihood(
-                            y_slice[i], w_slice[i], q, link_kind, 0.5,
-                        )?);
+                    acc += binomial_location_scale_log_likelihood(
+                        y_slice[i], w_slice[i], q, link_kind, 0.5,
+                    )?;
+                    continue;
                 }
                 let jet = inverse_link_jet_for_inverse_link(link_kind, q)
                     .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
-                Ok(acc
-                    + binomial_location_scale_log_likelihood(
-                        y_slice[i], w_slice[i], q, link_kind, jet.mu,
-                    )?)
-            },
-        )
-        .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))
+                acc += binomial_location_scale_log_likelihood(
+                    y_slice[i], w_slice[i], q, link_kind, jet.mu,
+                )?;
+            }
+            Ok(acc)
+        },
+        |a, b| Ok(a + b),
+    )?
+    .unwrap_or(0.0))
 }
 
 pub(crate) fn binomial_location_scale_core(
@@ -430,32 +432,38 @@ pub(crate) fn binomial_location_scale_core(
     let d2mu_p = SendPtr(d2mu_dq2.as_mut_ptr());
     let d3mu_p = SendPtr(d3mu_dq3.as_mut_ptr());
 
-    let ll = (0..n)
-        .into_par_iter()
-        .map(move |i| {
-            let row = binomial_location_scalerow(
-                y_slice[i],
-                w_slice[i],
-                et_slice[i],
-                el_slice[i],
-                ew_slice.map_or(0.0, |w| w[i]),
-                link_kind,
-            )?;
-            // SAFETY: `i` comes from `0..n`, so it is in-bounds for each
-            // preallocated length-`n` buffer, and every index is produced once;
-            // each pointer targets a distinct output buffer.
-            unsafe {
-                sigma_p.write(i, row.sigma);
-                dsigma_p.write(i, row.dsigma_deta);
-                q0_p.write(i, row.q0);
-                mu_p.write(i, row.inverse_link.mu);
-                dmu_p.write(i, row.inverse_link.d1);
-                d2mu_p.write(i, row.inverse_link.d2);
-                d3mu_p.write(i, row.inverse_link.d3);
+    let ll = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+        n,
+        move |range| -> Result<f64, String> {
+            let mut acc = 0.0_f64;
+            for i in range {
+                let row = binomial_location_scalerow(
+                    y_slice[i],
+                    w_slice[i],
+                    et_slice[i],
+                    el_slice[i],
+                    ew_slice.map_or(0.0, |w| w[i]),
+                    link_kind,
+                )?;
+                // SAFETY: `i` comes from `0..n`, so it is in-bounds for each
+                // preallocated length-`n` buffer, and every index is produced once;
+                // each pointer targets a distinct output buffer.
+                unsafe {
+                    sigma_p.write(i, row.sigma);
+                    dsigma_p.write(i, row.dsigma_deta);
+                    q0_p.write(i, row.q0);
+                    mu_p.write(i, row.inverse_link.mu);
+                    dmu_p.write(i, row.inverse_link.d1);
+                    d2mu_p.write(i, row.inverse_link.d2);
+                    d3mu_p.write(i, row.inverse_link.d3);
+                }
+                acc += row.ll;
             }
-            Ok::<f64, String>(row.ll)
-        })
-        .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))?;
+            Ok(acc)
+        },
+        |a, b| Ok(a + b),
+    )?
+    .unwrap_or(0.0);
 
     Ok(BinomialLocationScaleCore {
         sigma: Array1::from_vec(sigma),
