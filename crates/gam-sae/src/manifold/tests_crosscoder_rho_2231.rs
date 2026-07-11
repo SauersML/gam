@@ -320,6 +320,16 @@ fn block_gradient_matches_central_difference_of_cost_2231() {
     let is_wall = |c: f64| !(c < 1.0e11);
     let mut checked = 0usize;
     for &ll in &[0.0_f64, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3] {
+        // Mirror the engine's real sequence: a search runs the ValueAndGradient
+        // lane at ρ only AFTER the Value lane (cost probe) has converged there
+        // and parked a ρ-keyed handoff (the two-stage basin/envelope path the
+        // cost lane owns but the raw gradient call does not). Warming with
+        // eval_cost at THIS ρ immediately before eval lets eval open at the
+        // converged optimum instead of re-tracing from a cold state.
+        let center_cost = obj.eval_cost(&flat_at(ll));
+        if !matches!(center_cost, Ok(c) if !is_wall(c)) {
+            continue;
+        }
         let eval = match obj.eval(&flat_at(ll)) {
             Ok(eval) if !is_wall(eval.cost) => eval,
             _ => continue,
