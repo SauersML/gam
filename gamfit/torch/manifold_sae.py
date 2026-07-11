@@ -1640,6 +1640,20 @@ class ManifoldSAE(nn.Module):
         self.atom_raw_anchor = nn.Parameter(torch.zeros(F, d, dtype=dt))
         self.decoder_blocks = nn.Parameter(torch.empty(F, K, D, dtype=dt))
 
+        # Exact linear model nested inside the curved decoder (#2261).  A PCA
+        # warm start writes one orthonormal right-singular direction into each
+        # atom's constant basis row and keeps every harmonic row at zero.  The
+        # signed multi-atom least-squares gate therefore starts at the centered
+        # rank-target_k PCA projection, while nonzero harmonic gradients remain
+        # free to add curvature.  Both buffers are persistent so checkpoint /
+        # resume cannot silently lose the centering convention.
+        self.register_buffer(
+            "_linear_mean", torch.zeros(D, dtype=dt), persistent=True
+        )
+        self.register_buffer(
+            "_pca_initialized", torch.zeros((), dtype=torch.bool), persistent=True
+        )
+
         # Training-step counter for the #1282 committed-assignment window.
         # Non-persistent: a reloaded module is in eval/inference, not training.
         self.register_buffer(
@@ -1774,6 +1788,84 @@ class ManifoldSAE(nn.Module):
         nn.init.normal_(self.atom_raw_anchor, mean=0.0, std=s)
         nn.init.normal_(self.decoder_blocks, mean=0.0, std=s)
         nn.init.zeros_(self.log_lambda)
+        self._linear_mean.zero_()
+        self._pca_initialized.zero_()
+
+    @torch.no_grad()
+    def initialize_from_pca(self, x: torch.Tensor) -> None:
+        """Initialize the curved dictionary at its exact linear/PCA submodel.
+
+        Rust computes the centered top-``n_atoms`` right-singular frame.  Atom
+        ``j`` receives principal direction ``j`` in its constant decoder row;
+        every nonlinear basis row is zero.  In the signed ``softmax_topk`` lane
+        (``target_k > 1``), the existing least-squares gate then reconstructs
+        exactly the rank-``n_atoms`` PCA projection before the first optimizer
+        step.  Gradient training may subsequently add harmonic curvature but no
+        longer has to rediscover the converged linear baseline.
+
+        Call this with the full training tensor before constructing the training
+        loop for an exact full-corpus seed.  If it is omitted, the first eligible
+        training forward initializes from that first batch.  Exact PCA nesting
+        requires ``target_k == n_atoms <= min(N, D)`` and the signed multi-atom
+        gate; invalid configurations fail explicitly instead of claiming a
+        weaker sparse-dictionary start is PCA-equivalent.
+        """
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("initialize_from_pca expects a torch.Tensor")
+        if x.dim() != 2 or x.shape[1] != self.cfg.input_dim:
+            raise ValueError(
+                f"initialize_from_pca expected (N, {self.cfg.input_dim}); "
+                f"got {tuple(x.shape)}"
+            )
+        if x.dtype != self.cfg.dtype:
+            raise TypeError(
+                f"initialize_from_pca configured for dtype {self.cfg.dtype}; "
+                f"got input dtype {x.dtype}"
+            )
+        if self._last_fit is not None:
+            raise RuntimeError(
+                "initialize_from_pca is only for the gradient-trained model, "
+                "not a completed closed-form fit"
+            )
+        if self.cfg.sparsity.kind != "softmax_topk":
+            raise ValueError(
+                "initialize_from_pca requires sparsity.kind='softmax_topk'"
+            )
+        target_k = self.cfg.sparsity.target_k
+        if target_k is None or int(target_k) != int(self.cfg.n_atoms):
+            raise ValueError(
+                "initialize_from_pca requires target_k == n_atoms so the signed "
+                "least-squares gate exactly nests the full PCA projection; got "
+                f"target_k={target_k}, n_atoms={self.cfg.n_atoms}"
+            )
+        n_atoms = int(self.cfg.n_atoms)
+        if n_atoms > min(int(x.shape[0]), int(x.shape[1])):
+            raise ValueError(
+                "initialize_from_pca requires n_atoms <= min(N, D); got "
+                f"n_atoms={n_atoms}, N={x.shape[0]}, D={x.shape[1]}"
+            )
+        if int(self._train_steps.item()) != 0:
+            raise RuntimeError(
+                "initialize_from_pca must run before the first gradient-training forward"
+            )
+
+        mean_np, basis_np = rust_module().sae_principal_subspace(
+            to_numpy_f64(x), n_atoms
+        )
+        mean = from_numpy_like(mean_np, x)
+        basis = from_numpy_like(basis_np, x)
+        if tuple(mean.shape) != (self.cfg.input_dim,) or tuple(basis.shape) != (
+            n_atoms,
+            self.cfg.input_dim,
+        ):
+            raise RuntimeError(
+                "Rust PCA warm start returned an invalid shape: "
+                f"mean={tuple(mean.shape)}, basis={tuple(basis.shape)}"
+            )
+        self._linear_mean.copy_(mean)
+        self.decoder_blocks.zero_()
+        self.decoder_blocks[:, 0, :].copy_(basis)
+        self._pca_initialized.fill_(True)
 
     @property
     def _forward_centers(self) -> torch.Tensor | None:
@@ -1837,7 +1929,26 @@ class ManifoldSAE(nn.Module):
             )
         if self._last_fit is not None:
             return self._forward_from_closed_form(x)
-        raw_positions, amp_logits = self._encode(x)
+
+        # The signed multi-atom lane has an exact linear submodel.  Seed it on
+        # the first training batch when the caller did not supply the preferred
+        # full-corpus seed explicitly.  Overcomplete and top-1 dictionaries do
+        # not have this exact orthogonal PCA nesting and keep their own declared
+        # initialization rather than being mislabeled as PCA-equivalent.
+        if (
+            self.training
+            and not bool(self._pca_initialized.item())
+            and int(self._train_steps.item()) == 0
+            and self.cfg.sparsity.kind == "softmax_topk"
+            and self.cfg.sparsity.target_k is not None
+            and int(self.cfg.sparsity.target_k) == int(self.cfg.n_atoms)
+            and int(self.cfg.n_atoms) <= min(int(x.shape[0]), int(x.shape[1]))
+        ):
+            self.initialize_from_pca(x)
+
+        pca_initialized = bool(self._pca_initialized.item())
+        model_x = x - self._linear_mean if pca_initialized else x
+        raw_positions, amp_logits = self._encode(model_x)
         raw_with_anchor = raw_positions + self.atom_raw_anchor.unsqueeze(0)
         positions = _project_to_manifold(
             raw_with_anchor, self.cfg.atom_manifold, self.cfg.intrinsic_rank
@@ -1861,7 +1972,7 @@ class ManifoldSAE(nn.Module):
         if self.cfg.sparsity.kind == "softmax_topk":
             gate_pre = amp_logits
             assignments = self.sparsity.reconstruction_topk_gate(
-                x, per_atom_recon, step=step
+                model_x, per_atom_recon, step=step
             )
             z = assignments
             # Honest pre-mask magnitude: the independent non-negative activation
@@ -1876,6 +1987,8 @@ class ManifoldSAE(nn.Module):
             z = assignments
             raw_magnitudes = z
         x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
+        if pca_initialized:
+            x_hat = x_hat + self._linear_mean
 
         reml_score = torch.tensor(float("nan"), dtype=x.dtype, device=x.device)
         lambdas = torch.exp(self.log_lambda).to(dtype=x.dtype, device=x.device)

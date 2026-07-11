@@ -1409,6 +1409,28 @@ fn sae_apply_anchor_rule<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
+/// Centered PCA frame used by the gradient-trained manifold SAE's exact linear
+/// warm start (#2261). Rust owns the SVD and returns `(mean, basis)`, with
+/// `basis` containing orthonormal rows in descending singular-value order.
+/// Python only copies those rows into the constant decoder coefficient of each
+/// curved atom; the existing signed least-squares top-k gate then reconstructs
+/// the rank-`n_atoms` PCA projection exactly at step zero.
+#[pyfunction]
+fn sae_principal_subspace<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    rank: usize,
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray2<f64>>)> {
+    let x_owned = x.as_array().to_owned();
+    let (mean, basis) = py
+        .detach(move || gam::terms::sae::manifold::fit_principal_subspace(x_owned.view(), rank))
+        .map_err(PyValueError::new_err)?;
+    Ok((
+        mean.into_pyarray(py).unbind(),
+        basis.into_pyarray(py).unbind(),
+    ))
+}
+
 /// Residual-PC matching-pursuit commitment one-hot for the early training window
 /// of the torch `softmax_topk` lane (issue #1282). Given `x (N, D)`, the per-atom
 /// reconstructions `per_atom_recon (N, F, D)`, and the current non-negative codes
@@ -5291,6 +5313,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_direction_cluster_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_principal_subspace, module)?)?;
     module.add_function(wrap_pyfunction!(sae_matching_pursuit_commit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_row_trust_scores, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
