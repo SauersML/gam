@@ -3753,7 +3753,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // and caused real descent steps to fail Wolfe at iteration zero
                 // on the frozen #2253 circle fit.
                 let drive = ProbeInnerDrive::LineSearchProbe;
-                let (cost, _beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
+                let (cost, beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
                 {
                     Ok(evaluated) => evaluated,
                     // A recoverable non-PD/non-converged probe has undefined
@@ -3781,7 +3781,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     cost,
                     gradient: Array1::zeros(rho.len()),
                     hessian: HessianValue::Unavailable,
-                    inner_beta_hint: None,
+                    inner_beta_hint: Some(beta_hat),
                 })
             }
             OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
@@ -3983,6 +3983,91 @@ impl OuterObjective for SaeManifoldOuterObjective {
         if restoring_target {
             self.probe_telemetry.reactive_target_restores += 1;
         }
+        Ok(())
+    }
+
+    fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        if self.reactive_waypoint_checkpoint.is_some() {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "reactive coupled waypoint began while another waypoint transaction was active"
+                    .to_string(),
+            ));
+        }
+        let bundle_capacity = self.basin_bundle.member_capacity();
+        let basin_bundle = std::mem::replace(
+            &mut self.basin_bundle,
+            BasinBundle::new(bundle_capacity),
+        );
+        let registry_isometry_weights = self
+            .registry
+            .as_ref()
+            .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
+            .unwrap_or_default();
+        self.reactive_waypoint_checkpoint = Some(ReactiveWaypointCheckpoint {
+            term: self.term.clone(),
+            target: self.target.clone(),
+            registry_isometry_weights,
+            current_rho: self.current_rho.clone(),
+            last_loss: self.last_loss.clone(),
+            seeded_beta: self.seeded_beta.clone(),
+            probe_converged_handoff: self.probe_converged_handoff.take(),
+            basin_bundle,
+            termination: self.termination.clone(),
+            fit_verdict: self.fit_verdict,
+            crosscoder_blocks: self.crosscoder_blocks.clone(),
+        });
+        Ok(())
+    }
+
+    fn commit_reactive_domain_waypoint(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        if self.reactive_waypoint_checkpoint.is_none() {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "reactive coupled waypoint commit had no active transaction".to_string(),
+            ));
+        }
+        let converged_term = self
+            .take_probe_converged_handoff(rho.view())
+            .ok_or_else(|| {
+                EstimationError::RemlOptimizationFailed(
+                    "reactive coupled waypoint produced no exact-rho converged full-state handoff"
+                        .to_string(),
+                )
+            })?;
+        let rho_state = self.baseline_rho.from_flat(rho.view());
+        let loss = converged_term
+            .loss(self.target.view(), &rho_state)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        self.term = converged_term;
+        self.current_rho = rho_state;
+        self.last_loss = Some(loss);
+        self.seeded_beta = None;
+        self.fit_verdict = None;
+        self.reactive_waypoint_checkpoint = None;
+        Ok(())
+    }
+
+    fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        let checkpoint = self.reactive_waypoint_checkpoint.take().ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(
+                "reactive coupled waypoint rollback had no active transaction".to_string(),
+            )
+        })?;
+        self.term = checkpoint.term;
+        self.target = checkpoint.target;
+        if let Some(registry) = self.registry.as_mut() {
+            registry.set_isometry_scalar_weights(&checkpoint.registry_isometry_weights);
+        }
+        self.current_rho = checkpoint.current_rho;
+        self.last_loss = checkpoint.last_loss;
+        self.seeded_beta = checkpoint.seeded_beta;
+        self.probe_converged_handoff = checkpoint.probe_converged_handoff;
+        self.basin_bundle = checkpoint.basin_bundle;
+        self.termination = checkpoint.termination;
+        self.fit_verdict = checkpoint.fit_verdict;
+        self.crosscoder_blocks = checkpoint.crosscoder_blocks;
         Ok(())
     }
 }

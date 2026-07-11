@@ -267,6 +267,41 @@ pub trait OuterObjective {
         )))
     }
 
+    /// Snapshot the objective's complete accepted inner state before a reactive
+    /// coupled waypoint is installed. Contract-advertising objectives must make
+    /// this transactional: a failed trial is restored by
+    /// [`Self::rollback_reactive_domain_waypoint`].
+    fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(
+            "objective supplied a reactive-domain scalar contract but cannot checkpoint a waypoint"
+                .to_string(),
+        ))
+    }
+
+    /// Commit the converged full inner state produced by the value evaluation
+    /// at `rho`. A coefficient-only handoff is insufficient: latent coordinates,
+    /// routing logits, decoder frames, loss, and scalar state must advance as one
+    /// accepted waypoint.
+    fn commit_reactive_domain_waypoint(
+        &mut self,
+        _rho: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(
+            "objective supplied a reactive-domain scalar contract but cannot commit a waypoint"
+                .to_string(),
+        ))
+    }
+
+    /// Restore the full accepted state saved by
+    /// [`Self::begin_reactive_domain_waypoint`] after an errored or non-finite
+    /// trial.
+    fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(
+            "objective supplied a reactive-domain scalar contract but cannot roll back a waypoint"
+                .to_string(),
+        ))
+    }
+
     /// Run the objective's certified curvature-homotopy entry leg, if it has
     /// one, leaving the inner state warm at the real (`η = 1`) objective.
     ///
@@ -716,6 +751,21 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         state: &crate::continuation_path::ContinuationScalarState,
     ) -> Result<(), EstimationError> {
         self.inner.install_reactive_domain_scalar_state(state)
+    }
+
+    fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.inner.begin_reactive_domain_waypoint()
+    }
+
+    fn commit_reactive_domain_waypoint(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        self.inner.commit_reactive_domain_waypoint(rho)
+    }
+
+    fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.inner.rollback_reactive_domain_waypoint()
     }
 
     fn reset(&mut self) {
@@ -1275,6 +1325,22 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         state: &crate::continuation_path::ContinuationScalarState,
     ) -> Result<(), EstimationError> {
         self.inner.install_reactive_domain_scalar_state(state)
+    }
+
+    fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.inner.begin_reactive_domain_waypoint()
+    }
+
+    fn commit_reactive_domain_waypoint(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        self.inner
+            .commit_reactive_domain_waypoint(&self.to_native(rho))
+    }
+
+    fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.inner.rollback_reactive_domain_waypoint()
     }
 
     fn accept_seed_without_outer_iterations(

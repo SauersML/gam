@@ -1,28 +1,19 @@
-//! Object 1 — the `ContinuationPath`: one object that couples the three
-//! annealing schedules that today live separately and uncoupled, so a K≥2 SAE
-//! joint fit always arrives via a regime where the inner problem is a
-//! contraction — never solved cold.
+//! Reactive three-leg continuation for a non-finite K≥2 SAE outer seed.
 //!
 //! # The three schedules, coupled along one scalar path parameter `s`
 //!
-//! Three homotopy legs presently advance on their own clocks:
+//! One objective evaluation installs and solves all three homotopy legs at the
+//! same `s`:
 //!
-//! 1. **ρ-anneal** — heavy oversmoothing penalty ρ₀ ≫ ρ\* down to the target
-//!    ρ\*. Owned by the spine
-//!    [`crate::estimate::reml::continuation::fit_with_continuation`]
-//!    (the callable ρ-anneal primitive, promoted from a private warm-start
-//!    helper). At large ρ the penalized Hessian dominates the likelihood
-//!    Hessian, so the inner P-IRLS / arrow-Schur solve is strongly convex —
-//!    a contraction.
+//! 1. **log-ρ** — the objective's legal upper-box endpoint down to its literal
+//!    target. At large penalty strength the penalized Hessian dominates the
+//!    likelihood Hessian.
 //! 2. **Assignment temperature τ** — diffuse softmax / IBP relaxation (high τ)
-//!    sharpened toward the near-discrete MAP active set (low τ). Owned by
-//!    `gam_sae::manifold::GumbelTemperatureSchedule`. High τ makes
-//!    the assignment map smooth and far from the combinatorial argmax cliff.
-//! 3. **Isometry weight** — loose analytic isometry gauge (small w) ramped to
-//!    the tight target weight. Owned by
-//!    [`gam_terms::analytic_penalties::ScalarWeightSchedule`] on
-//!    [`gam_terms::analytic_penalties::IsometryPenalty`]. A loose gauge
-//!    leaves the decoder free to find a good fit before the gauge pins it.
+//!    sharpened toward the objective's literal target. High τ makes the
+//!    assignment map smooth and far from the combinatorial argmax cliff.
+//! 3. **Isometry weights** — zero entry weights ramped to the objective's
+//!    literal per-penalty vector. A loose gauge leaves the decoder free to find
+//!    a good fit before the gauge pins it.
 //!
 //! [`ContinuationPath`] advances all three **in lockstep** along a single
 //! scalar path parameter `s ∈ [1 → 0]`. `s = 1` is the *entry regime*: large
@@ -84,8 +75,8 @@ use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
 /// The endpoints of one coupled annealing leg, in path-parameter terms.
 /// `at_entry` is the value at `s = 1` (heavy-smoothing regime); `at_target`
 /// is the value at `s = 0` (real objective). Interpolation is in the leg's
-/// own natural geometry (log-space for ρ and τ, linear-in-weight for the
-/// isometry gauge, matching each schedule's `current_*` law).
+/// coordinate: ρ is already stored as log-precision, while temperature and
+/// isometry weights are literal objective scalars.
 #[derive(Debug, Clone, Copy)]
 pub struct LegEndpoints {
     /// Value at `s = 1`: the smoothing-extreme entry regime.
@@ -106,9 +97,8 @@ impl LegEndpoints {
 
     /// Linear interpolation in the leg's natural coordinate at path parameter
     /// `s ∈ [0, 1]`: `s = 1 → at_entry`, `s = 0 → at_target`. The caller passes
-    /// values already in the leg's natural geometry (e.g. log τ, log λ), so a
-    /// plain convex blend is the right law and matches the schedules'
-    /// `current_*` interpolation.
+    /// values in the coordinate the objective consumes, so a convex blend is
+    /// also the literal waypoint value installed or evaluated.
     #[must_use]
     pub fn at(&self, s: f64) -> f64 {
         let s = s.clamp(0.0, 1.0);
@@ -221,16 +211,12 @@ impl ContinuationScalarContract {
     }
 }
 
-/// The coupled schedule state that [`ContinuationPath`] owns. Each leg is the
-/// concrete schedule object the rest of the codebase already advances; the
-/// path holds them so they can only ever move together.
+/// Endpoint state that [`ContinuationPath`] owns. It computes every leg from
+/// the same `s`; there are no independently advancing schedule objects.
 #[derive(Debug, Clone)]
 pub struct CoupledSchedules {
-    /// ρ-anneal endpoints, **per-component** in ρ-space (one entry per
-    /// smoothing parameter). The entry vector is the oversmoothed ρ₀; the
-    /// target is ρ\*. The actual descent is executed by the ρ-anneal spine
-    /// ([`fit_with_continuation`]); these endpoints fix where `s` places the
-    /// spine's `target` waypoint along the coupled walk.
+    /// Log-ρ endpoints, **per-component** (one entry per outer coordinate).
+    /// Entry is the objective's legal upper box and target is literal ρ\*.
     pub rho_entry: Array1<f64>,
     /// ρ\* — the real-objective smoothing vector at `s = 0`.
     pub rho_target: Array1<f64>,
@@ -240,17 +226,14 @@ pub struct CoupledSchedules {
 
 impl CoupledSchedules {
     /// The coupled lockstep target value of every scalar leg at path parameter
-    /// `s`. ρ is a vector and rides the spine, so it is not returned here; the
-    /// two scalar legs (τ, isometry weight) are.
+    /// `s`. ρ is a vector and is returned by [`Self::rho_target_at`].
     #[must_use]
     pub fn scalar_targets_at(&self, s: f64) -> ContinuationScalarState {
         self.scalars.at(s)
     }
 
-    /// The ρ target the spine should anneal toward at path parameter `s`:
-    /// a convex blend (per component) of the oversmoothed entry ρ₀ and ρ\*.
-    /// At `s = 1` this is ρ₀ itself (so the spine's own oversmoothing offset
-    /// stacks the path into the deepest contraction); at `s = 0` it is ρ\*.
+    /// Exact log-ρ waypoint at path parameter `s`: a convex blend per
+    /// component from the legal upper-box entry to literal ρ\*.
     #[must_use]
     pub fn rho_target_at(&self, s: f64) -> Array1<f64> {
         assert_eq!(
@@ -731,12 +714,11 @@ impl ContinuationPath {
     /// Take one waypoint step down the coupled homotopy.
     ///
     /// 1. Lower `s` by the current step toward `0`.
-    /// 2. Advance the τ and isometry schedules to the new waypoint (lockstep).
-    /// 3. Run the ρ-anneal **spine** ([`fit_with_continuation`]) toward the new
-    ///    `s`'s ρ target, with the inner β carried warm.
-    /// 4. On spine success: [`ContinuationStep::Descended`] (or
+    /// 2. Install the exact scalar state and evaluate the exact log-ρ waypoint,
+    ///    with the last accepted inner β carried warm.
+    /// 3. On evaluation success: [`ContinuationStep::Descended`] (or
     ///    [`ContinuationStep::Arrived`] if `s` reached `0`).
-    /// 5. On spine struggle: retain the last successful waypoint and halve the
+    /// 4. On error or non-finite evidence: retain the last successful waypoint and halve the
     ///    attempted distance. If no strictly smaller representable waypoint
     ///    remains, return a typed non-convergence error.
     ///
@@ -760,11 +742,26 @@ impl ContinuationPath {
             (self.s - self.s_step).max(0.0)
         };
 
+        // Snapshot the complete accepted objective state before installing a
+        // trial. A coefficient hint alone cannot restore latent coordinates,
+        // routing logits, or decoder frames after a failed inner solve.
+        obj.begin_reactive_domain_waypoint()?;
+
         // Install the objective-owned scalar state before evaluating rho. This
         // is the actual coupling seam: mutating private schedule copies would
         // leave the evaluated objective unchanged.
         let scalar_state = self.schedules.scalar_targets_at(s_next);
-        obj.install_reactive_domain_scalar_state(&scalar_state)?;
+        if let Err(install_error) = obj.install_reactive_domain_scalar_state(&scalar_state) {
+            return match obj.rollback_reactive_domain_waypoint() {
+                Ok(()) => Err(install_error),
+                Err(rollback_error) => Err(
+                    gam_problem::EstimationError::RemlOptimizationFailed(format!(
+                        "reactive coupled waypoint installation failed ({install_error}); \
+                         full-state rollback also failed ({rollback_error})"
+                    )),
+                ),
+            };
+        }
         self.logit_tr = LogitTrustRegion::for_tau(scalar_state.assignment_temperature);
 
         // One path attempt is exactly one objective evaluation at the shared
@@ -802,6 +799,17 @@ impl ContinuationPath {
 
         Ok(match evaluation {
             Ok(eval) => {
+                if let Err(commit_error) = obj.commit_reactive_domain_waypoint(&rho_waypoint) {
+                    return match obj.rollback_reactive_domain_waypoint() {
+                        Ok(()) => Err(commit_error),
+                        Err(rollback_error) => Err(
+                            gam_problem::EstimationError::RemlOptimizationFailed(format!(
+                                "reactive coupled waypoint commit failed ({commit_error}); \
+                                 full-state rollback also failed ({rollback_error})"
+                            )),
+                        ),
+                    };
+                }
                 let state = ContinuationState {
                     last_rho: rho_waypoint,
                     last_eval: eval,
@@ -827,6 +835,13 @@ impl ContinuationPath {
                 }
             }
             Err(failure) => {
+                obj.rollback_reactive_domain_waypoint().map_err(|rollback_error| {
+                    gam_problem::EstimationError::RemlOptimizationFailed(format!(
+                        "reactive coupled waypoint failed ({}), and full-state rollback failed \
+                         ({rollback_error})",
+                        failure.message()
+                    ))
+                })?;
                 if entering {
                     return Err(gam_problem::EstimationError::RemlOptimizationFailed(
                         format!(
@@ -1123,8 +1138,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingObjective {
         orders: Vec<OuterEvalOrder>,
+        rho_evaluated: Vec<Array1<f64>>,
         seed_count: usize,
         installed: Vec<ContinuationScalarState>,
+        waypoint_transaction_active: bool,
     }
 
     impl OuterObjective for RecordingObjective {
@@ -1166,6 +1183,7 @@ mod tests {
             order: OuterEvalOrder,
         ) -> Result<gam_problem::OuterEval, crate::model_types::EstimationError> {
             self.orders.push(order);
+            self.rho_evaluated.push(rho.clone());
             let mut eval = self.eval(rho)?;
             if matches!(order, OuterEvalOrder::Value) {
                 eval.gradient = Array1::zeros(0);
@@ -1199,6 +1217,31 @@ mod tests {
             self.installed.push(state.clone());
             Ok(())
         }
+
+        fn begin_reactive_domain_waypoint(
+            &mut self,
+        ) -> Result<(), crate::model_types::EstimationError> {
+            assert!(!self.waypoint_transaction_active);
+            self.waypoint_transaction_active = true;
+            Ok(())
+        }
+
+        fn commit_reactive_domain_waypoint(
+            &mut self,
+            _: &Array1<f64>,
+        ) -> Result<(), crate::model_types::EstimationError> {
+            assert!(self.waypoint_transaction_active);
+            self.waypoint_transaction_active = false;
+            Ok(())
+        }
+
+        fn rollback_reactive_domain_waypoint(
+            &mut self,
+        ) -> Result<(), crate::model_types::EstimationError> {
+            assert!(self.waypoint_transaction_active);
+            self.waypoint_transaction_active = false;
+            Ok(())
+        }
     }
 
     #[test]
@@ -1220,6 +1263,7 @@ mod tests {
                 .expect("entry installation")
                 .bitwise_eq(scalar_contract().entry())
         );
+        assert_eq!(obj.rho_evaluated.first(), Some(&Array1::from_vec(vec![5.0, 5.0])));
         assert!(
             !obj.orders.is_empty(),
             "the coupled path should evaluate at least one rho waypoint"
@@ -1267,5 +1311,6 @@ mod tests {
                 .expect("target installation")
                 .bitwise_eq(scalar_contract().target())
         );
+        assert_eq!(obj.rho_evaluated.last(), Some(&Array1::zeros(2)));
     }
 }
