@@ -15,6 +15,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_xt_diag_x, fast_xt_diag_y};
 use gam_linalg::matrix::{DesignMatrix, LinearOperator};
+use gam_linalg::utils::KahanSum;
 // `DeclaredHessianForm`/`Derivative` originate in `gam_problem` and are only
 // re-exported privately inside `gam_solve::rho_optimizer`; import them from the
 // canonical source, matching every other `gam-models` outer-objective site.
@@ -121,7 +122,7 @@ pub struct SharedTangentRemlFit {
     pub coefficients: Array2<f64>,
     /// Training fitted tangent vectors (`N x D`).
     pub fitted: Array2<f64>,
-    /// Pooled profiled REML dispersion `Q / nu`.
+    /// Pooled residual dispersion `Q / (N·D - edf_total)`.
     pub sigma2: f64,
     /// Smoothing parameters in the request penalty order.  A numerically
     /// rank-zero penalty has no estimable smoothing coordinate and is `0`.
@@ -404,17 +405,19 @@ enum SufficientStatistics {
     Isotropic {
         gram: Array2<f64>,
         cross: Array2<f64>,
-        response_quadratic: f64,
     },
     Fisher {
         gram: Array2<f64>,
         cross: Array1<f64>,
-        response_quadratic: f64,
     },
 }
 
 #[derive(Clone, Debug)]
 struct PreparedSharedTangent {
+    design: DesignMatrix,
+    response: Array2<f64>,
+    weights: Array1<f64>,
+    fisher_metric: Option<Array3<f64>>,
     n_observations: usize,
     n_coefficients: usize,
     n_outputs: usize,
@@ -446,14 +449,16 @@ struct PenaltySpectrum {
 pub fn fit_shared_tangent_reml(
     request: SharedTangentRemlRequest,
 ) -> Result<SharedTangentRemlFit, EstimationError> {
-    let prepared = PreparedSharedTangent::from_request(&request)?;
+    let requested_penalty_count = request.penalties.len();
+    let initial_log_lambdas = request.initial_log_lambdas.clone();
+    let prepared = PreparedSharedTangent::from_request(request)?;
     let n_outer = prepared.penalties.len();
-    if let Some(initial) = request.initial_log_lambdas.as_ref() {
-        if initial.len() != request.penalties.len() {
+    if let Some(initial) = initial_log_lambdas.as_ref() {
+        if initial.len() != requested_penalty_count {
             return Err(invalid(format!(
                 "initial_log_lambdas has length {}, expected {}",
                 initial.len(),
-                request.penalties.len()
+                requested_penalty_count
             )));
         }
         if initial.iter().any(|value| !value.is_finite()) {
@@ -492,7 +497,7 @@ pub fn fit_shared_tangent_reml(
                     .ok_or_else(|| invalid("effective observation count overflow"))?
                     as f64,
             ));
-        if let Some(initial) = request.initial_log_lambdas.as_ref() {
+        if let Some(initial) = initial_log_lambdas.as_ref() {
             problem = problem.with_initial_rho(Array1::from_iter(
                 prepared
                     .penalties
@@ -527,7 +532,7 @@ pub fn fit_shared_tangent_reml(
     };
 
     let evaluation = prepared.evaluate(&rho)?;
-    let fitted = predict_from_coefficients(&request.design, &evaluation.coefficients)?;
+    let fitted = predict_from_coefficients(&prepared.design, &evaluation.coefficients)?;
     let mut lambdas = Array1::<f64>::zeros(prepared.output_penalty_slots);
     let mut edf_by_penalty = Array1::<f64>::zeros(prepared.output_penalty_slots);
     for (active_index, penalty) in prepared.penalties.iter().enumerate() {
@@ -548,11 +553,21 @@ pub fn fit_shared_tangent_reml(
         total_coefficients,
         "total effective degrees of freedom",
     )?;
+    let effective_joint_rows = prepared
+        .effective_observations
+        .checked_mul(prepared.n_outputs)
+        .ok_or_else(|| invalid("effective joint row count overflow"))? as f64;
+    let residual_df = effective_joint_rows - edf_total;
+    if !(residual_df.is_finite() && residual_df > 0.0) {
+        return Err(invalid(format!(
+            "residual scale requires positive n*D-edf; got {effective_joint_rows} - {edf_total} = {residual_df}"
+        )));
+    }
 
     Ok(SharedTangentRemlFit {
         coefficients: evaluation.coefficients,
         fitted,
-        sigma2: evaluation.profiled_deviance / evaluation.residual_degrees_of_freedom,
+        sigma2: evaluation.profiled_deviance / residual_df,
         lambdas,
         edf_by_penalty,
         edf_total,
@@ -613,10 +628,18 @@ impl OuterObjective for SharedTangentObjective<'_> {
 }
 
 impl PreparedSharedTangent {
-    fn from_request(request: &SharedTangentRemlRequest) -> Result<Self, EstimationError> {
-        let n = request.design.nrows();
-        let k = request.design.ncols();
-        let (response_rows, d) = request.response.dim();
+    fn from_request(request: SharedTangentRemlRequest) -> Result<Self, EstimationError> {
+        let SharedTangentRemlRequest {
+            design,
+            response,
+            weights,
+            fisher_metric,
+            penalties: requested_penalties,
+            initial_log_lambdas: _,
+        } = request;
+        let n = design.nrows();
+        let k = design.ncols();
+        let (response_rows, d) = response.dim();
         if n == 0 || k == 0 || d == 0 {
             return Err(invalid(format!(
                 "shared-tangent REML requires non-empty dimensions; got N={n}, K={k}, D={d}"
@@ -627,29 +650,28 @@ impl PreparedSharedTangent {
                 "response rows {response_rows} do not match design rows {n}"
             )));
         }
-        if request.weights.len() != n {
+        if weights.len() != n {
             return Err(invalid(format!(
                 "weight length {} does not match design rows {n}",
-                request.weights.len()
+                weights.len()
             )));
         }
-        if request.response.iter().any(|value| !value.is_finite()) {
+        if response.iter().any(|value| !value.is_finite()) {
             return Err(invalid("response must contain only finite values"));
         }
-        if request
-            .weights
+        if weights
             .iter()
             .any(|value| !value.is_finite() || *value < 0.0)
         {
             return Err(invalid("weights must be finite and non-negative"));
         }
-        let effective_observations = request.weights.iter().filter(|value| **value > 0.0).count();
+        let effective_observations = weights.iter().filter(|value| **value > 0.0).count();
         if effective_observations == 0 {
             return Err(invalid(
                 "at least one observation must have positive weight",
             ));
         }
-        if let Some(metric) = request.fisher_metric.as_ref()
+        if let Some(metric) = fisher_metric.as_ref()
             && metric.dim() != (n, d, d)
         {
             return Err(invalid(format!(
@@ -658,21 +680,18 @@ impl PreparedSharedTangent {
             )));
         }
 
-        let penalties = prepare_penalties(&request.penalties, k)?;
-        let output_penalty_slots = request.penalties.len();
-        let statistics = match request.fisher_metric.as_ref() {
-            None => {
-                assemble_isotropic_statistics(&request.design, &request.response, &request.weights)?
-            }
-            Some(metric) => assemble_fisher_statistics(
-                &request.design,
-                &request.response,
-                &request.weights,
-                metric,
-            )?,
+        let penalties = prepare_penalties(&requested_penalties, k)?;
+        let output_penalty_slots = requested_penalties.len();
+        let statistics = match fisher_metric.as_ref() {
+            None => assemble_isotropic_statistics(&design, &response, &weights)?,
+            Some(metric) => assemble_fisher_statistics(&design, &response, &weights, metric)?,
         };
 
         Ok(Self {
+            design,
+            response,
+            weights,
+            fisher_metric,
             n_observations: n,
             n_coefficients: k,
             n_outputs: d,
@@ -695,16 +714,12 @@ impl PreparedSharedTangent {
             return Err(invalid("log-lambdas must be finite"));
         }
         match &self.statistics {
-            SufficientStatistics::Isotropic {
-                gram,
-                cross,
-                response_quadratic,
-            } => self.evaluate_isotropic(rho, gram, cross, *response_quadratic),
-            SufficientStatistics::Fisher {
-                gram,
-                cross,
-                response_quadratic,
-            } => self.evaluate_fisher(rho, gram, cross, *response_quadratic),
+            SufficientStatistics::Isotropic { gram, cross } => {
+                self.evaluate_isotropic(rho, gram, cross)
+            }
+            SufficientStatistics::Fisher { gram, cross } => {
+                self.evaluate_fisher(rho, gram, cross)
+            }
         }
     }
 
@@ -713,7 +728,6 @@ impl PreparedSharedTangent {
         rho: &Array1<f64>,
         gram: &Array2<f64>,
         cross: &Array2<f64>,
-        response_quadratic: f64,
     ) -> Result<Evaluation, EstimationError> {
         let d = self.n_outputs;
         let (penalty, lambdas) = self.combined_penalty(rho)?;
@@ -722,7 +736,7 @@ impl PreparedSharedTangent {
         penalized += &penalty;
         let (inverse, log_determinant) = spd_inverse_and_logdet(&penalized)?;
         let coefficients = inverse.dot(cross);
-        let profiled_deviance = response_quadratic - sum_products(cross, &coefficients);
+        let profiled_deviance = self.profiled_deviance(&coefficients)?;
         let residual_degrees_of_freedom = self.residual_degrees_of_freedom(spectrum.rank)?;
         validate_profiled_deviance(profiled_deviance)?;
 
@@ -797,7 +811,6 @@ impl PreparedSharedTangent {
         rho: &Array1<f64>,
         gram: &Array2<f64>,
         cross: &Array1<f64>,
-        response_quadratic: f64,
     ) -> Result<Evaluation, EstimationError> {
         let k = self.n_coefficients;
         let d = self.n_outputs;
@@ -810,9 +823,7 @@ impl PreparedSharedTangent {
         add_base_penalty_to_joint(&mut penalized, &penalty, d);
         let (inverse, log_determinant) = spd_inverse_and_logdet(&penalized)?;
         let beta = inverse.dot(cross);
-        let profiled_deviance = response_quadratic - cross.dot(&beta);
         let residual_degrees_of_freedom = self.residual_degrees_of_freedom(spectrum.rank)?;
-        validate_profiled_deviance(profiled_deviance)?;
 
         let m = self.penalties.len();
         let mut penalty_traces = Array1::<f64>::zeros(m);
@@ -866,6 +877,8 @@ impl PreparedSharedTangent {
                 coefficients[[basis, output]] = beta[basis * d + output];
             }
         }
+        let profiled_deviance = self.profiled_deviance(&coefficients)?;
+        validate_profiled_deviance(profiled_deviance)?;
         let cost = 0.5
             * (log_determinant - d as f64 * spectrum.log_pseudo_determinant
                 + residual_degrees_of_freedom
