@@ -14,6 +14,7 @@ pub mod chart_transfer;
 pub mod coactivation_conditionality;
 pub mod corpus;
 pub mod criterion_atoms;
+pub mod criterion_atoms_gpu;
 pub mod description_length;
 pub mod dictionary_artifact;
 pub mod dual_certificate;

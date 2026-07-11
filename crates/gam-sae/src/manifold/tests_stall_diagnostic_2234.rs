@@ -14,9 +14,12 @@
 use super::*;
 
 fn planted_circle_cloud() -> (Array2<f64>, usize) {
-    // Mirrors the failing Python probe: n=200, p=8, rank-2 circle + 1e-2 noise.
-    let n = 200usize;
-    let p = 8usize;
+    // Mirrors the frozen #2253 weekday-L17 discriminator after its exact
+    // orthonormal reduction: K=1, d_atom=1, n=42, p=48. The prior n=200,
+    // p=8, d_atom=3 fixture did not enter the single-circle log-det seam whose
+    // analytic smoothing derivative is under audit.
+    let n = 42usize;
+    let p = 48usize;
     let mut state = 0x2468_ace0_1357_9bdfu64;
     let mut unit = move || {
         // LCG → [0,1); NO rand, NO clock (repo #932 rules).
@@ -48,14 +51,14 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
         target: z.view(),
         atom_basis: vec!["periodic".to_string()],
-        atom_dim: vec![3],
+        atom_dim: vec![1],
         assignment_kind: SaeFitAssignmentKind::Softmax,
         alpha: 1.0,
         tau: 1.0,
         threshold: 0.0,
         top_k: None,
         ibp_alpha_override: None,
-        random_state: 7,
+        random_state: 45,
         initial_logits: None,
         initial_coords: None,
     })
@@ -79,7 +82,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         assignment_kind: SaeFitAssignmentKind::Softmax,
         sparsity_strength: 1.0,
         smoothness: 1.0,
-        max_iter: 60,
+        max_iter: 40,
         learning_rate: 0.05,
         ridge_ext_coord: 1.0e-6,
         ridge_beta: 1.0e-6,
@@ -87,7 +90,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         threshold: 0.0,
         native_ard_enabled: true,
         seed_refine_routing: minimal.refine_routing,
-        seed_refine_random_state: 7,
+        seed_refine_random_state: 45,
         data_row_reseed: false,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
@@ -104,7 +107,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         z.clone(),
         Some(registry),
         seed.initial_rho,
-        60,
+        40,
         0.05,
         1.0e-6,
         1.0e-6,
@@ -146,35 +149,47 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
                  equivalent freeze are back",
                 telemetry.criterion_calls
             );
-            // FD-vs-analytic at the banked best iterate: name the coordinate.
-            let banked = objective
-                .try_resume_from_checkpoint(n_params)
-                .map(Array1::from)
-                .unwrap_or(initial_flat);
-            let grad = objective
-                .eval(&banked)
-                .expect("gradient eval at the stalled rho")
-                .gradient;
-            let h = 1.0e-3;
-            for j in 0..n_params {
-                let mut plus = banked.clone();
-                plus[j] += h;
-                let mut minus = banked.clone();
-                minus[j] -= h;
-                let c_plus = objective.eval_cost(&plus).expect("cost at +h");
-                let c_minus = objective.eval_cost(&minus).expect("cost at -h");
-                let fd = (c_plus - c_minus) / (2.0 * h);
-                eprintln!(
-                    "[zz2234] coord {j}: analytic={:+.6e} central_fd={:+.6e} |delta|={:.3e}",
-                    grad[j],
-                    fd,
-                    (grad[j] - fd).abs()
-                );
-            }
             eprintln!(
                 "[zz2234] no walls, genuine descent — non-certification on this tight \
                  fixture budget is documented as an optimizer limitation (see #2234)"
             );
         }
+    }
+
+    // #2253: compare the analytic gradient with the cost returned by the SAME
+    // production `eval()` lane. The old gate differentiated `eval_cost()` and
+    // compared that different value lane with `eval()`'s gradient, so it could
+    // pass while the value/gradient pair actually consumed by the optimizer was
+    // internally inconsistent. Finite differences remain confined to this test.
+    let banked = objective
+        .try_resume_from_checkpoint(n_params)
+        .map(Array1::from)
+        .unwrap_or(initial_flat);
+    let grad = objective
+        .eval(&banked)
+        .expect("gradient eval at the audited rho")
+        .gradient;
+    let h = 1.0e-4;
+    for j in 0..n_params {
+        let mut plus = banked.clone();
+        plus[j] += h;
+        let mut minus = banked.clone();
+        minus[j] -= h;
+        let c_plus = objective.eval(&plus).expect("eval at +h").cost;
+        let c_minus = objective.eval(&minus).expect("eval at -h").cost;
+        let fd = (c_plus - c_minus) / (2.0 * h);
+        let delta = (grad[j] - fd).abs();
+        let tolerance = 5.0e-3 * (1.0 + grad[j].abs().max(fd.abs()));
+        eprintln!(
+            "[zz2234] coord {j}: analytic={:+.6e} eval_fd={:+.6e} |delta|={delta:.3e} tol={tolerance:.3e}",
+            grad[j], fd,
+        );
+        assert!(
+            delta <= tolerance,
+            "#2253 eval value/gradient desync at rho coordinate {j}: analytic={:+.12e}, \
+             same-lane central FD={:+.12e}, delta={delta:.3e}, tolerance={tolerance:.3e}",
+            grad[j],
+            fd,
+        );
     }
 }

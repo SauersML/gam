@@ -1251,6 +1251,90 @@ fn sae_residual_em_score_vjp<'py>(
     Ok(grad.into_pyarray(py).unbind())
 }
 
+fn residual_em_cuda_dtype(
+    dtype: &str,
+) -> PyResult<gam::terms::sae::criterion_atoms_gpu::ResidualEmCudaDType> {
+    gam::terms::sae::criterion_atoms_gpu::ResidualEmCudaDType::parse(dtype)
+        .map_err(PyTypeError::new_err)
+}
+
+/// Raw-pointer CUDA forward for `sae_residual_em_score`.
+///
+/// `device_ptrs` is `(x, per_atom_recon, code, relative_residual)` and `shape`
+/// is `(N, F, D)`. All allocations must be contiguous, have the exact scalar
+/// type named by `dtype`, and belong to `ordinal`'s CUDA primary context. The
+/// torch bridge validates those invariants and synchronizes its producing
+/// stream before entering this ownership-free boundary.
+#[pyfunction]
+fn sae_residual_em_score_cuda(
+    py: Python<'_>,
+    ordinal: usize,
+    dtype: &str,
+    device_ptrs: (u64, u64, u64, u64),
+    shape: (usize, usize, usize),
+    nonneg: bool,
+) -> PyResult<()> {
+    let scalar_type = residual_em_cuda_dtype(dtype)?;
+    let (x_dev_ptr, recon_dev_ptr, code_dev_ptr, relative_residual_dev_ptr) = device_ptrs;
+    let (n, atoms, dim) = shape;
+    py.detach(move || {
+        gam::terms::sae::criterion_atoms_gpu::residual_em_score_device(
+            ordinal,
+            scalar_type,
+            x_dev_ptr,
+            recon_dev_ptr,
+            n,
+            atoms,
+            dim,
+            nonneg,
+            code_dev_ptr,
+            relative_residual_dev_ptr,
+        )
+    })
+    .map_err(PyValueError::new_err)
+}
+
+/// Raw-pointer analytic CUDA VJP for `sae_residual_em_score_vjp`.
+///
+/// `device_ptrs` is `(x, per_atom_recon, g_code, g_relative_residual,
+/// grad_per_atom_recon)` and `shape` is `(N, F, D)`, with the same strict
+/// device/dtype/layout contract as [`sae_residual_em_score_cuda`].
+#[pyfunction]
+fn sae_residual_em_score_vjp_cuda(
+    py: Python<'_>,
+    ordinal: usize,
+    dtype: &str,
+    device_ptrs: (u64, u64, u64, u64, u64),
+    shape: (usize, usize, usize),
+    nonneg: bool,
+) -> PyResult<()> {
+    let scalar_type = residual_em_cuda_dtype(dtype)?;
+    let (
+        x_dev_ptr,
+        recon_dev_ptr,
+        g_code_dev_ptr,
+        g_relative_residual_dev_ptr,
+        grad_recon_dev_ptr,
+    ) = device_ptrs;
+    let (n, atoms, dim) = shape;
+    py.detach(move || {
+        gam::terms::sae::criterion_atoms_gpu::residual_em_score_vjp_device(
+            ordinal,
+            scalar_type,
+            x_dev_ptr,
+            recon_dev_ptr,
+            n,
+            atoms,
+            dim,
+            nonneg,
+            g_code_dev_ptr,
+            g_relative_residual_dev_ptr,
+            grad_recon_dev_ptr,
+        )
+    })
+    .map_err(PyValueError::new_err)
+}
+
 /// Deterministic line-clustering routing anchor for the torch `softmax_topk`
 /// lane (issue #1282). Given the `(N, D)` input rows, returns
 /// `(onehot (N, atoms), valid, confident)`: `valid` is false (with an empty
@@ -5205,6 +5289,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_assign_ema_update, module)?)?;
     module.add_function(wrap_pyfunction!(sae_residual_em_score, module)?)?;
     module.add_function(wrap_pyfunction!(sae_residual_em_score_vjp, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_residual_em_score_cuda, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_residual_em_score_vjp_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sae_direction_cluster_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;

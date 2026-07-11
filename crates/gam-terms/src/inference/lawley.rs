@@ -1768,6 +1768,57 @@ mod tests {
         );
     }
 
+    /// Block-separated designs make the full Lawley epsilon the sum of the two
+    /// independent blocks. Subtracting the nuisance block must therefore erase
+    /// both its value and every rho derivative, while retaining the tested
+    /// block's closed-form intercept curvature.
+    #[test]
+    fn rho_hessian_nuisance_subtraction_is_exact_for_separated_blocks() {
+        let (nuisance_rows, tested_rows) = (13usize, 17usize);
+        let n = nuisance_rows + tested_rows;
+        let mut x = Array2::<f64>::zeros((n, 2));
+        let mut kappas = Vec::with_capacity(n);
+        for i in 0..nuisance_rows {
+            x[[i, 0]] = 1.0;
+            let eta = -0.2 + 0.3 * i as f64 / (nuisance_rows - 1) as f64;
+            kappas.push(RowExpectedJets::poisson_log(eta).kappas().unwrap());
+        }
+        let mut tested_kappas = Vec::with_capacity(tested_rows);
+        for i in 0..tested_rows {
+            x[[nuisance_rows + i, 1]] = 1.0;
+            let eta = 0.1 + 0.5 * i as f64 / (tested_rows - 1) as f64;
+            let row = RowExpectedJets::poisson_log(eta).kappas().unwrap();
+            tested_kappas.push(row);
+            kappas.push(row);
+        }
+
+        let (nuisance_strength, tested_strength) = (1.7, 2.4);
+        let mut nuisance_component = Array2::<f64>::zeros((2, 2));
+        nuisance_component[[0, 0]] = nuisance_strength;
+        let mut tested_component = Array2::<f64>::zeros((2, 2));
+        tested_component[[1, 1]] = tested_strength;
+        let penalty = &nuisance_component + &tested_component;
+        let components = vec![
+            RhoPenaltyComponent {
+                s_component: nuisance_component,
+            },
+            RhoPenaltyComponent {
+                s_component: tested_component,
+            },
+        ];
+
+        let (shift, hessian) =
+            lawley_lr_mean_shift_rho_hessian(x.view(), &kappas, penalty.view(), 1..2, &components)
+                .expect("separated-block rho Hessian");
+        let (expected_shift, expected_tested_hessian) =
+            intercept_lawley_value_and_rho_hessian(&tested_kappas, &[tested_strength]);
+        assert!((shift - expected_shift).abs() < 1e-13);
+        assert!(hessian[[0, 0]].abs() < 1e-13);
+        assert!(hessian[[0, 1]].abs() < 1e-13);
+        assert!(hessian[[1, 0]].abs() < 1e-13);
+        assert!((hessian[[1, 1]] - expected_tested_hessian[[0, 0]]).abs() < 1e-13);
+    }
+
     /// Shape guards: component/cov dimension mismatches are rejected.
     #[test]
     fn rho_variation_rejects_shape_mismatch() {
