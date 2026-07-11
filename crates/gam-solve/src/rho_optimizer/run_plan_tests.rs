@@ -207,6 +207,37 @@ fn certificate_hessian_psd_probe_classifies_definiteness() {
 }
 
 #[test]
+fn newton_predicted_decrease_is_curvature_scaled() {
+    // Diagonal PD Hessian: predicted decrease = ½ Σ gᵢ²/Hᵢᵢ (Newton decrement/2).
+    let hessian = array![[4.0, 0.0], [0.0, 100.0]];
+    let grad = array![2.0, 20.0];
+    let got = newton_predicted_decrease(&hessian, &grad).expect("PD Hessian decrement");
+    // ½·(2²/4 + 20²/100) = ½·(1 + 4) = 2.5 (shift ~√ε·100 ≈ 1.5e-6 is negligible).
+    assert!((got - 2.5).abs() < 1.0e-4, "got {got}");
+
+    // A residual concentrated on a STIFF (high-curvature) direction maps to a
+    // NEGLIGIBLE predicted decrease — the curvature-scaled certificate certifies
+    // it even though its raw magnitude is not tiny. This is the #2253 flat-valley
+    // case: |g| above the crude score-relative band, ½gᵀH⁻¹g below tolerance.
+    let stiff_h = array![[1.0e6, 0.0], [0.0, 1.0e6]];
+    let stiff_g = array![0.0717, 0.0];
+    let stiff = newton_predicted_decrease(&stiff_h, &stiff_g).expect("stiff decrement");
+    assert!(stiff < 1.0e-8, "stiff residual should predict tiny decrease, got {stiff}");
+
+    // A residual along a NEAR-FLAT direction (a linear ramp with real descent)
+    // inflates gᵀH⁻¹g and is NOT certified as negligible — the routine must never
+    // waive a genuine descent direction.
+    let flat_h = array![[1.0e-9, 0.0], [0.0, 1.0]];
+    let flat_g = array![0.05, 0.0];
+    let flat = newton_predicted_decrease(&flat_h, &flat_g).expect("flat decrement");
+    assert!(flat > 1.0, "flat-direction residual should predict large decrease, got {flat}");
+
+    // Malformed / mismatched shapes yield `None`.
+    assert!(newton_predicted_decrease(&array![[1.0, 0.0], [0.0, 1.0]], &array![1.0]).is_none());
+    assert!(newton_predicted_decrease(&array![[f64::NAN]], &array![1.0]).is_none());
+}
+
+#[test]
 fn certificate_rail_detection_uses_outer_box() {
     let config = OuterConfig::default(); // rho_bound = 30
     let rho = array![29.8, 0.0, -29.6];
