@@ -300,10 +300,14 @@ dictionary at a new smoothing state, the joint factor is rebuilt at the final
 model, so the reported band still reflects the joint covariance of the returned
 (possibly grown) dictionary, seed and born atoms alike.
 
-!!! note
-    The uncertainty arrays are populated only on a **freshly-fit** model.
-    A model round-tripped through `save` / `load` (or `to_dict` /
-    `from_dict`) drops them, and `shape_uncertainty` then raises `ValueError`.
+!!! note "Full fitted-state persistence"
+    `save` / `load` and `to_dict` / `from_dict` use the strict Rust-owned v3
+    artifact schema. They retain each atom's decoder coefficients, fitted
+    per-token coordinates, resolved topology, shape-band grid/mean/sd, and a
+    compact per-output-channel covariance factor. Loading reconstructs the
+    dense covariance surface used by `shape_uncertainty`, so the curve and its
+    uncertainty band can be rendered again without refitting. The on-disk
+    factor is `(p, M_k, M_k)`, not the unused dense `(M_k·p)^2` matrix.
 
 !!! note "Degenerate atoms and the huge-`p` fallback"
     A genuinely **unidentified** atom (no active rows, or a non-SPD joint block)
