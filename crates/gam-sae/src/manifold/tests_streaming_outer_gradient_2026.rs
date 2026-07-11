@@ -356,14 +356,24 @@ fn fixed_point_certificate_covers_non_ibp_exact_gradient() {
 fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     let (n, p, k) = (24usize, 2usize, 2usize);
     let mut term = build_softmax_term(n, p, k);
-    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
-        0.4 * ((row + 2 * col) as f64 * 0.17).sin() + 0.1 * col as f64
-    });
     let rho = SaeManifoldRho::new(
         0.7_f64.ln(),
         0.8_f64.ln(),
         vec![Array1::from_elem(1, 1.2_f64.ln()); k],
     );
+    // Keep the fixture on the same positive-rank Laplace branch that the
+    // production criterion admits.  The old unrelated synthetic target made
+    // both decoders fall below the hard MP edge, so the canonical complete
+    // gradient correctly refused the rank-zero branch before this test could
+    // reach its dense-vs-probe identity.  A small deterministic residual around
+    // this term's own nonzero reconstruction exercises the identical trace and
+    // IFT seams without relying on a value-invalid atom.
+    let fitted = term
+        .try_fitted_for_rho(&rho)
+        .expect("softmax positive-rank fixture reconstruction");
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        fitted[[row, col]] + 1.0e-3 * ((row + 2 * col) as f64 * 0.17).sin()
+    });
     let system = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .expect("softmax arrow system");
