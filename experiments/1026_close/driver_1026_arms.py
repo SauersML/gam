@@ -9,8 +9,8 @@ train/test split from --seed, so numbers are directly comparable across jobs.
 
 Arms:
   external_topk  — Gao-et-al. TopK SAE (torch, GPU), the "traditional SAE" bar.
-  gam_flat       — gamfit.sae_manifold_fit sparse-code lane (our linear lane;
-                   K>P routes to the linear REML schedule internally), held-out EV.
+  gam_flat       — gamfit.sparse_dictionary_fit (our certified linear sparse-code
+                   lane; the manifold engine rejects the flat config), held-out EV.
   curved_topk    — gamfit.sae_manifold_fit(assignment='topk') (CPU Rust core).
   torch_manifold — gamfit.torch.ManifoldSAE trained with Adam on the GPU.
   hybrid         — flat TopK at a reduced active budget + torch manifold on the
@@ -165,8 +165,8 @@ def fit_pca_bar(x_tr, x_te, mean_tr, *, ranks):
 def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, max_epochs, seed, collect=None):
     import gamfit
 
-    fit = gamfit.sae_manifold_fit(
-        x_tr, K=K, assignment="softmax", top_k=top_k, n_iter=max_epochs)
+    fit = gamfit.sparse_dictionary_fit(
+        x_tr, K, active=top_k, max_epochs=max_epochs)
     tr = fit.transform(x_te)
     recon = fit.reconstruct(tr.indices, tr.codes)
     if collect is not None:
