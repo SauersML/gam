@@ -2873,7 +2873,11 @@ fn routing_marginal_slope_stays_on_arc_when_both_derivs_analytic() {
 }
 
 #[test]
-fn plan_hybrid_efs_not_selected_few_params() {
+fn plan_hybrid_efs_selected_few_params() {
+    // ψ-carrying fixed-point objectives route to HybridEfs at every
+    // dimension: the former ≤8-coordinate BFGS crossover sent exactly the
+    // failing small fits into the fragile Wolfe/probe lane (see
+    // `SMALL_OUTER_BFGS_MAX_PARAMS`).
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
@@ -2885,8 +2889,8 @@ fn plan_hybrid_efs_not_selected_few_params() {
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    assert_eq!(p.solver, Solver::HybridEfs);
+    assert_eq!(p.hessian_source, HessianSource::HybridEfsFixedPoint);
 }
 
 #[test]
