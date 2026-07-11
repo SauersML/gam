@@ -670,7 +670,19 @@ impl SaeManifoldTerm {
         // numerical stall. It is not a stationary envelope root unless the raw
         // or quotient KKT residual also meets its gate, so a persistent stall is
         // refused instead of ranked.
-        let entry_loss_total = loss.total();
+        //
+        // ONE SCALAR: the stall detector prices `penalized_objective_total` —
+        // the exact scalar the inner Armijo line search descends and the KKT
+        // gradient differentiates — NOT the native-terms-only `loss.total()`.
+        // The KKT gradient carries the registry analytic penalties, decoder
+        // repulsion, and the Jeffreys separation barrier; a trajectory
+        // descending the full objective by trading data-fit against those
+        // terms shows a flat or non-monotone `loss.total()` (spurious stall),
+        // and vice versa. Progress, descent, and stationarity must be measured
+        // on the same function.
+        let entry_loss_total = self
+            .penalized_objective_total(target, rho, registry, 1.0)
+            .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
         let mut previous_loss_total = entry_loss_total;
         let mut refine_rounds: usize = 0;
         // Consecutive stall rounds. Once this reaches
@@ -1087,7 +1099,12 @@ impl SaeManifoldTerm {
             // Requires a few completed refine rounds (so the fraction baseline is
             // meaningful) but is NOT gated behind the full refine budget — the
             // whole point is to terminate the crawl long before that.
-            let new_loss_total = loss.total();
+            // Same ONE-SCALAR contract as `entry_loss_total` above: the round's
+            // progress is measured on the penalized objective the line search
+            // descends, not the native-terms-only loss.
+            let new_loss_total = self
+                .penalized_objective_total(target, rho, registry, 1.0)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // Two stagnation signals, both required: (1) the latest refine round
             // contributed a negligible FRACTION of the total objective reduction
             // achieved since entry — the fit has captured essentially all the
