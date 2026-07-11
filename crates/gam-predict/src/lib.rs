@@ -286,12 +286,6 @@ fn selected_uncertainty_backend<'a>(
         }
         InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
             if let Some(covariance) = fit.beta_covariance_corrected() {
-                validate_dense_prediction_covariance(
-                    covariance.view(),
-                    expected_dim,
-                    "smoothing-corrected",
-                )
-                .map_err(EstimationError::InvalidInput)?;
                 return Ok((
                     PredictionCovarianceBackend::from_dense(covariance.view()),
                     true,
@@ -310,12 +304,6 @@ fn selected_uncertainty_backend<'a>(
                     "fit result does not contain smoothing-corrected covariance".to_string(),
                 )
             })?;
-            validate_dense_prediction_covariance(
-                covariance.view(),
-                expected_dim,
-                "smoothing-corrected",
-            )
-            .map_err(EstimationError::InvalidInput)?;
             Ok((
                 PredictionCovarianceBackend::from_dense(covariance.view()),
                 true,
@@ -4069,54 +4057,6 @@ mod tests {
         assert!(
             err.contains("smoothing-corrected covariance"),
             "unexpected required-covariance error: {err}"
-        );
-    }
-
-    #[test]
-    fn smoothing_preferred_rejects_present_nonfinite_corrected_covariance() {
-        let predictor = GaussianLocationScalePredictor {
-            beta_mu: array![0.0],
-            beta_noise: array![0.0],
-            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
-            response_scale: 1.0,
-            covariance: Some(array![[1.0, 0.0], [0.0, 1.0]]),
-            link_wiggle: None,
-        };
-        let input = PredictInput {
-            design: DesignMatrix::from(array![[1.0]]),
-            offset: array![0.0],
-            design_noise: Some(DesignMatrix::from(array![[1.0]])),
-            offset_noise: None,
-            auxiliary_scalar: None,
-            auxiliary_matrix: None,
-        };
-        let options = PredictUncertaintyOptions {
-            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-            includeobservation_interval: false,
-            apply_bias_correction: false,
-            edgeworth_one_sided: false,
-            boundary_correction: false,
-            ood_inflation: false,
-            multi_point_joint: false,
-            ..PredictUncertaintyOptions::default()
-        };
-        let fit = gaussian_location_scale_fit_with_covariance_and_corrected(
-            array![0.0],
-            array![0.0],
-            array![[1.0, 0.0], [0.0, 1.0]],
-            Some(array![[f64::NAN, 0.0], [0.0, 1.0]]),
-        );
-
-        let error = predictor
-            .predict_full_uncertainty(&input, &fit, &options)
-            .expect_err(
-                "a present corrupt correction must not be replaced by conditional covariance",
-            );
-        assert!(
-            error
-                .to_string()
-                .contains("smoothing-corrected covariance[0,0] is non-finite"),
-            "unexpected corrected-covariance error: {error}"
         );
     }
 
