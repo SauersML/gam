@@ -98,9 +98,13 @@ fn logdet_audit_point(
         term.reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))?;
     let d_eff = term.per_atom_realised_rank_dof(rho, dispersion)?;
     let n_eff = term.per_atom_effective_sample_size();
-    let log_det_tt = coordinate_block_log_det(&cache)?;
-    let laplace_complexity =
-        rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
+    let log_det_tt = super::construction::coordinate_block_log_det(&cache)?;
+    let laplace_complexity = super::construction::rank_adjusted_laplace_complexity(
+        log_det,
+        log_det_tt,
+        &d_eff,
+        &n_eff,
+    )?;
     let occam = term.reml_occam_term(rho)?;
     let extra_penalty_energy = match registry {
         Some(registry) => term
