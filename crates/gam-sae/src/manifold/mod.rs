@@ -331,6 +331,9 @@ mod tests_sure_dispersion_2133;
 mod tests_behavioral_fisher_rung1;
 
 #[cfg(test)]
+mod tests_inner_budget_trajectory_2015;
+
+#[cfg(test)]
 mod tests_two_tier_2023;
 
 #[cfg(test)]
