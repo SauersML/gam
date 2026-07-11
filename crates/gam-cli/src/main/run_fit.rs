@@ -25,10 +25,14 @@ pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     if let Some(inf) = fit.inference.as_mut() {
         inf.reparam_qs = None;
     }
-    fit.artifacts = gam::estimate::FitArtifacts {
-        pirls: None,
-        ..Default::default()
-    };
+    // Only the PIRLS diagnostic payload is heavy; every other artifact field
+    // is a handful of scalars. Resetting the whole struct to `Default`
+    // previously also wiped `criterion_certificate`, which the very next
+    // save-time `validate_numeric_finiteness` call requires whenever
+    // `outer_iterations > 0` (#934) — every standard `gam fit --out ...`
+    // then failed with "outer iterations ran without an analytic
+    // stationarity certificate" despite having genuinely converged.
+    fit.artifacts.pirls = None;
 }
 
 fn read_fit_request_json_file(path: &Path, label: &str) -> Result<String, String> {
