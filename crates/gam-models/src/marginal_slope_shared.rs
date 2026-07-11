@@ -1109,9 +1109,16 @@ pub fn maybe_install_auto_outer_subsample(
             *guard = Some(Array1::from(outer_rho_key.to_vec()));
             phase_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         } else {
-            phase_counter
-                .load(std::sync::atomic::Ordering::SeqCst)
-                .saturating_sub(1)
+            let current = phase_counter.load(std::sync::atomic::Ordering::SeqCst);
+            // The generic runner can promote an early-stopped pilot directly
+            // to `phase1_budget` while remaining at the same rho checkpoint.
+            // Preserve that exact-phase marker; subtract one only while the
+            // counter still denotes an ordinary repeated Phase-1 evaluation.
+            if current >= phase1_budget {
+                current
+            } else {
+                current.saturating_sub(1)
+            }
         }
     };
     if phase_idx >= phase1_budget {
@@ -2030,6 +2037,88 @@ mod tests {
         assert!(
             rel_err < 0.02,
             "HT weight sum {weight_sum:.3} should ≈ n_full={n}, rel_err={rel_err:.4}"
+        );
+    }
+
+    #[test]
+    fn sampled_outer_schedule_promotes_same_checkpoint_to_exact_measure_979() {
+        let options = crate::custom_family::BlockwiseFitOptions::default();
+        let phase_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_rho = Arc::new(std::sync::Mutex::new(None));
+        let phase_budget = 12;
+        let rho = [0.25, -0.5];
+
+        // A small problem never installs a sample and therefore must not ask
+        // the generic runner for a redundant exact-polish solve.
+        let small_z: Vec<f64> = (0..1_000).map(|i| i as f64).collect();
+        assert!(
+            maybe_install_auto_outer_subsample(
+                &options,
+                &small_z,
+                None,
+                &rho,
+                &phase_counter,
+                &last_rho,
+                phase_budget,
+                "test-small",
+                1,
+                30_000,
+                10_000,
+                1_000,
+            )
+            .is_none()
+        );
+        let schedule = crate::custom_family::OuterDerivativePilotSchedule::new(
+            Arc::clone(&phase_counter),
+            phase_budget,
+        );
+        assert!(!schedule.enter_exact_phase());
+        assert_eq!(phase_counter.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Once a large problem actually installs its sampled measure, the
+        // transition is single-shot and the SAME checkpoint rho immediately
+        // evaluates on full data (no one-evaluation sampled leak into polish).
+        let large_z: Vec<f64> = (0..40_000).map(|i| (i as f64).sin()).collect();
+        assert!(
+            maybe_install_auto_outer_subsample(
+                &options,
+                &large_z,
+                None,
+                &rho,
+                &phase_counter,
+                &last_rho,
+                phase_budget,
+                "test-large",
+                1,
+                30_000,
+                10_000,
+                1_000,
+            )
+            .is_some()
+        );
+        assert!(schedule.enter_exact_phase());
+        assert!(!schedule.enter_exact_phase());
+        assert_eq!(
+            phase_counter.load(std::sync::atomic::Ordering::SeqCst),
+            phase_budget
+        );
+        assert!(
+            maybe_install_auto_outer_subsample(
+                &options,
+                &large_z,
+                None,
+                &rho,
+                &phase_counter,
+                &last_rho,
+                phase_budget,
+                "test-large",
+                1,
+                30_000,
+                10_000,
+                1_000,
+            )
+            .is_none(),
+            "the first exact-polish evaluation at the pilot checkpoint must use full data",
         );
     }
 
