@@ -1102,15 +1102,44 @@ impl SaeManifoldTerm {
                          a non-idempotent inner map."
                     ));
                 } else {
-                    // Inner solve did not converge in penalized_quasi_laplace_criterion; the returned
-                    // Err below carries the non-convergence diagnostic (gradient /
-                    // quotient-gradient norms and the tolerance) to the caller. The
-                    // historical quotient-Newton-step figures are no longer printed:
-                    // the pre-stationarity Newton step was ALWAYS diagnostic-only
-                    // (convergence is judged on the factorisation-independent KKT
-                    // gradient), and the #2080 restructure above no longer pays the
-                    // full dense factorization that produced it at non-stationary
-                    // rounds.
+                    // #2228 Stage-2, budget branch — the terminal exact-Newton
+                    // phase exists precisely to convert "the budget died near
+                    // the root" into convergence, but it historically lived
+                    // only behind the STALL branch; a solve that exhausts the
+                    // budget WITHOUT three stalled+idempotent rounds (measured
+                    // tier-0: ‖g‖ = 8.0e-5 against a 6.1e-5 band after 128,
+                    // one Newton step from the band) refused here without the
+                    // phase ever running. Try it before refusing: a committed
+                    // step strictly contracts ‖g‖ (its no-contraction bail
+                    // exits cheaply on genuinely hopeless states), and on
+                    // progress the loop resumes with fresh accounting — the
+                    // loop-top KKT gate and the idempotence certificate remain
+                    // the sole acceptance authority, exactly as at the stall
+                    // branch.
+                    if terminal_newton_rounds > 0 {
+                        terminal_newton_rounds -= 1;
+                        if self.terminal_exact_newton_polish(
+                            target,
+                            rho_fixed,
+                            registry,
+                            &lambda_smooth,
+                            grad_tolerance,
+                            previous_loss_total.abs() + 1.0,
+                            options,
+                            64,
+                        )? {
+                            *criterion_fixed_point = false;
+                            consecutive_objective_stalls = 0;
+                            saw_refine_progress = true;
+                            budget_escalation_extra = total_inner_iter
+                                .saturating_sub(refine_limit)
+                                .saturating_add(refine_limit.max(1));
+                            continue;
+                        }
+                    }
+                    // Inner solve did not converge; the returned Err carries
+                    // the non-convergence diagnostic (gradient /
+                    // quotient-gradient norms and the tolerance) to the caller.
                     return Err(format!(
                         "SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; \
                          neither the KKT gradient ‖g‖={grad_norm:.6e} nor the quotient KKT gradient \
