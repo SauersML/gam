@@ -867,8 +867,22 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
             }
             for &(a, lca) in &left_active {
                 let row_off = a * schur_cols;
-                for &(b, rcb) in &right_active {
-                    schur_flat[row_off + b] -= lca * rcb;
+                if right_active.len() == k {
+                    // Dense right row: at nnz == k the active list is exactly
+                    // `col = 0..k` in order, so this contiguous fused loop is
+                    // BIT-IDENTICAL to the sparse one below (same b order,
+                    // same subtractions) while being vectorizable — the old
+                    // codegen was 771 instructions with 18 bounds/compare
+                    // patterns around exactly 2 scalar FP ops and zero vector
+                    // ops (A10 asm read, 2026-07-11).
+                    let schur_row = &mut schur_flat[row_off..row_off + k];
+                    for (s, &r) in schur_row.iter_mut().zip(right_row) {
+                        *s -= lca * r;
+                    }
+                } else {
+                    for &(b, rcb) in &right_active {
+                        schur_flat[row_off + b] -= lca * rcb;
+                    }
                 }
             }
         }
