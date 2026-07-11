@@ -7076,16 +7076,16 @@ impl BlockSparseDictStream {
         Ok(out.unbind())
     }
 
-    /// Refresh γ + block frames from the epoch's accumulators, revive dead blocks
-    /// onto worst-reconstructed residual rows, and reset the epoch. Returns
-    /// `{explained_variance, revived, dead, gamma, converged, epoch}`.
+    /// Refresh γ + block frames from the epoch's accumulators and advance the
+    /// exact residual-row birth transaction. Returns
+    /// `{explained_variance, accepted_births, dead, gamma, converged, epoch}`.
     fn end_epoch(&mut self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let stats = py
             .detach(|| self.inner.end_epoch())
             .map_err(py_value_error)?;
         let out = PyDict::new(py);
         out.set_item("explained_variance", stats.explained_variance)?;
-        out.set_item("revived", stats.revived)?;
+        out.set_item("accepted_births", stats.accepted_births)?;
         out.set_item("dead", stats.dead)?;
         out.set_item("gamma", stats.gamma)?;
         out.set_item("converged", stats.converged)?;

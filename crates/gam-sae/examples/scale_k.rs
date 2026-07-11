@@ -186,11 +186,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // line, and under `--gpu required` a route that cannot make progress is a
         // typed error rather than a silent hang.
         println!(
-            "[scale_k] epoch {}/{} ev={:.6} revived={} dead={} elapsed={:.1}s",
+            "[scale_k] epoch {}/{} ev={:.6} accepted_births={} dead={} elapsed={:.1}s",
             epoch_index + 1,
             args.epochs,
             stats.explained_variance,
-            stats.revived,
+            stats.accepted_births,
             stats.dead,
             started.elapsed().as_secs_f64(),
         );
@@ -198,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "epoch": epoch_index + 1,
             "reported_epoch": stats.epoch,
             "explained_variance": stats.explained_variance,
-            "revived": stats.revived,
+            "accepted_births": stats.accepted_births,
             "dead": stats.dead,
             "gamma": stats.gamma,
             "converged": stats.converged,

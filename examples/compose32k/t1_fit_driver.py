@@ -190,7 +190,8 @@ def main(argv: list[str] | None = None) -> None:
             rows += stream.partial_fit(x[s:s + args.batch])["rows"]
         ep = stream.end_epoch()
         print(f"[t1 epoch {ep['epoch']:>2}] rows={rows} EV={ep['explained_variance']:.4f} "
-              f"gamma={ep['gamma']:.3f} dead={ep['dead']} revived={ep['revived']} "
+              f"gamma={ep['gamma']:.3f} dead={ep['dead']} "
+              f"accepted_births={ep['accepted_births']} "
               f"converged={ep['converged']} t={time.time()-t0:.0f}s", flush=True)
         if ep["converged"]:
             break

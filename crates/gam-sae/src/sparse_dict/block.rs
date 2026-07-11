@@ -1079,12 +1079,24 @@ fn dead_block_birth_proposals(
 }
 
 /// Held-in explained variance `1 − RSS/TSS` of the block reconstruction.
-fn explained_variance(
+fn reconstruction_rss(
     x: ArrayView2<'_, f32>,
     codes: &[RowBlockCode],
     decoder: ArrayView2<'_, f32>,
     b: usize,
 ) -> f64 {
+    let mut rss = 0.0_f64;
+    for (row, code) in codes.iter().enumerate() {
+        let reconstruction = reconstruct_stored_code_row(code, decoder, b);
+        for column in 0..x.ncols() {
+            let residual = x[[row, column]] as f64 - reconstruction[column] as f64;
+            rss += residual * residual;
+        }
+    }
+    rss
+}
+
+fn centered_total_sum_squares(x: ArrayView2<'_, f32>) -> f64 {
     let n = x.nrows();
     let p = x.ncols();
     let mut means = vec![0.0f64; p];
@@ -1094,27 +1106,37 @@ fn explained_variance(
             means[c] += xi[c] as f64;
         }
     }
-    for c in 0..p {
-        means[c] /= n as f64;
+    for mean in &mut means {
+        *mean /= n as f64;
     }
-    let mut rss = 0.0f64;
-    let mut tss = 0.0f64;
-    for i in 0..n {
-        let xi = x.row(i);
-        let code = &codes[i];
-        let recon = reconstruct_stored_code_row(code, decoder, b);
-        for c in 0..p {
-            let r = xi[c] as f64 - recon[c] as f64;
-            rss += r * r;
-            let t = xi[c] as f64 - means[c];
-            tss += t * t;
+    let mut tss = 0.0_f64;
+    for row in 0..n {
+        for column in 0..p {
+            let centered = x[[row, column]] as f64 - means[column];
+            tss += centered * centered;
         }
     }
+    tss
+}
+
+fn explained_variance_from_rss(rss: f64, tss: f64) -> f64 {
     if tss == 0.0 {
         if rss == 0.0 { 1.0 } else { 0.0 }
     } else {
         1.0 - rss / tss
     }
+}
+
+fn explained_variance(
+    x: ArrayView2<'_, f32>,
+    codes: &[RowBlockCode],
+    decoder: ArrayView2<'_, f32>,
+    b: usize,
+) -> f64 {
+    explained_variance_from_rss(
+        reconstruction_rss(x, codes, decoder, b),
+        centered_total_sum_squares(x),
+    )
 }
 
 fn log_spaced_prefix_atom_counts(n_blocks: usize, b: usize) -> Vec<usize> {

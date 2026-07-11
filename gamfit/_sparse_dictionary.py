@@ -1062,9 +1062,9 @@ class BlockSparseDictStream:
         return dict(self._handle.partial_fit(shard_arr))
 
     def end_epoch(self) -> dict[str, Any]:
-        """Close the epoch: refresh γ + block frames from the accumulators, revive
-        dead blocks onto worst-reconstructed residual rows, reset the accumulators.
-        Returns ``{explained_variance, revived, dead, gamma, converged, epoch}``."""
+        """Close the epoch: refresh γ + block frames and advance the exact
+        residual-row birth transaction. Returns
+        ``{explained_variance, accepted_births, dead, gamma, converged, epoch}``."""
         return dict(self._handle.end_epoch())
 
     def block_rank_charges(self, n_obs: int) -> dict[str, Any]:

@@ -1,18 +1,5 @@
 use super::*;
 
-/// One recorded ContinuationPath refinement. A structural defect retains the
-/// last accepted waypoint and reduces the next attempted distance instead of
-/// fabricating progress. Carried in the seed-loop ledger for startup diagnostics.
-#[derive(Clone, Debug)]
-pub(crate) struct PathRefinementRecord {
-    /// 0-based seed index whose structural defect triggered the refinement.
-    pub(crate) seed_idx: usize,
-    /// The last successfully solved path regime retained by the refinement.
-    pub(crate) regime: crate::continuation_path::PathRegime,
-    /// Human-readable reason (the underlying structural diagnosis message).
-    pub(crate) reason: String,
-}
-
 /// Bidirectional inner-PIRLS feedback channel.
 ///
 /// The outer-loop scheduler (BFGS or ARC bridge) writes a coarsened

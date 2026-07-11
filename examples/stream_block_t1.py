@@ -131,7 +131,8 @@ def stream_block_t1(args: argparse.Namespace) -> dict:
         ep = stream.end_epoch()
         print(
             f"[epoch {ep['epoch']:>3}] rows={rows} EV={ep['explained_variance']:.4f} "
-            f"gamma={ep['gamma']:.3f} dead={ep['dead']} revived={ep['revived']} "
+            f"gamma={ep['gamma']:.3f} dead={ep['dead']} "
+            f"accepted_births={ep['accepted_births']} "
             f"converged={ep['converged']}"
         )
         if ep["converged"]:

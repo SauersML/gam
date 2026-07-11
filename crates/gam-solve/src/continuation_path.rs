@@ -1,6 +1,6 @@
 //! Reactive three-leg continuation for a non-finite K≥2 SAE outer seed.
 //!
-//! # The three schedules, coupled along one scalar path parameter `s`
+//! # Three endpoint legs coupled by one scalar parameter
 //!
 //! One objective evaluation installs and solves all three homotopy legs at the
 //! same `s`:
@@ -16,20 +16,17 @@
 //!    a good fit before the gauge pins it.
 //!
 //! [`ContinuationPath`] advances all three **in lockstep** along a single
-//! scalar path parameter `s ∈ [1 → 0]`. `s = 1` is the *entry regime*: large
-//! ρ, high τ, loose-but-rising isometry — the regime in which the joint inner
-//! solve is provably a contraction. `s = 0` is the *real objective*: target ρ\*,
+//! scalar path parameter `s ∈ [1 → 0]`. `s = 1` is the *entry regime*: legal
+//! upper-box ρ, high τ, and loose isometry. `s = 0` is the real objective: target ρ\*,
 //! sharp τ, tight isometry. The path walks `s` monotonically down, advancing
-//! the underlying schedules at each waypoint so the inner problem is never
-//! asked to jump from cold to the real objective.
+//! the three literal waypoint values together.
 //!
 //! # Entry is always the heavy-smoothing regime
 //!
 //! There is no "solve cold at the real objective" entry. The only entry is
-//! `s = 1`, where every leg is at its smoothing extreme and the inner solve is
-//! a contraction. A K≥2 SAE joint fit therefore always *arrives* at ρ\* / τ_min
-//! / tight-isometry along a continuous descent from a regime where convergence
-//! is guaranteed.
+//! `s = 1`, where every leg is at its smoothing extreme. A K≥2 SAE joint fit
+//! either reaches the literal target through accepted coupled waypoints or
+//! returns a typed refusal; it never fabricates arrival.
 //!
 //! # The accepted path is monotone; failed attempts refine their distance
 //!
@@ -40,18 +37,6 @@
 //! [`ContinuationStep::Arrived`] value. If repeated refinement can no longer
 //! produce a strictly smaller representable waypoint, [`ContinuationPath::step`]
 //! returns a typed non-convergence error.
-//!
-//! # Warm-invariance
-//!
-//! * **#969 — warm-invariance.** A cold entry (no warm β) and a warm entry
-//!   (β carried from a previous fit / cache) both enter at `s = 1`, where the
-//!   inner solve is a contraction with a *unique* fixed point. A contraction
-//!   forgets its initial condition, so both entries are funneled to the SAME
-//!   `s = 1` iterate, and from there walk the SAME coupled schedule to the
-//!   SAME criterion at `s = 0`. Warm entry only *shortens* the walk (its β is
-//!   already near the `s = 1` fixed point); it cannot change the destination.
-//!   The path therefore makes "cold and warm reach the same criterion" a
-//!   structural property rather than a tolerance the caller must check.
 //!
 //! Full objective checkpoints, rather than coefficient-only fallback state,
 //! make each accepted waypoint independent of mutations from refused trials.
@@ -68,17 +53,17 @@ use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
 /// coordinate: ρ is already stored as log-precision, while temperature and
 /// isometry weights are literal objective scalars.
 #[derive(Debug, Clone, Copy)]
-pub struct LegEndpoints {
+struct LegEndpoints {
     /// Value at `s = 1`: the smoothing-extreme entry regime.
-    pub at_entry: f64,
+    at_entry: f64,
     /// Value at `s = 0`: the real-objective target.
-    pub at_target: f64,
+    at_target: f64,
 }
 
 impl LegEndpoints {
     /// Construct from an entry value and a target value.
     #[must_use]
-    pub fn new(at_entry: f64, at_target: f64) -> Self {
+    fn new(at_entry: f64, at_target: f64) -> Self {
         Self {
             at_entry,
             at_target,
@@ -90,7 +75,7 @@ impl LegEndpoints {
     /// values in the coordinate the objective consumes, so a convex blend is
     /// also the literal waypoint value installed or evaluated.
     #[must_use]
-    pub fn at(&self, s: f64) -> f64 {
+    fn at(&self, s: f64) -> f64 {
         let s = s.clamp(0.0, 1.0);
         self.at_target + s * (self.at_entry - self.at_target)
     }
@@ -221,28 +206,28 @@ impl ContinuationScalarContract {
 /// Endpoint state that [`ContinuationPath`] owns. It computes every leg from
 /// the same `s`; there are no independently advancing schedule objects.
 #[derive(Debug, Clone)]
-pub struct CoupledSchedules {
+struct CoupledSchedules {
     /// Log-ρ endpoints, **per-component** (one entry per outer coordinate).
     /// Entry is the objective's legal upper box and target is literal ρ\*.
-    pub rho_entry: Array1<f64>,
+    rho_entry: Array1<f64>,
     /// ρ\* — the real-objective smoothing vector at `s = 0`.
-    pub rho_target: Array1<f64>,
+    rho_target: Array1<f64>,
     /// Typed scalar entry/target state supplied by the objective itself.
-    pub scalars: ContinuationScalarContract,
+    scalars: ContinuationScalarContract,
 }
 
 impl CoupledSchedules {
     /// The coupled lockstep target value of every scalar leg at path parameter
     /// `s`. ρ is a vector and is returned by [`Self::rho_target_at`].
     #[must_use]
-    pub fn scalar_targets_at(&self, s: f64) -> ContinuationScalarState {
+    fn scalar_targets_at(&self, s: f64) -> ContinuationScalarState {
         self.scalars.at(s)
     }
 
     /// Exact log-ρ waypoint at path parameter `s`: a convex blend per
     /// component from the legal upper-box entry to literal ρ\*.
     #[must_use]
-    pub fn rho_target_at(&self, s: f64) -> Array1<f64> {
+    fn rho_target_at(&self, s: f64) -> Array1<f64> {
         assert_eq!(
             self.rho_entry.len(),
             self.rho_target.len(),
@@ -258,47 +243,6 @@ impl CoupledSchedules {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  Coarse diagnostic view of the last accepted scalar regime.
-//
-//  The seed cascade in `rho_optimizer.rs` observes the path through a coarser
-//  lens than the per-waypoint `s`: it only needs to know which scalar regime
-//  the path most recently solved. `PathRegime` is that coarse view — a band of
-//  the path parameter `s`.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Coarse band of the last accepted path parameter. Banded from
-/// `s ∈ [0, 1]`: larger `s` means deeper in the contraction basin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathRegime {
-    /// `s` near the real objective (`s ≤ 1/4`): the path is at or close to ρ*,
-    /// the lightest smoothing the path ever sits at. The nominal entry band
-    /// only on a fully-descended path.
-    Target,
-    /// Mid-path (`1/4 < s ≤ 3/4`): partially annealed, intermediate smoothing.
-    Annealing,
-    /// Heavy-smoothing entry band (`s > 3/4`): the deepest contraction regime,
-    /// where the joint inner solve is provably a contraction. The band a fresh
-    /// `heavy_entry` starts in.
-    Heavy,
-}
-
-impl PathRegime {
-    /// Band the live path parameter `s` into the coarse regime the seed cascade
-    /// reports. Monotone in `s`: larger `s` ⇒ heavier regime.
-    #[must_use]
-    fn from_s(s: f64) -> Self {
-        let s = s.clamp(0.0, 1.0);
-        if s > 0.75 {
-            PathRegime::Heavy
-        } else if s > 0.25 {
-            PathRegime::Annealing
-        } else {
-            PathRegime::Target
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 //  Typed outcomes for accepted progress and attempted-distance refinement.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -310,10 +254,10 @@ impl PathRegime {
 #[derive(Debug, Clone)]
 pub(crate) enum ContinuationStep {
     /// The objective installed and solved the literal heavy scalar entry at
-    /// `s = 1`. Carries the accepted spine state that warms the first descent.
+    /// `s = 1`. Carries the accepted waypoint state that warms the first descent.
     Entered { state: ContinuationState },
     /// `s` was lowered toward `0` and the inner solve at the new waypoint
-    /// succeeded. Carries the accepted spine state and the new `s`.
+    /// succeeded. Carries the accepted waypoint state and the new `s`.
     Descended { s: f64, state: ContinuationState },
     /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
     /// tight isometry). Terminal-but-successful; the criterion is the real
@@ -341,7 +285,7 @@ pub(crate) enum RefinementReason {
 
 /// Coupled continuation path. Owns the three endpoint legs and the scalar path
 /// parameter `s`, and drives the K≥2 SAE joint fit down the coupled
-/// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime), and
+/// homotopy. Entry is always the legal heavy endpoint at `s = 1`, and
 /// only a solved literal target can produce arrival.
 ///
 /// [`ContinuationPath::step`] transactionally installs and evaluates one exact
@@ -364,13 +308,10 @@ pub struct ContinuationPath {
 }
 
 impl ContinuationPath {
-    /// Build the coupled path. `s` is initialized to `1.0` — the heavy-smoothing
-    /// entry regime where the joint inner solve is a contraction. The path can
-    /// **only** be entered here; there is no constructor that starts cold at the
-    /// real objective. This is what makes warm-invariance (#969) structural: any
-    /// entry, warm or cold, funnels through the `s = 1` contraction fixed point.
+    /// Build at the legal heavy endpoint `s = 1`. Reactive continuation cannot
+    /// begin cold at the literal target; failure to solve this entry is typed.
     #[must_use]
-    pub fn enter(schedules: CoupledSchedules) -> Self {
+    fn enter(schedules: CoupledSchedules) -> Self {
         Self {
             schedules,
             s: 1.0,
@@ -420,13 +361,6 @@ impl ContinuationPath {
         Ok(Self::enter(schedules))
     }
 
-    /// Coarse diagnostic band of the last successfully solved waypoint. A fresh
-    /// path is in [`PathRegime::Heavy`].
-    #[must_use]
-    pub fn current_regime(&self) -> PathRegime {
-        PathRegime::from_s(self.s)
-    }
-
     /// Current path parameter `s ∈ [0, 1]`.
     #[must_use]
     pub fn s(&self) -> f64 {
@@ -438,12 +372,6 @@ impl ContinuationPath {
     #[must_use]
     pub fn current_scalar_targets(&self) -> ContinuationScalarState {
         self.schedules.scalar_targets_at(self.s)
-    }
-
-    /// The ρ target the spine should anneal toward at the current `s`.
-    #[must_use]
-    pub fn current_rho_target(&self) -> Array1<f64> {
-        self.schedules.rho_target_at(self.s)
     }
 
     /// Refine the next descent after a failed attempted waypoint. `s` remains
@@ -466,8 +394,7 @@ impl ContinuationPath {
     ///
     /// `obj` is the SAE joint outer objective (`SaeManifoldOuterObjective`,
     /// which is an [`OuterObjective`]). `initial_beta` warms the inner solve;
-    /// pass the empty array for cold entry (warm-invariance, #969, guarantees
-    /// the same destination either way).
+    /// pass the empty array for a cold entry.
     pub(crate) fn step(
         &mut self,
         obj: &mut dyn OuterObjective,
@@ -475,7 +402,7 @@ impl ContinuationPath {
     ) -> Result<ContinuationStep, gam_problem::EstimationError> {
         // The cold leg solves the literal heavy entry at s=1 before any
         // descent. Every later leg lowers s by one path step. This makes the
-        // contraction entry an evaluated waypoint rather than an unevaluated
+        // heavy entry an evaluated waypoint rather than an unevaluated
         // endpoint that the old implementation skipped on its first call.
         let entering = self.warm.is_none();
         let s_next = if entering {
@@ -483,6 +410,15 @@ impl ContinuationPath {
         } else {
             (self.s - self.s_step).max(0.0)
         };
+        if !entering && !(s_next < self.s) {
+            return Err(gam_problem::EstimationError::RemlOptimizationFailed(
+                format!(
+                    "reactive domain continuation cannot form a smaller representable waypoint \
+                     below accepted s={:.17e}",
+                    self.s
+                ),
+            ));
+        }
 
         // Snapshot the complete accepted objective state before installing a
         // trial. A coefficient hint alone cannot restore latent coordinates,
@@ -592,7 +528,7 @@ impl ContinuationPath {
                     return Err(gam_problem::EstimationError::RemlOptimizationFailed(
                         format!(
                             "reactive domain continuation cannot form a smaller representable \
-                             waypoint below s={:.17e} after spine non-convergence: {}",
+                             waypoint below s={:.17e} after coupled-waypoint non-convergence: {}",
                             self.s,
                             failure.message()
                         ),
@@ -614,7 +550,7 @@ impl ContinuationPath {
 /// legal upper-box endpoint. Each is evaluated at the same `s` as the scalar
 /// contract.
 #[must_use]
-pub fn couple_schedules(
+fn couple_schedules(
     rho_entry: Array1<f64>,
     rho_target: Array1<f64>,
     scalars: ContinuationScalarContract,
@@ -657,8 +593,8 @@ mod tests {
         let targets = path.current_scalar_targets();
         assert_eq!(targets.assignment_temperature.to_bits(), 2.0_f64.to_bits());
         assert_eq!(targets.isometry_weights, vec![0.01, 0.02]);
-        // ρ target at s = 1 is the oversmoothed entry ρ₀.
-        let rho = path.current_rho_target();
+        // Log-ρ at s = 1 is the supplied legal upper-box endpoint.
+        let rho = path.schedules.rho_target_at(path.s());
         assert!((rho[0] - 5.0).abs() < 1e-12 && (rho[1] - 5.0).abs() < 1e-12);
     }
 
@@ -696,11 +632,6 @@ mod tests {
         )
         .expect("finite ordered rho endpoints");
         assert_eq!(path.s(), 1.0, "heavy_entry must enter at s = 1");
-        assert_eq!(
-            path.current_regime(),
-            PathRegime::Heavy,
-            "a fresh heavy_entry is in the heavy-smoothing regime"
-        );
     }
 
     #[test]
@@ -720,15 +651,6 @@ mod tests {
         )
         .expect_err("entry below target must be typed refusal");
         assert!(reversed.to_string().contains("entry >= target"));
-    }
-
-    #[test]
-    fn path_regime_bands_are_monotone_in_s() {
-        assert_eq!(PathRegime::from_s(0.0), PathRegime::Target);
-        assert_eq!(PathRegime::from_s(0.2), PathRegime::Target);
-        assert_eq!(PathRegime::from_s(0.5), PathRegime::Annealing);
-        assert_eq!(PathRegime::from_s(0.9), PathRegime::Heavy);
-        assert_eq!(PathRegime::from_s(1.0), PathRegime::Heavy);
     }
 
     #[derive(Default)]
@@ -877,7 +799,7 @@ mod tests {
 
         let step = path
             .step(&mut obj, &initial_beta)
-            .expect("the entry contraction must solve");
+            .expect("the heavy entry must solve");
         assert!(
             matches!(step, ContinuationStep::Entered { .. }),
             "the first coupled-path call must solve the literal entry waypoint"
@@ -986,5 +908,23 @@ mod tests {
             "refined retry must start from the restored accepted state"
         );
         assert_eq!(obj.full_state_marker, 9, "refined midpoint must commit");
+    }
+
+    #[test]
+    fn unrepresentable_descent_is_typed_without_evaluating_again() {
+        let mut path = ContinuationPath::enter(schedules());
+        let mut obj = RecordingObjective::default();
+        let initial_beta = Array1::zeros(0);
+        path.step(&mut obj, &initial_beta).expect("entry solve");
+        let evals_after_entry = obj.rho_evaluated.len();
+        let installs_after_entry = obj.installed.len();
+        path.s_step = f64::MIN_POSITIVE;
+
+        let error = path
+            .step(&mut obj, &initial_beta)
+            .expect_err("rounded-away descent must be a typed refusal");
+        assert!(error.to_string().contains("smaller representable waypoint"));
+        assert_eq!(obj.rho_evaluated.len(), evals_after_entry);
+        assert_eq!(obj.installed.len(), installs_after_entry);
     }
 }

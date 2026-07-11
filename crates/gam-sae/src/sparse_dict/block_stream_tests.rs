@@ -217,7 +217,8 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     // starts dead. `planted_data` places row `i` in subspace `i % g`, so the rows
     // with `i % g != g - 1` live entirely in the first two subspaces; block 2's
     // seeded frame then lands inside span{subspace 0, subspace 1}, orthogonal to the
-    // (later-streamed) subspace-2 rows, so it routes to zero usage and is revived.
+    // (later-streamed) subspace-2 rows, so it routes to zero usage and its
+    // residual-row birth is accepted by the exact next-pass comparison.
     let seed_rows: Vec<usize> = (0..x.nrows()).filter(|&i| i % g != g - 1).collect();
     let mut seed = Array2::<f32>::zeros((seed_rows.len(), p));
     for (dst, &src) in seed_rows.iter().enumerate() {
@@ -230,12 +231,12 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     // (a parallel-reduction change, #49c27a883, could otherwise bootstrap it).
     state.zero_block_for_test(g - 1);
     let mut saw_dead = false;
-    let mut saw_revive = false;
+    let mut saw_accepted_birth = false;
     for _ in 0..cfg.max_epochs {
         state.partial_fit(x.view()).expect("partial_fit");
         let stats = state.end_epoch().expect("end_epoch");
         saw_dead |= stats.dead > 0;
-        saw_revive |= stats.revived > 0;
+        saw_accepted_birth |= stats.accepted_births > 0;
         if stats.converged {
             break;
         }
@@ -259,7 +260,7 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
         "dictionary must pass through a dead-block state before revival"
     );
     assert!(
-        saw_revive,
-        "AuxK revival must engage on the under-populated dictionary"
+        saw_accepted_birth,
+        "the residual-row proposal must commit after strict full-pass improvement"
     );
 }

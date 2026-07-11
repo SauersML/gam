@@ -598,15 +598,11 @@ pub(crate) fn run_outer_with_plan(
         let enter_via_continuation_path =
             obj.allow_continuation_prewarm() || continuation_path.is_some();
         // Reactive domain entry (SAE-manifold dense K>=2 joint fit): DRIVE the
-        // coupled `ContinuationPath` homotopy explicitly. This is the missing
-        // half of Object 1 — the descent walk. Rather than a single ρ-only
-        // `prime_outer_seed` pre-screen, we step the path waypoint by waypoint:
-        // each `step` runs the ρ-anneal spine for that waypoint and advances
-        // the τ / isometry legs in lockstep, so all three knobs arrive at the
-        // real objective together (the one-monotone-walk invariant). The
-        // converged inner β of each accepted descent leg warm-starts the next,
-        // and the warm iterate at `Arrived` is handed to the normal solver at
-        // ρ*. A failed attempted waypoint refines the step from the last
+        // coupled `ContinuationPath` homotopy explicitly. Each step installs
+        // the objective-owned scalar state and evaluates its matching log-ρ
+        // waypoint exactly once inside a full-state transaction. The committed
+        // term/rho/loss and beta hint warm the next waypoint; arrival hands the
+        // exact target state to the normal solver. A failed attempted waypoint refines the step from the last
         // successful state; representability exhaustion becomes a typed domain
         // refusal rather than a false arrival.
         //
@@ -708,11 +704,10 @@ pub(crate) fn run_outer_with_plan(
                 }
                 log::info!(
                     "[OUTER] {context}: continuation-path walk seed {seed_idx} legs={legs_descended} \
-                     arrived={continuation_arrived} reseeds={} elapsed={:.3}s",
-                    path.reseed_count(),
+                     arrived={continuation_arrived} accepted_s={:.4} elapsed={:.3}s",
+                    path.s(),
                     walk_start.elapsed().as_secs_f64(),
                 );
-                last_continuation_regime = Some(path.current_regime());
             }
         }
         if reactive_domain_entry_requested {
@@ -2117,7 +2112,7 @@ pub(crate) fn run_outer_with_plan(
         let structural = structural_early_exit_key
             .clone()
             .or_else(|| uniform_structural_key(&seed_rejections, 1));
-        let mut early_exit_note = if structural_early_exit_key.is_some() {
+        let early_exit_note = if structural_early_exit_key.is_some() {
             "early-exit triggered: every observed seed reported the same structural rejection"
                 .to_string()
         } else if let Some((sig, first_seed, last_seed)) = generic_structural_bail.as_ref() {
@@ -2130,28 +2125,6 @@ pub(crate) fn run_outer_with_plan(
         } else {
             String::new()
         };
-        // Surface attempted-distance refinements encountered inside an activated
-        // reactive path. These are path diagnostics; failure to arrive or to
-        // establish finite exact-seed evidence is still recorded as a refusal.
-        if !path_refinements.is_empty() {
-            if !early_exit_note.is_empty() {
-                early_exit_note.push_str("; ");
-            }
-            let final_regime = last_continuation_regime
-                .as_ref()
-                .map(|regime| format!("{regime:?}"))
-                .unwrap_or_else(|| "<none>".to_string());
-            early_exit_note.push_str(&format!(
-                "continuation-path: {} structural defect(s) refined the next attempted distance; \
-                 final accepted regime={final_regime}; reasons: [{}]",
-                path_refinements.len(),
-                path_refinements
-                    .iter()
-                    .map(|d| format!("seed {} -> {:?}: {}", d.seed_idx, d.regime, d.reason))
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            ));
-        }
         if started_seeds == 0 {
             EstimationError::RemlOptimizationFailed(format_no_seeds_passed(
                 context,

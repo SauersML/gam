@@ -650,49 +650,77 @@ impl BlockSparseStreamState {
         for c in 0..p {
             tss += self.col_sumsq[c] - self.col_sum[c] * self.col_sum[c] / n;
         }
+        // Resolve a staged residual-row birth against the exact full-pass
+        // criterion BEFORE any ordinary frame refresh consumes the candidate's
+        // accumulators. A rejected proposal restores the complete baseline
+        // decoder/gamma and its reporting accumulators; the candidate pass is
+        // discarded. An accepted proposal remains live and can take the usual
+        // gamma/frame coordinate step below.
+        let mut accepted_births = 0usize;
+        let mut rejected_birth = false;
+        if let Some(pending) = self.pending_birth.take() {
+            if pending.baseline_rows != self.row_count {
+                return Err(format!(
+                    "BlockSparseStream birth transaction saw {} candidate rows but {} baseline rows",
+                    self.row_count, pending.baseline_rows,
+                ));
+            }
+            let selected = self.usage[pending.block] > 0;
+            let strictly_improves = self.rss < pending.baseline_rss;
+            if selected && strictly_improves {
+                accepted_births = 1;
+            } else {
+                self.decoder = pending.baseline_decoder;
+                self.gamma = pending.baseline_gamma;
+                self.rss = pending.baseline_rss;
+                self.usage = pending.baseline_usage;
+                self.second = pending.baseline_second;
+                self.alive_count = self.usage.iter().filter(|&&count| count > 0).count();
+                rejected_birth = true;
+            }
+        }
+
         let ev = if tss <= 1.0e-24 {
             if self.rss <= 1.0e-24 { 1.0 } else { 0.0 }
         } else {
             1.0 - self.rss / tss
         };
 
-        // (γ) closed-form shared scalar from the accumulated least-squares.
-        let gamma_new = if self.gamma_den <= 1.0e-24 {
-            self.gamma
-        } else {
-            (self.gamma_num / self.gamma_den) as f32
-        };
+        if !rejected_birth {
+            // (γ) closed-form shared scalar from the accumulated least-squares.
+            self.gamma = if self.gamma_den <= 1.0e-24 {
+                self.gamma
+            } else {
+                (self.gamma_num / self.gamma_den) as f32
+            };
 
-        // (frames) EXACT polar refresh of every block that fired this epoch, over
-        // its accumulated cross-moment `M_g` (P×b). `GrassmannFrame::polar_update`
-        // returns the closest column-orthonormal frame to `M_g` (the orthogonal-
-        // Procrustes / MOD-on-the-Stiefel-manifold optimum) — the SAME update the
-        // one-shot lane runs (block.rs `refresh_frames`), so the streamed shards
-        // reproduce the full-batch frames exactly (M_g is additive). This is the
-        // block lane's native solver: a block is a small b×b orthonormal frame, so
-        // the polar step is exact and O(b³) cheap — no routability gate and no
-        // atom-level MOD approximation, both of which ceilinged reconstruction
-        // below one-shot parity and deadlocked dead-block revival.
-        let ridge = self.config.frame_ridge;
-        for gg in 0..self.g {
-            if self.usage[gg] == 0 {
-                continue;
-            }
-            if ridge > 0.0 {
-                for rr in 0..b {
-                    for c in 0..p {
-                        self.cross[gg][[c, rr]] += ridge * self.decoder[[gg * b + rr, c]] as f64;
-                    }
+            // (frames) EXACT polar refresh of every block that fired this epoch,
+            // over its accumulated cross-moment `M_g` (P×b). These accumulators
+            // belong to the candidate model when a birth was pending and to the
+            // ordinary live model otherwise. A rejected candidate never reaches
+            // this mutation point.
+            let ridge = self.config.frame_ridge;
+            for gg in 0..self.g {
+                if self.usage[gg] == 0 {
+                    continue;
                 }
-            }
-            if let Ok(frame) = GrassmannFrame::polar_update(self.cross[gg].view()) {
-                let u = frame.frame(); // P×b column-orthonormal
-                let sv = frame.gauge_singular_values();
-                let full_rank = sv.len() == b && sv.iter().all(|&s| s > 1.0e-9);
-                if full_rank && u.ncols() == b {
+                if ridge > 0.0 {
                     for rr in 0..b {
                         for c in 0..p {
-                            self.decoder[[gg * b + rr, c]] = u[[c, rr]] as f32;
+                            self.cross[gg][[c, rr]] +=
+                                ridge * self.decoder[[gg * b + rr, c]] as f64;
+                        }
+                    }
+                }
+                if let Ok(frame) = GrassmannFrame::polar_update(self.cross[gg].view()) {
+                    let u = frame.frame(); // P×b column-orthonormal
+                    let sv = frame.gauge_singular_values();
+                    let full_rank = sv.len() == b && sv.iter().all(|&s| s > 1.0e-9);
+                    if full_rank && u.ncols() == b {
+                        for rr in 0..b {
+                            for c in 0..p {
+                                self.decoder[[gg * b + rr, c]] = u[[c, rr]] as f32;
+                            }
                         }
                     }
                 }
@@ -702,9 +730,7 @@ impl BlockSparseStreamState {
         // certificate (that solver serves the atom/dict lane); report a default.
         let decoder_solve_stats = DecoderSolveStats::default();
 
-        // (revival) AuxK dead-block reseeding from worst-reconstructed rows.
         let dead: usize = self.usage.iter().filter(|&&u| u == 0).count();
-        let revived = self.revive();
 
         // Utilisation + stable-rank report from this epoch's accumulators.
         for gg in 0..self.g {
@@ -712,15 +738,25 @@ impl BlockSparseStreamState {
             self.last_stable[gg] = stable_rank_symmetric(self.second[gg].view());
         }
 
-        self.gamma = gamma_new;
         let improve = ev - self.prev_ev;
-        let converged =
-            revived == 0 && improve.abs() <= self.config.tolerance && self.epochs_run > 0;
+        // A rejected birth is deliberately quiescent for this close: if the
+        // restored baseline is on an EV plateau it may certify immediately. An
+        // ordinary or accepted-birth pass can stage ONE next proposal; serial
+        // transactions avoid O(aux_k) shadow routers at K~10^4.
+        let birth_pending = if rejected_birth {
+            false
+        } else {
+            self.stage_birth_proposal()
+        };
+        let converged = accepted_births == 0
+            && !birth_pending
+            && improve.abs() <= self.config.tolerance
+            && self.epochs_run > 0;
 
         self.prev_ev = ev;
         self.last_ev = ev;
         self.last_ev_residual = improve.abs();
-        self.last_revived = revived;
+        self.last_accepted_births = accepted_births;
         self.converged = converged;
         self.last_decoder_solve_stats = decoder_solve_stats;
         self.epochs_run += 1;
@@ -737,7 +773,7 @@ impl BlockSparseStreamState {
 
         Ok(BlockEpochStats {
             explained_variance: ev,
-            revived,
+            accepted_births,
             dead,
             gamma: self.gamma,
             converged,
@@ -746,51 +782,57 @@ impl BlockSparseStreamState {
         })
     }
 
-    /// Reseed each of the `k_aux` worst-utilised (dead) blocks with `b` orthonormal
-    /// rows Gram–Schmidt'd from `b` distinct worst-reconstructed residual rows
-    /// (never PCs, the house rule). Distinct contiguous groups of high-residual
-    /// rows so revived blocks do not duplicate. Residuals are measured under the
-    /// pre-refresh frames (the reservoir; see the module note).
-    fn revive(&mut self) -> usize {
-        if self.config.aux_k == 0 {
-            return 0;
+    /// Stage one residual-row birth for exact adjudication on the NEXT streamed
+    /// pass. The live decoder receives the candidate frame, while
+    /// [`PendingBlockBirth`] owns the complete baseline decoder/gamma and the
+    /// shadow accumulators needed to restore it. No birth is reported or treated
+    /// as a parameter update until [`Self::end_epoch`] observes both nonzero
+    /// routing and strict full-pass RSS improvement.
+    fn stage_birth_proposal(&mut self) -> bool {
+        if self.config.aux_k == 0 || self.pending_birth.is_some() {
+            return false;
         }
-        let ranked = self.reservoir.ranked();
-        if ranked.is_empty() {
-            return 0;
-        }
+        let Some(block) = (0..self.g)
+            .filter(|&candidate| self.usage[candidate] == 0)
+            .take(self.config.aux_k)
+            .next()
+        else {
+            return false;
+        };
         let b = self.b;
         let p = self.p;
-        // Dead blocks (never fired) in ascending index order — the k_aux worst-
-        // utilised, all at zero usage.
-        let dead_blocks: Vec<usize> = (0..self.g).filter(|&gg| self.usage[gg] == 0).collect();
-
-        let mut revived = 0usize;
-        let mut cursor = 0usize;
-        for &gg in dead_blocks.iter().take(self.config.aux_k) {
-            if cursor + b > ranked.len() {
-                break; // not enough distinct residual rows left to seed a frame
-            }
-            if ranked[cursor].norm2 <= DEAD_DENOM {
-                break; // remaining rows already reconstructed — nothing to seed
+        let proposal = {
+            let ranked = self.reservoir.ranked();
+            if ranked.len() < b || ranked[0].norm2 <= DEAD_DENOM {
+                return false;
             }
             let mut seed = Array2::<f32>::zeros((b, p));
-            for rr in 0..b {
-                let src = &ranked[cursor + rr].residual;
-                for c in 0..p {
-                    seed[[rr, c]] = src[c];
+            for row in 0..b {
+                for column in 0..p {
+                    seed[[row, column]] = ranked[row].residual[column];
                 }
             }
-            cursor += b;
             gram_schmidt_rows(&mut seed);
-            for rr in 0..b {
-                for c in 0..p {
-                    self.decoder[[gg * b + rr, c]] = seed[[rr, c]];
-                }
-            }
-            revived += 1;
-        }
-        revived
+            seed
+        };
+
+        let baseline_decoder = self.decoder.clone();
+        let baseline_gamma = self.gamma;
+        self.decoder
+            .slice_mut(ndarray::s![block * b..block * b + b, ..])
+            .assign(&proposal);
+        self.pending_birth = Some(PendingBlockBirth {
+            block,
+            baseline_decoder,
+            baseline_gamma,
+            baseline_rss: 0.0,
+            baseline_rows: 0,
+            baseline_usage: vec![0; self.g],
+            baseline_second: (0..self.g)
+                .map(|_| Array2::<f64>::zeros((b, b)))
+                .collect(),
+        });
+        true
     }
 
     fn reset_epoch(&mut self) {
@@ -825,17 +867,18 @@ impl BlockSparseStreamState {
     /// error and the state itself remains the resumable checkpoint — stream more
     /// epochs and finalize again.
     pub fn finalize(&self) -> Result<BlockSparseStreamArtifact, String> {
-        if !self.converged {
+        if !self.converged || self.pending_birth.is_some() {
             return Err(format!(
                 "BlockSparseStream.finalize: streaming fit has not converged after {} epoch(s) \
-                 (last EV {:.6e}, EV residual {:.3e} vs tolerance {:.3e}, {} block(s) revived in \
-                 the last epoch); the stream state is a resumable checkpoint, not a model — run \
-                 more epochs until end_epoch reports convergence",
+                 (last EV {:.6e}, EV residual {:.3e} vs tolerance {:.3e}, {} accepted block \
+                 birth(s) in the last epoch, birth pending={}); the stream state is a resumable \
+                 checkpoint, not a model — run more epochs until end_epoch reports convergence",
                 self.epochs_run,
                 self.last_ev,
                 self.last_ev_residual,
                 self.config.tolerance,
-                self.last_revived,
+                self.last_accepted_births,
+                self.pending_birth.is_some(),
             ));
         }
         Ok(BlockSparseStreamArtifact {
