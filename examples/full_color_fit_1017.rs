@@ -33,8 +33,9 @@ use gam::solver::seeding::SeedConfig;
 use gam::terms::{
     AnalyticPenaltyRegistry, AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator,
     SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective,
-    SaeManifoldRho, SaeManifoldTerm, StagewiseConfig,
+    SaeManifoldRho, SaeManifoldTerm,
 };
+use gam_sae::manifold::StagewiseConfig;
 use ndarray::{Array1, Array2};
 
 // Production color-arm shape from #1017: few rows, very wide ambient output.
