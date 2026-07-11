@@ -119,7 +119,7 @@ fn seed_term(turns0: &Array2<f64>, p: usize) -> (SaeManifoldTerm, SaeManifoldRho
         logits,
         vec![turns0.clone()],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();

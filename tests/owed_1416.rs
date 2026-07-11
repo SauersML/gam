@@ -203,7 +203,7 @@ fn ibp_cross_row_fixture(log_lambda_sparse: f64) -> Fixture {
         logits,
         coords,
         vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
-        AssignmentMode::ibp_map(0.7, 0.9, false),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false),
     )
     .expect("assignment");
     let term = SaeManifoldTerm::new(atoms, assignment).expect("term");

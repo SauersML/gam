@@ -223,7 +223,7 @@ pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {
 
 /// Convert a fitted encoder's `(N, K)` routing logits into assignment values
 /// with the exact production kernel used by the Rust fit. This deletes the
-/// former NumPy reimplementation (including its independently-maintained IBP
+/// former NumPy reimplementation (including its independently-maintained ordered Beta--Bernoulli
 /// exponent) from `gamfit.distill`.
 #[pyfunction(signature = (
     logits, assignment, temperature, threshold, top_k=None
@@ -1047,7 +1047,7 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn assignment_tokens_have_one_strict_parser() {
-        for canonical in ["softmax", "ibp_map", "threshold_gate", "topk"] {
+        for canonical in ["softmax", "ordered_beta_bernoulli", "threshold_gate", "topk"] {
             assert_eq!(
                 canonical_assignment_kind(canonical),
                 Ok(canonical),
@@ -1065,7 +1065,7 @@ mod manifold_sae_coercion_tests {
         ] {
             let err = canonical_assignment_kind(rejected).expect_err("alias must be rejected");
             assert!(err.contains("not a recognized assignment kind"));
-            assert!(err.contains("ibp_map") && err.contains("threshold_gate"));
+            assert!(err.contains("ordered_beta_bernoulli") && err.contains("threshold_gate"));
         }
     }
 
@@ -1113,7 +1113,7 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn flat_block_gating_uses_rust_owned_assignment_tokens() {
-        assert_eq!(flat_block_assignment("norm_selection"), Ok("ibp_map"));
+        assert_eq!(flat_block_assignment("norm_selection"), Ok("ordered_beta_bernoulli"));
         assert_eq!(flat_block_assignment("separate_gate"), Ok("threshold_gate"));
         assert!(flat_block_assignment("norm-selection").is_err());
         assert!(flat_block_assignment(" Separate-Gate ").is_err());

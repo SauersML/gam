@@ -42,7 +42,7 @@ def test_sae_fit_is_deterministic_for_fixed_seed():
         K=2,
         atom_basis="periodic",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=50,
         learning_rate=0.04,
         random_state=123,
@@ -86,7 +86,7 @@ def test_sae_fit_random_state_changes_output():
         K=2,
         atom_basis="periodic",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=30,
         learning_rate=0.2,
     )

@@ -215,7 +215,7 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
         K=2,
         d_atom=2,
         atom_topology="circle",
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.3,
@@ -228,7 +228,7 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
         random_state=11,
     )
 
-    assert fit.assignment == "ibp_map"
+    assert fit.assignment == "ordered_beta_bernoulli"
     assert {
         "ScadMcpPenalty",
         "NuclearNormPenalty",
@@ -325,7 +325,7 @@ def test_gate_sparsity_variants_are_accepted_and_described(
 @pytest.mark.parametrize(
     "assignment,expected_kind",
     [
-        ("ibp_map", "ibp_map"),
+        ("ordered_beta_bernoulli", "ordered_beta_bernoulli"),
         ("softmax", "softmax"),
         ("threshold_gate", "threshold_gate"),
     ],

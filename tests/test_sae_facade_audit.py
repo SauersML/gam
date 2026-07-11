@@ -114,7 +114,7 @@ def test_missing_x_raises():
 # #607 — assignment summary thresholds are mode-specific on the canonical kind.
 # ---------------------------------------------------------------------------
 def test_assignment_schema_accepts_only_canonical_tokens():
-    for token in ("softmax", "ibp_map", "threshold_gate", "topk"):
+    for token in ("softmax", "ordered_beta_bernoulli", "threshold_gate", "topk"):
         assert sae._canonical_assignment(token, "assignment") == token
     for alias in ("ibp", "top-k", "gated", "jumprelu"):
         with pytest.raises(ValueError):
@@ -566,10 +566,10 @@ def test_research_trust_scores_are_assignment_weighted():
     "kind,expected_threshold",
     [
         ("softmax", 0.25),   # 1/K with K=4
-        # #1547: the ibp_map summary threshold is a small responsibility-mass
+        # #1547: the ordered_beta_bernoulli summary threshold is a small responsibility-mass
         # epsilon (1e-8), not a 0.5 gate bar — `assignments_z` are normalized
         # reconstruction responsibilities that cannot reach 0.5 once K>=2.
-        ("ibp_map", 1.0e-8),
+        ("ordered_beta_bernoulli", 1.0e-8),
         ("jumprelu", 0.0),
     ],
 )
@@ -581,11 +581,11 @@ def test_summary_threshold_mode_specific(monkeypatch, kind, expected_threshold):
     assert stub.threshold == pytest.approx(expected_threshold)
 
 
-def test_summary_canonical_kind_for_ibp_map_label(monkeypatch):
-    """The canonical ibp_map label drives the responsibility-mass threshold."""
+def test_summary_canonical_kind_for_ordered_beta_bernoulli_label(monkeypatch):
+    """The canonical ordered_beta_bernoulli label drives the responsibility-mass threshold."""
     stub = _StubModule()
     monkeypatch.setattr(sae, "rust_module", lambda: stub)
-    fit = _make_fit("ibp_map", n_atoms=4)
+    fit = _make_fit("ordered_beta_bernoulli", n_atoms=4)
     fit.summary()
     assert stub.threshold == pytest.approx(1.0e-8)
 
@@ -684,7 +684,7 @@ def test_top_k_negative_raises(monkeypatch):
 # and do not depend on the current convergence state of the compiled solver.
 # ---------------------------------------------------------------------------
 
-def test_ibp_map_metadata_e2e(monkeypatch):
+def test_ordered_beta_bernoulli_metadata_e2e(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = np.random.default_rng(1).standard_normal((40, 4))
@@ -696,9 +696,9 @@ def test_ibp_map_metadata_e2e(monkeypatch):
         decoder_incoherence_weight=0.0,
     )
     fit_map = sae.sae_manifold_fit(
-        X=x, K=3, d_atom=2, assignment="ibp_map", n_iter=2, **baseline
+        X=x, K=3, d_atom=2, assignment="ordered_beta_bernoulli", n_iter=2, **baseline
     )
-    assert fit_map.assignment == "ibp_map"
+    assert fit_map.assignment == "ordered_beta_bernoulli"
 
 
 def test_mixed_basis_topology_e2e(monkeypatch):

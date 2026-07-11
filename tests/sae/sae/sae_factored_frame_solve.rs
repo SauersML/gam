@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use faer::Side as FaerSide;
 
-// ---- production defaults (gamfit `sae_manifold_fit`, ibp_map path) ----------
+// ---- production defaults (gamfit `sae_manifold_fit`, ordered_beta_bernoulli path) ----------
 const M: usize = 3; // const + 1 harmonic (sin, cos) -> circle basis, rank ≤ 3
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
@@ -356,7 +356,7 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>, p: usize) -> SaeManifol
         logits,
         coords_k,
         vec![LatentManifold::Circle { period: 1.0 }; k],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()

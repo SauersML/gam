@@ -129,8 +129,8 @@ def test_mechanism_sparsity_penalty_rust_value() -> None:
 
 def test_ibp_assignment_penalty_rust_value() -> None:
     _check_rust_value_matches_forward(
-        "IBPAssignmentPenalty",
-        gt.IBPAssignmentPenalty(k_max=3, alpha=1.2, tau=0.7),
+        "OrderedBetaBernoulliPenalty",
+        gt.OrderedBetaBernoulliPenalty(k_max=3, alpha=1.2, tau=0.7),
         _logits(),
     )
 

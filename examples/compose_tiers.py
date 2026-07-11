@@ -46,7 +46,7 @@ from typing import Any
 import numpy as np
 
 import gamfit
-from gamfit._sae_manifold import _default_ibp_concentration_for_k_atoms
+from gamfit._sae_manifold import _default_ordered_beta_bernoulli_concentration_for_k_atoms
 
 from compose_artifact_schema import (
     explained_variance_train_mean,
@@ -283,7 +283,7 @@ def compose_tiers(
             assignment=assignment,
             # K-aware concentration so the ordered prior spans the whole (small)
             # dictionary instead of masking every atom past the first few.
-            alpha=_default_ibp_concentration_for_k_atoms(k2),
+            alpha=_default_ordered_beta_bernoulli_concentration_for_k_atoms(k2),
             structured_residual_passes=residual_passes,
             promote_from_residual=promote_from_residual,
             n_iter=t2_n_iter,

@@ -104,7 +104,7 @@ def test_lock_snapshot_freezes_hypers():
     assert sae.is_locked
     assert not sae.log_lambda.requires_grad
     # IBP-Gumbel sparsity carries a learnable log_alpha through the Rust-backed
-    # IBPAssignmentPenalty submodule; lock_snapshot freezes it.
+    # OrderedBetaBernoulliPenalty submodule; lock_snapshot freezes it.
     locked = [p.requires_grad for p in sae.sparsity.parameters(recurse=True)]
     assert all(flag is False for flag in locked)
 
@@ -249,13 +249,13 @@ def test_advance_temperature_queries_rust_schedule():
 
 
 def test_ibp_gumbel_forward_applies_stick_breaking_prior():
-    # The torch IBP-Gumbel forward must route through the Rust ibp_map kernel so
+    # The torch IBP-Gumbel forward must route through the Rust ordered_beta_bernoulli kernel so
     # it applies the stick-breaking prior pi_k = (alpha/(alpha+1))^(k+1) and the
     # temperature scaling that the closed-form SaeAssignment IBP path uses. A bare
     # sigmoid(logits/tau) would omit pi_k. We pin it by reproducing the Rust
     # value out-of-band and asserting the forward matches bit-for-bit.
     from gamfit.torch.manifold_sae import _SparsityLayer  # type: ignore[attr-defined]
-    from gamfit.torch.penalties import ibp_map  # type: ignore[attr-defined]
+    from gamfit.torch.penalties import ordered_beta_bernoulli  # type: ignore[attr-defined]
 
     alpha = 1.3
     tau_start = 2.5
@@ -277,7 +277,7 @@ def test_ibp_gumbel_forward_applies_stick_breaking_prior():
     np.testing.assert_allclose(gate_pre.detach().numpy(), logits.numpy(), rtol=0.0, atol=0.0)
 
     tau = max(tau_start, 1e-6)
-    expected = ibp_map(logits, tau)
+    expected = ordered_beta_bernoulli(logits, tau)
     np.testing.assert_allclose(
         assignments.detach().numpy(), expected.detach().numpy(), rtol=0.0, atol=0.0
     )

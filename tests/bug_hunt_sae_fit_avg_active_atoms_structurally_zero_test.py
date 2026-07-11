@@ -4,7 +4,7 @@ that *no* atoms are active even when reconstruction R² ≈ 0.99 and every atom
 carries mass in every row.
 
 Root cause (``gamfit/_sae_manifold.py``, ``ManifoldSAE.summary``, lines
-~2457-2470). For the default ``ibp_map`` assignment mode the active-atom count
+~2457-2470). For the default ``ordered_beta_bernoulli`` assignment mode the active-atom count
 is computed as
 
     threshold = 0.5            # "active if its posterior gate exceeds 0.5"

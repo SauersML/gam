@@ -520,7 +520,7 @@ mod exact_stationarity_solve_1418_tests {
     #[test]
     fn ift_solve_deflates_saturated_gate_near_null_direction_2080() {
         let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-        term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+        term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false);
         // Saturate atom 1's gate logits hard OFF: σ'(−40)² ≈ 1e-35 kills the
         // data curvature along those logit coordinates while the assembled
         // majorizer keeps an O(1) diagonal there.
@@ -530,7 +530,7 @@ mod exact_stationarity_solve_1418_tests {
         rho.log_lambda_sparse = -1.0;
         let (_value, _loss, cache) = term
             .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
-            .expect("converged saturated-gate IBP cache");
+            .expect("converged saturated-gate ordered Beta--Bernoulli cache");
         let solver = DeflatedArrowSolver::plain(&cache);
 
         // Deterministic rhs with mass on every coordinate (including the
@@ -605,7 +605,7 @@ mod exact_stationarity_solve_1418_tests {
         );
     }
 
-    /// Build a converged IBP-MAP tiny SAE state whose cache carries the exact
+    /// Build a converged ordered Beta--Bernoulli-MAP tiny SAE state whose cache carries the exact
     /// cross-row rank-`R` Woodbury (`H_full = H₀' + U D Uᵀ`), with a genuinely
     /// nonzero inner residual so `ΔC = A − B` is also live.
     fn converged_ibp_state_with_woodbury() -> (
@@ -624,14 +624,14 @@ mod exact_stationarity_solve_1418_tests {
                 target[[row, col]] += 0.12 * (3.0 * theta + 0.5 * col as f64).sin();
             }
         }
-        // IBP-MAP assignment with an ACTIVE sparsity strength so the empirical-mass
+        // ordered Beta--Bernoulli-MAP assignment with an ACTIVE sparsity strength so the empirical-mass
         // prior's cross-row curvature `d_k = w·s'_k` is live (≠ 0) ⇒ a real
         // Woodbury is emitted and downdated into `H₀'`.
-        term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+        term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false);
         rho.log_lambda_sparse = -1.0;
         let (_value, _loss, cache) = term
             .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
-            .expect("converged IBP cache with cross-row Woodbury");
+            .expect("converged ordered Beta--Bernoulli cache with cross-row Woodbury");
         (term, target, rho, cache)
     }
 
@@ -641,7 +641,7 @@ mod exact_stationarity_solve_1418_tests {
         let w = cache
             .cross_row_woodbury
             .as_ref()
-            .expect("IBP cache must carry the cross-row Woodbury");
+            .expect("ordered Beta--Bernoulli cache must carry the cross-row Woodbury");
         let total_t = cache.delta_t_len();
         let r = w.d.len();
         // p_k = d_k · (Uᵀ v_t)_k.
@@ -709,7 +709,7 @@ mod exact_stationarity_solve_1418_tests {
         x
     }
 
-    /// #1038 / #1418 regression: for an IBP-MAP cache the EXACT-Hessian forward
+    /// #1038 / #1418 regression: for an ordered Beta--Bernoulli-MAP cache the EXACT-Hessian forward
     /// apply `apply_exact_hessian` must equal the DENSE exact joint Hessian
     /// `A_true = H_full + ΔC`, where `H_full = H₀' + U D Uᵀ` is the operator the
     /// inner solver (`full_inverse_apply`) inverts and `ΔC = ⟨r, ∂²f⟩` is the
@@ -725,10 +725,10 @@ mod exact_stationarity_solve_1418_tests {
     fn apply_exact_hessian_includes_ibp_cross_row_woodbury_1038() {
         let (term, target, rho, cache) = converged_ibp_state_with_woodbury();
 
-        // (2) The production IBP path must actually carry the Woodbury.
+        // (2) The production ordered Beta--Bernoulli path must actually carry the Woodbury.
         assert!(
             cache.cross_row_woodbury.is_some(),
-            "a converged IBP-MAP cache with active sparsity must carry the cross-row \
+            "a converged ordered Beta--Bernoulli-MAP cache with active sparsity must carry the cross-row \
              Woodbury — otherwise the bug is unreachable on this path"
         );
 
@@ -802,7 +802,7 @@ mod exact_stationarity_solve_1418_tests {
         let a_true_norm = a_true.iter().map(|x| x * x).sum::<f64>().sqrt().max(1.0);
         assert!(
             udut_norm > 1.0e-3 * a_true_norm,
-            "the IBP cross-row term U D Uᵀ v must be materially nonzero (‖UDUᵀv‖={udut_norm:.3e}, \
+            "the ordered Beta--Bernoulli cross-row term U D Uᵀ v must be materially nonzero (‖UDUᵀv‖={udut_norm:.3e}, \
              ‖A_true v‖={a_true_norm:.3e}) — otherwise this regression is vacuous"
         );
 
@@ -829,7 +829,7 @@ mod exact_stationarity_solve_1418_tests {
         assert!(
             resid <= 1.0e-9 * a_true_norm,
             "apply_exact_hessian must equal the dense exact joint Hessian H_full + ΔC for an \
-             IBP cache: ‖A_apply v − A_true v‖ = {resid:.3e} (rel {:.3e}); the omitted term is \
+             ordered Beta--Bernoulli cache: ‖A_apply v − A_true v‖ = {resid:.3e} (rel {:.3e}); the omitted term is \
              the cross-row Woodbury U D Uᵀ v (‖·‖={udut_norm:.3e}), confirmed by \
              ‖residual + UDUᵀv‖ = {resid_vs_udut:.3e} ≈ 0 (#1038)",
             resid / a_true_norm
@@ -991,13 +991,13 @@ mod shape_uncertainty_joint_recompute_tests {
     #[test]
     fn recompute_reproduces_joint_and_differs_from_per_atom_marginal() {
         // A reliably-converging tiny state: the fixture target was assembled under
-        // a softmax gate, so switching to an IBP-MAP gate at the PD-region ρ
+        // a softmax gate, so switching to an ordered Beta--Bernoulli-MAP gate at the PD-region ρ
         // (`log_lambda_sparse = 0.5`, the deflation-regression config) leaves a
         // genuine reconstruction residual — a real dispersion and nonzero bands —
         // while the state stays near its inner optimum so the undamped joint
         // factor converges in a few steps.
         let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-        term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+        term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
         rho.log_lambda_sparse = 0.5;
 
         // Reference joint bands via the direct Schur path.

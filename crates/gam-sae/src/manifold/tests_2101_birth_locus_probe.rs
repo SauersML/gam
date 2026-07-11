@@ -1,7 +1,7 @@
 //! #2101 birth-locus guards: localize WHERE the born decoder dies in the real
-//! IBP regime — the K=1 birth SUB-FIT (`fit_single_atom_response_in_place`,
+//! ordered Beta--Bernoulli regime — the K=1 birth SUB-FIT (`fit_single_atom_response_in_place`,
 //! penalty-on-scale-B) vs the JOINT BACKFIT (gate-dependent deflation).
-//! Reproduces red-tree's disjoint 6-circle ibp_map recovery (n=80, p=16,
+//! Reproduces red-tree's disjoint 6-circle ordered_beta_bernoulli recovery (n=80, p=16,
 //! distinct amps 1.0..0.55, noise 0.05, structured_whitening OFF) and records
 //! the last-born atom's ‖B‖ at every SAC progress event via the callback (no
 //! driver edit). Run with `-- --nocapture` to read the trajectory.
@@ -97,7 +97,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ibp() {
         logits,
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
     )
     .unwrap();
     let mut seed_term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -280,13 +280,13 @@ fn probe_2101_proper_circle_seed_survival() {
 
     let mut modes_checked = 0usize;
     for (mode_name, logit) in [
-        ("ibp_map", 3.0f64),
-        ("ibp_map", -4.0),
+        ("ordered_beta_bernoulli", 3.0f64),
+        ("ordered_beta_bernoulli", -4.0),
         ("softmax", 3.0),
         ("softmax", -4.0),
     ] {
-        let mode = if mode_name == "ibp_map" {
-            AssignmentMode::ibp_map(0.7, 1.0, false)
+        let mode = if mode_name == "ordered_beta_bernoulli" {
+            AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false)
         } else {
             AssignmentMode::softmax(1.0)
         };

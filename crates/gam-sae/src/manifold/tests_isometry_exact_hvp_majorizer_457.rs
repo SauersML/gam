@@ -446,7 +446,7 @@ pub(crate) fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();

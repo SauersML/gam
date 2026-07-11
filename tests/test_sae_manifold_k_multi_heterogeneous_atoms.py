@@ -99,7 +99,7 @@ def test_heterogeneous_mixed_topology_atoms_reconstruct():
         K=3,
         atom_basis=atom_basis,
         d_atom=atom_dim,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=60,
         learning_rate=0.04,
         random_state=0,

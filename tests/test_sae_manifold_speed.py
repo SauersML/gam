@@ -62,7 +62,7 @@ def test_periodic_atom_fit_recovers_one_harmonic_within_iteration_cap():
         K=4,
         atom_basis="periodic",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=MAX_ITER,
         learning_rate=0.04,
         random_state=0,

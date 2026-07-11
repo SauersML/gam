@@ -77,7 +77,7 @@ def test_sphere_atom_stable_at_poles():
         K=1,
         atom_basis="sphere",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=30,
         learning_rate=0.04,
         random_state=0,

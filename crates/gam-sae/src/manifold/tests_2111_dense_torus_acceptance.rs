@@ -155,19 +155,19 @@ fn seed_term(coords0: &Array2<f64>, p: usize) -> (SaeManifoldTerm, SaeManifoldRh
     let atom = circle_atom("seed_c0", &evaluator, coords0, 0, 1, p);
     let n = coords0.nrows();
     let logits = Array2::<f64>::from_elem((n, 1), 6.0);
-    // IBP (independent per-atom Bernoulli) assignment — NOT softmax. The dense
+    // ordered Beta--Bernoulli (independent per-atom Bernoulli) assignment — NOT softmax. The dense
     // torus has every row co-active on EVERY circle; softmax forces per-row
     // competition (probabilities sum to 1) and its entropy sparsity prior
     // maximally penalises exactly the dense co-activation the fixture requires,
     // so no born circle can clear the frozen-ρ evidence gate. This matches the
     // `probe_2101_birth_locus_disjoint_6circle_ibp` structure this test
     // reproduces (see the module docstring) and every sibling circle-recovery
-    // fixture (#2027/#2089/#2101), all of which seed `ibp_map(0.7, 1.0, false)`.
+    // fixture (#2027/#2089/#2101), all of which seed `ordered_beta_bernoulli(0.7, 1.0, false)`.
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         vec![coords0.clone()],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();

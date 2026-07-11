@@ -591,7 +591,7 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.IBPAssignmentPenalty
+::: gamfit.OrderedBetaBernoulliPenalty
     options:
       show_root_heading: true
       heading_level: 3

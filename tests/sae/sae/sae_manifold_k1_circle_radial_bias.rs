@@ -1,7 +1,7 @@
 //! #1023 task-2 radial-bias diagnostic: a K=1 IBP-MAP planted-circle fit through
 //! the production outer engine, measuring the three discriminating numbers
 //! (mean gate ζ, fitted_radius/data_radius, and λ_smooth vs the empirical-Bayes
-//! optimum). The historical user-facing default `sae_manifold_fit(assignment="ibp_map")`
+//! optimum). The historical user-facing default `sae_manifold_fit(assignment="ordered_beta_bernoulli")`
 //! routed K=1 through this gate path with a cold logit seed of 0 (the EM
 //! residual seed is gated on K>1), so ζ started at σ(0)=0.5 and the joint fit had
 //! to drive it back toward 1. A uniform radial contraction whose size tracks mean
@@ -84,7 +84,7 @@ fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
 
-    // `seed_logit` sets the cold K=1 ibp_map gate. Production historically
+    // `seed_logit` sets the cold K=1 ordered_beta_bernoulli gate. Production historically
     // seeded 0 (the EM residual seed is gated on K>1), so the cold gate was
     // σ(0)=0.5 — a 50% radial seed contraction the joint fit had to undo. The
     // fixed production seed is 6*tau, so gate = σ(6) independent of tau. The
@@ -129,7 +129,7 @@ fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
         logits,
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()

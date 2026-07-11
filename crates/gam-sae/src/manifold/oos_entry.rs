@@ -44,7 +44,7 @@ pub struct SaeOosAtomSpec {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SaeOosAssignmentKind {
     Softmax,
-    IbpMap { learnable_alpha: bool },
+    OrderedBetaBernoulli { learnable_alpha: bool },
     ThresholdGate { threshold: f64 },
     TopK,
 }
@@ -53,7 +53,7 @@ impl SaeOosAssignmentKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Softmax => "softmax",
-            Self::IbpMap { .. } => "ibp_map",
+            Self::OrderedBetaBernoulli { .. } => "ordered_beta_bernoulli",
             Self::ThresholdGate { .. } => "threshold_gate",
             Self::TopK => "topk",
         }
@@ -684,7 +684,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         }
         None => {
             let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
-            if k_atoms == 1 && matches!(assignment, SaeOosAssignmentKind::IbpMap { .. }) {
+            if k_atoms == 1 && matches!(assignment, SaeOosAssignmentKind::OrderedBetaBernoulli { .. }) {
                 logits.column_mut(0).fill(4.0);
             }
             logits
@@ -693,8 +693,8 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
 
     let mode = match assignment {
         SaeOosAssignmentKind::Softmax => AssignmentMode::softmax(tau),
-        SaeOosAssignmentKind::IbpMap { learnable_alpha } => {
-            AssignmentMode::ibp_map(tau, alpha, learnable_alpha)
+        SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha } => {
+            AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable_alpha)
         }
         SaeOosAssignmentKind::ThresholdGate { threshold } => {
             AssignmentMode::threshold_gate(tau, threshold)
@@ -737,7 +737,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     }
     if cold_logits && assignment == SaeOosAssignmentKind::Softmax {
         term.seed_oos_softmax_logits_from_projection_residuals(target.view(), tau);
-    } else if cold_logits && matches!(assignment, SaeOosAssignmentKind::IbpMap { .. }) {
+    } else if cold_logits && matches!(assignment, SaeOosAssignmentKind::OrderedBetaBernoulli { .. }) {
         term.seed_oos_ibp_logits_from_projected_decoder_lsq(target.view(), tau);
     }
 
@@ -822,7 +822,7 @@ pub struct SaeSteerRequest {
     /// restores the fitted assignment contract rather than guessing from the
     /// current logits.
     pub top_k: Option<usize>,
-    /// IBP-MAP concentration α (ignored outside `ibp_map`).
+    /// ordered Beta--Bernoulli-MAP concentration α (ignored outside `ordered_beta_bernoulli`).
     pub alpha: f64,
     /// Softmax / gate temperature.
     pub tau: f64,
@@ -907,8 +907,8 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     }
     let mode = match assignment {
         SaeOosAssignmentKind::Softmax => AssignmentMode::softmax(tau),
-        SaeOosAssignmentKind::IbpMap { learnable_alpha } => {
-            AssignmentMode::ibp_map(tau, alpha, learnable_alpha)
+        SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha } => {
+            AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable_alpha)
         }
         SaeOosAssignmentKind::ThresholdGate { threshold } => {
             if !threshold.is_finite() {

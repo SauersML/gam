@@ -5,7 +5,7 @@
 //!
 //! Repro (from the issue): `gamfit.sae_manifold_fit` on
 //! `X = rng.normal(size=(120, 32))`, `K = 6`, `d_atom = 1`,
-//! `atom_topology = "circle"`, `assignment = "ibp_map"`, `alpha = "auto"`
+//! `atom_topology = "circle"`, `assignment = "ordered_beta_bernoulli"`, `alpha = "auto"`
 //! terminated the Python PROCESS with exit 137 (SIGKILL) — uncatchable by
 //! `try/except`.
 //!
@@ -26,7 +26,7 @@
 //! of treating a made-up finite cost as evidence.
 //!
 //! This drives the inner joint fit on the EXACT repro geometry (120×32, K=6,
-//! circle, ibp_map) at a co-collapsing ρ, and asserts (a) it terminates with the
+//! circle, ordered_beta_bernoulli) at a co-collapsing ρ, and asserts (a) it terminates with the
 //! typed co-collapse refusal — never a panic/abort or a non-finite blow-up — and
 //! (b) that refusal is classified RECOVERABLE. Pre-fix (b) FAILS (the message is
 //! not in the recoverable set); post-fix it PASSES.
@@ -66,7 +66,7 @@ fn white_noise_gaussian_target(n: usize, p: usize) -> Array2<f64> {
     z
 }
 
-/// K-atom, d=1 periodic (circle) SAE term with IBP-MAP assignment, seeded the way
+/// K-atom, d=1 periodic (circle) SAE term with ordered Beta--Bernoulli-MAP assignment, seeded the way
 /// the production cold path does (PCA-seed the coordinates, ridge-LSQ each decoder).
 /// `harmonics` sets the basis size `m = 1 + 2·harmonics`. Mirrors the #2080 fixture.
 fn white_noise_circle_term(z: ArrayView2<'_, f64>, k: usize, harmonics: usize) -> SaeManifoldTerm {
@@ -106,14 +106,14 @@ fn white_noise_circle_term(z: ArrayView2<'_, f64>, k: usize, harmonics: usize) -
         manifolds.push(LatentManifold::Circle { period: 1.0 });
     }
     let logits = Array2::<f64>::from_elem((n, k), 6.0);
-    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let mode = AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false);
     let assignment =
         SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coords_blocks, manifolds, mode)
             .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()
 }
 
-/// #2089 — the featureless K=6 circle / ibp_map inner fit at a co-collapsing ρ must
+/// #2089 — the featureless K=6 circle / ordered_beta_bernoulli inner fit at a co-collapsing ρ must
 /// TERMINATE cleanly (a finite result or the typed co-collapse refusal, never a
 /// panic/abort or a non-finite blow-up), AND that refusal must be classified as a
 /// RECOVERABLE infeasible-ρ probe so the outer alpha="auto" search steers around it

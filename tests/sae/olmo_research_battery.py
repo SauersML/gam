@@ -245,7 +245,7 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
                     try:
                         fit, dt = manifold_fit(
                             gamfit, z, K=K, atom_topology=topo, atom_basis=basis,
-                            d_atom=d_atom, assignment="ibp_map", n_iter=n_iter, lr=0.04,
+                            d_atom=d_atom, assignment="ordered_beta_bernoulli", n_iter=n_iter, lr=0.04,
                             tau=None, n_harmonics=None, intrinsic_rank=None, seed=seed,
                         )
                         r2 = float(getattr(fit, "reconstruction_r2", _r2(z, np.asarray(fit.fitted))))
@@ -268,7 +268,7 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
         try:
             fit, dt = manifold_fit(
                 gamfit, z, K=K, atom_topology="circle", atom_basis="periodic",
-                d_atom=2, assignment="ibp_map", n_iter=n_iter, lr=0.04,
+                d_atom=2, assignment="ordered_beta_bernoulli", n_iter=n_iter, lr=0.04,
                 tau=None, n_harmonics=None, intrinsic_rank=None, seed=seed,
             )
             man["manifold_ev"] = float(getattr(fit, "reconstruction_r2", _r2(z, np.asarray(fit.fitted))))
@@ -293,7 +293,7 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
         ntr = z.shape[0] // 2
         fit, _ = manifold_fit(
             gamfit, z[:ntr], K=1, atom_topology="circle", atom_basis="periodic",
-            d_atom=2, assignment="ibp_map", n_iter=n_iter, lr=0.04,
+            d_atom=2, assignment="ordered_beta_bernoulli", n_iter=n_iter, lr=0.04,
             tau=None, n_harmonics=None, intrinsic_rank=None, seed=seed,
         )
         in_ev = float(getattr(fit, "reconstruction_r2", _r2(z[:ntr], np.asarray(fit.fitted))))
@@ -312,7 +312,7 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
         try:
             fit, _ = manifold_fit(
                 gamfit, z, K=1, atom_topology="circle", atom_basis="periodic",
-                d_atom=2, assignment="ibp_map", n_iter=n_iter, lr=0.04,
+                d_atom=2, assignment="ordered_beta_bernoulli", n_iter=n_iter, lr=0.04,
                 tau=None, n_harmonics=None, intrinsic_rank=None, seed=seed,
             )
             coords = np.asarray(fit.coords[0], dtype=float)

@@ -192,7 +192,7 @@ fn planted_warped_circle() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         logits,
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.5, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
     )
     .expect("assignment");
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
@@ -492,7 +492,7 @@ fn warped_interval_chart_canonicalizes_to_unit_speed_unit_span() {
         logits,
         vec![coords],
         vec![LatentManifold::Euclidean],
-        AssignmentMode::ibp_map(0.5, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
     )
     .expect("assignment");
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");

@@ -75,7 +75,7 @@ def _manifold_ev(z_tr, z_te, k, topology, seed, n_iter):
     t0 = time.perf_counter()
     m = sae_manifold_fit(
         z_tr, K=k, d_atom=1, atom_topology=topology,
-        assignment="ibp_map", n_iter=n_iter, random_state=seed,
+        assignment="ordered_beta_bernoulli", n_iter=n_iter, random_state=seed,
     )
     fit_s = time.perf_counter() - t0
     fitted = m.reconstruct(z_te)

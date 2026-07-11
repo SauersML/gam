@@ -28,7 +28,7 @@ def main() -> None:
         K=4,
         d_atom=1,
         atom_topology="euclidean",
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         schedule=schedule,
         n_iter=8,
         learning_rate=0.04,

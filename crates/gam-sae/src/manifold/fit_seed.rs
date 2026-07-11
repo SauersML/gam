@@ -20,7 +20,7 @@ pub const SAE_SHARED_ARD_K_THRESHOLD: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaeFitAssignmentKind {
     Softmax,
-    IbpMap,
+    OrderedBetaBernoulli,
     ThresholdGate,
     TopK,
 }
@@ -30,7 +30,7 @@ impl SaeFitAssignmentKind {
     pub fn from_tag(tag: &str) -> Result<Self, String> {
         match crate::atom_schema::canonical_assignment_kind(tag)? {
             "softmax" => Ok(Self::Softmax),
-            "ibp_map" => Ok(Self::IbpMap),
+            "ordered_beta_bernoulli" => Ok(Self::OrderedBetaBernoulli),
             "threshold_gate" => Ok(Self::ThresholdGate),
             "topk" => Ok(Self::TopK),
             canonical => Err(format!(
@@ -42,7 +42,7 @@ impl SaeFitAssignmentKind {
     pub const fn tag(self) -> &'static str {
         match self {
             Self::Softmax => "softmax",
-            Self::IbpMap => "ibp_map",
+            Self::OrderedBetaBernoulli => "ordered_beta_bernoulli",
             Self::ThresholdGate => "threshold_gate",
             Self::TopK => "topk",
         }
@@ -58,7 +58,7 @@ impl SaeFitAssignmentKind {
     ) -> Result<AssignmentMode, String> {
         match self {
             Self::Softmax => Ok(AssignmentMode::softmax(tau)),
-            Self::IbpMap => Ok(AssignmentMode::ibp_map(tau, alpha, learnable_alpha)),
+            Self::OrderedBetaBernoulli => Ok(AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable_alpha)),
             Self::ThresholdGate => Ok(AssignmentMode::threshold_gate(tau, threshold)),
             Self::TopK => top_k.map(AssignmentMode::top_k_support).ok_or_else(|| {
                 "assignment_kind 'topk' requires top_k (the fixed per-row support size)".to_string()
@@ -292,7 +292,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         .collect();
     let assignment_alpha = request
         .fit_config
-        .ibp_alpha_override
+        .ordered_beta_bernoulli_alpha_override
         .unwrap_or(request.alpha);
     let mode = request.assignment_kind.mode(
         request.tau,
@@ -334,7 +334,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         && k_atoms > 1
         && matches!(
             request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::IbpMap
+            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
         )
     {
         sae_em_refine_routing_seed(

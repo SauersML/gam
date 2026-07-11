@@ -1,4 +1,4 @@
-//! Bug hunt: `IBPAssignmentPenalty::hvp` returns only `diag(H) ⊙ v`, dropping
+//! Bug hunt: `OrderedBetaBernoulliPenalty::hvp` returns only `diag(H) ⊙ v`, dropping
 //! the entire off-diagonal block of its Hessian — so the value it returns is
 //! **not** the Hessian-vector product `H v` the trait contract promises.
 //!
@@ -11,7 +11,7 @@
 //!      dense (non-diagonal) Hessian … return `None` from `hessian_diag` and
 //!      supply their own analytic `hvp` override."
 //!
-//! `IBPAssignmentPenalty` violates that contract. Its penalty value couples
+//! `OrderedBetaBernoulliPenalty` violates that contract. Its penalty value couples
 //! **every row within a column** through the per-column aggregate
 //! `active_mass[k] = Σ_row z[row, k]` that drives `pi_map`
 //! (src/terms/analytic_penalties/mod.rs:2177-2192, used in `value` at 2200-2219).
@@ -19,7 +19,7 @@
 //! derivatives `∂²P / ∂target[i,k] ∂target[j,k]` (i ≠ j) are nonzero — the
 //! Hessian is block-diagonal *per column* but **dense within each column**.
 //!
-//! Yet `IBPAssignmentPenalty` implements `hessian_diag` (returns `Some`,
+//! Yet `OrderedBetaBernoulliPenalty` implements `hessian_diag` (returns `Some`,
 //! src/terms/analytic_penalties/mod.rs:2265-2321) and supplies **no** `hvp`
 //! override. So `hvp` falls through to the trait default
 //! (src/terms/analytic_penalties/mod.rs:381-407), which forms `diag(H) ⊙ v` and
@@ -38,11 +38,11 @@
 //! agrees with the FD diagonal, but the full vectors differ by ~0.12 here —
 //! orders of magnitude beyond finite-difference error. The assertion encodes
 //! the trait contract `hvp(t, v) == H v`; it fails today and will pass once
-//! `IBPAssignmentPenalty` supplies a closed-form dense (within-column) `hvp`.
+//! `OrderedBetaBernoulliPenalty` supplies a closed-form dense (within-column) `hvp`.
 //!
 //! Related: #804, #805, #796, #794 (sibling SAE-penalty curvature defects).
 
-use gam::terms::analytic_penalties::{AnalyticPenalty, IBPAssignmentPenalty};
+use gam::terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliPenalty};
 use ndarray::Array1;
 
 #[test]
@@ -51,7 +51,7 @@ fn ibp_assignment_hvp_equals_true_hessian_vector_product() {
     // n_eff = 4 rows are implied by the 12-element target below (len / k_max).
 
     // alpha = 1, tau = 1, non-learnable so the ρ vector is empty.
-    let penalty = IBPAssignmentPenalty::new(k_max, 1.0, 1.0, false);
+    let penalty = OrderedBetaBernoulliPenalty::new(k_max, 1.0, 1.0, false);
     let rho = Array1::<f64>::zeros(0);
 
     // Target laid out row-major with `k_max` interleaved columns:
@@ -93,7 +93,7 @@ fn ibp_assignment_hvp_equals_true_hessian_vector_product() {
     // off-diagonal coupling (~0.1) the diagonal-only hvp drops.
     assert!(
         max_abs_diff < 1e-5,
-        "IBPAssignmentPenalty::hvp does not equal the true Hessian-vector \
+        "OrderedBetaBernoulliPenalty::hvp does not equal the true Hessian-vector \
          product: max|hvp - H·v| = {max_abs_diff:.6e}. The default diagonal-only \
          hvp drops the within-column (row-coupling) off-diagonal Hessian block.\n\
          analytic hvp = {analytic_hv:?}\n\

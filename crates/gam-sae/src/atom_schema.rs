@@ -46,12 +46,12 @@ pub fn canon_name(name: &str) -> String {
 pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
     match kind {
         "softmax" => Ok("softmax"),
-        "ibp_map" => Ok("ibp_map"),
+        "ordered_beta_bernoulli" => Ok("ordered_beta_bernoulli"),
         "threshold_gate" => Ok("threshold_gate"),
         "topk" => Ok("topk"),
         _ => Err(format!(
             "assignment={kind:?} is not a recognized assignment kind; expected one of \
-             ['ibp_map', 'softmax', 'threshold_gate', 'topk']"
+             ['ordered_beta_bernoulli', 'softmax', 'threshold_gate', 'topk']"
         )),
     }
 }
@@ -140,7 +140,7 @@ pub fn coordinate_periods_for_basis(
 /// Assignment family implied by the public flat-block gating vocabulary.
 pub fn flat_block_assignment(gating: &str) -> Result<&'static str, String> {
     match gating {
-        "norm_selection" => Ok("ibp_map"),
+        "norm_selection" => Ok("ordered_beta_bernoulli"),
         "separate_gate" => Ok("threshold_gate"),
         _ => Err(format!(
             "flat_block gating={gating:?} is not recognized; expected one of \

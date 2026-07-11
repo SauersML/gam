@@ -51,7 +51,7 @@ use std::sync::Arc;
 
 use faer::Side as FaerSide;
 
-// ---- production defaults (gamfit `sae_manifold_fit`, ibp_map path) ----------
+// ---- production defaults (gamfit `sae_manifold_fit`, ordered_beta_bernoulli path) ----------
 const M: usize = 3; // const + 1 harmonic (sin, cos) -> circle
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
@@ -227,7 +227,7 @@ fn planted_response(truth: &Truth, frames: &[Array2<f64>], p: usize) -> (Array2<
     (z, signal_scale)
 }
 
-/// VERBATIM port of pyffi `sae_residual_seed_logits` (ibp_map cold seed).
+/// VERBATIM port of pyffi `sae_residual_seed_logits` (ordered_beta_bernoulli cold seed).
 fn residual_seed_logits(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -295,7 +295,7 @@ fn residual_seed_logits(
     logits
 }
 
-/// VERBATIM port of pyffi `sae_decoder_lsq_init` (ibp_map branch).
+/// VERBATIM port of pyffi `sae_decoder_lsq_init` (ordered_beta_bernoulli branch).
 fn decoder_lsq_init(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -426,7 +426,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize) -> SaeManifo
         logits,
         coords_k,
         vec![LatentManifold::Circle { period: 1.0 }; k],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()

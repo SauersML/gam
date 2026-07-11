@@ -184,7 +184,7 @@ def fit_layer_circle(
             K=1,
             d_atom=1,
             atom_topology="circle",
-            assignment="ibp_map",
+            assignment="ordered_beta_bernoulli",
             random_state=seed,
             # DOSE's proven-good K=1 kwargs on MSI (r2=0.997): the default
             # isometry_weight=1.0 / n_iter=50 path can live-lock on K=1 (STATE

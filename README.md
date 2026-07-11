@@ -160,7 +160,7 @@ extent = fit.coords[0].min(0), fit.coords[0].max(0)   # where atom 0 lives
 plan = fit.steer(atom_k=0, t_from=0.0, t_to=1.0)      # steering + dosimetry
 ```
 
-The dictionary supports three gating families (`assignment="ibp_map"`,
+The dictionary supports three gating families (`assignment="ordered_beta_bernoulli"`,
 `"softmax"`, `"jumprelu"`) and a `gamfit.torch.ManifoldSAE` autograd
 mirror with out-of-sample encoder distillation. Around it: `select_topology`
 to choose an atom's shape by evidence; `sae_checkpoint_dynamics` to track

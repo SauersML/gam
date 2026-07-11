@@ -206,7 +206,7 @@ fn build_cold_term(arm: Arm, z: &Array2<f64>, frac: &[f64]) -> SaeManifoldTerm {
         logits,
         vec![coords],
         vec![arm.manifold()],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()

@@ -74,7 +74,7 @@ class _FakeRustModule:
         jumprelu_threshold=0.0,
         **_forward_compat_kwargs,
     ):
-        assert assignment_kind == "ibp_map"
+        assert assignment_kind == "ordered_beta_bernoulli"
         # Production Rust iterates internally; emulate per-iteration basis
         # refresh by recording one snapshot per inner step. Each snapshot
         # uses perturbed input so the recovered coordinates drift between
@@ -128,7 +128,7 @@ class _FakeRustModule:
             "log_alpha": np.log(alpha),
             "log_lambda_smooth": np.log(smoothness),
             "log_ard": [np.zeros(dim) for dim in atom_dim],
-            "assignment_prior": "ibp_map",
+            "assignment_prior": "ordered_beta_bernoulli",
         }
 
 
@@ -142,7 +142,7 @@ def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
         K=1,
         atom_topology="circle",
         d_atom=1,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         alpha=1.0,
         schedule=sae.gumbel_linear_schedule(tau_start=0.7, tau_min=0.7, steps=1),
         n_iter=2,

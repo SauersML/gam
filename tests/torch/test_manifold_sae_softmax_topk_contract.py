@@ -217,7 +217,7 @@ def test_topk_activation_forward_contains_no_python_numerical_kernel() -> None:
     """Keep #2011's activation numerics in Rust; Python may only bridge autograd."""
     ffi_by_bridge = {
         torch_penalties._JumpReLUSTEFn: "jumprelu_gate_value_grad",
-        torch_penalties._IBPMapFn: "sae_ibp_map_batch_value_grad",
+        torch_penalties._OrderedBetaBernoulliFn: "sae_ordered_beta_bernoulli_batch_value_grad",
         torch_penalties._JumpReLUBoundedGateFn: "sae_jumprelu_batch_value_grad",
         torch_penalties._TopKActivationFn: "sae_topk_activation_value_grad",
     }

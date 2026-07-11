@@ -98,7 +98,7 @@ fn build_cold_circle_term(z: &Array2<f64>) -> SaeManifoldTerm {
         Array2::<f64>::zeros((N, 1)),
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(vec![atom], assignment).unwrap()

@@ -1,7 +1,7 @@
 """Stage-1 (guard surgery) acceptance: does the JOINT K=8 fit ignite?
 
 This is the direct Stage-1 kill-test for STAGE1_DIAGNOSIS.md. It runs the EXACT
-joint ``sae_manifold_fit(K=8, d_atom=1, circle, ibp_map, isometry_weight=1.0)``
+joint ``sae_manifold_fit(K=8, d_atom=1, circle, ordered_beta_bernoulli, isometry_weight=1.0)``
 call that timed out on the real W6 OLMo activations (W6: 3x1500s TIMEOUT), under
 the surgically-corrected guard stack (absolute-degeneracy null floor, iteration>0
 gate, wall restricted to non-finite + absolute degeneracy). Acceptance = the joint
@@ -38,7 +38,7 @@ def _ev(x: np.ndarray, recon: np.ndarray) -> float:
 def _joint_fit(X, K, d_atom, n_iter, seed, isometry):
     t0 = time.time()
     fit = gamfit.sae_manifold_fit(
-        X, K=K, d_atom=d_atom, atom_topology="circle", assignment="ibp_map",
+        X, K=K, d_atom=d_atom, atom_topology="circle", assignment="ordered_beta_bernoulli",
         isometry_weight=isometry, n_iter=n_iter, random_state=seed,
     )
     recon = np.asarray(fit.reconstruct(X), dtype=np.float64)
@@ -50,7 +50,7 @@ def run_w6(args) -> bool:
     n, p = X.shape
     print(f"[s1-w6] loaded {args.w6_cache}: X={X.shape} dtype={X.dtype}", flush=True)
     print(f"[s1-w6] JOINT sae_manifold_fit(K={args.k}, d_atom={args.d_atom}, circle, "
-          f"ibp_map, isometry_weight={args.isometry}, n_iter={args.n_iter}, "
+          f"ordered_beta_bernoulli, isometry_weight={args.isometry}, n_iter={args.n_iter}, "
           f"seed={args.seed})", flush=True)
     fit, ev, recon, dt = _joint_fit(X, args.k, args.d_atom, args.n_iter, args.seed,
                                     args.isometry)

@@ -80,7 +80,7 @@ def test_single_atom_recovers_each_supported_topology(basis: str):
         K=1,
         atom_basis=basis,
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=50,
         learning_rate=0.04,
         random_state=0,

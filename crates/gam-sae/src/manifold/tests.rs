@@ -468,25 +468,25 @@ pub(crate) fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius(
 
 /// `try_assignments_row` may only pin the K==1 assignment to `1.0` for
 /// Softmax, whose single simplex coordinate is genuinely fixed. For the
-/// independent gate modes (IBP-MAP, JumpReLU) the lone logit must drive the
+/// independent gate modes (ordered Beta--Bernoulli-MAP, JumpReLU) the lone logit must drive the
 /// gate; otherwise the reconstruction ignores a free parameter that the
 /// prior still penalizes (an invalid objective). Regression for the
 /// audit's K==1 special-case bug.
 #[test]
 pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
-    // IBP, K=1: the posterior-mean Bernoulli gate is σ(0/τ)=0.5. The ordered
+    // ordered Beta--Bernoulli, K=1: the posterior-mean Bernoulli gate is σ(0/τ)=0.5. The ordered
     // prior is scored separately and never caps the final function.
     let ibp = SaeAssignment::from_blocks_with_mode(
         array![[0.0]],
         vec![array![[0.0]]],
-        AssignmentMode::ibp_map(1.0, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
     )
     .unwrap();
     let ibp_gate = ibp.try_assignments_row(0).unwrap()[0];
     assert_abs_diff_eq!(ibp_gate, 0.5, epsilon = 1e-9);
     assert!(
         (ibp_gate - 1.0).abs() > 1e-6,
-        "K=1 IBP-MAP must not pin the gate to 1.0"
+        "K=1 ordered Beta--Bernoulli-MAP must not pin the gate to 1.0"
     );
 
     // JumpReLU, K=1, logit below threshold: hard-gated off (not 1.0).
@@ -521,7 +521,7 @@ pub(crate) fn jumprelu_surrogate_is_centered_at_threshold() {
     let threshold = 2.0;
     let temperature = 1.0;
     let logits = array![2.0 + 1e-6, 1.0];
-    let gates = jumprelu_row(logits.view(), temperature, threshold);
+    let gates = threshold_gate_row(logits.view(), temperature, threshold);
     // Just above threshold the centered surrogate is ≈ 0.5; the old
     // uncentered surrogate would have been σ(2.0) ≈ 0.88.
     assert_abs_diff_eq!(gates[0], 0.5, epsilon = 1e-3);
@@ -680,7 +680,7 @@ pub(crate) fn ard_value_continuous_across_periodic_cut_d1() {
         Array2::<f64>::zeros((1, 1)),
         vec![coords0],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -748,7 +748,7 @@ pub(crate) fn penalized_objective_continuous_across_periodic_cut_with_registry_a
         Array2::<f64>::zeros((1, 1)),
         vec![coords0],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -830,7 +830,7 @@ pub(crate) fn scad_coord_penalty_inert_and_continuous_on_periodic_axis() {
         Array2::<f64>::zeros((1, 1)),
         vec![coords0],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -987,7 +987,7 @@ pub(crate) fn scad_no_origin_pinning_occupancy_on_circle() {
             Array2::<f64>::zeros((n, 1)),
             vec![coords],
             vec![LatentManifold::Circle { period: 1.0 }],
-            AssignmentMode::ibp_map(0.7, 1.0, true),
+            AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
         )
         .unwrap();
         let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -1151,7 +1151,7 @@ pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
 ///
 /// This pins the equivalence directly: with EVERY row's active set forced to the
 /// full atom set, the compact column order coincides with the dense full-`q`
-/// order (IBP-MAP has `assignment_coord_dim == k_atoms`), so the two assemblies
+/// order (ordered Beta--Bernoulli-MAP has `assignment_coord_dim == k_atoms`), so the two assemblies
 /// must produce BIT-IDENTICAL `gt`, `htt`, and `htbeta` on a genuinely curved
 /// (Circle) two-atom term with non-trivial logits and coordinates (so the
 /// von-Mises gradient — hence the Riemannian Hessian correction — is nonzero).
@@ -1202,7 +1202,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom_a, atom_b], assignment).unwrap();
@@ -1284,7 +1284,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
 /// `sparse_active_plan_for_budget` so no multi-GB Gram is allocated.
 #[test]
 pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
-    // Build a `k`-atom IBP-MAP term with the given per-atom coordinate manifold.
+    // Build a `k`-atom ordered Beta--Bernoulli-MAP term with the given per-atom coordinate manifold.
     // Each atom carries the width-3 periodic basis, so `m_total = 3·k`.
     fn build_term(k: usize, curved: bool) -> SaeManifoldTerm {
         let n = 4usize;
@@ -1314,7 +1314,7 @@ pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
             Array2::<f64>::zeros((n, k)),
             (0..k).map(|_| coords.clone()).collect(),
             (0..k).map(|_| manifold.clone()).collect(),
-            AssignmentMode::ibp_map(0.7, 1.0, true),
+            AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
         )
         .unwrap();
         SaeManifoldTerm::new(atoms, assignment).unwrap()
@@ -1383,7 +1383,7 @@ pub(crate) fn snapshot_restore_round_trips_mutated_state() {
         Array2::<f64>::zeros((4, 1)),
         vec![coords0],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -1452,7 +1452,7 @@ pub(crate) fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
         Array2::<f64>::zeros((4, 1)),
         vec![coords0],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(0.7, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
@@ -1963,7 +1963,7 @@ fn collapse_rescue_term_and_target() -> (SaeManifoldTerm, Array2<f64>, SaeManifo
     )
     .unwrap()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-    // Softmax K=1 → gate ≡ 1 on every row (no IBP α to resolve).
+    // Softmax K=1 → gate ≡ 1 on every row (no ordered Beta--Bernoulli α to resolve).
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         Array2::<f64>::zeros((n, 1)),
         vec![coords],
@@ -2052,35 +2052,35 @@ pub(crate) fn collapse_rescue_projection_matches_train_and_oos_and_refuses_targe
 }
 
 /// #1777 GOAL 2 — the PER-FIT [`SaeFitConfig`] is the source of truth for the
-/// IBP-α and separation-barrier overrides: two terms carrying DIFFERENT configs
+/// ordered Beta--Bernoulli-α and separation-barrier overrides: two terms carrying DIFFERENT configs
 /// produce correspondingly-different α / barrier strength, and the two terms do
 /// not leak into each other.
 #[test]
-pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
+pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha() {
     let (mut term_a, _t_a, rho_a) = small_two_atom_ibp_term();
     let (mut term_b, _t_b, rho_b) = small_two_atom_ibp_term();
 
     // Distinct per-fit configs, applied to each term independently.
     term_a.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(0.1),
-        ibp_alpha_override: Some(0.2),
+        ordered_beta_bernoulli_alpha_override: Some(0.2),
     });
     term_b.set_fit_config(SaeFitConfig {
         separation_barrier_strength_override: Some(3.0),
-        ibp_alpha_override: Some(5.0),
+        ordered_beta_bernoulli_alpha_override: Some(5.0),
     });
 
     // Round-trips through the config accessor.
-    assert_eq!(term_a.fit_config().ibp_alpha_override, Some(0.2));
+    assert_eq!(term_a.fit_config().ordered_beta_bernoulli_alpha_override, Some(0.2));
     assert_eq!(
         term_b.fit_config().separation_barrier_strength_override,
         Some(3.0)
     );
 
-    // IBP-α: the per-fit override is the resolved α (bypassing the mode schedule),
+    // ordered Beta--Bernoulli-α: the per-fit override is the resolved α (bypassing the mode schedule),
     // and the two terms resolve different α values.
-    assert_eq!(term_a.assignment.resolved_ibp_alpha(&rho_a), Some(0.2));
-    assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
+    assert_eq!(term_a.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_a), Some(0.2));
+    assert_eq!(term_b.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_b), Some(5.0));
 
     // Distinct α ⇒ distinct gates (the ordered geometric prior π_k differs).
     let gates_a = term_a.assignment.try_assignments().unwrap();
@@ -2090,7 +2090,7 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
         .fold(0.0_f64, |m, d| m.max(d.abs()));
     assert!(
         gate_gap > 1e-6,
-        "distinct per-fit IBP-α overrides must produce distinct gates; gap {gate_gap:e}"
+        "distinct per-fit ordered Beta--Bernoulli-α overrides must produce distinct gates; gap {gate_gap:e}"
     );
 
     // Barrier strength (K=2, so the barrier is live): the per-fit override is the
@@ -2101,8 +2101,8 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
     // Isolation: clearing term_a's config leaves term_b untouched, and term_a
     // uses the mode's canonical α.
     term_a.set_fit_config(SaeFitConfig::default());
-    assert_eq!(term_a.assignment.resolved_ibp_alpha(&rho_a), Some(1.0)); // the mode's compiled α
-    assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
+    assert_eq!(term_a.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_a), Some(1.0)); // the mode's compiled α
+    assert_eq!(term_b.assignment.resolved_ordered_beta_bernoulli_alpha(&rho_b), Some(5.0));
 }
 
 /// F5 — the per-fit separation-barrier override (#1777) must isolate two
@@ -2127,7 +2127,7 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
                     let (mut term, _t, _rho) = small_two_atom_ibp_term();
                     term.set_fit_config(SaeFitConfig {
                         separation_barrier_strength_override: Some(mu),
-                        ibp_alpha_override: None,
+                        ordered_beta_bernoulli_alpha_override: None,
                     });
                     // Hammer the barrier-strength read while the sibling thread
                     // hammers its own with a different μ. The per-fit field is
@@ -2256,15 +2256,15 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
         epsilon = 1.0e-14
     );
 
-    // #1744 — IBP-MAP admits NO response-dispersion scaling on ANY ρ coordinate
+    // #1744 — ordered Beta--Bernoulli-MAP admits NO response-dispersion scaling on ANY ρ coordinate
     // (learnable-α or fixed-α). Its free per-row Bernoulli gates overfit under a
     // dispersion-weakened smoothness/ARD seed, collapsing the Fellner–Schall
     // fixed point; the sparse coordinate is a dimensionless log-α concentration
-    // offset that was never a squared-output-unit penalty weight. So every IBP
+    // offset that was never a squared-output-unit penalty weight. So every ordered Beta--Bernoulli
     // coordinate stays at its absolute (already dimensionless) construction value.
     for ibp_mode in [
-        AssignmentMode::ibp_map(1.0, 1.0, true),
-        AssignmentMode::ibp_map(1.0, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, true),
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
     ] {
         let ibp = rho
             .seed_scaled_by_dispersion_for_assignment(dispersion, ibp_mode)
@@ -2401,14 +2401,14 @@ pub(crate) fn global_ev(target: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>
 #[derive(Clone, Copy)]
 pub(crate) enum PlantedCircleAssignmentMode {
     Softmax,
-    IbpMap,
+    OrderedBetaBernoulli,
 }
 
 impl PlantedCircleAssignmentMode {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Softmax => "softmax",
-            Self::IbpMap => "ibp_map",
+            Self::OrderedBetaBernoulli => "ordered_beta_bernoulli",
         }
     }
 
@@ -2417,7 +2417,7 @@ impl PlantedCircleAssignmentMode {
         const ALPHA: f64 = 1.0;
         match self {
             Self::Softmax => AssignmentMode::softmax(TAU),
-            Self::IbpMap => AssignmentMode::ibp_map(TAU, ALPHA, false),
+            Self::OrderedBetaBernoulli => AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
         }
     }
 
@@ -2425,14 +2425,14 @@ impl PlantedCircleAssignmentMode {
         const TAU: f64 = 1.0;
         match self {
             Self::Softmax => 0.0,
-            Self::IbpMap => 6.0 * TAU,
+            Self::OrderedBetaBernoulli => 6.0 * TAU,
         }
     }
 
     pub(crate) fn seed_gate(self) -> f64 {
         match self {
             Self::Softmax => 1.0,
-            Self::IbpMap => 1.0 / (1.0 + (-6.0_f64).exp()),
+            Self::OrderedBetaBernoulli => 1.0 / (1.0 + (-6.0_f64).exp()),
         }
     }
 }
@@ -2495,7 +2495,7 @@ pub(crate) fn planted_circle_focus_1744() {
     let mut out = String::new();
     for assignment_mode in [
         PlantedCircleAssignmentMode::Softmax,
-        PlantedCircleAssignmentMode::IbpMap,
+        PlantedCircleAssignmentMode::OrderedBetaBernoulli,
     ] {
         let label = assignment_mode.label();
         let (term, seed_dispersion) = planted_circle_seed_term(z.view(), assignment_mode);
@@ -2538,7 +2538,7 @@ pub(crate) fn planted_circle_focus_1744() {
 }
 
 /// #1744 focused regression guard for the single noise-scale sweep point that
-/// failed: `ibp_map` n=40 σ=0.18. Runs exactly one outer solve from the
+/// failed: `ordered_beta_bernoulli` n=40 σ=0.18. Runs exactly one outer solve from the
 /// dimensionless ρ seed (the same construction the full sweep uses), so it
 /// reproduces the RED (~70s) far faster than the ~400s full sweep.
 ///
@@ -2549,8 +2549,8 @@ pub(crate) fn planted_circle_focus_1744() {
 /// both more-smoothed and farther from stationarity, so keep-best now retains
 /// the flexible seed. Uses the same 0.95 threshold as the full sweep.
 #[test]
-pub(crate) fn planted_circle_ibp_map_n40_sigma018_reaches_high_ev_1744() {
-    let assignment_mode = PlantedCircleAssignmentMode::IbpMap;
+pub(crate) fn planted_circle_ordered_beta_bernoulli_n40_sigma018_reaches_high_ev_1744() {
+    let assignment_mode = PlantedCircleAssignmentMode::OrderedBetaBernoulli;
     let n = 40usize;
     let sigma = 0.18_f64;
     let z = planted_circle_data(n, sigma);
@@ -2575,7 +2575,7 @@ pub(crate) fn planted_circle_ibp_map_n40_sigma018_reaches_high_ev_1744() {
     let ev = global_ev(z.view(), fitted_result.term.fitted().view());
     assert!(
         ev > 0.95,
-        "focused #1744 fixture (ibp_map n={n} sigma={sigma}) seed_ev={seed_ev:.4} \
+        "focused #1744 fixture (ordered_beta_bernoulli n={n} sigma={sigma}) seed_ev={seed_ev:.4} \
          final_rho=({:.3},{:?},{:?}) EV={ev:.4} should exceed 0.95",
         rho.log_lambda_sparse,
         rho.log_lambda_smooth,
@@ -2587,7 +2587,7 @@ pub(crate) fn planted_circle_ibp_map_n40_sigma018_reaches_high_ev_1744() {
 pub(crate) fn planted_circle_noise_scale_sweep_reaches_high_ev_with_dimensionless_rho_seed() {
     for assignment_mode in [
         PlantedCircleAssignmentMode::Softmax,
-        PlantedCircleAssignmentMode::IbpMap,
+        PlantedCircleAssignmentMode::OrderedBetaBernoulli,
     ] {
         let assignment_label = assignment_mode.label();
         for &n in &[40usize, 250usize] {
@@ -2655,13 +2655,13 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
             "SaeManifoldTerm::reml_criterion: undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity"
         )
     );
-    // A non-PD cross-row IBP joint Hessian at a probed ρ is genuine infeasibility
+    // A non-PD cross-row ordered Beta--Bernoulli joint Hessian at a probed ρ is genuine infeasibility
     // (the Laplace evidence log-det is undefined there) — recoverable, the same
     // class as the per-row non-PD refusal, so the outer optimizer returns +∞ and
     // steers back into the PD region instead of aborting the whole fit.
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
+            "SaeManifoldTerm::reml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
         )
     );
     // The generic "log-det unavailable" message (a real factorization defect, not
@@ -2694,7 +2694,7 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
-/// As [`small_two_atom_periodic_term`], but in **IBP-MAP** assignment mode so
+/// As [`small_two_atom_periodic_term`], but in **ordered Beta--Bernoulli-MAP** assignment mode so
 /// the exact joint Hessian carries the #1038 cross-row rank-`R` Woodbury block
 /// `H_full = H₀' + U D Uᵀ` (the empirical-mass coupling between distinct latent
 /// rows through a shared atom column). The dense evidence log-det therefore
@@ -2741,7 +2741,7 @@ pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeMan
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.8, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.8, 1.0, false),
     )
     .unwrap();
     let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
@@ -2755,11 +2755,11 @@ pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeMan
 }
 
 /// #1038/#1225 — the streaming evidence log-det MUST equal the dense full-batch
-/// evidence log-det for an **IBP-MAP** term, i.e. it MUST carry the exact
+/// evidence log-det for an **ordered Beta--Bernoulli-MAP** term, i.e. it MUST carry the exact
 /// cross-row Woodbury capacitance correction `log|C|`.
 ///
 /// Pre-fix the streaming path could not represent the rank-`R` cross-row block:
-/// `reduced_schur_and_log_det_tt` refused IBP-active systems outright, so
+/// `reduced_schur_and_log_det_tt` refused ordered Beta--Bernoulli-active systems outright, so
 /// `reml_criterion_streaming_exact` *errored* on this fixture — and if that
 /// refusal had instead silently returned `log_det_tt + log_det_schur`, the
 /// streaming criterion would have under-counted the dense criterion by exactly
@@ -2778,19 +2778,19 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_ibp_woodbury() {
     let mut full = term0;
     let (_full_cost, _full_loss, cache) = full
         .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
-        .expect("dense IBP criterion must evaluate");
+        .expect("dense ordered Beta--Bernoulli criterion must evaluate");
 
     // (1) The dense joint Hessian carries a genuine cross-row Woodbury block on
     // this fixture: its capacitance correction is present, finite, and nonzero.
     // This is the `log|C|` the streaming path would drop without the fix.
     assert!(
         cache.cross_row_woodbury.is_some(),
-        "IBP fixture must build a cross-row Woodbury carrier (else the test is vacuous)"
+        "ordered Beta--Bernoulli fixture must build a cross-row Woodbury carrier (else the test is vacuous)"
     );
     let log_c = cache.cross_row_woodbury_log_det();
     assert!(
         log_c.is_finite() && log_c.abs() > 1.0e-6,
-        "IBP fixture must have a load-bearing nonzero cross-row log|C|; got {log_c}"
+        "ordered Beta--Bernoulli fixture must have a load-bearing nonzero cross-row log|C|; got {log_c}"
     );
 
     // (2) The streaming exact LOG-DET must reproduce the dense `log|H|` at the SAME
@@ -4317,7 +4317,7 @@ pub(crate) fn production_builder_circle_reduces_rank_and_completes_stage1_step0_
         penalties.view(),
         logits.view(),
         std::slice::from_ref(&coords),
-        AssignmentMode::ibp_map(1.0, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
         &evaluators,
     )
     .unwrap();

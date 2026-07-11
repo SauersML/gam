@@ -81,7 +81,7 @@ fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
         logits,
         coords,
         manifolds,
-        AssignmentMode::ibp_map(0.7, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
     )
     .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()

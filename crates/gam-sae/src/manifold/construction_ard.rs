@@ -55,7 +55,7 @@ impl SaeManifoldTerm {
     /// `self.last_row_layout` must be the layout from the *same* assemble that
     /// produced `cache`:
     /// - `Some(layout)`: compact active-set mode (JumpReLU / large-K
-    ///   softmax-IBP truncation). For row `i`, atom `k`'s position in the
+    ///   softmax-ordered Beta--Bernoulli truncation). For row `i`, atom `k`'s position in the
     ///   active list gives its compact coord-block start `coord_starts[i][pos]`;
     ///   inactive atoms contribute 0 (the prior dominates there anyway).
     /// - `None`: dense full-support layout, uniform row dim
@@ -430,7 +430,7 @@ impl SaeManifoldTerm {
     /// natural soft-vs-hard scale (a uniform `K`-way split gives `1/K` per atom, so
     /// a winner far above `1−1/K` is saturated); a fixed `0.9` is robust across `K`
     /// and conservative (it EXCLUDES ambiguous soft rows, never over-shooting). The
-    /// hard gate families (TopK / ThresholdGate / IBP-MAP) are discrete by
+    /// hard gate families (TopK / ThresholdGate / ordered Beta--Bernoulli-MAP) are discrete by
     /// construction and bypass this threshold.
     pub(crate) const SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT: f64 = 0.9;
 
@@ -452,7 +452,7 @@ impl SaeManifoldTerm {
     /// `Δ_i = ‖δ‖²_M − 2⟨r, δ⟩_M`.
     ///
     /// The charge fires ONLY on effectively-discrete selection — TopK (the
-    /// `k`-th↔`(k+1)`-th support swap), ThresholdGate / IBP-MAP hard gates, and
+    /// `k`-th↔`(k+1)`-th support swap), ThresholdGate / ordered Beta--Bernoulli-MAP hard gates, and
     /// SATURATED softmax rows (`a_max ≥ SOFTMAX_HARD_SELECTION_MIN_TOP_WEIGHT`);
     /// genuinely-soft softmax rows contribute 0 (their selection smoothness is
     /// already in the within-basin edf — charging them double-counts). It is also
@@ -571,12 +571,12 @@ impl SaeManifoldTerm {
                     }
                     (top, ranked[1], a_top)
                 }
-                // Per-atom hard gates (IBP-MAP indicator, ThresholdGate hard
+                // Per-atom hard gates (ordered Beta--Bernoulli-MAP indicator, ThresholdGate hard
                 // sigmoid): discrete by construction. Dominant-pair approximation —
                 // the top-mass gated atom vs its nearest competitor (the exact
                 // multi-gate boundary enumeration is the documented follow-up, and
                 // like the within-basin term this dominant piece never over-counts).
-                AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => {
+                AssignmentMode::OrderedBetaBernoulli { .. } | AssignmentMode::ThresholdGate { .. } => {
                     let top = ranked[0];
                     (top, ranked[1], assignments[top])
                 }
@@ -653,7 +653,7 @@ impl SaeManifoldTerm {
     /// `E[z_i z_j] = 0`). Averaging over probes gives the unbiased diagonal. Each
     /// probe is ONE [`ArrowFactorCache::full_inverse_apply`] (per-row solves + a
     /// SINGLE Schur solve + the rank-`R` cross-row Woodbury correction — the same
-    /// `H_full` the exact path inverts), so the IBP curvature is included
+    /// `H_full` the exact path inverts), so the ordered Beta--Bernoulli curvature is included
     /// identically.
     ///
     /// Probes run serially and accumulate in a fixed order, so for a fixed

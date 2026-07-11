@@ -165,7 +165,7 @@ from ._penalties import (
     BlockOrthogonalityPenalty,
     BlockSparsityPenalty,
     GatedSAEDecoder,
-    IBPAssignmentPenalty,
+    OrderedBetaBernoulliPenalty,
     IsometryPenalty,
     IvaeRidgeMeanGauge,
     JumpReLUPenalty,

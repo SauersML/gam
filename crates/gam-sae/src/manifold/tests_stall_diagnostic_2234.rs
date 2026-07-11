@@ -263,7 +263,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         tau: 1.0,
         threshold: 0.0,
         top_k: None,
-        ibp_alpha_override: None,
+        ordered_beta_bernoulli_alpha_override: None,
         random_state: 45,
         initial_logits: None,
         initial_coords: None,

@@ -59,7 +59,7 @@ def test_euclidean_k4_fit_and_oos_reconstruct_issue_1132():
         K=4,
         atom_basis="euclidean",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=40,
         learning_rate=0.04,
         random_state=0,

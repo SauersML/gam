@@ -304,7 +304,7 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>) -> SaeManifoldTerm {
         logits,
         coords_k,
         vec![LatentManifold::Circle { period: 1.0 }; k],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()

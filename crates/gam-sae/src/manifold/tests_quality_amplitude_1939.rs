@@ -103,7 +103,7 @@ fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
         &basis_sizes,
         target.view(),
         logits.view(),
-        "ibp_map",
+        "ordered_beta_bernoulli",
         1.0,
         1.0,
         0.0,
@@ -126,7 +126,7 @@ fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
         penalties.view(),
         logits.view(),
         &coords_vec,
-        AssignmentMode::ibp_map(1.0, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
         &evaluators,
     )
     .unwrap()

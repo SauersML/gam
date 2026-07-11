@@ -49,7 +49,7 @@ def _fit_circle(x: np.ndarray) -> gamfit._sae_manifold.ManifoldSAE:
         K=1,
         atom_basis="periodic",
         d_atom=1,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=80,
         random_state=0,
     )

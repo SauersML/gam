@@ -12,7 +12,7 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 
-use crate::assignment::{ibp_map_row, jumprelu_row, topk_row};
+use crate::assignment::{ordered_beta_bernoulli_row, threshold_gate_row, topk_row};
 
 use super::{SaeAtomBasisKind, SaeManifoldTerm};
 
@@ -33,7 +33,7 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// to the neutral state), so the existing jitter still breaks those rare ties;
 /// rows with a clear best atom get a decisive — but bounded, hence escapable by
 /// the Newton refinement — head start. The mean-centring is translation-identity
-/// for softmax and keeps the IBP-MAP `sigmoid(logit/τ)` gate neutral (0.5) on
+/// for softmax and keeps the ordered Beta--Bernoulli-MAP `sigmoid(logit/τ)` gate neutral (0.5) on
 /// ties instead of slamming both gates shut, so the seed is safe for both
 /// assignment maps. The result is a proper responsibility seed rather than a
 /// saddle.
@@ -116,7 +116,7 @@ pub fn sae_residual_seed_logits(
     //
     // The mean-centring is what keeps the seed safe across assignment maps.
     // Softmax is translation-invariant, so subtracting the per-row mean leaves
-    // it bit-identical to the raw `-gain·r/m` form. IBP-MAP, by contrast, maps
+    // it bit-identical to the raw `-gain·r/m` form. ordered Beta--Bernoulli-MAP, by contrast, maps
     // each logit through an unnormalised `sigmoid(logit/τ)`: an *uncentred*
     // negative-only seed would push *every* gate below 0.5 and slam a tied row
     // shut (`sigmoid(-gain/τ)≈0`), which is worse than the neutral 0.5/0.5 state
@@ -545,14 +545,14 @@ pub fn sae_refine_mobius_seed_coords_by_cluster(
 /// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
 /// a_init * Phi_K]`, where `a_init` is the assignment map that the inner Newton
 /// driver will produce at iteration 0 from the supplied `initial_logits`.
-/// IBP-MAP uses the base `alpha` because learnable-alpha fits start with
+/// ordered Beta--Bernoulli-MAP uses the base `alpha` because learnable-alpha fits start with
 /// `rho0 = 0`, and JumpReLU uses the configured hard threshold.
 ///
 /// Zero-initialised decoder coefficients leave the joint-fit Arrow-Schur
 /// system in a degenerate fixed point on multi-atom configurations: the
 /// data-fit Jacobian, the assignment-weighted decoder gradient, and the
 /// sparsity-prior gradient cannot all be zero simultaneously, but the
-/// assignment prior (IBP-MAP stick-breaking or softmax entropy) is the only
+/// assignment prior (ordered Beta--Bernoulli-MAP stick-breaking or softmax entropy) is the only
 /// term with a non-zero gradient at iter 0. The optimizer then collapses the
 /// assignments to zero before any data signal has accumulated, even on
 /// trivially-separable signals such as the K=2 periodic torus reproducer in
@@ -664,16 +664,16 @@ pub fn sae_decoder_lsq_init(
                 }
             }
         }
-        "ibp_map" => {
+        "ordered_beta_bernoulli" => {
             if !alpha.is_finite() || alpha <= 0.0 {
                 return Err(format!(
-                    "sae_decoder_lsq_init: alpha must be finite and positive for IBP-MAP; got {alpha}"
+                    "sae_decoder_lsq_init: alpha must be finite and positive for ordered Beta--Bernoulli-MAP; got {alpha}"
                 ));
             }
             // Use the base alpha here. In learnable-alpha fits the first rho
             // coordinate starts at zero, so alpha_eff = alpha at initialization.
             for row in 0..n_obs {
-                let weights = ibp_map_row(initial_logits.row(row), tau);
+                let weights = ordered_beta_bernoulli_row(initial_logits.row(row), tau);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -687,7 +687,7 @@ pub fn sae_decoder_lsq_init(
                 ));
             }
             for row in 0..n_obs {
-                let weights = jumprelu_row(initial_logits.row(row), tau, jumprelu_threshold);
+                let weights = threshold_gate_row(initial_logits.row(row), tau, jumprelu_threshold);
                 for k in 0..k_atoms {
                     a_init[[row, k]] = weights[k];
                 }
@@ -853,7 +853,7 @@ pub fn sae_decoder_lsq_init(
 /// carry the interval extension needed to enumerate their complete stationary
 /// sets.
 ///
-/// Only invoked for cold-start multi-atom softmax / IBP-MAP fits; JumpReLU keeps
+/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli-MAP fits; JumpReLU keeps
 /// its margin-above-threshold gate seed and warm starts are respected verbatim.
 pub fn sae_em_refine_routing_seed(
     term: &mut SaeManifoldTerm,
@@ -1024,7 +1024,7 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #174: the joint LSQ seed for K=2 IBP-MAP
+    /// Regression test for issue #174: the joint LSQ seed for K=2 ordered Beta--Bernoulli-MAP
     /// must produce a non-zero decoder and a residual smaller than the
     /// trivial zero-decoder baseline. Without this seed the joint Newton
     /// driver collapses A → 0 before any data signal accumulates.
@@ -1069,10 +1069,10 @@ mod tests {
             &basis_sizes,
             z.view(),
             logits.view(),
-            "ibp_map",
-            1.0, // alpha (IBP concentration; canonical default)
+            "ordered_beta_bernoulli",
+            1.0, // alpha (ordered Beta--Bernoulli concentration; canonical default)
             0.7, // tau
-            0.0, // jumprelu_threshold (unused for ibp_map)
+            0.0, // jumprelu_threshold (unused for ordered_beta_bernoulli)
             None,
         )
         .expect("LSQ seed must succeed");
@@ -1091,15 +1091,15 @@ mod tests {
 
         // The seeded reconstruction must explain most of Z under the SAME forward
         // map the joint LSQ solved against: fitted[i,:] = Σ_k a_k · Phi_k[i,:] · B_k
-        // where a_k is the IBP-MAP activation of the initial (all-zero) logits. For
+        // where a_k is the ordered Beta--Bernoulli-MAP activation of the initial (all-zero) logits. For
         // zero logits the posterior-mean Bernoulli gate is σ(0) = 0.5. Ordered
-        // stick-breaking shrinkage is scored by the IBP prior, not multiplied
+        // stick-breaking shrinkage is scored by the ordered Beta--Bernoulli prior, not multiplied
         // into the reconstruction a second time.
         // Reconstructing with the true per-atom weights (rather than an imagined
         // uniform gate) is what makes this a faithful check of the LSQ seed: the
         // solver's design columns are a_k · Phi_k, so the fit it returns is only
         // meaningful when scored back through the same a_k.
-        let a_init = ibp_map_row(
+        let a_init = ordered_beta_bernoulli_row(
             ndarray::Array1::<f64>::zeros(k).view(),
             0.7, // tau (matches the sae_decoder_lsq_init call above)
         );

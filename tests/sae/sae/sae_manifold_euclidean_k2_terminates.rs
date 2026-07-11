@@ -125,7 +125,7 @@ fn build_cold_k2_term(s_true: &[Vec<f64>; 2], owner: &[usize], z: &Array2<f64>) 
         Array2::<f64>::zeros((N, K)),
         coords_all,
         manifolds,
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()

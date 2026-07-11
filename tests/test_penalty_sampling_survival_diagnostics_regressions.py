@@ -10,7 +10,7 @@ from gamfit._diagnostics import Diagnostics
 from gamfit._penalties import (
     ARDPenalty,
     BlockOrthogonalityPenalty,
-    IBPAssignmentPenalty,
+    OrderedBetaBernoulliPenalty,
     SoftmaxAssignmentSparsityPenalty,
     TotalVariationPenalty,
 )
@@ -26,7 +26,7 @@ def test_penalty_specs_sampling_survival_and_diagnostics_regressions():
         TotalVariationPenalty(weight=1.25, n_eff=4, difference_op="forward_1d", target="t"),
         BlockOrthogonalityPenalty(groups=[[0], [1]], weight=0.75, n_eff=4, target="t"),
         SoftmaxAssignmentSparsityPenalty(k_atoms=3, temperature=0.9, target="t"),
-        IBPAssignmentPenalty(k_max=3, alpha=1.5, tau=0.8, learnable=True, target="t"),
+        OrderedBetaBernoulliPenalty(k_max=3, alpha=1.5, tau=0.8, learnable=True, target="t"),
     ]
 
     descriptors = [p.to_rust_descriptor() for p in penalties]

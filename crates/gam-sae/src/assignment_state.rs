@@ -88,8 +88,8 @@ pub struct SaeAssignmentState {
     /// #1033 frozen/amortized routing, dense `(N, K)` when engaged (a
     /// full-support-only field; the sparse TopK lane never freezes routing).
     frozen_logits: Option<Array2<f64>>,
-    /// #1777 per-fit IBP-α override.
-    ibp_alpha_override: Option<f64>,
+    /// #1777 per-fit ordered Beta--Bernoulli-α override.
+    ordered_beta_bernoulli_alpha_override: Option<f64>,
 }
 
 impl SaeAssignmentState {
@@ -124,7 +124,7 @@ impl SaeAssignmentState {
             mode: AssignmentMode::softmax(1.0),
             ungated: vec![false; k_atoms],
             frozen_logits: None,
-            ibp_alpha_override: None,
+            ordered_beta_bernoulli_alpha_override: None,
         }
     }
 
@@ -204,7 +204,7 @@ impl SaeAssignmentState {
             mode: AssignmentMode::top_k_support(support_k),
             ungated: vec![false; k_atoms],
             frozen_logits: None,
-            ibp_alpha_override: None,
+            ordered_beta_bernoulli_alpha_override: None,
         })
     }
 
@@ -348,7 +348,7 @@ impl SaeAssignmentState {
             mode: self.mode,
             ungated: self.ungated.clone(),
             frozen_logits: self.frozen_logits.clone(),
-            ibp_alpha_override: self.ibp_alpha_override,
+            ordered_beta_bernoulli_alpha_override: self.ordered_beta_bernoulli_alpha_override,
         })
     }
 }
@@ -405,7 +405,7 @@ impl SaeAssignment {
             mode: self.mode,
             ungated: self.ungated.clone(),
             frozen_logits: self.frozen_logits.clone(),
-            ibp_alpha_override: self.ibp_alpha_override,
+            ordered_beta_bernoulli_alpha_override: self.ordered_beta_bernoulli_alpha_override,
         }
     }
 
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(dense.ungated, back.ungated, "ungated flags");
         assert_eq!(dense.frozen_logits, back.frozen_logits, "frozen routing");
         assert_eq!(
-            dense.ibp_alpha_override, back.ibp_alpha_override,
+            dense.ordered_beta_bernoulli_alpha_override, back.ordered_beta_bernoulli_alpha_override,
             "ibp alpha override"
         );
         // Coordinates bit-for-bit, including stable identity and geometry.
@@ -499,8 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn dense_state_dense_roundtrip_is_bit_exact_ibp_map() {
-        assert_bit_exact_roundtrip(AssignmentMode::ibp_map(0.9, 1.0, false));
+    fn dense_state_dense_roundtrip_is_bit_exact_ordered_beta_bernoulli() {
+        assert_bit_exact_roundtrip(AssignmentMode::ordered_beta_bernoulli(0.9, 1.0, false));
     }
 
     #[test]

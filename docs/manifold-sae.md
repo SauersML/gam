@@ -24,7 +24,7 @@ fit = gamfit.sae_manifold_fit(
     K=16,                       # dictionary size
     d_atom=1,                   # intrinsic dim per atom (default 2; int, or per-atom list)
     atom_topology="circle",     # default "circle"; see the topology table below
-    assignment="ibp_map",       # IBP-MAP sparsity (default)
+    assignment="ordered_beta_bernoulli",       # ordered independent Beta--Bernoulli sparsity
 )
 
 print(fit)              # ManifoldSAE(K=16, d_atom=1, atom_topology='circle', ...)
@@ -45,7 +45,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `K` | `None` | dictionary size (number of atoms) |
 | `d_atom` | `2` | intrinsic dim per atom (int, or per-atom list) |
 | `atom_topology` | `"circle"` | global topology string (see table) |
-| `assignment` | `"ibp_map"` | gate kind: `ibp_map` / `softmax` / `jumprelu` |
+| `assignment` | `"ordered_beta_bernoulli"` | gate kind: `ordered_beta_bernoulli` / `softmax` / `jumprelu` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
 | `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
 | `ard_per_atom` | `True` | ARD pruning of unused coordinate axes |
@@ -62,7 +62,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `nuclear_norm_weight` | `1.0` | embedding-rank selection penalty |
 | `nuclear_norm_max_rank` | `None` | optional cap on the embedding rank |
 | `decoder_incoherence_weight` | `1.0` | cross-atom incoherence (separability lever) |
-| `top_k` | `None` | cap on per-token active atoms, folded into the **optimization** as a **train-time active-set cap** (#1408/#1419). The engine builds the compact active×active solve over the capped per-token support (for `softmax`, `jumprelu`, and IBP-MAP), so it bounds the fit's per-token compute, not merely the reported support. The engine additionally applies an automatic **memory-budget cap**: when the dense `K` working set would exceed the host/device budget, the compact active-set layout engages even without an explicit `top_k`. `None`/`0` disable the explicit cap. |
+| `top_k` | `None` | optional cap on per-token active atoms. |
 | `t_init` | `None` | coordinate warm start `(K, N, D_max)` |
 | `a_init` | `None` | assignment-logit warm start `(N, K)` |
 | `tau` | `None` | Gumbel-softmax temperature |
@@ -146,23 +146,21 @@ smoothing weights selected by REML. Each piece plays a distinct role
 
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
   is selected by the assignment prior. The three supported kinds are
-  `"ibp_map"` (default), `"softmax"`, and `"jumprelu"`. `"ibp_map"`
-  (Indian Buffet Process, empirical-Bayes) adapts the *number* of active atoms
-  per token via a sigmoid gate scaled by the ordered stick-breaking **prior
-  mean** `π_k(α) = μ_k = (α/(α+1))^(k+1)`. The gate is `σ(ℓ/τ)·π_k(α)`, which is
-  strictly positive at every finite logit, so it
-  produces a **sharply decaying, sparsity-inducing** gate rather than a soft
-  simplex — but not exact zeros on its own; **hard zeros require the separate
-  `top_k=` truncation** (#1421). The gate and its analytic sparsity penalty are
-  **one generative model** — `π_k ~ Beta(a_k, 1)`, `z_ik | π_k ~ Bernoulli(π_k)`
-  with `a_k = μ_k/(1−μ_k)` (so `E[π_k] = μ_k`): the gate multiplies the **prior
-  mean** `μ_k`, while the penalty scores the relaxed indicators `z_ik = σ(ℓ/τ)`
-  against the **posterior mean** `π̂_k = (M_k + a_k)/(N + a_k + 1)` of that same
-  `π_k` (empirical Bayes). Despite the `ibp_map` keyword the plug-in is the
-  posterior **mean**, not the MAP/mode — the penalty is the negative
-  log-posterior of the model the gate samples, so fit = one coherent objective. `"softmax"` is a
-  dense, simplex-normalized gate; `"jumprelu"` is a hard threshold (its
-  cutoff is `jumprelu_threshold=`, default `0.0`). `top_k=` optionally caps
+  `"ordered_beta_bernoulli"` (default), `"softmax"`, and `"threshold_gate"`.
+  The ordered Beta--Bernoulli route uses posterior-mean relaxed indicators
+  `z_ik = σ(ℓ_ik/τ)` directly in reconstruction. Its independent column rates
+  satisfy `π_k ~ Beta(a_k, 1)` with
+  `a_k = μ_k/(1−μ_k)` and ordered means
+  `μ_k = (α/(α+1))^(k+1)`. These means define a geometric shrinkage schedule;
+  the columns do not share latent sticks and the model is therefore not an IBP.
+  Integrating each nuisance rate exactly gives the per-column penalty
+  `−log a_k − logΓ(M_k+a_k) − logΓ(N−M_k+1) + logΓ(N+a_k+1)`, where
+  `M_k = Σ_i z_ik`. Logit, concentration, Hessian, and REML/LAML channels all
+  differentiate this same scalar. The prior mean is not multiplied into the
+  reconstruction, so shrinkage is scored exactly once. `"softmax"` is a dense,
+  simplex-normalized gate. `"threshold_gate"` is the smooth bounded gate
+  `σ((ℓ−threshold)/τ)` with its exact logistic derivative; its threshold is
+  configured by `jumprelu_threshold=`. `top_k=` optionally caps
   the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
 
   **Gumbel temperature schedules.** For the annealed gates, pass `schedule=`
@@ -227,7 +225,8 @@ smoothing weights selected by REML. Each piece plays a distinct role
   (see the topology table). A fixed finite-/cyclic-difference Gram in the latent
   coordinate is the *base operator*; the intrinsic (function-space) Gram is
   refreshed from it between assemblies via the current decoder pullback
-  (lagged-diffusivity), so the converged penalty is the true intrinsic roughness.
+  (lagged diffusivity). Each inner solve differentiates the frozen quadratic
+  surrogate; it does not include derivatives of the geometry-dependent Gram.
 
 - **Coordinate-magnitude penalty** (`gate_sparsity="scad"` default; `"l1"` /
   `"mcp"` alternatives). Despite the parameter name, `scad` and `mcp` do **not**
@@ -242,7 +241,8 @@ Two more knobs: `decoder_feature_sparsity_groups=` group-lassoes the decoder
 over a partition of the `p` output features (encouraging each basis function
 to load on a single feature cluster), and
 `block_orthogonality_weight=` orthogonalizes the latent coordinate axes
-(requires `d_atom >= 2`).
+(requires `d_atom >= 2`) with the exact public convention
+`½·weight·Σ_{g<h} ‖T_gᵀT_h‖²_F`.
 
 ## Uncertainty and range: where each manifold lives, what shape, how confident
 

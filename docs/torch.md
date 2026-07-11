@@ -122,7 +122,7 @@ replacement for either top-eigenfactor/dosimetry harvest.
 | Closed-form REML | `gaussian_reml_fit`, `gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`, `gaussian_reml_fit_blocks`, `GaussianRemlOutput`, `AdditiveRemlOutput` |
 | Basis evaluations | `bspline_basis`, `bspline_basis_derivative`, `duchon_basis`, `periodic_spline_curve_basis`, `sphere_basis` |
 | Penalty / ridge | `smoothness_penalty`, `gaussian_weighted_ridge`, `gaussian_weighted_ridge_batch` |
-| Penalty modules | `AdaptiveTopK`, `ARDPenalty`, `BlockOrthogonalityPenalty`, `GatedSAEDecoder`, `GumbelTemperatureSchedule`, `IBPAssignmentPenalty`, `IsometryPenalty`, `IvaeRidgeMeanGauge`, `JumpReLUPenalty`, `LazyPcaBasis`, `MechanismSparsityPenalty`, `MonotonicityPenalty`, `RiemannianRetraction`, `SoftmaxAssignmentSparsityPenalty`, `SparsityPenalty`, `TopKActivationPenalty`, `TopologyAutoSelector` |
+| Penalty modules | `AdaptiveTopK`, `ARDPenalty`, `BlockOrthogonalityPenalty`, `GatedSAEDecoder`, `GumbelTemperatureSchedule`, `OrderedBetaBernoulliPenalty`, `IsometryPenalty`, `IvaeRidgeMeanGauge`, `JumpReLUPenalty`, `LazyPcaBasis`, `MechanismSparsityPenalty`, `MonotonicityPenalty`, `RiemannianRetraction`, `SoftmaxAssignmentSparsityPenalty`, `SparsityPenalty`, `TopKActivationPenalty`, `TopologyAutoSelector` |
 | Manifold SAE | `ManifoldSAE`, `ManifoldSAEConfig`, `DecoderConfig`, `RemlConfig`, `SparsityConfig`, `ManifoldSAEOutput`, `circular_concordance`, `CircularConcordanceReport` |
 | Harvest / Fisher factors | `HarvestShard`, `harvest_output_fisher_factors`, `harvest_downstream_output_fisher_factors`, `save_harvest_shard`, `load_harvest_shard` |
 | Hyperbolic / interchange | `PoincareAtoms`, `InterchangeSwapDecoder` |

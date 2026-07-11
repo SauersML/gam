@@ -1665,7 +1665,7 @@ fn sae_1026_solver_recovers_separable_superposition_but_not_below_2k() {
                 LatentManifold::Circle { period: 1.0 },
                 LatentManifold::Circle { period: 1.0 },
             ],
-            AssignmentMode::ibp_map(0.5, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![a0, a1], assignment).unwrap();

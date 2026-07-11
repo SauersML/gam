@@ -91,7 +91,7 @@ def run_t2(residual, topo, args):
         print(f"  [{topo}] birth {bi} ev_trace_tail={ev[-1] if isinstance(ev, list) and ev else '?'}",
               flush=True)
     sw = C._fit_stagewise_t2(
-        residual, d_atom=args.d_atom, atom_topology=topo, assignment="ibp_map",
+        residual, d_atom=args.d_atom, atom_topology=topo, assignment="ordered_beta_bernoulli",
         max_births=args.max_births, min_effect_ev=0.0, structured_whitening=True,
         sample_weights=None, max_iter=args.n_iter, random_state=0, birth_callback=_cb)
     wall = time.time() - t0

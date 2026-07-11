@@ -50,7 +50,7 @@ def test_periodic_atom_oos_r2_noise_sweep(noise: float):
         K=1,
         atom_basis="periodic",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=50,
         learning_rate=0.04,
         random_state=0,

@@ -22,7 +22,7 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
-use gam_sae::assignment::{AssignmentMode, SaeAssignment, default_ibp_concentration_for_k_atoms};
+use gam_sae::assignment::{AssignmentMode, SaeAssignment, default_ordered_beta_bernoulli_concentration_for_k_atoms};
 use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use gam_sae::manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, sae_pca_seed_initial_coords,
@@ -236,7 +236,7 @@ fn curved_single_atom_ev(z: ArrayView2<'_, f64>, num_basis: usize) -> f64 {
         Array2::<f64>::zeros((n, 1)),
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(1.0, default_ibp_concentration_for_k_atoms(1), false),
+        AssignmentMode::ordered_beta_bernoulli(1.0, default_ordered_beta_bernoulli_concentration_for_k_atoms(1), false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();

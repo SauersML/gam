@@ -41,7 +41,7 @@
     fisher_provenance = None,
     row_loss_weights = None,
     separation_barrier_strength_override = None,
-    ibp_alpha_override = None,
+    ordered_beta_bernoulli_alpha_override = None,
     // #2239 magic-by-default: evidence-certified residual structure is promoted
     // to the primary tier by default (the certificate gates the birth; the
     // alternation self-extends its pass budget only while lineages are live).
@@ -86,10 +86,10 @@ fn sae_manifold_fit_minimal<'py>(
     // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
     // unweighted path. Installed on the term before the joint fit / ρ selection.
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    // Per-fit config (separation-barrier strength / IBP-α). `Some` pins this
+    // Per-fit config (separation-barrier strength / ordered Beta--Bernoulli-α). `Some` pins this
     // term's value; `None` selects the canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
-    ibp_alpha_override: Option<f64>,
+    ordered_beta_bernoulli_alpha_override: Option<f64>,
     promote_from_residual: bool,
     run_structure_search: bool,
     run_outer_rho_search: bool,
@@ -108,7 +108,7 @@ fn sae_manifold_fit_minimal<'py>(
         tau,
         threshold: jumprelu_threshold,
         top_k,
-        ibp_alpha_override,
+        ordered_beta_bernoulli_alpha_override,
         random_state,
         initial_logits: initial_logits.as_ref().map(|values| values.as_array()),
         initial_coords: initial_coords.as_ref().map(|values| values.as_array()),
@@ -169,7 +169,7 @@ fn sae_manifold_fit_minimal<'py>(
         fisher_provenance.as_deref(),
         row_w,
         separation_barrier_strength_override,
-        ibp_alpha_override,
+        ordered_beta_bernoulli_alpha_override,
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
@@ -233,7 +233,7 @@ fn sae_oos_request_from_arrays(
     }
     let assignment = match assignment_kind.as_str() {
         "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
-        "ibp_map" => gam::terms::sae::manifold::SaeOosAssignmentKind::IbpMap { learnable_alpha },
+        "ordered_beta_bernoulli" => gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha },
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
             threshold: jumprelu_threshold,
         },
@@ -999,7 +999,7 @@ fn steer_delta_with_metric_from_arrays(
     }
     let assignment = match assignment_kind.as_str() {
         "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
-        "ibp_map" => gam::terms::sae::manifold::SaeOosAssignmentKind::IbpMap {
+        "ordered_beta_bernoulli" => gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli {
             learnable_alpha: false,
         },
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
@@ -1008,7 +1008,7 @@ fn steer_delta_with_metric_from_arrays(
         "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
         _ => {
             return Err(py_value_error(format!(
-                "sae_steer_delta: assignment_kind must be one of 'softmax', 'ibp_map', \
+                "sae_steer_delta: assignment_kind must be one of 'softmax', 'ordered_beta_bernoulli', \
                  'threshold_gate', or 'topk'; got {assignment_kind}"
             )));
         }
@@ -2240,7 +2240,7 @@ mod sae_assignment_kind_tests {
             "threshold_gate"
         );
         assert_eq!(canonicalize_assignment_kind("softmax").unwrap(), "softmax");
-        assert_eq!(canonicalize_assignment_kind("ibp_map").unwrap(), "ibp_map");
+        assert_eq!(canonicalize_assignment_kind("ordered_beta_bernoulli").unwrap(), "ordered_beta_bernoulli");
         assert_eq!(canonicalize_assignment_kind("topk").unwrap(), "topk");
         let removed = canonicalize_assignment_kind("jumprelu").unwrap_err();
         assert!(

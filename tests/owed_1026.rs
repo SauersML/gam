@@ -97,7 +97,7 @@ fn build_two_atom_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm 
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.5, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
     )
     .unwrap();
     SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()

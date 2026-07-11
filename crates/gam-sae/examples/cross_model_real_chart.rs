@@ -308,7 +308,7 @@ fn fit_real_chart(
     let top5_linear_ev = top_m_linear_ev(post_peel.view(), 5)?;
 
     let (term, seed_dispersion, basis_size) = periodic_k1_term(post_peel.view(), harmonics, label)?;
-    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let mode = AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false);
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![Array1::zeros(1)])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)?;
     let seed = init_rho.to_flat();
@@ -430,7 +430,7 @@ fn periodic_k1_term(
         logits,
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(1.0, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
     )?;
     let term = SaeManifoldTerm::new(vec![atom], assignment)?;
     Ok((term, seed_dispersion, num_basis))

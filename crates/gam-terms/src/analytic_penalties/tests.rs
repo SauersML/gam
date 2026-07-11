@@ -294,7 +294,7 @@ fn softmax_row_fisher_metric_is_psd_gauge_null_and_derivative_matches_fd() {
 }
 
 #[test]
-fn ibp_assignment_grad_target_matches_value_finite_difference() {
+fn ordered_beta_bernoulli_assignment_grad_target_matches_value_finite_difference() {
     let pen = OrderedBetaBernoulliPenalty::new(4, 6.0, 0.8, false);
     let t = array![
         0.2_f64, -0.3, 0.7, -0.5, 0.9, 0.4, -0.2, 0.1, -0.4, 0.8, 0.3, -0.1
@@ -317,13 +317,13 @@ fn ibp_assignment_grad_target_matches_value_finite_difference() {
     }
     assert!(
         max_err < 1.0e-7,
-        "IBP grad-FD max abs error = {max_err:.3e}"
+        "ordered Beta--Bernoulli grad-FD max abs error = {max_err:.3e}"
     );
 }
 
 #[test]
 fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
-    // #1038: the exact IBP Hessian couples DIFFERENT rows within a column
+    // #1038: the exact ordered Beta--Bernoulli Hessian couples DIFFERENT rows within a column
     // through the plug-in empirical mass `M_k = Σ_i z_ik`:
     //   ∂²(value)/∂ℓ_ik ∂ℓ_jk = w · s'_k · z'_ik · z'_jk   (the cross-row
     // rank-one block, including i=j). `cross_row_d[k] = w·s'_k` and
@@ -380,7 +380,7 @@ fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
     );
     assert!(
         max_err < 5.0e-5,
-        "IBP cross-row Woodbury d·z'·z' vs FD max abs error = {max_err:.3e}"
+        "ordered Beta--Bernoulli cross-row Woodbury d·z'·z' vs FD max abs error = {max_err:.3e}"
     );
 }
 
@@ -445,7 +445,7 @@ fn ibp_majorized_channels_match_fd_of_psd_majorized_operator() {
     // gam#2144 consistency: with `majorize = true` every third channel must be the
     // exact derivative of the PSD Loewner-majorized column block
     //   D_ik = max(w·s'_k, 0)·J_ik² + max(w·s_k·c_ik, 0),   d_k = max(w·s'_k, 0),
-    // NOT the raw indefinite IBP Hessian — so the low-rank-whitened θ-adjoint/ρ-trace
+    // NOT the raw indefinite ordered Beta--Bernoulli Hessian — so the low-rank-whitened θ-adjoint/ρ-trace
     // differentiate the SAME operator the majorized evidence log-det factors. Verify
     // (a) the clamps actually fire on this fixture (non-vacuous), (b) cross_row_d/dd
     // are the clamped coefficient and its gated mass-derivative, and (c)
@@ -586,7 +586,7 @@ fn ibp_cross_row_d_logalpha_matches_finite_difference() {
 
 #[test]
 fn ibp_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
-    // #2087/#1416 root cause guard: the IBP log-det θ-adjoint differentiates the
+    // #2087/#1416 root cause guard: the ordered Beta--Bernoulli log-det θ-adjoint differentiates the
     // same cross-row rank-one coefficient `d_k = w·score'_k` that the Hessian
     // assembly puts into the Woodbury block. Its mass channel must therefore be
     // `∂d_k/∂M_k = w·score''_k`, not a hand-expanded surrogate with a missing
@@ -631,7 +631,7 @@ fn ibp_cross_row_dd_matches_mass_derivative_of_cross_row_d_2087() {
 }
 
 #[test]
-fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
+fn ordered_beta_bernoulli_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, true);
     let t = array![
         0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
@@ -648,7 +648,7 @@ fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
 }
 
 #[test]
-fn ibp_assignment_learnable_alpha_mixed_log_alpha_target_matches_fd() {
+fn ordered_beta_bernoulli_assignment_learnable_alpha_mixed_log_alpha_target_matches_fd() {
     let pen = OrderedBetaBernoulliPenalty::new(2, 2.0, 0.9, true);
     let t = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
     let rho = array![0.15_f64];
@@ -667,7 +667,7 @@ fn ibp_assignment_learnable_alpha_mixed_log_alpha_target_matches_fd() {
 }
 
 #[test]
-fn ibp_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
+fn ordered_beta_bernoulli_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
     let pen = OrderedBetaBernoulliPenalty::new(2, 2.0, 0.9, true);
     let t = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
     let rho = array![0.15_f64];
@@ -677,10 +677,10 @@ fn ibp_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
     let rho_minus = array![rho[0] - step];
     let hp = pen
         .hessian_diag(t.view(), rho_plus.view())
-        .expect("IBP hessian diag exists");
+        .expect("ordered Beta--Bernoulli hessian diag exists");
     let hm = pen
         .hessian_diag(t.view(), rho_minus.view())
-        .expect("IBP hessian diag exists");
+        .expect("ordered Beta--Bernoulli hessian diag exists");
     for i in 0..t.len() {
         let fd = (hp[i] - hm[i]) / (2.0 * step);
         assert_abs_diff_eq!(analytic[i], fd, epsilon = 2.0e-7);
@@ -688,7 +688,7 @@ fn ibp_assignment_learnable_alpha_hdiag_log_alpha_derivative_matches_fd() {
 }
 
 #[test]
-fn ibp_assignment_extreme_logits_remain_finite() {
+fn ordered_beta_bernoulli_assignment_extreme_logits_remain_finite() {
     let pen = OrderedBetaBernoulliPenalty::new(3, 1.5, 1.0e-3, false);
     let t = array![
         1000.0_f64, -1000.0, 500.0, -500.0, 750.0, -750.0, 250.0, -250.0, 0.0
@@ -698,36 +698,36 @@ fn ibp_assignment_extreme_logits_remain_finite() {
     let value = pen.value(t.view(), rho.view());
     assert!(
         value.is_finite(),
-        "IBP value must remain finite for saturated concrete logits"
+        "ordered Beta--Bernoulli value must remain finite for saturated concrete logits"
     );
     let grad = pen.grad_target(t.view(), rho.view());
     assert!(
         grad.iter().all(|entry| entry.is_finite()),
-        "IBP gradient must remain finite for saturated concrete logits: {grad:?}"
+        "ordered Beta--Bernoulli gradient must remain finite for saturated concrete logits: {grad:?}"
     );
     let diag = pen
         .hessian_diag(t.view(), rho.view())
-        .expect("IBP assignment exposes a diagonal Hessian");
+        .expect("ordered Beta--Bernoulli assignment exposes a diagonal Hessian");
     assert!(
         diag.iter().all(|entry| entry.is_finite()),
-        "IBP Hessian diagonal must remain finite for saturated concrete logits: {diag:?}"
+        "ordered Beta--Bernoulli Hessian diagonal must remain finite for saturated concrete logits: {diag:?}"
     );
 }
 
 #[test]
-fn ibp_assignment_high_k_prior_keeps_positive_gradient_path() {
+fn ordered_beta_bernoulli_assignment_high_k_prior_keeps_positive_gradient_path() {
     let k = 400usize;
     let pen = OrderedBetaBernoulliPenalty::new(k, 0.1, 1.0, false);
     let t = Array1::<f64>::zeros(k);
     let rho = Array1::<f64>::zeros(0);
 
     let value = pen.value(t.view(), rho.view());
-    assert!(value.is_finite(), "high-K IBP value must stay finite");
+    assert!(value.is_finite(), "high-K ordered Beta--Bernoulli value must stay finite");
     let grad = pen.grad_target(t.view(), rho.view());
     assert_eq!(grad.len(), k);
     assert!(
         grad.iter().all(|entry| entry.is_finite()),
-        "high-K IBP gradient must stay finite: {grad:?}"
+        "high-K ordered Beta--Bernoulli gradient must stay finite: {grad:?}"
     );
     assert!(
         grad.slice(s![320..]).iter().any(|entry| entry.abs() > 0.0),
@@ -735,7 +735,7 @@ fn ibp_assignment_high_k_prior_keeps_positive_gradient_path() {
     );
 }
 
-/// #991 design-honesty weighting of the IBP prior: every channel must be the
+/// #991 design-honesty weighting of the ordered Beta--Bernoulli prior: every channel must be the
 /// exact derivative of the ONE weighted energy
 /// `F_w = w·[Σ_i w_i·bce(z_i; π̂) + beta_terms(π̂)]` with the weighted plug-in
 /// `π̂_k = (Σ_i w_i z_ik + a_k)/(Σ_i w_i + a_k + 1)`. This is the CI gate for
@@ -783,7 +783,7 @@ fn ibp_row_weighted_channels_are_one_operator_991() {
     // (c) hessian_diag == the diagonal of the weighted operator (FD of grad).
     let hd = pen
         .hessian_diag(t.view(), rho.view())
-        .expect("IBP hessian diag exists");
+        .expect("ordered Beta--Bernoulli hessian diag exists");
     for i in 0..t.len() {
         let mut tp = t.clone();
         let mut tm = t.clone();

@@ -9,7 +9,7 @@ from gamfit.distill import _activation_from_logits
 def test_distilled_ibp_activation_is_the_posterior_mean_gate() -> None:
     assignments = _activation_from_logits(
         np.zeros((1, 3)),
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         tau=1.0,
         jumprelu_threshold=0.0,
     )

@@ -8,16 +8,16 @@ use super::tests::{fixed_state_logdet, gamma_fd_tiny_fixture};
 use super::*;
 
 /// Deflation-derivative regression for a NON-α ρ-component. The deflation that
-/// the IBP-prior negative curvature triggers stiffens the WHOLE per-row `H_tt`
+/// the ordered Beta--Bernoulli-prior negative curvature triggers stiffens the WHOLE per-row `H_tt`
 /// block (logit AND coordinate slots), so it corrupts EVERY outer ρ-component's
-/// `½ tr(H⁻¹ ∂H/∂ρ)` trace — not only the IBP α one. This pins the ARD
+/// `½ tr(H⁻¹ ∂H/∂ρ)` trace — not only the ordered Beta--Bernoulli α one. This pins the ARD
 /// log-precision trace (`ard_log_precision_hessian_trace`, routed through the
 /// kept-subspace `latent_inverse_diagonal_kept`) against the fixed-state central
 /// difference of `log|H|` w.r.t. `log_ard[atom][axis]`, with deflation active.
 #[test]
 pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
     rho.log_lambda_sparse = 0.5;
     // The ARD log-precision stays at the fixture default; lifting it off the floor
     // pushes the inner solve into a non-PD basin at this ρ. The ARD curvature block is
@@ -74,7 +74,7 @@ pub(crate) fn ard_log_precision_trace_matches_dense_fd_pd_region_deflation() {
 #[test]
 pub(crate) fn assignment_log_strength_trace_ignores_fixed_logit_bug4() {
     let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, true);
     // Atom 1 is the #1026 ungated background tier: a FIXED (inert) logit.
     term.assignment = term
         .assignment

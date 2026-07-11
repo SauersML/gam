@@ -28,13 +28,13 @@ fn poincare_distance_batch<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-/// K-aware default IBP concentration `α` (#1784) from the Rust source of truth
-/// `assignment::default_ibp_concentration_for_k_atoms`. Exposed so the Python
+/// K-aware default ordered Beta--Bernoulli concentration `α` (#1784) from the Rust source of truth
+/// `assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms`. Exposed so the Python
 /// facade calls the core formula (`α = max(1, 1/(exp(1/K) − 1))`) instead of
 /// mirroring it — the thin-wrapper SPEC: no numeric policy lives in Python.
 #[pyfunction]
-fn sae_default_ibp_concentration_for_k_atoms(k_atoms: usize) -> f64 {
-    gam::terms::sae::assignment::default_ibp_concentration_for_k_atoms(k_atoms)
+fn sae_default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: usize) -> f64 {
+    gam::terms::sae::assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms)
 }
 
 /// Default large-K active cap from the data-per-atom ratio, from the Rust source
@@ -1140,313 +1140,6 @@ fn response_geometry_fit_curvature<'py>(
     ))
 }
 
-#[pyfunction]
-fn sae_duchon_centers_nd<'py>(
-    py: Python<'py>,
-    centers_1d: PyReadonlyArray1<'py, f64>,
-    d: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let centers_owned = centers_1d.as_array().to_owned();
-    let out = py.detach(move || sae_duchon_centers_nd_impl(centers_owned.view(), d));
-    Ok(out.into_pyarray(py).unbind())
-}
-
-/// Sinkhorn per-atom log-bias potentials that balance atom usage across the
-/// batch (torch-lane routing helper for `ManifoldSAE`). Given the row-wise
-/// log-responsibilities `log_scores[n, k]`, returns the additive potential
-/// `b_k`; the Python caller forms the balanced responsibilities as
-/// `log_scores + b`, keeping `log_scores` on the autograd tape while `b` is a
-/// detached constant. See `gam::geometry::sae_routing::sinkhorn_balance_bias`.
-#[pyfunction]
-fn sae_sinkhorn_balance_bias<'py>(
-    py: Python<'py>,
-    log_scores: PyReadonlyArray2<'py, f64>,
-    iters: usize,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let scores_owned = log_scores.as_array().to_owned();
-    let out = py.detach(move || sae_sinkhorn_balance_bias_impl(scores_owned.view(), iters));
-    Ok(out.into_pyarray(py).unbind())
-}
-
-/// Exponential-moving-average blend of the per-row assignment accumulator for
-/// the torch `softmax_topk` routing lane (issue #1282). Given the current
-/// accumulator `prev (N, F)`, the freshly observed assignment signal
-/// `signal (N, F)`, and the decay `beta`, returns `beta*prev + (1-beta)*signal`.
-/// Both inputs are detached routing state; the Python `_update_assign_ema` keeps
-/// the stateful orchestration (lazy sizing, reset on a row-count change, the
-/// training-only guard) and delegates only this numeric recurrence so the EMA
-/// math is single-sourced. See `gam::geometry::sae_routing::assign_ema_update`.
-#[pyfunction]
-fn sae_assign_ema_update<'py>(
-    py: Python<'py>,
-    prev: PyReadonlyArray2<'py, f64>,
-    signal: PyReadonlyArray2<'py, f64>,
-    beta: f64,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let prev_owned = prev.as_array().to_owned();
-    let signal_owned = signal.as_array().to_owned();
-    let out =
-        py.detach(move || sae_assign_ema_update_impl(prev_owned.view(), signal_owned.view(), beta));
-    Ok(out.into_pyarray(py).unbind())
-}
-
-/// Residual-EM routing scores for the torch `softmax_topk` lane (issue #1282).
-/// Given the input rows `x (N, D)` and the per-atom decoded curves
-/// `per_atom_recon (N, F, D)`, solves the best scalar code against each atom's
-/// curve and scores the atom by the scale-free relative residual it leaves,
-/// returning `(code (N, F), relative_residual (N, F))`. `nonneg` selects the
-/// `target_k == 1` non-negative code convention vs. the `target_k > 1` signed
-/// one. This is the criterion math the Python gate used to compute inline; the
-/// paired VJP `sae_residual_em_score_vjp` keeps the autograd tape continuous.
-/// See `gam::terms::sae::criterion_atoms::residual_em_score`.
-#[pyfunction]
-fn sae_residual_em_score<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    per_atom_recon: PyReadonlyArray3<'py, f64>,
-    nonneg: bool,
-) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
-    let x_owned = x.as_array().to_owned();
-    let recon_owned = per_atom_recon.as_array().to_owned();
-    let (code, relres) = py.detach(move || {
-        gam::terms::sae::criterion_atoms::residual_em_score(
-            x_owned.view(),
-            recon_owned.view(),
-            nonneg,
-        )
-    });
-    Ok((
-        code.into_pyarray(py).unbind(),
-        relres.into_pyarray(py).unbind(),
-    ))
-}
-
-/// Analytic backward (VJP) for `sae_residual_em_score`, w.r.t. `per_atom_recon`.
-/// Given the upstream cotangents `g_code (N, F)` and `g_relative_residual
-/// (N, F)`, returns `grad_per_atom_recon (N, F, D)`. `x` is a tape constant (the
-/// activation batch never requires grad), so no `∂/∂x` channel is produced. See
-/// `gam::terms::sae::criterion_atoms::residual_em_score_vjp`.
-#[pyfunction]
-fn sae_residual_em_score_vjp<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    per_atom_recon: PyReadonlyArray3<'py, f64>,
-    nonneg: bool,
-    g_code: PyReadonlyArray2<'py, f64>,
-    g_relative_residual: PyReadonlyArray2<'py, f64>,
-) -> PyResult<Py<PyArray3<f64>>> {
-    let x_owned = x.as_array().to_owned();
-    let recon_owned = per_atom_recon.as_array().to_owned();
-    let gc_owned = g_code.as_array().to_owned();
-    let gq_owned = g_relative_residual.as_array().to_owned();
-    let grad = py.detach(move || {
-        gam::terms::sae::criterion_atoms::residual_em_score_vjp(
-            x_owned.view(),
-            recon_owned.view(),
-            nonneg,
-            gc_owned.view(),
-            gq_owned.view(),
-        )
-    });
-    Ok(grad.into_pyarray(py).unbind())
-}
-
-fn residual_em_cuda_dtype(
-    dtype: &str,
-) -> PyResult<gam::terms::sae::criterion_atoms_gpu::ResidualEmCudaDType> {
-    gam::terms::sae::criterion_atoms_gpu::ResidualEmCudaDType::parse(dtype)
-        .map_err(PyTypeError::new_err)
-}
-
-/// Raw-pointer CUDA forward for `sae_residual_em_score`.
-///
-/// `device_ptrs` is `(x, per_atom_recon, code, relative_residual)` and `shape`
-/// is `(N, F, D)`. All allocations must be contiguous, have the exact scalar
-/// type named by `dtype`, and belong to `ordinal`'s CUDA primary context. The
-/// torch bridge validates those invariants and synchronizes its producing
-/// stream before entering this ownership-free boundary.
-#[pyfunction]
-fn sae_residual_em_score_cuda(
-    py: Python<'_>,
-    ordinal: usize,
-    dtype: &str,
-    device_ptrs: (u64, u64, u64, u64),
-    shape: (usize, usize, usize),
-    nonneg: bool,
-) -> PyResult<()> {
-    let scalar_type = residual_em_cuda_dtype(dtype)?;
-    let (x_dev_ptr, recon_dev_ptr, code_dev_ptr, relative_residual_dev_ptr) = device_ptrs;
-    let (n, atoms, dim) = shape;
-    py.detach(move || {
-        gam::terms::sae::criterion_atoms_gpu::residual_em_score_device(
-            ordinal,
-            scalar_type,
-            x_dev_ptr,
-            recon_dev_ptr,
-            n,
-            atoms,
-            dim,
-            nonneg,
-            code_dev_ptr,
-            relative_residual_dev_ptr,
-        )
-    })
-    .map_err(PyValueError::new_err)
-}
-
-/// Raw-pointer analytic CUDA VJP for `sae_residual_em_score_vjp`.
-///
-/// `device_ptrs` is `(x, per_atom_recon, g_code, g_relative_residual,
-/// grad_per_atom_recon)` and `shape` is `(N, F, D)`, with the same strict
-/// device/dtype/layout contract as [`sae_residual_em_score_cuda`].
-#[pyfunction]
-fn sae_residual_em_score_vjp_cuda(
-    py: Python<'_>,
-    ordinal: usize,
-    dtype: &str,
-    device_ptrs: (u64, u64, u64, u64, u64),
-    shape: (usize, usize, usize),
-    nonneg: bool,
-) -> PyResult<()> {
-    let scalar_type = residual_em_cuda_dtype(dtype)?;
-    let (
-        x_dev_ptr,
-        recon_dev_ptr,
-        g_code_dev_ptr,
-        g_relative_residual_dev_ptr,
-        grad_recon_dev_ptr,
-    ) = device_ptrs;
-    let (n, atoms, dim) = shape;
-    py.detach(move || {
-        gam::terms::sae::criterion_atoms_gpu::residual_em_score_vjp_device(
-            ordinal,
-            scalar_type,
-            x_dev_ptr,
-            recon_dev_ptr,
-            n,
-            atoms,
-            dim,
-            nonneg,
-            g_code_dev_ptr,
-            g_relative_residual_dev_ptr,
-            grad_recon_dev_ptr,
-        )
-    })
-    .map_err(PyValueError::new_err)
-}
-
-/// Deterministic line-clustering routing anchor for the torch `softmax_topk`
-/// lane (issue #1282). Given the `(N, D)` input rows, returns
-/// `(onehot (N, atoms), valid, confident)`: `valid` is false (with an empty
-/// `onehot`) for the torch `(None, False)` cases (too few rows, `< 2` atoms, or
-/// an eigensolver failure); otherwise `onehot` is the per-row cluster one-hot
-/// and `confident` reports the balance/margin gate. See
-/// `gam::geometry::sae_routing::direction_cluster_anchor`.
-#[pyfunction]
-fn sae_direction_cluster_anchor<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    n_atoms: usize,
-    iters: usize,
-) -> PyResult<(Py<PyArray2<f64>>, bool, bool)> {
-    let x_owned = x.as_array().to_owned();
-    let result =
-        py.detach(move || sae_direction_cluster_anchor_impl(x_owned.view(), n_atoms, iters));
-    match result {
-        Some((onehot, confident)) => Ok((onehot.into_pyarray(py).unbind(), true, confident)),
-        None => Ok((
-            Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(),
-            false,
-            false,
-        )),
-    }
-}
-
-/// Balanced quadratic union-of-subspaces routing anchor for the torch
-/// `softmax_topk` lane (issue #1282). Returns
-/// `(onehot (N, 2), confident, i, j, threshold)`: when `confident` is true the
-/// `onehot` is the accepted two-cluster split and `(i, j, threshold)` is the
-/// transferable decision rule; otherwise `confident` is false with an empty
-/// `onehot` and zeroed rule. See
-/// `gam::geometry::sae_routing::quadratic_subspace_anchor`.
-#[pyfunction]
-fn sae_quadratic_subspace_anchor<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    subspace_dim: usize,
-) -> PyResult<(Py<PyArray2<f64>>, bool, usize, usize, f64)> {
-    let x_owned = x.as_array().to_owned();
-    let result =
-        py.detach(move || sae_quadratic_subspace_anchor_impl(x_owned.view(), subspace_dim));
-    match result {
-        Some((onehot, i, j, threshold)) => {
-            Ok((onehot.into_pyarray(py).unbind(), true, i, j, threshold))
-        }
-        None => Ok((
-            Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(),
-            false,
-            0,
-            0,
-            0.0,
-        )),
-    }
-}
-
-/// Apply a cached quadratic-subspace decision rule to route an arbitrary batch
-/// (torch `softmax_topk` out-of-sample routing, issue #1282). Returns the
-/// `(N, 2)` one-hot from the `(i, j, threshold)` split of `x_i·x_j` on the
-/// L2-normalized rows. See `gam::geometry::sae_routing::apply_anchor_rule`.
-#[pyfunction]
-fn sae_apply_anchor_rule<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    i: usize,
-    j: usize,
-    threshold: f64,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let x_owned = x.as_array().to_owned();
-    let out = py.detach(move || sae_apply_anchor_rule_impl(x_owned.view(), i, j, threshold));
-    Ok(out.into_pyarray(py).unbind())
-}
-
-/// Centered PCA frame used by the gradient-trained manifold SAE's exact linear
-/// warm start (#2261). Rust owns the SVD and returns `(mean, basis)`, with
-/// `basis` containing orthonormal rows in descending singular-value order.
-/// Python only copies those rows into the constant decoder coefficient of each
-/// curved atom; the existing signed least-squares top-k gate then reconstructs
-/// the rank-`n_atoms` PCA projection exactly at step zero.
-#[pyfunction]
-fn sae_principal_subspace<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    rank: usize,
-) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray2<f64>>)> {
-    let x_owned = x.as_array().to_owned();
-    let (mean, basis) = py
-        .detach(move || gam::terms::sae::manifold::fit_principal_subspace(x_owned.view(), rank))
-        .map_err(PyValueError::new_err)?;
-    Ok((
-        mean.into_pyarray(py).unbind(),
-        basis.into_pyarray(py).unbind(),
-    ))
-}
-
-/// Canonical orthonormal row frame for a caller-supplied decoder output
-/// subspace (#2260). Rank validation and the polar/SVD gauge live in Rust.
-#[pyfunction]
-fn sae_canonical_output_subspace<'py>(
-    py: Python<'py>,
-    frame: PyReadonlyArray2<'py, f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let frame_owned = frame.as_array().to_owned();
-    let canonical = py
-        .detach(move || {
-            gam::terms::sae::frames::canonical_output_subspace_rows(frame_owned.view())
-        })
-        .map_err(PyValueError::new_err)?;
-    Ok(canonical.into_pyarray(py).unbind())
-}
-
 /// Replicate latent-angle agreement modulo exactly the circle's `O(2)` gauge
 /// (#2260). Returns per-replicate embedding-rank certificates and every pair's
 /// rotation/reflection resultants; aggregate scores are `None` when any
@@ -1509,45 +1202,6 @@ fn sae_circular_concordance<'py>(
     Ok(out.unbind())
 }
 
-/// Residual-PC matching-pursuit commitment one-hot for the early training window
-/// of the torch `softmax_topk` lane (issue #1282). Given `x (N, D)`, the per-atom
-/// reconstructions `per_atom_recon (N, F, D)`, and the current non-negative codes
-/// `code (N, F)`, returns `(onehot (N, F), valid)`. `valid` is false (empty
-/// `onehot`) for the non-committing configuration (`step ≥ commit_steps`) or an
-/// eigensolver failure — the torch `None` cases. See
-/// `gam::geometry::sae_routing::matching_pursuit_commit`.
-#[pyfunction]
-fn sae_matching_pursuit_commit<'py>(
-    py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    per_atom_recon: PyReadonlyArray3<'py, f64>,
-    code: PyReadonlyArray2<'py, f64>,
-    step: usize,
-    commit_steps: usize,
-    n_atoms: usize,
-) -> PyResult<(Py<PyArray2<f64>>, bool)> {
-    let x_owned = x.as_array().to_owned();
-    let recon_owned = per_atom_recon.as_array().to_owned();
-    let code_owned = code.as_array().to_owned();
-    let result = py.detach(move || {
-        sae_matching_pursuit_commit_impl(
-            x_owned.view(),
-            recon_owned.view(),
-            code_owned.view(),
-            step,
-            commit_steps,
-            n_atoms,
-        )
-    });
-    match result {
-        Some(onehot) => Ok((onehot.into_pyarray(py).unbind(), true)),
-        None => Ok((
-            Array2::<f64>::zeros((0, 0)).into_pyarray(py).unbind(),
-            false,
-        )),
-    }
-}
-
 /// Per-row / per-atom SAE trust scores from an assignment matrix and the
 /// per-atom trust vector. Returns `(row, per_atom)` where `row` is `(N,)` and
 /// `per_atom` is `(N, K)`. See `gam_sae::trust_scores::row_trust_scores`.
@@ -1571,89 +1225,6 @@ fn sae_row_trust_scores<'py>(
         row.into_pyarray(py).unbind(),
         per_atom.into_pyarray(py).unbind(),
     ))
-}
-
-/// Device-resident periodic basis+jet for the torch manifold-SAE lane.
-///
-/// `t_dev_ptr`, `phi_dev_ptr`, `jet_dev_ptr` are RAW CUDA device addresses of
-/// caller-owned (torch) float64 tensors on device `ordinal`: `t` is `(n,)` (or
-/// any contiguous layout of `n` doubles), `phi` and `jet` are contiguous
-/// `(n, 2*n_harmonics + 1)` buffers the kernel fills in place. The caller must
-/// have synchronized the producing stream (`torch.cuda.synchronize()`); the
-/// kernel's stream is synchronized before this returns. Mirrors the CPU
-/// `basis_with_jet("periodic", ...)` exactly — the d = 1 jet `(n, m, 1)` is
-/// contiguous as `(n, m)`. See `gam_sae::basis_gpu`.
-#[pyfunction]
-fn sae_periodic_basis_with_jet_cuda(
-    py: Python<'_>,
-    ordinal: usize,
-    t_dev_ptr: u64,
-    n: usize,
-    n_harmonics: usize,
-    phi_dev_ptr: u64,
-    jet_dev_ptr: u64,
-) -> PyResult<()> {
-    py.detach(move || {
-        gam::terms::sae::basis_gpu::sae_periodic_basis_with_jet_device(
-            ordinal,
-            t_dev_ptr,
-            n,
-            n_harmonics,
-            phi_dev_ptr,
-            jet_dev_ptr,
-        )
-    })
-    .map_err(PyValueError::new_err)
-}
-
-/// Width `(n_kernel + n_poly)` of the device Duchon basis for these centers —
-/// the torch bridge allocates its output tensors with exactly this width
-/// before calling [`sae_duchon_basis_with_jet_cuda`]. Also warms the device
-/// cache (uploads centers/Z once).
-#[pyfunction]
-fn sae_duchon_device_basis_width(
-    py: Python<'_>,
-    ordinal: usize,
-    centers: PyReadonlyArray2<'_, f64>,
-    m: usize,
-) -> PyResult<usize> {
-    let centers_owned = centers.as_array().to_owned();
-    py.detach(move || {
-        gam::terms::sae::basis_gpu::sae_duchon_device_basis_width(ordinal, centers_owned.view(), m)
-    })
-    .map_err(PyValueError::new_err)
-}
-
-/// Device-resident Duchon basis+jet for the torch manifold-SAE lane — the
-/// multi-`d` sibling of [`sae_periodic_basis_with_jet_cuda`] with the same
-/// pointer and synchronization contract. `t` is `(n, dim)` doubles on device
-/// `ordinal`; `phi` is `(n, width)` and `jet` is `(n, width, dim)` with
-/// `width` from [`sae_duchon_device_basis_width`]. Center-derived state
-/// (`Z`, amplification, polyharmonic coefficient, monomial exponents) is
-/// cached on device per (centers, m). Returns the width actually written.
-#[pyfunction]
-fn sae_duchon_basis_with_jet_cuda(
-    py: Python<'_>,
-    ordinal: usize,
-    device_ptrs: (u64, u64, u64),
-    n: usize,
-    centers: PyReadonlyArray2<'_, f64>,
-    m: usize,
-) -> PyResult<usize> {
-    let (t_dev_ptr, phi_dev_ptr, jet_dev_ptr) = device_ptrs;
-    let centers_owned = centers.as_array().to_owned();
-    py.detach(move || {
-        gam::terms::sae::basis_gpu::sae_duchon_basis_with_jet_device(
-            ordinal,
-            t_dev_ptr,
-            n,
-            centers_owned.view(),
-            m,
-            phi_dev_ptr,
-            jet_dev_ptr,
-        )
-    })
-    .map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
@@ -2726,8 +2297,8 @@ impl IsometryPenalty {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "IBPAssignmentPenalty")]
-struct PyIBPAssignmentPenalty {
+#[pyclass(module = "gam_pyffi._rust", name = "OrderedBetaBernoulliPenalty")]
+struct PyOrderedBetaBernoulliPenalty {
     #[pyo3(get, set)]
     target: PyObject,
     #[pyo3(get, set)]
@@ -2745,7 +2316,7 @@ struct PyIBPAssignmentPenalty {
 }
 
 #[pymethods]
-impl PyIBPAssignmentPenalty {
+impl PyOrderedBetaBernoulliPenalty {
     #[new]
     #[pyo3(signature = (k_max, alpha = 1.0, tau = 1.0, learnable = false, *, target = None, temperature_schedule = None, weight_schedule = None))]
     fn new(
@@ -2762,17 +2333,17 @@ impl PyIBPAssignmentPenalty {
         let k_max = builtins.getattr("int")?.call1((k_max,))?.extract::<i64>()?;
         if k_max <= 0 {
             return Err(PyValueError::new_err(format!(
-                "IBPAssignmentPenalty.k_max must be > 0, got {k_max}"
+                "OrderedBetaBernoulliPenalty.k_max must be > 0, got {k_max}"
             )));
         }
         if alpha <= 0.0 {
             return Err(PyValueError::new_err(format!(
-                "IBPAssignmentPenalty.alpha must be > 0, got {alpha}"
+                "OrderedBetaBernoulliPenalty.alpha must be > 0, got {alpha}"
             )));
         }
         if tau <= 0.0 {
             return Err(PyValueError::new_err(format!(
-                "IBPAssignmentPenalty.tau must be > 0, got {tau}"
+                "OrderedBetaBernoulliPenalty.tau must be > 0, got {tau}"
             )));
         }
         Ok(Self {
@@ -2787,7 +2358,7 @@ impl PyIBPAssignmentPenalty {
     }
 
     #[classattr]
-    const KIND_TAG: &'static str = "ibp_assignment";
+    const KIND_TAG: &'static str = "ordered_beta_bernoulli_assignment";
 
     fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
         let payload = PyDict::new(py);
@@ -2820,7 +2391,7 @@ impl PyIBPAssignmentPenalty {
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(format!(
-            "IBPAssignmentPenalty(target={}, k_max={}, alpha={}, tau={}, learnable={}, temperature_schedule={}, weight_schedule={})",
+            "OrderedBetaBernoulliPenalty(target={}, k_max={}, alpha={}, tau={}, learnable={}, temperature_schedule={}, weight_schedule={})",
             py_repr(py, self.target.bind(py))?,
             self.k_max,
             self.alpha,
@@ -5302,10 +4873,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_ibp_map_batch_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_jumprelu_row_value_grad, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_jumprelu_batch_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_ordered_beta_bernoulli_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_ordered_beta_bernoulli_batch_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_threshold_gate_row_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_threshold_gate_batch_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(sae_topk_activation_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(jumprelu_gate_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
@@ -5381,24 +4952,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         response_geometry_sphere_normalize_base,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(sae_duchon_centers_nd, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_sinkhorn_balance_bias, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_assign_ema_update, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_residual_em_score, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_residual_em_score_vjp, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_residual_em_score_cuda, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_residual_em_score_vjp_cuda, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_direction_cluster_anchor, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_principal_subspace, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_canonical_output_subspace, module)?)?;
     module.add_function(wrap_pyfunction!(sae_circular_concordance, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_matching_pursuit_commit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_row_trust_scores, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_duchon_device_basis_width, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_duchon_basis_with_jet_cuda, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_circular_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_euclidean_cost, module)?)?;
     module.add_function(wrap_pyfunction!(sinkhorn_geodesic_sphere_cost, module)?)?;
@@ -5418,7 +4973,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_rho_so3_jvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(
-        sae_default_ibp_concentration_for_k_atoms,
+        sae_default_ordered_beta_bernoulli_concentration_for_k_atoms,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
@@ -5640,7 +5195,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<OrthogonalityPenalty>()?;
     module.add_class::<SheafConsistencyPenalty>()?;
     module.add_class::<SoftmaxAssignmentSparsityPenalty>()?;
-    module.add_class::<PyIBPAssignmentPenalty>()?;
+    module.add_class::<PyOrderedBetaBernoulliPenalty>()?;
     module.add_class::<ScadMcpPenalty>()?;
     module.add_class::<TotalVariationPenalty>()?;
     module.add_class::<NuclearNormPenalty>()?;

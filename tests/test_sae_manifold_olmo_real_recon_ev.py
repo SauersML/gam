@@ -120,7 +120,7 @@ def _fit_and_score_olmo_real(queue: mp.Queue) -> None:
             K=_K,
             atom_basis="periodic",
             d_atom=2,
-            assignment="ibp_map",
+            assignment="ordered_beta_bernoulli",
             n_iter=_N_ITER,
             learning_rate=0.04,
             random_state=0,
@@ -205,7 +205,7 @@ def test_olmo_real_heldout_reconstruction_ev_meets_linear_parity():
     assert not result["uses_affine_pca_lane"], (
         "The real-OLMo #1026 gate must exercise the production manifold-SAE "
         "decoder and frozen-decoder OOS solve. Returning an affine PCA projector "
-        "from sae_manifold_fit(..., atom_basis='periodic', assignment='ibp_map') "
+        "from sae_manifold_fit(..., atom_basis='periodic', assignment='ordered_beta_bernoulli') "
         "only reproduces the linear reference model this test is using as the "
         "bar; it does not show the curved manifold dictionary earned held-out EV "
         "on real activations."

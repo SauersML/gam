@@ -141,7 +141,7 @@ def _sae_fit_worker(
     seed,
     n_iter,
     separation_barrier_strength,
-    ibp_alpha,
+    ordered_beta_bernoulli_alpha,
 ):
     """TOP-LEVEL (picklable) worker: fit + reconstruct in a child process.
 
@@ -158,11 +158,11 @@ def _sae_fit_worker(
         K=k,
         d_atom=1,
         atom_topology=topology,  # "circle" (curved) or "linear" (true rank-1 affine lane)
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=n_iter,
         random_state=seed,
         separation_barrier_strength=separation_barrier_strength,
-        ibp_alpha=ibp_alpha,
+        ordered_beta_bernoulli_alpha=ordered_beta_bernoulli_alpha,
     )
     fit_seconds = time.perf_counter() - fit_started
 
@@ -203,7 +203,7 @@ def _fit_ev(
     seed: int,
     n_iter: int,
     separation_barrier_strength: float | None,
-    ibp_alpha: float | None,
+    ordered_beta_bernoulli_alpha: float | None,
 ) -> tuple[float, float, float, dict | None, list[str]]:
     """Fit one dictionary through the production engine; return HELD-OUT EV.
 
@@ -226,7 +226,7 @@ def _fit_ev(
             seed,
             n_iter,
             separation_barrier_strength,
-            ibp_alpha,
+            ordered_beta_bernoulli_alpha,
         ).result()
     finally:
         executor.shutdown(wait=False)
@@ -388,8 +388,8 @@ def main() -> None:
 
     if args.sep_mu is not None:
         print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
-    if args.ibp_alpha is not None:
-        print(f"[ibp] alpha={args.ibp_alpha}", flush=True)
+    if args.ordered_beta_bernoulli_alpha is not None:
+        print(f"[ibp] alpha={args.ordered_beta_bernoulli_alpha}", flush=True)
 
     x = _load_activations(args)
     rng = np.random.default_rng(args.seed)
@@ -433,7 +433,7 @@ def main() -> None:
             args.seed,
             args.n_iter,
             args.sep_mu,
-            args.ibp_alpha,
+            args.ordered_beta_bernoulli_alpha,
         )
         # The pure-linear comparison arm rides a separate basis lane whose OOS /
         # basis_with_jet plumbing can error independently of the curved arm (e.g.
@@ -449,7 +449,7 @@ def main() -> None:
                 args.seed,
                 args.n_iter,
                 args.sep_mu,
-                args.ibp_alpha,
+                args.ordered_beta_bernoulli_alpha,
             )
         except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
             print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)

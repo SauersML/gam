@@ -29,9 +29,7 @@ def test_spd_step_metric_raises_differential_and_enables_closure_grad() -> None:
         torch.tensor([[2.0, 0.0, 0.0, 1.0]], dtype=torch.float64)
     )
     learning_rate = 0.05
-    optimizer = RiemannianRetraction(
-        [point], {"kind": "spd", "n": 2}, lr=learning_rate
-    )
+    optimizer = RiemannianRetraction([point], {"kind": "spd", "n": 2}, lr=learning_rate)
     closure_calls = 0
 
     def closure() -> torch.Tensor:
@@ -53,12 +51,14 @@ def test_spd_step_metric_raises_differential_and_enables_closure_grad() -> None:
     # diag(2 exp(-2 eta), exp(-eta)). A projection-only step would have the
     # different first coordinate 2 exp(-eta/2).
     expected = torch.tensor(
-        [[
-            2.0 * math.exp(-2.0 * learning_rate),
-            0.0,
-            0.0,
-            math.exp(-learning_rate),
-        ]],
+        [
+            [
+                2.0 * math.exp(-2.0 * learning_rate),
+                0.0,
+                0.0,
+                math.exp(-learning_rate),
+            ]
+        ],
         dtype=torch.float64,
     )
     torch.testing.assert_close(point.detach(), expected, rtol=1.0e-12, atol=1.0e-12)
@@ -67,9 +67,7 @@ def test_spd_step_metric_raises_differential_and_enables_closure_grad() -> None:
 def test_stiefel_step_uses_canonical_riesz_representative() -> None:
     from gamfit.torch import RiemannianRetraction
 
-    y = torch.tensor(
-        [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=torch.float64
-    )
+    y = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=torch.float64)
     differential = torch.tensor(
         [[0.4, 1.2], [-0.3, 0.8], [0.5, -0.7]], dtype=torch.float64
     )
@@ -83,9 +81,7 @@ def test_stiefel_step_uses_canonical_riesz_representative() -> None:
     optimizer.step()
 
     canonical_gradient = differential - y @ differential.T @ y
-    observed_direction = (
-        point.detach().reshape(3, 2) - y
-    ) / learning_rate
+    observed_direction = (point.detach().reshape(3, 2) - y) / learning_rate
     torch.testing.assert_close(
         observed_direction,
         -canonical_gradient,
@@ -96,9 +92,7 @@ def test_stiefel_step_uses_canonical_riesz_representative() -> None:
     embedded_projection = differential - y @ (
         0.5 * (y.T @ differential + differential.T @ y)
     )
-    assert torch.linalg.vector_norm(
-        observed_direction + embedded_projection
-    ) > 0.1
+    assert torch.linalg.vector_norm(observed_direction + embedded_projection) > 0.1
 
 
 def test_inner_steps_api_is_removed() -> None:
@@ -107,6 +101,4 @@ def test_inner_steps_api_is_removed() -> None:
     point = torch.nn.Parameter(torch.tensor([[1.0]], dtype=torch.float64))
     constructor: Any = RiemannianRetraction
     with pytest.raises(TypeError, match="inner_steps"):
-        constructor(
-            [point], {"kind": "euclidean", "dim": 1}, inner_steps=2
-        )
+        constructor([point], {"kind": "euclidean", "dim": 1}, inner_steps=2)

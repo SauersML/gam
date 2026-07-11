@@ -4,10 +4,10 @@ Three contracts are pinned here, all for ``K=4``:
 
 1. End-to-end parity: ``ManifoldSAE.fit(x, sparsity={'kind': 'ibp_gumbel', ...})``
    produces the same ``assignments`` (and ``fitted`` / ``reml_score``) as the
-   closed-form ``gamfit.sae_manifold_fit(..., assignment='ibp_map', schedule=...)``,
+   closed-form ``gamfit.sae_manifold_fit(..., assignment='ordered_beta_bernoulli', schedule=...)``,
    because both delegate to the same Rust kernel with the same schedule object.
 
-2. Differentiability of the IBP-MAP forward: the torch ``ibp_map`` activation
+2. Differentiability of the IBP-MAP forward: the torch ``ordered_beta_bernoulli`` activation
    carries a Rust value+grad backward; its Jacobian must match a central
    difference of the forward (same numeric-validation technique as
    ``test_manifold_sae_parity.test_isometry_backward_grad_matches_rust_grad_jacobian``).
@@ -91,7 +91,7 @@ def test_ibp_gumbel_fit_k4_matches_closed_form() -> None:
 
 
 def test_ibp_gumbel_k4_forward_backward_matches_numeric() -> None:
-    from gamfit.torch.penalties import ibp_map  # type: ignore[attr-defined]
+    from gamfit.torch.penalties import ordered_beta_bernoulli  # type: ignore[attr-defined]
 
     alpha = 1.2
     tau = 0.9
@@ -99,7 +99,7 @@ def test_ibp_gumbel_k4_forward_backward_matches_numeric() -> None:
     logits_np = rng.standard_normal((5, 4))
     logits = torch.as_tensor(logits_np, dtype=torch.float64, requires_grad=True)
 
-    assignments = ibp_map(logits, tau)
+    assignments = ordered_beta_bernoulli(logits, tau)
     # Scalarize with a fixed non-uniform weighting so the backprop exercises a
     # full Jacobian-vector product, not just a row sum.
     w_np = rng.standard_normal(assignments.shape)
@@ -118,8 +118,8 @@ def test_ibp_gumbel_k4_forward_backward_matches_numeric() -> None:
             lp[i, j] += h
             lm[i, j] -= h
             with torch.no_grad():
-                vp = ibp_map(torch.as_tensor(lp, dtype=torch.float64), tau).numpy()
-                vm = ibp_map(torch.as_tensor(lm, dtype=torch.float64), tau).numpy()
+                vp = ordered_beta_bernoulli(torch.as_tensor(lp, dtype=torch.float64), tau).numpy()
+                vm = ordered_beta_bernoulli(torch.as_tensor(lm, dtype=torch.float64), tau).numpy()
             numeric[i, j] = float(np.sum(w_np * (vp - vm)) / (2.0 * h))
 
     np.testing.assert_allclose(autograd_grad, numeric, rtol=1e-6, atol=1e-7)

@@ -13,11 +13,11 @@ use super::*;
 // Gershgorin majorizer helpers it calls are include!'d into construction, so import them.
 use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_majorizer_log_mean};
 
-/// #2144 — PSD Loewner majorizer of the raw IBP assignment-prior diagonal
+/// #2144 — PSD Loewner majorizer of the raw ordered Beta--Bernoulli assignment-prior diagonal
 /// curvature `raw = w·(s'·J² + s·c)` at one logit slot, for the low-rank-metric
 /// PD-repair path.
 ///
-/// The exact IBP column-`k` Hessian block is `H_p = w·s'·J Jᵀ + diag(w·s·c)`,
+/// The exact ordered Beta--Bernoulli column-`k` Hessian block is `H_p = w·s'·J Jᵀ + diag(w·s·c)`,
 /// with both the rank-one coefficient `w·s' = cross_row_d[k]` and the concrete
 /// second-jacobian diagonal `w·s·c` possibly NEGATIVE (`s'` is the not-sign-
 /// definite empirical-mass score derivative; `s·c` flips past the inflection of
@@ -53,7 +53,7 @@ impl SaeManifoldTerm {
     /// Build the per-row dense gate maps `a_{n,·}` at `rho` for all `n` rows.
     ///
     /// `try_assignments_row` is a pure read-only per-row computation
-    /// (softmax / IBP-MAP / TopK over that row's routing logits — no shared
+    /// (softmax / ordered Beta--Bernoulli-MAP / TopK over that row's routing logits — no shared
     /// mutable state, no faer GEMM), so the rows are independent. Above the
     /// `SAE_LOSS_PARALLEL_ROW_MIN` floor (and when not already inside a rayon
     /// worker) they are computed in parallel and collected in row order; the
@@ -247,7 +247,7 @@ impl SaeManifoldTerm {
             .map(|&l| l * penalty_scale)
             .collect();
         // #991 — the softmax/JumpReLU assignment prior's per-(row, atom) gradient
-        // (and, for JumpReLU/IBP, its curvature diagonal) is design-weighted by
+        // (and, for JumpReLU/ordered Beta--Bernoulli, its curvature diagonal) is design-weighted by
         // `w_i` here so `gt`/`htt` estimate the same target as the `√w`-weighted
         // data likelihood. The softmax curvature written to `htt` below is the
         // per-row Gershgorin/`row_psd_majorizer` block, weighted by folding
@@ -265,7 +265,7 @@ impl SaeManifoldTerm {
         // `assignment_hdiag` diagonal. Build the shared penalty + `scale = λ/τ²`
         // once here so the dense row block written into `block.htt` below, the
         // criterion's `log|H|`, and the #1006 θ-adjoint all differentiate the
-        // SAME operator. JumpReLU / IBP keep their (separately exact) diagonal /
+        // SAME operator. JumpReLU / ordered Beta--Bernoulli keep their (separately exact) diagonal /
         // cross-row channels and leave this `None`. The block is gauge-null in
         // isolation (`H·𝟙 = 0`); it is only ever summed onto the gauge-breaking
         // data-fit row block before the Cholesky factor, never factored alone.
@@ -359,7 +359,7 @@ impl SaeManifoldTerm {
         //     (logit ≤ threshold) carry zero assignment mass so their data-fit
         //     reconstruction contribution and data-fit logit JVP are zero, but
         //     supported atoms keep value-consistent prior gradient in the row block.
-        //   * IBP-MAP at large `K` — the dense `(m_total · p)²` data
+        //   * ordered Beta--Bernoulli-MAP at large `K` — the dense `(m_total · p)²` data
         //     Gram is infeasible, so each row is truncated to its
         //     top-`k_active` atoms above a relative magnitude cutoff
         //     ([`Self::sparse_active_plan`]). Small-`K` problems return `None`
@@ -525,7 +525,7 @@ impl SaeManifoldTerm {
                     }
                     None => None,
                 },
-                AssignmentMode::IBPMap { .. } => {
+                AssignmentMode::OrderedBetaBernoulli { .. } => {
                     match self.sparse_active_plan() {
                         Some((k_active_cap, relative_cutoff)) => {
                             // Build per-row dense assignments once to derive the
@@ -548,7 +548,7 @@ impl SaeManifoldTerm {
                                 relative_cutoff,
                                 coord_dims.clone(),
                                 self.assignment.coord_offsets(),
-                                // IBP-MAP is column-separable: no reference atom.
+                                // ordered Beta--Bernoulli-MAP is column-separable: no reference atom.
                                 None,
                             ))
                         }
@@ -708,10 +708,10 @@ impl SaeManifoldTerm {
         // (`rank == p`) and no-metric paths keep `low_rank_whiten == false` and
         // are bit-for-bit unchanged.
         let low_rank_whiten = whitens_likelihood && w_dim < p;
-        // #2144/#1038 — PSD-majorize the IBP assignment-prior curvature
+        // #2144/#1038 — PSD-majorize the ordered Beta--Bernoulli assignment-prior curvature
         // UNCONDITIONALLY (see `ibp_psd_majorized_hdiag`), exactly as softmax's
         // Gershgorin majorizer (#1419) and ARD's `max(V'',0)` already are. The raw
-        // IBP pieces (`w·s'` rank-one, `w·s·c` diagonal) are not sign-definite, so
+        // ordered Beta--Bernoulli pieces (`w·s'` rank-one, `w·s·c` diagonal) are not sign-definite, so
         // the raw operator's cross-row capacitance `C = I + D·M` goes indefinite by
         // design on weakly-identified fits — `log|H|` is then not a Laplace
         // normalizer at all (det H < 0), the outer-ρ criterion is undefined along
@@ -722,11 +722,11 @@ impl SaeManifoldTerm {
         // GRADIENT is untouched, so stationary points do not move; the ρ-trace and
         // θ-adjoint differentiate this SAME majorized operator (their sites clamp
         // identically), keeping value/trace/adjoint on one branch. `None` on every
-        // non-IBP mode (the third channels only exist for IBP-MAP).
+        // non-ordered Beta--Bernoulli mode (the third channels only exist for ordered Beta--Bernoulli-MAP).
         // RAW channels: `ibp_psd_majorized_hdiag` and the source-`d` clamp below do
         // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
         // un-majorized channel set.
-        let ibp_majorizer = ibp_assignment_third_channels_weighted(
+        let ibp_majorizer = ordered_beta_bernoulli_assignment_third_channels_weighted(
             &self.assignment,
             rho,
             false,
@@ -823,7 +823,7 @@ impl SaeManifoldTerm {
         // breach engages `softmax_active_plan` → `from_dense_weights`, so its
         // per-worker `decoded`/`jac_white` scratch is the COMPACT
         // `max_active`/`max_q_row` size too — no longer the full `(k_atoms·p)` /
-        // `(q·max(w_dim,p))` blow-up. JumpReLU / IBP-MAP likewise pay only
+        // `(q·max(w_dim,p))` blow-up. JumpReLU / ordered Beta--Bernoulli-MAP likewise pay only
         // `max_active`. The remaining `None` (full-`K`) branch is the UNCAPPED
         // softmax / no-budget-breach case, which genuinely assembles the dense
         // entropy block over all `K`; capping it (the compact contract) removes
@@ -1016,7 +1016,7 @@ impl SaeManifoldTerm {
                         // Determine whether this row uses the compact active-set layout.
                         //   * JumpReLU: gated atoms plus the smooth prior's
                         //     machine-precision support enter.
-                        //   * IBP-MAP at large K: only the top-`k_active` atoms.
+                        //   * ordered Beta--Bernoulli-MAP at large K: only the top-`k_active` atoms.
                         //   * Otherwise (small K): the dense uniform-q layout.
                         let (q_row, mut local_jac_row) = if let Some(layout) = row_layout.as_ref() {
                             let active = &layout.active_atoms[row];
@@ -1177,14 +1177,14 @@ impl SaeManifoldTerm {
                         // H-consistency note (#1006 audit / #1416 update). This
                         // `assignment_hdiag` is the assignment channel's raw diagonal
                         // curvature, added un-majorized. It is exact for JumpReLU and exact
-                        // within each IBP row/column diagonal, and stores ONLY the diagonal of
+                        // within each ordered Beta--Bernoulli row/column diagonal, and stores ONLY the diagonal of
                         // two full-Hessian structures — but those off-diagonal structures are
                         // now carried elsewhere, not dropped:
                         //
                         //   * softmax entropy has dense within-row Hessian
                         //     H_kj = (λ/τ²) a_k[δ_kj(m-L_k-1) + a_j(L_k+L_j+1-2m)];
                         //     this diagonal stores its Gershgorin Loewner majorizer (#1419).
-                        //   * IBP empirical-π has cross-row rank-one terms per column
+                        //   * ordered Beta--Bernoulli empirical-π has cross-row rank-one terms per column
                         //     H_(i,k),(j,k) = w score_derivative_k z'_ik z'_jk for i != j.
                         //     This per-row diagonal stores only the diagonal/self-row part;
                         //     the FULL rank-one cross-row block `U D Uᵀ` is now INSTALLED as a
@@ -1221,7 +1221,7 @@ impl SaeManifoldTerm {
                             // (a genuine majorizer on the retained support). The
                             // gradient stays the EXACT entropy gradient (it sets the
                             // fixed point), so majorizing only conditions the Newton
-                            // step. JumpReLU/IBP keep their (exact) diagonal.
+                            // step. JumpReLU/ordered Beta--Bernoulli keep their (exact) diagonal.
                             //
                             // #1410: compute only the active `D_kk` directly from this
                             // row's softmax assignments `a` (= `assignments`, already
@@ -1259,7 +1259,7 @@ impl SaeManifoldTerm {
                                     }
                                     _ => {
                                         let raw = assignment_hdiag[assignment_base + k];
-                                        // #2144: PSD-majorize the IBP diagonal under a
+                                        // #2144: PSD-majorize the ordered Beta--Bernoulli diagonal under a
                                         // low-rank whitening metric (no-op otherwise).
                                         let val = match ibp_majorizer.as_ref() {
                                             Some(ch) => {
@@ -1324,7 +1324,7 @@ impl SaeManifoldTerm {
                             } else {
                                 for free_idx in 0..assignment_dim {
                                     let raw = assignment_hdiag[assignment_base + free_idx];
-                                    // #2144: PSD-majorize the IBP diagonal under a
+                                    // #2144: PSD-majorize the ordered Beta--Bernoulli diagonal under a
                                     // low-rank whitening metric (no-op otherwise).
                                     let val = match ibp_majorizer.as_ref() {
                                         Some(ch) => ibp_psd_majorized_hdiag(
@@ -1786,7 +1786,7 @@ impl SaeManifoldTerm {
         // here to the (q × p) kron_jac so the Kronecker htbeta_matvec uses
         // the Riemannian-projected form.
         // Apply Riemannian geometry only for the dense uniform-q layout. Any
-        // compact active-set layout (JumpReLU gate or large-K softmax/IBP
+        // compact active-set layout (JumpReLU gate or large-K softmax/ordered Beta--Bernoulli
         // truncation) has heterogeneous q_i; the Riemannian projector path
         // requires a uniform latent dimension. The sparse plan only engages on
         // Euclidean ext-coord manifolds (see `sparse_active_plan`), so skipping
@@ -2533,7 +2533,7 @@ impl SaeManifoldTerm {
         {
             sys.set_row_gauge_deflation(deflation);
         }
-        // #1038 IBP cross-row Woodbury source. The exact IBP Hessian has the
+        // #1038 ordered Beta--Bernoulli cross-row Woodbury source. The exact ordered Beta--Bernoulli Hessian has the
         // per-column rank-one cross-row block `H_(i,k),(j,k) = w·s'_k·z'_ik·z'_jk`
         // (for ALL `i,j`, including the `i=j` self term) that couples DISTINCT
         // latent rows through the shared empirical mass `M_k = Σ_i z_ik`. The
@@ -2547,7 +2547,7 @@ impl SaeManifoldTerm {
         // lemma — so value, the evidence log-determinant, and the θ/ρ-adjoint all
         // differentiate the SAME `H_full = H₀' + U D Uᵀ`.
         //
-        // The source is built from the SAME `ibp_assignment_third_channels`
+        // The source is built from the SAME `ordered_beta_bernoulli_assignment_third_channels`
         // operator the #1006 θ-adjoint consumes:
         //   * `d[k] = cross_row_d[k]` (the column `D`-coefficient — since #2144
         //     clamped at the source to `max(w·s'_k, 0)`, so the capacitance
@@ -2562,7 +2562,7 @@ impl SaeManifoldTerm {
         //     `active_atoms[row]`, so `global_t_index = sys.row_offsets[i] + pos`.
         //     Both pin the `U`-column convention bit-for-bit to the consumer's
         //     `ibp_logit_sites`/`row_vars_for_cache_row` slot mapping.
-        if let Some(channels) = ibp_assignment_third_channels_weighted(
+        if let Some(channels) = ordered_beta_bernoulli_assignment_third_channels_weighted(
             &self.assignment,
             rho,
             false,

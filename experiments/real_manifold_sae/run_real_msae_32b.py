@@ -143,7 +143,7 @@ def main():
         t0 = time.time()
         try:
             sw = gamfit.sae_manifold_fit_stagewise(
-                Xs, d_atom=1, atom_topology="circle", assignment="ibp_map",
+                Xs, d_atom=1, atom_topology="circle", assignment="ordered_beta_bernoulli",
                 structured_whitening=True, max_births=args.max_births,
                 max_backfit_sweeps=4, n_iter=args.stagewise_niter, random_state=0)
             wall = time.time() - t0

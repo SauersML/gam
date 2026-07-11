@@ -2855,7 +2855,7 @@ impl SaeManifoldTerm {
                 }
                 canonicalize_softmax_logits(&mut self.assignment.logits);
             }
-            AssignmentMode::IBPMap { .. } => {
+            AssignmentMode::OrderedBetaBernoulli { .. } => {
                 // σ(0/τ) = ½ — the Bernoulli posterior mean's neutral point.
                 for row in 0..n {
                     self.assignment.logits[[row, atom]] = 0.0;
@@ -4630,7 +4630,7 @@ impl SaeManifoldTerm {
         }
 
         // When last_row_layout is set (compact active-set mode — JumpReLU
-        // gate or large-K IBP truncation), delta_ext_coord uses a
+        // gate or large-K ordered Beta--Bernoulli truncation), delta_ext_coord uses a
         // variable-stride layout where row i occupies
         // [compact_offset_i .. compact_offset_i + q_active_i].
         // We expand each row back to full-q before applying.
@@ -7281,14 +7281,14 @@ impl SaeManifoldTerm {
         // Without this the streaming/chunked path silently diverges from the dense
         // path: ungated atoms revert to their raw-logit gate instead of the fixed
         // unit gate (#1026), frozen routing thaws back to the free logits (#1033),
-        // and the per-fit truncated-IBP α override is dropped (#1777). All three
+        // and the per-fit truncated-ordered Beta--Bernoulli α override is dropped (#1777). All three
         // change the forward gate map, hence the loss, gradient, and log-det.
         //   * `ungated` is per-atom (length K) — row-independent.
-        //   * `ibp_alpha_override` is scalar — row-independent.
+        //   * `ordered_beta_bernoulli_alpha_override` is scalar — row-independent.
         //   * frozen routing is per-row (n×K) — the caller slices it to the chunk's
         //     rows and passes it as `chunk_frozen_logits`.
         assignment.ungated = self.assignment.ungated.clone();
-        assignment.ibp_alpha_override = self.assignment.ibp_alpha_override;
+        assignment.ordered_beta_bernoulli_alpha_override = self.assignment.ordered_beta_bernoulli_alpha_override;
         if let Some(frozen) = chunk_frozen_logits {
             if frozen.dim() != (n_chunk, k_atoms) {
                 return Err(format!(

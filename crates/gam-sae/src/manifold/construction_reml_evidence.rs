@@ -313,7 +313,7 @@ impl SaeManifoldTerm {
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             // Distinguish a GENUINE infeasibility — a probed ρ where the joint
             // Hessian is not PD so the Laplace evidence log-det is undefined —
-            // from a real factorization defect. The cross-row IBP Woodbury
+            // from a real factorization defect. The cross-row ordered Beta--Bernoulli Woodbury
             // capacitance `C = I_R + D·Uᵀ H₀'⁻¹ U` can have det ≤ 0 at a ρ the
             // outer optimizer line-searches into (the indefinite basin adjacent
             // to the PD region); there the log-det legitimately does not exist.
@@ -326,7 +326,7 @@ impl SaeManifoldTerm {
             // non-finite term.)
             if cache.cross_row_woodbury.is_some() && !cache.cross_row_woodbury_log_det().is_finite()
             {
-                "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
+                "SaeManifoldTerm::reml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at \
                  this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
                     .to_string()
             } else {
@@ -773,7 +773,7 @@ impl SaeManifoldTerm {
             // the infeasible-ρ signal that drives the #2080 probe fast-refusal
             // and the refine-budget escalation below.
             // `probe_undamped_evidence_row_factors` surfaces that identical
-            // verdict (same #1038 IBP self-term downdate, same gauge/spectral
+            // verdict (same #1038 ordered Beta--Bernoulli self-term downdate, same gauge/spectral
             // deflation policy, same `factor_one_row` error text) at the
             // per-row-only `O(N·q³)` cost, never forming the border Schur.
             //
@@ -815,7 +815,7 @@ impl SaeManifoldTerm {
                     match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options) {
                         Ok(factored) => factored,
                         Err(err) if Self::is_undamped_evidence_row_non_pd(&err) => {
-                            // K>1: the softmax/IBP logit–coordinate Gauss-Newton
+                            // K>1: the softmax/ordered Beta--Bernoulli logit–coordinate Gauss-Newton
                             // cross-terms (H_zt = J_z^T J_t, assembled row-locally from
                             // the assignment JVP × basis JVP) can make a per-row H_tt
                             // indefinite at the TRUE KKT stationary point — when two
@@ -931,7 +931,7 @@ impl SaeManifoldTerm {
                         );
                         if total_inner_iter >= refine_limit {
                             // #1117/#1118 — pre-stationarity genuinely-indefinite
-                            // non-gauge H_tt under K>1 IBP/softmax row-sharing. The
+                            // non-gauge H_tt under K>1 ordered Beta--Bernoulli/softmax row-sharing. The
                             // logit × coordinate Gauss-Newton cross term H_zt = J_zᵀJ_t
                             // can drive a shared row's H_tt Schur complement NEGATIVE off
                             // the gauge orbit; the LM-escalated refinement above cannot
@@ -2268,12 +2268,12 @@ impl SaeManifoldTerm {
             // Cholesky-factoring the dense Schur. Peak memory is the per-row block
             // storage the inner PCG already holds, not the extra O(k²) dense S.
             //
-            // Valid for the NON-IBP (softmax / JumpReLU) evidence, whose exact
+            // Valid for the NON-ordered Beta--Bernoulli (softmax / JumpReLU) evidence, whose exact
             // log-det is `log_det_tt + log_det_schur` with NO cross-row Woodbury
-            // correction. The IBP cross-row term additionally needs
+            // correction. The ordered Beta--Bernoulli cross-row term additionally needs
             // `log det(I_R + D Uᵀ H₀'⁻¹ U)`, which has no matrix-free route yet, so
             // it keeps refusing (loudly, pointing at the dense resident path).
-            if ibp_assignment_third_channels_weighted(
+            if ordered_beta_bernoulli_assignment_third_channels_weighted(
                 &self.assignment,
                 rho,
                 false,
@@ -2283,8 +2283,8 @@ impl SaeManifoldTerm {
             {
                 return Err(format!(
                     "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur \
-                     {} bytes exceeds budget {} bytes and the exact cross-row IBP Woodbury evidence \
-                     has no matrix-free log-det route yet; route IBP-active large-K fits through the \
+                     {} bytes exceeds budget {} bytes and the exact cross-row ordered Beta--Bernoulli Woodbury evidence \
+                     has no matrix-free log-det route yet; route ordered Beta--Bernoulli-active large-K fits through the \
                      dense resident ArrowFactorCache::arrow_log_det",
                     plan.estimated_dense_schur_bytes, plan.in_core_budget_bytes
                 ));
@@ -2345,11 +2345,11 @@ impl SaeManifoldTerm {
         };
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
         let mut log_det_tt = 0.0_f64;
-        // #1038 cross-row IBP Woodbury accumulators. `M = Uᵀ H₀'⁻¹ U` is
+        // #1038 cross-row ordered Beta--Bernoulli Woodbury accumulators. `M = Uᵀ H₀'⁻¹ U` is
         // chunk-additive in `M0 = Σ Uᵢᵀ Aᵢ⁻¹ Uᵢ` and `W = Σ Bᵢᵀ Aᵢ⁻¹ Uᵢ`
         // (`A = H₀'` block-diagonal, `U` row-supported), closed against the
         // GLOBAL reduced Schur `S = schur_acc` after the loop. `None` for every
-        // non-IBP (softmax / JumpReLU) term, where the streaming log-det is
+        // non-ordered Beta--Bernoulli (softmax / JumpReLU) term, where the streaming log-det is
         // exactly the bare `log_det_tt + log_det_schur` as before.
         let mut wood_m0: Option<Array2<f64>> = None;
         let mut wood_w: Option<Array2<f64>> = None;
@@ -2408,7 +2408,7 @@ impl SaeManifoldTerm {
                 }
             }
             if chunk_wood.is_some() && chunk_size < n_total {
-                // The cross-row IBP empirical mass `M_k = Σ_i z_ik` couples ALL
+                // The cross-row ordered Beta--Bernoulli empirical mass `M_k = Σ_i z_ik` couples ALL
                 // rows, so the per-row `H₀'` diagonal (`score_derivative_k(M_k)`)
                 // and the column coefficient `d_k = w·s'_k(M_k)` are only exact
                 // when every row is assembled together — a SINGLE chunk. Under a
@@ -2419,10 +2419,10 @@ impl SaeManifoldTerm {
                 // runs when the dense reduced Schur fits budget, so the single-
                 // chunk regime is the common case; this guards the rest.
                 return Err(
-                    "SaeManifoldTerm::streaming_exact_arrow_log_det: exact cross-row IBP \
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det: exact cross-row ordered Beta--Bernoulli \
                      Woodbury evidence requires a single-chunk pass (the empirical mass \
                      M_k = Σ_i z_ik couples all rows); this shape needs >1 chunk. Route \
-                     IBP-active large-n fits through the dense resident \
+                     ordered Beta--Bernoulli-active large-n fits through the dense resident \
                      ArrowFactorCache::arrow_log_det."
                         .to_string(),
                 );
@@ -2453,7 +2453,7 @@ impl SaeManifoldTerm {
         let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
             .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
         let mut total = log_det_tt + log_det_schur;
-        // #1038/#1225: close the exact cross-row IBP Woodbury correction
+        // #1038/#1225: close the exact cross-row ordered Beta--Bernoulli Woodbury correction
         // `log det(I_R + D Uᵀ H₀'⁻¹ U)` so the streaming evidence equals the
         // dense `arrow_log_det_from_cache` (which adds the SAME term). Without
         // it the streaming criterion would silently drop the entire cross-row
@@ -2468,7 +2468,7 @@ impl SaeManifoldTerm {
             )
             .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?
             .ok_or_else(|| {
-                "SaeManifoldTerm::reml_criterion: cross-row IBP joint Hessian is non-PD at \
+                "SaeManifoldTerm::reml_criterion: cross-row ordered Beta--Bernoulli joint Hessian is non-PD at \
                      this ρ; evidence Laplace log-det undefined (infeasible ρ probe)"
                     .to_string()
             })?;
@@ -2778,7 +2778,7 @@ impl SaeManifoldTerm {
         } else {
             Array2::<f64>::zeros((0, 0))
         };
-        // #1416 cross-row IBP source: the per-row block that the deflation
+        // #1416 cross-row ordered Beta--Bernoulli source: the per-row block that the deflation
         // factorizes is the NO-SELF base `H₀'` — the rank-one self curvature
         // `d_k·J_ik²` is DOWNDATED from each logit diagonal and re-applied through
         // the Woodbury carrier. The full-`H` diagonal contraction below still uses
@@ -2786,21 +2786,21 @@ impl SaeManifoldTerm {
         // DEFLATION correction must use `(∂H₀'/∂ρ)_tt`, i.e. `hdiag` MINUS the
         // downdated self term — otherwise the Daleckii–Krein correction
         // mis-attributes the (un-deflated) Woodbury self curvature's derivative to
-        // the deflated subspace. For non-IBP modes there is no Woodbury source and
+        // the deflated subspace. For non-ordered Beta--Bernoulli modes there is no Woodbury source and
         // the self term is `0` (the deflated block IS the full block).
-        // #1416 (compact-layout completion): the IBP cross-row Woodbury source is
+        // #1416 (compact-layout completion): the ordered Beta--Bernoulli cross-row Woodbury source is
         // installed for BOTH the dense and the compact (#1420 top-`k`) layouts (see
         // `set_ibp_cross_row_source`, which emits `(g_base + pos, atom, z'_ik)` for
         // the active set under a compact layout), so the deflated base `H₀'` is the
         // no-self block in BOTH layouts. The self-curvature downdate below must
         // therefore run regardless of layout — gating it to the dense path (the
         // pre-fix bug) left the compact deflation correction differentiating the
-        // un-downdated full block. For non-IBP modes `ibp_assignment_third_channels`
+        // un-downdated full block. For non-ordered Beta--Bernoulli modes `ordered_beta_bernoulli_assignment_third_channels`
         // returns `None`, there is no Woodbury source, and `self_curv` is
         // identically 0 (the deflated block IS the full block).
         // RAW channels: the `w·s·c` diagonal split needs the un-clamped `w·s'`, so
         // build raw and apply the gam#2144 majorization here.
-        let mut cross_channels = ibp_assignment_third_channels_weighted(
+        let mut cross_channels = ordered_beta_bernoulli_assignment_third_channels_weighted(
             &self.assignment,
             rho,
             false,
@@ -2808,12 +2808,12 @@ impl SaeManifoldTerm {
         )?;
         let learnable_alpha = matches!(
             self.assignment.mode,
-            AssignmentMode::IBPMap {
+            AssignmentMode::OrderedBetaBernoulli {
                 learnable_alpha: true,
                 ..
             }
         );
-        // gam#2144/#1038: the assembled `H` carries the PSD-majorized IBP
+        // gam#2144/#1038: the assembled `H` carries the PSD-majorized ordered Beta--Bernoulli
         // curvature UNCONDITIONALLY (`ibp_psd_majorized_hdiag` + clamped Woodbury
         // `d` — the same doctrine as softmax's #1419 Gershgorin). Differentiate the
         // SAME operator: overwrite the per-slot diagonal with its majorizer and
@@ -2931,16 +2931,16 @@ impl SaeManifoldTerm {
                 trace -= Self::deflation_block_correction(&inv_vv, &d_mat, dirs, spectrum);
             }
         }
-        // #1416: the IBP prior Hessian is `H_p = d·J Jᵀ + diag(s, c)`, where the
+        // #1416: the ordered Beta--Bernoulli prior Hessian is `H_p = d·J Jᵀ + diag(s, c)`, where the
         // rank-one `d·J Jᵀ` couples EVERY row pair `(i, j)` in a column `k`
         // through the shared empirical mass `M_k`. The assembled `H` carries the
         // full `H_full = H₀' + U D Uᵀ` (Woodbury, `set_ibp_cross_row_source`), and
-        // for fixed alpha the entire IBP prior scales with `λ = eᵖ`, so
+        // for fixed alpha the entire ordered Beta--Bernoulli prior scales with `λ = eᵖ`, so
         // `∂H_p/∂ρ = H_p`. The diagonal loop above already captures the `i = j`
         // self terms (the `d·J_ik²` summand lives in `hdiag`); this pass adds the
-        // omitted off-diagonal `½·d_k·Σ_{i≠j}(H⁻¹)_{ik,jk}·J_ik·J_jk`. Only IBP
+        // omitted off-diagonal `½·d_k·Σ_{i≠j}(H⁻¹)_{ik,jk}·J_ik·J_jk`. Only ordered Beta--Bernoulli
         // has the cross-row rank-one source; for other diagonal modes
-        // `ibp_assignment_third_channels` returns `None` and the trace stays the
+        // `ordered_beta_bernoulli_assignment_third_channels` returns `None` and the trace stays the
         // pure diagonal contraction.
         //
         // #1416 (compact completion): this pass is LAYOUT-AGNOSTIC. Under the dense
@@ -2957,7 +2957,7 @@ impl SaeManifoldTerm {
         if let Some(channels) = cross_channels.as_ref() {
             let n = self.n_obs();
             let total_t = cache.delta_t_len();
-            // This trace is ½ ∂log|H|/∂ρ. For FIXED-α IBP the whole prior
+            // This trace is ½ ∂log|H|/∂ρ. For FIXED-α ordered Beta--Bernoulli the whole prior
             // scales with λ=eᵖ so ∂H_p/∂ρ = H_p and the rank-one coefficient
             // is the VALUE `cross_row_d[k] = w·s'_k`. For LEARNABLE-α this trace
             // is ½ ∂log|H|/∂logα, and the rank-one block's logα-derivative is
@@ -3074,10 +3074,10 @@ impl SaeManifoldTerm {
         }
 
         let mut ibp_channels =
-            ibp_assignment_third_channels_weighted(&self.assignment, rho, false, row_weights)?;
+            ordered_beta_bernoulli_assignment_third_channels_weighted(&self.assignment, rho, false, row_weights)?;
         let learnable_alpha = matches!(
             self.assignment.mode,
-            AssignmentMode::IBPMap {
+            AssignmentMode::OrderedBetaBernoulli {
                 learnable_alpha: true,
                 ..
             }
@@ -3214,7 +3214,7 @@ impl SaeManifoldTerm {
     ///   (A_i^-1 H_tbeta z_j) * (A_i^-1 H_tbeta S^-1 z_j)`.
     ///
     /// This is the missing assignment-strength trace in the matrix-free analytic
-    /// rho-gradient cluster.  It deliberately refuses IBP cross-row curvature and
+    /// rho-gradient cluster.  It deliberately refuses ordered Beta--Bernoulli cross-row curvature and
     /// per-row spectral/gauge deflation: the border-only bundle represents the
     /// plain row-block arrow inverse and cannot reconstruct either correction.
     pub(crate) fn assignment_log_strength_hessian_trace_from_probes(
@@ -3224,11 +3224,11 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<f64, String> {
-        if matches!(self.assignment.mode, AssignmentMode::IBPMap { .. })
+        if matches!(self.assignment.mode, AssignmentMode::OrderedBetaBernoulli { .. })
             || cache.cross_row_woodbury.is_some()
         {
             return Err(
-                "assignment_log_strength_hessian_trace_from_probes: IBP cross-row curvature \
+                "assignment_log_strength_hessian_trace_from_probes: ordered Beta--Bernoulli cross-row curvature \
                  is not represented by the border-only inverse-probe bundle"
                     .to_string(),
             );
@@ -3709,8 +3709,8 @@ impl SaeManifoldTerm {
         // #Bug4: a FIXED logit (ungated atom, or every atom under frozen routing)
         // has its assembled `htt` diagonal entry ZEROED (see
         // `assignment_prior_grad_hdiag`), so the θ-adjoint third derivative of that
-        // zeroed entry must also be zero. Mirror the IBP channel zeroing in
-        // `ibp_assignment_third_channels`. The ThresholdGate/IBP branches below are
+        // zeroed entry must also be zero. Mirror the ordered Beta--Bernoulli channel zeroing in
+        // `ordered_beta_bernoulli_assignment_third_channels`. The ThresholdGate/ordered Beta--Bernoulli branches below are
         // both diagonal (`diag_atom == wrt_atom`), so masking on `wrt_atom` suffices.
         if self.assignment.logit_is_fixed(wrt_atom) {
             return 0.0;
@@ -3734,10 +3734,6 @@ impl SaeManifoldTerm {
                     return 0.0;
                 }
                 let logit = self.assignment.logits[[row, diag_atom]];
-                if !crate::assignment::jumprelu_in_optimization_band(logit, threshold, temperature)
-                {
-                    return 0.0;
-                }
                 let inv_tau = 1.0 / temperature;
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
@@ -3756,7 +3752,7 @@ impl SaeManifoldTerm {
                     * inv_tau
                     * inv_tau
             }
-            AssignmentMode::IBPMap { .. } => {
+            AssignmentMode::OrderedBetaBernoulli { .. } => {
                 // The assembled `htt` diagonal consumes
                 // `OrderedBetaBernoulliPenalty::hessian_diag`, whose logit derivative
                 // splits into a row-local direct-`z` channel and a global
@@ -4138,7 +4134,7 @@ impl SaeManifoldTerm {
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
         // Newton/Schur Cholesky factorizes — so each block's θ-derivative channel
         // is differentiated on the criterion's own branch (no value/gradient
-        // desync). The IBP-MAP assignment prior is the one block whose
+        // desync). The ordered Beta--Bernoulli-MAP assignment prior is the one block whose
         // `hessian_diag` couples every row in a column through the plug-in
         // empirical mass `M_k = Σ_i z_ik`; its logit derivative therefore has a
         // row-local channel (handled inline via
@@ -4166,8 +4162,8 @@ impl SaeManifoldTerm {
         } else {
             Array2::<f64>::zeros((cache.k, cache.k))
         };
-        // IBP `hessian_diag` logit third-derivative channels (#1006). The full
-        // IBP Hessian also has per-column cross-row rank-one terms
+        // ordered Beta--Bernoulli `hessian_diag` logit third-derivative channels (#1006). The full
+        // ordered Beta--Bernoulli Hessian also has per-column cross-row rank-one terms
         // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE carried in `H` via the #1038
         // Woodbury source (`IbpCrossRowSource`, construction.rs:4710-4752), the
         // ρ-trace differentiates them (#1416,
@@ -4178,17 +4174,17 @@ impl SaeManifoldTerm {
         // `logit_curvature`) contracts the `∂/∂ℓ_w (d_k·J_ik·J_jk)` rank-one
         // derivative — so value, logdet, ρ-trace, and θ-adjoint all differentiate
         // the one operator `H = H₀ + Σ_k d_k u_k u_kᵀ`.
-        // gam#2144/#1038: the assembly PSD-majorizes the IBP curvature
+        // gam#2144/#1038: the assembly PSD-majorizes the ordered Beta--Bernoulli curvature
         // UNCONDITIONALLY, so the θ-adjoint differentiates the MAJORIZED channels
         // (clamped `cross_row_d`, gated `cross_row_dd`/`m_channel`/
         // `local_logit_third`) — the exact derivative of the operator the evidence
-        // log-det factors, on every IBP path. Anything else desyncs the outer-REML
+        // log-det factors, on every ordered Beta--Bernoulli path. Anything else desyncs the outer-REML
         // gradient from the evidence (#2087).
         // gam#2144: whitening of the row jets tracks `whitens_likelihood()` at ANY
         // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike) and is
         // independent of the PSD majorization.
         let whiten_row_jets = self.whiten_logdet_row_jets();
-        let ibp_channels = ibp_assignment_third_channels_weighted(
+        let ibp_channels = ordered_beta_bernoulli_assignment_third_channels_weighted(
             &self.assignment,
             rho,
             true,
@@ -4201,7 +4197,7 @@ impl SaeManifoldTerm {
         // `scale = λ/τ²` the assembly uses so value/logdet/adjoint differentiate
         // one operator. `None` for non-softmax modes (their diagonal/cross-row
         // channels are handled by `assignment_prior_hdiag_derivative_entry` and
-        // the IBP column pass).
+        // the ordered Beta--Bernoulli column pass).
         let softmax_dense_adjoint: Option<(
             gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
             f64,
@@ -4308,7 +4304,7 @@ impl SaeManifoldTerm {
             // criterion uses the deflation-map derivative `DΦ`. The kept-subspace Γ
             // subtracts `tr(inv_vv·(D − DΦ[D]))` over the t–t block via the same
             // Daleckii–Krein helper the ρ-traces use (the t–β / β–β blocks are not
-            // deflated). IBP cross-row Woodbury caches factor the no-self base, so
+            // deflated). ordered Beta--Bernoulli cross-row Woodbury caches factor the no-self base, so
             // the correction matrix below removes the local self derivative before
             // applying `DΦ`; the full self/off-row rank-one derivative stays in the
             // ordinary raw contractions.
@@ -4323,7 +4319,7 @@ impl SaeManifoldTerm {
                 .and_then(Option::as_ref);
 
             // Record each active logit's column, global t-index, and raw
-            // selected-inverse diagonal for the IBP cross-row passes. Also cache
+            // selected-inverse diagonal for the ordered Beta--Bernoulli cross-row passes. Also cache
             // the per-slot Daleckii-Krein weight for a unit diagonal derivative:
             // the empirical-M `m_channel` later splits into a no-self row-base
             // derivative plus a rank-one self derivative, and only the no-self
@@ -4388,7 +4384,7 @@ impl SaeManifoldTerm {
             // #991 — the softmax majorizer written into `htt` carries this row's
             // design weight `w_row`, so its θ-derivative below carries the SAME
             // `w_row`; the data-curvature θ-derivative already carries `w` through
-            // the √w-scaled jets, and the IBP prior derivative
+            // the √w-scaled jets, and the ordered Beta--Bernoulli prior derivative
             // (`assignment_prior_hdiag_derivative_entry`) is left unweighted.
             let w_row_prior = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
             for w in 0..q {
@@ -4454,7 +4450,7 @@ impl SaeManifoldTerm {
                         }
                         let mut ibp_self_derivative = 0.0_f64;
                         // #2144: the row factor that spectral deflation conditions is
-                        // the IBP no-self base `H0'`, because
+                        // the ordered Beta--Bernoulli no-self base `H0'`, because
                         // `solve_arrow_newton_step_with_options` downdates the
                         // row-local `d_k J_ik^2` self curvature before factoring and
                         // re-adds the full rank-one column through Woodbury. The trace
@@ -4462,7 +4458,7 @@ impl SaeManifoldTerm {
                         // against the full selected inverse; only the Daleckii-Krein
                         // deflation-map correction must see the derivative of the
                         // actually deflated row block. Therefore remove just the
-                        // direct-local derivative of the downdated IBP self term from
+                        // direct-local derivative of the downdated ordered Beta--Bernoulli self term from
                         // the matrix passed to `deflation_block_correction`. The
                         // empirical-M and off-row Woodbury channels remain in their
                         // existing passes.
@@ -4482,7 +4478,7 @@ impl SaeManifoldTerm {
                         }
                         let deflated_base_dh = dh - ibp_self_derivative;
                         if !joint_block {
-                            // `htt_half` is formed from the factored IBP no-self
+                            // `htt_half` is formed from the factored ordered Beta--Bernoulli no-self
                             // row base. Its raw contraction therefore excludes
                             // the local diagonal piece reintroduced only by the
                             // joint cross-row Woodbury carrier.
@@ -4497,7 +4493,7 @@ impl SaeManifoldTerm {
                     // conditioned `Φ(H_tt)`, while the local theta channels above
                     // assemble the raw row derivative `D`. Subtract
                     // `tr(inv_vv · (D - DΦ[D]))` for every deflated row, including
-                    // the low-rank IBP majorizer path, so the theta adjoint
+                    // the low-rank ordered Beta--Bernoulli majorizer path, so the theta adjoint
                     // differentiates the same operator as `arrow_log_det`,
                     // `apply_cached_arrow_hessian`, and the selected inverse.
                     gamma -= Self::deflation_block_correction(
@@ -4553,7 +4549,7 @@ impl SaeManifoldTerm {
             }
         }
 
-        // IBP cross-row empirical-`M_k` channel of Γ (#1006). The assembled
+        // ordered Beta--Bernoulli cross-row empirical-`M_k` channel of Γ (#1006). The assembled
         // diagonal H_ik consumes `hessian_diag`, whose dependence on the column
         // mass M_k = Σ_i z_ik couples every row in a column. Differentiating
         // tr(H⁻¹ ∂H/∂ℓ_wk) on that shared branch:
@@ -4674,7 +4670,7 @@ impl SaeManifoldTerm {
                 let x_k = solver
                     .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
                     .map_err(|err| {
-                        format!("logdet_theta_adjoint: IBP cross-row Woodbury solve: {err}")
+                        format!("logdet_theta_adjoint: ordered Beta--Bernoulli cross-row Woodbury solve: {err}")
                     })?;
                 // Clear this column's active slots for the next atom's RHS.
                 for &(_row, t_index, _g) in &col_sites[atom] {
@@ -4743,7 +4739,7 @@ impl SaeManifoldTerm {
     /// * **Per-row deflation** (`deflated_row_directions`): the Daleckii–Krein
     ///   correction `−tr(inv_vv·(D − DΦ[D]))` needs the DEFLATED block the plain-S⁻¹
     ///   bundle does not carry.
-    /// * **IBP cross-row Woodbury** (`ibp_channels` / `cache.cross_row_woodbury`):
+    /// * **ordered Beta--Bernoulli cross-row Woodbury** (`ibp_channels` / `cache.cross_row_woodbury`):
     ///   `W_k = d_k u_k u_kᵀ` lives in the T-block, layered onto `H₀'` as a rank-R
     ///   correction (`full_inverse_apply`), NOT in the border the bundle spans —
     ///   folding it matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
@@ -4811,18 +4807,18 @@ impl SaeManifoldTerm {
             }
         }
 
-        // Cross-row IBP Woodbury hard-refuse. The bundle spans only the reduced-Schur
+        // Cross-row ordered Beta--Bernoulli Woodbury hard-refuse. The bundle spans only the reduced-Schur
         // BORDER (the decoder-β channels, `cache.k`); the #1038 cross-row rank-one
         // curvature `W_k = d_k u_k u_kᵀ` lives in the T-block, layered onto the NO-SELF
         // base `H₀'` as a rank-R correction (`full_inverse_apply` / the
         // `subtract_inverse_diagonal` step). The border-only outer products reconstruct
         // exactly `A_i⁻¹ + G_i S⁻¹ G_iᵀ = (H₀')⁻¹` per row — NOT the Woodbury-corrected
-        // full inverse the dense adjoint contracts — so an IBP cross-row cache is routed
+        // full inverse the dense adjoint contracts — so an ordered Beta--Bernoulli cross-row cache is routed
         // to the dense channel (same hard-refuse discipline as deflation; folding this
         // channel matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
         // reduced-Schur/bundle design step). The from-probes lane therefore owns the
         // softmax / euclidean / non-cross-row regimes where base = full inverse.
-        let ibp_channels = ibp_assignment_third_channels_weighted(
+        let ibp_channels = ordered_beta_bernoulli_assignment_third_channels_weighted(
             &self.assignment,
             rho,
             true,
@@ -4830,7 +4826,7 @@ impl SaeManifoldTerm {
         )?;
         if ibp_channels.is_some() || cache.cross_row_woodbury.is_some() {
             return Err(
-                "logdet_theta_adjoint_from_probes: cache carries an IBP cross-row Woodbury \
+                "logdet_theta_adjoint_from_probes: cache carries an ordered Beta--Bernoulli cross-row Woodbury \
                  (T-space rank-R) curvature the border-only probe bundle cannot reconstruct — \
                  route this fit through the dense channel"
                     .to_string(),
@@ -5092,7 +5088,7 @@ impl SaeManifoldTerm {
             }
         }
 
-        // No IBP empirical-M / cross-row Woodbury pass here: those channels are
+        // No ordered Beta--Bernoulli empirical-M / cross-row Woodbury pass here: those channels are
         // hard-refused above (the border-only bundle cannot carry the T-space
         // rank-R Woodbury), so on every accepted cache `ibp_channels` is `None` and
         // the softmax/euclidean core folds above are the complete θ-adjoint.

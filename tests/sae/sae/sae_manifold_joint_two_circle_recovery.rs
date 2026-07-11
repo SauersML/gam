@@ -19,7 +19,7 @@
 //! seed the latent coordinates from the planted angles (the production PCA /
 //! cluster coordinate seed is a separate stage; #853 is a routing/active-mass
 //! failure, not a coordinate-recovery one — mirroring the inline torus oracle
-//! `ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init`).
+//! `ordered_beta_bernoulli_k2_periodic_torus_recovers_signal_with_lsq_init`).
 
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use gam::solver::rho_optimizer::OuterProblem;
@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use faer::Side as FaerSide;
 
-// ---- production defaults (gamfit `sae_manifold_fit`, ibp_map path) ----------
+// ---- production defaults (gamfit `sae_manifold_fit`, ordered_beta_bernoulli path) ----------
 const N: usize = 600;
 const P: usize = 24;
 const K: usize = 2;
@@ -178,7 +178,7 @@ fn planted_response(truth: &Truth, u_a: &Array2<f64>, u_b: &Array2<f64>) -> (Arr
     (z, signal_scale)
 }
 
-/// VERBATIM port of pyffi `sae_residual_seed_logits` (ibp_map cold seed).
+/// VERBATIM port of pyffi `sae_residual_seed_logits` (ordered_beta_bernoulli cold seed).
 fn residual_seed_logits(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -246,7 +246,7 @@ fn residual_seed_logits(
     logits
 }
 
-/// VERBATIM port of pyffi `sae_decoder_lsq_init` (ibp_map branch).
+/// VERBATIM port of pyffi `sae_decoder_lsq_init` (ordered_beta_bernoulli branch).
 fn decoder_lsq_init(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -373,7 +373,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
         logits,
         coords_k,
         vec![LatentManifold::Circle { period: 1.0 }; K],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .unwrap();
     SaeManifoldTerm::new(atoms, assignment).unwrap()
@@ -502,7 +502,7 @@ fn circular_corr_active(theta_true: &[f64], theta_fit: &[f64], active: &[bool]) 
 }
 
 #[test]
-fn sae_manifold_joint_two_circle_recovery_ibp_map() {
+fn sae_manifold_joint_two_circle_recovery_ordered_beta_bernoulli() {
     let (u_a, u_b) = planted_frames();
     let truth = planted_truth();
     let (z, signal_scale) = planted_response(&truth, &u_a, &u_b);

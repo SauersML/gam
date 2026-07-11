@@ -41,7 +41,7 @@ use gam::terms::{
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-// ---- production defaults (gamfit `sae_manifold_fit`, ibp_map path) ---------
+// ---- production defaults (gamfit `sae_manifold_fit`, ordered_beta_bernoulli path) ---------
 const N: usize = 200;
 const P: usize = 12;
 const M: usize = 3; // const + 1 harmonic (sin, cos) -> circle
@@ -140,7 +140,7 @@ fn planted_response(theta: &[f64], amp: &[f64], frame: &Array2<f64>) -> Array2<f
     z
 }
 
-/// Production cold decoder init for the single-atom ibp_map path: weighted LSQ
+/// Production cold decoder init for the single-atom ordered_beta_bernoulli path: weighted LSQ
 /// at the zero-logit gate `a = σ(0) = 0.5` (the K = 1 specialization of the
 /// pyffi `sae_decoder_lsq_init`, whose residual-seed logits are identically
 /// zero for a single atom).
@@ -189,7 +189,7 @@ fn run_production_fit(z: &Array2<f64>, coord_seed: &[f64], label: &str) -> SaeMa
         logits,
         vec![coords],
         vec![LatentManifold::Circle { period: 1.0 }],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .expect("assignment");
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");

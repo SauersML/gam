@@ -172,7 +172,7 @@ impl SaeRowLayout {
             n,
             k_atoms,
             threshold,
-            temperature,
+            temperature: _,
             logits,
             contribution,
             ungated,
@@ -187,13 +187,7 @@ impl SaeRowLayout {
         for row in 0..n {
             let row_logits = logits.row(row);
             let row_contrib = contribution.row(row);
-            let in_band = |k: usize| {
-                crate::assignment::jumprelu_in_optimization_band(
-                    row_logits[k],
-                    threshold,
-                    temperature,
-                )
-            };
+            let in_band = |_k: usize| true;
             // Hard forward gate: nonzero EFFECTIVE assignment mass ⇒ data-fit
             // coupling in the joint block. Always retained. `logits` is the
             // effective routing (frozen-aware), and #Bug3: an UNGATED atom has its
@@ -201,7 +195,7 @@ impl SaeRowLayout {
             // the reconstruction and MUST be in the compact support even when its
             // raw logit sits below the threshold.
             let hard: Vec<usize> = (0..k_atoms)
-                .filter(|&k| ungated[k] || row_logits[k] > threshold)
+                .filter(|&k| ungated[k] || row_contrib[k] != 0.0)
                 .collect();
             // Relative-cutoff base: the largest separable contribution over all
             // in-band atoms in this row.

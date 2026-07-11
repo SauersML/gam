@@ -16,7 +16,7 @@ pub struct SaeMinimalSeedRequest<'a> {
     pub tau: f64,
     pub threshold: f64,
     pub top_k: Option<usize>,
-    pub ibp_alpha_override: Option<f64>,
+    pub ordered_beta_bernoulli_alpha_override: Option<f64>,
     pub random_state: u64,
     pub initial_logits: Option<ArrayView2<'a, f64>>,
     pub initial_coords: Option<ArrayView3<'a, f64>>,
@@ -143,7 +143,7 @@ pub fn build_sae_minimal_seed(
         && k_atoms > 1
         && matches!(
             request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::IbpMap
+            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
         )
     {
         let labels = sae_output_energy_cluster_labels(request.target, k_atoms);
@@ -187,9 +187,12 @@ pub fn build_sae_minimal_seed(
                 request.threshold + THRESHOLD_GATE_SEED_MARGIN,
             )
         }
-        None if k_atoms == 1 && request.assignment_kind == SaeFitAssignmentKind::IbpMap => {
-            const IBP_K1_PRESENT_GATE_LOGIT: f64 = 6.0;
-            Array2::<f64>::from_elem((n_obs, k_atoms), IBP_K1_PRESENT_GATE_LOGIT * request.tau)
+        None if k_atoms == 1 && request.assignment_kind == SaeFitAssignmentKind::OrderedBetaBernoulli => {
+            const ORDERED_BETA_BERNOULLI_K1_PRESENT_GATE_LOGIT: f64 = 6.0;
+            Array2::<f64>::from_elem(
+                (n_obs, k_atoms),
+                ORDERED_BETA_BERNOULLI_K1_PRESENT_GATE_LOGIT * request.tau,
+            )
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
@@ -197,7 +200,7 @@ pub fn build_sae_minimal_seed(
         && k_atoms > 1
         && matches!(
             request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::IbpMap
+            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
         )
     {
         const RESIDUAL_SEED_GAIN: f64 = 4.0;
@@ -230,7 +233,7 @@ pub fn build_sae_minimal_seed(
         request.target,
         initial_logits.view(),
         request.assignment_kind.tag(),
-        request.ibp_alpha_override.unwrap_or(request.alpha),
+        request.ordered_beta_bernoulli_alpha_override.unwrap_or(request.alpha),
         request.tau,
         request.threshold,
         request.top_k,
@@ -268,7 +271,7 @@ mod tests {
             tau: 1.0,
             threshold: 0.0,
             top_k: None,
-            ibp_alpha_override: None,
+            ordered_beta_bernoulli_alpha_override: None,
             random_state: 0,
             initial_logits: None,
             initial_coords: None,

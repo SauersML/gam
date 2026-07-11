@@ -62,7 +62,7 @@ def main() -> None:
     t0 = time.time()
     sac = sac_fit(
         Xtr, t1_recon=t1_tr, max_atoms=k2, d_atom=1, atom_topology="circle",
-        assignment="ibp_map", ev_floor=2e-3, structured_residual_passes=0,
+        assignment="ordered_beta_bernoulli", ev_floor=2e-3, structured_residual_passes=0,
         n_iter=n_iter, backfit_sweeps=1, isometry_weight=1.0, random_state=0,
         verbose=True,
     )

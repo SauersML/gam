@@ -74,7 +74,7 @@ def _fit(z_tr, k, topology, seed, n_iter):
 
     return sae_manifold_fit(
         z_tr, K=k, d_atom=1, atom_topology=topology,
-        assignment="ibp_map", n_iter=n_iter, random_state=seed,
+        assignment="ordered_beta_bernoulli", n_iter=n_iter, random_state=seed,
     )
 
 

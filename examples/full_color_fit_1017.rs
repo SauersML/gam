@@ -140,7 +140,7 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
         vec![LatentManifold::Circle { period: 1.0 }],
         // Match the #1017 production color-arm gate exactly; this explicit
         // diagnostic fixture does not alter the library's default assignment.
-        AssignmentMode::ibp_map(GATE_TEMPERATURE, IBP_CONCENTRATION, false),
+        AssignmentMode::ordered_beta_bernoulli(GATE_TEMPERATURE, IBP_CONCENTRATION, false),
     )?;
     let term = SaeManifoldTerm::new(vec![atom], assignment)?;
     let target = term.fitted();

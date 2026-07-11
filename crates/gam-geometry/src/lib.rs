@@ -6,7 +6,6 @@ pub mod manifold;
 pub mod manifolds;
 pub mod optimizer;
 pub mod response_geometry;
-pub mod sae_routing;
 pub mod sinkhorn_barycenter;
 
 // Re-export each manifold submodule at the crate root so the historical paths

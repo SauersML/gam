@@ -150,7 +150,7 @@ def sac_fit(
     max_atoms: int = 16,
     d_atom: int = 2,
     atom_topology: str = "circle",
-    assignment: str = "ibp_map",
+    assignment: str = "ordered_beta_bernoulli",
     ev_floor: float = 5e-3,
     structured_residual_passes: int = 2,
     n_iter: int = 50,

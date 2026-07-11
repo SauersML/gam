@@ -29,7 +29,7 @@ impl SaeManifoldTerm {
                 let a_wrt = assignments[wrt_atom];
                 a_atom * ((if atom == wrt_atom { 1.0 } else { 0.0 }) - a_wrt) / temperature
             }
-            AssignmentMode::IBPMap { temperature, .. } if atom == wrt_atom => {
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } if atom == wrt_atom => {
                 let a = assignments[atom];
                 a * (1.0 - a) / temperature
             }
@@ -40,7 +40,7 @@ impl SaeManifoldTerm {
                 let a = assignments[atom];
                 a * (1.0 - a) / temperature
             }
-            AssignmentMode::IBPMap { .. }
+            AssignmentMode::OrderedBetaBernoulli { .. }
             | AssignmentMode::ThresholdGate { .. }
             | AssignmentMode::TopK { .. } => 0.0,
         }

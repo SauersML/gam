@@ -1738,7 +1738,7 @@ fn structured_residual_pass_diagnostics_dict<'py>(
     fisher_provenance = None,
     row_loss_weights = None,
     separation_barrier_strength_override = None,
-    ibp_alpha_override = None,
+    ordered_beta_bernoulli_alpha_override = None,
     // #2239 magic-by-default: evidence-certified residual structure is promoted
     // to the primary tier by default (the certificate gates the birth; the
     // alternation self-extends its pass budget only while lineages are live).
@@ -1787,10 +1787,10 @@ fn sae_manifold_fit<'py>(
     // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
     // unweighted path. Installed on the term before the joint fit / ρ selection.
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    // Per-fit config (separation-barrier strength / IBP-α). `Some` pins this
+    // Per-fit config (separation-barrier strength / ordered Beta--Bernoulli-α). `Some` pins this
     // term's value; `None` selects the canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
-    ibp_alpha_override: Option<f64>,
+    ordered_beta_bernoulli_alpha_override: Option<f64>,
     promote_from_residual: bool,
     run_structure_search: bool,
     run_outer_rho_search: bool,
@@ -1846,7 +1846,7 @@ fn sae_manifold_fit<'py>(
         fisher_provenance.as_deref(),
         row_w,
         separation_barrier_strength_override,
-        ibp_alpha_override,
+        ordered_beta_bernoulli_alpha_override,
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
@@ -2301,10 +2301,10 @@ fn sae_manifold_fit_inner<'py>(
     // outer ρ selection. Uniform / absent ⇒ the bit-identical unweighted path.
     row_loss_weights: Option<ArrayView1<'_, f64>>,
     // Per-fit config. `Some(x)` pins this term's separation-barrier strength /
-    // IBP-α to `x` via `SaeManifoldTerm::set_fit_config`; `None` selects the
+    // ordered Beta--Bernoulli-α to `x` via `SaeManifoldTerm::set_fit_config`; `None` selects the
     // canonical data-derived or mode default.
     separation_barrier_strength_override: Option<f64>,
-    ibp_alpha_override: Option<f64>,
+    ordered_beta_bernoulli_alpha_override: Option<f64>,
     promote_from_residual: bool,
     run_structure_search: bool,
     run_outer_rho_search: bool,
@@ -2385,7 +2385,7 @@ fn sae_manifold_fit_inner<'py>(
         data_row_reseed,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
-            ibp_alpha_override,
+            ordered_beta_bernoulli_alpha_override,
         },
         temperature_schedule,
         fisher_metric,
@@ -3484,7 +3484,7 @@ fn sae_manifold_fit_ibp<'py>(
         alpha,
         tau,
         learnable_alpha,
-        "ibp_map".to_string(),
+        "ordered_beta_bernoulli".to_string(),
         sparsity_strength,
         smoothness,
         max_iter,
@@ -3494,17 +3494,17 @@ fn sae_manifold_fit_ibp<'py>(
         gumbel_schedule,
         analytic_penalties,
         None,
-        // IBP-MAP never reaches the JumpReLU dispatch; threshold is inert here.
+        // ordered Beta--Bernoulli-MAP never reaches the JumpReLU dispatch; threshold is inert here.
         0.0,
-        // No output-Fisher shard on this convenience IBP entry point; the
+        // No output-Fisher shard on this convenience ordered Beta--Bernoulli entry point; the
         // metric stays Euclidean (the precomputed-basis `sae_manifold_fit` and
         // the auto `sae_manifold_fit_minimal` entry points carry the shard).
         None,
         None,
         None,
-        // No per-row design-honesty weights on this convenience IBP entry point.
+        // No per-row design-honesty weights on this convenience ordered Beta--Bernoulli entry point.
         None,
-        // No explicit separation-barrier / IBP-α values on this convenience IBP
+        // No explicit separation-barrier / ordered Beta--Bernoulli-α values on this convenience ordered Beta--Bernoulli
         // entry point: use their canonical data-derived and assignment defaults.
         None,
         None,

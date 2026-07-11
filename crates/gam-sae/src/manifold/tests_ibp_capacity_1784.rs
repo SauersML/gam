@@ -1,4 +1,4 @@
-//! IBP prior-capacity and assignment-mode admission invariants.
+//! ordered Beta--Bernoulli prior-capacity and assignment-mode admission invariants.
 //!
 //! The forward reconstruction gate is the Bernoulli posterior mean and is not
 //! capped by the ordered prior. These tests therefore exercise the prior itself
@@ -6,13 +6,13 @@
 
 use crate::assignment::{
     AssignmentMode, AssignmentModeRequest, OrderedPriorSchedule, admit_assignment_mode_for_size,
-    default_ibp_concentration_for_k_atoms, ordered_prior_means,
+    default_ordered_beta_bernoulli_concentration_for_k_atoms, ordered_prior_means,
 };
 
 #[test]
 fn k_aware_ibp_prior_spans_large_dictionary_without_capping_forward_gate() {
     let k = 128usize;
-    let alpha = default_ibp_concentration_for_k_atoms(k);
+    let alpha = default_ordered_beta_bernoulli_concentration_for_k_atoms(k);
     let prior = ordered_prior_means(k, OrderedPriorSchedule::Geometric { alpha });
 
     // The closed form chooses alpha so the final ordered prior mean is e^-1.
@@ -40,9 +40,9 @@ fn default_mode_admission_uses_top_k_at_large_k_and_never_implicit_ibp() {
     assert_eq!(admitted.top_k, Some(n.div_ceil(k)));
 
     let explicit =
-        admit_assignment_mode_for_size(AssignmentModeRequest::IbpMap, n, k, 1.0, 1.0, false, 0.0)
-            .expect("explicit large-K IBP admission");
-    assert!(matches!(explicit.mode, AssignmentMode::IBPMap { .. }));
+        admit_assignment_mode_for_size(AssignmentModeRequest::OrderedBetaBernoulli, n, k, 1.0, 1.0, false, 0.0)
+            .expect("explicit large-K ordered Beta--Bernoulli admission");
+    assert!(matches!(explicit.mode, AssignmentMode::OrderedBetaBernoulli { .. }));
     assert_eq!(explicit.top_k, Some(n.div_ceil(k)));
 }
 
@@ -60,11 +60,11 @@ fn ibp_mode_admission_requires_explicit_small_fit_request() {
     assert_eq!(default_admitted.top_k, None);
 
     let ibp =
-        admit_assignment_mode_for_size(AssignmentModeRequest::IbpMap, n, k, 0.7, 1.3, true, 0.0)
-            .expect("explicit small-fit IBP admission");
+        admit_assignment_mode_for_size(AssignmentModeRequest::OrderedBetaBernoulli, n, k, 0.7, 1.3, true, 0.0)
+            .expect("explicit small-fit ordered Beta--Bernoulli admission");
     assert!(matches!(
         ibp.mode,
-        AssignmentMode::IBPMap {
+        AssignmentMode::OrderedBetaBernoulli {
             alpha,
             learnable_alpha: true,
             ..

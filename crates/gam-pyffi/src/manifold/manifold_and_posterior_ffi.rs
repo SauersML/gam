@@ -2214,66 +2214,66 @@ fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f6
     Ok(parsed.current_tau(iter))
 }
 
-/// IBP-MAP concrete-relaxation activations and their diagonal logit Jacobian.
+/// ordered Beta--Bernoulli-MAP concrete-relaxation activations and their diagonal logit Jacobian.
 ///
 /// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ)` is the posterior-mean Bernoulli
 /// activation and `dz_dl_k = ∂z_k/∂l_k`. Ordered stick-breaking shrinkage is
-/// scored by the Rust IBP prior rather than multiplied into reconstruction.
+/// scored by the Rust ordered Beta--Bernoulli prior rather than multiplied into reconstruction.
 /// The map is diagonal in `k`,
 /// so torch's autograd `Function` multiplies the upstream gradient elementwise
 /// by `dz_dl`. This is the single source of truth shared with the closed-form
-/// `SaeAssignment` IBP path so torch IBP-Gumbel applies the same prior and
+/// `SaeAssignment` ordered Beta--Bernoulli path so torch ordered Beta--Bernoulli-Gumbel applies the same prior and
 /// temperature scaling as the Rust fit.
 #[pyfunction(signature = (logits, temperature))]
-fn sae_ibp_map_value_grad<'py>(
+fn sae_ordered_beta_bernoulli_value_grad<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray1<'py, f64>,
     temperature: f64,
 ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(py_value_error(format!(
-            "sae_ibp_map_value_grad: temperature must be finite and positive; got {temperature}"
+            "sae_ordered_beta_bernoulli_value_grad: temperature must be finite and positive; got {temperature}"
         )));
     }
     let logits_view = logits.as_array();
     for (col, &v) in logits_view.iter().enumerate() {
         if !v.is_finite() {
             return Err(py_value_error(format!(
-                "sae_ibp_map_value_grad: non-finite logit at atom {col}: {v}"
+                "sae_ordered_beta_bernoulli_value_grad: non-finite logit at atom {col}: {v}"
             )));
         }
     }
     let (value, grad) =
-        gam::terms::sae::assignment::ibp_map_row_value_grad(logits_view.view(), temperature);
+        gam::terms::sae::assignment::ordered_beta_bernoulli_row_value_grad(logits_view.view(), temperature);
     Ok((
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),
     ))
 }
 
-/// Batched sibling of [`sae_ibp_map_value_grad`] for a complete `(N, K)`
+/// Batched sibling of [`sae_ordered_beta_bernoulli_value_grad`] for a complete `(N, K)`
 /// tensor crossing the Python/Rust boundary once per forward pass.
 #[pyfunction(signature = (logits, temperature))]
-fn sae_ibp_map_batch_value_grad<'py>(
+fn sae_ordered_beta_bernoulli_batch_value_grad<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray2<'py, f64>,
     temperature: f64,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(py_value_error(format!(
-            "sae_ibp_map_batch_value_grad: temperature must be finite and positive; got {temperature}"
+            "sae_ordered_beta_bernoulli_batch_value_grad: temperature must be finite and positive; got {temperature}"
         )));
     }
     let logits_view = logits.as_array();
     for ((row, col), &v) in logits_view.indexed_iter() {
         if !v.is_finite() {
             return Err(py_value_error(format!(
-                "sae_ibp_map_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
+                "sae_ordered_beta_bernoulli_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
             )));
         }
     }
     let (value, grad) =
-        gam::terms::sae::assignment::ibp_map_batch_value_grad(logits_view.view(), temperature);
+        gam::terms::sae::assignment::ordered_beta_bernoulli_batch_value_grad(logits_view.view(), temperature);
     Ok((
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),
@@ -2285,14 +2285,14 @@ fn sae_ibp_map_batch_value_grad<'py>(
 ///
 /// Returns `(a, da_dl)` where `a_k = σ((l_k − θ_k)/τ) · 1[l_k > θ_k]` — the
 /// SAME bounded `[0, 1)` gate the closed-form `SaeAssignment` jumprelu /
-/// threshold_gate path evaluates (`jumprelu_row`; magnitude lives in the
+/// threshold_gate path evaluates (`threshold_gate_row`; magnitude lives in the
 /// decoder) — and `da_dl_k = σ'((l_k − θ_k)/τ)/τ` is the smooth surrogate's
 /// derivative on both sides of the jump (straight-through estimator).
 /// `∂a_k/∂θ_k = −da_dl_k`; torch negates. This is the single source of truth
 /// shared with `gamfit.torch`'s bounded jumprelu gate so the torch lane trains
 /// the family the closed-form fit solves.
 #[pyfunction(signature = (logits, temperature, thresholds))]
-fn sae_jumprelu_row_value_grad<'py>(
+fn sae_threshold_gate_row_value_grad<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray1<'py, f64>,
     temperature: f64,
@@ -2300,14 +2300,14 @@ fn sae_jumprelu_row_value_grad<'py>(
 ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(py_value_error(format!(
-            "sae_jumprelu_row_value_grad: temperature must be finite and positive; got {temperature}"
+            "sae_threshold_gate_row_value_grad: temperature must be finite and positive; got {temperature}"
         )));
     }
     let logits_view = logits.as_array();
     let thresholds_view = thresholds.as_array();
     if logits_view.len() != thresholds_view.len() {
         return Err(py_value_error(format!(
-            "sae_jumprelu_row_value_grad: thresholds length {} does not match logits length {}",
+            "sae_threshold_gate_row_value_grad: thresholds length {} does not match logits length {}",
             thresholds_view.len(),
             logits_view.len()
         )));
@@ -2315,18 +2315,18 @@ fn sae_jumprelu_row_value_grad<'py>(
     for (col, &v) in logits_view.iter().enumerate() {
         if !v.is_finite() {
             return Err(py_value_error(format!(
-                "sae_jumprelu_row_value_grad: non-finite logit at atom {col}: {v}"
+                "sae_threshold_gate_row_value_grad: non-finite logit at atom {col}: {v}"
             )));
         }
     }
     for (col, &v) in thresholds_view.iter().enumerate() {
         if !v.is_finite() {
             return Err(py_value_error(format!(
-                "sae_jumprelu_row_value_grad: non-finite threshold at atom {col}: {v}"
+                "sae_threshold_gate_row_value_grad: non-finite threshold at atom {col}: {v}"
             )));
         }
     }
-    let (value, grad) = gam::terms::sae::assignment::jumprelu_row_value_grad(
+    let (value, grad) = gam::terms::sae::assignment::threshold_gate_row_value_grad(
         logits_view.view(),
         temperature,
         thresholds_view.view(),
@@ -2337,16 +2337,16 @@ fn sae_jumprelu_row_value_grad<'py>(
     ))
 }
 
-/// Batched sibling of [`sae_jumprelu_row_value_grad`]: the whole `(N, K)` gate
+/// Batched sibling of [`sae_threshold_gate_row_value_grad`]: the whole `(N, K)` gate
 /// value+grad in ONE FFI call, so `gamfit.torch`'s bounded jumprelu gate crosses
 /// the Python↔Rust boundary once per forward pass instead of once per row.
 ///
 /// Returns `(a, da_dl)`, each `(N, K)`, where `a[i,k] = σ((l−θ)/τ)·1[l>θ]` and
 /// `da_dl[i,k] = σ'((l−θ)/τ)/τ` (straight-through, both sides of the jump);
 /// `∂a/∂θ = −da_dl` (torch negates and row-sums). Bit-identical to invoking
-/// `sae_jumprelu_row_value_grad` row-by-row — the shared Rust source of truth.
+/// `sae_threshold_gate_row_value_grad` row-by-row — the shared Rust source of truth.
 #[pyfunction(signature = (logits, temperature, thresholds))]
-fn sae_jumprelu_batch_value_grad<'py>(
+fn sae_threshold_gate_batch_value_grad<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray2<'py, f64>,
     temperature: f64,
@@ -2354,7 +2354,7 @@ fn sae_jumprelu_batch_value_grad<'py>(
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
     if !(temperature.is_finite() && temperature > 0.0) {
         return Err(py_value_error(format!(
-            "sae_jumprelu_batch_value_grad: temperature must be finite and positive; got {temperature}"
+            "sae_threshold_gate_batch_value_grad: temperature must be finite and positive; got {temperature}"
         )));
     }
     let logits_view = logits.as_array();
@@ -2362,25 +2362,25 @@ fn sae_jumprelu_batch_value_grad<'py>(
     let (_n, k) = logits_view.dim();
     if k != thresholds_view.len() {
         return Err(py_value_error(format!(
-            "sae_jumprelu_batch_value_grad: thresholds length {} does not match logits columns {k}",
+            "sae_threshold_gate_batch_value_grad: thresholds length {} does not match logits columns {k}",
             thresholds_view.len()
         )));
     }
     for ((row, col), &v) in logits_view.indexed_iter() {
         if !v.is_finite() {
             return Err(py_value_error(format!(
-                "sae_jumprelu_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
+                "sae_threshold_gate_batch_value_grad: non-finite logit at row {row} atom {col}: {v}"
             )));
         }
     }
     for (col, &v) in thresholds_view.iter().enumerate() {
         if !v.is_finite() {
             return Err(py_value_error(format!(
-                "sae_jumprelu_batch_value_grad: non-finite threshold at atom {col}: {v}"
+                "sae_threshold_gate_batch_value_grad: non-finite threshold at atom {col}: {v}"
             )));
         }
     }
-    let (value, grad) = gam::terms::sae::assignment::jumprelu_batch_value_grad(
+    let (value, grad) = gam::terms::sae::assignment::threshold_gate_batch_value_grad(
         logits_view.view(),
         temperature,
         thresholds_view.view(),

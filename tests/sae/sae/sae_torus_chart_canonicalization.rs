@@ -280,7 +280,7 @@ fn planted_warped_torus(
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ])],
-        AssignmentMode::ibp_map(0.5, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
     )
     .expect("assignment");
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");

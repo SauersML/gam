@@ -107,14 +107,6 @@ pub(crate) use gam_predict::input::{
     build_predict_input_for_model, build_transformation_normal_observed_scores,
 };
 
-pub(crate) use gam::geometry::sae_routing::apply_anchor_rule as sae_apply_anchor_rule_impl;
-pub(crate) use gam::geometry::sae_routing::assign_ema_update as sae_assign_ema_update_impl;
-pub(crate) use gam::geometry::sae_routing::direction_cluster_anchor as sae_direction_cluster_anchor_impl;
-pub(crate) use gam::geometry::sae_routing::duchon_centers_nd as sae_duchon_centers_nd_impl;
-pub(crate) use gam::geometry::sae_routing::matching_pursuit_commit as sae_matching_pursuit_commit_impl;
-pub(crate) use gam::geometry::sae_routing::quadratic_subspace_anchor as sae_quadratic_subspace_anchor_impl;
-pub(crate) use gam::geometry::sae_routing::sinkhorn_balance_bias as sae_sinkhorn_balance_bias_impl;
-
 pub(crate) use gam::geometry::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,
     geodesic_sphere_cost as sinkhorn_geodesic_sphere_cost_impl,

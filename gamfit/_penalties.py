@@ -32,7 +32,7 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `NuclearNormPenalty` lives on t. Smoothed L¹ on singular values
   encourages low rank in a basis-free way; pair with ARD/Orthogonality
   depending on whether canonical-axis pruning or gauge fixing is also needed.
-* `SoftmaxAssignmentSparsityPenalty` and `IBPAssignmentPenalty` live on
+* `SoftmaxAssignmentSparsityPenalty` and `OrderedBetaBernoulliPenalty` live on
   row-wise assignment logits. They serialize to the Rust assignment-prior
   registry used by SAE-style latent blocks; the IBP wrapper canonicalizes to
   the finite IBP-MAP descriptor on the Rust side.
@@ -105,7 +105,7 @@ __all__ = [
     "IvaeRidgeMeanGauge",
     "ParametricAuxConditionalPriorPenalty",
     "OrthogonalityPenalty",
-    "IBPAssignmentPenalty",
+    "OrderedBetaBernoulliPenalty",
     "SoftmaxAssignmentSparsityPenalty",
     "SheafConsistencyPenalty",
     "ScalarWeightSchedule",
@@ -333,7 +333,7 @@ from ._sheaf import SheafConsistencyPenalty as SheafConsistencyPenalty
 
 BlockSparsityPenalty = _rust_descriptor_class("BlockSparsityPenalty")
 ParametricAuxConditionalPriorPenalty = _rust_descriptor_class("ParametricAuxConditionalPriorPenalty")
-IBPAssignmentPenalty = _rust_descriptor_class("IBPAssignmentPenalty")
+OrderedBetaBernoulliPenalty = _rust_descriptor_class("OrderedBetaBernoulliPenalty")
 TotalVariationPenalty = _rust_descriptor_class("TotalVariationPenalty")
 SoftmaxAssignmentSparsityPenalty = _rust_descriptor_class("SoftmaxAssignmentSparsityPenalty")
 OrthogonalityPenalty = _rust_descriptor_class("OrthogonalityPenalty")
@@ -671,7 +671,7 @@ descriptor.
 Learns a diagonal row-conditional precision map from auxiliary covariates via
 the Rust descriptor and applies it to the targeted latent block.
 """,
-    "IBPAssignmentPenalty": """Finite IBP prior over row-wise assignment logits.
+    "OrderedBetaBernoulliPenalty": """Finite IBP prior over row-wise assignment logits.
 
 The public Rust-backed wrapper accepts fields such as ``k_max``, ``alpha``,
 ``tau``, ``learnable``, and ``target`` where supported by the extension, then
@@ -762,6 +762,6 @@ Penalty = (
     "TopKActivationPenalty | JumpReLUPenalty | TotalVariationPenalty | "
     "NuclearNormPenalty | BlockSparsityPenalty | "
     "MechanismSparsityPenalty | AuxConditionalPriorPenalty | IvaeRidgeMeanGauge | "
-    "ParametricAuxConditionalPriorPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
+    "ParametricAuxConditionalPriorPenalty | OrthogonalityPenalty | OrderedBetaBernoulliPenalty | "
     "SoftmaxAssignmentSparsityPenalty"
 )

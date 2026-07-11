@@ -217,7 +217,7 @@ pub struct SaeFitReport {
     pub top_k_will_project: bool,
     pub pre_topk_assignments: Option<Array2<f64>>,
     pub pre_topk_fitted: Option<Array2<f64>>,
-    /// The reported `log_alpha` (IBP concentration or the caller's α fallback).
+    /// The reported `log_alpha` (ordered Beta--Bernoulli concentration or the caller's α fallback).
     pub reported_log_alpha: f64,
 }
 
@@ -1102,7 +1102,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     };
     // Apply hard top-k projection per row, then recompute `fitted` from the
     // projected assignments so the returned `assignments` and `fitted` stay
-    // mutually consistent. Smooth softmax (or IBP/JumpReLU) drives optimisation;
+    // mutually consistent. Smooth softmax (or ordered Beta--Bernoulli/JumpReLU) drives optimisation;
     // the hard top-k gate is applied at inference time. For softmax mode the kept
     // entries are renormalised; for the other modes they retain their unnormalised
     // values.
@@ -1220,7 +1220,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     let reconstruction_r2 = if tss > 0.0 { 1.0 - rss / tss } else { 0.0 };
 
     let reported_log_alpha = match term.assignment.mode {
-        AssignmentMode::IBPMap { alpha, .. } => alpha.ln(),
+        AssignmentMode::OrderedBetaBernoulli { alpha, .. } => alpha.ln(),
         _ => alpha.ln(),
     };
 

@@ -112,7 +112,7 @@ def run_t2_arm(residual_reduced: np.ndarray, topo: str, args) -> dict:
             residual_reduced,
             d_atom=args.d_atom,
             atom_topology=topo,
-            assignment="ibp_map",
+            assignment="ordered_beta_bernoulli",
             max_births=args.max_births,
             min_effect_ev=0.0,
             structured_whitening=True,

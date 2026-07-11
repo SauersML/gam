@@ -1,5 +1,5 @@
 //! Regression guard (companion to the #809 fix) attacking the
-//! `IBPAssignmentPenalty::hvp` contract from the *operator-structure* side
+//! `OrderedBetaBernoulliPenalty::hvp` contract from the *operator-structure* side
 //! rather than a single `hvp == FD(grad)·v` point check.
 //!
 //! After #809, `hvp` returns the exact `∂²P·v`. The penalty's Hessian has a
@@ -34,12 +34,12 @@
 //! Related: #809 (this fix), #810 (sibling DecoderIncoherencePenalty hvp dropped
 //! the residual cross term).
 
-use gam::terms::analytic_penalties::{AnalyticPenalty, IBPAssignmentPenalty};
+use gam::terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliPenalty};
 use ndarray::{Array1, Array2};
 
 /// Central-difference Hessian: column `q` is `(grad(t+h e_q) − grad(t−h e_q))/2h`.
 fn fd_hessian(
-    penalty: &IBPAssignmentPenalty,
+    penalty: &OrderedBetaBernoulliPenalty,
     target: &Array1<f64>,
     rho: &Array1<f64>,
     h: f64,
@@ -63,7 +63,7 @@ fn fd_hessian(
 #[test]
 fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
     let k_max = 3usize;
-    let penalty = IBPAssignmentPenalty::new(k_max, 1.0, 1.0, false);
+    let penalty = OrderedBetaBernoulliPenalty::new(k_max, 1.0, 1.0, false);
     let rho = Array1::<f64>::zeros(0);
     let n_rows = 4usize;
     let total = n_rows * k_max;
@@ -138,7 +138,7 @@ fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
     // (4) Diagonal of hvp agrees with hessian_diag bit-for-bit.
     let diag = penalty
         .hessian_diag(target.view(), rho.view())
-        .expect("IBPAssignmentPenalty exposes an analytic hessian_diag");
+        .expect("OrderedBetaBernoulliPenalty exposes an analytic hessian_diag");
     for j in 0..total {
         assert_eq!(
             hv_mat[[j, j]],
@@ -151,7 +151,7 @@ fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
 #[test]
 fn ibp_hvp_collapses_to_diagonal_when_pi_is_clamped() {
     let k_max = 2usize;
-    let penalty = IBPAssignmentPenalty::new(k_max, 1.0, 1.0, false);
+    let penalty = OrderedBetaBernoulliPenalty::new(k_max, 1.0, 1.0, false);
     let rho = Array1::<f64>::zeros(0);
     let n_rows = 4usize;
     let total = n_rows * k_max;

@@ -65,24 +65,24 @@ def _canonical_assignment(value: str, label: str) -> str:
 
 # Sentinel so ``alpha`` can tell "not supplied" apart from an explicit
 # ``alpha=1.0``. When the caller does not set ``alpha`` and the assignment is
-# an explicit ``ibp_map``, the concentration defaults to the K-aware value below
+# an explicit ``ordered_beta_bernoulli``, the concentration defaults to the K-aware value below
 # rather than the historical fixed ``1.0`` (see #1784).
 _ALPHA_UNSET: Any = object()
 
 
-def _default_ibp_concentration_for_k_atoms(k_atoms: int) -> float:
+def _default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: int) -> float:
     """K-aware default IBP concentration ``α`` (#1784).
 
     Thin wrapper over the Rust source of truth
-    ``assignment::default_ibp_concentration_for_k_atoms`` (FFI
-    ``sae_default_ibp_concentration_for_k_atoms``): the formula
+    ``assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms`` (FFI
+    ``sae_default_ordered_beta_bernoulli_concentration_for_k_atoms``): the formula
     ``α = max(1, 1/(exp(1/K) − 1))`` is computed once in the core, never mirrored
     in Python. Choosing ``α`` so the last atom retains prior mass
     ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}`` makes the ordered stick-breaking prior SPAN
     the whole dictionary (no atom structurally masked); floored at ``1.0`` so
     ``K = 1`` keeps the historical ``α = 1``.
     """
-    return float(rust_module().sae_default_ibp_concentration_for_k_atoms(int(max(int(k_atoms), 1))))
+    return float(rust_module().sae_default_ordered_beta_bernoulli_concentration_for_k_atoms(int(max(int(k_atoms), 1))))
 
 
 def _default_top_k_for_large_dictionary(n_obs: int, k_atoms: int) -> int | None:
@@ -135,7 +135,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      atom_basis: Any = None, fisher_factors: Any = None,
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
-                     ibp_alpha: float | None = None,
+                     ordered_beta_bernoulli_alpha: float | None = None,
                      promote_from_residual: bool = True,
                      _run_structure_search: bool = True,
                      _run_outer_rho_search: bool = True) -> ManifoldSAE:
@@ -171,7 +171,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Assignment/gating family. ``"softmax"`` uses soft mixture masses and is
         the production default; at large ``K`` the fit derives a train-time
         ``top_k`` cap from rows per atom when the caller leaves ``top_k`` unset.
-        ``"ibp_map"`` uses the IBP-MAP gate path as an explicit small-fit
+        ``"ordered_beta_bernoulli"`` uses the IBP-MAP gate path as an explicit small-fit
         research mode, and ``"threshold_gate"`` uses the
         hard-sigmoid gate family (#1777, renamed from ``"jumprelu"``).
         ``"topk"`` is the hard per-row support gate (``AssignmentMode::TopK``):
@@ -180,7 +180,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         to the CURVED framed/streaming manifold lane in the overcomplete
         ``K > P`` regime (within the host memory budget; refused with an
         actionable error over it) instead of the penalty-gated sparse-code
-        reroute. The accepted tokens are exactly ``"softmax"``, ``"ibp_map"``,
+        reroute. The accepted tokens are exactly ``"softmax"``, ``"ordered_beta_bernoulli"``,
         ``"threshold_gate"``, and ``"topk"``.
     schedule
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
@@ -231,7 +231,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``None`` (default) uses the canonical evidence-derived strength; a finite
         value pins the strength for this fit. Threaded into the Rust
         ``SaeFitConfig``.
-    ibp_alpha
+    ordered_beta_bernoulli_alpha
         Optional per-fit IBP-α value, which controls the ordered geometric
         assignment prior. ``None`` uses the assignment mode's canonical fixed or
         learnable value; an explicit value pins α for this fit. Threaded into
@@ -249,11 +249,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Assignment-prior concentration/scale. Pass a float for a fixed value or
         ``"auto"`` to mark alpha learnable in the Rust solve; returned metadata
         records ``alpha=1.0`` and ``learnable_alpha=True`` in that case. If left
-        unset with an explicit ``ibp_map`` gate, the concentration defaults to
-        the K-aware ``default_ibp_concentration_for_k_atoms(K) ≈ K − 1/2`` (#1784)
+        unset with an explicit ``ordered_beta_bernoulli`` gate, the concentration defaults to
+        the K-aware ``default_ordered_beta_bernoulli_concentration_for_k_atoms(K) ≈ K − 1/2`` (#1784)
         so the ordered stick-breaking prior spans the whole dictionary instead of
         masking every atom past the first few (which underfit an equal-K linear
-        dictionary and left the K=128 fit rank-deficient). A per-fit ``ibp_alpha``
+        dictionary and left the K=128 fit rank-deficient). A per-fit ``ordered_beta_bernoulli_alpha``
         overrides it.
     promote_from_residual
         When ``True`` (the default, #2239 magic-by-default), factor directions
@@ -399,7 +399,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             "coord_sparsity (alias gate_sparsity) must be one of 'l1', 'scad', or "
             f"'mcp'; got {coord_sparsity_resolved!r}"
         )
-    # #1777 — per-fit overrides must be finite when supplied; ibp_alpha must be
+    # #1777 — per-fit overrides must be finite when supplied; ordered_beta_bernoulli_alpha must be
     # strictly positive (it scales the ordered geometric assignment prior).
     if separation_barrier_strength is not None and not np.isfinite(
         float(separation_barrier_strength)
@@ -408,11 +408,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             "separation_barrier_strength must be finite or None; "
             f"got {separation_barrier_strength}"
         )
-    if ibp_alpha is not None and not (
-        np.isfinite(float(ibp_alpha)) and float(ibp_alpha) > 0.0
+    if ordered_beta_bernoulli_alpha is not None and not (
+        np.isfinite(float(ordered_beta_bernoulli_alpha)) and float(ordered_beta_bernoulli_alpha) > 0.0
     ):
         raise ValueError(
-            f"ibp_alpha must be finite and > 0 or None; got {ibp_alpha}"
+            f"ordered_beta_bernoulli_alpha must be finite and > 0 or None; got {ordered_beta_bernoulli_alpha}"
         )
     promote_from_residual = bool(promote_from_residual)
     if scad_mcp_gamma is None:
@@ -593,19 +593,19 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         )
     kind = _canonical_assignment(assignment, "assignment")
     # #1784 — K-aware default IBP concentration. When the caller does not set
-    # `alpha` and explicitly chooses the ordered stick-breaking `ibp_map` gate,
-    # default the concentration to `default_ibp_concentration_for_k_atoms(K)`
+    # `alpha` and explicitly chooses the ordered stick-breaking `ordered_beta_bernoulli` gate,
+    # default the concentration to `default_ordered_beta_bernoulli_concentration_for_k_atoms(K)`
     # so the prior SPANS the whole dictionary instead of collapsing to a near-hard
     # mask past the first ~3 atoms (the fixed `alpha=1.0` failure that made the
     # manifold underfit an equal-K linear dictionary and left late atoms massless,
-    # rank-deficient at K=128). A per-fit `ibp_alpha` still wins in Rust
-    # (`resolved_ibp_alpha`), so this only moves the *base* default.
+    # rank-deficient at K=128). A per-fit `ordered_beta_bernoulli_alpha` still wins in Rust
+    # (`resolved_ordered_beta_bernoulli_alpha`), so this only moves the *base* default.
     # `alpha="auto"` (learnable) and every
-    # non-`ibp_map` gate keep the historical `1.0` seed.
+    # non-`ordered_beta_bernoulli` gate keep the historical `1.0` seed.
     alpha_is_auto = alpha == "auto"
     if alpha is _ALPHA_UNSET:
-        if kind == "ibp_map" and ibp_alpha is None:
-            alpha_value = _default_ibp_concentration_for_k_atoms(k_atoms)
+        if kind == "ordered_beta_bernoulli" and ordered_beta_bernoulli_alpha is None:
+            alpha_value = _default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms)
         else:
             alpha_value = 1.0
         alpha_is_auto = False
@@ -689,7 +689,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         )
     # Front-door lane admission, owned by the Rust front door so the Python
     # public entry and the FFI boundary share one rule:
-    #   * penalty-gated assignments (softmax / ibp_map / threshold_gate) carry
+    #   * penalty-gated assignments (softmax / ordered_beta_bernoulli / threshold_gate) carry
     #     live N x K Newton logits, so the dense exact manifold engine is their
     #     small-K certification lane only: once K > P they route to the
     #     sparse-code trainer before constructing dense logits / coordinates;
@@ -781,7 +781,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         separation_barrier_strength_override=(
             None if separation_barrier_strength is None else float(separation_barrier_strength)
         ),
-        ibp_alpha_override=None if ibp_alpha is None else float(ibp_alpha),
+        ordered_beta_bernoulli_alpha_override=None if ordered_beta_bernoulli_alpha is None else float(ordered_beta_bernoulli_alpha),
         promote_from_residual=bool(promote_from_residual),
         run_structure_search=bool(_run_structure_search),
         run_outer_rho_search=bool(_run_outer_rho_search),
@@ -1162,7 +1162,7 @@ def sae_manifold_fit_stagewise(
     assignment
         Assignment/gate family, resolved through the shared public validator.
         ``"softmax"`` is the default and carries posterior responsibility mass
-        through births and backfitting. ``"ibp_map"`` remains an explicit MAP
+        through births and backfitting. ``"ordered_beta_bernoulli"`` remains an explicit MAP
         opt-in; ``"threshold_gate"`` selects the hard threshold gate.
     structured_whitening
         Install the Σ-whitened per-row metric on each birth so the K=1 candidate
@@ -1214,7 +1214,7 @@ def sae_manifold_fit_stagewise(
         Inner coordinate / β ridges for the stagewise fits.
     alpha, tau
         Assignment concentration / temperature. ``None`` resolves to the seed
-        fit's values (K-aware IBP α when ``assignment="ibp_map"``; τ = 0.5).
+        fit's values (K-aware IBP α when ``assignment="ordered_beta_bernoulli"``; τ = 0.5).
     random_state
         Seed forwarded to the K=1 seed fit's initializer.
     progress_callback
@@ -1783,7 +1783,7 @@ def flat_block_assignment(gating: str) -> str:
 
     Exposes the two gating modes of a BSF-block-as-manifold-atom
     (``atom_topology="linear_block"``): ``"norm_selection"`` (the paper's group-ℓ2
-    block-TopK, → ``"ibp_map"``) and ``"separate_gate"`` (presence gate separate
+    block-TopK, → ``"ordered_beta_bernoulli"``) and ``"separate_gate"`` (presence gate separate
     from amplitude, → ``"threshold_gate"``). Use it as
     ``sae_manifold_fit(..., atom_topology="linear_block",
     assignment=flat_block_assignment("norm_selection"))`` so the flat block and a

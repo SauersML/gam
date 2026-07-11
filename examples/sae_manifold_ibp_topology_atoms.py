@@ -57,7 +57,7 @@ def main() -> None:
         K=2,
         atom_basis=["periodic", "torus"],
         d_atom=[1, 2],
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         schedule=gamfit.GumbelTemperatureSchedule(
             tau_start=1.0,
             tau_min=0.2,

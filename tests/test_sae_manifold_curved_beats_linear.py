@@ -12,7 +12,7 @@ truly lives on a 1-D circle, so:
 is the load-bearing claim of the whole machinery. This test pins that.
 
 Before the periodic manifold fit was fixed:
-    curved K=1, d=2, periodic, ibp_map  →  R^2 ≈ 0.18
+    curved K=1, d=2, periodic, ordered_beta_bernoulli  →  R^2 ≈ 0.18
     linear K=10, d=1, duchon, softmax   →  R^2 ≈ 0.83
 The curved atom collapses; the bug is somewhere between the periodic
 basis dispatch, the assignment update, and the atom-coordinate Newton
@@ -73,7 +73,7 @@ def test_curved_atom_beats_linear_shards_on_one_harmonic():
         K=1,
         atom_basis="periodic",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=50,
         learning_rate=0.04,
         random_state=0,

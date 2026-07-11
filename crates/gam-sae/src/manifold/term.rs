@@ -228,7 +228,7 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// mass, so the co-activation it would register and the anti-collapse repulsion /
 /// separation it would receive are negligible.
 ///
-/// For structurally sparse assignments (JumpReLU hard gate, IBP-MAP) the surviving
+/// For structurally sparse assignments (JumpReLU hard gate, ordered Beta--Bernoulli-MAP) the surviving
 /// active atoms sit far above this floor and the hard zeros are excluded anyway,
 /// so the co-active support is unchanged. It is load-bearing for SOFTMAX, whose
 /// normalization gives EVERY atom a tiny but strictly nonzero tail mass: a plain
@@ -339,7 +339,7 @@ pub struct SaeManifoldTerm {
     pub(crate) chart_atlases: Vec<ManifoldChartAtlas>,
     pub(crate) temperature_schedule: Option<GumbelTemperatureSchedule>,
     /// Active-set row layout from the most recent `assemble_arrow_schur` call.
-    /// `None` for dense modes (Softmax / IBPMap) or when not yet assembled.
+    /// `None` for dense modes (Softmax / OrderedBetaBernoulli) or when not yet assembled.
     pub(crate) last_row_layout: Option<SaeRowLayout>,
     /// The single provenance-carrying per-row inner product (Object 2). The
     /// reconstruction likelihood whitens residuals through it and the isometry
@@ -680,9 +680,9 @@ pub struct SaeFitConfig {
     /// Per-fit separation-barrier strength `μ_C`. `Some` bypasses the #1610
     /// evidence-derived per-pair strengths (`0.0` = conditioner off).
     pub separation_barrier_strength_override: Option<f64>,
-    /// Per-fit truncated-IBP concentration `α`. `Some` bypasses the mode's own
+    /// Per-fit truncated-ordered Beta--Bernoulli concentration `α`. `Some` bypasses the mode's own
     /// `α` / learnable schedule.
-    pub ibp_alpha_override: Option<f64>,
+    pub ordered_beta_bernoulli_alpha_override: Option<f64>,
 }
 
 impl Clone for SaeManifoldTerm {

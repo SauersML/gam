@@ -42,12 +42,12 @@ def test_linear_block_is_its_own_topology_label():
 
 
 def test_both_block_gating_modes_are_constructible():
-    # norm-selection mirrors the BSF paper (group-l2 block-TopK) -> ibp_map;
+    # norm-selection mirrors the BSF paper (group-l2 block-TopK) -> ordered_beta_bernoulli;
     # separate-gate is presence separate from amplitude -> threshold_gate.
-    assert flat_block_assignment("norm_selection") == "ibp_map"
+    assert flat_block_assignment("norm_selection") == "ordered_beta_bernoulli"
     assert flat_block_assignment("separate_gate") == "threshold_gate"
     # aliases + rejection of unknown modes.
-    assert flat_block_assignment("norm") == "ibp_map"
+    assert flat_block_assignment("norm") == "ordered_beta_bernoulli"
     assert flat_block_assignment("separate") == "threshold_gate"
     with pytest.raises(ValueError):
         flat_block_assignment("softmax")

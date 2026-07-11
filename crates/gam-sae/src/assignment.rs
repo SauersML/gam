@@ -211,7 +211,7 @@ pub enum AssignmentMode {
     Softmax { temperature: f64, sparsity: f64 },
     /// Deterministic concrete posterior means for a truncated ordered Beta--Bernoulli active set:
     /// `a_k = σ(logit_k/temperature)`. These are independent Bernoulli gates,
-    /// not mixture/simplex responsibilities. The ordered stick-breaking mean
+    /// not mixture/simplex responsibilities. The ordered geometric mean schedule
     /// `π_k = (α/(α+1))^{k+1}` is scored once by the ordered Beta--Bernoulli prior; it is not
     /// multiplied into the final reconstructed function.
     OrderedBetaBernoulli {
@@ -237,15 +237,15 @@ pub enum AssignmentMode {
     /// outer ρ search. At fixed support size `|S| = k` this is the
     /// constrained-MAP member of the same spike-slab generative family the ordered Beta--Bernoulli
     /// gate lives in, with the ℓ2,0 constraint standing in for the
-    /// stick-breaking prior. The gate is per-row independent (couples rows
+    /// ordered independent-Beta prior. The gate is per-row independent (couples rows
     /// through NOTHING), so fits stream chunk-invariantly at any K, and it is
-    /// exchangeable across atom index — the ordered-ordered Beta--Bernoulli concentration
+    /// exchangeable across atom index — the ordered Beta--Bernoulli concentration
     /// pathology (#1784) cannot arise.
     TopK { k: usize },
 }
 
 /// Caller intent for assignment-mode admission. `Default` is the production
-/// route: it never selects ordered Beta--Bernoulli-MAP implicitly.
+/// route: it never selects ordered Beta--Bernoulli implicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignmentModeRequest {
     Default,
@@ -390,7 +390,7 @@ impl AssignmentMode {
         Ok(())
     }
 
-    /// Resolve the effective truncated-ordered Beta--Bernoulli concentration `α` for this mode.
+    /// Resolve the effective ordered independent Beta--Bernoulli concentration `α` for this mode.
     ///
     /// `per_fit_override` is the #1777 PER-FIT override (from
     /// [`SaeAssignment::ordered_beta_bernoulli_alpha_override`]) and is the source of truth when set.
@@ -439,7 +439,7 @@ pub fn default_top_k_for_large_dictionary(n_obs: usize, k_atoms: usize) -> Optio
 }
 
 /// Admit the assignment mode for a fit size. The default route is softmax, with
-/// a top-k cap at large K. ordered Beta--Bernoulli-MAP is a research-mode opt-in and is refused once
+/// a top-k cap at large K. ordered Beta--Bernoulli is a research-mode opt-in and is refused once
 /// the large-K top-k admission engages.
 pub fn admit_assignment_mode_for_size(
     request: AssignmentModeRequest,
@@ -469,13 +469,13 @@ pub fn admit_assignment_mode_for_size(
             top_k: None,
         },
         AssignmentModeRequest::OrderedBetaBernoulli => {
-            // #F2 — re-admit ordered Beta--Bernoulli-MAP at large K, with the same rows-per-atom
+            // #F2 — re-admit ordered Beta--Bernoulli at large K, with the same rows-per-atom
             // `top_k` used as the ACTIVE-SET COMPUTE CAP (the softmax lane's
             // large-K cap), instead of refusing the request. The occupancy-driven
             // empirical-Bayes α M-step (#F1) now un-caps the effective atom count
-            // that the fixed geometric schedule used to pin at ~3, so ordered Beta--Bernoulli-MAP is a
+            // that the fixed geometric schedule used to pin at ~3, so ordered Beta--Bernoulli is a
             // usable large-K lane once its per-row work is bounded by `top_k`.
-            // Small fits keep `top_k = None` (dense ordered Beta--Bernoulli-MAP), unchanged.
+            // Small fits keep `top_k = None` (dense ordered Beta--Bernoulli), unchanged.
             AssignmentModeAdmission {
                 mode: AssignmentMode::ordered_beta_bernoulli(temperature, alpha, learnable_alpha),
                 top_k: large_k_top,
@@ -501,8 +501,8 @@ pub fn admit_assignment_mode_for_size(
 /// state off the public API surface to match the demotion.
 ///
 /// The stored assignment parameter is `logits`; non-negative assignments are
-/// derived by row-wise softmax, independent ordered Beta--Bernoulli-MAP sigmoid active indicators,
-/// or JumpReLU gates. Softmax logits are canonicalized to the reference chart
+/// derived by row-wise softmax, independent ordered Beta--Bernoulli sigmoid active indicators,
+/// or threshold gate gates. Softmax logits are canonicalized to the reference chart
 /// `logits[K - 1] = 0`, so the row-local Newton coordinates contain only the
 /// first `K - 1` logits (`0` coordinates for `K = 1`). Gate-style modes keep
 /// all `K` logits as identifiable scalar parameters. `coords[k]` holds
@@ -517,7 +517,7 @@ pub struct SaeAssignment {
     /// ungated atom is the dense linear/background tier: its per-row gate is
     /// fixed at `a_k ≡ 1` (it contributes `γ_k(t_k)` to EVERY row, unweighted),
     /// it is excluded from the other atoms' gate (for the column-separable
-    /// ordered Beta--Bernoulli / JumpReLU modes the remaining atoms are computed independently, so
+    /// ordered Beta--Bernoulli / threshold gate modes the remaining atoms are computed independently, so
     /// they are unaffected), and its logit is NOT a free parameter — its
     /// logit-JVP, sparsity-prior gradient/curvature, and softmax majorizer
     /// contributions are all zero, leaving its logit slot an inert
@@ -618,7 +618,7 @@ impl SaeAssignment {
                     "SaeAssignment::with_frozen_routing: frozen routing under Softmax is rejected \
                      — the coupled simplex's entropy majorizer is assembled over the logits, which \
                      a frozen (non-optimized) routing would leave inconsistent; this separable-mode \
-                     contract supports ordered Beta--Bernoulli-MAP and JumpReLU, whose per-atom gates have no \
+                     contract supports ordered Beta--Bernoulli and threshold gate, whose per-atom gates have no \
                      simplex-coupled curvature to skip"
                         .to_string(),
                 );
@@ -699,7 +699,7 @@ impl SaeAssignment {
         if matches!(self.mode, AssignmentMode::Softmax { .. }) {
             return Err(
                 "SaeAssignment::freeze_routing_in_place: frozen routing under Softmax is rejected \
-                 (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli-MAP or JumpReLU"
+                 (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli or threshold gate"
                     .to_string(),
             );
         }
@@ -727,7 +727,7 @@ impl SaeAssignment {
         if matches!(self.mode, AssignmentMode::Softmax { .. }) {
             return Err(
                 "SaeAssignment::set_frozen_routing_in_place: frozen routing under Softmax is \
-                 rejected (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli-MAP or JumpReLU"
+                 rejected (coupled-simplex entropy-majorizer); use ordered Beta--Bernoulli or threshold gate"
                     .to_string(),
             );
         }
@@ -746,8 +746,8 @@ impl SaeAssignment {
     /// #1026 — designate which atoms are UNGATED (the dense linear/background
     /// tier; see [`SaeAssignment::ungated`]). `flags` must have length `K`.
     ///
-    /// Ungating is defined for the COLUMN-SEPARABLE gate modes (ordered Beta--Bernoulli-MAP and
-    /// JumpReLU): each atom's gate is an independent per-atom function of its own
+    /// Ungating is defined for the COLUMN-SEPARABLE gate modes (ordered Beta--Bernoulli and
+    /// threshold gate): each atom's gate is an independent per-atom function of its own
     /// logit, so pinning one atom to `a_k ≡ 1` leaves every other atom's gate
     /// exactly as computed. Softmax is a coupled simplex (`Σ_k a_k = 1` over all
     /// `K`), so a unit gate for one atom is only well defined relative to a
@@ -755,8 +755,8 @@ impl SaeAssignment {
     /// and the entropy majorizer; this constructor's contract is restricted to
     /// the separable modes, and an ungated atom under Softmax is REJECTED here so
     /// the inner solve never runs on a value/gradient-mismatched gate. Callers
-    /// wanting a dense background tier under Softmax route it as an ordered Beta--Bernoulli-MAP or
-    /// JumpReLU atom.
+    /// wanting a dense background tier under Softmax route it as an ordered Beta--Bernoulli or
+    /// threshold gate atom.
     #[must_use = "build error must be handled"]
     pub fn with_ungated(mut self, flags: Vec<bool>) -> Result<Self, String> {
         if flags.len() != self.k_atoms() {
@@ -771,7 +771,7 @@ impl SaeAssignment {
                 "SaeAssignment::with_ungated: an ungated atom under Softmax routing is \
                  rejected — the coupled simplex requires a gated-subset renormalization \
                  reflected in the logit-JVP and entropy majorizer, which this separable-mode \
-                 contract does not perform; route a dense background tier as ordered Beta--Bernoulli-MAP or JumpReLU"
+                 contract does not perform; route a dense background tier as ordered Beta--Bernoulli or threshold gate"
                     .to_string(),
             );
         }
@@ -843,7 +843,7 @@ impl SaeAssignment {
         self.try_assignments_row_inner(row)
     }
 
-    /// #1777 — the effective truncated-ordered Beta--Bernoulli `α` for this assignment at `rho`,
+    /// #1777 — the effective ordered independent Beta--Bernoulli `α` for this assignment at `rho`,
     /// honoring the PER-FIT [`Self::ordered_beta_bernoulli_alpha_override`] before the mode's
     /// canonical value or learnable schedule. The single seam every
     /// gate/jet/prior site reads so the per-fit override is applied consistently.
@@ -852,7 +852,7 @@ impl SaeAssignment {
         self.mode.resolved_ordered_beta_bernoulli_alpha(rho, self.ordered_beta_bernoulli_alpha_override)
     }
 
-    /// Whether the truncated-ordered Beta--Bernoulli concentration α is a FREE outer parameter that
+    /// Whether the ordered independent Beta--Bernoulli concentration α is a FREE outer parameter that
     /// varies with ρ (`rho.log_lambda_sparse`). α is learnable ONLY when the mode
     /// requests it AND no per-fit override pins it: an override forces the fixed
     /// value and bypasses the learnable
@@ -878,12 +878,12 @@ impl SaeAssignment {
 
     /// #F1 — the Fellner–Schall-analog empirical-Bayes M-step for the
     /// `log_lambda_sparse` slot: the additive step `Δθ = ln α_EB* − ln α_current`
-    /// that moves the ordered-ordered Beta--Bernoulli concentration to the occupancy-driven marginal
+    /// that moves the ordered Beta--Bernoulli concentration to the occupancy-driven marginal
     /// stationary point (`log_lambda_sparse += Δθ` IS the multiplicative α update,
     /// since the resolved α is `α_base · exp(log_lambda_sparse)`).
     ///
     /// Returns `Some(Δθ)` ONLY when the effective α is a FREE learnable parameter
-    /// (ordered Beta--Bernoulli-MAP, `learnable_alpha`, no per-fit override) —
+    /// (ordered Beta--Bernoulli, `learnable_alpha`, no per-fit override) —
     /// exactly when [`Self::effective_alpha_is_learnable`] holds, so the α
     /// ρ-derivatives are non-zero and the marginal M-step is the coherent update.
     /// `None` for every other sparsity prior (softmax entropy, gated L1) or a
@@ -955,7 +955,7 @@ impl SaeAssignment {
         validate_finite_logits(routing, row)?;
         // Only Softmax collapses to a fixed assignment at K==1: its
         // assignment_coord_dim is K-1 = 0, so there is no free logit. OrderedBetaBernoulli and
-        // JumpReLU keep a free per-atom gate logit even at K==1
+        // threshold gate keep a free per-atom gate logit even at K==1
         // (assignment_coord_dim = K = 1), so they must fall through to their real
         // row functions or the logit would move the prior but not the gate.
         if self.k_atoms() == 1 && matches!(self.mode, AssignmentMode::Softmax { .. }) {
@@ -971,7 +971,7 @@ impl SaeAssignment {
             AssignmentMode::TopK { k } => topk_row(routing, k),
         };
         // #1026 — ungated (background-tier) atoms have a fixed unit gate. For the
-        // column-separable ordered Beta--Bernoulli / JumpReLU modes the other atoms' gates are
+        // column-separable ordered Beta--Bernoulli / threshold gate modes the other atoms' gates are
         // computed independently above, so overwriting the ungated entries to 1.0
         // leaves the gated atoms exactly as they were; the ungated atom then
         // contributes `γ_k(t_k)` unweighted to every row. (Softmax + ungated is
@@ -1196,24 +1196,24 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
     }
 }
 
-/// Truncated Indian-Buffet-Process stick-breaking prior *means*
-/// `π_k = E[∏_{j=0}^{k} v_j] = (α/(α+1))^{k+1}` for k = 0, .., K-1, with sticks
+/// Truncated Indian-Buffet-Process ordered independent-Beta prior *means*
+/// `π_k = E[∏_{j=0}^{k} v_j] = (α/(α+1))^{k+1}` for k = 0, .., K-1, with independent rates
 /// `v_j ~ Beta(α, 1)` so `E[v_j] = α/(α+1)`. EVERY atom (including the first,
 /// `π_0 = α/(α+1)`) carries the consistent Beta(α, 1) shrinkage: there is no
 /// special-cased always-on base atom, so `α` behaves as a genuine ordered Beta--Bernoulli
 /// concentration — larger `α` ⇒ heavier mass / slower decay, `α → 0` ⇒ all mass
 /// collapses onto nothing, matching the stick-breaking limit. This is the
 /// deterministic mean-field form of the ordered Beta--Bernoulli prior (the closed form the
-/// analytic Newton / Hessian / Woodbury machinery differentiates); no sticks are
+/// analytic Newton / Hessian / Woodbury machinery differentiates); no independent rates are
 /// *sampled* here, the per-atom weight is the exact expectation of the
-/// stick-breaking product. (#614: previously `π_0 = 1` left the first atom
+/// geometric schedule. (#614: previously `π_0 = 1` left the first atom
 /// unshrunk, which is the prior mean of NO stick at all and broke α's role as a
 /// concentration; the consistent product mean restores genuine ordered Beta--Bernoulli semantics.)
-/// Ordered prior-mean *schedule* for the truncated-ordered Beta--Bernoulli assignment prior. Both
+/// Ordered prior-mean *schedule* for the ordered independent Beta--Bernoulli assignment prior. Both
 /// forms produce a strictly positive, ordered (decreasing) prior mean
 /// `μ_k ∈ (0, 1]` consumed by the Beta--Bernoulli penalty.
 ///
-/// * [`Self::Geometric`] — the historical stick-breaking mean
+/// * [`Self::Geometric`] — the historical geometric mean schedule
 ///   `μ_k = (α/(α+1))^{k+1}`, which decays GEOMETRICALLY in the atom index and
 ///   at `α = 1` assigns overwhelming prior shrinkage to late atoms.
 /// * [`Self::PowerLaw`] — a heavier (near-Zipfian) polynomial tail
@@ -1267,7 +1267,7 @@ pub fn ordered_prior_means(k_atoms: usize, schedule: OrderedPriorSchedule) -> Ar
 
 /// #1784 — K-aware default ordered Beta--Bernoulli concentration.
 ///
-/// The ordered stick-breaking prior mean `π_k = (α/(α+1))^{k+1}` decays
+/// The ordered ordered independent-Beta prior mean `π_k = (α/(α+1))^{k+1}` decays
 /// GEOMETRICALLY in the atom INDEX, so a fixed small concentration (the
 /// historical default `α = 1`, i.e. the `(0.5)^{k+1}` schedule) collapses to a
 /// near-hard mask past atom ~3: a K-atom dictionary can then only ever place
@@ -1279,7 +1279,7 @@ pub fn ordered_prior_means(k_atoms: usize, schedule: OrderedPriorSchedule) -> Ar
 /// For a K-atom dictionary to actually USE all K atoms the ordered Beta--Bernoulli concentration must
 /// scale with K. Choosing `α` so the LAST atom retains prior mass
 /// `π_{K-1} = (α/(α+1))^K ≈ e^{-1}` spans the whole dictionary while keeping the
-/// prior monotone (still an honest ordered stick-breaking prior — no atom is
+/// prior monotone (still an honest ordered ordered independent-Beta prior — no atom is
 /// structurally masked). Solving `(α/(α+1))^K = e^{-1}` gives
 /// `α = 1/(exp(1/K) − 1) ≈ K − 1/2`. Floored at `1.0` so `K = 1` keeps the
 /// historical `α = 1`.
@@ -1454,7 +1454,7 @@ pub fn ordered_beta_bernoulli_row(logits: ArrayView1<'_, f64>, temperature: f64)
     out
 }
 
-/// ordered Beta--Bernoulli-MAP activations together with the diagonal Jacobian `∂z_k/∂l_k`,
+/// ordered Beta--Bernoulli activations together with the diagonal Jacobian `∂z_k/∂l_k`,
 /// shared with the torch autograd `Function` so the Python ordered Beta--Bernoulli-Gumbel path
 /// applies the same posterior-mean gate and temperature scaling as the Rust
 /// closed form. With `z_k = σ(l_k/τ)` the per-atom derivative is
@@ -1476,7 +1476,7 @@ pub fn ordered_beta_bernoulli_row_value_grad(
     (value, grad)
 }
 
-/// Batched ordered Beta--Bernoulli-MAP value and diagonal logit Jacobian over an `(N, K)` logit
+/// Batched ordered Beta--Bernoulli value and diagonal logit Jacobian over an `(N, K)` logit
 /// matrix. This shares the per-element arithmetic of
 /// [`ordered_beta_bernoulli_row_value_grad`] while crossing the Rust/Python boundary once for
 /// the whole batch.
@@ -1628,7 +1628,7 @@ pub fn threshold_gate_row_value_grad(
 ///   * `value[i, k] = σ((l − θ)/τ)` — the bounded `(0, 1)` gate,
 ///   * `grad[i, k]  = σ·(1 − σ)/τ` — its exact diagonal derivative.
 ///
-/// This is the single source of truth for `gamfit.torch`'s bounded jumprelu
+/// This is the single source of truth for `gamfit.torch`'s bounded threshold_gate
 /// gate: the torch autograd `Function` crosses the FFI boundary ONCE with the
 /// whole matrix instead of once per row.
 #[must_use]
@@ -1890,11 +1890,11 @@ mod topk_support_gate_tests {
 }
 
 #[cfg(test)]
-mod jumprelu_batch_tests {
+mod threshold_gate_batch_tests {
     use super::*;
 
     #[test]
-    fn jumprelu_batch_matches_row_kernel_bit_for_bit() {
+    fn threshold_gate_batch_matches_row_kernel_bit_for_bit() {
         // Deterministic (N, K) logit matrix with per-atom thresholds spanning
         // both sides of the jump.
         let n = 5usize;
@@ -1906,14 +1906,14 @@ mod jumprelu_batch_tests {
         let thresholds = Array1::from_shape_fn(k, |j| 0.2 - 0.05 * j as f64);
 
         let (value, grad) =
-            jumprelu_batch_value_grad(logits.view(), temperature, thresholds.view());
+            threshold_gate_batch_value_grad(logits.view(), temperature, thresholds.view());
         assert_eq!(value.dim(), (n, k));
         assert_eq!(grad.dim(), (n, k));
 
         // The batch kernel must reproduce the row kernel EXACTLY (same ops, same
         // order) — bit-for-bit, not merely within a tolerance.
         for i in 0..n {
-            let (rv, rg) = jumprelu_row_value_grad(logits.row(i), temperature, thresholds.view());
+            let (rv, rg) = threshold_gate_row_value_grad(logits.row(i), temperature, thresholds.view());
             for j in 0..k {
                 assert_eq!(value[[i, j]], rv[j], "value mismatch at row {i} atom {j}");
                 assert_eq!(grad[[i, j]], rg[j], "grad mismatch at row {i} atom {j}");
@@ -1924,7 +1924,7 @@ mod jumprelu_batch_tests {
 
 // #1557 — fill-into-caller-buffer variants of the three per-mode row functions.
 // These compute the EXACT SAME values as `softmax_row` / `ordered_beta_bernoulli_row` /
-// `jumprelu_row` (same arithmetic, same order of operations) but write into a
+// `threshold_gate_row` (same arithmetic, same order of operations) but write into a
 // caller-provided `&mut [f64]` slice instead of heap-allocating a fresh
 // `Array1<f64>` per call. The hot per-row loops (loss eval, arrow/Schur row
 // loops) call these with a reused scratch buffer, eliminating millions of tiny
@@ -2180,8 +2180,8 @@ pub fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) 
 /// per-row latent prior's analog of the `√w_i`-weighted data likelihood and the
 /// `w_i`-weighted `ard_value` — each retained row of a design-honest subsample
 /// stands in for `w_i` population rows, so its routing prior carries `w_i` too.
-/// `None` ⇒ the unweighted path, bit-for-bit. Softmax/JumpReLU are row-separable
-/// and fully weighted here; the ordered Beta--Bernoulli prior lives in the un-owned `ibp.rs` penalty
+/// `None` ⇒ the unweighted path, bit-for-bit. Softmax/threshold gate are row-separable
+/// and fully weighted here; the ordered Beta--Bernoulli prior lives in the un-owned `ordered_beta_bernoulli.rs` penalty
 /// and is left unweighted (self-consistent) until that penalty gains a per-row
 /// weight hook — see the module note on `assignment_prior_grad_hdiag`.
 pub(crate) fn assignment_prior_value_weighted(
@@ -2227,7 +2227,7 @@ pub(crate) fn assignment_prior_value_weighted(
         } => {
             // Sparsity penalty uses the same threshold-centered surrogate and
             // machine-precision support as its gradient/Hessian. Data-fit
-            // reconstruction remains hard-gated by `jumprelu_row`.
+            // reconstruction remains hard-gated by `threshold_gate_row`.
             let sparsity_strength = rho.lambda_sparse();
             let k = assignment.k_atoms();
             let mut acc = 0.0;
@@ -2256,9 +2256,9 @@ pub fn assignment_prior_log_strength_derivative(
     assignment_prior_log_strength_derivative_weighted(assignment, rho, None)
 }
 
-/// #991-weighted [`assignment_prior_log_strength_derivative`]. Softmax/JumpReLU
+/// #991-weighted [`assignment_prior_log_strength_derivative`]. Softmax/threshold gate
 /// route through the `w_i`-weighted value; ordered Beta--Bernoulli stays unweighted (un-owned
-/// `ibp.rs`).
+/// `ordered_beta_bernoulli.rs`).
 pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2305,8 +2305,8 @@ pub fn assignment_prior_log_strength_hdiag(
     assignment_prior_log_strength_hdiag_weighted(assignment, rho, None)
 }
 
-/// #991-weighted [`assignment_prior_log_strength_hdiag`]. Softmax/JumpReLU carry
-/// `w_i` per row; ordered Beta--Bernoulli stays unweighted (un-owned `ibp.rs`).
+/// #991-weighted [`assignment_prior_log_strength_hdiag`]. Softmax/threshold gate carry
+/// `w_i` per row; ordered Beta--Bernoulli stays unweighted (un-owned `ordered_beta_bernoulli.rs`).
 pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2415,7 +2415,7 @@ pub fn assignment_prior_log_strength_target_mixed(
 
 /// #991-weighted [`assignment_prior_log_strength_target_mixed`]. The fixed-α
 /// fall-through reuses the `w_i`-weighted gradient; the learnable-α ordered Beta--Bernoulli branch
-/// lives in the un-owned `ibp.rs` penalty and stays unweighted.
+/// lives in the un-owned `ordered_beta_bernoulli.rs` penalty and stays unweighted.
 pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -2460,8 +2460,8 @@ pub fn assignment_prior_grad_hdiag(
 
 /// #991-weighted [`assignment_prior_grad_hdiag`] — the per-(row, atom) logit
 /// gradient and Hessian diagonal of the assignment prior, each row scaled by its
-/// design weight `w_i`. Softmax/JumpReLU are fully weighted (row-separable); the
-/// ordered Beta--Bernoulli prior is in the un-owned `ibp.rs` penalty and is left unweighted, so a
+/// design weight `w_i`. Softmax/threshold gate are fully weighted (row-separable); the
+/// ordered Beta--Bernoulli prior is in the un-owned `ordered_beta_bernoulli.rs` penalty and is left unweighted, so a
 /// design-honesty subsample under ordered Beta--Bernoulli routing keeps its current (self-consistent)
 /// prior strength — closing that gap needs a per-row weight hook on
 /// `OrderedBetaBernoulliPenalty::{value, grad_target, hessian_diag, grad_rho,
@@ -2505,7 +2505,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
         } => {
             // Scale the ordered Beta--Bernoulli assignment-sparsity prior by `lambda_sparse` in the
             // fixed-α branch (Softmax folds it into the penalty's rho coordinate;
-            // JumpReLU multiplies `sparsity_strength`). #Bug6: `ordered_beta_bernoulli_prior_penalty`
+            // threshold gate multiplies `sparsity_strength`). #Bug6: `ordered_beta_bernoulli_prior_penalty`
             // picks the EFFECTIVE-α learnability — an override pins α so the prior
             // uses the fixed-α weight convention and the resolved (override) α,
             // matching the forward gate — and installs the #Bug4 ungated mask. The
@@ -2558,7 +2558,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     // frozen routing) is not a free parameter, so it carries NO sparsity-prior
     // gradient or curvature. Zero its flat columns (`flat_logits` is row-major
     // `row*K + atom`) so the assembled `gt` and `htt` logit slots stay zero —
-    // matching the zero logit-JVP. The column-separable ordered Beta--Bernoulli / JumpReLU priors are
+    // matching the zero logit-JVP. The column-separable ordered Beta--Bernoulli / threshold gate priors are
     // per-atom, so zeroing one atom's columns leaves the others' prior intact;
     // under frozen routing ALL atoms' logit columns are zeroed (the whole routing
     // is a fixed predicted function, not optimized).
@@ -2702,10 +2702,10 @@ pub fn select_hybrid_atom_parameterization(
 
 #[cfg(test)]
 mod ordered_beta_bernoulli_prior_614_tests {
-    // #614: `ibp_stick_breaking_prior` used to compute `π_k = (α/(α+1))^k` with
+    // #614: the former geometric schedule used `π_k = (α/(α+1))^k` with
     // `π_0 = 1`, i.e. an UNSHRUNK first atom — the prior mean of no stick at all,
     // which broke α's role as an ordered Beta--Bernoulli concentration parameter. The consistent
-    // truncated-ordered Beta--Bernoulli stick-breaking prior mean is `π_k = (α/(α+1))^{k+1}`, the
+    // ordered independent Beta--Bernoulli ordered independent-Beta prior mean is `π_k = (α/(α+1))^{k+1}`, the
     // expectation of the product of (k+1) i.i.d. Beta(α,1) stick means, so EVERY
     // atom (including the first) carries one stick of shrinkage. This test pins
     // that contract so the regression cannot silently return.
@@ -2994,7 +2994,7 @@ mod fill_into_buffer_1557_tests {
     //! [`SaeAssignment::try_assignments_row_into`] must produce
     //! BIT-IDENTICAL output to the allocating
     //! [`SaeAssignment::try_assignments_row`] across every assignment
-    //! mode (Softmax, OrderedBetaBernoulli, JumpReLU), the #1026 ungated case, and the K==1
+    //! mode (Softmax, OrderedBetaBernoulli, threshold gate), the #1026 ungated case, and the K==1
     //! edge. Exact `==` on f64 — not an approximate tolerance — because the
     //! `_into` path is a pure allocation-elision refactor and any numeric drift
     //! is a regression.
@@ -3018,7 +3018,7 @@ mod fill_into_buffer_1557_tests {
         let mut scratch = vec![f64::NAN; k];
         for row in 0..n {
             let allocated = a.try_assignments_row(row).unwrap();
-            // Pre-fill with NaN so a partial write (e.g. a JumpReLU below-threshold
+            // Pre-fill with NaN so a partial write (e.g. a threshold gate below-threshold
             // entry left untouched) is caught as a mismatch, not silently passed.
             for s in scratch.iter_mut() {
                 *s = f64::NAN;
@@ -3049,7 +3049,7 @@ mod fill_into_buffer_1557_tests {
     }
 
     #[test]
-    fn jumprelu_into_is_bit_identical() {
+    fn threshold_gate_into_is_bit_identical() {
         // Threshold chosen so SOME atoms fall below it (the untouched-entry path)
         // and some clear it (the sigmoid path) — both branches are exercised.
         assert_into_matches_alloc(&build(7, 5, AssignmentMode::threshold_gate(0.9, 0.2)));
@@ -3057,7 +3057,7 @@ mod fill_into_buffer_1557_tests {
 
     #[test]
     fn ungated_into_is_bit_identical() {
-        // #1026 ungated overwrite under a gate-style mode (ordered Beta--Bernoulli/JumpReLU allow it).
+        // #1026 ungated overwrite under a gate-style mode (ordered Beta--Bernoulli/threshold gate allow it).
         let a = build(6, 4, AssignmentMode::ordered_beta_bernoulli(0.6, 1.1, false))
             .with_ungated(vec![false, true, false, true])
             .unwrap();
@@ -3070,7 +3070,7 @@ mod fill_into_buffer_1557_tests {
 
     #[test]
     fn k_equals_one_into_is_bit_identical() {
-        // Softmax K==1 hits the fixed-unit early return; ordered Beta--Bernoulli/JumpReLU K==1 keep a
+        // Softmax K==1 hits the fixed-unit early return; ordered Beta--Bernoulli/threshold gate K==1 keep a
         // free per-atom gate and fall through to the real row functions.
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::softmax(1.0)));
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false)));
@@ -3227,7 +3227,10 @@ mod ordered_beta_bernoulli_eb_alpha_f1_tests {
         );
     }
 
-    fn learnable_ibp(logits: Array2<f64>, alpha_base: f64) -> SaeAssignment {
+    fn learnable_ordered_beta_bernoulli(
+        logits: Array2<f64>,
+        alpha_base: f64,
+    ) -> SaeAssignment {
         let (n, k) = logits.dim();
         let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
         SaeAssignment::from_blocks_with_mode(
@@ -3239,13 +3242,13 @@ mod ordered_beta_bernoulli_eb_alpha_f1_tests {
     }
 
     #[test]
-    fn eb_log_alpha_step_moves_for_learnable_ibp_only() {
+    fn eb_log_alpha_step_moves_for_learnable_ordered_beta_bernoulli_only() {
         let n = 300usize;
         let k = 8usize;
         // Logits rising in k lift σ(l_k) toward 1, flattening occupancy relative
         // to the α=1 geometric decay, so the EB step must be a POSITIVE Δ (raise α).
         let logits = Array2::from_shape_fn((n, k), |(_, kk)| 2.0 * kk as f64);
-        let assign = learnable_ibp(logits.clone(), 1.0);
+        let assign = learnable_ordered_beta_bernoulli(logits.clone(), 1.0);
         // effective α = alpha_base·exp(log_lambda_sparse) = 1·exp(0) = 1.
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
         let step = assign
@@ -3272,7 +3275,7 @@ mod ordered_beta_bernoulli_eb_alpha_f1_tests {
         );
 
         // A pinned (overridden) α is not a free parameter → None.
-        let mut pinned = learnable_ibp(logits, 1.0);
+        let mut pinned = learnable_ordered_beta_bernoulli(logits, 1.0);
         pinned.set_ordered_beta_bernoulli_alpha_override(Some(3.0));
         assert!(
             pinned.ordered_beta_bernoulli_eb_log_alpha_step(&rho).unwrap().is_none(),

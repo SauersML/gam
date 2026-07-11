@@ -161,7 +161,7 @@ impl SaeManifoldTerm {
                 vec![0.0; k_atoms],
                 vec![1.0; k_atoms],
             ),
-            AssignmentMode::IBPMap { temperature, .. } => (
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => (
                 RowGate::PerAtomLogistic {
                     inv_tau: 1.0 / temperature,
                 },
@@ -318,7 +318,7 @@ impl SaeManifoldTerm {
     /// #736 guard) — keeping this single-source hand path guarded against the
     /// forgotten-channel bug class.
     ///
-    /// Softmax-only: the per-atom-logistic (IBP / JumpReLU) modes keep the jet
+    /// Softmax-only: the per-atom-logistic (ordered Beta--Bernoulli / JumpReLU) modes keep the jet
     /// path (their hand gate prior diverged from the live ordered-geometric
     /// prior, so routing them through the jet is the value-preserving choice).
     fn fill_row_jets_hand_softmax(
@@ -599,7 +599,7 @@ impl SaeManifoldTerm {
                     &mut beta_l_deriv,
                 );
             }
-            AssignmentMode::IBPMap { .. }
+            AssignmentMode::OrderedBetaBernoulli { .. }
             | AssignmentMode::ThresholdGate { .. }
             | AssignmentMode::TopK { .. } => {
                 // PER-ATOM modes keep the jet path: value-preserving (their hand

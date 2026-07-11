@@ -259,7 +259,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
         logits(shape.n, shape.k, &mut rng),
         coord_blocks,
         manifolds,
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )?;
     let term = SaeManifoldTerm::new(atoms, assignment)?;
     let target = term.fitted();

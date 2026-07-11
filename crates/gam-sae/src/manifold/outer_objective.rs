@@ -467,7 +467,7 @@ impl OuterProbeTelemetry {
     fn record_refusal_kind(&mut self, err: &str) {
         if err.contains("inner solve did not converge at fixed ρ") {
             self.infeasible_inner_not_converged += 1;
-        } else if err.contains("cross-row IBP joint Hessian is non-PD") {
+        } else if err.contains("cross-row ordered Beta--Bernoulli joint Hessian is non-PD") {
             self.infeasible_cross_row += 1;
         } else if err.contains("Schur complement Cholesky failed") {
             self.infeasible_schur += 1;
@@ -720,7 +720,7 @@ pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivativ
 }
 
 /// The one active outer coordinate that is neither a Gaussian/Fellner-Schall
-/// precision nor an IBP occupancy fixed point. Softmax
+/// precision nor an ordered Beta--Bernoulli occupancy fixed point. Softmax
 /// entropy and threshold-gated L1 have a true REML derivative but no EFS root;
 /// Hybrid-EFS therefore treats this coordinate as its analytic-gradient block
 /// while all smoothness/ARD coordinates retain simultaneous EFS updates.
@@ -1398,7 +1398,7 @@ impl SaeManifoldOuterObjective {
             .iter()
             .zip(pre_canonical_flags.iter())
             .any(|(atom, before)| atom.chart_canonicalized != *before);
-        if fitted.assignment.persist_resolved_ibp_alpha(&fitted_rho) {
+        if fitted.assignment.persist_resolved_ordered_beta_bernoulli_alpha(&fitted_rho) {
             fitted_rho.log_lambda_sparse = 0.0;
         }
         let fitted_loss = fitted.loss(target.view(), &fitted_rho)?;
@@ -2097,13 +2097,13 @@ impl SaeManifoldOuterObjective {
             || err.contains(
                 "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
             )
-            // A probed ρ whose cross-row IBP joint Hessian is non-PD has an
+            // A probed ρ whose cross-row ordered Beta--Bernoulli joint Hessian is non-PD has an
             // undefined Laplace evidence log-det — a genuine infeasibility, the
             // same class as the per-row non-PD refusal above. The outer optimizer
             // must read it as +∞ and steer back into the PD region, NOT abort the
             // whole fit (the indefinite basin is adjacent to the PD optimum, so
             // line searches WILL overshoot into it).
-            || err.contains("cross-row IBP joint Hessian is non-PD at this ρ")
+            || err.contains("cross-row ordered Beta--Bernoulli joint Hessian is non-PD at this ρ")
             // #1782 — at a seed ρ, a K>1 jumprelu/softmax (or a rank-deficient
             // euclidean/linear) fit's OFF-OPTIMUM inner state can leave the
             // reduced joint-Hessian Schur complement indefinite, so the undamped
@@ -2116,7 +2116,7 @@ impl SaeManifoldOuterObjective {
             // adjacent to the PD optimum, so the outer optimizer must read it as
             // +∞ and steer back into the PD region rather than reject the seed and
             // abort the whole fit ("no candidate seeds passed outer startup
-            // validation"). `ibp_map`+`circle`'s seed lands in the PD region and
+            // validation"). `ordered_beta_bernoulli`+`circle`'s seed lands in the PD region and
             // never trips this, which is exactly why it converged on identical
             // data while the other assignments/topologies did not.
             //
@@ -2785,7 +2785,7 @@ impl SaeManifoldOuterObjective {
     ///   `step = ln λ_k_new − log_lambda_smooth[k]`, written into each atom's own
     ///   step slot `1+k`.
     /// - λ_sparse: 0.0 — the assignment-sparsity priors (softmax entropy,
-    ///   gated L1, IBP) are non-quadratic, so no Gaussian-logdet FS fixed
+    ///   gated L1, ordered Beta--Bernoulli) are non-quadratic, so no Gaussian-logdet FS fixed
     ///   point exists; it stays cost-driven (the cascade still moves it via
     ///   the cost path when EFS is not the active lane for that coord).
     pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
@@ -2956,7 +2956,7 @@ impl SaeManifoldOuterObjective {
         let mut assignment_psi_gradient: Option<Array1<f64>> = None;
         let mut assignment_psi_indices: Option<Vec<usize>> = None;
 
-        // λ_sparse (when present): the ordered-IBP concentration α is the ONE sparsity
+        // λ_sparse (when present): the ordered-ordered Beta--Bernoulli concentration α is the ONE sparsity
         // prior with a closed-form empirical-Bayes marginal M-step (the
         // Beta–Bernoulli occupancy fixed point), so it gets a genuine
         // Fellner–Schall-analog step here — this is what UNFREEZES λ_sparse at
@@ -2969,9 +2969,9 @@ impl SaeManifoldOuterObjective {
             let sparse_step = self
                 .term
                 .assignment
-                .ibp_eb_log_alpha_step(&rho)
+                .ordered_beta_bernoulli_eb_log_alpha_step(&rho)
                 .map_err(|e| {
-                    format!("SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}")
+                    format!("SaeManifoldOuterObjective::efs_step: ordered Beta--Bernoulli empirical-Bayes α step: {e}")
                 })?;
             match sparse_step {
                 Some(step) if step.is_finite() => {
@@ -2982,7 +2982,7 @@ impl SaeManifoldOuterObjective {
                 Some(_) => {
                     fixed_point_coordinates[sparse_index] =
                         FixedPointCoordinateCertificate::uncovered(
-                            "IBP empirical-Bayes alpha equation returned a non-finite update",
+                            "ordered Beta--Bernoulli empirical-Bayes alpha equation returned a non-finite update",
                         );
                 }
                 None => {
@@ -3652,14 +3652,14 @@ fn reactive_rho_domain_upper(
         }
     }
 
-    // Fixed-alpha IBP carries no assignment-strength dependence. Every other
+    // Fixed-alpha ordered Beta--Bernoulli carries no assignment-strength dependence. Every other
     // present assignment coordinate is capped on the same largest observed
     // native-curvature scale, rather than inheriting the unrelated generic
     // `exp(30)` strength.
     if let Some(index) = rho.sparse_flat_index()
         && !matches!(
             entry_term.assignment.mode,
-            AssignmentMode::IBPMap {
+            AssignmentMode::OrderedBetaBernoulli {
                 learnable_alpha: false,
                 ..
             }
@@ -3689,7 +3689,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
             //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
-            //    every assignment mode incl. IBP-MAP (#1006).
+            //    every assignment mode incl. ordered Beta--Bernoulli-MAP (#1006).
             //  * Matrix-free (dense evidence factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): no dense cache exists for the
             //    IFT solve, so the fixed-point lane updates covered ρ coordinates
@@ -3923,7 +3923,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // seed (`max_seeds = 1`, no fallback) — aborted the WHOLE fit at "no
         // candidate seeds passed outer startup validation" for the assignment /
         // topology combinations whose seed or a walk probe lands on such a ρ,
-        // while ibp_map (whose seed happens to stay PD) survived. Treat it the
+        // while ordered_beta_bernoulli (whose seed happens to stay PD) survived. Treat it the
         // same infeasible way here so the three lanes agree; a genuinely
         // non-recoverable error still propagates.
         let (cost, loss, cache) = match self.term.reml_criterion_with_cache(
@@ -4983,10 +4983,10 @@ mod linear_parity_anchor_1026_tests {
     //! ## #1026 routing-bound finding (why a GATED linear SAE under-reconstructs)
     //!
     //! The anchor reaches the rank-(K·d) PCA ceiling because its NEUTRAL gates
-    //! ([`neutral_gate_weights`]: softmax `1/K`, IBP prior) keep every atom ON for
+    //! ([`neutral_gate_weights`]: softmax `1/K`, ordered Beta--Bernoulli prior) keep every atom ON for
     //! every row, so all `K·d` decoder directions are available to reconstruct
     //! each row — exactly the unrestricted linear subspace PCA uses. A FITTED
-    //! softmax/IBP SAE instead routes each row through learned gates, so its
+    //! softmax/ordered Beta--Bernoulli SAE instead routes each row through learned gates, so its
     //! per-row reconstruction is `Σ_k a_k(row)·γ_k(t_k(row))` — a gate-WEIGHTED
     //! (softmax: simplex `Σ_k a_k ≈ 1`) combination whose per-row effective rank is
     //! bounded by that row's active-atom count. End-to-end linear-SAE parity with
@@ -5083,7 +5083,7 @@ mod linear_parity_anchor_1026_tests {
             logits,
             coords_blocks,
             manifolds,
-            AssignmentMode::ibp_map(0.5, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
         )
         .unwrap();
         let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
@@ -5147,7 +5147,7 @@ mod linear_parity_anchor_1026_tests {
             // right-singular subspace — essentially the rank-(K·basis) PCA optimum.
             // It reaches the ceiling to within a small numerical margin (MSI:
             // ~1.3e-3 at K=1) rather than machine epsilon, because the per-atom
-            // NEUTRAL IBP gate `π_k < 1` weights the residual SVD that picks the
+            // NEUTRAL ordered Beta--Bernoulli gate `π_k < 1` weights the residual SVD that picks the
             // frame while the coordinates are read from the unweighted residual, so
             // the recovered subspace is the gate-weighted (not the bare) top-rank
             // subspace. A genuinely broken anchor (wrong per-atom rank, dropped
@@ -5308,7 +5308,7 @@ mod linear_parity_anchor_1026_tests {
 
     /// Build a single-atom LINEAR SAE whose one atom has latent dim `d` (basis
     /// `{1, t_1, …, t_d}`), with the atom's coordinates seeded to `coords`
-    /// (`n × d`) and the per-row IBP gate logits set explicitly. IBP-MAP routing.
+    /// (`n × d`) and the per-row ordered Beta--Bernoulli gate logits set explicitly. ordered Beta--Bernoulli-MAP routing.
     /// Returns the term; the caller marks the atom ungated (or not).
     fn single_linear_atom_term(
         coords: Array2<f64>,
@@ -5336,7 +5336,7 @@ mod linear_parity_anchor_1026_tests {
             logits,
             vec![coords],
             vec![LatentManifold::Euclidean],
-            AssignmentMode::ibp_map(0.5, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
         )
         .unwrap()
         .with_ungated(vec![ungated])
@@ -5436,7 +5436,7 @@ mod linear_parity_anchor_1026_tests {
         //
         // HONEST FINDING (MSI, this fixture): ungated EV = gated EV = 1.000000, so
         // the closed gap is ~0 here. That is REAL information, NOT a tuning target:
-        // because `into_fitted` OPTIMIZES the IBP gate logits, a single gated atom
+        // because `into_fitted` OPTIMIZES the ordered Beta--Bernoulli gate logits, a single gated atom
         // drives its OWN gate toward the unit region and reaches parity too, so the
         // planted row-varying gate is optimized away. The ungate's value is
         // therefore NOT an unconditional single-atom EV gap — it is STRUCTURAL: the
@@ -5458,14 +5458,14 @@ mod linear_parity_anchor_1026_tests {
     /// #1026 AIRTIGHT inert-logit gate: the ungated atom's logit slot must carry
     /// EXACTLY zero assembled gradient `gt` AND exactly zero `htt` row/column —
     /// i.e. NO assembly term (data logit-JVP, sparsity-prior grad/hdiag, softmax
-    /// majorizer, IBP third channels) leaks a nonzero into that slot. Combined
+    /// majorizer, ordered Beta--Bernoulli third channels) leaks a nonzero into that slot. Combined
     /// with the per-row ridge floor added at solve time (which makes the slot's
     /// diagonal PD), `Δlogit = −0/ridge = 0` DETERMINISTICALLY at every Newton
     /// iterate — the gate stays pinned at `1`, never drifting. We assemble at a
     /// NON-seed point (a perturbed decoder + nonzero ρ) so the assertion is not a
     /// seed coincidence: any leaking term would be excited here.
     ///
-    /// IBP dense layout: the per-row block is `[logit_0 … logit_{K−1}, coords…]`,
+    /// ordered Beta--Bernoulli dense layout: the per-row block is `[logit_0 … logit_{K−1}, coords…]`,
     /// so the ungated atom's logit gradient/curvature live at row-block index
     /// equal to its atom index.
     #[test]
@@ -5512,7 +5512,7 @@ mod linear_parity_anchor_1026_tests {
             logits,
             coords_blocks,
             vec![LatentManifold::Euclidean; 2],
-            AssignmentMode::ibp_map(0.5, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
         )
         .unwrap()
         .with_ungated(vec![false, true]) // atom 1 is the ungated background tier
@@ -5531,7 +5531,7 @@ mod linear_parity_anchor_1026_tests {
             .assemble_arrow_schur(target.view(), &rho, None)
             .expect("assembly with an ungated atom must succeed");
 
-        // The ungated atom is index 1; in the IBP dense layout its logit slot is
+        // The ungated atom is index 1; in the ordered Beta--Bernoulli dense layout its logit slot is
         // row-block index 1. Assert EXACT zero gradient + zero htt row/col there,
         // for EVERY data row (no term leaks at any row).
         let ungated_slot = 1usize;
@@ -5562,7 +5562,7 @@ mod linear_parity_anchor_1026_tests {
     }
 
     /// #1026 — the routing-bound regime where the ungate's benefit becomes a REAL
-    /// reconstruction gap: SPARSITY PRESSURE. Under a large `λ_sparse`, the IBP
+    /// reconstruction gap: SPARSITY PRESSURE. Under a large `λ_sparse`, the ordered Beta--Bernoulli
     /// assignment-sparsity prior pulls the gated atom's logits toward OFF (its
     /// Beta-Bernoulli energy prefers gates below 1), so a gated atom can no longer
     /// self-optimize its gate to ≈1 and under-reconstructs the unit-magnitude

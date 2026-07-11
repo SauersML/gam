@@ -189,7 +189,7 @@ def run_ab(
     shard: Any,
     *,
     topology: str = "circle",
-    assignment: str = "ibp_map",
+    assignment: str = "ordered_beta_bernoulli",
     max_births: int = 8,
     n_iter: int = 40,
     random_state: int = 0,
@@ -294,7 +294,7 @@ def main() -> int:
     ap.add_argument("--acts", required=True, help="(N, p) tier-0-normalised clean acts .npy")
     ap.add_argument("--shard", required=True, help="behavioral_fisher shard (npz / dir)")
     ap.add_argument("--topology", default="circle")
-    ap.add_argument("--assignment", default="ibp_map")
+    ap.add_argument("--assignment", default="ordered_beta_bernoulli")
     ap.add_argument("--max-births", type=int, default=8)
     ap.add_argument("--n-iter", type=int, default=40)
     ap.add_argument("--random-state", type=int, default=0)

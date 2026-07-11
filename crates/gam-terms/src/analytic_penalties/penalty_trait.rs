@@ -2,20 +2,6 @@ use super::*;
 
 pub(crate) const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
 
-/// Half-width of the open-interval clamp `[ε, 1−ε]` applied to IBP-assignment
-/// probabilities before `ln`/`1/p` so the Bernoulli cross-entropy and its score
-/// stay finite at the simplex boundary.
-pub(crate) const IBP_PROBABILITY_CLAMP: f64 = 1.0e-12;
-
-/// Interior tolerance for the IBP straight-through Bernoulli mean: the
-/// pass-through Jacobian `∂π/∂(mass)` is taken only when the unclamped mean lies
-/// strictly inside `(δ, 1−δ)`; at the saturated boundary the gradient is zero.
-pub(crate) const IBP_INTERIOR_TOL: f64 = 1.0e-9;
-
-/// Floor on the IBP posterior-count denominator `n + a − 1`, guarding the
-/// per-component mean against a zero (or negative) effective count.
-pub(crate) const IBP_COUNT_DENOM_FLOOR: f64 = 1.0e-9;
-
 // ---------------------------------------------------------------------------
 // Common trait
 // ---------------------------------------------------------------------------

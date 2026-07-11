@@ -35,7 +35,7 @@ fn schur_non_pd_seed_refusal_message() -> String {
 /// recoverable infeasible-ρ probe, so it propagated as a hard
 /// `RemlOptimizationFailed`; with a single PCA seed the fixed-point seed-startup
 /// validation then rejected every candidate → "no candidate seeds passed outer
-/// startup validation (SAE manifold)". `ibp_map`+`circle`'s seed lands in the PD
+/// startup validation (SAE manifold)". `ordered_beta_bernoulli`+`circle`'s seed lands in the PD
 /// region and never trips it — exactly why it converged on identical data while
 /// the other assignments/topologies did not.
 ///

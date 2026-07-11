@@ -319,13 +319,13 @@ fn sae_outer_rho_gradient_components_match_centered_fd_jumprelu() {
 }
 
 #[test]
-fn sae_outer_rho_gradient_components_match_centered_fd_ibp_map() {
+fn sae_outer_rho_gradient_components_match_centered_fd_ordered_beta_bernoulli() {
     // IBP-MAP exercises the #1006 empirical-π third channel: pi_k(M_k) couples
     // every row in a column, so the outer-ρ gradient through log|H| depends on
     // the cross-row M_k channel of `logdet_theta_adjoint`. lambda_sparse is the
     // active prior weight here, so coord 0's FD directly stresses it.
-    let f = fixture(AssignmentMode::ibp_map(0.7, 0.9, false), -1.5);
-    assert_full_gradient_matches_fd("ibp_map", &f);
+    let f = fixture(AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false), -1.5);
+    assert_full_gradient_matches_fd("ordered_beta_bernoulli", &f);
 }
 
 /// Centered finite difference of the FROZEN-θ penalized loss `loss.total()` at
@@ -435,13 +435,13 @@ fn sae_outer_rho_gradient_channel_decomposition_softmax_2087() {
 }
 
 #[test]
-fn sae_outer_rho_gradient_channel_decomposition_ibp_map_2087() {
+fn sae_outer_rho_gradient_channel_decomposition_ordered_beta_bernoulli_2087() {
     // Suspect arm: IBP-MAP drives the cross-row empirical-`M` / Woodbury log-det
     // channels of `logdet_theta_adjoint`. The decomposition pins whether a #2087
     // desync lives in the explicit prior channel or the Hessian log-det block —
     // the located artifact a build-capable seat consumes to fix the θ-adjoint.
-    let f = fixture(AssignmentMode::ibp_map(0.7, 0.9, false), -1.5);
-    assert_channel_decomposition("ibp_map", &f);
+    let f = fixture(AssignmentMode::ordered_beta_bernoulli(0.7, 0.9, false), -1.5);
+    assert_channel_decomposition("ordered_beta_bernoulli", &f);
 }
 
 /// #2087 discriminator — is the `third_order` channel (−15.49 on the softmax

@@ -996,7 +996,7 @@ def fit(
         indices declared in ``latents``. The Rust-backed public wrappers also
         include the SAE/assignment family
         (:class:`gamfit.SoftmaxAssignmentSparsityPenalty`,
-        :class:`gamfit.IBPAssignmentPenalty`,
+        :class:`gamfit.OrderedBetaBernoulliPenalty`,
         :class:`gamfit.TopKActivationPenalty`,
         :class:`gamfit.JumpReLUPenalty`) and newer structured penalties such
         as :class:`gamfit.ScadMcpPenalty` and

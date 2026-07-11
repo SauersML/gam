@@ -3,10 +3,8 @@ use statrs::function::gamma::{digamma, ln_gamma};
 
 /// Ordered independent Beta--Bernoulli active-set prior over assignment logits.
 ///
-/// `IBP` remains in the Rust type name because the surrounding assignment API
-/// still uses that historical route name.  The distribution implemented here
-/// is not a stick-breaking IBP: columns have independent
-/// `pi_k ~ Beta(a_k, 1)` rates whose means follow the ordered schedule
+/// Columns have independent `pi_k ~ Beta(a_k, 1)` rates whose means follow the
+/// ordered schedule
 ///
 /// `mu_k = (alpha / (alpha + 1))^(k + 1),  a_k = mu_k / (1 - mu_k)`.
 ///

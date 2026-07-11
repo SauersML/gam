@@ -594,7 +594,7 @@ struct BirthSeed {
     /// `f64::NEG_INFINITY` (the conservative birth default). `born_circle_atom` routes
     /// each present row at the STRONGER of this own-presence gate and the incumbent
     /// per-row logit scale, so a circle genuinely present on incumbent-SPARSE rows
-    /// (low/negative `inc_max`) still gets a gate strong enough to ESTABLISH under IBP
+    /// (low/negative `inc_max`) still gets a gate strong enough to ESTABLISH under ordered Beta--Bernoulli
     /// (the flat `BIRTH_SEED_LOGIT` starves it, and the incumbent scale is weak where
     /// the circle actually lives). Derived from `ρ_i` + the existing `λ₊` floor, no new
     /// constant. `None` for the rank-1 / shared-factor DC fallback.
@@ -645,7 +645,7 @@ fn top_factor_birth_decoder(
     // carries a genuine DEGENERATE 2-plane (a real circle, not a rank-1 shared
     // factor), seed the born atom directly ON that circle with the own-presence gate
     // — exactly the disjoint principal path — rather than the flat row-0 DC seed that
-    // dies under IBP on incumbent-sparse rows. Only a real circle (`circle_coords`
+    // dies under ordered Beta--Bernoulli on incumbent-sparse rows. Only a real circle (`circle_coords`
     // Some) is adopted; a genuine rank-1 shared factor returns a DC seed here, which
     // we IGNORE and fall through to the anchor-scored factor pick below, so the #2080
     // factor-selection behavior on non-circle residuals is unchanged. The circle
@@ -891,7 +891,7 @@ fn isa_birth_seed_batch(
 ///
 /// Used both as the Phase-2 per-atom refit and as the chart-EXTENSION birth
 /// candidate (refit the last atom on its LOO residual so it can absorb the arc it
-/// left behind). Independent-gate modes (JumpReLU / IBP) refit exactly-additively;
+/// left behind). Independent-gate modes (JumpReLU / ordered Beta--Bernoulli) refit exactly-additively;
 /// under Softmax the K=1 sub-gate is the constant `1`, so the sub-fit sees the
 /// full partial residual (classical additive backfitting) and the subsequent warm
 /// polish reconciles the re-normalized joint gate.
@@ -1732,7 +1732,7 @@ pub fn fit_stagewise(
 // atoms are disjoint on EITHER axis — two independent routes to the sufficient
 // orthogonality:
 //
-//   (1) DISJOINT GATE ROW SUPPORT under an INDEPENDENT gate (IBP / ThresholdGate):
+//   (1) DISJOINT GATE ROW SUPPORT under an INDEPENDENT gate (ordered Beta--Bernoulli / ThresholdGate):
 //       a born atom's gate is exactly `0` on rows below its threshold, so its
 //       weighted K=1 objective + gradient read ONLY its support rows. Two atoms on
 //       disjoint rows never see each other's rows.
@@ -2560,7 +2560,7 @@ mod tests {
 
     /// #2080 — anchor-scored birth selection must prefer the SINGLY-ATTRIBUTABLE
     /// residual factor (supported on rows the existing dictionary leaves UNCONTESTED)
-    /// over the dominant-VARIANCE factor, under an IBP routing whose per-row mass
+    /// over the dominant-VARIANCE factor, under an ordered Beta--Bernoulli routing whose per-row mass
     /// varies. Also pins the fallback: a UNIFORM routing (no anchor contrast) keeps
     /// the historical dominant-energy (column-0) pick.
     #[test]
@@ -2601,7 +2601,7 @@ mod tests {
         let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
         let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
 
-        // Helper: build a 1-atom IBP term from a per-row logit column.
+        // Helper: build a 1-atom ordered Beta--Bernoulli term from a per-row logit column.
         let build_ibp = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
             let mut logits = Array2::<f64>::zeros((n, 1));
             for row in 0..n {
@@ -2611,7 +2611,7 @@ mod tests {
                 logits,
                 vec![cb0.clone()],
                 vec![LatentManifold::Circle { period: 1.0 }],
-                AssignmentMode::ibp_map(1.0, 1.0, false),
+                AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
             )
             .unwrap();
             SaeManifoldTerm::new(vec![atom0.clone()], assignment).unwrap()
@@ -2623,7 +2623,7 @@ mod tests {
         let act = activity_of(&contrast_term);
         assert!(
             act[0] > act[n - 1] + 1e-6,
-            "IBP activity must be higher on contested rows (got {} vs {})",
+            "ordered Beta--Bernoulli activity must be higher on contested rows (got {} vs {})",
             act[0],
             act[n - 1]
         );
@@ -2971,12 +2971,12 @@ mod tests {
     /// #2109 — a born circle PRESENT on incumbent-SPARSE rows must SURVIVE. The
     /// #2101 fix routed the born gate at the incumbent per-row logit scale
     /// (`inc_max`), which is low/negative exactly where an incumbent-sparse circle
-    /// lives, so the born circle re-collapses under IBP (the #3 starvation
+    /// lives, so the born circle re-collapses under ordered Beta--Bernoulli (the #3 starvation
     /// resurfacing at scale). The #2109 fix routes each present row at the STRONGER
     /// of `inc_max` and the born circle's OWN presence gate `ln(ρ_i²/2·λ₊)`, so the
     /// circle keeps a strong gate where the incumbents do not cover it. This test
     /// FAILS with the `inc_max`-only gate (the born logit on the circle's rows is the
-    /// incumbent's very-negative `inc_max`, and the K=1 IBP sub-fit collapses ‖B‖ to
+    /// incumbent's very-negative `inc_max`, and the K=1 ordered Beta--Bernoulli sub-fit collapses ‖B‖ to
     /// ~1e-4) and PASSES with the own-presence gate.
     #[test]
     fn born_circle_survives_on_incumbent_sparse_rows_2109() {
@@ -3007,7 +3007,7 @@ mod tests {
             }
         }
 
-        // Incumbent K=1 IBP term: one circle atom on channels (4,5), co-present on
+        // Incumbent K=1 ordered Beta--Bernoulli term: one circle atom on channels (4,5), co-present on
         // [0,h) (high logit) and INACTIVE on [h,n) (very negative logit) — so `inc_max`
         // is deeply negative exactly where the born circle lives.
         let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
@@ -3021,7 +3021,7 @@ mod tests {
             inc_logits,
             vec![inc_cb],
             vec![LatentManifold::Circle { period: 1.0 }],
-            AssignmentMode::ibp_map(0.7, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![inc_atom], inc_assignment).unwrap();
@@ -3073,7 +3073,7 @@ mod tests {
              (>1), not the incumbent's negative inc_max (−6); got min={min_born_logit_on_circle:.3}"
         );
 
-        // BEHAVIORAL guard: the K=1 IBP birth sub-fit must keep the born circle
+        // BEHAVIORAL guard: the K=1 ordered Beta--Bernoulli birth sub-fit must keep the born circle
         // ESTABLISHED — ‖B‖ stays O(1) rather than collapsing to ~1e-4.
         let config = StagewiseConfig {
             inner_max_iter: 40,
@@ -3104,7 +3104,7 @@ mod tests {
             .sqrt();
         assert!(
             born_norm.is_finite() && born_norm > 0.3,
-            "born circle must SURVIVE the IBP sub-fit on incumbent-sparse rows \
+            "born circle must SURVIVE the ordered Beta--Bernoulli sub-fit on incumbent-sparse rows \
              (‖B‖ O(1)); got ‖B‖={born_norm:.3e} (a collapse to ~1e-4 is the #2109 bug)"
         );
     }
@@ -3114,7 +3114,7 @@ mod tests {
     /// model rank ≥ 1, so `top_factor_birth_decoder` is the primary path) ALSO carries
     /// a degenerate 2-plane circle, the born atom must be seeded ON that circle (cos/sin
     /// harmonic rows + phase coordinate + own-presence gate), not the flat row-0 DC seed
-    /// that dies under IBP. A genuine rank-1 shared factor still gets the DC seed.
+    /// that dies under ordered Beta--Bernoulli. A genuine rank-1 shared factor still gets the DC seed.
     #[test]
     fn top_factor_birth_mirrors_circle_seed_2109() {
         use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
@@ -3126,7 +3126,7 @@ mod tests {
         // diagonal correlation ⇒ `top_factor_birth_decoder` is the active path, the
         // entangled regime) — while the two equal-variance axes (uniform phase) form a
         // degenerate 2-plane the #2109 mirror must detect and seed as a circle, not the
-        // flat row-0 DC factor seed that dies under IBP on incumbent-sparse rows.
+        // flat row-0 DC factor seed that dies under ordered Beta--Bernoulli on incumbent-sparse rows.
         let mut residual = Array2::<f64>::zeros((n, p));
         for i in 0..n {
             let theta = std::f64::consts::TAU * (i as f64) / n as f64;
@@ -3156,7 +3156,7 @@ mod tests {
             logits,
             vec![cb0],
             vec![LatentManifold::Circle { period: 1.0 }],
-            AssignmentMode::ibp_map(0.7, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
         )
         .unwrap();
         let term = SaeManifoldTerm::new(vec![atom0], assignment).unwrap();

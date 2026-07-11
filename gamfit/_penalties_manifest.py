@@ -19,9 +19,9 @@ PENALTY_MANIFEST = (
         "row_block_diagonal": True,
     },
     {
-        "kind": "ibp_assignment",
-        "rust": "IBPAssignment:IBPAssignmentPenalty",
-        "python": "IBPAssignmentPenalty",
+        "kind": "ordered_beta_bernoulli",
+        "rust": "OrderedBetaBernoulli:OrderedBetaBernoulliPenalty",
+        "python": "OrderedBetaBernoulliPenalty",
         "row_block_diagonal": True,
     },
     {

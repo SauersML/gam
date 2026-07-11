@@ -8,7 +8,7 @@ scale and to capture the wall-time scaling curve.
 Design choices per the massive-K streaming contract:
   * ``assignment="jumprelu"`` -> canonicalizes to the ``threshold_gate`` family,
     which is per-row independent and therefore streams cleanly across chunks at
-    large K. (``ibp_map`` couples rows via a cross-row Woodbury mass and refuses
+    large K. (``ordered_beta_bernoulli`` couples rows via a cross-row Woodbury mass and refuses
     multi-chunk streaming, blowing up the dense working set at large K.)
   * ``d_atom=1`` intrinsic coordinate per atom (1D manifold fibers).
   * homogeneous ``atom_basis`` / ``atom_topology`` so every atom is the same

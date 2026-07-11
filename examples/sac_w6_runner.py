@@ -1,7 +1,7 @@
 """SAC vs joint K=8 on the real W6 OLMo activations (SAC_PLAN Part 5 kill-test).
 
 Runs on node2. Loads the EXACT (500, 128) matrix the joint ``sae_manifold_fit(
-K=8, d_atom=1, circle, ibp_map, isometry_weight=1.0)`` fit timed out on (W6:
+K=8, d_atom=1, circle, ordered_beta_bernoulli, isometry_weight=1.0)`` fit timed out on (W6:
 3x1500s TIMEOUT). Runs SAC as 8 forced sequential K=1 fits under the same
 whitened / isometry-gauged settings and reports, per atom: marginal EV, whether
 EV climbs monotonically, decoder/recon finiteness, gate mass, and wall time.
@@ -41,7 +41,7 @@ def main() -> None:
     n, p = X.shape
     print(f"[sac_w6] loaded {CACHE}: X={X.shape} dtype={X.dtype}", flush=True)
     print(f"[sac_w6] running SAC: {K_TARGET} forced sequential K=1 fits "
-          f"(d_atom=1, circle, ibp_map, isometry_weight=1.0, "
+          f"(d_atom=1, circle, ordered_beta_bernoulli, isometry_weight=1.0, "
           f"structured_residual_passes={SRP}, n_iter={N_ITER}, backfit={BACKFIT})",
           flush=True)
 
@@ -51,7 +51,7 @@ def main() -> None:
         max_atoms=K_TARGET,
         d_atom=1,
         atom_topology="circle",
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         ev_floor=1e-3,
         structured_residual_passes=SRP,
         n_iter=N_ITER,

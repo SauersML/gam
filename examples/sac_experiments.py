@@ -128,7 +128,7 @@ def main() -> None:
     # ---- Joint K=2 baseline (the call SAC replaces) --------------------- #
     print("\n[exp1] === JOINT sae_manifold_fit(K=2) ===")
     joint = gamfit.sae_manifold_fit(
-        X, K=2, d_atom=args.d_atom, atom_topology="circle", assignment="ibp_map",
+        X, K=2, d_atom=args.d_atom, atom_topology="circle", assignment="ordered_beta_bernoulli",
         isometry_weight=args.isometry, n_iter=args.n_iter, random_state=args.seed,
     )
     joint_recon = np.asarray(joint.reconstruct(X), dtype=np.float64)
@@ -150,7 +150,7 @@ def main() -> None:
     print("\n[exp1] === SAC prototype ===")
     sac = sac_fit(
         X, max_atoms=6, d_atom=args.d_atom, atom_topology="circle",
-        assignment="ibp_map", ev_floor=5e-3, structured_residual_passes=args.srp,
+        assignment="ordered_beta_bernoulli", ev_floor=5e-3, structured_residual_passes=args.srp,
         n_iter=args.n_iter, backfit_sweeps=args.backfit, isometry_weight=args.isometry,
         random_state=args.seed, verbose=True,
     )

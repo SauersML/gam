@@ -38,7 +38,7 @@ pub enum ArdSharing {
 /// the inner assignment prior, but the flat outer layout includes it only when
 /// the assignment family has a non-constant strength-dependent objective:
 ///
-/// * [`Self::PenaltyWeight`] always carries the coordinate (IBP-MAP and
+/// * [`Self::PenaltyWeight`] always carries the coordinate (ordered Beta--Bernoulli-MAP and
 ///   threshold-gate priors).
 /// * [`Self::SoftmaxEntropy`] carries it only for `K > 1`. At `K = 1` the
 ///   simplex assignment is identically one and its entropy is identically zero,
@@ -70,7 +70,7 @@ impl AssignmentStrengthLayout {
 #[derive(Debug, Clone)]
 pub struct SaeManifoldRho {
     /// `log(lambda_sparse)` for softmax entropy or JumpReLU gated L1, or the
-    /// learnable `log(alpha)` offset for IBP-MAP assignment.
+    /// learnable `log(alpha)` offset for ordered Beta--Bernoulli-MAP assignment.
     pub log_lambda_sparse: f64,
     /// Typed assignment-strength layout. This is assignment-family state, not
     /// an optimizer mask: when the coordinate is structurally absent it is not
@@ -195,7 +195,7 @@ impl SaeManifoldRho {
         self.assignment_strength_layout = match assignment_mode {
             AssignmentMode::Softmax { .. } => AssignmentStrengthLayout::SoftmaxEntropy,
             AssignmentMode::TopK { .. } => AssignmentStrengthLayout::FixedSupport,
-            AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => {
+            AssignmentMode::OrderedBetaBernoulli { .. } | AssignmentMode::ThresholdGate { .. } => {
                 AssignmentStrengthLayout::PenaltyWeight
             }
         };
@@ -310,7 +310,7 @@ impl SaeManifoldRho {
     /// while the decoder/coordinates are refit, so `λ/φ` is exactly the effective
     /// stiffness.
     ///
-    /// IBP-MAP is different in kind. Its per-row Bernoulli gates are FREE latent
+    /// ordered Beta--Bernoulli-MAP is different in kind. Its per-row Bernoulli gates are FREE latent
     /// variables the inner joint solve co-optimizes with the coordinates and
     /// decoder. A response-dispersion-WEAKENED smoothness/ARD seed
     /// (`φ_seed ≪ 1` at any non-trivial noise scale) hands that extra gate +
@@ -318,13 +318,13 @@ impl SaeManifoldRho {
     /// overfits, the reconstruction dispersion `φ̂` collapses toward 0, and the
     /// Fellner–Schall multiplicative fixed point (`λ_new ∝ φ̂`) then spirals the
     /// smoothing/ARD penalties to zero — a degenerate outer basin the ρ-optimizer
-    /// stalls in (#1744: ibp_map n=40 σ=0.18 stalled at EV 0.86). The IBP sparse
+    /// stalls in (#1744: ordered_beta_bernoulli n=40 σ=0.18 stalled at EV 0.86). The ordered Beta--Bernoulli sparse
     /// coordinate is additionally a dimensionless log-alpha concentration offset,
     /// not a squared-output-unit penalty weight, so it was never dispersion-
-    /// scalable either. NONE of the IBP-MAP ρ coordinates therefore admit the
+    /// scalable either. NONE of the ordered Beta--Bernoulli-MAP ρ coordinates therefore admit the
     /// Gaussian response-dispersion scaling; the seed stays at its absolute
     /// (already dimensionless) construction values, which keeps the smoothing/ARD
-    /// penalties strong enough that the inner IBP solve cannot overfit at the seed
+    /// penalties strong enough that the inner ordered Beta--Bernoulli solve cannot overfit at the seed
     /// and the EFS fixed point lands on the interior optimum instead of the
     /// zero-penalty collapse. The separable-gate modes are byte-for-byte
     /// unchanged.
@@ -334,10 +334,10 @@ impl SaeManifoldRho {
         assignment_mode: AssignmentMode,
     ) -> Result<Self, String> {
         let bound = self.clone().for_assignment(assignment_mode);
-        if matches!(assignment_mode, AssignmentMode::IBPMap { .. }) {
+        if matches!(assignment_mode, AssignmentMode::OrderedBetaBernoulli { .. }) {
             // Validate the dispersion for parity with the scaled path (a
             // non-finite/​non-positive φ is still a caller error), then return the
-            // unscaled seed: no IBP-MAP ρ coordinate is response-dispersion-scalable.
+            // unscaled seed: no ordered Beta--Bernoulli-MAP ρ coordinate is response-dispersion-scalable.
             if !(dispersion.is_finite() && dispersion > 0.0) {
                 return Err(format!(
                     "SaeManifoldRho::seed_scaled_by_dispersion_for_assignment: dispersion must \
@@ -361,7 +361,7 @@ impl SaeManifoldRho {
         // undefined. Because the SAE fit runs a single seed (`max_seeds = 1`),
         // the EFS startup validation then rejects it with "no candidate seeds
         // passed outer startup validation" (the #1782 softmax / jumprelu failure),
-        // exactly where ibp_map — which is never dispersion-weakened — survives.
+        // exactly where ordered_beta_bernoulli — which is never dispersion-weakened — survives.
         //
         // Fix: for K > 1 keep the seed decoder-smoothness / ARD from being
         // WEAKENED below their (dimensionless) construction strength — floor the

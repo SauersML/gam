@@ -1,5 +1,5 @@
-"""#1784 — the ibp_map assignment must default its concentration to the K-aware
-``default_ibp_concentration_for_k_atoms(K)`` when the caller leaves ``alpha``
+"""#1784 — the ordered_beta_bernoulli assignment must default its concentration to the K-aware
+``default_ordered_beta_bernoulli_concentration_for_k_atoms(K)`` when the caller leaves ``alpha``
 unset, instead of the historical fixed ``alpha=1.0`` that collapsed the ordered
 stick-breaking prior to a near-hard mask past the first ~3 atoms (which made the
 manifold SAE underfit an equal-K linear dictionary and left the K=128 joint
@@ -112,7 +112,7 @@ class _FakeRustModule:
         jumprelu_threshold=0.0,
         **_forward_compat_kwargs,
     ):
-        assert assignment_kind == "ibp_map"
+        assert assignment_kind == "ordered_beta_bernoulli"
         n = int(z.shape[0])
         coords_seed = np.linspace(0.0, 1.0, n, dtype=float)
         for step in range(int(max_iter)):
@@ -161,7 +161,7 @@ class _FakeRustModule:
             "log_alpha": np.log(alpha),
             "log_lambda_smooth": np.log(smoothness),
             "log_ard": [np.zeros(dim) for dim in atom_dim],
-            "assignment_prior": "ibp_map",
+            "assignment_prior": "ordered_beta_bernoulli",
         }
 
 
@@ -194,15 +194,15 @@ def _fit(monkeypatch, *, K, **kwargs):
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     model = sae.sae_manifold_fit(
         _x(3 * K + 1), K=K, atom_topology="circle", d_atom=1,
-        assignment="ibp_map", n_iter=1, **kwargs)
+        assignment="ordered_beta_bernoulli", n_iter=1, **kwargs)
     return fake, model
 
 
-def test_default_ibp_concentration_formula_matches_rust():
+def test_default_ordered_beta_bernoulli_concentration_formula_matches_rust():
     # α = 1/(exp(1/K) − 1), floored at 1.0. Spot-check the boundary + span.
-    assert sae._default_ibp_concentration_for_k_atoms(1) == pytest.approx(1.0)
+    assert sae._default_ordered_beta_bernoulli_concentration_for_k_atoms(1) == pytest.approx(1.0)
     for K in (2, 8, 64, 128, 512):
-        alpha = sae._default_ibp_concentration_for_k_atoms(K)
+        alpha = sae._default_ordered_beta_bernoulli_concentration_for_k_atoms(K)
         # last atom retains prior mass π_{K-1} = (α/(α+1))^K ≈ e^{-1}.
         pi_last = (alpha / (alpha + 1.0)) ** K
         assert pi_last == pytest.approx(math.exp(-1.0), rel=1e-9)
@@ -212,8 +212,8 @@ def test_default_ibp_concentration_formula_matches_rust():
 @pytest.mark.parametrize("K", [64, 128])
 def test_ibp_unset_alpha_defaults_to_k_aware(monkeypatch, K):
     fake, model = _fit(monkeypatch, K=K)  # alpha left unset
-    expected = sae._default_ibp_concentration_for_k_atoms(K)
-    assert fake.captured_kind == "ibp_map"
+    expected = sae._default_ordered_beta_bernoulli_concentration_for_k_atoms(K)
+    assert fake.captured_kind == "ordered_beta_bernoulli"
     assert fake.captured_alpha == pytest.approx(expected)
     assert float(model.alpha) == pytest.approx(expected)
     # The old fixed default would have been 1.0; the K-aware value must be larger.
@@ -226,10 +226,10 @@ def test_ibp_explicit_alpha_is_respected(monkeypatch):
     assert float(model.alpha) == pytest.approx(2.5)
 
 
-def test_ibp_alpha_override_leaves_base_at_one(monkeypatch):
-    # A per-fit ibp_alpha override drives the concentration in Rust, so the base
+def test_ordered_beta_bernoulli_alpha_override_leaves_base_at_one(monkeypatch):
+    # A per-fit ordered_beta_bernoulli_alpha override drives the concentration in Rust, so the base
     # alpha the facade forwards stays the historical 1.0 (no K-aware bump).
-    fake, _ = _fit(monkeypatch, K=64, ibp_alpha=3.0)
+    fake, _ = _fit(monkeypatch, K=64, ordered_beta_bernoulli_alpha=3.0)
     assert fake.captured_alpha == pytest.approx(1.0)
 
 

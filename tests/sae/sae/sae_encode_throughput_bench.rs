@@ -272,7 +272,7 @@ fn build_frozen_encode_term(batch: &Batch, frames: &[Array2<f64>]) -> SaeManifol
         logits,
         coords_k,
         vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
-        AssignmentMode::ibp_map(TAU, ALPHA, false),
+        AssignmentMode::ordered_beta_bernoulli(TAU, ALPHA, false),
     )
     .expect("assignment build");
     SaeManifoldTerm::new(atoms, assignment).expect("frozen encode term")

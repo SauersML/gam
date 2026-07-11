@@ -323,15 +323,15 @@ impl SaeManifoldTerm {
     /// Apply the FFI-facing [`SaeFitConfig`] as the source of truth for this fit.
     ///
     /// Distributes the config to its two authorities: the barrier strength override
-    /// onto the term (read by `separation_barrier_strength`), and the IBP-α
+    /// onto the term (read by `separation_barrier_strength`), and the ordered Beta--Bernoulli-α
     /// override onto the assignment (read by
-    /// [`SaeAssignment::resolved_ibp_alpha`]). A `None` field selects the canonical
+    /// [`SaeAssignment::resolved_ordered_beta_bernoulli_alpha`]). A `None` field selects the canonical
     /// data-derived or assignment-mode default. Call this after building the term
     /// and before fitting; distinct terms remain isolated by construction.
     pub fn set_fit_config(&mut self, config: SaeFitConfig) {
         self.separation_barrier_strength_override = config.separation_barrier_strength_override;
         self.assignment
-            .set_ibp_alpha_override(config.ibp_alpha_override);
+            .set_ordered_beta_bernoulli_alpha_override(config.ordered_beta_bernoulli_alpha_override);
     }
 
     /// #1777 — the per-fit configuration currently in force on this term,
@@ -341,7 +341,7 @@ impl SaeManifoldTerm {
     pub fn fit_config(&self) -> SaeFitConfig {
         SaeFitConfig {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
-            ibp_alpha_override: self.assignment.ibp_alpha_override,
+            ordered_beta_bernoulli_alpha_override: self.assignment.ordered_beta_bernoulli_alpha_override,
         }
     }
 
@@ -358,7 +358,7 @@ impl SaeManifoldTerm {
     /// `primary` is the linear/bulk tier that defines the fit's global regime —
     /// it owns the sparse-penalty scale (`log_lambda_sparse`), the observation
     /// `row_metric` / row-loss weighting (the whitening the curved tier is fit
-    /// *against*), and the fit-config (barrier / IBP-α). The curved `secondary`
+    /// *against*), and the fit-config (barrier / ordered Beta--Bernoulli-α). The curved `secondary`
     /// tier is fit on the whitened residual under that same regime, so it
     /// contributes only its per-atom parameters (atoms, coords, ungated,
     /// per-atom `log_lambda_smooth` / `log_ard`); its globals are byproducts of
@@ -374,7 +374,7 @@ impl SaeManifoldTerm {
     /// not in this merge — see below.
     ///
     /// Fitted-additivity `merged.fitted() == primary.fitted() + secondary.fitted()`
-    /// holds EXACTLY for independent-gate modes (JumpReLU / IBP, where each atom's
+    /// holds EXACTLY for independent-gate modes (JumpReLU / ordered Beta--Bernoulli, where each atom's
     /// gate is computed independently); under Softmax the gate re-normalizes over
     /// the merged `K`, so the merge is a WARM START into the joint objective (the
     /// two-tier driver's final joint polish reconciles it).
@@ -440,7 +440,7 @@ impl SaeManifoldTerm {
             ));
         }
         // Assignment: column-hstack logits (n×K1 | n×K2), append per-atom coords
-        // and ungated flags. Carries primary's mode + ibp_alpha_override.
+        // and ungated flags. Carries primary's mode + ordered_beta_bernoulli_alpha_override.
         let mut logits = Array2::<f64>::zeros((n, k1 + k2));
         logits
             .slice_mut(s![.., 0..k1])
@@ -2293,9 +2293,9 @@ impl SaeManifoldTerm {
     /// gam#2144 — `true` when the installed row metric whitens the likelihood at
     /// ANY rank. Drives whitening of the log-det row jets so they differentiate
     /// the SAME whitened operator (`JᵀU UᵀJ`) the assembly builds. Independent of
-    /// the IBP PSD majorization, which (#2144/#1038) is UNCONDITIONAL — the
+    /// the ordered Beta--Bernoulli PSD majorization, which (#2144/#1038) is UNCONDITIONAL — the
     /// assembly, evidence log-det, ρ-trace, and θ-adjoint all carry the majorized
-    /// IBP curvature on every path, whitened or not, so there is no rank-gated
+    /// ordered Beta--Bernoulli curvature on every path, whitened or not, so there is no rank-gated
     /// majorization predicate anymore. `false` for the identity metric or no
     /// metric.
     pub(crate) fn whiten_logdet_row_jets(&self) -> bool {
@@ -2814,7 +2814,7 @@ impl SaeManifoldTerm {
     /// cap and magnitude cutoff.
     ///
     /// #1408: this plan is mode-agnostic. `assemble_arrow_schur` consults it
-    /// directly for IBP-MAP, and for `AssignmentMode::Softmax` via
+    /// directly for ordered Beta--Bernoulli-MAP, and for `AssignmentMode::Softmax` via
     /// [`Self::softmax_active_plan`], which tightens it with an explicit `top_k`
     /// (`softmax_active_cap`). Softmax therefore engages the compact active-set
     /// layout whenever `top_k` or the budget bounds the active set (the
@@ -2928,7 +2928,7 @@ impl SaeManifoldTerm {
     /// Engages the compact top-`k` row layout when EITHER the user supplied a
     /// hard `top_k` cap ([`Self::softmax_active_cap`], `1 <= k < K`) OR the
     /// dense data Gram exceeds the in-core budget (the same memory lever the
-    /// IBP path uses via [`Self::sparse_active_plan`]). The returned
+    /// ordered Beta--Bernoulli path uses via [`Self::sparse_active_plan`]). The returned
     /// `k_active_cap` is the tighter of the two, so an explicit `top_k`
     /// genuinely bounds the optimization even below the memory threshold and a
     /// large-K budget breach still bounds it when no `top_k` is set. Returns
@@ -4404,7 +4404,7 @@ impl SaeManifoldTerm {
         // Arrow-Schur assembly used, so this scalar objective value and the
         // assembled Newton gradient/Hessian are derivatives of ONE truncated
         // reconstruction. When a compact layout is engaged (softmax top-k /
-        // large-K IBP), the assembly forms `fitted` from the row's active atoms
+        // large-K ordered Beta--Bernoulli), the assembly forms `fitted` from the row's active atoms
         // only; summing all K here would make `loss_scaled` a DIFFERENT objective
         // than the Newton step descends whenever dropped atoms carry mass. `None`
         // (dense layout) ⇒ the historical full-K sum, bit-for-bit. Guarded on the
@@ -4704,7 +4704,7 @@ impl SaeManifoldTerm {
     ///
     /// This is deliberately narrower than [`Self::analytic_penalty_value_total`]:
     /// it excludes the Psi-tier coordinate / assignment penalties (ARD,
-    /// Isometry, ScadMcp, BlockOrthogonality, IBP/softmax assignment sparsity).
+    /// Isometry, ScadMcp, BlockOrthogonality, ordered Beta--Bernoulli/softmax assignment sparsity).
     /// The SAE already carries its own ARD (`loss.ard`) and assignment sparsity
     /// (`loss.assignment_sparsity`) energy, so adding the registry ARD /
     /// assignment value on top would double-count, and the gauge-only
@@ -5053,7 +5053,7 @@ impl SaeManifoldTerm {
     /// Build the compact-layout ext-coord product manifold and point for one row.
     ///
     /// The dense `ext_coord_manifold()` is keyed to the full-`q` block ordering
-    /// `[assignment parts (all Euclidean for IBP-MAP / JumpReLU), then per-atom
+    /// `[assignment parts (all Euclidean for ordered Beta--Bernoulli-MAP / JumpReLU), then per-atom
     /// coord blocks in atom order]`. A compact active-set row instead lays its
     /// `q_active` columns out as `[one Euclidean logit slot per active atom,
     /// then each active atom's coord block in `active` order]` (see

@@ -49,7 +49,7 @@
 //! contract; it fails today (max error ≈ 0.26 here) and will pass once `hvp`
 //! adds the dropped `Σ C·V` term (with GN moved to `psd_majorizer_hvp`).
 //!
-//! Related: #809 (sibling: IBPAssignmentPenalty hvp drops the off-diagonal
+//! Related: #809 (sibling: OrderedBetaBernoulliPenalty hvp drops the off-diagonal
 //! block). Both are `AnalyticPenalty` curvature-contract defects; #804, #805,
 //! #796, #794 are further SAE-penalty curvature/majorizer bugs.
 

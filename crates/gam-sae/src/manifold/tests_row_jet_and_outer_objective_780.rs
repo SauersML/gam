@@ -1,5 +1,5 @@
 //! `sae_row_jet_program_matches_production_row_jets_on_converged_cache` and
-//! `ibp_map_outer_objective_advertises_analytic_gradient`, split verbatim out
+//! `ordered_beta_bernoulli_outer_objective_advertises_analytic_gradient`, split verbatim out
 //! of `tests.rs` to keep that tracked file under the #780 10k-line gate.
 //! Declared as a sibling `#[cfg(test)] mod` in `mod.rs`; the shared
 //! `gamma_fd_tiny_fixture` is sourced from the sibling `tests` module.
@@ -44,7 +44,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
         // optimum. A fixed-state ρ-sweep of this exact softmax fixture shows the
         // inner solve converges for every `log_lambda_sparse ≥ -2`; `-1.0` sits
         // comfortably inside that PD region (the value the sibling #1416
-        // IBP-ρ_sparse oracle already pins). This is a setup fix that makes a
+        // ordered Beta--Bernoulli-ρ_sparse oracle already pins). This is a setup fix that makes a
         // genuine converged cache EXIST so the hand-vs-jet row-jet oracle below
         // can reach its real bit-identity assertions; it weakens no tolerance.
         rho.log_lambda_sparse = -1.0;
@@ -254,19 +254,19 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
 }
 
 #[test]
-pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
-    // The IBP-MAP empirical-π third channel (including the cross-row M_k
+pub(crate) fn ordered_beta_bernoulli_outer_objective_advertises_analytic_gradient() {
+    // The ordered Beta--Bernoulli-MAP empirical-π third channel (including the cross-row M_k
     // coupling) is now assembled exactly in `logdet_theta_adjoint` (#1006),
     // so the outer objective advertises an analytic gradient like every
     // other assignment mode.
     let (mut term, target, rho) = gamma_fd_tiny_fixture();
-    term.assignment.mode = AssignmentMode::ibp_map(0.9, 1.0, false);
+    term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.9, 1.0, false);
 
     let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
     assert_eq!(obj.capability().gradient, Derivative::Analytic);
 }
 
-/// A trivial n=1, K=2, IBP-MAP term whose atoms carry a single basis function
+/// A trivial n=1, K=2, ordered Beta--Bernoulli-MAP term whose atoms carry a single basis function
 /// with a KNOWN value / jacobian / decoder so the reconstruction row program's
 /// value and first-derivative channels are hand-computable. Atom `k` has
 /// `decoded_k = phi_k·dec_k`, `d(decoded_k)/dt = dphi_k·dec_k`. Used to pin the
@@ -301,7 +301,7 @@ fn fixed_gate_probe_term() -> (SaeManifoldTerm, SaeManifoldRho) {
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.8, 1.8, false),
+        AssignmentMode::ordered_beta_bernoulli(0.8, 1.8, false),
     )
     .unwrap();
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
@@ -388,7 +388,7 @@ pub(crate) fn frozen_ibp_row_program_gates_on_frozen_not_free_logit() {
 pub(crate) fn ungated_ibp_row_program_gates_at_unit_with_zero_logit_derivative() {
     use ndarray::{Array1, Array4};
     let mut term = fixed_gate_probe_term().0;
-    // Atom 0 ungated (dense background tier), atom 1 gated. Not frozen. IBP-MAP
+    // Atom 0 ungated (dense background tier), atom 1 gated. Not frozen. ordered Beta--Bernoulli-MAP
     // accepts ungated atoms (only Softmax rejects them; see `with_ungated`).
     term.assignment.ungated = vec![true, false];
     assert!(!term.assignment.routing_is_frozen());

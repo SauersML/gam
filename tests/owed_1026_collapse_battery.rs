@@ -418,7 +418,7 @@ fn zero_amplitude_interior_force_points_away_from_collapse_1026() {
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.5, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
@@ -539,7 +539,7 @@ fn duplicate_decoder_has_finite_nonzero_separating_curvature_1026() {
                 LatentManifold::Circle { period: 1.0 },
                 LatentManifold::Circle { period: 1.0 },
             ],
-            AssignmentMode::ibp_map(0.5, 1.0, false),
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
         )
         .unwrap();
         SaeManifoldTerm::new(vec![a0, a1], assignment).unwrap()

@@ -340,7 +340,7 @@ pub(crate) fn sae_registry_refuses_assignment_sparsity_penalties() {
     )));
     let ibp_err = term
         .validate_analytic_penalty_registry(&ibp_registry)
-        .expect_err("SAE registry must reject IBP assignment sparsity");
+        .expect_err("SAE registry must reject ordered Beta--Bernoulli assignment sparsity");
     assert!(ibp_err.contains("assignment sparsity"));
 }
 
@@ -354,19 +354,19 @@ pub(crate) fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
             -0.4, 0.2, 0.7, 0.1, -0.3, 0.5, 0.8, -0.1, -0.6, 0.3, 0.6, -0.2,
         ],
     )
-    .expect("valid IBP logit grid");
+    .expect("valid ordered Beta--Bernoulli logit grid");
     let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
     let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         coords,
         manifolds,
-        AssignmentMode::ibp_map(0.9, 1.4, false),
+        AssignmentMode::ordered_beta_bernoulli(0.9, 1.4, false),
     )
-    .expect("valid IBP assignment");
+    .expect("valid ordered Beta--Bernoulli assignment");
     let rho = SaeManifoldRho::new(0.23_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
     let (grad, _) =
-        assignment_prior_grad_hdiag(&assignment, &rho).expect("IBP assignment gradient");
+        assignment_prior_grad_hdiag(&assignment, &rho).expect("ordered Beta--Bernoulli assignment gradient");
     let idx = 5usize;
     let step = 1.0e-6_f64;
     let mut plus = assignment.clone();
@@ -379,11 +379,11 @@ pub(crate) fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
     assert_abs_diff_eq!(grad[idx], fd, epsilon = 2.0e-7);
 }
 
-/// #1038 assembly-site wiring: a live IBP-active multi-atom assembly must
+/// #1038 assembly-site wiring: a live ordered Beta--Bernoulli-active multi-atom assembly must
 /// emit the exact cross-row Woodbury source `IbpCrossRowSource` whose
 /// entries reproduce the NUMERICAL off-diagonal (`i≠j`) logit Hessian of the
 /// SAE objective end-to-end. The ONLY source of cross-row `i≠j` logit
-/// coupling is the IBP empirical-mass prior `M_k = Σ_i z_ik` (the data-fit
+/// coupling is the ordered Beta--Bernoulli empirical-mass prior `M_k = Σ_i z_ik` (the data-fit
 /// reconstruction of each row depends only on that row's own logits), so
 /// `∂²(assignment_prior_value)/∂ℓ_ik∂ℓ_jk = d_k·z'_ik·z'_jk` for `i≠j`, with
 /// `d_k = cross_row_d[k]` and `z'_ik = z_jac[i·K+k]` — exactly the rank-one
@@ -392,7 +392,7 @@ pub(crate) fn ibp_fixed_alpha_assignment_value_matches_logit_gradient_fd() {
 ///
 /// This certifies the assembly-site source matches the consumer's `U`/index
 /// convention bit-for-bit: each entry's `global_t_index` is the row's logit
-/// slot in the latent block (`row_offsets[i] + k` for the dense IBP layout),
+/// slot in the latent block (`row_offsets[i] + k` for the dense ordered Beta--Bernoulli layout),
 /// and the rank-one product against the central-difference Hessian closes.
 #[test]
 pub(crate) fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian() {
@@ -422,7 +422,7 @@ pub(crate) fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian()
     )
     .unwrap()
     .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
-    // IBP-active logits (positive ⇒ near-on gate, interior π so the
+    // ordered Beta--Bernoulli-active logits (positive ⇒ near-on gate, interior π so the
     // empirical-mass channel is live — `pi_jac ≠ 0`).
     let logits = array![[1.2, 0.4], [0.6, 1.0], [0.9, 0.3], [1.4, 0.7]];
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
@@ -432,7 +432,7 @@ pub(crate) fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian()
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.8, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.8, 1.0, false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
@@ -446,18 +446,18 @@ pub(crate) fn ibp_assembly_emits_cross_row_woodbury_source_matching_fd_hessian()
     let n = term.assignment.n_obs();
     let k = term.assignment.k_atoms();
 
-    // Assemble the live arrow system; it must now carry the IBP source.
+    // Assemble the live arrow system; it must now carry the ordered Beta--Bernoulli source.
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
-        .expect("IBP arrow assembly");
+        .expect("ordered Beta--Bernoulli arrow assembly");
     let source = sys
         .ibp_cross_row
         .as_ref()
-        .expect("an IBP-active assembly must emit the cross-row Woodbury source");
+        .expect("an ordered Beta--Bernoulli-active assembly must emit the cross-row Woodbury source");
     assert_eq!(source.r, k, "the rank must be the atom count K");
 
     // Rebuild the dense `U` and `d` the consumer sees from the sparse entries,
-    // and check the global-index convention is the dense IBP layout
+    // and check the global-index convention is the dense ordered Beta--Bernoulli layout
     // (`row_offsets[i] + k`), i.e. atom `k`'s logit slot of row `i`.
     let total_t = sys.row_offsets[n];
     let mut u = Array2::<f64>::zeros((total_t, k));
@@ -628,7 +628,7 @@ pub(crate) fn jumprelu_assignment_prior_hessian_diag_is_exact_over_logit_sweep()
 /// on a clean K=2 periodic torus signal, mirroring the failing
 /// reproducer in #174.
 #[test]
-pub(crate) fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
+pub(crate) fn ordered_beta_bernoulli_k2_periodic_torus_recovers_signal_with_lsq_init() {
     use faer::Side as FaerSide;
     use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 
@@ -700,7 +700,7 @@ pub(crate) fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
         jet_k.push(jet);
     }
 
-    // LSQ seed: joint design X = [0.5 * Phi_1 | 0.5 * Phi_2] (IBP-MAP
+    // LSQ seed: joint design X = [0.5 * Phi_1 | 0.5 * Phi_2] (ordered Beta--Bernoulli-MAP
     // logit 0 gives sigmoid(0/tau) = 0.5 for both atoms), solve normal
     // equations with a small ridge.
     let m_total = k * m;
@@ -752,12 +752,12 @@ pub(crate) fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
         Array2::<f64>::zeros((n, k)),
         coords_k,
         vec![LatentManifold::Circle { period: 1.0 }; k],
-        AssignmentMode::ibp_map(0.7, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, false),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-    // `lambda_sparse` is the IBP assignment-sparsity prior weight (now wired
-    // through `assignment_prior_grad_hdiag`'s IBP branch, #853). The
+    // `lambda_sparse` is the ordered Beta--Bernoulli assignment-sparsity prior weight (now wired
+    // through `assignment_prior_grad_hdiag`'s ordered Beta--Bernoulli branch, #853). The
     // Beta-Bernoulli BCE energy toward the self-referential empirical active
     // fraction has its global minimum at the all-off gate, so at the old
     // full weight (`log_lambda_sparse = 0 → λ = 1`) it overwhelmed the
@@ -797,7 +797,7 @@ pub(crate) fn ibp_map_k2_periodic_torus_recovers_signal_with_lsq_init() {
     let r2 = 1.0 - ssr / sst.max(1.0e-12);
     assert!(
         r2 > 0.5,
-        "K=2 periodic torus IBP-MAP R² = {r2:.4} (ssr={ssr:.4}, sst={sst:.4}) should be > 0.5 with LSQ-seeded decoder"
+        "K=2 periodic torus ordered Beta--Bernoulli-MAP R² = {r2:.4} (ssr={ssr:.4}, sst={sst:.4}) should be > 0.5 with LSQ-seeded decoder"
     );
     // Also confirm at least one atom remains active (assignment did not
     // collapse to ~0) — the active mass averaged over rows must exceed

@@ -26,7 +26,7 @@
 //!      difference of the analytic gradient) whenever the cross-Gram `C` is
 //!      nonzero — the two are not the same operator.
 //!
-//! Related: #810 (this fix), #809 (sibling IBPAssignmentPenalty diagonal-only
+//! Related: #810 (this fix), #809 (sibling OrderedBetaBernoulliPenalty diagonal-only
 //! hvp).
 
 use gam::terms::analytic_penalties::{AnalyticPenalty, DecoderIncoherencePenalty, PsiSlice};

@@ -137,7 +137,7 @@ def _fit(z_tr, z_te, k, topology, seed, n_iter, lift=None, x_te_raw=None):
         K=k,
         d_atom=1,
         atom_topology=topology,  # SEED only; structure search re-derives the dict
-        assignment="ibp_map",
+        assignment="ordered_beta_bernoulli",
         n_iter=n_iter,
         random_state=seed,
     )

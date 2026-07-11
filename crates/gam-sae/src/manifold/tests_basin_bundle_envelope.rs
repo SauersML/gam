@@ -85,7 +85,7 @@ fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
 
 /// Build a K-atom, d=1 periodic SAE term seeded the way the production cold path
 /// does (PCA-seed the per-atom coordinates, ridge-LSQ each per-atom decoder), with
-/// IBP-MAP assignment. Returns the term and the seed reconstruction dispersion.
+/// ordered Beta--Bernoulli-MAP assignment. Returns the term and the seed reconstruction dispersion.
 fn two_circle_periodic_term(
     z: ArrayView2<'_, f64>,
     k: usize,
@@ -138,7 +138,7 @@ fn two_circle_periodic_term(
     }
     let seed_dispersion = (rss / (k * n * p) as f64).max(1.0e-12);
     let logits = Array2::<f64>::from_elem((n, k), 6.0);
-    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let mode = AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false);
     let assignment =
         SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coords_blocks, manifolds, mode)
             .unwrap();
@@ -159,7 +159,7 @@ fn two_circle_objective(
 ) -> (SaeManifoldOuterObjective, Array2<f64>, Array1<f64>) {
     let z = two_circle_wide_target(n, p, 0.03);
     let (term, seed_dispersion) = two_circle_periodic_term(z.view(), k, harmonics);
-    let mode = AssignmentMode::ibp_map(1.0, 1.0, false);
+    let mode = AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false);
     let init_rho = SaeManifoldRho::new(0.02_f64.ln(), 1.0_f64.ln(), vec![array![0.0]; k])
         .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
         .unwrap();
@@ -196,7 +196,7 @@ fn reactive_rho_upper_face_comes_from_live_penalty_geometry() {
     assert_eq!(
         upper[0].to_bits(),
         seed[0].to_bits(),
-        "fixed-alpha IBP has no live assignment-strength coordinate to anneal"
+        "fixed-alpha ordered Beta--Bernoulli has no live assignment-strength coordinate to anneal"
     );
     for index in 3..upper.len() {
         assert_eq!(

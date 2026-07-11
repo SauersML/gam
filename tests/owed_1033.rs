@@ -142,7 +142,7 @@ fn build_term_with_n_rows(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ibp_map(0.5, 1.0, false),
+        AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
     )
     .unwrap();
     let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();

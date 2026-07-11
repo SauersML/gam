@@ -57,7 +57,7 @@ def test_reml_evidence_picks_k1_on_one_harmonic_data():
             K=k,
             atom_basis="periodic",
             d_atom=2,
-            assignment="ibp_map",
+            assignment="ordered_beta_bernoulli",
             n_iter=50,
             learning_rate=0.04,
             random_state=0,
