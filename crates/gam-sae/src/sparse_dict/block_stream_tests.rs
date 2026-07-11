@@ -4,7 +4,7 @@
 //! in-memory [`fit_block_sparse_dictionary`] on the concatenation.
 
 use super::BlockSparseStreamState;
-use super::test_support::ZeroBlockForTest;
+use super::test_support::BlockStreamTestAccess;
 use crate::sparse_dict::{
     BlockSparseConfig, block_gates, block_projections_row, fit_block_sparse_dictionary,
     reconstruct_row, route_row_blocks,
@@ -179,25 +179,51 @@ fn streaming_over_shards_matches_one_shot() {
 
 #[test]
 fn warm_start_persists_across_epochs() {
-    // A later epoch's pre-refresh EV (which sees frames refreshed by earlier epochs)
-    // must improve on the first epoch's — the frames/γ warm-start across calls.
+    // The second epoch's pre-refresh EV must be exactly the reconstruction emitted
+    // by the first epoch's refreshed frames/γ: partial_fit consumes the prior state
+    // instead of silently reseeding at the call boundary.
     let (p, b, g) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, g, b);
     let x = planted_data(&planted, g, b, p, 150);
     let mut cfg = config(g, b, 1);
-    cfg.max_epochs = 6;
+    cfg.max_epochs = 2;
+    cfg.aux_k = 0;
 
-    let mut state = BlockSparseStreamState::new(x.view(), &cfg).expect("fit_begin");
-    let mut evs = Vec::new();
-    for _ in 0..cfg.max_epochs {
-        state.partial_fit(x.view()).expect("partial_fit");
-        evs.push(state.end_epoch().expect("end_epoch").explained_variance);
-    }
+    // Tilt the seed away from the planted subspaces so the first refresh is
+    // observably different from initialization; a reset cannot pass vacuously.
+    let seed = Array2::<f32>::from_shape_fn(x.raw_dim(), |(row, col)| {
+        x[[row, col]] + 0.2 * ((row + 3 * col) as f32 * 0.11).sin()
+    });
+
+    let mut state = BlockSparseStreamState::new(seed.view(), &cfg).expect("fit_begin");
+    let (initial_decoder, initial_gamma) = state.model_snapshot_for_test();
+    state.partial_fit(x.view()).expect("first partial_fit");
+    state.end_epoch().expect("first end_epoch");
+    let (warm_decoder, warm_gamma) = state.model_snapshot_for_test();
+
+    let decoder_change = initial_decoder
+        .iter()
+        .zip(warm_decoder.iter())
+        .map(|(&before, &after)| {
+            let delta = f64::from(after - before);
+            delta * delta
+        })
+        .sum::<f64>()
+        .sqrt();
     assert!(
-        evs[evs.len() - 1] > evs[0] + 1.0e-4,
-        "later-epoch EV {} must improve on first-epoch EV {} (warm-start persisted)",
-        evs[evs.len() - 1],
-        evs[0]
+        decoder_change > 1.0e-4 || f64::from(warm_gamma - initial_gamma).abs() > 1.0e-4,
+        "first epoch must materially refresh decoder/gamma so the handoff check is non-vacuous"
+    );
+
+    let expected_second_ev = model_ev(x.view(), &warm_decoder, warm_gamma, g, b, cfg.block_topk);
+    state.partial_fit(x.view()).expect("second partial_fit");
+    let second = state.end_epoch().expect("second end_epoch");
+
+    assert!(
+        (second.explained_variance - expected_second_ev).abs() <= 1.0e-10,
+        "second pass EV {} must use the exact first-epoch decoder/gamma (expected {})",
+        second.explained_variance,
+        expected_second_ev
     );
 }
 

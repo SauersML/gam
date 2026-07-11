@@ -1052,19 +1052,26 @@ fn validate_config(config: &BlockSparseConfig) -> Result<(), String> {
 
 #[cfg(test)]
 mod test_support {
+    use ndarray::Array2;
+
     use super::BlockSparseStreamState;
 
-    pub(super) trait ZeroBlockForTest {
+    pub(super) trait BlockStreamTestAccess {
         fn zero_block_for_test(&mut self, block: usize);
+        fn model_snapshot_for_test(&self) -> (Array2<f32>, f32);
     }
 
-    impl ZeroBlockForTest for BlockSparseStreamState {
+    impl BlockStreamTestAccess for BlockSparseStreamState {
         fn zero_block_for_test(&mut self, block: usize) {
             for r in 0..self.b {
                 for c in 0..self.p {
                     self.decoder[[block * self.b + r, c]] = 0.0;
                 }
             }
+        }
+
+        fn model_snapshot_for_test(&self) -> (Array2<f32>, f32) {
+            (self.decoder.clone(), self.gamma)
         }
     }
 }
