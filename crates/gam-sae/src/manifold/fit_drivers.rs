@@ -6645,6 +6645,72 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// Deterministic alternating block-sweep engine: decoder-LSQ →
+    /// per-row coordinate reprojection (global companion-matrix solves) →
+    /// decoder-LSQ, repeated to its penalized-objective fixed point.
+    ///
+    /// Each round is committed ONLY on a strict decrease of
+    /// `penalized_objective_total` (the one scalar the whole inner stack
+    /// prices), else the pre-round state is restored bit-for-bit and the loop
+    /// stops — so the sweep map is monotone, deterministic given the seed, and
+    /// can never worsen the state. Frames-active fits are skipped (the decoder
+    /// LSQ writes the full-`B` layout, which would desync the factored
+    /// frames); callers must not invoke this under the `max_iter == 0` freeze
+    /// contract (a decoder refit would overwrite the warm-started β).
+    ///
+    /// This is the stage-4 primary engine (#2228): at fixed gates the decoder
+    /// block is an exactly solvable penalized linear LS and the coordinate
+    /// block decouples per row with globally enumerable solutions, so sweeps
+    /// do in O(1) exact block solves what the majorized joint Newton needs
+    /// O(10²–10³) linear-rate iterations for. Returns whether any round was
+    /// committed.
+    pub(crate) fn sweep_blocks_to_objective_fixed_point(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<bool, String> {
+        if self.frames_active() {
+            return Ok(false);
+        }
+        let mut best_objective =
+            self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+        if !best_objective.is_finite() {
+            return Ok(false);
+        }
+        let mut moved = false;
+        loop {
+            let snapshot = self.snapshot_mutable_state();
+            let round = self
+                .refit_decoder_least_squares_at_current_state(target, Some(rho))
+                .and_then(|()| self.seed_coords_by_decoder_projection(target))
+                .and_then(|()| {
+                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))
+                })
+                .and_then(|()| {
+                    self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                });
+            // Commit only on a STRICT decrease of the penalized objective,
+            // scaled by the objective magnitude so the test is meaningful at
+            // any loss scale. Anything else (already-converged decoder, a
+            // round that traded data-fit for penalty, or a refit/projection
+            // failure) restores the pre-round state and stops.
+            let accept_floor =
+                SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + best_objective.abs());
+            match round {
+                Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
+                    best_objective = value;
+                    moved = true;
+                }
+                _ => {
+                    self.restore_mutable_state(&snapshot)?;
+                    break;
+                }
+            }
+        }
+        Ok(moved)
+    }
+
     /// Allocate one zero `(M_k × M_k)` Gram accumulator per atom for the
     /// chunk-aware decoder identifiability audit.
     pub(crate) fn empty_decoder_gram_accumulator(&self) -> Vec<Array2<f64>> {
