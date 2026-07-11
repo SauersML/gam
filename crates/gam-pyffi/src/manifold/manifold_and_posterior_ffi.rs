@@ -6565,16 +6565,23 @@ fn manifold_sae_resident_fisher_metric(
     let p_out = payload.fitted.first().map_or(0, Vec::len);
     match &payload.fisher_factors {
         None => {
-            if payload.fisher_provenance.is_some()
-                || payload.fisher_mass_residual.is_some()
-                || payload.metric_provenance != "Euclidean"
-            {
+            if payload.fisher_provenance.is_some() || payload.fisher_mass_residual.is_some() {
                 return Err(py_value_error(
-                    "ManifoldSAE: a Euclidean model cannot carry Fisher provenance, mass, or a non-Euclidean metric label"
+                    "ManifoldSAE: Fisher provenance and residual mass require retained fisher_factors"
                         .to_string(),
                 ));
             }
-            Ok(None)
+            match payload.metric_provenance.as_str() {
+                // A structured-residual fit uses its estimated whitening metric
+                // while fitting, but the artifact retains no output-behavior
+                // shard. Steering is therefore geometry-only after load, just as
+                // it is for Euclidean fits; the persisted provenance remains an
+                // honest account of the metric used to fit the dictionary.
+                "Euclidean" | "WhitenedStructured" => Ok(None),
+                provenance => Err(py_value_error(format!(
+                    "ManifoldSAE: metric provenance {provenance:?} requires retained fisher_factors"
+                ))),
+            }
         }
         Some(factors) => {
             let provenance = payload.fisher_provenance.as_deref().ok_or_else(|| {
