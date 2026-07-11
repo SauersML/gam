@@ -2879,15 +2879,29 @@ where
                     )));
                 }
                 if meanvar == f64::INFINITY {
-                    // The exact response-variance integral overflowed (a
-                    // degenerate fit can leave se_eta in the thousands). The
-                    // mathematical variance is then larger than anything
-                    // representable, so the honest SE is +inf — an
-                    // infinite-width interval that support clamping reduces to
-                    // the family's full response range. Substituting the
-                    // (finite, often tiny) delta-method SE here fabricated
-                    // precision the posterior does not have.
-                    return Ok(f64::INFINITY);
+                    // The exact response-variance integral E[g⁻¹(η)²]−E[g⁻¹(η)]²
+                    // overflowed f64. A degenerate fit — an all-zero-count
+                    // Poisson/NB whose likelihood is flat as η→−∞ — leaves the
+                    // penalized Hessian near-singular with se_eta in the
+                    // thousands, so the Laplace–lognormal moment integral is
+                    // dominated by the far Gaussian tail, a region where the
+                    // Gaussian (Laplace) approximation to the true log-concave,
+                    // data-bounded η-posterior is invalid. The +inf is a
+                    // numerical artifact of that invalid tail, not the fit's
+                    // actual spread: its plug-in rate g⁻¹(η̂) is ~0, so an
+                    // infinite-width response interval is exactly wrong, and it
+                    // serializes to JSON null and crashes the Python shaper —
+                    // breaking the locked #1515 contract that a fitted model
+                    // stay predictable. Degrade to the delta-method SE
+                    // |dμ/dη|·se_eta: the first-order posterior spread evaluated
+                    // AT the mode, where the Gaussian approximation IS valid.
+                    // This is the same finite fallback `enrich_posterior_mean_bounds`
+                    // applies and is self-consistent with the plug-in response
+                    // mean g⁻¹(η̂) the posterior-mean path reports. Fires ONLY on
+                    // a non-finite exact integral, so every well-posed fit still
+                    // reports the exact response SE.
+                    let dmu_deta = strategy.inverse_link_jet(eta[i])?.d1;
+                    return Ok(dmu_deta.abs() * se_i);
                 }
                 Ok(meanvar.max(0.0).sqrt())
             })
@@ -3344,6 +3358,89 @@ mod tests {
         assert!(
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
+        );
+    }
+
+    #[test]
+    fn degenerate_poisson_interval_falls_back_to_finite_delta_se() {
+        // #2255/#1515: a degenerate all-zero-count Poisson fit leaves the
+        // penalized Hessian near-singular (se_eta in the thousands), so the
+        // EXACT log-normal response variance Var[exp(η)] = exp(2η+s²)·expm1(s²)
+        // overflows f64 to +inf. The interval path must NOT surface +inf (an
+        // infinite-width interval clamps to the unbounded Poisson support and
+        // serializes to a non-finite column that crashes the Python shaper);
+        // it must degrade to the delta-method SE |dμ/dη|·se_eta = exp(η̂)·se_eta,
+        // finite and self-consistent with the plug-in mean exp(η̂).
+        let x = array![[1.0_f64]];
+        let eta_hat = -23.0_f64; // ≈ ln(1e-10): the ~0 MLE rate for all-zero counts
+        let beta = array![eta_hat];
+        let offset = array![0.0_f64];
+        // Var(η) = 1e7 ⇒ se_eta ≈ 3162, forcing the exact variance to overflow.
+        let etavar = 1.0e7_f64;
+        let covariance = array![[etavar]];
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let spec = gam_spec::LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        );
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            spec,
+            &covariance,
+            &options,
+        )
+        .expect("degenerate Poisson interval prediction");
+
+        // Guard: this scenario really does overflow the exact integral, so we
+        // are exercising the fallback and not the ordinary exact-SE path.
+        let s2 = etavar;
+        let exact_var = (2.0 * eta_hat + s2).exp() * s2.exp_m1();
+        assert!(
+            !exact_var.is_finite(),
+            "test setup must overflow the exact variance integral, got {exact_var}"
+        );
+
+        let se = pred.mean_standard_error[0];
+        let se_eta = etavar.sqrt();
+        let expected = eta_hat.exp() * se_eta; // delta-method SE = exp(η̂)·se_eta
+        assert!(se.is_finite(), "degenerate-fit mean SE must be finite, got {se}");
+        assert!(
+            (se - expected).abs() <= 1e-9 * expected.max(1e-30),
+            "expected delta-method SE {expected:e}, got {se:e}"
+        );
+
+        // Mean and both interval bounds must be finite and near-zero, and the
+        // interval must bracket the mean.
+        assert!(
+            pred.mean[0].is_finite() && pred.mean[0] >= 0.0,
+            "response mean must be finite and non-negative, got {}",
+            pred.mean[0]
+        );
+        assert!(
+            pred.mean_lower[0].is_finite() && pred.mean_upper[0].is_finite(),
+            "interval bounds must be finite: [{}, {}]",
+            pred.mean_lower[0],
+            pred.mean_upper[0]
+        );
+        assert!(pred.mean_lower[0] <= pred.mean[0] + 1e-12);
+        assert!(pred.mean[0] <= pred.mean_upper[0] + 1e-12);
+        assert!(
+            pred.mean_upper[0] < 1.0,
+            "all-zero-count rate must stay near zero, got upper {}",
+            pred.mean_upper[0]
         );
     }
 
