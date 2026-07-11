@@ -6024,7 +6024,7 @@ impl<'d> ExactJointDesignCache<'d> {
     impl_exact_joint_theta_memo!();
 
     /// Cache a cost-only result. Called after `ensure_theta(theta)` for
-    /// line-search probes that pay only for the cost evaluation. We
+    /// line-search probes and value-only seed prewarming. We
     /// intentionally do not populate `last_eval` because no gradient was
     /// computed; the next outer evaluation at this θ will recompute
     /// (V, ∇V) via `evaluate_with_order` if the optimizer asks for it.
@@ -6744,8 +6744,10 @@ where
             if let Some((cost, grad, hess)) = ctx.cache.memoized_eval(theta) {
                 let cached_satisfies_order = match order {
                     OuterEvalOrder::Value => true,
-                    OuterEvalOrder::ValueAndGradient => true,
-                    OuterEvalOrder::ValueGradientHessian => hess.is_analytic(),
+                    OuterEvalOrder::ValueAndGradient => grad.len() == theta.len(),
+                    OuterEvalOrder::ValueGradientHessian => {
+                        grad.len() == theta.len() && hess.is_analytic()
+                    }
                 };
                 if cached_satisfies_order {
                     if !cost.is_finite() {
@@ -6791,9 +6793,12 @@ where
             // top-of-function declaration so the optimizer and the
             // evaluator never disagree on what was requested.
             let clamped = outer_derivative_policy.order_for_evaluation(order);
+            let value_only = matches!(clamped, OuterEvalOrder::Value);
             let need_hessian = matches!(clamped, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
-            let eval_mode = if need_hessian {
+            let eval_mode = if value_only {
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly
+            } else if need_hessian {
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
             } else {
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
@@ -6818,7 +6823,11 @@ where
             );
             match result {
                 Ok((cost, grad, hess)) => {
-                    ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
+                    if value_only {
+                        ctx.cache.store_cost_only(theta, cost);
+                    } else {
+                        ctx.cache.store_eval((cost, grad.clone(), hess.clone()));
+                    }
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
                     }

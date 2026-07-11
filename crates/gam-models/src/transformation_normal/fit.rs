@@ -10,23 +10,67 @@ pub(crate) struct TransformationExactGeometryCache {
     pub(crate) derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
 }
 
-#[derive(Clone)]
-pub(crate) struct TransformationExactWarmStart {
-    pub(crate) theta: Array1<f64>,
-    pub(crate) warm_start: CustomFamilyWarmStart,
+#[derive(Default)]
+pub(crate) struct TransformationExactModeBranch {
+    continuation: Option<CustomFamilyWarmStart>,
+    anchor: Option<CustomFamilyWarmStart>,
+    frozen: bool,
 }
 
-impl TransformationExactWarmStart {
-    pub(crate) fn is_compatible_with(&self, theta: &Array1<f64>, rho: &Array1<f64>) -> bool {
-        const MAX_THETA_DISTANCE: f64 = 1.5;
+impl TransformationExactModeBranch {
+    pub(crate) fn warm_start(&self, rho: &Array1<f64>) -> Option<CustomFamilyWarmStart> {
+        self.anchor
+            .as_ref()
+            .or(self.continuation.as_ref())
+            .filter(|warm| warm.compatible_with_rho(rho))
+            .cloned()
+    }
 
-        self.theta.len() == theta.len()
-            && self
-                .theta
-                .iter()
-                .zip(theta.iter())
-                .all(|(&a, &b)| (a - b).abs() <= MAX_THETA_DISTANCE)
-            && self.warm_start.compatible_with_rho(rho)
+    /// Before the branch is frozen, compare a cold solve with the carried
+    /// continuation at every value-only prewarm point. This is a deterministic
+    /// mode-selection rule based on the profiled criterion, not coefficient
+    /// magnitude or cache distance. After freezing, expose only the anchor.
+    pub(crate) fn candidates(
+        &mut self,
+        eval_mode: gam_problem::EvalMode,
+        rho: &Array1<f64>,
+    ) -> (bool, Vec<Option<CustomFamilyWarmStart>>) {
+        let froze = self.prepare(eval_mode);
+        if !self.frozen {
+            let continuation = self
+                .continuation
+                .as_ref()
+                .filter(|warm| warm.compatible_with_rho(rho))
+                .cloned();
+            return match continuation {
+                Some(warm) => (froze, vec![None, Some(warm)]),
+                None => (froze, vec![None]),
+            };
+        }
+        (froze, vec![self.warm_start(rho)])
+    }
+
+    /// Freeze the INPUT mode for the first derivative-bearing seed evaluation.
+    /// Freezing before the solve makes that seed evaluation and every later
+    /// evaluation at the same theta restart from bit-identical coefficients.
+    pub(crate) fn prepare(&mut self, eval_mode: gam_problem::EvalMode) -> bool {
+        if self.frozen || matches!(eval_mode, gam_problem::EvalMode::ValueOnly) {
+            return false;
+        }
+        self.anchor = self.continuation.take();
+        self.frozen = true;
+        true
+    }
+
+    /// Value-only prewarm is the sole phase allowed to advance the continuation.
+    pub(crate) fn record_value(
+        &mut self,
+        eval_mode: gam_problem::EvalMode,
+        warm_start: CustomFamilyWarmStart,
+    ) {
+        if !self.frozen && matches!(eval_mode, gam_problem::EvalMode::ValueOnly) {
+            self.continuation = Some(warm_start);
+        }
     }
 }
 
@@ -338,8 +382,13 @@ pub fn fit_transformation_normal(
         );
     }
 
-    // Shared mutable state for warm-starting across optimizer iterations.
-    let exact_warm_start: RefCell<Option<TransformationExactWarmStart>> = RefCell::new(None);
+    // SCOP's squared shape coordinates make the coefficient objective
+    // non-convex. Value-only prewarming compares cold and continuation modes;
+    // the first derivative-bearing evaluation freezes the selected mode's
+    // INPUT as the branch anchor. Every later trial restarts from that fixed
+    // anchor, making the profile independent of rejected-trial cache history.
+    let exact_mode_branch: RefCell<TransformationExactModeBranch> =
+        RefCell::new(TransformationExactModeBranch::default());
 
     let joint_setup =
         ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
@@ -427,21 +476,16 @@ pub fn fit_transformation_normal(
         Ok(())
     };
 
-    let compatible_warm_start =
-        |theta: &Array1<f64>, rho: &Array1<f64>| -> Option<CustomFamilyWarmStart> {
-            exact_warm_start
-                .borrow()
-                .as_ref()
-                .filter(|warm| warm.is_compatible_with(theta, rho))
-                .map(|warm| warm.warm_start.clone())
-        };
-    let store_warm_start = |theta: &Array1<f64>, warm_start: CustomFamilyWarmStart| {
-        exact_warm_start
-            .borrow_mut()
-            .replace(TransformationExactWarmStart {
-                theta: theta.clone(),
-                warm_start,
-            });
+    let exact_mode_candidates = |eval_mode: gam_problem::EvalMode,
+                                 rho: &Array1<f64>|
+     -> Vec<Option<CustomFamilyWarmStart>> {
+        let (froze, candidates) = exact_mode_branch.borrow_mut().candidates(eval_mode, rho);
+        if froze {
+            log::info!(
+                "[transformation-normal] froze deterministic exact coefficient-mode branch at the first derivative-bearing outer seed evaluation"
+            );
+        }
+        candidates
     };
 
     log::info!(
@@ -484,7 +528,7 @@ pub fn fit_transformation_normal(
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             geometry.update_initial_log_lambdas(&rho)?;
-            let warm_start = compatible_warm_start(theta, &rho);
+            let warm_start = exact_mode_branch.borrow().warm_start(&rho);
             let fit = fit_custom_family_fixed_log_lambdas(
                 &geometry.family,
                 &geometry.blocks,
@@ -542,37 +586,69 @@ pub fn fit_transformation_normal(
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let warm_start = compatible_warm_start(theta, &rho);
-
-            let eval = evaluate_custom_family_joint_hyper(
-                &geometry.family,
-                &geometry.blocks,
-                &options,
-                &rho,
-                &geometry.derivative_blocks,
-                warm_start.as_ref(),
-                eval_mode,
-            )
-            .map_err(|e| format!("transformation exact_fn: {e}"))?;
-
-            if !eval.objective.is_finite() {
-                log::warn!(
-                    "transformation exact joint returned non-finite objective: eval_mode={:?} rho={:?} gradient_len={}",
+            let warm_starts = exact_mode_candidates(eval_mode, &rho);
+            let competing_modes = warm_starts.len() > 1;
+            let mut selected_eval = None;
+            let mut selected_source = "anchor";
+            for (candidate_idx, warm_start) in warm_starts.iter().enumerate() {
+                let candidate = evaluate_custom_family_joint_hyper(
+                    &geometry.family,
+                    &geometry.blocks,
+                    &options,
+                    &rho,
+                    &geometry.derivative_blocks,
+                    warm_start.as_ref(),
                     eval_mode,
-                    rho,
-                    eval.gradient.len(),
+                )
+                .map_err(|e| {
+                    format!("transformation exact_fn mode candidate {candidate_idx}: {e}")
+                })?;
+                if !candidate.inner_converged {
+                    return Err(format!(
+                        "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}, mode_candidate={candidate_idx}"
+                    ));
+                }
+                if !candidate.objective.is_finite()
+                    || candidate.gradient.iter().any(|value| !value.is_finite())
+                {
+                    return Err(format!(
+                        "transformation exact joint returned non-finite criterion for eval_mode={eval_mode:?}, mode_candidate={candidate_idx}"
+                    ));
+                }
+                let source = if candidate_idx == 0 {
+                    "cold"
+                } else {
+                    "continuation"
+                };
+                if competing_modes {
+                    log::info!(
+                        "[transformation-normal] exact coefficient-mode prewarm candidate source={} objective={:.16e}",
+                        source,
+                        candidate.objective,
+                    );
+                }
+                if selected_eval.as_ref().is_none_or(
+                    |best: &gam_custom_family::CustomFamilyJointHyperResult| {
+                        candidate.objective < best.objective
+                    },
+                ) {
+                    selected_eval = Some(candidate);
+                    selected_source = source;
+                }
+            }
+            let eval = selected_eval.ok_or_else(|| {
+                "transformation exact joint produced no coefficient-mode candidate".to_string()
+            })?;
+            if competing_modes {
+                log::info!(
+                    "[transformation-normal] selected exact coefficient-mode prewarm source={} objective={:.16e}",
+                    selected_source,
+                    eval.objective,
                 );
             }
-
-            if eval.objective.is_finite() && eval.gradient.iter().all(|value| value.is_finite()) {
-                store_warm_start(theta, eval.warm_start.clone());
-            }
-
-            if !eval.inner_converged {
-                return Err(format!(
-                    "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}; cached warm start for retry"
-                ));
-            }
+            exact_mode_branch
+                .borrow_mut()
+                .record_value(eval_mode, eval.warm_start.clone());
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
@@ -583,7 +659,10 @@ pub fn fit_transformation_normal(
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
-            let warm_start = compatible_warm_start(theta, &rho);
+            let warm_start = exact_mode_candidates(gam_problem::EvalMode::ValueAndGradient, &rho)
+                .into_iter()
+                .next()
+                .expect("a frozen CTN branch always has one EFS candidate");
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
@@ -593,11 +672,9 @@ pub fn fit_transformation_normal(
                 warm_start.as_ref(),
             )
             .map_err(|e| format!("transformation exact_efs_fn: {e}"))?;
-            store_warm_start(theta, eval.warm_start.clone());
             if !eval.inner_converged {
                 return Err(
-                    "transformation exact joint EFS inner solve did not converge; cached warm start for retry"
-                        .to_string(),
+                    "transformation exact joint EFS inner solve did not converge".to_string(),
                 );
             }
             Ok(eval.efs_eval)

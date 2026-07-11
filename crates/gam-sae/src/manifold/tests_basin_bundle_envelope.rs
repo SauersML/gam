@@ -176,6 +176,33 @@ fn two_circle_objective(
     (objective, z, seed)
 }
 
+#[test]
+fn reactive_rho_upper_face_comes_from_live_penalty_geometry() {
+    let (objective, _z, seed) = two_circle_objective(96, 48, 2, 2, 8);
+    let upper = OuterObjective::outer_domain_upper_bound(&objective)
+        .expect("reactive rho domain construction must succeed")
+        .expect("dense K=2 objective must advertise a legal upper face");
+    eprintln!("[#2080] geometry-derived reactive rho upper={upper:?}, target={seed:?}");
+    assert_eq!(upper.len(), seed.len());
+    assert!(upper.iter().all(|value| value.is_finite()));
+    assert!(
+        upper
+            .iter()
+            .zip(seed.iter())
+            .all(|(entry, target)| entry >= target),
+        "the legal entry {upper:?} must contain the literal target {seed:?}"
+    );
+    assert_eq!(
+        upper[0].to_bits(),
+        seed[0].to_bits(),
+        "fixed-alpha IBP has no live assignment-strength coordinate to anneal"
+    );
+    assert!(
+        upper.iter().skip(1).all(|value| *value < 30.0),
+        "live smoothing/ARD bounds must come from curvature geometry, not generic +30: {upper:?}"
+    );
+}
+
 /// (A) A two-basin fit engages the envelope, keeps the bundle BOUNDED by the
 /// exact, memory-admitted envelope and still fits. The member count must remain
 /// within the cgroup-aware retained-state capacity; reaching that capacity is a

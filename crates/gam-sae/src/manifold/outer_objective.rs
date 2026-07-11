@@ -3413,6 +3413,205 @@ fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
     }
 }
 
+/// Exact scale of the decoder data curvature relative to one unit of an
+/// atom's native smoothing penalty. The trace of `P⁺G` bounds the largest
+/// generalized eigenvalue of `(G, P)` on `range(P)`, so choosing
+/// `lambda >= tr(P⁺G)` makes the native penalty at least as strong as the
+/// likelihood on every penalized decoder direction. Null directions remain
+/// identified by the likelihood and are deliberately absent from this scale.
+fn reactive_smooth_curvature_scale(
+    term: &SaeManifoldTerm,
+    assignments: &Array2<f64>,
+    atom_idx: usize,
+) -> Result<Option<f64>, String> {
+    let atom = &term.atoms[atom_idx];
+    let m = atom.basis_values.ncols();
+    if atom.smooth_penalty.dim() != (m, m) {
+        return Err(format!(
+            "reactive rho domain: atom {atom_idx} smooth penalty shape {:?} != ({m}, {m})",
+            atom.smooth_penalty.dim()
+        ));
+    }
+    let (rank, penalty_pinv) =
+        gam_linalg::utils::block_penalty_rank_and_pinv(&atom.smooth_penalty)
+            .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
+    if rank == 0 {
+        return Ok(None);
+    }
+
+    let whitens = term
+        .row_metric
+        .as_ref()
+        .is_some_and(gam_problem::RowMetric::whitens_likelihood);
+    let mut data_gram = Array2::<f64>::zeros((m, m));
+    for row in 0..term.n_obs() {
+        let honesty_weight = term
+            .row_loss_weights
+            .as_ref()
+            .map_or(1.0, |weights| weights[row]);
+        let metric_norm_bound = match term.row_metric.as_ref() {
+            Some(metric) if whitens => metric.row_traces()[row],
+            _ => 1.0,
+        };
+        let gate = assignments[[row, atom_idx]];
+        let weight = honesty_weight * metric_norm_bound * gate * gate;
+        if !(weight.is_finite() && weight >= 0.0) {
+            return Err(format!(
+                "reactive rho domain: atom {atom_idx} row {row} has invalid data-curvature weight {weight}"
+            ));
+        }
+        for left in 0..m {
+            let weighted_left = weight * atom.basis_values[[row, left]];
+            for right in 0..m {
+                data_gram[[left, right]] +=
+                    weighted_left * atom.basis_values[[row, right]];
+            }
+        }
+    }
+
+    let mut generalized_trace = 0.0_f64;
+    for row in 0..m {
+        for col in 0..m {
+            generalized_trace += penalty_pinv[[row, col]] * data_gram[[col, row]];
+        }
+    }
+    if !(generalized_trace.is_finite() && generalized_trace >= 0.0) {
+        return Err(format!(
+            "reactive rho domain: atom {atom_idx} generalized decoder curvature is invalid ({generalized_trace})"
+        ));
+    }
+    Ok((generalized_trace > 0.0).then_some(generalized_trace))
+}
+
+/// Exact observed Gauss--Newton scale of one latent coordinate at the diffuse
+/// scalar entry. Native ARD curvature has unit coefficient before multiplying
+/// by `alpha`, so this is the data-curvature-matching precision for that axis.
+fn reactive_ard_curvature_scale(
+    term: &SaeManifoldTerm,
+    assignments: &Array2<f64>,
+    atom_idx: usize,
+    axis: usize,
+) -> Result<f64, String> {
+    let atom = &term.atoms[atom_idx];
+    let p = atom.decoder_coefficients.ncols();
+    let m = atom.decoder_coefficients.nrows();
+    if atom.basis_jacobian.dim().1 != m || axis >= atom.basis_jacobian.dim().2 {
+        return Err(format!(
+            "reactive rho domain: atom {atom_idx} axis {axis} is incompatible with basis Jacobian {:?} and decoder {:?}",
+            atom.basis_jacobian.dim(),
+            atom.decoder_coefficients.dim()
+        ));
+    }
+    let whitens = term
+        .row_metric
+        .as_ref()
+        .is_some_and(gam_problem::RowMetric::whitens_likelihood);
+    let mut tangent = vec![0.0_f64; p];
+    let mut maximum = 0.0_f64;
+    for row in 0..term.n_obs() {
+        tangent.fill(0.0);
+        let gate = assignments[[row, atom_idx]];
+        for basis in 0..m {
+            let coefficient = gate * atom.basis_jacobian[[row, basis, axis]];
+            for out in 0..p {
+                tangent[out] += coefficient * atom.decoder_coefficients[[basis, out]];
+            }
+        }
+        let tangent_norm_sq = match term.row_metric.as_ref() {
+            Some(metric) if whitens => metric
+                .whiten_residual_row(row, ArrayView1::from(tangent.as_slice()))
+                .into_iter()
+                .map(|value| value * value)
+                .sum::<f64>(),
+            _ => tangent.iter().map(|value| value * value).sum(),
+        };
+        let honesty_weight = term
+            .row_loss_weights
+            .as_ref()
+            .map_or(1.0, |weights| weights[row]);
+        let curvature = honesty_weight * tangent_norm_sq;
+        if !(curvature.is_finite() && curvature >= 0.0) {
+            return Err(format!(
+                "reactive rho domain: atom {atom_idx} axis {axis} row {row} has invalid latent data curvature {curvature}"
+            ));
+        }
+        maximum = maximum.max(curvature);
+    }
+    Ok(maximum)
+}
+
+/// Objective-owned legal rho upper face for dense reactive SAE fits.
+///
+/// The generic `+30` box corresponds to a penalty strength around `1e13` and
+/// is outside the SAE objective's structural domain: it drives the dictionary
+/// below the exact signal-free null floor before continuation can start. This
+/// contract instead uses the objective's literal entry assignments and native
+/// penalty geometry. Decoder smoothness is bounded by `tr(P⁺G)`; each ARD axis
+/// is bounded by its observed latent Gauss--Newton curvature. Every bound is at
+/// least the literal target strength. No criterion probe or fitted-state trial
+/// participates in constructing the box.
+fn reactive_rho_domain_upper(
+    term: &SaeManifoldTerm,
+    rho: &SaeManifoldRho,
+    entry_temperature: f64,
+) -> Result<Array1<f64>, String> {
+    let mut entry_term = term.clone();
+    entry_term
+        .assignment
+        .mode
+        .set_temperature(entry_temperature)?;
+    entry_term.temperature_schedule = None;
+    let assignments = entry_term.assignment.try_assignments()?;
+    let target = rho.to_flat();
+    let mut upper = target.clone();
+    let mut largest_native_scale = 0.0_f64;
+
+    for atom_idx in 0..rho.k_atoms() {
+        if let Some(scale) =
+            reactive_smooth_curvature_scale(&entry_term, &assignments, atom_idx)?
+        {
+            largest_native_scale = largest_native_scale.max(scale);
+            let index = rho.smooth_flat_index(atom_idx);
+            let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+            upper[index] = target_strength.max(scale).ln();
+        }
+        for axis in 0..rho.log_ard[atom_idx].len() {
+            let scale =
+                reactive_ard_curvature_scale(&entry_term, &assignments, atom_idx, axis)?;
+            largest_native_scale = largest_native_scale.max(scale);
+            let index = rho.ard_flat_index(atom_idx, axis);
+            let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+            upper[index] = upper[index].max(target_strength.max(scale).ln());
+        }
+    }
+
+    // Fixed-alpha IBP carries no assignment-strength dependence. Every other
+    // present assignment coordinate is capped on the same largest observed
+    // native-curvature scale, rather than inheriting the unrelated generic
+    // `exp(30)` strength.
+    if let Some(index) = rho.sparse_flat_index()
+        && !matches!(
+            entry_term.assignment.mode,
+            AssignmentMode::IBPMap {
+                learnable_alpha: false,
+                ..
+            }
+        )
+        && largest_native_scale > 0.0
+    {
+        let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+        upper[index] = target_strength.max(largest_native_scale).ln();
+    }
+
+    if upper.iter().all(|value| value.is_finite()) {
+        Ok(upper)
+    } else {
+        Err(format!(
+            "reactive rho domain produced a non-finite upper face: {upper:?}"
+        ))
+    }
+}
+
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let streaming_plan = self.term.streaming_plan();
@@ -3888,6 +4087,19 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // saw; drop them so the envelope re-seeds from the seeded accepted basin.
         self.basin_bundle.clear();
         Ok(SeedOutcome::Installed)
+    }
+
+    fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        let Some(contract) = self.reactive_domain_scalar_contract()? else {
+            return Ok(None);
+        };
+        reactive_rho_domain_upper(
+            &self.baseline_term,
+            &self.baseline_rho,
+            contract.entry().assignment_temperature,
+        )
+        .map(Some)
+        .map_err(EstimationError::RemlOptimizationFailed)
     }
 
     /// Dense K≥2 joint fits may have undefined Laplace evidence at the literal

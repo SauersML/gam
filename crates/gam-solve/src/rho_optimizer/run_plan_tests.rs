@@ -3368,6 +3368,7 @@ struct ReactiveDomainObjective {
     domain_open: bool,
     exact_seed_value_evals: usize,
     off_seed_value_evals: usize,
+    rho_value_evals: Vec<f64>,
     derivative_evals: usize,
     installed_scalar_states: Vec<crate::continuation_path::ContinuationScalarState>,
     checkpoint_domain_open: Option<bool>,
@@ -3381,6 +3382,7 @@ impl ReactiveDomainObjective {
             domain_open: matches!(mode, ReactiveDomainMode::FiniteAtColdSeed),
             exact_seed_value_evals: 0,
             off_seed_value_evals: 0,
+            rho_value_evals: Vec::new(),
             derivative_evals: 0,
             installed_scalar_states: Vec::new(),
             checkpoint_domain_open: None,
@@ -3422,6 +3424,7 @@ impl OuterObjective for ReactiveDomainObjective {
     }
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.rho_value_evals.push(rho[0]);
         if self.is_exact_seed(rho) {
             self.exact_seed_value_evals += 1;
         } else {
@@ -3454,6 +3457,10 @@ impl OuterObjective for ReactiveDomainObjective {
 
     fn seed_inner_state(&mut self, _: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         Ok(SeedOutcome::NoSlot)
+    }
+
+    fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(Some(array![2.5]))
     }
 
     fn reactive_domain_scalar_contract(
@@ -3622,6 +3629,20 @@ fn reactive_domain_entry_repairs_nonfinite_seed_from_heavy_side() {
     assert!(
         objective.off_seed_value_evals > 0,
         "the initially undefined seed must activate heavy continuation work"
+    );
+    assert!(
+        objective
+            .rho_value_evals
+            .iter()
+            .any(|rho| rho.to_bits() == 2.5_f64.to_bits()),
+        "reactive entry must evaluate the objective-owned legal upper face"
+    );
+    assert!(
+        objective
+            .rho_value_evals
+            .iter()
+            .all(|rho| rho.to_bits() != 30.0_f64.to_bits()),
+        "the generic +30 box must not leak past an objective-domain contract"
     );
     assert!(
         objective.exact_seed_value_evals >= 2,
