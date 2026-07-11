@@ -41,7 +41,7 @@ __all__ = [
     "call_rust_value_grad",
     "jax_value_grad_from_rust",
     "ard_descriptor",
-    "ibp_assignment_descriptor",
+    "ordered_beta_bernoulli_descriptor",
     "block_orthogonality_descriptor",
     "mechanism_sparsity_descriptor",
     "GumbelTemperatureSchedule",
@@ -183,7 +183,7 @@ def ard_descriptor(target: str, weight: float) -> dict[str, Any]:
     return desc
 
 
-def ibp_assignment_descriptor(
+def ordered_beta_bernoulli_descriptor(
     target: str,
     k_max: int,
     alpha: float,
@@ -193,7 +193,7 @@ def ibp_assignment_descriptor(
 ) -> dict[str, Any]:
     """Finite-IBP assignment-logit descriptor."""
     return {
-        "kind": "ibp_assignment",
+        "kind": "ordered_beta_bernoulli",
         "target": str(target),
         "k_max": int(k_max),
         "alpha": float(alpha),

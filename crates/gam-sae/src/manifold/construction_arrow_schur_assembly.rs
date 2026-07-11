@@ -282,7 +282,6 @@ impl SaeManifoldTerm {
                 Some((
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,
-                        temperature,
                     ),
                     scale,
                 ))
@@ -351,15 +350,8 @@ impl SaeManifoldTerm {
             smooth_scaled_s.push(scaled_s);
         }
 
-        // Per-row active-set layout. Engaged for two regimes:
-        //   * JumpReLU — structural gate plus the smooth prior's
-        //     machine-precision support: atoms with
-        //     `(logit - threshold)/tau > -36` enter the compact solve
-        //     ([`jumprelu_in_optimization_band`]). Strictly gated-off atoms
-        //     (logit ≤ threshold) carry zero assignment mass so their data-fit
-        //     reconstruction contribution and data-fit logit JVP are zero, but
-        //     supported atoms keep value-consistent prior gradient in the row block.
-        //   * ordered Beta--Bernoulli-MAP at large `K` — the dense `(m_total · p)²` data
+        // Per-row active-set layout. Engaged for ordered Beta--Bernoulli-MAP at
+        // large `K`, where the dense `(m_total · p)²` data
         //     Gram is infeasible, so each row is truncated to its
         //     top-`k_active` atoms above a relative magnitude cutoff
         //     ([`Self::sparse_active_plan`]). Small-`K` problems return `None`
@@ -375,135 +367,10 @@ impl SaeManifoldTerm {
         let row_layout: Option<SaeRowLayout> = match forced_layout {
             Some(layout) => layout,
             None => match self.assignment.mode {
-                AssignmentMode::ThresholdGate {
-                    threshold,
-                    temperature,
-                } => {
-                    // #1801 — size the JumpReLU joint block by the HARD FORWARD GATE.
-                    // The joint (cross-coupling) row block only ever needs the atoms
-                    // that actually DATA-FIT COUPLE: a gated-off atom (`logit ≤ θ`,
-                    // `a_k = 0`) has a hard-zero reconstruction contribution and a
-                    // hard-zero data-fit logit JVP, so it never couples with the
-                    // decoder or any on atom. Its ONLY footprint is a column-
-                    // SEPARABLE diagonal prior (its own sparsity-logit + ARD-coord
-                    // gradient/curvature), which a diagonal-only atom carries without
-                    // a joint-block slot; profiling it out leaves the reduced β /
-                    // decoder Schur system and its Δβ Newton step unchanged, and the
-                    // OBJECTIVE VALUE is layout-independent (the loss sums the full
-                    // −36 optimization band regardless of this layout).
-                    //
-                    // `contribution[row, k]` is therefore the atom's DATA-FIT
-                    // coupling magnitude — the gate mass `a_{n,k}` — NOT its separable
-                    // prior gradient. `a_{n,k}` is EXACTLY zero for every gated-off
-                    // atom (the JumpReLU hard gate) and positive only above the
-                    // threshold, so `from_jumprelu`'s relative cutoff drops all
-                    // gated-off atoms and the block collapses from `K·(1+d)` to the
-                    // hard-gate `k_active·(1+d)`, independent of K. (The prior layout
-                    // scored membership by the SEPARABLE prior gradient, which is O(1)
-                    // for gated-off logits sitting near the threshold, so essentially
-                    // all K atoms were retained and the per-token block ballooned to
-                    // `K·(1+d)` — the bug pinned by
-                    // `sae_streaming_arrow_schur_contract::per_token_block_dim_is_independent_of_k_at_fixed_active`.)
-                    // PRICED (#2071), with the exact-gradient alternative stated.
-                    // `from_jumprelu` drops atoms whose contribution ≤ cutoff · (max
-                    // contribution). Gated-off atoms have `a_{n,k}` EXACTLY 0, so
-                    // ANY cutoff in `(0, min_active_contribution]` drops precisely the
-                    // gated-off set and the assembled gradient is EXACT. `1e-3`
-                    // additionally drops ACTIVE atoms whose coupling is < 0.1 % of the
-                    // row's peak — this is the gradient approximation, traded for a
-                    // per-token block bounded at `k_active·(1+d)` even when many atoms
-                    // sit just above the JumpReLU threshold with tiny mass.
-                    // Exact-gradient alternative: a numerical-zero cutoff (~a few ULP,
-                    // dropping only the exact zeros) makes the gradient exact but lets
-                    // the block grow to the FULL above-threshold set, whose size near
-                    // the threshold is not bounded independently of that near-threshold
-                    // population — a memory/exactness design choice at K = 32k scale,
-                    // not a free tuning dial, so it is left priced pending that
-                    // validation. What breaks at 10×: `1e-2` drops couplings up to 1 %
-                    // of peak (coarser gradient, smaller block); `1e-4` retains more
-                    // near-threshold atoms (finer gradient, larger block).
-                    const JUMPRELU_RELATIVE_CUTOFF: f64 = 1.0e-3;
-                    // `assignments()` are the EFFECTIVE gates: ungated atoms pinned
-                    // to 1.0 and frozen routing read from `frozen_logits`. Gate mass
-                    // is the data-fit coupling contribution (the #2071 block-size
-                    // contract), and is already routing-aware.
-                    let gates = self.assignment.assignments();
-                    let contribution = gates.mapv(f64::abs);
-                    // #Bug3: select the compact support from the EFFECTIVE routing
-                    // logits (frozen-aware), NOT the raw free `self.logits`, so a
-                    // frozen atom's true gate decides membership. Ungated atoms are
-                    // force-included by `from_jumprelu` via the `ungated` mask.
-                    let routing = {
-                        let mut m = Array2::<f64>::zeros((n, k_atoms));
-                        // Each row copies its own read-only routing-logit view into
-                        // its own `m` row — disjoint output rows, no reduction, so
-                        // the row-parallel fill is bit-identical to the serial copy.
-                        let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN
-                            && rayon::current_thread_index().is_none();
-                        if parallel {
-                            use rayon::prelude::*;
-                            const CHUNK: usize = 64;
-                            m.axis_chunks_iter_mut(ndarray::Axis(0), CHUNK)
-                                .into_par_iter()
-                                .enumerate()
-                                .for_each(|(chunk, mut block)| {
-                                    let start = chunk * CHUNK;
-                                    for local in 0..block.nrows() {
-                                        let r = self.assignment.routing_logits_row(start + local);
-                                        for k in 0..k_atoms {
-                                            block[[local, k]] = r[k];
-                                        }
-                                    }
-                                });
-                        } else {
-                            for row in 0..n {
-                                let r = self.assignment.routing_logits_row(row);
-                                for k in 0..k_atoms {
-                                    m[[row, k]] = r[k];
-                                }
-                            }
-                        }
-                        m
-                    };
-                    Some(SaeRowLayout::from_jumprelu(JumpReluLayoutParams {
-                        n,
-                        k_atoms,
-                        threshold,
-                        temperature,
-                        logits: &routing,
-                        contribution: &contribution,
-                        ungated: &self.assignment.ungated,
-                        // Cap: rely on the relative cutoff to bound the active set;
-                        // a memory-budget cap can be layered in like
-                        // `sparse_active_plan` without changing the contract.
-                        k_active_cap: k_atoms,
-                        relative_cutoff: JUMPRELU_RELATIVE_CUTOFF,
-                        coord_dims: coord_dims.clone(),
-                        coord_offsets_full: self.assignment.coord_offsets(),
-                    }))
-                }
-                // #1408/#1409 — Softmax engages the COMPACT top-`k` row layout
-                // inside the optimization (no longer a post-fit projection).
-                // The active set is each row's top-`k_active_cap` softmax atoms
-                // above the relative cutoff; the cap comes from the user's
-                // `top_k` (`softmax_active_cap`) and/or the in-core memory budget
-                // ([`Self::softmax_active_plan`]). The full-`K` softmax
-                // normalization still forms `a` (the gate map); only the dropped
-                // tail logits, carrying negligible `O(a)` reconstruction mass and
-                // `O(a²)` curvature, leave the per-row block.
-                //
-                // Coherence (the load-bearing correctness invariant): the
-                // assembly's softmax curvature branch writes the ACTIVE×ACTIVE
-                // principal sub-block of the Gershgorin Loewner majorizer
-                // `D = diag(Σ_j|H_kj|)` (#1419; PSD and `D ⪰ H_entropy`) on the
-                // compact logit slots — NOT the indefinite `assignment_hdiag`
-                // diagonal. The logdet ρ-trace
-                // (`assignment_log_strength_hessian_trace`) iterates the row's
-                // active logit slots and indexes that SAME majorizer by global
-                // atom, and the θ-adjoint reads its derivative via `jets.vars`
-                // (global-atom indexed), so value, log|H|, and Γ differentiate
-                // ONE operator on the compact support. The FFI's after-the-fit
-                // top-`k` projection is then a no-op at the optimum.
+                // The threshold-centered logistic is strictly nonzero with a
+                // nonzero derivative at every finite logit. Its exact Newton
+                // system therefore uses the full dense row layout.
+                AssignmentMode::ThresholdGate { .. } => None,
                 AssignmentMode::Softmax { .. } => match self.softmax_active_plan() {
                     Some((k_active_cap, relative_cutoff)) => {
                         // Per-row gate maps are independent read-only computations

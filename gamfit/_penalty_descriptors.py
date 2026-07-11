@@ -28,7 +28,7 @@ from ._penalty_bridge import (
     block_orthogonality_descriptor,
     call_hvp as _call_hvp,
     call_value_grad as _call_value_grad,
-    ibp_assignment_descriptor,
+    ordered_beta_bernoulli_descriptor,
     mechanism_sparsity_descriptor,
 )
 from ._protocol import PenaltyDescriptor, _require_torch
@@ -290,7 +290,7 @@ class IBPPenalty(_RustPenaltyDescriptor):
 
     def _descriptor(self, n: int, d: int) -> dict[str, Any]:
         k_max = self.k_max if self.k_max is not None else d
-        return ibp_assignment_descriptor(
+        return ordered_beta_bernoulli_descriptor(
             self.target_name, int(k_max), self.alpha, self.tau
         )
 

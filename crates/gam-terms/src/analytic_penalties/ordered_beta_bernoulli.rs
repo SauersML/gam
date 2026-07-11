@@ -578,7 +578,7 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
     }
 
     fn name(&self) -> &str {
-        "ordered_beta_bernoulli_assignment"
+        "ordered_beta_bernoulli"
     }
 
     fn apply_schedule(&mut self, iter: usize) {

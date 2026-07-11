@@ -176,10 +176,7 @@ impl SaeManifoldTerm {
                     inv_tau: 1.0 / temperature,
                 },
                 vec![threshold; k_atoms],
-                logits
-                    .iter()
-                    .map(|&logit| if logit > threshold { 1.0 } else { 0.0 })
-                    .collect(),
+                vec![1.0; k_atoms],
             ),
             // TopK: every atom is `logit_is_fixed`, so `fixed_gate_value`
             // (= the exact {0, 1} support gates) overrides the gate machinery

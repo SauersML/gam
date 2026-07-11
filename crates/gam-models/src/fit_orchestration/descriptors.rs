@@ -854,7 +854,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 };
                 registry.push(AnalyticPenaltyKind::DecoderIncoherence(Arc::new(penalty)));
             }
-            "ordered_beta_bernoulli_assignment" | "ordered_beta_bernoulli_assignment_penalty" => {
+            "ordered_beta_bernoulli" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,

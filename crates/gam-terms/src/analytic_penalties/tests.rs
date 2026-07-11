@@ -322,6 +322,38 @@ fn ordered_beta_bernoulli_assignment_grad_target_matches_value_finite_difference
 }
 
 #[test]
+fn ordered_beta_bernoulli_value_is_exact_integrated_marginal() {
+    let k = 2usize;
+    let alpha = 1.7_f64;
+    let tau = 0.8_f64;
+    let pen = OrderedBetaBernoulliPenalty::new(k, alpha, tau, false);
+    let target = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
+    let rho = Array1::<f64>::zeros(0);
+    let n = target.len() / k;
+    let mut mass = [0.0_f64; 2];
+    for row in 0..n {
+        for col in 0..k {
+            mass[col] += 1.0 / (1.0 + (-target[row * k + col] / tau).exp());
+        }
+    }
+    let ratio = alpha / (alpha + 1.0);
+    let mut expected = 0.0;
+    for col in 0..k {
+        let mu = ratio.powi(col as i32 + 1);
+        let a = mu / (1.0 - mu);
+        expected += -a.ln()
+            - statrs::function::gamma::ln_gamma(mass[col] + a)
+            - statrs::function::gamma::ln_gamma(n as f64 - mass[col] + 1.0)
+            + statrs::function::gamma::ln_gamma(n as f64 + a + 1.0);
+    }
+    assert_abs_diff_eq!(
+        pen.value(target.view(), rho.view()),
+        expected,
+        epsilon = 1.0e-12
+    );
+}
+
+#[test]
 fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
     // #1038: the exact ordered Beta--Bernoulli Hessian couples DIFFERENT rows within a column
     // through the plug-in empirical mass `M_k = Σ_i z_ik`:

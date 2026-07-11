@@ -2822,8 +2822,8 @@ impl SaeManifoldTerm {
     /// landed — see `SaeRowLayout`'s doc); it keeps the full `K`-atom layout only
     /// when neither lever engages. The decision is auto-derived from
     /// the problem size and the device/host working-set budget — never a CLI flag
-    /// or kwarg. JumpReLU is not handled here (it always uses its structural gate
-    /// via [`SaeRowLayout::from_jumprelu`]). The dense Gauss-Newton data Gram `G`
+    /// or kwarg. The smooth threshold gate always uses the exact dense layout.
+    /// The dense Gauss-Newton data Gram `G`
     /// is `(m_total × m_total)` f64; if its dense form fits the budget we keep
     /// the exact full-support solve (every atom active per row), so small-`K`
     /// problems are bit-for-bit unchanged. Above that, we cap each row to the

@@ -2358,7 +2358,7 @@ impl PyOrderedBetaBernoulliPenalty {
     }
 
     #[classattr]
-    const KIND_TAG: &'static str = "ordered_beta_bernoulli_assignment";
+    const KIND_TAG: &'static str = "ordered_beta_bernoulli";
 
     fn to_rust_descriptor(&self, py: Python<'_>) -> PyResult<PyObject> {
         let payload = PyDict::new(py);

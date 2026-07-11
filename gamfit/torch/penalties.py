@@ -19,9 +19,9 @@ from .._penalty_bridge import (
     ard_descriptor,
     block_orthogonality_descriptor,
     call_rust_value_grad as _call_rust_value_grad,
-    ibp_assignment_descriptor,
     latent_json as _latent_json,
     mechanism_sparsity_descriptor,
+    ordered_beta_bernoulli_descriptor,
     penalty_json as _penalty_json,
 )
 from .._select_topology import TopologyAutoSelector
@@ -516,8 +516,8 @@ class MechanismSparsityPenalty(_RustPenaltyModule):
         )
 
 
-class IBPAssignmentPenalty(_RustPenaltyModule):
-    """Finite IBP prior over row-wise assignment logits."""
+class OrderedBetaBernoulliPenalty(_RustPenaltyModule):
+    """Ordered independent Beta--Bernoulli prior over assignment logits."""
 
     def __init__(self, k_max: int, alpha: float = 1.0, tau: float = 1.0, *, target: str = "t", learnable: bool = False) -> None:
         super().__init__()
@@ -536,7 +536,7 @@ class IBPAssignmentPenalty(_RustPenaltyModule):
         logits = _check_matrix(primary, "logits")
         if logits.shape[1] != self.k_max:
             raise ValueError("logits width must equal k_max")
-        descriptor = ibp_assignment_descriptor(
+        descriptor = ordered_beta_bernoulli_descriptor(
             self.target,
             self.k_max,
             self.alpha,
@@ -717,135 +717,6 @@ class _JumpReLUSTEFn(torch.autograd.Function):
         return grad_z, grad_tau, None
 
 
-class _IBPMapFn(torch.autograd.Function):
-    """IBP posterior-mean gate, value+grad from the Rust source of truth.
-
-    Forward returns ``z_k = σ(l_k/τ)``. The ordered Beta--Bernoulli shrinkage is
-    scored once by the IBP prior rather than multiplied into the final function;
-    backward multiplies the upstream gradient by
-    the diagonal logit Jacobian ``∂z_k/∂l_k`` that Rust returns. Replacing the
-    bare ``sigmoid(logits/τ)`` torch path makes torch IBP-Gumbel agree with the
-    closed-form ``SaeAssignment`` IBP-MAP assignments (see
-    ``src/terms/sae_manifold.rs`` ``ibp_map_row``).
-    """
-
-    @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor, temperature: float) -> torch.Tensor:
-        value_np, grad_np = rust_module().sae_ibp_map_batch_value_grad(
-            to_numpy_f64(logits.reshape(logits.shape[0], -1)),
-            float(temperature),
-        )
-        value = from_numpy_like(value_np, logits).reshape_as(logits)
-        grad = from_numpy_like(grad_np, logits).reshape_as(logits)
-        ctx.save_for_backward(grad)
-        return value
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        (jac_diag,) = ctx.saved_tensors
-        return grad_output * jac_diag, None
-
-
-def ibp_map(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Differentiable IBP posterior-mean assignments via Rust."""
-    if not isinstance(logits, torch.Tensor):
-        raise TypeError("ibp_map logits must be a torch.Tensor")
-    apply = cast(Callable[..., torch.Tensor], _IBPMapFn.apply)
-    return apply(logits, float(temperature))
-
-
-class _JumpReLUBoundedGateFn(torch.autograd.Function):
-    """Bounded threshold gate backed by the Rust value/gradient kernel.
-
-    Forward returns ``a_k = σ((l_k − θ_k)/τ) · 1[l_k > θ_k]`` — the SAME bounded
-    ``[0, 1)`` gate the closed-form ``SaeAssignment`` jumprelu / threshold_gate
-    path evaluates (``jumprelu_row``; magnitude lives in the decoder). The math
-    is computed by the Rust source of truth
-    ``gam_sae::assignment::jumprelu_batch_value_grad`` through one batched FFI
-    call. Python caches the returned diagonal derivative for Torch's backward.
-    Backward multiplies the upstream gradient by the smooth surrogate's diagonal
-    derivative ``da/dl_k = σ'((l_k − θ_k)/τ)/τ`` (a straight-through estimator,
-    alive on both sides of the jump so gated-off atoms keep a training signal);
-    the threshold gradient is its negated row-sum
-    (``∂a_k/∂θ_k = −da/dl_k``); callers negate and accumulate.
-    """
-
-    @staticmethod
-    def forward(
-        ctx: Any, logits: torch.Tensor, thresholds: torch.Tensor, temperature: float
-    ) -> torch.Tensor:
-        value_np, grad_np = rust_module().sae_jumprelu_batch_value_grad(
-            to_numpy_f64(logits.reshape(logits.shape[0], -1)),
-            float(temperature),
-            to_numpy_f64(thresholds.reshape(-1)),
-        )
-        value = from_numpy_like(value_np, logits).reshape_as(logits)
-        grad = from_numpy_like(grad_np, logits).reshape_as(logits)
-        ctx.save_for_backward(grad)
-        return value
-
-    @staticmethod
-    def backward(
-        ctx: Any, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        (jac_diag,) = ctx.saved_tensors
-        upstream = grad_output * jac_diag
-        return upstream, -upstream.sum(dim=0), None
-
-
-def jumprelu_bounded_gate(
-    logits: torch.Tensor, thresholds: torch.Tensor, temperature: float
-) -> torch.Tensor:
-    """Differentiable bounded threshold gate via the Rust value+grad kernel."""
-    if not isinstance(logits, torch.Tensor):
-        raise TypeError("jumprelu_bounded_gate logits must be a torch.Tensor")
-    if not isinstance(thresholds, torch.Tensor):
-        raise TypeError("jumprelu_bounded_gate thresholds must be a torch.Tensor")
-    apply = cast(Callable[..., torch.Tensor], _JumpReLUBoundedGateFn.apply)
-    return apply(logits, thresholds, float(temperature))
-
-
-class _TopKActivationFn(torch.autograd.Function):
-    """Top-k SAE activation backed by the Rust value-and-gradient kernel.
-
-    Forward returns the per-atom **independent**, strictly non-negative
-    activation ``a_k = τ·softplus(l_k/τ)`` the ``softmax_topk`` gate scores atoms
-    with. Both that value and its diagonal derivative ``da/dl_k = σ(l_k/τ)``
-    come from ``gam_sae::assignment::topk_activation_batch_value_grad`` through
-    ``sae_topk_activation_value_grad``. Python only caches the returned Jacobian
-    diagonal for Torch's backward pass. The hard top-k *selection* and its masked
-    gradient remain on the caller's tape.
-    """
-
-    @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor, temperature: float) -> torch.Tensor:
-        value_np, grad_np = rust_module().sae_topk_activation_value_grad(
-            to_numpy_f64(logits), float(temperature)
-        )
-        value = from_numpy_like(value_np, logits).reshape_as(logits)
-        grad = from_numpy_like(grad_np, logits).reshape_as(logits)
-        ctx.save_for_backward(grad)
-        return value
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
-        (jac_diag,) = ctx.saved_tensors
-        return grad_output * jac_diag, None
-
-
-def topk_activation(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Differentiable top-k SAE activation via the Rust value+grad kernel.
-
-    Returns ``τ·softplus(logits/τ)`` with the Rust-defined diagonal derivative
-    ``σ(logits/τ)`` on the backward. The hard top-k mask/STE stays on the caller's
-    tape; this owns only the smooth non-negative activation.
-    """
-    if not isinstance(logits, torch.Tensor):
-        raise TypeError("topk_activation logits must be a torch.Tensor")
-    apply = cast(Callable[..., torch.Tensor], _TopKActivationFn.apply)
-    return apply(logits, float(temperature))
-
-
 class RiemannianRetraction(Optimizer):
     """One-step Riemannian gradient optimizer using the manifold metric."""
 
@@ -927,7 +798,7 @@ __all__ = [
     "BlockOrthogonalityPenalty",
     "GumbelTemperatureSchedule",
     "HarmonicRoughnessPenalty",
-    "IBPAssignmentPenalty",
+    "OrderedBetaBernoulliPenalty",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
     "JumpReLUPenalty",
@@ -935,5 +806,4 @@ __all__ = [
     "MechanismSparsityPenalty",
     "RiemannianRetraction",
     "TopologyAutoSelector",
-    "ibp_map",
 ]

@@ -347,7 +347,7 @@ class AnalyticPenaltyKind(str, Enum):
     ISOMETRY = "isometry"
     SPARSITY = "sparsity"
     SOFTMAX_ASSIGNMENT_SPARSITY = "softmax_assignment_sparsity"
-    IBP_ASSIGNMENT = "ibp_assignment"
+    ORDERED_BETA_BERNOULLI = "ordered_beta_bernoulli"
     ARD = "ard"
     TOPK_ACTIVATION = "topk_activation"
     JUMPRELU = "jumprelu"
@@ -671,7 +671,7 @@ descriptor.
 Learns a diagonal row-conditional precision map from auxiliary covariates via
 the Rust descriptor and applies it to the targeted latent block.
 """,
-    "OrderedBetaBernoulliPenalty": """Finite IBP prior over row-wise assignment logits.
+    "OrderedBetaBernoulliPenalty": """Ordered independent Beta--Bernoulli prior over row-wise assignment logits.
 
 The public Rust-backed wrapper accepts fields such as ``k_max``, ``alpha``,
 ``tau``, ``learnable``, and ``target`` where supported by the extension, then
