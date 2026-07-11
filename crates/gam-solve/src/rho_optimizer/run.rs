@@ -1390,16 +1390,6 @@ pub(crate) fn certify_outer_optimality(
     let grad_norm = evaluation.gradient.dot(&evaluation.gradient).sqrt();
     let projected_grad_norm =
         projected_gradient_norm(&result.rho, &evaluation.gradient, Some(&bounds));
-    eprintln!(
-        "[ZZDIAG certify {context}] plan={:?} cost={:.6e} rho={:?} grad={:?} raw|g|={:.6e} proj|g|={:.6e} stop={:?}",
-        result.plan_used.solver,
-        evaluation.cost,
-        result.rho.to_vec(),
-        evaluation.gradient.to_vec(),
-        grad_norm,
-        projected_grad_norm,
-        result.operator_stop_reason,
-    );
     let solver_bound = outer_gradient_tolerance(config).threshold(evaluation.cost, grad_norm);
     let mut stationarity_bound = if matches!(
         result.operator_stop_reason,
