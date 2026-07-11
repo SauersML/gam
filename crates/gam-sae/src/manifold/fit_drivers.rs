@@ -5636,6 +5636,32 @@ impl SaeManifoldTerm {
             best_reconstruction_obj = f64::INFINITY;
             None
         };
+        // EXIT-BOUNDARY OBJECTIVE WARRANTY bank (#2228 divergence class). The
+        // EV-keyed incumbent above is deliberately CONDITIONAL (structural-
+        // coherence/EV-gated basin preference), which leaves a gap: on a
+        // trajectory where the coherence gate fires from the start, NOTHING is
+        // ever banked, the end-of-loop restore has nothing to restore, and a
+        // non-monotone boundary mover (a collapse reseed thrown at the budget
+        // edge, a gauge hook, a post-loop sweep whose exact block solves
+        // themselves fail on the blown state) leaks an amplified iterate to
+        // the caller. Chaotic ulp-level trajectory sensitivity made that leak
+        // intermittent (fd_2015: the same binary/host/thread-count returned
+        // ‖g‖ ≈ 2e-3 or ≈ 3.8e30 run to run before the deterministic-reduction
+        // stack pinned the trajectory). This bank is UNCONDITIONAL and keyed
+        // on the penalized objective alone — the one scalar the walk descends
+        // — so the engine can always honor the contract "never return a state
+        // materially worse than the best state it held". Basin preference
+        // (EV/uniformity/coherence) is untouched: it still owns WHICH
+        // near-equal-objective state is kept; the warranty only forbids
+        // returning an objectively degraded one.
+        let mut warranty_obj = self
+            .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+            .unwrap_or(f64::INFINITY);
+        let mut warranty_state = if warranty_obj.is_finite() {
+            Some(self.snapshot_mutable_state())
+        } else {
+            None
+        };
         // #2100/#1117 — objective-stagnation convergence for the JOINT outer loop,
         // the exact analogue of the #1051 stall gate already guarding
         // `converge_inner_for_undamped_logdet`. On a co-collapsed K≥2 basin (two
@@ -6448,15 +6474,24 @@ impl SaeManifoldTerm {
             })? {
                 state_moved = true;
             }
+            // Unconditional warranty-bank update (see the bank's declaration):
+            // strictly-better penalized objective ⇒ this accepted boundary is
+            // the new exit-warranty fallback, independent of any EV/coherence
+            // basin preference below.
+            let boundary_obj = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
+            if boundary_obj.is_finite() && boundary_obj < warranty_obj {
+                warranty_obj = boundary_obj;
+                warranty_state = Some(self.snapshot_mutable_state());
+            }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
                 // (the walk's own referee) and, at (near-)equal objective, on the
                 // #2081 EV-then-uniformity certificate ([`prefer_candidate_state`]).
                 if self.structural_coherence_collapse_detected()?.is_none() {
                     let candidate_uniformity = self.coordinate_uniformity_aggregate();
-                    let candidate_obj = self
-                        .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                        .unwrap_or(f64::INFINITY);
+                    let candidate_obj = boundary_obj;
                     if prefer_candidate_state(
                         candidate_obj,
                         ev,
@@ -6609,6 +6644,35 @@ impl SaeManifoldTerm {
             )?
         {
             state_moved = true;
+        }
+        // EXIT-BOUNDARY OBJECTIVE WARRANTY enforcement (#2228): the LAST gate
+        // before the loss is priced. Whatever combination of non-monotone
+        // movers ran above — a reseed thrown at the budget edge, a gauge hook,
+        // an incumbent restore that had nothing banked, a rescue sweep whose
+        // exact block solves failed transactionally on a blown state — the
+        // returned state's penalized objective may not be materially worse
+        // than the best state this call held at any accepted boundary (entry
+        // included). A warranty restore is idempotence-safe: a settled
+        // re-entry never improves on its own entry objective, so the bank
+        // equals the entry state and the comparison is a no-op there.
+        if let Some(bank) = warranty_state.as_ref() {
+            let final_obj = self
+                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                .unwrap_or(f64::INFINITY);
+            let warranty_tol = SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                * (1.0 + final_obj.abs().max(warranty_obj.abs()));
+            if !(final_obj <= warranty_obj + warranty_tol) {
+                log::warn!(
+                    "[#2228] exit warranty: final penalized objective {final_obj:.6e} degraded \
+                     past the best accepted boundary {warranty_obj:.6e}; restoring the banked \
+                     state (non-monotone boundary-mover damage leaked to the exit)"
+                );
+                self.restore_mutable_state(bank)?;
+                state_moved = true;
+                // A warranty restore means the walk was NOT settled; any
+                // cross-call incumbent streak is void.
+                self.best_fit_incumbent = None;
+            }
         }
         // Track an exact recurrence of the OBJECTIVE-keyed in-call restore.
         // This is convergence evidence only; it is never a cross-ρ state bank
