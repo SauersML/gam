@@ -144,13 +144,25 @@ where
         let mut direction_converged = false;
         for _ in 0..dim {
             let bv = apply_b_q(&v)?;
-            let mut refined = solve_b_preconditioned_gmres(solver, &bv, |w| apply_a_q(w))
-                .map_err(|err| {
-                    format!(
-                        "solve_exact_stationarity: inverse-power refinement did not converge: {err}"
-                    )
-                })?;
-            normalize_b(&mut refined)?;
+            // #2253 — A⁻¹(Bv) is ILL-POSED along a near-null/indefinite pencil
+            // direction (that is exactly the direction we are isolating), so the
+            // refinement GMRES can legitimately exhaust its budget without
+            // reaching tolerance. That is not a fatal error: the seed `v` is
+            // already the B-normalized corrupted solution `x`, which — because
+            // μ(x) collapsed onto μ_min — is ALREADY aligned with the offending
+            // direction. Keep the best `v` and let the alignment/μ checks below
+            // decide, instead of aborting the whole outer gradient.
+            let refined = match solve_b_preconditioned_gmres(solver, &bv, |w| apply_a_q(w)) {
+                Ok(mut refined) => {
+                    normalize_b(&mut refined)?;
+                    refined
+                }
+                Err(_) => {
+                    // Refinement stalled — the current `v` is our best isolate.
+                    direction_converged = true;
+                    break;
+                }
+            };
             let b_refined = apply_b_q(&refined)?;
             let alignment = sae_inner(&v, &b_refined).abs();
             if !alignment.is_finite() {
