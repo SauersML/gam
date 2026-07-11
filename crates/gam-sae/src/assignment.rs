@@ -222,7 +222,7 @@ pub enum AssignmentMode {
     },
     /// Smooth threshold-centered logistic gate
     /// `a_k = σ((logit_k − threshold) / temperature)`. Magnitude lives in the
-    /// decoder curve `g_k(t) = φ(t)ᵀB_k`; this gate supplies a bounded posterior
+    /// decoder curve `g_k(t) = φ(t)ᵀB_k`; this gate supplies a bounded
     /// activation in `(0, 1)`. Its derivative is exact on both sides of the
     /// threshold, so fitted values, data-fit Jacobians, priors, and Hessians are
     /// derivatives of one smooth objective.
@@ -1515,14 +1515,8 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
         )
         .unwrap();
 
-        let AssignmentMode::OrderedBetaBernoulli {
-            temperature, alpha, ..
-        } = assignment.mode
-        else {
-            unreachable!()
-        };
         let (penalty, rho_view) =
-            ordered_beta_bernoulli_prior_penalty(&assignment, &rho, alpha, temperature, None);
+            ordered_beta_bernoulli_prior_penalty(&assignment, &rho, 1.7, 0.8, None);
         let target = flat_logits(assignment.logits.view());
         let step = 1.0e-6;
         let plus = &target + &(step * &direction);

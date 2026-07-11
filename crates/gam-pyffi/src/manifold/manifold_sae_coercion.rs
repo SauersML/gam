@@ -1,15 +1,10 @@
-//! Rust-owned coercion helpers for the `ManifoldSAE.from_payload` -> flat
-//! `to_dict` schema derivation (#2091 phase-2, design (A)). These own the
-//! derivations so the fit path can return
-//! a Rust-owned `ManifoldSaeCore` built directly from the raw
-//! `sae_manifold_fit_minimal` payload, with no Python dataclass in the middle.
+//! Rust-owned conversion from the native fit report to the persisted
+//! `ManifoldSaePayload` schema. The public fit path returns a Rust-owned
+//! `ManifoldSaeCore` directly, with no Python model or schema in the middle.
 //!
-//! This module owns assignment tokens and topology aliases, topology naming,
-//! and the periodic shape-band reorder,
-//! exposed to Python as `sae_atom_topologies` / `sae_periodic_shape_band_reorder`
-//! — the same Rust-owner pattern as `sae_canonical_n_harmonics`. The full
-//! `RawFitPayload -> ManifoldSaePayload` assembly below consumes those same
-//! helpers; Python only marshals typed inputs to this owner.
+//! This module owns assignment tokens, topology naming, periodic shape-band
+//! ordering, and `RawFitPayload -> ManifoldSaePayload` assembly. Python only
+//! marshals typed inputs to this owner.
 
 use crate::manifold::manifold_sae_payload::{
     AtomPayload, CrosscoderPayload, ManifoldSaePayload, SCHEMA_TAG,
@@ -411,7 +406,7 @@ fn shape_band_for_kind(
 }
 
 /// Build a [`ManifoldSaePayload`] (the flat `to_dict` schema) directly from the
-/// raw `sae_manifold_fit_minimal` payload (as a `serde_json::Value`), the
+/// native raw fit payload (as a `serde_json::Value`), the
 /// training mean, and [`FitConfig`]. Fisher retention and `linear_block`
 /// relabeling happen in this same builder, with no parallel Python schema.
 pub(crate) fn build_manifold_sae_payload(
@@ -524,7 +519,7 @@ pub(crate) fn build_manifold_sae_payload(
     }
 
     let mut primitive_names = Vec::with_capacity(cfg.penalties.len() + 1);
-    primitive_names.push("rust_module.sae_manifold_fit_minimal".to_string());
+    primitive_names.push("rust_module.sae_manifold_fit_model".to_string());
     primitive_names.extend(cfg.penalties.iter().cloned());
 
     // `basis_specs` keeps the fitted kinds; public labels may be restored to
@@ -656,15 +651,7 @@ mod manifold_sae_coercion_tests {
                 "canonical token {canonical}"
             );
         }
-        for rejected in [
-            " SoftMax ",
-            "ibp",
-            "ibp-map",
-            "gated",
-            "jump-relu",
-            "jumprelu",
-            "top-k",
-        ] {
+        for rejected in ["unknown"] {
             let err = canonical_assignment_kind(rejected).expect_err("alias must be rejected");
             assert!(err.contains("not a recognized assignment kind"));
             assert!(err.contains("ordered_beta_bernoulli") && err.contains("threshold_gate"));

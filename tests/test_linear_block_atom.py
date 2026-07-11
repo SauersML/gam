@@ -19,26 +19,7 @@ extension is rebuilt.
 import numpy as np
 import pytest
 
-from gamfit._sae_manifold import (
-    _basis_to_topology,
-    _bases,
-    _canonical_topology,
-    flat_block_assignment,
-    rust_module,
-)
-
-
-def test_linear_block_is_its_own_topology_label():
-    # linear_block resolves to its OWN label (not collapsed to "linear"), so the
-    # per-atom topology list round-trips through save/load (which stores
-    # atom_topologies / basis_kinds verbatim).
-    assert _bases(3, None, "linear_block") == ["linear_block"] * 3
-    _scalar, topologies = rust_module().sae_atom_topologies(["linear_block"] * 3)
-    assert topologies == ["linear_block"] * 3
-    assert _basis_to_topology("linear_block") == "linear_block"
-    # flat_block is an accepted alias; case / dash normalise.
-    assert _basis_to_topology("flat_block") == "linear_block"
-    assert _canonical_topology("Linear-Block") == "linear_block"
+from gamfit._sae_manifold import flat_block_assignment
 
 
 def test_both_block_gating_modes_are_constructible():
@@ -46,9 +27,6 @@ def test_both_block_gating_modes_are_constructible():
     # separate-gate is presence separate from amplitude -> threshold_gate.
     assert flat_block_assignment("norm_selection") == "ordered_beta_bernoulli"
     assert flat_block_assignment("separate_gate") == "threshold_gate"
-    # aliases + rejection of unknown modes.
-    assert flat_block_assignment("norm") == "ordered_beta_bernoulli"
-    assert flat_block_assignment("separate") == "threshold_gate"
     with pytest.raises(ValueError):
         flat_block_assignment("softmax")
 

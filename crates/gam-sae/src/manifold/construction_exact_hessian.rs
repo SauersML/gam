@@ -288,7 +288,8 @@ where
 
 impl SaeManifoldTerm {
     /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
-    /// to a joint `(t, β)` vector, matrix-free and per row.
+    /// to a joint `(t, β)` vector, matrix-free via row-local work and ordered
+    /// prior column reductions.
     ///
     /// `A = ∇²_θθ L` is the true inner-fit Hessian; `B` is the assembled
     /// evidence/Newton operator the solver factors. They differ only by the four
@@ -313,8 +314,9 @@ impl SaeManifoldTerm {
     /// `jets.second`/`jets.beta_deriv` (the same raw-jet convention the whole
     /// θ-adjoint and the Gauss-Newton `htt = J̃J̃ᵀ = J M Jᵀ` assembly use). On the
     /// isotropic path `M_n = I` so `error_metric = √w·r` and `J M Jᵀ = JJᵀ`,
-    /// recovering the plain case. The softmax / ARD deltas are logit/coord-space
-    /// prior curvatures and carry no output metric, so they are path-independent.
+    /// recovering the plain case. The softmax, ordered Beta--Bernoulli, and ARD
+    /// deltas are logit/coord-space prior curvatures and carry no output metric,
+    /// so they are path-independent.
     fn apply_exact_hessian_minus_b(
         &self,
         rho: &SaeManifoldRho,
