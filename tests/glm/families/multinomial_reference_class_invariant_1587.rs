@@ -21,7 +21,9 @@
 //! machine precision (and that a refit of one labeling is deterministic).
 
 use csv::StringRecord;
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
 /// Deterministic LCG → `U[0,1)`; no external RNG so labels are byte-identical
@@ -93,14 +95,11 @@ fn fit_predict_aligned(
         .map(|(x, &c)| StringRecord::from(vec![format!("{x:.8}"), name_map[c].to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode training data");
-    let model = fit_penalized_multinomial_formula(
-        &data,
-        "y ~ s(x)",
-        &FitConfig::default(),
-        1.0,
-        200,
-        1.0e-7,
-    )
+    let config = FitConfig::default();
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        max_iter: 200,
+        ..MultinomialFitRequest::new(&data, "y ~ s(x)", &config)
+    })
     .expect("multinomial smooth fit must succeed");
 
     // Predict frame: just the x grid (predict resolves features by name).

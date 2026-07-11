@@ -21,7 +21,8 @@
 
 use csv::StringRecord;
 use gam::families::multinomial::{
-    fit_penalized_multinomial_formula, predict_multinomial_formula_with_intervals,
+    MultinomialFitRequest, fit_penalized_multinomial_formula,
+    predict_multinomial_formula_with_intervals,
 };
 use gam::{FitConfig, encode_recordswith_inferred_schema};
 use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
@@ -100,14 +101,13 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
         let data =
             encode_recordswith_inferred_schema(headers, rows).expect("encode multinomial dataset");
 
-        let model = fit_penalized_multinomial_formula(
-            &data,
-            "y ~ s(x, bs='tp', k=8)",
-            &FitConfig::default(),
-            1.0,
-            60,
-            1e-8,
-        )
+        let config = FitConfig::default();
+        let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+            init_lambda: 1.0,
+            max_iter: 60,
+            tol: 1e-8,
+            ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tp', k=8)", &config)
+        })
         .unwrap_or_else(|e| panic!("multinomial smooth fit failed: {e:?}"));
         let hi_col = model
             .class_levels

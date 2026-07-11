@@ -24,7 +24,9 @@
 //! All three must yield identical, valid `(N, 3)` probability matrices.
 
 use csv::StringRecord;
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -125,9 +127,12 @@ fn multinomial_predicts_on_label_free_and_reordered_frames() {
     init_parallelism();
     let rows = samples();
     let train = training_dataset(&rows);
-    let model =
-        fit_penalized_multinomial_formula(&train, "y ~ x", &FitConfig::default(), 1.0, 50, 1.0e-8)
-            .expect("multinomial formula fit must succeed");
+    let config = FitConfig::default();
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        tol: 1.0e-8,
+        ..MultinomialFitRequest::new(&train, "y ~ x", &config)
+    })
+    .expect("multinomial formula fit must succeed");
     let xs = rows.iter().map(|(x, _)| *x).collect::<Vec<_>>();
     let n = xs.len();
 
@@ -191,9 +196,12 @@ fn multinomial_predict_reports_a_genuinely_missing_feature_by_name() {
     init_parallelism();
     let rows = samples();
     let train = training_dataset(&rows);
-    let model =
-        fit_penalized_multinomial_formula(&train, "y ~ x", &FitConfig::default(), 1.0, 50, 1.0e-8)
-            .expect("multinomial formula fit must succeed");
+    let config = FitConfig::default();
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        tol: 1.0e-8,
+        ..MultinomialFitRequest::new(&train, "y ~ x", &config)
+    })
+    .expect("multinomial formula fit must succeed");
     let xs = rows.iter().map(|(x, _)| *x).collect::<Vec<_>>();
 
     // A frame that carries neither the feature `x` nor the response: realignment

@@ -30,7 +30,7 @@
 //! zero-width `class_1` (the pre-fix behaviour) cannot produce a nonzero slope.
 
 use csv::StringRecord;
-use gam::families::multinomial::fit_penalized_multinomial_formula;
+use gam::families::multinomial::{MultinomialFitRequest, fit_penalized_multinomial_formula};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
 /// Deterministic 3-class multinomial-logit sample.
@@ -74,13 +74,17 @@ fn multinomial_three_class_fit_keeps_all_blocks_full_width() {
     let data = three_class_dataset();
 
     // Same entry point the Python FFI uses for family="multinomial".
-    let model =
-        fit_penalized_multinomial_formula(&data, "y ~ x", &FitConfig::default(), 1.0, 200, 1.0e-8)
-            .expect(
-                "3-class multinomial fit must succeed: before the #363 fix it aborted with \
+    let config = FitConfig::default();
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        max_iter: 200,
+        tol: 1.0e-8,
+        ..MultinomialFitRequest::new(&data, "y ~ x", &config)
+    })
+    .expect(
+        "3-class multinomial fit must succeed: before the #363 fix it aborted with \
          'no candidate seeds passed outer startup validation' because every block past \
          class_0 was stripped to zero width by the flat identifiability audit",
-            );
+    );
 
     // K − 1 = 2 active class blocks, each carrying the full P = 2 design
     // (intercept + slope). A collapsed block would report p_per_class for the

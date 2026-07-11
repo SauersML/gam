@@ -19,7 +19,7 @@
 //! decidable contract on the public saved model and rejects the over-count.
 
 use csv::StringRecord;
-use gam::families::multinomial::fit_penalized_multinomial_formula;
+use gam::families::multinomial::{MultinomialFitRequest, fit_penalized_multinomial_formula};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
 /// 3-class categorical response with a numeric feature, fit with a penalized
@@ -53,14 +53,11 @@ fn smooth_multinomial_dataset() -> gam::data::EncodedDataset {
 fn multinomial_edf_per_class_is_per_class_not_per_block_overcount() {
     init_parallelism();
     let data = smooth_multinomial_dataset();
-    let model = fit_penalized_multinomial_formula(
-        &data,
-        "y ~ s(x)",
-        &FitConfig::default(),
-        1.0,
-        100,
-        1.0e-7,
-    )
+    let config = FitConfig::default();
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        max_iter: 100,
+        ..MultinomialFitRequest::new(&data, "y ~ s(x)", &config)
+    })
     .expect("multinomial smooth fit must succeed");
 
     let m = model.n_active_classes; // K - 1

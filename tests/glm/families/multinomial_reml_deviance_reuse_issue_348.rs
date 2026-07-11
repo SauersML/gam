@@ -16,7 +16,9 @@
 //! caught.
 
 use csv::StringRecord;
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
 /// 3-class categorical response with one numeric feature that separates the
@@ -53,8 +55,9 @@ fn multinomial_formula_deviance_equals_independent_softmax_recompute() {
     let (data, labels) = categorical_dataset();
 
     // Same entry point + tuning the Python FFI uses (fit_multinomial_formula_pyfunc).
+    let config = FitConfig::default();
     let model =
-        fit_penalized_multinomial_formula(&data, "y ~ x", &FitConfig::default(), 1.0, 50, 1.0e-7)
+        fit_penalized_multinomial_formula(&MultinomialFitRequest::new(&data, "y ~ x", &config))
             .expect("multinomial formula fit must succeed");
 
     // Independently recompute the unpenalized deviance from the fitted softmax

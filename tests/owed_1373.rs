@@ -61,7 +61,9 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Poisson, Uniform};
 use std::f64::consts::PI;
 
-use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
+use gam::families::multinomial::{
+    MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
+};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
@@ -163,14 +165,12 @@ fn hetero_multinomial_recovers_true_simplex_at_true_df_basis_1373() {
     // The #1373 fix: x1 at k=12 (~11 spline df > the true df≈8) so the basis can
     // EXPRESS the wiggle; x2 stays modest at k=6 (true df≈2). Adaptive per-term
     // REML must then recover the surface, not be capped by basis capacity.
-    let model = fit_penalized_multinomial_formula(
-        &ds,
-        "y ~ s(x1, k=12) + s(x2, k=6) + x3",
-        &cfg,
-        1.0,
-        40,
-        1e-8,
-    )
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        init_lambda: 1.0,
+        max_iter: 40,
+        tol: 1e-8,
+        ..MultinomialFitRequest::new(&ds, "y ~ s(x1, k=12) + s(x2, k=6) + x3", &cfg)
+    })
     .expect("gam hetero multinomial fit");
     assert_eq!(
         model.class_levels.len(),

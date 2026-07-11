@@ -13,7 +13,7 @@
 //! Python renderer.
 
 use csv::StringRecord;
-use gam::families::multinomial::fit_penalized_multinomial_formula;
+use gam::families::multinomial::{MultinomialFitRequest, fit_penalized_multinomial_formula};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
 /// 3-class categorical response with TWO numeric features, each smoothed. Two
@@ -54,14 +54,11 @@ fn two_smooth_multinomial_dataset() -> gam::data::EncodedDataset {
 fn multinomial_lambda_labels_are_one_per_penalty_component() {
     init_parallelism();
     let data = two_smooth_multinomial_dataset();
-    let model = fit_penalized_multinomial_formula(
-        &data,
-        "y ~ s(x) + s(z)",
-        &FitConfig::default(),
-        1.0,
-        100,
-        1.0e-7,
-    )
+    let config = FitConfig::default();
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        max_iter: 100,
+        ..MultinomialFitRequest::new(&data, "y ~ s(x) + s(z)", &config)
+    })
     .expect("two-smooth multinomial fit must succeed");
 
     let m = model.n_active_classes;
