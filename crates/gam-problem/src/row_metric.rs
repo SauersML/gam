@@ -277,6 +277,12 @@ pub struct RowMetric {
     /// `δ` is deliberately *not* baked in here, so this is the
     /// criterion-facing trace.
     traces: ndarray::Array1<f64>,
+    /// Optional per-row non-negative Fisher trace omitted by a truncated factor
+    /// stack. Diagnostic only: it never changes `M_n = U_n U_n^T`, the
+    /// criterion, or solver. Steering threads it into its dose contract so a
+    /// low-rank quadratic is identified as a lower bound instead of being
+    /// presented as an audited full-rank KL (#2249/#2263).
+    truncation_mass_residual: Option<Arc<ndarray::Array1<f64>>>,
 }
 
 impl RowMetric {
@@ -296,6 +302,7 @@ impl RowMetric {
             factors: None,
             solver_delta: 0.0,
             traces: ndarray::Array1::<f64>::from_elem(n_rows, p as f64),
+            truncation_mass_residual: None,
         })
     }
 
@@ -451,7 +458,38 @@ impl RowMetric {
             factors: Some(u),
             solver_delta,
             traces,
+            truncation_mass_residual: None,
         })
+    }
+
+    /// Attach the harvested per-row omitted Fisher trace to this factored
+    /// metric. This is an audit channel, not a metric modification.
+    pub fn with_truncation_mass_residual(
+        mut self,
+        residual: Arc<ndarray::Array1<f64>>,
+    ) -> Result<Self, String> {
+        if self.factors.is_none() {
+            return Err(
+                "RowMetric::with_truncation_mass_residual requires a factored metric"
+                    .to_string(),
+            );
+        }
+        if residual.len() != self.n_rows {
+            return Err(format!(
+                "RowMetric::with_truncation_mass_residual requires {} rows; got {}",
+                self.n_rows,
+                residual.len()
+            ));
+        }
+        for (row, &value) in residual.iter().enumerate() {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(format!(
+                    "RowMetric::with_truncation_mass_residual row {row} must be finite and non-negative; got {value}"
+                ));
+            }
+        }
+        self.truncation_mass_residual = Some(residual);
+        Ok(self)
     }
 
     /// Restrict the metric to the rows `rows` (an index subset or permutation),
@@ -485,13 +523,22 @@ impl RowMetric {
                 // Re-runs the shared PSD normalizer on the subset (a subset of
                 // valid rows stays valid) and preserves the exact provenance and
                 // solver floor.
-                Self::from_factors(
+                let metric = Self::from_factors(
                     self.provenance,
                     Arc::new(sub),
                     self.p,
                     self.rank,
                     self.solver_delta,
-                )
+                )?;
+                match self.truncation_mass_residual.as_ref() {
+                    None => Ok(metric),
+                    Some(residual) => {
+                        let gathered = ndarray::Array1::from_iter(
+                            rows.iter().map(|&row| residual[row]),
+                        );
+                        metric.with_truncation_mass_residual(Arc::new(gathered))
+                    }
+                }
             }
         }
     }
@@ -586,6 +633,23 @@ impl RowMetric {
     /// [`Self::metric_rank`]-sized factors.
     pub fn row_traces(&self) -> ndarray::ArrayView1<'_, f64> {
         self.traces.view()
+    }
+
+    /// Omitted Fisher trace for `row`, when the harvest supplied one.
+    pub fn truncation_mass_residual(&self, row: usize) -> Option<f64> {
+        self.truncation_mass_residual
+            .as_ref()
+            .map(|residual| residual[row])
+    }
+
+    /// Fraction of total audited Fisher trace omitted at `row`. `None` means the
+    /// factor stack carried no truncation audit. A zero-total metric has zero
+    /// omitted fraction when its reported residual is also zero.
+    pub fn truncation_mass_residual_fraction(&self, row: usize) -> Option<f64> {
+        self.truncation_mass_residual(row).map(|residual| {
+            let total = self.traces[row] + residual;
+            if total > 0.0 { residual / total } else { 0.0 }
+        })
     }
 
     /// Whiten a single `p`-dimensional residual row `r` into the coordinates

@@ -30,6 +30,21 @@ struct JointFitOutcome {
     state_moved: bool,
 }
 
+/// Whether disjoint chart placement starts a new ordinary inner objective or
+/// moves inside an already-declared reactive objective.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisjointChartPenaltyPolicy {
+    /// Ordinary cold entry is the initialization boundary: derive the intrinsic
+    /// coefficient-space roughness operator from the placed decoder before the
+    /// first joint assembly freezes it.
+    RefreshAtColdEntry,
+    /// Reactive continuation moves inside one objective whose native roughness
+    /// operator already defined the advertised rho face. Preserve that operator
+    /// exactly; changing it here would make the installed waypoint a different
+    /// objective from the one whose legal face the runner queried.
+    PreserveReactiveObjective,
+}
+
 pub(crate) struct EvidenceJointFitOutcome {
     pub(crate) loss: SaeManifoldLoss,
     /// A whole evidence-only re-entry started at the current state and found no
@@ -4152,6 +4167,35 @@ impl SaeManifoldTerm {
         &mut self,
         target: ArrayView2<'_, f64>,
     ) -> Result<(), String> {
+        self.seed_disjoint_charts_with_penalty_policy(
+            target,
+            DisjointChartPenaltyPolicy::RefreshAtColdEntry,
+        )
+    }
+
+    /// #2080 reactive-domain chart placement.
+    ///
+    /// The chart/decoder separation is identical to
+    /// [`Self::seed_cold_start_disjoint_charts`], but this is a move inside the
+    /// objective whose rho upper face was already derived from each atom's
+    /// native `smooth_penalty`. Preserve that operator instead of refreshing it
+    /// from the placed decoder, so the later fixed-face decoder solve and joint
+    /// corrector optimize exactly the advertised objective.
+    pub(crate) fn place_reactive_entry_disjoint_charts(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        self.seed_disjoint_charts_with_penalty_policy(
+            target,
+            DisjointChartPenaltyPolicy::PreserveReactiveObjective,
+        )
+    }
+
+    fn seed_disjoint_charts_with_penalty_policy(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        penalty_policy: DisjointChartPenaltyPolicy,
+    ) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let k = self.k_atoms();
@@ -4224,7 +4268,9 @@ impl SaeManifoldTerm {
                     self.atoms[atom].decoder_coefficients[[col, out]] = beta[[col, out]];
                 }
             }
-            self.atoms[atom].refresh_intrinsic_smooth_penalty();
+            if penalty_policy == DisjointChartPenaltyPolicy::RefreshAtColdEntry {
+                self.atoms[atom].refresh_intrinsic_smooth_penalty();
+            }
         }
         Ok(())
     }

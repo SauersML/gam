@@ -82,6 +82,31 @@ const STEER_VALIDITY_STEPS: usize = 64;
 /// validity radius.
 const VALIDITY_DIVERGENCE_FRACTION: f64 = 0.1;
 
+/// Scientific status of the quadratic dose relative to the full output Fisher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FisherDoseKind {
+    /// Euclidean/no-behavior metric: no nats dose exists.
+    Unavailable,
+    /// A behavioral factor metric exists, but no omitted-mass audit was supplied.
+    UnauditedFactorMetric,
+    /// The harvest reports zero omitted Fisher trace.
+    FullMass,
+    /// A non-negative Fisher tail was omitted; the local quadratic is a lower
+    /// bound on the full-Fisher local KL.
+    TruncatedLowerBound,
+}
+
+impl FisherDoseKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::UnauditedFactorMetric => "unaudited_factor_metric",
+            Self::FullMass => "full_mass",
+            Self::TruncatedLowerBound => "truncated_lower_bound",
+        }
+    }
+}
+
 /// The actionable output of a steering query over one atom.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SteerPlan {
@@ -106,6 +131,16 @@ pub struct SteerPlan {
     /// `None` when the metric carries no behavioral information (Euclidean
     /// provenance) — the dose is *not available*, not zero.
     pub predicted_nats: Option<f64>,
+    /// Whether `predicted_nats` is full-mass, unaudited, or a low-rank lower
+    /// bound. This prevents consumers from treating every factor rank as an
+    /// equally calibrated full-Fisher dose.
+    pub predicted_nats_kind: FisherDoseKind,
+    /// Captured trace `tr(U_n U_n^T)` at `metric_row`, when behavior is present.
+    pub fisher_mass_captured: Option<f64>,
+    /// Non-negative omitted Fisher trace supplied by the harvest, when audited.
+    pub fisher_mass_residual: Option<f64>,
+    /// `residual / (captured + residual)`, when audited.
+    pub fisher_mass_residual_fraction: Option<f64>,
     /// **VALIDITY RADIUS**: the latent step size (Euclidean norm of the move from
     /// `t_from`) at which the exact chord dose first diverges from the
     /// initial-tangent quadratic prediction by more than
@@ -416,6 +451,23 @@ pub fn steer_delta(
     // Whether the metric can/does match this term and carries behavior.
     let provenance = metric.provenance();
     let behavior_available = metric_carries_behavior(provenance);
+    let fisher_mass_captured =
+        behavior_available.then(|| metric.row_traces()[metric_row]);
+    let fisher_mass_residual = behavior_available
+        .then(|| metric.truncation_mass_residual(metric_row))
+        .flatten();
+    let fisher_mass_residual_fraction = behavior_available
+        .then(|| metric.truncation_mass_residual_fraction(metric_row))
+        .flatten();
+    let predicted_nats_kind = if !behavior_available {
+        FisherDoseKind::Unavailable
+    } else {
+        match fisher_mass_residual {
+            None => FisherDoseKind::UnauditedFactorMetric,
+            Some(0.0) => FisherDoseKind::FullMass,
+            Some(_) => FisherDoseKind::TruncatedLowerBound,
+        }
+    };
 
     // --- off-manifold guard -------------------------------------------------
     // Project δ onto the span of the local decoder tangents ∂g_k/∂t and report
@@ -464,6 +516,10 @@ pub fn steer_delta(
         metric_row,
         delta,
         predicted_nats,
+        predicted_nats_kind,
+        fisher_mass_captured,
+        fisher_mass_residual,
+        fisher_mass_residual_fraction,
         validity_radius,
         off_manifold_norm,
         metric_provenance: provenance,

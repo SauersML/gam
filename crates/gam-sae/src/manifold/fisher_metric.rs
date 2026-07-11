@@ -133,7 +133,7 @@ pub fn build_sae_fisher_row_metric(
         }
     }
     let packed = Arc::new(packed);
-    match request.provenance {
+    let metric = match request.provenance {
         SaeFisherMetricProvenance::OutputFisher => {
             RowMetric::output_fisher(packed, request.expected_output_dim, rank)
         }
@@ -142,6 +142,12 @@ pub fn build_sae_fisher_row_metric(
         }
         SaeFisherMetricProvenance::BehavioralFisher => {
             RowMetric::behavioral_fisher(packed, request.expected_output_dim, rank)
+        }
+    }?;
+    match request.mass_residual {
+        None => Ok(metric),
+        Some(residual) => {
+            metric.with_truncation_mass_residual(Arc::new(residual.to_owned()))
         }
     }
 }
