@@ -71,8 +71,8 @@ fn two_unequal_circles_plus_dead(
     z
 }
 
-/// Build a fresh K periodic term (production PCA seed, cold decoders) at the given
-/// atom count on the UN-whitened target.
+/// Build a fresh K periodic term with the production PCA coordinates and joint
+/// decoder-LSQ seed at the given atom count on the UN-whitened target.
 fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
     let n = target.nrows();
     let p = target.ncols();
@@ -84,7 +84,6 @@ fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
 
     let mut basis_values = Array3::<f64>::zeros((k, n, m));
     let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
-    let decoder = Array3::<f64>::zeros((k, m, p));
     let mut penalties = Array3::<f64>::zeros((k, m, m));
     let mut coords_vec: Vec<Array2<f64>> = Vec::new();
     for atom in 0..k {
@@ -98,6 +97,19 @@ fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
         coords_vec.push(coords);
     }
     let logits = Array2::<f64>::zeros((n, k));
+    let basis_sizes = vec![m; k];
+    let decoder = sae_decoder_lsq_init(
+        basis_values.view(),
+        &basis_sizes,
+        target.view(),
+        logits.view(),
+        "ibp_map",
+        1.0,
+        1.0,
+        0.0,
+        None,
+    )
+    .unwrap();
     let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
     for _ in 0..k {
         evaluators.push(Some(evaluator.clone()));
@@ -108,7 +120,7 @@ fn kterm_periodic(target: &Array2<f64>, k: usize, m: usize) -> SaeManifoldTerm {
         &basis_kinds,
         basis_values.view(),
         basis_jacobian.view(),
-        &vec![m; k],
+        &basis_sizes,
         &dims,
         decoder.view(),
         penalties.view(),
