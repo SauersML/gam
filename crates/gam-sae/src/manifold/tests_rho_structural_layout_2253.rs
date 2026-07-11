@@ -6,10 +6,31 @@
 //! its fixed support is the sparsity mechanism. These are typed layout absences,
 //! not optimizer-held coordinates.
 
-use super::tests::warmstart_test_objective_with_evaluator;
+use super::tests::{
+    PlantedCircleAssignmentMode, planted_circle_embedded, planted_circle_seed_term,
+};
 use super::*;
 use approx::assert_abs_diff_eq;
 use ndarray::{Array1, array};
+use std::sync::Arc;
+
+/// Deterministic K=1 periodic objective whose fitted dictionary carries real
+/// non-constant signal. The four-row, one-output warm-start contract toy used
+/// here previously is intentionally tiny and strongly regularized; its fitted
+/// output lands at the column mean and correctly triggers the absolute
+/// fit-data-collapse wall. That makes it invalid as a value-derivative witness:
+/// every nearby rho is supposed to return the same discrete wall.
+fn planted_periodic_outer_objective_2253() -> SaeManifoldOuterObjective {
+    let target = planted_circle_embedded(32, 4, 0.02);
+    let mut term =
+        planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
+    // `planted_circle_seed_term` installs the harmonic evaluator for basis
+    // refresh. The analytic logdet-state adjoint also needs its second-jet view.
+    term.atoms[0].basis_second_jet =
+        Some(Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator")));
+    let rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    SaeManifoldOuterObjective::new(term, target, None, rho, 40, 1.0, 1.0e-6, 1.0e-6)
+}
 
 #[test]
 fn fixed_assignment_strength_is_absent_from_flat_rho_layout_2253() {
@@ -53,7 +74,7 @@ fn fixed_assignment_strength_is_absent_from_flat_rho_layout_2253() {
 
 #[test]
 fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
-    let mut gradient_objective = warmstart_test_objective_with_evaluator();
+    let mut gradient_objective = planted_periodic_outer_objective_2253();
     let base = gradient_objective.baseline_rho.to_flat();
     assert_eq!(
         base.len(),
@@ -63,12 +84,23 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     assert_eq!(gradient_objective.baseline_rho.sparse_flat_index(), None);
 
     // Match the real optimizer's Value -> ValueAndGradient handoff order.
-    gradient_objective
+    let base_cost = gradient_objective
         .eval_cost(&base)
         .expect("base value lane must converge");
+    assert!(
+        base_cost.is_finite() && base_cost < SAE_FIT_DATA_COLLAPSE_COST,
+        "the active-rho derivative witness must start in a real noncollapsed basin, \
+         not on the discrete fit-data wall: base={base_cost:.17e}"
+    );
     let evaluation = gradient_objective
         .eval(&base)
         .expect("base analytic-gradient lane must converge");
+    assert!(
+        evaluation.cost.is_finite() && evaluation.cost < SAE_FIT_DATA_COLLAPSE_COST,
+        "the analytic-gradient lane must price the same real noncollapsed basin: \
+         cost={:.17e}",
+        evaluation.cost
+    );
     assert_eq!(evaluation.gradient.len(), 2);
 
     let direction = array![0.6_f64, -0.8_f64];
@@ -77,7 +109,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let plus = &base + &(h * &direction);
     let minus = &base - &(h * &direction);
     let cost_at = |rho: &Array1<f64>| {
-        let mut objective = warmstart_test_objective_with_evaluator();
+        let mut objective = planted_periodic_outer_objective_2253();
         let cost = objective
             .eval_cost(rho)
             .expect("directional finite-difference value probe must converge");
@@ -85,6 +117,16 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     };
     let (plus_cost, plus_telemetry) = cost_at(&plus);
     let (minus_cost, minus_telemetry) = cost_at(&minus);
+    assert!(
+        plus_cost.is_finite() && plus_cost < SAE_FIT_DATA_COLLAPSE_COST,
+        "+h must evaluate the real REML criterion, not the discrete fit-data wall: \
+         cost={plus_cost:.17e}, telemetry={plus_telemetry:?}"
+    );
+    assert!(
+        minus_cost.is_finite() && minus_cost < SAE_FIT_DATA_COLLAPSE_COST,
+        "-h must evaluate the real REML criterion, not the discrete fit-data wall: \
+         cost={minus_cost:.17e}, telemetry={minus_telemetry:?}"
+    );
     assert_eq!(
         plus_telemetry.wall_cost_value_probes, 0,
         "+h value probe returned the recoverable-refusal wall: {plus_telemetry:?}"
