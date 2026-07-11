@@ -109,7 +109,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
 
     let rho_state = gradient_objective.baseline_rho.from_flat(base.view());
     let mut audit_term = gradient_objective.term.clone();
-    let (_, audit_loss, audit_cache) = audit_term
+    let mut atomized_audit_term = audit_term.clone();
+    let (audit_value, audit_loss, audit_cache) = audit_term
         .reml_criterion_with_cache(
             gradient_objective.target.view(),
             &rho_state,
@@ -120,6 +121,26 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             gradient_objective.ridge_beta,
         )
         .expect("frozen accepted-state evidence audit must evaluate");
+    let atomized_criterion = atomized_audit_term
+        .criterion_as_atoms(
+            gradient_objective.target.view(),
+            &rho_state,
+            gradient_objective.registry.as_ref(),
+            0,
+            gradient_objective.learning_rate,
+            gradient_objective.ridge_ext_coord,
+            gradient_objective.ridge_beta,
+        )
+        .expect("rank-adjusted criterion atoms must assemble");
+    let atom_identity_roundoff = 64.0
+        * f64::EPSILON
+        * (1.0 + audit_value.abs().max(atomized_criterion.value().abs()));
+    assert!(
+        (atomized_criterion.value() - audit_value).abs() <= atom_identity_roundoff,
+        "criterion atoms must equal the production rank-adjusted scalar: \
+         atoms={:.17e}, production={audit_value:.17e}, roundoff={atom_identity_roundoff:.3e}",
+        atomized_criterion.value(),
+    );
     let audit_solver = audit_term
         .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec())
         .expect("frozen accepted-state outer solver");
