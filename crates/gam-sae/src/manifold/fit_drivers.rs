@@ -5461,13 +5461,31 @@ impl SaeManifoldTerm {
                 // regression). Only a BACKTRACKED acceptance carries overshoot
                 // evidence forward, warmed one contraction-step above the
                 // accepted length.
-                warm_step = if step.step >= warm_step {
+                let clean_acceptance = step.step >= warm_step;
+                warm_step = if clean_acceptance {
                     step_size
                 } else {
                     (step.step * warm_growth).min(step_size)
                 };
+                // LM ridge adaptation (see the loop-top note): a clean full-step
+                // acceptance means the (possibly damped) Gauss–Newton step did not
+                // overshoot, so relax the damping toward Gauss–Newton; a
+                // backtracked acceptance is direct overshoot evidence, so increase
+                // the damping for the next iterate. Geometric, floored at the
+                // caller's ridges, using the existing growth constant.
+                if clean_acceptance {
+                    lm_ridge_t = (lm_ridge_t / SAE_MANIFOLD_ROW_RIDGE_GROWTH).max(ridge_ext_coord);
+                    lm_ridge_b = (lm_ridge_b / SAE_MANIFOLD_ROW_RIDGE_GROWTH).max(ridge_beta);
+                } else {
+                    lm_ridge_t *= SAE_MANIFOLD_ROW_RIDGE_GROWTH;
+                    lm_ridge_b *= SAE_MANIFOLD_ROW_RIDGE_GROWTH;
+                }
             }
             if !accepted {
+                // The proximal correction below runs its own ridge escalation from
+                // the caller's base, so reset the adaptive LM ridge to base too.
+                lm_ridge_t = ridge_ext_coord;
+                lm_ridge_b = ridge_beta;
                 // The proximal LM correction below re-solves with its own ridge
                 // escalation; the next line-search regime is unrelated to this
                 // iterate's accepted length, so reset the warm start.
