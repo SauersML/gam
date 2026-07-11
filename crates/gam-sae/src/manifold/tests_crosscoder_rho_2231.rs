@@ -286,7 +286,7 @@ fn engaged_objective(
 /// above this window), not a precision gate.
 #[test]
 fn block_gradient_matches_central_difference_of_cost_2231() {
-    let (z, coords, _p_x, p_1, closed_form) = planted_two_layer();
+    let (z, coords, _p_x, p_1, _) = planted_two_layer();
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
     let n = z.nrows();
     let rho_template = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)])
