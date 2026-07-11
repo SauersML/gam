@@ -2637,7 +2637,14 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     min,
                     max,
                     prior,
-                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(true),
+                    // Unlike a plain `linear()` term, `bounded()` already commits
+                    // the coefficient to an exact interval transform (plus an
+                    // optional prior); layering the null-space ridge on top is
+                    // structurally rejected downstream (`design_construction.rs`:
+                    // "bounded linear term ... cannot also use double_penalty"),
+                    // so the default must be `false`, not the `linear()`/`s()`
+                    // convention of `true`.
+                    double_penalty: option_bool_strict(&options, "double_penalty")?.unwrap_or(false),
                 });
             }
             "group" | "re" | "factor" => {

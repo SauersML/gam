@@ -5734,8 +5734,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let parsed = parse_formula("y ~ x + bounded(z, min=-2, max=2) + x:z")
-            .expect("parse linear defaults");
+        let parsed = parse_formula("y ~ x + z + x:z").expect("parse linear defaults");
         let mut notes = Vec::new();
         let terms = build_termspec(
             &parsed.terms,
@@ -5754,6 +5753,27 @@ mod tests {
                 .iter()
                 .map(|term| (&term.name, term.double_penalty))
                 .collect::<Vec<_>>()
+        );
+
+        // `bounded()` is a distinct coefficient geometry (an exact interval
+        // transform, not a penalized linear slope): it structurally rejects
+        // `double_penalty` (see `design_construction.rs`), so — unlike the
+        // plain linear terms above — it must default to `false`.
+        let bounded_parsed =
+            parse_formula("y ~ bounded(z, min=-2, max=2)").expect("parse bounded defaults");
+        let mut bounded_notes = Vec::new();
+        let bounded_terms = build_termspec(
+            &bounded_parsed.terms,
+            &ds,
+            &ds.column_map(),
+            &mut bounded_notes,
+            &gam_runtime::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build bounded defaults");
+        assert_eq!(bounded_terms.linear_terms.len(), 1);
+        assert!(
+            !bounded_terms.linear_terms[0].double_penalty,
+            "bounded() must default double_penalty=false since it cannot combine with the interval transform"
         );
 
         for formula in [
