@@ -4539,24 +4539,20 @@ fn feature_columns_max_range(data: ArrayView2<'_, f64>, feature_cols: &[usize]) 
     }
 }
 
-/// Rotation-invariant analogue of [`feature_columns_max_range`]: the cloud
-/// diameter proxy `2·max_i ‖x_i − x̄‖` over the feature columns.
+/// Rotation-invariant analogue of [`feature_columns_max_range`], calibrated to
+/// the span of the cloud's longest direction.
 ///
-/// Unlike the per-axis span (a projection of the cloud onto each axis, which
-/// changes when the covariates are rotated), the maximum distance from the
-/// centroid is a pure function of the unordered Euclidean geometry and is
-/// therefore invariant under any orthogonal map — the property an ISOTROPIC
-/// kernel's characteristic length must have for its fit to be rotation-invariant
-/// (gam#2252). The centroid is computed in value-sorted order per axis so the
-/// result is also bit-stable under a pure row permutation (gam#1378).
+/// For a uniform interval of width `L`, the leading covariance eigenvalue is
+/// `L²/12`, so `sqrt(12·λ_max)` recovers `L`. The same identity holds for the
+/// longest side of an axis-aligned uniform box, while `λ_max` is invariant
+/// under every orthogonal change of coordinates. This preserves the scale of
+/// the former widest-axis seed without making it frame-dependent (gam#2252).
+/// Sorting the complete points lexicographically makes each frame stable under
+/// a pure row permutation (gam#1378).
 fn feature_columns_rotation_invariant_range(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
 ) -> Option<f64> {
-    let n = data.nrows();
-    if n == 0 {
-        return None;
-    }
     let cols: Vec<usize> = feature_cols
         .iter()
         .copied()
@@ -4565,40 +4561,65 @@ fn feature_columns_rotation_invariant_range(
     if cols.is_empty() {
         return None;
     }
-    let centroid: Vec<f64> = cols
-        .iter()
-        .map(|&c| {
-            let mut vals: Vec<f64> = data
-                .column(c)
-                .iter()
-                .copied()
-                .filter(|v| v.is_finite())
-                .collect();
-            vals.sort_by(f64::total_cmp);
-            let m = vals.len().max(1) as f64;
-            vals.iter().sum::<f64>() / m
+    let mut points: Vec<Vec<f64>> = data
+        .rows()
+        .into_iter()
+        .filter_map(|row| {
+            let point: Vec<f64> = cols.iter().map(|&column| row[column]).collect();
+            point.iter().all(|value| value.is_finite()).then_some(point)
         })
         .collect();
-    let mut max_r2 = 0.0_f64;
-    for i in 0..n {
-        let mut r2 = 0.0_f64;
-        let mut finite = true;
-        for (ci, &c) in cols.iter().enumerate() {
-            let v = data[[i, c]];
-            if !v.is_finite() {
-                finite = false;
-                break;
-            }
-            let d = v - centroid[ci];
-            r2 += d * d;
-        }
-        if finite && r2 > max_r2 {
-            max_r2 = r2;
+    if points.is_empty() {
+        return None;
+    }
+    points.sort_by(|left, right| {
+        left.iter()
+            .zip(right)
+            .find_map(|(a, b)| {
+                let ordering = a.total_cmp(b);
+                ordering.is_ne().then_some(ordering)
+            })
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let dimensions = cols.len();
+    let count = points.len() as f64;
+    let mut centroid = vec![0.0_f64; dimensions];
+    for point in &points {
+        for (coordinate, value) in centroid.iter_mut().zip(point) {
+            *coordinate += *value;
         }
     }
-    let diameter = 2.0 * max_r2.sqrt();
-    if diameter.is_finite() && diameter > 0.0 {
-        Some(diameter)
+    for coordinate in &mut centroid {
+        *coordinate /= count;
+    }
+
+    let mut covariance = Array2::<f64>::zeros((dimensions, dimensions));
+    for point in &points {
+        for row in 0..dimensions {
+            let centered_row = point[row] - centroid[row];
+            for column in 0..=row {
+                covariance[[row, column]] +=
+                    centered_row * (point[column] - centroid[column]);
+            }
+        }
+    }
+    for row in 0..dimensions {
+        for column in 0..=row {
+            let value = covariance[[row, column]] / count;
+            covariance[[row, column]] = value;
+            covariance[[column, row]] = value;
+        }
+    }
+
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let (eigenvalues, _) = covariance
+        .eigh(faer::Side::Lower)
+        .expect("finite covariance must have a symmetric eigendecomposition");
+    let leading_variance = eigenvalues[eigenvalues.len() - 1];
+    let extent = (12.0 * leading_variance).sqrt();
+    if extent.is_finite() && extent > 0.0 {
+        Some(extent)
     } else {
         None
     }
@@ -4658,10 +4679,11 @@ pub fn auto_initial_length_scale_for_centers(
     // — starts from a frame-independent point and lands in the SAME basin in every
     // rotated frame, making the isotropic Matérn fit rotation-invariant. The
     // per-axis span (`feature_columns_max_range`) is a projection of the cloud and
-    // is rotation-variant; the diameter proxy `2·max‖x−x̄‖` is invariant under any
-    // orthogonal map of the covariates. Duchon/thin-plate seeds are computed by
-    // separate helpers and are unchanged, so those (seed-robust) bases stay
-    // bit-identical — this fix is scoped to the seed-sensitive Matérn path.
+    // is rotation-variant; the covariance spectral extent `sqrt(12·λ_max)` is
+    // invariant under any orthogonal map and retains the former span calibration.
+    // Duchon/thin-plate seeds are computed by separate helpers and are unchanged,
+    // so those (seed-robust) bases stay bit-identical — this fix is scoped to the
+    // seed-sensitive Matérn path.
     let Some(max_range) = feature_columns_rotation_invariant_range(data, feature_cols) else {
         return 1.0;
     };

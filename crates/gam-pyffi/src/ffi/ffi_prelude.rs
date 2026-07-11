@@ -21,8 +21,7 @@ pub(crate) use gam::solver::estimate::{
 };
 
 pub(crate) use gam::linalg::faer_ndarray::{
-    FaerCholesky, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata, fast_atb,
-    fast_xt_diag_x,
+    FaerCholesky, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
 };
 
 pub(crate) use gam::families::bms::BernoulliMarginalSlopeFitResult;
@@ -150,8 +149,8 @@ pub(crate) use gam::terms::basis::{
     build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
     build_matern_basis, build_matern_basis_literal_aniso, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
-    create_difference_penalty_matrix, cyclic_bspline_derivative_penalty_matrix,
-    duchon_cubic_default, duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
+    cyclic_bspline_derivative_penalty_matrix, duchon_cubic_default,
+    duchon_polynomial_first_derivative_nd,
     duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd,
     duchon_sae_atom_basis_with_jet, evaluate_bspline_basis_scalar,
     matern_input_location_hessian_nd, matern_input_location_jet_nd,
@@ -180,8 +179,8 @@ pub(crate) use gam::terms::dictionary::{
 
 pub(crate) use gam::terms::sae::sparse_dict::{
     BlockChartComposeConfig, BlockChartRecord, BlockSeedManifest, BlockSeedManifestConfig,
-    BlockSeedRecord, BlockSparseConfig, BlockSparseFitError, BlockSparseStreamState,
-    MdlFeaturizerRow, SparseDictConfig, SparseDictStreamState, SparseDictionaryError,
+    BlockSeedRecord, BlockSparseConfig, BlockSparseStreamState, MdlFeaturizerRow, SparseDictConfig,
+    SparseDictStreamState,
     block_sparse_dictionary_block_coords, block_sparse_dictionary_firings,
     block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
     block_sparse_dictionary_seed_manifest, block_sparse_dictionary_transform,
@@ -190,18 +189,13 @@ pub(crate) use gam::terms::sae::sparse_dict::{
 };
 
 pub(crate) use gam::terms::sae::manifold::{
-    CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
-    GumbelTemperatureSchedule, MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator,
-    SAE_DEFAULT_TORUS_HARMONICS, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS,
-    SAE_MOBIUS_CIRCLE_HARMONICS, SAE_MOBIUS_WIDTH_DEGREE, SAE_SPHERE_BASIS_SIZE,
-    SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator, SaeBasisSecondJet,
+    GumbelTemperatureSchedule, SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind,
     SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitSeedReport, SaeFitSeedRequest,
     SaeManifoldRho, SaeMinimalSeedReport, SaeMinimalSeedRequest, SaeStagewiseSeedReport,
-    SaeStagewiseSeedRequest, ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator,
+    SaeStagewiseSeedRequest, ScheduleKind,
     build_sae_basis_evaluators, build_sae_fisher_row_metric, build_sae_fit_seed,
     build_sae_minimal_seed, build_sae_stagewise_seed, sae_atom_basis_kind_from_str,
-    sae_atom_basis_kind_name, sae_duchon_atom_m, sae_euclidean_degree_for_basis_size,
-    sae_periodic_basis_size, sae_pick_duchon_center_indices, sae_torus_axis_basis_size,
+    sae_atom_basis_kind_name, sae_pick_duchon_center_indices, sae_torus_axis_basis_size,
     sphere_chart_basis_jet,
 };
 
@@ -233,7 +227,7 @@ pub(crate) use gam::families::fit_orchestration::{
 };
 
 pub(crate) use ndarray::{
-    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn, s,
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn, s,
 };
 
 pub(crate) use numpy::{

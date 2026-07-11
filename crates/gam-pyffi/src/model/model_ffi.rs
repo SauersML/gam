@@ -589,7 +589,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// Python objects and then reparsing their string representations. This class
 /// owns the canonical `EncodedDataset`. Its sequence protocol renders only a
 /// requested row for the few metadata helpers that still consume text.
-#[pyclass(name = "_EncodedTable", frozen)]
+#[pyclass(name = "_EncodedTable", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyEncodedTable {
     dataset: EncodedDataset,
@@ -4266,8 +4266,6 @@ const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
 const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
 
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
-
-const DEVIANCE_KEYS: &[&str] = &["deviance"];
 
 const LOG_LIK_KEYS: &[&str] = &["log_likelihood", "loglik", "log_lik"];
 // Response-family tag, used only by the compare_models comparability guard

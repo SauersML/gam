@@ -163,20 +163,14 @@ def _activation_from_logits(
     *,
     assignment: str,
     tau: float,
-    alpha: float,
     jumprelu_threshold: float,
-    learnable_alpha: bool = False,
-    log_lambda_sparse: float | None = None,
     top_k: int | None = None,
 ) -> np.ndarray:
     values = rust_module().sae_activation_matrix_from_logits(
         np.ascontiguousarray(np.asarray(logits, dtype=np.float64)),
         str(assignment),
         float(tau),
-        float(alpha),
         float(jumprelu_threshold),
-        bool(learnable_alpha),
-        None if log_lambda_sparse is None else float(log_lambda_sparse),
         None if top_k is None else int(top_k),
     )
     return np.ascontiguousarray(np.asarray(values, dtype=np.float64))
@@ -227,10 +221,7 @@ class DistilledEncoder:
     coord_periods: tuple[tuple[float | None, ...], ...]
     assignment: str
     tau: float
-    alpha: float
     jumprelu_threshold: float
-    learnable_alpha: bool
-    log_lambda_sparse: float | None
     top_k: int | None
     assignment_tolerance: float
     coord_tolerance: float
@@ -278,10 +269,7 @@ class DistilledEncoder:
             logits,
             assignment=self.assignment,
             tau=self.tau,
-            alpha=self.alpha,
             jumprelu_threshold=self.jumprelu_threshold,
-            learnable_alpha=self.learnable_alpha,
-            log_lambda_sparse=self.log_lambda_sparse,
             top_k=self.top_k,
         )
 
@@ -404,10 +392,7 @@ def distill_encoder(
         pred_logits,
         assignment=str(model.assignment),
         tau=float(model.tau),
-        alpha=float(model.alpha),
         jumprelu_threshold=float(model.jumprelu_threshold),
-        learnable_alpha=bool(model.learnable_alpha),
-        log_lambda_sparse=model.selected_log_lambda_sparse,
         top_k=model.top_k,
     )
     exact_assign = np.asarray(exact["assignments"], dtype=np.float64)
@@ -436,14 +421,7 @@ def distill_encoder(
         coord_periods=coord_periods,
         assignment=str(model.assignment),
         tau=float(model.tau),
-        alpha=float(model.alpha),
         jumprelu_threshold=float(model.jumprelu_threshold),
-        learnable_alpha=bool(model.learnable_alpha),
-        log_lambda_sparse=(
-            None
-            if model.selected_log_lambda_sparse is None
-            else float(model.selected_log_lambda_sparse)
-        ),
         top_k=None if model.top_k is None else int(model.top_k),
         assignment_tolerance=assign_tol,
         coord_tolerance=coord_tol,
@@ -464,10 +442,7 @@ def encode_with_fallback(
         logits_init,
         assignment=encoder.assignment,
         tau=encoder.tau,
-        alpha=encoder.alpha,
         jumprelu_threshold=encoder.jumprelu_threshold,
-        learnable_alpha=encoder.learnable_alpha,
-        log_lambda_sparse=encoder.log_lambda_sparse,
         top_k=encoder.top_k,
     )
     # #1166 — the acceptance gate MUST be cold-started. The "exact" reference

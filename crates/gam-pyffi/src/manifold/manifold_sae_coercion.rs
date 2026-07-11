@@ -224,42 +224,18 @@ pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {
 /// former NumPy reimplementation (including its independently-maintained IBP
 /// exponent) from `gamfit.distill`.
 #[pyfunction(signature = (
-    logits, assignment, temperature, alpha, threshold,
-    learnable_alpha=false, log_lambda_sparse=None, top_k=None
+    logits, assignment, temperature, threshold, top_k=None
 ))]
 pub(crate) fn sae_activation_matrix_from_logits<'py>(
     py: Python<'py>,
     logits: PyReadonlyArray2<'py, f64>,
     assignment: &str,
     temperature: f64,
-    alpha: f64,
     threshold: f64,
-    learnable_alpha: bool,
-    log_lambda_sparse: Option<f64>,
     top_k: Option<usize>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let kind =
         canonical_assignment_kind(assignment).map_err(pyo3::exceptions::PyValueError::new_err)?;
-    if kind == "ibp_map" && !(alpha.is_finite() && alpha > 0.0) {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "alpha must be finite and positive; got {alpha}"
-        )));
-    }
-    let effective_alpha = if kind == "ibp_map" && learnable_alpha {
-        let rho = log_lambda_sparse.ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
-                "learnable IBP activation requires terminal log_lambda_sparse",
-            )
-        })?;
-        if !rho.is_finite() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "log_lambda_sparse must be finite; got {rho}"
-            )));
-        }
-        gam::terms::sae::manifold::resolve_learnable_weight(alpha, rho)
-    } else {
-        alpha
-    };
     if kind == "topk" {
         let support = top_k.ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(

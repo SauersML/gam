@@ -931,8 +931,6 @@ fn steer_delta_from_arrays(
         amplitude,
         t_from,
         t_to,
-        n_obs,
-        p_out,
         atom_basis,
         atom_dim,
         decoder_blocks,
@@ -960,8 +958,6 @@ fn steer_delta_with_metric_from_arrays(
     amplitude: f64,
     t_from: ndarray::ArrayView1<'_, f64>,
     t_to: ndarray::ArrayView1<'_, f64>,
-    n_obs: usize,
-    p_out: usize,
     atom_basis: &[String],
     atom_dim: &[usize],
     decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
@@ -2163,7 +2159,8 @@ fn latent_relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
 
 #[cfg(test)]
 mod sae_euclidean_oos_rebuild_tests {
-    use super::{monomial_exponents, sae_euclidean_degree_for_basis_size};
+    use super::monomial_exponents;
+    use gam::terms::sae::manifold::sae_euclidean_degree_for_basis_size;
 
     /// #1132 bug 3: the OOS basis rebuild for a Euclidean (linear) atom must
     /// re-emit a basis whose width `M` equals the TRAINED decoder block's row
