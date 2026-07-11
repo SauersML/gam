@@ -1676,12 +1676,12 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
 mod tests {
     use super::{
         FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
-        LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsPosterior,
-        NutsResult, SharedData, cloglog_bernoulli_logp_and_residual, firth_jeffreys_logp_and_grad,
-        joint_family_logp_and_grad, laplace_directional_cubic_diagnostic,
-        laplace_skewness_threshold, laplace_trustworthiness_from_skewness,
-        run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
-        run_nuts_sampling_flattened_family,
+        LinkWiggleFamilyParams, LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig,
+        NutsFamily, NutsPosterior, NutsResult, SharedData, cloglog_bernoulli_logp_and_residual,
+        firth_jeffreys_logp_and_grad, joint_family_logp_and_grad,
+        laplace_directional_cubic_diagnostic, laplace_skewness_threshold,
+        laplace_trustworthiness_from_skewness, run_joint_beta_rho_sampling,
+        run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
     };
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};

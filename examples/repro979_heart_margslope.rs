@@ -84,8 +84,8 @@ fn main() {
     match result {
         Ok(FitResult::SurvivalMarginalSlope(fit)) => {
             eprintln!(
-                "[979-HEART] DONE n_train={n_train} total_s={elapsed:.2} outer_iters={} outer_converged={} reml={:.4}",
-                fit.fit.outer_iterations, fit.fit.outer_converged, fit.fit.reml_score
+                "[979-HEART] DONE certified n_train={n_train} total_s={elapsed:.2} outer_iters={} reml={:.4}",
+                fit.fit.outer_iterations, fit.fit.reml_score
             );
         }
         Ok(_) => eprintln!("[979-HEART] wrong variant after {elapsed:.2}s"),
