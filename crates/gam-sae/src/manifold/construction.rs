@@ -1,5 +1,4 @@
 use super::*;
-use gam_math::jet_scalar::JetScalar;
 
 // ── Theorem K: the rank charge is a RUNNING COMPLEXITY λ(n) ──────────────────
 //

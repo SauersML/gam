@@ -41,12 +41,12 @@
 //! sign-flipped cross block loudly. That oracle is the riding test below.
 
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOrder1, DynamicOrder2, FixedRuntimeJet, JetScalar, Order1, Order2,
+    DynamicJetArena, DynamicOrder1, DynamicOrder2, FixedRuntimeJet, Order1, Order2,
     RuntimeJetScalar,
 };
 use gam_math::jet_tower::Tower4;
 
-/// `1/self` for any [`JetScalar`] via Faà di Bruno on `f(u) = 1/u`
+/// `1/self` for any [`gam_math::jet_scalar::JetScalar`] via Faà di Bruno on `f(u) = 1/u`
 /// (stack `[1/u, -1/u², 2/u³, -6/u⁴, 24/u⁵]`). Caller guarantees `self.value()`
 /// is nonzero — softmax denominators are strictly positive sums of exponentials.
 #[inline]
@@ -284,7 +284,7 @@ impl SaeReconstructionRowProgram {
                         .sub(&S::constant(shift, dimension, workspace))
                         .exp();
                     if j == atom {
-                        numer = ej;
+                        numer = ej.clone();
                     }
                     denom = denom.add(&ej);
                 }
@@ -321,7 +321,7 @@ impl SaeReconstructionRowProgram {
     /// `K(K−1)` redundant exps and `K−1` redundant recips eliminated per row at
     /// `K=8` ⇒ 56 exps + 7 recips removed), and is **bit-identical** to the
     /// per-atom path (same `exp_k · recip(denom)` product, same Leibniz order).
-    /// Pure [`JetScalar`] ops — single-source, exact, no softmax chain rule.
+    /// Pure [`gam_math::jet_scalar::JetScalar`] ops — single-source, exact, no softmax chain rule.
     fn all_gates<'arena, S: RuntimeJetScalar<'arena>>(
         &self,
         workspace: &'arena S::Workspace,
@@ -896,7 +896,8 @@ impl<const K: usize> O2x4<K> {
     }
     /// `1/self`, per-lane stack `[1/u, -1/u², 2/u³]` — the DIVISION-based stack
     /// of the [`recip`] free fn the scalar reconstruction path uses (NOT the
-    /// reciprocal-multiply `[r,-r²,2r³]` of `JetScalar::recip`; those differ by a
+    /// reciprocal-multiply `[r,-r²,2r³]` of
+    /// [`gam_math::jet_scalar::JetScalar::recip`]; those differ by a
     /// ULP and would break `to_bits` parity). Caller guarantees nonzero.
     #[inline]
     fn recip(&self) -> Self {
@@ -1372,6 +1373,7 @@ impl SaeReconstructionRowProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_math::jet_scalar::JetScalar;
 
     /// Replicate the production hand path (`row_jets_for_logdet`) arithmetic for
     /// the reconstruction `first`/`second` channels of ONE output column, from
@@ -1708,7 +1710,13 @@ mod tests {
     #[test]
     fn runtime_row_jets_match_fixed_oracle_above_old_arity_ceiling_932() {
         const K: usize = 18;
-        let program = softmax_fixture_k(9, 1, 3, 5, 1.3);
+        let mut program = softmax_fixture_k(9, 1, 3, 5, 1.3);
+        program.gate = RowGate::PerAtomLogistic { inv_tau: 1.3 };
+        program.gate_shift.fill(0.0);
+        program.gate_scale.fill(1.0);
+        for atom in 0..program.logits.len() {
+            program.gate_value[atom] = 1.0 / (1.0 + (-1.3 * program.logits[atom]).exp());
+        }
         assert_eq!(program.n_primaries, K);
 
         let arena = DynamicJetArena::new();
@@ -1749,8 +1757,7 @@ mod tests {
                 "β-border channel {channel} value mismatch"
             );
             for a in 0..K {
-                let tolerance =
-                    1.0e-12 * (1.0 + dynamic.g()[a].abs().max(fixed.g()[a].abs()));
+                let tolerance = 1.0e-12 * (1.0 + dynamic.g()[a].abs().max(fixed.g()[a].abs()));
                 assert!(
                     (dynamic.g()[a] - fixed.g()[a]).abs() <= tolerance,
                     "β-border channel {channel} gradient[{a}] mismatch"

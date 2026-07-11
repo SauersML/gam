@@ -6728,14 +6728,8 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
                     }
                 }};
             }
-            match 9 + pw {
-                10 => run_kw!(10),
-                11 => run_kw!(11),
-                12 => run_kw!(12),
-                13 => run_kw!(13),
-                14 => run_kw!(14),
-                other => panic!("wiggle oracle: unsupported KW={other}"),
-            }
+            assert_eq!(9 + pw, 13, "fixture's clamped cubic basis width changed");
+            run_kw!(13);
         }
 
         // #932: the production single-source §13 wiggle joint Hessian
@@ -6757,6 +6751,103 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
                 "{distribution:?}: §13 wiggle joint Hessian [{a}][{b}] dense {dj} != independent tower {tj}"
             );
         }
+    }
+}
+
+/// Runtime-sized #932 regression: a valid cubic link-wiggle basis wider than
+/// the retired 11-column const-generic ceiling must run every production packed
+/// derivative channel. This exercises the actual survival family/kernel rather
+/// than a validator in isolation.
+#[test]
+fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
+    use super::row_kernel::{
+        survival_ls_wiggle_directional_derivative_dense,
+        survival_ls_wiggle_joint_hessian_dense,
+        survival_ls_wiggle_second_directional_derivative_dense,
+    };
+    use crate::row_kernel::RowSet;
+
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 1.0, 1.0, 1.0];
+    let weight = [1.0, 0.8, 1.2, 1.1];
+    let q0_exit = Array1::from_shape_fn(primaries.len(), |i| {
+        primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
+    });
+    // Cubic clamping (four repeated endpoints) plus eight interior knots gives
+    // twelve basis columns: one beyond the retired pw<=11 production ceiling.
+    let knots = Array1::from_vec(vec![
+        -2.5, -2.5, -2.5, -2.5, -2.0, -1.4, -0.8, -0.2, 0.4, 1.0, 1.6, 2.2, 3.2, 3.2,
+        3.2, 3.2,
+    ]);
+    let degree = 3usize;
+    let xwiggle = survival_wiggle_basis_with_options(
+        q0_exit.view(),
+        &knots,
+        degree,
+        BasisOptions::value(),
+    )
+    .expect("wide wiggle design");
+    let pw = xwiggle.ncols();
+    assert!(pw > 11, "fixture must exceed the retired width ceiling, got {pw}");
+
+    let inverse_link = residual_distribution_inverse_link(ResidualDistribution::Gaussian);
+    let mut family =
+        survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+    family.x_link_wiggle = Some(DesignMatrix::Dense(
+        gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+    ));
+    family.wiggle_knots = Some(knots);
+    family.wiggle_degree = Some(degree);
+
+    let mut states = survival_ls_joint_oracle_states(&primaries);
+    let betaw = Array1::<f64>::zeros(pw);
+    states.push(ParameterBlockState {
+        beta: betaw.clone(),
+        eta: xwiggle.dot(&betaw),
+    });
+    let q = family
+        .collect_joint_quantities(&states)
+        .expect("wide joint quantities");
+    let dynamic = family
+        .build_dynamic_geometry(&states)
+        .expect("wide dynamic geometry");
+    let n_coefficients: usize = states.iter().map(|state| state.beta.len()).sum();
+    let direction_u: Vec<f64> = (0..n_coefficients)
+        .map(|axis| 0.01 * (axis as f64 + 1.0))
+        .collect();
+    let direction_v: Vec<f64> = (0..n_coefficients)
+        .map(|axis| -0.007 * (axis as f64 + 0.5))
+        .collect();
+
+    let hessian = survival_ls_wiggle_joint_hessian_dense(&family, &q, &dynamic, 0.0)
+        .expect("wide runtime Hessian");
+    let third = survival_ls_wiggle_directional_derivative_dense(
+        &family,
+        &q,
+        &dynamic,
+        0.0,
+        &RowSet::All,
+        &direction_u,
+    )
+    .expect("wide runtime contracted third");
+    let fourth = survival_ls_wiggle_second_directional_derivative_dense(
+        &family,
+        &q,
+        &dynamic,
+        0.0,
+        &RowSet::All,
+        &direction_u,
+        &direction_v,
+    )
+    .expect("wide runtime contracted fourth");
+    for matrix in [&hessian, &third, &fourth] {
+        assert_eq!(matrix.dim(), (n_coefficients, n_coefficients));
+        assert!(matrix.iter().all(|value| value.is_finite()));
     }
 }
 
