@@ -601,10 +601,10 @@ pub fn harvest_move_proposals(
     // a d=1 periodic pair whose decoder AMBIENT spans align (small principal
     // angles via the Grassmann frame) and whose supports are disjoint is a
     // candidate. Acceptance is NOT decided here — the seam equivalence e-value
-    // (`glue_pair_evalue`) is carried on the proposal's trigger and the engine's
-    // Glue arm banks it against the churn null. The pre-screen only RANKS, so
-    // the budget spends its e-value evaluations on the most-aligned pairs; it
-    // carries no acceptance threshold of its own (magic-free).
+    // from `unit_speed_glue_certificate` is carried on the proposal's trigger and
+    // the engine's Glue arm banks it against the churn null. The pre-screen only
+    // RANKS, so the budget spends its e-value evaluations on the most-aligned
+    // pairs; it carries no acceptance threshold of its own (magic-free).
     let mut certified_glues = Vec::new();
     let (glues_proposed, glue_candidates_screened) = harvest_glue_proposals(
         term,
@@ -1064,7 +1064,7 @@ pub struct ChartTransition {
 
 /// The geometric half of a chart glue (no e-value): the fitted sign + offset and
 /// the decoded seam clouds/curves, shared by the acceptance e-value
-/// ([`glue_pair_evalue`]) and the warm-start coordinate transplant
+/// ([`unit_speed_glue_certificate`]) and the warm-start coordinate transplant
 /// ([`transplant_glued_coords`]).
 struct SeamTransition {
     sign: f64,
@@ -1405,17 +1405,8 @@ fn unit_speed_glue_certificate(
     ))
 }
 
-fn glue_pair_evalue(
-    term: &SaeManifoldTerm,
-    residuals: ArrayView2<'_, f64>,
-    a: usize,
-    b: usize,
-) -> Option<ChartTransition> {
-    unit_speed_glue_certificate(term, residuals, a, b).map(|(transition, _)| transition)
-}
-
 /// The sample-split equivalence log-e-value shared by the 1-D
-/// ([`glue_pair_evalue`]) and sphere ([`sphere_glue_pair_evalue`]) seam
+/// ([`unit_speed_glue_certificate`]) and sphere ([`sphere_glue_pair_evalue`]) seam
 /// certifiers.  `points_*` are the decoded ambient clouds of each chart's active
 /// rows; `mapped_*` are the SAME points carried through the fitted transition to
 /// the other chart's coordinate; `rows_*` index `residuals` for the
@@ -6737,8 +6728,8 @@ mod tests {
             report.glue_candidates_screened >= 1,
             "the shared-plane pair must be geometrically screened"
         );
-        let e_distinct = glue_pair_evalue(&term, residuals.view(), 0, 1)
-            .expect("the aligned pair yields a seam e-value");
+        let (e_distinct, _) = unit_speed_glue_certificate(&term, residuals.view(), 0, 1)
+            .expect("the aligned pair yields a seam e-value and transition certificate");
         assert!(
             e_distinct.log_e_value < 0.0,
             "distinct concentric circles must NOT glue (negative log-e), got {}",
@@ -6786,8 +6777,8 @@ mod tests {
         // exactly A's image with the orientation-reversing transition t_A=-t_B.
         term.atoms[1].decoder_coefficients[[1, 0]] = -1.0;
         let residuals = Array2::<f64>::zeros((n, 4));
-        let transition = glue_pair_evalue(&term, residuals.view(), 0, 1)
-            .expect("reflected charts have an exact seam");
+        let (transition, _) = unit_speed_glue_certificate(&term, residuals.view(), 0, 1)
+            .expect("reflected charts have an exact certified seam");
         assert_eq!(transition.sign, -1);
         assert!(transition.log_e_value > 5.0);
 
@@ -6849,7 +6840,7 @@ mod tests {
     /// #1890 over-birth reassembly — the PHYSICAL-excision resurrection fix, on the
     /// private primitives the `chart_gluing_1890.rs` integration test cannot reach.
     /// A circle over-tiled into 4 disjoint arcs proposes a spanning set of glues
-    /// (each arc pair lies on ONE circle, so the primitive `glue_pair_evalue`
+    /// (each arc pair lies on ONE circle, so `unit_speed_glue_certificate`
     /// certifies with large positive log-e) with ZERO co-activation fusions. A
     /// round that accepts a matching of those glues then EXCISES the folded
     /// partners for real ([`compact_glued_atoms`]): folding + demoting alone leaves
@@ -6868,8 +6859,8 @@ mod tests {
         // The primitive certifies every arc pair as ONE circle (large positive
         // log-e), and the co-activation lane stays silent on the disjoint supports.
         let residuals0 = Array2::<f64>::zeros((n, 4));
-        let e_arc = glue_pair_evalue(&term, residuals0.view(), 0, 2)
-            .expect("a d=1 aligned disjoint pair yields a seam e-value");
+        let (e_arc, _) = unit_speed_glue_certificate(&term, residuals0.view(), 0, 2)
+            .expect("a d=1 aligned disjoint pair yields a certified seam e-value");
         assert!(
             e_arc.log_e_value > 5.0,
             "e_glue must certify two arcs of one circle, got {}",
