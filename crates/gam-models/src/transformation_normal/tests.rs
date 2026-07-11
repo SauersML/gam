@@ -782,6 +782,92 @@ pub(crate) fn transformation_normal_joint_psi_second_order_terms_match_fd() {
 }
 
 #[test]
+pub(crate) fn transformation_normal_full_outer_hessian_matches_resolved_objective_fd_979() {
+    use gam_custom_family::evaluate_custom_family_joint_hyper;
+
+    let psi = array![0.15, -0.10];
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 200,
+        inner_tol: 1.0e-10,
+        outer_max_iter: 40,
+        outer_tol: 1.0e-10,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+
+    let evaluate = |psi_value: &Array1<f64>, mode: gam_problem::EvalMode| {
+        let (family, derivative_blocks, _state, spec) = toy_family_and_derivatives(psi_value);
+        let rho = spec.initial_log_lambdas.clone();
+        evaluate_custom_family_joint_hyper(
+            &family,
+            std::slice::from_ref(&spec),
+            &options,
+            &rho,
+            &derivative_blocks,
+            None,
+            mode,
+        )
+        .expect("CTN full joint-hyper evaluation")
+    };
+
+    let analytic = evaluate(&psi, gam_problem::EvalMode::ValueGradientHessian);
+    assert!(
+        analytic.inner_converged,
+        "base CTN inner solve must converge"
+    );
+    assert!(
+        analytic.outer_hessian.is_analytic(),
+        "CTN joint-hyper evaluation must expose its exact outer Hessian"
+    );
+    let hessian = analytic
+        .outer_hessian
+        .clone()
+        .materialize_dense()
+        .expect("CTN outer Hessian materialization")
+        .expect("CTN outer Hessian must be present");
+    let rho_dim = analytic.gradient.len() - psi.len();
+    assert_eq!(hessian.nrows(), analytic.gradient.len());
+
+    let step = 1.0e-5;
+    for psi_axis in 0..psi.len() {
+        let mut plus = psi.clone();
+        plus[psi_axis] += step;
+        let plus_eval = evaluate(&plus, gam_problem::EvalMode::ValueAndGradient);
+        assert!(
+            plus_eval.inner_converged,
+            "plus CTN inner solve must converge"
+        );
+        let mut minus = psi.clone();
+        minus[psi_axis] -= step;
+        let minus_eval = evaluate(&minus, gam_problem::EvalMode::ValueAndGradient);
+        assert!(
+            minus_eval.inner_converged,
+            "minus CTN inner solve must converge"
+        );
+
+        let objective_fd = (plus_eval.objective - minus_eval.objective) / (2.0 * step);
+        let column = rho_dim + psi_axis;
+        let gradient_tolerance = 5.0e-3 * (1.0 + objective_fd.abs());
+        assert!(
+            (analytic.gradient[column] - objective_fd).abs() <= gradient_tolerance,
+            "CTN resolved-objective gradient mismatch on psi axis {psi_axis}: analytic={}, fd={objective_fd}",
+            analytic.gradient[column]
+        );
+
+        let gradient_fd = (&plus_eval.gradient - &minus_eval.gradient) / (2.0 * step);
+        for row in 0..analytic.gradient.len() {
+            let tolerance = 5.0e-2 * (1.0 + gradient_fd[row].abs());
+            assert!(
+                (hessian[[row, column]] - gradient_fd[row]).abs() <= tolerance,
+                "CTN resolved-objective Hessian mismatch at ({row},{column}): analytic={}, fd={}",
+                hessian[[row, column]],
+                gradient_fd[row]
+            );
+        }
+    }
+}
+
+#[test]
 pub(crate) fn transformation_normal_joint_psi_first_order_matches_normalized_loglik_fd() {
     let psi = array![0.15, -0.10];
     let h = 1e-6;
