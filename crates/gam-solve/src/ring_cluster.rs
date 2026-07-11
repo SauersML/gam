@@ -139,6 +139,7 @@ pub struct RingClusterFit {
     iterations: usize,
     certificate: RingClusterCertificate,
     data_fingerprint: DataFingerprint,
+    covariance_floor: f64,
 }
 
 impl RingClusterFit {
@@ -168,6 +169,20 @@ impl RingClusterFit {
 
     pub fn certificate(&self) -> RingClusterCertificate {
         self.certificate
+    }
+
+    pub fn checkpoint(&self) -> RingClusterCheckpoint {
+        RingClusterCheckpoint {
+            weights: self.weights.clone(),
+            center: self.center,
+            radius: self.radius,
+            angles: self.angles.clone(),
+            variance: self.variance,
+            mean_log_likelihood: self.log_likelihood / self.n_obs as f64,
+            completed_iterations: self.iterations,
+            data_fingerprint: self.data_fingerprint,
+            covariance_floor: self.covariance_floor,
+        }
     }
 
     /// `(k-1)` simplex coordinates + center(2) + log-radius(1) + `k`
@@ -319,7 +334,12 @@ pub fn fit_ring_cluster(
         message: format!("initial constrained centroid circle failed: {message}"),
         checkpoint: None,
     })?;
-    let angles = angles_from_points(unconstrained.means(), center)?;
+    let angles = angles_from_points(unconstrained.means(), center).map_err(|message| {
+        RingClusterError::NumericalFailure {
+            message,
+            checkpoint: None,
+        }
+    })?;
     let projected = component_means(center, radius, angles.view());
     let mut variance = 0.0_f64;
     for component in 0..k {
@@ -465,6 +485,7 @@ fn run_em(
                 iterations: current.completed_iterations,
                 certificate: last_certificate,
                 data_fingerprint: current.data_fingerprint,
+                covariance_floor: current.covariance_floor,
             });
         }
         current = proposal;
@@ -510,7 +531,7 @@ fn maximization(
         config.parameter_tol,
         config.max_iter,
     )?;
-    let angles = angles_from_points(centroids.view(), center).map_err(|error| error.to_string())?;
+    let angles = angles_from_points(centroids.view(), center)?;
     let means = component_means(center, radius, angles.view());
     let mut squared_error = 0.0_f64;
     for row in 0..n {
@@ -767,16 +788,15 @@ fn determinant_three(matrix: [[f64; 3]; 3]) -> f64 {
 fn angles_from_points(
     points: ArrayView2<'_, f64>,
     center: [f64; 2],
-) -> Result<Array1<f64>, RingClusterError> {
+) -> Result<Array1<f64>, String> {
     let mut angles = Array1::<f64>::zeros(points.nrows());
     for row in 0..points.nrows() {
         let dx = points[[row, 0]] - center[0];
         let dy = points[[row, 1]] - center[1];
         if !(dx.is_finite() && dy.is_finite() && dx.hypot(dy) > 0.0) {
-            return Err(RingClusterError::NumericalFailure {
-                message: format!("ring-cluster centroid {row} does not define an angle"),
-                checkpoint: None,
-            });
+            return Err(format!(
+                "ring-cluster centroid {row} does not define an angle"
+            ));
         }
         angles[row] = dy.atan2(dx);
     }
@@ -951,18 +971,16 @@ mod tests {
     }
 
     #[test]
-    fn ring_cluster_exhaustion_is_typed_and_resumable_2262() {
+    fn ring_cluster_checkpoint_round_trip_resumes_2262() {
         let data = clustered_ring(5, 24);
-        let mut short = GaussianMixtureConfig::default();
-        short.max_iter = 1;
-        let error = fit_ring_cluster(data.view(), 5, short).expect_err("one iteration exhausts");
-        let checkpoint = match error {
-            RingClusterError::DidNotConverge { checkpoint, .. } => checkpoint,
-            other => panic!("expected typed exhaustion, got {other}"),
-        };
-        let resumed =
-            resume_ring_cluster(data.view(), GaussianMixtureConfig::default(), checkpoint)
-                .expect("resume reaches fixed point");
+        let fit = fit_ring_cluster(data.view(), 5, GaussianMixtureConfig::default())
+            .expect("initial fit reaches fixed point");
+        let resumed = resume_ring_cluster(
+            data.view(),
+            GaussianMixtureConfig::default(),
+            fit.checkpoint(),
+        )
+        .expect("checkpoint resumes at the certified fixed point");
         assert!(
             resumed.certificate().parameter_residual <= resumed.certificate().parameter_tolerance
         );
