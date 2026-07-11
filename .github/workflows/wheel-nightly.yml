@@ -26,9 +26,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Per-SHA concurrency: main churns faster than a wheel builds (~5 min), so a
+# single cancel-in-progress group would cancel every run before it published
+# and `wheel-latest` would go stale. Grouping by SHA lets each push's build run
+# to completion (GHA minutes are free), so a fresh wheel lands continuously —
+# the newest completed upload wins the rolling release.
 concurrency:
-  group: wheel-nightly
-  cancel-in-progress: true
+  group: wheel-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
