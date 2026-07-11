@@ -916,7 +916,7 @@ fn refit_single_atom_in_place(
     let mut e_k = &target.to_owned() - &full;
     let mut g_buf = vec![0.0_f64; p];
     for row in 0..n {
-        let weights = term.assignment.try_assignments_row_for_rho(row, rho)?;
+        let weights = term.assignment.try_assignments_row(row)?;
         let a_k = weights[atom_idx];
         if a_k == 0.0 {
             continue;

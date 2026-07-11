@@ -2144,8 +2144,8 @@ pub(crate) fn per_fit_config_isolates_barrier_and_ibp_alpha() {
     assert_eq!(term_b.assignment.resolved_ibp_alpha(&rho_b), Some(5.0));
 
     // Distinct α ⇒ distinct gates (the ordered geometric prior π_k differs).
-    let gates_a = term_a.assignment.assignments_for_rho(&rho_a).unwrap();
-    let gates_b = term_b.assignment.assignments_for_rho(&rho_b).unwrap();
+    let gates_a = term_a.assignment.try_assignments().unwrap();
+    let gates_b = term_b.assignment.try_assignments().unwrap();
     let gate_gap = (&gates_a - &gates_b)
         .iter()
         .fold(0.0_f64, |m, d| m.max(d.abs()));

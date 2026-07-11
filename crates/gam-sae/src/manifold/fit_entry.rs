@@ -891,7 +891,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // #1097 / #1103 — harvest each atom's fixed inner-decoder-smooth snapshot at
     // the settled state, so the diagnostics report can produce per-atom
     // Riesz-debiased functionals and the split-LRT smooth-structure e-value.
-    term.set_atom_inner_fits(z.view(), &rho, shape_uncertainty.dispersion)?;
+    term.set_atom_inner_fits(z.view(), shape_uncertainty.dispersion)?;
 
     // #977 / #1230 — recompute the joint-Hessian shape bands when structure
     // search changed the model OR a finalization fallback fired: the pre-search

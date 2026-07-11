@@ -7534,7 +7534,7 @@ mod tests {
         // penalized inner Hessian for EVERY atom, born included).
         let target = born.try_fitted().expect("born term reconstructs");
         let dispersion = 1.0e-2_f64;
-        born.set_atom_inner_fits(target.view(), &born_rho, dispersion)
+        born.set_atom_inner_fits(target.view(), dispersion)
             .expect("inner fits build");
 
         // The pre-search Schur factor only covered the SEED atoms: emulate the

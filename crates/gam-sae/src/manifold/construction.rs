@@ -580,7 +580,6 @@ impl SaeManifoldTerm {
     pub fn set_atom_inner_fits(
         &mut self,
         target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
         dispersion: f64,
     ) -> Result<(), String> {
         if !dispersion.is_finite() || dispersion <= 0.0 {
@@ -610,7 +609,7 @@ impl SaeManifoldTerm {
         // per-atom partial residual is `e_k = (z − fitted) + a_k decoded_k`.
         let mut assignments = Vec::with_capacity(n);
         for row in 0..n {
-            assignments.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+            assignments.push(self.assignment.try_assignments_row(row)?);
         }
         let mut decoded = Array3::<f64>::zeros((n, k_atoms, p));
         let mut dbuf = vec![0.0_f64; p];
@@ -2601,7 +2600,7 @@ impl SaeManifoldTerm {
         // (disjoint-writes determinism — no cross-row float reduction).
         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         // Gate map: order-preserving parallel collect == serial push.
-        let assignments = self.assignments_all_for_rho_parallel(n, rho)?;
+        let assignments = self.assignments_all_parallel(n)?;
         let mut decoded = Array3::<f64>::zeros((n, k_atoms, p));
         {
             let atoms = &self.atoms;
@@ -3001,7 +3000,7 @@ impl SaeManifoldTerm {
         let mut design = Array2::<f64>::zeros((n, m_total));
         for row in 0..n {
             let assignments = match rho {
-                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                Some(_) => self.assignment.try_assignments_row(row)?,
                 None => self.assignment.try_assignments_row(row)?,
             };
             for atom_idx in 0..k_atoms {
@@ -3263,7 +3262,7 @@ impl SaeManifoldTerm {
         let mut resid_buf = vec![0.0_f64; p];
         for row in 0..n {
             let a = match rho {
-                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                Some(_) => self.assignment.try_assignments_row(row)?,
                 None => self.assignment.try_assignments_row(row)?,
             };
             for atom_idx in 0..k_atoms {
@@ -3367,7 +3366,7 @@ impl SaeManifoldTerm {
         let fill_out_row =
             |row: usize, out_row: &mut [f64], g_buf: &mut [f64]| -> Result<(), String> {
                 let a = match rho {
-                    Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
+                    Some(_) => self.assignment.try_assignments_row(row)?,
                     None => self.assignment.try_assignments_row(row)?,
                 };
                 for atom_idx in 0..k_atoms {
@@ -3498,7 +3497,7 @@ impl SaeManifoldTerm {
         // fit uses the same row weighting the joint reconstruction loss does.
         let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
         for row in 0..n {
-            weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+            weights.push(self.assignment.try_assignments_row(row)?);
         }
         // The full assembled reconstruction `Σ_k a[i,k]·γ_k`, computed once. Each
         // atom's leave-this-atom-out response residual is `y_resp = target −
@@ -3627,7 +3626,7 @@ impl SaeManifoldTerm {
         // whole dictionary k times.
         let mut weights: Vec<Array1<f64>> = Vec::with_capacity(n);
         for row in 0..n {
-            weights.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+            weights.push(self.assignment.try_assignments_row(row)?);
         }
         let mut g_buf = vec![0.0_f64; p];
         let mut out = Vec::with_capacity(k_atoms);
@@ -3897,15 +3896,12 @@ impl SaeManifoldTerm {
     /// amplitudes `z_k` the amortized encode recovers `t` against), as an
     /// `n × K` matrix. These are the posterior assignment intensities `a_{ik}`
     /// that [`Self::try_fitted_with_rho`] multiplies into each atom's decoded row.
-    pub fn fitted_assignment_amplitudes(
-        &self,
-        rho: &SaeManifoldRho,
-    ) -> Result<Array2<f64>, String> {
+    pub fn fitted_assignment_amplitudes(&self) -> Result<Array2<f64>, String> {
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
         let mut amplitudes = Array2::<f64>::zeros((n, k_atoms));
         for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            let a = self.assignment.try_assignments_row(row)?;
             for atom_idx in 0..k_atoms {
                 amplitudes[[row, atom_idx]] = a[atom_idx];
             }
@@ -3920,9 +3916,8 @@ impl SaeManifoldTerm {
     pub fn amortized_encode_fitted(
         &self,
         targets: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
     ) -> Result<crate::encode::JointEncodeResult, String> {
-        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        let amplitudes = self.fitted_assignment_amplitudes()?;
         self.amortized_encode_target(targets, amplitudes.view())
     }
 
@@ -3962,7 +3957,7 @@ impl SaeManifoldTerm {
                 targets.dim()
             ));
         }
-        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        let amplitudes = self.fitted_assignment_amplitudes()?;
         let encodes = self.amortized_encode_target(targets, amplitudes.view())?;
         // The EXACT fitted reconstruction the inner solve converged to (pure
         // curved image, rho-keyed) is the supervision target for the amortized
@@ -4121,7 +4116,7 @@ impl SaeManifoldTerm {
         if n == 0 || k_atoms == 0 {
             return Ok(0);
         }
-        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        let amplitudes = self.fitted_assignment_amplitudes()?;
         let encodes = self.amortized_encode_target(target, amplitudes.view())?;
         let p = self.output_dim();
         // Per-row reconstruction squared error BEFORE any seed is applied. The
@@ -4319,11 +4314,11 @@ impl SaeManifoldTerm {
             // #1557 — fill the per-atom assignment row into reused per-worker
             // scratch via the `_into` twin instead of heap-allocating a fresh
             // `Array1` per row per loss eval. Bit-identical to the allocating
-            // `try_assignments_row_for_rho` (same arithmetic, same order); this
+            // `try_assignments_row` (same arithmetic, same order); this
             // loss reruns every Armijo halving × inner Newton iter × outer ρ
             // eval, so the per-row K-sized allocation was a hot-path churn.
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, assign_buf)?;
+                .try_assignments_row_into(row, assign_buf)?;
             let a = &*assign_buf;
             for slot in fitted_row.iter_mut() {
                 *slot = 0.0;

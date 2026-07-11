@@ -2222,7 +2222,7 @@ impl SaeManifoldOuterObjective {
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
         let fitted = self.term.try_fitted_for_rho(rho)?;
-        let assignments = self.term.assignment.assignments_for_rho(rho)?;
+        let assignments = self.term.assignment.try_assignments()?;
         let collapsed = self.term.record_fit_data_collapse_if_needed(
             self.target.view(),
             fitted.view(),

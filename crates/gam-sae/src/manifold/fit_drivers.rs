@@ -594,9 +594,9 @@ impl SaeManifoldTerm {
         let mut scratch = vec![0.0_f64; self.k_atoms()];
         for row in 0..n {
             match rho {
-                Some(rho) => {
+                Some(_) => {
                     self.assignment
-                        .try_assignments_row_for_rho_into(row, rho, &mut scratch)?
+                        .try_assignments_row_into(row, &mut scratch)?
                 }
                 None => {
                     let a = self.assignment.try_assignments_row(row)?;
@@ -2313,7 +2313,7 @@ impl SaeManifoldTerm {
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
+                .try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2336,7 +2336,7 @@ impl SaeManifoldTerm {
         let mut out = Array1::<f64>::zeros(self.beta_dim());
         for row in 0..n {
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
+                .try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2403,7 +2403,7 @@ impl SaeManifoldTerm {
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
+                .try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2427,7 +2427,7 @@ impl SaeManifoldTerm {
         let mut curved_buf = vec![0.0_f64; p];
         for row in 0..n {
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
+                .try_assignments_row_into(row, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -2492,7 +2492,7 @@ impl SaeManifoldTerm {
             match rho {
                 Some(rho) => self
                     .assignment
-                    .try_assignments_row_for_rho_into(row, rho, &mut a),
+                    .try_assignments_row_into(row, &mut a),
                 None => self
                     .assignment
                     .try_assignments_row(row)
@@ -3350,7 +3350,7 @@ impl SaeManifoldTerm {
         // the deflation design matches the joint audit's `diag(a_·k)·Φ_k` blocks.
         let mut gates = Array2::<f64>::zeros((n, k));
         for row in 0..n {
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            let assignments = self.assignment.try_assignments_row(row)?;
             for atom in 0..k {
                 gates[[row, atom]] = assignments[atom];
             }
@@ -3858,7 +3858,7 @@ impl SaeManifoldTerm {
             let m = self.atoms[atom].basis_size();
             let mut d = Array2::<f64>::zeros((n, m));
             for row in 0..n {
-                let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+                let assignments = self.assignment.try_assignments_row(row)?;
                 let w = assignments[atom];
                 for col in 0..m {
                     d[[row, col]] = w * self.atoms[atom].basis_values[[row, col]];
@@ -4040,7 +4040,7 @@ impl SaeManifoldTerm {
     ) -> Result<Array2<f64>, String> {
         let mut d = Array2::<f64>::zeros((end - start, m));
         for row in start..end {
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            let assignments = self.assignment.try_assignments_row(row)?;
             let w = assignments[atom];
             for col in 0..m {
                 d[[row - start, col]] = w * self.atoms[atom].basis_values[[row, col]];

@@ -1586,9 +1586,9 @@ mod tests {
         let random_weight = noise_fixture(128, 6, 1717);
         let alpha = 0.05_f64;
         // With the plus-one correction, zero exceedances attain 1 / (R + 1).
-        // Derive the smallest battery that can actually clear the declared
+        // Derive the smallest battery that can strictly clear the declared
         // level instead of weakening alpha to accommodate too few draws.
-        let replicates = (1.0_f64 / alpha).ceil() as usize - 1;
+        let replicates = (1.0_f64 / alpha).floor() as usize;
         let config = NullBatteryConfig {
             replicates,
             seed: 17,
@@ -1610,7 +1610,7 @@ mod tests {
             report
                 .summaries
                 .iter()
-                .all(|s| s.z > 2.0 && s.p_value <= alpha),
+                .all(|s| s.z > 2.0 && s.p_value < alpha),
             "structured ordered circle should separate from nulls: {:?}",
             report.summaries
         );
@@ -1628,7 +1628,7 @@ mod tests {
             noise_report
                 .summaries
                 .iter()
-                .all(|s| s.z.abs() < 2.0 || s.p_value > alpha),
+                .all(|s| s.z.abs() < 2.0 || s.p_value >= alpha),
             "pure noise must not look separated from nulls: {:?}",
             noise_report.summaries
         );

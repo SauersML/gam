@@ -11,7 +11,7 @@ mod amortized_encoder_tests {
         let k = term.k_atoms();
 
         let results = term
-            .amortized_encode_fitted(target.view(), &rho)
+            .amortized_encode_fitted(target.view())
             .expect("amortized encode of the fit-time target runs end-to-end");
         assert_eq!(results.coords.len(), k, "one coordinate block per atom");
 
@@ -47,13 +47,13 @@ mod amortized_encoder_tests {
         let n = term.n_obs();
         let k = term.k_atoms();
         let amplitudes = term
-            .fitted_assignment_amplitudes(&rho)
+            .fitted_assignment_amplitudes()
             .expect("fitted amplitudes derive from posterior assignments");
         assert_eq!(amplitudes.dim(), (n, k));
         for row in 0..n {
             let a = term
                 .assignment
-                .try_assignments_row_for_rho(row, &rho)
+                .try_assignments_row(row)
                 .expect("assignment row resolves");
             for atom_idx in 0..k {
                 assert_eq!(
@@ -1008,7 +1008,7 @@ mod shape_uncertainty_joint_recompute_tests {
         // fallback produces DIFFERS materially from the joint band. Compared
         // scale-free (both scale by the same dispersion), so the gap reflects the
         // dropped cross-atom / coordinate couplings, not the dispersion.
-        term.set_atom_inner_fits(target.view(), &rho, dispersion)
+        term.set_atom_inner_fits(target.view(), dispersion)
             .expect("inner fits harvested");
         let mut marginal = joint.clone();
         marginal.invalidate_bands_for_recompute();

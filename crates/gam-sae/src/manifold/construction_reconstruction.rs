@@ -859,9 +859,8 @@ impl SaeManifoldTerm {
         let mut rhs_beta = Array1::<f64>::zeros(beta_dim);
 
         for row in 0..n {
-            self.assignment.try_assignments_row_for_rho_into(
+            self.assignment.try_assignments_row_into(
                 row,
-                rho,
                 assignments.as_slice_mut().expect("contiguous assignments"),
             )?;
             for out_col in 0..p {

@@ -6563,7 +6563,7 @@ fn sae_manifold_core_from_fit_payload(
     let payload =
         crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(&raw, training_mean, &cfg)
             .map_err(py_value_error)?;
-    Py::new(py, ManifoldSaeCore { inner: payload })
+    Py::new(py, ManifoldSaeCore::from_payload(payload)?)
 }
 
 /// Round-trip a `ManifoldSAE.to_dict()` JSON payload through the Rust-owned
@@ -6746,6 +6746,61 @@ fn manifold_sae_owned3(v: &[Vec<Vec<f64>>]) -> PyResult<Array3<f64>> {
     Array3::from_shape_vec((d0, d1, d2), flat).map_err(|e| py_value_error(e.to_string()))
 }
 
+/// Build the packed row metric owned by a fitted model and validate the
+/// serialized Fisher fields as one coherent state.  This runs exactly once at
+/// construction/load time (and once for each explicit `attach_fisher` call),
+/// never from `steer`.
+fn manifold_sae_resident_fisher_metric(
+    payload: &crate::manifold::manifold_sae_payload::ManifoldSaePayload,
+) -> PyResult<Option<gam::inference::row_metric::RowMetric>> {
+    let n_rows = payload.fitted.len();
+    let p_out = payload.fitted.first().map_or(0, Vec::len);
+    match &payload.fisher_factors {
+        None => {
+            if payload.fisher_provenance.is_some()
+                || payload.fisher_mass_residual.is_some()
+                || payload.metric_provenance != "Euclidean"
+            {
+                return Err(py_value_error(
+                    "ManifoldSAE: a Euclidean model cannot carry Fisher provenance, mass, or a non-Euclidean metric label"
+                        .to_string(),
+                ));
+            }
+            Ok(None)
+        }
+        Some(factors) => {
+            let provenance = payload.fisher_provenance.as_deref().ok_or_else(|| {
+                py_value_error(
+                    "ManifoldSAE: fisher_provenance is required when fisher_factors are present"
+                        .to_string(),
+                )
+            })?;
+            let factors = manifold_sae_owned3(factors)?;
+            let mass = payload
+                .fisher_mass_residual
+                .as_ref()
+                .map(|values| Array1::from(values.clone()));
+            let request = SaeFisherRowMetricRequest::from_tag(
+                factors.view(),
+                n_rows,
+                p_out,
+                Some(provenance),
+                mass.as_ref().map(|values| values.view()),
+            )
+            .map_err(py_value_error)?;
+            let metric = build_sae_fisher_row_metric(request).map_err(py_value_error)?;
+            let label = gam::terms::sae::manifold::metric_provenance_label(metric.provenance());
+            if payload.metric_provenance != label {
+                return Err(py_value_error(format!(
+                    "ManifoldSAE: metric_provenance {:?} disagrees with Fisher metric {:?}",
+                    payload.metric_provenance, label
+                )));
+            }
+            Ok(Some(metric))
+        }
+    }
+}
+
 /// Parse a JSON array of numbers into an owned `Array1` (for the hybrid-split
 /// linear-image `b0`/`b1`/`v` vectors read from the stored payload).
 fn manifold_sae_json_vec1(value: Option<&serde_json::Value>) -> PyResult<Array1<f64>> {
@@ -6902,14 +6957,32 @@ impl AtomCore {
     }
 }
 
-/// Rust-owned fitted `ManifoldSAE` model handle (#2091). Flat surface only in
-/// this increment; see the module comment above.
-#[pyclass(module = "gamfit._rust", name = "ManifoldSaeCore")]
+/// Rust-owned fitted `ManifoldSAE` model handle (#2091).  The Python-visible
+/// type is the public model itself; there is no wrapper/adapter class.
+#[pyclass(module = "gamfit._rust", name = "ManifoldSAE")]
 pub(crate) struct ManifoldSaeCore {
     inner: crate::manifold::manifold_sae_payload::ManifoldSaePayload,
+    /// Packed, validated Fisher row metric. `RowMetric` keeps its factor matrix
+    /// behind `Arc`, so cloning it into a steering request is O(1).
+    fisher_metric: Option<gam::inference::row_metric::RowMetric>,
+    /// Observable contract counter: construction/attach increments this once;
+    /// repeated `steer` calls leave it unchanged.
+    fisher_metric_build_count: usize,
 }
 
 impl ManifoldSaeCore {
+    fn from_payload(
+        inner: crate::manifold::manifold_sae_payload::ManifoldSaePayload,
+    ) -> PyResult<Self> {
+        let fisher_metric = manifold_sae_resident_fisher_metric(&inner)?;
+        let fisher_metric_build_count = usize::from(fisher_metric.is_some());
+        Ok(Self {
+            inner,
+            fisher_metric,
+            fisher_metric_build_count,
+        })
+    }
+
     /// Build the OOS argument bundle from this handle's state and run the
     /// frozen-decoder Newton solve, returning the full payload dict
     /// (`assignments_z`, `on_atom_coords_t`, `logits`, `fitted`). The Rust-owned
@@ -7004,7 +7077,7 @@ impl ManifoldSaeCore {
         let json_str: String = dumped.extract()?;
         let inner = crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(&json_str)
             .map_err(py_value_error)?;
-        Ok(Self { inner })
+        Self::from_payload(inner)
     }
 
     /// Re-serialize to the `to_dict` schema as a Python dict (through the serde

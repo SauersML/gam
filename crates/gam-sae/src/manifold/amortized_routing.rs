@@ -41,7 +41,7 @@ impl SaeManifoldTerm {
         for atom_idx in 0..k {
             coords.push(self.assignment.coords[atom_idx].as_matrix().to_owned());
         }
-        let amplitudes = self.fitted_assignment_amplitudes(rho)?;
+        let amplitudes = self.fitted_assignment_amplitudes()?;
         // Seam-invariant periodic path: circular axes are regressed through
         // their (cos, sin) embedding instead of the raw coordinate, so a chart
         // seam inside the data cloud no longer pulls predictions to the
@@ -254,7 +254,7 @@ impl SaeManifoldTerm {
         }
         // Per-atom amortized encode (atlas distilled from the current dictionary)
         // → predicted coords t̂ + per-row certificates.
-        let encoded = self.amortized_encode_fitted(targets, rho)?;
+        let encoded = self.amortized_encode_fitted(targets)?;
         // Start from the current logits so an uncertified ROW keeps its existing
         // routing verbatim (the predictor only overrides rows it can fully
         // certify — see the per-row gate below).

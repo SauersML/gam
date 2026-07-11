@@ -916,6 +916,66 @@ fn steer_delta_from_arrays(
     fisher_factors: Option<ndarray::ArrayView3<'_, f64>>,
     fisher_provenance: Option<&str>,
 ) -> PyResult<gam::inference::steering::SteerPlan> {
+    let fisher_metric = match fisher_factors {
+        Some(u3) => {
+            let request =
+                SaeFisherRowMetricRequest::from_tag(u3, n_obs, p_out, fisher_provenance, None)
+                    .map_err(py_value_error)?;
+            Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
+        }
+        None => None,
+    };
+    steer_delta_with_metric_from_arrays(
+        atom_k,
+        metric_row,
+        amplitude,
+        t_from,
+        t_to,
+        n_obs,
+        p_out,
+        atom_basis,
+        atom_dim,
+        decoder_blocks,
+        duchon_centers,
+        n_harmonics_list,
+        basis_size_list,
+        coords,
+        logits,
+        assignment_kind,
+        tau,
+        alpha,
+        jumprelu_threshold,
+        fisher_metric,
+    )
+}
+
+/// Resident-metric steering core used by [`ManifoldSaeCore::steer`].  The
+/// public array-oriented function above builds a metric because its caller owns
+/// only a borrowed factor stack.  A fitted model owns the packed [`RowMetric`]
+/// and calls this entry directly, so steering never repacks or revalidates the
+/// `(n, p, rank)` Fisher shard.
+fn steer_delta_with_metric_from_arrays(
+    atom_k: usize,
+    metric_row: usize,
+    amplitude: f64,
+    t_from: ndarray::ArrayView1<'_, f64>,
+    t_to: ndarray::ArrayView1<'_, f64>,
+    n_obs: usize,
+    p_out: usize,
+    atom_basis: &[String],
+    atom_dim: &[usize],
+    decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
+    duchon_centers: &[Option<Array2<f64>>],
+    n_harmonics_list: &[Option<usize>],
+    basis_size_list: &[usize],
+    coords: &[ndarray::ArrayView2<'_, f64>],
+    logits: ndarray::ArrayView2<'_, f64>,
+    assignment_kind: &str,
+    tau: f64,
+    alpha: f64,
+    jumprelu_threshold: f64,
+    fisher_metric: Option<gam::inference::row_metric::RowMetric>,
+) -> PyResult<gam::inference::steering::SteerPlan> {
     // Assignment tokens are strict: compatibility aliases are rejected.
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
     let k_atoms = atom_basis.len();
@@ -965,20 +1025,6 @@ fn steer_delta_from_arrays(
         })
         .collect();
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
-
-    // Borrow the WP-D output-Fisher shard for the typed gam-sae metric entry. Its
-    // presence installs the OutputFisher metric inside the engine so
-    // `predicted_nats` / `validity_radius` are available; absence keeps the
-    // geometry-only Euclidean path (dose degrades to None).
-    let fisher_metric = match fisher_factors {
-        Some(u3) => {
-            let request =
-                SaeFisherRowMetricRequest::from_tag(u3, n_obs, p_out, fisher_provenance, None)
-                    .map_err(py_value_error)?;
-            Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
-        }
-        None => None,
-    };
 
     let request = gam::terms::sae::manifold::SaeSteerRequest {
         atoms,

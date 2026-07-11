@@ -52,29 +52,28 @@ pub(super) fn ibp_psd_majorized_hdiag(
 impl SaeManifoldTerm {
     /// Build the per-row dense gate maps `a_{n,·}` at `rho` for all `n` rows.
     ///
-    /// `try_assignments_row_for_rho` is a pure read-only per-row computation
+    /// `try_assignments_row` is a pure read-only per-row computation
     /// (softmax / IBP-MAP / TopK over that row's routing logits — no shared
     /// mutable state, no faer GEMM), so the rows are independent. Above the
     /// `SAE_LOSS_PARALLEL_ROW_MIN` floor (and when not already inside a rayon
     /// worker) they are computed in parallel and collected in row order; the
     /// order-preserving `collect` reproduces the serial push order bit-for-bit
     /// (deterministic — each row computed exactly once, no cross-row reduction).
-    pub(crate) fn assignments_all_for_rho_parallel(
+    pub(crate) fn assignments_all_parallel(
         &self,
         n: usize,
-        rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
             use rayon::prelude::*;
             (0..n)
                 .into_par_iter()
-                .map(|row| self.assignment.try_assignments_row_for_rho(row, rho))
+                .map(|row| self.assignment.try_assignments_row(row))
                 .collect::<Result<Vec<_>, String>>()
         } else {
             let mut assignments_all = Vec::with_capacity(n);
             for row in 0..n {
-                assignments_all.push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+                assignments_all.push(self.assignment.try_assignments_row(row)?);
             }
             Ok(assignments_all)
         }
@@ -557,7 +556,7 @@ impl SaeManifoldTerm {
                         // order-preserving parallel collect is bit-identical to the
                         // serial push (deterministic — each row computed once, no
                         // cross-row reduction).
-                        let assignments_all = self.assignments_all_for_rho_parallel(n, rho)?;
+                        let assignments_all = self.assignments_all_parallel(n)?;
                         Some(SaeRowLayout::from_dense_weights(
                             &assignments_all,
                             k_active_cap,
@@ -580,7 +579,7 @@ impl SaeManifoldTerm {
                             // active sets. Independent read-only per-row builds →
                             // order-preserving parallel collect is bit-identical to
                             // the serial push (deterministic).
-                            let assignments_all = self.assignments_all_for_rho_parallel(n, rho)?;
+                            let assignments_all = self.assignments_all_parallel(n)?;
                             // #1414: pass the RELATIVE cutoff through;
                             // `from_dense_weights` applies it per row against that
                             // row's own peak `max_k |a_{n,k}|`, matching the
@@ -609,7 +608,7 @@ impl SaeManifoldTerm {
                     // (the #2071 block-size contract holds with equality).
                     // Independent read-only per-row builds → order-preserving
                     // parallel collect is bit-identical to the serial push.
-                    let assignments_all = self.assignments_all_for_rho_parallel(n, rho)?;
+                    let assignments_all = self.assignments_all_parallel(n)?;
                     Some(SaeRowLayout::from_dense_weights(
                         &assignments_all,
                         k,
@@ -973,7 +972,7 @@ impl SaeManifoldTerm {
                         // #1557 — fill per-worker scratch (bit-identical to alloc path).
                         let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
                         self.assignment
-                            .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+                            .try_assignments_row_into(row, a_scratch)?;
                         // Reconstruction uses the row's active support: for the dense
                         // full-support layout this is all atoms (exact); for a compact
                         // layout the dropped atoms carry negligible `O(a)` reconstruction

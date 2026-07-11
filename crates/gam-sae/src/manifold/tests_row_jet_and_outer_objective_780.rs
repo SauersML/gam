@@ -296,9 +296,8 @@ pub(crate) fn batch4_jet_lanes_match_scalar_hand_row_jets() {
         let vars = term.row_vars_for_cache_row(row, &cache).expect("row vars");
         let mut a = Array1::<f64>::zeros(term.k_atoms());
         term.assignment
-            .try_assignments_row_for_rho_into(
+            .try_assignments_row_into(
                 row,
-                &rho,
                 a.as_slice_mut().expect("contiguous scratch"),
             )
             .expect("assignments row");

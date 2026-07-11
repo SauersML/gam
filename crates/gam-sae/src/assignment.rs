@@ -1074,12 +1074,12 @@ impl SaeAssignment {
         true
     }
 
-    pub(crate) fn assignments_for_rho(&self, rho: &SaeManifoldRho) -> Result<Array2<f64>, String> {
+    pub(crate) fn try_assignments(&self) -> Result<Array2<f64>, String> {
         let n = self.n_obs();
         let k = self.k_atoms();
         let mut out = Array2::<f64>::zeros((n, k));
         for row in 0..n {
-            let a = self.try_assignments_row_for_rho(row, rho)?;
+            let a = self.try_assignments_row(row)?;
             for atom in 0..k {
                 out[[row, atom]] = a[atom];
             }
@@ -2931,13 +2931,13 @@ mod frozen_routing_1033_tests {
         // Gates BEFORE mutating the free logits.
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
         let before: Vec<Array1<f64>> = (0..n)
-            .map(|r| a.try_assignments_row_for_rho(r, &rho).unwrap())
+            .map(|r| a.try_assignments_row(r).unwrap())
             .collect();
         // Simulate an inner-fit logit update (what the ρ-search would otherwise do
         // every eval): perturb every free logit substantially.
         a.logits.mapv_inplace(|v| v + 5.0);
         let after: Vec<Array1<f64>> = (0..n)
-            .map(|r| a.try_assignments_row_for_rho(r, &rho).unwrap())
+            .map(|r| a.try_assignments_row(r).unwrap())
             .collect();
         // FROZEN routing reads the snapshot, so the gates are UNCHANGED by the
         // free-logit perturbation — the routing is decoupled from inner-fit drift.
@@ -2972,8 +2972,8 @@ mod frozen_routing_1033_tests {
             vec![Array1::<f64>::zeros(1); k],
         );
         for r in 0..n {
-            let ga = a.try_assignments_row_for_rho(r, &rho_a).unwrap();
-            let gb = a.try_assignments_row_for_rho(r, &rho_b).unwrap();
+            let ga = a.try_assignments_row(r).unwrap();
+            let gb = a.try_assignments_row(r).unwrap();
             for kk in 0..k {
                 assert_eq!(
                     ga[kk], gb[kk],
@@ -3071,9 +3071,9 @@ mod support_measure_tests {
 #[cfg(test)]
 mod fill_into_buffer_1557_tests {
     //! #1557 — the fill-into-caller-buffer variant
-    //! [`SaeAssignment::try_assignments_row_for_rho_into`] must produce
+    //! [`SaeAssignment::try_assignments_row_into`] must produce
     //! BIT-IDENTICAL output to the allocating
-    //! [`SaeAssignment::try_assignments_row_for_rho`] across every assignment
+    //! [`SaeAssignment::try_assignments_row`] across every assignment
     //! mode (Softmax, IBPMap, JumpReLU), the #1026 ungated case, and the K==1
     //! edge. Exact `==` on f64 — not an approximate tolerance — because the
     //! `_into` path is a pure allocation-elision refactor and any numeric drift
@@ -3106,20 +3106,20 @@ mod fill_into_buffer_1557_tests {
         let rho = rho(k);
         let mut scratch = vec![f64::NAN; k];
         for row in 0..n {
-            let allocated = a.try_assignments_row_for_rho(row, &rho).unwrap();
+            let allocated = a.try_assignments_row(row).unwrap();
             // Pre-fill with NaN so a partial write (e.g. a JumpReLU below-threshold
             // entry left untouched) is caught as a mismatch, not silently passed.
             for s in scratch.iter_mut() {
                 *s = f64::NAN;
             }
-            a.try_assignments_row_for_rho_into(row, &rho, &mut scratch)
+            a.try_assignments_row_into(row, &mut scratch)
                 .unwrap();
             assert_eq!(allocated.len(), k);
             for kk in 0..k {
                 assert_eq!(
                     allocated[kk], scratch[kk],
                     "row {row} atom {kk}: _into must be BIT-IDENTICAL to the allocating \
-                     try_assignments_row_for_rho; got {} vs {}",
+                     try_assignments_row; got {} vs {}",
                     allocated[kk], scratch[kk]
                 );
             }

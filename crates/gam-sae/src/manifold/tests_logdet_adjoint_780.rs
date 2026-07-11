@@ -589,9 +589,8 @@ fn softmax_logit_dual_channel_report_2156(
     let dual_a = dual_softmax_row_2156(&logits, temperature, seed_atom);
     let mut assignments = Array1::<f64>::zeros(term.k_atoms());
     term.assignment
-        .try_assignments_row_for_rho_into(
+        .try_assignments_row_into(
             row,
-            rho,
             assignments.as_slice_mut().expect("assignment scratch"),
         )
         .expect("softmax assignments");
@@ -1160,9 +1159,8 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
         .expect("border channels");
     let mut assignments = Array1::<f64>::zeros(term.k_atoms());
     term.assignment
-        .try_assignments_row_for_rho_into(
+        .try_assignments_row_into(
             row,
-            &rho,
             assignments.as_slice_mut().expect("assignment scratch"),
         )
         .expect("assignments");

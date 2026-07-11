@@ -355,7 +355,7 @@ fn amortized_encoder_is_faithful_on_known_manifold() {
     // smoothing bias — comparing against it would conflate encoder fidelity
     // with the smoother. We therefore compare the two PER-ROW encodes, decoded
     // through the SAME basis, exactly as the held-out arm below does.)
-    let amplitudes = term.fitted_assignment_amplitudes(&rho_fit).unwrap();
+    let amplitudes = term.fitted_assignment_amplitudes().unwrap();
     let encodes = term
         .amortized_encode_target(target.view(), amplitudes.view())
         .expect("amortized encode runs");

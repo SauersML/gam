@@ -344,9 +344,8 @@ impl SaeManifoldTerm {
         let floor = Self::SURE_DIVERGENCE_PD_FLOOR;
         let mut acc = 0.0_f64;
         for row in 0..n {
-            self.assignment.try_assignments_row_for_rho_into(
+            self.assignment.try_assignments_row_into(
                 row,
-                rho,
                 assignments.as_mut_slice(),
             )?;
             let r_row = residual.row(row);
@@ -518,9 +517,8 @@ impl SaeManifoldTerm {
         let mut ranked: Vec<usize> = Vec::with_capacity(k_atoms);
         let mut acc = 0.0_f64;
         for row in 0..n {
-            self.assignment.try_assignments_row_for_rho_into(
+            self.assignment.try_assignments_row_into(
                 row,
-                rho,
                 assignments.as_mut_slice(),
             )?;
             let logits = self.assignment.logits.row(row);

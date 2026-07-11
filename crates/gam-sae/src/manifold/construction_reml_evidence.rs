@@ -3578,7 +3578,6 @@ impl SaeManifoldTerm {
             let base = cache.row_offsets[row];
             if jet_window.is_empty() {
                 jet_window_next = self.refill_jet_window(
-                    rho,
                     jet_window_next,
                     cache,
                     &second_jets,
@@ -3828,10 +3827,9 @@ impl SaeManifoldTerm {
             let base = cache.row_offsets[row];
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+                .try_assignments_row_into(row, a_scratch)?;
             if jet_window.is_empty() {
                 jet_window_next = self.refill_jet_window(
-                    rho,
                     jet_window_next,
                     cache,
                     &second_jets,
@@ -4408,10 +4406,9 @@ impl SaeManifoldTerm {
             let base = cache.row_offsets[row];
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
             self.assignment
-                .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+                .try_assignments_row_into(row, a_scratch)?;
             if jet_window.is_empty() {
                 jet_window_next = self.refill_jet_window(
-                    rho,
                     jet_window_next,
                     cache,
                     &second_jets,

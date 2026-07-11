@@ -733,9 +733,8 @@ mod batch4_oracle_tests {
             for (i, &row) in rows.iter().enumerate() {
                 let vars = self.row_vars_for_cache_row(row, cache)?;
                 let mut a = Array1::<f64>::zeros(k_atoms);
-                self.assignment.try_assignments_row_for_rho_into(
+                self.assignment.try_assignments_row_into(
                     row,
-                    rho,
                     a.as_slice_mut().expect("contiguous assignment scratch"),
                 )?;
                 let prog =
@@ -843,7 +842,6 @@ impl SaeManifoldTerm {
     /// time); `cache` stays in the signature for `row_vars_for_cache_row`.
     fn refill_jet_window(
         &self,
-        rho: &SaeManifoldRho,
         start: usize,
         cache: &ArrowFactorCache,
         second_jets: &[Array4<f64>],
@@ -852,9 +850,8 @@ impl SaeManifoldTerm {
     ) -> Result<usize, String> {
         let vars = self.row_vars_for_cache_row(start, cache)?;
         let mut a = Array1::<f64>::zeros(self.k_atoms());
-        self.assignment.try_assignments_row_for_rho_into(
+        self.assignment.try_assignments_row_into(
             start,
-            rho,
             a.as_slice_mut().expect("contiguous assignment scratch"),
         )?;
         let jets = self.row_jets_for_logdet(start, vars, a.view(), second_jets, border)?;

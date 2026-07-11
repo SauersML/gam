@@ -117,7 +117,7 @@ fn hand_correction(
     let mut max_abs = 0.0_f64;
     for i in 0..n {
         term.assignment
-            .try_assignments_row_for_rho_into(i, rho, &mut a_row)
+            .try_assignments_row_into(i, &mut a_row)
             .unwrap();
         let a_k = a_row[0];
         let t = term.assignment.coords[0].row(i)[0];
@@ -158,7 +158,7 @@ fn sure_correction_wiring_and_stability_2133() {
     let mut max_incons = 0.0_f64;
     for i in 0..n {
         term.assignment
-            .try_assignments_row_for_rho_into(i, &rho, &mut a_row)
+            .try_assignments_row_into(i, &mut a_row)
             .unwrap();
         term.atoms[0].fill_decoded_row(i, &mut decoded);
         for k in 0..p {
@@ -213,7 +213,7 @@ fn sure_correction_matches_fd_divergence_2133() {
     let a_of: Vec<f64> = (0..n)
         .map(|i| {
             term.assignment
-                .try_assignments_row_for_rho_into(i, &rho, &mut a_row)
+                .try_assignments_row_into(i, &mut a_row)
                 .unwrap();
             a_row[0]
         })

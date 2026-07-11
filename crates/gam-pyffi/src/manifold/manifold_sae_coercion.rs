@@ -588,7 +588,7 @@ pub(crate) fn sae_manifold_core_from_stagewise<'py>(
         &cfg,
     )
     .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    Py::new(py, crate::ManifoldSaeCore { inner: payload })
+    Py::new(py, crate::ManifoldSaeCore::from_payload(payload)?)
 }
 
 /// Restore the `linear_block` label a flat-block fit reports as the generic
