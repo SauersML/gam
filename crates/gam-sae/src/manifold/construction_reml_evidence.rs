@@ -1017,19 +1017,21 @@ impl SaeManifoldTerm {
                 // DESCENDING (`saw_refine_progress`) is an unfinished
                 // computation, not an infeasibility: grant it one additional
                 // window of the same size and keep refining. The ordinary
-                // nonstationary lane retains that single-window hang bound. A
-                // coarse-KKT state that is still non-idempotent is different:
-                // returning it is the #2253 value/gradient mismatch, so every
-                // FURTHER window remains available only while the EXISTING
-                // round-to-round KKT predicate proves fresh progress. The first
-                // non-decreasing round reaches the typed refusal below; no new
-                // tolerance or fixed iteration budget is introduced.
-                let stationary_window_paid = gradient_stationary
-                    && budget_escalation_extra > 0
-                    && Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
-                if (saw_refine_progress && budget_escalation_extra == 0)
-                    || stationary_window_paid
-                {
+                // nonstationary lane retains that single-window hang bound.
+                //
+                // DELETED (#2234→stage-1 hooks): the former
+                // `stationary_window_paid` arm granted UNBOUNDED further windows
+                // to a coarse-KKT-but-non-idempotent state — machinery that
+                // existed to grind out state motion injected by the unguarded
+                // post-accept reseed/polish hooks at a near-stationary iterate.
+                // Those hooks are now quiescent inside the KKT band (see the
+                // guard quiescence in `run_joint_fit_arrow_schur_with_
+                // termination_policy`) and the reseed ledger persists across
+                // refine rounds, so a KKT-band state recurs exactly on its next
+                // evidence re-entry and is accepted; a state that STILL moves
+                // there is genuinely non-idempotent and takes the typed refusal
+                // below immediately instead of after grinding extra windows.
+                if saw_refine_progress && budget_escalation_extra == 0 {
                     let escalation_window = refine_limit.max(1);
                     // `refine_iteration_limit` is dynamic and may return a
                     // ceiling below the iterations already consumed.  Carry
