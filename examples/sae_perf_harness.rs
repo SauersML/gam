@@ -132,10 +132,6 @@ impl OuterObjective for CountingObjective {
     fn allow_continuation_prewarm(&self) -> bool {
         false
     }
-
-    fn requires_continuation_path_entry(&self) -> bool {
-        false
-    }
 }
 
 fn shape_named(name: &str) -> Option<Shape> {
