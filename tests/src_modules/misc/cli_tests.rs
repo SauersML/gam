@@ -1,9 +1,8 @@
 use super::{
     BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
     FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
-    MODEL_PAYLOAD_VERSION, ModelKind, ResponseColumnKind, ResponseFamily, SavedFitSummary,
-    SavedModel, SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-    SurvivalTimeBasisConfig, build_survival_time_basis, classify_cli_error,
+    ResponseFamily, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalBaselineTarget,
+    SurvivalLikelihoodMode, SurvivalTimeBasisConfig, build_survival_time_basis, classify_cli_error,
     collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
     collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
     compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
@@ -11,7 +10,8 @@ use super::{
     load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
     parse_surv_response, parse_survival_time_basis_config, predict_gam,
     prepend_id_column_to_prediction_csv, required_columns_for_fit, required_columns_for_formula,
-    summarizewiggle_domain, validate_cli_firth_configuration, validate_fit_args_preflight,
+    route_marginal_slope_deviation_blocks, summarizewiggle_domain,
+    validate_cli_firth_configuration, validate_fit_args_preflight,
     write_gaussian_location_scale_prediction_csv, write_prediction_csv,
     write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
@@ -51,8 +51,8 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{ParsedTerm, parse_linkwiggle_formulaspec};
 use gam::inference::model::{
-    ColumnKindTag, FittedModelPayload, SavedCompiledFlexBlock, SavedLatentZNormalization,
-    SchemaColumn,
+    ColumnKindTag, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedCompiledFlexBlock,
+    SavedLatentZNormalization, SchemaColumn,
 };
 use gam::inference::model_payload_builders::{
     BernoulliMarginalSlopeInputs, SavedModelSourceMetadata,
@@ -70,7 +70,7 @@ use gam::term_builder::{
 };
 use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LinkComponent, LinkFunction, LogLikelihoodNormalization,
-    StandardLink, WigglePenaltyConfig,
+    ResponseColumnKind, StandardLink, WigglePenaltyConfig,
 };
 use gam_predict::{FittedModelPredictExt, PredictableModel};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, array, s};
@@ -3073,6 +3073,7 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
             min,
             max,
             prior,
+            double_penalty,
         } => {
             assert_eq!(name, "mu_hat");
             assert_eq!((*min, *max), (0.0, 1.0));
@@ -3080,6 +3081,7 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
                 BoundedCoefficientPriorSpec::None => {}
                 other => panic!("unexpected prior: {other:?}"),
             }
+            assert!(*double_penalty);
         }
         other => panic!("expected bounded linear term, got {other:?}"),
     }
@@ -3096,6 +3098,7 @@ fn parse_bounded_linear_termwith_center_pull() {
             min,
             max,
             prior,
+            double_penalty,
         } => {
             assert_eq!(name, "mu_hat");
             assert_eq!((*min, *max), (0.0, 1.0));
@@ -3105,6 +3108,7 @@ fn parse_bounded_linear_termwith_center_pull() {
                 }
                 other => panic!("unexpected prior: {other:?}"),
             }
+            assert!(*double_penalty);
         }
         other => panic!("expected bounded linear term, got {other:?}"),
     }
@@ -3121,6 +3125,7 @@ fn parse_bounded_linear_termwith_uniform_prior() {
             min,
             max,
             prior,
+            double_penalty,
         } => {
             assert_eq!(name, "mu_hat");
             assert_eq!(*min, 0.0);
@@ -3129,6 +3134,7 @@ fn parse_bounded_linear_termwith_uniform_prior() {
                 BoundedCoefficientPriorSpec::Uniform => {}
                 other => panic!("unexpected prior: {other:?}"),
             }
+            assert!(*double_penalty);
         }
         other => panic!("unexpected term: {other:?}"),
     }
@@ -3622,13 +3628,10 @@ fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
             "y ~ x + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let routed = super::deviation_block_config_from_formula_linkwiggle(
-        parsed
-            .linkwiggle
-            .as_ref()
-            .unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
-    )
-    .expect("cubic linkwiggle must route into the deviation config");
+    let routed = route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)
+        .expect("cubic linkwiggle must route into the deviation config")
+        .link_dev
+        .expect("main linkwiggle must produce a link-deviation block");
     assert_eq!(routed.degree, 3);
     assert_eq!(routed.num_internal_knots, 9);
     assert_eq!(routed.penalty_order, 3);
@@ -3657,13 +3660,8 @@ fn marginal_slope_linkwiggle_rejects_non_cubic_degree_at_routing_boundary() {
                 "non-cubic linkwiggle must still parse at the shared layer", e
             )
         });
-        let err = super::deviation_block_config_from_formula_linkwiggle(
-            parsed
-                .linkwiggle
-                .as_ref()
-                .unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
-        )
-        .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block");
+        let err = route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)
+            .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block");
         assert!(
             err.contains("degree must be 3"),
             "error should state degree must be 3, got: {err}"
