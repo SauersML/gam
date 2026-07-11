@@ -55,7 +55,37 @@ pub fn cuda_driver_library_present() -> bool {
     load_library_names(&cuda_library_candidate_names()).is_ok()
 }
 
+/// Bind to a CUDA driver that is ALREADY RESIDENT in this process, if any.
+///
+/// `RTLD_NOLOAD` makes `dlopen` return a handle only when some other
+/// component (e.g. torch) has already mapped the library — it never loads a
+/// new copy. Inside a torch process, walking the candidate list below can
+/// dlopen a SECOND driver instance (system driver vs the CUDA-toolkit compat
+/// driver at `/usr/local/cuda*/compat/`): CUDA contexts created by torch's
+/// instance are invisible to ours, which is the measured dual-stack failure
+/// "no CUDA context for ordinal 0" (and steering the loader at the compat
+/// driver instead breaks torch with error 803) — gam#2259. Binding to the
+/// resident copy first guarantees ONE driver instance per process, so gam's
+/// runtime shares torch's contexts; a standalone process has nothing
+/// resident and falls through to the candidate walk unchanged.
+#[cfg(target_os = "linux")]
+fn already_resident_cuda_driver() -> Option<Library> {
+    const RTLD_NOLOAD: std::os::raw::c_int = 0x4;
+    for soname in ["libcuda.so.1", "libcuda.so"] {
+        // SAFETY: RTLD_NOLOAD never runs a new loader initializer — it only
+        // binds to a library some other component already loaded.
+        if let Ok(library) = unsafe { UnixLibrary::open(Some(soname), RTLD_NOW | RTLD_NOLOAD) } {
+            return Some(library.into());
+        }
+    }
+    None
+}
+
 fn load_library_names(candidates: &[String]) -> Result<Library, GpuError> {
+    #[cfg(target_os = "linux")]
+    if let Some(resident) = already_resident_cuda_driver() {
+        return Ok(resident);
+    }
     for candidate in candidates {
         // SAFETY: Library::new runs the library's loader initializer; we
         // only pass CUDA driver candidates discovered from fixed NVIDIA
