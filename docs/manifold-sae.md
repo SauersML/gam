@@ -526,6 +526,45 @@ OLMo-2 weekday/month token sets, plus injected synthetic controls):
    variance projection, and at 2× the adjudicator prefers a cluster mixture
    (validated by injection). Absence of circle wins is not absence of circles.
 
+### Running an unsupervised census honestly
+
+If you adjudicate many feature groups (an unsupervised topology census), two
+rules keep the verdict rates meaningful:
+
+- **Gate on dictionary health, and report it.** Circle verdicts only appeared
+  at mean L0 below ~300 in the measured censuses (0 circle wins across 377
+  dense-dictionary groups) — so a raw verdict rate is uninterpretable without
+  the code sparsity it was measured at. Report mean L0 next to any rate.
+- **Run matched structureless controls.** Push a per-dimension-shuffled copy
+  and a covariance-matched Gaussian copy of the same matrix through the
+  byte-identical pipeline, and report verdict rates against that per-run
+  false-circle floor (measured floors reached double digits), never raw.
+
+`examples/topology_census_recipe.py` documents the full validated recipe.
+
+### On real activations, lead with deterministic readouts
+
+Everything that *established* circles on real LLM activations in the measured
+studies was fit-free or supervision-seeded: label-class-mean planes,
+circular-linear ordering against chart-rebuilt permutation nulls, per-label
+angular binding, and layer transport on those coordinates. The gradient fit
+is a reconstruction/decoder tool — its latent angle is not guaranteed to be a
+stable coordinate: on wider models, circle fits reaching EV ≈ 0.98 still
+produced seed-dependent orderings (0.67–0.97 across seeds) while the
+deterministic plane readout sat at 0.98–0.99, because a high-EV closed curve
+can wander through subspace dimensions outside the ordering plane.
+Reconstruction EV alone does not validate the latent coordinate; when the
+ordering matters, read it from a deterministic projection and use the fit for
+reconstruction.
+
+### Availability note
+
+`adjudicate_atom_shape` is currently only available when building from
+source: the released PyPI wheel predates the symbol. Source builds require
+the repo's `.git` directory (the build script's tracked-file audits read the
+git index); building from a source *archive* without `.git` skips those
+audits with a warning.
+
 ## Supervised SAE
 
 `gamfit.sae_supervised` fits a manifold dictionary jointly with a supervised
