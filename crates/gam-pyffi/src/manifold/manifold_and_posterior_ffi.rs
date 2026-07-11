@@ -111,8 +111,14 @@ fn posterior_eta_bands_impl(
         posterior_bands::LinkSelector::Tag(tag) => tag.to_string(),
         posterior_bands::LinkSelector::Spec(spec) => spec.link_function().name().to_string(),
     };
-    let (linear_predictor, linear_predictor_lower, linear_predictor_upper, mean, mean_lower, mean_upper) =
-        posterior_bands::eta_bands_from_matrix_link(eta.view(), selector, level)?;
+    let (
+        linear_predictor,
+        linear_predictor_lower,
+        linear_predictor_upper,
+        mean,
+        mean_lower,
+        mean_upper,
+    ) = posterior_bands::eta_bands_from_matrix_link(eta.view(), selector, level)?;
     Ok(PosteriorPredictBandsPayload {
         linear_predictor,
         linear_predictor_lower,
@@ -181,11 +187,7 @@ fn posterior_predict_bands_encoded_table_impl(
     let result = posterior_predict_encoded_table_impl(model_bytes, source, samples)?;
     let (n_draws, n_rows) = result.eta.dim();
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
-        posterior_bands::draw_bands_from_matrices(
-            result.eta.view(),
-            result.mean.view(),
-            level,
-        )?;
+        posterior_bands::draw_bands_from_matrices(result.eta.view(), result.mean.view(), level)?;
     Ok(PosteriorPredictBandsPayload {
         linear_predictor: eta_mean,
         linear_predictor_lower: eta_lower,
@@ -1008,10 +1010,7 @@ fn frozen_factor_levels_by_col(
     // Walk the (possibly nested) basis, accumulating factor columns. The DSL
     // wraps the geometric core in `ByVariable`/`FactorSumToZero`/`BySmooth`
     // envelopes, so recurse through them exactly like `smooth_basis_feature_cols`.
-    fn walk(
-        basis: &SmoothBasisSpec,
-        record: &mut dyn FnMut(usize, &[u64]),
-    ) {
+    fn walk(basis: &SmoothBasisSpec, record: &mut dyn FnMut(usize, &[u64])) {
         match basis {
             SmoothBasisSpec::FactorSumToZero {
                 inner,
@@ -1081,11 +1080,7 @@ fn representative_data_from_ranges(
 ) -> Array2<f64> {
     const REP_ROWS_MIN: usize = 16;
     // Enough rows that the widest factor has every level represented.
-    let max_levels = factor_levels
-        .values()
-        .map(|lv| lv.len())
-        .max()
-        .unwrap_or(0);
+    let max_levels = factor_levels.values().map(|lv| lv.len()).max().unwrap_or(0);
     let rep_rows = REP_ROWS_MIN.max(max_levels).max(1);
     let n_cols = ranges.len();
     let mut data = Array2::<f64>::zeros((rep_rows, n_cols));
@@ -1240,11 +1235,7 @@ mod whitening_gram_tests {
     fn categorical_columns_cycle_every_frozen_level() {
         let ranges = [(0.0_f64, 1.0_f64), (0.0, 0.0)];
         let mut levels = BTreeMap::new();
-        let lv = vec![
-            1.0_f64.to_bits(),
-            2.0_f64.to_bits(),
-            3.0_f64.to_bits(),
-        ];
+        let lv = vec![1.0_f64.to_bits(), 2.0_f64.to_bits(), 3.0_f64.to_bits()];
         levels.insert(1usize, lv.clone());
         let data = whitening_data_from_ranges(&ranges, &levels, 64);
         let allowed: Vec<f64> = lv.iter().map(|&b| f64::from_bits(b)).collect();
@@ -1960,10 +1951,7 @@ fn postfit_standard_materialization_config(model: &FittedModel) -> Result<FitCon
     Ok(fit_config)
 }
 
-fn check_dataset_json_impl(
-    model_bytes: &[u8],
-    dataset: EncodedDataset,
-) -> Result<String, String> {
+fn check_dataset_json_impl(model_bytes: &[u8], dataset: EncodedDataset) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let check = schema_check_encoded(&model, &dataset)?;
     serde_json::to_string(&check).map_err(|err| format!("failed to serialize schema check: {err}"))
@@ -2284,10 +2272,8 @@ fn sae_ibp_map_batch_value_grad<'py>(
             )));
         }
     }
-    let (value, grad) = gam::terms::sae::assignment::ibp_map_batch_value_grad(
-        logits_view.view(),
-        temperature,
-    );
+    let (value, grad) =
+        gam::terms::sae::assignment::ibp_map_batch_value_grad(logits_view.view(), temperature);
     Ok((
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),
@@ -2399,7 +2385,10 @@ fn sae_jumprelu_batch_value_grad<'py>(
         temperature,
         thresholds_view.view(),
     );
-    Ok((value.into_pyarray(py).unbind(), grad.into_pyarray(py).unbind()))
+    Ok((
+        value.into_pyarray(py).unbind(),
+        grad.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Top-k SAE activation value+grad over an `(N, K)` logit matrix — the single
@@ -2433,7 +2422,10 @@ fn sae_topk_activation_value_grad<'py>(
         logits_view.view(),
         temperature,
     );
-    Ok((value.into_pyarray(py).unbind(), grad.into_pyarray(py).unbind()))
+    Ok((
+        value.into_pyarray(py).unbind(),
+        grad.into_pyarray(py).unbind(),
+    ))
 }
 
 #[pyfunction(signature = (
@@ -2553,7 +2545,10 @@ fn harmonic_roughness_evidence_weight<'py>(
             "harmonic_roughness_evidence_weight: target must be finite".to_string(),
         ));
     }
-    if !row_weights_view.iter().all(|value| value.is_finite() && *value >= 0.0) {
+    if !row_weights_view
+        .iter()
+        .all(|value| value.is_finite() && *value >= 0.0)
+    {
         return Err(py_value_error(
             "harmonic_roughness_evidence_weight: row_weights must be finite and non-negative"
                 .to_string(),
@@ -3680,22 +3675,80 @@ fn bspline_basis_derivative_impl(
     Ok((*basis).clone())
 }
 
-fn duchon_basis_1d_impl(
+/// Compute the data-metric Duchon radial chart once over the complete position
+/// collection. Strict operator policy forces the raw-Gram pass through row
+/// chunks, so this never constructs the concatenated `n × p` design that the
+/// position-batched API is designed to avoid.
+fn duchon_position_radial_reparam_streamed(
     t: ArrayView1<'_, f64>,
     centers: ArrayView1<'_, f64>,
     m: usize,
     periodic: bool,
     period: Option<f64>,
+) -> Result<Option<Array2<f64>>, String> {
+    validate_vector("t", t)?;
+    validate_vector("centers", centers)?;
+    if m == 0 {
+        return Err("Duchon m must be at least 1".to_string());
+    }
+    if periodic {
+        return Ok(None);
+    }
+    if period.is_some() {
+        return Err("Duchon period is only valid when periodic=true".to_string());
+    }
+    let data = column_array(t);
+    let center_matrix = column_array(centers);
+    let spec = DuchonBasisSpec {
+        radial_reparam: None,
+        center_strategy: CenterStrategy::UserProvided(center_matrix),
+        periodic: None,
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: duchon_nullspace_from_m(m),
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let mut workspace = gam::terms::basis::BasisWorkspace::with_policy(
+        gam::ResourcePolicy::analytic_operator_required(),
+    );
+    let built =
+        gam::terms::basis::build_duchon_basiswithworkspace(data.view(), &spec, &mut workspace)
+            .map_err(|err| format!("failed to freeze global Duchon radial chart: {err}"))?;
+    match built.metadata {
+        gam::terms::basis::BasisMetadata::Duchon { radial_reparam, .. } => Ok(radial_reparam),
+        other => Err(format!(
+            "global Duchon radial-chart build returned unexpected metadata {:?}",
+            std::mem::discriminant(&other)
+        )),
+    }
+}
+
+fn duchon_basis_1d_impl_with_radial_reparam(
+    t: ArrayView1<'_, f64>,
+    centers: ArrayView1<'_, f64>,
+    m: usize,
+    periodic: bool,
+    period: Option<f64>,
+    radial_reparam: Option<&Array2<f64>>,
 ) -> Result<Array2<f64>, String> {
     validate_vector("t", t)?;
     validate_vector("centers", centers)?;
     if m == 0 {
         return Err("Duchon m must be at least 1".to_string());
     }
+    if periodic && radial_reparam.is_some() {
+        return Err(
+            "periodic Duchon positions do not admit an open-domain radial reparameterization"
+                .to_string(),
+        );
+    }
     let data = column_array(t);
     let center_matrix = column_array(centers);
     let spec = DuchonBasisSpec {
-        radial_reparam: None,
+        radial_reparam: radial_reparam.cloned(),
         center_strategy: CenterStrategy::UserProvided(center_matrix),
         periodic: None,
         length_scale: None,
@@ -3730,26 +3783,28 @@ fn duchon_basis_1d_impl(
         .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))
 }
 
-fn duchon_basis_1d_derivative_impl(
+fn duchon_basis_1d_derivative_impl_with_radial_reparam(
     t: ArrayView1<'_, f64>,
     centers: ArrayView1<'_, f64>,
     m: usize,
     order: usize,
     periodic: bool,
     period: Option<f64>,
+    radial_reparam: Option<&Array2<f64>>,
 ) -> Result<Array2<f64>, String> {
     validate_vector("t", t)?;
     validate_vector("centers", centers)?;
     if m == 0 {
         return Err("Duchon m must be at least 1".to_string());
     }
-    create_duchon_basis_1d_derivative_dense(
+    gam::terms::basis::create_duchon_basis_1d_derivative_dense_with_radial_reparam(
         t,
         centers,
         0.0,
         duchon_nullspace_from_m(m),
         periodic,
         if periodic { period } else { None },
+        radial_reparam.map(|v| v.view()),
         order,
     )
     .map_err(|err| format!("failed to evaluate Duchon basis derivative: {err}"))
@@ -6093,8 +6148,11 @@ fn decoder_channel_cov_factors<'py>(
     decoder_covariance: PyReadonlyArray2<'py, f64>,
     m_basis: i64,
 ) -> Option<Py<PyArray3<f64>>> {
-    crate::manifold::manifold_sae_coercion::channel_cov_factors(decoder_covariance.as_array(), m_basis)
-        .map(|blocks| blocks.into_pyarray(py).unbind())
+    crate::manifold::manifold_sae_coercion::channel_cov_factors(
+        decoder_covariance.as_array(),
+        m_basis,
+    )
+    .map(|blocks| blocks.into_pyarray(py).unbind())
 }
 
 /// Rebuild the full-shape `(M·p, M·p)` decoder covariance from the compact
@@ -6155,11 +6213,13 @@ fn sae_canonical_n_harmonics(
             decoder_widths.len()
         )));
     }
-    Ok(crate::manifold::manifold_sae_coercion::canonical_n_harmonics(
-        &basis_kinds,
-        &raw_n_harmonics,
-        &decoder_widths,
-    ))
+    Ok(
+        crate::manifold::manifold_sae_coercion::canonical_n_harmonics(
+            &basis_kinds,
+            &raw_n_harmonics,
+            &decoder_widths,
+        ),
+    )
 }
 
 /// Rust owner of the SAE atom-topology naming (#2091). Given the resolved
@@ -6312,9 +6372,12 @@ fn sae_manifold_from_fit_payload(
         fisher_provenance,
         declared_bases,
     };
-    let payload =
-        crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(&raw, training_mean, &cfg)
-            .map_err(py_value_error)?;
+    let payload = crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(
+        &raw,
+        training_mean,
+        &cfg,
+    )
+    .map_err(py_value_error)?;
     Py::new(py, ManifoldSaeCore::from_payload(payload)?)
 }
 
@@ -6349,10 +6412,7 @@ fn manifold_sae_vec1<'py>(py: Python<'py>, v: &[f64]) -> Bound<'py, PyArray1<f64
 }
 
 /// Build a numpy `(R, C)` array from nested `Vec`s, rejecting a ragged payload.
-fn manifold_sae_vec2<'py>(
-    py: Python<'py>,
-    v: &[Vec<f64>],
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+fn manifold_sae_vec2<'py>(py: Python<'py>, v: &[Vec<f64>]) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let rows = v.len();
     let cols = v.first().map_or(0, Vec::len);
     let mut flat = Vec::with_capacity(rows * cols);
@@ -6593,11 +6653,9 @@ fn manifold_sae_hybrid_linear_images(
         if li.is_null() || is_empty_container {
             continue;
         }
-        let atom_idx = li
-            .get("atom_idx")
-            .and_then(|v| v.as_f64())
-            .ok_or_else(|| py_value_error("hybrid_split linear_image missing atom_idx".to_string()))?
-            as usize;
+        let atom_idx = li.get("atom_idx").and_then(|v| v.as_f64()).ok_or_else(|| {
+            py_value_error("hybrid_split linear_image missing atom_idx".to_string())
+        })? as usize;
         let t_bar = li
             .get("t_bar")
             .and_then(|v| v.as_f64())
@@ -6611,7 +6669,11 @@ fn manifold_sae_hybrid_linear_images(
         };
         images.push((atom_idx, t_bar, b0, b1, v));
     }
-    Ok(if images.is_empty() { None } else { Some(images) })
+    Ok(if images.is_empty() {
+        None
+    } else {
+        Some(images)
+    })
 }
 
 /// A single fitted atom's object surface (#2091). Mirrors the attributes
@@ -6680,20 +6742,14 @@ impl AtomCore {
         }
     }
     #[getter]
-    fn shape_band_mean<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    fn shape_band_mean<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
         match &self.inner.shape_band_mean {
             None => Ok(None),
             Some(v) => Ok(Some(manifold_sae_vec2(py, v)?)),
         }
     }
     #[getter]
-    fn shape_band_sd<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
+    fn shape_band_sd<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray2<f64>>>> {
         match &self.inner.shape_band_sd {
             None => Ok(None),
             Some(v) => Ok(Some(manifold_sae_vec2(py, v)?)),
@@ -6759,8 +6815,11 @@ impl ManifoldSaeCore {
             .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
             .collect::<PyResult<_>>()?;
         let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
-        let basis_sizes: Vec<usize> =
-            inner.basis_sizes.iter().map(|&s| s.max(0) as usize).collect();
+        let basis_sizes: Vec<usize> = inner
+            .basis_sizes
+            .iter()
+            .map(|&s| s.max(0) as usize)
+            .collect();
         // Exact mirror of the Python OOS n_harmonics gate. Every harmonic
         // topology must carry its persisted order; the typed entry never
         // guesses it from a decoder width.
@@ -6806,8 +6865,8 @@ impl ManifoldSaeCore {
             inner.learnable_alpha,
         )
         .map_err(py_value_error)?;
-        let report = gam::terms::sae::manifold::run_sae_manifold_oos(request)
-            .map_err(py_value_error)?;
+        let report =
+            gam::terms::sae::manifold::run_sae_manifold_oos(request).map_err(py_value_error)?;
         sae_oos_report_to_pydict(py, report)
     }
 }
@@ -6841,10 +6900,7 @@ impl ManifoldSaeCore {
     }
 
     #[staticmethod]
-    fn load(
-        py: Python<'_>,
-        path: std::path::PathBuf,
-    ) -> PyResult<Py<ManifoldSaeCore>> {
+    fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Py<ManifoldSaeCore>> {
         let payload_json = std::fs::read_to_string(path)
             .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
         Self::from_json(py, &payload_json)
@@ -7078,8 +7134,11 @@ impl ManifoldSaeCore {
             .collect::<PyResult<_>>()?;
         let logits_owned = manifold_sae_owned2(&inner.low_level_logits)?;
         let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
-        let basis_sizes: Vec<usize> =
-            inner.basis_sizes.iter().map(|&s| s.max(0) as usize).collect();
+        let basis_sizes: Vec<usize> = inner
+            .basis_sizes
+            .iter()
+            .map(|&s| s.max(0) as usize)
+            .collect();
         // Exact mirror of the Python steer's per-kind n_harmonics gate:
         // `int(h) if bk in {"periodic", "torus"} else None` (case-sensitive) — a
         // looser (e.g. lowercased) predicate would diverge the rebuilt basis.
@@ -7217,7 +7276,12 @@ impl ManifoldSaeCore {
     fn atoms<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let list = PyList::empty(py);
         for atom in &self.inner.atoms {
-            list.append(Py::new(py, AtomCore { inner: atom.clone() })?)?;
+            list.append(Py::new(
+                py,
+                AtomCore {
+                    inner: atom.clone(),
+                },
+            )?)?;
         }
         Ok(list)
     }
@@ -7233,10 +7297,7 @@ impl ManifoldSaeCore {
         Ok(list)
     }
     #[getter]
-    fn fisher_factors<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Option<Bound<'py, PyArray3<f64>>>> {
+    fn fisher_factors<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray3<f64>>>> {
         match &self.inner.fisher_factors {
             None => Ok(None),
             Some(v) => Ok(Some(manifold_sae_vec3(py, v)?)),
@@ -7296,10 +7357,7 @@ impl ManifoldSaeCore {
         self.fisher_metric_build_count
     }
     #[getter]
-    fn fisher_mass_residual<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Option<Bound<'py, PyArray1<f64>>> {
+    fn fisher_mass_residual<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
         self.inner
             .fisher_mass_residual
             .as_ref()

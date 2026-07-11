@@ -2460,14 +2460,16 @@ fn position_fit_design_for_slice(
     by_start_col: usize,
     expected_cols: usize,
     batch_index: usize,
+    radial_reparam: Option<&Array2<f64>>,
 ) -> Result<Array2<f64>, String> {
-    let x = position_basis_design(
+    let x = position_basis_design_with_radial_reparam(
         t,
         knots_or_centers,
         basis_kind,
         basis_order,
         periodic,
         period,
+        radial_reparam,
     )?;
     if x.ncols() != expected_cols {
         return Err(format!(
@@ -2519,6 +2521,16 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     let gated_weights = gate_weights_for_forward(weights, by, t.len())?;
     let weights = gated_weights.as_ref().map(|w| w.view());
 
+    // Duchon's data-metric radial chart is a property of the whole position
+    // collection. Compute it once from a streamed global Gram and freeze it
+    // into every ragged segment; segment-local charts represent different
+    // coefficient bases and cannot share one penalty or λ coordinate.
+    let radial_reparam = if normalized_position_basis_kind(basis_kind)? == "duchon" {
+        duchon_position_radial_reparam_streamed(t, knots_or_centers, basis_order, periodic, period)?
+    } else {
+        None
+    };
+
     // Build each ragged segment's basis independently. This makes it
     // impossible for the position-batched API to materialize the concatenated
     // n_total x p design, which is exactly the shape that becomes
@@ -2542,6 +2554,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 by_start_col,
                 p,
                 b,
+                radial_reparam.as_ref(),
             )?;
             let owned_weight: Array1<f64> = match weights.as_ref() {
                 Some(w) => w.slice(s![start..end]).to_owned(),
@@ -2598,6 +2611,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 by_start_col,
                 p,
                 b,
+                radial_reparam.as_ref(),
             )?;
             let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
             let cache_ref = prebuilt_caches[b].as_ref();
@@ -2760,6 +2774,11 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             ));
         }
     }
+    let radial_reparam = if normalized_position_basis_kind(basis_kind)? == "duchon" {
+        duchon_position_radial_reparam_streamed(t, knots_or_centers, basis_order, periodic, period)?
+    } else {
+        None
+    };
     type PositionBackwardParts = (
         Array1<f64>,
         Array2<f64>,
@@ -2781,13 +2800,14 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             let upstream_edf = grad_edf.as_ref().map_or(0.0, |g| g[b]);
             let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
             let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
-            let x_base = position_basis_design(
+            let x_base = position_basis_design_with_radial_reparam(
                 t.slice(s![start..end]),
                 knots_or_centers,
                 basis_kind,
                 basis_order,
                 periodic,
                 period,
+                radial_reparam.as_ref(),
             )?;
             if x_base.ncols() != p {
                 return Err(format!(
@@ -2795,13 +2815,14 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                     x_base.ncols()
                 ));
             }
-            let basis_derivative = position_basis_derivative(
+            let basis_derivative = position_basis_derivative_with_radial_reparam(
                 t.slice(s![start..end]),
                 knots_or_centers,
                 basis_kind,
                 basis_order,
                 periodic,
                 period,
+                radial_reparam.as_ref(),
             )?;
             if basis_derivative.dim() != x_base.dim() {
                 return Err(format!(
@@ -2922,13 +2943,45 @@ fn position_basis_design(
     periodic: bool,
     period: Option<f64>,
 ) -> Result<Array2<f64>, String> {
+    let radial_reparam = if normalized_position_basis_kind(basis_kind)? == "duchon" {
+        duchon_position_radial_reparam_streamed(t, knots_or_centers, basis_order, periodic, period)?
+    } else {
+        None
+    };
+    position_basis_design_with_radial_reparam(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+        radial_reparam.as_ref(),
+    )
+}
+
+fn position_basis_design_with_radial_reparam(
+    t: ArrayView1<'_, f64>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    period: Option<f64>,
+    radial_reparam: Option<&Array2<f64>>,
+) -> Result<Array2<f64>, String> {
     match normalized_position_basis_kind(basis_kind)?.as_str() {
         "bspline" => {
             bspline_position_basis_impl(t, knots_or_centers, basis_order, periodic, period)
         }
         "duchon" => {
             validate_position_period("duchon", knots_or_centers, periodic, period)?;
-            duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic, period)
+            duchon_basis_1d_impl_with_radial_reparam(
+                t,
+                knots_or_centers,
+                basis_order,
+                periodic,
+                period,
+                radial_reparam,
+            )
         }
         other => Err(format!(
             "normalized_position_basis_kind returned an unsupported basis name: {other}"
@@ -2944,13 +2997,46 @@ fn position_basis_derivative(
     periodic: bool,
     period: Option<f64>,
 ) -> Result<Array2<f64>, String> {
+    let radial_reparam = if normalized_position_basis_kind(basis_kind)? == "duchon" {
+        duchon_position_radial_reparam_streamed(t, knots_or_centers, basis_order, periodic, period)?
+    } else {
+        None
+    };
+    position_basis_derivative_with_radial_reparam(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+        radial_reparam.as_ref(),
+    )
+}
+
+fn position_basis_derivative_with_radial_reparam(
+    t: ArrayView1<'_, f64>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    period: Option<f64>,
+    radial_reparam: Option<&Array2<f64>>,
+) -> Result<Array2<f64>, String> {
     match normalized_position_basis_kind(basis_kind)?.as_str() {
         "bspline" => {
             bspline_position_derivative_impl(t, knots_or_centers, basis_order, 1, periodic, period)
         }
         "duchon" => {
             validate_position_period("duchon", knots_or_centers, periodic, period)?;
-            duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic, period)
+            duchon_basis_1d_derivative_impl_with_radial_reparam(
+                t,
+                knots_or_centers,
+                basis_order,
+                1,
+                periodic,
+                period,
+                radial_reparam,
+            )
         }
         other => Err(format!(
             "normalized_position_basis_kind returned an unsupported basis name: {other}"
@@ -3370,12 +3456,7 @@ fn posterior_predict_bands_table(
     let dataset = rows.dataset.clone();
     let samples = owned_row_major_f64(samples.as_array());
     let payload = detach_py_result(py, "posterior_predict_bands_table", move || {
-        posterior_predict_bands_encoded_table_impl(
-            &model_bytes,
-            dataset,
-            samples,
-            level,
-        )
+        posterior_predict_bands_encoded_table_impl(&model_bytes, dataset, samples, level)
     })?;
     posterior_bands_payload_to_py(py, payload)
 }
@@ -3889,14 +3970,13 @@ fn model_debiased_functional_dataset_json_impl(
                 // the same frozen identifiability chart the value design uses, so
                 // its columns align with beta.
                 let deriv_col = resolve_average_derivative_column(&spec, &dataset, &spec_val)?;
-                let dx = build_term_collection_derivative_design(
-                    standard.data.view(),
-                    &spec,
-                    deriv_col,
-                )
-                .map_err(|e| {
-                    format!("debiased_functional: average_derivative design build failed: {e}")
-                })?;
+                let dx =
+                    build_term_collection_derivative_design(standard.data.view(), &spec, deriv_col)
+                        .map_err(|e| {
+                            format!(
+                                "debiased_functional: average_derivative design build failed: {e}"
+                            )
+                        })?;
                 if dx.ncols() != x.ncols() {
                     return Err(format!(
                         "debiased_functional: average_derivative design width {} does not \
@@ -4417,12 +4497,8 @@ fn log_loss_from_predictions(
     predicted_mean: Vec<f64>,
     eps: f64,
 ) -> PyResult<f64> {
-    gam::inference::diagnostics::binary_log_loss_from_predictions(
-        &observed,
-        &predicted_mean,
-        eps,
-    )
-    .map_err(py_value_error)
+    gam::inference::diagnostics::binary_log_loss_from_predictions(&observed, &predicted_mean, eps)
+        .map_err(py_value_error)
 }
 
 #[pyfunction(signature = (observed, predicted_mean, null_mean, eps = 1e-12))]
@@ -4484,7 +4560,13 @@ fn make_folds_indices(
     // pattern with both IEEE zeros canonicalized to +0.0 — `-0.0 == +0.0`,
     // so they are one class level, not two; NaN is rejected above.
     let mut buckets: Vec<Vec<usize>> = if stratified {
-        let label_key = |v: f64| if v == 0.0 { 0.0_f64.to_bits() } else { v.to_bits() };
+        let label_key = |v: f64| {
+            if v == 0.0 {
+                0.0_f64.to_bits()
+            } else {
+                v.to_bits()
+            }
+        };
         let mut by_label: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
         for (i, v) in y.iter().enumerate() {
             by_label.entry(label_key(*v)).or_default().push(i);
@@ -5268,8 +5350,7 @@ fn survival_lifted_metrics_from_predictions<'py>(
                     )
                 };
                 null_log_losses[row] = hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
-                null_hazard_quadratic_losses[row] =
-                    0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
+                null_hazard_quadratic_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
             }
             let null_logloss = null_log_losses.iter().sum::<f64>() / null_log_losses.len() as f64;
             let null_hazard_quadratic = null_hazard_quadratic_losses.iter().sum::<f64>()
@@ -5302,12 +5383,11 @@ fn survival_lifted_metrics_from_predictions<'py>(
             )?;
             let ll_model = -log_losses.iter().sum::<f64>();
             let ll_null = -null_log_losses.iter().sum::<f64>();
-            nagelkerke =
-                gam::inference::diagnostics::nagelkerke_r_squared_from_log_likelihoods(
-                    ll_model,
-                    ll_null,
-                    event_times.len(),
-                );
+            nagelkerke = gam::inference::diagnostics::nagelkerke_r_squared_from_log_likelihoods(
+                ll_model,
+                ll_null,
+                event_times.len(),
+            );
         }
     }
     match nagelkerke {

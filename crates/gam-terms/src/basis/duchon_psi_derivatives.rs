@@ -1772,6 +1772,32 @@ pub fn create_duchon_basis_1d_derivative_dense(
     period: Option<f64>,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    create_duchon_basis_1d_derivative_dense_with_radial_reparam(
+        t,
+        centers,
+        power,
+        nullspace_order,
+        periodic,
+        period,
+        None,
+        order,
+    )
+}
+
+/// Evaluate a 1-D Duchon design derivative in an already-frozen radial chart.
+/// Position-batched consumers compute the data-metric chart once from the
+/// complete ragged batch and reuse it for every segment; without this argument
+/// each segment differentiates a different coefficient basis.
+pub fn create_duchon_basis_1d_derivative_dense_with_radial_reparam(
+    t: ArrayView1<'_, f64>,
+    centers: ArrayView1<'_, f64>,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    periodic: bool,
+    period: Option<f64>,
+    radial_reparam: Option<ArrayView2<'_, f64>>,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
     if order > 2 {
         crate::bail_invalid_basis!(
             "Duchon basis derivative supports orders 0, 1, and 2; got order={order}"
@@ -1786,6 +1812,11 @@ pub fn create_duchon_basis_1d_derivative_dense(
     if !periodic && period.is_some() {
         crate::bail_invalid_basis!(
             "Duchon basis derivative period is only valid when periodic=true"
+        );
+    }
+    if periodic && radial_reparam.is_some() {
+        crate::bail_invalid_basis!(
+            "periodic 1-D Duchon derivatives do not admit an open-domain radial reparameterization"
         );
     }
 
@@ -1867,8 +1898,18 @@ pub fn create_duchon_basis_1d_derivative_dense(
         return Ok(basis);
     }
 
-    let z =
+    let mut z =
         kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
+    if let Some(radial_reparam) = radial_reparam {
+        if radial_reparam.nrows() != z.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon frozen radial reparam shape {:?} does not match constrained kernel dimension {}",
+                radial_reparam.dim(),
+                z.ncols()
+            );
+        }
+        z = fast_ab(&z, &radial_reparam.to_owned());
+    }
     let kernel_cols = z.ncols();
     let poly_cols = polynomial_block_from_order(data.view(), effective_order).ncols();
 

@@ -2053,7 +2053,10 @@ pub(crate) fn should_use_lazy_spatial_design(
     p: usize,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> bool {
-    dense_design_bytes(n, p) > policy.max_single_materialization_bytes
+    matches!(
+        policy.derivative_storage_mode,
+        gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired
+    ) || dense_design_bytes(n, p) > policy.max_single_materialization_bytes
 }
 
 pub(crate) fn wrap_dense_design_with_transform(
