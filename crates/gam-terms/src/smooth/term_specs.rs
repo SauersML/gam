@@ -3755,6 +3755,7 @@ pub fn spatial_term_psi_bounds(
 #[cfg(test)]
 mod spatial_psi_bound_coordinate_tests {
     use super::*;
+    use crate::basis::{MaternIdentifiability, MaternNu};
     use ndarray::array;
 
     fn frozen_matern_bounds(theta: f64, dilation: f64) -> (f64, f64) {
