@@ -338,17 +338,6 @@ pub(crate) fn toy_family_and_derivatives(
     toy_family_and_derivatives_with_penalty_mode(psi, false)
 }
 
-fn toy_penalized_family_and_derivatives(
-    psi: &Array1<f64>,
-) -> (
-    TransformationNormalFamily,
-    Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    ParameterBlockState,
-    ParameterBlockSpec,
-) {
-    toy_family_and_derivatives_with_penalty_mode(psi, true)
-}
-
 #[test]
 pub(crate) fn ctn_row_quantity_cache_matches_direct_formulas() {
     let psi = array![0.15, -0.10];
