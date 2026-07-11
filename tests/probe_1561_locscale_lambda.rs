@@ -1,9 +1,9 @@
 //! Probe (NOT a permanent guard): measure the Gaussian location-scale
 //! over-smoothing of the log-sigma surface (#1561) under several penalty
-//! configurations, to localize whether the over-smoothing is driven by the
-//! default null-space double penalty on the SCALE block (mgcv `gaulss` defaults
-//! to `select=FALSE`, i.e. NO null-space penalty) vs the wiggliness lambda
-//! selection itself. Prints pearson(log sigma, truth), rmse, lambdas, edf.
+//! configurations, to localize whether the over-smoothing is driven by adding
+//! null-space shrinkage to the SCALE block (the shipped default and mgcv
+//! `gaulss` both leave it off) vs the wiggliness-lambda selection itself.
+//! Prints pearson(log sigma, truth), rmse, lambdas, edf.
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
@@ -150,13 +150,13 @@ fn probe_1561_locscale_penalty_configs() {
     init_parallelism();
     let n = 200;
     eprintln!("=== #1561 probe: Gaussian location-scale log-sigma recovery (n={n}) ===");
-    // Baseline: default (double_penalty=true on both blocks).
+    // Shipped default: mean double penalty on, secondary/scale penalty off.
     let default_corr = run_case("default", "y ~ s(x, bs='tp')", "1 + s(x, bs='tp')", n);
-    // Scale block WITHOUT null-space double penalty (mgcv gaulss select=FALSE).
-    let scale_nodbl_corr = run_case(
-        "scale_nodbl",
+    // Explicitly add null-space shrinkage to the scale block.
+    let scale_with_double_corr = run_case(
+        "scale_with_double",
         "y ~ s(x, bs='tp')",
-        "1 + s(x, bs='tp', double_penalty=false)",
+        "1 + s(x, bs='tp', double_penalty=true)",
         n,
     );
     // BOTH blocks without null-space double penalty.
@@ -173,7 +173,7 @@ fn probe_1561_locscale_penalty_configs() {
     // over-smoothing question this probe investigates.
     for (label, c) in [
         ("default", default_corr),
-        ("scale_nodbl", scale_nodbl_corr),
+        ("scale_with_double", scale_with_double_corr),
         ("both_nodbl", both_nodbl_corr),
     ] {
         assert!(
