@@ -1820,13 +1820,28 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
-            // The posterior-integrated mean E[g⁻¹(η)] can genuinely overflow
-            // f64 (an all-zero Poisson fit leaves se_eta in the thousands, so
-            // exp(η + se_eta²/2) → +inf). +inf IS the correctly rounded value
-            // of that integral; substituting the finite plug-in g⁻¹(η̂) here —
-            // the pre-audit #1515 behavior — silently reported an unbounded
-            // posterior mean as an innocuous finite number. Report it honestly.
-            strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])
+            let pm = strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])?;
+            if pm.is_finite() {
+                return Ok(pm);
+            }
+            // #1515 (locked owner contract; see issue #2255): a fitted model the
+            // public API accepts must always yield a finite response mean. A
+            // pathological coefficient posterior — an all-zero-count Poisson/NB
+            // fit, whose flat-at-η→−∞ likelihood leaves the penalized Hessian
+            // near-singular with `se_eta` in the thousands — makes the
+            // Laplace-lognormal integral E[g⁻¹(η)] = exp(η + se_eta²/2) overflow
+            // f64. That astronomical value is not a meaningful posterior mean:
+            // it is dominated by the far upper tail of the Gaussian η-posterior,
+            // a region where the Gaussian (Laplace) approximation to the true
+            // log-concave, data-bounded posterior is invalid. It also serializes
+            // to JSON null across the gam-pyffi boundary and crashes the Python
+            // shaper with a `None` mean. Degrade to the plug-in / MAP mean
+            // g⁻¹(η̂): finite (exp(η̂) for the log link) and exactly consistent
+            // with the reported `linear_predictor`. The fallback fires ONLY on a
+            // non-finite exact integral — every well-posed fit still reports the
+            // exact posterior mean, so the honest-reporting contract holds
+            // wherever it does not collide with predictability.
+            strategy.inverse_link(eta[i])
         })
         .collect();
 
@@ -2864,15 +2879,29 @@ where
                     )));
                 }
                 if meanvar == f64::INFINITY {
-                    // The exact response-variance integral overflowed (a
-                    // degenerate fit can leave se_eta in the thousands). The
-                    // mathematical variance is then larger than anything
-                    // representable, so the honest SE is +inf — an
-                    // infinite-width interval that support clamping reduces to
-                    // the family's full response range. Substituting the
-                    // (finite, often tiny) delta-method SE here fabricated
-                    // precision the posterior does not have.
-                    return Ok(f64::INFINITY);
+                    // The exact response-variance integral E[g⁻¹(η)²]−E[g⁻¹(η)]²
+                    // overflowed f64. A degenerate fit — an all-zero-count
+                    // Poisson/NB whose likelihood is flat as η→−∞ — leaves the
+                    // penalized Hessian near-singular with se_eta in the
+                    // thousands, so the Laplace–lognormal moment integral is
+                    // dominated by the far Gaussian tail, a region where the
+                    // Gaussian (Laplace) approximation to the true log-concave,
+                    // data-bounded η-posterior is invalid. The +inf is a
+                    // numerical artifact of that invalid tail, not the fit's
+                    // actual spread: its plug-in rate g⁻¹(η̂) is ~0, so an
+                    // infinite-width response interval is exactly wrong, and it
+                    // serializes to JSON null and crashes the Python shaper —
+                    // breaking the locked #1515 contract that a fitted model
+                    // stay predictable. Degrade to the delta-method SE
+                    // |dμ/dη|·se_eta: the first-order posterior spread evaluated
+                    // AT the mode, where the Gaussian approximation IS valid.
+                    // This is the same finite fallback `enrich_posterior_mean_bounds`
+                    // applies and is self-consistent with the plug-in response
+                    // mean g⁻¹(η̂) the posterior-mean path reports. Fires ONLY on
+                    // a non-finite exact integral, so every well-posed fit still
+                    // reports the exact response SE.
+                    let dmu_deta = strategy.inverse_link_jet(eta[i])?.d1;
+                    return Ok(dmu_deta.abs() * se_i);
                 }
                 Ok(meanvar.max(0.0).sqrt())
             })
@@ -3329,6 +3358,89 @@ mod tests {
         assert!(
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
+        );
+    }
+
+    #[test]
+    fn degenerate_poisson_interval_falls_back_to_finite_delta_se() {
+        // #2255/#1515: a degenerate all-zero-count Poisson fit leaves the
+        // penalized Hessian near-singular (se_eta in the thousands), so the
+        // EXACT log-normal response variance Var[exp(η)] = exp(2η+s²)·expm1(s²)
+        // overflows f64 to +inf. The interval path must NOT surface +inf (an
+        // infinite-width interval clamps to the unbounded Poisson support and
+        // serializes to a non-finite column that crashes the Python shaper);
+        // it must degrade to the delta-method SE |dμ/dη|·se_eta = exp(η̂)·se_eta,
+        // finite and self-consistent with the plug-in mean exp(η̂).
+        let x = array![[1.0_f64]];
+        let eta_hat = -23.0_f64; // ≈ ln(1e-10): the ~0 MLE rate for all-zero counts
+        let beta = array![eta_hat];
+        let offset = array![0.0_f64];
+        // Var(η) = 1e7 ⇒ se_eta ≈ 3162, forcing the exact variance to overflow.
+        let etavar = 1.0e7_f64;
+        let covariance = array![[etavar]];
+        let options = PredictUncertaintyOptions {
+            confidence_level: 0.95,
+            covariance_mode: InferenceCovarianceMode::Conditional,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
+            includeobservation_interval: false,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let spec = gam_spec::LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        );
+        let pred = predict_gamwith_uncertainty(
+            x.view(),
+            beta.view(),
+            offset.view(),
+            spec,
+            &covariance,
+            &options,
+        )
+        .expect("degenerate Poisson interval prediction");
+
+        // Guard: this scenario really does overflow the exact integral, so we
+        // are exercising the fallback and not the ordinary exact-SE path.
+        let s2 = etavar;
+        let exact_var = (2.0 * eta_hat + s2).exp() * s2.exp_m1();
+        assert!(
+            !exact_var.is_finite(),
+            "test setup must overflow the exact variance integral, got {exact_var}"
+        );
+
+        let se = pred.mean_standard_error[0];
+        let se_eta = etavar.sqrt();
+        let expected = eta_hat.exp() * se_eta; // delta-method SE = exp(η̂)·se_eta
+        assert!(se.is_finite(), "degenerate-fit mean SE must be finite, got {se}");
+        assert!(
+            (se - expected).abs() <= 1e-9 * expected.max(1e-30),
+            "expected delta-method SE {expected:e}, got {se:e}"
+        );
+
+        // Mean and both interval bounds must be finite and near-zero, and the
+        // interval must bracket the mean.
+        assert!(
+            pred.mean[0].is_finite() && pred.mean[0] >= 0.0,
+            "response mean must be finite and non-negative, got {}",
+            pred.mean[0]
+        );
+        assert!(
+            pred.mean_lower[0].is_finite() && pred.mean_upper[0].is_finite(),
+            "interval bounds must be finite: [{}, {}]",
+            pred.mean_lower[0],
+            pred.mean_upper[0]
+        );
+        assert!(pred.mean_lower[0] <= pred.mean[0] + 1e-12);
+        assert!(pred.mean[0] <= pred.mean_upper[0] + 1e-12);
+        assert!(
+            pred.mean_upper[0] < 1.0,
+            "all-zero-count rate must stay near zero, got upper {}",
+            pred.mean_upper[0]
         );
     }
 
@@ -5814,7 +5926,15 @@ mod tests {
     }
 
     #[test]
-    fn posterior_mean_overflow_remains_explicit_infinity() {
+    fn posterior_mean_overflow_degrades_to_finite_plugin() {
+        // A representable covariance whose Laplace-lognormal integral overflows
+        // f64 (E[exp(η)] = exp(η̂ + se²/2) = exp(0 + 800)) must NOT surface the
+        // +inf that serializes to JSON null and crashes the Python shaper: the
+        // owner's locked #1515 contract (see issue #2255) requires a model the
+        // public API accepts to always predict a finite response mean. The row
+        // degrades to the plug-in / MAP mean g⁻¹(η̂) = exp(0) = 1 — finite and
+        // consistent with the reported linear predictor. The fallback fires ONLY
+        // on a non-finite exact integral, so every well-posed fit is unaffected.
         let result = predict_gam_posterior_mean(
             array![[1.0]],
             array![0.0].view(),
@@ -5825,8 +5945,15 @@ mod tests {
         .expect("a representable covariance with an overflowing integral is valid");
         assert_eq!(result.eta[0], 0.0);
         assert!(
-            result.mean[0].is_infinite() && result.mean[0].is_sign_positive(),
-            "E[exp(η)] = exp(800) must be reported as +inf, not plug-in exp(0)=1"
+            result.mean[0].is_finite(),
+            "an overflowing posterior-mean integral must degrade to a finite \
+             plug-in, not report +inf (got {})",
+            result.mean[0]
+        );
+        assert!(
+            (result.mean[0] - 1.0).abs() < 1e-12,
+            "plug-in mean must be g⁻¹(η̂) = exp(0) = 1, got {}",
+            result.mean[0]
         );
     }
 

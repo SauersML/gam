@@ -462,14 +462,166 @@ fn constant_gaussian_standard_fit(
             beta[col] = intercept;
         }
     }
-    let lambdas = Array1::<f64>::ones(design.penalties.len());
-    let log_lambdas = Array1::<f64>::zeros(design.penalties.len());
+
+    // A constant response is fit EXACTLY by the intercept (residual ≡ 0), so the
+    // fitted β is invariant to the smoothing parameters: every penalized wiggle
+    // is unsupported and shrinks out. But a fit is only usable if it carries a
+    // complete inference bundle — the penalized Hessian, EDF, dispersion, and
+    // covariance that null-space metadata, `edf_total()`, prediction bands, and
+    // the persistence payload all read. The prior shortcut returned `inference:
+    // None`/`geometry: None`, so the model builder then hard-failed with
+    // "null-space Hessian logdet requires fitted penalized Hessian" (#2254) even
+    // for `y ~ 1`. We assemble that bundle here at a fully-smoothed λ. Because the
+    // residual is exactly zero the estimated dispersion φ̂ = 0, so every
+    // coefficient covariance is exactly zero (no ill-conditioned inverse needed).
+    let x_dense = design.design.to_dense();
+    let weights = request.weights.as_ref().clone();
+    let xtwx = gam_linalg::faer_ndarray::fast_xt_diag_x(&x_dense, &weights);
+    // Fully-smoothed λ: scaled to dominate the data information in every
+    // penalized direction so the reported EDF collapses onto the penalty null
+    // space (the honest complexity of a fit that carries no wiggle). β is
+    // λ-invariant here, so this only shapes the reported geometry, not the fit.
+    let info_scale = xtwx.diag().iter().fold(1.0_f64, |acc, &v| acc.max(v.abs()));
+    let lambda_full = 1.0e10 * info_scale;
+    let mut penalized_hessian = xtwx.clone();
+    for block in &design.penalties {
+        let r = block.col_range.clone();
+        if r.end <= p && block.local.nrows() == r.len() && block.local.ncols() == r.len() {
+            penalized_hessian
+                .slice_mut(ndarray::s![r.clone(), r])
+                .scaled_add(lambda_full, &block.local);
+        }
+    }
+    // Symmetrize defensively against accumulated round-off before the Cholesky.
+    penalized_hessian = (&penalized_hessian + &penalized_hessian.t()) * 0.5;
+    let n_penalties = design.penalties.len();
+    // Effective degrees of freedom from the influence matrix `F = H⁻¹ XᵀWX`,
+    // decomposed per penalty by the SAME trace formula the standard REML path
+    // (`estimate.rs`) and the survival fast-path (`survival_transformation_edf`)
+    // use: `tr_k = λ·tr(H⁻¹ S_k)`, `edf_k = block_cols_k − tr_k`, and
+    // `edf_total = p − Σ_k tr_k = tr(F)`. Producing the WHOLE bundle here — not
+    // just the scalar total — is what makes the fit self-consistent: `edf_by_block`
+    // aligns 1:1 with `lambdas` (a length the constructor validates), the raw
+    // shrinkage traces feed per-term EDF, and `coefficient_influence = F` is the
+    // authoritative leverage matrix every downstream EDF consumer prefers. At the
+    // fully-smoothed λ each penalized direction is absorbed (`tr_k → rank(S_k)`),
+    // so every block collapses onto its own penalty null space — the honest
+    // complexity of a wiggle-free fit, and exactly the λ→∞ limit of the
+    // near-constant fit that already works.
+    let (edf_total, edf_by_block, penalty_block_trace, coefficient_influence) = {
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        match penalized_hessian.cholesky(faer::Side::Lower) {
+            Ok(chol) => {
+                // F = H⁻¹ XᵀWX. Generally NOT symmetric (a product of two
+                // symmetric matrices); it must be stored as-is so `H·F = XᵀWX`
+                // and per-term `tr(F_jj)` stay exact (see estimate.rs / #1027).
+                let influence = chol.solve_mat(&xtwx);
+                let mut edf_by_block = vec![0.0_f64; n_penalties];
+                let mut penalty_block_trace = vec![0.0_f64; n_penalties];
+                for (kk, block) in design.penalties.iter().enumerate() {
+                    let r = block.col_range.clone();
+                    let block_cols = r.len();
+                    // Skip a block the design left inconsistent (same guard the
+                    // Hessian-assembly loop above uses): its penalty never entered
+                    // `H`, so its penalized EDF is 0 and its full column count is
+                    // unpenalized d.f. accounted for in `edf_total = tr(F)`.
+                    if block_cols == 0
+                        || r.end > p
+                        || block.local.nrows() != block_cols
+                        || block.local.ncols() != block_cols
+                    {
+                        continue;
+                    }
+                    // tr(H⁻¹ S_k): solve `H Z = S_k` (embedded in the full p×block
+                    // layout) and read the block diagonal of the solution.
+                    let mut rhs = Array2::<f64>::zeros((p, block_cols));
+                    for c in 0..block_cols {
+                        for rr in 0..block_cols {
+                            rhs[[r.start + rr, c]] = block.local[[rr, c]];
+                        }
+                    }
+                    let sol = chol.solve_mat(&rhs);
+                    let mut trace = 0.0_f64;
+                    for j in 0..block_cols {
+                        trace += sol[[r.start + j, j]];
+                    }
+                    let lam_trace = (lambda_full * trace).clamp(0.0, block_cols as f64);
+                    penalty_block_trace[kk] = lam_trace;
+                    edf_by_block[kk] =
+                        (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
+                }
+                let edf_total = influence
+                    .diag()
+                    .iter()
+                    .copied()
+                    .sum::<f64>()
+                    .clamp(0.0, p as f64);
+                (edf_total, edf_by_block, penalty_block_trace, Some(influence))
+            }
+            // A design left rank-deficient upstream still has a well-defined
+            // null-space EDF. Report each penalty's structural null-space dim (the
+            // λ→∞ limit of `edf_by_block`) when the term planner recorded it, else
+            // 0 — either way the length matches `lambdas`, so the fit still mints
+            // and stays predictable rather than hard-failing downstream.
+            Err(_) => {
+                let edf_by_block: Vec<f64> = if design.nullspace_dims.len() == n_penalties {
+                    design
+                        .penalties
+                        .iter()
+                        .zip(&design.nullspace_dims)
+                        .map(|(b, &ns)| (ns as f64).min(b.col_range.len() as f64))
+                        .collect()
+                } else {
+                    vec![0.0_f64; n_penalties]
+                };
+                let edf_total = (design.intercept_range.len() as f64
+                    + edf_by_block.iter().sum::<f64>())
+                .clamp(0.0, p as f64);
+                (edf_total, edf_by_block, vec![0.0_f64; n_penalties], None)
+            }
+        }
+    };
+    // IRLS working response for the identity link is the raw response y (η
+    // absorbs the offset); the working weights are the prior weights.
+    let working_response = request.y.as_ref().clone();
+    let lambdas = Array1::<f64>::from_elem(n_penalties, lambda_full);
+    let log_lambdas = lambdas.mapv(|v| v.max(f64::MIN_POSITIVE).ln());
+    let penalized_hessian_precision =
+        gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian.clone());
+    let inference = gam_solve::estimate::FitInference {
+        edf_by_block,
+        penalty_block_trace,
+        edf_total,
+        smoothing_correction: None,
+        penalized_hessian: penalized_hessian_precision.clone(),
+        working_weights: weights.clone(),
+        working_response: working_response.clone(),
+        reparam_qs: None,
+        // Exact fit ⇒ residual variance is exactly zero.
+        dispersion: gam_solve::estimate::Dispersion::Estimated(0.0),
+        beta_covariance: Some(gam_problem::dispersion_cov::PhiScaledCovariance::wrap(
+            ndarray::Array2::<f64>::zeros((p, p)),
+        )),
+        beta_standard_errors: Some(Array1::<f64>::zeros(p)),
+        beta_covariance_corrected: None,
+        beta_standard_errors_corrected: None,
+        beta_covariance_frequentist: None,
+        coefficient_influence,
+        weighted_gram: Some(xtwx),
+        bias_correction_beta: None,
+        bias_correction_jacobian: None,
+    };
+    let geometry = Some(gam_solve::estimate::FitGeometry {
+        penalized_hessian: penalized_hessian_precision,
+        working_weights: weights,
+        working_response,
+    });
     let fit = gam_solve::estimate::UnifiedFitResult::try_from_parts(
         gam_solve::estimate::UnifiedFitResultParts {
             blocks: vec![gam_solve::estimate::FittedBlock {
                 beta: beta.clone(),
                 role: gam_problem::BlockRole::Mean,
-                edf: design.intercept_range.len() as f64,
+                edf: edf_total,
                 lambdas: lambdas.clone(),
             }],
             log_lambdas,
@@ -487,11 +639,11 @@ fn constant_gaussian_standard_fit(
             outer_converged: true,
             outer_gradient_norm: Some(0.0),
             standard_deviation: 0.0,
-            covariance_conditional: None,
+            covariance_conditional: Some(ndarray::Array2::<f64>::zeros((p, p))),
             covariance_corrected: None,
-            inference: None,
+            inference: Some(inference),
             fitted_link: gam_solve::estimate::FittedLinkState::Standard(None),
-            geometry: None,
+            geometry,
             block_states: Vec::new(),
             pirls_status: gam_solve::pirls::PirlsStatus::Converged,
             max_abs_eta: intercept.abs(),
@@ -529,19 +681,29 @@ fn constant_gaussian_standard_fit(
 }
 
 fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
-    if !request.family.is_gaussian_identity()
-        || request.y.is_empty()
-        || request.y.iter().any(|value| !value.is_finite())
-    {
+    if !request.family.is_gaussian_identity() || request.y.is_empty() {
         return false;
     }
-    let (lo, hi) = request
-        .y
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &value| {
-            (lo.min(value), hi.max(value))
-        });
-    (hi - lo).abs() <= 1.0e-12 * hi.abs().max(1.0)
+    // The intercept-only shortcut is exact — residual ≡ 0 — precisely when the
+    // OFFSET-ADJUSTED response `y − offset` is constant: then `η = offset +
+    // intercept = y` at every row. Testing the raw `y` alone would (a) miss an
+    // exact fit where a varying offset cancels a varying `y`, and (b) wrongly
+    // fire on a constant `y` under a varying offset, where the fit is NOT exact
+    // and the zero-dispersion inference the shortcut mints would be invalid.
+    if request.y.len() != request.offset.len() {
+        return false;
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (&yi, &oi) in request.y.iter().zip(request.offset.iter()) {
+        let value = yi - oi;
+        if !value.is_finite() {
+            return false;
+        }
+        lo = lo.min(value);
+        hi = hi.max(value);
+    }
+    (hi - lo).abs() <= 1.0e-12 * hi.abs().max(lo.abs()).max(1.0)
 }
 
 pub fn fit_from_formula(

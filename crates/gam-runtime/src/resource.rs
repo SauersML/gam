@@ -502,8 +502,7 @@ pub fn prediction_chunk_rows(parameter_dim: usize, local_dim: usize, total_rows:
         ResourcePolicy::default_library().row_chunk_target_bytes,
         live_f64_values_per_row,
     )
-    .max(MIN_ROWS)
-    .min(MAX_ROWS)
+    .clamp(MIN_ROWS, MAX_ROWS)
     .min(total_rows)
 }
 

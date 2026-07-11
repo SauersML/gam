@@ -1887,6 +1887,75 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         // curvature to |λ|, exactly as the prior spectral solve did.
                         let spectral_step = spectrum.trust_region_step(f64::INFINITY);
                         spectral_nullity_for_step = spectral_step.nullity;
+                        // gam#979: Levenberg shift-to-PD of the SEED search direction on
+                        // the rigid ill-conditioned path. When the whitened inner Hessian
+                        // is indefinite the Moré–Sorensen step reflects the negative
+                        // modes to |λ|; on the near-separable coupled marginal-slope
+                        // surface those reflected modes then ride a poor gain ratio that
+                        // shrinks the single scalar trust radius, which clamps the
+                        // *well-conditioned* modes that DO carry real descent — the
+                        // measured "reflected-descent crawl" where the residual plateaus
+                        // (‖g‖~1e-1) while the objective creeps down ~1e-3/cycle and the
+                        // solve exhausts its budget without ever reaching residual_tol
+                        // (the binary twin of the survival-MS oversmoothed-ρ endgame).
+                        // Once the residual has stalled for a few cycles, seed the trust
+                        // loop from a genuinely convex modified-Newton step: add
+                        // μ·D_trust (μ just above |λ_min| so the reflected modes become
+                        // gently positive while the well-conditioned modes, |λ|≫μ, keep
+                        // their full Newton step) and re-solve once. This is a modified-
+                        // Newton SEARCH DIRECTION only — the trust-region accept/reject
+                        // still judges it against the true `lhs_true` model, `joint_spectrum`
+                        // stays the exact (unshifted) spectrum for the trust re-solves and
+                        // the Newton-decrement certificate, and μ is applied ONLY while the
+                        // Hessian is indefinite (it vanishes once the endgame becomes PD),
+                        // so a healthy convex fit is byte-unchanged and no non-minimum can
+                        // be certified. Family-gated on `levenberg_on_ill_conditioning()`.
+                        const JOINT_REFLECTED_CONVEXIFY_STALL_WINDOW: usize = 3;
+                        const JOINT_REFLECTED_CONVEXIFY_MARGIN: f64 = 1.5;
+                        let mut seed_delta = spectral_step.delta;
+                        if family.levenberg_on_ill_conditioning()
+                            && spectral_step.reflected_negative_modes > 0
+                            && cycles_since_residual_improved
+                                >= JOINT_REFLECTED_CONVEXIFY_STALL_WINDOW
+                            && spectral_step.most_negative_eigenvalue.is_finite()
+                            && spectral_step.most_negative_eigenvalue < 0.0
+                        {
+                            let mu = spectral_step.most_negative_eigenvalue.abs()
+                                * JOINT_REFLECTED_CONVEXIFY_MARGIN;
+                            if mu.is_finite() && mu > 0.0 {
+                                let mut lhs_convex = lhs_true.clone();
+                                for d in 0..lhs_convex.nrows() {
+                                    lhs_convex[[d, d]] += mu * joint_trust_metric_diag[d];
+                                }
+                                if let Ok(convex_spectrum) =
+                                    whitened_spectrum::WhitenedHessianSpectrum::decompose(
+                                        &lhs_convex,
+                                        &spectral_rhs,
+                                        &joint_trust_metric_diag,
+                                        KKT_REFUSAL_RANK_TOL,
+                                    )
+                                {
+                                    let convex_step =
+                                        convex_spectrum.trust_region_step(f64::INFINITY);
+                                    if convex_step.reflected_negative_modes == 0
+                                        && convex_step.delta.iter().all(|v| v.is_finite())
+                                    {
+                                        log::info!(
+                                            "[PIRLS/joint-Newton] cycle {cycle:>3} | gam#979 \
+                                             Levenberg shift-to-PD seed: μ={mu:.3e}·D convexified \
+                                             {} reflected mode(s) (λ_min={:.3e}) after {} stalled \
+                                             cycle(s); seeding the trust loop from the convex \
+                                             modified-Newton step to break the reflected-descent \
+                                             crawl",
+                                            spectral_step.reflected_negative_modes,
+                                            spectral_step.most_negative_eigenvalue,
+                                            cycles_since_residual_improved,
+                                        );
+                                        seed_delta = convex_step.delta;
+                                    }
+                                }
+                            }
+                        }
                         if spectral_step.reflected_negative_modes > 0 {
                             log::info!(
                                 "[PIRLS/joint-Newton] cycle {cycle:>3} | indefinite inner \
@@ -1912,9 +1981,13 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 spectral_step.reflected_negative_modes,
                             );
                         }
-                        delta = Some(spectral_step.delta);
+                        delta = Some(seed_delta);
                         // The same factorization powers every trust-radius re-solve
                         // in the loop below (gam#979) — no second eigendecomposition.
+                        // `spectrum` is the EXACT (unshifted) Hessian: the gam#979
+                        // Levenberg shift-to-PD above only reshapes the SEED direction,
+                        // so the trust re-solves and the Newton-decrement certificate
+                        // keep judging against the true model.
                         joint_spectrum = Some(spectrum);
                     }
 
