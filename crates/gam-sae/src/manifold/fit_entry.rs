@@ -927,7 +927,6 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         // one certified structural move, refits it to convergence, and repeats
         // until a round applies no move. This keeps candidate memory bounded
         // independently of K and p without a size-dependent skip or round cap.
-        let k_now = term.k_atoms().max(1);
         let harvest_params = structure_harvest::HarvestParams {
             max_fusions: 1,
             max_fissions: 1,
