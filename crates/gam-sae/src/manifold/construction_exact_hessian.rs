@@ -178,6 +178,35 @@ where
                 return Err("solve_exact_stationarity: non-finite inverse-power alignment".into());
             }
             v = refined;
+            // The discriminator asks whether the response's near-zero aggregate
+            // Rayleigh quotient came from a numerical null or cancellation among
+            // resolved pencil directions.  One inverse step amplifies smaller-|μ|
+            // components relative to larger ones.  Therefore a refined direction
+            // whose own curvature is already resolved proves the latter case; it
+            // is unnecessary (and generally much slower) to wait for full
+            // eigenvector alignment before keeping the original finite response.
+            // Strict alignment remains mandatory below before a direction may be
+            // projected as a numerical null.
+            let av = apply_a_q(&v)?;
+            let bv = apply_b_q(&v)?;
+            let norm_sq = sae_inner(&v, &bv);
+            if !(norm_sq.is_finite() && norm_sq > 0.0) {
+                return Err(format!(
+                    "solve_exact_stationarity: refined inverse-power direction has invalid \
+                     B-norm squared {norm_sq:.6e}"
+                ));
+            }
+            let refined_mu = sae_inner(&v, &av) / norm_sq;
+            if !refined_mu.is_finite() {
+                return Err(
+                    "solve_exact_stationarity: refined inverse-power direction has non-finite \
+                     generalized curvature"
+                        .into(),
+                );
+            }
+            if refined_mu.abs() >= rank_floor {
+                return Ok(x);
+            }
             if 1.0 - alignment.min(1.0) <= rank_floor {
                 direction_converged = true;
                 break;
