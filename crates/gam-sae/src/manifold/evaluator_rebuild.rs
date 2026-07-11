@@ -359,8 +359,7 @@ pub fn build_sae_basis_evaluators(
 /// Rust fit front doors validate seed tokens before calling this converter;
 /// `Precomputed` remains an internal representation for typed native artifacts.
 pub fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
-    let canonical = crate::atom_schema::canonical_basis_kind(value);
-    match canonical.as_str() {
+    match value {
         "duchon" => SaeAtomBasisKind::Duchon,
         "periodic" => SaeAtomBasisKind::Periodic,
         "sphere" => SaeAtomBasisKind::Sphere,

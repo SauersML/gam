@@ -170,15 +170,11 @@ pub fn calculate_deviance(
             raw / phi
         }
         ResponseFamily::Poisson => {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let total: f64 = (0..y.len())
-                .into_par_iter()
-                .map(|i| {
-                    let yi = y[i];
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i] * poisson_unit_deviance(yi, mui_c)
-                })
-                .sum();
+            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
+                let yi = y[i];
+                let mui_c = mu[i].max(MU_FLOOR);
+                priorweights[i] * poisson_unit_deviance(yi, mui_c)
+            });
             2.0 * total
         }
         ResponseFamily::Tweedie { p } => {
@@ -199,28 +195,20 @@ pub fn calculate_deviance(
             if validate_tweedie_responses(&y, &priorweights).is_err() {
                 return f64::NAN;
             }
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let total: f64 = (0..y.len())
-                .into_par_iter()
-                .map(|i| {
-                    let yi = y[i];
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i] * tweedie_unit_deviance(yi, mui_c, p)
-                })
-                .sum();
+            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
+                let yi = y[i];
+                let mui_c = mu[i].max(MU_FLOOR);
+                priorweights[i] * tweedie_unit_deviance(yi, mui_c, p)
+            });
             2.0 * total
         }
         ResponseFamily::NegativeBinomial { theta, .. } => {
             let theta = *theta;
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let total: f64 = (0..y.len())
-                .into_par_iter()
-                .map(|i| {
-                    let yi = y[i];
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i] * negative_binomial_unit_deviance(yi, mui_c, theta)
-                })
-                .sum();
+            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
+                let yi = y[i];
+                let mui_c = mu[i].max(MU_FLOOR);
+                priorweights[i] * negative_binomial_unit_deviance(yi, mui_c, theta)
+            });
             2.0 * total
         }
         ResponseFamily::Beta { phi } => {
@@ -228,11 +216,9 @@ pub fn calculate_deviance(
             if !valid_beta_phi(phi) {
                 return f64::NAN;
             }
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let total: f64 = (0..y.len())
-                .into_par_iter()
-                .map(|i| priorweights[i] * beta_unit_deviance(y[i], mu[i], phi))
-                .sum();
+            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
+                priorweights[i] * beta_unit_deviance(y[i], mu[i], phi)
+            });
             2.0 * total
         }
         ResponseFamily::Gamma => {
@@ -244,15 +230,11 @@ pub fn calculate_deviance(
             // — the #2126 defect. The dispersion is reported separately; the
             // deviance itself must stay scale-free so `deviance_explained =
             // 1 − D_resid/D_null` is a pure ratio of like-scaled deviances.
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let total: f64 = (0..y.len())
-                .into_par_iter()
-                .map(|i| {
-                    let yi_c = y[i].max(EPS);
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i] * gamma_unit_deviance(yi_c, mui_c)
-                })
-                .sum();
+            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
+                let yi_c = y[i].max(EPS);
+                let mui_c = mu[i].max(MU_FLOOR);
+                priorweights[i] * gamma_unit_deviance(yi_c, mui_c)
+            });
             2.0 * total
         }
         ResponseFamily::RoystonParmar => f64::NAN,
@@ -403,7 +385,6 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     // Same μ floor as PIRLS log-link working-state writers; see note in
     // `calculate_deviance` above.
     const MU_FLOOR: f64 = 1e-10;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
@@ -418,32 +399,23 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 return f64::NAN;
             }
             let inv_phi = 1.0 / phi;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let resid = y[i] - mu[i];
-                    -0.5 * priorweights[i] * resid * resid * inv_phi
-                })
-                .sum()
+            gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                let resid = y[i] - mu[i];
+                -0.5 * priorweights[i] * resid * resid * inv_phi
+            })
         }
-        ResponseFamily::Binomial => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                // Share the deviance helper so both reductions floor mu at
-                // the same epsilon — otherwise the deviance / log-lik identity
-                // drifts whenever the link saturates.
-                let mui_c = safe_mu_for_binomial(mu[i]);
-                priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
-            })
-            .sum(),
-        ResponseFamily::Poisson => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mui_c = mu[i].max(MU_FLOOR);
-                let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-                priorweights[i] * (log_term - mui_c)
-            })
-            .sum(),
+        ResponseFamily::Binomial => gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+            // Share the deviance helper so both reductions floor mu at
+            // the same epsilon — otherwise the deviance / log-lik identity
+            // drifts whenever the link saturates.
+            let mui_c = safe_mu_for_binomial(mu[i]);
+            priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
+        }),
+        ResponseFamily::Poisson => gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+            let mui_c = mu[i].max(MU_FLOOR);
+            let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
+            priorweights[i] * (log_term - mui_c)
+        }),
         ResponseFamily::Tweedie { p } => {
             let p = *p;
             let phi = fixed_glm_dispersion(likelihood);
@@ -454,36 +426,30 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
         }
         ResponseFamily::NegativeBinomial { theta, .. } => {
             let theta = *theta;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if !valid_negbin_theta(theta) {
-                        return f64::NAN;
-                    }
-                    let yi = y[i];
-                    if !valid_count_response(yi) {
-                        return f64::NAN;
-                    }
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    priorweights[i]
-                        * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
-                            + theta * (theta.ln() - (theta + mui_c).ln())
-                            + xlogy(yi, mui_c)
-                            - yi * (theta + mui_c).ln())
-                })
-                .sum()
+            gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                if !valid_negbin_theta(theta) {
+                    return f64::NAN;
+                }
+                let yi = y[i];
+                if !valid_count_response(yi) {
+                    return f64::NAN;
+                }
+                let mui_c = mu[i].max(MU_FLOOR);
+                priorweights[i]
+                    * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
+                        + theta * (theta.ln() - (theta + mui_c).ln())
+                        + xlogy(yi, mui_c)
+                        - yi * (theta + mui_c).ln())
+            })
         }
         ResponseFamily::Beta { phi } => {
             let phi = *phi;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if !valid_beta_phi(phi) {
-                        return f64::NAN;
-                    }
-                    priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
-                })
-                .sum()
+            gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                if !valid_beta_phi(phi) {
+                    return f64::NAN;
+                }
+                priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
+            })
         }
         ResponseFamily::Gamma => {
             // REML/LAML outer objective: use the scaled-deviance form
@@ -923,11 +889,9 @@ pub fn tweedie_exact_loglik_total(
     if validate_tweedie_responses(&y, &priorweights).is_err() {
         return f64::NAN;
     }
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    (0..y.len())
-        .into_par_iter()
-        .map(|i| tweedie_exact_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi))
-        .sum()
+    gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
+        tweedie_exact_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi)
+    })
 }
 
 /// Total fully-normalized log-likelihood — the sum of [`pointwise_loglikelihood`]

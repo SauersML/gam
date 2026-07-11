@@ -384,7 +384,7 @@ pub(super) fn run(
 
     let fit_start = Instant::now();
     let mut decoder = seed_decoder(x, k);
-    unit_norm_rows(&mut decoder);
+    unit_norm_rows(&mut decoder)?;
     // Coarse phase heartbeat on the same channel as the score-router DECLINE
     // (log::warn survives the RUST_LOG=warn harnesses that drop log::info), so a
     // multi-hour host fit is never silent. Emitted at seed / initial-route /
@@ -463,7 +463,7 @@ pub(super) fn run(
         let refresh_secs = epoch_start.elapsed().as_secs_f64();
 
         // (d) unit-norm projection (identifies code scale) + stable sign.
-        unit_norm_rows(&mut decoder);
+        unit_norm_rows(&mut decoder)?;
 
         // (e) dead-atom revival. Atoms that fired for no row this epoch are re-
         // seeded onto the current worst-reconstructed rows' residual directions.
@@ -476,7 +476,7 @@ pub(super) fn run(
         // remain, so a fully-alive small-`K` dictionary is untouched.
         let revived_atoms = revive_dead_atoms(x, &codes, &mut decoder);
         if !revived_atoms.is_empty() {
-            unit_norm_rows(&mut decoder);
+            unit_norm_rows(&mut decoder)?;
         }
 
         // (a)+(b) FRESH codes against the just-refreshed, unit-normed decoder.
@@ -2095,15 +2095,23 @@ fn cholesky_solve_block(mat: &Array2<f64>, rhs: &Array2<f64>) -> Option<Array2<f
     Some(factor.solve_mat(rhs))
 }
 
-pub(super) fn unit_norm_rows(decoder: &mut Array2<f32>) {
-    for mut row in decoder.outer_iter_mut() {
+pub(super) fn unit_norm_rows(decoder: &mut Array2<f32>) -> Result<(), String> {
+    for (atom, mut row) in decoder.outer_iter_mut().enumerate() {
         let nrm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if nrm > 1.0e-12 {
+        if !nrm.is_finite() {
+            return Err(format!(
+                "decoder atom {atom} has a non-finite norm before gauge normalization"
+            ));
+        }
+        // An exactly zero row is an explicitly dead atom and carries no scale;
+        // the revival step handles it. Every nonzero row is normalized exactly,
+        // with no epsilon-defined scale convention.
+        if nrm > 0.0 {
             row.mapv_inplace(|v| v / nrm);
-            // Orient by first significant component for a stable sign.
+            // Orient by the first nonzero component for a stable sign.
             let mut sign = 1.0f32;
             for &v in row.iter() {
-                if v.abs() > 1.0e-9 {
+                if v != 0.0 {
                     sign = v.signum();
                     break;
                 }
@@ -2113,6 +2121,7 @@ pub(super) fn unit_norm_rows(decoder: &mut Array2<f32>) {
             }
         }
     }
+    Ok(())
 }
 
 fn explained_variance(

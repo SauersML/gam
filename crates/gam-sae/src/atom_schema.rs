@@ -52,8 +52,7 @@ pub fn validated_n_harmonics(
 
 /// Validate one canonical assignment-family token.
 ///
-/// The fit,
-/// stagewise, payload, and distilled-encoder paths all call this parser before
+/// The fit, payload, and native routing paths all call this parser before
 /// dispatching to the core [`crate::assignment::AssignmentMode`] implementation,
 /// so accepted and emitted tokens cannot drift.
 pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
@@ -69,22 +68,16 @@ pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
     }
 }
 
-/// Return an exact basis token unchanged. Validation is deliberately separate
-/// so internal native outputs can admit discovery-only kinds while public seed
-/// inputs use [`validate_seed_basis_kind`].
-pub fn canonical_basis_kind(name: &str) -> String {
-    name.to_string()
-}
-
 /// Validate a basis kind that may appear in a converged native artifact.
 pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
     match name {
         "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean"
-        | "duchon" | "poincare" | "cylinder" | "mobius" | "finite_set" => Ok(()),
+        | "duchon" | "poincare" | "cylinder" | "mobius" | "finite_set"
+        | "spectral_graph" => Ok(()),
         _ => Err(format!(
             "basis kind {name:?} is not canonical; expected one of ['cylinder', 'duchon', \
              'euclidean', 'finite_set', 'linear', 'linear_block', 'mobius', 'periodic', \
-             'poincare', 'sphere', 'torus']"
+             'poincare', 'spectral_graph', 'sphere', 'torus']"
         )),
     }
 }
@@ -127,6 +120,7 @@ pub fn basis_to_topology(basis: &str) -> Result<String, String> {
     Ok(match basis {
         "periodic" => "circle",
         "duchon" | "euclidean" => "euclidean",
+        "spectral_graph" => "graph",
         other => other,
     }
     .to_string())

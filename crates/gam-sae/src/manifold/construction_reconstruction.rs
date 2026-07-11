@@ -2,8 +2,8 @@
 //! tail of `construction.rs` to keep that tracked file under the #780 10k-line
 //! gate. Holds the contiguous trailing `impl SaeManifoldTerm` block:
 //! `reconstruction_dispersion` (the Gaussian dispersion `φ̂` estimator),
-//! `assemble_shape_uncertainty`, `complete_born_atom_shape_bands`, and
-//! `shape_uncertainty_without_decoder_covariance`. All are reached bare by
+//! `assemble_shape_uncertainty`, `recompute_joint_shape_uncertainty`, and the
+//! explicit streaming-unavailable shape report. All are reached bare by
 //! callers through `use super::*`, so their visibility is unchanged.
 
 use super::*;
@@ -544,19 +544,15 @@ impl SaeManifoldTerm {
     /// per-atom covariance and bands off its Schur factor, scaling by the
     /// reconstruction dispersion `φ̂`. The result is the DOCUMENTED joint
     /// covariance: it carries the cross-atom covariance and the decoder-coordinate
-    /// Schur couplings, and its per-channel band varies across output channels —
-    /// unlike the per-atom inner-Hessian marginal
-    /// [`Self::complete_born_atom_shape_bands`] falls back to. Every atom is
-    /// covered, seed AND structure-search-born, because the factor is assembled at
-    /// the final dictionary's `k_atoms()`.
+    /// Schur couplings, and its per-channel band varies across output channels.
+    /// Every atom is covered because the factor is assembled at the final
+    /// dictionary's `k_atoms()`.
     ///
     /// The term is already at its optimum, so the inner re-solve converges
-    /// immediately. Mirrors `decoder_shape_uncertainty`'s admission fallback: when
-    /// the streaming plan cannot admit the dense Direct factor (LLM-scale fits
-    /// with no dense Schur), it returns
-    /// [`Self::shape_uncertainty_without_decoder_covariance`] — honest NaN bands,
-    /// never a fabricated number. Call before [`Self::into_fitted`] has run is not
-    /// required; it takes the fitted `term`/`rho` directly.
+    /// immediately. When the streaming plan cannot expose the exact Direct
+    /// factor, the returned atom entries carry explicit `None` bands. Call before
+    /// [`Self::into_fitted`] has run is not required; it takes the fitted
+    /// `term`/`rho` directly.
     pub fn recompute_joint_shape_uncertainty(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -573,13 +569,12 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if !plan.direct_logdet_admitted() {
-            // No dense Direct Schur factor at this scale: the joint covariance
-            // cannot be materialized. Report the honest without-covariance bands
-            // (NaN sd) rather than a per-atom stand-in dressed up as joint.
+            // No exact Direct Schur factor at this scale: report explicit
+            // unavailability rather than substituting a different covariance.
             let loss = self.loss(target, rho)?;
             let n_scalar = (self.n_obs().saturating_mul(self.output_dim())).max(1) as f64;
             let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
-            return Ok(self.shape_uncertainty_without_decoder_covariance(dispersion));
+            return Ok(self.unavailable_shape_uncertainty(dispersion));
         }
         let (_cost, loss, cache) = self.penalized_quasi_laplace_criterion_with_cache(
             target,

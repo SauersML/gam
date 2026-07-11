@@ -30,17 +30,12 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use gam_math::probability::beta_quantile;
 use gam_problem::topology_certificates::CertificateLedger;
 use gam_problem::{EstimationError, MetricProvenance};
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
 use gam_solve::seeding::SeedConfig;
-use gam_solve::structure_search::{MoveBudget, StructureMove};
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
-use gam_terms::inference::structure_evidence::StructureLedger;
-
-use crate::structure_harvest;
 
 use super::{
     AssignmentMode, CoordinateFidelityCertificate, SaeManifoldFitDiagnostics, SaeManifoldLoss,
@@ -78,20 +73,6 @@ pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 /// leaving every genuinely-structured residual (relative energy `≥ ~1e-8`, i.e. a
 /// fit that leaves `≥ 1e-4` RMS unexplained) to run the pass unchanged.
 pub(crate) const STRUCTURED_RESIDUAL_MIN_REL_ENERGY: f64 = 1.0e-10;
-
-/// #2071 residual-promotion alignment threshold under the random-direction
-/// null. Rank one has no informative angle, so its threshold is exactly one.
-/// Keeping this derivation in `gam-sae` makes the typed fit entry self-sufficient
-/// for Rust, CLI, and binding callers alike.
-fn promotion_alignment_threshold(factor_rank: usize) -> f64 {
-    if factor_rank <= 1 {
-        return 1.0;
-    }
-    let rank = factor_rank as f64;
-    beta_quantile(0.95, 0.5, (rank - 1.0) / 2.0)
-        .sqrt()
-        .clamp(0.0, 1.0)
-}
 
 /// One #2021 structured-residual outer-alternation pass's diagnostic record. The
 /// binding serializes a `&[StructuredResidualPassDiagnostic]` into the payload;
@@ -215,12 +196,6 @@ pub struct SaeFitReport {
     pub amortized_encoder_consistency: AmortizedEncoderConsistency,
     /// Unified conservative certificate ledger assembled from this fit's reports.
     pub certificate_ledger: CertificateLedger,
-    /// Serialized per-round structure-search ledger (#997) as a JSON string;
-    /// `None` when the search did not run (skipped by K ceiling or
-    /// `run_structure_search == false`).
-    pub structure_search_json: Option<String>,
-    /// The anytime-valid structure certificate (#1058/#984), serialized JSON.
-    pub structure_certificate_json: String,
     /// The reported `log_alpha` (ordered Beta--Bernoulli concentration or the caller's α fallback).
     pub reported_log_alpha: f64,
 }
@@ -383,16 +358,10 @@ pub struct SaeFitRequest {
     pub alpha: f64,
     pub isometry_pin_active: bool,
     pub metric_provenance: &'static str,
-    pub promote_from_residual: bool,
-    pub run_structure_search: bool,
-    pub run_outer_rho_search: bool,
     /// Number of structured-residual whitening passes (each installs a NEW
     /// row-metric likelihood and re-runs the entire outer ρ search). `None` =
     /// the historical default ([`STRUCTURED_RESIDUAL_PASSES_DEFAULT`] = 2);
-    /// `Some(0)` = the UNBUNDLED direct path: seed → single certified fit on
-    /// the iid likelihood. Together with `promote_from_residual = false` and
-    /// `run_structure_search = false` this is the stage-5 "which path did my
-    /// fit take" answer: exactly one.
+    /// `Some(0)` selects the direct iid-likelihood fit.
     pub structured_residual_passes: Option<usize>,
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -550,9 +519,6 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         alpha,
         isometry_pin_active,
         metric_provenance: metric_provenance_initial,
-        promote_from_residual,
-        run_structure_search,
-        run_outer_rho_search,
         structured_residual_passes,
         cancel,
     } = request;
@@ -590,35 +556,20 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // seed already installed on the term) with NO ρ-multistart. seed_budget=1 +
     // max_seeds=1 collapses the cascade to the single initial ρ.
     objective.set_cancel_flag(Arc::clone(&cancel_flag));
-    let mut objective = if run_outer_rho_search {
-        // #2241 — do not tune convergence to a workload's observed criterion
-        // creep and do not return merely because an iteration budget expired.
-        // SAE's Fellner–Schall lane carries a typed recurrent-incumbent
-        // certificate: two consecutive inner solves restoring the same banked
-        // model terminate the fixed-point walk directly. Gradient-based plans
-        // retain the shared solver's stationarity and cost-stall tests.
-        // SPEC wall-survival resume: if a checkpoint for this exact data
-        // fingerprint exists (a prior job died at its wall mid-search), install
-        // the banked incumbent as the warm start and open the ρ search at the
-        // banked coordinate. The resumed run must still CONVERGE on its own —
-        // a checkpoint never mints a fit, it only saves the work.
-        let search_init_rho = match objective.try_resume_from_checkpoint(n_params) {
-            Some(banked) => ndarray::Array1::from(banked),
-            None => init_rho_flat.clone(),
-        };
-        let problem = OuterProblem::new(n_params)
-            .with_initial_rho(search_init_rho)
-            .with_seed_config(SeedConfig {
-                max_seeds: 1,
-                seed_budget: 1,
-                ..Default::default()
-            });
-        let run_result = problem.run(&mut objective, "SAE manifold");
-        certify_outer_stage(objective, SaeFitStage::Primary, run_result)?
-    } else {
-        objective.fit_at_fixed_rho(init_rho_flat.view())?;
-        objective
+    // Every minted fit runs the converged outer hyperparameter optimizer.
+    let search_init_rho = match objective.try_resume_from_checkpoint(n_params) {
+        Some(banked) => ndarray::Array1::from(banked),
+        None => init_rho_flat.clone(),
     };
+    let problem = OuterProblem::new(n_params)
+        .with_initial_rho(search_init_rho)
+        .with_seed_config(SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let run_result = problem.run(&mut objective, "SAE manifold");
+    let mut objective = certify_outer_stage(objective, SaeFitStage::Primary, run_result)?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
@@ -672,43 +623,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<StructuredResidualModel> = None;
-        // #2021 Λ nursery→promotion (evidence-gated). Accumulate residual-factor
-        // directions that PERSIST across passes (producer
-        // `StructuredResidualModel::promotion_candidates`: energy above the
-        // idiosyncratic-noise floor AND |cos|-alignment with the previous pass's
-        // Λ) and, once a lineage matures, promote it to a born atom so the NEXT
-        // pass refits with the discovered structure. A lineage that skips a pass
-        // loses its dwell; at most one birth per pass, and only when a later pass
-        // remains to refit the born atom, so K grows ≤ the pass budget and no
-        // born atom is left unrefit inside the alternation.
-        //
-        // #2239 evidence-driven pass extension: a live nursery lineage is itself
-        // the certificate that residual structure persists. When the planned
-        // budget would expire with lineages still maturing (or a matured lineage
-        // still owed its post-birth refit), the alternation grants itself one
-        // more pass, hard-capped at `STRUCTURED_RESIDUAL_PASSES_MAX`. Compute
-        // grows only while the certificate keeps firing; on structureless data
-        // the nursery stays empty and the planned budget is exact.
-        //
-        // PROMOTION_ENERGY_FLOOR_MULT — DERIVED (identity). The energy gate is
-        // "above the idiosyncratic-noise floor"; the floor is already the
-        // data-estimated detection threshold, so the canonical multiplier is 1.0.
-        const PROMOTION_ENERGY_FLOOR_MULT: f64 = 1.0;
-        // PROMOTION_NURSERY_MIN_PASSES — DERIVED (minimal persistence). Two is the
-        // smallest dwell at which a direction has been re-observed across a refit,
-        // i.e. the minimal count that distinguishes a repeated structural signal
-        // from a one-pass artifact.
-        const PROMOTION_NURSERY_MIN_PASSES: usize = 2;
-        // The #2071 per-pass alignment threshold `align_min(r)` is the
-        // Beta-quantile of the random-alignment null keyed to the residual factor
-        // rank `r`. It is derived here and used identically by the producer-side
-        // candidate gate and the nursery lineage-dedup below.
-        //
-        // `promote_from_residual` is the typed caller flag (default TRUE, #2239:
-        // magic-by-default — the evidence certificate above, not the flag, is the
-        // real gate). `false` pins the historical whitening-without-growth path.
-        let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
-        let mut total_passes = structured_passes;
+        let total_passes = structured_passes;
         let mut pass = 0usize;
         while pass < total_passes {
             let Some(model) = sae_structured_residual_model(&term, z.view())? else {
@@ -1016,15 +931,57 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         // refresh it to the final joint recompute's value.
         term.set_certificate_dispersion(shape_uncertainty.dispersion)?;
     }
-    if shape_uncertainty.atoms.len() != term.k_atoms()
-        || shape_uncertainty
-            .atoms
-            .iter()
-            .any(|atom| atom.band_sd.iter().any(|value| !value.is_finite()))
-    {
+    if shape_uncertainty.atoms.len() != term.k_atoms() {
         return Err(SaeFitError::Fit(
-            "final joint shape uncertainty is incomplete or non-finite".to_string(),
+            "final joint shape uncertainty does not match the fitted atom count".to_string(),
         ));
+    }
+    for (atom_idx, uncertainty) in shape_uncertainty.atoms.iter().enumerate() {
+        match (
+            &uncertainty.band_coords,
+            &uncertainty.band_mean,
+            &uncertainty.band_sd,
+        ) {
+            (None, None, None) => {
+                if uncertainty.decoder_covariance.is_some()
+                    || uncertainty.band_sd_robust.is_some()
+                {
+                    return Err(SaeFitError::Fit(format!(
+                        "atom {atom_idx} has a partial unavailable shape-uncertainty payload"
+                    )));
+                }
+            }
+            (Some(coords), Some(mean), Some(sd)) => {
+                if coords.nrows() != mean.nrows()
+                    || mean.dim() != sd.dim()
+                    || coords.iter().chain(mean.iter()).chain(sd.iter()).any(|value| !value.is_finite())
+                {
+                    return Err(SaeFitError::Fit(format!(
+                        "atom {atom_idx} has inconsistent or non-finite joint shape uncertainty"
+                    )));
+                }
+                if let Some(covariance) = &uncertainty.decoder_covariance
+                    && covariance.iter().any(|value| !value.is_finite())
+                {
+                    return Err(SaeFitError::Fit(format!(
+                        "atom {atom_idx} has non-finite decoder covariance"
+                    )));
+                }
+                if let Some(robust) = &uncertainty.band_sd_robust
+                    && (robust.dim() != sd.dim()
+                        || robust.iter().any(|value| !value.is_finite()))
+                {
+                    return Err(SaeFitError::Fit(format!(
+                        "atom {atom_idx} has inconsistent robust shape uncertainty"
+                    )));
+                }
+            }
+            _ => {
+                return Err(SaeFitError::Fit(format!(
+                    "atom {atom_idx} has a partial joint shape-uncertainty band"
+                )));
+            }
+        }
     }
 
     // Additive post-fit diagnostics (#980): the two-score per-atom lens and the

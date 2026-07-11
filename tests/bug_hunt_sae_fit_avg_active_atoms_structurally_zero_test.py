@@ -1,32 +1,4 @@
-"""Bug hunt: ``sae_fit(...)["summary"]["avg_active_atoms"]`` is structurally ~0
-— the SAE sparsity (L0) diagnostic thresholds the wrong quantity, so it reports
-that *no* atoms are active even when reconstruction R² ≈ 0.99 and every atom
-carries mass in every row.
-
-Root cause (``gamfit/_sae_manifold.py``, ``ManifoldSAE.summary``, lines
-~2457-2470). For the default ``ordered_beta_bernoulli`` assignment mode the active-atom count
-is computed as
-
-    threshold = 0.5            # "active if its posterior gate exceeds 0.5"
-    avg_active, _ = rust_module().sae_manifold_assignment_summary(self.assignments, threshold)
-
-but ``self.assignments`` does **not** hold posterior gates — it holds the
-normalized reconstruction *responsibilities* (``assignments_z``), which sum to
-~1 across the K atoms per row. With K ≥ 2 the largest per-row responsibility can
-essentially never reach 0.5 (here the max entry is 0.499), so the count of
-entries ≥ 0.5 is ~0 and ``avg_active_atoms`` collapses to 0.0 regardless of how
-many atoms are genuinely active. (The Rust helper is correct; the same module's
-``_closed_form_trust_diagnostics`` even defines "active" as ``> 1e-8`` on the
-same array, contradicting the 0.5 rule.)
-
-This test fits an SAE on data built from K well-separated rank-1 atoms (so the
-fit reconstructs it well and all atoms are used), then asserts that the reported
-``avg_active_atoms`` is internally consistent with that reconstruction: a model
-that reconstructs the data with R² ≈ 0.99 *must* have at least one active atom
-per row on average. It currently fails (``avg_active_atoms == 0.0`` while
-``reconstruction_r2 ≈ 0.99``); once the diagnostic thresholds the right quantity
-the count becomes ≥ 1 and the assertion holds without edits.
-"""
+"""The native fit summary must count the same applied codes it reconstructs with."""
 
 from __future__ import annotations
 

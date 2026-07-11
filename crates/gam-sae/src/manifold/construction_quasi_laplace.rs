@@ -4709,7 +4709,7 @@ impl SaeManifoldTerm {
     }
 
     // [#780 line-count gate] reconstruction_dispersion + assemble_shape_uncertainty
-    // + complete_born_atom_shape_bands + shape_uncertainty_without_decoder_covariance
+    // + recompute_joint_shape_uncertainty + unavailable_shape_uncertainty
     // (the contiguous trailing methods of this impl block) were split into the
     // sibling construction_reconstruction.rs (declared in mod.rs); callers reach
     // them bare via use super::*.

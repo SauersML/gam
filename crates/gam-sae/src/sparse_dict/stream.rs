@@ -233,7 +233,7 @@ impl SparseDictStreamState {
         let s = config.active.min(k).max(1);
 
         let mut decoder = seed_decoder(seed, k);
-        unit_norm_rows(&mut decoder);
+        unit_norm_rows(&mut decoder)?;
 
         let scorer = TileScorer::new(s, config.score_tile);
         Ok(Self {
@@ -394,13 +394,13 @@ impl SparseDictStreamState {
             sigma,
         );
         self.eq.clear_refreshed_atoms(&gate);
-        unit_norm_rows(&mut self.decoder);
+        unit_norm_rows(&mut self.decoder)?;
 
         // (e) dead-atom revival onto worst-reconstructed residual rows (never PCs).
         let dead: usize = self.alive.iter().filter(|&&a| !a).count();
         let revived = self.revive(dead);
         if revived > 0 {
-            unit_norm_rows(&mut self.decoder);
+            unit_norm_rows(&mut self.decoder)?;
         }
 
         // Same stopping rule as the one-shot loop: never converge while atoms are

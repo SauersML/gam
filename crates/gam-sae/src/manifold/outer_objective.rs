@@ -188,25 +188,19 @@ pub(crate) fn reachable_dictionary_rank(atoms: &[SaeManifoldAtom], n: usize, p: 
     sv.iter().filter(|&&v| v > tol).count().min(n)
 }
 
-/// #1207 — observable telemetry for the amortized warm-start (Design A). The
-/// warm-start is advisory (a transient atlas-build / encode refusal must not
-/// abort the criterion), so its failures were previously discarded with `.ok()`
-/// and a silent cold solve was indistinguishable from a successful warm-start.
-/// This counter makes the warm-start outcome verifiable: how many outer evals
-/// attempted it, how many certified ≥1 row (a genuine warm-start), how many
-/// certified ZERO rows (a full cold fallback — degenerate atlas), and how many
-/// the warm-start path errored (logged, then cold). "Uses amortized warm-start"
-/// is true exactly when `warm_started_evals > 0`.
+/// Observable telemetry for the amortized basin-entry accelerator: attempted
+/// evaluations, positive and zero-row certificates, and failures. Failures are
+/// propagated by the caller and never converted into a different solve path.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AmortizedWarmStartTelemetry {
     /// Outer evals that invoked the warm-start (gradient + value-probe lanes).
     pub attempts: usize,
     /// Evals where the amortized encoder certified ≥1 row → a real warm-start.
     pub warm_started_evals: usize,
-    /// Evals where the encoder certified ZERO rows → a full cold fallback.
-    pub cold_fallback_evals: usize,
-    /// Evals where the warm-start path returned an error (logged, then cold).
-    pub failed_evals: usize,
+    /// Evals where the encoder validly certified zero rows.
+    pub zero_certified_evals: usize,
+    /// Evals where the warm-start path returned an error.
+    pub failed_attempts: usize,
     /// Total certified (row, atom) coords warm-started across all evals.
     pub total_rows_warm_started: usize,
 }
@@ -364,17 +358,17 @@ impl SaeIntoFittedResult {
 
 impl AmortizedWarmStartTelemetry {
     /// Fold one warm-start outcome into the running tally. `Ok(rows)` with
-    /// `rows > 0` is a genuine warm-start; `Ok(0)` is a degenerate-atlas cold
-    /// fallback; `Err` is a (logged) failure that also proceeded cold.
+    /// `rows > 0` is a genuine warm-start; `Ok(0)` is a valid zero-row
+    /// certificate; `Err` is a propagated failure.
     pub(crate) fn record(&mut self, outcome: &Result<usize, String>) {
         self.attempts += 1;
         match outcome {
-            Ok(0) => self.cold_fallback_evals += 1,
+            Ok(0) => self.zero_certified_evals += 1,
             Ok(rows) => {
                 self.warm_started_evals += 1;
                 self.total_rows_warm_started += rows;
             }
-            Err(_) => self.failed_evals += 1,
+            Err(_) => self.failed_attempts += 1,
         }
     }
 }
@@ -1273,22 +1267,17 @@ impl SaeManifoldOuterObjective {
     }
 
     /// #1207 — the accumulated amortized warm-start telemetry. "Uses amortized
-    /// warm-start" is verifiable as `telemetry.warm_started_evals > 0`; a silent
-    /// cold solve shows up as `cold_fallback_evals` / `failed_evals`.
+    /// warm-start" is verifiable as `telemetry.warm_started_evals > 0`.
     pub fn warm_start_telemetry(&self) -> AmortizedWarmStartTelemetry {
         self.warm_start_telemetry
     }
 
-    /// #1207 — record the outcome of one amortized warm-start attempt, logging a
-    /// failure instead of silently swallowing it. The warm-start is advisory (a
-    /// transient atlas/encode refusal must not abort the criterion), so the
-    /// caller still proceeds cold — but the failure is now observable in both the
-    /// telemetry tally and the log, never invisible.
-    fn record_warm_start(&mut self, outcome: Result<usize, String>) {
-        if let Err(err) = &outcome {
-            log::debug!("[SAE/#1207] amortized warm-start fell back to a cold inner solve: {err}");
-        }
+    /// Record one amortized warm-start attempt. Once selected, this accelerator
+    /// is part of the declared optimization path: an encoder/atlas failure is
+    /// propagated instead of silently changing the basin-entry algorithm.
+    fn record_warm_start(&mut self, outcome: Result<usize, String>) -> Result<(), String> {
         self.warm_start_telemetry.record(&outcome);
+        outcome.map(|_| ())
     }
 
     /// Stamp the currently installed state with a successful outer search's
@@ -1459,28 +1448,18 @@ impl SaeManifoldOuterObjective {
             self.term.output_dim(),
             self.term.k_atoms(),
         )?;
-        // Honest no-joint-covariance shape bands: per-atom Laplace marginals only,
-        // scaled by the Gaussian reconstruction dispersion φ̂. Used both when the
-        // Direct log-det factor is not admitted and when the optional joint
-        // re-solve refuses recoverably (see below).
-        let fallback_without_joint_covariance = |term: &SaeManifoldTerm| {
-            let loss = term.loss(self.target.view(), &rho)?;
-            let n_scalar = (term.n_obs().saturating_mul(term.output_dim())).max(1) as f64;
-            let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
-            Ok(term.shape_uncertainty_without_decoder_covariance(dispersion))
-        };
         if !plan.direct_logdet_admitted() {
-            return fallback_without_joint_covariance(&self.term);
+            let loss = self.term.loss(self.target.view(), &rho)?;
+            let n_scalar = (self
+                .term
+                .n_obs()
+                .saturating_mul(self.term.output_dim()))
+            .max(1) as f64;
+            let dispersion = (2.0 * loss.data_fit / n_scalar).max(f64::MIN_POSITIVE);
+            return Ok(self.term.unavailable_shape_uncertainty(dispersion));
         }
-        // This optional post-fit covariance recompute re-enters the strict undamped
-        // Laplace inner solve at the settled ρ. Although the term is at the outer
-        // optimum, that re-solve can still refuse to certify the full-budget joint
-        // factor (the same recoverable "inner solve did not converge at fixed ρ"
-        // class the value/gradient/EFS lanes map to an infeasible eval). This path is
-        // optional — a recoverable refusal must degrade to no-covariance shape
-        // bands, NOT abort the public fit. `penalized_quasi_laplace_criterion_with_cache` mutates
-        // `self.term` while re-solving, so snapshot and restore the fitted term
-        // before falling back.
+        // Re-form the strict undamped joint factor at the settled ρ. A failure is
+        // an inference failure; it is never replaced by a different covariance.
         let saved_term = self.term.clone();
         let evaluated = self.term.penalized_quasi_laplace_criterion_with_cache(
             self.target.view(),
@@ -1493,14 +1472,6 @@ impl SaeManifoldOuterObjective {
         );
         let (_cost, loss, cache) = match evaluated {
             Ok(evaluated) => evaluated,
-            Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
-                self.term = saved_term;
-                log::warn!(
-                    "[shape-uncertainty] joint decoder covariance unavailable ({err}); \
-                     returning no-covariance per-atom shape bands"
-                );
-                return fallback_without_joint_covariance(&self.term);
-            }
             Err(err) => {
                 self.term = saved_term;
                 return Err(err);
@@ -2257,25 +2228,27 @@ impl SaeManifoldOuterObjective {
         };
         if let Some(beta) = self.seeded_beta.take() {
             // Warm-start the inner decoder coefficients before the solve.
-            if beta.len() == self.term.beta_dim() {
-                self.term.set_flat_beta(beta.view())?;
+            if beta.len() != self.term.beta_dim() {
+                return Err(format!(
+                    "seeded decoder has length {}; expected {}",
+                    beta.len(),
+                    self.term.beta_dim()
+                ));
             }
+            self.term.set_flat_beta(beta.view())?;
         }
         // #1154 item 2 (Design A) — warm-start the inner latent coords from the
         // amortized encoder built on the CURRENT dictionary. At outer step m this
         // seeds the inner solve from the per-chart IFT predictor of the dictionary
         // settled at step m−1, refined to the SAME stationary point (so the penalized quasi-Laplace
-        // λ-gradient is untouched). Best-effort: a first-build / degenerate atlas
-        // certifies no rows and warm-starts nothing, leaving the cold path
-        // byte-for-byte unchanged; a transient atlas-build refusal must not abort
-        // the criterion evaluation, so the warm-start is advisory only. #1207 —
-        // the outcome is recorded (and a failure logged) so the cold fallback is
-        // observable, never silently swallowed.
+        // λ-gradient is untouched). A first-build / degenerate atlas may
+        // certify zero rows, but an actual encoder/atlas error aborts the
+        // evaluation rather than silently selecting a different basin-entry path.
         if !probe_handoff_installed {
             let warm_start_outcome = self
                 .term
                 .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
-            self.record_warm_start(warm_start_outcome);
+            self.record_warm_start(warm_start_outcome)?;
         }
         let (penalized_quasi_laplace_cost, loss) = match drive {
             ProbeInnerDrive::Criterion {
@@ -3859,9 +3832,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
             } else {
                 false
             };
-        if let Some(beta) = self.seeded_beta.take()
-            && beta.len() == self.term.beta_dim()
-        {
+        if let Some(beta) = self.seeded_beta.take() {
+            if beta.len() != self.term.beta_dim() {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "seeded decoder has length {}; expected {}",
+                    beta.len(),
+                    self.term.beta_dim()
+                )));
+            }
             self.term
                 .set_flat_beta(beta.view())
                 .map_err(EstimationError::RemlOptimizationFailed)?;
@@ -3872,9 +3850,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // iterate's inner solve then refines from the cheap one-mat-vec seed to
         // the SAME stationary point, so the exact penalized quasi-Laplace λ-gradient computed below
         // is untouched — the warm-start changes only the basin entry, never the
-        // root. Advisory: a degenerate atlas certifies/warm-starts nothing and
-        // leaves the cold path byte-for-byte unchanged. #1207 — the outcome is
-        // recorded (failure logged) so a silent cold fallback is observable.
+        // root. A degenerate atlas may certify zero rows; an actual encoder
+        // failure is propagated.
         // Skipped under a #2080 (a) handoff: the installed state is already AT
         // the converged optimum for this ρ, and the encoder warm-start is a
         // basin-ENTRY heuristic that would only move latents off it.
@@ -3882,7 +3859,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             let warm_start_outcome = self
                 .term
                 .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state);
-            self.record_warm_start(warm_start_outcome);
+            self.record_warm_start(warm_start_outcome)
+                .map_err(EstimationError::RemlOptimizationFailed)?;
         }
         // The analytic gradient lane (`eval`) reads the dense joint-Hessian cache.
         // In the matrix-free regime that cache does not exist, but SAE never

@@ -122,9 +122,9 @@ def build_payload() -> dict[str, Any]:
         "schema": "gamfit.ManifoldSAE/v3",
         "atoms": atoms,
         "atom_topology": "mixed",
-        "atom_topologies": list(kinds),
-        "assignment": "topk",  # canonical; aliases do not round-trip unchanged
-        "assignment_label": "TopK",
+        "atom_topologies": ["circle", "euclidean", "euclidean"],
+        "assignment": "topk",
+        "assignment_label": "topk",
         "primitive_names": ["circle_0", "line_1", "duchon_2"],
         "fitted": fitted.tolist(),
         "assignments": assignments.tolist(),

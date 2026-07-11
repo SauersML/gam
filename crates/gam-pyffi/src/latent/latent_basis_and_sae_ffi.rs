@@ -1968,17 +1968,9 @@ fn sae_manifold_fit_inner<'py>(
         // covariance Cov(β_k) and the closed-form ambient band (coords / mean /
         // per-channel sd) along the atom's on-atom coordinates.
         //
-        // #977 variable-K: `shape_uncertainty` was assembled from the PRE-search
-        // joint-Hessian Schur factor (indexed by the SEED dictionary), then
-        // COMPLETED above (`complete_born_atom_shape_bands`) so every post-search
-        // atom — born atoms included — carries a band: seed atoms keep their exact
-        // joint-Hessian band, born atoms get the per-atom Laplace band from their
-        // own fitted inner Hessian, and a genuinely-degenerate atom keeps an
-        // honest NaN band. `decoder_covariance` is still present only for the
-        // Schur-assembled atoms (the dense lift is omitted for born atoms and at
-        // LLM-scale `p`); the python reader treats it as optional (`_opt_arr`). The
-        // atom's decoder, coordinates, assignments, basis kind, and active dim (all
-        // read from the fitted term above) are exact regardless.
+        // Exact joint bands are present when the execution plan exposes their
+        // Schur factor. Streaming-unavailable bands remain absent; no alternate
+        // per-atom covariance is substituted.
         if let Some(unc) = shape_uncertainty.atoms.get(atom_idx) {
             // Omitted (not set) above the SAE_DECODER_COV_PAYLOAD_MAX_ENTRIES
             // budget — the python reader treats the key as optional and the band
@@ -2008,25 +2000,32 @@ fn sae_manifold_fit_inner<'py>(
                 }
                 atom_dict.set_item("decoder_covariance", cov_full.into_pyarray(py))?;
             }
-            atom_dict.set_item(
-                "shape_band_coords",
-                unc.band_coords.clone().into_pyarray(py),
-            )?;
-            let mut band_mean = unc.band_mean.clone();
-            let mut band_sd = unc.band_sd.clone();
-            if let Some(sigma) = tier0_scale.as_ref() {
-                // Ambient channel values (mean AND sd, both linear in the
-                // channel's physical scale — sd is not a variance) lift the
-                // same way as the decoder they are read off of.
-                for mut row in band_mean.rows_mut() {
-                    row *= sigma;
+            match (&unc.band_coords, &unc.band_mean, &unc.band_sd) {
+                (Some(coords), Some(mean), Some(sd)) => {
+                    atom_dict.set_item(
+                        "shape_band_coords",
+                        coords.clone().into_pyarray(py),
+                    )?;
+                    let mut band_mean = mean.clone();
+                    let mut band_sd = sd.clone();
+                    if let Some(sigma) = tier0_scale.as_ref() {
+                        for mut row in band_mean.rows_mut() {
+                            row *= sigma;
+                        }
+                        for mut row in band_sd.rows_mut() {
+                            row *= sigma;
+                        }
+                    }
+                    atom_dict.set_item("shape_band_mean", band_mean.into_pyarray(py))?;
+                    atom_dict.set_item("shape_band_sd", band_sd.into_pyarray(py))?;
                 }
-                for mut row in band_sd.rows_mut() {
-                    row *= sigma;
+                (None, None, None) => {}
+                _ => {
+                    return Err(py_value_error(format!(
+                        "atom {atom_idx} has a partial shape-uncertainty band"
+                    )));
                 }
             }
-            atom_dict.set_item("shape_band_mean", band_mean.into_pyarray(py))?;
-            atom_dict.set_item("shape_band_sd", band_sd.into_pyarray(py))?;
         }
         atoms_py.append(atom_dict)?;
     }

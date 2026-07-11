@@ -21,9 +21,12 @@ use serde_json::Value;
 // vocabulary.
 pub(crate) use gam::terms::sae::atom_schema::canonical_assignment_kind;
 use gam::terms::sae::atom_schema::{
+    flat_block_assignment, topologies_for_bases, topology_for_bases, validated_n_harmonics,
+};
+#[cfg(test)]
+use gam::terms::sae::atom_schema::{
     basis_kind_for_topology, basis_to_topology, canonical_topology,
-    coordinate_periods_for_basis, flat_block_assignment, topologies_for_bases,
-    topology_for_bases, validated_n_harmonics,
+    coordinate_periods_for_basis,
 };
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector

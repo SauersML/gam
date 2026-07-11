@@ -23,7 +23,7 @@ fit = gamfit.sae_manifold_fit(
     X=Z,
     K=16,                       # dictionary size
     d_atom=1,                   # intrinsic dim per atom (default 2; int, or per-atom list)
-    atom_topology="circle",     # default "circle"; see the topology table below
+    atom_topology="circle",     # exact token; omit for native discovery
     assignment="softmax",           # production default
 )
 
@@ -41,10 +41,10 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `X` | `None` | `(N, p)` data to decompose |
-| `K` | `None` | dictionary size (number of atoms) |
+| `X` | required | `(N, p)` data to decompose |
+| `K` | required | dictionary size (number of atoms) |
 | `d_atom` | `2` | intrinsic dim per atom (int, or per-atom list) |
-| `atom_topology` | `"circle"` | global topology string (see table) |
+| `atom_topology` | `None` | exact global topology token; omitted means native `auto` discovery |
 | `assignment` | `"softmax"` | gate kind: `softmax` / `ordered_beta_bernoulli` / `threshold_gate` / `topk` |
 | `schedule` | `None` | `GumbelTemperatureSchedule` for annealed gates |
 | `isometry_weight` | `1.0` | unit-speed gauge penalty (on by default) |
@@ -55,7 +55,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `coord_sparsity` | `"scad"` | coordinate (latent `t`-block) magnitude penalty: `scad` / `mcp` / `l1` |
 | `scad_mcp_gamma` | `None` | SCAD/MCP concavity (defaults SCAD 3.7, MCP 2.5) |
 | `smoothness_weight` | `1.0` | roughness penalty strength |
-| `alpha` | `1.0` | ARD/precision seed (`float` or a string policy) |
+| `alpha` | `None` | assignment-concentration seed (`float`, `None`, or exact policy `"auto"`) |
 | `learning_rate` | `None` | optional step size override |
 | `random_state` | `0` | RNG seed |
 | `block_orthogonality_weight` | `0.0` | orthogonalize latent axes (needs `d_atom >= 2`) |
@@ -70,6 +70,8 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `atom_basis` | `None` | per-atom topology list (overrides `atom_topology`) |
 | `fisher_factors` | `None` | per-token Fisher reweighting factors |
 | `weights` | `None` | per-row observation weights |
+| `separation_barrier_strength` | `None` | optional native cross-atom separation strength override |
+| `promote_from_residual` | `True` | admit evidence-certified residual promotions during native structure search |
 
 ## Topology types
 
@@ -82,14 +84,13 @@ of typed shapes:
 | `atom_topology` / `atom_basis` | Intrinsic dim `d_atom` | Underlying basis | Shape |
 | --- | --- | --- | --- |
 | `linear` | 1 | affine rank-1 line | true linear atom `gamma(t)=b0+t*b1` |
-| `circle` (aliases `periodic`, `periodic_spline`) | 1 (each axis if `d>1`) | periodic Fourier, sine-first per harmonic: `[1, sin(2π·h·t), cos(2π·h·t), …]` | closed loop, seamless at the wrap |
-| `euclidean` (alias `euclidean_patch`) | any | monomial / polynomial patch | open Euclidean patch (a "line" at `d_atom=1`) |
+| topology `circle`; basis `periodic` | 1 (each axis if `d>1`) | periodic Fourier, sine-first per harmonic: `[1, sin(2π·h·t), cos(2π·h·t), …]` | closed loop, seamless at the wrap |
+| `euclidean` | any | monomial / polynomial patch | open Euclidean patch (a "line" at `d_atom=1`) |
 | `duchon` | any | Duchon thin-plate RKHS | open Euclidean patch with the thin-plate roughness Gram |
 | `sphere` | 2 | lat/lon product chart, basis `[1, x, y, z, xy, yz, xz]` | sphere chart with pole singularities (longitude is gauge-degenerate at the poles; the quadratic part is not rotationally invariant) |
 | `torus` | 2 (each axis) | doubly-periodic Fourier | torus, seamless on both axes |
 | `cylinder` (**discovery-only**) | 2 | periodic circle axis ⊗ flat line axis | cylinder `S¹ × ℝ`, periodic in axis 0, open in axis 1. The line-axis roughness is a canonical `[0,1)` **reference-domain** penalty (not an intrinsic roughness integrated over all of `ℝ`, which would diverge for polynomials), so the line coordinate's scale/origin matter through that reference interval. **Not seedable**: cylinder atoms are birth-discovered by the structure search, not accepted as a closed-form `atom_topology` / `atom_basis` seed (the seed path rejects it). |
-| `poincare` (aliases `hyperbolic`, `poincare_patch`) | any | monomial patch, hyperbolic roughness metric | Poincaré-ball tangent patch at curvature `c = −1` (wiggle measured in hyperbolic arc length) |
-| any other string | any | caller-supplied | `Precomputed`: a precomputed basis you attach yourself |
+| `poincare` | any | monomial patch, hyperbolic roughness metric | Poincaré-ball tangent patch at curvature `c = −1` (wiggle measured in hyperbolic arc length) |
 
 `duchon` and `euclidean` share the same flat-`ℝᵈ` latent **domain**, but they
 use *different* decoders and declared reference-function seminorms. `euclidean`
@@ -109,8 +110,8 @@ fitted latent coordinates and decoder coefficients do not redefine it. Missing
 or invalid Poincaré reference coordinates are an error, never a silent flat-Gram
 fallback. For `d = 1` the declared tangent chart is intrinsically flat but runs
 at half arc length, so this reference Gram is exactly `½` the flat first-jet
-Dirichlet Gram. String matching is case-insensitive and treats `-` and `_`
-interchangeably.
+Dirichlet Gram. Tokens are exact and case-sensitive. Removed aliases and
+unknown precomputed seed kinds are errors rather than compatibility conversions.
 
 A `d_atom=1` linear atom is the true rank-1 **line** primitive. A
 `d_atom=1` Euclidean atom is a stronger polynomial patch, not the pure-linear

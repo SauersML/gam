@@ -147,3 +147,62 @@ def test_on_disk_format_is_compact_per_channel_not_dense_joint(tmp_path: Path):
     assert blocks.shape == (p, m, m)
     assert blocks.size == p * m * m
     assert blocks.size < (m * p) * (m * p), "factor must be smaller than the dense joint"
+
+
+def test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale(
+    tmp_path: Path,
+):
+    """#2271 persistence-surface regression.
+
+    Tier-0 input standardization (#2015) fits on ``(Z - mu) / sigma`` with
+    ``sigma`` the per-column centered RMS, so the per-atom decoder / decoder
+    covariance / shape bands the fit reports live in that standardized frame.
+    If the sigma lift is dropped anywhere on the path from the fitted term to
+    the persisted/exposed artifact, a column with a large RMS (real activation
+    data measures ratios of ~1e4) comes back mis-scaled by that same ratio --
+    silently, since a same-order-of-magnitude column would hide the bug. This
+    pins that the reconstruction and the shape band are in the ORIGINAL
+    (physical) units, both on the fresh fit and after a save/load round trip.
+    """
+    rng = np.random.default_rng(11)
+    n = 400
+    t = rng.uniform(0.0, 1.0, n)
+    col_scale = np.array([1.0, 1.0e4])
+    clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)]) * col_scale
+    x = clean + 0.02 * col_scale * rng.standard_normal((n, 2))
+    fit = gamfit.sae_manifold_fit(
+        X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
+        isometry_weight=0.0, ard_per_atom=False, sparsity_weight=0.01,
+        smoothness_weight=0.01, n_iter=40, learning_rate=1.0, random_state=11,
+    )
+    recon = np.asarray(fit.reconstruct_training())
+    resid_rms = np.sqrt(((recon - x) ** 2).mean(axis=0))
+    data_rms = np.sqrt((x ** 2).mean(axis=0))
+    rel_resid = resid_rms / data_rms
+    assert np.all(rel_resid < 0.5), (
+        f"reconstruction is not in physical units (relative residual {rel_resid}); "
+        "the high-scale column looks mis-scaled by the Tier-0 sigma ratio"
+    )
+
+    atom = fit.atoms[0]
+    band_sd = np.asarray(atom.shape_band_sd)
+    # The high-scale column's band sd must itself land on the ~1e4 scale, not
+    # the ~1 standardized-frame scale a dropped sigma lift would leave behind.
+    assert band_sd[:, 1].mean() > 10.0 * band_sd[:, 0].mean(), (
+        "shape_band_sd ratio between columns does not track the data's column-scale "
+        "ratio -- the band looks like it is still in the standardized frame"
+    )
+
+    path = tmp_path / "sae_hetero.json"
+    fit.save(path)
+    restored = gamfit.ManifoldSAE.load(path)
+    np.testing.assert_array_equal(
+        np.asarray(restored.atoms[0].decoder_coefficients),
+        np.asarray(atom.decoder_coefficients),
+    )
+    np.testing.assert_allclose(
+        np.asarray(restored.reconstruct_training()), recon, rtol=1e-10, atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        np.asarray(restored.atoms[0].shape_band_sd), band_sd, rtol=1e-10, atol=1e-12,
+    )

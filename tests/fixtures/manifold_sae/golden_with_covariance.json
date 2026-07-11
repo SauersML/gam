@@ -1,7 +1,7 @@
 {
   "alpha": 0.75,
   "assignment": "topk",
-  "assignment_label": "TopK",
+  "assignment_label": "topk",
   "assignments": [
     [
       0.02,
@@ -55,9 +55,9 @@
     }
   ],
   "atom_topologies": [
-    "periodic",
+    "circle",
     "euclidean",
-    "duchon"
+    "euclidean"
   ],
   "atom_topology": "mixed",
   "atom_two_lens": {

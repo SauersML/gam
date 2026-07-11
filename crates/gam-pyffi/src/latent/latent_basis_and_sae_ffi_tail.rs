@@ -400,10 +400,7 @@ fn sae_manifold_fit_model<'py>(
         gam::terms::sae::atom_schema::validate_seed_basis_kind(basis)
             .map_err(py_value_error)?;
     }
-    let atom_basis = basis_seed
-        .iter()
-        .map(|basis| gam::terms::sae::atom_schema::canonical_basis_kind(basis))
-        .collect::<Vec<_>>();
+    let atom_basis = basis_seed.clone();
     let declared_bases = has_declared_bases.then(|| basis_seed.clone());
     if let (Some(topology), true) = (atom_topology.as_deref(), has_declared_bases) {
         let resolved = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
@@ -1195,52 +1192,6 @@ fn sae_manifold_reconstruction_r2(
         return Ok(f64::NAN);
     }
     Ok(1.0 - ssr / sst)
-}
-
-/// Sparsity summary stats for an `(n_rows, K)` assignment matrix returned by
-/// `sae_manifold_fit*`. Returns `(avg_active_atoms, mean_assignment_mass)` where
-/// "active" is `assignment >= threshold`.
-fn manifold_assignment_summary_from_array(
-    assignments: ndarray::ArrayView2<'_, f64>,
-    threshold: f64,
-) -> Result<(f64, f64), String> {
-    if !threshold.is_finite() {
-        return Err("assignment summary threshold must be finite".to_string());
-    }
-    let (n_rows, k) = assignments.dim();
-    if n_rows == 0 || k == 0 {
-        return Err("assignment summary requires a non-empty matrix".to_string());
-    }
-    let n_entries = n_rows
-        .checked_mul(k)
-        .ok_or_else(|| "assignment summary shape is too large".to_string())?;
-    let mut active_total = 0_usize;
-    let mut mass_total = 0.0_f64;
-    for &assignment in assignments {
-        if !assignment.is_finite() {
-            return Err("assignment summary contains a non-finite value".to_string());
-        }
-        mass_total += assignment;
-        if !mass_total.is_finite() {
-            return Err("assignment summary mass overflowed".to_string());
-        }
-        if assignment >= threshold {
-            active_total += 1;
-        }
-    }
-    Ok((
-        active_total as f64 / n_rows as f64,
-        mass_total / n_entries as f64,
-    ))
-}
-
-#[pyfunction]
-fn sae_manifold_assignment_summary(
-    assignments: PyReadonlyArray2<'_, f64>,
-    threshold: f64,
-) -> PyResult<(f64, f64)> {
-    manifold_assignment_summary_from_array(assignments.as_array(), threshold)
-        .map_err(py_value_error)
 }
 
 #[pyfunction(signature = (x, w_gate, w_amp))]

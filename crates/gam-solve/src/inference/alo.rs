@@ -471,14 +471,10 @@ fn compute_alo_diagnostics_from_pirls_inner(
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => 1.0,
         LinkFunction::Identity => {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let rss: f64 = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let r = y[i] - base.finalmu[i];
-                    base.finalweights[i] * r * r
-                })
-                .sum();
+            let rss: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                let r = y[i] - base.finalmu[i];
+                base.finalweights[i] * r * r
+            });
             // Effective sample size for dispersion (#584): a zero prior weight
             // makes w_i·r_i² = 0, so the row is already excluded from the RSS
             // numerator and must be excluded from the denominator too. Count only
@@ -1233,14 +1229,10 @@ pub fn compute_case_deletion_from_pirls(
     // the residual degrees of freedom either (#584 weighting consistency).
     let phi = match link {
         LinkFunction::Identity => {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let rss: f64 = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let r = y[i] - base.finalmu[i];
-                    base.finalweights[i] * r * r
-                })
-                .sum();
+            let rss: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
+                let r = y[i] - base.finalmu[i];
+                base.finalweights[i] * r * r
+            });
             let n_pos = (0..n).filter(|&i| base.finalweights[i] > 0.0).count();
             let dof = (n_pos as f64) - base.edf;
             rss / dof.max(1.0)
