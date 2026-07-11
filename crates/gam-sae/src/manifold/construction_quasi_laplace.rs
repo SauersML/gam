@@ -1266,7 +1266,16 @@ impl SaeManifoldTerm {
                         grad_tolerance,
                         objective_scale,
                         options,
-                        12,
+                        // Anti-runaway cap ONLY — the polish's acceptance gate
+                        // already requires strict ‖g‖ contraction per step, so
+                        // the loop terminates numerically on its own. Measured
+                        // (tier-0 fixtures, host lane): at 12 the polish
+                        // silently expired at ‖g‖ = 6.48e-5 against a 6.11e-5
+                        // band — refused 1.07× from convergence purely by cap.
+                        // Near the marginally-indefinite root the quotient
+                        // GMRES steps contract slower than pure quadratic, so
+                        // the cap must not impersonate a convergence bound.
+                        64,
                     )? {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
