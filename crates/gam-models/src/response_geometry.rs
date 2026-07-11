@@ -434,7 +434,6 @@ struct Evaluation {
     hessian: Array2<f64>,
     coefficients: Array2<f64>,
     profiled_deviance: f64,
-    residual_degrees_of_freedom: f64,
     penalty_traces: Array1<f64>,
 }
 
@@ -810,7 +809,6 @@ impl PreparedSharedTangent {
             hessian,
             coefficients,
             profiled_deviance,
-            residual_degrees_of_freedom,
             penalty_traces,
         })
     }
@@ -905,7 +903,6 @@ impl PreparedSharedTangent {
             hessian,
             coefficients,
             profiled_deviance,
-            residual_degrees_of_freedom,
             penalty_traces,
         })
     }
