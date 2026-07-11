@@ -5,6 +5,38 @@ pub(crate) const EXPENSIVE_PREWARM_RHO_DIM: usize = 4;
 pub(crate) const MULTI_SEED_PREWARM_BUDGET: usize = 8;
 pub(crate) const SINGLE_EXPENSIVE_PREWARM_BUDGET: usize = 16;
 
+/// Require a continuation arrival to certify the literal outer seed itself.
+///
+/// A structural walk ceiling may carry the best earlier waypoint while moving
+/// the scalar schedule to `s = 0`. That state remains useful as a checkpoint,
+/// but it is not an arrival at the requested REML point. Only a state whose rho
+/// is bit-identical to the bounded literal seed and whose real-objective value
+/// is finite may authorize the outer solver to start.
+pub(crate) fn reactive_arrival_postcondition(
+    state: &crate::estimate::reml::continuation::ContinuationState,
+    literal_seed: &Array1<f64>,
+) -> Result<(), String> {
+    let at_literal_seed = state.last_rho.len() == literal_seed.len()
+        && state
+            .last_rho
+            .iter()
+            .zip(literal_seed.iter())
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits());
+    if !at_literal_seed {
+        return Err(format!(
+            "reactive domain entry refused: continuation reported arrival at rho {:?}, not the literal seed {:?}",
+            state.last_rho, literal_seed
+        ));
+    }
+    if !state.last_eval.cost.is_finite() {
+        return Err(format!(
+            "reactive domain entry refused: continuation arrival at the literal seed retained non-finite evidence {}",
+            state.last_eval.cost
+        ));
+    }
+    Ok(())
+}
+
 /// Coefficient dimension at which the per-step inner solve cost begins to grow
 /// steeply (the empirical #979 "centers≈8→10" cliff). For a custom-family
 /// marginal-slope fit `p_coefficients` ≈ Σ over both formulas of the basis
@@ -586,6 +618,7 @@ pub(crate) fn run_outer_with_plan(
         // `eval_cost` demonstrated that its Laplace evidence is undefined (the
         // K>=2 routing-collapse failure Object 1 exists to repair).
         let mut continuation_arrived = continuation_path.is_none();
+        let mut continuation_arrival_refusal: Option<String> = None;
         if continuation_path.is_some() {
             {
                 let path = continuation_path
@@ -611,10 +644,6 @@ pub(crate) fn run_outer_with_plan(
                 // no rejection exit.
                 let walk_budget = crate::continuation_path::CONTINUATION_WALK_BUDGET;
                 for _ in 0..walk_budget {
-                    if path.arrived() {
-                        continuation_arrived = true;
-                        break;
-                    }
                     match path.step(obj, &warm_beta) {
                         crate::continuation_path::ContinuationStep::Descended { s, state } => {
                             // Warm-start the next leg from this leg's converged
@@ -633,13 +662,16 @@ pub(crate) fn run_outer_with_plan(
                             }
                             legs_descended += 1;
                         }
-                        crate::continuation_path::ContinuationStep::Arrived => {
+                        crate::continuation_path::ContinuationStep::Arrived { state } => {
                             // Leave the objective in the path-warmed state.
                             // The exact-value verification below owns the
                             // full-state handoff; replacing it with a copied
                             // coefficient-only seed here would discard it.
                             legs_descended += 1;
-                            continuation_arrived = true;
+                            match reactive_arrival_postcondition(&state, seed) {
+                                Ok(()) => continuation_arrived = true,
+                                Err(reason) => continuation_arrival_refusal = Some(reason),
+                            }
                             break;
                         }
                         crate::continuation_path::ContinuationStep::Reentered { s, reason } => {
@@ -710,9 +742,11 @@ pub(crate) fn run_outer_with_plan(
         }
         if reactive_domain_entry_requested {
             if !continuation_arrived {
-                let msg = "reactive domain entry refused: certified continuation walk budget \
-                           exhausted before arrival at the exact seed"
-                    .to_string();
+                let msg = continuation_arrival_refusal.take().unwrap_or_else(|| {
+                    "reactive domain entry refused: certified continuation walk budget \
+                     exhausted before arrival at the exact seed"
+                        .to_string()
+                });
                 log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
                 rejection_reasons.push((seed_idx, "domain-entry", msg));
                 continue 'seed_attempts;
@@ -1317,9 +1351,8 @@ pub(crate) fn run_outer_with_plan(
                                     // silently revert to the much tighter raw
                                     // solver bound and reject the identical
                                     // point (#1689: |g|=.042 on |V|≈982).
-                                    result.operator_stop_reason = Some(
-                                        OperatorTrustRegionStopReason::CostStallFlatValley,
-                                    );
+                                    result.operator_stop_reason =
+                                        Some(OperatorTrustRegionStopReason::CostStallFlatValley);
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(

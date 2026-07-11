@@ -107,12 +107,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
                 })
             },
             None::<fn(&mut PilotState)>,
-            None::<
-                fn(
-                    &mut PilotState,
-                    &Array1<f64>,
-                ) -> Result<EfsEval, EstimationError>,
-            >,
+            None::<fn(&mut PilotState, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         )
         .with_exact_polish(|state: &mut PilotState| {
             if state.exact || state.pilot_derivative_evals == 0 {
@@ -131,7 +126,10 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
         "returned sampled optimum instead of exact optimum: rho={:?}",
         result.rho,
     );
-    assert_eq!(obj.state.transitions, 1, "exact transition must be single-shot");
+    assert_eq!(
+        obj.state.transitions, 1,
+        "exact transition must be single-shot"
+    );
     assert!(obj.state.pilot_derivative_evals > 0);
     assert!(obj.state.exact_derivative_evals > 0);
     assert!(
@@ -305,7 +303,10 @@ fn newton_predicted_decrease_is_curvature_scaled() {
     let stiff_h = array![[1.0e6, 0.0], [0.0, 1.0e6]];
     let stiff_g = array![0.0717, 0.0];
     let stiff = newton_predicted_decrease(&stiff_h, &stiff_g).expect("stiff decrement");
-    assert!(stiff < 1.0e-8, "stiff residual should predict tiny decrease, got {stiff}");
+    assert!(
+        stiff < 1.0e-8,
+        "stiff residual should predict tiny decrease, got {stiff}"
+    );
 
     // A residual along a NEAR-FLAT direction (a linear ramp with real descent)
     // inflates gᵀH⁻¹g and is NOT certified as negligible — the routine must never
@@ -313,7 +314,10 @@ fn newton_predicted_decrease_is_curvature_scaled() {
     let flat_h = array![[1.0e-9, 0.0], [0.0, 1.0]];
     let flat_g = array![0.05, 0.0];
     let flat = newton_predicted_decrease(&flat_h, &flat_g).expect("flat decrement");
-    assert!(flat > 1.0, "flat-direction residual should predict large decrease, got {flat}");
+    assert!(
+        flat > 1.0,
+        "flat-direction residual should predict large decrease, got {flat}"
+    );
 
     // Malformed / mismatched shapes yield `None`.
     assert!(newton_predicted_decrease(&array![[1.0, 0.0], [0.0, 1.0]], &array![1.0]).is_none());
@@ -3448,7 +3452,10 @@ impl OuterObjective for ReactiveDomainObjective {
 
 fn run_reactive_domain_fixture(
     mode: ReactiveDomainMode,
-) -> (Result<OuterResult, EstimationError>, ReactiveDomainObjective) {
+) -> (
+    Result<OuterResult, EstimationError>,
+    ReactiveDomainObjective,
+) {
     const SEED: f64 = 0.125;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
@@ -3463,6 +3470,55 @@ fn run_reactive_domain_fixture(
     let mut objective = ReactiveDomainObjective::new(SEED, mode);
     let result = problem.run(&mut objective, "reactive-domain-entry fixture");
     (result, objective)
+}
+
+fn reactive_arrival_state(
+    rho: Array1<f64>,
+    cost: f64,
+) -> crate::estimate::reml::continuation::ContinuationState {
+    crate::estimate::reml::continuation::ContinuationState {
+        last_rho: rho,
+        last_eval: OuterEval {
+            cost,
+            gradient: Array1::zeros(0),
+            hessian: HessianValue::Unavailable,
+            inner_beta_hint: None,
+        },
+        last_beta: Array1::zeros(0),
+        steps_accepted: 1,
+    }
+}
+
+#[test]
+fn reactive_domain_arrival_accepts_exact_finite_literal_seed() {
+    let seed = array![0.125, -0.75];
+    let state = reactive_arrival_state(seed.clone(), 3.5);
+    reactive_arrival_postcondition(&state, &seed)
+        .expect("an exact finite literal-seed state must authorize arrival");
+}
+
+#[test]
+fn reactive_domain_arrival_rejects_an_earlier_waypoint() {
+    let seed = array![0.125, -0.75];
+    let state = reactive_arrival_state(array![0.25, -0.75], 3.5);
+    let error = reactive_arrival_postcondition(&state, &seed)
+        .expect_err("an earlier continuation waypoint must not authorize arrival");
+    assert!(
+        error.contains("not the literal seed"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn reactive_domain_arrival_rejects_nonfinite_literal_seed_evidence() {
+    let seed = array![0.125, -0.75];
+    let state = reactive_arrival_state(seed.clone(), f64::INFINITY);
+    let error = reactive_arrival_postcondition(&state, &seed)
+        .expect_err("undefined exact-seed evidence must not authorize arrival");
+    assert!(
+        error.contains("retained non-finite evidence"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
