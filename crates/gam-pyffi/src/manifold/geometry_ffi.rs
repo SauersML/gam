@@ -4742,42 +4742,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         build_difference_smooth_request_json,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(decoder_channel_cov_factors, module)?)?;
-    module.add_function(wrap_pyfunction!(decoder_cov_from_channel_factors, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_canonical_n_harmonics, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_atom_topologies, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_canonical_assignment_kind,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_canonical_basis_kind,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_basis_kind_for_topology,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_topology_for_basis,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_canonical_topology,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_coordinate_periods,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(
         crate::manifold::manifold_sae_coercion::sae_flat_block_assignment,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        sae_manifold_from_fit_payload,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;
@@ -4975,12 +4941,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_description_length, module)?)?;
     module.add_function(wrap_pyfunction!(sae_eq4_description_length, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        sae_manifold_fit_ordered_beta_bernoulli,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_model, module)?)?;
     module.add_function(wrap_pyfunction!(sae_crosscoder_fit, module)?)?;
     module.add_class::<ManifoldCrosscoderCore>()?;

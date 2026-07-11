@@ -1446,12 +1446,15 @@ pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
     direction: ArrayView1<'_, f64>,
-) -> Result<Option<Array1<f64>>, String> {
+) -> Result<Array1<f64>, String> {
     let AssignmentMode::OrderedBetaBernoulli {
         temperature, alpha, ..
     } = assignment.mode
     else {
-        return Ok(None);
+        return Err(
+            "ordered Beta--Bernoulli exact-Hessian correction requires ordered assignment mode"
+                .to_string(),
+        );
     };
     let target = flat_logits(assignment.logits.view());
     if direction.len() != target.len() {
@@ -1465,7 +1468,7 @@ pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
         return Err("ordered Beta--Bernoulli exact-Hessian direction must be finite".to_string());
     }
     if assignment.routing_is_frozen() {
-        return Ok(Some(Array1::<f64>::zeros(target.len())));
+        return Ok(Array1::<f64>::zeros(target.len()));
     }
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
@@ -1478,7 +1481,7 @@ pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
     for index in 0..delta.len() {
         delta[index] -= channels.diagonal_term[index].max(0.0) * direction[index];
     }
-    Ok(Some(delta))
+    Ok(delta)
 }
 
 #[cfg(test)]
@@ -1510,7 +1513,6 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
             None,
             direction.view(),
         )
-        .unwrap()
         .unwrap();
 
         let AssignmentMode::OrderedBetaBernoulli {

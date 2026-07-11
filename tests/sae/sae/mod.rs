@@ -16,7 +16,7 @@ mod sae_manifold_circle_d2_ridge0_fits;
 mod sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse;
 mod sae_manifold_euclidean_k2_terminates;
 mod sae_manifold_euclidean_line_fit;
-mod sae_manifold_gauge_deflated_evidence;
+mod sae_manifold_gauge_deflated_quasi_laplace;
 mod sae_manifold_joint_two_circle_recovery;
 mod sae_manifold_k1_circle_radial_bias;
 mod sae_manifold_k_ladder_recovery;

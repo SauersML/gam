@@ -121,7 +121,7 @@ fn nested_torus_term(parent_decoder: Array2<f64>) -> (SaeManifoldTerm, SaeManifo
     }
 
     let make_atom = |name: &str, decoder: Array2<f64>| -> SaeManifoldAtom {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Torus,
             2,

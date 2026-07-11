@@ -70,7 +70,7 @@ fn build_seed(
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, 0]] = 1.0;
     decoder[[2, 1]] = 1.0;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "seed".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

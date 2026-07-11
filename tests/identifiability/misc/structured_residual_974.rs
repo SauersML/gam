@@ -423,7 +423,7 @@ fn build_sae_term(
         for i in 0..m {
             smooth[[i, i]] = 0.1;
         }
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("atom_{atom_idx}"),
             SaeAtomBasisKind::EuclideanPatch,
             d,

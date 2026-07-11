@@ -116,7 +116,7 @@ fn build_term_with_n_rows(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
     dec1[[2, 0]] = 1.0; // cos   -> ch0
 
     let make = |name: &str, phi: Array2<f64>, jet, dec: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             D,

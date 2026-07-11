@@ -214,7 +214,7 @@ fn sae_euclidean_line_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho
     let m = phi.ncols();
     let smooth_penalty =
         gam::basis::create_difference_penalty_matrix(m, 2, None).expect("roughness penalty");
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "contract-line",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -348,7 +348,7 @@ fn sae_k2_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
             weights[atom_idx][basis_col][out_col]
         });
         atoms.push(
-            SaeManifoldAtom::new(
+            SaeManifoldAtom::new_with_provided_function_gram(
                 format!("k2_{atom_idx}"),
                 SaeAtomBasisKind::Periodic,
                 1,

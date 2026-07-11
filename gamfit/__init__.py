@@ -31,17 +31,6 @@ API ``gamfit.fit(df, 'y ~ s(x1) + s(x2)')``.
 See https://github.com/SauersML/gam for the full guide.
 """
 
-# Source-vs-wheel skew note:
-# This Python source expects the Rust extension from gam-pyffi >= 0.1.124.
-# Wheels published before that extension version may lack these pyfunctions:
-# - sae_manifold_reconstruction_r2
-# - sae_manifold_assignment_summary
-# - topology_dispatch_key
-# - assemble_candidate_formula
-# - select_topology_candidate_lifecycle
-# Rebuild or reinstall the local extension if importing from a source tree with
-# an older compiled .so.
-
 from importlib import metadata as _metadata
 from pathlib import Path
 

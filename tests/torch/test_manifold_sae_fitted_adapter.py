@@ -42,6 +42,15 @@ def test_adapter_output_is_one_native_converged_latent_state() -> None:
     assert out.penalized_quasi_laplace_criterion.item() == pytest.approx(
         native.penalized_quasi_laplace_criterion
     )
+    expected_log_lambdas = native.selected_log_lambda_smooth
+    if expected_log_lambdas is None:
+        assert out.selected_smooth_lambdas is None
+    else:
+        assert out.selected_smooth_lambdas is not None
+        np.testing.assert_allclose(
+            out.selected_smooth_lambdas.numpy(),
+            np.exp(np.asarray(expected_log_lambdas, dtype=np.float64)),
+        )
 
 
 def test_adapter_state_dict_restores_the_serialized_native_fit() -> None:

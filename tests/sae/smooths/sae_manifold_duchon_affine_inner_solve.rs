@@ -74,7 +74,7 @@ fn fit_euclidean_curve(kind: CurveKind) -> f64 {
     let m = phi.ncols();
     let smooth_penalty =
         gam::basis::create_difference_penalty_matrix(m, 2, None).expect("roughness penalty");
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "euclidean_curve",
         SaeAtomBasisKind::EuclideanPatch,
         1,
@@ -108,7 +108,7 @@ fn fit_euclidean_curve(kind: CurveKind) -> f64 {
         .expect("REML fixed-rho convergence check should accept the inner optimum");
     assert!(
         criterion.is_finite() && criterion_loss.total().is_finite(),
-        "REML criterion should be finite after the inner solve: {criterion}"
+        "quasi-Laplace criterion should be finite after the inner solve: {criterion}"
     );
     explained_variance(&z, &term.try_fitted().expect("fitted values"))
 }

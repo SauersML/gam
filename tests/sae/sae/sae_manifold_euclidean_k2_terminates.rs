@@ -106,7 +106,7 @@ fn build_cold_k2_term(s_true: &[Vec<f64>; 2], owner: &[usize], z: &Array2<f64>) 
         });
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         let decoder = decoder_lsq_init(&phi, z);
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("line_{k}"),
             SaeAtomBasisKind::EuclideanPatch,
             1,

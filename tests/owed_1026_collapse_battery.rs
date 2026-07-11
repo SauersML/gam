@@ -97,7 +97,7 @@ fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
 /// (fraction-of-period in `[0,1)`).
 fn circle_atom(name: &str, coords: &Array2<f64>, decoder: Array2<f64>) -> SaeManifoldAtom {
     let (phi, jet) = periodic_basis(coords);
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         name,
         SaeAtomBasisKind::Periodic,
         1,

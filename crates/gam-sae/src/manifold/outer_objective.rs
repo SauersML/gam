@@ -3685,8 +3685,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // moves by its exact penalized quasi-Laplace gradient. Small dense fits still select the
             // ordinary full-gradient BFGS plan at the existing crossover.
             psi_dim: assignment_gradient_dim,
-            // SPEC: "REML or LAML is used for fitting." The extended
-            // Fellner--Schall fixed point targets this penalized quasi-Laplace criterion and needs only the traces
+            // The SAE path minimizes its explicitly named custom quasi-Laplace
+            // criterion. The extended Fellner--Schall fixed point needs only the traces
             // tr(H⁻¹ S_c) (decoder_smoothness_effective_dof + ard_inverse_traces),
             // never a finite-difference or autodiff gradient — which is required
             // here because the per-atom-ARD outer problem is O(K)-dimensional and a

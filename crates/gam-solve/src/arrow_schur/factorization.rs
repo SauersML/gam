@@ -408,7 +408,7 @@ pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// applied to the spectral-deflation decision for *positive* near-floor
 /// eigenvalues, to stop the per-row deflation COUNT from flickering as a small
 /// positive curvature direction wanders across the cutoff over a ρ/θ-walk
-/// (#1117). The quotient-dimension guard (`record_evidence_gauge_deflation_count`)
+/// (#1117). The quotient-dimension guard (`record_criterion_gauge_deflation_count`)
 /// correctly refuses to compare Laplace normalizers across different deflated
 /// dimensions, so a single eigenvalue oscillating around the bare floor would
 /// otherwise toggle the count 6↔7 within one optimization and trip the guard

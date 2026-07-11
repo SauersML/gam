@@ -105,7 +105,7 @@ fn build_fixture(
         decoder[[1, c]] = v[c];
     }
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,

@@ -152,10 +152,10 @@ pub(crate) fn trivial_k1_euclidean_term() -> SaeManifoldTerm {
 /// simplest possible manifold-SAE fit (isometry on OR off) — this pins that a
 /// sustained small-amplitude flicker survives indefinitely.
 #[test]
-pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() {
+pub(crate) fn criterion_gauge_deflation_count_bounded_flicker_reanchors_freely() {
     let mut term = trivial_k1_euclidean_term();
     // Pin the expected count at a realistic large level (like the circle fit).
-    term.record_evidence_gauge_deflation_count(150, true)
+    term.record_criterion_gauge_deflation_count(150, true)
         .unwrap();
     // A sustained 150<->147 flicker reverses direction on EVERY step — far more
     // reversals than the K=1 budget of 6 — yet the amplitude (3) is well inside
@@ -164,7 +164,7 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
         147usize, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150, 147, 150,
     ];
     for &c in &flicker {
-        term.record_evidence_gauge_deflation_count(c, true)
+        term.record_criterion_gauge_deflation_count(c, true)
             .expect("a bounded low-amplitude flicker must re-anchor, never abort");
     }
     assert_eq!(
@@ -181,14 +181,14 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
     // pathology and must still be refused: 150<->40 swings ~73% of the level.
     let mut term2 = trivial_k1_euclidean_term();
     term2
-        .record_evidence_gauge_deflation_count(150, true)
+        .record_criterion_gauge_deflation_count(150, true)
         .unwrap();
     let mut errored = false;
     for &c in &[
         40usize, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150, 40, 150,
     ] {
         if term2
-            .record_evidence_gauge_deflation_count(c, true)
+            .record_criterion_gauge_deflation_count(c, true)
             .is_err()
         {
             errored = true;
@@ -212,18 +212,18 @@ pub(crate) fn evidence_gauge_deflation_count_bounded_flicker_reanchors_freely() 
 /// catch is an OSCILLATING count — repeated direction reversals that never
 /// settle — which is refused loudly past the reversal budget.
 #[test]
-pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runaway() {
+pub(crate) fn criterion_gauge_deflation_count_guard_reanchors_then_rejects_runaway() {
     let mut term = trivial_k1_euclidean_term();
     assert!(term.expected_criterion_gauge_deflated_directions.is_none());
 
     // First observation pins the expected count (high, like a real K=2 walk
     // that starts with many near-null evidence directions).
-    term.record_evidence_gauge_deflation_count(60, true)
+    term.record_criterion_gauge_deflation_count(60, true)
         .unwrap();
     assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(60));
 
     // A matching later observation is a no-op (still Ok, count unchanged).
-    term.record_evidence_gauge_deflation_count(60, true)
+    term.record_criterion_gauge_deflation_count(60, true)
         .unwrap();
     assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(60));
 
@@ -232,7 +232,7 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     // no matter how many steps it takes. This is exactly the real-OLMo K=2
     // signature (171→…→113) that the old `k`-event budget wrongly tripped on.
     for c in [50usize, 40, 33, 21, 12, 9, 6, 4, 3, 2] {
-        term.record_evidence_gauge_deflation_count(c, true).unwrap();
+        term.record_criterion_gauge_deflation_count(c, true).unwrap();
         assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(c));
     }
     assert_eq!(
@@ -247,7 +247,7 @@ pub(crate) fn evidence_gauge_deflation_count_guard_reanchors_then_rejects_runawa
     let oscillation = [9usize, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2, 9, 2];
     let mut errored = false;
     for &c in &oscillation {
-        match term.record_evidence_gauge_deflation_count(c, true) {
+        match term.record_criterion_gauge_deflation_count(c, true) {
             Ok(()) => {
                 last_ok = c;
             }

@@ -73,7 +73,7 @@ fn build_two_atom_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm 
     let (phi0, jet0) = eval.evaluate(coords0.view()).unwrap();
     let (phi1, jet1) = eval.evaluate(coords1.view()).unwrap();
     let make = |name: &str, phi: Array2<f64>, jet, dec: Array2<f64>| {
-        SaeManifoldAtom::new(
+        SaeManifoldAtom::new_with_provided_function_gram(
             name,
             SaeAtomBasisKind::Periodic,
             1,
@@ -642,7 +642,7 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
 ///   1. the shared flat coordinate is strictly SHORTER than the per-atom one
 ///      (1 + K + max_d  <  1 + K + Σ_k d_k for K>1, since the ARD block
 ///      collapses from Σ_k d_k to max_d) — the ARD-block collapse, and
-///   2. the inner fit CONVERGES to a FINITE Laplace/REML criterion, i.e. the
+///   2. the inner fit converges to a finite custom quasi-Laplace criterion, i.e. the
 ///      shared `from_flat` broadcast feeds the inner solve a well-posed per-atom
 ///      precision table that the joint Newton can actually reach a minimum on.
 /// A regression that broke the broadcast (or made the shared coordinate
@@ -694,6 +694,6 @@ fn shared_ard_is_a_convergent_outer_coordinate_1026() {
         .expect("inner joint fit must converge at the shared-ARD ρ");
     assert!(
         cost.is_finite(),
-        "shared-ARD inner fit must reach a FINITE REML criterion (convergence); got {cost}"
+        "shared-ARD inner fit must reach a finite quasi-Laplace criterion; got {cost}"
     );
 }

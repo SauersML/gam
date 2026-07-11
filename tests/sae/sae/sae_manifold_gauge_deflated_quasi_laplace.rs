@@ -85,7 +85,7 @@ fn planted_circle_term(z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
         .cholesky(FaerSide::Lower)
         .expect("seed normal equation")
         .solve_mat(&xtz);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,
@@ -132,11 +132,11 @@ fn run_outer_fit(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> SaeMani
 }
 
 #[test]
-fn gauge_deflated_evidence_planted_circle_fits_high_p() {
+fn gauge_deflated_quasi_laplace_planted_circle_fits_high_p() {
     for p in [512usize, 2048] {
         let z = planted_circle_data(p);
         let term = planted_circle_term(z.view());
-        let fitted = run_outer_fit(term, &z, &format!("gauge-aware H_tt evidence p={p}"));
+        let fitted = run_outer_fit(term, &z, &format!("gauge-aware H_tt criterion p={p}"));
         let ev = global_ev(z.view(), fitted.fitted().view());
         assert!(
             ev >= 0.95,

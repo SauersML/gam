@@ -169,7 +169,7 @@ fn run_production_fit(z: &Array2<f64>, coord_seed: &[f64], label: &str) -> SaeMa
     let coords = Array2::from_shape_fn((N, 1), |(i, _)| coord_seed[i]);
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("basis evaluation");
     let decoder = decoder_lsq_init_single(&phi, z);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

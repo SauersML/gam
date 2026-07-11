@@ -339,7 +339,7 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>, p: usize) -> SaeManifol
     let mut atoms = Vec::with_capacity(k);
     for a in 0..k {
         let b = decoder.slice(ndarray::s![a, 0..M, ..]).to_owned();
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{a}"),
             SaeAtomBasisKind::Periodic,
             1,

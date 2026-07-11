@@ -234,7 +234,7 @@ fn build_frozen_encode_term(batch: &Batch, frames: &[Array2<f64>]) -> SaeManifol
         });
         let (phi, jet) = evaluator.evaluate(coords.view()).expect("evaluate basis");
         let decoder = planted_decoder(&frames[k]);
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{k}"),
             SaeAtomBasisKind::Periodic,
             1,
@@ -409,7 +409,7 @@ fn build_device_encode_fixture() -> (
     let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
         (1.0 / (1.0 + b as f64)) * (((b as f64 + 1.0) * (c as f64 + 1.0)) * 0.3).cos()
     });
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "euclid_device_encode_gate",
         SaeAtomBasisKind::EuclideanPatch,
         d,

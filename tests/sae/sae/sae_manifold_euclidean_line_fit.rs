@@ -107,7 +107,7 @@ fn build_cold_term(s_true: &[f64], z: &Array2<f64>) -> SaeManifoldTerm {
     let coords = Array2::from_shape_fn((N, 1), |(i, _)| s_true[i] + 0.05);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let decoder = decoder_lsq_init(&phi, z);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "line_0",
         SaeAtomBasisKind::EuclideanPatch,
         1,

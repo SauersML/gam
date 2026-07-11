@@ -415,7 +415,7 @@ fn periodic_k1_term(
         }
     }
     let seed_dispersion = (rss / ((n * p) as f64)).max(1.0e-12);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         label,
         SaeAtomBasisKind::Periodic,
         dim,

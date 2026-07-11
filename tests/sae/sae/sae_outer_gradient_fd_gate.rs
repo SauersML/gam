@@ -99,7 +99,7 @@ fn fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixture {
         };
         let mut smooth = Array2::<f64>::eye(m);
         smooth[[0, 0]] = 0.0;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{atom_idx}"),
             SaeAtomBasisKind::Periodic,
             1,
@@ -148,7 +148,7 @@ fn evaluate(
             1.0e-6,
             1.0e-6,
         )
-        .unwrap_or_else(|err| panic!("REML criterion failed: {err}"));
+        .unwrap_or_else(|err| panic!("quasi-Laplace criterion failed: {err}"));
     (term, value, loss, cache)
 }
 
@@ -173,7 +173,7 @@ fn centered_fd(
 
 /// The full analytic outer-ρ gradient — explicit + direct log-det traces +
 /// Occam + the #1006 third-order implicit-state correction — must match a
-/// centered finite difference of the actual REML criterion (inner problem
+/// centered finite difference of the actual quasi-Laplace criterion (inner problem
 /// re-solved at each ρ, so the FD carries the envelope/IFT terms).
 fn assert_full_gradient_matches_fd(label: &str, f: &Fixture) {
     let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, 8);
@@ -261,7 +261,7 @@ fn rank_deficient_fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixtu
         });
         let mut smooth = Array2::<f64>::eye(m);
         smooth[[0, 0]] = 0.0;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{atom_idx}"),
             SaeAtomBasisKind::Periodic,
             1,

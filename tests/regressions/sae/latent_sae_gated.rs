@@ -19,7 +19,7 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
     )
     .expect("test setup must construct assignment");
 
-    let atom0 = SaeManifoldAtom::new(
+    let atom0 = SaeManifoldAtom::new_with_provided_function_gram(
         "a0",
         gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict0".into()),
         2,
@@ -29,7 +29,7 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
         array![[1.0]],
     )
     .expect("test setup must construct atom0");
-    let atom1 = SaeManifoldAtom::new(
+    let atom1 = SaeManifoldAtom::new_with_provided_function_gram(
         "a1",
         gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict1".into()),
         2,
@@ -159,7 +159,7 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
             basis_jacobian[[i, j, j]] = 1.0;
         }
     }
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "a",
         gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
         d,
@@ -213,7 +213,7 @@ fn penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis() {
     let argmin = best.1;
     assert!(
         argmin > log_alpha_grid[0] && argmin < *log_alpha_grid.last().unwrap(),
-        "REML criterion argmin over log α must be a finite INTERIOR minimum \
+        "quasi-Laplace criterion argmin over log α must be a finite INTERIOR minimum \
          (balancing ½log|H| against −½n·logα), not pinned to a grid endpoint; \
          got argmin={argmin}"
     );
@@ -244,7 +244,7 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
         [1.0, -1.1],
         [1.0, 0.4]
     ];
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "a",
         gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
         1,
@@ -290,7 +290,7 @@ fn penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth()
     let argmin = best.1;
     assert!(
         argmin > log_lambda_grid[0] && argmin < *log_lambda_grid.last().unwrap(),
-        "REML criterion over log λ_smooth must have a finite INTERIOR argmin \
+        "quasi-Laplace criterion over log λ_smooth must have a finite INTERIOR argmin \
          (validating the −½·rank·logλ Occam term's presence and sign); got \
          argmin={argmin} (monotone to an endpoint means the term is missing or \
          wrong-signed)"
@@ -400,7 +400,7 @@ fn temperature_schedule_is_applied_each_iteration_and_near_zero_behaves_like_arg
         .expect("assignment should build");
         let atoms = (0..3)
             .map(|k| {
-                SaeManifoldAtom::new(
+                SaeManifoldAtom::new_with_provided_function_gram(
                     format!("a{k}"),
                     gam::terms::sae::manifold::SaeAtomBasisKind::Precomputed("dict".into()),
                     1,

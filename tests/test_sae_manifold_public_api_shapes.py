@@ -78,18 +78,13 @@ def test_per_atom_uncertainty_shape_band_shapes_are_sane():
         np.testing.assert_allclose(atom.decoder_covariance, atom.decoder_covariance.T, atol=1e-8)
         assert np.all(np.diag(atom.decoder_covariance) >= -1e-10)
 
-        band = fit.shape_uncertainty(atom=atom_k, n_sd=1.5)
-        assert set(band) == {"coords", "mean", "sd", "lower", "upper"}
-        assert band["coords"].shape == atom.shape_band_coords.shape
-        assert band["coords"].ndim == 2
-        assert band["coords"].shape[1] == d_k
-        assert band["mean"].shape == band["sd"].shape == band["lower"].shape
-        assert band["upper"].shape == band["mean"].shape
-        assert band["mean"].shape == atom.shape_band_mean.shape
-        assert band["sd"].shape == atom.shape_band_sd.shape
-        assert band["mean"].shape[1] == p
-        for key in ("coords", "mean", "sd", "lower", "upper"):
-            assert np.all(np.isfinite(band[key]))
-        assert np.all(band["sd"] >= 0.0)
-        np.testing.assert_allclose(band["lower"], band["mean"] - 1.5 * band["sd"])
-        np.testing.assert_allclose(band["upper"], band["mean"] + 1.5 * band["sd"])
+        coords = np.asarray(atom.shape_band_coords)
+        mean = np.asarray(atom.shape_band_mean)
+        sd = np.asarray(atom.shape_band_sd)
+        assert coords.ndim == 2
+        assert coords.shape[1] == d_k
+        assert mean.shape == sd.shape
+        assert mean.shape[1] == p
+        for array in (coords, mean, sd):
+            assert np.all(np.isfinite(array))
+        assert np.all(sd >= 0.0)

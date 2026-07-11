@@ -29,7 +29,7 @@ impl SaeManifoldLoss {
 
     /// Honest component breakdown of [`Self::total`] — the four penalized-loss
     /// terms this struct actually carries — so a consumer can see exactly what
-    /// the score is (and what it is *not*: it is missing the evidence pieces
+    /// the score is (and what it is *not*: it is missing the quasi-Laplace pieces
     /// listed on [`Self::penalized_loss_score`]). The values are the raw
     /// (positive) loss contributions; `penalized_loss_score == −Σ` of the first
     /// four.
@@ -61,7 +61,7 @@ pub struct SaeManifoldLossBreakdown {
     pub total_penalized_loss: f64,
     /// `−total_penalized_loss` (larger = less penalized loss).
     pub penalized_loss_score: f64,
-    /// Count of evidence-gauge-deflated directions recorded on the loss.
+    /// Count of criterion-gauge-deflated directions recorded on the loss.
     pub criterion_gauge_deflated_directions: usize,
 }
 
@@ -73,14 +73,14 @@ pub struct SaeManifoldLossBreakdown {
 #[derive(Debug, Clone)]
 pub struct SaeOuterRhoGradientComponents {
     /// Direct derivative of `loss.total() + extra_penalty_energy` with respect to
-    /// log-strength coordinates, excluding the Hessian logdet and Occam terms.
+    /// log-strength coordinates, excluding the custom factor logdet and Occam terms.
     pub explicit: Array1<f64>,
-    /// `0.5 * tr(H^{-1} dH/d rho_j)` for the currently available penalty blocks.
+    /// `0.5 * tr(B^{-1} dB/d rho_j)` for the currently available penalty blocks.
     pub logdet_trace: Array1<f64>,
     /// Derivative contribution of `-occam`.
     pub occam: Array1<f64>,
-    /// `−½·Γᵀθ̂_ρ`, the implicit fitted-state response of the Laplace
-    /// log-determinant.  Inner stationarity removes the corresponding response
+    /// `−½·Γᵀθ̂_ρ`, the implicit fitted-state response of the custom `log|B|`
+    /// term. Inner stationarity removes the corresponding response
     /// of the penalized loss, not this trace term.
     pub third_order_correction: Array1<f64>,
 }

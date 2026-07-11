@@ -85,7 +85,7 @@ fn build_term(theta: &[f64], z: &Array2<f64>) -> SaeManifoldTerm {
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let decoder = decoder_lsq_init(&phi, z);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

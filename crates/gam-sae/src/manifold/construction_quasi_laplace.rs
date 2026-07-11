@@ -16,7 +16,7 @@ impl SaeManifoldTerm {
     /// therefore no ρ-independent assignment-prior normalizer that can be dropped
     /// as a constant. The smoothing-penalty `−½log|λS|_+` term IS a genuine
     /// (proper-Gaussian) REML normalizer and is kept exactly; the rest is a
-    /// penalized quasi-Laplace score (Laplace curvature term `½log|H|` around the
+    /// penalized quasi-Laplace score (custom curvature term `½log|B|` around the
     /// inner optimum), which the engine minimizes over ρ.
     ///
     /// Runs the inner `(t, β)` arrow-Schur Newton solve to convergence at the
@@ -32,7 +32,7 @@ impl SaeManifoldTerm {
     /// optimum and `½ log|B|` is the custom curvature charge. `B` is the PSD /
     /// Gauss--Newton factor assembled by the arrow-Schur system, not the exact
     /// stationarity Hessian; its `B_tt` block
-    /// carries `α = exp(log_ard)` on its diagonal, so as α grows `½ log|H|`
+    /// carries `α = exp(log_ard)` on its diagonal, so as α grows `½ log|B|`
     /// rises while the `−½·n·log α` already inside `loss.ard` falls — their
     /// balance IS the effective-dof term that the deleted `α = n/‖t‖²` rule
     /// dropped, which is why the criterion needs no clamp to stay finite on a
@@ -44,7 +44,7 @@ impl SaeManifoldTerm {
     /// structure), so `log|λ S|_+ = p·rank(S)·log λ + p·log|S|_+`, and the
     /// `½ p·log|S|_+` piece is ρ-independent. The ρ-independent additive
     /// constants that ARE dropped here (they shift `V` by a constant and do not
-    /// affect the ρ-argmin) are the `2π` Laplace constant and the base
+    /// affect the ρ-argmin) are the formal `2π` Gaussian constant and the base
     /// `½ p·log|S|_+` penalty logdet. #1421: NO assignment-prior normalizer is
     /// dropped, because none exists (softmax/ThresholdGate priors are improper — see
     /// the doc on this function): the quasi-Laplace score simply omits a
@@ -306,7 +306,7 @@ impl SaeManifoldTerm {
             &options,
             refine_progress_extension,
         )?;
-        self.record_evidence_gauge_deflation_count(
+        self.record_criterion_gauge_deflation_count(
             cache.gauge_deflated_directions,
             refine_progress_extension,
         )?;
@@ -397,9 +397,9 @@ impl SaeManifoldTerm {
             // `0.5 log|H| - 0.5 log|H_tt| + rank_charge`; dense, streaming, and
             // criterion-as-atoms assembly therefore cannot drift apart.
             let log_det_tt = coordinate_block_log_det(&cache)?;
-            let laplace_complexity =
-                rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
-            loss.total() + extra_penalty_energy + laplace_complexity - occam
+            let quasi_laplace_complexity =
+                rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
+            loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
         };
         Ok((v, loss, cache))
     }
@@ -433,7 +433,7 @@ impl SaeManifoldTerm {
     /// deflated direction contributes the ρ-independent `log 1 = 0` to
     /// `½log|H|`, so skipping the probe-lane anchor move never changes any
     /// probe's value.
-    pub(crate) fn record_evidence_gauge_deflation_count(
+    pub(crate) fn record_criterion_gauge_deflation_count(
         &mut self,
         count: usize,
         re_anchor: bool,
@@ -2116,9 +2116,9 @@ impl SaeManifoldTerm {
             // INVALID (degenerate β-mode / β-Schur log-det → −∞), not payable. Reject
             // categorically (v → +∞). Same guard as the dense path; see the dense
             // penalized_quasi_laplace_criterion for the full rationale + β-Schur-floor trailhead.
-            let laplace_complexity =
-                rank_adjusted_laplace_complexity(log_det, ri.log_det_tt, &d_eff, &ri.n_eff)?;
-            loss.total() + extra_penalty_energy + laplace_complexity - occam
+            let quasi_laplace_complexity =
+                rank_adjusted_quasi_laplace_complexity(log_det, ri.log_det_tt, &d_eff, &ri.n_eff)?;
+            loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
         };
         Ok((v, loss, converged_cache))
     }
@@ -4631,7 +4631,7 @@ impl SaeManifoldTerm {
             .map_err(|e| e.to_string())
     }
 
-    /// Compose the SAE LAML criterion as a sum of atoms (#931 SAE pilot).
+    /// Compose the custom SAE quasi-Laplace criterion as a sum of atoms.
     ///
     /// This is the single seam that establishes value↔gradient coherence for
     /// the SAE objective: it runs the inner solve once via
@@ -4675,8 +4675,8 @@ impl SaeManifoldTerm {
         let d_eff = self.per_atom_realised_rank_dof(rho, dispersion)?;
         let n_eff = self.per_atom_effective_sample_size();
         let log_det_tt = coordinate_block_log_det(&cache)?;
-        let laplace_complexity =
-            rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
+        let quasi_laplace_complexity =
+            rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
         let occam = self.reml_occam_term(rho)?;
         let extra_penalty_energy = self
             .reml_extra_penalty_value_total(registry)
@@ -4688,7 +4688,7 @@ impl SaeManifoldTerm {
             self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
         let criterion = SaeCriterion::assemble(
             data_fit_priors_value,
-            laplace_complexity,
+            quasi_laplace_complexity,
             occam,
             components.explicit,
             components.logdet_trace,

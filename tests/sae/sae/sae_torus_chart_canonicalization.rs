@@ -260,7 +260,7 @@ fn planted_warped_torus(
     }
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("row basis");
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         gauge.atom_name(),
         SaeAtomBasisKind::Torus,
         D,

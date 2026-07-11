@@ -100,7 +100,7 @@ fn sphere_topology_recovers_synthetic_signal() {
     assert_eq!(m, 7, "sphere chart basis must have 7 columns");
     let mut penalty = Array2::<f64>::eye(m);
     penalty *= 1.0e-4;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "sphere_atom",
         SaeAtomBasisKind::Sphere,
         d,
@@ -161,7 +161,7 @@ fn torus_topology_recovers_synthetic_signal() {
         .expect("torus evaluation");
     let mut penalty = Array2::<f64>::eye(m);
     penalty *= 1.0e-4;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "torus_atom",
         SaeAtomBasisKind::Torus,
         d,
@@ -239,7 +239,7 @@ fn k2_periodic_atoms_recover_torus_signal() {
             .expect("periodic atom evaluation");
         let mut penalty = Array2::<f64>::eye(m);
         penalty *= 1.0e-4;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             &format!("periodic_atom_{ai}"),
             SaeAtomBasisKind::Periodic,
             1,

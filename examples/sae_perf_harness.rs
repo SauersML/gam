@@ -219,7 +219,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
                 let coords = circle_coords(shape.n, atom_idx);
                 let (phi, jet) = evaluator.evaluate(coords.view())?;
                 let width = phi.ncols();
-                let atom = SaeManifoldAtom::new(
+                let atom = SaeManifoldAtom::new_with_provided_function_gram(
                     format!("circle_{atom_idx}"),
                     SaeAtomBasisKind::Periodic,
                     shape.d,
@@ -238,7 +238,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
                 let coords = euclidean_coords(shape.n, shape.d, atom_idx);
                 let (phi, jet) = evaluator.evaluate(coords.view())?;
                 let width = phi.ncols();
-                let atom = SaeManifoldAtom::new(
+                let atom = SaeManifoldAtom::new_with_provided_function_gram(
                     format!("euclidean_{atom_idx}"),
                     SaeAtomBasisKind::EuclideanPatch,
                     shape.d,

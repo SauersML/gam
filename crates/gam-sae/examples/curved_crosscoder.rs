@@ -379,7 +379,7 @@ fn circle_term(
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
     let (phi, jet) = evaluator.evaluate(coords.view())?;
     let m = phi.ncols();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "crosscoder",
         SaeAtomBasisKind::Periodic,
         1,

@@ -65,7 +65,7 @@ fn degenerate_oos_term() -> (SaeManifoldTerm, SaeManifoldRho, Array2<f64>) {
     // #163 and #175 describe.
     let coords = array![[0.1], [0.4], [0.7]];
     let (phi, jet) = periodic_basis_tiny(&coords);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,

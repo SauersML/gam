@@ -65,7 +65,7 @@ fn sae_manifold_p_greater_than_d_does_not_panic() {
         .expect("periodic atom evaluation");
     let mut penalty = Array2::<f64>::eye(m_basis);
     penalty *= 1.0e-4;
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle_atom",
         SaeAtomBasisKind::Periodic,
         1,

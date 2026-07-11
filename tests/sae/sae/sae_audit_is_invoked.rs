@@ -47,7 +47,7 @@ fn make_atom(name: &str, phi: Array2<f64>) -> SaeManifoldAtom {
     }
     let penalty = Array2::<f64>::eye(m);
     let jet = Array3::<f64>::zeros((N, m, LATENT_DIM));
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         name,
         SaeAtomBasisKind::EuclideanPatch,
         LATENT_DIM,

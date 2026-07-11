@@ -101,7 +101,7 @@ fn build_cold_single_atom_term() -> SaeManifoldTerm {
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
     let coords = Array2::from_shape_fn((N, 1), |(i, _)| ((i as f64) * 0.061_803).rem_euclid(1.0));
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle_0".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

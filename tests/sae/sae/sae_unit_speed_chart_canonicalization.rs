@@ -175,7 +175,7 @@ fn planted_warped_circle() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         }
     }
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "warped-circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,
@@ -475,7 +475,7 @@ fn warped_interval_chart_canonicalizes_to_unit_speed_unit_span() {
         }
     }
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "warped-segment".to_string(),
         SaeAtomBasisKind::EuclideanPatch,
         1,

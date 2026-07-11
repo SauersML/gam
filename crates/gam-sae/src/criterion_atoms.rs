@@ -87,7 +87,7 @@
 
 use ndarray::Array1;
 
-/// One additive term of the SAE LAML criterion, carrying its scalar value and
+/// One additive term of the custom SAE quasi-Laplace criterion, carrying its scalar value and
 /// its ρ-gradient contribution from the **same** emission so the two cannot
 /// drift. The variants partition `V(ρ)` and `dV/dρ` term for term.
 #[derive(Debug, Clone)]
@@ -101,11 +101,11 @@ pub enum SaeCriterionAtom {
         /// Explicit ∂/∂ρ of the data-fit + priors value.
         grad: Array1<f64>,
     },
-    /// `½·log|H| − ½·log|H_tt| + rank_charge`, the realised-rank-adjusted
-    /// Laplace complexity. Its direct derivative differentiates the same joint
+    /// `½·log|B| − ½·log|B_tt| + rank_charge`, the realised-rank-adjusted
+    /// quasi-Laplace complexity. Its direct derivative differentiates the same joint
     /// factor, coordinate factors, and hard-rank branch.
-    LaplaceComplexity {
-        /// Complete rank-adjusted Laplace-complexity value.
+    QuasiLaplaceComplexity {
+        /// Complete rank-adjusted quasi-Laplace-complexity value.
         value: f64,
         /// Direct derivative of the same complexity scalar.
         grad: Array1<f64>,
@@ -117,7 +117,7 @@ pub enum SaeCriterionAtom {
         /// `−∂occam/∂ρ`.
         grad: Array1<f64>,
     },
-    /// The implicit-state envelope correction `−½·Γᵀ H⁻¹ ∂g/∂ρ` (#1006's Γ):
+    /// The implicit-state correction `−½·Γᵀ A⁻¹ ∂g/∂ρ` (#1006's Γ):
     /// the part of `dV/dρ` arising because the inner optimum `θ̂(ρ)` moves with
     /// ρ. It contributes **no value** (the value terms are evaluated at the
     /// converged θ̂; the envelope theorem kills `∂L/∂θ·θ̂'`) — only a gradient
@@ -125,7 +125,7 @@ pub enum SaeCriterionAtom {
     /// desync class keeps dropping; making it explicit makes its omission a
     /// visible missing atom, not a silent zero.
     ImplicitStationarityCorrection {
-        /// `−½·Γᵀ H⁻¹ ∂g/∂ρ`.
+        /// `−½·Γᵀ A⁻¹ ∂g/∂ρ`.
         grad: Array1<f64>,
     },
 }
@@ -137,7 +137,7 @@ impl SaeCriterionAtom {
     pub fn value(&self) -> f64 {
         match self {
             Self::DataFitPriors { value, .. }
-            | Self::LaplaceComplexity { value, .. }
+            | Self::QuasiLaplaceComplexity { value, .. }
             | Self::Occam { value, .. } => *value,
             Self::ImplicitStationarityCorrection { .. } => 0.0,
         }
@@ -148,7 +148,7 @@ impl SaeCriterionAtom {
     pub fn grad(&self) -> &Array1<f64> {
         match self {
             Self::DataFitPriors { grad, .. }
-            | Self::LaplaceComplexity { grad, .. }
+            | Self::QuasiLaplaceComplexity { grad, .. }
             | Self::Occam { grad, .. }
             | Self::ImplicitStationarityCorrection { grad } => grad,
         }
@@ -160,14 +160,14 @@ impl SaeCriterionAtom {
     pub fn label(&self) -> &'static str {
         match self {
             Self::DataFitPriors { .. } => "data_fit_priors",
-            Self::LaplaceComplexity { .. } => "laplace_complexity",
+            Self::QuasiLaplaceComplexity { .. } => "quasi_laplace_complexity",
             Self::Occam { .. } => "occam",
             Self::ImplicitStationarityCorrection { .. } => "implicit_stationarity_correction",
         }
     }
 }
 
-/// The SAE LAML criterion as a sum of atoms. The outer optimizer consumes only
+/// The custom SAE quasi-Laplace criterion as a sum of atoms. The outer optimizer consumes only
 /// `Σ atoms` through [`Self::value`] and [`Self::gradient`]; because every atom
 /// was emitted from one cache by [`Self::assemble`], the value and gradient are
 /// projections of a single factorization and cannot disagree by construction.
@@ -183,14 +183,14 @@ impl SaeCriterion {
     /// place the criterion's value-vs-gradient coherence is established.
     ///
     /// `data_fit_priors_value` is `loss.total() + extra_penalty_energy`;
-    /// `laplace_complexity_value` is the exact production scalar
+    /// `quasi_laplace_complexity_value` is the exact production scalar
     /// `½log|H| − ½log|H_tt| + rank_charge`; `occam` is the smoothing Occam
     /// term (the criterion subtracts it). The gradient component arrays are the
     /// `SaeOuterRhoGradientComponents` channels.
     #[must_use]
     pub fn assemble(
         data_fit_priors_value: f64,
-        laplace_complexity_value: f64,
+        quasi_laplace_complexity_value: f64,
         occam: f64,
         explicit: Array1<f64>,
         logdet_trace: Array1<f64>,
@@ -203,8 +203,8 @@ impl SaeCriterion {
                 value: data_fit_priors_value,
                 grad: explicit,
             },
-            SaeCriterionAtom::LaplaceComplexity {
-                value: laplace_complexity_value,
+            SaeCriterionAtom::QuasiLaplaceComplexity {
+                value: quasi_laplace_complexity_value,
                 grad: logdet_trace,
             },
             SaeCriterionAtom::Occam {

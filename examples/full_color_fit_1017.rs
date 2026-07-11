@@ -124,7 +124,7 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
     let coords = circle_coords(N);
     let (phi, jet) = evaluator.evaluate(coords.view())?;
     let width = phi.ncols();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "color_circle",
         SaeAtomBasisKind::Periodic,
         LATENT_DIM,

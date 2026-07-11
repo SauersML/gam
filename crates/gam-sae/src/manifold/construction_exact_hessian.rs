@@ -557,11 +557,7 @@ impl SaeManifoldTerm {
                 rho,
                 row_loss_w,
                 direction.view(),
-            )?
-            .ok_or_else(|| {
-                "ordered Beta--Bernoulli exact-Hessian correction unexpectedly unavailable"
-                    .to_string()
-            })?;
+            )?;
             for row in 0..n {
                 let base = cache.row_offsets[row];
                 let vars = self.row_vars_for_cache_row(row, cache)?;

@@ -1543,8 +1543,7 @@ pub(crate) fn exact_stationarity_a_minus_b_includes_ordered_beta_bernoulli_share
             term.row_loss_weights.as_deref(),
             flat_logit_direction.view(),
         )
-        .expect("ordered exact-Hessian helper")
-        .expect("ordered mode");
+        .expect("ordered exact-Hessian helper");
 
     let mut saw_cross_row = false;
     for row in 0..term.n_obs() {

@@ -46,7 +46,7 @@ fn build_term(n: usize, arcs: &[(usize, usize)], decoders: &[Array2<f64>]) -> Sa
     let mut atoms = Vec::with_capacity(k);
     let mut coord_blocks = Vec::with_capacity(k);
     for decoder in decoders.iter() {
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "arc",
             SaeAtomBasisKind::Periodic,
             1,

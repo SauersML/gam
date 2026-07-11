@@ -83,7 +83,7 @@ fn build_cold_circle_term(z: &Array2<f64>) -> SaeManifoldTerm {
         (angle / std::f64::consts::TAU).rem_euclid(1.0)
     });
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle_0".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

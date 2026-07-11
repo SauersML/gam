@@ -83,7 +83,7 @@ fn planted_circle(t0: f64) -> (SaeManifoldTerm, RowMetric) {
     // No roughness penalty (m × m zeros ⇒ operator order 0, no reweighting).
     let smooth = Array2::<f64>::zeros((m, m));
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         d,

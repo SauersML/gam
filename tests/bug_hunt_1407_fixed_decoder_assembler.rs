@@ -60,7 +60,7 @@ fn two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let (phi0, jet0) = periodic_basis(&coords0);
     let (phi1, jet1) = periodic_basis(&coords1);
 
-    let atom0 = SaeManifoldAtom::new(
+    let atom0 = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic0",
         SaeAtomBasisKind::Periodic,
         1,
@@ -73,7 +73,7 @@ fn two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     .with_basis_evaluator(Arc::new(
         PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator width 3"),
     ));
-    let atom1 = SaeManifoldAtom::new(
+    let atom1 = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic1",
         SaeAtomBasisKind::Periodic,
         1,

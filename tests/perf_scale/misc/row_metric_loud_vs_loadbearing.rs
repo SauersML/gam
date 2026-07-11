@@ -83,7 +83,7 @@ fn single_channel_atom(name: &str, channel: usize, amplitude: f64) -> SaeManifol
     decoder[[0, channel]] = amplitude;
     // No roughness penalty: a 1×1 zero Gram (order 0, reweighting skipped).
     let smooth_penalty = Array2::<f64>::zeros((m, m));
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         name,
         SaeAtomBasisKind::EuclideanPatch,
         latent_dim,

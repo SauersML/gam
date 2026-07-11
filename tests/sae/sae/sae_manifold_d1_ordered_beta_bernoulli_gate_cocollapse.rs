@@ -96,7 +96,7 @@ fn build_cold_d1_term(z: &Array2<f64>) -> SaeManifoldTerm {
     let coords = seed_coords();
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let decoder = decoder_lsq_init(&phi, z);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "curve_d1".to_string(),
         SaeAtomBasisKind::EuclideanPatch,
         D,

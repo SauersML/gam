@@ -47,7 +47,7 @@ fn planted_circle_atom(n_obs: usize) -> SaeManifoldAtom {
     let mut decoder = Array2::<f64>::zeros((M, P));
     decoder[[2, 0]] = 1.0; // cos column -> x
     decoder[[1, 1]] = 1.0; // sin column -> y
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,
@@ -745,7 +745,7 @@ fn planted_circle_atom_in_plane(
     let mut decoder = Array2::<f64>::zeros((M, ambient));
     decoder[[2, axis0]] = 1.0; // cos column -> axis0
     decoder[[1, axis1]] = 1.0; // sin column -> axis1
-    SaeManifoldAtom::new(
+    SaeManifoldAtom::new_with_provided_function_gram(
         "circle".to_string(),
         SaeAtomBasisKind::Periodic,
         1,

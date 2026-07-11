@@ -110,7 +110,7 @@ fn build_cold_circle_d2_term(z: &Array2<f64>) -> SaeManifoldTerm {
     let coords = embedded_circle_coords(z);
     let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let decoder = decoder_lsq_init(&phi, z);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle_d2".to_string(),
         SaeAtomBasisKind::EuclideanPatch,
         D,

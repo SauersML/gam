@@ -92,7 +92,7 @@ fn main() -> Result<(), String> {
         (1.0 / (1.0 + b as f64)) * (((b as f64 + 1.0) * (c as f64 + 1.0)).cos())
     });
     let target = phi.dot(&decoder);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "residency_measure",
         SaeAtomBasisKind::Periodic,
         1,

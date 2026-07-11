@@ -85,7 +85,7 @@ fn build_dictionary(
             decoder[[1, c]] = v[c];
         }
         blocks.push(decoder.t().to_owned());
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "circle",
             SaeAtomBasisKind::Periodic,
             1,

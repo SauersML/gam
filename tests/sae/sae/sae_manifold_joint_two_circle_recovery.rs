@@ -356,7 +356,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
     let mut atoms = Vec::with_capacity(K);
     for k in 0..K {
         let b = decoder.slice(s![k, 0..M, ..]).to_owned();
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{k}"),
             SaeAtomBasisKind::Periodic,
             1,

@@ -4655,7 +4655,7 @@ impl StructureSearchResult {
 }
 
 /// The round driver's configuration: how the data is split into shards, the
-/// e-gate's budget/level, the round cap, and the per-round harvest breadth.
+/// e-gate's budget/level and the per-round harvest breadth.
 /// Bundled so the driver entry points stay below the argument-count threshold
 /// and so a caller configures one object rather than a positional argument
 /// cascade.
@@ -4665,8 +4665,6 @@ pub struct RoundDriverConfig {
     pub n_shards: usize,
     /// Move budget + α the e-gates certify at (fixed for the run).
     pub budget: MoveBudget,
-    /// Maximum harvest → search rounds before stopping at the fixpoint.
-    pub max_rounds: usize,
     /// Per-round harvest breadth (max fusions / fissions / births).
     pub harvest_params: HarvestParams,
     /// Curl/flatten structure moves (INTEGRATION_PLAN Phase 4). `None` (the
@@ -4732,15 +4730,14 @@ impl Default for CurlConfig {
 /// Each round: harvest proposals from the current fitted term, run [`search`]
 /// over the held-out evaluation shards (gating births/fissions/fusions, demoting
 /// never-certified deaths), and adopt the restructured state. The loop stops
-/// when a round's ledger contains no applied move (every record is
-/// contested / vetoed / deduplicated / deferred / stale) or `max_rounds` is hit.
+/// only when a round's ledger contains no applied move (every record is
+/// contested / vetoed / deduplicated / deferred / stale).
 ///
 /// `candidate_fit` is the warm refit: given a RESTRUCTURED candidate term + ρ,
 /// it refits the candidate on the ESTIMATION rows only (held-out evaluation rows
 /// carry weight `0`), so the candidate is the predictable plug-in the e-process
-/// evaluates on the held-out shard stream. It is INFALLIBLE at this boundary —
-/// it absorbs its own inner-solve errors by returning the unchanged candidate (a
-/// conservative no-improvement signal to the gate, never a panic). The shard
+/// evaluates on the held-out shard stream. A non-converged candidate has no
+/// valid likelihood score and therefore aborts the search. The shard
 /// fold is a no-op: the candidate is fixed across the stream (a predictable
 /// plug-in), and each shard contributes its held-out reconstruction
 /// likelihood-ratio against the honestly-refit null sup.
@@ -4754,17 +4751,16 @@ pub fn run_structure_search_rounds(
         SaeManifoldTerm,
         SaeManifoldRho,
         &[usize],
-    ) -> (SaeManifoldTerm, SaeManifoldRho),
+    ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String>,
     mut finalize_round: impl FnMut(
         SaeManifoldTerm,
         SaeManifoldRho,
         &[usize],
-    ) -> (SaeManifoldTerm, SaeManifoldRho),
+    ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String>,
 ) -> Result<StructureSearchResult, String> {
     let RoundDriverConfig {
         n_shards,
         budget,
-        max_rounds,
         harvest_params,
         curl,
     } = config;
@@ -4779,7 +4775,7 @@ pub fn run_structure_search_rounds(
     // and the two moves cannot chase each other (INTEGRATION_PLAN risk #5).
     let mut cooldown = crate::manifold::CurlCooldownLedger::new();
 
-    for _ in 0..max_rounds {
+    loop {
         // Harvest from the current fitted state. Residuals R = target − fitted.
         let fitted = term.try_fitted_target_aware(target, None)?;
         let residuals = &target.to_owned() - &fitted;
@@ -4892,7 +4888,7 @@ pub fn run_structure_search_rounds(
                 let (cand_term, cand_rho) =
                     apply_structure_move_seeded(&state.0, &state.1, mv, &decoders)?;
                 // Refit the restructured candidate on the estimation rows only.
-                Ok(candidate_fit(cand_term, cand_rho, &estimation_rows))
+                candidate_fit(cand_term, cand_rho, &estimation_rows)
             },
             |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
             |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
@@ -4973,7 +4969,7 @@ pub fn run_structure_search_rounds(
                 // then refresh any registered regular seams against that terminal
                 // numerical state.
                 let (mut polished_term, polished_rho) =
-                    finalize_round(next_term, next_rho, &split.estimation_rows);
+                    finalize_round(next_term, next_rho, &split.estimation_rows)?;
                 refresh_registered_atlas_transitions(&mut polished_term)?;
                 term = polished_term;
                 rho = polished_rho;
@@ -5597,17 +5593,18 @@ pub struct ProductionRefitParams {
 
 /// Run the production structure-search pass around a fitted SAE term: harvest →
 /// e-gated [`search`] over held-out row blocks → adopt certified/demoted moves →
-/// repeat, returning the (possibly restructured) term + ρ and the per-round
-/// ledgers (#997).
+/// repeat to a no-move fixpoint, returning the (possibly restructured) term + ρ
+/// and the per-round ledgers (#997).
 ///
 /// The shard refit folds a held-out block into a candidate via the SAME inner
 /// joint-fit driver the outer fit used ([`SaeManifoldTerm::run_joint_fit_arrow_schur`]),
 /// PENALTY-FREE: the gate's evidence is a held-out reconstruction
 /// likelihood-ratio, and the isometry/ARD penalties are gauge/regularization
-/// terms that do not belong in the evaluation likelihood. The refit absorbs its
-/// own inner-solve errors by returning the unchanged candidate (a conservative
-/// no-improvement signal, never a panic). `ledger` carries banked evidence
-/// across rounds so the death veto sees earlier certifications.
+/// terms that do not belong in the evaluation likelihood. Every candidate and
+/// adopted state must reach the inner solver's convergence certificate; a fit
+/// error aborts the structure search rather than being converted into a
+/// no-improvement score. `ledger` carries banked evidence across rounds so the
+/// death veto sees earlier certifications.
 pub fn run_production_structure_search(
     term: SaeManifoldTerm,
     rho: SaeManifoldRho,

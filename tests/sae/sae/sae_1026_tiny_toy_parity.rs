@@ -190,7 +190,7 @@ fn build_cold_term(arm: Arm, z: &Array2<f64>, frac: &[f64]) -> SaeManifoldTerm {
         .expect("decoder LSQ Cholesky")
         .solve_mat(&xtz);
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "atom_0",
         arm.basis_kind(),
         1,

@@ -223,7 +223,7 @@ fn curved_single_atom_ev(z: ArrayView2<'_, f64>, num_basis: usize) -> f64 {
     }
     let xtz = fast_atb(&phi, &z.to_owned());
     let decoder = xtx.cholesky(Side::Lower).unwrap().solve_mat(&xtz);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,

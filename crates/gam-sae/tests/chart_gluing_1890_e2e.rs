@@ -63,7 +63,7 @@ fn build_term(n: usize, arcs: &[(usize, usize)], decoders: &[Array2<f64>]) -> Sa
     let mut atoms = Vec::with_capacity(k);
     let mut coord_blocks = Vec::with_capacity(k);
     for decoder in decoders.iter() {
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             "arc",
             SaeAtomBasisKind::Periodic,
             1,
@@ -545,7 +545,7 @@ fn build_sphere_pair_term(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
 
     let mut penalty = Array2::<f64>::eye(7);
     penalty *= 1.0e-4;
-    let atom_a = SaeManifoldAtom::new(
+    let atom_a = SaeManifoldAtom::new_with_provided_function_gram(
         "sphere_a",
         SaeAtomBasisKind::Sphere,
         2,
@@ -556,7 +556,7 @@ fn build_sphere_pair_term(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
     )
     .unwrap()
     .with_basis_second_jet(evaluator.clone());
-    let atom_b = SaeManifoldAtom::new(
+    let atom_b = SaeManifoldAtom::new_with_provided_function_gram(
         "sphere_b",
         SaeAtomBasisKind::Sphere,
         2,

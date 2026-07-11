@@ -1412,7 +1412,7 @@ pub(crate) fn evidence_row_recovers_intrinsic_dimension_flat_block_without_gauge
 /// positive near-floor eigenvalue would be counted as deflated on one side
 /// (`λ ≤ floor`) and live on the other (`λ > floor`), flipping the per-row
 /// count and tripping the quotient-dimension guard
-/// (`record_evidence_gauge_deflation_count`) mid-optimization — the slow
+/// (`record_criterion_gauge_deflation_count`) mid-optimization — the slow
 /// seed/homotopy cascade. The genuine indefinite direction (the true
 /// quotient null) is deflated on BOTH sides, so the count is stable.
 #[test]

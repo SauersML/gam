@@ -16,7 +16,6 @@ pub struct SaeMinimalSeedRequest<'a> {
     pub tau: f64,
     pub threshold: f64,
     pub top_k: Option<usize>,
-    pub ordered_beta_bernoulli_alpha_override: Option<f64>,
     pub random_state: u64,
     pub initial_logits: Option<ArrayView2<'a, f64>>,
     pub initial_coords: Option<ArrayView3<'a, f64>>,
@@ -235,9 +234,7 @@ pub fn build_sae_minimal_seed(
         request.target,
         initial_logits.view(),
         request.assignment_kind.tag(),
-        request
-            .ordered_beta_bernoulli_alpha_override
-            .unwrap_or(request.alpha),
+        request.alpha,
         request.tau,
         request.threshold,
         request.top_k,
@@ -275,7 +272,6 @@ mod tests {
             tau: 1.0,
             threshold: 0.0,
             top_k: None,
-            ordered_beta_bernoulli_alpha_override: None,
             random_state: 0,
             initial_logits: None,
             initial_coords: None,

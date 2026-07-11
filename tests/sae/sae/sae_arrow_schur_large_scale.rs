@@ -73,7 +73,7 @@ fn build_fixture(
             // Diagonal-dominant → PD.
             smooth[[i, i]] = 0.1 + 0.01 * lcg_f64(&mut rng).abs();
         }
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("atom_{_k}"),
             SaeAtomBasisKind::EuclideanPatch,
             d,

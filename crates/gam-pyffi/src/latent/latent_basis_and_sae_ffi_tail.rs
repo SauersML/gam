@@ -2,7 +2,7 @@
 /// ...scalar hyperparams)` and assembles the full basis + jacobian + penalty
 /// stack + PCA seed coords + zero-init decoder + zero-init logits internally
 /// before delegating to the same end-to-end Rust Newton loop as
-/// [`sae_manifold_fit`]. Returns the same payload dict with one extra key,
+/// the native fit orchestration. Returns the raw native fit payload with
 /// `"atom_plans"`, holding the per-atom basis spec so OOS prediction can
 /// rebuild the design without going through Python.
 ///
@@ -11,42 +11,6 @@
 /// coordinates / zero-jitter logit initialization. The basis *design* (Duchon centers, harmonic
 /// counts) is still derived from the PCA seed so the warm coordinates are
 /// evaluated against the same atom geometry the unconstrained fit would build.
-#[pyfunction(signature = (
-    z,
-    atom_basis,
-    atom_dim,
-    alpha,
-    tau,
-    learnable_alpha,
-    assignment_kind,
-    sparsity_strength = 1.0,
-    smoothness = 1.0,
-    max_iter = 50,
-    learning_rate = 0.05,
-    ridge_ext_coord = 1.0e-6,
-    ridge_beta = 1.0e-6,
-    gumbel_schedule = None,
-    analytic_penalties = None,
-    random_state = 0,
-    top_k = None,
-    initial_logits = None,
-    initial_coords = None,
-    threshold_gate_threshold = 0.0,
-    native_ard_enabled = true,
-    fisher_factors = None,
-    fisher_mass_residual = None,
-    fisher_provenance = None,
-    row_loss_weights = None,
-    separation_barrier_strength_override = None,
-    ordered_beta_bernoulli_alpha_override = None,
-    // #2239 magic-by-default: evidence-certified residual structure is promoted
-    // to the primary tier by default (the certificate gates the birth; the
-    // alternation self-extends its pass budget only while lineages are live).
-    promote_from_residual = true,
-    run_structure_search = true,
-    run_outer_rho_search = true,
-    data_row_reseed = false,
-))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -83,14 +47,9 @@ fn sae_manifold_fit_minimal<'py>(
     // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
     // unweighted path. Installed on the term before the joint fit / ρ selection.
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    // Per-fit config (separation-barrier strength / ordered Beta--Bernoulli-α). `Some` pins this
-    // term's value; `None` selects the canonical data-derived or mode default.
+    // Per-fit separation-barrier configuration. `None` selects the native default.
     separation_barrier_strength_override: Option<f64>,
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
     promote_from_residual: bool,
-    run_structure_search: bool,
-    run_outer_rho_search: bool,
-    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     // Convert borrowed Python arrays into the typed library seed request.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -105,7 +64,6 @@ fn sae_manifold_fit_minimal<'py>(
         tau,
         threshold: threshold_gate_threshold,
         top_k,
-        ordered_beta_bernoulli_alpha_override,
         random_state,
         initial_logits: initial_logits.as_ref().map(|values| values.as_array()),
         initial_coords: initial_coords.as_ref().map(|values| values.as_array()),
@@ -157,20 +115,14 @@ fn sae_manifold_fit_minimal<'py>(
         native_ard_enabled,
         refine_routing,
         random_state,
-        // WP-D → fit wiring (#980): thread the optional output-Fisher shard
-        // through so the auto facade installs `RowMetric::OutputFisher` the same
-        // magic-by-default way as the precomputed-basis `sae_manifold_fit`.
-        // Absent ⇒ the bit-identical Euclidean path.
+        // WP-D → fit wiring (#980): the factor shard selects the native
+        // OutputFisher row metric; absence selects the Euclidean metric.
         fisher_u,
         fisher_mr,
         fisher_provenance.as_deref(),
         row_w,
         separation_barrier_strength_override,
-        ordered_beta_bernoulli_alpha_override,
         promote_from_residual,
-        run_structure_search,
-        run_outer_rho_search,
-        data_row_reseed,
     )?;
     // Post-search atom plans are emitted by the shared fit entry from the final
     // variable-K dictionary; the minimal binding never patches the payload.
@@ -523,11 +475,7 @@ fn sae_manifold_fit_model<'py>(
         fisher_provenance.clone(),
         row_loss_weights,
         separation_barrier_strength_override,
-        None,
         promote_from_residual,
-        true,
-        true,
-        false,
     )?;
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(
         raw.bind(py).as_any(),

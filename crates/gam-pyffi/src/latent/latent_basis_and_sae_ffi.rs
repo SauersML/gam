@@ -359,12 +359,11 @@ fn sae_set_penalized_loss_items(
         "criterion_gauge_deflated_directions",
         b.criterion_gauge_deflated_directions,
     )?;
-    // Honesty markers: this score is NOT a REML criterion; these evidence pieces
-    // are deliberately absent (#1231). Surfaced as `None` so a consumer that
-    // wants real evidence sees that it was not computed here, rather than reading
-    // the penalized loss as if it were the marginal likelihood.
+    // Honesty markers: this score is only the inner penalized loss; the custom
+    // quasi-Laplace pieces are deliberately absent. Surfaced as `None` so a
+    // consumer cannot mistake the penalized loss for the outer criterion.
     for missing in [
-        "logdet_hessian",
+        "logdet_factor",
         "occam_log_lambda",
         "extra_penalty_energy",
         "amortization_consistency",
@@ -1698,162 +1697,6 @@ fn structured_residual_pass_diagnostics_dict<'py>(
     Ok(out)
 }
 
-/// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
-/// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
-/// the per-atom [`SaeBasisSecondJet`] (analytic harmonic for `Periodic`
-/// `latent_dim == 1`, chart for `Sphere`, tensor harmonic for `Torus`; the
-/// radial+polynomial Duchon and monomial Euclidean evaluators refresh from the
-/// auto path that threads their metadata). This precomputed-basis entry point
-/// carries no Duchon centers, so a Duchon/precomputed atom here errors instead
-/// of freezing the seed snapshot. The smoothing / sparsity / ARD strengths
-/// (ρ) are selected automatically by the generic outer cascade driving the
-/// term's REML criterion — no per-call λ-grid.
-#[pyfunction(signature = (
-    z,
-    atom_basis,
-    atom_dim,
-    basis_values,
-    basis_jacobian,
-    basis_sizes,
-    decoder_coefficients,
-    smooth_penalties,
-    initial_logits,
-    initial_coords,
-    alpha,
-    tau,
-    learnable_alpha,
-    assignment_kind,
-    sparsity_strength = 1.0,
-    smoothness = 1.0,
-    max_iter = 12,
-    learning_rate = 1.0,
-    ridge_ext_coord = 1.0e-6,
-    ridge_beta = 1.0e-6,
-    gumbel_schedule = None,
-    analytic_penalties = None,
-    top_k = None,
-    threshold_gate_threshold = 0.0,
-    fisher_factors = None,
-    fisher_mass_residual = None,
-    fisher_provenance = None,
-    row_loss_weights = None,
-    separation_barrier_strength_override = None,
-    ordered_beta_bernoulli_alpha_override = None,
-    // #2239 magic-by-default: evidence-certified residual structure is promoted
-    // to the primary tier by default (the certificate gates the birth; the
-    // alternation self-extends its pass budget only while lineages are live).
-    promote_from_residual = true,
-    run_structure_search = true,
-    run_outer_rho_search = true,
-    data_row_reseed = false,
-))]
-fn sae_manifold_fit<'py>(
-    py: Python<'py>,
-    z: PyReadonlyArray2<'py, f64>,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
-    basis_values: PyReadonlyArray3<'py, f64>,
-    basis_jacobian: PyReadonlyArray4<'py, f64>,
-    basis_sizes: Vec<usize>,
-    decoder_coefficients: PyReadonlyArray3<'py, f64>,
-    smooth_penalties: PyReadonlyArray3<'py, f64>,
-    initial_logits: PyReadonlyArray2<'py, f64>,
-    initial_coords: PyReadonlyArray3<'py, f64>,
-    alpha: f64,
-    tau: f64,
-    learnable_alpha: bool,
-    assignment_kind: String,
-    sparsity_strength: f64,
-    smoothness: f64,
-    max_iter: usize,
-    learning_rate: f64,
-    ridge_ext_coord: f64,
-    ridge_beta: f64,
-    gumbel_schedule: Option<&Bound<'py, PyDict>>,
-    analytic_penalties: Option<String>,
-    top_k: Option<usize>,
-    threshold_gate_threshold: f64,
-    // WP-D output-Fisher shard (#980). `fisher_factors` is `(n, p, r)` f64 (the
-    // harvest shard's `U`); its presence activates `RowMetric::OutputFisher`. No
-    // flag — magic-by-default. `fisher_mass_residual` is the optional `(n,)`
-    // truncation diagnostic that rides into the report.
-    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
-    fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
-    // The harvest shard's provenance tag (#980): `"output_fisher"` (same-position,
-    // the default) or `"output_fisher_downstream"` (KV-path aggregate over future
-    // positions). Selects which output-Fisher `RowMetric` is installed; the gauge
-    // / lens / dose consume either unchanged. Ignored when no shard is supplied.
-    fisher_provenance: Option<String>,
-    // Per-row design-honesty reconstruction weights (#977); `(n,)` √w. Absent ⇒
-    // unweighted path. Installed on the term before the joint fit / ρ selection.
-    row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
-    // Per-fit config (separation-barrier strength / ordered Beta--Bernoulli-α). `Some` pins this
-    // term's value; `None` selects the canonical data-derived or mode default.
-    separation_barrier_strength_override: Option<f64>,
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
-    promote_from_residual: bool,
-    run_structure_search: bool,
-    run_outer_rho_search: bool,
-    data_row_reseed: bool,
-) -> PyResult<Py<PyDict>> {
-    // The precomputed-basis entry point carries no Duchon centers / kernel
-    // metadata, so any basis kind whose refresh needs them cannot re-evaluate
-    // `Phi(t)` at updated coordinates. Pass empty per-atom centers; the
-    // evaluator builder errors for such kinds (rather than silently freezing
-    // the seed snapshot). Kinds with an analytic, centers-free basis
-    // (periodic, sphere, torus) refresh as usual.
-    let atom_centers: Vec<Option<Array2<f64>>> = vec![None; atom_basis.len()];
-    // Validate the strict canonical assignment token before the inner driver parses it.
-    let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
-    let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
-    let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
-    let row_w = row_loss_weights.as_ref().map(|w| w.as_array());
-    sae_manifold_fit_inner(
-        py,
-        z.as_array(),
-        &atom_basis,
-        atom_dim,
-        &atom_centers,
-        basis_values.as_array(),
-        basis_jacobian.as_array(),
-        basis_sizes,
-        decoder_coefficients.as_array(),
-        smooth_penalties.as_array(),
-        initial_logits.as_array(),
-        initial_coords.as_array(),
-        alpha,
-        tau,
-        learnable_alpha,
-        assignment_kind,
-        sparsity_strength,
-        smoothness,
-        max_iter,
-        learning_rate,
-        ridge_ext_coord,
-        ridge_beta,
-        gumbel_schedule,
-        analytic_penalties,
-        top_k,
-        threshold_gate_threshold,
-        true,
-        // This precomputed-basis entry point hands the term verbatim seeds;
-        // routing-seed refinement is owned by the higher-level `fit_minimal`
-        // auto path, so do not re-seed here (random_state unused when off).
-        false,
-        0,
-        fisher_u,
-        fisher_mr,
-        fisher_provenance.as_deref(),
-        row_w,
-        separation_barrier_strength_override,
-        ordered_beta_bernoulli_alpha_override,
-        promote_from_residual,
-        run_structure_search,
-        run_outer_rho_search,
-        data_row_reseed,
-    )
-}
-
 fn sae_manifold_fit_inner<'py>(
     py: Python<'py>,
     z_view: ArrayView2<'_, f64>,
@@ -1902,15 +1745,9 @@ fn sae_manifold_fit_inner<'py>(
     // scales every per-row reconstruction loss before the inner joint fit and
     // outer ρ selection. Uniform / absent ⇒ the bit-identical unweighted path.
     row_loss_weights: Option<ArrayView1<'_, f64>>,
-    // Per-fit config. `Some(x)` pins this term's separation-barrier strength /
-    // ordered Beta--Bernoulli-α to `x` via `SaeManifoldTerm::set_fit_config`; `None` selects the
-    // canonical data-derived or mode default.
+    // Per-fit separation barrier. `None` selects the native data-derived default.
     separation_barrier_strength_override: Option<f64>,
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
     promote_from_residual: bool,
-    run_structure_search: bool,
-    run_outer_rho_search: bool,
-    data_row_reseed: bool,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -1984,10 +1821,10 @@ fn sae_manifold_fit_inner<'py>(
         native_ard_enabled,
         seed_refine_routing,
         seed_refine_random_state,
-        data_row_reseed,
+        data_row_reseed: false,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override,
+            ordered_beta_bernoulli_alpha_override: None,
         },
         temperature_schedule,
         fisher_metric,
@@ -2020,8 +1857,8 @@ fn sae_manifold_fit_inner<'py>(
         isometry_pin_active,
         metric_provenance,
         promote_from_residual,
-        run_structure_search,
-        run_outer_rho_search,
+        run_structure_search: true,
+        run_outer_rho_search: true,
         structured_residual_passes: None,
         cancel: Some(std::sync::Arc::clone(&cancel_flag)),
     };
@@ -2255,14 +2092,14 @@ fn sae_manifold_fit_inner<'py>(
     )?;
     // #1026 — the load-bearing curved-vs-linear hybrid-split verdict: per d=1
     // atom, whether its fitted curved image beats its straight (linear
-    // special-case) secant on the common Laplace evidence scale. Present
+    // special-case) secant on the common rank-aware quasi-Laplace scale. Present
     // whenever the post-fit pass adjudicated at least one eligible atom; absent
     // for dictionaries with no eligible d=1 atom (nothing to split).
     if let Some(report) = term.hybrid_split_report() {
         out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
     }
     // #1154 — post-fit amortized-encoder diagnostics. The outer ρ-cascade ranks
-    // the pure REML criterion; encoder consistency is deliberately excluded from
+    // the pure custom quasi-Laplace criterion; encoder consistency is deliberately excluded from
     // fitting/ranking because it has no matching analytic ρ gradient. Here we
     // measure, at the settled dictionary, how faithfully the cheap initializer
     // approximates the exact encode-by-inner-solve map:
@@ -2987,102 +2824,6 @@ fn sae_incoherence_report_dict<'py>(
     d.set_item("global_optimality_margin", margin)?;
     d.set_item("note", report.note.clone())?;
     Ok(d)
-}
-
-#[pyfunction(signature = (
-    z,
-    atom_basis,
-    atom_dim,
-    basis_values,
-    basis_jacobian,
-    basis_sizes,
-    decoder_coefficients,
-    smooth_penalties,
-    initial_logits,
-    initial_coords,
-    alpha,
-    tau,
-    learnable_alpha,
-    sparsity_strength = 1.0,
-    smoothness = 1.0,
-    max_iter = 12,
-    learning_rate = 1.0,
-    ridge_ext_coord = 1.0e-6,
-    ridge_beta = 1.0e-6,
-    gumbel_schedule = None,
-    analytic_penalties = None,
-))]
-fn sae_manifold_fit_ordered_beta_bernoulli<'py>(
-    py: Python<'py>,
-    z: PyReadonlyArray2<'py, f64>,
-    atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
-    basis_values: PyReadonlyArray3<'py, f64>,
-    basis_jacobian: PyReadonlyArray4<'py, f64>,
-    basis_sizes: Vec<usize>,
-    decoder_coefficients: PyReadonlyArray3<'py, f64>,
-    smooth_penalties: PyReadonlyArray3<'py, f64>,
-    initial_logits: PyReadonlyArray2<'py, f64>,
-    initial_coords: PyReadonlyArray3<'py, f64>,
-    alpha: f64,
-    tau: f64,
-    learnable_alpha: bool,
-    sparsity_strength: f64,
-    smoothness: f64,
-    max_iter: usize,
-    learning_rate: f64,
-    ridge_ext_coord: f64,
-    ridge_beta: f64,
-    gumbel_schedule: Option<&Bound<'py, PyDict>>,
-    analytic_penalties: Option<String>,
-) -> PyResult<Py<PyDict>> {
-    sae_manifold_fit(
-        py,
-        z,
-        atom_basis,
-        atom_dim,
-        basis_values,
-        basis_jacobian,
-        basis_sizes,
-        decoder_coefficients,
-        smooth_penalties,
-        initial_logits,
-        initial_coords,
-        alpha,
-        tau,
-        learnable_alpha,
-        "ordered_beta_bernoulli".to_string(),
-        sparsity_strength,
-        smoothness,
-        max_iter,
-        learning_rate,
-        ridge_ext_coord,
-        ridge_beta,
-        gumbel_schedule,
-        analytic_penalties,
-        None,
-        // ordered Beta--Bernoulli-MAP never reaches the JumpReLU dispatch; threshold is inert here.
-        0.0,
-        // No output-Fisher shard on this convenience ordered Beta--Bernoulli entry point; the
-        // metric stays Euclidean (the precomputed-basis `sae_manifold_fit` and
-        // the auto `sae_manifold_fit_minimal` entry points carry the shard).
-        None,
-        None,
-        None,
-        // No per-row design-honesty weights on this convenience ordered Beta--Bernoulli entry point.
-        None,
-        // No explicit separation-barrier / ordered Beta--Bernoulli-α values on this convenience ordered Beta--Bernoulli
-        // entry point: use their canonical data-derived and assignment defaults.
-        None,
-        None,
-        // Residual promotion stays disabled for this narrow convenience entry;
-        // canonical structured whitening and rank charge are unconditional in
-        // the shared core.
-        false,
-        true,
-        true,
-        false,
-    )
 }
 
 ///

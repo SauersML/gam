@@ -23,7 +23,7 @@
 //! CERTIFICATE (public API only, survives refactors of the private solver): the
 //! full analytic outer-ρ gradient — explicit + direct log-det traces + Occam +
 //! the implicit-state correction — must match a centered finite difference of the
-//! ACTUAL REML criterion (the inner problem is re-solved at each perturbed ρ, so
+//! actual custom quasi-Laplace criterion (the inner problem is re-solved at each perturbed ρ, so
 //! the FD carries the true envelope/IFT terms governed by `A`). The fixture is
 //! deliberately built with a LARGE, unmodellable residual at the inner optimum on
 //! a curved (periodic-harmonic) basis, so the dropped residual curvature
@@ -138,7 +138,7 @@ fn high_residual_curvature_fixture(mode: AssignmentMode, log_lambda_sparse: f64)
         // genuine λ_smooth gradient channel exists.
         let mut smooth = Array2::<f64>::eye(m);
         smooth[[0, 0]] = 0.0;
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!("circle_{atom_idx}"),
             SaeAtomBasisKind::Periodic,
             1,
@@ -189,7 +189,7 @@ fn evaluate(
             1.0e-6,
             1.0e-6,
         )
-        .unwrap_or_else(|err| panic!("REML criterion failed: {err}"));
+        .unwrap_or_else(|err| panic!("quasi-Laplace criterion failed: {err}"));
     (term, value, loss, cache)
 }
 
@@ -213,7 +213,7 @@ fn centered_fd(
 }
 
 /// The full analytic outer-ρ gradient must match a centered finite difference of
-/// the actual re-solved REML criterion. The FD is the ground truth for the IFT
+/// the actual re-solved quasi-Laplace criterion. The FD is the ground truth for the IFT
 /// step: it differentiates the value through the inner re-solve, so it carries
 /// the exact stationarity Jacobian `A`. The analytic path matches it ONLY if its
 /// implicit correction also uses `A` (the #1418 fix) and not the surrogate `B`.

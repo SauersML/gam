@@ -98,8 +98,8 @@ fn logdet_audit_point(
     let d_eff = term.per_atom_realised_rank_dof(rho, dispersion)?;
     let n_eff = term.per_atom_effective_sample_size();
     let log_det_tt = super::construction::coordinate_block_log_det(&cache)?;
-    let laplace_complexity =
-        super::construction::rank_adjusted_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
+    let quasi_laplace_complexity =
+        super::construction::rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
     let occam = term.reml_occam_term(rho)?;
     let extra_penalty_energy = term
         .reml_extra_penalty_value_total(registry)
@@ -122,7 +122,7 @@ fn logdet_audit_point(
         .map_err(|err| err.to_string());
     let criterion = SaeCriterion::assemble(
         loss.total() + extra_penalty_energy,
-        laplace_complexity,
+        quasi_laplace_complexity,
         occam,
         components.explicit.clone(),
         components.logdet_trace.clone(),

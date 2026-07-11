@@ -156,59 +156,6 @@ pub(crate) fn py_any_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
-/// Python bridge for the complete dictionary's structural chart periods.
-#[pyfunction]
-pub(crate) fn sae_coordinate_periods(
-    basis_kinds: Vec<String>,
-    atom_dims: Vec<usize>,
-) -> PyResult<Vec<Vec<Option<f64>>>> {
-    if basis_kinds.len() != atom_dims.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "basis_kinds and atom_dims must have equal length; got {} and {}",
-            basis_kinds.len(),
-            atom_dims.len()
-        )));
-    }
-    basis_kinds
-        .iter()
-        .zip(atom_dims)
-        .map(|(basis, dim)| coordinate_periods_for_basis(basis, dim))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
-/// Python bridge for [`canonical_assignment_kind`].
-#[pyfunction]
-pub(crate) fn sae_canonical_assignment_kind(kind: &str) -> PyResult<String> {
-    canonical_assignment_kind(kind)
-        .map(str::to_string)
-        .map_err(pyo3::exceptions::PyValueError::new_err)
-}
-
-/// Python bridge for [`canonical_basis_kind`].
-#[pyfunction]
-pub(crate) fn sae_canonical_basis_kind(name: &str) -> String {
-    canonical_basis_kind(name)
-}
-
-/// Python bridge for [`basis_kind_for_topology`].
-#[pyfunction]
-pub(crate) fn sae_basis_kind_for_topology(name: &str) -> String {
-    basis_kind_for_topology(name)
-}
-
-/// Python bridge for [`basis_to_topology`].
-#[pyfunction]
-pub(crate) fn sae_topology_for_basis(name: &str) -> String {
-    basis_to_topology(name)
-}
-
-/// Python bridge for [`canonical_topology`].
-#[pyfunction]
-pub(crate) fn sae_canonical_topology(name: &str) -> String {
-    canonical_topology(name)
-}
-
 /// Python bridge for [`flat_block_assignment`].
 #[pyfunction]
 pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {

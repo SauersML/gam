@@ -235,7 +235,7 @@ fn circle_term(
     let behavior = BehaviorBlock::fit(probs, p_x, 0.0)?;
     let p_tot = p_x + behavior.behavior_dim();
     let basis_size = evaluator.basis_size();
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "qwen_weekday_circle",
         SaeAtomBasisKind::Periodic,
         1,

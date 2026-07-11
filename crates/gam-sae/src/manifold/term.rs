@@ -362,18 +362,16 @@ pub struct SaeManifoldTerm {
     /// the design's selection bias is removed (oversampled loud rows are
     /// downweighted back).
     ///
-    /// The weights enter the objective as a per-row scalar metric `w_i · I_p`
-    /// on the reconstruction channel ONLY, realized as a `√w_i` scaling of the
+    /// The weights enter the reconstruction as a per-row scalar metric `w_i · I_p`,
+    /// realized as a `√w_i` scaling of the
     /// per-row residual, latent Jacobian, and β basis load at their single
     /// construction sites in the assembly — so the data-fit value, the t-block
     /// Gauss-Newton, the β gradient/Gram, and the cross blocks all carry
     /// exactly one factor of `w_i` and cannot desync (the same discipline as
-    /// the #974 whitening seam). Per-row latent priors (assignment prior, ARD
-    /// coordinate prior) are deliberately NOT weighted: included rows' latent
-    /// states are genuine model components of the subsampled model,
-    /// conditional on inclusion; the HT correction applies to the row
-    /// *evidence* about shared structure (decoder β, ρ), not to the latent
-    /// priors. `None` ⇒ the exact unweighted path, bit-for-bit.
+    /// the #974 whitening seam). Per-row assignment and ARD priors use the same
+    /// population measure: row-separable terms carry `w_i`, while the integrated
+    /// ordered Beta--Bernoulli prior uses `M_k = Σ_i w_i z_ik` and
+    /// `N_eff = Σ_i w_i`. `None` selects unit row weights.
     pub(crate) row_loss_weights: Option<Vec<f64>>,
     /// #2231 crosscoder block-relevance pricing spans `(p_x, block_dims)` in
     /// stacked-column order, installed by
@@ -691,7 +689,8 @@ impl Clone for SaeManifoldTerm {
             expected_criterion_gauge_deflated_directions: self
                 .expected_criterion_gauge_deflated_directions,
             criterion_gauge_deflation_reanchors: self.criterion_gauge_deflation_reanchors,
-            criterion_gauge_deflation_last_delta_sign: self.criterion_gauge_deflation_last_delta_sign,
+            criterion_gauge_deflation_last_delta_sign: self
+                .criterion_gauge_deflation_last_delta_sign,
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             // Transient in-fit multi-start incumbent — not part of the persisted
             // term identity (like `border_hbb_workspace`); a fresh clone starts

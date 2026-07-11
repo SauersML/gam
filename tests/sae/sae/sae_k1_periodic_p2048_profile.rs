@@ -73,7 +73,7 @@ fn build_term(z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
     let z_owned = z.to_owned();
     let xtz = fast_atb(&phi, &z_owned);
     let decoder = xtx.cholesky(FaerSide::Lower).unwrap().solve_mat(&xtz);
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "circle",
         SaeAtomBasisKind::Periodic,
         1,

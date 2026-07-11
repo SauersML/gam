@@ -448,7 +448,7 @@ fn build_cold_term(
     for (ai, slot) in slots.iter().enumerate() {
         let m_k = slot.kind.basis_size();
         let b = decoder.slice(s![ai, 0..m_k, ..]).to_owned();
-        let atom = SaeManifoldAtom::new(
+        let atom = SaeManifoldAtom::new_with_provided_function_gram(
             format!(
                 "{}_{ai}",
                 match slot.kind {

@@ -372,7 +372,7 @@ fn planted_sphere(chart: Chart) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho
     }
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("row basis");
 
-    let atom = SaeManifoldAtom::new(
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
         atom_name(chart),
         SaeAtomBasisKind::Sphere,
         D,

@@ -148,7 +148,7 @@ pub(crate) fn coordinate_block_log_det(cache: &ArrowFactorCache) -> Result<f64, 
 /// gradient has switched to the realised-rank charge. A zero realised rank is
 /// the categorical Laplace-invalid branch and therefore yields positive
 /// infinity, matching the production criterion contract.
-pub(crate) fn rank_adjusted_laplace_complexity(
+pub(crate) fn rank_adjusted_quasi_laplace_complexity(
     log_det: f64,
     log_det_tt: f64,
     d_eff: &[f64],
@@ -156,7 +156,7 @@ pub(crate) fn rank_adjusted_laplace_complexity(
 ) -> Result<f64, String> {
     if d_eff.len() != n_eff.len() {
         return Err(format!(
-            "rank_adjusted_laplace_complexity: d_eff length {} does not match N_eff length {}",
+            "rank_adjusted_quasi_laplace_complexity: d_eff length {} does not match N_eff length {}",
             d_eff.len(),
             n_eff.len()
         ));
@@ -166,7 +166,7 @@ pub(crate) fn rank_adjusted_laplace_complexity(
     }
     if !(log_det.is_finite() && log_det_tt.is_finite()) {
         return Err(format!(
-            "rank_adjusted_laplace_complexity: non-finite logdet input \
+            "rank_adjusted_quasi_laplace_complexity: non-finite logdet input \
              (joint={log_det}, coordinate={log_det_tt})"
         ));
     }
@@ -174,12 +174,12 @@ pub(crate) fn rank_adjusted_laplace_complexity(
     for (atom, (&dof, &occupancy)) in d_eff.iter().zip(n_eff.iter()).enumerate() {
         if !(dof.is_finite() && dof > 0.0) {
             return Err(format!(
-                "rank_adjusted_laplace_complexity: atom {atom} has invalid positive realised DOF {dof}"
+                "rank_adjusted_quasi_laplace_complexity: atom {atom} has invalid positive realised DOF {dof}"
             ));
         }
         if !(occupancy.is_finite() && occupancy >= 0.0) {
             return Err(format!(
-                "rank_adjusted_laplace_complexity: atom {atom} has invalid effective sample size {occupancy}"
+                "rank_adjusted_quasi_laplace_complexity: atom {atom} has invalid effective sample size {occupancy}"
             ));
         }
         rank_charge += 0.5 * dof * occupancy.max(1.0).ln();
@@ -189,7 +189,7 @@ pub(crate) fn rank_adjusted_laplace_complexity(
         Ok(value)
     } else {
         Err(format!(
-            "rank_adjusted_laplace_complexity: assembled non-finite value {value}"
+            "rank_adjusted_quasi_laplace_complexity: assembled non-finite value {value}"
         ))
     }
 }
@@ -890,7 +890,9 @@ impl SaeManifoldTerm {
     /// corrections of a designed corpus subsample (see the field docs on
     /// `row_loss_weights` for exactly where they enter the objective).
     ///
-    /// Weights must be finite and strictly positive, one per term row. They
+    /// Weights must be finite and nonnegative, with positive total mass and one
+    /// value per term row. Exact zeros represent rows excluded by a designed
+    /// estimation split; no numerical epsilon is substituted for zero. They
     /// are self-normalized to mean `1.0` here (only the *relative* design
     /// correction matters at the fitted sample size; the absolute `n/budget`
     /// scale would silently inflate the dispersion estimate against the
@@ -921,10 +923,12 @@ impl SaeManifoldTerm {
             self.row_loss_weights = None;
             return Ok(());
         }
-        if !weights.iter().all(|w| w.is_finite() && *w > 0.0) {
+        if !weights.iter().all(|w| w.is_finite() && *w >= 0.0)
+            || !weights.iter().any(|w| *w > 0.0)
+        {
             return Err(
-                "SaeManifoldTerm::set_row_loss_weights: weights must be finite and strictly \
-                 positive"
+                "SaeManifoldTerm::set_row_loss_weights: weights must be finite, nonnegative, \
+                 and contain positive total mass"
                     .to_string(),
             );
         }
@@ -4001,7 +4005,7 @@ impl SaeManifoldTerm {
     /// added term
     ///
     /// ```text
-    ///   J_cotrain(ρ) = penalized_LAML(ρ) + w · ‖x̂_amortized − x̂_exact‖²/(n·p)
+    ///   J_cotrain(ρ) = penalized_quasi_laplace(ρ) + w · ‖x̂_amortized − x̂_exact‖²/(n·p)
     ///                            +  w_conv · unconverged_fraction
     /// ```
     ///
@@ -4055,7 +4059,7 @@ impl SaeManifoldTerm {
     /// route through THIS function, so the folded objective cannot drift between
     /// the criterion and the cascade-ranked cost (the objective↔gradient desync
     /// bug class). The weights are auto-scaled to the penalized quasi-Laplace magnitude
-    /// (`max(|penalized_LAML|,
+    /// (`max(|penalized_quasi_laplace|,
     /// 1)`) so the penalty is a bounded, scale-free fraction of the objective
     /// regardless of problem scale; the fold carries no analytic gradient (under
     /// Design A the penalized quasi-Laplace λ-gradient stays the exact implicit-function path).
