@@ -593,7 +593,11 @@ mod laziness_gate_tests {
         // the gate does not change behaviour for genuinely GPU-sized problems.
         // The returned handle is irrelevant here (None on CPU-only boxes);
         // the observable is the consultation count below.
-        let _ = GpuRuntime::global_if_dense_work_exceeds_floor(u128::MAX);
+        let runtime = GpuRuntime::global_if_dense_work_exceeds_floor(u128::MAX);
+        assert!(
+            runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
+            "a successful global runtime probe must expose at least one usable device"
+        );
         assert_eq!(
             GpuRuntime::global_call_count(),
             before + 1,
@@ -612,7 +616,11 @@ mod laziness_gate_tests {
         assert!(GpuRuntime::global_if_dense_work_exceeds_floor(floor - 1).is_none());
         assert_eq!(GpuRuntime::global_call_count(), before);
         // At the floor the gate must consult the runtime (fall through).
-        let _ = GpuRuntime::global_if_dense_work_exceeds_floor(floor);
+        let runtime = GpuRuntime::global_if_dense_work_exceeds_floor(floor);
+        assert!(
+            runtime.is_none_or(|runtime| !runtime.devices.is_empty()),
+            "a successful floor-boundary probe must expose at least one usable device"
+        );
         assert_eq!(GpuRuntime::global_call_count(), before + 1);
     }
 }

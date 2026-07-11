@@ -1014,9 +1014,11 @@ mod pre_probe_gate_tests {
         };
         assert!(big.admissible_under_any_policy());
         let before = GpuRuntime::global_call_count();
-        // Discard the routing result; this test asserts only the fall-through
-        // side effect (that an admissible op reached GpuRuntime::global()).
-        let _ = route_through_gpu(big);
+        let routed = route_through_gpu(big);
+        assert!(
+            routed.is_none_or(|runtime| !runtime.devices.is_empty()),
+            "a routed operation must receive a runtime with at least one usable device"
+        );
         assert!(
             GpuRuntime::global_call_count() > before,
             "an admissible op must fall through to GpuRuntime::global()"
