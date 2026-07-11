@@ -47,9 +47,11 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 /// Apply the standard workflow's per-term adaptive spatial resolution plan.
 ///
 /// Eligibility (never clobber a pinned basis):
-/// * spatial radial family only (thin-plate / Duchon / Matérn / constant-curvature
-///   / measure-jet); ordinary 1-D `s(x)` P-splines are a different basis and
-///   remain untouched, while an explicitly radial 1-D basis is evidence-sized;
+/// * spatial radial families with a validated saturation contract (thin-plate /
+///   Duchon / constant-curvature / measure-jet); Matérn has a separately learned
+///   kernel range whose basin and numerical rank both move with the center count,
+///   so it retains its established full/default count until a Matérn-specific
+///   saturation proof exists; ordinary 1-D `s(x)` P-splines are also untouched;
 /// * the current strategy must retain [`CenterStrategy::Auto`] provenance;
 ///   every explicit formula/programmatic strategy is therefore left alone;
 /// Python `smooths={...}` overrides are applied by the caller AFTER this, so they
@@ -124,14 +126,6 @@ fn spatial_center_strategy_mut(
             Some((&mut spec.center_strategy, cols))
         }
         B::Duchon {
-            feature_cols,
-            spec,
-            input_scales: _,
-        } => {
-            let cols = feature_cols.clone();
-            Some((&mut spec.center_strategy, cols))
-        }
-        B::Matern {
             feature_cols,
             spec,
             input_scales: _,

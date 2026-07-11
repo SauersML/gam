@@ -265,12 +265,10 @@ pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool>
                 !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
             }
-            B::Matern {
-                feature_cols, spec, ..
-            } => {
-                !feature_cols.is_empty()
-                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
-            }
+            // Matérn's learned range changes both its basin and realized kernel
+            // rank as centers move. It has no validated EDF-saturation growth
+            // theorem yet, so the generic radial grow loop must not claim it.
+            B::Matern { .. } => false,
             B::ConstantCurvature { feature_cols, spec } => {
                 !feature_cols.is_empty()
                     && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
@@ -307,11 +305,7 @@ pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<O
             } if !feature_cols.is_empty() => {
                 Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
             }
-            B::Matern {
-                feature_cols, spec, ..
-            } if !feature_cols.is_empty() => {
-                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
-            }
+            B::Matern { .. } => None,
             B::ConstantCurvature { feature_cols, spec } if !feature_cols.is_empty() => {
                 Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
             }

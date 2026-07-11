@@ -876,90 +876,123 @@ fn univariate_radial_workflow_dataset() -> Dataset {
 
 fn planned_radial_centers(basis: &SmoothBasisSpec) -> (usize, bool) {
     match basis {
-        SmoothBasisSpec::Matern {
-            feature_cols, spec, ..
-        } => (
-            spec.center_strategy.planned_num_centers(feature_cols.len()),
-            center_strategy_is_auto(&spec.center_strategy),
-        ),
         SmoothBasisSpec::Duchon {
             feature_cols, spec, ..
         } => (
             spec.center_strategy.planned_num_centers(feature_cols.len()),
             center_strategy_is_auto(&spec.center_strategy),
         ),
-        other => panic!("expected Matérn or Duchon basis, got {other:?}"),
+        other => panic!("expected Duchon basis, got {other:?}"),
     }
 }
 
 #[test]
-fn adaptive_univariate_radial_start_preserves_formula_floor_and_applies_growth_1867() {
+fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1867() {
     let data = univariate_radial_workflow_dataset();
 
-    for (label, formula) in [("Matérn", "y ~ matern(x)"), ("Duchon", "y ~ duchon(x)")] {
-        let raw = materialize(formula, &data, &FitConfig::default())
-            .unwrap_or_else(|error| panic!("raw {label} materialization failed: {error}"));
-        let FitRequest::Standard(raw_request) = raw.request else {
-            panic!("expected standard {label} request");
-        };
-        let (raw_centers, raw_is_auto) =
-            planned_radial_centers(&raw_request.spec.smooth_terms[0].basis);
-        assert!(
-            raw_is_auto,
-            "implicit {label} centers must retain Auto provenance"
-        );
-        assert!(
-            raw_centers > starting_num_centers(data.values.nrows(), 1),
-            "{label} formula default must retain its derived univariate resolution floor"
-        );
+    let label = "Duchon";
+    let formula = "y ~ duchon(x)";
+    let raw = materialize(formula, &data, &FitConfig::default())
+        .unwrap_or_else(|error| panic!("raw {label} materialization failed: {error}"));
+    let FitRequest::Standard(raw_request) = raw.request else {
+        panic!("expected standard {label} request");
+    };
+    let (raw_centers, raw_is_auto) =
+        planned_radial_centers(&raw_request.spec.smooth_terms[0].basis);
+    assert!(
+        raw_is_auto,
+        "implicit {label} centers must retain Auto provenance"
+    );
+    assert!(
+        raw_centers > starting_num_centers(data.values.nrows(), 1),
+        "{label} formula default must retain its derived univariate resolution floor"
+    );
 
-        let initial_config = FitConfig {
-            spatial_center_counts: Some(Vec::new()),
-            ..FitConfig::default()
-        };
-        let initial = materialize(formula, &data, &initial_config).unwrap_or_else(|error| {
-            panic!("initial adaptive {label} materialization failed: {error}")
-        });
-        let FitRequest::Standard(initial_request) = initial.request else {
-            panic!("expected standard adaptive {label} request");
-        };
-        let (initial_centers, initial_is_auto) =
-            planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
-        assert_eq!(
-            initial_centers, raw_centers,
-            "an absent adaptive proposal must preserve the canonical 1-D {label} formula resolution"
-        );
-        assert!(
-            initial_is_auto,
-            "adaptive {label} centers must retain Auto provenance"
-        );
+    let initial_config = FitConfig {
+        spatial_center_counts: Some(Vec::new()),
+        ..FitConfig::default()
+    };
+    let initial = materialize(formula, &data, &initial_config)
+        .unwrap_or_else(|error| panic!("initial adaptive {label} materialization failed: {error}"));
+    let FitRequest::Standard(initial_request) = initial.request else {
+        panic!("expected standard adaptive {label} request");
+    };
+    let (initial_centers, initial_is_auto) =
+        planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
+    assert_eq!(
+        initial_centers, raw_centers,
+        "an absent adaptive proposal must preserve the canonical 1-D {label} formula resolution"
+    );
+    assert!(
+        initial_is_auto,
+        "adaptive {label} centers must retain Auto provenance"
+    );
 
-        let proposed_centers = raw_centers.saturating_mul(2).min(data.values.nrows());
-        assert!(
-            proposed_centers > raw_centers,
-            "test data must leave room for a genuine {label} growth proposal"
-        );
-        let growth_config = FitConfig {
-            spatial_center_counts: Some(vec![Some(proposed_centers)]),
+    let proposed_centers = raw_centers.saturating_mul(2).min(data.values.nrows());
+    assert!(
+        proposed_centers > raw_centers,
+        "test data must leave room for a genuine {label} growth proposal"
+    );
+    let growth_config = FitConfig {
+        spatial_center_counts: Some(vec![Some(proposed_centers)]),
+        ..FitConfig::default()
+    };
+    let grown = materialize(formula, &data, &growth_config)
+        .unwrap_or_else(|error| panic!("grown adaptive {label} materialization failed: {error}"));
+    let FitRequest::Standard(grown_request) = grown.request else {
+        panic!("expected grown standard {label} request");
+    };
+    let (grown_centers, grown_is_auto) =
+        planned_radial_centers(&grown_request.spec.smooth_terms[0].basis);
+    assert_eq!(
+        grown_centers, proposed_centers,
+        "an explicit adaptive {label} growth proposal must remain authoritative"
+    );
+    assert!(
+        grown_is_auto,
+        "grown {label} centers must retain Auto provenance"
+    );
+}
+
+#[test]
+fn matern_is_excluded_from_generic_adaptive_center_growth() {
+    let data = univariate_radial_workflow_dataset();
+    let formula = "y ~ matern(x)";
+    let raw = materialize(formula, &data, &FitConfig::default()).expect("raw Matérn request");
+    let FitRequest::Standard(raw_request) = raw.request else {
+        panic!("expected standard Matérn request");
+    };
+    let SmoothBasisSpec::Matern { spec: raw_spec, .. } =
+        &raw_request.spec.smooth_terms[0].basis
+    else {
+        panic!("expected Matérn basis");
+    };
+    let raw_centers = raw_spec.center_strategy.planned_num_centers(1);
+
+    let adaptive = materialize(
+        formula,
+        &data,
+        &FitConfig {
+            spatial_center_counts: Some(vec![Some(raw_centers.saturating_mul(2))]),
             ..FitConfig::default()
-        };
-        let grown = materialize(formula, &data, &growth_config).unwrap_or_else(|error| {
-            panic!("grown adaptive {label} materialization failed: {error}")
-        });
-        let FitRequest::Standard(grown_request) = grown.request else {
-            panic!("expected grown standard {label} request");
-        };
-        let (grown_centers, grown_is_auto) =
-            planned_radial_centers(&grown_request.spec.smooth_terms[0].basis);
-        assert_eq!(
-            grown_centers, proposed_centers,
-            "an explicit adaptive {label} growth proposal must remain authoritative"
-        );
-        assert!(
-            grown_is_auto,
-            "grown {label} centers must retain Auto provenance"
-        );
-    }
+        },
+    )
+    .expect("Matérn request with generic adaptive proposal");
+    let FitRequest::Standard(adaptive_request) = adaptive.request else {
+        panic!("expected standard Matérn request");
+    };
+    let SmoothBasisSpec::Matern {
+        spec: adaptive_spec,
+        ..
+    } = &adaptive_request.spec.smooth_terms[0].basis
+    else {
+        panic!("expected Matérn basis");
+    };
+    assert_eq!(
+        adaptive_spec.center_strategy.planned_num_centers(1),
+        raw_centers,
+        "generic EDF saturation proposals must not rewrite Matérn center topology"
+    );
 }
 
 #[test]
