@@ -92,6 +92,7 @@ fn matern_2d_spec(num_centers: usize) -> TermCollectionSpec {
 
 fn fit_options() -> FitOptions {
     FitOptions {
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

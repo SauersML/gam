@@ -225,6 +225,7 @@ fn bug_projected_kkt_residual_identity_not_satisfied() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -402,6 +403,7 @@ fn bug_inner_newton_accepts_non_monotone_step() {
             InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

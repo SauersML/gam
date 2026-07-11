@@ -95,6 +95,7 @@ fn second_difference_penalty(k: usize) -> Array2<f64> {
 
 fn logit_fit_options(nullspace_dims: Vec<usize>, firth: bool) -> FitOptions {
     FitOptions {
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

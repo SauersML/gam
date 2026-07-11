@@ -114,6 +114,7 @@ fn simulate(n: usize) -> (Array2<f64>, Array1<f64>) {
 
 fn fit_options(skip_rho_posterior_inference: bool) -> FitOptions {
     FitOptions {
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

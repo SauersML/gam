@@ -137,6 +137,7 @@ fn large_scale_dense_logit_regression_guard() {
             InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

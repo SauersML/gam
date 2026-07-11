@@ -253,6 +253,7 @@ fn duchon_gaussian_smooth_baseline_is_fast() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

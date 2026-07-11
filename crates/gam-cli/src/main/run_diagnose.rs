@@ -152,6 +152,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
     } else {
         let fit_options = FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

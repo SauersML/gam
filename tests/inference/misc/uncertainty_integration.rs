@@ -62,6 +62,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         &[dense_penalty(s.clone())],
         gaussian_identity_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -306,6 +307,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         &[dense_penalty(s)],
         binomial_likelihood(StandardLink::Logit),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -422,6 +424,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
         &[dense_penalty(s)],
         gaussian_identity_likelihood(),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -582,6 +585,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         &[dense_penalty(s)],
         binomial_likelihood(StandardLink::Logit),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

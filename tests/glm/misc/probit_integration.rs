@@ -42,6 +42,7 @@ fn probit_fit_and_predict_fast_integration() {
         &s_list,
         binomial_likelihood(StandardLink::Probit),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -256,6 +257,7 @@ fn cloglog_fit_and_predict_fast_integration() {
         &s_list,
         binomial_likelihood(StandardLink::CLogLog),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

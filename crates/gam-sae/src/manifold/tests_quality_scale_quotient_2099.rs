@@ -98,7 +98,7 @@ fn fit_circle(n: usize, p: usize, amp: f64) -> (SaeManifoldTerm, Array2<f64>, Sa
 fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
     let n = 128usize;
     let p = 12usize;
-    let (term, target, rho) = fit_circle(n, p, 3.0);
+    let (mut term, target, rho) = fit_circle(n, p, 3.0);
 
     let ev0 = term.dictionary_reconstruction_ev(target.view(), &rho).unwrap();
     let uniformity0 = term.coordinate_uniformity_aggregate();
@@ -112,15 +112,14 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
          ‖B‖={norm0:.4})"
     );
 
-    // Apply the scale gauge: decoder ↦ c·B and target ↦ c·T. On this tree this is
-    // the honest stand-in for the physical `exp(s)·B` redundancy.
+    // Apply the scale gauge IN PLACE: decoder ↦ c·B and target ↦ c·T. On this tree
+    // this is the honest stand-in for the physical `exp(s)·B` redundancy.
     let c = 1000.0_f64;
-    let mut scaled = term.clone();
-    scaled.atoms[0].decoder_coefficients.mapv_inplace(|v| v * c);
+    term.atoms[0].decoder_coefficients.mapv_inplace(|v| v * c);
     let scaled_target = &target * c;
 
     // Reconstruction scales by EXACTLY c.
-    let fitted1 = scaled.try_fitted_for_rho(&rho).unwrap();
+    let fitted1 = term.try_fitted_for_rho(&rho).unwrap();
     let mut max_img_defect = 0.0_f64;
     for (a, b) in fitted1.iter().zip(fitted0.iter()) {
         max_img_defect = max_img_defect.max((a - c * b).abs());
@@ -132,7 +131,7 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
     );
 
     // EV against the co-scaled target is BIT-invariant (scale cancels in the ratio).
-    let ev1 = scaled
+    let ev1 = term
         .dictionary_reconstruction_ev(scaled_target.view(), &rho)
         .unwrap();
     assert!(
@@ -142,12 +141,12 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
 
     // Coordinate-uniformity and per-atom occupancy read the latent/assignment, not
     // the magnitude — they must be byte-identical.
-    let uniformity1 = scaled.coordinate_uniformity_aggregate();
+    let uniformity1 = term.coordinate_uniformity_aggregate();
     assert_eq!(
         uniformity0, uniformity1,
         "coordinate-uniformity diagnostic must be invariant under decoder rescale"
     );
-    let occupancy1 = scaled.per_atom_effective_sample_size();
+    let occupancy1 = term.per_atom_effective_sample_size();
     assert_eq!(
         occupancy0, occupancy1,
         "per-atom occupancy must be invariant under decoder rescale"
@@ -155,7 +154,7 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
 
     // The decoder DIRECTION (unit-Frobenius shape) is unchanged — scale is confined
     // to the magnitude, which is exactly what the quotient factors out.
-    let b1 = &scaled.atoms[0].decoder_coefficients;
+    let b1 = &term.atoms[0].decoder_coefficients;
     let norm1 = b1.iter().map(|v| v * v).sum::<f64>().sqrt();
     let mut max_dir_defect = 0.0_f64;
     for (a, b) in b1.iter().zip(b0.iter()) {

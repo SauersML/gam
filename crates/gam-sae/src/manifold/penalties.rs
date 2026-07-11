@@ -2697,6 +2697,37 @@ mod tests_findings_234 {
         cross / (n0 * n1)
     }
 
+    /// #1610 — the Jeffreys separation barrier is DECODER-SCALE-INVARIANT: its
+    /// value reads only the scale-free overlap `o_jk` (a subspace cosine), the
+    /// frozen routing `q`, and the routing-derived softening `ε_C` — never a
+    /// decoder magnitude. Scaling EVERY atom's decoder by a common `s` must leave
+    /// the barrier value (and every gradient component's implied force direction)
+    /// exactly unchanged, because both `‖B_k‖²_F` and the data-derived active-norm
+    /// floor scale by `s²`, so the abstain set is invariant too. A regression that
+    /// reintroduced an ABSOLUTE norm floor (the pre-#1610 `1e-6²`) would silently
+    /// break this on a corpus whose natural decoder scale is small or large.
+    #[test]
+    fn separation_barrier_value_is_decoder_scale_invariant() {
+        let dec0 = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+        let dec1 = array![[0.9, 0.2], [0.1, 0.8], [0.0, 0.0]];
+        let base = two_atom_term_with_decoders(dec0.clone(), dec1.clone());
+        let (v0, _) = base.separation_barrier_value_and_grad_for_test(1.0);
+        assert!(v0 > 0.0, "fixture must carry a positive barrier, got {v0}");
+        for &s in &[0.01_f64, 100.0, 1.0e4] {
+            let scaled = two_atom_term_with_decoders(
+                dec0.mapv(|x| s * x),
+                dec1.mapv(|x| s * x),
+            );
+            let (vs, _) = scaled.separation_barrier_value_and_grad_for_test(1.0);
+            let rel = (vs - v0).abs() / (1.0 + v0.abs());
+            assert!(
+                rel < 1.0e-9,
+                "separation barrier value must be invariant under a common decoder \
+                 rescale by {s}: base={v0:.12e}, scaled={vs:.12e}, rel={rel:.3e}"
+            );
+        }
+    }
+
     /// #2 — the collinearity metric is now a TRUE rank-aware subspace overlap: two
     /// atoms sharing an IDENTICAL rank-2 output subspace score 1.0 (and trip BOTH
     /// the separation barrier and the decoder-repulsion gate), whereas the old

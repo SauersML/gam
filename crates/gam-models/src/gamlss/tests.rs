@@ -4027,22 +4027,6 @@ pub(crate) fn simple_matern_term_collection(
     }
 }
 
-/// Direct `TermCollectionSpec` counterpart of a formula with its ordinary
-/// intercept retained. The low-level term API does not synthesize formula
-/// intercepts, so tests of a location-scale null need to request the constant
-/// column explicitly in both parameter blocks.
-pub(crate) fn simple_matern_term_collection_with_intercept(
-    feature_cols: &[usize],
-    length_scale: f64,
-) -> TermCollectionSpec {
-    let mut collection = simple_matern_term_collection(feature_cols, length_scale);
-    match &mut collection.smooth_terms[0].basis {
-        SmoothBasisSpec::Matern { spec, .. } => spec.include_intercept = true,
-        _ => unreachable!("simple_matern_term_collection always constructs a Matérn basis"),
-    }
-    collection
-}
-
 pub(crate) fn empty_term_collection() -> TermCollectionSpec {
     TermCollectionSpec {
         linear_terms: Vec::new(),
@@ -4991,13 +4975,12 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     let spec = GaussianLocationScaleTermSpec {
         y,
         weights,
-        // Smooth mean AND smooth log-σ block with the ordinary formula
-        // intercept in each block. The direct TermSpec API does not add these
-        // implicitly; omitting them removes both the constant mean and the
-        // homoscedastic constant-log-σ null, so that fixture cannot test the
-        // stated `y ~ 1 + s(x)`, `noise ~ 1 + s(x)` contract at all.
-        meanspec: simple_matern_term_collection_with_intercept(&[0], 0.6),
-        log_sigmaspec: simple_matern_term_collection_with_intercept(&[0], 0.6),
+        // `TermCollectionSpec` contributes the ordinary formula intercept as a
+        // separate unpenalized block. The Matérn smooth itself is centered, so
+        // `include_intercept` must remain false to avoid duplicating that null
+        // direction inside the smooth.
+        meanspec: simple_matern_term_collection(&[0], 0.6),
+        log_sigmaspec: simple_matern_term_collection(&[0], 0.6),
         mean_offset: Array1::zeros(n),
         log_sigma_offset: Array1::zeros(n),
     };
@@ -5019,6 +5002,34 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
         sq_err += d * d;
     }
     let mean_rmse = (sq_err / n as f64).sqrt();
+
+    let log_sigma_eta = &fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+    let mean_min = mean_eta.iter().copied().fold(f64::INFINITY, f64::min);
+    let mean_max = mean_eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let scale_mean = log_sigma_eta.iter().sum::<f64>() / n as f64;
+    let scale_sd = (log_sigma_eta
+        .iter()
+        .map(|value| (value - scale_mean).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+    let scale_min = log_sigma_eta.iter().copied().fold(f64::INFINITY, f64::min);
+    let scale_max = log_sigma_eta
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    eprintln!(
+        "#365 homoscedastic diagnostic: rmse={mean_rmse:.6} mean_range=[{mean_min:.6}, {mean_max:.6}] log_sigma_eta_mean={scale_mean:.6} log_sigma_eta_sd={scale_sd:.6} log_sigma_eta_range=[{scale_min:.6}, {scale_max:.6}] mean_cols={} scale_cols={} mean_penalties={} scale_penalties={} log_lambdas={:?} blocks={:?} outer_iters={} outer_grad={:?} reml={:.6}",
+        fit.mean_design.design.ncols(),
+        fit.noise_design.design.ncols(),
+        fit.mean_design.penalties.len(),
+        fit.noise_design.penalties.len(),
+        fit.fit.log_lambdas,
+        fit.fit.blocks,
+        fit.fit.outer_iterations,
+        fit.fit.outer_gradient_norm,
+        fit.fit.reml_score,
+    );
 
     // A correctly converged mean tracks the truth to well within the noise
     // scale; the #365 collapse-to-grand-mean failure produces RMSE ~1.5.

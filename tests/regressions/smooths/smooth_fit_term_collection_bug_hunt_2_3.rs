@@ -12,6 +12,7 @@ use ndarray::{Array1, Array2};
 
 fn opts() -> FitOptions {
     FitOptions {
+        resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

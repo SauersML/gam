@@ -1994,6 +1994,52 @@ pub(crate) fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
 mod tests {
     use super::*;
 
+    /// The overflow-free `(log I0(η), I1(η)/I0(η))` must satisfy the exact Bessel
+    /// identity `d/dη log I0(η) = I1(η)/I0(η)` on BOTH the small-argument series
+    /// branch and the large-argument scaled-polynomial branch — including
+    /// `η ≫ 709`, where the naive `bessel_i0(η).ln()` / `bessel_i1/bessel_i0`
+    /// overflow to `+inf` and divide to `NaN` (the #1113 iter-0 ρ-gradient poison).
+    /// The returned `ratio` is the analytic derivative the periodic ARD
+    /// normalizer's ρ-gradient consumes, so a central-difference of the returned
+    /// `log_i0` must reproduce it.
+    #[test]
+    fn bessel_log_i0_and_ratio_is_overflow_free_and_derivative_consistent() {
+        // η spanning both branches and well past the e^η overflow threshold.
+        for &eta in &[0.25_f64, 1.0, 3.0, 3.74, 3.76, 5.0, 12.0, 50.0, 400.0, 900.0] {
+            let (log_i0, ratio) = bessel_i0_log_and_ratio(eta);
+            assert!(
+                log_i0.is_finite() && ratio.is_finite(),
+                "bessel_i0_log_and_ratio({eta}) must be finite, got log_i0={log_i0}, ratio={ratio}"
+            );
+            // Central difference of log I0 must match the returned ratio.
+            let h = 1.0e-4 * eta.max(1.0);
+            let (lp, _) = bessel_i0_log_and_ratio(eta + h);
+            let (lm, _) = bessel_i0_log_and_ratio(eta - h);
+            let fd = (lp - lm) / (2.0 * h);
+            let err = (fd - ratio).abs();
+            let tol = 1.0e-6 + 1.0e-5 * ratio.abs();
+            assert!(
+                err <= tol,
+                "d/dη log I0({eta}) mismatch: analytic ratio={ratio:.12e}, fd={fd:.12e}, err={err:.3e}"
+            );
+            // I1/I0 ∈ (0, 1) and → 1 as η → ∞.
+            assert!(
+                ratio > 0.0 && ratio < 1.0,
+                "I1/I0({eta}) must lie in (0,1), got {ratio}"
+            );
+        }
+        // Known reference value at η = 1: I0(1)=1.26606587..., I1(1)=0.56515910...
+        let (log_i0_1, ratio_1) = bessel_i0_log_and_ratio(1.0);
+        assert!(
+            (log_i0_1 - 1.266_065_877_752_008_f64.ln()).abs() < 1.0e-6,
+            "log I0(1) reference mismatch, got {log_i0_1}"
+        );
+        assert!(
+            (ratio_1 - 0.446_389_221_869_1_f64).abs() < 1.0e-6,
+            "I1/I0(1) reference mismatch, got {ratio_1}"
+        );
+    }
+
     // Build an atom over the degree-2 monomial basis `[1, t, t²]` at the given
     // latent coordinates, with decoder `γ(t) = t + t²` (decoded speed `1 + 2t`,
     // which varies across the samples so the arc-length reweighting is

@@ -232,6 +232,7 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
             InverseLink::Standard(StandardLink::Identity),
         ),
         options: FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -370,6 +371,7 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
             InverseLink::Standard(StandardLink::Identity),
         ),
         options: FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

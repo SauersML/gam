@@ -142,6 +142,7 @@ fn run_fit_with_k(n: usize, k: usize) -> (f64, usize, usize, bool) {
             InverseLink::Standard(StandardLink::Logit),
         ),
         &FitOptions {
+            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
