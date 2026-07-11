@@ -217,6 +217,83 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     );
     let finite_difference = (plus_cost - minus_cost) / (2.0 * h);
     let frozen_finite_difference = (frozen_plus_cost - frozen_minus_cost) / (2.0 * h);
+    // Differentiate the accepted branch's actual inner state and compare it to
+    // the implicit-function response used by the analytic log-det correction.
+    // This is the decisive split between a bad IFT assembly and a bounded inner
+    // driver that selects a different stationary root at rho +/- h.  Every
+    // state probe starts from the same accepted center state; no cold-seed map
+    // or prior directional probe is allowed to contaminate the response.
+    let converged_state_at = |rho_flat: &Array1<f64>| {
+        let mut term = frozen_anchor_term.clone();
+        let rho = frozen_baseline_rho.from_flat(rho_flat.view());
+        let (cost, _, _) = term
+            .reml_criterion_with_cache(
+                frozen_target.view(),
+                &rho,
+                frozen_registry.as_ref(),
+                40,
+                frozen_learning_rate,
+                frozen_ridge_ext_coord,
+                frozen_ridge_beta,
+            )
+            .expect("accepted-branch state-response probe must converge");
+        let t = term.assignment.flatten_ext_coords();
+        let beta = term
+            .flatten_factored_border()
+            .expect("accepted-branch factored border");
+        (cost, t, beta)
+    };
+    let (state_plus_cost, state_plus_t, state_plus_beta) = converged_state_at(&plus);
+    let (state_minus_cost, state_minus_t, state_minus_beta) = converged_state_at(&minus);
+    let theta_fd = SaeArrowVector {
+        t: (&state_plus_t - &state_minus_t) / (2.0 * h),
+        beta: (&state_plus_beta - &state_minus_beta) / (2.0 * h),
+    };
+    let gamma = audit_term
+        .logdet_theta_adjoint(&rho_state, &audit_cache, &audit_solver)
+        .expect("accepted-state logdet theta adjoint");
+    let mut directional_rhs = audit_term
+        .outer_rho_gradient_ift_rhs(&rho_state, 0, &audit_cache)
+        .expect("smoothness IFT rhs");
+    directional_rhs.t *= direction[0];
+    directional_rhs.beta *= direction[0];
+    let ard_rhs = audit_term
+        .outer_rho_gradient_ift_rhs(&rho_state, 1, &audit_cache)
+        .expect("ARD IFT rhs");
+    directional_rhs.t.scaled_add(direction[1], &ard_rhs.t);
+    directional_rhs.beta.scaled_add(direction[1], &ard_rhs.beta);
+    let solved_response = audit_term
+        .solve_exact_stationarity(
+            &rho_state,
+            frozen_target.view(),
+            &audit_cache,
+            &audit_solver,
+            &directional_rhs,
+        )
+        .expect("accepted-state exact stationarity response");
+    let actual_implicit_logdet = 0.5 * (gamma.t.dot(&theta_fd.t) + gamma.beta.dot(&theta_fd.beta));
+    let predicted_implicit_logdet =
+        -0.5 * (gamma.t.dot(&solved_response.t) + gamma.beta.dot(&solved_response.beta));
+    let response_error_norm = (&theta_fd.t + &solved_response.t)
+        .iter()
+        .chain((&theta_fd.beta + &solved_response.beta).iter())
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let theta_fd_norm = theta_fd
+        .t
+        .iter()
+        .chain(theta_fd.beta.iter())
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let solved_response_norm = solved_response
+        .t
+        .iter()
+        .chain(solved_response.beta.iter())
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
     let mut coordinate_fd = Array1::<f64>::zeros(base.len());
     let mut frozen_coordinate_fd = Array1::<f64>::zeros(base.len());
     for coordinate in 0..base.len() {
@@ -243,6 +320,11 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          frozen_coordinate_fd={frozen_coordinate_fd:?}, \
          explicit={:?}, trace={:?}, occam={:?}, adjoint={:?}, \
          frozen_fd={frozen_finite_difference:.9e}, \
+         actual_implicit_logdet={actual_implicit_logdet:.9e}, \
+         predicted_implicit_logdet={predicted_implicit_logdet:.9e}, \
+         theta_fd_norm={theta_fd_norm:.9e}, solved_response_norm={solved_response_norm:.9e}, \
+         response_error_norm={response_error_norm:.9e}, \
+         state_plus_cost={state_plus_cost:.17e}, state_minus_cost={state_minus_cost:.17e}, \
          kkt={kkt_norm:.9e}, quotient_kkt={quotient_kkt_norm:.9e}, \
          kkt_tolerance={kkt_tolerance:.9e}, \
          base_cost={base_cost:.17e}, plus_cost={plus_cost:.17e}, \
