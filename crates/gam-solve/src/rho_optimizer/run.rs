@@ -1426,8 +1426,27 @@ pub(crate) fn certify_outer_optimality(
     result.final_grad_norm = Some(projected_grad_norm);
     result.final_gradient = Some(evaluation.gradient);
     result.converged = false;
-    if !solver_final_value.is_finite()
-        || (solver_final_value - result.final_value).abs() > cost_agreement_bound
+    // #2253 — a WALL-SENTINEL solver value against a FINITE analytic sample is a
+    // transient-refusal-vs-real mismatch, NOT a two-closure objective desync.
+    // The solver's terminal value comes from the value/probe lane, which can hit
+    // the finite collapse/refusal wall (a bounded but astronomically large
+    // sentinel) at a hard terminal ρ where the full derivative-bearing eval
+    // still certifies a real value — measured 2026-07-11: solver 1e12 vs
+    // analytic 51.86 on a K=1 circle after the IFT-deflation fixes. The analytic
+    // sample is the authoritative objective (it just re-solved the inner state
+    // AND its gradient at this exact point and passed the finite check above);
+    // adopt it and let the stationarity/Hessian gates below judge it. A genuine
+    // closure desync surfaces as two FINITE values differing beyond the roundoff
+    // bound, which the branch still rejects.
+    const OUTER_WALL_SENTINEL_FLOOR: f64 = 1.0e10;
+    let solver_is_wall =
+        !solver_final_value.is_finite() || solver_final_value.abs() >= OUTER_WALL_SENTINEL_FLOOR;
+    let analytic_is_real = result.final_value.is_finite()
+        && result.final_value.abs() < OUTER_WALL_SENTINEL_FLOOR;
+    let transient_wall = solver_is_wall && analytic_is_real;
+    if !transient_wall
+        && (!solver_final_value.is_finite()
+            || (solver_final_value - result.final_value).abs() > cost_agreement_bound)
     {
         return Err(outer_nonconvergence_error(
             context,
