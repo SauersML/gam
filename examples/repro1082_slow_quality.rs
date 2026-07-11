@@ -176,7 +176,7 @@ fn gaussian_te() {
 /// `gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet`
 /// (TEST_STRIDE=4 train split). Prints the gam fit's wall-clock seconds.
 fn penguin() {
-    use gam::families::multinomial::fit_penalized_multinomial_formula;
+    use gam::families::multinomial::{MultinomialFitRequest, fit_penalized_multinomial_formula};
     const PENGUINS_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/penguins.csv");
     let file = std::fs::File::open(Path::new(PENGUINS_CSV)).expect("open penguins.csv");
     let mut lines = std::io::BufRead::lines(std::io::BufReader::new(file));
@@ -233,14 +233,14 @@ fn penguin() {
         encode_recordswith_inferred_schema(headers, train).expect("encode penguin train");
     let cfg = FitConfig::default();
     let t0 = Instant::now();
-    let model = fit_penalized_multinomial_formula(
-        &train_ds,
-        "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
-        &cfg,
-        1.0,
-        100,
-        1e-8,
-    );
+    let formula = "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) + \
+                   s(flipper_length_mm, k=10) + s(body_mass_g, k=10)";
+    let model = fit_penalized_multinomial_formula(&MultinomialFitRequest {
+        init_lambda: 1.0,
+        max_iter: 100,
+        tol: 1e-8,
+        ..MultinomialFitRequest::new(&train_ds, formula, &cfg)
+    });
     let dt = t0.elapsed().as_secs_f64();
     match model {
         Ok(m) => eprintln!(
