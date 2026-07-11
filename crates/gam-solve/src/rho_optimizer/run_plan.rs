@@ -633,11 +633,11 @@ pub(crate) fn run_outer_with_plan(
                             }
                             legs_descended += 1;
                         }
-                        crate::continuation_path::ContinuationStep::Arrived { state: _ } => {
-                            // The final path value evaluation occurred at the
-                            // literal seed. Stateful objectives park that full
-                            // converged state as a probe handoff. Calling
-                            // `seed_inner_state` here would invalidate it.
+                        crate::continuation_path::ContinuationStep::Arrived => {
+                            // Leave the objective in the path-warmed state.
+                            // The exact-value verification below owns the
+                            // full-state handoff; replacing it with a copied
+                            // coefficient-only seed here would discard it.
                             legs_descended += 1;
                             continuation_arrived = true;
                             break;

@@ -505,7 +505,7 @@ pub(crate) enum ContinuationStep {
     /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
     /// tight isometry). Terminal-but-successful; the criterion is the real
     /// objective's, identical for cold and warm entry (#969).
-    Arrived { state: ContinuationState },
+    Arrived,
     /// The inner solve at the attempted waypoint struggled, so the path
     /// re-entered a heavier regime (`s` raised back toward `1` by the back-off
     /// fraction) and will re-descend with a finer step. This is the homotopy
@@ -715,7 +715,7 @@ impl ContinuationPath {
         match step {
             ContinuationStep::Reentered { .. }
             | ContinuationStep::Descended { .. }
-            | ContinuationStep::Arrived { .. } => self.enter_regime(),
+            | ContinuationStep::Arrived => self.enter_regime(),
         }
     }
 
@@ -825,7 +825,7 @@ impl ContinuationPath {
         // With no converged state yet the walk keeps trying (the consumer's
         // own `CONTINUATION_WALK_BUDGET` loop bounds that case).
         if self.evals_budgeted >= WALK_EVAL_CEILING {
-            if let Some(state) = self.warm.clone() {
+            if self.warm.is_some() {
                 log::warn!(
                     "[PATH] walk eval ceiling {WALK_EVAL_CEILING} reached at s={:.4}; arriving \
                      with the best converged waypoint state (scalar legs advanced to target)",
@@ -833,7 +833,7 @@ impl ContinuationPath {
                 );
                 self.advance_scalar_legs_to(0.0);
                 self.s = 0.0;
-                return ContinuationStep::Arrived { state };
+                return ContinuationStep::Arrived;
             }
         }
 
@@ -907,7 +907,7 @@ impl ContinuationPath {
                 self.logit_tr =
                     LogitTrustRegion::for_tau(self.schedules.scalar_targets_at(self.s).tau);
                 if self.s <= 0.0 {
-                    ContinuationStep::Arrived { state }
+                    ContinuationStep::Arrived
                 } else {
                     ContinuationStep::Descended { s: self.s, state }
                 }
@@ -1268,7 +1268,7 @@ mod tests {
         fn is_progress(step: &ContinuationStep) -> bool {
             match step {
                 ContinuationStep::Descended { .. }
-                | ContinuationStep::Arrived { .. }
+                | ContinuationStep::Arrived
                 | ContinuationStep::Reentered { .. } => true,
             }
         }
@@ -1439,7 +1439,7 @@ mod tests {
         assert!(
             matches!(
                 step,
-                ContinuationStep::Descended { .. } | ContinuationStep::Arrived { .. }
+                ContinuationStep::Descended { .. } | ContinuationStep::Arrived
             ),
             "recording objective should accept the first coupled-path waypoint"
         );
