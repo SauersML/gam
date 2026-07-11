@@ -25,6 +25,7 @@
 use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::inference::model_payload_builders::{StandardPayloadInputs, assemble_standard_payload};
+use gam::matrix::LinearOperator;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 
 fn encode_columns(headers: &[&str], columns: &[&[f64]]) -> EncodedDataset {
@@ -124,5 +125,91 @@ fn gaussian_constant_response_fits_completely_and_builds_payload_2254() {
                 panic!("`{formula}` on constant y={yval}: payload assembly failed: {e}")
             });
         }
+    }
+}
+
+/// The precise root cause of #2254's *second* wave (after the fit stopped
+/// returning `inference: None`) was a MALFORMED inference bundle: the shortcut
+/// hard-coded `edf_by_block = vec![edf_total]` (length 1), so the
+/// `UnifiedFitResult` constructor rejected every model whose penalty count was
+/// not exactly 1 — `y ~ 1` (0 penalties) and `y ~ s(x, k=10)` / `matern` (2–3
+/// penalties) failed with "EDF smoothing-parameter count mismatch", while
+/// `y ~ x` (exactly 1 penalty) slipped through. This test pins the bundle's
+/// structural invariants directly, from every penalty-count regime, so a
+/// regression is caught at the source rather than only through a downstream
+/// consumer:
+///   * `edf_by_block` and `penalty_block_trace` align 1:1 with `lambdas`;
+///   * the reported `edf_total` equals `tr(F)` (the influence-matrix trace) and
+///     the per-block decomposition `edf_total = p − Σ_k tr_k`;
+///   * every per-penalty EDF/trace is finite and in `[0, block_cols]`.
+#[test]
+fn gaussian_constant_response_inference_bundle_is_self_consistent_2254() {
+    let n = 96usize;
+    let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
+    let y: Vec<f64> = vec![1.25_f64; n];
+    let data = encode_columns(&["x", "y"], &[&x, &y]);
+
+    // One representative from each penalty-count regime: 0, 1, and ≥2.
+    for formula in ["y ~ 1", "y ~ x", "y ~ s(x, k=10)", "y ~ matern(x, centers=8)"] {
+        let FitResult::Standard(fit) = fit_from_formula(formula, &data, &gaussian_cfg())
+            .unwrap_or_else(|e| panic!("`{formula}` failed to fit: {e}"))
+        else {
+            panic!("`{formula}` did not produce a standard fit");
+        };
+
+        let n_lambda = fit.fit.lambdas.len();
+        let inference = fit
+            .fit
+            .inference
+            .as_ref()
+            .unwrap_or_else(|| panic!("`{formula}`: fit carries no inference bundle"));
+
+        // (1) Length invariants — the exact contract the constructor validates.
+        assert_eq!(
+            inference.edf_by_block.len(),
+            n_lambda,
+            "`{formula}`: edf_by_block must align 1:1 with lambdas"
+        );
+        assert_eq!(
+            inference.penalty_block_trace.len(),
+            n_lambda,
+            "`{formula}`: penalty_block_trace must align 1:1 with lambdas"
+        );
+
+        // (2) The influence matrix F = H⁻¹XᵀWX is present and its trace is the
+        // reported EDF (the model's own definition of effective d.f.).
+        let p = fit.fit.beta.len();
+        let f_mat = inference
+            .coefficient_influence
+            .as_ref()
+            .unwrap_or_else(|| panic!("`{formula}`: missing coefficient influence matrix F"));
+        assert_eq!((f_mat.nrows(), f_mat.ncols()), (p, p));
+        let tr_f: f64 = (0..p).map(|j| f_mat[[j, j]]).sum();
+        let edf_total = fit.fit.edf_total().expect("edf_total");
+        assert!(
+            (tr_f - edf_total).abs() <= 1e-6 * (1.0 + edf_total.abs()),
+            "`{formula}`: edf_total {edf_total} must equal tr(F) {tr_f}"
+        );
+
+        // (3) Per-block decomposition edf_total = p − Σ_k tr_k, each block finite
+        // and bounded by its own column count.
+        let mut sum_trace = 0.0_f64;
+        for (kk, (&edf_k, &tr_k)) in inference
+            .edf_by_block
+            .iter()
+            .zip(inference.penalty_block_trace.iter())
+            .enumerate()
+        {
+            assert!(
+                edf_k.is_finite() && tr_k.is_finite() && edf_k >= -1e-9 && tr_k >= -1e-9,
+                "`{formula}`: penalty {kk} EDF/trace not finite/non-negative: edf={edf_k}, tr={tr_k}"
+            );
+            sum_trace += tr_k;
+        }
+        assert!(
+            ((p as f64 - sum_trace) - edf_total).abs() <= 1e-6 * (1.0 + edf_total.abs()),
+            "`{formula}`: edf_total {edf_total} must equal p − Σ tr_k = {}",
+            p as f64 - sum_trace
+        );
     }
 }

@@ -494,34 +494,103 @@ fn constant_gaussian_standard_fit(
     }
     // Symmetrize defensively against accumulated round-off before the Cholesky.
     penalized_hessian = (&penalized_hessian + &penalized_hessian.t()) * 0.5;
-    let edf_total = {
+    let n_penalties = design.penalties.len();
+    // Effective degrees of freedom from the influence matrix `F = H⁻¹ XᵀWX`,
+    // decomposed per penalty by the SAME trace formula the standard REML path
+    // (`estimate.rs`) and the survival fast-path (`survival_transformation_edf`)
+    // use: `tr_k = λ·tr(H⁻¹ S_k)`, `edf_k = block_cols_k − tr_k`, and
+    // `edf_total = p − Σ_k tr_k = tr(F)`. Producing the WHOLE bundle here — not
+    // just the scalar total — is what makes the fit self-consistent: `edf_by_block`
+    // aligns 1:1 with `lambdas` (a length the constructor validates), the raw
+    // shrinkage traces feed per-term EDF, and `coefficient_influence = F` is the
+    // authoritative leverage matrix every downstream EDF consumer prefers. At the
+    // fully-smoothed λ each penalized direction is absorbed (`tr_k → rank(S_k)`),
+    // so every block collapses onto its own penalty null space — the honest
+    // complexity of a wiggle-free fit, and exactly the λ→∞ limit of the
+    // near-constant fit that already works.
+    let (edf_total, edf_by_block, penalty_block_trace, coefficient_influence) = {
         use gam_linalg::faer_ndarray::FaerCholesky;
         match penalized_hessian.cholesky(faer::Side::Lower) {
-            // EDF = tr(H⁻¹ XᵀWX): penalized directions collapse toward 0, the
-            // unpenalized null space (intercept / parametric terms) toward 1 each.
-            Ok(chol) => chol
-                .solve_mat(&xtwx)
-                .diag()
-                .iter()
-                .copied()
-                .sum::<f64>()
-                .clamp(0.0, p as f64),
+            Ok(chol) => {
+                // F = H⁻¹ XᵀWX. Generally NOT symmetric (a product of two
+                // symmetric matrices); it must be stored as-is so `H·F = XᵀWX`
+                // and per-term `tr(F_jj)` stay exact (see estimate.rs / #1027).
+                let influence = chol.solve_mat(&xtwx);
+                let mut edf_by_block = vec![0.0_f64; n_penalties];
+                let mut penalty_block_trace = vec![0.0_f64; n_penalties];
+                for (kk, block) in design.penalties.iter().enumerate() {
+                    let r = block.col_range.clone();
+                    let block_cols = r.len();
+                    // Skip a block the design left inconsistent (same guard the
+                    // Hessian-assembly loop above uses): its penalty never entered
+                    // `H`, so its penalized EDF is 0 and its full column count is
+                    // unpenalized d.f. accounted for in `edf_total = tr(F)`.
+                    if block_cols == 0
+                        || r.end > p
+                        || block.local.nrows() != block_cols
+                        || block.local.ncols() != block_cols
+                    {
+                        continue;
+                    }
+                    // tr(H⁻¹ S_k): solve `H Z = S_k` (embedded in the full p×block
+                    // layout) and read the block diagonal of the solution.
+                    let mut rhs = Array2::<f64>::zeros((p, block_cols));
+                    for c in 0..block_cols {
+                        for rr in 0..block_cols {
+                            rhs[[r.start + rr, c]] = block.local[[rr, c]];
+                        }
+                    }
+                    let sol = chol.solve_mat(&rhs);
+                    let mut trace = 0.0_f64;
+                    for j in 0..block_cols {
+                        trace += sol[[r.start + j, j]];
+                    }
+                    let lam_trace = (lambda_full * trace).clamp(0.0, block_cols as f64);
+                    penalty_block_trace[kk] = lam_trace;
+                    edf_by_block[kk] =
+                        (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
+                }
+                let edf_total = influence
+                    .diag()
+                    .iter()
+                    .copied()
+                    .sum::<f64>()
+                    .clamp(0.0, p as f64);
+                (edf_total, edf_by_block, penalty_block_trace, Some(influence))
+            }
             // A design left rank-deficient upstream still has a well-defined
-            // null-space EDF: the count of unpenalized coefficients.
-            Err(_) => design.intercept_range.len() as f64,
+            // null-space EDF. Report each penalty's structural null-space dim (the
+            // λ→∞ limit of `edf_by_block`) when the term planner recorded it, else
+            // 0 — either way the length matches `lambdas`, so the fit still mints
+            // and stays predictable rather than hard-failing downstream.
+            Err(_) => {
+                let edf_by_block: Vec<f64> = if design.nullspace_dims.len() == n_penalties {
+                    design
+                        .penalties
+                        .iter()
+                        .zip(&design.nullspace_dims)
+                        .map(|(b, &ns)| (ns as f64).min(b.col_range.len() as f64))
+                        .collect()
+                } else {
+                    vec![0.0_f64; n_penalties]
+                };
+                let edf_total = (design.intercept_range.len() as f64
+                    + edf_by_block.iter().sum::<f64>())
+                .clamp(0.0, p as f64);
+                (edf_total, edf_by_block, vec![0.0_f64; n_penalties], None)
+            }
         }
     };
     // IRLS working response for the identity link is the raw response y (η
     // absorbs the offset); the working weights are the prior weights.
     let working_response = request.y.as_ref().clone();
-    let n_penalties = design.penalties.len();
     let lambdas = Array1::<f64>::from_elem(n_penalties, lambda_full);
     let log_lambdas = lambdas.mapv(|v| v.max(f64::MIN_POSITIVE).ln());
     let penalized_hessian_precision =
         gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian.clone());
     let inference = gam_solve::estimate::FitInference {
-        edf_by_block: vec![edf_total],
-        penalty_block_trace: Vec::new(),
+        edf_by_block,
+        penalty_block_trace,
         edf_total,
         smoothing_correction: None,
         penalized_hessian: penalized_hessian_precision.clone(),
@@ -537,7 +606,7 @@ fn constant_gaussian_standard_fit(
         beta_covariance_corrected: None,
         beta_standard_errors_corrected: None,
         beta_covariance_frequentist: None,
-        coefficient_influence: None,
+        coefficient_influence,
         weighted_gram: Some(xtwx),
         bias_correction_beta: None,
         bias_correction_jacobian: None,
