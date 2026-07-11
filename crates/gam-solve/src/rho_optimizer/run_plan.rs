@@ -291,11 +291,11 @@ pub(crate) fn run_outer_with_plan(
 
     let mut best: Option<CertifiedOuterCandidate> = None;
     let mut best_checkpoint: Option<OuterResult> = None;
-    // A reactive domain-entry path is created per seed only after the
-    // objective's exact seed cost is non-finite. Keeping `None` here is the
-    // zero-heavy-entry fast path for every already-feasible seed.
+    // A reactive domain-entry path is created inside a seed attempt only after
+    // that objective's exact seed cost is non-finite. Already-feasible seeds
+    // therefore stay on the zero-heavy-entry path.
     let reactive_domain_entry_available = obj.supports_reactive_domain_entry();
-    let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = None;
+    let mut last_continuation_regime: Option<crate::continuation_path::PathRegime> = None;
     // Demotion ledger: every structural defect that would historically have
     // rejected a seed (or short-circuited the cascade) is instead recorded
     // here with its reason and the regime it was demoted to, so the
@@ -384,10 +384,9 @@ pub(crate) fn run_outer_with_plan(
         if started_seeds == seed_budget {
             break;
         }
-        // Domain entry is a property of this literal seed. Never carry a path
-        // (or its regime) across seed attempts: every candidate first receives
-        // its own exact-value probe below.
-        continuation_path = None;
+        // Domain entry is a property of this literal seed. A loop-local path
+        // cannot leak its state or regime into another candidate.
+        let mut continuation_path: Option<crate::continuation_path::ContinuationPath> = None;
         // Lazy structured classification: convert any new entries in
         // `rejection_reasons` into `SeedRejection`s and probe whether
         // the seed cascade has slipped into a uniform structural
@@ -477,8 +476,8 @@ pub(crate) fn run_outer_with_plan(
             // pristine cold state. Rejecting the seed here instead emptied the
             // candidate set for objectives WITHOUT a continuation path (#1095:
             // a periodic K=1 circle whose walk "buys nothing" and refuses on a
-            // small-N pivot bifurcation — `requires_continuation_path_entry` is
-            // false for periodic K=1, so every one of its seeds was rejected
+            // small-N pivot bifurcation — periodic K=1 does not advertise
+            // reactive domain entry, so every one of its seeds was rejected
             // before any solver started). Reset to the baseline so the cascade
             // opens each seed from its own cold default, exactly as a hard
             // anchor-construction error already does above.
@@ -512,6 +511,47 @@ pub(crate) fn run_outer_with_plan(
                 }
             }
         }
+        // Typed, reactive domain entry. The literal seed is always evaluated
+        // first on the real objective. A finite value keeps the converged probe
+        // handoff and pays no continuation work. Only an undefined criterion
+        // activates the certified heavy-smoothing path; a hard evaluation error
+        // remains a seed refusal and is never converted into a pseudo-value.
+        let mut reactive_domain_entry_requested = false;
+        if reactive_domain_entry_available {
+            match obj.eval_cost(seed) {
+                Ok(cost) if cost.is_finite() => {
+                    log::debug!(
+                        "[OUTER] {context}: exact seed {seed_idx} is inside the objective domain; \
+                         reactive continuation entry not needed"
+                    );
+                }
+                Ok(_) => {
+                    log::info!(
+                        "[OUTER] {context}: exact seed {seed_idx} has undefined criterion; \
+                         entering through certified heavy-smoothing continuation"
+                    );
+                    // The failed cold probe may have left objective-owned trial
+                    // state. Re-enter from the pristine baseline; successful
+                    // path evaluations establish a fresh exact-seed handoff.
+                    obj.reset();
+                    continuation_path = Some(
+                        crate::continuation_path::ContinuationPath::heavy_entry_for_rho(
+                            seed.clone(),
+                            bounds_template.1.clone(),
+                        ),
+                    );
+                    reactive_domain_entry_requested = true;
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "reactive domain-entry seed probe failed before continuation: {err}"
+                    );
+                    log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
+                    rejection_reasons.push((seed_idx, "domain-entry", msg));
+                    continue 'seed_attempts;
+                }
+            }
+        }
         // Magic-by-default continuation pre-warm. On hard fits this
         // walks ρ from an oversmoothing ρ₀ down to `seed`, leaving the
         // objective's inner state warm at `seed`. On easy fits (ρ₀
@@ -525,15 +565,12 @@ pub(crate) fn run_outer_with_plan(
         // The pre-warm is a warm-start for gradient-bearing PIRLS-inner
         // REML objectives: it walks ρ via `eval_with_order(_, ValueAndGradient)`
         // and carries the converged inner β forward through each step's
-        // `inner_beta_hint`. A continuation-entry objective (SAE-manifold joint
-        // fit) MUST enter every seed through the heavy-smoothing
-        // ContinuationPath walk, so it opts into the priming pass even though it
-        // does not advertise the generic `allow_continuation_prewarm`
-        // warm-start. For a continuation-entry objective a refused walk is
-        // DEMOTED to a heavier regime below, not treated as a feasibility gate.
+        // `inner_beta_hint`. A reactive-domain objective enters the explicit
+        // path only after the exact real-objective probe above returned a
+        // non-finite criterion; already-finite seeds never allocate or drive it.
         let enter_via_continuation_path =
             obj.allow_continuation_prewarm() || continuation_path.is_some();
-        // Continuation-entry objective (SAE-manifold joint fit): DRIVE the
+        // Reactive domain entry (SAE-manifold dense K>=2 joint fit): DRIVE the
         // coupled `ContinuationPath` homotopy explicitly. This is the missing
         // half of Object 1 — the descent walk. Rather than a single ρ-only
         // `prime_outer_seed` pre-screen, we step the path waypoint by waypoint:
@@ -545,36 +582,21 @@ pub(crate) fn run_outer_with_plan(
         // ρ*. Re-entry / breach / underflow are non-fatal floor behaviors,
         // each consumed below — never a rejection.
         //
-        // The walk runs for EVERY continuation-entry objective regardless of the
-        // primary solver class: the only objective that sets
-        // `requires_continuation_path_entry` is the SAE-manifold joint fit,
-        // whose `eval` / `seed_inner_state` / inner arrow-Schur ARE reachable.
-        // The heavy-smoothing walk warms the cold inner solve first, or the cold
-        // `eval_cost` hits a non-PD inner block (the K≥2 routing-collapse failure
-        // Object 1 exists to prevent).
+        // The heavy-smoothing walk warms the cold inner solve after the literal
+        // `eval_cost` demonstrated that its Laplace evidence is undefined (the
+        // K>=2 routing-collapse failure Object 1 exists to repair).
+        let mut continuation_arrived = continuation_path.is_none();
         if continuation_path.is_some() {
             {
-                // Rebuild the path per-seed against the OBJECTIVE's real ρ
-                // dimension and legal box. The seed-loop-scoped `heavy_entry`
-                // placeholder is dimension-1 (built before any seed is in hand);
-                // the spine call inside `step` requires the ρ target to match
-                // the objective's ρ dim, so we re-enter the heavy-smoothing
-                // regime coupled to this seed's ρ\* and bounds. Re-entry resets
-                // the path to a fresh `s = 1` for every seed, which is correct:
-                // each seed is its own descent from the contraction regime.
-                let path = continuation_path.insert(
-                    crate::continuation_path::ContinuationPath::heavy_entry_for_rho(
-                        seed.clone(),
-                        bounds_template.1.clone(),
-                    ),
-                );
+                let path = continuation_path
+                    .as_mut()
+                    .expect("reactive continuation path checked above");
                 let walk_start = std::time::Instant::now();
                 // β carried warm across legs. Empty = cold entry (#969:
                 // warm-invariance funnels cold and warm to the same s=1
                 // contraction fixed point).
                 let mut warm_beta: Array1<f64> = Array1::zeros(0);
                 let mut legs_descended = 0usize;
-                let mut arrived = false;
                 // Bound the walk: CONTINUATION_WAYPOINTS clean descents plus a
                 // re-entry allowance (every re-entry is progress toward the
                 // contraction floor, reachable in finitely many back-offs).
@@ -590,7 +612,7 @@ pub(crate) fn run_outer_with_plan(
                 let walk_budget = crate::continuation_path::CONTINUATION_WALK_BUDGET;
                 for _ in 0..walk_budget {
                     if path.arrived() {
-                        arrived = true;
+                        continuation_arrived = true;
                         break;
                     }
                     match path.step(obj, &warm_beta) {
@@ -611,21 +633,13 @@ pub(crate) fn run_outer_with_plan(
                             }
                             legs_descended += 1;
                         }
-                        crate::continuation_path::ContinuationStep::Arrived { state } => {
-                            // The path reached ρ* / τ_min / tight isometry along
-                            // the coupled walk. Install the warm iterate so the
-                            // normal solver below starts from the contraction's
-                            // image at the real objective, not cold.
-                            warm_beta = state.last_beta.clone();
-                            if let Err(err) = obj.seed_inner_state(&warm_beta) {
-                                log::warn!(
-                                    "[OUTER] {context}: continuation arrival seed {seed_idx} \
-                                     warm-start unusable ({err}); solver starts cold at ρ*"
-                                );
-                                obj.reset();
-                            }
+                        crate::continuation_path::ContinuationStep::Arrived { state: _ } => {
+                            // The final path value evaluation occurred at the
+                            // literal seed. Stateful objectives park that full
+                            // converged state as a probe handoff. Calling
+                            // `seed_inner_state` here would invalidate it.
                             legs_descended += 1;
-                            arrived = true;
+                            continuation_arrived = true;
                             break;
                         }
                         crate::continuation_path::ContinuationStep::Reentered { s, reason } => {
@@ -687,10 +701,50 @@ pub(crate) fn run_outer_with_plan(
                 }
                 log::info!(
                     "[OUTER] {context}: continuation-path walk seed {seed_idx} legs={legs_descended} \
-                     arrived={arrived} reseeds={} elapsed={:.3}s",
+                     arrived={continuation_arrived} reseeds={} elapsed={:.3}s",
                     path.reseed_count(),
                     walk_start.elapsed().as_secs_f64(),
                 );
+                last_continuation_regime = Some(path.enter_regime());
+            }
+        }
+        if reactive_domain_entry_requested {
+            if !continuation_arrived {
+                let msg = "reactive domain entry refused: certified continuation walk budget \
+                           exhausted before arrival at the exact seed"
+                    .to_string();
+                log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
+                rejection_reasons.push((seed_idx, "domain-entry", msg));
+                continue 'seed_attempts;
+            }
+            // Arrival is not itself evidence that the real objective is
+            // defined: the path's structural eval ceiling may arrive with its
+            // best earlier waypoint. Re-evaluate the literal seed and require a
+            // finite exact criterion before any optimizer can start.
+            match obj.eval_cost(seed) {
+                Ok(cost) if cost.is_finite() => {
+                    log::info!(
+                        "[OUTER] {context}: reactive continuation seed {seed_idx} arrived with \
+                         finite exact criterion {cost:.6e}"
+                    );
+                }
+                Ok(_) => {
+                    let msg = "reactive domain entry refused: exact seed criterion remained \
+                               non-finite after certified continuation arrival"
+                        .to_string();
+                    log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
+                    rejection_reasons.push((seed_idx, "domain-entry", msg));
+                    continue 'seed_attempts;
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "reactive domain entry refused: exact seed verification failed after \
+                         certified continuation arrival: {err}"
+                    );
+                    log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
+                    rejection_reasons.push((seed_idx, "domain-entry", msg));
+                    continue 'seed_attempts;
+                }
             }
         }
         if continuation_path.is_none()
@@ -728,10 +782,10 @@ pub(crate) fn run_outer_with_plan(
                         // The pre-warm surfaced a structural defect of the seed's
                         // joint design (rank/alias deficiency or a genuine
                         // active-set KKT bug). This block runs only for
-                        // NON-continuation-entry objectives (continuation-entry
-                        // objectives drive the explicit `ContinuationPath` walk
-                        // above, where a structural refusal is a heavier-regime
-                        // demotion, never a rejection). Legacy contract: a cold solve
+                        // Objectives without an active reactive-domain path.
+                        // An active path was already driven and exact-verified
+                        // above, so it cannot enter this generic pre-warm block.
+                        // Legacy contract: a cold solve
                         // at the seed ρ* would hit the same defect, so disqualify the
                         // seed and route the failure through the same structural
                         // accounting any other pre-validation rejection takes.
@@ -2071,18 +2125,16 @@ pub(crate) fn run_outer_with_plan(
         } else {
             String::new()
         };
-        // Surface the ContinuationPath demotion ledger: for a continuation-entry
-        // objective, structural defects DEMOTED the cascade to heavier path
-        // regimes instead of rejecting seeds, so the final diagnosis must show
-        // the heavier-regime re-entries (with their reasons) rather than imply
-        // the candidate set was emptied by a structural early-exit.
+        // Surface any heavier-regime re-entries encountered inside an activated
+        // reactive path. These are path diagnostics; failure to arrive or to
+        // establish finite exact-seed evidence is still recorded as a refusal.
         if !path_demotions.is_empty() {
             if !early_exit_note.is_empty() {
                 early_exit_note.push_str("; ");
             }
-            let final_regime = continuation_path
+            let final_regime = last_continuation_regime
                 .as_ref()
-                .map(|path| format!("{:?}", path.enter_regime()))
+                .map(|regime| format!("{regime:?}"))
                 .unwrap_or_else(|| "<none>".to_string());
             early_exit_note.push_str(&format!(
                 "continuation-path: {} structural defect(s) DEMOTED to heavier regime(s) \

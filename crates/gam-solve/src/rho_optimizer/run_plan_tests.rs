@@ -3346,6 +3346,172 @@ fn run_with_initial_seed_still_considers_generated_candidates() {
     assert_eq!(result.rho, expected_seed);
 }
 
+#[derive(Clone, Copy)]
+enum ReactiveDomainMode {
+    FiniteAtColdSeed,
+    OpensFromHeavySide,
+    NeverOpens,
+}
+
+/// Analytic one-dimensional objective used to pin the reactive domain-entry
+/// contract. Its real optimum is the literal seed. In the repair fixture the
+/// exact seed starts outside the domain, while any heavier-smoothing (larger
+/// rho) value probe opens a connected finite branch that remains defined when
+/// the path returns to the seed.
+struct ReactiveDomainObjective {
+    seed: f64,
+    mode: ReactiveDomainMode,
+    domain_open: bool,
+    exact_seed_value_evals: usize,
+    off_seed_value_evals: usize,
+    derivative_evals: usize,
+}
+
+impl ReactiveDomainObjective {
+    fn new(seed: f64, mode: ReactiveDomainMode) -> Self {
+        Self {
+            seed,
+            mode,
+            domain_open: matches!(mode, ReactiveDomainMode::FiniteAtColdSeed),
+            exact_seed_value_evals: 0,
+            off_seed_value_evals: 0,
+            derivative_evals: 0,
+        }
+    }
+
+    fn is_exact_seed(&self, rho: &Array1<f64>) -> bool {
+        rho.len() == 1 && rho[0].to_bits() == self.seed.to_bits()
+    }
+
+    fn finite_cost(&self, rho: &Array1<f64>) -> f64 {
+        let delta = rho[0] - self.seed;
+        0.5 * delta * delta
+    }
+}
+
+impl OuterObjective for ReactiveDomainObjective {
+    fn capability(&self) -> OuterCapability {
+        OuterCapability {
+            gradient: Derivative::Analytic,
+            hessian: DeclaredHessianForm::Unavailable,
+            n_params: 1,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        }
+    }
+
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        if self.is_exact_seed(rho) {
+            self.exact_seed_value_evals += 1;
+        } else {
+            self.off_seed_value_evals += 1;
+            if matches!(self.mode, ReactiveDomainMode::OpensFromHeavySide) {
+                self.domain_open = true;
+            }
+        }
+        if self.domain_open {
+            Ok(self.finite_cost(rho))
+        } else {
+            Ok(f64::INFINITY)
+        }
+    }
+
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        self.derivative_evals += 1;
+        if !self.domain_open {
+            return Ok(OuterEval::infeasible(rho.len()));
+        }
+        let delta = rho[0] - self.seed;
+        Ok(OuterEval {
+            cost: 0.5 * delta * delta,
+            gradient: array![delta],
+            hessian: HessianValue::Unavailable,
+            inner_beta_hint: None,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.domain_open = matches!(self.mode, ReactiveDomainMode::FiniteAtColdSeed);
+    }
+
+    fn seed_inner_state(&mut self, _: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        Ok(SeedOutcome::NoSlot)
+    }
+
+    fn supports_reactive_domain_entry(&self) -> bool {
+        true
+    }
+}
+
+fn run_reactive_domain_fixture(
+    mode: ReactiveDomainMode,
+) -> (Result<OuterResult, EstimationError>, ReactiveDomainObjective) {
+    const SEED: f64 = 0.125;
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_initial_rho(array![SEED])
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+        .with_max_iter(4);
+    let mut objective = ReactiveDomainObjective::new(SEED, mode);
+    let result = problem.run(&mut objective, "reactive-domain-entry fixture");
+    (result, objective)
+}
+
+#[test]
+fn reactive_domain_entry_leaves_finite_seed_on_zero_heavy_work_path() {
+    let (result, objective) = run_reactive_domain_fixture(ReactiveDomainMode::FiniteAtColdSeed);
+    let result = result.expect("a finite exact seed must optimize and certify directly");
+    assert_eq!(result.rho, array![0.125]);
+    assert_eq!(
+        objective.off_seed_value_evals, 0,
+        "a finite literal seed must not evaluate a heavy continuation waypoint"
+    );
+    assert!(objective.exact_seed_value_evals > 0);
+    assert!(objective.derivative_evals > 0);
+}
+
+#[test]
+fn reactive_domain_entry_repairs_nonfinite_seed_from_heavy_side() {
+    let (result, objective) = run_reactive_domain_fixture(ReactiveDomainMode::OpensFromHeavySide);
+    let result = result.expect("the connected heavy-side branch must reach a finite exact seed");
+    assert_eq!(result.rho, array![0.125]);
+    assert!(
+        objective.off_seed_value_evals > 0,
+        "the initially undefined seed must activate heavy continuation work"
+    );
+    assert!(
+        objective.exact_seed_value_evals >= 2,
+        "the exact seed must be probed before entry and verified after arrival"
+    );
+    assert!(objective.derivative_evals > 0);
+}
+
+#[test]
+fn reactive_domain_entry_keeps_unrepairable_seed_as_typed_refusal() {
+    let (result, objective) = run_reactive_domain_fixture(ReactiveDomainMode::NeverOpens);
+    let error = result.expect_err("a path that never establishes finite evidence must refuse");
+    assert!(
+        error.to_string().contains("reactive domain entry refused"),
+        "unexpected refusal: {error}"
+    );
+    assert!(
+        objective.off_seed_value_evals > 0,
+        "an undefined capable seed must attempt the certified heavy path"
+    );
+    assert_eq!(
+        objective.derivative_evals, 0,
+        "the outer solver must not start without finite exact-seed evidence"
+    );
+}
+
 #[test]
 fn run_indefinite_analytic_seed_stays_on_arc() {
     let mut seed_config = gam_problem::SeedConfig::default();
