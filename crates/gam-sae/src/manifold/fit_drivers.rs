@@ -6744,6 +6744,54 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // LOGIT-BLOCK stage (the third block of the engine, #2082 primitive):
+        // once the (t, B) rounds reach their fixed point, attempt a bounded
+        // number of gate-ownership rounds — the soft row-ownership anchor
+        // (no-op at K=1) followed by the decoder refit the anchor contract
+        // requires, then a fresh (t, B) chain — each as its OWN
+        // strict-decrease transaction, so a rejected gate move can never claw
+        // back committed (t, B) progress. This is the EM shape: E-step gates
+        // toward the decoder that owns each row, M-step refits decoders and
+        // coordinates; the objective gate makes it monotone rather than
+        // heuristic, and the bound (2) exists only because each committed
+        // anchor changes the ownership pattern it would recompute — two dry
+        // rounds prove the pattern is stable.
+        for _ in 0..2 {
+            let snapshot = self.snapshot_mutable_state();
+            let round = self
+                .anchor_logits_to_residual_ownership(target)
+                .and_then(|()| {
+                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))
+                })
+                .and_then(|()| {
+                    if frames {
+                        self.refresh_active_frames_from_data(target)
+                            .map(drop)
+                            .map_err(|err| format!("sweep frame re-polar: {err}"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| self.seed_coords_by_decoder_projection(target))
+                .and_then(|()| {
+                    self.refit_decoder_least_squares_at_current_state(target, Some(rho))
+                })
+                .and_then(|()| {
+                    self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                });
+            let accept_floor =
+                SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + best_objective.abs());
+            match round {
+                Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
+                    best_objective = value;
+                    moved = true;
+                }
+                _ => {
+                    self.restore_mutable_state(&snapshot)?;
+                    break;
+                }
+            }
+        }
         Ok(moved)
     }
 
