@@ -139,6 +139,29 @@ fn logdet_audit_point(
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
     let branch_certificate =
         BranchCertificate::from_arrow_cache(&cache, MajorizerAnchorMode::FrozenAnchor);
+    // #2253 mechanism gate: a model whose evidence cache was returned must be
+    // an exact recurrence of the evidence-only inner map. Re-enter from the
+    // returned state with the same bounded chunk; any accepted strict move
+    // proves the cache was formed at the coarse KKT admission band rather than
+    // at the differentiable no-descent root.
+    let mut recurrence_term = term.clone();
+    let mut recurrence_rho = rho.clone();
+    let recurrence = recurrence_term.run_joint_fit_arrow_schur_for_evidence(
+        target,
+        &mut recurrence_rho,
+        registry,
+        inner_max_iter,
+        0.05,
+        1.0e-6,
+        1.0e-6,
+    )?;
+    if !recurrence.fixed_point {
+        return Err(format!(
+            "logdet_audit_point: evidence cache returned at a non-idempotent inner state \
+             (budget={inner_max_iter}, KKT={kkt_grad_norm:.6e}, \
+             quotient KKT={quotient_kkt_grad_norm:.6e}, tolerance={kkt_tolerance:.6e})"
+        ));
+    }
     Ok(LogdetAuditPoint {
         term,
         criterion,
