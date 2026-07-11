@@ -781,6 +781,26 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
             "penalized criterion changed under physical co-scale c={physical_scale}: \
              relative criterion defect {criterion_defect:.3e}"
         );
+        let component_names = [
+            "data",
+            "assignment",
+            "smooth",
+            "ard",
+            "analytic",
+            "repulsion",
+            "separation",
+        ];
+        for (idx, name) in component_names.into_iter().enumerate() {
+            let unit = base.components[idx];
+            let rescaled = scaled.components[idx];
+            let defect = (rescaled - unit).abs() / (1.0 + rescaled.abs().max(unit.abs()));
+            assert!(
+                defect < 1.0e-3,
+                "{name} criterion component changed under physical co-scale \
+                 c={physical_scale}: unit={unit:.8e}, rescaled={rescaled:.8e}, \
+                 relative defect={defect:.3e}"
+            );
+        }
     }
 }
 
