@@ -172,11 +172,12 @@ CPU. Inspect the calibrated thresholds with
 `gamfit.build_info()["cuda_diagnostics"]` or
 `gamfit.format_cuda_diagnostics()`.
 
-If both a system CUDA toolkit and pip `nvidia-*-cu12` wheels are present
-in the same environment, gamfit warns once per conflict-set and
-continues; glibc resolves `dlopen(SONAME)` to a single file, so this is
-usually benign. If you use gamfit with `torch`, install a torch build
-whose CUDA suffix matches your driver.
+The wheel uses the CUDA 12 ABI. If PyTorch has already mapped a complete CUDA
+stack, gamfit continues that same stack rather than preloading a second system
+toolkit. Without an existing stack it loads one complete system or packaged
+NVIDIA stack. The GPU probe refuses a partial or mixed mapped stack because
+CUDA context and library-handle ownership cannot be safely split across
+implementations.
 
 ## License
 

@@ -329,11 +329,12 @@ import gamfit
 print(gamfit.format_cuda_diagnostics())
 ```
 
-Keep one CUDA toolkit reachable. If a system CUDA install and PyTorch's
-bundled CUDA wheels are both present, gamfit warns once and continues; it
-loads cuBLAS / cuSOLVER / cuSPARSE through whichever `libcudart.so.12` it
-finds first. When using gamfit with `torch` on a CUDA 12.x driver,
-install a torch build whose CUDA suffix matches (`+cu12x`).
+The wheel is compiled against the CUDA 12 driver/userspace ABI. If PyTorch has
+already mapped a complete CUDA stack, gamfit continues that exact stack; it
+does not preload a second system toolkit into the process. Otherwise it loads
+one complete system or packaged NVIDIA stack. A process whose mapped CUDA
+libraries do not belong to one complete stack is refused by the GPU probe
+instead of mixing context or handle ownership across implementations.
 
 ## Repository layout
 

@@ -146,8 +146,8 @@ impl GpuRuntime {
             // workspace allocation), so we refuse to advertise GPU unless all
             // three load cleanly here.
             for stem in ["cublas", "cusolver", "cusparse"] {
-                if !crate::driver::cuda_compute_library_present(stem) {
-                    let reason = format!("lib{stem} unavailable");
+                if let Err(error) = crate::driver::require_cuda_compute_library(stem) {
+                    let reason = format!("lib{stem} unavailable: {error}");
                     Self::record_cpu_reason(reason.clone());
                     log::info!("[GPU] CUDA acceleration disabled: {reason}");
                     diagnostics::log_cuda_disabled(&reason);

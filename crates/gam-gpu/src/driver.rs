@@ -93,7 +93,7 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
     static PRELOAD: OnceLock<Result<Vec<UnixLibrary>, String>> = OnceLock::new();
     PRELOAD
         .get_or_init(|| {
-            let paths = cuda_userspace_preload_paths();
+            let paths = cuda_userspace_preload_paths()?;
             if paths.is_empty() {
                 return Ok(Vec::new());
             }
@@ -121,8 +121,8 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
         .map_err(Clone::clone)
 }
 
-/// Returns whether the platform loader can open the named CUDA compute
-/// library (`cublas`, `cusolver`, `cusparse`).
+/// Require that the platform loader can open the named CUDA compute library
+/// (`cublas`, `cusolver`, `cusparse`) from the one selected userspace stack.
 ///
 /// cudarc 0.19 attempts to lazy-load these via its own generated
 /// `panic_no_lib_found` helpers the first time `CudaBlas::new` /
@@ -131,18 +131,10 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
 /// `libcuda.so.1` but no cuBLAS at all), those calls panic out of the
 /// PyO3 FFI boundary instead of returning a typed error.
 ///
-/// `GpuRuntime::probe()` calls this for every compute library it depends
-/// on; failure to load any of them downgrades the runtime to CPU with a
-/// `DriverLibraryUnavailable { reason: "lib<name> unavailable" }`, which
-/// keeps the panic completely off the call path.
-#[must_use]
-pub fn cuda_compute_library_present(stem: &str) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if preload_cuda_userspace_libraries().is_err() {
-            return false;
-        }
-    }
+/// `GpuRuntime::probe()` calls this for every compute library it depends on;
+/// failure retains the exact stack-selection or loader error in the typed GPU
+/// refusal and keeps cudarc's panic completely off the call path.
+pub fn require_cuda_compute_library(stem: &str) -> Result<(), String> {
     // Cache the probe per stem and KEEP the loaded handle alive for the process
     // lifetime. Dropping the `Library` here dlclose's it; that dlopen+dlclose
     // cycle tears down the compute library's global init state, after which
@@ -150,16 +142,19 @@ pub fn cuda_compute_library_present(stem: &str) -> bool {
     // CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED on the next handle creation (the GPU
     // then silently declines and falls back to CPU). Holding the handle keeps the
     // library mapped and initialized so cudarc reuses it intact.
-    static PROBED: OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-        OnceLock::new();
+    static PROBED: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Result<(), String>>>,
+    > = OnceLock::new();
     static KEEP_ALIVE: OnceLock<std::sync::Mutex<Vec<Library>>> = OnceLock::new();
     let probed = PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(cache) = probed.lock() {
-        if let Some(&present) = cache.get(stem) {
-            return present;
+        if let Some(outcome) = cache.get(stem) {
+            return outcome.clone();
         }
     }
-    let present = match load_library_names(&cuda_compute_library_candidate_names(stem)) {
+    #[cfg(target_os = "linux")]
+    preload_cuda_userspace_libraries()?;
+    let outcome = match load_library_names(&cuda_compute_library_candidate_names(stem)) {
         Ok(library) => {
             if let Ok(mut keep) = KEEP_ALIVE
                 .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -167,33 +162,120 @@ pub fn cuda_compute_library_present(stem: &str) -> bool {
             {
                 keep.push(library);
             }
-            true
+            Ok(())
         }
-        Err(_) => false,
+        Err(error) => Err(error.to_string()),
     };
     if let Ok(mut cache) = probed.lock() {
-        cache.insert(stem.to_string(), present);
+        cache.insert(stem.to_string(), outcome.clone());
     }
-    present
+    outcome
 }
 
 #[cfg(target_os = "linux")]
-fn cuda_userspace_preload_paths() -> Vec<PathBuf> {
+fn cuda_userspace_preload_paths() -> Result<Vec<PathBuf>, String> {
+    // A host package such as PyTorch may already own the process's CUDA
+    // userspace stack. Loading gam's system-first stack on top of that maps a
+    // second cudart/cuBLAS implementation and splits context/handle ownership.
+    // Continue the already-mapped stack instead: pip NVIDIA wheels are spread
+    // across component directories under one `nvidia/` root, while a system
+    // toolkit keeps this preload set in one directory.
+    let mapped = mapped_cuda_userspace_libraries()?;
+    if !mapped.is_empty() {
+        return complete_mapped_cuda_stack(&mapped);
+    }
+
     let system_dirs = cuda_system_library_dirs();
     for dir in &system_dirs {
         if let Some(stack) = complete_system_cuda_stack(dir) {
-            return dedup_paths(stack);
+            return Ok(dedup_paths(stack));
         }
         if let Some(stack) = system_cuda_stack_with_packaged_nvjitlink(dir) {
-            return dedup_paths(stack);
+            return Ok(dedup_paths(stack));
         }
     }
     for root in nvidia_package_roots() {
         if let Some(stack) = complete_nvidia_cuda_stack(&root) {
-            return dedup_paths(stack);
+            return Ok(dedup_paths(stack));
         }
     }
-    Vec::new()
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "linux")]
+fn complete_mapped_cuda_stack(mapped: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut candidates = Vec::new();
+    for path in mapped {
+        if let Some(root) = nvidia_package_root_for_library(path)
+            && let Some(stack) = complete_nvidia_cuda_stack(&root)
+        {
+            candidates.push(stack);
+        }
+        if let Some(parent) = path.parent()
+            && let Some(stack) = complete_system_cuda_stack_path(parent)
+        {
+            candidates.push(stack);
+        }
+    }
+    for stack in candidates {
+        let stack = dedup_paths(stack);
+        if mapped.iter().all(|mapped_path| {
+            let mapped_path = mapped_path
+                .canonicalize()
+                .unwrap_or_else(|_| mapped_path.clone());
+            stack.iter().any(|candidate| candidate == &mapped_path)
+        }) {
+            return Ok(stack);
+        }
+    }
+    Err(format!(
+        "CUDA userspace is already mapped from no single complete stack: {}",
+        mapped
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn mapped_cuda_userspace_libraries() -> Result<Vec<PathBuf>, String> {
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .map_err(|error| format!("cannot inspect mapped CUDA userspace libraries: {error}"))?;
+    let mut mapped = Vec::new();
+    for line in maps.lines() {
+        let Some(raw_path) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !raw_path.starts_with('/') {
+            continue;
+        }
+        let path = PathBuf::from(raw_path);
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if [
+            "libcudart.so",
+            "libnvJitLink.so",
+            "libcublasLt.so",
+            "libcublas.so",
+            "libcusparse.so",
+            "libcusolver.so",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        {
+            mapped.push(path);
+        }
+    }
+    Ok(dedup_paths(mapped))
+}
+
+#[cfg(target_os = "linux")]
+fn nvidia_package_root_for_library(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("nvidia"))
+        .map(Path::to_path_buf)
 }
 
 fn cuda_compute_library_candidate_names(stem: &str) -> Vec<String> {
@@ -244,7 +326,11 @@ fn cuda_system_library_dirs() -> Vec<&'static str> {
 
 #[cfg(target_os = "linux")]
 fn complete_system_cuda_stack(dir: &str) -> Option<Vec<PathBuf>> {
-    let dir = Path::new(dir);
+    complete_system_cuda_stack_path(Path::new(dir))
+}
+
+#[cfg(target_os = "linux")]
+fn complete_system_cuda_stack_path(dir: &Path) -> Option<Vec<PathBuf>> {
     let stack = vec![
         first_existing(dir, &["libcudart.so.13", "libcudart.so.12", "libcudart.so"])?,
         first_existing(
@@ -650,6 +736,28 @@ mod tests {
     use super::*;
     use ndarray::array;
 
+    #[cfg(target_os = "linux")]
+    fn fake_nvidia_stack(root: &Path) -> Vec<PathBuf> {
+        let libraries = [
+            ("cuda_runtime", "libcudart.so.12"),
+            ("nvjitlink", "libnvJitLink.so.12"),
+            ("cublas", "libcublasLt.so.12"),
+            ("cublas", "libcublas.so.12"),
+            ("cusparse", "libcusparse.so.12"),
+            ("cusolver", "libcusolver.so.11"),
+        ];
+        libraries
+            .into_iter()
+            .map(|(component, name)| {
+                let path = root.join(component).join("lib").join(name);
+                std::fs::create_dir_all(path.parent().expect("library parent"))
+                    .expect("create fake CUDA component directory");
+                std::fs::write(&path, []).expect("create fake CUDA library");
+                path
+            })
+            .collect()
+    }
+
     #[test]
     fn to_i32_fits_small_value() {
         assert_eq!(to_i32(0), Some(0));
@@ -702,5 +810,36 @@ mod tests {
     fn from_col_major_single_element() {
         let result = from_col_major(&[7.0], 1, 1).expect("should succeed");
         assert_eq!(result[[0, 0]], 7.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_pytorch_stack_is_continued_as_one_complete_stack() {
+        let temp = tempfile::tempdir().expect("temporary CUDA tree");
+        let root = temp.path().join("site-packages").join("nvidia");
+        let stack = fake_nvidia_stack(&root);
+        let mapped = vec![stack[0].clone(), stack[3].clone()];
+
+        let selected = complete_mapped_cuda_stack(&mapped).expect("one mapped NVIDIA root");
+
+        assert_eq!(selected.len(), stack.len());
+        assert!(mapped.iter().all(|path| {
+            let canonical = path.canonicalize().expect("canonical fake library");
+            selected.contains(&canonical)
+        }));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_mixed_cuda_stacks_are_refused() {
+        let temp = tempfile::tempdir().expect("temporary CUDA tree");
+        let first = fake_nvidia_stack(&temp.path().join("first").join("nvidia"));
+        let second = fake_nvidia_stack(&temp.path().join("second").join("nvidia"));
+        let mapped = vec![first[0].clone(), second[3].clone()];
+
+        let error = complete_mapped_cuda_stack(&mapped)
+            .expect_err("libraries from two mapped roots must not be mixed");
+
+        assert!(error.contains("no single complete stack"));
     }
 }
