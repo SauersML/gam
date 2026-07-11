@@ -449,10 +449,13 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     // partial implementation that wires only 0.5 tr(B^-1 dB/drho) while silently
     // dropping -0.5 Gamma^T A^-1 dg/drho.
     let loss = term.loss(target.view(), &rho).expect("softmax loss");
-    let dense_gradient = term
+    let sparse_index = rho
+        .sparse_flat_index()
+        .expect("softmax sparse coordinate");
+    let dense_components = term
         .analytic_outer_rho_gradient_components(target.view(), &rho, &loss, &cache, &solver)
-        .expect("dense complete outer gradient")
-        .gradient()[rho.sparse_flat_index().expect("softmax sparse coordinate")];
+        .expect("dense complete outer gradient");
+    let dense_gradient = dense_components.gradient()[sparse_index];
     let dense_coordinate_gradient = term
         .analytic_assignment_strength_gradient_dense(target.view(), &rho, &cache, &solver)
         .expect("dense Hybrid-EFS assignment-strength gradient");
@@ -472,6 +475,10 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
             && matrix_free_gradient.is_finite(),
         "complete assignment gradients must be finite (dense={dense_gradient}, \
          dense_coordinate={dense_coordinate_gradient}, matrix_free={matrix_free_gradient})"
+    );
+    assert!(
+        dense_components.third_order_correction[sparse_index].abs() > 1.0e-12,
+        "fixture must excite a nonzero exact-stationarity IFT correction"
     );
     assert_abs_diff_eq!(dense_coordinate_gradient, dense_gradient, epsilon = 1.0e-10);
     assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
