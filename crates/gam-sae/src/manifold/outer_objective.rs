@@ -3609,12 +3609,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 )
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
-        // #2253 channel-isolation probe (temporary): axis-aligned FD of the
+        // #2253 test-only channel-isolation probe: axis-aligned FD of the
         // criterion's log-det VALUE (arrow_log_det = log|B|) vs the analytic
         // log-det gradient channel (logdet_trace + adjoint). If FD(½log|B|)
         // matches (logdet_trace+adjoint) the log-det channel is consistent and
         // the desync is in `explicit`/`occam`; if not, the log-det channel is
         // the culprit. Also FD the total. Keyed by ρ.
+        #[cfg(test)]
         {
             let n_p = rho.len();
             let h = 1.0e-5_f64;
