@@ -15,7 +15,7 @@
 //! direction a diagnostic needs it.
 //!
 //! Before this, the tree computed `H⁻¹·` in independent dialects with
-//! independent factorizations — `AloFactoredHessian` (runtime.rs), an
+//! independent factorizations — an
 //! `ift_dbeta_drho_from_solver` solve-closure and a separate coned variant
 //! (evidence.rs), and the projected pseudo-inverse of the rank-deficient
 //! LAML kernel (unified.rs) — so each site had to answer on its own the

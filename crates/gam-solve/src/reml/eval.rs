@@ -601,37 +601,22 @@ impl<'a> RemlState<'a> {
         if final_rho.is_empty() {
             return (None, None);
         }
-        // The Laplace proposal Hessian must be the same base-criterion curvature
-        // the suppressed sampling target uses (#979); the ALO-stabilization term
-        // contributes no curvature anyway (dropped as dead), so this only keeps
-        // the proposal and target derived from one consistent criterion.
-        let Ok(outer_hessian) =
-            self.without_alo_stabilization(|| self.compute_lamlhessian_consistent(final_rho))
-        else {
+        let Ok(outer_hessian) = self.compute_lamlhessian_consistent(final_rho) else {
             return (None, None);
         };
-        // The certificate and the Tier-2 NUTS escalation both sample the genuine
-        // marginal criterion `π(ρ|y) ∝ exp(−LAML(ρ))`. The Gaussian-identity
-        // ALO-stabilization augmentation is suppressed throughout (#979): it is
-        // an outer-optimizer leverage barrier (#813/#821), not part of the
-        // marginal posterior — whose Laplace proposal here (`outer_hessian`) is
-        // the BASE REML Hessian — and its full per-evaluation ALO diagnostic
-        // suite would otherwise dominate the thousands of leapfrog evaluations.
-        let certificate = self.without_alo_stabilization(|| {
-            escalator.rho_posterior_certificate(
-                final_rho,
-                &outer_hessian,
-                &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
-                n_samples,
-            )
-        });
+        let certificate = escalator.rho_posterior_certificate(
+            final_rho,
+            &outer_hessian,
+            &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
+            n_samples,
+        );
         let escalation = match certificate.as_ref().map(|c| c.certificate) {
             // The certificate refuses to certify the plug-in, but escalation
             // (Tier-1 quadrature / Tier-2 NUTS over ρ) is the expensive tier;
             // only run it when the caller opts in. Interactive formula/CLI fits
             // pass `allow_escalation = false`, so they surface the cheap Tier-0
             // certificate while never launching the sampler.
-            Some(RhoCertificate::Escalate) if allow_escalation => self.without_alo_stabilization(|| {
+            Some(RhoCertificate::Escalate) if allow_escalation => {
                 Some(escalator.escalate_rho_posterior(
                     final_rho,
                     &outer_hessian,
@@ -646,7 +631,7 @@ impl<'a> RemlState<'a> {
                         })
                     },
                 ))
-            }),
+            }
             _ => None,
         };
         (certificate, escalation)

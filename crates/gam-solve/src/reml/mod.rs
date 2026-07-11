@@ -5250,12 +5250,6 @@ impl RemlArena {
     }
 }
 
-pub(crate) struct AloFrozenNuisance {
-    pub(crate) n_obs: usize,
-    pub(crate) influence_scale: Vec<f64>,
-    pub(crate) phi: f64,
-}
-
 pub(crate) struct RemlState<'a> {
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
@@ -5539,33 +5533,6 @@ pub(crate) struct RemlState<'a> {
     /// joint pressure skips caching (the streamed path remains available).
     pub(crate) flat_glm_first_step_gram:
         RwLock<Option<gam_runtime::resource::Governed<Arc<ndarray::Array2<f64>>>>>,
-    /// Frozen ALO robustness weights for this REML surface.
-    ///
-    /// The PSIS influence scale is a non-smooth function of the current hat
-    /// diagonals. Once the high-leverage ALO objective activates, it is frozen
-    /// for the current surface so the analytic gradient differentiates the
-    /// same fixed-weight objective the cost evaluates.
-    pub(crate) alo_frozen_nuisance: RwLock<Option<AloFrozenNuisance>>,
-
-    /// ρ-independent certificate that the Gaussian-identity ALO-stabilization
-    /// augmentation can never activate on this surface (#1689).
-    ///
-    /// The augmentation engages only when some row's *penalized* leverage
-    /// `h_i = w_i · xᵢᵀ H_λ⁻¹ xᵢ` reaches `ALO_MAX_LEVERAGE_THRESHOLD`, where
-    /// `H_λ = XᵀWX + S_λ + ridge·I ⪰ XᵀWX`. Because `S_λ + ridge·I ⪰ 0` we have
-    /// `H_λ⁻¹ ⪯ (XᵀWX)⁻¹`, so `h_i ≤ w_i · xᵢᵀ (XᵀWX)⁻¹ xᵢ` — the *unpenalized*
-    /// weighted hat diagonal, which (for Gaussian identity, where W is the fixed
-    /// prior-weight diagonal) is independent of ρ. If the max of that bound is
-    /// below the activation threshold, no ρ can trip the gate, so the entire
-    /// per-outer-evaluation O(n·p²) ALO leverage diagnostic — recomputed and
-    /// discarded on every cost/gradient eval otherwise — is skipped.
-    ///
-    /// `Some(true)`  → provably inactive everywhere, skip the diagnostic.
-    /// `Some(false)` → bound is ≥ threshold or XᵀWX is rank-deficient/ill-
-    ///                 conditioned (bound not certifiable); fall through to the
-    ///                 exact per-eval gate. Computed lazily, at most once.
-    pub(crate) alo_provably_inactive: RwLock<Option<bool>>,
-
     /// Stable disk-cache key for the current realized REML surface. Computed
     /// lazily because it hashes the row-chunked design and data vectors.
     pub(crate) persistent_warm_start_key: RwLock<Option<String>>,
@@ -5578,16 +5545,6 @@ pub(crate) struct RemlState<'a> {
     /// evaluations. In-memory warm starts still update; only JSON/bin
     /// persistence and eviction sweeps are suppressed.
     pub(crate) persistent_warm_start_store_suppression: AtomicUsize,
-    /// Scoped counter disabling the Gaussian-identity ALO-stabilization
-    /// augmentation (#979). The leverage barrier `Σ_i (h_i − τ)₊²` is an OUTER
-    /// OPTIMIZER aid (#813/#821) that keeps the smoothing-parameter search off
-    /// pathological high-leverage λ regions. The marginal smoothing-parameter
-    /// posterior `π(ρ|y) ∝ exp(−LAML(ρ))` (#938) is a property of the genuine
-    /// model criterion, sampled against a Laplace proposal built from the BASE
-    /// REML Hessian, so the certificate / NUTS evaluations suppress the
-    /// augmentation (see `without_alo_stabilization`) — both for proposal↔target
-    /// consistency and to drop the per-leapfrog ALO diagnostic suite.
-    pub(crate) alo_stabilization_suppression: AtomicUsize,
     /// Whether the cross-process ON-DISK warm-start layer is engaged at all.
     ///
     /// Default `false`: the optimizer's IN-MEMORY warm start (the actual

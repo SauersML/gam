@@ -183,8 +183,7 @@ pub struct ThetaDirection {
 /// this object; none holds its own factorization:
 ///
 /// - `beta_dot(dir)`       — dβ̂/dθ for the REML gradient (IFT);
-/// - `alo_leverages()`     — t = case-weight perturbations (ALO; absorbs
-///                           `AloFactoredHessian`);
+/// - `alo_leverages()`     — t = case-weight perturbations for ALO diagnostics;
 /// - `influence(J)`        — t = stage-1 nuisance (#461 absorber);
 /// - `case_deletion(i)`    — exact Cook's/dfbeta diagnostics;
 /// - `hvp(dir)`            — outer-Hessian θ-HVP (#740): directional trace

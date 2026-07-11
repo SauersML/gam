@@ -78,11 +78,29 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let minus = &base - &(h * &direction);
     let cost_at = |rho: &Array1<f64>| {
         let mut objective = warmstart_test_objective_with_evaluator();
-        objective
+        let cost = objective
             .eval_cost(rho)
-            .expect("directional finite-difference value probe must converge")
+            .expect("directional finite-difference value probe must converge");
+        (cost, objective.probe_telemetry())
     };
-    let finite_difference = (cost_at(&plus) - cost_at(&minus)) / (2.0 * h);
+    let (plus_cost, plus_telemetry) = cost_at(&plus);
+    let (minus_cost, minus_telemetry) = cost_at(&minus);
+    assert_eq!(
+        plus_telemetry.wall_cost_value_probes, 0,
+        "+h value probe returned the recoverable-refusal wall: {plus_telemetry:?}"
+    );
+    assert_eq!(
+        minus_telemetry.wall_cost_value_probes, 0,
+        "-h value probe returned the recoverable-refusal wall: {minus_telemetry:?}"
+    );
+    assert_ne!(
+        plus_cost.to_bits(),
+        minus_cost.to_bits(),
+        "the active-rho value lane is bit-flat across a nonzero directional step: \
+         plus={plus_cost:.17e}, minus={minus_cost:.17e}, \
+         plus_telemetry={plus_telemetry:?}, minus_telemetry={minus_telemetry:?}"
+    );
+    let finite_difference = (plus_cost - minus_cost) / (2.0 * h);
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
         (analytic - finite_difference).abs() <= 5.0e-3 * scale,

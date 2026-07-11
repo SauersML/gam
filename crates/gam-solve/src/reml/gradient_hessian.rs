@@ -4205,15 +4205,12 @@ impl<'a> RemlState<'a> {
             glm_psi_gram_deriv: RwLock::new(None),
             glm_first_step_gram: RwLock::new(None),
             flat_glm_first_step_gram: RwLock::new(None),
-            alo_frozen_nuisance: RwLock::new(None),
-            alo_provably_inactive: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
             persistent_latent_values_cache: RwLock::new(PersistentLatentValuesCache::default()),
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
             persistent_warm_start_store_suppression: AtomicUsize::new(0),
-            alo_stabilization_suppression: AtomicUsize::new(0),
             persistent_warm_start_disk_enabled: AtomicBool::new(false),
             gaussian_weight_log_sum_half_cache: std::sync::OnceLock::new(),
             gaussian_dp_floor_scale_cache: std::sync::OnceLock::new(),
@@ -4277,7 +4274,6 @@ impl<'a> RemlState<'a> {
         // The flat-warm-start GLM first-step Gram is keyed to the previous
         // surface's design and warm β; a surface reset invalidates both.
         *self.flat_glm_first_step_gram.write().unwrap() = None;
-        *self.alo_frozen_nuisance.write().unwrap() = None;
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
             .store(false, Ordering::Relaxed);
@@ -5416,30 +5412,6 @@ impl<'a> RemlState<'a> {
         self.persistent_warm_start_store_suppression
             .fetch_add(1, Ordering::Relaxed);
         let guard = StoreSuppressionGuard(&self.persistent_warm_start_store_suppression);
-        let out = f();
-        drop(guard);
-        out
-    }
-
-    /// Run `f` with the Gaussian-identity ALO-stabilization augmentation
-    /// disabled (#979). Used to evaluate the genuine LAML criterion during
-    /// ρ-posterior certificate / NUTS sampling, where the optimizer-stability
-    /// leverage barrier (#813/#821) is both inappropriate (it is not part of the
-    /// marginal posterior, whose Laplace proposal uses the base REML Hessian)
-    /// and ruinously expensive (its full ALO diagnostic suite would run on every
-    /// leapfrog step). Re-entrant via a counter, like
-    /// [`Self::without_persistent_warm_start_store`].
-    pub(crate) fn without_alo_stabilization<T>(&self, f: impl FnOnce() -> T) -> T {
-        struct AloSuppressionGuard<'a>(&'a AtomicUsize);
-        impl Drop for AloSuppressionGuard<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-
-        self.alo_stabilization_suppression
-            .fetch_add(1, Ordering::Relaxed);
-        let guard = AloSuppressionGuard(&self.alo_stabilization_suppression);
         let out = f();
         drop(guard);
         out
