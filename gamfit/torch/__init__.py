@@ -59,12 +59,16 @@ from .geometry import (
     sphere_log_map,
 )
 from .manifold_sae import (
+    CircularConcordanceReport,
+    CircularPairConcordance,
+    CircularReplicateCoverage,
     DecoderConfig,
     ManifoldSAE,
     ManifoldSAEConfig,
     ManifoldSAEOutput,
     RemlConfig,
     SparsityConfig,
+    circular_concordance,
 )
 from .modules import (
     AdaptiveTopK,
@@ -147,12 +151,16 @@ __all__ = [
     "IvaeRidgeMeanGauge",
     "JumpReLUPenalty",
     "LazyPcaBasis",
+    "CircularConcordanceReport",
+    "CircularPairConcordance",
+    "CircularReplicateCoverage",
     "DecoderConfig",
     "ManifoldSAE",
     "ManifoldSAEConfig",
     "ManifoldSAEOutput",
     "RemlConfig",
     "SparsityConfig",
+    "circular_concordance",
     "PoincareAtoms",
     "SkipAffineSmooth",
     "SkipTranscoderCandidateFailed",

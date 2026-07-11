@@ -49,6 +49,7 @@ from typing import Any, Callable, Literal, Mapping, cast
 import numpy as np
 import torch
 from torch import nn
+from torch.nn.utils import parametrize
 
 from .._binding import rust_module
 from .._sae_manifold import (
@@ -253,6 +254,12 @@ class ManifoldSAEConfig:
     # The direct linear encoder remains available explicitly with zero width.
     encoder_hidden: int = 16
     init_scale: float = 0.05
+    # Optional known ordering plane for a gradient-trained circle. Rows may be
+    # scaled/non-orthogonal; Rust canonicalizes their span. The unit constant
+    # decoder row remains ambient while every coordinate-dependent harmonic is
+    # parameterized only inside this frame, eliminating out-of-plane angle
+    # wandering without leaving dead ambient decoder parameters (#2260).
+    decoder_subspace: Any = None
     dtype: Any = field(default=None)
     # ``K`` is constructor sugar for ``n_atoms`` (the spelling the docs and the
     # closed-form ``sae_manifold_fit`` API use). It is normalized into
@@ -422,6 +429,125 @@ class ManifoldSAEOutput:
     reml_score: torch.Tensor
     lambdas: torch.Tensor
     raw_magnitudes: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class CircularReplicateCoverage:
+    """Whether one replicate spans a two-dimensional circle embedding."""
+
+    replicate: int
+    minimum_embedding_eigenvalue: float
+    maximum_embedding_eigenvalue: float
+    isotropic_coverage: float
+    rank_resolution: float
+    well_posed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CircularPairConcordance:
+    """One replicate pair aligned by rotation or reflection."""
+
+    left: int
+    right: int
+    rotation_score: float | None
+    reflection_score: float | None
+    aligned_score: float | None
+    reflected: bool | None
+    phase_shift: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class CircularConcordanceReport:
+    """Cross-seed latent-angle stability modulo the circle's exact O(2) gauge."""
+
+    n_replicates: int
+    n_rows: int
+    period: float
+    coverage: tuple[CircularReplicateCoverage, ...]
+    pairs: tuple[CircularPairConcordance, ...]
+    minimum_aligned_score: float | None
+    mean_aligned_score: float | None
+
+
+def circular_concordance(
+    coordinates: torch.Tensor | np.ndarray, *, period: float = 1.0
+) -> CircularConcordanceReport:
+    """Report cross-seed angle agreement after exact rotation/reflection alignment.
+
+    ``coordinates`` has shape ``(replicates, rows)`` and must keep observation
+    rows aligned across fits. Rust computes both O(2) quotient resultants and an
+    embedding-rank certificate. A collapsed replicate makes the corresponding
+    pair and aggregate scores ``None`` rather than earning vacuous agreement.
+    No pass/fail threshold is imposed: the measured pairwise/minimum scores are
+    the diagnostic.
+    """
+    if isinstance(coordinates, torch.Tensor):
+        values = to_numpy_f64(coordinates)
+    else:
+        values = np.ascontiguousarray(np.asarray(coordinates, dtype=np.float64))
+    raw = rust_module().sae_circular_concordance(values, float(period))
+    coverage = tuple(
+        CircularReplicateCoverage(
+            replicate=int(item["replicate"]),
+            minimum_embedding_eigenvalue=float(
+                item["minimum_embedding_eigenvalue"]
+            ),
+            maximum_embedding_eigenvalue=float(
+                item["maximum_embedding_eigenvalue"]
+            ),
+            isotropic_coverage=float(item["isotropic_coverage"]),
+            rank_resolution=float(item["rank_resolution"]),
+            well_posed=bool(item["well_posed"]),
+        )
+        for item in raw["coverage"]
+    )
+    pairs = tuple(
+        CircularPairConcordance(
+            left=int(item["left"]),
+            right=int(item["right"]),
+            rotation_score=(
+                None
+                if item["rotation_score"] is None
+                else float(item["rotation_score"])
+            ),
+            reflection_score=(
+                None
+                if item["reflection_score"] is None
+                else float(item["reflection_score"])
+            ),
+            aligned_score=(
+                None
+                if item["aligned_score"] is None
+                else float(item["aligned_score"])
+            ),
+            reflected=(
+                None if item["reflected"] is None else bool(item["reflected"])
+            ),
+            phase_shift=(
+                None
+                if item["phase_shift"] is None
+                else float(item["phase_shift"])
+            ),
+        )
+        for item in raw["pairs"]
+    )
+    return CircularConcordanceReport(
+        n_replicates=int(raw["n_replicates"]),
+        n_rows=int(raw["n_rows"]),
+        period=float(raw["period"]),
+        coverage=coverage,
+        pairs=pairs,
+        minimum_aligned_score=(
+            None
+            if raw["minimum_aligned_score"] is None
+            else float(raw["minimum_aligned_score"])
+        ),
+        mean_aligned_score=(
+            None
+            if raw["mean_aligned_score"] is None
+            else float(raw["mean_aligned_score"])
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1615,6 +1741,66 @@ class _SparsityLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class _CircleDecoderSubspaceParametrization(nn.Module):
+    """Shape-changing live parameterization of a circle decoder (#2260).
+
+    The DC coefficient remains an unrestricted ambient vector. Every harmonic
+    coefficient is stored in coordinates of the caller's orthonormal ``(r, D)``
+    frame and lifted on the autograd tape. Thus the latent-coordinate-dependent
+    curve cannot leave the requested plane, while the constant reconstruction
+    component may still use all ambient dimensions. The optimizer sees only
+    ``D + (K-1)r`` live scalars per atom—there are no projected-away parameters.
+    """
+
+    def __init__(self, frame: torch.Tensor, n_basis: int, input_dim: int) -> None:
+        super().__init__()
+        if frame.dim() != 2 or frame.shape[1] != input_dim:
+            raise ValueError(
+                "decoder subspace frame must have shape (rank, input_dim); "
+                f"got {tuple(frame.shape)}"
+            )
+        self.register_buffer("frame", frame.detach().clone(), persistent=True)
+        self.n_basis = int(n_basis)
+        self.input_dim = int(input_dim)
+
+    @property
+    def rank(self) -> int:
+        return int(self.frame.shape[0])
+
+    @property
+    def encoded_width(self) -> int:
+        return self.input_dim + (self.n_basis - 1) * self.rank
+
+    def forward(self, encoded: torch.Tensor) -> torch.Tensor:
+        if encoded.dim() != 2 or encoded.shape[1] != self.encoded_width:
+            raise ValueError(
+                "encoded decoder coordinates must have shape "
+                f"(n_atoms, {self.encoded_width}); got {tuple(encoded.shape)}"
+            )
+        intercept = encoded[:, : self.input_dim].unsqueeze(1)
+        harmonic_coordinates = encoded[:, self.input_dim :].reshape(
+            encoded.shape[0], self.n_basis - 1, self.rank
+        )
+        harmonics = harmonic_coordinates @ self.frame
+        return torch.cat((intercept, harmonics), dim=1)
+
+    def right_inverse(self, decoder: torch.Tensor) -> torch.Tensor:
+        if decoder.dim() != 3 or tuple(decoder.shape[1:]) != (
+            self.n_basis,
+            self.input_dim,
+        ):
+            raise ValueError(
+                "ambient decoder must have shape "
+                f"(n_atoms, {self.n_basis}, {self.input_dim}); "
+                f"got {tuple(decoder.shape)}"
+            )
+        intercept = decoder[:, 0, :]
+        harmonic_coordinates = decoder[:, 1:, :] @ self.frame.T
+        return torch.cat(
+            (intercept, harmonic_coordinates.reshape(decoder.shape[0], -1)), dim=1
+        )
+
+
 class ManifoldSAE(nn.Module):
     """Trainable manifold-SAE module — see module docstring."""
 
@@ -1771,6 +1957,8 @@ class ManifoldSAE(nn.Module):
             "_fit_blob", torch.zeros(0, dtype=torch.uint8), persistent=True
         )
         self.reset_parameters()
+        if cfg.decoder_subspace is not None:
+            self._install_decoder_subspace(cfg.decoder_subspace)
         self.to(dtype=cfg.dtype)
 
     def reset_parameters(self) -> None:
@@ -1786,10 +1974,67 @@ class ManifoldSAE(nn.Module):
             nn.init.normal_(self.encoder.weight, mean=0.0, std=s)
             nn.init.zeros_(self.encoder.bias)
         nn.init.normal_(self.atom_raw_anchor, mean=0.0, std=s)
-        nn.init.normal_(self.decoder_blocks, mean=0.0, std=s)
+        if parametrize.is_parametrized(self, "decoder_blocks"):
+            nn.init.normal_(
+                self.parametrizations.decoder_blocks.original, mean=0.0, std=s
+            )
+        else:
+            nn.init.normal_(self.decoder_blocks, mean=0.0, std=s)
         nn.init.zeros_(self.log_lambda)
         self._linear_mean.zero_()
         self._pca_initialized.zero_()
+
+    def _install_decoder_subspace(self, raw_frame: Any) -> None:
+        """Install the live reduced-coordinate decoder parameterization."""
+        if self.cfg.atom_manifold != "circle":
+            raise ValueError(
+                "decoder_subspace requires atom_manifold='circle': only the "
+                "coordinate-dependent periodic harmonic rows are restricted"
+            )
+        if parametrize.is_parametrized(self, "decoder_blocks"):
+            raise RuntimeError("decoder_subspace is already installed")
+        if isinstance(raw_frame, torch.Tensor):
+            frame_np = to_numpy_f64(raw_frame)
+        else:
+            frame_np = np.ascontiguousarray(
+                np.asarray(raw_frame, dtype=np.float64)
+            )
+        canonical_np = rust_module().sae_canonical_output_subspace(frame_np)
+        canonical = torch.as_tensor(
+            canonical_np,
+            dtype=self.decoder_blocks.dtype,
+            device=self.decoder_blocks.device,
+        )
+        if canonical.dim() != 2 or canonical.shape[1] != self.cfg.input_dim:
+            raise ValueError(
+                "decoder_subspace must have shape (rank, input_dim); got "
+                f"{tuple(canonical.shape)} for input_dim={self.cfg.input_dim}"
+            )
+        parametrization = _CircleDecoderSubspaceParametrization(
+            canonical,
+            int(self.cfg.n_basis_per_atom),
+            int(self.cfg.input_dim),
+        )
+        parametrize.register_parametrization(
+            self, "decoder_blocks", parametrization, unsafe=True
+        )
+
+    @property
+    def decoder_subspace_frame(self) -> torch.Tensor | None:
+        """Canonical `(rank, input_dim)` ordering frame, if one is installed."""
+        if not parametrize.is_parametrized(self, "decoder_blocks"):
+            return None
+        return self.parametrizations.decoder_blocks[0].frame
+
+    @torch.no_grad()
+    def _set_effective_decoder_blocks(self, blocks: torch.Tensor) -> None:
+        """Write ambient blocks through either the direct or reduced parameter."""
+        if parametrize.is_parametrized(self, "decoder_blocks"):
+            transform = self.parametrizations.decoder_blocks[0]
+            encoded = transform.right_inverse(blocks)
+            self.parametrizations.decoder_blocks.original.copy_(encoded)
+        else:
+            self.decoder_blocks.copy_(blocks)
 
     @torch.no_grad()
     def initialize_from_pca(self, x: torch.Tensor) -> None:
@@ -1869,8 +2114,9 @@ class ManifoldSAE(nn.Module):
                 f"mean={tuple(mean.shape)}, basis={tuple(basis.shape)}"
             )
         self._linear_mean.copy_(mean)
-        self.decoder_blocks.zero_()
-        self.decoder_blocks[:, 0, :].copy_(basis)
+        blocks = torch.zeros_like(self.decoder_blocks)
+        blocks[:, 0, :].copy_(basis)
+        self._set_effective_decoder_blocks(blocks)
         self._pca_initialized.fill_(True)
 
     @property
@@ -2134,6 +2380,12 @@ class ManifoldSAE(nn.Module):
                 f"ManifoldSAE.fit expected (N, {self.cfg.input_dim}); got {tuple(x.shape)}"
             )
         cfg = self.cfg
+        if cfg.decoder_subspace is not None:
+            raise NotImplementedError(
+                "decoder_subspace is a gradient-trained circle parameterization; "
+                "the closed-form .fit() objective has no fixed output-subspace "
+                "constraint"
+            )
         kwargs: dict[str, Any] = {}
         if learning_rate is not None:
             kwargs["learning_rate"] = float(learning_rate)
@@ -2569,10 +2821,14 @@ def _topology_for_manifold(manifold: str) -> str:
 
 
 __all__ = [
+    "CircularConcordanceReport",
+    "CircularPairConcordance",
+    "CircularReplicateCoverage",
     "DecoderConfig",
     "ManifoldSAE",
     "ManifoldSAEConfig",
     "ManifoldSAEOutput",
     "RemlConfig",
     "SparsityConfig",
+    "circular_concordance",
 ]

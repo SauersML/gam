@@ -1431,6 +1431,84 @@ fn sae_principal_subspace<'py>(
     ))
 }
 
+/// Canonical orthonormal row frame for a caller-supplied decoder output
+/// subspace (#2260). Rank validation and the polar/SVD gauge live in Rust.
+#[pyfunction]
+fn sae_canonical_output_subspace<'py>(
+    py: Python<'py>,
+    frame: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let frame_owned = frame.as_array().to_owned();
+    let canonical = py
+        .detach(move || {
+            gam::terms::sae::frames::canonical_output_subspace_rows(frame_owned.view())
+        })
+        .map_err(PyValueError::new_err)?;
+    Ok(canonical.into_pyarray(py).unbind())
+}
+
+/// Replicate latent-angle agreement modulo exactly the circle's `O(2)` gauge
+/// (#2260). Returns per-replicate embedding-rank certificates and every pair's
+/// rotation/reflection resultants; aggregate scores are `None` when any
+/// replicate is collapsed and the quotient alignment is ill-posed.
+#[pyfunction]
+#[pyo3(signature = (coordinates, period=1.0))]
+fn sae_circular_concordance<'py>(
+    py: Python<'py>,
+    coordinates: PyReadonlyArray2<'py, f64>,
+    period: f64,
+) -> PyResult<Py<PyDict>> {
+    let coordinates_owned = coordinates.as_array().to_owned();
+    let report = py
+        .detach(move || {
+            gam::terms::sae::circular_concordance::circular_concordance(
+                coordinates_owned.view(),
+                period,
+            )
+        })
+        .map_err(PyValueError::new_err)?;
+    let out = PyDict::new(py);
+    out.set_item("n_replicates", report.n_replicates)?;
+    out.set_item("n_rows", report.n_rows)?;
+    out.set_item("period", report.period)?;
+    out.set_item("minimum_aligned_score", report.minimum_aligned_score)?;
+    out.set_item("mean_aligned_score", report.mean_aligned_score)?;
+
+    let coverage = PyList::empty(py);
+    for entry in report.coverage {
+        let item = PyDict::new(py);
+        item.set_item("replicate", entry.replicate)?;
+        item.set_item(
+            "minimum_embedding_eigenvalue",
+            entry.minimum_embedding_eigenvalue,
+        )?;
+        item.set_item(
+            "maximum_embedding_eigenvalue",
+            entry.maximum_embedding_eigenvalue,
+        )?;
+        item.set_item("isotropic_coverage", entry.isotropic_coverage)?;
+        item.set_item("rank_resolution", entry.rank_resolution)?;
+        item.set_item("well_posed", entry.well_posed)?;
+        coverage.append(item)?;
+    }
+    out.set_item("coverage", coverage)?;
+
+    let pairs = PyList::empty(py);
+    for entry in report.pairs {
+        let item = PyDict::new(py);
+        item.set_item("left", entry.left)?;
+        item.set_item("right", entry.right)?;
+        item.set_item("rotation_score", entry.rotation_score)?;
+        item.set_item("reflection_score", entry.reflection_score)?;
+        item.set_item("aligned_score", entry.aligned_score)?;
+        item.set_item("reflected", entry.reflected)?;
+        item.set_item("phase_shift", entry.phase_shift)?;
+        pairs.append(item)?;
+    }
+    out.set_item("pairs", pairs)?;
+    Ok(out.unbind())
+}
+
 /// Residual-PC matching-pursuit commitment one-hot for the early training window
 /// of the torch `softmax_topk` lane (issue #1282). Given `x (N, D)`, the per-atom
 /// reconstructions `per_atom_recon (N, F, D)`, and the current non-negative codes
@@ -5314,6 +5392,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_quadratic_subspace_anchor, module)?)?;
     module.add_function(wrap_pyfunction!(sae_apply_anchor_rule, module)?)?;
     module.add_function(wrap_pyfunction!(sae_principal_subspace, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_canonical_output_subspace, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_circular_concordance, module)?)?;
     module.add_function(wrap_pyfunction!(sae_matching_pursuit_commit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_row_trust_scores, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_basis_with_jet_cuda, module)?)?;

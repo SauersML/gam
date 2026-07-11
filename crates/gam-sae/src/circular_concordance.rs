@@ -99,9 +99,8 @@ pub fn circular_concordance(
     let mut sin = vec![vec![0.0; n_rows]; n_replicates];
     for replicate in 0..n_replicates {
         for row in 0..n_rows {
-            let phase = std::f64::consts::TAU
-                * coordinates[[replicate, row]].rem_euclid(period)
-                / period;
+            let phase =
+                std::f64::consts::TAU * coordinates[[replicate, row]].rem_euclid(period) / period;
             let (sin_phase, cos_phase) = phase.sin_cos();
             sin[replicate][row] = sin_phase;
             cos[replicate][row] = cos_phase;
@@ -146,10 +145,7 @@ pub fn circular_concordance(
             let reflection_score = reflection_cos.hypot(reflection_sin) / denominator;
             let reflected = reflection_score > rotation_score;
             let (aligned_score, shift_radians) = if reflected {
-                (
-                    reflection_score,
-                    reflection_sin.atan2(reflection_cos),
-                )
+                (reflection_score, reflection_sin.atan2(reflection_cos))
             } else {
                 (rotation_score, rotation_sin.atan2(rotation_cos))
             };
@@ -173,8 +169,8 @@ pub fn circular_concordance(
     let minimum_aligned_score = all_pairs_well_posed
         .then(|| aggregate.iter().copied().reduce(f64::min))
         .flatten();
-    let mean_aligned_score = all_pairs_well_posed
-        .then(|| aggregate.iter().sum::<f64>() / aggregate.len() as f64);
+    let mean_aligned_score =
+        all_pairs_well_posed.then(|| aggregate.iter().sum::<f64>() / aggregate.len() as f64);
     Ok(CircularConcordanceReport {
         n_replicates,
         n_rows,
