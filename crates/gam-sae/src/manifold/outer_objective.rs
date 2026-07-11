@@ -635,7 +635,20 @@ struct ProbeForcingState {
 impl ProbeForcingState {
     fn new() -> Self {
         Self {
-            enabled: true,
+            // #2253 — DEFAULT OFF (always-tight probes). Eisenstat–Walker forcing
+            // loosens the line-search VALUE probe's inner solve while the
+            // gradient-lane anchor (`eval`) stays at full tolerance, so the
+            // Wolfe/Armijo test compares a loose-inner trial cost against a
+            // tight-inner anchor. On the frozen K=1 circle fit that invalid
+            // comparison makes Strong Wolfe fail at iter 0 at a genuinely real
+            // (tight-gradient) |g|≈0.9: the optimizer cannot take the descent
+            // step, exhausts the stall escapes, and reports NON-CONVERGED though
+            // the point is not stationary (measured across every rdim 4..41).
+            // Certification correctness beats line-search-probe speed for these
+            // fits; forcing is re-enabled per-fit via `set_probe_forcing_enabled`
+            // and can return as a default once the anchor is made commensurate
+            // with the loosened probe.
+            enabled: false,
             last_grad_rho: None,
             g_prev: None,
             g_curr: None,

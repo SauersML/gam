@@ -170,6 +170,10 @@ fn eisenstat_walker_forcing_loosens_probes_and_preserves_terminal_criterion() {
     let (mut forced, seed) = forcing_test_objective(&z, 1);
     let (mut tight, seed_b) = forcing_test_objective(&z, 1);
     assert_eq!(seed, seed_b, "fixture must be deterministic across arms");
+    // #2253 flipped the default to always-tight, so the forced arm opts IN
+    // explicitly (the tight arm's `set_probe_forcing_enabled(false)` is now the
+    // production default, but stays explicit here to document the contrast).
+    forced.set_probe_forcing_enabled(true);
     tight.set_probe_forcing_enabled(false);
 
     // Outer iterate 0 (seed) and iterate 1: two accepted-gradient evaluations
@@ -264,6 +268,9 @@ fn eisenstat_walker_forcing_loosens_probes_and_preserves_terminal_criterion() {
 fn ew_forcing_engages_on_full_outer_walk() {
     let z = one_circle_target(64, 12, 0.05);
     let (mut objective, seed) = forcing_test_objective(&z, 2);
+    // #2253 made always-tight the production default; this test exercises the
+    // forcing lane specifically, so it opts in explicitly.
+    objective.set_probe_forcing_enabled(true);
     let n_params = seed.len();
     let result = OuterProblem::new(n_params)
         .with_initial_rho(seed)
