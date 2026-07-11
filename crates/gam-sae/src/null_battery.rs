@@ -1012,8 +1012,14 @@ pub fn first_two_ordered_circle_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
     let pos = pos_re * pos_re + pos_im * pos_im;
     let neg = neg_re * neg_re + neg_im * neg_im;
     let winding_balance = (pos - neg).max(0.0) / (pos + neg).max(f64::MIN_POSITIVE);
+    // Parseval-normalized energy in the ordered frequency-1 mode. A coherent
+    // circle attains one; unstructured architecture-matched activations put only
+    // O(1/n) of their energy in this single Fourier mode. The previous statistic
+    // computed these coefficients but omitted their concentration, allowing a
+    // chance high-area noise polygon to outrank the planted circle.
+    let harmonic_concentration = ((pos + neg) / (n as f64 * energy)).clamp(0.0, 1.0);
     let area_scale = signed_area.abs() / energy.max(f64::MIN_POSITIVE);
-    Ok(winding_balance * area_scale)
+    Ok(winding_balance * harmonic_concentration * area_scale)
 }
 
 /// Basis-dependent energy in the first two coordinates.
