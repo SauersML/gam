@@ -1287,14 +1287,38 @@ impl SaeManifoldTerm {
                          λ²={newton_decrement_sq:.6e} ½λ²/scale={predicted_relative_decrease:.6e} \
                          obj_scale={objective_scale:.6e} accept_tol={SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL:.6e}"
                     );
-                    // A small model-predicted decrease is diagnostic evidence of
-                    // an ill-conditioned crawl, not a KKT root. The analytic outer
-                    // gradient differentiates the stationary envelope, so only the
-                    // raw/quotient KKT gate above may return this cache.
-                    // A flat objective round is only a convergence shortcut when
-                    // the KKT certificate above is stationary. If not, keep using
-                    // the deterministic refinement budget: either later rounds
-                    // reach stationarity, or the normal `total_inner_iter >=
+                    // Affine-invariant ACCEPTANCE (#2253 doctrine, applied to the
+                    // inner gate). ½λ² = ½·gᵀH⁻¹g is the exact quadratic model's
+                    // predicted remaining decrease measured on the SAME deflated
+                    // exact Hessian the outer adjoint consumes. When it falls at
+                    // or below the stall detector's own no-meaningful-change
+                    // band, NO step — in any direction, under any affine
+                    // reparametrisation — lowers the penalized objective by an
+                    // amount the criterion can resolve: the iterate IS the
+                    // numerical stationary root on the identifiable subspace,
+                    // regardless of where the ambient-metric ‖g‖ sits (a stiff
+                    // narrow valley legitimately parks ‖g‖ orders above the
+                    // Euclidean tolerance while λ² certifies optimality — the
+                    // measured tier-0 refusal was ‖g‖ 1.0034× tol with
+                    // ½λ²/scale = 5.9e-11 against a 1e-8 band). This mirrors the
+                    // outer certify_outer_optimality Newton-decrement rescue
+                    // verbatim and inherits its safety argument: the decrement
+                    // scales quadratically with ‖g‖ at fixed direction, so a fit
+                    // with genuinely available descent inflates λ² and falls
+                    // through to the refine budget exactly as before. (The
+                    // historical refusal here predates the outer rescue; keeping
+                    // the inner gate blind to curvature while the outer gate
+                    // trusts it was inconsistent, and no budget can close a gap
+                    // that the objective's own resolution cannot express.)
+                    if predicted_relative_decrease
+                        <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                    {
+                        return Ok(stationary_cache);
+                    }
+                    // Otherwise: a flat objective round is only a convergence
+                    // shortcut when a certificate is stationary. Keep using the
+                    // deterministic refinement budget: either later rounds reach
+                    // stationarity, or the normal `total_inner_iter >=
                     // refine_limit` branch reports non-convergence without
                     // ranking an off-optimum Laplace criterion. Returning `Err`
                     // here was too strong for K=1 circle fits: one weakly
