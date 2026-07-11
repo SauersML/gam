@@ -6390,21 +6390,14 @@ fn sae_manifold_payload_roundtrip(payload_json: &str) -> PyResult<String> {
     crate::manifold::manifold_sae_payload::roundtrip_json(payload_json).map_err(py_value_error)
 }
 
-// --- #[pyclass] ManifoldSAE skeleton (issue #2091 cutover) ----------------
+// --- Rust-owned #[pyclass] ManifoldSAE (issue #2091) ----------------------
 //
 // The Rust-owned model handle. It wraps the serde `ManifoldSaePayload` and
 // exposes the flat attribute surface consumers read (dense arrays, config
-// scalars, diagnostic/certificate report blocks) via `#[getter]`s, plus the
-// `to_dict`/`from_dict` round-trip delegating through the same serde schema the
-// `sae_manifold_payload_roundtrip` seam uses.
-//
-// SCOPE (this increment): the flat surface only. The per-atom object surface
-// (`.atoms` — a list of `SaeManifoldAtomFit`, read as attributes ~200× across
-// consumers), the OOS/steering *methods* (`steer` / `reconstruct` / `encode` /
-// `attach_fisher`), and `fit`-returns-pyclass are deliberately NOT here: they
-// either change a type consumers depend on or drive the heavy Rust cores, so
-// they land as separate build-loop-validated increments while the Python
-// dataclass stays as the adapter (deletion LAST).
+// scalars, diagnostic/certificate report blocks, and per-atom objects) via
+// `#[getter]`s. Serialization, OOS encoding/reconstruction, steering, Fisher
+// attachment, and native fit construction all terminate on this class; there
+// is no Python model adapter or alternate payload schema.
 
 /// Build a numpy `(N,)` array from a flat `Vec<f64>`.
 fn manifold_sae_vec1<'py>(py: Python<'py>, v: &[f64]) -> Bound<'py, PyArray1<f64>> {
