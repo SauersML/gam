@@ -3114,13 +3114,22 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     let p = 2usize;
     let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
     let (phi, jet) = periodic_basis(&coords);
+    let decoder = array![[0.30, -0.10], [1.20, 0.20], [0.10, 1.10]];
+    // Keep the parity witness on a resolved hard-MP branch. The prior target was
+    // unrelated to the hand-seeded decoder, so the canonical rank-zero veto
+    // fired before either dense/bundle derivative route could be exercised.
+    let mut target = phi.dot(&decoder);
+    for row in 0..n {
+        target[[row, 0]] += 1.0e-3 * (0.37 * row as f64).sin();
+        target[[row, 1]] += 1.0e-3 * (0.29 * row as f64).cos();
+    }
     let atom = SaeManifoldAtom::new(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
         phi,
         jet,
-        array![[0.30, -0.10], [0.20, 0.40], [-0.35, 0.15]],
+        decoder,
         Array2::<f64>::eye(3),
     )
     .unwrap()
@@ -3133,14 +3142,6 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-    let target = Array2::from_shape_fn((n, p), |(row, col)| {
-        let x = (row as f64 + 0.5) / n as f64;
-        if col == 0 {
-            0.45 * (std::f64::consts::TAU * x).sin() + 0.07
-        } else {
-            -0.20 * (std::f64::consts::TAU * x).cos() + 0.03 * row as f64
-        }
-    });
     let alpha = 250.0_f64;
     let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![alpha.ln()]]);
     let loss = term.loss(target.view(), &rho).unwrap();

@@ -569,7 +569,7 @@ pub(crate) fn run_outer_with_plan(
                             reactive_domain_scalar_contract
                                 .clone()
                                 .expect("reactive scalar contract checked above"),
-                        ),
+                        )?,
                     );
                     reactive_domain_entry_requested = true;
                 }
@@ -625,17 +625,16 @@ pub(crate) fn run_outer_with_plan(
                     .as_mut()
                     .expect("reactive continuation path checked above");
                 let walk_start = std::time::Instant::now();
-                // β carried warm across legs. Empty = cold entry (#969:
-                // warm-invariance funnels cold and warm to the same s=1
-                // contraction fixed point).
-                let mut warm_beta: Array1<f64> = Array1::zeros(0);
+                // Only the first path call is cold. After it commits, the path
+                // and objective own the complete accepted state transactionally.
+                let cold_entry_beta: Array1<f64> = Array1::zeros(0);
                 let mut legs_descended = 0usize;
                 // The path controls its own progress from solver evidence. It
                 // can only report arrival after a successful exact-target leg;
                 // inability to refine a failed leg is returned as a typed
                 // refusal, so this loop needs no unrelated iteration ceiling.
                 loop {
-                    let step = match path.step(obj, &warm_beta) {
+                    let step = match path.step(obj, &cold_entry_beta) {
                         Ok(step) => step,
                         Err(err) => {
                             continuation_arrival_refusal = Some(format!(
@@ -646,32 +645,12 @@ pub(crate) fn run_outer_with_plan(
                     };
                     match step {
                         crate::continuation_path::ContinuationStep::Entered { state } => {
-                            warm_beta = state.last_beta.clone();
-                            if let Err(err) = obj.seed_inner_state(&warm_beta) {
-                                log::warn!(
-                                    "[OUTER] {context}: continuation entry seed {seed_idx} \
-                                     warm-start unusable ({err}); proceeding cold"
-                                );
-                                warm_beta = Array1::zeros(0);
-                                obj.reset();
-                            }
+                            debug_assert!(state.last_eval.cost.is_finite());
                             legs_descended += 1;
                         }
                         crate::continuation_path::ContinuationStep::Descended { s, state } => {
-                            // Warm-start the next leg from this leg's converged
-                            // inner β. `NoSlot` is fine (the objective simply
-                            // starts the next spine pass cold); a genuine
-                            // dimension error resets to a clean baseline before
-                            // the next path attempt.
-                            warm_beta = state.last_beta.clone();
-                            if let Err(err) = obj.seed_inner_state(&warm_beta) {
-                                log::warn!(
-                                    "[OUTER] {context}: continuation descent seed {seed_idx} \
-                                     warm-start at s={s:.4} unusable ({err}); proceeding cold"
-                                );
-                                warm_beta = Array1::zeros(0);
-                                obj.reset();
-                            }
+                            debug_assert!(state.last_eval.cost.is_finite());
+                            debug_assert!(s > 0.0);
                             legs_descended += 1;
                         }
                         crate::continuation_path::ContinuationStep::Arrived { state } => {
@@ -680,27 +659,22 @@ pub(crate) fn run_outer_with_plan(
                             // full-state handoff; replacing it with a copied
                             // coefficient-only seed here would discard it.
                             legs_descended += 1;
-                            match reactive_arrival_postcondition(&state, seed) {
-                                Ok(()) => {
-                                    // The successful target solve may have
-                                    // advanced objective-owned inner schedules.
-                                    // Reinstall the literal scalar target before
-                                    // the independent exact-value verification.
-                                    let target = reactive_domain_scalar_contract
-                                        .as_ref()
-                                        .expect("reactive scalar contract checked above")
-                                        .target();
-                                    match obj.install_reactive_domain_scalar_state(target) {
-                                        Ok(()) => continuation_arrived = true,
-                                        Err(err) => {
-                                            continuation_arrival_refusal = Some(format!(
-                                                "reactive domain entry could not restore the \
-                                                 literal scalar target before verification: {err}"
-                                            ));
-                                        }
-                                    }
+                            let scalar_at_target = path.current_scalar_targets().bitwise_eq(
+                                reactive_domain_scalar_contract
+                                    .as_ref()
+                                    .expect("reactive scalar contract checked above")
+                                    .target(),
+                            );
+                            if !scalar_at_target {
+                                continuation_arrival_refusal = Some(
+                                    "reactive domain entry reported arrival away from the literal scalar target"
+                                        .to_string(),
+                                );
+                            } else {
+                                match reactive_arrival_postcondition(&state, seed) {
+                                    Ok(()) => continuation_arrived = true,
+                                    Err(reason) => continuation_arrival_refusal = Some(reason),
                                 }
-                                Err(reason) => continuation_arrival_refusal = Some(reason),
                             }
                             break;
                         }
@@ -719,22 +693,19 @@ pub(crate) fn run_outer_with_plan(
                                     );
                                 }
                                 RefinementReason::MassFloorBreached(breach) => {
-                                    // Active-mass collapse toward the uniform
-                                    // saddle: reset to the pristine seeded
-                                    // baseline (the scaffold) so the assignment
-                                    // re-diffuses, and record the breach with its
-                                    // observed mass / floor in the refinement
-                                    // ledger. Never fatal.
-                                    obj.reset();
-                                    warm_beta = Array1::zeros(0);
+                                    // Record the breach against the last accepted
+                                    // full state. The path already refined the
+                                    // next distance; resetting here would destroy
+                                    // that accepted state while leaving `s`
+                                    // advanced.
                                     let regime = path.current_regime();
                                     path_refinements.push(PathRefinementRecord {
                                         seed_idx,
                                         regime,
                                         reason: format!(
                                             "active-mass breach (observed mean {:.4} < floor \
-                                             {:.4}); re-seeded from scaffold and refined the next \
-                                             attempted distance",
+                                             {:.4}); retained the accepted full state and refined \
+                                             the next attempted distance",
                                             breach.observed_mean_mass, breach.floor,
                                         ),
                                     });

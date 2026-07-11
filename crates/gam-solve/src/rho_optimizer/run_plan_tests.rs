@@ -3370,6 +3370,7 @@ struct ReactiveDomainObjective {
     off_seed_value_evals: usize,
     derivative_evals: usize,
     installed_scalar_states: Vec<crate::continuation_path::ContinuationScalarState>,
+    checkpoint_domain_open: Option<bool>,
 }
 
 impl ReactiveDomainObjective {
@@ -3382,6 +3383,7 @@ impl ReactiveDomainObjective {
             off_seed_value_evals: 0,
             derivative_evals: 0,
             installed_scalar_states: Vec::new(),
+            checkpoint_domain_open: None,
         }
     }
 
@@ -3470,6 +3472,37 @@ impl OuterObjective for ReactiveDomainObjective {
         {
             self.domain_open = true;
         }
+        Ok(())
+    }
+
+    fn begin_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        if self.checkpoint_domain_open.is_some() {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "nested reactive test waypoint".to_string(),
+            ));
+        }
+        self.checkpoint_domain_open = Some(self.domain_open);
+        Ok(())
+    }
+
+    fn commit_reactive_domain_waypoint(
+        &mut self,
+        _: &Array1<f64>,
+    ) -> Result<(), EstimationError> {
+        self.checkpoint_domain_open.take().ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(
+                "reactive test commit without checkpoint".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {
+        self.domain_open = self.checkpoint_domain_open.take().ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(
+                "reactive test rollback without checkpoint".to_string(),
+            )
+        })?;
         Ok(())
     }
 }
@@ -3562,6 +3595,10 @@ fn reactive_domain_entry_leaves_finite_seed_on_zero_heavy_work_path() {
     );
     assert!(objective.exact_seed_value_evals > 0);
     assert!(objective.derivative_evals > 0);
+    assert!(
+        objective.checkpoint_domain_open.is_none(),
+        "successful path must close every waypoint transaction"
+    );
 }
 
 #[test]
@@ -3594,6 +3631,10 @@ fn reactive_domain_entry_repairs_nonfinite_seed_from_heavy_side() {
         "the exact seed must be probed before entry and verified after arrival"
     );
     assert!(objective.derivative_evals > 0);
+    assert!(
+        objective.checkpoint_domain_open.is_none(),
+        "successful repaired path must close every waypoint transaction"
+    );
 }
 
 #[test]
@@ -3611,6 +3652,11 @@ fn reactive_domain_entry_keeps_unrepairable_seed_as_typed_refusal() {
     assert_eq!(
         objective.derivative_evals, 0,
         "the outer solver must not start without finite exact-seed evidence"
+    );
+    assert!(!objective.domain_open, "failed entry must roll back full state");
+    assert!(
+        objective.checkpoint_domain_open.is_none(),
+        "typed refusal must not leak an active waypoint transaction"
     );
 }
 

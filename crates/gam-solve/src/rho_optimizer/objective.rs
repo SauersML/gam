@@ -1335,8 +1335,8 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         &mut self,
         rho: &Array1<f64>,
     ) -> Result<(), EstimationError> {
-        self.inner
-            .commit_reactive_domain_waypoint(&self.to_native(rho))
+        let native = self.to_native(rho);
+        self.inner.commit_reactive_domain_waypoint(&native)
     }
 
     fn rollback_reactive_domain_waypoint(&mut self) -> Result<(), EstimationError> {

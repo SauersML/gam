@@ -176,6 +176,23 @@ impl ContinuationScalarContract {
                 target.isometry_weights.len()
             ));
         }
+        if entry.assignment_temperature < target.assignment_temperature {
+            return Err(format!(
+                "continuation entry temperature {} is sharper than literal target {}",
+                entry.assignment_temperature, target.assignment_temperature
+            ));
+        }
+        if let Some((index, (&entry_weight, &target_weight))) = entry
+            .isometry_weights
+            .iter()
+            .zip(&target.isometry_weights)
+            .enumerate()
+            .find(|(_, (entry_weight, target_weight))| entry_weight > target_weight)
+        {
+            return Err(format!(
+                "continuation entry isometry weight[{index}]={entry_weight} exceeds literal target {target_weight}"
+            ));
+        }
         Ok(Self { entry, target })
     }
 
@@ -570,17 +587,32 @@ impl ContinuationPath {
     /// The scalar legs use the typed entry/target contract supplied by the
     /// objective; no private default may replace its literal target. Enters at
     /// `s = 1`. `rho_target` and `bounds_upper` must share length.
-    #[must_use]
     pub fn heavy_entry_for_rho(
         rho_target: Array1<f64>,
         bounds_upper: Array1<f64>,
         scalars: ContinuationScalarContract,
-    ) -> Self {
-        assert_eq!(
-            rho_target.len(),
-            bounds_upper.len(),
-            "ContinuationPath::heavy_entry_for_rho: ρ target/bounds dim mismatch"
-        );
+    ) -> Result<Self, gam_problem::EstimationError> {
+        if rho_target.len() != bounds_upper.len() {
+            return Err(gam_problem::EstimationError::RemlOptimizationFailed(
+                format!(
+                    "reactive continuation rho target/bounds dimensions differ: {} != {}",
+                    rho_target.len(),
+                    bounds_upper.len()
+                ),
+            ));
+        }
+        for (index, (&target, &entry)) in
+            rho_target.iter().zip(bounds_upper.iter()).enumerate()
+        {
+            if !(target.is_finite() && entry.is_finite() && entry >= target) {
+                return Err(gam_problem::EstimationError::RemlOptimizationFailed(
+                    format!(
+                        "reactive continuation rho endpoint[{index}] must be finite with legal \
+                         upper entry >= target; entry={entry}, target={target}"
+                    ),
+                ));
+            }
+        }
         // The legal upper box is the literal heavy-penalty endpoint. This uses
         // objective-owned geometry rather than a private log-offset heuristic,
         // and makes rho move under the same `s` as temperature and isometry.
@@ -589,7 +621,7 @@ impl ContinuationPath {
             rho_target,
             scalars,
         );
-        Self::enter(schedules)
+        Ok(Self::enter(schedules))
     }
 
     /// Coarse diagnostic band of the last successfully solved waypoint. A fresh
@@ -1086,7 +1118,8 @@ mod tests {
             Array1::zeros(1),
             Array1::from_elem(1, 10.0),
             scalar_contract(),
-        );
+        )
+        .expect("finite ordered rho endpoints");
         assert_eq!(path.s(), 1.0, "heavy_entry must enter at s = 1");
         assert_eq!(
             path.current_regime(),
@@ -1097,6 +1130,25 @@ mod tests {
             path.logit_step_radius().is_finite() && path.logit_step_radius() > 0.0,
             "logit step radius must be finite and positive at entry"
         );
+    }
+
+    #[test]
+    fn heavy_entry_refuses_nonfinite_or_reversed_rho_endpoints() {
+        let nonfinite = ContinuationPath::heavy_entry_for_rho(
+            Array1::zeros(1),
+            Array1::from_vec(vec![f64::INFINITY]),
+            scalar_contract(),
+        )
+        .expect_err("non-finite legal entry must be typed refusal");
+        assert!(nonfinite.to_string().contains("must be finite"));
+
+        let reversed = ContinuationPath::heavy_entry_for_rho(
+            Array1::from_vec(vec![2.0]),
+            Array1::from_vec(vec![1.0]),
+            scalar_contract(),
+        )
+        .expect_err("entry below target must be typed refusal");
+        assert!(reversed.to_string().contains("entry >= target"));
     }
 
     #[test]
@@ -1141,7 +1193,12 @@ mod tests {
         rho_evaluated: Vec<Array1<f64>>,
         seed_count: usize,
         installed: Vec<ContinuationScalarState>,
-        waypoint_transaction_active: bool,
+        installed_current: Option<ContinuationScalarState>,
+        full_state_marker: usize,
+        checkpoint_full_state_marker: Option<usize>,
+        checkpoint_installed_current: Option<Option<ContinuationScalarState>>,
+        fail_literal_target_once: bool,
+        trial_entry_markers: Vec<usize>,
     }
 
     impl OuterObjective for RecordingObjective {
@@ -1184,7 +1241,19 @@ mod tests {
         ) -> Result<gam_problem::OuterEval, crate::model_types::EstimationError> {
             self.orders.push(order);
             self.rho_evaluated.push(rho.clone());
+            self.trial_entry_markers.push(self.full_state_marker);
+            if self.fail_literal_target_once
+                && self
+                    .installed_current
+                    .as_ref()
+                    .is_some_and(|state| state.bitwise_eq(scalar_contract().target()))
+            {
+                self.fail_literal_target_once = false;
+                self.full_state_marker = usize::MAX;
+                return Ok(gam_problem::OuterEval::infeasible(rho.len()));
+            }
             let mut eval = self.eval(rho)?;
+            self.full_state_marker += 1;
             if matches!(order, OuterEvalOrder::Value) {
                 eval.gradient = Array1::zeros(0);
                 eval.hessian = gam_problem::HessianValue::Unavailable;
@@ -1215,14 +1284,16 @@ mod tests {
             state: &ContinuationScalarState,
         ) -> Result<(), crate::model_types::EstimationError> {
             self.installed.push(state.clone());
+            self.installed_current = Some(state.clone());
             Ok(())
         }
 
         fn begin_reactive_domain_waypoint(
             &mut self,
         ) -> Result<(), crate::model_types::EstimationError> {
-            assert!(!self.waypoint_transaction_active);
-            self.waypoint_transaction_active = true;
+            assert!(self.checkpoint_full_state_marker.is_none());
+            self.checkpoint_full_state_marker = Some(self.full_state_marker);
+            self.checkpoint_installed_current = Some(self.installed_current.clone());
             Ok(())
         }
 
@@ -1230,16 +1301,26 @@ mod tests {
             &mut self,
             _: &Array1<f64>,
         ) -> Result<(), crate::model_types::EstimationError> {
-            assert!(self.waypoint_transaction_active);
-            self.waypoint_transaction_active = false;
+            self.checkpoint_full_state_marker
+                .take()
+                .expect("active waypoint checkpoint");
+            self.checkpoint_installed_current
+                .take()
+                .expect("active scalar checkpoint");
             Ok(())
         }
 
         fn rollback_reactive_domain_waypoint(
             &mut self,
         ) -> Result<(), crate::model_types::EstimationError> {
-            assert!(self.waypoint_transaction_active);
-            self.waypoint_transaction_active = false;
+            self.full_state_marker = self
+                .checkpoint_full_state_marker
+                .take()
+                .expect("active waypoint checkpoint");
+            self.installed_current = self
+                .checkpoint_installed_current
+                .take()
+                .expect("active scalar checkpoint");
             Ok(())
         }
     }
@@ -1312,5 +1393,54 @@ mod tests {
                 .bitwise_eq(scalar_contract().target())
         );
         assert_eq!(obj.rho_evaluated.last(), Some(&Array1::zeros(2)));
+    }
+
+    #[test]
+    fn failed_waypoint_rolls_back_full_state_before_refined_retry() {
+        let mut path = ContinuationPath::enter(schedules());
+        let mut obj = RecordingObjective {
+            full_state_marker: 7,
+            fail_literal_target_once: true,
+            ..Default::default()
+        };
+        let initial_beta = Array1::zeros(0);
+
+        assert!(matches!(
+            path.step(&mut obj, &initial_beta).expect("entry solve"),
+            ContinuationStep::Entered { .. }
+        ));
+        assert_eq!(obj.full_state_marker, 8, "entry state must commit");
+
+        assert!(matches!(
+            path.step(&mut obj, &initial_beta)
+                .expect("non-finite target must refine"),
+            ContinuationStep::Refined {
+                reason: RefinementReason::WaypointStruggled(_),
+                ..
+            }
+        ));
+        assert_eq!(path.s().to_bits(), 1.0_f64.to_bits());
+        assert_eq!(
+            obj.full_state_marker, 8,
+            "failed trial mutation must roll back the complete accepted state"
+        );
+        assert!(
+            obj.installed_current
+                .as_ref()
+                .expect("restored accepted scalar")
+                .bitwise_eq(scalar_contract().entry()),
+            "rollback must restore the accepted scalar state too"
+        );
+
+        assert!(matches!(
+            path.step(&mut obj, &initial_beta).expect("refined midpoint"),
+            ContinuationStep::Descended { s, .. } if s.to_bits() == 0.5_f64.to_bits()
+        ));
+        assert_eq!(
+            obj.trial_entry_markers.last(),
+            Some(&8),
+            "refined retry must start from the restored accepted state"
+        );
+        assert_eq!(obj.full_state_marker, 9, "refined midpoint must commit");
     }
 }
