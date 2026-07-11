@@ -4972,6 +4972,21 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     }));
     let weights = Array1::from_elem(n, 1.0);
 
+    let constant_scale_fit = fit_gaussian_location_scale_terms(
+        data.view(),
+        GaussianLocationScaleTermSpec {
+            y: y.clone(),
+            weights: weights.clone(),
+            meanspec: simple_matern_term_collection(&[0], 0.6),
+            log_sigmaspec: empty_term_collection(),
+            mean_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
+        },
+        &spatial_fit_smoke_options(),
+        &spatial_kappa_options(),
+    )
+    .expect("gaussian location-scale constant-noise homoscedastic diagnostic fit");
+
     let spec = GaussianLocationScaleTermSpec {
         y,
         weights,
@@ -5003,6 +5018,16 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     }
     let mean_rmse = (sq_err / n as f64).sqrt();
 
+    let constant_scale_mean =
+        &constant_scale_fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+    let constant_scale_mean_rmse = (constant_scale_mean
+        .iter()
+        .zip(&true_mean)
+        .map(|(fitted, truth)| (fitted - truth).powi(2))
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+
     let log_sigma_eta = &fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
     let mean_min = mean_eta.iter().copied().fold(f64::INFINITY, f64::min);
     let mean_max = mean_eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -5019,7 +5044,7 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
         .copied()
         .fold(f64::NEG_INFINITY, f64::max);
     eprintln!(
-        "#365 homoscedastic diagnostic: rmse={mean_rmse:.6} mean_range=[{mean_min:.6}, {mean_max:.6}] log_sigma_eta_mean={scale_mean:.6} log_sigma_eta_sd={scale_sd:.6} log_sigma_eta_range=[{scale_min:.6}, {scale_max:.6}] mean_cols={} scale_cols={} mean_penalties={} scale_penalties={} log_lambdas={:?} blocks={:?} outer_iters={} outer_grad={:?} reml={:.6}",
+        "#365 homoscedastic diagnostic: rmse={mean_rmse:.6} constant_scale_rmse={constant_scale_mean_rmse:.6} mean_range=[{mean_min:.6}, {mean_max:.6}] log_sigma_eta_mean={scale_mean:.6} log_sigma_eta_sd={scale_sd:.6} log_sigma_eta_range=[{scale_min:.6}, {scale_max:.6}] mean_cols={} scale_cols={} mean_penalties={} scale_penalties={} log_lambdas={:?} blocks={:?} outer_iters={} outer_grad={:?} reml={:.6} constant_scale_log_lambdas={:?} constant_scale_blocks={:?} constant_scale_reml={:.6}",
         fit.mean_design.design.ncols(),
         fit.noise_design.design.ncols(),
         fit.mean_design.penalties.len(),
@@ -5029,6 +5054,9 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
         fit.fit.outer_iterations,
         fit.fit.outer_gradient_norm,
         fit.fit.reml_score,
+        constant_scale_fit.fit.log_lambdas,
+        constant_scale_fit.fit.blocks,
+        constant_scale_fit.fit.reml_score,
     );
 
     // A correctly converged mean tracks the truth to well within the noise
