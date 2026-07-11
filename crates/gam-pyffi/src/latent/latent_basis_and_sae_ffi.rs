@@ -1751,7 +1751,6 @@ fn sae_manifold_fit_inner<'py>(
         None => None,
     };
     let (n_obs, p_out) = z_view.dim();
-    let k_atoms = atom_dim.len();
     let max_atom_dim = atom_dim
         .iter()
         .copied()
