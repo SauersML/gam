@@ -520,12 +520,13 @@ fn constant_gaussian_standard_fit(
     } else {
         use gam_linalg::faer_ndarray::FaerEigh;
         let symmetric_penalty = (&unit_penalty + &unit_penalty.t().to_owned()) * 0.5;
-        let (penalty_eigenvalues, _) = symmetric_penalty
-            .eigh(faer::Side::Lower)
-            .map_err(|error| WorkflowError::IntegrationFailed {
-                reason: format!(
-                    "constant Gaussian shortcut could not resolve the penalty spectrum: {error}"
-                ),
+        let (penalty_eigenvalues, _) =
+            symmetric_penalty.eigh(faer::Side::Lower).map_err(|error| {
+                WorkflowError::IntegrationFailed {
+                    reason: format!(
+                        "constant Gaussian shortcut could not resolve the penalty spectrum: {error}"
+                    ),
+                }
             })?;
         let largest_penalty = penalty_eigenvalues
             .iter()
@@ -600,40 +601,44 @@ fn constant_gaussian_standard_fit(
                 ),
             })?;
         {
-                // F = H⁻¹ XᵀWX. Generally NOT symmetric (a product of two
-                // symmetric matrices); it must be stored as-is so `H·F = XᵀWX`
-                // and per-term `tr(F_jj)` stay exact (see estimate.rs / #1027).
-                let influence = chol.solve_mat(&xtwx);
-                let mut edf_by_block = vec![0.0_f64; n_penalties];
-                let mut penalty_block_trace = vec![0.0_f64; n_penalties];
-                for (kk, block) in design.penalties.iter().enumerate() {
-                    let r = block.col_range.clone();
-                    let block_cols = r.len();
-                    // tr(H⁻¹ S_k): solve `H Z = S_k` (embedded in the full p×block
-                    // layout) and read the block diagonal of the solution.
-                    let mut rhs = Array2::<f64>::zeros((p, block_cols));
-                    for c in 0..block_cols {
-                        for rr in 0..block_cols {
-                            rhs[[r.start + rr, c]] = block.local[[rr, c]];
-                        }
+            // F = H⁻¹ XᵀWX. Generally NOT symmetric (a product of two
+            // symmetric matrices); it must be stored as-is so `H·F = XᵀWX`
+            // and per-term `tr(F_jj)` stay exact (see estimate.rs / #1027).
+            let influence = chol.solve_mat(&xtwx);
+            let mut edf_by_block = vec![0.0_f64; n_penalties];
+            let mut penalty_block_trace = vec![0.0_f64; n_penalties];
+            for (kk, block) in design.penalties.iter().enumerate() {
+                let r = block.col_range.clone();
+                let block_cols = r.len();
+                // tr(H⁻¹ S_k): solve `H Z = S_k` (embedded in the full p×block
+                // layout) and read the block diagonal of the solution.
+                let mut rhs = Array2::<f64>::zeros((p, block_cols));
+                for c in 0..block_cols {
+                    for rr in 0..block_cols {
+                        rhs[[r.start + rr, c]] = block.local[[rr, c]];
                     }
-                    let sol = chol.solve_mat(&rhs);
-                    let mut trace = 0.0_f64;
-                    for j in 0..block_cols {
-                        trace += sol[[r.start + j, j]];
-                    }
-                    let lam_trace = (lambda_full * trace).clamp(0.0, block_cols as f64);
-                    penalty_block_trace[kk] = lam_trace;
-                    edf_by_block[kk] =
-                        (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
                 }
-                let edf_total = influence
-                    .diag()
-                    .iter()
-                    .copied()
-                    .sum::<f64>()
-                    .clamp(0.0, p as f64);
-                (edf_total, edf_by_block, penalty_block_trace, Some(influence))
+                let sol = chol.solve_mat(&rhs);
+                let mut trace = 0.0_f64;
+                for j in 0..block_cols {
+                    trace += sol[[r.start + j, j]];
+                }
+                let lam_trace = (lambda_full * trace).clamp(0.0, block_cols as f64);
+                penalty_block_trace[kk] = lam_trace;
+                edf_by_block[kk] = (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
+            }
+            let edf_total = influence
+                .diag()
+                .iter()
+                .copied()
+                .sum::<f64>()
+                .clamp(0.0, p as f64);
+            (
+                edf_total,
+                edf_by_block,
+                penalty_block_trace,
+                Some(influence),
+            )
         }
     };
     // IRLS working response for the identity link is the raw response y (η

@@ -151,7 +151,12 @@ fn gaussian_constant_response_inference_bundle_is_self_consistent_2254() {
     let data = encode_columns(&["x", "y"], &[&x, &y]);
 
     // One representative from each penalty-count regime: 0, 1, and ≥2.
-    for formula in ["y ~ 1", "y ~ x", "y ~ s(x, k=10)", "y ~ matern(x, centers=8)"] {
+    for formula in [
+        "y ~ 1",
+        "y ~ x",
+        "y ~ s(x, k=10)",
+        "y ~ matern(x, centers=8)",
+    ] {
         let FitResult::Standard(fit) = fit_from_formula(formula, &data, &gaussian_cfg())
             .unwrap_or_else(|e| panic!("`{formula}` failed to fit: {e}"))
         else {
