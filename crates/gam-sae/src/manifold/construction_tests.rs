@@ -6,7 +6,7 @@ mod amortized_encoder_tests {
     /// block per atom plus one honest joint-convergence verdict per row.
     #[test]
     fn amortized_encode_fitted_is_reachable_and_jointly_solved() {
-        let (term, target, rho) = small_two_atom_periodic_term();
+        let (term, target, _rho_unused) = small_two_atom_periodic_term();
         let n = term.n_obs();
         let k = term.k_atoms();
 
@@ -43,7 +43,7 @@ mod amortized_encoder_tests {
     /// there is no second radial-scale channel to fold into these values.
     #[test]
     fn fitted_assignment_amplitudes_equal_posterior_gates() {
-        let (term, _target, rho) = small_two_atom_periodic_term();
+        let (term, _target, _rho_unused) = small_two_atom_periodic_term();
         let n = term.n_obs();
         let k = term.k_atoms();
         let amplitudes = term

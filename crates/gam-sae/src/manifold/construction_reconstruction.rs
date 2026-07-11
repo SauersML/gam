@@ -389,7 +389,7 @@ impl SaeManifoldTerm {
             // identically 0 for single-basin / hard-frozen / genuinely-soft rows, so
             // w=None + non-selecting fits are bit-for-bit today's φ̂.
             let phi_seed = rss / (n_scalar - beta_edf - coord_edf).max(1.0);
-            let df_search = self.basin_selection_deflation_correction(residual, rho, phi_seed)?;
+            let df_search = self.basin_selection_deflation_correction(residual, phi_seed)?;
             coord_edf = (coord_edf + df_search).clamp(0.0, n_scalar);
         }
         let resid_dof = (n_scalar - beta_edf - coord_edf).max(1.0);

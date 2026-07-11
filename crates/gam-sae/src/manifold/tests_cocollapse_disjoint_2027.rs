@@ -176,7 +176,7 @@ pub(crate) fn sequential_deflation_gives_both_atoms_material_norm_2027() {
         -6.0,
         vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
     );
-    term.refit_decoder_sequential_deflation(target.view(), &rho)
+    term.refit_decoder_sequential_deflation(target.view())
         .unwrap();
     let mut norms = [0.0_f64; 2];
     for (atom_idx, atom) in term.atoms.iter().enumerate() {

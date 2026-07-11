@@ -2490,7 +2490,7 @@ impl SaeManifoldTerm {
         let mut a = vec![0.0_f64; k];
         for row in 0..n {
             match rho {
-                Some(rho) => self
+                Some(_) => self
                     .assignment
                     .try_assignments_row_into(row, &mut a),
                 None => self
@@ -2958,7 +2958,7 @@ impl SaeManifoldTerm {
             // solved AT those gates), so the reconstruction EV strictly improves over
             // the degenerate incumbent — the keep-best multi-start below then banks or
             // restores it as usual.
-            self.refit_decoder_sequential_deflation(target, rho)?;
+            self.refit_decoder_sequential_deflation(target)?;
             // #2082 anchor-then-refit: with disjoint decoders now placed, pin each row
             // (softly) to the atom that best explains it, THEN re-fit the decoders AT
             // the anchored gates so decoders and gates stay consistent (anchoring after
@@ -2966,7 +2966,7 @@ impl SaeManifoldTerm {
             // the anchor safe). Gives each atom a stable territory the outer Newton
             // descent starts from, without breaking the reseed-improves-EV contract.
             self.anchor_logits_to_residual_ownership(target)?;
-            self.refit_decoder_sequential_deflation(target, rho)?;
+            self.refit_decoder_sequential_deflation(target)?;
             // #2089 — enforce the #1026 keep-best contract on the STATE between
             // reseeds, not only at budget exhaustion. A reseed refit at the
             // near-singular co-collapsed Gram can return a huge-norm decoder
@@ -3332,7 +3332,6 @@ impl SaeManifoldTerm {
     pub(crate) fn refit_decoder_sequential_deflation(
         &mut self,
         target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
     ) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -3774,9 +3773,9 @@ impl SaeManifoldTerm {
         for &atom in &to_reseed {
             self.reseed_collapsed_atom_logits(atom);
         }
-        self.refit_decoder_sequential_deflation(target, rho)?;
+        self.refit_decoder_sequential_deflation(target)?;
         self.anchor_logits_to_residual_ownership(target)?;
-        self.refit_decoder_sequential_deflation(target, rho)?;
+        self.refit_decoder_sequential_deflation(target)?;
         Ok(())
     }
 
@@ -3804,7 +3803,6 @@ impl SaeManifoldTerm {
     pub(crate) fn seed_cold_start_disjoint_charts(
         &mut self,
         target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
     ) -> Result<(), String> {
         let n = self.n_obs();
         let p = self.output_dim();
@@ -3952,7 +3950,6 @@ impl SaeManifoldTerm {
     pub fn seed_cold_start_disjoint_charts_streaming(
         &mut self,
         target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
         chunk_rows: usize,
     ) -> Result<(), String> {
         let n = self.n_obs();
@@ -3994,7 +3991,7 @@ impl SaeManifoldTerm {
             let mut start = 0usize;
             while start < n {
                 let end = (start + step).min(n);
-                let design_chunk = self.gated_design_chunk(atom, start, end, m, rho)?;
+                let design_chunk = self.gated_design_chunk(atom, start, end, m)?;
                 eq.accumulate_chunk(design_chunk.view(), residual.slice(s![start..end, ..]))?;
                 start = end;
             }
@@ -4010,7 +4007,7 @@ impl SaeManifoldTerm {
             let mut start = 0usize;
             while start < n {
                 let end = (start + step).min(n);
-                let design_chunk = self.gated_design_chunk(atom, start, end, m, rho)?;
+                let design_chunk = self.gated_design_chunk(atom, start, end, m)?;
                 let fit_chunk = design_chunk.dot(&beta);
                 let mut resid_chunk = residual.slice_mut(s![start..end, ..]);
                 resid_chunk -= &fit_chunk;
@@ -4036,7 +4033,6 @@ impl SaeManifoldTerm {
         start: usize,
         end: usize,
         m: usize,
-        rho: &SaeManifoldRho,
     ) -> Result<Array2<f64>, String> {
         let mut d = Array2::<f64>::zeros((end - start, m));
         for row in start..end {
@@ -4990,7 +4986,7 @@ impl SaeManifoldTerm {
             // atom's coordinates from the residual left by prior atoms so the atoms
             // align with DISTINCT planted factors and separate, rather than both
             // fitting the dominant factor (high EV, no structure recovery).
-            self.seed_cold_start_disjoint_charts(target, rho)?;
+            self.seed_cold_start_disjoint_charts(target)?;
         }
         // #1026/#2230 — keep the best state found inside this bounded inner
         // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
@@ -5663,7 +5659,7 @@ impl SaeManifoldTerm {
             // accepted outer iteration is a sensible cadence (the issue's
             // streaming-polar fixed point).
             if self.frames_active() {
-                self.refresh_active_frames_from_data(target, rho)
+                self.refresh_active_frames_from_data(target)
                     .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
@@ -5733,7 +5729,7 @@ impl SaeManifoldTerm {
                 self.restore_mutable_state(best_state)?;
                 inner_incumbent_restored = true;
                 if self.frames_active() {
-                    self.refresh_active_frames_from_data(target, rho)
+                    self.refresh_active_frames_from_data(target)
                         .map_err(|err| {
                             format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
                         })?;

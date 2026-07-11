@@ -286,7 +286,7 @@ pub(crate) fn batch4_jet_lanes_match_scalar_hand_row_jets() {
 
     let rows = [0usize, 1, 2, 3];
     let batch = term
-        .row_jets_for_logdet_batch4(&rho, rows, &cache, &second_jets, &border)
+        .row_jets_for_logdet_batch4(rows, &cache, &second_jets, &border)
         .expect("batch4 build")
         .expect("softmax-aligned fixture rows must batch");
 

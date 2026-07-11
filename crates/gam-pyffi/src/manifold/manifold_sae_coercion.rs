@@ -524,7 +524,7 @@ fn build_stagewise_manifold_sae_payload(
     sparsity_strength, smoothness, learning_rate, max_iter, random_state,
     jumprelu_threshold, reconstruction_r2
 ))]
-pub(crate) fn sae_manifold_core_from_stagewise<'py>(
+pub(crate) fn sae_manifold_from_stagewise<'py>(
     py: Python<'py>,
     atom_topologies: Vec<String>,
     decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,

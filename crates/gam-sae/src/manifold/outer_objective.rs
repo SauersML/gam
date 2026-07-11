@@ -1402,7 +1402,6 @@ impl SaeManifoldOuterObjective {
             RoutingPredictor::ChartGeometry => {
                 let predicted = self.term.chart_geometry_routing_logits(
                     self.target.view(),
-                    &self.current_rho,
                     AMORTIZED_GATE_LOGIT_SCALE,
                 )?;
                 self.term

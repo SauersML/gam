@@ -26,6 +26,178 @@ fn sae_ift_min_curvature_fraction() -> f64 {
     f64::EPSILON.sqrt()
 }
 
+/// Apply a raw arrow operator on the closed-form gauge quotient represented by
+/// `solver`: `M_Q v = M v + κ Q Qᵀ v`.
+fn apply_gauge_fixed_arrow_operator<F>(
+    solver: &DeflatedArrowSolver<'_>,
+    v: &SaeArrowVector,
+    apply_raw: &F,
+) -> Result<SaeArrowVector, String>
+where
+    F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
+    let mut out = apply_raw(v)?;
+    solver.add_gauge_stiffness(v, &mut out)?;
+    Ok(out)
+}
+
+/// Exact-stationarity Krylov and numerical-null refinement on one coherent
+/// gauge-fixed pencil `(A_Q, B_Q)`, where both raw operators receive the same
+/// `κ Q Qᵀ` action installed in `solver`.
+///
+/// Keeping this seam operator-generic makes the quotient invariant directly
+/// testable with deterministic matrices while production supplies the real
+/// matrix-free exact Hessian `A` and cached majorizer `B`. The helper owns every
+/// Krylov, Rayleigh, normalization, and inverse-power apply so none can
+/// accidentally regress to a raw operator while using the gauge-fixed inverse.
+fn solve_exact_stationarity_on_gauge_quotient<A, B>(
+    solver: &DeflatedArrowSolver<'_>,
+    rhs: &SaeArrowVector,
+    apply_raw_a: A,
+    apply_raw_b: B,
+) -> Result<SaeArrowVector, String>
+where
+    A: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+    B: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
+    let apply_a_q = |v: &SaeArrowVector| {
+        apply_gauge_fixed_arrow_operator(solver, v, &apply_raw_a)
+    };
+    let apply_b_q = |v: &SaeArrowVector| {
+        apply_gauge_fixed_arrow_operator(solver, v, &apply_raw_b)
+    };
+    let mut x = solve_b_preconditioned_gmres(solver, rhs, |v| apply_a_q(v))?;
+    // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
+    //
+    // The generalized Rayleigh quotient `μ(x) = xᵀAx / xᵀBx` of the
+    // SOLUTION is a detector: expanding
+    // `x = Σ (vᵢᵀrhs/μᵢ) vᵢ` in the B-orthonormal
+    // `(A, B)`-eigenbasis, any near-null component present in `rhs` enters
+    // `x` with weight `1/μᵢ`, so `μ(x)` collapses to `≈ μ_min` exactly
+    // when the solve was amplified. A healthy solve (`rhs` B-orthogonal to
+    // the flat directions, or no flat directions) leaves `μ(x)` above the
+    // floor and pays only one extra `A`/`B` apply.
+    //
+    // Deflation is EXACT in that eigenbasis with no re-solve: the
+    // amplified term of `x` along a B-normalized eigendirection `v` is
+    // `v·(vᵀBx)` (since `vᵀBx = vᵀrhs/μ_v`), so subtracting the
+    // B-projection removes precisely the unidentifiable component while
+    // leaving every resolved direction untouched.
+    let dim = x.t.len() + x.beta.len();
+    let rank_floor = sae_ift_min_curvature_fraction();
+    for _ in 0..dim {
+        let ax = apply_a_q(&x)?;
+        let bx = apply_b_q(&x)?;
+        let x_b_norm_sq = sae_inner(&x, &bx);
+        if x_b_norm_sq == 0.0 && sae_inner(&x, &x) == 0.0 {
+            return Ok(x);
+        }
+        if !(x_b_norm_sq.is_finite() && x_b_norm_sq > 0.0) {
+            return Err(format!(
+                "solve_exact_stationarity: invalid B-norm squared {x_b_norm_sq:.6e}"
+            ));
+        }
+        let mu = sae_inner(&x, &ax) / x_b_norm_sq;
+        if !mu.is_finite() {
+            return Err("solve_exact_stationarity: non-finite generalized curvature".into());
+        }
+        if mu <= 0.0 {
+            return Err(format!(
+                "solve_exact_stationarity: exact stationarity Hessian has non-positive \
+                 generalized curvature μ={mu:.6e}; the inner state is not a stable minimum"
+            ));
+        }
+        if mu >= rank_floor {
+            return Ok(x);
+        }
+        // Sharpen the offending direction by inverse power iteration on
+        // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
+        // already dominated by it, so it is the natural seed. Convergence
+        // is certified by successive B-normalized direction alignment;
+        // exhaustion or a failed inner solve propagates instead of silently
+        // projecting with `v=x` (which would delete the entire response).
+        let mut v = x.clone();
+        let normalize_b = |v: &mut SaeArrowVector| -> Result<(), String> {
+            let bv = apply_b_q(v)?;
+            let norm_sq = sae_inner(v, &bv);
+            if !(norm_sq.is_finite() && norm_sq > 0.0) {
+                return Err(format!(
+                    "solve_exact_stationarity: inverse-power direction has invalid \
+                     B-norm squared {norm_sq:.6e}"
+                ));
+            }
+            let inv_norm = 1.0 / norm_sq.sqrt();
+            v.t.mapv_inplace(|val| val * inv_norm);
+            v.beta.mapv_inplace(|val| val * inv_norm);
+            Ok(())
+        };
+        normalize_b(&mut v)?;
+        let mut direction_converged = false;
+        for _ in 0..dim {
+            let bv = apply_b_q(&v)?;
+            let mut refined = solve_b_preconditioned_gmres(solver, &bv, |w| apply_a_q(w))
+                .map_err(|err| {
+                    format!(
+                        "solve_exact_stationarity: inverse-power refinement did not converge: {err}"
+                    )
+                })?;
+            normalize_b(&mut refined)?;
+            let b_refined = apply_b_q(&refined)?;
+            let alignment = sae_inner(&v, &b_refined).abs();
+            if !alignment.is_finite() {
+                return Err("solve_exact_stationarity: non-finite inverse-power alignment".into());
+            }
+            v = refined;
+            if 1.0 - alignment.min(1.0) <= rank_floor {
+                direction_converged = true;
+                break;
+            }
+        }
+        if !direction_converged {
+            return Err(format!(
+                "solve_exact_stationarity: inverse-power direction did not converge in the \
+                 derived Krylov dimension {dim}"
+            ));
+        }
+        // Refuse to remove a resolved or non-positive direction. A stable
+        // converged inner minimum has positive exact curvature; a negative
+        // Ritz value is a second-order convergence failure, not a null gauge.
+        let av = apply_a_q(&v)?;
+        let bv = apply_b_q(&v)?;
+        let v_b_norm_sq = sae_inner(&v, &bv);
+        if !(v_b_norm_sq.is_finite() && v_b_norm_sq > 0.0) {
+            return Err(format!(
+                "solve_exact_stationarity: converged inverse-power direction has invalid \
+                 B-norm squared {v_b_norm_sq:.6e}"
+            ));
+        }
+        let v_mu = sae_inner(&v, &av) / v_b_norm_sq;
+        if !(v_mu.is_finite() && v_mu > 0.0 && v_mu < rank_floor) {
+            return Err(format!(
+                "solve_exact_stationarity: inverse power failed to isolate a positive \
+                 numerical-null direction: μ={v_mu:.6e}, floor={rank_floor:.6e}"
+            ));
+        }
+        let proj = sae_inner(&v, &bx);
+        if proj == 0.0 || !proj.is_finite() {
+            return Err(format!(
+                "solve_exact_stationarity: invalid near-null B-projection {proj:.6e}"
+            ));
+        }
+        x.t.scaled_add(-proj, &v.t);
+        x.beta.scaled_add(-proj, &v.beta);
+        log::debug!(
+            "[SAE/#2080-d4] IFT solve deflated a near-null pencil direction \
+             (μ={mu:.3e} < {rank_floor:.1e}, |proj|={:.3e})",
+            proj.abs(),
+        );
+    }
+    Err(format!(
+        "solve_exact_stationarity: numerical-null deflation exhausted the derived \
+         dimension {dim} without an identifiable IFT response"
+    ))
+}
+
 impl SaeManifoldTerm {
     /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
     /// to a joint `(t, β)` vector, matrix-free and per row.
@@ -288,45 +460,11 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// Exact stationarity operator on the same gauge-fixed quotient represented
-    /// by `solver`: `A_Q v = A v + κ Q Qᵀ v`.
-    ///
-    /// The raw exact Hessian retains the structural chart-gauge null. The
-    /// preconditioner already inverts `B_Q = B + κ Q Qᵀ`; using raw `A` against
-    /// that inverse is not a quotient solve and can leave an irreducible residual
-    /// in `range(Q)` before the post-solve numerical-null detector is reachable
-    /// (#2253). Adding the identical Faddeev-Popov stiffness makes the exact
-    /// operator and its preconditioner one coherent gauge-fixed pencil.
-    fn apply_gauge_fixed_exact_hessian(
-        &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-        v: &SaeArrowVector,
-    ) -> Result<SaeArrowVector, String> {
-        let mut out = self.apply_exact_hessian(rho, target, cache, v)?;
-        solver.add_gauge_stiffness(v, &mut out)?;
-        Ok(out)
-    }
-
-    /// Majorizer action on the same gauge-fixed quotient:
-    /// `B_Q v = B v + κ Q Qᵀ v`.
-    fn apply_gauge_fixed_majorizer(
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-        v: &SaeArrowVector,
-    ) -> Result<SaeArrowVector, String> {
-        let mut out = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
-        solver.add_gauge_stiffness(v, &mut out)?;
-        Ok(out)
-    }
-
     /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
     /// on the closed-form gauge quotient via left-`B_Q`-preconditioned GMRES
     /// ([`solve_b_preconditioned_gmres`]) with the matrix-free
-    /// `A_Q v = B v + ΔC v + κ Q Qᵀv` apply
-    /// ([`Self::apply_gauge_fixed_exact_hessian`]). The
+    /// `A_Q v = B v + ΔC v + κ Q Qᵀv` apply owned by
+    /// [`solve_exact_stationarity_on_gauge_quotient`]. The
     /// IFT step `θ̂_ρ = −A⁻¹ g_ρ` (the code contracts `−½·⟨Γ, A⁻¹ g_ρ⟩` with rhs `= +∂g/∂ρ`, i.e. `+½·Γᵀθ̂_ρ` of the response — the sign lives in the −0.5 factor) must invert the EXACT `A`, not the surrogate `B`;
     /// GMRES does not require the exact stationarity Jacobian to be SPD; it
     /// refuses non-convergence instead of returning a negative-curvature CG
@@ -704,7 +842,6 @@ impl SaeManifoldTerm {
                 let block = coord - block_tail_start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
                 self.crosscoder_block_ift_rhs(
-                    rho,
                     cache,
                     target,
                     start..start + block_dims[block],

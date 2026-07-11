@@ -471,7 +471,6 @@ impl SaeManifoldTerm {
     pub(crate) fn basin_selection_deflation_correction(
         &self,
         residual: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
         dispersion: f64,
     ) -> Result<f64, String> {
         let n = self.n_obs();

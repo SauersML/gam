@@ -2929,7 +2929,6 @@ mod frozen_routing_1033_tests {
             .unwrap();
         assert!(a.routing_is_frozen());
         // Gates BEFORE mutating the free logits.
-        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
         let before: Vec<Array1<f64>> = (0..n)
             .map(|r| a.try_assignments_row(r).unwrap())
             .collect();
@@ -2959,18 +2958,9 @@ mod frozen_routing_1033_tests {
         let a = ibp_assignment(n, k)
             .freeze_routing_from_current_logits()
             .unwrap();
-        // Two different ρ (different sparse + smooth strengths). With frozen routing
-        // and learnable_alpha=false, the gate value must be identical at both ρ.
-        let rho_a = SaeManifoldRho::new(
-            (1e-3_f64).ln(),
-            (1e-2_f64).ln(),
-            vec![Array1::<f64>::zeros(1); k],
-        );
-        let rho_b = SaeManifoldRho::new(
-            (1e3_f64).ln(),
-            (1e1_f64).ln(),
-            vec![Array1::<f64>::zeros(1); k],
-        );
+        // The ρ-invariance is now STRUCTURAL: the assignment APIs take no ρ
+        // (the signature is the proof). What remains observable is purity —
+        // repeated reads of a frozen row must be identical.
         for r in 0..n {
             let ga = a.try_assignments_row(r).unwrap();
             let gb = a.try_assignments_row(r).unwrap();
@@ -3103,7 +3093,6 @@ mod fill_into_buffer_1557_tests {
     fn assert_into_matches_alloc(a: &SaeAssignment) {
         let n = a.n_obs();
         let k = a.k_atoms();
-        let rho = rho(k);
         let mut scratch = vec![f64::NAN; k];
         for row in 0..n {
             let allocated = a.try_assignments_row(row).unwrap();

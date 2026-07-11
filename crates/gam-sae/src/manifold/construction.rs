@@ -2585,7 +2585,6 @@ impl SaeManifoldTerm {
     pub(crate) fn refresh_active_frames_from_data(
         &mut self,
         target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
     ) -> Result<usize, String> {
         let n = self.n_obs();
         let p = self.output_dim();

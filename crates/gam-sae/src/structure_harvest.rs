@@ -605,8 +605,14 @@ pub fn harvest_move_proposals(
     // Glue arm banks it against the churn null. The pre-screen only RANKS, so
     // the budget spends its e-value evaluations on the most-aligned pairs; it
     // carries no acceptance threshold of its own (magic-free).
-    let (glues_proposed, glue_candidates_screened) =
-        harvest_glue_proposals(term, residuals, params.max_fusions, &mut proposals);
+    let mut certified_glues = Vec::new();
+    let (glues_proposed, glue_candidates_screened) = harvest_glue_proposals(
+        term,
+        residuals,
+        params.max_fusions,
+        &mut proposals,
+        &mut certified_glues,
+    );
 
     // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
     let mut fission_atoms: Vec<(usize, f64)> = Vec::new();
@@ -861,6 +867,7 @@ pub fn harvest_move_proposals(
         birth_skipped_reason,
         glues_proposed,
         glue_candidates_screened,
+        certified_glues,
     })
 }
 
@@ -921,6 +928,30 @@ fn run_within_atom_carve(
     Some(carve(&input, WITHIN_ATOM_CARVE_ALPHA))
 }
 
+/// The exact geometric object which earned a chart-glue proposal's equivalence
+/// e-value.  Glue acceptance is based on that harvest-time certificate, so the
+/// round driver carries it unchanged to the adoption boundary instead of trying
+/// to infer the seam again from a proposal-scoring refit.
+#[derive(Clone, Debug)]
+enum CertifiedGlueTransition {
+    UnitSpeed {
+        transition: UnitSpeedChartTransition,
+        /// B's support at certification time.  A destructive fusion transplants
+        /// precisely these coordinates before B is physically removed.
+        rows_b: Vec<usize>,
+    },
+    Sphere(SphereChartTransition),
+}
+
+/// Harvest-time certificate paired one-to-one with an emitted glue proposal.
+#[derive(Clone, Debug)]
+struct CertifiedGlue {
+    a: usize,
+    b: usize,
+    outcome: ChartGlueOutcome,
+    transition: CertifiedGlueTransition,
+}
+
 /// The output of one [`harvest_move_proposals`] pass: the proposal stream plus
 /// the loud records of any degrade-to-skip path taken (no silent drops).
 #[derive(Clone, Debug)]
@@ -972,6 +1003,10 @@ pub struct HarvestReport {
     /// pre-screen) before ranking under budget — the loud denominator for the
     /// glues actually proposed.
     pub glue_candidates_screened: usize,
+    /// Exact seam transitions paired with the emitted glue proposals.  Private
+    /// because these are adoption capabilities, not an additional public
+    /// proposal/evidence surface.
+    certified_glues: Vec<CertifiedGlue>,
 }
 
 // ===========================================================================
@@ -1321,12 +1356,12 @@ fn fit_seam_transition(term: &SaeManifoldTerm, a: usize, b: usize) -> Option<Sea
 /// each other's curve (`e_glue ~ σ_pool ≫ σ_band`) so the `−e_glue/(2σ_band²)`
 /// term drives the ratio large negative — the tied-EV-cannot-win property the
 /// issue requires.
-fn glue_pair_evalue(
+fn unit_speed_glue_certificate(
     term: &SaeManifoldTerm,
     residuals: ArrayView2<'_, f64>,
     a: usize,
     b: usize,
-) -> Option<ChartTransition> {
+) -> Option<(ChartTransition, CertifiedGlue)> {
     let seam = fit_seam_transition(term, a, b)?;
     let log_e = seam_equivalence_log_e(
         residuals,
@@ -1337,11 +1372,46 @@ fn glue_pair_evalue(
         &seam.points_b,
         &seam.mapped_b_to_a,
     )?;
-    Some(ChartTransition {
+    let chart_transition = ChartTransition {
         sign: seam.sign as i8,
         offset: seam.offset,
         log_e_value: log_e,
-    })
+    };
+    let outcome = if chart_transition.sign == 1 {
+        ChartGlueOutcome::Fuse
+    } else {
+        ChartGlueOutcome::RegisterAtlas
+    };
+    let transition = UnitSpeedChartTransition::new(
+        b,
+        a,
+        chart_transition.sign,
+        chart_transition.offset,
+        seam.period,
+        AtlasSeamKind::Regular,
+    )
+    .ok()?;
+    Some((
+        chart_transition,
+        CertifiedGlue {
+            a,
+            b,
+            outcome,
+            transition: CertifiedGlueTransition::UnitSpeed {
+                transition,
+                rows_b: seam.rows_b,
+            },
+        },
+    ))
+}
+
+fn glue_pair_evalue(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+    a: usize,
+    b: usize,
+) -> Option<ChartTransition> {
+    unit_speed_glue_certificate(term, residuals, a, b).map(|(transition, _)| transition)
 }
 
 /// The sample-split equivalence log-e-value shared by the 1-D
@@ -1772,6 +1842,7 @@ fn harvest_glue_proposals(
     residuals: ArrayView2<'_, f64>,
     budget: usize,
     proposals: &mut Vec<MoveProposal>,
+    certified_glues: &mut Vec<CertifiedGlue>,
 ) -> (usize, usize) {
     let k = term.k_atoms();
     if k < 2 || budget == 0 {
@@ -1858,17 +1929,17 @@ fn harvest_glue_proposals(
 
     let mut proposed = 0usize;
     for &(a, b, _score) in candidates.iter().take(budget) {
-        if let Some(tr) = glue_pair_evalue(term, residuals, a, b) {
-            let outcome = if tr.sign == 1 {
-                ChartGlueOutcome::Fuse
-            } else {
-                ChartGlueOutcome::RegisterAtlas
-            };
+        if let Some((tr, certificate)) = unit_speed_glue_certificate(term, residuals, a, b) {
             proposals.push(proposal(
                 term,
-                StructureMove::Glue { a, b, outcome },
+                StructureMove::Glue {
+                    a,
+                    b,
+                    outcome: certificate.outcome,
+                },
                 tr.log_e_value,
             ));
+            certified_glues.push(certificate);
             proposed += 1;
         }
     }
@@ -1903,7 +1974,7 @@ fn harvest_glue_proposals(
     }
     for &(a, b) in sphere_candidates.iter().take(budget) {
         screened += 1;
-        if let Some((_transition, log_e)) = sphere_glue_pair_evalue(term, residuals, a, b) {
+        if let Some((transition, log_e)) = sphere_glue_pair_evalue(term, residuals, a, b) {
             proposals.push(proposal(
                 term,
                 StructureMove::Glue {
@@ -1913,6 +1984,12 @@ fn harvest_glue_proposals(
                 },
                 log_e,
             ));
+            certified_glues.push(CertifiedGlue {
+                a,
+                b,
+                outcome: ChartGlueOutcome::RegisterAtlas,
+                transition: CertifiedGlueTransition::Sphere(transition),
+            });
             proposed += 1;
         }
     }
@@ -1920,30 +1997,53 @@ fn harvest_glue_proposals(
 }
 
 /// Warm the glued atom `a`'s chart to cover the union of both arcs by
-/// transplanting `b`'s per-row latent coordinate through the fitted seam
+/// transplanting `b`'s per-row latent coordinate through the certified seam
 /// transition `t_a = sign·t_b + offset` (mod `2π`), so the joint refit starts
 /// from a full-manifold chart rather than re-discovering `b`'s arc cold.
-fn transplant_glued_coords(term: &mut SaeManifoldTerm, a: usize, b: usize, seam: &SeamTransition) {
+fn transplant_glued_coords(
+    term: &mut SaeManifoldTerm,
+    a: usize,
+    b: usize,
+    transition: &UnitSpeedChartTransition,
+    rows_b: &[usize],
+) -> Result<(), String> {
+    if transition.from_chart != b || transition.to_chart != a {
+        return Err(format!(
+            "transplant_glued_coords: transition {}->{} does not match glue ({a},{b})",
+            transition.from_chart, transition.to_chart
+        ));
+    }
     let coords = &mut term.assignment.coords;
     if a >= coords.len() || b >= coords.len() {
-        return;
+        return Err(format!(
+            "transplant_glued_coords: glue ({a},{b}) outside {} coordinate blocks",
+            coords.len()
+        ));
     }
     let da = coords[a].latent_dim();
     let db = coords[b].latent_dim();
     if da < 1 || db < 1 || coords[a].n_obs() != coords[b].n_obs() {
-        return;
+        return Err(format!(
+            "transplant_glued_coords: incompatible coordinate blocks for glue ({a},{b})"
+        ));
     }
     // Read B's flat coords, then write A's transplanted rows through the fitted
     // transition. The read is cloned first, so the mutable borrow of A's coords
     // never aliases B's.
     let flat_b = coords[b].as_flat().to_owned();
     let mut flat_a = coords[a].as_flat().to_owned();
-    for &r in &seam.rows_b {
+    let n = coords[b].n_obs();
+    for &r in rows_b {
+        if r >= n {
+            return Err(format!(
+                "transplant_glued_coords: certified row {r} outside n={n} for glue ({a},{b})"
+            ));
+        }
         let t_b = flat_b[r * db];
-        let t_a = (seam.sign * t_b + seam.offset).rem_euclid(seam.period);
-        flat_a[r * da] = t_a;
+        flat_a[r * da] = transition.apply(t_b);
     }
     coords[a].set_flat(flat_a.view());
+    Ok(())
 }
 
 /// Apply one [`StructureMove`] to a fitted term + ρ, returning the warm child
@@ -2028,8 +2128,22 @@ pub fn apply_structure_move(
                     }
                     // Index-stable within the round: fold/demote now, physically
                     // excise at [`compact_glued_atoms`] before polish.
+                    let transition = UnitSpeedChartTransition::new(
+                        *b,
+                        *a,
+                        1,
+                        seam.offset,
+                        seam.period,
+                        AtlasSeamKind::Regular,
+                    )?;
                     fold_atom_into(&mut child, *a, *b)?;
-                    transplant_glued_coords(&mut child, *a, *b, &seam);
+                    transplant_glued_coords(
+                        &mut child,
+                        *a,
+                        *b,
+                        &transition,
+                        &seam.rows_b,
+                    )?;
                 }
                 ChartGlueOutcome::RegisterAtlas => {
                     if seam.sign != -1.0 {
@@ -7520,7 +7634,7 @@ mod tests {
         let mut decoder = Array2::<f64>::zeros((m, p));
         decoder[[1, 0]] = 0.9;
         decoder[[2, 1]] = -0.6;
-        let (mut born, born_rho) = apply_structure_move(
+        let (mut born, _born_rho) = apply_structure_move(
             &term,
             &rho,
             &StructureMove::Birth { candidate: 0 },

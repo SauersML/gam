@@ -6507,7 +6507,7 @@ fn sae_coercion_json_roundtrip(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResu
     max_iter, random_state, top_k, jumprelu_threshold,
     fisher_factors=None, fisher_provenance=None, declared_bases=None
 ))]
-fn sae_manifold_core_from_fit_payload(
+fn sae_manifold_from_fit_payload(
     py: Python<'_>,
     raw_payload: &Bound<'_, PyAny>,
     x: PyReadonlyArray2<'_, f64>,
@@ -7080,6 +7080,29 @@ impl ManifoldSaeCore {
         Self::from_payload(inner)
     }
 
+    #[staticmethod]
+    fn from_dict(
+        py: Python<'_>,
+        payload: &Bound<'_, PyDict>,
+    ) -> PyResult<Py<ManifoldSaeCore>> {
+        Py::new(py, Self::new(py, payload)?)
+    }
+
+    #[staticmethod]
+    fn from_json(py: Python<'_>, payload_json: &str) -> PyResult<Py<ManifoldSaeCore>> {
+        let inner =
+            crate::manifold::manifold_sae_payload::ManifoldSaePayload::from_json(payload_json)
+                .map_err(py_value_error)?;
+        Py::new(py, Self::from_payload(inner)?)
+    }
+
+    #[staticmethod]
+    fn load(py: Python<'_>, path: &str) -> PyResult<Py<ManifoldSaeCore>> {
+        let payload_json = std::fs::read_to_string(path)
+            .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
+        Self::from_json(py, &payload_json)
+    }
+
     /// Re-serialize to the `to_dict` schema as a Python dict (through the serde
     /// round-trip: `reml_score` re-duplicated, `structured_residual_diagnostics`
     /// dropped).
@@ -7093,6 +7116,26 @@ impl ManifoldSaeCore {
     /// The canonical JSON payload string (what `save()` writes).
     fn to_json(&self) -> PyResult<String> {
         self.inner.to_json().map_err(py_value_error)
+    }
+
+    fn save(&self, path: &str) -> PyResult<()> {
+        let payload = self.inner.to_json().map_err(py_value_error)?;
+        std::fs::write(path, payload)
+            .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))
+    }
+
+    fn __repr__(&self) -> String {
+        let n_rows = self.inner.fitted.len();
+        let p_out = self.inner.fitted.first().map_or(0, Vec::len);
+        format!(
+            "ManifoldSAE(K={}, n={}, p={}, topology={:?}, assignment={:?}, r2={:.3})",
+            self.inner.atoms.len(),
+            n_rows,
+            p_out,
+            self.inner.atom_topology,
+            self.inner.assignment,
+            self.inner.reconstruction_r2,
+        )
     }
 
     /// In-sample dense reconstruction `(N, p)` rebuilt from the stored per-atom
@@ -7291,11 +7334,6 @@ impl ManifoldSaeCore {
             .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
             .collect::<PyResult<_>>()?;
         let logits_owned = manifold_sae_owned2(&inner.low_level_logits)?;
-        let fisher_owned: Option<Array3<f64>> = inner
-            .fisher_factors
-            .as_ref()
-            .map(|f| manifold_sae_owned3(f))
-            .transpose()?;
         let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
         let basis_sizes: Vec<usize> =
             inner.basis_sizes.iter().map(|&s| s.max(0) as usize).collect();
@@ -7318,8 +7356,7 @@ impl ManifoldSaeCore {
             decoder_owned.iter().map(|a| a.view()).collect();
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
             coord_owned.iter().map(|a| a.view()).collect();
-        let fisher_view = fisher_owned.as_ref().map(|a| a.view());
-        let plan = steer_delta_from_arrays(
+        let plan = steer_delta_with_metric_from_arrays(
             atom_k,
             metric_row,
             amplitude,
@@ -7339,8 +7376,7 @@ impl ManifoldSaeCore {
             inner.tau,
             inner.alpha,
             inner.jumprelu_threshold,
-            fisher_view,
-            inner.fisher_provenance.as_deref(),
+            self.fisher_metric.clone(),
         )?;
         steer_plan_to_pydict(py, plan)
     }
@@ -7354,6 +7390,19 @@ impl ManifoldSaeCore {
     /// `fitted` array. Unlike the dataclass path there is no training-data
     /// shortcut: every call runs the OOS solve.
     fn reconstruct<'py>(
+        &self,
+        py: Python<'py>,
+        x_new: PyReadonlyArray2<'py, f64>,
+    ) -> PyResult<PyObject> {
+        let payload = self.oos_payload_dict(py, x_new)?;
+        let bound = payload.bind(py);
+        let fitted = bound
+            .get_item("fitted")?
+            .ok_or_else(|| py_value_error("OOS payload missing 'fitted'".to_string()))?;
+        Ok(fitted.unbind())
+    }
+
+    fn predict<'py>(
         &self,
         py: Python<'py>,
         x_new: PyReadonlyArray2<'py, f64>,
@@ -7452,21 +7501,58 @@ impl ManifoldSaeCore {
             Some(v) => Ok(Some(manifold_sae_vec3(py, v)?)),
         }
     }
-    /// Install or replace the retained output-Fisher shard `(n, p, r)` in place —
-    /// the Rust-owned counterpart of `ManifoldSAE.attach_fisher` / the fit-time
-    /// post-attach `model.fisher_factors = ...`. Stored in the SAME nested-`Vec`
-    /// layout the payload uses (identical to the `sae_manifold_core_from_fit_payload`
-    /// build-time conversion), so `to_dict` / `to_json` / `steer` read it back
-    /// unchanged; `None` detaches the shard (reverting steering to the
-    /// geometry-only, no-dose path).
-    #[setter]
-    fn set_fisher_factors(&mut self, factors: Option<PyReadonlyArray3<'_, f64>>) {
-        self.inner.fisher_factors = factors.map(|arr| {
-            arr.as_array()
-                .outer_iter()
-                .map(|m| m.rows().into_iter().map(|r| r.to_vec()).collect())
-                .collect()
-        });
+    /// Atomically validate, pack, and install an output-Fisher shard.  No field
+    /// becomes visible until the complete `RowMetric` has been constructed, so
+    /// a failed attach leaves the prior model state untouched.
+    #[pyo3(signature = (factors, provenance, mass_residual=None))]
+    fn attach_fisher<'py>(
+        &mut self,
+        factors: PyReadonlyArray3<'py, f64>,
+        provenance: String,
+        mass_residual: Option<PyReadonlyArray1<'py, f64>>,
+    ) -> PyResult<()> {
+        let n_rows = self.inner.fitted.len();
+        let p_out = self.inner.fitted.first().map_or(0, Vec::len);
+        let request = SaeFisherRowMetricRequest::from_tag(
+            factors.as_array(),
+            n_rows,
+            p_out,
+            Some(&provenance),
+            mass_residual.as_ref().map(|values| values.as_array()),
+        )
+        .map_err(py_value_error)?;
+        let metric = build_sae_fisher_row_metric(request).map_err(py_value_error)?;
+        let metric_label =
+            gam::terms::sae::manifold::metric_provenance_label(metric.provenance()).to_string();
+        let factors_nested = factors
+            .as_array()
+            .outer_iter()
+            .map(|matrix| matrix.rows().into_iter().map(|row| row.to_vec()).collect())
+            .collect();
+        let mass_nested = mass_residual.map(|values| values.as_array().to_vec());
+
+        self.inner.fisher_factors = Some(factors_nested);
+        self.inner.fisher_mass_residual = mass_nested;
+        self.inner.fisher_provenance = Some(provenance);
+        self.inner.metric_provenance = metric_label;
+        self.fisher_metric = Some(metric);
+        self.fisher_metric_build_count += 1;
+        Ok(())
+    }
+
+    /// Explicitly remove the Fisher state.  Detach is a separate operation;
+    /// `attach_fisher(None)` is not a compatibility alias.
+    fn detach_fisher(&mut self) {
+        self.inner.fisher_factors = None;
+        self.inner.fisher_mass_residual = None;
+        self.inner.fisher_provenance = None;
+        self.inner.metric_provenance = "Euclidean".to_string();
+        self.fisher_metric = None;
+    }
+
+    #[getter]
+    fn fisher_metric_build_count(&self) -> usize {
+        self.fisher_metric_build_count
     }
     #[getter]
     fn fisher_mass_residual<'py>(
@@ -7477,12 +7563,6 @@ impl ManifoldSaeCore {
             .fisher_mass_residual
             .as_ref()
             .map(|v| manifold_sae_vec1(py, v))
-    }
-    /// Set the per-row output-Fisher truncation residual `(n,)` in place, or
-    /// `None` to clear it (the Euclidean-detach branch of `attach_fisher`).
-    #[setter]
-    fn set_fisher_mass_residual(&mut self, residual: Option<PyReadonlyArray1<'_, f64>>) {
-        self.inner.fisher_mass_residual = residual.map(|arr| arr.as_array().to_vec());
     }
     #[getter]
     fn selected_log_lambda_smooth<'py>(
@@ -7529,21 +7609,9 @@ impl ManifoldSaeCore {
     fn metric_provenance(&self) -> String {
         self.inner.metric_provenance.clone()
     }
-    /// Set the installed inner-product provenance (`"Euclidean"` /
-    /// `"OutputFisher"`) in place, mirroring `attach_fisher`'s metric flip.
-    #[setter]
-    fn set_metric_provenance(&mut self, value: String) {
-        self.inner.metric_provenance = value;
-    }
     #[getter]
     fn fisher_provenance(&self) -> Option<String> {
         self.inner.fisher_provenance.clone()
-    }
-    /// Set the retained shard's pullback provenance (`"output_fisher"` /
-    /// `"output_fisher_downstream"`) in place, or `None` on detach.
-    #[setter]
-    fn set_fisher_provenance(&mut self, value: Option<String>) {
-        self.inner.fisher_provenance = value;
     }
     #[getter]
     fn structure_certificate_json(&self) -> Option<String> {

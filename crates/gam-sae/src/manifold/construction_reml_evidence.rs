@@ -3547,7 +3547,6 @@ impl SaeManifoldTerm {
     /// the fitted state is held fixed (#2087 desync class).
     pub(crate) fn crosscoder_block_ift_rhs(
         &self,
-        rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
         target: ArrayView2<'_, f64>,
         col_range: std::ops::Range<usize>,

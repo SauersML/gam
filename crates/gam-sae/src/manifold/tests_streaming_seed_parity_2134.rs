@@ -98,15 +98,15 @@ fn streaming_seed_matches_dense_seed_on_topk_overcomplete() {
     assert!(k > p, "the fixture must be overcomplete (K > P)");
 
     // Dense reference seed.
-    let (mut dense_term, z, rho) = build_topk_term(n, p, k, support_k);
+    let (mut dense_term, z, _rho_unused) = build_topk_term(n, p, k, support_k);
     dense_term
-        .seed_cold_start_disjoint_charts(z.view(), &rho)
+        .seed_cold_start_disjoint_charts(z.view())
         .expect("dense seed");
 
     for &chunk in &[7usize, 16, 31, 64, 4096] {
-        let (mut stream_term, z2, rho2) = build_topk_term(n, p, k, support_k);
+        let (mut stream_term, z2, _rho_unused) = build_topk_term(n, p, k, support_k);
         stream_term
-            .seed_cold_start_disjoint_charts_streaming(z2.view(), &rho2, chunk)
+            .seed_cold_start_disjoint_charts_streaming(z2.view(), chunk)
             .expect("streaming seed");
 
         // Every atom's decoder must agree to tolerance (the chunked normal

@@ -25,7 +25,6 @@ impl SaeManifoldTerm {
     pub fn fit_amortized_encoder(
         &self,
         targets: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
     ) -> Result<LearnedAmortizedEncoder, String> {
         let n = self.n_obs();
         let k = self.k_atoms();
@@ -240,7 +239,6 @@ impl SaeManifoldTerm {
     pub fn chart_geometry_routing_logits(
         &self,
         targets: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
         gate_logit_scale: f64,
     ) -> Result<Array2<f64>, String> {
         let n = self.n_obs();
@@ -455,7 +453,7 @@ mod amortized_encoder_glue_tests {
         );
         // The exact amplitudes are the term's OWN masses; generate x from them so
         // the term's exact code reconstructs x exactly (self-consistent).
-        let amps = term.fitted_assignment_amplitudes(&rho).expect("masses");
+        let amps = term.fitted_assignment_amplitudes().expect("masses");
         let mut x = Array2::<f64>::zeros((n, p));
         for row in 0..n {
             for atom_idx in 0..k {
@@ -484,12 +482,11 @@ mod amortized_encoder_glue_tests {
         let PlantedTwoAtomTerm {
             term,
             target: x_tr,
-            rho,
             ..
         } = planted_two_atom_term(400, 7);
         // Fit the encoder on the term's own exact code (logits/coords/masses).
         let encoder = term
-            .fit_amortized_encoder(x_tr.view(), &rho)
+            .fit_amortized_encoder(x_tr.view())
             .expect("fit encoder");
 
         // Held-out rows from the SAME dictionary (identical atoms, fresh coords).

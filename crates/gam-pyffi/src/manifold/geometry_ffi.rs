@@ -5087,14 +5087,14 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
-        crate::manifold::manifold_sae_coercion::sae_manifold_core_from_stagewise,
+        crate::manifold::manifold_sae_coercion::sae_manifold_from_stagewise,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_training_mean, module)?)?;
     module.add_function(wrap_pyfunction!(sae_periodic_shape_band_reorder, module)?)?;
     module.add_function(wrap_pyfunction!(sae_coercion_json_roundtrip, module)?)?;
     module.add_function(wrap_pyfunction!(
-        sae_manifold_core_from_fit_payload,
+        sae_manifold_from_fit_payload,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_payload_roundtrip, module)?)?;

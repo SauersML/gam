@@ -718,7 +718,6 @@ mod batch4_oracle_tests {
         /// path (`batch4_jet_lanes_match_scalar_hand_row_jets`).
         pub(crate) fn row_jets_for_logdet_batch4(
             &self,
-            rho: &SaeManifoldRho,
             rows: [usize; 4],
             cache: &ArrowFactorCache,
             second_jets: &[Array4<f64>],
