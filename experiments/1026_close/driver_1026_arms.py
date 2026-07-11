@@ -520,7 +520,7 @@ def main() -> int:
 
     wall = time.perf_counter() - t0
     rec = {"issue": 1026, "arm": args.arm, "tag": args.tag, "N": n, "p": p,
-           "K": args.K, "top_k": args.top_k, "d_atom": args.d_atom,
+           "K": args.K, "k_flat": args.k_flat, "top_k": args.top_k, "d_atom": args.d_atom,
            "curved_atoms": args.curved_atoms, "curved_k": args.curved_k,
            "steps": args.steps, "seed": args.seed, "ev": ev, "wall_s": round(wall, 1),
            **extra}
