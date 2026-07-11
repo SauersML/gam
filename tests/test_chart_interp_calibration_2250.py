@@ -20,10 +20,11 @@ class _ChartInterpRust:
             },
             "calibration": {
                 "statistic": "orientation_quotiented_weighted_phase_lock_v1",
-                "protocol": "matched_spectrum_gaussian_chart_refit_v1",
+                "protocol": "matched_spectrum_gaussian_v1",
+                "readout": "token_mean_pca_plane_v1",
                 "null_kind": "matched_spectrum_gaussian",
                 "draw_policy": (
-                    "regenerate_surrogate_refit_chart_and_readout_each_draw"
+                    "regenerate_surrogate_and_repeat_declared_readout_each_draw"
                 ),
                 "seed": 2250,
                 "tail": "larger",
@@ -55,7 +56,8 @@ def test_chart_interp_wrapper_preserves_null_provenance_and_samples(
     observations = [(0.0, 0.0, 1.0), (0.5, 0.5, 1.0)]
     null_draws = [observations, observations, observations]
     calibration = sae.ChartInterpNullCalibration(
-        protocol=sae.ChartInterpNullProtocol.MATCHED_SPECTRUM_GAUSSIAN_CHART_REFIT_V1,
+        protocol=sae.ChartInterpNullProtocol.MATCHED_SPECTRUM_GAUSSIAN_V1,
+        readout=sae.ChartInterpReadout.TOKEN_MEAN_PCA_PLANE_V1,
         seed=2250,
         expected_draws=3,
         observation_draws=null_draws,
@@ -64,10 +66,12 @@ def test_chart_interp_wrapper_preserves_null_provenance_and_samples(
     report = sae.chart_interp_score(observations, calibration, 0.05)
 
     assert rust.call is not None
-    assert rust.call[2] == "matched_spectrum_gaussian_chart_refit_v1"
-    assert rust.call[3:5] == (2250, 3)
+    assert rust.call[2] == "matched_spectrum_gaussian_v1"
+    assert rust.call[3] == "token_mean_pca_plane_v1"
+    assert rust.call[4:6] == (2250, 3)
     assert report.statistic == report.calibration.statistic
     assert report.calibration.null_kind == "matched_spectrum_gaussian"
+    assert report.calibration.readout == "token_mean_pca_plane_v1"
     assert report.calibration.seed == 2250
     assert report.calibration.null_statistics == (0.9, 0.1, 0.5)
     assert report.verdict == "null_compatible"

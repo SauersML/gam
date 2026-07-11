@@ -218,9 +218,10 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
     angle is converted to turns and scored against the ground-truth calendar
     cyclic label by ``gamfit.chart_interp_score``. Each cyclic-ordering record
     must also carry a ``matched_spectrum_null`` object with the null fit's
-    ``angles_rad`` draws, closed protocol, seed, declared draw count, and
-    significance level. Null kind and draw policy are owned by that protocol
-    rather than accepted as free-form labels.
+    ``angles_rad`` draws, closed protocol, readout, seed, declared draw count,
+    and significance level. The observed cyclic-ordering record must name the
+    same readout. Null kind and draw policy are owned by the protocol rather
+    than accepted as free-form labels.
     Missing null evidence is an error: a scalar correlation is not a
     chart-interpretability result (#2250)."""
     doc = json.loads(fit_path.read_text())
@@ -268,6 +269,20 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                     for a, i in zip(draw_angles, indices)
                 ]
             )
+        observed_readout = cyc.get("readout")
+        null_readout = null.get("readout")
+        if observed_readout != null_readout:
+            raise ValueError(
+                f"atom {entry.get('atom')!r} observed readout {observed_readout!r} "
+                f"does not match null readout {null_readout!r}"
+            )
+        try:
+            readout = gamfit.ChartInterpReadout(observed_readout)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"atom {entry.get('atom')!r} cyclic_ordering.readout must name "
+                "a supported coordinate readout"
+            ) from error
         protocol_value = null.get("protocol")
         try:
             protocol = gamfit.ChartInterpNullProtocol(protocol_value)
@@ -278,6 +293,7 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
             ) from error
         calibration = gamfit.ChartInterpNullCalibration(
             protocol=protocol,
+            readout=readout,
             seed=int(null["seed"]),
             expected_draws=int(null["draws"]),
             observation_draws=null_obs,
@@ -292,6 +308,7 @@ def chart_interp_report(fit_path: Path) -> dict[str, Any]:
                 "period": period,
                 "n_words": len(words),
                 "statistic": rep.statistic,
+                "readout": rep.calibration.readout,
                 "circular_correlation": rep.observed.circular_correlation,
                 "signed_circular_correlation": rep.observed.signed_circular_correlation,
                 "effective_weight": rep.observed.effective_weight,

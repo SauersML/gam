@@ -1,8 +1,9 @@
 use gam_sae::null_battery::{NullKind, Tail};
 use gam_sae::saebench_metrics::{
     ChartInterpNullCalibration, ChartInterpNullDrawPolicy, ChartInterpNullProtocol,
-    ChartInterpObservation, ChartInterpStatistic, ChartInterpVerdict, DoseResponseObservation,
-    chart_interp_score, coordinate_posterior_from_precision, dose_response_calibration,
+    ChartInterpObservation, ChartInterpReadout, ChartInterpStatistic, ChartInterpVerdict,
+    DoseResponseObservation, chart_interp_score, coordinate_posterior_from_precision,
+    dose_response_calibration,
 };
 
 fn matched_spectrum_calibration(
@@ -10,7 +11,8 @@ fn matched_spectrum_calibration(
     draws: Vec<Vec<ChartInterpObservation>>,
 ) -> ChartInterpNullCalibration {
     ChartInterpNullCalibration::new(
-        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        ChartInterpNullProtocol::MatchedSpectrumGaussianV1,
+        ChartInterpReadout::TokenMeanPcaPlaneV1,
         seed,
         draws.len(),
         draws,
@@ -102,11 +104,15 @@ fn chart_interp_report_carries_typed_provenance_and_recomputed_samples_2250() {
     assert_eq!(report.calibration.statistic, report.statistic);
     assert_eq!(
         report.calibration.protocol,
-        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1
+        ChartInterpNullProtocol::MatchedSpectrumGaussianV1
+    );
+    assert_eq!(
+        report.calibration.readout,
+        ChartInterpReadout::TokenMeanPcaPlaneV1
     );
     assert_eq!(
         report.calibration.draw_policy,
-        ChartInterpNullDrawPolicy::RegenerateRefitAndReadout
+        ChartInterpNullDrawPolicy::RegenerateSurrogateAndRepeatReadout
     );
     assert_eq!(
         report.calibration.null_kind,
@@ -128,8 +134,15 @@ fn chart_interp_report_carries_typed_provenance_and_recomputed_samples_2250() {
 
 #[test]
 fn chart_interp_rejects_scalar_only_evidence_2250() {
+    assert!(
+        ChartInterpNullProtocol::parse("matched_spectrum_gaussian_chart_refit_v1").is_err(),
+        "the old protocol falsely asserted that PCA token-mean angles came from a chart refit"
+    );
+    assert!(ChartInterpReadout::parse("unspecified").is_err());
+
     let error = ChartInterpNullCalibration::new(
-        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        ChartInterpNullProtocol::MatchedSpectrumGaussianV1,
+        ChartInterpReadout::TokenMeanPcaPlaneV1,
         0x2250,
         0,
         Vec::new(),
@@ -138,7 +151,8 @@ fn chart_interp_rejects_scalar_only_evidence_2250() {
     assert!(error.contains("at least one draw"));
 
     let error = ChartInterpNullCalibration::new(
-        ChartInterpNullProtocol::MatchedSpectrumGaussianChartRefitV1,
+        ChartInterpNullProtocol::MatchedSpectrumGaussianV1,
+        ChartInterpReadout::TokenMeanPcaPlaneV1,
         0x2250,
         2,
         vec![zero_null_draw()],

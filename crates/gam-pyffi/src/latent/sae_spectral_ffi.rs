@@ -2222,12 +2222,13 @@ fn effect_weighted_retention(
 /// per row. `null_observation_draws` contains complete ledgers produced by the
 /// closed `null_protocol`; the declared draw count must match the artifact. The
 /// scorer is fail-closed: neither provenance nor null draws are optional.
-#[pyfunction(signature = (observations, null_observation_draws, null_protocol, null_seed, expected_draws, significance_level))]
+#[pyfunction(signature = (observations, null_observation_draws, null_protocol, readout, null_seed, expected_draws, significance_level))]
 fn chart_interp_score(
     py: Python<'_>,
     observations: Vec<(f64, f64, f64)>,
     null_observation_draws: Vec<Vec<(f64, f64, f64)>>,
     null_protocol: String,
+    readout: String,
     null_seed: u64,
     expected_draws: usize,
     significance_level: f64,
@@ -2260,8 +2261,10 @@ fn chart_interp_score(
                 .collect();
         let protocol =
             gam::terms::sae::saebench_metrics::ChartInterpNullProtocol::parse(&null_protocol)?;
+        let readout = gam::terms::sae::saebench_metrics::ChartInterpReadout::parse(&readout)?;
         let calibration = gam::terms::sae::saebench_metrics::ChartInterpNullCalibration::new(
             protocol,
+            readout,
             null_seed,
             expected_draws,
             null_draws,
@@ -2284,6 +2287,7 @@ fn chart_interp_score(
     let calibration = PyDict::new(py);
     calibration.set_item("statistic", report.calibration.statistic.as_str())?;
     calibration.set_item("protocol", report.calibration.protocol.as_str())?;
+    calibration.set_item("readout", report.calibration.readout.as_str())?;
     calibration.set_item("null_kind", report.calibration.null_kind.as_str())?;
     calibration.set_item("draw_policy", report.calibration.draw_policy.as_str())?;
     calibration.set_item("seed", report.calibration.seed)?;
@@ -2507,7 +2511,8 @@ mod ffi_completeness_tests {
                 py,
                 observations.clone(),
                 vec![observations],
-                "matched_spectrum_gaussian_chart_refit_v1".to_string(),
+                "matched_spectrum_gaussian_v1".to_string(),
+                "fitted_chart_coordinate_v1".to_string(),
                 17,
                 1,
                 0.05,
@@ -2546,7 +2551,14 @@ mod ffi_completeness_tests {
                 .unwrap()
                 .extract()
                 .unwrap();
-            assert_eq!(protocol, "matched_spectrum_gaussian_chart_refit_v1");
+            assert_eq!(protocol, "matched_spectrum_gaussian_v1");
+            let readout: String = calibration
+                .get_item("readout")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(readout, "fitted_chart_coordinate_v1");
             let seed: u64 = calibration
                 .get_item("seed")
                 .unwrap()

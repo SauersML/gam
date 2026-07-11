@@ -42,19 +42,48 @@ impl ChartInterpStatistic {
     }
 }
 
+/// Coordinate readout applied identically to the observed data and every null
+/// surrogate before the phase-lock statistic is evaluated.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartInterpReadout {
+    /// Angle in the leading two-PC plane of cyclic-label mean activations.
+    TokenMeanPcaPlaneV1,
+    /// Coordinate returned by a fitted chart model.
+    FittedChartCoordinateV1,
+}
+
+impl ChartInterpReadout {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "token_mean_pca_plane_v1" => Ok(Self::TokenMeanPcaPlaneV1),
+            "fitted_chart_coordinate_v1" => Ok(Self::FittedChartCoordinateV1),
+            other => Err(format!(
+                "chart_interp: unsupported readout {other:?}; expected token_mean_pca_plane_v1 or fitted_chart_coordinate_v1"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenMeanPcaPlaneV1 => "token_mean_pca_plane_v1",
+            Self::FittedChartCoordinateV1 => "fitted_chart_coordinate_v1",
+        }
+    }
+}
+
 /// How one complete null observation ledger is produced.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChartInterpNullDrawPolicy {
-    /// Regenerate the declared surrogate, refit the chart, and run the same
+    /// Regenerate the declared surrogate and repeat the explicitly declared
     /// coordinate readout before evaluating the statistic.
-    RegenerateRefitAndReadout,
+    RegenerateSurrogateAndRepeatReadout,
 }
 
 impl ChartInterpNullDrawPolicy {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::RegenerateRefitAndReadout => {
-                "regenerate_surrogate_refit_chart_and_readout_each_draw"
+            Self::RegenerateSurrogateAndRepeatReadout => {
+                "regenerate_surrogate_and_repeat_declared_readout_each_draw"
             }
         }
     }
@@ -67,37 +96,35 @@ impl ChartInterpNullDrawPolicy {
 /// contradictory policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChartInterpNullProtocol {
-    MatchedSpectrumGaussianChartRefitV1,
+    MatchedSpectrumGaussianV1,
 }
 
 impl ChartInterpNullProtocol {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "matched_spectrum_gaussian_chart_refit_v1" => {
-                Ok(Self::MatchedSpectrumGaussianChartRefitV1)
-            }
+            "matched_spectrum_gaussian_v1" => Ok(Self::MatchedSpectrumGaussianV1),
             other => Err(format!(
-                "chart_interp: unsupported null protocol {other:?}; expected matched_spectrum_gaussian_chart_refit_v1"
+                "chart_interp: unsupported null protocol {other:?}; expected matched_spectrum_gaussian_v1"
             )),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::MatchedSpectrumGaussianChartRefitV1 => "matched_spectrum_gaussian_chart_refit_v1",
+            Self::MatchedSpectrumGaussianV1 => "matched_spectrum_gaussian_v1",
         }
     }
 
     pub fn null_kind(self) -> NullKind {
         match self {
-            Self::MatchedSpectrumGaussianChartRefitV1 => NullKind::MatchedSpectrumGaussian,
+            Self::MatchedSpectrumGaussianV1 => NullKind::MatchedSpectrumGaussian,
         }
     }
 
     pub fn draw_policy(self) -> ChartInterpNullDrawPolicy {
         match self {
-            Self::MatchedSpectrumGaussianChartRefitV1 => {
-                ChartInterpNullDrawPolicy::RegenerateRefitAndReadout
+            Self::MatchedSpectrumGaussianV1 => {
+                ChartInterpNullDrawPolicy::RegenerateSurrogateAndRepeatReadout
             }
         }
     }
@@ -109,6 +136,7 @@ impl ChartInterpNullProtocol {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChartInterpNullCalibration {
     protocol: ChartInterpNullProtocol,
+    readout: ChartInterpReadout,
     seed: u64,
     expected_draws: usize,
     observation_draws: Vec<Vec<ChartInterpObservation>>,
@@ -117,6 +145,7 @@ pub struct ChartInterpNullCalibration {
 impl ChartInterpNullCalibration {
     pub fn new(
         protocol: ChartInterpNullProtocol,
+        readout: ChartInterpReadout,
         seed: u64,
         expected_draws: usize,
         observation_draws: Vec<Vec<ChartInterpObservation>>,
@@ -132,6 +161,7 @@ impl ChartInterpNullCalibration {
         }
         Ok(Self {
             protocol,
+            readout,
             seed,
             expected_draws,
             observation_draws,
@@ -140,6 +170,10 @@ impl ChartInterpNullCalibration {
 
     pub fn protocol(&self) -> ChartInterpNullProtocol {
         self.protocol
+    }
+
+    pub fn readout(&self) -> ChartInterpReadout {
+        self.readout
     }
 
     pub fn seed(&self) -> u64 {
@@ -171,11 +205,13 @@ pub struct ChartInterpStatisticValue {
 pub struct ChartInterpNullCalibrationReport {
     /// The statistic recomputed for the observation and every null draw.
     pub statistic: ChartInterpStatistic,
-    /// Closed generator/refit/readout protocol.
+    /// Closed surrogate-generation protocol.
     pub protocol: ChartInterpNullProtocol,
+    /// Coordinate readout repeated for observed and null data.
+    pub readout: ChartInterpReadout,
     /// Native null kind fixed by [`Self::protocol`].
     pub null_kind: NullKind,
-    /// Per-draw generation/refit/readout policy fixed by [`Self::protocol`].
+    /// Per-draw generation/readout policy fixed by [`Self::protocol`].
     pub draw_policy: ChartInterpNullDrawPolicy,
     /// Seed from which draw-index-specific surrogates were generated.
     pub seed: u64,
@@ -305,6 +341,7 @@ pub fn chart_interp_score(
         calibration: ChartInterpNullCalibrationReport {
             statistic,
             protocol,
+            readout: null_calibration.readout(),
             null_kind: protocol.null_kind(),
             draw_policy: protocol.draw_policy(),
             seed: null_calibration.seed(),
@@ -322,7 +359,7 @@ fn validate_null_ledger_alignment(
 ) -> Result<(), String> {
     if null_draw.len() != observed.len() {
         return Err(format!(
-            "chart_interp null draw {draw_idx} has {} rows but observed ledger has {}; the refit/readout protocol requires the same labeled rows",
+            "chart_interp null draw {draw_idx} has {} rows but observed ledger has {}; the generation/readout protocol requires the same labeled rows",
             null_draw.len(),
             observed.len()
         ));
@@ -330,7 +367,7 @@ fn validate_null_ledger_alignment(
     for (row, (observed_row, null_row)) in observed.iter().zip(null_draw).enumerate() {
         if wrap_turns(observed_row.label_turns) != wrap_turns(null_row.label_turns) {
             return Err(format!(
-                "chart_interp null draw {draw_idx} changes label_turns at row {row}; matched-spectrum refits must score the identical labeled ledger"
+                "chart_interp null draw {draw_idx} changes label_turns at row {row}; matched-spectrum draws must score the identical labeled ledger"
             ));
         }
     }

@@ -121,6 +121,7 @@ from ._sae_spectral import (
     ChartInterpNullCalibration,
     ChartInterpNullCalibrationReport,
     ChartInterpNullProtocol,
+    ChartInterpReadout,
     ChartInterpReport,
     ChartInterpStatisticValue,
     ComposedContract,

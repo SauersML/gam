@@ -506,11 +506,16 @@ class ChartInterpStatisticValue:
 
 
 class ChartInterpNullProtocol(str, Enum):
-    """Closed Rust-owned chart-null generator/refit/readout protocols."""
+    """Closed Rust-owned chart-null surrogate protocols."""
 
-    MATCHED_SPECTRUM_GAUSSIAN_CHART_REFIT_V1 = (
-        "matched_spectrum_gaussian_chart_refit_v1"
-    )
+    MATCHED_SPECTRUM_GAUSSIAN_V1 = "matched_spectrum_gaussian_v1"
+
+
+class ChartInterpReadout(str, Enum):
+    """Coordinate readout repeated identically on observed and null data."""
+
+    TOKEN_MEAN_PCA_PLANE_V1 = "token_mean_pca_plane_v1"
+    FITTED_CHART_COORDINATE_V1 = "fitted_chart_coordinate_v1"
 
 
 @dataclass(frozen=True)
@@ -518,6 +523,7 @@ class ChartInterpNullCalibration:
     """Complete null input; scalar null statistics are intentionally invalid."""
 
     protocol: ChartInterpNullProtocol
+    readout: ChartInterpReadout
     seed: int
     expected_draws: int
     observation_draws: Sequence[Sequence[tuple[float, float, float]]]
@@ -527,6 +533,7 @@ class ChartInterpNullCalibration:
 class ChartInterpNullCalibrationReport:
     statistic: str
     protocol: str
+    readout: str
     null_kind: str
     draw_policy: str
     seed: int
@@ -568,10 +575,11 @@ def chart_interp_score(
     ``observations`` are ``(recovered_turns, label_turns, weight)`` triples: the
     recovered chart coordinate and its ground-truth cyclic label, both in turns
     (wrapped modulo one), and a non-negative posterior/evidence weight.
-    ``null_calibration`` names the closed surrogate/refit/readout protocol and
-    carries every complete draw ledger. Rust recomputes the same named statistic
-    on each ledger; a p-value for an EV gap or adjacency score cannot enter this
-    API. There is deliberately no scalar-only fallback."""
+    ``null_calibration`` separately names the closed surrogate protocol and the
+    coordinate readout repeated on observed and null data, then carries every
+    complete draw ledger. Rust recomputes the same named statistic on each
+    ledger; a p-value for an EV gap or adjacency score cannot enter this API.
+    There is deliberately no scalar-only fallback."""
     payload = rust_module().chart_interp_score(
         [(float(t), float(y), float(w)) for t, y, w in observations],
         [
@@ -579,6 +587,7 @@ def chart_interp_score(
             for draw in null_calibration.observation_draws
         ],
         null_calibration.protocol.value,
+        null_calibration.readout.value,
         int(null_calibration.seed),
         int(null_calibration.expected_draws),
         float(significance_level),
@@ -597,6 +606,7 @@ def chart_interp_score(
         calibration=ChartInterpNullCalibrationReport(
             statistic=str(calibration["statistic"]),
             protocol=str(calibration["protocol"]),
+            readout=str(calibration["readout"]),
             null_kind=str(calibration["null_kind"]),
             draw_policy=str(calibration["draw_policy"]),
             seed=int(calibration["seed"]),
