@@ -4275,6 +4275,134 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Refit the already-separated reactive-entry decoders against the exact
+    /// per-atom smoothness strengths on the advertised rho face.
+    ///
+    /// Chart placement deliberately uses an unpenalized residual peel because
+    /// that is what identifies distinct factors. Carrying those coefficients
+    /// directly into a heavy-smoothing waypoint, however, leaves a large
+    /// `lambda_k S_k B_k` score that the bounded joint corrector must first
+    /// unwind. This second peel keeps the placed charts fixed and solves
+    ///
+    /// `(D_k' W D_k + lambda_k sym(S_k)) B_k = D_k' W R_k`
+    ///
+    /// before deflating `R_k`, where `D_k = diag(a_k) Phi_k` and `W` is the
+    /// objective's design-honesty row weight. The native `S_k` is the preserved
+    /// reactive-objective operator; it is not refreshed from the new decoder.
+    /// This is an entry placement, not an evidence certificate: the subsequent
+    /// joint corrector still owns cross-atom, chart, routing, row-metric, and
+    /// analytic-registry terms and must pass the unchanged strict KKT gate.
+    pub(crate) fn refit_reactive_entry_decoders_at_smooth_face(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<(), String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k = self.k_atoms();
+        if target.dim() != (n, p) {
+            return Err(format!(
+                "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: target shape {:?} != ({n}, {p})",
+                target.dim()
+            ));
+        }
+        if rho.log_lambda_smooth.len() != k {
+            return Err(format!(
+                "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: rho smoothness length {} != K {k}",
+                rho.log_lambda_smooth.len()
+            ));
+        }
+        if n == 0 || k == 0 {
+            return Ok(());
+        }
+
+        let mut residual = target.to_owned();
+        for atom in 0..k {
+            let m = self.atoms[atom].basis_size();
+            if self.atoms[atom].smooth_penalty.dim() != (m, m) {
+                return Err(format!(
+                    "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: atom {atom} smooth penalty shape {:?} != ({m}, {m})",
+                    self.atoms[atom].smooth_penalty.dim()
+                ));
+            }
+
+            let mut weighted_design = Array2::<f64>::zeros((n, m));
+            let mut weighted_residual = residual.clone();
+            for row in 0..n {
+                let assignments = self.assignment.try_assignments_row(row)?;
+                let honesty_weight = self
+                    .row_loss_weights
+                    .as_ref()
+                    .map_or(1.0, |weights| weights[row]);
+                if !(honesty_weight.is_finite() && honesty_weight >= 0.0) {
+                    return Err(format!(
+                        "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: row {row} has invalid design-honesty weight {honesty_weight}"
+                    ));
+                }
+                let root_weight = honesty_weight.sqrt();
+                let gate = assignments[atom];
+                for basis_col in 0..m {
+                    weighted_design[[row, basis_col]] =
+                        root_weight * gate * self.atoms[atom].basis_values[[row, basis_col]];
+                }
+                for output in 0..p {
+                    weighted_residual[[row, output]] *= root_weight;
+                }
+            }
+
+            let mut normal = fast_atb(&weighted_design, &weighted_design);
+            let lambda = rho.lambda_smooth_for(atom);
+            for left in 0..m {
+                for right in 0..m {
+                    let smooth = 0.5
+                        * (self.atoms[atom].smooth_penalty[[left, right]]
+                            + self.atoms[atom].smooth_penalty[[right, left]]);
+                    normal[[left, right]] += lambda * smooth;
+                }
+            }
+            let rhs = fast_atb(&weighted_design, &weighted_residual);
+            let factor = normal.cholesky(Side::Lower).map_err(|error| {
+                format!(
+                    "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: atom {atom} penalized normal equation is not positive definite at lambda={lambda:.6e}: {error}"
+                )
+            })?;
+            let beta = factor.solve_mat(&rhs);
+            if beta.dim() != (m, p) || !beta.iter().all(|value| value.is_finite()) {
+                return Err(format!(
+                    "SaeManifoldTerm::refit_reactive_entry_decoders_at_smooth_face: atom {atom} solve produced invalid beta shape {:?}",
+                    beta.dim()
+                ));
+            }
+
+            // Deflate in the physical reconstruction geometry. The honesty
+            // weights choose the coefficients but do not rescale the model's
+            // emitted contribution.
+            let mut design = weighted_design;
+            for row in 0..n {
+                let honesty_weight = self
+                    .row_loss_weights
+                    .as_ref()
+                    .map_or(1.0, |weights| weights[row]);
+                let root_weight = honesty_weight.sqrt();
+                if root_weight > 0.0 {
+                    for basis_col in 0..m {
+                        design[[row, basis_col]] /= root_weight;
+                    }
+                } else {
+                    let assignments = self.assignment.try_assignments_row(row)?;
+                    for basis_col in 0..m {
+                        design[[row, basis_col]] = assignments[atom]
+                            * self.atoms[atom].basis_values[[row, basis_col]];
+                    }
+                }
+            }
+            let fit = design.dot(&beta);
+            residual = &residual - &fit;
+            self.atoms[atom].decoder_coefficients.assign(&beta);
+        }
+        Ok(())
+    }
+
     /// Seed atom `atom`'s chart coordinates from the current residual: write the
     /// certified ISA circle phase when a jointly-separated plane is supplied,
     /// otherwise the one-atom Periodic/Euclidean PCA seed on the residual, then

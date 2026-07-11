@@ -914,13 +914,19 @@ fn steer_delta_from_arrays(
     alpha: f64,
     jumprelu_threshold: f64,
     fisher_factors: Option<ndarray::ArrayView3<'_, f64>>,
+    fisher_mass_residual: Option<ndarray::ArrayView1<'_, f64>>,
     fisher_provenance: Option<&str>,
 ) -> PyResult<gam::inference::steering::SteerPlan> {
     let fisher_metric = match fisher_factors {
         Some(u3) => {
-            let request =
-                SaeFisherRowMetricRequest::from_tag(u3, n_obs, p_out, fisher_provenance, None)
-                    .map_err(py_value_error)?;
+            let request = SaeFisherRowMetricRequest::from_tag(
+                u3,
+                n_obs,
+                p_out,
+                fisher_provenance,
+                fisher_mass_residual,
+            )
+            .map_err(py_value_error)?;
             Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
         }
         None => None,
@@ -1061,6 +1067,13 @@ fn steer_plan_to_pydict(
     // immutable fitted model yields directly comparable dictionaries.
     out.set_item("delta", plan.delta.to_vec())?;
     out.set_item("predicted_nats", plan.predicted_nats)?;
+    out.set_item("predicted_nats_kind", plan.predicted_nats_kind.as_str())?;
+    out.set_item("fisher_mass_captured", plan.fisher_mass_captured)?;
+    out.set_item("fisher_mass_residual", plan.fisher_mass_residual)?;
+    out.set_item(
+        "fisher_mass_residual_fraction",
+        plan.fisher_mass_residual_fraction,
+    )?;
     out.set_item("validity_radius", plan.validity_radius)?;
     out.set_item("off_manifold_norm", plan.off_manifold_norm)?;
     out.set_item("metric_provenance", provenance_str)?;
@@ -1095,6 +1108,7 @@ fn steer_plan_to_pydict(
     jumprelu_threshold = 0.0,
     top_k = None,
     fisher_factors = None,
+    fisher_mass_residual = None,
     fisher_provenance = None,
 ))]
 fn sae_steer_delta<'py>(
@@ -1120,6 +1134,7 @@ fn sae_steer_delta<'py>(
     jumprelu_threshold: f64,
     top_k: Option<usize>,
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
     fisher_provenance: Option<String>,
 ) -> PyResult<Py<PyDict>> {
     let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
@@ -1131,6 +1146,7 @@ fn sae_steer_delta<'py>(
         .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
         .collect();
     let fisher_view = fisher_factors.as_ref().map(|f| f.as_array());
+    let fisher_mass_view = fisher_mass_residual.as_ref().map(|mass| mass.as_array());
     let plan = steer_delta_from_arrays(
         atom_k,
         metric_row,
@@ -1153,6 +1169,7 @@ fn sae_steer_delta<'py>(
         alpha,
         jumprelu_threshold,
         fisher_view,
+        fisher_mass_view,
         fisher_provenance.as_deref(),
     )?;
     steer_plan_to_pydict(py, plan)

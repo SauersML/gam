@@ -101,7 +101,7 @@ fn joint_decoder_gauge_quotients_full_rank_atom_redistribution_2080() -> Result<
 /// rank-4 subspace of the whitened `p`-dim cloud, so an honest K=2 dictionary
 /// explains a materially positive fraction of the variance. `p` is the wide-`p`
 /// knob that drives the outer hang.
-fn independent_two_circle_phases(n: usize, row: usize) -> (f64, f64) {
+pub(super) fn independent_two_circle_phases(n: usize, row: usize) -> (f64, f64) {
     let mut n1 = 1usize;
     let root = (n as f64).sqrt() as usize;
     for d in 1..=root.max(1) {

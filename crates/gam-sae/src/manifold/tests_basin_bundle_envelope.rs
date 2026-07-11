@@ -17,6 +17,7 @@
 //!      admitted mid-fit (admission can only lower the envelope).
 
 use super::tests::{deterministic_circle_noise, global_ev};
+use super::tests_outer_reml_probe_budget_2080::independent_two_circle_phases;
 use super::*;
 use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_atb};
@@ -25,10 +26,11 @@ use ndarray::{Array1, Array2, ArrayView2, array, s};
 use std::sync::Arc;
 
 /// Two planted circles on DISJOINT ambient column parities (circle A on the even
-/// output channels, circle B on the odd), per-column standardized — a rank-4
-/// whitened cloud an honest K=2 dictionary explains. With two atoms competing for
-/// the same rows this has genuinely distinct inner ROUTINGS (which atom claims
-/// which circle), i.e. the coexisting basins the envelope exists to track.
+/// output channels, circle B on the odd), driven by two independent phases on an
+/// exact Cartesian product grid and per-column standardized — a rank-4 whitened
+/// cloud an honest K=2 dictionary explains. With two atoms competing for the same
+/// rows this has genuinely distinct inner ROUTINGS (which atom claims which
+/// circle), i.e. the coexisting basins the envelope exists to track.
 fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     let mut fa = Array2::<f64>::zeros((2, p));
     let mut fb = Array2::<f64>::zeros((2, p));
@@ -51,8 +53,7 @@ fn two_circle_wide_target(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     }
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
-        let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
-        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        let (ta, tb) = independent_two_circle_phases(n, row);
         let (ca, sa) = (ta.cos(), ta.sin());
         let (cb, sb) = (tb.cos(), tb.sin());
         for j in 0..p {

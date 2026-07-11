@@ -4195,8 +4195,28 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let Some(contract) = self.reactive_domain_scalar_contract()? else {
             return Ok(None);
         };
+        // The reactive entry replaces the invalid common cold dictionary with a
+        // deterministic disjoint-chart placement. Derive the legal rho face
+        // from that SAME placed geometry, not from the common-chart literal
+        // seed: its gated basis Grams (and Euclidean ARD curvature for flat
+        // atoms) are the operators the entry corrector will actually see.
+        // Work on a clone because querying an optimizer domain is read-only.
+        let mut entry_term = self.baseline_term.clone();
+        entry_term
+            .assignment
+            .mode
+            .set_temperature(contract.entry().assignment_temperature)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        entry_term.temperature_schedule = None;
+        entry_term
+            .place_reactive_entry_disjoint_charts(self.target.view())
+            .map_err(|error| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "reactive rho domain could not construct its separated entry geometry: {error}"
+                ))
+            })?;
         reactive_rho_domain_upper(
-            &self.baseline_term,
+            &entry_term,
             &self.baseline_rho,
             contract.entry().assignment_temperature,
         )
@@ -4320,10 +4340,34 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // next coupled waypoint. Finite literal seeds never open this path,
             // and later accepted warm waypoints are not reinitialized.
             self.term
-                .seed_cold_start_disjoint_charts(self.target.view())
+                .place_reactive_entry_disjoint_charts(self.target.view())
                 .map_err(|err| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "reactive scalar entry could not install its separated legal basin: {err}"
+                    ))
+                })?;
+            // Rebuild the exact face from the just-installed geometry. This is
+            // bitwise the same deterministic placement used by
+            // `outer_domain_upper_bound`; parsing it through the baseline rho
+            // layout gives the per-atom lambda values the first corrector will
+            // evaluate. Refit the separated decoders at those strengths before
+            // the joint solve so the heavy entry does not begin with the large
+            // score of an unpenalized full-signal decoder.
+            let entry_rho_flat = reactive_rho_domain_upper(
+                &self.term,
+                &self.baseline_rho,
+                state.assignment_temperature,
+            )
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+            let entry_rho = self.baseline_rho.from_flat(entry_rho_flat.view());
+            self.term
+                .refit_reactive_entry_decoders_at_smooth_face(
+                    self.target.view(),
+                    &entry_rho,
+                )
+                .map_err(|err| {
+                    EstimationError::RemlOptimizationFailed(format!(
+                        "reactive scalar entry could not fit its separated decoders at the legal smooth face: {err}"
                     ))
                 })?;
         }
