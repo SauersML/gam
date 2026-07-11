@@ -2324,7 +2324,11 @@ mod saturation_escalation_tests {
     fn starting_count_is_a_supported_low_rank_pilot_capped_by_default() {
         assert_eq!(starting_num_centers(800, 2), 30);
         assert_eq!(starting_num_centers(100_000, 1), 10);
-        assert_eq!(starting_num_centers(3, 5), default_num_centers(3, 5));
+        // The generic conditioning ceiling is `n / 4` and therefore reports
+        // zero below four rows; the pilot retains the basis-wide one-center
+        // degenerate minimum, which materialization subsequently raises to the
+        // exact polynomial floor for the requested family.
+        assert_eq!(starting_num_centers(3, 5), 1);
         assert_eq!(starting_num_centers(1, 2), 1);
     }
 
