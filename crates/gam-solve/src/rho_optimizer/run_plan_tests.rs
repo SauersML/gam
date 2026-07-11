@@ -2278,6 +2278,75 @@ fn cost_stall_certifies_converged_below_probe_noise_floor_2241() {
     );
 }
 
+/// #1689 — a criterion-flat ARC halt that the guard certified through the
+/// score-relative band must retain that halt provenance through the mandatory
+/// analytic final-point certificate. The old runner marked only NON-converged
+/// stalls as `CostStallFlatValley`; a converged stall lost the marker and the
+/// final certificate incorrectly reverted to the raw absolute bound.
+#[test]
+fn criterion_flat_provenance_preserves_score_relative_certificate_1689() {
+    let score = -982.0_f64;
+    let residual = 0.042_f64;
+    assert!(
+        residual > 1.0e-6 && residual < flat_valley_converged_grad_bound(score),
+        "fixture must require the criterion-flat band rather than raw tolerance"
+    );
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either)
+        .with_tolerance(1.0e-10)
+        .with_objective_scale(Some(1_200.0));
+    let config = problem.config();
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        move |_: &mut (), _: &Array1<f64>| Ok(score),
+        move |_: &mut (), _: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: score,
+                gradient: array![residual],
+                hessian: HessianValue::Dense(array![[1.0]]),
+                inner_beta_hint: None,
+            })
+        },
+        move |_: &mut (), _: &Array1<f64>, _: OuterEvalOrder| {
+            Ok(OuterEval {
+                cost: score,
+                gradient: array![residual],
+                hessian: HessianValue::Dense(array![[1.0]]),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let mut result = outer_result_with_gradient_norm(
+        array![0.0],
+        score,
+        10,
+        Some(residual),
+        true,
+        OuterPlan {
+            solver: Solver::Arc,
+            hessian_source: HessianSource::Analytic,
+        },
+    );
+    result.operator_stop_reason = Some(OperatorTrustRegionStopReason::CostStallFlatValley);
+
+    let certificate = certify_outer_optimality(
+        &mut obj,
+        &config,
+        "#1689 criterion-flat provenance regression",
+        &mut result,
+    )
+    .expect("score-relative flat certificate must survive final remeasurement");
+    assert!(certificate.certifies());
+    assert!(certificate.stationarity.bound() >= flat_valley_converged_grad_bound(score));
+    assert!(matches!(
+        result.converged_via,
+        Some(OuterConvergedVia::CriterionFlat { .. })
+    ));
+}
+
 /// #2241 companion — the noise certificate must be un-gameable by collapsed
 /// step sizes: Δ → 0 inflates the raw σ̂/Δ arbitrarily, but the bound is capped
 /// at `FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP`, so a genuinely steep point

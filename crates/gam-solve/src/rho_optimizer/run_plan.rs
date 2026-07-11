@@ -1299,11 +1299,19 @@ pub(crate) fn run_outer_with_plan(
                                     // certificate honors the same flat band the
                                     // guard certified in the loop.
                                     result.flat_noise_grad_bound = exit.noise_grad_bound;
-                                    if !exit.converged {
-                                        result.operator_stop_reason = Some(
-                                            OperatorTrustRegionStopReason::CostStallFlatValley,
-                                        );
-                                    }
+                                    // Preserve HOW ARC stopped even when the
+                                    // guard already certified the stalled score
+                                    // surface. The mandatory final analytic
+                                    // certificate uses this provenance to apply
+                                    // the same derived score-relative flat-valley
+                                    // bound as the guard. Dropping the marker on
+                                    // `exit.converged=true` made the final pass
+                                    // silently revert to the much tighter raw
+                                    // solver bound and reject the identical
+                                    // point (#1689: |g|=.042 on |V|≈982).
+                                    result.operator_stop_reason = Some(
+                                        OperatorTrustRegionStopReason::CostStallFlatValley,
+                                    );
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(

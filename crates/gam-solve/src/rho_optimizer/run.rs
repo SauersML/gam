@@ -1691,6 +1691,11 @@ pub enum OperatorTrustRegionStopReason {
     Converged,
     RejectFloor,
     IterationBudget,
+    /// The objective stopped changing on a criterion-flat surface. The
+    /// in-loop guard may already have certified the score-relative residual or
+    /// may have returned a non-stationary floor; either way the final analytic
+    /// certificate needs this provenance to reproduce the guard's derived
+    /// stationarity band exactly.
     CostStallFlatValley,
     /// Family returned a non-operator Hessian mid-flight after routing into
     /// the operator path. Best-effort `x_k` returned with this reason; the
