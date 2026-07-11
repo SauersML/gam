@@ -792,6 +792,8 @@ impl Clone for SaeManifoldTerm {
 ///
 /// Static fields (atom names, basis kinds, assignment mode, temperature schedule)
 /// are still not snapshotted: they are invariant across a Newton line search.
+/// The profiled decoder frame is not static: the block-coordinate polar refresh
+/// changes it between Newton steps, so it is part of the canonical state below.
 ///
 /// The canonical `smooth_penalty_raw` / `smooth_penalty_order` are static, but
 /// the live intrinsic roughness Gram `smooth_penalty` is mutable state: it is
@@ -802,8 +804,9 @@ impl Clone for SaeManifoldTerm {
 #[derive(Debug)]
 pub(crate) struct SaeManifoldMutableState {
     /// Per-atom differential state
-    /// `(decoder_coefficients, smooth_penalty, basis_evaluator, basis_second_jet,
-    /// homotopy_eta)`. `basis_values`/`basis_jacobian` are rebuilt on restore.
+    /// `(decoder_coefficients, decoder_frame, smooth_penalty, basis_evaluator,
+    /// basis_second_jet, homotopy_eta)`. `basis_values`/`basis_jacobian` are
+    /// rebuilt on restore.
     pub(crate) atoms: Vec<SaeManifoldAtomSnapshot>,
     pub(crate) logits: Array2<f64>,
     pub(crate) coords: Vec<LatentCoordValues>,
@@ -828,6 +831,11 @@ pub(crate) struct SaeFitIncumbent {
 #[derive(Debug)]
 pub(crate) struct SaeManifoldAtomSnapshot {
     pub(crate) decoder_coefficients: Array2<f64>,
+    /// Canonical profiled Grassmann frame, including the singular-value gauge
+    /// that fixes its serialized representative. Evidence-map recurrence must
+    /// compare both: a hidden polar-frame update changes the profiled criterion
+    /// even when the decoder/coordinate snapshot happens to recur (#2253).
+    pub(crate) decoder_frame: Option<GrassmannFrame>,
     pub(crate) smooth_penalty: Array2<f64>,
     pub(crate) basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     pub(crate) basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,

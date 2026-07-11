@@ -96,6 +96,10 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .eval(&base)
         .expect("base analytic-gradient lane must converge");
     assert!(
+        gradient_objective.term.frames_active(),
+        "the focused identity witness must exercise the profiled decoder-frame map"
+    );
+    assert!(
         evaluation.cost.is_finite(),
         "the analytic-gradient lane must price the same feasible REML basin: \
          cost={:.17e}",
@@ -128,6 +132,21 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             &audit_solver,
         )
         .expect("frozen accepted-state gradient components");
+    let plain_audit_solver = DeflatedArrowSolver::plain(&audit_cache);
+    let plain_audit_components = audit_term
+        .analytic_outer_rho_gradient_components(
+            gradient_objective.target.view(),
+            &rho_state,
+            &audit_loss,
+            &audit_cache,
+            &plain_audit_solver,
+        )
+        .expect("plain-cache frozen gradient components");
+    let deflated_row_directions: usize = audit_cache
+        .deflated_row_directions
+        .iter()
+        .map(Vec::len)
+        .sum();
     let mut kkt_term = audit_term.clone();
     let kkt_system = kkt_term
         .assemble_arrow_schur(
@@ -155,21 +174,38 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let frozen_learning_rate = gradient_objective.learning_rate;
     let frozen_ridge_ext_coord = gradient_objective.ridge_ext_coord;
     let frozen_ridge_beta = gradient_objective.ridge_beta;
-    let frozen_cost_at = |rho_flat: &Array1<f64>| {
+    let frozen_parts_at = |rho_flat: &Array1<f64>| {
         let mut term = frozen_anchor_term.clone();
         let rho = frozen_baseline_rho.from_flat(rho_flat.view());
-        term.reml_criterion_with_cache(
-            frozen_target.view(),
-            &rho,
-            frozen_registry.as_ref(),
-            0,
-            frozen_learning_rate,
-            frozen_ridge_ext_coord,
-            frozen_ridge_beta,
-        )
-        .expect("frozen-state directional value probe")
-        .0
+        let (criterion, loss, cache) = term
+            .reml_criterion_with_cache(
+                frozen_target.view(),
+                &rho,
+                frozen_registry.as_ref(),
+                0,
+                frozen_learning_rate,
+                frozen_ridge_ext_coord,
+                frozen_ridge_beta,
+            )
+            .expect("frozen-state directional value probe");
+        let extra_penalty = frozen_registry.as_ref().map_or(Ok(0.0), |registry| {
+            term.reml_extra_penalty_value_total(registry)
+                .map_err(|error| error.to_string())
+        });
+        let data_and_priors = loss.total() + extra_penalty.expect("frozen extra penalty");
+        let half_logdet =
+            0.5 * arrow_log_det_from_cache(&cache).expect("frozen authoritative log determinant");
+        let occam = -term.reml_occam_term(&rho).expect("frozen Occam value");
+        let reconstructed = data_and_priors + half_logdet + occam;
+        let roundoff = 64.0 * f64::EPSILON * (1.0 + criterion.abs().max(reconstructed.abs()));
+        assert!(
+            (criterion - reconstructed).abs() <= roundoff,
+            "frozen criterion atoms must reconstruct exactly: criterion={criterion:.17e}, \
+             reconstructed={reconstructed:.17e}, roundoff={roundoff:.3e}"
+        );
+        (criterion, data_and_priors, half_logdet, occam)
     };
+    let frozen_cost_at = |rho_flat: &Array1<f64>| frozen_parts_at(rho_flat).0;
 
     let direction = array![0.6_f64, -0.8_f64];
     let analytic = evaluation.gradient.dot(&direction);
@@ -296,6 +332,9 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .sqrt();
     let mut coordinate_fd = Array1::<f64>::zeros(base.len());
     let mut frozen_coordinate_fd = Array1::<f64>::zeros(base.len());
+    let mut frozen_data_and_priors_fd = Array1::<f64>::zeros(base.len());
+    let mut frozen_half_logdet_fd = Array1::<f64>::zeros(base.len());
+    let mut frozen_occam_fd = Array1::<f64>::zeros(base.len());
     for coordinate in 0..base.len() {
         let mut axis = Array1::<f64>::zeros(base.len());
         axis[coordinate] = 1.0;
@@ -308,8 +347,13 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             .eval_cost(&axis_minus)
             .expect("coordinate -h value probe must converge");
         coordinate_fd[coordinate] = (axis_plus_cost - axis_minus_cost) / (2.0 * h);
-        frozen_coordinate_fd[coordinate] =
-            (frozen_cost_at(&axis_plus) - frozen_cost_at(&axis_minus)) / (2.0 * h);
+        let frozen_axis_plus = frozen_parts_at(&axis_plus);
+        let frozen_axis_minus = frozen_parts_at(&axis_minus);
+        frozen_coordinate_fd[coordinate] = (frozen_axis_plus.0 - frozen_axis_minus.0) / (2.0 * h);
+        frozen_data_and_priors_fd[coordinate] =
+            (frozen_axis_plus.1 - frozen_axis_minus.1) / (2.0 * h);
+        frozen_half_logdet_fd[coordinate] = (frozen_axis_plus.2 - frozen_axis_minus.2) / (2.0 * h);
+        frozen_occam_fd[coordinate] = (frozen_axis_plus.3 - frozen_axis_minus.3) / (2.0 * h);
     }
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
@@ -318,7 +362,11 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          central FD={finite_difference:.9e}, error={:.3e}, scale={scale:.3e}, \
          gradient={:?}, coordinate_fd={coordinate_fd:?}, \
          frozen_coordinate_fd={frozen_coordinate_fd:?}, \
+         frozen_data_and_priors_fd={frozen_data_and_priors_fd:?}, \
+         frozen_half_logdet_fd={frozen_half_logdet_fd:?}, \
+         frozen_occam_fd={frozen_occam_fd:?}, \
          explicit={:?}, trace={:?}, occam={:?}, adjoint={:?}, \
+         plain_trace={:?}, solver_gauges={}, deflated_row_directions={deflated_row_directions}, \
          frozen_fd={frozen_finite_difference:.9e}, \
          actual_implicit_logdet={actual_implicit_logdet:.9e}, \
          predicted_implicit_logdet={predicted_implicit_logdet:.9e}, \
@@ -334,6 +382,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         audit_components.explicit,
         audit_components.logdet_trace,
         audit_components.occam,
-        audit_components.third_order_correction
+        audit_components.third_order_correction,
+        plain_audit_components.logdet_trace,
+        audit_solver.gauge_basis.len(),
     );
 }

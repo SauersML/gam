@@ -145,6 +145,11 @@ fn logdet_audit_point(
     // proves the cache was formed at the coarse KKT admission band rather than
     // at the differentiable no-descent root.
     let mut recurrence_term = term.clone();
+    let recurrence_entry_frames: Vec<_> = recurrence_term
+        .atoms
+        .iter()
+        .map(|atom| atom.decoder_frame.clone())
+        .collect();
     let mut recurrence_rho = rho.clone();
     let recurrence = recurrence_term.run_joint_fit_arrow_schur_for_evidence(
         target,
@@ -155,11 +160,15 @@ fn logdet_audit_point(
         1.0e-6,
         1.0e-6,
     )?;
-    if !recurrence.fixed_point {
+    let decoder_frames_recurred =
+        decoder_frames_match_exactly(&recurrence_term, &recurrence_entry_frames);
+    if !recurrence.fixed_point || !decoder_frames_recurred {
         return Err(format!(
             "logdet_audit_point: evidence cache returned at a non-idempotent inner state \
              (budget={inner_max_iter}, KKT={kkt_grad_norm:.6e}, \
-             quotient KKT={quotient_kkt_grad_norm:.6e}, tolerance={kkt_tolerance:.6e})"
+             quotient KKT={quotient_kkt_grad_norm:.6e}, tolerance={kkt_tolerance:.6e}, \
+             reported_fixed_point={}, decoder_frames_recurred={decoder_frames_recurred})",
+            recurrence.fixed_point,
         ));
     }
     Ok(LogdetAuditPoint {
@@ -191,6 +200,23 @@ fn frozen_raw_logdet(
         term.reml_criterion_with_cache(target, rho, registry, 0, 0.05, 1.0e-6, 1.0e-6)?;
     arrow_log_det_from_cache(&criterion_result.2)
         .ok_or_else(|| "frozen_raw_logdet: authoritative log determinant unavailable".to_string())
+}
+
+fn decoder_frames_match_exactly(
+    current: &SaeManifoldTerm,
+    expected: &[Option<GrassmannFrame>],
+) -> bool {
+    current.atoms.len() == expected.len()
+        && current.atoms.iter().zip(expected).all(|(atom, saved)| {
+            match (&atom.decoder_frame, saved) {
+                (Some(current), Some(expected)) => {
+                    current.frame() == expected.frame()
+                        && current.gauge_singular_values() == expected.gauge_singular_values()
+                }
+                (None, None) => true,
+                _ => false,
+            }
+        })
 }
 
 #[test]

@@ -444,11 +444,11 @@ fn constant_gaussian_standard_fit(
             reason: "constant Gaussian shortcut requires positive total weight".to_string(),
         });
     }
-    let mut centered_sum = 0.0_f64;
-    for i in 0..request.y.len() {
-        centered_sum += request.weights[i] * (request.y[i] - request.offset[i]);
-    }
-    let intercept = centered_sum / weight_sum;
+    // Dispatch proved every represented `y - offset` value is identical. Use
+    // that exact value instead of recomputing it as a weighted mean: the latter
+    // can introduce summation round-off and contradict the shortcut's defining
+    // residual≡0 invariant even though the mathematical mean is unchanged.
+    let intercept = request.y[0] - request.offset[0];
     let design =
         build_term_collection_design(request.data.view(), &request.spec).map_err(|err| {
             WorkflowError::InvalidConfig {

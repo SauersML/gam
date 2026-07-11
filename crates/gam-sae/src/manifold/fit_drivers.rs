@@ -202,6 +202,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|atom| SaeManifoldAtomSnapshot {
                 decoder_coefficients: atom.decoder_coefficients.clone(),
+                decoder_frame: atom.decoder_frame.clone(),
                 smooth_penalty: atom.smooth_penalty.clone(),
                 // Pointer-cheap handle clones; `basis_values`/`basis_jacobian`
                 // are rebuilt from these + coords on restore, avoiding the
@@ -244,7 +245,17 @@ impl SaeManifoldTerm {
                         (None, None) => true,
                         _ => false,
                     };
+                    let decoder_frame_matches = match (&atom.decoder_frame, &saved.decoder_frame) {
+                        (Some(current), Some(expected)) => {
+                            current.frame() == expected.frame()
+                                && current.gauge_singular_values()
+                                    == expected.gauge_singular_values()
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    };
                     atom.decoder_coefficients == saved.decoder_coefficients
+                        && decoder_frame_matches
                         && atom.smooth_penalty == saved.smooth_penalty
                         && atom.homotopy_eta.to_bits() == saved.homotopy_eta.to_bits()
                         && evaluator_matches
@@ -295,6 +306,7 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         for (atom, snap) in self.atoms.iter_mut().zip(snapshot.atoms.iter()) {
             atom.decoder_coefficients.assign(&snap.decoder_coefficients);
+            atom.decoder_frame.clone_from(&snap.decoder_frame);
             atom.smooth_penalty.assign(&snap.smooth_penalty);
             atom.basis_evaluator.clone_from(&snap.basis_evaluator);
             atom.basis_second_jet.clone_from(&snap.basis_second_jet);
@@ -6074,13 +6086,13 @@ impl SaeManifoldTerm {
             // hang). Guard the pair the way the affine-gauge canonicalization above
             // is guarded: keep the re-gauged/re-polared state only when the SAME
             // penalized scalar the line search descends does NOT increase; else
-            // revert. The frame U (`decoder_frame`) is not in
-            // `snapshot_mutable_state`, so capture/restore it alongside.
+            // revert. The canonical snapshot includes the frame U and its
+            // singular-value gauge, so rejection restores the complete
+            // profiled state and evidence recurrence can observe a kept polar
+            // update (#2253).
             let pre_hook_obj =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
             let pre_hook_state = self.snapshot_mutable_state();
-            let pre_hook_frames: Vec<_> =
-                self.atoms.iter().map(|a| a.decoder_frame.clone()).collect();
             self.retract_unit_speed_charts_in_loop()?;
             // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
             // After the decoder `B` has been updated by the accepted (t, ΔC) step
@@ -6102,9 +6114,11 @@ impl SaeManifoldTerm {
                 .unwrap_or(f64::INFINITY);
             if !(post_hook_obj.is_finite() && post_hook_obj <= pre_hook_obj) {
                 self.restore_mutable_state(&pre_hook_state)?;
-                for (atom, frame) in self.atoms.iter_mut().zip(pre_hook_frames) {
-                    atom.decoder_frame = frame;
-                }
+            } else if !self.matches_mutable_state(&pre_hook_state) {
+                // A kept unit-speed or polar-frame block update is a real
+                // transition of the evidence map. Without this bit the wrapper
+                // could report `fixed_point=true` after U moved invisibly.
+                state_moved = true;
             }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
                 // #2230 — keep the best state on the PENALIZED OBJECTIVE first
