@@ -2957,6 +2957,34 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
     );
 }
 
+/// #2253 exact-envelope gate: an objective-stall or small-decrement diagnostic
+/// cannot mint an analytic outer derivative while both the raw and quotient
+/// KKT residuals remain above the stationarity bound.
+#[test]
+pub(crate) fn objective_stall_cannot_substitute_for_kkt_envelope_2253() {
+    let tolerance = 1.0e-4;
+    assert!(!SaeManifoldTerm::evidence_kkt_stationary(
+        2.0 * tolerance,
+        3.0 * tolerance,
+        tolerance,
+    ));
+    assert!(SaeManifoldTerm::evidence_kkt_stationary(
+        tolerance,
+        3.0 * tolerance,
+        tolerance,
+    ));
+    assert!(SaeManifoldTerm::evidence_kkt_stationary(
+        2.0 * tolerance,
+        tolerance,
+        tolerance,
+    ));
+    assert!(!SaeManifoldTerm::evidence_kkt_stationary(
+        f64::NAN,
+        f64::INFINITY,
+        tolerance,
+    ));
+}
+
 #[test]
 pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     let (mut term0, target, rho) = small_two_atom_periodic_term();

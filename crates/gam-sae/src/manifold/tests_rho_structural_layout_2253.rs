@@ -192,6 +192,16 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         &rho_state.lambda_smooth_vec(),
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
+    assert!(
+        SaeManifoldTerm::evidence_kkt_stationary(
+            kkt_norm,
+            quotient_kkt_norm,
+            kkt_tolerance,
+        ),
+        "an off-KKT state cannot emit or certify the analytic envelope gradient: \
+         raw={kkt_norm:.9e}, quotient={quotient_kkt_norm:.9e}, \
+         tolerance={kkt_tolerance:.9e}"
+    );
     // Freeze one accepted base state for the fixed-theta derivative audit. Own
     // every closure input so the live objective remains mutably available to
     // the continuation probes below, and every directional/axis frozen FD is

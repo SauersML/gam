@@ -158,6 +158,17 @@ fn logdet_audit_point(
         &rho.lambda_smooth_vec(),
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
+    if !SaeManifoldTerm::evidence_kkt_stationary(
+        kkt_grad_norm,
+        quotient_kkt_grad_norm,
+        kkt_tolerance,
+    ) {
+        return Err(format!(
+            "logdet_audit_point: an off-KKT state cannot emit/certify an analytic envelope \
+             gradient (raw={kkt_grad_norm:.6e}, quotient={quotient_kkt_grad_norm:.6e}, \
+             tolerance={kkt_tolerance:.6e})"
+        ));
+    }
     let branch_certificate =
         BranchCertificate::from_arrow_cache(&cache, MajorizerAnchorMode::FrozenAnchor);
     // #2253 mechanism gate: a model whose evidence cache was returned must be

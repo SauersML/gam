@@ -654,38 +654,23 @@ impl SaeManifoldTerm {
         // tolerances (the near-singular Schur amplifies the step in the
         // weakly-identified decoder direction). The grad-OR-step gate then never
         // fires and the solve is rejected as "did not converge". A Newton/LM
-        // iterate whose objective has stopped decreasing
-        // to within `√εmach` of its scale IS the numerical inner optimum; ranking
-        // the Laplace criterion there is correct. We accept that fixed point
-        // instead of grinding the budget.
+        // iterate whose objective has stopped decreasing is diagnosed as a
+        // numerical stall. It is not a stationary envelope root unless the raw
+        // or quotient KKT residual also meets its gate, so a persistent stall is
+        // refused instead of ranked.
         let entry_loss_total = loss.total();
         let mut previous_loss_total = entry_loss_total;
         let mut refine_rounds: usize = 0;
-        // Consecutive stall rounds: counts how many successive refine rounds
-        // ended in a stall AND a failed undamped factor.  Once this reaches
-        // `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` the iterate is at
-        // its numerical fixed point and cannot be improved further; returning
-        // `Err` here is the same "did not converge" signal that
+        // Consecutive stall rounds. Once this reaches
+        // `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS` without a KKT
+        // certificate, returning `Err` is the same "did not converge" signal that
         // `is_recoverable_value_probe_refusal` already handles, so the outer
         // BFGS treats it as an INFINITY probe and tries a different ρ instead
         // of looping forever burning the extended progress budget.  Without
         // this counter the stagnation handler fell through when the undamped
         // factor failed and the loop kept extending via `saw_refine_progress`
         // from earlier rounds, accumulating minutes of wasted work (#1094).
-        let mut consecutive_stall_factor_fail: usize = 0;
-        // #1094 — the finite deflated evidence cache to rank at a persistent
-        // objective-stall fixed point. At a rank-deficient K>1 optimum the KKT
-        // gradient parks permanently in the weakly-identified decoder/gauge
-        // directions, so neither the gradient nor the affine-invariant
-        // Newton-decrement stationarity certificate below can ever reach
-        // tolerance even though the penalised objective is at its numerical
-        // floor. When the undamped/deflated factorization nonetheless yields a
-        // FINITE Laplace log-det, we stash that cache here; once the objective
-        // stall persists for the full `STALL_MIN_ROUNDS` the floor itself is the
-        // inner-convergence witness (#1051) and ranking this cache is correct —
-        // instead of returning an infeasible refusal at a fit that is
-        // de-facto converged (R²≈0.99).
-        let mut stalled_finite_cache: Option<ArrowFactorCache> = None;
+        let mut consecutive_objective_stalls: usize = 0;
         loop {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
@@ -759,7 +744,7 @@ impl SaeManifoldTerm {
             // so the criterion VALUE is untouched. Only work whose result was
             // provably discarded is removed.
             let gradient_stationary =
-                grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance;
+                Self::evidence_kkt_stationary(grad_norm, quotient_grad_norm, grad_tolerance);
             // #2253 — a coarse KKT-band hit is only an admission signal, not the
             // differentiable root the IFT gradient assumes. A bounded evidence
             // chunk reports `fixed_point` only when a whole re-entry accepted no
@@ -1123,11 +1108,10 @@ impl SaeManifoldTerm {
                 let mut stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-                // #1095/#2228 — decouple stall ACCEPTANCE from undamped-factor
-                // success. Both stationarity certificates below (the KKT grad-norm
-                // and the #2226 affine Newton-decrement ½λ²) and the returned
-                // evidence log-det are read from the ridge-0 factorization of this
-                // stationary system. On a chart that is over-parametrized for its
+                // #1095/#2228 — diagnose the stalled state with the ridge-0
+                // deflated factor. Only the raw/quotient KKT residual can accept;
+                // the affine Newton decrement is reported but cannot mint an
+                // envelope root. On a chart that is over-parametrized for its
                 // intrinsic data dimension — d_atom=2 on an intrinsic 1-D circle,
                 // so every per-row H_tt carries a rank-1 radial null — that
                 // undamped per-row Cholesky is non-PD BY CONSTRUCTION, so without
@@ -1163,9 +1147,11 @@ impl SaeManifoldTerm {
                     &lambda_smooth,
                     options,
                 ) {
-                    if stationary_grad_norm <= grad_tolerance
-                        || stationary_quotient_grad_norm <= grad_tolerance
-                    {
+                    if Self::evidence_kkt_stationary(
+                        stationary_grad_norm,
+                        stationary_quotient_grad_norm,
+                        grad_tolerance,
+                    ) {
                         return Ok(stationary_cache);
                     }
                     // Affine-invariant stationarity certificate (#2226). The raw and
@@ -1211,9 +1197,10 @@ impl SaeManifoldTerm {
                          λ²={newton_decrement_sq:.6e} ½λ²/scale={predicted_relative_decrease:.6e} \
                          obj_scale={objective_scale:.6e} accept_tol={SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL:.6e}"
                     );
-                    if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
-                        return Ok(stationary_cache);
-                    }
+                    // A small model-predicted decrease is diagnostic evidence of
+                    // an ill-conditioned crawl, not a KKT root. The analytic outer
+                    // gradient differentiates the stationary envelope, so only the
+                    // raw/quotient KKT gate above may return this cache.
                     // A flat objective round is only a convergence shortcut when
                     // the KKT certificate above is stationary. If not, keep using
                     // the deterministic refinement budget: either later rounds
@@ -1224,69 +1211,28 @@ impl SaeManifoldTerm {
                     // identified round could abort a still-descending solve and
                     // poison the outer BFGS line search with a false value-probe
                     // refusal.
-                    //
-                    // #1094 — but the undamped/deflated evidence factor DID
-                    // succeed this round with a finite Laplace log-det. Stash it:
-                    // at a rank-deficient K>1 fixed point (euclidean K=2 with
-                    // near-zero initial latent coords) the residual KKT gradient
-                    // lives permanently in the weakly-identified decoder/gauge
-                    // directions the near-singular Schur cannot resolve, so no
-                    // stationarity certificate can ever fire — yet the penalised
-                    // objective is genuinely at its numerical floor. If that stall
-                    // persists for the full `STALL_MIN_ROUNDS` (below), the floor
-                    // is the #1051 inner-convergence witness and this finite
-                    // deflated evidence is the value to rank.
-                    if arrow_log_det_from_cache(&stationary_cache).is_some_and(f64::is_finite) {
-                        stalled_finite_cache = Some(stationary_cache);
-                    }
                 }
                 // Persistent objective-stall fixed point (`STALL_MIN_ROUNDS`
-                // consecutive stalled rounds). Two outcomes:
-                //   * The evidence factor produced a finite log-det that no
-                //     stationarity certificate could accept (#1094): the objective
-                //     has held at its numerical floor across every stalled round,
-                //     which IS the inner-convergence certificate, so rank the
-                //     finite deflated Laplace evidence. The unit-stiffness /
-                //     PD-floor conditioning of the rank-deficient directions is a
-                //     bias consistent across every ρ evaluation and so does not
-                //     move the outer optimum, whereas refusing hands the outer BFGS
-                //     a +∞ at a de-facto-converged point and freezes the fit.
-                //   * The undamped factor FAILED at every stall round (a genuinely
-                //     broken / non-finite rank-deficient geometry, no finite
-                //     evidence to rank): surface the hard refusal — the same signal
-                //     `is_recoverable_value_probe_refusal` handles, so the outer
-                //     BFGS treats this ρ as an INFINITY probe and tries another.
-                // Either way the loop terminates here rather than burning the
-                // extended `progress_refine_iter` budget indefinitely.
-                consecutive_stall_factor_fail += 1;
-                if consecutive_stall_factor_fail >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
-                    if let Some(cache) = stalled_finite_cache.take() {
-                        log::debug!(
-                            "SAE inner objective-stall fixed point accepted after \
-                             {consecutive_stall_factor_fail} consecutive stalled rounds: ranking \
-                             the finite deflated Laplace evidence at the rank-deficient optimum \
-                             (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) instead of the \
-                             infeasible sentinel (#1094)"
-                        );
-                        return Ok(cache);
-                    }
+                // consecutive stalled rounds) without KKT stationarity. Surface
+                // the typed refusal that the outer bridge treats as an infeasible
+                // probe; a finite factor or objective floor is not an envelope
+                // certificate. This also terminates the loop instead of burning
+                // the extended progress budget indefinitely.
+                consecutive_objective_stalls += 1;
+                if consecutive_objective_stalls >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
                     return Err(format!(
                         "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
-                         objective stalled for {consecutive_stall_factor_fail} consecutive refine \
-                         rounds (‖g‖={grad_norm:.6e}, tol {grad_tolerance:.6e}) and the undamped \
-                         evidence factorization failed at each stall point — the iterate is at the \
-                         numerical fixed point under rank-deficient geometry (#{consecutive_stall_factor_fail} \
-                         stall-factor-fail rounds; refusing to rank an off-optimum Laplace criterion)"
+                         objective stalled for {consecutive_objective_stalls} consecutive refine \
+                         rounds, but neither the raw KKT gradient ‖g‖={grad_norm:.6e} nor its \
+                         quotient met tolerance {grad_tolerance:.6e}. Objective stagnation and a \
+                         finite deflated factor are diagnostic only; refusing to rank or \
+                         differentiate an off-optimum Laplace criterion."
                     ));
                 }
             } else {
                 // The stall streak broke (this round is materially descending or
-                // the fraction baseline is not yet meaningful): drop any stashed
-                // cache so the #1094 accept only ever ranks a cache from an
-                // UNBROKEN run of `STALL_MIN_ROUNDS` stalled rounds at a frozen
-                // iterate, never a stale one from an earlier, since-abandoned stall.
-                consecutive_stall_factor_fail = 0;
-                stalled_finite_cache = None;
+                // the fraction baseline is not yet meaningful).
+                consecutive_objective_stalls = 0;
             }
         }
     }
@@ -1310,7 +1256,7 @@ impl SaeManifoldTerm {
     /// Force an EVIDENCE/ACCEPTANCE system to opt into per-row spectral discovery
     /// by installing [`Self::empty_row_gauge_deflation`] when none is present
     /// (#1095/#2228): the frozen warm-start reuse and the two stationary /
-    /// objective-stall acceptance factorizations. Idempotent — an already-gauged
+    /// objective-stall diagnostic factorizations. Idempotent — an already-gauged
     /// system (rotation/phase gauge, #1273/#974 metric-null) is left untouched.
     ///
     /// CRITICAL INVARIANT: this MUST only ever run on a system that is about to
@@ -1337,13 +1283,28 @@ impl SaeManifoldTerm {
             + sys.gb.iter().map(|&v| v * v).sum::<f64>()
     }
 
+    /// The sole acceptance gate for a differentiable inner-envelope root.
+    /// Objective stagnation, a finite deflated factor, or a small Newton
+    /// decrement may diagnose conditioning but cannot substitute for raw or
+    /// quotient KKT stationarity.
+    pub(crate) fn evidence_kkt_stationary(
+        grad_norm: f64,
+        quotient_grad_norm: f64,
+        tolerance: f64,
+    ) -> bool {
+        tolerance.is_finite()
+            && tolerance >= 0.0
+            && ((grad_norm.is_finite() && grad_norm <= tolerance)
+                || (quotient_grad_norm.is_finite() && quotient_grad_norm <= tolerance))
+    }
+
     /// Install the per-row spectral deflation on an ACCEPTANCE system, take its
     /// undamped (ridge-0) evidence factorization, and read back both KKT residual
     /// norms (raw and quotient) off the SAME assembled system. This is the
-    /// objective-stall acceptance factorization (#1095/#2228/#1094): the returned
-    /// [`DeflatedEvidenceFactor`] carries the finite deflated Laplace evidence
-    /// cache to rank plus the discarded Newton step retained for the affine
-    /// Newton-decrement certificate (#2226). A solve failure surfaces as `Err`,
+    /// objective-stall diagnostic factorization (#1095/#2228/#1094): the returned
+    /// [`DeflatedEvidenceFactor`] carries the finite deflated cache plus the
+    /// discarded Newton step retained for the affine Newton-decrement diagnostic
+    /// (#2226). Only its KKT residual fields can authorize acceptance. A solve failure surfaces as `Err`,
     /// exactly the `if let Ok(..)` guard the caller uses to fall through to the
     /// persistent-stall counter.
     fn factor_deflated_evidence_with_grad_norms(

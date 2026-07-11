@@ -548,6 +548,7 @@ enum ProbeInnerDrive {
 /// the UNSCALED augmented target (all `λ_ℓ = 1`); this state owns every `√λ_ℓ`
 /// scaling thereafter, always rewriting a moved block FROM `pristine_blocks`
 /// (never multiplicatively), so thousands of evals cannot drift.
+#[derive(Clone)]
 struct CrosscoderBlockPricing {
     /// Anchor width `p_x` — the leading `[0, p_x)` target columns, never scaled.
     p_x: usize,
@@ -562,6 +563,23 @@ struct CrosscoderBlockPricing {
     /// the as-handed target), so `apply_block_scaling` rewrites a block only when
     /// its ρ `log λ` moves off the currently materialized value.
     last_log_lambda: Vec<f64>,
+}
+
+/// Full transactional checkpoint for one reactive coupled waypoint. The value
+/// lane is a trial probe and may mutate routing/decoder state before refusing;
+/// retaining only β would not restore the accepted basin.
+struct ReactiveWaypointCheckpoint {
+    term: SaeManifoldTerm,
+    target: Array2<f64>,
+    registry_isometry_weights: Vec<f64>,
+    current_rho: SaeManifoldRho,
+    last_loss: Option<SaeManifoldLoss>,
+    seeded_beta: Option<Array1<f64>>,
+    probe_converged_handoff: Option<ProbeConvergedHandoff>,
+    basin_bundle: BasinBundle<SaeManifoldTerm>,
+    termination: OuterTerminationLedger,
+    fit_verdict: Option<SaeOuterVerdict>,
+    crosscoder_blocks: Option<CrosscoderBlockPricing>,
 }
 
 pub struct SaeManifoldOuterObjective {
@@ -662,6 +680,9 @@ pub struct SaeManifoldOuterObjective {
     /// early-return and every lane is byte-identical to the historical path.
     /// Installed by [`Self::with_crosscoder_blocks`].
     crosscoder_blocks: Option<CrosscoderBlockPricing>,
+    /// Present only while one reactive coupled waypoint is being evaluated.
+    /// Success commits the probe handoff; failure restores this full snapshot.
+    reactive_waypoint_checkpoint: Option<ReactiveWaypointCheckpoint>,
 }
 
 /// #2230/#2087 exact basin-bundle memory admission.
@@ -806,6 +827,7 @@ impl SaeManifoldOuterObjective {
             checkpoint_fingerprint,
             checkpoint_path,
             crosscoder_blocks: None,
+            reactive_waypoint_checkpoint: None,
         }
     }
 
@@ -2323,9 +2345,9 @@ impl SaeManifoldOuterObjective {
     ///    factorization at the frozen state) — the same evidence convention as
     ///    the historical loop's stationary factorization.
     /// 4. If the exact gate is not met within the probe budget, adjudication is
-    ///    handed back verbatim to the historical evaluator (which owns the
-    ///    #1051 objective-stagnation acceptance and the typed
-    ///    "did not converge" refusal), warm from the partially refined state —
+    ///    handed to the shared evaluator, warm from the partially refined state;
+    ///    a persistent objective stall without KKT stationarity is a typed
+    ///    "did not converge" refusal —
     ///    this lane cannot introduce a new refusal class.
     ///
     /// Regimes with no dense per-round assembly (streaming / matrix-free) and
@@ -2400,7 +2422,7 @@ impl SaeManifoldOuterObjective {
             // objective; an inexact inner solve would make Armijo/Wolfe compare
             // unlike values and can reject a real descent step (#2253).
             let gate = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
-            if grad_norm <= gate || quotient_grad_norm <= gate {
+            if SaeManifoldTerm::evidence_kkt_stationary(grad_norm, quotient_grad_norm, gate) {
                 // Price the criterion at the stationary iterate through the
                 // sanctioned FREEZE evaluation (`inner_max_iter == 0`): one
                 // undamped factorization at the frozen state, the same evidence
@@ -2422,9 +2444,9 @@ impl SaeManifoldOuterObjective {
             }
             if spent >= budget {
                 // Gate not met within the probe budget: hand adjudication back
-                // to the historical evaluator — which owns the #1051
-                // objective-stagnation acceptance and the canonical typed
-                // "did not converge" refusal — warm from the current
+                // to the shared evaluator, whose objective-stall path is
+                // diagnostic-only and returns the canonical typed
+                // "did not converge" refusal without KKT — warm from the current
                 // partially-refined state. This lane never mints a refusal of
                 // its own for this class.
                 return self.term.reml_criterion_with_refine_policy_and_lane(
@@ -3800,6 +3822,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn reset(&mut self) {
+        self.reactive_waypoint_checkpoint = None;
         self.fit_verdict = None;
         self.term = self.baseline_term.clone();
         if let Some(registry) = self.registry.as_mut() {
