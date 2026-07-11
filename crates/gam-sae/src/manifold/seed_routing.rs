@@ -1133,6 +1133,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
+        use ndarray::array;
+
+        let n = 4usize;
+        let k_atoms = 2usize;
+        let mut basis = Array3::<f64>::zeros((k_atoms, n, 1));
+        for atom_idx in 0..k_atoms {
+            for row in 0..n {
+                basis[[atom_idx, row, 0]] = 1.0;
+            }
+        }
+        let z = array![[1.0], [1.0], [-1.0], [-1.0]];
+        // Moderate logits keep the uncapped softmax genuinely dense. Projecting
+        // onto top-1 support must decouple the positive and negative rows.
+        let logits = array![[0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [-0.5, 0.5]];
+
+        let decoder = sae_decoder_lsq_init(
+            basis.view(),
+            &[1, 1],
+            z.view(),
+            logits.view(),
+            "softmax",
+            1.0,
+            1.0,
+            0.0,
+            Some(1),
+        )
+        .expect("top-k softmax seed LSQ succeeds");
+        assert!(
+            (decoder[[0, 0, 0]] - 1.0).abs() < 1.0e-3,
+            "top_k=1 must fit atom 0 only on selected positive rows; got {}",
+            decoder[[0, 0, 0]]
+        );
+        assert!(
+            (decoder[[1, 0, 0]] + 1.0).abs() < 1.0e-3,
+            "top_k=1 must fit atom 1 only on selected negative rows; got {}",
+            decoder[[1, 0, 0]]
+        );
+
+        let decoder_dense = sae_decoder_lsq_init(
+            basis.view(),
+            &[1, 1],
+            z.view(),
+            logits.view(),
+            "softmax",
+            1.0,
+            1.0,
+            0.0,
+            None,
+        )
+        .expect("dense softmax seed LSQ succeeds");
+        assert!(
+            (decoder_dense[[0, 0, 0]] - 1.0).abs() > 0.5,
+            "uncapped softmax must remain coupled; got {}",
+            decoder_dense[[0, 0, 0]]
+        );
+    }
+
     /// Regression test for issue #629: the cold-start residual seed must break
     /// the symmetric saddle of a uniform logit init by preferring, per row, the
     /// atom whose seed geometry best reconstructs that row. Planted: two
