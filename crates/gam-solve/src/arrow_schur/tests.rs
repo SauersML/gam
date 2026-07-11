@@ -6454,3 +6454,54 @@ fn zz_measure_reduced_schur_log_det_phases() {
         t_build, t_factor, t_solve, t_gemm
     );
 }
+
+/// zz_measure: naive scalar `cholesky_lower` vs faer LLT on the dense k×k
+/// reduced Schur, the per-Newton-step reduced factorization (#1017 CPU perf).
+#[test]
+#[ignore]
+fn zz_measure_reduced_schur_cholesky() {
+    use std::time::Instant;
+    for k in [1024usize, 2048, 4096] {
+        // Build an SPD matrix A = M Mᵀ + k·I (well-conditioned, dense).
+        let mut a = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in 0..k {
+                a[[i, j]] = 0.001 * (((i + 1) * (j + 3)) as f64).sin();
+            }
+        }
+        let ata = a.t().dot(&a);
+        let mut spd = ata;
+        for i in 0..k {
+            spd[[i, i]] += k as f64;
+        }
+        // warm + time naive
+        let mut checksum = 0.0_f64;
+        let _ = super::reduced_solve::cholesky_lower(&spd).unwrap();
+        let reps = 3;
+        let mut best_naive = f64::INFINITY;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let l = super::reduced_solve::cholesky_lower(&spd).unwrap();
+            best_naive = best_naive.min(t.elapsed().as_secs_f64());
+            checksum += l[[k - 1, 0]];
+        }
+        // faer LLT
+        let view = gam_linalg::faer_ndarray::FaerArrayView::new(&spd);
+        let _ = gam_linalg::faer_ndarray::FaerLlt::new(view.as_ref(), faer::Side::Lower);
+        let mut best_faer = f64::INFINITY;
+        for _ in 0..reps {
+            let t = Instant::now();
+            let llt =
+                gam_linalg::faer_ndarray::FaerLlt::new(view.as_ref(), faer::Side::Lower).unwrap();
+            best_faer = best_faer.min(t.elapsed().as_secs_f64());
+            checksum += llt.L()[(k - 1, 0)];
+        }
+        eprintln!(
+            "zz_measure cholesky k={k}: naive={:.4}s faer={:.4}s speedup={:.1}x checksum={:.3}",
+            best_naive,
+            best_faer,
+            best_naive / best_faer,
+            checksum
+        );
+    }
+}

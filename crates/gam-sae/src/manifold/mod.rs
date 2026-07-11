@@ -443,6 +443,15 @@ mod tests_chart_angle_fidelity_2081;
 #[cfg(test)]
 mod tests_joint_vs_cascade_2131;
 
+#[cfg(test)]
+mod tests_quality_behavior_calibration_2015;
+
+#[cfg(test)]
+mod tests_quality_amplitude_1939;
+
+#[cfg(test)]
+mod tests_quality_scale_quotient_2099;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use basin_bundle::*;

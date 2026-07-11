@@ -5896,7 +5896,11 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
     );
     assert_eq!(
         sources_for(MaternNu::ThreeHalves),
-        vec![PenaltySource::OperatorMass, PenaltySource::OperatorTension]
+        vec![
+            PenaltySource::OperatorMass,
+            PenaltySource::OperatorTension,
+            PenaltySource::OperatorStiffness
+        ]
     );
     assert_eq!(
         sources_for(MaternNu::FiveHalves),
@@ -5923,11 +5927,10 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
     let centers = array![[0.0_f64], [0.2], [0.45], [0.7], [1.0]];
     let length_scale = 0.4_f64;
     let include_intercept = false;
-    // ν=3/2, d=1 ⇒ RKHS Sobolev order m = ν + d/2 = 2.0. The strict gate
-    // admits mass (j=0) and tension (j=1) but DROPS stiffness (j=2, since
-    // 2.0 is not > 2.0). That gated-out stiffness is exactly the operator
-    // whose ψ-derivative the pre-fix builder emitted anyway, so this config
-    // genuinely exercises the index-alignment invariant.
+    // ν=3/2, d=1 ⇒ RKHS Sobolev order m = ν + d/2 = 2.0. The Sobolev-boundary
+    // gate admits mass (j=0), tension (j=1), and stiffness (j=2). This exact
+    // boundary case guards the inclusive j <= m topology and verifies that the
+    // ψ-derivative list follows the same decision as the forward builder.
     //
     // ν=3/2 (not ν=1/2): the exponential ν=1/2 kernel φ(r)=exp(−s r) has a
     // cusp at r=0 (q = φ'/r → −∞), so its discrete collocation gradient /
@@ -5958,8 +5961,12 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
         .collect();
     assert_eq!(
         forward_sources,
-        vec![PenaltySource::OperatorMass, PenaltySource::OperatorTension],
-        "ν=3/2 (m=2) must admit mass+tension and gate out stiffness"
+        vec![
+            PenaltySource::OperatorMass,
+            PenaltySource::OperatorTension,
+            PenaltySource::OperatorStiffness
+        ],
+        "ν=3/2 (m=2) must include the Sobolev-boundary stiffness operator"
     );
 
     // ψ-derivative list for the same config.
@@ -5994,8 +6001,8 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
     }
 
     // Finite-difference each SURVIVING operator's κ-gradient against its
-    // analytic ψ-derivative, positionally (mass at index 0, tension at
-    // index 1). ψ = log κ with κ = 1/length_scale, so length_scale(ψ) =
+    // analytic ψ-derivative, positionally (mass, tension, stiffness). ψ = log κ
+    // with κ = 1/length_scale, so length_scale(ψ) =
     // exp(-ψ) and a +h step in ψ scales length_scale by exp(-h). A pre-fix
     // misalignment (an extra stiffness ψ-derivative shifting the indices,
     // or the analytic deriv paired with the wrong forward penalty) would

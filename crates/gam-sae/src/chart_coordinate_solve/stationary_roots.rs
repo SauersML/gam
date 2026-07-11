@@ -68,11 +68,13 @@ impl PeriodicCurveExtrema {
         })
     }
 
-    /// Maximise `(c^T phi(t))^2 / (phi(t)^T G phi(t))`, the decoder-amplitude
-    /// profiled reconstruction gain.  Its nonzero-score stationary points are
-    /// the roots of `2 q' r - q r'`, with `q = c^T phi` and
-    /// `r = phi^T G phi`.
-    pub(crate) fn maximize_profiled_score(
+    /// Maximise `max(c^T phi(t), 0)^2 / (phi(t)^T G phi(t))`, the reconstruction
+    /// gain after profiling the non-negative SAE amplitude. Its positive-score
+    /// stationary points are the roots of `2 q' r - q r'`, with
+    /// `q = c^T phi` and `r = phi^T G phi`. Restricting the score to `q > 0`
+    /// resolves the antipodal ambiguity of a sign-free projection and keeps the
+    /// coordinate solve consistent with the non-negative routed amplitude.
+    pub(crate) fn maximize_nonnegative_profiled_score(
         &self,
         linear: &[f64],
     ) -> Result<PeriodicExtremum, String> {
@@ -110,8 +112,14 @@ impl PeriodicCurveExtrema {
         // every score to infinity) even though their ordering is perfectly
         // representable.
         let mut solution = global_extremum(&stationarity, ExtremumKind::Maximum, |t| {
-            profiled_score_at(&q, &r, t)
+            nonnegative_profiled_score_at(&q, &r, t)
         })?;
+        if solution.value == 0.0 {
+            // No positive projection exists. The constrained optimum is the
+            // zero-amplitude reconstruction at every coordinate, so choose the
+            // canonical chart origin instead of leaking a root-ordering choice.
+            solution.coordinate = 0.0;
+        }
         solution.value = rescale_profiled_score(solution.value, q_scale, r_scale)?;
         Ok(solution)
     }
@@ -517,7 +525,7 @@ fn polish_real_root(
     coordinate
 }
 
-fn profiled_score_at(
+fn nonnegative_profiled_score_at(
     linear: &LaurentPolynomial,
     quadratic: &LaurentPolynomial,
     coordinate: f64,
@@ -531,7 +539,11 @@ fn profiled_score_at(
         // Treating every value below a coefficient-scale tolerance as an exact
         // zero can misclassify a merely nearby singular point and then abort the
         // complete candidate comparison through an inapplicable Taylor limit.
-        return Ok((numerator / denominator) * numerator);
+        return Ok(if numerator > 0.0 {
+            (numerator / denominator) * numerator
+        } else {
+            0.0
+        });
     }
     if denominator < -denominator_tolerance {
         return Err(format!(
@@ -563,7 +575,15 @@ fn profiled_score_at(
                     "periodic profiled score: non-positive removable-limit denominator {r_taylor}"
                 ));
             }
-            Ok(q_taylor * q_taylor / r_taylor)
+            // If the leading numerator order is odd, one side of the zero has
+            // a positive projection. For an even order, the sign is the sign of
+            // its Taylor coefficient on both sides. Only a positively reachable
+            // branch belongs to the non-negative-amplitude profile.
+            if q_order % 2 == 1 || q_taylor > 0.0 {
+                Ok(q_taylor * q_taylor / r_taylor)
+            } else {
+                Ok(0.0)
+            }
         }
     }
 }
@@ -661,12 +681,14 @@ mod tests {
         ];
         let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
         let linear = [0.4, -0.7, 0.2, 1.1, -0.3];
-        let solved = solver.maximize_profiled_score(&linear).unwrap();
+        let solved = solver
+            .maximize_nonnegative_profiled_score(&linear)
+            .unwrap();
         let q = harmonic_linear(&linear);
         let r = harmonic_quadratic(gram.view());
         let dense_best = (0..200_003)
             .map(|index| index as f64 / 200_003.0)
-            .map(|t| profiled_score_at(&q, &r, t).unwrap())
+            .map(|t| nonnegative_profiled_score_at(&q, &r, t).unwrap())
             .fold(f64::NEG_INFINITY, f64::max);
         assert!(solved.value + 1e-10 >= dense_best);
     }
@@ -676,7 +698,9 @@ mod tests {
         let gram = array![[4.0]];
         let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
         let distance = solver.minimize_squared_distance(&[3.0]).unwrap();
-        let score = solver.maximize_profiled_score(&[3.0]).unwrap();
+        let score = solver
+            .maximize_nonnegative_profiled_score(&[3.0])
+            .unwrap();
         assert_eq!(distance.coordinate, 0.0);
         assert_eq!(score.coordinate, 0.0);
         assert!((score.value - 9.0 / 4.0).abs() < 1e-14);
@@ -684,7 +708,7 @@ mod tests {
         let zero = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         let zero_solver = PeriodicCurveExtrema::from_gram(zero.view()).unwrap();
         let zero_score = zero_solver
-            .maximize_profiled_score(&[0.0, 0.0, 0.0])
+            .maximize_nonnegative_profiled_score(&[0.0, 0.0, 0.0])
             .unwrap();
         assert_eq!(zero_score.coordinate, 0.0);
         assert_eq!(zero_score.value, 0.0);
@@ -702,14 +726,13 @@ mod tests {
             ];
             let linear = [0.0, amplitude * angle.sin(), amplitude * angle.cos()];
             let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
-            let solved = solver.maximize_profiled_score(&linear).unwrap();
-            // A sign-free amplitude identifies a pure circle only modulo its
-            // antipode, so compare on the half-period quotient.
-            let error = (solved.coordinate - planted).rem_euclid(0.5);
-            let error = error.min(0.5 - error);
+            let solved = solver
+                .maximize_nonnegative_profiled_score(&linear)
+                .unwrap();
+            let error = circular_distance(solved.coordinate, planted);
             assert!(
                 error < 1.0e-10,
-                "decoder scale {amplitude:e} returned {}, half-period error {error}",
+                "decoder scale {amplitude:e} returned {}, circular error {error}",
                 solved.coordinate
             );
         }
@@ -720,7 +743,7 @@ mod tests {
         let gram = Array2::<f64>::zeros((3, 3));
         let solver = PeriodicCurveExtrema::from_gram(gram.view()).unwrap();
         let error = solver
-            .maximize_profiled_score(&[0.0, 1.0, 0.0])
+            .maximize_nonnegative_profiled_score(&[0.0, 1.0, 0.0])
             .unwrap_err();
         assert!(error.contains("zero decoder Gram"), "{error}");
     }

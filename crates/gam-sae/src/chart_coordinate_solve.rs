@@ -22,10 +22,10 @@
 //! Atom `f` decodes the curve `m_f(t) = Σ_k φ_k(t) · D_f[k, :]` for a decoder
 //! block `D_f ∈ R^{K×D}` and a period-1 basis `φ(t) ∈ R^K`. For a target
 //! vector `y ∈ R^D` the amplitude-profiled reconstruction gain at coordinate
-//! `t` (minimizing `‖y − a·m_f(t)‖²` over the free amplitude `a`) is
+//! `t` (minimizing `‖y − a·m_f(t)‖²` over the SAE amplitude `a ≥ 0`) is
 //!
 //! ```text
-//!     score_f(t) = ⟨y, m_f(t)⟩² / ‖m_f(t)‖² .
+//!     score_f(t) = max(⟨y, m_f(t)⟩, 0)² / ‖m_f(t)‖² .
 //! ```
 //!
 //! The solver returns the global `argmax_t score_f(t)` by forming its analytic
@@ -236,7 +236,7 @@ pub fn solve_chart_coordinates(
                         + if has_addback { gram_phi[kk] } else { 0.0 };
                 }
                 let solution = extrema[fi]
-                    .maximize_profiled_score(&linear)
+                    .maximize_nonnegative_profiled_score(&linear)
                     .map_err(|error| {
                         format!(
                             "solve_chart_coordinates: row {row}, atom {fi} stationary solve: {error}"
@@ -400,10 +400,9 @@ mod chart_coordinate_solve_tests {
     /// a unit circle in the ambient plane spanned by two orthonormal frame
     /// columns; all other rows/dims are zero. Returns `(F=1, K, D)` decoders.
     ///
-    /// This curve is a PURE circle: `m(t+½) = −m(t)`, so the amplitude-profiled
-    /// (sign-free) projection score is identical at `t` and `t+½` — the
-    /// coordinate is identifiable only modulo ½. Recovery is measured
-    /// accordingly.
+    /// This curve is a PURE circle: `m(t+½) = −m(t)`. Profiling the model's
+    /// non-negative amplitude selects the member whose inner product with the
+    /// target is positive, so the coordinate remains identifiable modulo one.
     fn planted_circle_decoder(n_harmonics: usize, d: usize, ax: usize, ay: usize) -> Array3<f64> {
         let k = 2 * n_harmonics + 1;
         let mut dec = Array3::<f64>::zeros((1, k, d));
@@ -527,7 +526,11 @@ mod chart_coordinate_solve_tests {
                     nrm2 += v * v;
                     dot += x[[row, col]] * v;
                 }
-                let a = if nrm2 > 1e-30 { dot / nrm2 } else { 0.0 };
+                let a = if nrm2 > 1e-30 {
+                    (dot / nrm2).max(0.0)
+                } else {
+                    0.0
+                };
                 for col in 0..d {
                     let r = x[[row, col]] - a * m[col];
                     sse += r * r;
@@ -543,20 +546,19 @@ mod chart_coordinate_solve_tests {
             "solved reconstruction SSE {sse_solved} should beat random-init SSE {sse_rand} by a wide margin"
         );
 
-        // Coordinates should track the planted phase closely. A PURE circle is
-        // identifiable only up to the antipode (m(t+½) = −m(t) reconstructs
-        // equally under the sign-free amplitude), so the recovered coordinate is
-        // compared modulo ½ (period-½ wrap into [0, ¼]).
+        // Coordinates should track the planted phase closely. The non-negative
+        // amplitude rejects the antipode `m(t+½) = −m(t)`, so compare on the
+        // model's full period rather than quotienting away the sign error.
         let mut circ_err = 0.0_f64;
         for row in 0..n {
-            let raw = (solved[[row, 0]] - true_t[row]).rem_euclid(0.5);
-            let dt = raw.min(0.5 - raw);
+            let raw = (solved[[row, 0]] - true_t[row]).abs().rem_euclid(1.0);
+            let dt = raw.min(1.0 - raw);
             circ_err += dt;
         }
         circ_err /= n as f64;
         assert!(
             circ_err < 0.02,
-            "mean half-period coordinate error {circ_err} should be small on a clean planted circle"
+            "mean circular coordinate error {circ_err} should be small on a clean planted circle"
         );
     }
 }

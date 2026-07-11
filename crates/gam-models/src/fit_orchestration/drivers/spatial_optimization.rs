@@ -2683,13 +2683,13 @@ fn try_exact_joint_spatial_length_scale_optimization(
 ///
 /// Anisotropic and isotropic spatial terms drive the *same* joint `[ρ, ψ]`
 /// optimizer: identical outer-Hessian policy, identical
-/// `ExternalJointHyperEvaluator` wiring, identical multistart problem, identical
-/// convergence processing, and an identical `eval_full / eval_efs / eval_cost`
+/// `ExternalJointHyperEvaluator` wiring, identical convergence processing, and
+/// an identical `eval_full / eval_efs / eval_cost`
 /// inner loop that routes ψ through `try_build_spatial_log_kappa_hyper_dirs`.
-/// The only difference is the coordinate *kind*: the anisotropic path carries
-/// one log-scale coordinate per axis per term (ψ_a) while the isotropic path
-/// carries one log-κ coordinate per term. The kind selects diagnostic labels
-/// only — the numerics are shared verbatim.
+/// The coordinate *kind* distinguishes per-axis log scales (ψ_a) from one
+/// log-κ per term and selects diagnostic labels. It also tells the startup
+/// policy when an isotropic Matérn point has already won the explicit certified
+/// endpoint comparison, in which case that point owns the sole joint start.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SpatialHyperKind {
     Anisotropic,
@@ -3948,6 +3948,21 @@ fn run_exact_joint_spatial_optimization(
         // constant-curvature term is present (collapsing +κ kernel needs a large
         // smoothing λ beyond the historical ±12 box).
         !constant_curvature_term_indices(resolvedspec).is_empty(),
+        // The scalar Matérn endpoint comparison has already selected and
+        // certified the range basin. Give its explicit theta0 the only joint
+        // start; anisotropic and non-Matérn paths keep their established seed
+        // policy.
+        kind == SpatialHyperKind::Isotropic
+            && constant_curvature_term_indices(resolvedspec).is_empty()
+            && spatial_terms.iter().any(|&term_idx| {
+                matches!(
+                    resolvedspec
+                        .smooth_terms
+                        .get(term_idx)
+                        .map(|term| &term.basis),
+                    Some(SmoothBasisSpec::Matern { .. })
+                )
+            }),
     );
 
     let eval_outer = |ctx: &mut &mut SpatialJointContext<'_>,
@@ -6098,6 +6113,7 @@ const EXACT_JOINT_SECOND_ORDER_THETA_CAP: usize = 8;
 fn exact_joint_seed_config(
     risk_profile: gam_problem::SeedRiskProfile,
     auxiliary_dim: usize,
+    initial_seed_only: bool,
 ) -> gam_problem::SeedConfig {
     let mut config = gam_problem::SeedConfig {
         risk_profile,
@@ -6130,6 +6146,17 @@ fn exact_joint_seed_config(
             config.screen_max_inner_iterations = 8;
         }
     }
+    if initial_seed_only {
+        // The isotropic Matérn path has already compared and fully profiled its
+        // two geometry-derived range basins. Its winning [rho, psi] point is an
+        // explicit certified initial point, so launching another heuristic seed
+        // would repeat basin selection inside the local joint solve. A budget of
+        // one gives that explicit initial point sole ownership of the run-plan
+        // slot (run_plan inserts it at slot zero and skips seed screening).
+        config.max_seeds = 1;
+        config.seed_budget = 1;
+        config.over_smoothing_probe_rho = None;
+    }
     config
 }
 
@@ -6139,13 +6166,18 @@ mod exact_joint_seed_config_tests {
 
     #[test]
     fn exact_joint_marginal_slope_profiles_get_deeper_startup_validation() {
-        let bms = exact_joint_seed_config(gam_problem::SeedRiskProfile::GeneralizedLinear, 2);
+        let bms = exact_joint_seed_config(
+            gam_problem::SeedRiskProfile::GeneralizedLinear,
+            2,
+            false,
+        );
         assert_eq!(bms.max_seeds, 1);
         assert_eq!(bms.seed_budget, 1);
         assert_eq!(bms.screen_max_inner_iterations, 8);
         assert_eq!(bms.num_auxiliary_trailing, 2);
 
-        let survival = exact_joint_seed_config(gam_problem::SeedRiskProfile::Survival, 3);
+        let survival =
+            exact_joint_seed_config(gam_problem::SeedRiskProfile::Survival, 3, false);
         assert_eq!(survival.max_seeds, 8);
         assert_eq!(survival.seed_budget, 4);
         assert_eq!(survival.screen_max_inner_iterations, 8);
@@ -6154,13 +6186,22 @@ mod exact_joint_seed_config_tests {
 
     #[test]
     fn exact_joint_gaussian_keeps_tight_historical_multistart_budget() {
-        let gaussian = exact_joint_seed_config(gam_problem::SeedRiskProfile::Gaussian, 1);
+        let gaussian = exact_joint_seed_config(gam_problem::SeedRiskProfile::Gaussian, 1, false);
         assert_eq!(gaussian.max_seeds, 4);
         assert_eq!(gaussian.seed_budget, 2);
         assert_eq!(
             gaussian.screen_max_inner_iterations,
             gam_problem::SeedConfig::default().screen_max_inner_iterations
         );
+        assert_eq!(gaussian.num_auxiliary_trailing, 1);
+    }
+
+    #[test]
+    fn certified_matern_basin_owns_the_only_joint_start() {
+        let gaussian = exact_joint_seed_config(gam_problem::SeedRiskProfile::Gaussian, 1, true);
+        assert_eq!(gaussian.max_seeds, 1);
+        assert_eq!(gaussian.seed_budget, 1);
+        assert_eq!(gaussian.over_smoothing_probe_rho, None);
         assert_eq!(gaussian.num_auxiliary_trailing, 1);
     }
 }
@@ -6281,6 +6322,11 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // ±12 box and seed grid byte-for-byte for every other spatial/Matérn/Duchon/
     // sphere/survival joint fit.
     has_constant_curvature: bool,
+    // `true` only after the isotropic Matérn endpoint profiler has certified a
+    // winning range basin. The explicit theta0 then owns the sole joint-start
+    // budget; generic multi-block and latent-coordinate callers retain their
+    // family-specific multistart policies.
+    initial_seed_only: bool,
 ) -> gam_solve::rho_optimizer::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
@@ -6318,7 +6364,8 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
         .with_seed_config({
-            let mut sc = exact_joint_seed_config(risk_profile, auxiliary_dim);
+            let mut sc =
+                exact_joint_seed_config(risk_profile, auxiliary_dim, initial_seed_only);
             if has_constant_curvature {
                 // Let the seed grid reach the widened over-smoothing ceiling so a
                 // smooth whose true REML optimum genuinely lives at large λ can be
@@ -6700,6 +6747,9 @@ where
         block_specs
             .iter()
             .any(|s| !constant_curvature_term_indices(s).is_empty()),
+        // Multi-block optimization has no preceding scalar Matérn endpoint
+        // certificate, so retain its family-specific seed cascade.
+        false,
     );
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
@@ -7375,6 +7425,8 @@ fn try_exact_joint_latent_coord_optimization(
         // #1464: widen the over-smoothing ρ ceiling and seed the high-ρ probe
         // only when a constant-curvature curv() term is present in this fit.
         !constant_curvature_term_indices(resolvedspec).is_empty(),
+        // Latent-coordinate optimization is not a profiled Matérn range solve.
+        false,
     );
 
     let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,
