@@ -30,26 +30,25 @@
 //!      gamlss is DEMOTED to a baseline on the objective metric; the primary
 //!      claim is the oracle bound (1), not agreement with gamlss.
 //!
-//! gamlss's per-observation CRPS is still computed (via the closed-form
-//! Gaussian CRPS in plain base-R, so no external `scoringrules` dependency is
-//! needed) and gam's via `properscoring` purely so the head-to-head ratio and a
-//! context Pearson r can be printed; the PASS/FAIL gate is the oracle and truth
-//! bounds.
+//! gamlss's per-observation CRPS is computed via the closed-form Gaussian CRPS
+//! in plain base-R, and gam's with the same closed form in plain Rust. No
+//! optional scoring-package dependency is needed for the gate or its context
+//! diagnostics.
 //!
 //! gam-side API pinned by reading the source (mirrors
 //! tests/quality_vs_gamlss_gaussian_location_scale.rs):
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
-//!     to `FitResult::GaussianLocationScale`; this in-Rust path does NOT rescale
-//!     y, so mu/sigma are already in raw response units.
-//!   * sigma = LOGB_SIGMA_FLOOR + exp(eta_scale), LOGB_SIGMA_FLOOR = 0.01
-//!     (`families::sigma_link`); location block = BlockRole::Location, log-sigma
-//!     block = BlockRole::Scale.
+//!     to `FitResult::GaussianLocationScale`; the response is standardized while
+//!     fitting and coefficients are mapped back to raw units.
+//!   * raw sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale), where
+//!     LOGB_SIGMA_FLOOR = 0.01 (`families::sigma_link`); location block =
+//!     BlockRole::Location, log-sigma block = BlockRole::Scale.
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_python, run_r};
+use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -175,7 +174,11 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     };
     let result =
         fit_from_formula("y ~ s(x, k=7) + s(z, k=5)", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -196,7 +199,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     // ---- predict gam's (mu, sigma) on the 60 held-out TEST rows ------------
     // Rebuild the frozen mean / log-sigma designs at the test (x, z) and apply
     // each block's coefficients. mu = X_mean*beta_location;
-    // sigma = LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
+    // sigma = response_scale*LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
     let mut test_grid = Array2::<f64>::zeros((n_test, ncols));
     for i in 0..n_test {
         test_grid[[i, x_idx]] = x_test[i];
@@ -211,7 +214,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     let gam_eta_sigma: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
         .collect();
     assert_eq!(gam_mu.len(), n_test);
     assert_eq!(gam_sigma.len(), n_test);
@@ -268,29 +271,12 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
         "gamlss crps test length mismatch"
     );
 
-    // ---- score gam's predictive distribution with the SAME proper scoring
-    // rule, via an independent third-party implementation
-    // (properscoring.crps_gaussian) on the identical held-out y. gam's predicted
-    // (mu, sigma) are passed in; this isolates the scoring library from gam's
-    // internals so any CRPS-formula bias cancels against the closed form used
-    // elsewhere here.
-    let py = run_python(
-        &[
-            Column::new("y", y_test),
-            Column::new("mu", &gam_mu),
-            Column::new("sigma", &gam_sigma),
-        ],
-        r#"
-import properscoring as ps
-y = np.asarray(df["y"], dtype=float)
-mu = np.asarray(df["mu"], dtype=float)
-sigma = np.asarray(df["sigma"], dtype=float)
-crps = ps.crps_gaussian(y, mu=mu, sig=sigma)
-emit("crps", crps)
-"#,
-    );
-    let gam_crps = py.vector("crps");
-    assert_eq!(gam_crps.len(), n_test, "gam crps test length mismatch");
+    // ---- score gam's predictive distribution with the SAME proper score ---
+    // The formula is evaluated directly from gam's held-out (mu, sigma), so the
+    // test has no optional Python-package dependency.
+    let gam_crps: Vec<f64> = (0..n_test)
+        .map(|i| crps_gaussian(y_test[i], gam_mu[i], gam_sigma[i]))
+        .collect();
 
     // ---- OBJECTIVE METRIC 1: oracle CRPS floor on the SAME held-out rows -----
     // The held-out y were drawn from N(mu_true(x,z), sigma_true(x)^2). The
@@ -307,13 +293,7 @@ emit("crps", crps)
         .collect();
     let oracle_mean_crps: f64 = oracle_crps.iter().sum::<f64>() / n_test as f64;
 
-    // gam's own mean CRPS recomputed in plain Rust from gam's (mu, sigma) — this
-    // is the quantity the gate compares to the oracle, so it must not depend on
-    // the `properscoring` round-trip (that vector is kept only for context).
-    let gam_mean_crps_rust: f64 = (0..n_test)
-        .map(|i| crps_gaussian(y_test[i], gam_mu[i], gam_sigma[i]))
-        .sum::<f64>()
-        / n_test as f64;
+    let gam_mean_crps_rust: f64 = gam_crps.iter().sum::<f64>() / n_test as f64;
     let oracle_excess = gam_mean_crps_rust / oracle_mean_crps;
 
     // ---- OBJECTIVE METRIC 2: out-of-sample truth recovery of both moments ----
@@ -327,8 +307,7 @@ emit("crps", crps)
     let mu_signal_range = 2.0 + 0.5;
 
     // ---- context-only head-to-head vs the gamlss BASELINE --------------------
-    let crps_corr = pearson(gam_crps, gamlss_crps);
-    let gam_mean_crps_ps: f64 = gam_crps.iter().sum::<f64>() / n_test as f64;
+    let crps_corr = pearson(&gam_crps, gamlss_crps);
     let gamlss_mean_crps: f64 = gamlss_crps.iter().sum::<f64>() / n_test as f64;
     let crps_ratio = gam_mean_crps_rust / gamlss_mean_crps;
     let gamlss_mu_rmse = rmse(gamlss_mu, &mu_truth_test);
@@ -336,7 +315,7 @@ emit("crps", crps)
 
     eprintln!(
         "gaussian loc-scale held-out CRPS: n_train={n_train} n_test={n_test} \
-         gam_mean_crps={gam_mean_crps_rust:.5} (properscoring={gam_mean_crps_ps:.5}) \
+         gam_mean_crps={gam_mean_crps_rust:.5} \
          oracle_mean_crps={oracle_mean_crps:.5} oracle_excess={oracle_excess:.4} \
          gam_mu_rmse={mu_rmse:.5} gam_sigma_rmse={sigma_rmse:.5} sigma_floor={sigma_floor:.4} \
          | baseline gamlss: mean_crps={gamlss_mean_crps:.5} ratio={crps_ratio:.4} \
@@ -451,7 +430,11 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
     };
     let result = fit_from_formula("GAG ~ s(Age)", &train_ds, &cfg)
         .expect("gam location-scale fit on gagurine");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -483,7 +466,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
     let gam_eta_sigma: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
         .collect();
     assert_eq!(gam_mu.len(), n_test);
     assert_eq!(gam_sigma.len(), n_test);
