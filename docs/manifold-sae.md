@@ -667,7 +667,7 @@ import torch
 from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
 
 cfg = ManifoldSAEConfig(
-    input_dim=D, n_atoms=F, intrinsic_rank=2,    # intrinsic_rank default 2
+    input_dim=D, n_atoms=F, intrinsic_rank=1,
     atom_manifold="circle",                       # circle / cylinder / sphere / product
     atom_basis="duchon",                          # duchon / bspline / fourier
     basis_order=2, n_basis_per_atom=8,
@@ -676,6 +676,34 @@ sae = ManifoldSAE(cfg)
 out = sae(x)               # forward → ManifoldSAEOutput(z, x_hat, positions, ...)
 fitted = sae.fit(x, max_iter=None, random_state=0, learning_rate=None)
 ```
+
+For gradient training of the dense curved arm, use the exact PCA seed before
+creating the optimizer. This configuration has `target_k == n_atoms`, so the
+signed least-squares gate and each circle atom's constant Fourier coefficient
+contain the centered rank-`F` PCA model exactly:
+
+```python
+cfg = ManifoldSAEConfig(
+    input_dim=D,
+    n_atoms=F,
+    intrinsic_rank=1,
+    atom_manifold="circle",
+    atom_basis="fourier",
+    sparsity={"kind": "softmax_topk", "target_k": F},
+)
+sae = ManifoldSAE(cfg).to(x_train.device)
+sae.initialize_from_pca(x_train)  # Rust SVD over the full training corpus
+optimizer = torch.optim.Adam(sae.parameters(), lr=learning_rate)
+```
+
+At initialization, `sae(x_train).x_hat` is the centered rank-`F` PCA
+reconstruction. All harmonic decoder rows start at zero but retain nonzero
+gradients, so training can add curvature without first spending thousands of
+steps recovering the linear baseline. If the explicit call is omitted, the
+first eligible training forward seeds from that batch; the full-corpus call is
+preferred because it exactly matches the converged training-set PCA baseline.
+Sparse (`target_k < n_atoms`), top-1, overcomplete, and non-circle dictionaries
+are not mislabeled as PCA-equivalent; `initialize_from_pca` rejects them.
 
 `forward` returns a `ManifoldSAEOutput` dataclass with fields `z`, `x_hat`,
 `positions`, `amplitudes`, `curves`, `gate`, `assignments`, `reml_score`,

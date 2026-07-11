@@ -1806,8 +1806,9 @@ class ManifoldSAE(nn.Module):
         Call this with the full training tensor before constructing the training
         loop for an exact full-corpus seed.  If it is omitted, the first eligible
         training forward initializes from that first batch.  Exact PCA nesting
-        requires ``target_k == n_atoms <= min(N, D)`` and the signed multi-atom
-        gate; invalid configurations fail explicitly instead of claiming a
+        requires a circle atom (its periodic basis owns the exact unit constant
+        row), ``target_k == n_atoms <= min(N, D)``, and the signed multi-atom
+        gate. Invalid configurations fail explicitly instead of claiming a
         weaker sparse-dictionary start is PCA-equivalent.
         """
         if not isinstance(x, torch.Tensor):
@@ -1830,6 +1831,11 @@ class ManifoldSAE(nn.Module):
         if self.cfg.sparsity.kind != "softmax_topk":
             raise ValueError(
                 "initialize_from_pca requires sparsity.kind='softmax_topk'"
+            )
+        if self.cfg.atom_manifold != "circle":
+            raise ValueError(
+                "initialize_from_pca currently requires atom_manifold='circle', "
+                "whose periodic basis has an exact unit constant row"
             )
         target_k = self.cfg.sparsity.target_k
         if target_k is None or int(target_k) != int(self.cfg.n_atoms):
@@ -1940,6 +1946,7 @@ class ManifoldSAE(nn.Module):
             and not bool(self._pca_initialized.item())
             and int(self._train_steps.item()) == 0
             and self.cfg.sparsity.kind == "softmax_topk"
+            and self.cfg.atom_manifold == "circle"
             and self.cfg.sparsity.target_k is not None
             and int(self.cfg.sparsity.target_k) == int(self.cfg.n_atoms)
             and int(self.cfg.n_atoms) <= min(int(x.shape[0]), int(x.shape[1]))

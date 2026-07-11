@@ -142,6 +142,15 @@ bases-on-manifold: `duchon`, `bspline`, `fourier`. Sparsity layers:
 `circle` maps to a periodic atom, `sphere` maps to a sphere atom, and `product`
 maps to a Duchon Euclidean patch; `bspline` remains a torch-training basis.
 
+The dense gradient-trained circle arm (`softmax_topk` with
+`target_k == n_atoms`) should call `sae.initialize_from_pca(x_train)` before
+the optimizer is created. Rust fits the centered principal frame, the frame is
+placed in the atoms' unit constant Fourier rows, and all harmonic rows start at
+zero. The step-zero reconstruction is therefore exactly the converged
+rank-`n_atoms` PCA reconstruction while curvature gradients remain live. An
+omitted explicit call uses the first eligible training batch; using the full
+training corpus explicitly gives the exact training-set baseline.
+
 ## Related reading
 
 - [Formula DSL — periodic / cyclic smooths](formulas.md#periodic-cyclic-smooths)
