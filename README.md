@@ -147,7 +147,7 @@ Manifold SAE dictionary. `sae_manifold_fit` decomposes an activation /
 embedding matrix into `K` sparse atoms, each a low-dimensional typed shape
 (line, circle, sphere, torus, or Euclidean patch) with a per-token
 coordinate. Cross-atom decoder incoherence (on by default) keeps co-firing
-atoms separable; the IBP gate adapts the number of active atoms per token
+atoms separable; the ordered Beta--Bernoulli gate adapts the number of active atoms per token
 with true zeros. A fresh fit reports, per atom, a closed-form posterior
 shape band (mean curve ± sd) and the typical coordinate range the atom is
 used over — where each manifold lives, what shape, and how confident.

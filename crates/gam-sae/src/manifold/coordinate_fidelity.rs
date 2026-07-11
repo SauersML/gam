@@ -1372,7 +1372,7 @@ pub fn prefer_candidate_basin(
 
 /// #2230 — ONE-referee state preference for the inner-fit keep-best incumbent,
 /// keyed on the PENALIZED OBJECTIVE (the exact scalar the inner Armijo lane
-/// descends and the outer REML evidence consumes), with the #2081
+/// descends and the outer penalized-LAML evidence consumes), with the #2081
 /// EV-then-uniformity ordering ([`prefer_candidate_basin`]) demoted to a
 /// tie-break at (near-)equal objective.
 ///

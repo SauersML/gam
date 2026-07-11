@@ -20,7 +20,7 @@
 //!     metric) fit at K=32, p=128, n=500 — the composition regime whose predicted
 //!     dense evidence cache (`N·q·border_dim`, q=K(1+d), border_dim=Σ_k M_k·p)
 //!     exceeds the in-core budget — must ROUTE to the streaming criterion and
-//!     COMPLETE with a finite REML value rather than hard-erroring. We pin both
+//!     COMPLETE with a finite penalized LAML value rather than hard-erroring. We pin both
 //!     halves deterministically: (a) the memory planner refuses the dense direct
 //!     plan at this shape but admits the matrix-free plan, so the auto-router
 //!     selects streaming; and (b) the streaming value path itself returns a finite
@@ -484,7 +484,7 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
 }
 
-/// End-to-end: the whitened streaming REML criterion (`penalized_laml_criterion_streaming_
+/// End-to-end: the whitened streaming penalized LAML criterion (`penalized_laml_criterion_streaming_
 /// exact`) must COMPLETE with a finite value rather than surfacing the
 /// `cost-only streaming route is required` hard-error class. The streaming lane is
 /// size-INVARIANT — it runs the identical `converge_inner_for_undamped_logdet` +
@@ -524,7 +524,7 @@ fn whitened_streaming_criterion_completes() {
         .expect("whitened streaming criterion must complete, not hard-error");
     assert!(
         cost.is_finite(),
-        "streaming REML criterion must be finite; got {cost}"
+        "streaming penalized LAML criterion must be finite; got {cost}"
     );
     assert!(
         loss.total().is_finite() && loss.data_fit.is_finite(),

@@ -1,4 +1,4 @@
-//! Basin-bundle lower envelope for the outer REML criterion (#2230/#2087 genus).
+//! Basin-bundle lower envelope for the outer penalized-LAML criterion (#2230/#2087 genus).
 //!
 //! The outer criterion as historically implemented is `V_{b(warm,ρ)}(ρ)` — the
 //! value of whichever inner basin the warm-started inner solve lands in. The

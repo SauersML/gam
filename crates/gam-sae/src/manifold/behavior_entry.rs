@@ -4,7 +4,7 @@
 //! the activation matrix is the anchor and the nats-unit sphere-tangent image of
 //! the row-aligned probability distributions is the sole non-anchor block.  The
 //! existing crosscoder outer objective therefore selects `log(lambda_y)` in the
-//! same converged REML/LAML run that selects every other variance component.
+//! same converged penalized LAML run that selects every other variance component.
 //! There is no binding-owned fit fork and no bounded inner-only fit object.
 
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub struct BehaviorWeightIdentifiability {
     pub identifiable: bool,
     pub activation_residual_variance: f64,
     pub behavior_residual_variance: f64,
-    /// Conditional observed curvature of the profiled two-block REML criterion
+    /// Conditional observed curvature of the profiled two-block penalized LAML criterion
     /// with respect to `log(lambda_y)`. It is strictly positive exactly when
     /// both response blocks retain residual variance.
     pub log_lambda_curvature: f64,
@@ -215,7 +215,7 @@ fn kl_summary(target: &Array2<f64>, fitted: &Array2<f64>) -> Result<BehaviorKlSu
 }
 
 /// Fit activations and behavioral distributions through one converged outer
-/// REML/LAML objective and one shared latent/routing state.
+/// penalized LAML objective and one shared latent/routing state.
 pub fn run_auto_sae_behavior_fit(
     request: SaeBehaviorAutoFitRequest,
 ) -> Result<SaeBehaviorFitReport, SaeFitError> {

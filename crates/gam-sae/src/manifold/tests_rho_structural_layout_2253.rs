@@ -89,7 +89,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         .expect("base value lane must converge");
     assert!(
         base_cost.is_finite(),
-        "the active-rho derivative witness must start at feasible REML evidence: \
+        "the active-rho derivative witness must start at feasible penalized LAML evidence: \
          base={base_cost:.17e}"
     );
     let evaluation = gradient_objective
@@ -304,12 +304,12 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let frozen_minus_cost = frozen_cost_at(&minus);
     assert!(
         plus_cost.is_finite(),
-        "+h must evaluate feasible REML evidence: \
+        "+h must evaluate feasible penalized LAML evidence: \
          cost={plus_cost:.17e}, telemetry={plus_telemetry:?}"
     );
     assert!(
         minus_cost.is_finite(),
-        "-h must evaluate feasible REML evidence: \
+        "-h must evaluate feasible penalized LAML evidence: \
          cost={minus_cost:.17e}, telemetry={minus_telemetry:?}"
     );
     assert_eq!(

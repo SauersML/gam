@@ -1,6 +1,6 @@
 use super::*;
 
-/// #1026 — how the per-atom ARD precisions are exposed to the OUTER REML
+/// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED-LAML
 /// optimizer.
 ///
 /// The term's inner solve always reads a full per-atom, per-axis precision
@@ -32,7 +32,7 @@ pub enum ArdSharing {
     Shared,
 }
 
-/// Whether assignment strength contributes an outer REML coordinate.
+/// Whether assignment strength contributes an outer penalized-LAML coordinate.
 ///
 /// The stored [`SaeManifoldRho::log_lambda_sparse`] value remains available to
 /// the inner assignment prior, but the flat outer layout includes it only when

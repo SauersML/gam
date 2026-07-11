@@ -372,12 +372,12 @@ impl AmortizedWarmStartTelemetry {
     }
 }
 
-/// Outer REML objective for the SAE-manifold term.
+/// Outer penalized-LAML objective for the SAE-manifold term.
 ///
 /// Routes the SAE's smoothing hyperparameters ρ
 /// (`log_lambda_sparse`, per-atom `log_lambda_smooth`, per-atom/axis `log_ard`)
 /// through the *one* generic [`OuterObjective`] engine + cascade that the
-/// main GAM REML path uses, instead of the SAE's deleted forked
+/// main GAM penalized-LAML path uses, instead of the SAE's deleted forked
 /// `update_ard_reml` fixed-point rule. Each outer eval runs the inner
 /// `(t, β)` arrow-Schur Newton solve at the engine's current ρ and returns
 /// the penalised quasi-Laplace evidence score (see
@@ -393,7 +393,7 @@ impl AmortizedWarmStartTelemetry {
 /// gradient through the rank-revealing joint-Hessian solve; matrix-free fits
 /// use the analytic Fellner--Schall trace fixed point.
 
-/// #2080 — probe telemetry for the outer REML ρ-search. Counts how the outer
+/// #2080 — probe telemetry for the outer penalized-LAML ρ-search. Counts how the outer
 /// objective spends its criterion evaluations so the wide-`p` acceptance test can
 /// assert a BOUNDED probe budget (not a wall-clock limit — SPEC bans time
 /// budgets). Every counter is a plain evaluation tally; the fields are read after
@@ -408,7 +408,7 @@ impl AmortizedWarmStartTelemetry {
 /// bounded number of criterion evals.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OuterProbeTelemetry {
-    /// Full REML criterion evaluations requested through the generic outer
+    /// Full penalized LAML criterion evaluations requested through the generic outer
     /// lanes. Accepted gradient/EFS lanes commit their solved basin; value-only
     /// comparison probes restore the incumbent state before returning.
     pub criterion_calls: usize,
@@ -422,7 +422,7 @@ pub struct OuterProbeTelemetry {
     /// infeasible value (`+inf`) because the Laplace evidence was undefined or
     /// the fixed-ρ inner solve refused. A finite, data-collapsed fit is not an
     /// infeasible objective value: collapse remains a structural ledger verdict
-    /// while REML/LAML remains the sole optimized criterion.
+    /// while penalized LAML remains the sole optimized criterion.
     pub infeasible_criterion_evals: usize,
     /// #2234 — cost-only probes whose capped/forced inner solve exhausted its
     /// budget and were RESCUED by a one-shot retry at the accepted-point drive
@@ -1416,7 +1416,7 @@ impl SaeManifoldOuterObjective {
     /// [`SaeManifoldTerm::assemble_shape_uncertainty`]).
     ///
     /// Recomputes the converged joint-Hessian Laplace factor at the settled ρ
-    /// — the same undamped Direct factor the REML criterion forms at the inner
+    /// — the same undamped Direct factor the penalized LAML criterion forms at the inner
     /// optimum — and reads the per-atom covariance and bands off its cached
     /// Schur factor, scaling by the Gaussian reconstruction dispersion `φ̂`.
     /// The term is already at the optimum after the outer fit, so the inner
@@ -2063,9 +2063,9 @@ impl SaeManifoldOuterObjective {
     }
 
     /// Record the discrete fitted-data collapse verdict without changing the
-    /// REML/LAML objective. The verdict feeds structure search and the final fit
+    /// penalized LAML objective. The verdict feeds structure search and the final fit
     /// ledger; it is not a smooth term and therefore cannot be added to a cost
-    /// that is paired with the bare analytic REML derivative (#2253).
+    /// that is paired with the analytic derivative of the penalized-LAML scalar (#2253).
     fn record_fit_data_collapse_verdict(&mut self, rho: &SaeManifoldRho) -> Result<(), String> {
         let fitted = self.term.try_fitted_for_rho(rho)?;
         let assignments = self.term.assignment.try_assignments()?;
@@ -2078,9 +2078,9 @@ impl SaeManifoldOuterObjective {
         Ok(())
     }
 
-    /// Whether a value probe has no defined REML/LAML evidence. Such a state is
+    /// Whether a value probe has no defined penalized LAML evidence. Such a state is
     /// not admitted to the handoff or basin bundle. Finite collapsed fits remain
-    /// ordinary REML values; their separate structural verdict is recorded above.
+    /// ordinary penalized LAML values; their separate structural verdict is recorded above.
     fn probe_value_is_infeasible(value: f64) -> bool {
         !value.is_finite()
     }
@@ -2172,7 +2172,7 @@ impl SaeManifoldOuterObjective {
         if matches { Some(handoff.term) } else { None }
     }
 
-    /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
+    /// Shared cost path: evaluate the penalized LAML criterion at `rho_flat`, updating
     /// the cached ρ / loss and (optionally) priming the inner solve from a
     /// seeded β. Returns `(cost, β̂)`.
     ///
@@ -2253,7 +2253,7 @@ impl SaeManifoldOuterObjective {
         // #1154 item 2 (Design A) — warm-start the inner latent coords from the
         // amortized encoder built on the CURRENT dictionary. At outer step m this
         // seeds the inner solve from the per-chart IFT predictor of the dictionary
-        // settled at step m−1, refined to the SAME stationary point (so the REML
+        // settled at step m−1, refined to the SAME stationary point (so the penalized-LAML
         // λ-gradient is untouched). Best-effort: a first-build / degenerate atlas
         // certifies no rows and warm-starts nothing, leaving the cold path
         // byte-for-byte unchanged; a transient atlas-build refusal must not abort
@@ -2266,7 +2266,7 @@ impl SaeManifoldOuterObjective {
                 .warm_start_latents_from_amortized_encoder(self.target.view(), &rho);
             self.record_warm_start(warm_start_outcome);
         }
-        let (reml_cost, loss) = match drive {
+        let (penalized_laml_cost, loss) = match drive {
             ProbeInnerDrive::Criterion {
                 refine_progress_extension,
             } => self.term.penalized_laml_criterion_with_refine_policy_and_lane(
@@ -2285,7 +2285,7 @@ impl SaeManifoldOuterObjective {
         let beta_hat = self.term.flatten_beta();
         // ONE criterion everywhere. Every outer lane — BFGS/ARC descent, the
         // line-search value probes, cross-seed ranking, EFS backtracking, and
-        // final selection — prices the SAME pure REML criterion `f(ρ)` whose
+        // final selection — prices the SAME penalized LAML criterion `f(ρ)` whose
         // exact implicit gradient `∇f` the gradient lane returns. The former
         // #1154 amortized-encoder consistency fold `c(ρ)` ranked seeds/EFS
         // states by `f+c` while optimization descended `f` alone (c had no
@@ -2295,11 +2295,11 @@ impl SaeManifoldOuterObjective {
         // every fitting/ranking lane; encoder consistency remains available as
         // a pure diagnostic (`penalized_laml_criterion_cotrained`). The fitted-data
         // collapse detector is a structural ledger verdict, not an objective
-        // fold: changing a finite REML value by a constant sentinel would pair
-        // that post-hoc value with the bare analytic REML derivative (#2253).
+        // fold: changing a finite penalized LAML value by a constant sentinel would pair
+        // that post-hoc value with the analytic penalized-LAML derivative (#2253).
         self.record_fit_data_collapse_verdict(&rho)?;
-        let cost = if reml_cost.is_finite() {
-            reml_cost
+        let cost = if penalized_laml_cost.is_finite() {
+            penalized_laml_cost
         } else {
             self.probe_telemetry.infeasible_criterion_evals += 1;
             f64::INFINITY
@@ -2464,7 +2464,7 @@ impl SaeManifoldOuterObjective {
         let (cost, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
         if !cost.is_finite() {
             return Err(
-                "SaeManifoldOuterObjective::fit_at_fixed_rho: REML/LAML evidence is infeasible at the requested rho"
+                "SaeManifoldOuterObjective::fit_at_fixed_rho: penalized LAML evidence is infeasible at the requested rho"
                     .to_string(),
             );
         }
@@ -2495,7 +2495,7 @@ impl SaeManifoldOuterObjective {
         // accept pattern re-evaluates the accepted point at the ρ of its last
         // successful value probe. Only a genuinely converged finite value is
         // worth handing off; a refused or non-finite probe never defines usable
-        // REML/LAML evidence.
+        // penalized LAML evidence.
         match &result {
             Ok((cost, _beta)) if !Self::probe_value_is_infeasible(*cost) => {
                 let converged = std::mem::replace(&mut self.term, saved_term);
@@ -2674,7 +2674,7 @@ impl SaeManifoldOuterObjective {
                 }
                 // Install the argmin basin's converged state as the handoff so the
                 // gradient lane prices THIS basin (envelope theorem). Only a
-                // finite REML envelope is worth handing off.
+                // finite penalized-LAML envelope is worth handing off.
                 if !Self::probe_value_is_infeasible(env_value) {
                     self.probe_converged_handoff = Some(ProbeConvergedHandoff {
                         rho_flat: rho_flat.to_owned(),
@@ -2760,7 +2760,7 @@ impl SaeManifoldOuterObjective {
 
     /// Fellner-Schall / Mackay multiplicative fixed-point step on ρ at
     /// `rho_flat`. Runs the inner `(t, β)` solve to convergence at fixed ρ
-    /// (sharing the single Direct factor with the REML criterion), then
+    /// (sharing the single Direct factor with the penalized LAML criterion), then
     /// returns `(cost, additive-log-steps, β̂)`.
     ///
     /// All ρ coords are log-quantities, so the engine's additive step
@@ -2894,7 +2894,7 @@ impl SaeManifoldOuterObjective {
                 self.probe_telemetry.record_refusal_kind(&err);
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
-                return Ok(infeasible_evaluation("infeasible REML/LAML evidence"));
+                return Ok(infeasible_evaluation("infeasible penalized LAML evidence"));
             }
             Err(err) => return Err(err),
         };
@@ -2904,7 +2904,7 @@ impl SaeManifoldOuterObjective {
         if !cost.is_finite() {
             self.probe_telemetry.infeasible_criterion_evals += 1;
             return Ok(infeasible_evaluation(
-                "the REML/LAML criterion is non-finite",
+                "the penalized LAML criterion is non-finite",
             ));
         }
 
@@ -3662,11 +3662,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // Softmax/threshold fits have one non-FS coordinate: assignment
             // strength. Mark it as the Hybrid-EFS analytic-gradient block so
             // scalable EFS updates still own smoothness/ARD while this coordinate
-            // moves by its exact REML gradient. Small dense fits still select the
+            // moves by its exact penalized-LAML gradient. Small dense fits still select the
             // ordinary full-gradient BFGS plan at the existing crossover.
             psi_dim: assignment_gradient_dim,
-            // SPEC: "REML or LAML is used for fitting." The Fellner–Schall
-            // fixed point is the canonical REML method and needs ONLY the traces
+            // SPEC: "REML or LAML is used for fitting." The extended
+            // Fellner--Schall fixed point targets this penalized-LAML criterion and needs only the traces
             // tr(H⁻¹ S_c) (decoder_smoothness_effective_dof + ard_inverse_traces),
             // never a finite-difference or autodiff gradient — which is required
             // here because the per-atom-ARD outer problem is O(K)-dimensional and a
@@ -3674,7 +3674,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // intractable at large K. EFS updates all coords SIMULTANEOUSLY from a
             // single trace pass, so it scales. The #1023 boundary-collapse (EFS
             // railing λ_smooth and collapsing the decoder to the mean) is guarded
-            // two ways now: efs_step's update targets the FINITE REML stationary
+            // two ways now: efs_step's update targets the finite penalized-LAML stationary
             // point λ_new = (rank−edof)/energy (#F1 — the unit-dispersion fixed
             // point the value criterion's ∂/∂ρ = 0 defines; `rank−edof ≤ rank`
             // bounded and `energy > 0`, so λ cannot rail to a mean-collapse).
@@ -3699,7 +3699,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // the full-budget path, so all ranked comparisons stay in one measure.
         // `eval_cost` is the value-only CROSS-SEED RANKING / EFS lane (seed
         // screening, cross-seed final selection, EFS backtracking). It prices
-        // the SAME pure REML criterion `f(ρ)` the gradient lane descends, so
+        // the SAME penalized LAML criterion `f(ρ)` the gradient lane descends, so
         // the fit selection is stationary for the criterion that selected it.
         self.probe_telemetry.criterion_calls += 1;
         // #2230/#2087 — descend the basin lower envelope V*(ρ)=min_b V_b(ρ) here
@@ -3757,7 +3757,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // validation") for any large-K / wide-border (duchon) fit whose dense
         // evidence factor exceeds the in-core budget. Route it to the SAME streaming
         // value path the `Value` order uses: validation then gets a finite streaming
-        // REML cost (paired with a zero gradient it never consumes) and the fit
+        // penalized LAML cost (paired with a zero gradient it never consumes) and the fit
         // proceeds on the EFS lane. Dense-admitted fits never enter this branch and
         // are byte-for-byte unchanged.
         if !self.term.streaming_plan().direct_logdet_admitted() {
@@ -3852,7 +3852,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // built on the running dictionary at this ρ (Design A), exactly as the
         // value-probe lane (`evaluate_with_refine_policy`) does. The accepted
         // iterate's inner solve then refines from the cheap one-mat-vec seed to
-        // the SAME stationary point, so the exact REML λ-gradient computed below
+        // the SAME stationary point, so the exact penalized-LAML λ-gradient computed below
         // is untouched — the warm-start changes only the basin entry, never the
         // root. Advisory: a degenerate atlas certifies/warm-starts nothing and
         // leaves the cold path byte-for-byte unchanged. #1207 — the outcome is
@@ -3959,7 +3959,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
         // is the gradient we return: the consistent pair `(f, ∇f)` for the pure
-        // REML criterion — the SAME criterion every value/ranking/EFS lane prices
+        // penalized LAML criterion — the SAME criterion every value/ranking/EFS lane prices
         // (one coherent objective; see `evaluate_with_inner_drive`). Collapse was
         // recorded above as a structural verdict and leaves this value unchanged.
         // #2231 Inc-B — price the block Jacobian into the gradient lane's cost so
@@ -4008,7 +4008,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             OuterEvalOrder::Value => {
                 // The `Value` order is the BFGS / ARC LINE-SEARCH cost probe
                 // (see `solver/rho_optimizer/bridges.rs`). Its cost is compared
-                // against steps whose direction came from `eval`'s pure REML
+                // against steps whose direction came from `eval`'s penalized LAML
                 // `∇f` — the same single criterion every lane prices.
                 // Line-search comparisons use the exact same inner KKT gate as
                 // the accepted-point value/gradient lane. Comparing a loosened
@@ -4034,7 +4034,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         // the complete objective state back before refinement.
                         if self.reactive_waypoint_checkpoint.is_some() {
                             return Err(EstimationError::RemlOptimizationFailed(format!(
-                                "reactive coupled waypoint has undefined REML evidence: {err}"
+                                "reactive coupled waypoint has undefined penalized LAML evidence: {err}"
                             )));
                         }
                         return Ok(OuterEval::infeasible(rho.len()));
@@ -4285,7 +4285,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 ));
             }
             // The literal seed was already evaluated before the runner opened
-            // this repair path and its REML evidence was undefined. Do not carry
+            // this repair path and its penalized LAML evidence was undefined. Do not carry
             // that invalid basin into the supposedly legal entry merely because
             // its decoder coefficients are nonzero: a common cold seed fits every
             // atom independently to the full target, so summing those decoders is
@@ -5583,7 +5583,7 @@ mod linear_parity_anchor_1026_tests {
 
         // Sparsity sweep: λ_sparse from mild to strong. PRINTED as the #1026
         // routing-bound evidence; the gated degradation magnitude is observed (it
-        // depends on the REML basin / inner-solve dynamics that the no-MSI build
+        // depends on the penalized-LAML basin / inner-solve dynamics that the no-MSI build
         // cannot pre-calibrate), so only the two PROVABLY-TRUE facts are asserted.
         for &log_lam in &[
             (1.0e-3_f64).ln(),

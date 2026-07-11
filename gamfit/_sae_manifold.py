@@ -63,22 +63,15 @@ def _canonical_assignment(value: str, label: str) -> str:
         ) from None
 
 
-# Sentinel so ``alpha`` can tell "not supplied" apart from an explicit
-# ``alpha=1.0``. When the caller does not set ``alpha`` and the assignment is
-# an explicit ``ordered_beta_bernoulli``, the concentration defaults to the K-aware value below
-# rather than the historical fixed ``1.0`` (see #1784).
-_ALPHA_UNSET: Any = object()
-
-
 def _default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: int) -> float:
-    """K-aware default IBP concentration ``α`` (#1784).
+    """K-aware default ordered Beta--Bernoulli concentration ``α`` (#1784).
 
     Thin wrapper over the Rust source of truth
     ``assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms`` (FFI
     ``sae_default_ordered_beta_bernoulli_concentration_for_k_atoms``): the formula
     ``α = max(1, 1/(exp(1/K) − 1))`` is computed once in the core, never mirrored
     in Python. Choosing ``α`` so the last atom retains prior mass
-    ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}`` makes the ordered stick-breaking prior SPAN
+    ``π_{K-1} = (α/(α+1))^K ≈ e^{-1}`` makes the ordered geometric prior SPAN
     the whole dictionary (no atom structurally masked); floored at ``1.0`` so
     ``K = 1`` keeps the historical ``α = 1``.
     """
@@ -111,27 +104,19 @@ def gumbel_reciprocal_iter_schedule(tau_start: float, tau_min: float, iter_count
     return GumbelTemperatureSchedule(tau_start, tau_min, "reciprocal_iter", iter_count=iter_count)
 
 
-_TOPOLOGY_UNSET: Any = object()
-# #1777 — sentinel so `coord_sparsity` (primary) and its deprecated alias
-# `gate_sparsity` can each be detected as explicitly-passed-or-not.
-_COORD_SPARSITY_UNSET: Any = object()
-
-
-def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
+def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = None,
                      assignment: str = "softmax", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
-                     n_atoms: int | None = None,
                      sparsity_weight: float = 1.0,
-                     coord_sparsity: Any = _COORD_SPARSITY_UNSET,
-                     gate_sparsity: Any = _COORD_SPARSITY_UNSET, scad_mcp_gamma: float | None = None,
+                     coord_sparsity: str = "scad", scad_mcp_gamma: float | None = None,
                      smoothness_weight: float = 1.0,
-                     alpha: float | str | Any = _ALPHA_UNSET, learning_rate: float | None = None, random_state: int = 0,
+                     alpha: float | str | None = None, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
                      nuclear_norm_weight: float = 1.0, nuclear_norm_max_rank: int | None = None,
                      decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
-                     tau: float | None = None, jumprelu_threshold: float = 0.0,
+                     tau: float | None = None, threshold_gate_threshold: float = 0.0,
                      atom_basis: Any = None, fisher_factors: Any = None,
                      weights: Any = None,
                      separation_barrier_strength: float | None = None,
@@ -147,9 +132,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Response data matrix reconstructed by the SAE. It may be a finite 1D
         or 2D numeric array; 1D input is reshaped to ``(N, 1)``.
     K
-        Number of atoms. Must be positive, and the training set must satisfy
-        ``N > K``. ``n_atoms`` is an alias for ``K`` (#160); supplying both with
-        different values raises ``ValueError``.
+        Number of atoms. Must be positive.
     d_atom
         Intrinsic coordinate dimension per atom. Pass an int for a shared
         dimension or a length-``K`` iterable for heterogeneous atoms. ``None``
@@ -171,9 +154,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Assignment/gating family. ``"softmax"`` uses soft mixture masses and is
         the production default; at large ``K`` the fit derives a train-time
         ``top_k`` cap from rows per atom when the caller leaves ``top_k`` unset.
-        ``"ordered_beta_bernoulli"`` uses the IBP-MAP gate path as an explicit small-fit
-        research mode, and ``"threshold_gate"`` uses the
-        hard-sigmoid gate family (#1777, renamed from ``"jumprelu"``).
+        ``"ordered_beta_bernoulli"`` uses independent posterior-mean Bernoulli
+        gates with an ordered integrated Beta prior. ``"threshold_gate"`` uses
+        a smooth threshold-centered logistic gate.
         ``"topk"`` is the hard per-row support gate (``AssignmentMode::TopK``):
         it requires an explicit ``top_k`` (the fixed active-set size), carries
         no live gate coordinates, and is therefore the one assignment admitted
@@ -184,7 +167,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``"threshold_gate"``, and ``"topk"``.
     schedule
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
-        IBP/Gumbel assignment path.
+        ordered Beta--Bernoulli/Gumbel assignment path.
     isometry_weight
         Weight for ``IsometryPenalty`` on the latent coordinate block. Defaults
         to ``1.0`` (on). The Rust core compares ``g / gbar`` with the identity
@@ -217,22 +200,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     sparsity_weight
         Non-negative assignment sparsity strength.
     coord_sparsity
-        Coordinate-block sparsity penalty family (#1777, primary name for the
-        former ``gate_sparsity``). The default ``"scad"`` enables adaptive
-        non-convex sparsity for the recommended research objective. ``"l1"``
-        keeps the historical assignment-prior sparsity path. ``"scad"`` and
+        Coordinate-block sparsity penalty family. The default ``"scad"``
+        enables adaptive non-convex sparsity. ``"l1"`` uses the assignment
+        prior sparsity path. ``"scad"`` and
         ``"mcp"`` emit the SAE row-block ``ScadMcpPenalty`` on the ``"t"``
         latent block with ``weight=sparsity_weight``.
-    gate_sparsity
-        Deprecated alias for ``coord_sparsity`` (#1777). Supplying both with
-        different values raises ``ValueError``.
     separation_barrier_strength
         Optional per-fit value for this term's decoder-repulsion conditioner.
         ``None`` (default) uses the canonical evidence-derived strength; a finite
         value pins the strength for this fit. Threaded into the Rust
         ``SaeFitConfig``.
     ordered_beta_bernoulli_alpha
-        Optional per-fit IBP-α value, which controls the ordered geometric
+        Optional per-fit ordered Beta--Bernoulli-α value, which controls the ordered geometric
         assignment prior. ``None`` uses the assignment mode's canonical fixed or
         learnable value; an explicit value pins α for this fit. Threaded into
         the Rust ``SaeFitConfig``.
@@ -251,7 +230,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         records ``alpha=1.0`` and ``learnable_alpha=True`` in that case. If left
         unset with an explicit ``ordered_beta_bernoulli`` gate, the concentration defaults to
         the K-aware ``default_ordered_beta_bernoulli_concentration_for_k_atoms(K) ≈ K − 1/2`` (#1784)
-        so the ordered stick-breaking prior spans the whole dictionary instead of
+        so the ordered geometric prior spans the whole dictionary instead of
         masking every atom past the first few (which underfit an equal-K linear
         dictionary and left the K=128 fit rank-deficient). A per-fit ``ordered_beta_bernoulli_alpha``
         overrides it.
@@ -267,8 +246,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         whitening while disabling evidence-certified atom birth. Coerced to
         ``bool``.
     learning_rate
-        Damped Newton/Gauss-Newton step size. If omitted, the Python facade uses
-        ``1.0`` for IBP/softmax and ``0.05`` for JumpReLU.
+        Damped Newton/Gauss-Newton step size. If omitted, the facade uses
+        ``1.0`` for ordered Beta--Bernoulli/softmax and ``0.05`` for the smooth
+        threshold gate.
     random_state
         Integer seed forwarded to the Rust initializer.
     block_orthogonality_weight
@@ -307,8 +287,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     tau
         Starting assignment temperature. If ``None`` (the default), it is
         inferred from ``schedule`` or defaults to ``0.5``.
-    jumprelu_threshold
-        JumpReLU hard-gate threshold. Must be finite. Defaults to ``0.0``.
+    threshold_gate_threshold
+        Center of the smooth threshold gate. Must be finite. Defaults to ``0.0``.
     atom_basis
         Per-atom basis kind(s). If supplied with ``atom_topology``, both must
         resolve to the same topology.
@@ -345,8 +325,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         and ``assignment_label``, ``penalized_loss_score``, ``reconstruction_r2``,
         ``dispersion``, ``training_mean``, ``low_level_logits``, and fit-control metadata including ``alpha``,
         ``learnable_alpha``, ``tau``, ``sparsity_strength``, ``smoothness``,
-        ``learning_rate``, ``max_iter``, ``random_state``, ``top_k``, and
-        ``jumprelu_threshold``. Each atom exposes ``basis``,
+        ``learning_rate``, ``max_iter``, ``random_state``, and ``top_k``. Each
+        atom exposes ``basis``,
         ``decoder_coefficients`` ``(M_k, p)``, per-atom ``assignments`` ``(N,)``,
         recovered ``coords`` ``(N, d_k)``, ``evidence``, ``active_dim``,
         ``decoder_covariance`` ``(M_k*p, M_k*p)``, ``shape_band_coords``
@@ -360,44 +340,15 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     if X is None:
         raise TypeError("sae_manifold_fit requires X input array")
     x = _as_2d_float(X, "X")
-    # `K` and `n_atoms` are aliases for the number of atoms (#160). If both are
-    # supplied with DIFFERENT values, raise an eager ValueError naming both;
-    # equal values pass through. Resolve before any Rust call.
-    if K is not None and n_atoms is not None and int(K) != int(n_atoms):
-        raise ValueError(
-            f"K and n_atoms both supplied with different values "
-            f"({int(K)} vs {int(n_atoms)}); pass only one (they are aliases)."
-        )
-    k_resolved = K if K is not None else n_atoms
-    k_atoms = int(k_resolved if k_resolved is not None else 0)
+    k_atoms = int(K if K is not None else 0)
     max_iter_total = int(n_iter)
     smoothness = float(smoothness_weight)
     sparsity = float(sparsity_weight)
-    # #1777 — `coord_sparsity` is the primary name for the coordinate-block penalty
-    # family; `gate_sparsity` is retained as a deprecated alias. Both normalize to a
-    # single resolved value; supplying both with conflicting values raises.
-    coord_given = coord_sparsity is not _COORD_SPARSITY_UNSET
-    gate_given = gate_sparsity is not _COORD_SPARSITY_UNSET
-    if coord_given and gate_given:
-        if str(coord_sparsity).strip().lower() != str(gate_sparsity).strip().lower():
-            raise ValueError(
-                "coord_sparsity and gate_sparsity (a deprecated alias) were both "
-                f"supplied with different values ({coord_sparsity!r} vs "
-                f"{gate_sparsity!r}); pass only coord_sparsity."
-            )
-        coord_sparsity_resolved = coord_sparsity
-    elif coord_given:
-        coord_sparsity_resolved = coord_sparsity
-    elif gate_given:
-        coord_sparsity_resolved = gate_sparsity
-    else:
-        coord_sparsity_resolved = "scad"
-    gate_sparsity = coord_sparsity_resolved
-    gate_sparsity_kind = str(coord_sparsity_resolved).strip().lower()
-    if gate_sparsity_kind not in {"l1", "scad", "mcp"}:
+    coord_sparsity_kind = str(coord_sparsity).strip().lower()
+    if coord_sparsity_kind not in {"l1", "scad", "mcp"}:
         raise ValueError(
-            "coord_sparsity (alias gate_sparsity) must be one of 'l1', 'scad', or "
-            f"'mcp'; got {coord_sparsity_resolved!r}"
+            "coord_sparsity must be one of 'l1', 'scad', or "
+            f"'mcp'; got {coord_sparsity!r}"
         )
     # #1777 — per-fit overrides must be finite when supplied; ordered_beta_bernoulli_alpha must be
     # strictly positive (it scales the ordered geometric assignment prior).
@@ -416,11 +367,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         )
     promote_from_residual = bool(promote_from_residual)
     if scad_mcp_gamma is None:
-        scad_mcp_gamma_value = 3.7 if gate_sparsity_kind == "scad" else 2.5
+        scad_mcp_gamma_value = 3.7 if coord_sparsity_kind == "scad" else 2.5
     else:
         scad_mcp_gamma_value = float(scad_mcp_gamma)
     tau = float(tau if tau is not None else _schedule_tau_start(schedule, 0.5))
-    jumprelu_threshold = float(jumprelu_threshold)
+    threshold_gate_threshold = float(threshold_gate_threshold)
     if k_atoms <= 0:
         raise ValueError(f"K must be positive, got {k_atoms}")
     if max_iter_total < 1:
@@ -508,21 +459,22 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"sparsity_weight must be finite and non-negative; got {sparsity}"
         )
-    if gate_sparsity_kind == "scad":
+    if coord_sparsity_kind == "scad":
         if not (np.isfinite(scad_mcp_gamma_value) and scad_mcp_gamma_value > 2.0):
             raise ValueError(
                 "scad_mcp_gamma must be finite and > 2 for coord_sparsity='scad'; "
                 f"got {scad_mcp_gamma_value}"
             )
-    elif gate_sparsity_kind == "mcp":
+    elif coord_sparsity_kind == "mcp":
         if not (np.isfinite(scad_mcp_gamma_value) and scad_mcp_gamma_value > 1.0):
             raise ValueError(
                 "scad_mcp_gamma must be finite and > 1 for coord_sparsity='mcp'; "
                 f"got {scad_mcp_gamma_value}"
             )
-    if not np.isfinite(jumprelu_threshold):
+    if not np.isfinite(threshold_gate_threshold):
         raise ValueError(
-            f"jumprelu_threshold must be finite; got {jumprelu_threshold}"
+            "threshold_gate_threshold must be finite; got "
+            f"{threshold_gate_threshold}"
         )
     # Gauge-invariance of the topology evidence (issue #673, resolved). The
     # decoder smoothness penalty is reparameterized by the decoder pullback
@@ -567,7 +519,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"decoder_incoherence_weight must be finite and non-negative; "
             f"got {decoder_incoherence_weight}"
         )
-    topology_supplied = atom_topology is not _TOPOLOGY_UNSET
+    topology_supplied = atom_topology is not None
     # Magic default (#2238/#2239): when the caller names no topology, every
     # atom is seeded "auto" and the Rust fit entry races circle / torus /
     # sphere / flat-2-D per atom by REML evidence over its seed cluster —
@@ -592,8 +544,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"supplied; they must describe the same topology."
         )
     kind = _canonical_assignment(assignment, "assignment")
-    # #1784 — K-aware default IBP concentration. When the caller does not set
-    # `alpha` and explicitly chooses the ordered stick-breaking `ordered_beta_bernoulli` gate,
+    # #1784 — K-aware default ordered Beta--Bernoulli concentration. When the caller does not set
+    # `alpha` and explicitly chooses the ordered geometric `ordered_beta_bernoulli` gate,
     # default the concentration to `default_ordered_beta_bernoulli_concentration_for_k_atoms(K)`
     # so the prior SPANS the whole dictionary instead of collapsing to a near-hard
     # mask past the first ~3 atoms (the fixed `alpha=1.0` failure that made the
@@ -603,7 +555,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # `alpha="auto"` (learnable) and every
     # non-`ordered_beta_bernoulli` gate keep the historical `1.0` seed.
     alpha_is_auto = alpha == "auto"
-    if alpha is _ALPHA_UNSET:
+    if alpha is None:
         if kind == "ordered_beta_bernoulli" and ordered_beta_bernoulli_alpha is None:
             alpha_value = _default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms)
         else:
@@ -613,12 +565,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         alpha_value = 1.0 if alpha_is_auto else float(alpha)
     # Magic-by-default learning rate: the SAE Newton kernel is a damped
     # Gauss-Newton step against a quadratic local model with Armijo
-    # backtracking. For softmax / IBP-MAP assignments the natural full step
+    # backtracking. For softmax / ordered Beta--Bernoulli assignments the natural full step
     # is `lr=1.0` (matches the Rust reference test
     # `sae_manifold_fit_10_steps_one_harmonic_reaches_high_r2`, which reaches
     # R² ≥ 0.95 in 10 steps from a phase-shifted init). A small literal
     # `lr=0.05` starves the assignment posterior of gradient mass and lets
-    # the IBP sigmoid drift into the saturated tail (the issue #165
+    # the ordered Beta--Bernoulli sigmoid drift into the saturated tail (the issue #165
     # collapse: assignment mass ~1e-146). The ThresholdGate (#1777, formerly
     # "jumprelu") keeps the historical smaller step because its hard-gate STE is
     # more sensitive to overshooting the threshold. Callers can still override.
@@ -627,7 +579,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     else:
         effective_lr = float(learning_rate)
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
-        ("ScadMcpPenalty", gate_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0),
+        ("ScadMcpPenalty", coord_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0),
         ("MechanismSparsityPenalty", decoder_feature_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0),
         ("NuclearNormPenalty", nuclear_norm_weight > 0.0),
@@ -639,7 +591,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # previously these knobs only populated `primitive_names` metadata.
     analytic_penalties_json = _build_analytic_penalties_payload(
         isometry_weight=isometry_weight,
-        gate_sparsity=gate_sparsity_kind,
+        coord_sparsity=coord_sparsity_kind,
         sparsity_weight=sparsity,
         scad_mcp_gamma=scad_mcp_gamma_value,
         decoder_feature_sparsity_groups=decoder_feature_sparsity_groups,
@@ -739,7 +691,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             )
     # SPEC: the SAE fit is a Rust solver. All fits route through the
     # `sae_manifold_fit_minimal` FFI; the former numpy closed-form "fast path"
-    # (disjoint-periodic top-1 / dense-periodic IBP-LSQ) was a Python
+    # (disjoint-periodic top-1 / dense-periodic ordered Beta--Bernoulli-LSQ) was a Python
     # reimplementation of the Rust joint fit and has been removed.
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
@@ -759,7 +711,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         top_k=top_k_arg,
         initial_logits=logits_init,
         initial_coords=coords_init,
-        jumprelu_threshold=float(jumprelu_threshold),
+        threshold_gate_threshold=float(threshold_gate_threshold),
         # #240: `ard_per_atom` is the user-facing ARD switch. The ONLY thing that
         # actually enables/disables ARD in the SAE objective is the native
         # `ArdAxisPrior`, gated by `native_ard_enabled` (it sizes each atom's
@@ -806,7 +758,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         int(max_iter_total),
         int(random_state),
         top_k_arg,
-        float(jumprelu_threshold),
+        float(threshold_gate_threshold),
         fisher_factors=(
             None if fisher_shard is None else np.ascontiguousarray(fisher_shard[0])
         ),
@@ -1214,7 +1166,7 @@ def sae_manifold_fit_stagewise(
         Inner coordinate / β ridges for the stagewise fits.
     alpha, tau
         Assignment concentration / temperature. ``None`` resolves to the seed
-        fit's values (K-aware IBP α when ``assignment="ordered_beta_bernoulli"``; τ = 0.5).
+        fit's values (K-aware ordered Beta--Bernoulli α when ``assignment="ordered_beta_bernoulli"``; τ = 0.5).
     random_state
         Seed forwarded to the K=1 seed fit's initializer.
     progress_callback

@@ -663,7 +663,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // (or, on the first structured pass, the MEASURED iid anchor φ̂·I —
     // `isotropic_dispersion`, #2243 cap #2: a unit-I anchor assumed unit noise,
     // so near-noiseless factors were whitened ~1/φ̂ too coarsely and the
-    // unit-dispersion REML criterion over-penalized them; anchoring at the
+    // unit-dispersion penalized LAML criterion over-penalized them; anchoring at the
     // measured scale prices the smoothing penalty against the real
     // dispersion). A small, increasing γ schedule
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while

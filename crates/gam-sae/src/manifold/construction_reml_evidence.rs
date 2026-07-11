@@ -21,7 +21,7 @@ impl SaeManifoldTerm {
     ///
     /// Runs the inner `(t, β)` arrow-Schur Newton solve to convergence at the
     /// supplied ρ (with NO in-loop ARD update — ρ is owned by the engine),
-    /// then forms the Laplace/REML cost
+    /// then forms the penalized LAML cost
     ///
     /// ```text
     /// V(ρ) = ℓ_pen(t̂, β̂; ρ) + ½ log|H(t̂, β̂; ρ)|
@@ -127,12 +127,12 @@ impl SaeManifoldTerm {
         )?;
         if plan.streaming {
             // #1225: streaming and dense MUST optimize the SAME mathematical
-            // objective — the full REML criterion `loss.total() + extra_penalty +
+            // objective — the full penalized LAML criterion `loss.total() + extra_penalty +
             // ½ log|H| − Occam`. The streaming branch previously returned only
             // `loss.total() + extra_penalty_energy`, dropping the Laplace
             // normalizer `½ log|H|` and the Occam term, so large shapes (exactly
             // where streaming is needed) were ranked by penalized loss rather than
-            // REML — and dense vs streaming disagreed on the objective. Route
+            // penalized LAML — and dense vs streaming disagreed on the objective. Route
             // through the streaming exact-logdet path, which assembles the same
             // chunk-by-chunk-bit-identical `½ log|H|_stream` and the same
             // `−Occam`/extra-penalty terms as the dense `penalized_laml_criterion_with_cache`
@@ -211,7 +211,7 @@ impl SaeManifoldTerm {
             self.k_atoms(),
         )?;
         if !admission_plan.direct_logdet_admitted() {
-            // The cache-returning REML entry is used by the EFS/outer lanes that
+            // The cache-returning penalized-LAML entry is used by the EFS/outer lanes that
             // need selected-inverse traces in addition to the scalar evidence.
             // Large SAE fits cannot form the dense `N · q · border_dim`
             // evidence slab (`q = K(1+d)`, `border_dim = Σ_k M_k · p`), so the
@@ -254,7 +254,7 @@ impl SaeManifoldTerm {
         //    mode so `arrow_log_det_from_cache` returns the exact
         //    `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects damped
         //    factors and InexactPCG caches, which have no dense Schur factor).
-        //    This is the same evidence convention the main GAM REML path uses.
+        //    This is the same evidence convention the main GAM penalized-LAML path uses.
         //    The shared `converge_inner_for_undamped_logdet` driver guarantees
         //    the per-row `H_tt^(i)` blocks are PD at the converged optimum so
         //    the undamped (`ridge = 0`) factorization succeeds — the streaming
@@ -586,7 +586,7 @@ impl SaeManifoldTerm {
     /// Drive the inner `(t, β)` Newton solve to the KKT/step-converged optimum
     /// and return the final UNDAMPED (`ridge = 0`) joint-Hessian factor cache.
     ///
-    /// The Laplace normaliser `½log|H|` is only the correct REML criterion at
+    /// The Laplace normaliser `½log|H|` is only the correct penalized LAML criterion at
     /// the inner optimum `(t̂, β̂)`, so the criterion must refine the inner state
     /// until either the KKT gradient or the undamped Newton step meets tolerance
     /// before factoring. Crucially, **at the converged optimum the per-row
@@ -755,7 +755,7 @@ impl SaeManifoldTerm {
                 ));
             }
             // #2080 criterion-cost restructure — the Laplace normaliser ½log|H|
-            // is the REML criterion ONLY at the inner KKT optimum, so the FULL
+            // is the penalized LAML criterion ONLY at the inner KKT optimum, so the FULL
             // undamped Direct factorization (dense border β-Schur assembly
             // `O(n·q·k²)` plus the `O(k³)` border Cholesky / eigen-floor, with
             // `k = border_dim = Σ_k M_k·p`) is taken exactly ONCE — at the
@@ -908,7 +908,7 @@ impl SaeManifoldTerm {
                         // refine budget (up to `4×inner_max_iter`, and historically
                         // the accepted `16×/64×` via `penalized_laml_criterion_with_cache`) on
                         // every overshooting line-search / FD probe is exactly the
-                        // wide-`p` outer REML hang (#2080). Return the typed refusal
+                        // wide-`p` outer penalized-LAML hang (#2080). Return the typed refusal
                         // after this single diagnostic factor pass;
                         // `is_recoverable_value_probe_refusal` maps it to the finite
                         // infeasibility wall.
@@ -4178,7 +4178,7 @@ impl SaeManifoldTerm {
         // UNCONDITIONALLY, so the θ-adjoint differentiates the MAJORIZED channels
         // (clamped `cross_row_d`, gated `cross_row_dd`/`m_channel`/
         // `local_logit_third`) — the exact derivative of the operator the evidence
-        // log-det factors, on every ordered Beta--Bernoulli path. Anything else desyncs the outer-REML
+        // log-det factors, on every ordered Beta--Bernoulli path. Anything else desyncs the outer penalized-LAML
         // gradient from the evidence (#2087).
         // gam#2144: whitening of the row jets tracks `whitens_likelihood()` at ANY
         // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike) and is

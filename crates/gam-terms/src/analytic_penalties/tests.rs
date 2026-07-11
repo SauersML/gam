@@ -921,17 +921,17 @@ fn learnable_weights_stay_finite_at_extreme_rho() {
         assert!(diag.iter().all(|entry| entry.is_finite()));
     }
 
-    let jump = JumpReLUPenalty::new(PsiSlice::full(2, Some(1)), array![1.0_f64], 0.5, 0.1).unwrap();
+    let jump = SmoothThresholdPenalty::new(PsiSlice::full(2, Some(1)), array![1.0_f64], 0.5, 0.1).unwrap();
     let jump_target = array![0.0_f64, 0.2];
     for rho in [array![1000.0_f64], array![-1000.0_f64]] {
         let value = jump.value(jump_target.view(), rho.view());
         let grad = jump.grad_target(jump_target.view(), rho.view());
         let diag = jump
             .hessian_diag(jump_target.view(), rho.view())
-            .expect("JumpReLU exposes a diagonal Hessian");
+            .expect("smooth threshold exposes a diagonal Hessian");
         assert!(
             value.is_finite(),
-            "JumpReLU value non-finite at rho={rho:?}"
+            "smooth-threshold value non-finite at rho={rho:?}"
         );
         assert!(grad.iter().all(|entry| entry.is_finite()));
         assert!(diag.iter().all(|entry| entry.is_finite()));
@@ -1129,12 +1129,12 @@ fn isometry_gn_majorizer_matches_exact_hvp_at_zero_residual() {
     }
 }
 
-/// Build the canonical JumpReLU sweep fixture: a logit grid that straddles
+/// Build the canonical smooth-threshold sweep fixture: a logit grid that straddles
 /// each per-axis scaled threshold so the gate `g = σ((z − τ)/ε)` sweeps both
 /// sides of its inflection `g = ½`, where the true Hessian
 /// `wτ·g(1−g)(1−2g)/ε²` changes sign.
-fn jumprelu_sweep_fixture() -> (
-    JumpReLUPenalty,
+fn smooth_threshold_sweep_fixture() -> (
+    SmoothThresholdPenalty,
     Array1<f64>,
     Array1<f64>,
     [f64; 2],
@@ -1155,13 +1155,14 @@ fn jumprelu_sweep_fixture() -> (
     }
     let target_values = Array1::from_vec(values);
     let slice = PsiSlice::full(target_values.len(), Some(latent_dim));
-    let pen = JumpReLUPenalty::new(slice, thresholds, weight, eps).expect("valid JumpReLU penalty");
+    let pen = SmoothThresholdPenalty::new(slice, thresholds, weight, eps)
+        .expect("valid smooth-threshold penalty");
     (pen, target_values, rho, scaled_thresholds, eps, weight)
 }
 
 #[test]
-fn jumprelu_hessian_diag_is_exact_true_second_derivative() {
-    let (pen, target_values, rho, scaled_thresholds, eps, weight) = jumprelu_sweep_fixture();
+fn smooth_threshold_hessian_diag_is_exact_true_second_derivative() {
+    let (pen, target_values, rho, scaled_thresholds, eps, weight) = smooth_threshold_sweep_fixture();
     let latent_dim = scaled_thresholds.len();
     // `hessian_diag` must be the EXACT diagonal second derivative of the
     // smoothed jump penalty `P(z) = wτ·σ((z − τ)/ε)`:
@@ -1169,7 +1170,7 @@ fn jumprelu_hessian_diag_is_exact_true_second_derivative() {
     // This is the true (indefinite) Hessian, not the PSD majorizer.
     let diag = pen
         .hessian_diag(target_values.view(), rho.view())
-        .expect("JumpReLU exposes an analytic diagonal Hessian");
+        .expect("smooth threshold exposes an analytic diagonal Hessian");
 
     let mut saw_negative = false;
     for (idx, &entry) in diag.iter().enumerate() {
@@ -1179,7 +1180,7 @@ fn jumprelu_hessian_diag_is_exact_true_second_derivative() {
             / (eps * eps);
         assert!(
             entry.is_finite(),
-            "JumpReLU hessian_diag must be finite at index {idx}; entry={entry}"
+            "smooth-threshold hessian_diag must be finite at index {idx}; entry={entry}"
         );
         assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         if entry < 0.0 {
@@ -1191,18 +1192,18 @@ fn jumprelu_hessian_diag_is_exact_true_second_derivative() {
     // catch any regression back to the always-nonnegative PSD surrogate.
     assert!(
         saw_negative,
-        "true JumpReLU hessian_diag must go negative once the gate passes g = ½"
+        "true smooth-threshold hessian_diag must go negative once the gate passes g = ½"
     );
 }
 
 #[test]
-fn jumprelu_hvp_diagonal_matches_hessian_diag() {
-    let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) = jumprelu_sweep_fixture();
+fn smooth_threshold_hvp_diagonal_matches_hessian_diag() {
+    let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) = smooth_threshold_sweep_fixture();
     // `hvp` and `hessian_diag` are the SAME true operator; probing `hvp`
     // with unit vectors must reproduce `hessian_diag` exactly.
     let diag = pen
         .hessian_diag(target_values.view(), rho.view())
-        .expect("JumpReLU exposes an analytic diagonal Hessian");
+        .expect("smooth threshold exposes an analytic diagonal Hessian");
     for i in 0..target_values.len() {
         let mut e_i = Array1::<f64>::zeros(target_values.len());
         e_i[i] = 1.0;
@@ -1212,8 +1213,8 @@ fn jumprelu_hvp_diagonal_matches_hessian_diag() {
 }
 
 #[test]
-fn jumprelu_psd_majorizer_diag_is_psd_over_logit_sweep() {
-    let (pen, target_values, rho, scaled_thresholds, eps, weight) = jumprelu_sweep_fixture();
+fn smooth_threshold_psd_majorizer_diag_is_psd_over_logit_sweep() {
+    let (pen, target_values, rho, scaled_thresholds, eps, weight) = smooth_threshold_sweep_fixture();
     let latent_dim = scaled_thresholds.len();
     // The PSD majorizer is a DISTINCT operator from the true Hessian. The
     // bare re-weighted-ℓ₂ surrogate wτ·[g(1−g)]²/ε² is ≥ 0 but does NOT
@@ -1225,10 +1226,10 @@ fn jumprelu_psd_majorizer_diag_is_psd_over_logit_sweep() {
     // block consumes this, not `hessian_diag`.
     let diag = pen
         .psd_majorizer_diag(target_values.view(), rho.view())
-        .expect("JumpReLU exposes a PSD diagonal majorizer");
+        .expect("smooth threshold exposes a PSD diagonal majorizer");
     let exact = pen
         .hessian_diag(target_values.view(), rho.view())
-        .expect("JumpReLU exposes a closed-form diagonal Hessian");
+        .expect("smooth threshold exposes a closed-form diagonal Hessian");
 
     for (idx, &entry) in diag.iter().enumerate() {
         let axis = idx % latent_dim;
@@ -1240,7 +1241,7 @@ fn jumprelu_psd_majorizer_diag_is_psd_over_logit_sweep() {
             weight * scaled_thresholds[axis] * reweighted_l2.max(abs_exact) / (eps * eps);
         assert!(
             entry.is_finite() && entry >= 0.0,
-            "JumpReLU psd_majorizer_diag must be finite and PSD at index {idx}; entry={entry}"
+            "smooth-threshold psd_majorizer_diag must be finite and PSD at index {idx}; entry={entry}"
         );
         assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         // The defining contract: the majorizer dominates the exact Hessian.

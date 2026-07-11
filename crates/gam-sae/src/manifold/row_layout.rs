@@ -132,17 +132,6 @@ impl SaeRowLayout {
         )
     }
 
-    /// Build from explicit per-row active-atom index lists. Every active atom is
-    /// logit-bearing (the column-separable ordered Beta--Bernoulli chart). For the
-    /// reduced SOFTMAX chart use [`Self::from_active_atoms_with_reference`].
-    pub(crate) fn from_active_atoms(
-        active_atoms: Vec<Vec<usize>>,
-        coord_dims: Vec<usize>,
-        coord_offsets_full: Vec<usize>,
-    ) -> Self {
-        Self::from_active_atoms_with_reference(active_atoms, coord_dims, coord_offsets_full, None)
-    }
-
     /// Build honoring an optional `reference_atom` that carries a COORD block but
     /// NO free logit slot (softmax's pinned reference `K−1`). When a row's active
     /// set contains it, it is excluded from `logit_atoms` but kept in

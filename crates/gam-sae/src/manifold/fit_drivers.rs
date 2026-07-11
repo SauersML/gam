@@ -3341,7 +3341,7 @@ impl SaeManifoldTerm {
             // grows geometrically and the "residual ≈ target" invariant every reseed
             // relies on (see the reseed rationale above) is violated — the bounded
             // multi-start degenerates into a runaway whose blown-up decoders also
-            // corrupt the outer REML evidence, and the host process is SIGKILLed
+            // corrupt the outer penalized-LAML evidence, and the host process is SIGKILLed
             // (OOM / watchdog, exit 137) before any model or error is returned.
             //
             // A reseed is therefore RETAINED only when it is the new best basin under
@@ -5210,7 +5210,7 @@ impl SaeManifoldTerm {
     /// becomes full-rank by construction, the decoder is the rank-`r_k` oracle
     /// `B̃ = Q_kᵀ B`, the roughness Gram is `Q_kᵀ S Q_k`, and the evaluator is
     /// wrapped so the reduction survives every basis refresh. The inner solve no
-    /// longer descends a flat valley and the outer REML log-det is well-posed —
+    /// longer descends a flat valley and the outer penalized-LAML log-det is well-posed —
     /// no step-time deflation, ridge floor, or post-fit projection needed for
     /// the deficiency. The depth decision is made ONCE here, before the outer
     /// loop, so it is held fixed across the inner Newton walk.
@@ -5502,19 +5502,19 @@ impl SaeManifoldTerm {
         // not the fitted `t`/assignment excite them; on a near-degenerate
         // checkpoint (OLMo `stage1-step0` PCA-32: data Gram rank `3/5`) the
         // unexcited columns make the decoder design rank-deficient BY
-        // CONSTRUCTION, flattening the outer REML surface so BFGS stalls. We
+        // CONSTRUCTION, flattening the outer penalized-LAML surface so BFGS stalls. We
         // discover the data-supported subspace `Q_k = range(G_k)` ONCE here from
         // the bare data Gram and, for any rank-deficient atom, REPARAMETRIZE its
         // basis onto that subspace (`Φ̃ = Φ Q_k`, `B̃ = Q_kᵀ B`, `S̃ = Q_kᵀ S Q_k`,
         // and a `SubspaceReducedEvaluator` so the reduction survives every
         // refresh). The reduced design is full-rank, so the identifiability audit
         // passes, the frame profiles the reduced block, the inner solve needs no
-        // step-time deflation, and the outer REML log-det is well-conditioned —
+        // step-time deflation, and the outer penalized-LAML log-det is well-conditioned —
         // this SUPERSEDES the prior data-null projector deflation + post-fit
         // range projection for the rank-deficiency case. The depth decision is
         // made once here and held FIXED across the inner Newton walk. A full-rank
         // atom (`base`/`step_2300`, `r_k == M_k`) is left untouched, so its
-        // design, decoder, and REML criterion are byte-for-byte the historical
+        // design, decoder, and penalized LAML criterion are byte-for-byte the historical
         // full-`B` path.
         self.reduce_atoms_to_data_supported_rank()?;
         // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
@@ -5628,7 +5628,7 @@ impl SaeManifoldTerm {
         }
         // #1026/#2230 — keep the best state found inside this bounded inner
         // solve, keyed on the PENALIZED OBJECTIVE (`prefer_candidate_state`):
-        // the same scalar the Armijo lane descends and the outer REML evidence
+        // the same scalar the Armijo lane descends and the outer penalized-LAML evidence
         // consumes. The incumbent exists to undo damage from the NON-monotone
         // boundary hooks (collapse reseeds, gauge retraction/pin, frame
         // refresh) — the Armijo walk itself is objective-monotone, so under
@@ -6376,7 +6376,7 @@ impl SaeManifoldTerm {
             // co-collapse for this input — every atom's decoder co-vanished and no
             // residual structure could anchor `K` distinct charts. The guard has
             // already restored the best basin it banked, so continuing the outer
-            // loop (and the outer-REML ρ-search that drives it) only re-derives the
+            // loop (and the outer-penalized-LAML ρ-search that drives it) only re-derives the
             // same degenerate basin at cost. Return a typed error so the FFI raises
             // a diagnosable Python exception PROMPTLY instead of thrashing toward a
             // useless model. Gated to genuine, budget-exhausted TOTAL co-collapse:
@@ -6592,7 +6592,7 @@ impl SaeManifoldTerm {
         // never reached this polish before.
         //
         // CRITICAL: the gate is the PENALIZED objective total — the exact same
-        // scalar the inner Armijo line search and the outer REML evidence engine
+        // scalar the inner Armijo line search and the outer penalized-LAML evidence engine
         // consume (`penalized_objective_total(target, rho, analytic_penalties, 1.0)`)
         // — NOT raw reconstruction EV. The decoder refit is an UNPENALIZED data-fit
         // least squares (and the coordinate re-projection is pure data-fit too), so a

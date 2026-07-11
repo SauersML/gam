@@ -742,7 +742,7 @@ class RiemannianGradientDescent(Optimizer):
                         continue
                     if param.dim() != 2:
                         raise ValueError(
-                            "RiemannianRetraction parameters must be 2-D row batches"
+                            "RiemannianGradientDescent parameters must be 2-D row batches"
                         )
                     out = rust_module().riemannian_gradient_step(
                         manifold_json,

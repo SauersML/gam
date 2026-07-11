@@ -23,13 +23,13 @@ def setup_module(module) -> None:  # noqa: D401 - pytest hook
 
 
 def test_spd_step_metric_raises_differential_and_enables_closure_grad() -> None:
-    from gamfit.torch import RiemannianRetraction
+    from gamfit.torch import RiemannianGradientDescent
 
     point = torch.nn.Parameter(
         torch.tensor([[2.0, 0.0, 0.0, 1.0]], dtype=torch.float64)
     )
     learning_rate = 0.05
-    optimizer = RiemannianRetraction([point], {"kind": "spd", "n": 2}, lr=learning_rate)
+    optimizer = RiemannianGradientDescent([point], {"kind": "spd", "n": 2}, lr=learning_rate)
     closure_calls = 0
 
     def closure() -> torch.Tensor:
@@ -65,7 +65,7 @@ def test_spd_step_metric_raises_differential_and_enables_closure_grad() -> None:
 
 
 def test_stiefel_step_uses_canonical_riesz_representative() -> None:
-    from gamfit.torch import RiemannianRetraction
+    from gamfit.torch import RiemannianGradientDescent
 
     y = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=torch.float64)
     differential = torch.tensor(
@@ -75,7 +75,7 @@ def test_stiefel_step_uses_canonical_riesz_representative() -> None:
     point.grad = differential.reshape(1, -1).clone()
     learning_rate = 1.0e-7
 
-    optimizer = RiemannianRetraction(
+    optimizer = RiemannianGradientDescent(
         [point], {"kind": "stiefel", "k": 2, "n": 3}, lr=learning_rate
     )
     optimizer.step()
@@ -96,9 +96,9 @@ def test_stiefel_step_uses_canonical_riesz_representative() -> None:
 
 
 def test_inner_steps_api_is_removed() -> None:
-    from gamfit.torch import RiemannianRetraction
+    from gamfit.torch import RiemannianGradientDescent
 
     point = torch.nn.Parameter(torch.tensor([[1.0]], dtype=torch.float64))
-    constructor: Any = RiemannianRetraction
+    constructor: Any = RiemannianGradientDescent
     with pytest.raises(TypeError, match="inner_steps"):
         constructor([point], {"kind": "euclidean", "dim": 1}, inner_steps=2)

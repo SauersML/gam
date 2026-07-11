@@ -599,7 +599,7 @@ impl SaeManifoldTerm {
     /// #1610 — the EVIDENCE-DERIVED data-fit INSEPARABILITY `γ_jk ∈ [0, 1]` of a
     /// coactive atom pair: the largest canonical correlation between the two atoms'
     /// coactivation-weighted chart-design column spaces. This is the quantity that
-    /// decides whether the SAE's joint inner (Laplace/REML) Hessian stays positive
+    /// decides whether the SAE's joint inner (penalized LAML) Hessian stays positive
     /// definite — i.e. whether the model evidence is even DEFINED — so it is read
     /// straight off the reconstruction objective, not from a rank-count heuristic.
     ///
@@ -765,7 +765,7 @@ impl SaeManifoldTerm {
     /// `μ_C`), a subdominant Gauss–Newton nudge on near-collinear co-firing pairs.
     ///
     /// The repulsion is an interior-point SAFEGUARD whose job is to help keep the
-    /// joint inner (Laplace/REML) Hessian positive definite; it is NOT statistical
+    /// joint inner (penalized LAML) Hessian positive definite; it is NOT statistical
     /// shrinkage. The principled strength is the reciprocal-margin to the data-fit's
     /// co-collapse boundary, the data-fit inseparability `γ_jk`
     /// ([`Self::design_inseparability_with_gates`]): the whitened data Hessian loses
@@ -1707,7 +1707,7 @@ impl SaeManifoldTerm {
             // `½λ(t_after²−t_before²)` across the cut, so a near-zero Newton step
             // crossing the cut changes the line-search objective discontinuously
             // and Armijo rejects it. Skip it on every SAE path so the von-Mises
-            // built-in is the single source of truth (matching the REML criterion,
+            // built-in is the single source of truth (matching the penalized LAML criterion,
             // which already scores only `loss.ard`).
             if matches!(penalty, AnalyticPenaltyKind::Ard(_)) {
                 continue;
@@ -2161,7 +2161,7 @@ impl SaeManifoldTerm {
         // `is_euclidean()` instead wrongly dropped the cross-block for the
         // single-circle fit, leaving a block-diagonal Hessian that misses the
         // strong isometry `t`↔`B` coupling; the joint Newton step then never
-        // reaches the KKT stationarity the REML criterion now requires, and the
+        // reaches the KKT stationarity the penalized LAML criterion now requires, and the
         // arrow-Schur proximal ridge saturates at 1e15 (issue #795, a regression
         // of #681). For a genuinely curved chart (Sphere, an active Interval
         // boundary) we contribute only the PSD `htt` diagonal block and DROP the
@@ -2491,7 +2491,7 @@ pub(crate) fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) 
 /// single registry entry dispatches cleanly across atoms whose coordinate dims
 /// differ (issue F6). For these the assembled value / gradient / curvature is
 /// *exactly* the sum of the per-atom energies — the same additive
-/// decomposition the Laplace/REML evidence log-det already sums per atom — so
+/// decomposition the penalized LAML evidence log-det already sums per atom — so
 /// admitting them on a mixed `{d=1 circle, d=2 patch, linear}` dictionary keeps
 /// the evidence exact with zero padding or truncation.
 ///

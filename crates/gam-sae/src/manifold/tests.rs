@@ -1233,7 +1233,12 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     let coord_dims = vec![1usize, 1usize];
     let coord_offsets = term.assignment.coord_offsets();
     let full_active: Vec<Vec<usize>> = (0..n).map(|_| vec![0usize, 1usize]).collect();
-    let layout = SaeRowLayout::from_active_atoms(full_active, coord_dims, coord_offsets);
+    let layout = SaeRowLayout::from_active_atoms_with_reference(
+        full_active,
+        coord_dims,
+        coord_offsets,
+        None,
+    );
     let compact = term
         .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(Some(layout)))
         .unwrap();
@@ -2771,7 +2776,7 @@ pub(crate) fn small_two_atom_ibp_term() -> (SaeManifoldTerm, Array2<f64>, SaeMan
 /// refusal had instead silently returned `log_det_tt + log_det_schur`, the
 /// streaming criterion would have under-counted the dense criterion by exactly
 /// `½·log|C|` (the dropped capacitance term), violating the #1225 invariant
-/// that streaming and dense optimize the SAME REML objective.
+/// that streaming and dense optimize the SAME penalized LAML objective.
 ///
 /// This pins both halves of the fix:
 ///   (1) the dense cache genuinely carries a non-trivial cross-row correction
@@ -2850,15 +2855,15 @@ pub(crate) fn value_probe_refine_policy_ranks_same_criterion_as_full_policy() {
     assert_abs_diff_eq!(probe_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
-/// #1224 — every fitting/ranking lane must price the same pure REML criterion.
+/// #1224 — every fitting/ranking lane must price the same penalized LAML criterion.
 ///
 /// The outer optimizer compares three lanes at a fixed ρ:
 ///   * `eval` (`OuterEvalOrder::ValueAndGradient`) returns the consistent
-///     gradient-lane pair `(f, ∇f)` — pure REML cost paired with the exact
+///     gradient-lane pair `(f, ∇f)` — penalized LAML cost paired with the exact
 ///     REML λ-gradient.
 ///   * `eval_with_order(Value)` is the line-search probe: it accepts/rejects
 ///     steps whose DIRECTION came from `eval`'s `∇f`, so its cost must be the
-///     SAME pure REML `f`. Folding the gradient-free consistency penalty `c(ρ)`
+///     SAME penalized LAML `f`. Folding the gradient-free consistency penalty `c(ρ)`
 ///     here while the direction is `∇f` mixes two functions in the Armijo test
 ///     (the objective↔gradient desync bug class). The fix threads
 ///     `fold_cotrain = false` into this lane.
@@ -2876,7 +2881,7 @@ pub(crate) fn outer_value_and_ranking_lanes_share_pure_penalized_laml_criterion(
     let rho_flat = warmstart_test_objective().baseline_rho.to_flat();
 
     // Gradient lane (ValueAndGradient): the consistent `(f, ∇f)` pair. Its cost
-    // is pure REML (+ the discrete collapse barrier, which stays on both lanes).
+    // is penalized LAML (+ the discrete collapse barrier, which stays on both lanes).
     let mut grad_obj = warmstart_test_objective();
     let grad_cost = grad_obj
         .eval(&rho_flat)
@@ -2884,7 +2889,7 @@ pub(crate) fn outer_value_and_ranking_lanes_share_pure_penalized_laml_criterion(
         .cost;
 
     // Line-search lane (Value order): the BFGS/ARC probe. Post-fix this reports
-    // the SAME pure REML cost the gradient lane reports.
+    // the SAME penalized LAML cost the gradient lane reports.
     let mut ls_obj = warmstart_test_objective();
     let ls_cost = ls_obj
         .eval_with_order(&rho_flat, OuterEvalOrder::Value)
@@ -3976,7 +3981,12 @@ pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
     }
     let coord_dims = vec![1usize; k_atoms];
     let coord_offsets_full: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
-    let layout = SaeRowLayout::from_active_atoms(active_rows, coord_dims, coord_offsets_full);
+    let layout = SaeRowLayout::from_active_atoms_with_reference(
+        active_rows,
+        coord_dims,
+        coord_offsets_full,
+        None,
+    );
     for row in 0..n {
         assert_eq!(layout.active_atoms[row].len(), 3);
         assert_eq!(layout.row_q_active(row), 6);
@@ -5417,7 +5427,7 @@ fn ard_atom_and_coord(
 /// F6 (fit-level composition): the native ARD energy on a coordinate-
 /// HETEROGENEOUS `{circle d=1, patch d=2, linear d=1}` dictionary is *exactly*
 /// the sum of the per-atom ARD energies — the same per-atom-additive
-/// decomposition the Laplace/REML evidence sums over atoms — so admitting ARD on
+/// decomposition the penalized LAML evidence sums over atoms — so admitting ARD on
 /// a mixed dictionary (the F6 composition) keeps the evidence exact with no
 /// padding or truncation. This is the concrete counterpart to the validator
 /// test: the gate opens (validator) AND the energy it lets through composes

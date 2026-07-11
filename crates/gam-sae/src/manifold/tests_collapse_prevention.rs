@@ -1095,7 +1095,7 @@ pub(crate) fn decoder_repulsion_strength_is_derived_and_scale_invariant_1610() {
 /// strength `μ_jk = γ_jk/(1-γ_jk)` is a MONOTONE function of the data-fit
 /// inseparability `γ_jk` (the largest canonical correlation of the two atoms'
 /// coactivation-weighted chart designs — the quantity that decides whether the
-/// joint inner Laplace/REML Hessian stays PD). This replaces the old geometry
+/// joint inner penalized LAML Hessian stays PD). This replaces the old geometry
 /// heuristic `Σ min(M_k,p)/min(n,p)`, which was blind to the actual design/routing
 /// and so gave the SAME strength to a data-separable pair and a data-degenerate
 /// one. Here two atoms with IDENTICAL chart designs are driven from data-fit

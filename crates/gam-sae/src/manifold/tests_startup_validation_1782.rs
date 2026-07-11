@@ -399,7 +399,7 @@ fn cocollapse_startup_frontier_1026() {
 /// WIN artifact (#1026 / #1610). A PRINCIPLED joint manifold SAE — curved 1-D
 /// circle fibers, hard-sigmoid gate (`threshold_gate`/"jumprelu", the per-row
 /// streaming assignment whose evidence log-det takes the matrix-free SLQ route,
-/// unlike ordered Beta--Bernoulli's cross-row Woodbury) — fit end-to-end by the real outer REML
+/// unlike ordered Beta--Bernoulli's cross-row Woodbury) — fit end-to-end by the real outer penalized-LAML
 /// cascade must MATCH-OR-BEAT a traditional linear SAE (`fit_sparse_dictionary`,
 /// the "large linear SAE" of #1026) at matched, OVERCOMPLETE dictionary size K on
 /// genuinely curved data. On a planted circle a linear dictionary is rank-capped
@@ -409,7 +409,7 @@ fn cocollapse_startup_frontier_1026() {
 /// diversification and the spectral Schur PD-floor that keep the overcomplete
 /// (K > true-rank) joint block PD instead of co-collapsing. K is kept box-safe
 /// here; the per-row work is `top_k`-bounded, so it is the same solve at larger
-/// K (the streaming matrix-free evidence log-det, exercised by the outer REML
+/// K (the streaming matrix-free evidence log-det, exercised by the outer penalized-LAML
 /// cascade, is what carries it to K=32,000).
 #[test]
 fn manifold_beats_linear_joint_streaming_1026() {
@@ -423,7 +423,7 @@ fn manifold_beats_linear_joint_streaming_1026() {
 
         // Principled joint manifold SAE: curved circle fibers, hard-sigmoid gate,
         // solved directly by the coupled inner arrow-Schur joint Newton over the
-        // (coords t, decoders β) block — the exact joint solve the outer REML
+        // (coords t, decoders β) block — the exact joint solve the outer penalized-LAML
         // cascade drives, run here at a fixed penalty seed so the comparison is a
         // fast, deterministic reconstruction check (no per-step evidence log-det).
         let mode = AssignmentMode::threshold_gate(1.0, 0.0);

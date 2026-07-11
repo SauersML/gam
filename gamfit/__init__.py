@@ -412,12 +412,9 @@ try:
 except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
-# Names whose implementation lives behind the optional ``torch`` extra. They are
-# advertised at the top level so users can write ``gamfit.AdaptiveTopK(...)``
-# without an explicit ``gamfit.torch`` import, while keeping the cold-start
-# import path torch-free.
+# Names whose implementation lives behind the optional ``torch`` extra. They
+# are loaded lazily while keeping the cold-start import path torch-free.
 _LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
-    "AdaptiveTopK":          ("gamfit.torch.modules",     "AdaptiveTopK"),
     "Crosscoder":            ("gamfit.crosscoder",        "Crosscoder"),
     "PoincareAtoms":         ("gamfit.torch.hyperbolic",  "PoincareAtoms"),
     "InterchangeSwapDecoder":("gamfit.torch.interchange", "InterchangeSwapDecoder"),
@@ -434,8 +431,7 @@ def __getattr__(name: str):
     ``AttributeError`` chained from the underlying ``ModuleNotFoundError``.
     This preserves the Python contract that ``hasattr`` only ever returns a
     bool and that ``from gamfit import *`` does not blow up on torch-less
-    installs, while ``gamfit.AdaptiveTopK`` (direct access) still produces a
-    clear actionable message pointing at ``pip install torch``.
+    installs while torch-specific modules remain under ``gamfit.torch``.
     """
     target = _LAZY_TORCH_ATTRS.get(name)
     if target is not None:

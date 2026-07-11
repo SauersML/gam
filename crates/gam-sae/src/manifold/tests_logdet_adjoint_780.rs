@@ -2032,7 +2032,12 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_compact_layout_matches_dense_1416() {
     let coord_dims = vec![1usize, 1usize];
     let coord_offsets = term.assignment.coord_offsets();
     let full_active: Vec<Vec<usize>> = (0..n).map(|_| vec![0usize, 1usize]).collect();
-    let layout = SaeRowLayout::from_active_atoms(full_active, coord_dims, coord_offsets);
+    let layout = SaeRowLayout::from_active_atoms_with_reference(
+        full_active,
+        coord_dims,
+        coord_offsets,
+        None,
+    );
     let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
     let sys = term
         .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(Some(layout)))

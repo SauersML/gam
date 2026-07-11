@@ -1,4 +1,4 @@
-//! #2230/#2087 — the outer REML ρ-search must descend the basin LOWER ENVELOPE
+//! #2230/#2087 — the outer penalized-LAML ρ-search must descend the basin LOWER ENVELOPE
 //! `V*(ρ) = min_b V_b(ρ)` over a memory-admitted bundle of saved inner basins, not the
 //! hysteretic single warm-start trajectory `V_{b(warm,ρ)}(ρ)` whose value JUMPS
 //! at basin-boundary crossings (the measured pathology: hours of `[#1026]
@@ -230,7 +230,7 @@ fn two_basin_outer_fit_engages_exact_envelope() {
             ..Default::default()
         })
         .run(&mut objective, "SAE manifold basin envelope")
-        .expect("two-basin outer REML fit must terminate");
+        .expect("two-basin outer penalized-LAML fit must terminate");
     assert!(result.converged, "the envelope fit must be certified");
     let certificate = result
         .criterion_certificate

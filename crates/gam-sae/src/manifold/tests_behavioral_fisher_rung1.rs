@@ -11,8 +11,8 @@
 //!   (`s = p`, `U_n = I_p`, so `G_n = I`) the `BehavioralFisher` metric reports
 //!   `whitens_likelihood()` yet reproduces the plain-MSE fit: the data-fit
 //!   value and every entry of the assembled Arrow–Schur system (the penalized
-//!   normal system whose factorization/logdet the REML evidence and EDF are
-//!   computed from) match the no-metric isotropic path. Because REML evidence
+//!   normal system whose factorization/logdet the penalized LAML evidence and EDF are
+//!   computed from) match the no-metric isotropic path. Because penalized LAML evidence
 //!   and EDF are deterministic functions of exactly that assembled system,
 //!   identical assembly ⇒ identical evidence and EDF. This is the operational
 //!   statement of "GLS with a fixed row metric is still a linear Gaussian model,
@@ -128,7 +128,7 @@ fn behavioral_fisher_anisotropic(n: usize, p: usize) -> RowMetric {
 
 /// GLS preserves REML: at `G = I` the `BehavioralFisher` likelihood-whitening
 /// path reproduces the isotropic plain-MSE fit bit-for-bit — data-fit value and
-/// every assembled Arrow–Schur entry — so the REML evidence and EDF (functions
+/// every assembled Arrow–Schur entry — so the penalized LAML evidence and EDF (functions
 /// of exactly that assembled system) are unchanged.
 #[test]
 fn behavioral_fisher_identity_reproduces_plain_mse_reml_assembly() {

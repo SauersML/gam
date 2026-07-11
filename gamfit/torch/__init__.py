@@ -66,14 +66,7 @@ from .manifold_sae import (
     ManifoldSAEOutput,
     circular_concordance,
 )
-from .modules import (
-    AdaptiveTopK,
-    GatedSAEDecoder,
-    SoftmaxAssignmentSparsityPenalty,
-    SparsityPenalty,
-    TopKActivationPenalty,
-    from_fitted,
-)
+from .modules import from_fitted
 from .penalties import (
     ARDPenalty,
     BlockOrthogonalityPenalty,
@@ -137,7 +130,6 @@ __all__ = [
     "harvest_output_fisher_factors",
     "load_harvest_shard",
     "save_harvest_shard",
-    "AdaptiveTopK",
     "ARDPenalty",
     "BlockOrthogonalityPenalty",
     "GumbelTemperatureSchedule",
@@ -164,14 +156,10 @@ __all__ = [
     "SkipTranscoderTrial",
     "select_skip_transcoder",
     "skip_transcoder",
-    "GatedSAEDecoder",
     "MechanismSparsityPenalty",
     "MonotonicityPenalty",
     "RiemannianGradientDescent",
     "SmoothThresholdPenalty",
-    "SoftmaxAssignmentSparsityPenalty",
-    "SparsityPenalty",
-    "TopKActivationPenalty",
     "TopologyAutoSelector",
     "Smooth",
     "Duchon",

@@ -16,7 +16,7 @@ impl SaeManifoldLoss {
     }
 
     /// Negative penalized loss `−(data_fit + assignment_sparsity + smoothness +
-    /// ard)`. Larger is "less penalized loss", so Laplace/REML wrappers that rank
+    /// ard)`. Larger is "less penalized loss", so penalized LAML wrappers that rank
     /// larger-is-better can sort on it — but this is **not** a REML / marginal
     /// likelihood: it omits the Hessian log-determinant, the Occam log-λ term,
     /// any extra analytic penalties, the co-training fold, the top-k projection
@@ -65,7 +65,7 @@ pub struct SaeManifoldLossBreakdown {
     pub evidence_gauge_deflated_directions: usize,
 }
 
-/// Componentized analytic derivative of the SAE REML criterion with respect to
+/// Componentized analytic derivative of the SAE penalized LAML criterion with respect to
 /// the flat [`SaeManifoldRho`] layout.
 ///
 /// Production objective and certificate paths consume this value object so the
@@ -100,7 +100,7 @@ mod tests {
 
     /// #1231 — the public score is the NEGATIVE penalized loss of the four loss
     /// components, and the breakdown itemizes exactly those components. It is not
-    /// (and must not be presented as) a REML criterion.
+    /// (and must not be presented as) a penalized LAML criterion.
     #[test]
     fn penalized_loss_score_is_negative_total_with_breakdown() {
         let loss = SaeManifoldLoss {

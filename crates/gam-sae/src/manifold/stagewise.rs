@@ -29,7 +29,7 @@
 //! versus (B) *extending the previous atom's chart* — refitting the last atom so
 //! it can absorb the residual arc it left behind (stagewise arc-tiling, caught at
 //! birth rather than by post-hoc fusion). Acceptance is an EVIDENCE gate (the
-//! frozen joint REML criterion strictly improves) PLUS an explicit MINIMUM-EFFECT
+//! frozen joint penalized LAML criterion strictly improves) PLUS an explicit MINIMUM-EFFECT
 //! floor ([`StagewiseConfig::min_effect_ev`]): with frontier-scale `n`, evidence
 //! alone keeps true-but-trivial wiggles forever, so salience is a separate,
 //! explicit dial (a config knob whose null-recovering default is `0.0`, never a
@@ -70,7 +70,7 @@
 //! typed config knob (defaulting to the null-recovering value) or a data-derived
 //! quantity (the residual model's evidence-selected factor rank is the salience
 //! oracle). REML throughout (the inner fits and the frozen evidence pass are the
-//! same REML criterion every term is scored by).
+//! same penalized LAML criterion every term is scored by).
 
 use ndarray::{Array1, Array2, ArrayView2};
 
@@ -170,9 +170,9 @@ pub struct BirthRecord {
     /// Explained residual energy `‖Λ_:,0‖²` of the top factor the seed came from
     /// — the birth's dose, reported so a trivial-but-real wiggle is visible.
     pub factor_energy: f64,
-    /// Frozen joint REML criterion before the round (lower is better evidence).
+    /// Frozen joint penalized LAML criterion before the round (lower is better evidence).
     pub joint_reml_before: f64,
-    /// Frozen joint REML criterion of the winning candidate (or the unchanged
+    /// Frozen joint penalized LAML criterion of the winning candidate (or the unchanged
     /// pre-round value when the round was rejected).
     pub joint_reml_after: f64,
     /// Whether a candidate cleared BOTH the evidence gate and the minimum-effect
@@ -204,7 +204,7 @@ pub struct StagewiseReport {
     pub backfit_ev_trace: Vec<f64>,
     /// Why the forward-birth phase stopped.
     pub stopped_reason: StagewiseStop,
-    /// The frozen (evaluate-don't-optimize) joint REML criterion of the final
+    /// The frozen (evaluate-don't-optimize) joint penalized LAML criterion of the final
     /// composed dictionary — the terminal Phase-3 evidence.
     pub terminal_joint_reml: f64,
     /// The loss breakdown at the frozen terminal state.
@@ -309,7 +309,7 @@ fn current_residual(
     Ok(&target.to_owned() - &fitted)
 }
 
-/// Frozen (`inner_max_iter == 0`, the #850 freeze) joint REML criterion of a term
+/// Frozen (`inner_max_iter == 0`, the #850 freeze) joint penalized LAML criterion of a term
 /// at its current `(t, β)` — evaluate-don't-optimize. This is the joint-Laplace
 /// evidence at a fixed converged state (`loss.total() + extra penalties + ½
 

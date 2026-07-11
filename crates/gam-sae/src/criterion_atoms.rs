@@ -13,7 +13,7 @@
 //!
 //! # The decomposition
 //!
-//! The SAE Laplace/REML criterion the outer optimizer minimizes is, exactly as
+//! The SAE penalized LAML criterion the outer optimizer minimizes is, exactly as
 //! `SaeManifoldTerm::penalized_laml_criterion_with_cache` assembles it,
 //!
 //! ```text

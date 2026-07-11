@@ -2216,7 +2216,7 @@ impl SaeManifoldTerm {
     /// `d_k` (`ScadMcp`/`Sparsity` iterate the flat block element-wise; native
     /// ARD sums per atom over `d_k` axes with a per-atom `log_ard[k]`; isometry
     /// is rebuilt per atom by `corrected_isometry_penalty`), so the arrow-Schur
-    /// assembler dispatches them cleanly across mixed dims and the Laplace/REML
+    /// assembler dispatches them cleanly across mixed dims and the penalized LAML
     /// evidence — itself a per-atom sum — stays exact with no padding or
     /// truncation (see
     /// [`sae_row_block_penalty_composes_over_heterogeneous_coord_dims`]). The
@@ -4132,24 +4132,24 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// #1154 — the co-trained REML criterion: the exact REML criterion at `rho`
+    /// #1154 — the co-trained penalized LAML criterion: the exact penalized LAML criterion at `rho`
     /// PLUS the amortized-encoder consistency penalty, so the outer optimizer
     /// co-adapts the dictionary + smoothing parameters λ toward a dictionary the
     /// fast initializer and joint refinement can faithfully invert.
     ///
     /// This is Design A of #1154. The inner solve still converges the `(t, β)`
     /// system to stationarity at the engine's current ρ (so the implicit-function
-    /// REML λ-gradient `dβ̂/dλ = −(H+S_λ)⁻¹(dS_λ/dλ)β̂` stays EXACT — the encoder
+    /// penalized-LAML λ-gradient `dβ̂/dλ = −(H+S_λ)⁻¹(dS_λ/dλ)β̂` stays exact — the encoder
     /// only warm-starts/co-adapts, it never replaces the stationary point). The
     /// added term
     ///
     /// ```text
-    ///   J_cotrain(ρ) = REML(ρ)  +  w · ‖x̂_amortized − x̂_exact‖²/(n·p)
+    ///   J_cotrain(ρ) = penalized_LAML(ρ) + w · ‖x̂_amortized − x̂_exact‖²/(n·p)
     ///                            +  w_conv · unconverged_fraction
     /// ```
     ///
     /// folds the post-fit amortized-encode quality into the ranked objective. The
-    /// weights are auto-scaled to the REML criterion magnitude (magic by default:
+    /// weights are auto-scaled to the penalized LAML criterion magnitude (magic by default:
     /// no caller knob) so the consistency term is a meaningful but non-dominant
     /// fraction of the objective regardless of problem scale.
     pub fn penalized_laml_criterion_cotrained(
@@ -4170,7 +4170,7 @@ impl SaeManifoldTerm {
         // outer objective callers when present.
         self.warm_start_latents_from_amortized_encoder(target, rho)
             .unwrap_or(0);
-        let (reml, loss) = self.penalized_laml_criterion_with_refine_policy(
+        let (penalized_laml, loss) = self.penalized_laml_criterion_with_refine_policy(
             target,
             rho,
             registry,
@@ -4181,34 +4181,35 @@ impl SaeManifoldTerm {
             true,
         )?;
         let consistency = self.amortized_encoder_consistency(target, rho)?;
-        // Auto-scale the co-training weights to the REML magnitude so the
+        // Auto-scale the co-training weights to the penalized-LAML magnitude so the
         // consistency penalty is a bounded, scale-free fraction of the objective
-        // (magic by default: no caller knob). `reml_scale` floors at 1 so a
+        // (magic by default: no caller knob). `criterion_scale` floors at 1 so a
         // near-zero criterion still admits a meaningful consistency contribution.
-        let cotrained = Self::fold_cotrain_consistency(reml, &consistency);
+        let cotrained = Self::fold_cotrain_consistency(penalized_laml, &consistency);
         Ok((cotrained, loss, consistency))
     }
 
     /// #1154 — the single source of the co-training fold arithmetic: add the
     /// auto-scaled amortized-encoder consistency penalty to an already-computed
-    /// REML criterion at the converged dictionary. Both the public
+    /// penalized LAML criterion at the converged dictionary. Both the public
     /// [`Self::penalized_laml_criterion_cotrained`] entry point and the outer-loop value /
     /// gradient lanes (`SaeManifoldOuterObjective::fold_cotrain_consistency`)
     /// route through THIS function, so the folded objective cannot drift between
     /// the criterion and the cascade-ranked cost (the objective↔gradient desync
-    /// bug class). The weights are auto-scaled to the REML magnitude (`max(|REML|,
+    /// bug class). The weights are auto-scaled to the penalized-LAML magnitude
+    /// (`max(|penalized_LAML|,
     /// 1)`) so the penalty is a bounded, scale-free fraction of the objective
     /// regardless of problem scale; the fold carries no analytic gradient (under
-    /// Design A the REML λ-gradient stays the exact implicit-function path).
+    /// Design A the penalized-LAML λ-gradient stays the exact implicit-function path).
     #[must_use]
     pub fn fold_cotrain_consistency(
-        reml_cost: f64,
+        penalized_laml_cost: f64,
         consistency: &AmortizedEncoderConsistency,
     ) -> f64 {
-        let reml_scale = reml_cost.abs().max(1.0);
-        reml_cost
-            + COTRAIN_RECON_WEIGHT * reml_scale * consistency.recon_consistency
-            + COTRAIN_CONVERGENCE_WEIGHT * reml_scale * consistency.unconverged_fraction
+        let criterion_scale = penalized_laml_cost.abs().max(1.0);
+        penalized_laml_cost
+            + COTRAIN_RECON_WEIGHT * criterion_scale * consistency.recon_consistency
+            + COTRAIN_CONVERGENCE_WEIGHT * criterion_scale * consistency.unconverged_fraction
     }
 
     /// #1154 item 2 — warm-start the inner latent coordinates from the amortized
@@ -4218,7 +4219,7 @@ impl SaeManifoldTerm {
     /// stationarity. Unconverged rows are left at their current coordinates, so the
     /// warm-start can only help. The subsequent inner Newton refines from this seed to
     /// the SAME stationary point (the warm-start changes only the basin entry,
-    /// not the root), so the REML λ-gradient stays exactly the implicit-function
+    /// not the root), so the penalized-LAML λ-gradient stays exactly the implicit-function
     /// path and the criterion is unchanged at convergence — the amortized encoder
     /// only accelerates/co-adapts the inner solve, it never replaces the
     /// stationary point.
@@ -4709,7 +4710,7 @@ impl SaeManifoldTerm {
     /// (`loss.assignment_sparsity`) energy, so adding the registry ARD /
     /// assignment value on top would double-count, and the gauge-only
     /// coordinate penalties are not part of the penalized deviance the
-    /// REML/Laplace criterion scores. The decoder-block penalties, by contrast,
+    /// penalized LAML criterion scores. The decoder-block penalties, by contrast,
     /// are real penalized-energy terms with no `loss.*` representative: the
     /// inner solve minimizes them (they enter `gb`/`hbb`) but they were absent
     /// from the criterion scalar `v`. This restores that consistency so the
@@ -4767,7 +4768,7 @@ impl SaeManifoldTerm {
     /// summed over atoms, evaluated through `corrected_isometry_penalty` so the
     /// live decoder/coordinate caches drive the value exactly as the assemble
     /// path does. It has no `SaeManifoldLoss` twin (the loss carries only
-    /// data-fit / assignment / smoothness / ARD), so the Laplace/REML criterion
+    /// data-fit / assignment / smoothness / ARD), so the penalized LAML criterion
     /// must add it explicitly to score the same penalized objective the inner
     /// solve descends.
     pub fn isometry_penalty_value_total(
@@ -4823,7 +4824,7 @@ impl SaeManifoldTerm {
 
     /// Extra penalized-objective energy that has no native `SaeManifoldLoss`
     /// component but is part of the objective the inner Newton solve descends,
-    /// and therefore of the penalized deviance the SAE Laplace/REML criterion
+    /// and therefore of the penalized deviance the SAE penalized LAML criterion
     /// must rank.
     ///
     /// ENVELOPE CONTRACT: the criterion value `v = loss.total() + extra +
@@ -5114,7 +5115,7 @@ impl SaeManifoldTerm {
     /// relative spectral cutoff used elsewhere in the codebase).
     ///
     /// Used to count the penalised dimension of each atom's `smooth_penalty`
-    /// `S_k` so the REML criterion's `−½·p·rank(S)·log λ_smooth` Occam term
+    /// `S_k` so the penalized LAML criterion's `−½·p·rank(S)·log λ_smooth` Occam term
     /// uses the *effective* penalty rank rather than the ambient basis size
     /// (a thin-plate / B-spline penalty has a non-trivial null space).
     pub(crate) fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {

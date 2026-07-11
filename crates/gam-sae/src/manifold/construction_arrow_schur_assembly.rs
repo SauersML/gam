@@ -282,6 +282,7 @@ impl SaeManifoldTerm {
                 Some((
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,
+                        temperature,
                     ),
                     scale,
                 ))

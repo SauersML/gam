@@ -7,7 +7,7 @@ to ``None`` so any ``import torch`` raises ``ModuleNotFoundError``. In that stat
 error, and ``from gamfit import *`` must succeed.
 
 Currently FAILING: ``gamfit.__getattr__`` lazily imports torch for names like
-``AdaptiveTopK``, ``PoincareAtoms``, ``InterchangeSwapDecoder``, ``Crosscoder``,
+``PoincareAtoms``, ``InterchangeSwapDecoder``, and ``Crosscoder``,
 all of which appear in ``gamfit.__all__``.
 """
 
@@ -21,7 +21,6 @@ import gamfit
 
 
 TORCH_LAZY_NAMES = [
-    "AdaptiveTopK",
     "PoincareAtoms",
     "InterchangeSwapDecoder",
     "Crosscoder",

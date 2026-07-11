@@ -540,7 +540,7 @@ impl SaeManifoldTerm {
     /// finalization fallback swaps the settled basin / canonicalizes charts, that
     /// factor no longer describes the returned model. This rebuilds the undamped
     /// Direct joint-Hessian factor from THIS (final) term at `rho` — the exact
-    /// factor the REML criterion forms at the inner optimum — and reads the
+    /// factor the penalized LAML criterion forms at the inner optimum — and reads the
     /// per-atom covariance and bands off its Schur factor, scaling by the
     /// reconstruction dispersion `φ̂`. The result is the DOCUMENTED joint
     /// covariance: it carries the cross-atom covariance and the decoder-coordinate

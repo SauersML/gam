@@ -952,7 +952,7 @@ fn sae_k1_circle_penalized_laml_criterion_ranks_fixed_point_2226() {
 /// The amortized-encoder consistency diagnostic `c(ρ)` has no analytic
 /// derivative, so it cannot rank `f+c` while BFGS descends `f`: the selected fit
 /// would not be stationary for its selection criterion. Both lanes therefore
-/// report their matched pure-REML value, while encoder consistency and the
+/// report their matched pure-penalized LAML value, while encoder consistency and the
 /// fitted-data collapse ledger remain read-only diagnostics.
 #[test]
 fn ranking_and_gradient_lanes_match_bare_reml() {
@@ -963,7 +963,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
     // cross-seed ranking.
     let value_lane = objective
         .eval_cost(&rho_flat)
-        .expect("value-probe lane evaluates pure REML");
+        .expect("value-probe lane evaluates penalized LAML");
 
     // Gradient lane: the cost an ACCEPTED iterate reports, paired with the
     // analytic ∇f the BFGS Armijo test consumes. A fresh objective so the two
@@ -1010,7 +1010,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
                 probe.ridge_beta,
                 false,
             )
-            .expect("bare value-lane REML criterion evaluates");
+            .expect("bare value-lane penalized LAML criterion evaluates");
         reml
     };
     let value_vs_bare = (value_lane - bare_value).abs();
@@ -1048,7 +1048,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
                 probe.ridge_ext_coord,
                 probe.ridge_beta,
             )
-            .expect("bare gradient-lane REML criterion evaluates");
+            .expect("bare gradient-lane penalized LAML criterion evaluates");
         reml
     };
     let gradient_vs_bare = (gradient_lane - bare_grad).abs();
@@ -1172,7 +1172,7 @@ fn amortized_warm_start_matches_or_beats_cold_inner_solve_on_known_manifold() {
 /// planted periodic dictionary; they differ only in HOW ρ is ranked and how
 /// the inner solve is seeded:
 ///
-///   * sequential — rank ρ by the BARE REML criterion, fit cold (chart-center
+///   * sequential — rank ρ by the BARE penalized LAML criterion, fit cold (chart-center
 ///     inner solve), then distill the amortized encoder once from the frozen
 ///     fitted dictionary (the #357 / #1026-ladder post-hoc path);
 ///   * co-trained (Design A) — rank ρ by the co-trained criterion (REML + the

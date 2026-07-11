@@ -613,18 +613,18 @@ impl BehaviorBlock {
         Ok(next)
     }
 
-    /// The profiled two-block REML criterion's dependence on `log(λ_y)` beyond
+    /// The profiled two-block penalized LAML criterion's dependence on `log(λ_y)` beyond
     /// what the single-block engine sees: the change-of-variables Jacobian
     /// `−(n·p_y/2)·log λ_y` that the `√λ_y` target scaling introduces into the
     /// Gaussian negative-log-marginal-likelihood.
     ///
-    /// The engine's REML criterion is computed on the **scaled** augmented target
+    /// The engine's penalized LAML criterion is computed on the **scaled** augmented target
     /// `[Z | √λ_y·Y]` and so treats all `p̃` output columns as one homoscedastic
     /// block with a single dispersion `φ̂`. But the honest two-block model has
     /// `φ_y = φ_x/λ_y`; writing the behavior likelihood in the scaled variable
     /// `Ỹ = √λ_y·Y` contributes a Jacobian `∏_i (√λ_y)^{p_y} = λ_y^{n p_y/2}`,
     /// whose negative log is this term. **Add it** to the engine criterion (a
-    /// quantity that is *minimised*) to obtain the two-block REML criterion whose
+    /// quantity that is *minimised*) to obtain the two-block penalized LAML criterion whose
     /// minimiser over `log λ_y` is the variance-ratio REML estimate. Without it
     /// the criterion is monotone in `λ_y` — behavior residuals shrink for free in
     /// scaled units — and `λ_y` is unidentifiable.
@@ -637,7 +637,7 @@ impl BehaviorBlock {
     /// units the fit saw (columns `[0, p_x)` activation, `[p_x, p̃)` the
     /// `√λ_y`-scaled behavior).
     ///
-    /// The profiled two-block REML criterion (engine criterion `+`
+    /// The profiled two-block penalized LAML criterion (engine criterion `+`
     /// [`Self::reml_log_lambda_jacobian`]) is stationary in `log λ_y` at
     ///
     /// ```text
@@ -1057,7 +1057,7 @@ pub fn stack_augmented_target(
     Ok(augmented)
 }
 
-/// The multi-block profiled REML criterion (the quantity minimised over the
+/// The multi-block profiled penalized LAML criterion (the quantity minimised over the
 /// block weights), evaluated at a fitted state's UNSCALED residual sums of
 /// squares. Up to `log λ`-independent constants it is
 ///
