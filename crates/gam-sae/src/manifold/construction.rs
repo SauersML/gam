@@ -2821,19 +2821,16 @@ impl SaeManifoldTerm {
         &self,
         budget_bytes: usize,
     ) -> Result<(), String> {
-        if matches!(self.assignment.mode, AssignmentMode::TopK { .. }) {
-            return Ok(());
-        }
+        let family = match self.assignment.mode {
+            AssignmentMode::TopK { .. } => return Ok(()),
+            AssignmentMode::Softmax { .. } => "softmax",
+            AssignmentMode::OrderedBetaBernoulli { .. } => "ordered_beta_bernoulli",
+            AssignmentMode::ThresholdGate { .. } => "threshold_gate",
+        };
         let required_bytes = self.exact_dense_assignment_bytes();
         if required_bytes <= budget_bytes {
             return Ok(());
         }
-        let family = match self.assignment.mode {
-            AssignmentMode::Softmax { .. } => "softmax",
-            AssignmentMode::OrderedBetaBernoulli { .. } => "ordered_beta_bernoulli",
-            AssignmentMode::ThresholdGate { .. } => "threshold_gate",
-            AssignmentMode::TopK { .. } => unreachable!(),
-        };
         Err(format!(
             "exact {family} assignment assembly requires at least {required_bytes} bytes for row curvature and decoder Gram, exceeding the in-core budget {budget_bytes} bytes at N={}, K={}. Use assignment='topk' with an explicit support size; smooth assignments are never silently truncated",
             self.n_obs(),
