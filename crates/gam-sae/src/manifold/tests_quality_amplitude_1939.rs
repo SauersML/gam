@@ -1,10 +1,7 @@
-//! #1939 OBJECTIVE-QUALITY acceptance bar — existence/intensity DECOUPLING under
-//! the amplitude prior. The design of #1939 is that an atom's contribution factors
-//! as `a[k] · exp(s_k) · Φ_k B_k`, with a SCAD/ARD prior on the amplitude so that
-//! (i) genuinely absent (dead) atoms are driven to exact zero, (ii) the surviving
-//! atoms' intensities are recovered across orders of magnitude, and (iii)
-//! *existence* (does this atom explain any held-out structure) is identified
-//! SEPARATELY from *intensity* (how large its contribution is).
+//! #1939 OBJECTIVE-QUALITY acceptance bar — existence/intensity DECOUPLING in the
+//! physical dictionary. The current representation carries intensity directly in
+//! each fitted decoder. *Existence* (does this atom explain held-out structure)
+//! must be identified separately from *intensity* (how large its contribution is).
 //!
 //! We plant that ground truth: two live circles on DISJOINT output subspaces whose
 //! amplitudes differ by ~an order of magnitude, plus a DEAD atom slot with no
@@ -58,7 +55,11 @@ fn two_unequal_circles_plus_dead(
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
         let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
-        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        // Use frequency 3 for the weak circle. Each fitted circle basis reaches
+        // only harmonic 2, so the strong frequency-1 chart cannot also absorb the
+        // weak signal as its second harmonic. A frequency-2 planting would make
+        // decoder ownership non-identifiable before existence/intensity is tested.
+        let tb = std::f64::consts::TAU * (3.0 * row as f64 + 0.37) / (n as f64);
         let (ca, sa) = (ta.cos(), ta.sin());
         let (cb, sb) = (tb.cos(), tb.sin());
         for j in 0..p {
