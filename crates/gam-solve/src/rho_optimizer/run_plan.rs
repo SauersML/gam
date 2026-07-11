@@ -7,11 +7,9 @@ pub(crate) const SINGLE_EXPENSIVE_PREWARM_BUDGET: usize = 16;
 
 /// Require a continuation arrival to certify the literal outer seed itself.
 ///
-/// A structural walk ceiling may carry the best earlier waypoint while moving
-/// the scalar schedule to `s = 0`. That state remains useful as a checkpoint,
-/// but it is not an arrival at the requested REML point. Only a state whose rho
-/// is bit-identical to the bounded literal seed and whose real-objective value
-/// is finite may authorize the outer solver to start.
+/// Only a state whose rho is bit-identical to the bounded literal seed and
+/// whose real-objective value is finite may authorize the outer solver to
+/// start.
 pub(crate) fn reactive_arrival_postcondition(
     state: &crate::estimate::reml::continuation::ContinuationState,
     literal_seed: &Array1<f64>,
@@ -326,7 +324,8 @@ pub(crate) fn run_outer_with_plan(
     // A reactive domain-entry path is created inside a seed attempt only after
     // that objective's exact seed cost is non-finite. Already-feasible seeds
     // therefore stay on the zero-heavy-entry path.
-    let reactive_domain_entry_available = obj.supports_reactive_domain_entry();
+    let reactive_domain_scalar_contract = obj.reactive_domain_scalar_contract()?;
+    let reactive_domain_entry_available = reactive_domain_scalar_contract.is_some();
     let mut last_continuation_regime: Option<crate::continuation_path::PathRegime> = None;
     // Demotion ledger: every structural defect that would historically have
     // rejected a seed (or short-circuited the cascade) is instead recorded
@@ -570,6 +569,9 @@ pub(crate) fn run_outer_with_plan(
                         crate::continuation_path::ContinuationPath::heavy_entry_for_rho(
                             seed.clone(),
                             bounds_template.1.clone(),
+                            reactive_domain_scalar_contract
+                                .clone()
+                                .expect("reactive scalar contract checked above"),
                         ),
                     );
                     reactive_domain_entry_requested = true;
@@ -611,8 +613,9 @@ pub(crate) fn run_outer_with_plan(
         // real objective together (the one-monotone-walk invariant). The
         // converged inner β of each accepted descent leg warm-starts the next,
         // and the warm iterate at `Arrived` is handed to the normal solver at
-        // ρ*. Re-entry / breach / underflow are non-fatal floor behaviors,
-        // each consumed below — never a rejection.
+        // ρ*. A failed attempted waypoint refines the step from the last
+        // successful state; representability exhaustion becomes a typed domain
+        // refusal rather than a false arrival.
         //
         // The heavy-smoothing walk warms the cold inner solve after the literal
         // `eval_cost` demonstrated that its Laplace evidence is undefined (the
@@ -630,21 +633,33 @@ pub(crate) fn run_outer_with_plan(
                 // contraction fixed point).
                 let mut warm_beta: Array1<f64> = Array1::zeros(0);
                 let mut legs_descended = 0usize;
-                // Bound the walk: CONTINUATION_WAYPOINTS clean descents plus a
-                // re-entry allowance (every re-entry is progress toward the
-                // contraction floor, reachable in finitely many back-offs).
-                // Each `step` runs the ρ-anneal spine, which is itself an inner
-                // homotopy, so the budget stays bounded — but it must tolerate
-                // the expected near-cliff floor bounces: at the one-waypoint
-                // `REENTRY_BACKOFF` each bounce costs ~2 legs, and the shared
-                // `CONTINUATION_WALK_BUDGET` (2× waypoints) absorbs ~half-a-
-                // walk's worth of bounces before cutoff. The spine warm-starts
-                // from the previous leg's β, so post-entry legs are cheap. The
-                // loop only ever exits on `Arrived` or this budget — there is
-                // no rejection exit.
-                let walk_budget = crate::continuation_path::CONTINUATION_WALK_BUDGET;
-                for _ in 0..walk_budget {
-                    match path.step(obj, &warm_beta) {
+                // The path controls its own progress from solver evidence. It
+                // can only report arrival after a successful exact-target leg;
+                // inability to refine a failed leg is returned as a typed
+                // refusal, so this loop needs no unrelated iteration ceiling.
+                loop {
+                    let step = match path.step(obj, &warm_beta) {
+                        Ok(step) => step,
+                        Err(err) => {
+                            continuation_arrival_refusal = Some(format!(
+                                "reactive domain entry refused before exact-target arrival: {err}"
+                            ));
+                            break;
+                        }
+                    };
+                    match step {
+                        crate::continuation_path::ContinuationStep::Entered { state } => {
+                            warm_beta = state.last_beta.clone();
+                            if let Err(err) = obj.seed_inner_state(&warm_beta) {
+                                log::warn!(
+                                    "[OUTER] {context}: continuation entry seed {seed_idx} \
+                                     warm-start unusable ({err}); proceeding cold"
+                                );
+                                warm_beta = Array1::zeros(0);
+                                obj.reset();
+                            }
+                            legs_descended += 1;
+                        }
                         crate::continuation_path::ContinuationStep::Descended { s, state } => {
                             // Warm-start the next leg from this leg's converged
                             // inner β. `NoSlot` is fine (the objective simply
@@ -662,13 +677,16 @@ pub(crate) fn run_outer_with_plan(
                             }
                             legs_descended += 1;
                         }
-                        crate::continuation_path::ContinuationStep::Arrived { state } => {
+                        crate::continuation_path::ContinuationStep::Arrived => {
                             // Leave the objective in the path-warmed state.
                             // The exact-value verification below owns the
                             // full-state handoff; replacing it with a copied
                             // coefficient-only seed here would discard it.
                             legs_descended += 1;
-                            match reactive_arrival_postcondition(&state, seed) {
+                            let state = path.arrival_state().expect(
+                                "ContinuationStep::Arrived requires a solved target state",
+                            );
+                            match reactive_arrival_postcondition(state, seed) {
                                 Ok(()) => continuation_arrived = true,
                                 Err(reason) => continuation_arrival_refusal = Some(reason),
                             }
@@ -676,35 +694,17 @@ pub(crate) fn run_outer_with_plan(
                         }
                         crate::continuation_path::ContinuationStep::Reentered { s, reason } => {
                             use crate::continuation_path::ReentryReason;
-                            // The homotopy FLOOR: never reject. Each reason is a
-                            // re-entry into a heavier regime (the path already
-                            // raised `s`); we consume its payload for diagnostics
-                            // and continue descending from the heavier regime.
+                            // The accepted waypoint remains unchanged while the
+                            // next attempted distance is refined. Consume the
+                            // reason for diagnostics, then continue.
                             match reason {
                                 ReentryReason::SpineStruggled(failure) => {
                                     log::info!(
                                         "[OUTER] {context}: continuation seed {seed_idx} spine \
-                                         struggled at s={s:.4} ({}); re-entered heavier regime {:?}",
+                                         struggled below s={s:.4} ({}); refining from regime {:?}",
                                         failure.message(),
                                         path.enter_regime(),
                                     );
-                                }
-                                ReentryReason::StepUnderflow => {
-                                    // The descent step underflowed: demote with a
-                                    // recorded reason so the ledger surfaces the
-                                    // heavier-regime re-entry, then keep
-                                    // descending from the pinned floor.
-                                    let regime = path.demote_with_reason(
-                                        crate::continuation_path::PathDemotionReason::PrewarmStructural,
-                                    );
-                                    path_demotions.push(PathDemotionRecord {
-                                        seed_idx,
-                                        regime,
-                                        reason: format!(
-                                            "continuation step underflow at s={s:.4}; pinned to \
-                                             the homotopy floor and re-descending"
-                                        ),
-                                    });
                                 }
                                 ReentryReason::MassFloorBreached(breach) => {
                                     // Active-mass collapse toward the uniform
@@ -743,18 +743,15 @@ pub(crate) fn run_outer_with_plan(
         if reactive_domain_entry_requested {
             if !continuation_arrived {
                 let msg = continuation_arrival_refusal.take().unwrap_or_else(|| {
-                    "reactive domain entry refused: certified continuation walk budget \
-                     exhausted before arrival at the exact seed"
+                    "reactive domain entry refused before a solved exact-target waypoint"
                         .to_string()
                 });
                 log::warn!("[OUTER] {context}: rejecting seed {seed_idx}: {msg}");
                 rejection_reasons.push((seed_idx, "domain-entry", msg));
                 continue 'seed_attempts;
             }
-            // Arrival is not itself evidence that the real objective is
-            // defined: the path's structural eval ceiling may arrive with its
-            // best earlier waypoint. Re-evaluate the literal seed and require a
-            // finite exact criterion before any optimizer can start.
+            // Independently re-evaluate the literal target and require a finite
+            // exact criterion before any optimizer can start.
             match obj.eval_cost(seed) {
                 Ok(cost) if cost.is_finite() => {
                     log::info!(

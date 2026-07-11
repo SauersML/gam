@@ -447,13 +447,9 @@ impl ReseedLedger {
 //  Regime-escalation view of re-entry (#969 seed-cascade demotion).
 //
 //  The seed cascade in `rho_optimizer.rs` observes the path through a coarser
-//  lens than the per-waypoint `s`: it only needs to know "which heavier regime
-//  did this seed get demoted to". `PathRegime` is that coarse view — a band of
-//  the path parameter `s` — and `PathDemotionReason` records *why* the cascade
-//  asked for the demotion. A demotion is exactly a re-entry into a heavier
-//  regime (it routes onto the same `reenter_heavier` mechanism as a spine
-//  struggle or a mass-floor breach); there is NO rejection / disqualification
-//  arm, mirroring `ContinuationStep`.
+//  lens than the per-waypoint `s`: it only needs to know which scalar regime
+//  the path most recently solved. `PathRegime` is that coarse view — a band of
+//  the path parameter `s`.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The coarse "which heavy-smoothing regime is the path currently entering at"
@@ -555,11 +551,13 @@ pub(crate) enum ReentryReason {
 #[derive(Debug, Clone)]
 pub struct ContinuationPath {
     schedules: CoupledSchedules,
-    /// Current path parameter. Starts at `1.0` (entry regime) and walks toward
-    /// `0.0`. Re-entry raises it back toward `1.0`; descent lowers it.
+    /// Last successfully solved path parameter. Starts at `1.0` (entry regime)
+    /// and walks monotonically toward `0.0`.
     s: f64,
-    /// Current descent step in `s`. Halved on re-entry, restored on a clean
-    /// descent. Floored at [`S_STEP_FLOOR`] (a behavior, not an exit).
+    /// Current descent step in `s`. A failed attempted waypoint halves it; a
+    /// successful waypoint doubles it up to the remaining distance. There is
+    /// no numeric floor: inability to form a strictly smaller representable
+    /// waypoint is a typed non-convergence result.
     s_step: f64,
     /// Logit trust region and active-mass floor recomputed per waypoint from
     /// the current τ.
@@ -574,13 +572,8 @@ pub struct ContinuationPath {
     /// The most recent converged waypoint state. `None` until the first leg
     /// converges (that leg runs the full cold spine); every later waypoint is
     /// a WARM leg from here — the structural fix for the per-waypoint
-    /// cold-spine cost blowup. Kept across re-entries (a heavier waypoint is
-    /// still downstream of a converged lighter-ρ state in walk distance).
+    /// cold-spine cost blowup. A failed attempted waypoint never overwrites it.
     warm: Option<ContinuationState>,
-    /// Budgeted spine evals spent so far (cold legs budget the full spine,
-    /// warm legs budget [`WARM_LEG_EVAL_BUDGET`]). Compared against
-    /// [`WALK_EVAL_CEILING`] for the #968 structural-termination guarantee.
-    evals_budgeted: usize,
 }
 
 impl ContinuationPath {
@@ -596,12 +589,11 @@ impl ContinuationPath {
         Self {
             schedules,
             s: 1.0,
-            s_step: 1.0 / CONTINUATION_WAYPOINTS as f64,
+            s_step: 1.0,
             logit_tr,
             mass_floor: ActiveMassFloor::default_floor(),
             reseed_ledger: ReseedLedger::new(),
             warm: None,
-            evals_budgeted: 0,
         }
     }
 
@@ -645,26 +637,6 @@ impl ContinuationPath {
     #[must_use]
     pub fn enter_regime(&self) -> PathRegime {
         PathRegime::from_s(self.s)
-    }
-
-    /// Demote the seed cascade to a heavier path regime with a recorded reason
-    /// and return the regime re-entered at. This is the regime-escalation view
-    /// of re-entry: it routes onto the same [`ContinuationPath::reenter_heavier`]
-    /// mechanism a spine struggle or a mass-floor breach uses (raise `s` toward
-    /// the entry regime, refine the step), so a structural diagnosis becomes a
-    /// heavier-regime RE-ENTRY of the same seed — **never** a rejection. The
-    /// `reason` is a diagnostic tag the caller records alongside the returned
-    /// regime; the demotion mechanism is identical for every reason.
-    pub fn demote_with_reason(&mut self, reason: PathDemotionReason) -> PathRegime {
-        // The reason is diagnostic only: every demotion is a re-entry into a
-        // heavier regime. Naming it explicitly keeps the value live (no silent
-        // discard) while documenting that the escalation path is reason-agnostic.
-        match reason {
-            PathDemotionReason::UniformStructural | PathDemotionReason::PrewarmStructural => {
-                self.reenter_heavier();
-            }
-        }
-        self.enter_regime()
     }
 
     /// The base radius the per-iteration assignment-logit trust region is built
@@ -763,21 +735,18 @@ impl ContinuationPath {
         ledger: &mut ReseedLedger,
     ) -> ContinuationStep {
         ledger.record(self.s, breach);
-        self.reenter_heavier();
+        self.refine_step();
         ContinuationStep::Reentered {
             s: self.s,
             reason: ReentryReason::MassFloorBreached(breach),
         }
     }
 
-    /// Raise `s` back toward the entry regime by the back-off fraction and
-    /// halve the descent step (finer re-descent). Floors the step at
-    /// [`S_STEP_FLOOR`]; underflow does not abandon the path, it pins the
-    /// heavier regime. Recomputes the τ-tied logit trust region for the
-    /// heavier regime.
-    fn reenter_heavier(&mut self) {
-        self.s = (self.s + REENTRY_BACKOFF).min(1.0);
-        self.s_step = (self.s_step * 0.5).max(S_STEP_FLOOR);
+    /// Refine the next descent after a failed attempted waypoint. `s` remains
+    /// the last successfully solved waypoint; only the attempted distance is
+    /// halved, so the accepted path is monotone and never fabricates progress.
+    fn refine_step(&mut self) {
+        self.s_step *= 0.5;
         self.logit_tr = LogitTrustRegion::for_tau(
             self.schedules
                 .scalar_targets_at(self.s)
@@ -793,6 +762,14 @@ impl ContinuationPath {
         self.s <= 0.0
     }
 
+    /// Most recent successfully solved waypoint. At a reported arrival this is
+    /// the exact `s = 0` state; it is intentionally retained by the path rather
+    /// than copied into the terminal enum payload.
+    #[must_use]
+    pub(crate) fn arrival_state(&self) -> Option<&ContinuationState> {
+        self.warm.as_ref().filter(|_| self.arrived())
+    }
+
     /// Take one waypoint step down the coupled homotopy.
     ///
     /// 1. Lower `s` by the current step toward `0`.
@@ -801,8 +778,9 @@ impl ContinuationPath {
     ///    `s`'s ρ target, with the inner β carried warm.
     /// 4. On spine success: [`ContinuationStep::Descended`] (or
     ///    [`ContinuationStep::Arrived`] if `s` reached `0`).
-    /// 5. On spine struggle: re-enter a heavier regime and return
-    ///    [`ContinuationStep::Reentered`]. **No rejection branch exists.**
+    /// 5. On spine struggle: retain the last successful waypoint and halve the
+    ///    attempted distance. If no strictly smaller representable waypoint
+    ///    remains, return a typed non-convergence error.
     ///
     /// `obj` is the SAE joint outer objective (`SaeManifoldOuterObjective`,
     /// which is an [`OuterObjective`]). `initial_beta` warms the inner solve;
@@ -813,38 +791,6 @@ impl ContinuationPath {
         obj: &mut dyn OuterObjective,
         initial_beta: &Array1<f64>,
     ) -> Result<ContinuationStep, gam_problem::EstimationError> {
-        // #968 hard ceiling: total budgeted spine evals across the walk are
-        // bounded. At the ceiling the path hands its best converged state to
-        // the real optimizer (legs advanced to the target regime) instead of
-        // spending another leg — termination is structural, not statistical.
-        // With no converged state yet the walk keeps trying (the consumer's
-        // own `CONTINUATION_WALK_BUDGET` loop bounds that case).
-        if self.evals_budgeted >= WALK_EVAL_CEILING {
-            if self.warm.is_some() {
-                log::warn!(
-                    "[PATH] walk eval ceiling {WALK_EVAL_CEILING} reached at s={:.4}; arriving \
-                     with the best converged waypoint state (scalar legs advanced to target)",
-                    self.s
-                );
-                let target = self.schedules.scalar_targets_at(0.0);
-                obj.install_reactive_domain_scalar_state(&target)?;
-                self.logit_tr = LogitTrustRegion::for_tau(target.assignment_temperature);
-                self.s = 0.0;
-                return Ok(ContinuationStep::Arrived);
-            }
-        }
-
-        // Descent step in s, floored. If the step has already underflowed, the
-        // path pins the heavier regime and re-descends from there — still no
-        // rejection.
-        if self.s_step < S_STEP_FLOOR {
-            self.reenter_heavier();
-            return Ok(ContinuationStep::Reentered {
-                s: self.s,
-                reason: ReentryReason::StepUnderflow,
-            });
-        }
-
         // The cold leg solves the literal heavy entry at s=1 before any
         // descent. Every later leg lowers s by one path step. This makes the
         // contraction entry an evaluated waypoint rather than an unevaluated
@@ -876,7 +822,6 @@ impl ContinuationPath {
         // (the K=2 existence fixture burned 7 CPU-hours exactly that way).
         let spine = match self.warm.clone() {
             Some(start) => {
-                self.evals_budgeted += WARM_LEG_EVAL_BUDGET;
                 // The coupled path is still a continuation pre-warm: its only
                 // payload is the converged inner coefficient state carried by
                 // `inner_beta_hint`.  Requesting an outer gradient here repeats
@@ -890,11 +835,10 @@ impl ContinuationPath {
                     start,
                     &rho_target,
                     OuterEvalOrder::Value,
-                    WARM_LEG_EVAL_BUDGET,
+                    PATH_BUDGET,
                 )
             }
             None => {
-                self.evals_budgeted += PATH_BUDGET;
                 fit_with_continuation(
                     obj,
                     &rho_target,
@@ -909,9 +853,9 @@ impl ContinuationPath {
             Ok(state) => {
                 self.warm = Some(state.clone());
                 self.s = s_next;
-                // Clean descent: restore the nominal step (grow back toward the
-                // coarse schedule) and refresh the τ-tied logit trust region.
-                self.s_step = (1.0 / CONTINUATION_WAYPOINTS as f64).min(self.s.max(S_STEP_FLOOR));
+                // Successful progress permits a naturally larger next step,
+                // bounded only by the distance remaining to the literal target.
+                self.s_step = (self.s_step * 2.0).min(self.s);
                 self.logit_tr = LogitTrustRegion::for_tau(
                     self.schedules
                         .scalar_targets_at(self.s)
@@ -926,11 +870,26 @@ impl ContinuationPath {
                 }
             }
             Err(failure) => {
-                // The homotopy FLOOR: never reject. Re-enter a heavier regime
-                // and re-descend with a finer step. At the heaviest regime the
-                // inner solve is a contraction and must converge, so the floor
-                // is reachable in finitely many back-offs.
-                self.reenter_heavier();
+                if entering {
+                    return Err(gam_problem::EstimationError::RemlOptimizationFailed(
+                        format!(
+                            "reactive domain entry failed at the objective-owned scalar entry: {}",
+                            failure.message()
+                        ),
+                    ));
+                }
+                self.refine_step();
+                let refined_next = (self.s - self.s_step).max(0.0);
+                if !(refined_next < self.s) {
+                    return Err(gam_problem::EstimationError::RemlOptimizationFailed(
+                        format!(
+                            "reactive domain continuation cannot form a smaller representable \
+                             waypoint below s={:.17e} after spine non-convergence: {}",
+                            self.s,
+                            failure.message()
+                        ),
+                    ));
+                }
                 ContinuationStep::Reentered {
                     s: self.s,
                     reason: ReentryReason::SpineStruggled(failure),
