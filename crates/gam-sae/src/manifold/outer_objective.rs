@@ -2854,26 +2854,37 @@ impl SaeManifoldOuterObjective {
     /// per-eval cost is `len(bundle) + 1` cheap inner solves. Retention is bounded
     /// only by memory admission; a work-count cap would make the envelope inexact.
     /// #2234 stall fix — a cost-only probe whose inner solve exhausts its CAPPED
-    /// budget (#1029: probes never earn the progress extension; the EW forced
-    /// probe stops at the forcing gate) is an UNFINISHED COMPUTATION, not an
-    /// undefined Laplace evidence. Classifying that marker as a recoverable
-    /// infeasibility returned the 1e12 wall on every line-search/ranking probe
-    /// near any ρ whose inner problem needs more than the probe budget — the
-    /// value lane then disagreed with the (extended-budget) gradient lane at the
-    /// SAME ρ by ten orders of magnitude ("cost-only value 1e12 disagrees with
-    /// analytic-sample value 3.07e2"), Armijo rejected every step, and every fit
-    /// froze at a live gradient and refused to mint (the 2026-07-10 fleet-wide
-    /// plain-fit failure). Rescue: retry ONCE at the accepted-point drive (the
-    /// full budget the gradient lane runs); only a rescue that ITSELF fails
-    /// reaches the caller's wall/hard-error classification, so the genuine
-    /// non-PD/infeasibility classes keep their wall semantics unchanged.
+    /// budget is an UNFINISHED COMPUTATION, not undefined Laplace evidence.
+    /// The same is true when the cheap CROSS-SEED/RANKING drive sees a non-PD
+    /// per-row factor BEFORE inner KKT stationarity: that factor describes the
+    /// current warm-start iterate, not the probed ρ. The full accepted-point
+    /// drive can cross that transient indefinite state and reach a finite
+    /// stationary factor (the linear-block seed that produced cost-only 1e12
+    /// versus analytic 3.6e13 at the identical ρ).
+    ///
+    /// Retry either provisional result once at the accepted-point drive. The
+    /// pre-KKT non-PD retry is deliberately limited to `Criterion` ranking
+    /// evaluations; `ForcedLineSearchProbe` retains #2080's fast rejection for
+    /// an overshooting trial. Only a full-drive refusal reaches the caller's
+    /// wall/hard-error classification, so genuinely non-PD stationary factors
+    /// keep their infeasibility semantics.
     fn value_probe_with_budget_rescue(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
         drive: ProbeInnerDrive,
     ) -> Result<(f64, Array1<f64>), String> {
         match self.evaluate_envelope_value_probe(rho_flat, drive) {
-            Err(err) if err.contains("inner solve did not converge at fixed ρ") => {
+            Err(err)
+                if err.contains("inner solve did not converge at fixed ρ")
+                    || (matches!(
+                        drive,
+                        ProbeInnerDrive::Criterion {
+                            refine_progress_extension: false
+                        }
+                    ) && err.contains(
+                        "undamped evidence factorization hit a non-PD per-row H_tt block before KKT stationarity",
+                    )) =>
+            {
                 self.probe_telemetry.budget_rescued_value_probes += 1;
                 self.evaluate_envelope_value_probe(
                     rho_flat,
