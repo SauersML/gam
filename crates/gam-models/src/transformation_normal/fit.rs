@@ -307,10 +307,10 @@ pub fn fit_transformation_normal(
     );
     let analytic_gradient = analytic_psi_available;
     let analytic_hessian_supported = analytic_gradient && cap_hessian.is_analytic();
-    let analytic_hessian = false;
-    if analytic_hessian_supported {
+    let analytic_hessian = analytic_hessian_supported;
+    if analytic_hessian {
         log::info!(
-            "[transformation-normal] CTN exact joint analytic outer Hessian is available but disabled for spatial kappa optimization; using analytic-gradient outer solves to avoid callback logdet trace work"
+            "[transformation-normal] CTN exact joint analytic outer Hessian is available for spatial kappa optimization; using exact second-order outer geometry"
         );
     }
 
@@ -467,9 +467,11 @@ pub fn fit_transformation_normal(
         analytic_gradient,
         analytic_hessian,
         // Transformation-normal has β-dependent H (through 1/h'²), so the
-        // EFS Wood-Fasiolo PSD invariant fails. Keep fixed-point disabled,
-        // but do not expose CTN's analytic Hessian to ARC: its callback
-        // trace route applies full-rank logdet operators at large-scale shape.
+        // EFS Wood-Fasiolo PSD invariant fails. Keep fixed-point disabled while
+        // exposing the exact outer Hessian to ARC: hiding it forces this
+        // three-coordinate problem onto BFGS, whose Strong-Wolfe probes each
+        // repeat a full CTN inner solve and caused every large-scale lane to
+        // exhaust the 2400-second command budget before marginal-slope began.
         true,
         None,
         outer_derivative_policy,
