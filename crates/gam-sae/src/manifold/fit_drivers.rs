@@ -6292,34 +6292,43 @@ impl SaeManifoldTerm {
             // line-search trial, and any re-seed is simply the next
             // iteration's starting state.
             //
-            // QUIESCENCE near stationarity: a reseed is a rescue for a
-            // collapsed basin the line search cannot escape; near a KKT root it
-            // is never a rescue — it is a deliberate state jump that spikes ‖g‖
-            // at an objective-good iterate (the measured 2.887e8 gradient spike
-            // in `tests_inner_budget_trajectory_2015`), invalidates the #2253
-            // idempotence certificate, and breaks the evidence refine loop's
-            // monotone-‖g‖ progress accounting. Once the joint KKT residual is
-            // within one order of magnitude of the acceptance band the guards
-            // stand down; a genuinely collapsed dictionary never gets there (a
-            // vanished atom leaves a live data-fit gradient), so the rescue
-            // path is untouched exactly where it is needed.
+            // QUIESCENCE near stationarity — for the BASIN-SELECTION guards
+            // only. The hook taxonomy has three kinds:
+            //   (a) basin-selection escapes (active-mass reseed, structural-
+            //       coherence reseed): escaping a degenerate basin is OPTIONAL;
+            //       near a KKT root a reseed is never a rescue — it is a state
+            //       jump that spikes ‖g‖ at an objective-good iterate (the
+            //       measured 2.887e8 event), invalidates the #2253 idempotence
+            //       certificate, and breaks the refine loop's monotone-‖g‖
+            //       accounting. Basin choice at stationarity belongs to the
+            //       outer / structure search, so these stand down inside the
+            //       band.
+            //   (b) divergence CONTAINMENT (the decoder-norm guard here, the
+            //       #2015 scale re-gauge below): interruption is MANDATORY and
+            //       must NEVER be quiesced — the amplitude-gauge runaway
+            //       (a→0, B→∞ at fixed a·B) is gradient-invisible, i.e. it
+            //       lives exactly INSIDE the KKT band, and the iterate-scaled
+            //       yardstick is self-reinforcing under a norm blow-up (the
+            //       band widens with ‖B‖). Containment keyed on norms, not on
+            //       ‖g‖, is the only sound trigger there.
+            //   (c) representation re-gauges (unit-speed, polar, affine
+            //       canonicalization): objective-guarded transactions below,
+            //       unaffected here.
             let kkt_quiescent = grad_norm_sq.is_finite()
                 && grad_norm_sq.sqrt()
                     <= 10.0 * SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
             if !kkt_quiescent {
                 self.enforce_active_mass_guard(outer_iteration, Some(rho))?;
-                // #976 Layer-1 guard 3b (decoder arm): the gate-mass guard above is
-                // blind to a dictionary whose gates stay spread but whose decoders
-                // have all collapsed to ≈0 (the real-data K>1 failure that drives
-                // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
-                // that has fallen far behind its peers and reseed it onto the
-                // residual; a strict no-op for K=1.
-                self.enforce_decoder_norm_guard(
-                    target,
-                    outer_iteration,
-                    rho,
-                    Some(&target_col_stats),
-                )?;
+            }
+            // #976 Layer-1 guard 3b (decoder arm): the gate-mass guard above is
+            // blind to a dictionary whose gates stay spread but whose decoders
+            // have all collapsed to ≈0 (the real-data K>1 failure that drives
+            // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
+            // that has fallen far behind its peers and reseed it onto the
+            // residual; a strict no-op for K=1. CONTAINMENT class (b): always
+            // live, never quiesced.
+            self.enforce_decoder_norm_guard(target, outer_iteration, rho, Some(&target_col_stats))?;
+            if !kkt_quiescent {
                 self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
             }
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
