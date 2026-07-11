@@ -17,6 +17,6 @@
 - The goal of this project is never to copy existing reference implementations.
 - Grid search is never allowed.
 - Wall-clock time budgets and deadlines are never allowed. In general, do not paper over solver issues.
-- A fit object must only ever come from a converged optimization. Non-convergence is a error Work survives walls via checkpoint/resume.
+- A fit object must only ever come from a converged optimization. Non-convergence is an error. Work survives walls via checkpoint/resume.
 - Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible.
 - General outer optimizer work should be in opt crate, not here. Code specific to our applications or inner optimizer code can stay here.
