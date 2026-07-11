@@ -1493,6 +1493,7 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::terminal_exact_newton_polish: {err}"))?;
             let grad_norm_sq = Self::system_grad_norm_sq(&sys);
             if !grad_norm_sq.is_finite() {
+                log::debug!("terminal Newton bail: non-finite ‖g‖² at entry");
                 break;
             }
             let grad_norm = grad_norm_sq.sqrt();
@@ -1504,19 +1505,35 @@ impl SaeManifoldTerm {
                 return Ok(true);
             }
             if !(grad_norm < prev_grad_norm) {
+                log::debug!(
+                    "terminal Newton bail: no contraction (‖g‖={grad_norm:.6e} ≥ prev={prev_grad_norm:.6e})"
+                );
                 break;
             }
             prev_grad_norm = grad_norm;
             // Ridge-0 deflated evidence factor = the B-preconditioner for the
             // exact-pencil GMRES (identical to the outer IFT's preconditioner).
-            let Ok(factor) =
-                self.factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options)
-            else {
-                break;
+            let factor = match self
+                .factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options)
+            {
+                Ok(factor) => factor,
+                Err(err) => {
+                    log::debug!(
+                        "terminal Newton bail: deflated evidence factor at ‖g‖={grad_norm:.6e}: {err}"
+                    );
+                    break;
+                }
             };
             let cache = factor.cache;
-            let Ok(solver) = self.outer_gradient_arrow_solver(&cache, lambda_smooth) else {
-                break;
+            let solver = match self.outer_gradient_arrow_solver(&cache, lambda_smooth) {
+                Ok(solver) => solver,
+                Err(err) => {
+                    log::debug!(
+                        "terminal Newton bail: outer-gradient quotient solver at \
+                         ‖g‖={grad_norm:.6e}: {err:?}"
+                    );
+                    break;
+                }
             };
             // Newton step on the exact Hessian: A Δ = −g on the gauge quotient.
             let mut rhs_t = Array1::<f64>::zeros(cache.delta_t_len());
@@ -1531,10 +1548,15 @@ impl SaeManifoldTerm {
                 t: rhs_t,
                 beta: sys.gb.mapv(|v| -v),
             };
-            let Ok(newton) =
-                self.solve_exact_stationarity(rho_fixed, target, &cache, &solver, &rhs)
-            else {
-                break;
+            let newton = match self.solve_exact_stationarity(rho_fixed, target, &cache, &solver, &rhs)
+            {
+                Ok(newton) => newton,
+                Err(err) => {
+                    log::debug!(
+                        "terminal Newton bail: exact-pencil GMRES at ‖g‖={grad_norm:.6e}: {err}"
+                    );
+                    break;
+                }
             };
             let pre_obj = self
                 .penalized_objective_total(target, rho_fixed, registry, 1.0)
@@ -1584,6 +1606,10 @@ impl SaeManifoldTerm {
                 alpha *= 0.5;
             }
             if !accepted {
+                log::debug!(
+                    "terminal Newton bail: all backtracks rejected at ‖g‖={grad_norm:.6e} \
+                     (pre_obj={pre_obj:.9e}, rise_budget={obj_rise_budget:.3e})"
+                );
                 break;
             }
             log::debug!(
