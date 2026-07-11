@@ -4715,7 +4715,7 @@ pub(crate) fn from_topk_gates_large_k_support_is_exact() {
     let (k_atoms, d, k_true, n) = (100_000_usize, 1, 4, 4);
     let planted: Vec<usize> = (0..k_true).map(|j| j * k_atoms / k_true).collect();
     let assignments: Vec<Array1<f64>> = (0..n)
-        .map(|row| {
+        .map(|_| {
             let mut a = vec![0.0_f64; k_atoms];
             for &atom in &planted {
                 a[atom] = 1.0;
