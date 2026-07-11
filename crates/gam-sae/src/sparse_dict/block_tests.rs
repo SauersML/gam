@@ -433,6 +433,10 @@ fn small_k_block_fit_runs_on_cpu_baseline_2134() {
     };
     let fit = fit_block_sparse_dictionary(x.view(), &config)
         .expect("small-K block fit must run on the CPU baseline, not refuse");
+    eprintln!(
+        "[#2134 small-k] EV={:.12} epochs={} convergence={:?}",
+        fit.explained_variance, fit.epochs, fit.convergence
+    );
     assert!(
         fit.explained_variance > 0.95,
         "small-K CPU block baseline must reconstruct the planted blocks: EV = {}",
@@ -479,6 +483,9 @@ fn block_seed_preserves_planted_subspaces_2134() {
             }
             best_overlap = best_overlap.max(overlap);
         }
+        eprintln!(
+            "[#2134 seed] planted_block={planted_block} best_projector_overlap={best_overlap:.12} rank={b}"
+        );
         assert!(
             b as f64 - best_overlap <= projector_roundoff,
             "block-aware seed must preserve planted subspace {planted_block}: \
@@ -506,6 +513,10 @@ fn planted_block_subspaces_recovered() {
         tolerance: 1.0e-10,
     };
     let fit = fit_block_sparse_dictionary(x.view(), &config).expect("block fit");
+    eprintln!(
+        "[#2134 planted] EV={:.12} epochs={} convergence={:?}",
+        fit.explained_variance, fit.epochs, fit.convergence
+    );
 
     assert!(
         fit.explained_variance > 0.98,
@@ -536,6 +547,7 @@ fn planted_block_subspaces_recovered() {
                 .expect("principal angle");
             best = best.min(ang);
         }
+        eprintln!("[#2134 planted] block={t} min_principal_angle={best:.12}");
         assert!(
             best < 2.0e-2,
             "planted subspace {t} not recovered by any fitted block: min angle {best} rad"
