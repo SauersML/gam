@@ -1093,7 +1093,7 @@ impl BernoulliRigidRowKernel {
         }
         let acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
             chunks.len(),
-            |range| {
+            |range| -> Result<BernoulliBlockHessianAccumulator, String> {
                 let mut acc = BernoulliBlockHessianAccumulator::new(slices);
                 for chunk in &chunks[range] {
                     let partial = chunk_body(*chunk)?;

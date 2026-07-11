@@ -2508,7 +2508,7 @@ impl BernoulliMarginalSlopeFamily {
                 // oversubscription that intermittently stalled the joint-Newton
                 // `hessian_qp` cycle). Bit-identical: faer partitions the matmul
                 // output, never the contracted axis.
-                let chunk_acc: Vec<f64> = gam_problem::with_nested_parallel(|| {
+                let chunk_acc: Vec<f64> = gam_problem::with_nested_parallel(|| -> Result<Vec<f64>, String> {
                 let start = chunk_idx * rows_per_chunk;
                 let end = (start + rows_per_chunk).min(n);
                 let rows = start..end;
