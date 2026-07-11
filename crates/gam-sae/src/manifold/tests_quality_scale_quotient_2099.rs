@@ -98,7 +98,9 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
     let p = 12usize;
     let (mut term, target, rho) = fit_circle(n, p, 3.0);
 
-    let ev0 = term.dictionary_reconstruction_ev(target.view(), &rho).unwrap();
+    let ev0 = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .unwrap();
     let uniformity0 = term.coordinate_uniformity_aggregate();
     let occupancy0 = term.per_atom_effective_sample_size();
     let fitted0 = term.try_fitted_for_rho(&rho).unwrap();
@@ -137,13 +139,24 @@ fn reconstruction_criterion_and_diagnostics_quotient_decoder_scale_2099() {
         "the reconstruction criterion must quotient the scale: EV {ev0} vs {ev1}"
     );
 
-    // Coordinate-uniformity and per-atom occupancy read the latent/assignment, not
-    // the magnitude — they must be byte-identical.
+    // Coordinate-uniformity and per-atom occupancy do not read absolute decoder
+    // magnitude. The arc-length defect computes a scale-cancelling floating-point
+    // ratio, so it is invariant to machine roundoff; occupancy is byte-identical.
     let uniformity1 = term.coordinate_uniformity_aggregate();
-    assert_eq!(
-        uniformity0, uniformity1,
-        "coordinate-uniformity diagnostic must be invariant under decoder rescale"
-    );
+    match (uniformity0, uniformity1) {
+        (Some(before), Some(after)) => {
+            let roundoff = f64::EPSILON * (1.0 + before.abs().max(after.abs()));
+            assert!(
+                (after - before).abs() <= roundoff,
+                "coordinate-uniformity diagnostic must be invariant under decoder rescale: \
+                 {before} vs {after}"
+            );
+        }
+        (None, None) => {}
+        (before, after) => panic!(
+            "decoder rescale changed coordinate-uniformity definedness: {before:?} vs {after:?}"
+        ),
+    }
     let occupancy1 = term.per_atom_effective_sample_size();
     assert_eq!(
         occupancy0, occupancy1,
