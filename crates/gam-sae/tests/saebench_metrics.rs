@@ -42,28 +42,14 @@ fn chart_interp_wraps_cyclic_boundary_and_quotients_orientation() {
             weight: 1.0,
         },
     ];
-    let null_draw = vec![
-        ChartInterpObservation {
+    let null_draw = obs
+        .iter()
+        .map(|row| ChartInterpObservation {
             recovered_turns: 0.0,
-            label_turns: 0.0,
-            weight: 1.0,
-        },
-        ChartInterpObservation {
-            recovered_turns: 0.0,
-            label_turns: 0.25,
-            weight: 1.0,
-        },
-        ChartInterpObservation {
-            recovered_turns: 0.0,
-            label_turns: 0.5,
-            weight: 1.0,
-        },
-        ChartInterpObservation {
-            recovered_turns: 0.0,
-            label_turns: 0.75,
-            weight: 1.0,
-        },
-    ];
+            label_turns: row.label_turns,
+            weight: row.weight,
+        })
+        .collect();
     let calibration = matched_spectrum_calibration(7, vec![null_draw]);
     let report = chart_interp_score(&obs, &calibration, 0.05).unwrap();
     assert!(
