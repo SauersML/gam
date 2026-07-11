@@ -949,12 +949,9 @@ pub(crate) fn build_manifold_sae_payload(
     };
     let selected_log_lambda_smooth = vopt(raw, "log_lambda_smooth").map(v_arr1).transpose()?;
     let selected_log_ard = vopt(raw, "log_ard").map(v_arr2).transpose()?;
-    let structured_residual_diagnostics: Vec<Value> = serde_json::from_value(
-        vget(raw, "structured_residual_diagnostics")?.clone(),
-    )
-    .map_err(|error| {
-        format!("invalid structured_residual_diagnostics payload: {error}")
-    })?;
+    let structured_residual_diagnostics: Vec<Value> =
+        serde_json::from_value(vget(raw, "structured_residual_diagnostics")?.clone())
+            .map_err(|error| format!("invalid structured_residual_diagnostics payload: {error}"))?;
     let structure_certificate = vopt(raw, "structure_certificate")
         .and_then(|v| v.as_str())
         .map(str::to_string);

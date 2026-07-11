@@ -501,8 +501,7 @@ impl SaeManifoldRho {
                 let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
                 let block_len = self.log_lambda_block.len();
-                let mut out =
-                    Array1::<f64>::zeros(smooth_start + k + ard_len + block_len);
+                let mut out = Array1::<f64>::zeros(smooth_start + k + ard_len + block_len);
                 if let Some(index) = self.sparse_flat_index() {
                     out[index] = self.log_lambda_sparse;
                 }
@@ -528,8 +527,7 @@ impl SaeManifoldRho {
                 let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
                 let block_len = self.log_lambda_block.len();
-                let mut out =
-                    Array1::<f64>::zeros(smooth_start + k + max_d + block_len);
+                let mut out = Array1::<f64>::zeros(smooth_start + k + max_d + block_len);
                 if let Some(index) = self.sparse_flat_index() {
                     out[index] = self.log_lambda_sparse;
                 }
@@ -549,8 +547,7 @@ impl SaeManifoldRho {
                             count += 1;
                         }
                     }
-                    out[smooth_start + k + j] =
-                        if count > 0 { acc / count as f64 } else { 0.0 };
+                    out[smooth_start + k + j] = if count > 0 { acc / count as f64 } else { 0.0 };
                 }
                 // #2231 §2a — crosscoder block weights appended after the shared
                 // ARD block (empty ⇒ byte-identical).
@@ -640,10 +637,9 @@ impl SaeManifoldRho {
                     log_ard.push(block);
                 }
                 // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
-                let log_lambda_block: Vec<f64> =
-                    (0..block_len)
-                        .map(|b| flat[smooth_start + k + max_d + b])
-                        .collect();
+                let log_lambda_block: Vec<f64> = (0..block_len)
+                    .map(|b| flat[smooth_start + k + max_d + b])
+                    .collect();
                 SaeManifoldRho {
                     log_lambda_sparse: self
                         .sparse_flat_index()

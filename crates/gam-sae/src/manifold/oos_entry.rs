@@ -1136,9 +1136,7 @@ mod tests {
         let plan = run_sae_manifold_steer(SaeSteerRequest {
             atoms: request.atoms,
             coords: vec![coords],
-            logits: request
-                .initial_logits
-                .expect("periodic fixture has logits"),
+            logits: request.initial_logits.expect("periodic fixture has logits"),
             assignment: SaeOosAssignmentKind::TopK,
             top_k: Some(1),
             alpha: 1.0,

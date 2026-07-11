@@ -2965,9 +2965,7 @@ impl SaeManifoldOuterObjective {
                 .assignment
                 .ibp_eb_log_alpha_step(&rho)
                 .map_err(|e| {
-                    format!(
-                        "SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}"
-                    )
+                    format!("SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}")
                 })?;
             match sparse_step {
                 Some(step) if step.is_finite() => {

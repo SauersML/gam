@@ -60,10 +60,8 @@ where
     A: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
     B: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
 {
-    let apply_a_q =
-        |v: &SaeArrowVector| apply_gauge_fixed_arrow_operator(solver, v, apply_raw_a);
-    let apply_b_q =
-        |v: &SaeArrowVector| apply_gauge_fixed_arrow_operator(solver, v, apply_raw_b);
+    let apply_a_q = |v: &SaeArrowVector| apply_gauge_fixed_arrow_operator(solver, v, apply_raw_a);
+    let apply_b_q = |v: &SaeArrowVector| apply_gauge_fixed_arrow_operator(solver, v, apply_raw_b);
     let mut x = solve_b_preconditioned_gmres(solver, rhs, |v| apply_a_q(v))?;
     // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
     //
@@ -317,8 +315,7 @@ impl SaeManifoldTerm {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
-            self.assignment
-                .try_assignments_row_into(row, a_scratch)?;
+            self.assignment.try_assignments_row_into(row, a_scratch)?;
             if jet_window.is_empty() {
                 jet_window_next = self.refill_jet_window(
                     jet_window_next,
@@ -505,15 +502,9 @@ impl SaeManifoldTerm {
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
         let apply_raw_a = |v: &SaeArrowVector| self.apply_exact_hessian(rho, target, cache, v);
-        let apply_raw_b = |v: &SaeArrowVector| {
-            apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())
-        };
-        solve_exact_stationarity_on_gauge_quotient(
-            solver,
-            rhs,
-            &apply_raw_a,
-            &apply_raw_b,
-        )
+        let apply_raw_b =
+            |v: &SaeArrowVector| apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view());
+        solve_exact_stationarity_on_gauge_quotient(solver, rhs, &apply_raw_a, &apply_raw_b)
     }
 
     /// Analytic SAE REML outer-ρ gradient components at the already converged
@@ -574,25 +565,30 @@ impl SaeManifoldTerm {
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
 
-        explicit[0] = crate::assignment::assignment_prior_log_strength_derivative_weighted(
-            &self.assignment,
-            rho,
-            self.row_loss_weights.as_deref(),
-        );
-        // IBP concentration controls only the Beta--Bernoulli prior. The final
-        // posterior-mean gate is `sigmoid(logit/tau)`, so the data likelihood
-        // and its Gauss--Newton blocks have no direct alpha derivative.
-        logdet_trace[0] = match inverse_probe_bundle {
-            Some((probes, sinv)) => self
-                .assignment_log_strength_hessian_trace_from_probes(rho, cache, probes, sinv)
-                .map_err(OuterGradientError::internal)?,
-            None => self
-                .assignment_log_strength_hessian_trace(rho, cache, solver)
-                .map_err(OuterGradientError::internal)?,
-        };
+        if let Some(sparse_index) = rho.sparse_flat_index() {
+            explicit[sparse_index] =
+                crate::assignment::assignment_prior_log_strength_derivative_weighted(
+                    &self.assignment,
+                    rho,
+                    self.row_loss_weights.as_deref(),
+                );
+            // IBP concentration controls only the Beta--Bernoulli prior. The
+            // final posterior-mean gate is `sigmoid(logit/tau)`, so the data
+            // likelihood and its Gauss--Newton blocks have no direct alpha
+            // derivative. Structurally fixed assignments have no sparse index
+            // and skip this channel entirely.
+            logdet_trace[sparse_index] = match inverse_probe_bundle {
+                Some((probes, sinv)) => self
+                    .assignment_log_strength_hessian_trace_from_probes(rho, cache, probes, sinv)
+                    .map_err(OuterGradientError::internal)?,
+                None => self
+                    .assignment_log_strength_hessian_trace(rho, cache, solver)
+                    .map_err(OuterGradientError::internal)?,
+            };
+        }
 
         // #1556: λ_smooth is per-atom, so the smoothness gradient block occupies
-        // flat indices `1..1+K` (one per atom), not a single index 1. Each atom
+        // the K layout-derived smooth indices (one per atom). Each atom
         // `k` carries its own explicit penalty-energy derivative, log|H| trace,
         // and Occam-normalizer derivative.
         let k_smooth = rho.log_lambda_smooth.len();
@@ -638,9 +634,10 @@ impl SaeManifoldTerm {
             .reml_occam_log_lambda_smooth_derivative(rho)
             .map_err(OuterGradientError::internal)?;
         for atom_idx in 0..k_smooth {
-            explicit[1 + atom_idx] = smooth_explicit[atom_idx];
-            logdet_trace[1 + atom_idx] = 0.5 * smooth_logdet[atom_idx];
-            occam[1 + atom_idx] = -smooth_occam[atom_idx];
+            let index = rho.smooth_flat_index(atom_idx);
+            explicit[index] = smooth_explicit[atom_idx];
+            logdet_trace[index] = 0.5 * smooth_logdet[atom_idx];
+            occam[index] = -smooth_occam[atom_idx];
         }
 
         let ard_explicit = self
@@ -742,12 +739,8 @@ impl SaeManifoldTerm {
                     })?;
                 let block = coord - block_tail_start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
-                self.crosscoder_block_ift_rhs(
-                    cache,
-                    target,
-                    start..start + block_dims[block],
-                )
-                .map_err(OuterGradientError::internal)?
+                self.crosscoder_block_ift_rhs(cache, target, start..start + block_dims[block])
+                    .map_err(OuterGradientError::internal)?
             } else {
                 self.outer_rho_gradient_ift_rhs(rho, coord, cache)
                     .map_err(OuterGradientError::internal)?

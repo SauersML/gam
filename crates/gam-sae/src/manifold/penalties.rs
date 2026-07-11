@@ -2714,10 +2714,7 @@ mod tests_findings_234 {
         let (v0, _) = base.separation_barrier_value_and_grad_for_test(1.0);
         assert!(v0 > 0.0, "fixture must carry a positive barrier, got {v0}");
         for &s in &[0.01_f64, 100.0, 1.0e4] {
-            let scaled = two_atom_term_with_decoders(
-                dec0.mapv(|x| s * x),
-                dec1.mapv(|x| s * x),
-            );
+            let scaled = two_atom_term_with_decoders(dec0.mapv(|x| s * x), dec1.mapv(|x| s * x));
             let (vs, _) = scaled.separation_barrier_value_and_grad_for_test(1.0);
             let rel = (vs - v0).abs() / (1.0 + v0.abs());
             assert!(

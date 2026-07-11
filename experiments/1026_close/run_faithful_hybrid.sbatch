@@ -37,7 +37,7 @@
 #SBATCH --mem=96G
 #SBATCH --time=08:00:00
 #SBATCH --output=/projects/standard/hsiehph/sauer354/sae2233_faithful_%j.out
-set -uo pipefail
+set -euo pipefail
 
 R=${R:-/projects/standard/hsiehph/sauer354}
 unset RUSTFLAGS   # MSI gam_env booby-traps RUSTFLAGS; this job runs a prebuilt wheel.
@@ -78,9 +78,12 @@ OUT=${OUT:-$R/2233_faithful/eq4_faithful.jsonl}
 VENV=${VENV:-$R/saevenv}
 DRIVER=${DRIVER:-$(dirname "$(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | awk -F= '/Command=/{print $2}')")/driver_1026_arms.py}
 [ -f "$DRIVER" ] || DRIVER=$R/driver_1026_arms.py
+DRIVER_DIR=$(cd "$(dirname "$DRIVER")" && pwd)
 
 test -f "$CHUNK_DIR/chunk_0000.npy" || { echo "FATAL: no chunk_0000.npy in $CHUNK_DIR"; exit 2; }
 test -f "$DRIVER" || { echo "FATAL: driver not found: $DRIVER (set DRIVER=)"; exit 2; }
+test -f "$DRIVER_DIR/bits_eq4.py" || { echo "FATAL: missing $DRIVER_DIR/bits_eq4.py beside driver"; exit 2; }
+test -f "$DRIVER_DIR/arm_featurizers.py" || { echo "FATAL: missing $DRIVER_DIR/arm_featurizers.py beside driver"; exit 2; }
 test -x "$VENV/bin/python" || { echo "FATAL: no venv python at $VENV (set VENV=)"; exit 2; }
 mkdir -p "$(dirname "$OUT")"
 
@@ -92,6 +95,7 @@ PY=$VENV/bin/python
 echo "=== gam#2233 faithful  K=$K k_flat=$K_FLAT curved_atoms=$CURVED_ATOMS B=$B  $(date)  node=$(hostname) ==="
 echo "    dict-param budget: external K*P = $K*$P_HINT ; hybrid k_flat*P + curved*B*P = ($K_FLAT + $CURVED_ATOMS*$B)*P = $(( K_FLAT + CURVED_ATOMS*B ))*P"
 $PY -c "import gamfit; print('gamfit', getattr(gamfit,'__version__','?'))"
+(cd "$DRIVER_DIR" && $PY -c "import arm_featurizers, bits_eq4; print('Eq-4 modules: ready')")
 
 COMMON=(--chunk-dir "$CHUNK_DIR" --max-rows "$MAX_ROWS" --seed "$SEED" --K "$K"
         --top-k "$TOP_K" --out "$OUT" --bits --bits-max-rows "$BITS_MAX_ROWS")
@@ -109,7 +113,5 @@ $PY -u "$DRIVER" --arm hybrid "${COMMON[@]}" \
   --curved-atoms "$CURVED_ATOMS" --curved-k "$CURVED_K" \
   --atom-manifold "$ATOM_MANIFOLD" --atom-basis "$ATOM_BASIS" \
   --tag "${TAG}-hybrid"
-rc=$?
-echo "=== rc=$rc DONE $(date) — CHECK bits_dict_params_faithful==true in $OUT ==="
+echo "=== rc=0 DONE $(date) — CHECK bits_dict_params_faithful==true in $OUT ==="
 echo "    if false: the built curved tier is wider than B=$B; rerun with B=<real width>."
-exit $rc

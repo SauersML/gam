@@ -54,7 +54,8 @@ mod tests {
         let (n, p) = target.dim();
         for i in 0..n {
             for j in 0..p {
-                let mut s = (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (j as u64).wrapping_add(1);
+                let mut s =
+                    (i as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ (j as u64).wrapping_add(1);
                 s ^= s >> 33;
                 s = s.wrapping_mul(0xFF51AFD7ED558CCD);
                 s ^= s >> 33;

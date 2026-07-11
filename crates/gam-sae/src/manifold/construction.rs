@@ -423,6 +423,7 @@ impl SaeManifoldTerm {
         rho.log_lambda_smooth
             .extend_from_slice(&secondary_rho.log_lambda_smooth);
         rho.log_ard.extend(secondary_rho.log_ard.iter().cloned());
+        rho = rho.for_assignment(primary.assignment.mode);
         Ok((primary, rho))
     }
 

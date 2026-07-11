@@ -847,6 +847,9 @@ pub fn run_sae_crosscoder_fit(
         .base_term
         .ensure_decoder_frames_active_for_current_decoder()
         .map_err(SaeFitError::Fit)?;
+    request.initial_rho = request
+        .initial_rho
+        .for_assignment(request.base_term.assignment.mode);
     let initial_flat = request.initial_rho.to_flat();
     let n_params = initial_flat.len();
     let cancel = request

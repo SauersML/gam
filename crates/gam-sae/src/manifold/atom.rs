@@ -2005,7 +2005,9 @@ mod tests {
     #[test]
     fn bessel_log_i0_and_ratio_is_overflow_free_and_derivative_consistent() {
         // η spanning both branches and well past the e^η overflow threshold.
-        for &eta in &[0.25_f64, 1.0, 3.0, 3.74, 3.76, 5.0, 12.0, 50.0, 400.0, 900.0] {
+        for &eta in &[
+            0.25_f64, 1.0, 3.0, 3.74, 3.76, 5.0, 12.0, 50.0, 400.0, 900.0,
+        ] {
             let (log_i0, ratio) = bessel_i0_log_and_ratio(eta);
             assert!(
                 log_i0.is_finite() && ratio.is_finite(),

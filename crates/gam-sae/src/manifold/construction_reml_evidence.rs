@@ -3499,7 +3499,7 @@ impl SaeManifoldTerm {
         }
         let mut t = Array1::<f64>::zeros(cache.delta_t_len());
         let mut beta = Array1::<f64>::zeros(cache.k);
-        if j == 0 {
+        if rho.sparse_flat_index() == Some(j) {
             let assignment_grad =
                 crate::assignment::assignment_prior_log_strength_target_mixed_weighted(
                     &self.assignment,
@@ -3527,11 +3527,13 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-        } else if (1..=rho.log_lambda_smooth.len()).contains(&j) {
-            // #1556: coordinate `j ∈ 1..=K` is the per-atom smoothness strength
-            // `log λ_smooth[j-1]`. `∂(penalty)/∂log λ_k = λ_k·S_k C_k` touches ONLY
-            // atom `k = j-1`'s decoder block; every other atom's RHS is zero.
-            let target_atom = j - 1;
+        } else if (rho.smooth_flat_start()..rho.smooth_flat_start() + rho.log_lambda_smooth.len())
+            .contains(&j)
+        {
+            // #1556: this layout-derived coordinate is one atom's smoothness
+            // strength. `∂(penalty)/∂log λ_k = λ_k·S_k C_k` touches ONLY
+            // atom `k`'s decoder block; every other atom's RHS is zero.
+            let target_atom = j - rho.smooth_flat_start();
             let lambda = rho.lambda_smooth_for(target_atom);
             let frames_active = self.last_frames_active && cache.k == self.factored_border_dim();
             let offsets = if frames_active {
@@ -3898,8 +3900,7 @@ impl SaeManifoldTerm {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
-            self.assignment
-                .try_assignments_row_into(row, a_scratch)?;
+            self.assignment.try_assignments_row_into(row, a_scratch)?;
             if jet_window.is_empty() {
                 jet_window_next = self.refill_jet_window(
                     jet_window_next,
@@ -4477,8 +4478,7 @@ impl SaeManifoldTerm {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
-            self.assignment
-                .try_assignments_row_into(row, a_scratch)?;
+            self.assignment.try_assignments_row_into(row, a_scratch)?;
             if jet_window.is_empty() {
                 jet_window_next = self.refill_jet_window(
                     jet_window_next,

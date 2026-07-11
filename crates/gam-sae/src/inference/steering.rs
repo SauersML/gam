@@ -769,6 +769,266 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String
     Ok(full_len)
 }
 
+/// One dose sample on a collateral-damage curve (gam#2234 E2, the intrinsic
+/// Rust-owned counterpart of the model-in-the-loop KL frontier): the on-target
+/// effect and the off-target collateral of a single steering intervention,
+/// measured in the fitted dictionary's own representation, with no LLM in the
+/// loop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralPoint {
+    /// The chart-coordinate dose applied to the target atom's steered axis
+    /// (radians / fraction-of-period, per the atom's manifold).
+    pub dose: f64,
+    /// RMS-over-rows on-target effect: `‖proj_{T_k} Δ‖`, the energy the
+    /// intervention deposits into the TARGET atom's own local decode-tangent
+    /// frame `T_k = ∂g_k/∂t` at each row's fitted operating point. This is the
+    /// intended landing — how loudly the knob turned the feature it names.
+    pub on_target_effect: f64,
+    /// RMS-over-rows collateral: `sqrt(Σ_{j∈others} ‖proj_{T_j} Δ‖²)`, the energy
+    /// the SAME intervention leaks onto OTHER atoms' local frames. This is the
+    /// damage — how much turning atom `k`'s knob spuriously moves features the
+    /// intervention did not name.
+    pub collateral: f64,
+}
+
+/// One intervention family's swept collateral curve plus its aggregate
+/// collateral efficiency (collateral energy spent per unit on-target effect).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralArm {
+    /// Per-dose `(effect, collateral)` samples, in the order of the input doses.
+    pub points: Vec<CollateralPoint>,
+    /// Collateral energy per unit on-target effect over the swept doses:
+    /// `sqrt(Σ collateral²) / sqrt(Σ effect²)`. Lower is a cleaner control knob.
+    /// `NaN` when the arm achieves no on-target effect at any dose.
+    pub efficiency: f64,
+}
+
+/// The on-manifold-vs-flat collateral-damage comparison for one target atom
+/// (gam#2234 E2 thesis, measured intrinsically — no model surgery, no outer-fit
+/// convergence in the loop). The two arms move the SAME per-row ambient energy:
+/// the flat arm applies it along a single fixed decoder direction (the flat-SAE
+/// `x' = x + α·w` baseline), the manifold arm applies the chart-coordinate group
+/// action `x' = x + a·(Φ_k(t⊕δ) − Φ_k(t))·B_k`, which rotates with each row's
+/// coordinate to stay on the atom's decoded image. The thesis: at matched
+/// per-row norm the manifold arm spends strictly less collateral per unit
+/// on-target effect — curved features are the right control knobs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollateralCurve {
+    /// The steered (target) atom.
+    pub atom: usize,
+    /// The target atom's latent axis the dose is applied along.
+    pub axis: usize,
+    /// The atoms collateral is measured against (typically every `j ≠ atom`).
+    pub others: Vec<usize>,
+    /// The on-manifold group-action arm.
+    pub manifold: CollateralArm,
+    /// The matched-per-row-norm fixed-direction (flat-SAE) control arm.
+    pub flat: CollateralArm,
+    /// `true` when the on-manifold arm spends strictly less collateral per unit
+    /// on-target effect than the flat arm (`manifold.efficiency < flat.efficiency`),
+    /// with both efficiencies finite — the E2 dominance verdict, decided
+    /// structurally in the SAE's own representation.
+    pub manifold_is_cleaner: bool,
+}
+
+/// Norm of `δ`'s component that lands inside the span of a local decode-tangent
+/// frame — the energy the ambient move deposits into that atom's feature
+/// direction at its current operating point.
+fn frame_landed_norm(frame: &Array2<f64>, delta: ArrayView1<'_, f64>) -> f64 {
+    let proj = project_onto_tangent_span(frame, delta);
+    proj.iter().map(|&x| x * x).sum::<f64>().sqrt()
+}
+
+/// Sweep the intrinsic collateral-damage curve for steering atom `atom_k` along
+/// latent `axis` over `doses`, comparing the on-manifold group action against a
+/// matched-per-row-norm flat-direction control (gam#2234 E2).
+///
+/// For each dose `δ` the on-manifold ambient move is the fitted group-action
+/// delta [`SaeManifoldTerm::steer_rows`] (chart step `δ` on `axis`, gate held
+/// fixed). The flat control replays the SAME per-row move NORM along one fixed
+/// ambient direction `w` — the atom's mean decode-tangent direction along `axis`,
+/// the manifold analog of a flat SAE's single decoder column. Each move is
+/// decomposed against every atom's local decode-tangent frame at its fitted
+/// coordinate: the projection onto the TARGET atom's frame is the on-target
+/// effect, the projection onto the OTHER atoms' frames is the collateral.
+///
+/// This is a pure read over the fitted term (no criterion, no penalty, no outer
+/// fit), so it runs on any fitted or hand-built term with installed evaluators —
+/// it does not wait on outer-loop convergence, unlike the model-in-the-loop E1/E2
+/// KL frontier it mirrors.
+///
+/// Errors when `atom_k`/`axis`/an `others` index is out of range, `doses` is
+/// empty, or the target atom's mean tangent along `axis` vanishes (no fixed
+/// direction to define the flat control against).
+pub fn collateral_curve(
+    model: &SaeManifoldTerm,
+    atom_k: usize,
+    axis: usize,
+    others: &[usize],
+    doses: &[f64],
+) -> Result<CollateralCurve, String> {
+    let k = model.k_atoms();
+    if atom_k >= k {
+        return Err(format!(
+            "collateral_curve: atom index {atom_k} out of range (term has {k} atoms)"
+        ));
+    }
+    let d_k = model.atoms[atom_k].latent_dim;
+    if axis >= d_k {
+        return Err(format!(
+            "collateral_curve: axis {axis} out of range for atom {atom_k} latent_dim {d_k}"
+        ));
+    }
+    if doses.is_empty() {
+        return Err("collateral_curve: doses must be non-empty".to_string());
+    }
+    for &j in others {
+        if j >= k {
+            return Err(format!(
+                "collateral_curve: other atom index {j} out of range (term has {k} atoms)"
+            ));
+        }
+    }
+    let n = model.n_obs();
+    let p = model.output_dim();
+    let rows: Vec<usize> = (0..n).collect();
+
+    // Per-row local decode-tangent frames at each atom's fitted operating point.
+    // These are dose-independent (the fitted coordinates never move; steering is
+    // the hypothetical move whose leakage we price against the CURRENT features).
+    let frame_at = |atom_idx: usize| -> Result<Vec<Array2<f64>>, String> {
+        let coords = model.assignment.coords[atom_idx].as_matrix();
+        let mut frames = Vec::with_capacity(n);
+        for row in 0..n {
+            let t: Vec<f64> = coords.row(row).to_vec();
+            frames.push(decode_tangents_at(&model.atoms[atom_idx], &t)?);
+        }
+        Ok(frames)
+    };
+    let target_frames = frame_at(atom_k)?;
+    let mut other_frames: Vec<Vec<Array2<f64>>> = Vec::with_capacity(others.len());
+    for &j in others {
+        other_frames.push(frame_at(j)?);
+    }
+
+    // The fixed flat direction w: the dominant ambient direction the target atom
+    // moves along `axis` — the top left singular vector of its per-row tangent
+    // field, i.e. the leading eigenvector of `G = Σ_i g_i g_iᵀ` with
+    // `g_i = ∂g_k/∂t_axis|_{t_i}`. This is the single best fixed decoder column a
+    // flat SAE would steer this feature with (the mean tangent is not usable — it
+    // averages to ≈0 over a full circle). Found by power iteration on the small
+    // `p × p` Gram, which is exact for the leading direction.
+    let mut gram = Array2::<f64>::zeros((p, p));
+    for frame in &target_frames {
+        for i in 0..p {
+            let gi = frame[[i, axis]];
+            if gi == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                gram[[i, j]] += gi * frame[[j, axis]];
+            }
+        }
+    }
+    let mut w = Array1::<f64>::from_elem(p, 1.0 / (p as f64).sqrt());
+    for _ in 0..128 {
+        let mut next = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            let mut acc = 0.0_f64;
+            for j in 0..p {
+                acc += gram[[i, j]] * w[j];
+            }
+            next[i] = acc;
+        }
+        let norm = next.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        if !(norm > 0.0) {
+            return Err(format!(
+                "collateral_curve: atom {atom_k} has a vanishing tangent field along axis {axis}; \
+                 no fixed direction to define the flat control"
+            ));
+        }
+        next.mapv_inplace(|x| x / norm);
+        w = next;
+    }
+
+    // Decompose one per-row move field into (effect, collateral) RMS over rows.
+    let decompose = |field: &Array2<f64>| -> CollateralPoint {
+        let mut eff_sq = 0.0_f64;
+        let mut col_sq = 0.0_f64;
+        for row in 0..n {
+            let delta = field.row(row);
+            let e = frame_landed_norm(&target_frames[row], delta);
+            eff_sq += e * e;
+            let mut c = 0.0_f64;
+            for frames in &other_frames {
+                let l = frame_landed_norm(&frames[row], delta);
+                c += l * l;
+            }
+            col_sq += c;
+        }
+        let denom = n.max(1) as f64;
+        CollateralPoint {
+            dose: 0.0,
+            on_target_effect: (eff_sq / denom).sqrt(),
+            collateral: (col_sq / denom).sqrt(),
+        }
+    };
+
+    let mut manifold_pts = Vec::with_capacity(doses.len());
+    let mut flat_pts = Vec::with_capacity(doses.len());
+    for &dose in doses {
+        let mut step = Array1::<f64>::zeros(d_k);
+        step[axis] = dose;
+        let on_field = model.steer_rows(atom_k, &rows, step.view())?;
+
+        // Matched control: same per-row move NORM, along the fixed direction w.
+        let mut flat_field = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let norm = on_field.row(row).iter().map(|&x| x * x).sum::<f64>().sqrt();
+            for i in 0..p {
+                flat_field[[row, i]] = norm * w[i];
+            }
+        }
+
+        let mut m = decompose(&on_field);
+        m.dose = dose;
+        manifold_pts.push(m);
+        let mut f = decompose(&flat_field);
+        f.dose = dose;
+        flat_pts.push(f);
+    }
+
+    let efficiency = |pts: &[CollateralPoint]| -> f64 {
+        let eff_sq: f64 = pts.iter().map(|q| q.on_target_effect * q.on_target_effect).sum();
+        let col_sq: f64 = pts.iter().map(|q| q.collateral * q.collateral).sum();
+        if eff_sq > 0.0 {
+            (col_sq / eff_sq).sqrt()
+        } else {
+            f64::NAN
+        }
+    };
+    let manifold = CollateralArm {
+        efficiency: efficiency(&manifold_pts),
+        points: manifold_pts,
+    };
+    let flat = CollateralArm {
+        efficiency: efficiency(&flat_pts),
+        points: flat_pts,
+    };
+    let manifold_is_cleaner = manifold.efficiency.is_finite()
+        && flat.efficiency.is_finite()
+        && manifold.efficiency < flat.efficiency;
+
+    Ok(CollateralCurve {
+        atom: atom_k,
+        axis,
+        others: others.to_vec(),
+        manifold,
+        flat,
+        manifold_is_cleaner,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

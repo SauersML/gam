@@ -149,6 +149,17 @@ pub struct RowKappas {
     pub k3_1: f64,
 }
 
+/// Penalized expected-information geometry shared by the Lawley value and its
+/// log-smoothing-parameter derivatives.
+struct LawleyPairGeometry {
+    /// `J^-1`, where `J = X^T W X + S_lambda`.
+    inverse_information: Array2<f64>,
+    /// `E = X J^-1 X^T`.
+    pair_influence: Array2<f64>,
+    /// `diag(E)`.
+    leverage: Array1<f64>,
+}
+
 impl RowKappas {
     /// Scale every cumulant by a prior weight `w`: a row observed with weight
     /// `w` contributes `w·ℓᵢ` to the log-likelihood (for binomial data `w`
@@ -270,11 +281,11 @@ impl RowExpectedJets {
 /// function on the null model) is the second-order mean shift of the LR
 /// statistic; feed `q + ε_k − ε_{k−q}` to
 /// [`crate::inference::higher_order::bartlett_factor_from_mean`].
-pub fn lawley_epsilon(
+fn lawley_pair_geometry(
     x: ArrayView2<'_, f64>,
     kappas: &[RowKappas],
     penalty: Option<ArrayView2<'_, f64>>,
-) -> Result<f64, String> {
+) -> Result<LawleyPairGeometry, String> {
     let n = x.nrows();
     let k = x.ncols();
     if n == 0 || k == 0 {
@@ -323,6 +334,22 @@ pub fn lawley_epsilon(
     let e_pairs = x.dot(&j_inv).dot(&x.t());
     let h = e_pairs.diag().to_owned();
 
+    Ok(LawleyPairGeometry {
+        inverse_information: j_inv,
+        pair_influence: e_pairs,
+        leverage: h,
+    })
+}
+
+/// Evaluate Lawley's epsilon polynomial on a precomputed pair geometry.
+fn lawley_epsilon_from_geometry(
+    kappas: &[RowKappas],
+    geometry: &LawleyPairGeometry,
+) -> Result<f64, String> {
+    let n = kappas.len();
+    let e_pairs = &geometry.pair_influence;
+    let h = &geometry.leverage;
+
     // λ₄ = Σ_i a_i h_i².
     let mut lambda4 = 0.0;
     for (i, row_kappas) in kappas.iter().enumerate() {
@@ -352,6 +379,15 @@ pub fn lawley_epsilon(
         ));
     }
     Ok(epsilon)
+}
+
+pub fn lawley_epsilon(
+    x: ArrayView2<'_, f64>,
+    kappas: &[RowKappas],
+    penalty: Option<ArrayView2<'_, f64>>,
+) -> Result<f64, String> {
+    let geometry = lawley_pair_geometry(x, kappas, penalty)?;
+    lawley_epsilon_from_geometry(kappas, &geometry)
 }
 
 /// Row cap for LR consumers that build the `O(n²)`-memory pair matrix `E` per
