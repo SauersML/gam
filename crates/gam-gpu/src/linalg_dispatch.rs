@@ -1016,7 +1016,7 @@ mod pre_probe_gate_tests {
         let before = GpuRuntime::global_call_count();
         // Discard the routing result; this test asserts only the fall-through
         // side effect (that an admissible op reached GpuRuntime::global()).
-        drop(route_through_gpu(big));
+        let _ = route_through_gpu(big);
         assert!(
             GpuRuntime::global_call_count() > before,
             "an admissible op must fall through to GpuRuntime::global()"
