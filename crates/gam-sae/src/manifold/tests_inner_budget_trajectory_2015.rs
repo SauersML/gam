@@ -103,6 +103,121 @@ fn wide_p_k4_in_regime() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
+/// PROBE (mechanism ID): ‖g‖ vs inner-iteration budget, with per-budget
+/// discriminators. The round-1 trajectory established NO FLOOR + a catastrophic
+/// non-monotone spike (67.9→17.1→22.1→2.887e8@80→0.115→…→2.25e-3@1280). The
+/// Armijo line search already gates the accepted step on OBJECTIVE descent
+/// (`run_joint_fit_arrow_schur` line-search + proximal-correction both require a
+/// strict decrease vs `pre_step_total`), so the 2.887e8 is a GRADIENT spike, NOT
+/// an accepted objective increase. This probe distinguishes the two remaining
+/// mechanisms by logging, at each returned iterate:
+///   - `pen_obj` — is the objective monotone across budgets (⇒ the spike is a
+///     non-stationary perturbation at an objective-good state) or does it also
+///     spike (⇒ a guard was bypassed)?
+///   - `reseeds` (`dictionary_cocollapse_reseeds`) — did a NON-objective-guarded
+///     collapse reseed (`enforce_active_mass_guard` / `enforce_decoder_norm_guard`
+///     / `enforce_structural_coherence_guard`, applied post-acceptance OUTSIDE the
+///     line search) fire at the spike? (mechanism A)
+///   - `max|coord|` — did an Armijo-accepted step drive a coordinate to a huge
+///     value where the degree-2 basis makes ‖g‖ explode? (mechanism B)
+/// A distinguishes {reseeds↑, coords modest}; B distinguishes {reseeds=0, coords
+/// huge}. The fix differs: A ⇒ make the reseeds gradient-aware / quiescent near
+/// convergence; B ⇒ a coordinate trust-region / reconditioner.
+///
+/// Asserts the round-1 "no floor" fact as a real regression guard (so this is not
+/// a print-only probe): at the largest budget the inner solve DOES reach a small
+/// ‖g‖ — the solver CAN converge, the wall is trajectory instability, not a
+/// genuine stationary floor. If a future change reintroduces a floor this fails.
+#[test]
+fn inner_gnorm_vs_budget_trajectory_2015() {
+    let (base, target, rho) = wide_p_k4_in_regime();
+    let lr = 0.4;
+    let ridge = 1.0e-6;
+
+    eprintln!(
+        "[2015-TRAJ] wide-p K=4 in-regime: n_obs={} p_out={} k={} beta_dim={} coord_dim={}",
+        base.n_obs(),
+        base.output_dim(),
+        base.k_atoms(),
+        base.beta_dim(),
+        base.n_obs() * base.k_atoms(),
+    );
+    eprintln!(
+        "[2015-TRAJ] budget | ‖g‖(raw) | ‖Π⊥gauge g‖ | pen_obj | max|coord| | reseeds | \
+         decnorm[min,max] | fp"
+    );
+
+    let budgets = [10usize, 20, 40, 80, 160, 320, 640, 1280];
+    let mut prev: Option<f64> = None;
+    let mut final_g = f64::INFINITY;
+    for &budget in &budgets {
+        let mut term = base.clone();
+        let mut rho_fixed = rho.clone();
+        let outcome = term
+            .run_joint_fit_arrow_schur_for_evidence(
+                target.view(),
+                &mut rho_fixed,
+                None,
+                budget,
+                lr,
+                ridge,
+                ridge,
+            )
+            .expect("inner evidence fit must not hard-error");
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho_fixed, None)
+            .expect("reassemble at fitted iterate");
+        let gsq = SaeManifoldTerm::system_grad_norm_sq(&sys);
+        let g = gsq.sqrt();
+        let qg = term.quotient_gradient_norm_from_system(&sys, gsq, &rho_fixed.lambda_smooth_vec());
+        let pen_obj = term
+            .penalized_objective_total(target.view(), &rho_fixed, None, 1.0)
+            .unwrap_or(f64::NAN);
+        let mut max_abs_coord = 0.0_f64;
+        for atom_idx in 0..term.k_atoms() {
+            for &v in term.assignment.coords[atom_idx].as_flat().iter() {
+                max_abs_coord = max_abs_coord.max(v.abs());
+            }
+        }
+        let mut min_dec = f64::INFINITY;
+        let mut max_dec = 0.0_f64;
+        for atom in &term.atoms {
+            let nrm = atom
+                .decoder_coefficients
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            min_dec = min_dec.min(nrm);
+            max_dec = max_dec.max(nrm);
+        }
+        let delta = match prev {
+            Some(p) => format!("Δ‖g‖={:+.3e}", g - p),
+            None => "Δ‖g‖=—".to_string(),
+        };
+        eprintln!(
+            "[2015-TRAJ] {budget:>5} | {g:.6e} | {qg:.6e} | {pen_obj:.6e} | {max_abs_coord:.4e} | \
+             {} | [{min_dec:.3e},{max_dec:.3e}] | fp={} | {delta}",
+            term.dictionary_cocollapse_reseeds,
+            outcome.fixed_point,
+        );
+        prev = Some(g);
+        final_g = g;
+    }
+    eprintln!(
+        "[2015-TRAJ] VERDICT: mechanism A (reseeds↑, coords modest) vs B (reseeds=0, coords huge)."
+    );
+
+    // Round-1 "no floor" regression guard: the inner solve reaches a small ‖g‖ at
+    // the largest budget — convergence is achievable; the wall is trajectory
+    // instability, not a stationary floor. (Round-1 measured 2.25e-3 at 1280.)
+    assert!(
+        final_g < 1.0e-1,
+        "inner solve reintroduced a ‖g‖ floor: final ‖g‖={final_g:.6e} at budget 1280 \
+         (round-1 reached 2.25e-3 — convergence must remain achievable)"
+    );
+}
+
 /// Trap-immune gate: the assembled analytic inner gradient (`gt`/`gb`) vs a
 /// DIRECT central-FD of `penalized_objective_total` at a well-converged iterate.
 /// No resolve is on the path, so an under-converged budget cannot fool this: it
