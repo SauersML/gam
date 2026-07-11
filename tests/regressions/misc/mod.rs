@@ -21,7 +21,7 @@ mod gamlss_joint_derivatives_fd_bug_hunt;
 mod ordered_beta_bernoulli_assignment_hvp_drops_offdiagonal_coupling;
 mod inference_bug_hunt;
 mod inference_model;
-mod jumprelu_psd_majorizer_underestimates_curvature;
+mod smooth_threshold_psd_majorizer_underestimates_curvature;
 mod large_scale_dense_regression_guard;
 mod latent_cache_inner_bug_hunt;
 mod linalg_low_rank_utils;

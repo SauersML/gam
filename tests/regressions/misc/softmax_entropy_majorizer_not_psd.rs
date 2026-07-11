@@ -26,7 +26,7 @@
 //!
 //! This must FAIL now (majorizer == exact negative diagonal) and PASS once the
 //! penalty supplies a genuine PSD majorizer. Related: the sibling ScadMcp
-//! majorizer bug filed in this run, and the (closed) JumpReLU majorizer #796.
+//! majorizer bug filed in this run, and the (closed) smooth-threshold majorizer #796.
 
 use gam::terms::analytic_penalties::{AnalyticPenalty, SoftmaxAssignmentSparsityPenalty};
 use ndarray::array;

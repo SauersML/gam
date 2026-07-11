@@ -14,8 +14,8 @@
 //! `hessian_diag` — the exact, *negative* Hessian. The resulting "majorizer" is
 //! therefore not PSD, violating `B ⪰ 0`.
 //!
-//! This is the same failure mode as the (closed) JumpReLU majorizer bug, but a
-//! distinct penalty: JumpReLU at least overrides the method; `ScadMcpPenalty`
+//! This is the same failure mode as the (closed) smooth-threshold majorizer bug,
+//! but a distinct penalty: `SmoothThresholdPenalty` at least overrides the method; `ScadMcpPenalty`
 //! does not override it at all.
 //!
 //! This test must FAIL on the current code (majorizer == exact negative
