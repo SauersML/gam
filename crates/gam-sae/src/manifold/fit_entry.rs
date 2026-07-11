@@ -209,6 +209,8 @@ pub struct SaeFitReport {
     pub structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic>,
     pub trust_diagnostics: SaeTrustDiagnostics,
     pub fit_diagnostics: SaeManifoldFitDiagnostics,
+    /// Consistency of the fitted native encoder with the converged latent solve.
+    pub amortized_encoder_consistency: AmortizedEncoderConsistency,
     /// Serialized per-round structure-search ledger (#997) as a JSON string;
     /// `None` when the search did not run (skipped by K ceiling or
     /// `run_structure_search == false`).
@@ -915,61 +917,34 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         if !run_structure_search {
             break 'structure None;
         }
-        // #1026 — structure search is a post-fit DISCOVERY pass: each round refits
-        // the full dictionary over ALL N rows. Scale rounds down with K and SKIP
-        // entirely past a ceiling so a fixed-K performance run returns the fitted
-        // dictionary without paying the search.
-        let structure_max_rounds = {
-            let k_now = term.k_atoms().max(1);
-            if k_now <= 2 {
-                3
-            } else if k_now <= 8 {
-                2
-            } else if k_now <= 64 {
-                1
-            } else {
-                0
-            }
-        };
-        if structure_max_rounds == 0 {
-            break 'structure None;
-        }
-        // Per-round harvest breadth derived from the fitted K (magic-by-default):
-        // propose at most a handful of each move kind, scaled gently with the
-        // dictionary size, with a small fixed floor so even a K=1 fit can grow.
+        // Structure search is a convergent greedy coordinate search. Each round
+        // proposes the strongest birth, fission, and fusion direction, permits
+        // one certified structural move, refits it to convergence, and repeats
+        // until a round applies no move. This keeps candidate memory bounded
+        // independently of K and p without a size-dependent skip or round cap.
         let k_now = term.k_atoms().max(1);
-        let births_per_round = (k_now + 1).min(4);
-        let fissions_per_round = k_now.min(4);
         let harvest_params = structure_harvest::HarvestParams {
-            max_fusions: 4,
-            max_fissions: fissions_per_round,
-            max_births: births_per_round,
+            max_fusions: 1,
+            max_fissions: 1,
+            max_births: 1,
         };
-        // The per-candidate scoring refit is capped well below the outer fit's
-        // `max_iter`: a structural move yields a WARM child, so only the touched
-        // atom must re-equilibrate before the held-out evidence gate can rank the
-        // candidate. Each round's accepted winner is re-refit at the full
-        // `max_iter` before adoption (#1026, verified move-equivalent).
-        const STRUCTURE_SCORING_INNER_MAX_ITER: usize = 8;
         let refit_params = structure_harvest::ProductionRefitParams {
             inner_max_iter: max_iter,
-            scoring_inner_max_iter: STRUCTURE_SCORING_INNER_MAX_ITER.min(max_iter),
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
         };
-        // Moves that may LAND this round (accepted births/fissions/fusions +
-        // demoted deaths); remaining proposals are recorded `Deferred` and
-        // replayed next round. Magic-by-default — a function of the fitted K.
-        let max_moves = k_now + births_per_round + fissions_per_round;
         let budget = MoveBudget {
-            max_moves,
+            max_moves: 1,
             alpha: 0.05,
         };
+        // The evaluation half is streamed one row per shard. The shard count is
+        // therefore derived from the sample size rather than an optimization
+        // knob, while memory remains O(N) for the row-index partition.
+        let n_shards = n_obs.saturating_sub(n_obs / 2).max(1);
         let config = structure_harvest::RoundDriverConfig {
-            n_shards: 4,
+            n_shards,
             budget,
-            max_rounds: structure_max_rounds,
             harvest_params,
             // Curl/flatten structure moves stay off in the production path until
             // the killer-demo gate graduates them (INTEGRATION_PLAN §8).
@@ -987,7 +962,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
                 structure_changed = result.structure_changed();
                 term = result.term;
                 rho = result.rho;
-                structure_harvest::rounds_to_json(&result.rounds).ok()
+                Some(structure_harvest::rounds_to_json(&result.rounds)?)
             }
             Err(e) => {
                 // Structure search is a post-fit audit pass; a failure must not
@@ -1089,6 +1064,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         fitted.view(),
         Some(assignments.view()),
     )?;
+    let amortized_encoder_consistency = term.amortized_encoder_consistency(z.view(), &rho)?;
 
     let active_mask: Vec<bool> = (0..k_atoms)
         .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
@@ -1143,6 +1119,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         structured_residual_diagnostics,
         trust_diagnostics,
         fit_diagnostics,
+        amortized_encoder_consistency,
         structure_search_json,
         structure_certificate_json,
         reported_log_alpha,

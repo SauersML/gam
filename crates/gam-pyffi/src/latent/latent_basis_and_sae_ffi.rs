@@ -1881,6 +1881,7 @@ fn sae_manifold_fit_inner<'py>(
         structured_residual_diagnostics,
         trust_diagnostics,
         fit_diagnostics,
+        amortized_encoder_consistency,
         structure_search_json,
         structure_certificate_json,
         reported_log_alpha,
@@ -2030,16 +2031,7 @@ fn sae_manifold_fit_inner<'py>(
     sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
     out.set_item("penalized_quasi_laplace_criterion", penalized_quasi_laplace_criterion)?;
     out.set_item("log_alpha", reported_log_alpha)?;
-    // Clone, do NOT move the field out: `rho` is still owned and is borrowed
-    // again below for the post-fit amortized-encoder diagnostic
-    // (`term.amortized_encoder_consistency(.., &rho)`). Moving the non-`Copy`
-    // `log_lambda_smooth: Vec<f64>` out here would partially move `rho` and make
-    // that later `&rho` borrow a borrow-after-move (E0382), which broke the
-    // gam-pyffi build (#1559). The predict path (`sae_manifold_predict_oos`) can
-    // move the field by value because its `rho` dies immediately after; here it
-    // lives on, so we clone the K-length vector once at result emission — a
-    // negligible allocation that matches every other still-live-owner field
-    // emission in this file (`lambdas.clone()`, `class_levels.clone()`, …).
+    // Persist the terminal native smoothing coordinates verbatim.
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth.clone())?;
     // #2132 — the terminal REML-selected sparsity strength, alongside the
     // per-atom `log_lambda_smooth` / `log_ard` above. The OOS fixed-decoder
@@ -2098,26 +2090,21 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(report) = term.hybrid_split_report() {
         out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
     }
-    // #1154 — post-fit amortized-encoder diagnostics. The outer ρ-cascade ranks
-    // the pure custom quasi-Laplace criterion; encoder consistency is deliberately excluded from
-    // fitting/ranking because it has no matching analytic ρ gradient. Here we
-    // measure, at the settled dictionary, how faithfully the cheap initializer
-    // approximates the exact encode-by-inner-solve map:
-    //   * `recon_consistency` — mean per-element squared gap between the amortized
-    //     reconstruction and the exact encode-by-inner-solve reconstruction (0 ⇒
-    //     the IFT predictor is an exact first-order model of the encode map);
-    //   * `unconverged_fraction` — share of shared-residual row solves that did
-    //     not meet the first-order stationarity tolerance.
-    // Best-effort: a degenerate atlas (no usable charts) yields no report rather
-    // than aborting the fit payload; this diagnostic never changes the fit.
-    if let Ok(consistency) = term.amortized_encoder_consistency(z_view.view(), &rho) {
-        let cotrain = PyDict::new(py);
-        cotrain.set_item("recon_consistency", consistency.recon_consistency)?;
-        cotrain.set_item("unconverged_fraction", consistency.unconverged_fraction)?;
-        cotrain.set_item("n_unconverged", consistency.n_unconverged)?;
-        cotrain.set_item("n_encodes", consistency.n_encodes)?;
-        out.set_item("cotrain", cotrain)?;
-    }
+    let cotrain = PyDict::new(py);
+    cotrain.set_item(
+        "recon_consistency",
+        amortized_encoder_consistency.recon_consistency,
+    )?;
+    cotrain.set_item(
+        "unconverged_fraction",
+        amortized_encoder_consistency.unconverged_fraction,
+    )?;
+    cotrain.set_item(
+        "n_unconverged",
+        amortized_encoder_consistency.n_unconverged,
+    )?;
+    cotrain.set_item("n_encodes", amortized_encoder_consistency.n_encodes)?;
+    out.set_item("cotrain", cotrain)?;
     if let Some(report) = &fit_diagnostics.incoherence_report {
         out.set_item("curvature_report", sae_curvature_report_dict(py, report)?)?;
         out.set_item(
@@ -2218,10 +2205,9 @@ fn sae_manifold_fit_inner<'py>(
             SaeAtomBasisKind::Periodic => (basis_size.saturating_sub(1) / 2).max(1),
             SaeAtomBasisKind::Torus => {
                 // basis_size = (2H+1)^latent_dim; recover the per-axis 2H+1, then H.
-                match sae_torus_axis_basis_size(basis_size, latent_dim.max(1)) {
-                    Ok(axis_m) => (axis_m.saturating_sub(1) / 2).max(1),
-                    Err(_) => 1,
-                }
+                let axis_m = sae_torus_axis_basis_size(basis_size, latent_dim.max(1))
+                    .map_err(py_value_error)?;
+                (axis_m.saturating_sub(1) / 2).max(1)
             }
             _ => 0,
         };
