@@ -5394,6 +5394,77 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_mixture_issue_scale_negative_step_is_within_computed_uncertainty_2264() {
+        // Recorded issue mechanism: a signed mean-log-likelihood step of
+        // -1.4e-13 was rejected even though it is unresolved at the scale of
+        // the composite EM map. The admissible decrease below is derived only
+        // from that map's observed objective scale and arithmetic reduction
+        // bounds; the recorded step is an input to the decision, not a new
+        // tolerance.
+        let objective_scale = 1.0;
+        let recorded_step = -1.4e-13;
+        let uncertainty =
+            gaussian_mixture_monotonicity_uncertainty(objective_scale, 0.0, 0.0);
+        let certificate = GaussianMixtureCertificate {
+            mean_log_likelihood: -objective_scale,
+            mean_log_likelihood_gain: recorded_step,
+            monotonicity_uncertainty: uncertainty,
+            objective_residual: recorded_step.abs() / objective_scale,
+            objective_tolerance: f64::EPSILON.sqrt(),
+            parameter_residual: 0.0,
+            parameter_tolerance: f64::EPSILON.sqrt(),
+        };
+
+        assert_eq!(
+            certificate.monotonicity_uncertainty,
+            f64::EPSILON.sqrt() * objective_scale,
+            "reported uncertainty must be the computed composite-map resolution"
+        );
+        assert!(
+            certificate.mean_log_likelihood_gain >= -certificate.monotonicity_uncertainty,
+            "the recorded noise-scale decrease must not be a monotonicity violation"
+        );
+    }
+
+    #[test]
+    fn gaussian_mixture_below_roundoff_positive_gain_can_certify_2264() {
+        // Recorded issue mechanism: a +6.6e-15 gain with a 1.5e-14 reduction
+        // bound exhausted instead of certifying. A below-resolution gain is a
+        // valid objective fixed point only when the independent parameter-map
+        // residual also clears its configured tolerance.
+        let objective_scale = 1.0;
+        let recorded_gain = 6.6e-15;
+        let recorded_reduction_bound = 1.5e-14;
+        let objective_tolerance = f64::EPSILON.sqrt();
+        let parameter_tolerance = f64::EPSILON.sqrt();
+        let uncertainty = gaussian_mixture_monotonicity_uncertainty(
+            objective_scale,
+            recorded_reduction_bound,
+            0.0,
+        );
+        let certificate = GaussianMixtureCertificate {
+            mean_log_likelihood: -objective_scale,
+            mean_log_likelihood_gain: recorded_gain,
+            monotonicity_uncertainty: uncertainty,
+            objective_residual: recorded_gain / objective_scale,
+            objective_tolerance,
+            parameter_residual: 0.5 * parameter_tolerance,
+            parameter_tolerance,
+        };
+
+        assert_eq!(
+            certificate.monotonicity_uncertainty,
+            (f64::EPSILON.sqrt() * objective_scale).max(recorded_reduction_bound),
+            "reported uncertainty must come from the composite-map and reduction bounds"
+        );
+        assert!(
+            certificate.mean_log_likelihood_gain >= -certificate.monotonicity_uncertainty
+        );
+        assert!(certificate.objective_residual <= certificate.objective_tolerance);
+        assert!(certificate.parameter_residual <= certificate.parameter_tolerance);
+    }
+
+    #[test]
     fn gaussian_mixture_fit_certificate_describes_the_exact_returned_iterate() {
         let data = two_cluster_mixture_data();
         let config = GaussianMixtureConfig::default();
