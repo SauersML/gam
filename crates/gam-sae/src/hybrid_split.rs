@@ -114,38 +114,15 @@ pub struct AtomLinearImage {
     pub b0: Array1<f64>,
     /// Per-output-channel slope `b₁` (length `p`).
     pub b1: Array1<f64>,
-    /// #1026 collapse-rescue per-row coordinates. `None` for the ordinary path:
-    /// the line is evaluated at the atom's OWN realized coordinate `t`. `Some(u)`
-    /// only when the atom's circle codes had collapsed to a single point
-    /// (`s_tt ≈ 0`) so its own coordinate carries no spread — then the line is fit
-    /// against, and reconstruct evaluates it at, these FRESH per-row codes `uᵢ`
-    /// (the projection of the leave-this-atom-out residual onto its top
-    /// mass-weighted output direction). This is what lets a circle atom that the
-    /// joint fit drove into the degenerate "chord-through-the-arc" fixed point
-    /// still reconstruct its residual's best linear direction — recovering the
-    /// linear-tail reach the hybrid-split was designed to deliver — instead of a
-    /// constant (its collapsed curve), which is the real-OLMo rank-1 co-collapse
-    /// (held-out EV ≈ 0.13 vs the linear ceiling ≈ 0.74). Length `n` (one per
-    /// reconstructed row); unassigned rows are gated to zero by `a_k` anyway.
-    ///
-    /// TRAIN-ONLY CAVEAT (#1777): these are the TRAIN rows' codes. They are only
-    /// meaningful for the exact rows the split was fit on; a held-out row has no
-    /// entry here and used to fall back to the atom's own (collapsed) coordinate
-    /// `own_t` — a DIFFERENT, degraded model out of sample. Prefer [`Self::v`]:
-    /// projecting a held-out row's leave-this-atom-out residual onto `v` recovers
-    /// that row's coordinate by the SAME math the train codes were built with, so
-    /// train and OOS use one model. `row_codes` is retained for back-compat and as
-    /// the exact cached train projection.
-    pub row_codes: Option<Array1<f64>>,
     /// #1777 collapse-rescue projection DIRECTION `v` (length `p`, unit norm), the
     /// top mass-weighted output direction of the atom's leave-this-atom-out
-    /// residual. `Some` exactly when this is a collapse-rescued image (paired with
-    /// `row_codes`); `None` for the ordinary straight-image path (which decodes at
-    /// the atom's own coordinate). This is the SERIALIZABLE quantity the FFI must
-    /// persist so an OOS term can recompute any row's coordinate as
+    /// residual. `Some` exactly when this is a collapse-rescued image; `None` for
+    /// the ordinary straight-image path (which decodes at the atom's own
+    /// coordinate). This is the only serializable rescue coordinate model: every
+    /// train or OOS reconstruction must recompute a row's coordinate as
     /// `uᵢ = ⟨y_i − Σ_{j≠k} f_j(x_i), v⟩` — identical to the train code
-    /// `row_codes[i]` on a train row, and the correct held-out coordinate on an OOS
-    /// row (see [`Self::coordinate_from_residual`]). Length must equal `b0`/`b1`.
+    /// used to fit the image and valid for held-out rows by the same model (see
+    /// [`Self::coordinate_from_residual`]). Length must equal `b0`/`b1`.
     pub v: Option<Array1<f64>>,
 }
 
@@ -158,31 +135,15 @@ impl AtomLinearImage {
         }
     }
 
-    /// The coordinate at which row `row` should evaluate this image: the
-    /// collapse-rescue fresh code `uᵢ` when present (#1026), else the atom's own
-    /// realized coordinate `own_t` passed by the caller.
-    ///
-    /// TRAIN-ONLY: `row_codes` is indexed by TRAIN row, so this is correct only
-    /// for the rows the split was fit on. Out of sample use
-    /// [`Self::coordinate_from_residual`] (target-aware, model-identical to train).
-    pub fn coordinate_for_row(&self, row: usize, own_t: f64) -> f64 {
-        match &self.row_codes {
-            Some(u) if row < u.len() => u[row],
-            _ => own_t,
-        }
-    }
-
     /// #1777 — the collapse-rescue coordinate of a row from ITS OWN
     /// leave-this-atom-out residual `resid = y_i − Σ_{j≠k} f_j(x_i)` (length `p`),
     /// namely `uᵢ = ⟨resid, v⟩`. `Some(uᵢ)` exactly when this is a collapse-rescued
     /// image (`v` is set); `None` for the ordinary straight-image path (which has
     /// no projection direction and decodes at the atom's own coordinate).
     ///
-    /// This is the SAME math [`build_collapse_rescue_linear_image`] used to build
-    /// the train `row_codes` (`row_codes[i] = ⟨target_resid[i], v⟩`), so on a TRAIN
-    /// row it reproduces `row_codes[i]` exactly, and on a HELD-OUT row it yields
-    /// that row's correct coordinate — train and OOS share one model. Returns
-    /// `None` if `resid`'s length disagrees with `v`.
+    /// This is the SAME math [`build_collapse_rescue_linear_image`] used to fit the
+    /// train image, so train and OOS share one model. Returns `None` if `resid`'s
+    /// length disagrees with `v`.
     pub fn coordinate_from_residual(&self, resid: &[f64]) -> Option<f64> {
         let v = self.v.as_ref()?;
         if resid.len() != v.len() {
@@ -192,8 +153,8 @@ impl AtomLinearImage {
     }
 
     /// Whether this image is a #1777 collapse-rescued image (carries a projection
-    /// direction `v` and per-row train codes) rather than an ordinary straight
-    /// image evaluated at the atom's own coordinate.
+    /// direction `v`) rather than an ordinary straight image evaluated at the
+    /// atom's own coordinate.
     pub fn is_collapse_rescued(&self) -> bool {
         self.v.is_some()
     }

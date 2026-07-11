@@ -2,8 +2,8 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeed, OneSeedBatch,
-    OneSeedLane, Order2, Order2Lane, RuntimeJetScalar, TwoSeed,
+    DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeed, OneSeedBatch, OneSeedLane,
+    Order2, Order2Lane, RuntimeJetScalar, TwoSeed,
 };
 use wide::f64x4;
 
@@ -629,7 +629,11 @@ pub(crate) fn sls_row_nll_wiggle<S: RuntimeJetScalar>(
     pw: usize,
     basis: &SlsWiggleRowBasis<'_>,
 ) -> S {
-    assert_eq!(vars.len(), SLS_ROW_K + pw, "link-wiggle row primary layout mismatch");
+    assert_eq!(
+        vars.len(),
+        SLS_ROW_K + pw,
+        "link-wiggle row primary layout mismatch"
+    );
     let [b0e, b1e, b2e, b3e] = basis.b_u0;
     let [b0x, b1x, b2x, b3x] = basis.b_u1;
     let inv_sigma_entry = vars[7].neg().exp();
@@ -637,8 +641,8 @@ pub(crate) fn sls_row_nll_wiggle<S: RuntimeJetScalar>(
     let inv_sigma_exit = vars[6].neg().exp();
     let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
     let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
-    let mut u0w = u0;
-    let mut u1w = u1;
+    let mut u0w = u0.clone();
+    let mut u1w = u1.clone();
     let mut m1 = S::constant(1.0, vars.len());
     for j in 0..pw {
         let bw = &vars[SLS_ROW_K + j];
@@ -702,7 +706,7 @@ pub(crate) fn sls_row_nll_wiggle<S: RuntimeJetScalar>(
 /// 9 channels reuse the existing [`SurvivalLsRowKernel`] designs; the βw
 /// amplitudes are an IDENTITY map into a wiggle coefficient block appended last.
 /// `KW = SLS_ROW_K + pw`.
-pub(crate) struct SurvivalLsWiggleRowKernel<'a, const KW: usize> {
+pub(crate) struct SurvivalLsWiggleRowKernel<'a> {
     base: SurvivalLsRowKernel<'a>,
     pw: usize,
     wiggle_off: usize,
@@ -717,7 +721,7 @@ pub(crate) struct SurvivalLsWiggleRowKernel<'a, const KW: usize> {
     b_u1_3: Array2<f64>,
 }
 
-impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
+impl<'a> SurvivalLsWiggleRowKernel<'a> {
     pub(crate) fn new(
         family: &'a SurvivalLocationScaleFamily,
         q: &'a SurvivalJointQuantities,
@@ -790,10 +794,17 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
         )?;
         let b_u1_3 = survival_wiggle_third_basis(q_exit.view(), knots, degree)?;
         let pw = b_u1_0.ncols();
-        if SLS_ROW_K + pw != KW {
+        let design_pw = family
+            .x_link_wiggle
+            .as_ref()
+            .ok_or("link-wiggle kernel: missing wiggle design")?
+            .ncols();
+        if pw == 0 {
+            return Err("link-wiggle kernel: wiggle basis has zero columns".to_string());
+        }
+        if pw != design_pw {
             return Err(format!(
-                "link-wiggle kernel: KW={KW} but SLS_ROW_K+pw={}",
-                SLS_ROW_K + pw
+                "link-wiggle kernel: basis width {pw} does not match design width {design_pw}"
             ));
         }
         // joint_block_offsets() appends the wiggle block last, so its start is
@@ -807,6 +818,12 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
             .as_ref()
             .map(|b| b.to_vec())
             .ok_or("link-wiggle kernel: missing wiggle_beta on dynamic geometry")?;
+        if betaw.len() != pw {
+            return Err(format!(
+                "link-wiggle kernel: coefficient width {} does not match basis width {pw}",
+                betaw.len()
+            ));
+        }
         Ok(Self {
             base,
             pw,
@@ -824,19 +841,31 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
     }
 
     #[inline]
-    fn row_vars<S: JetScalar<KW>>(&self, row: usize, seed: impl Fn(f64, usize) -> S) -> [S; KW] {
-        let p = self.base.row_primary_values(row);
-        std::array::from_fn(|a| {
-            if a < SLS_ROW_K {
-                seed(p[a], a)
-            } else {
-                seed(self.betaw[a - SLS_ROW_K], a)
-            }
-        })
+    fn primary_dimension(&self) -> usize {
+        SLS_ROW_K + self.pw
     }
 
     #[inline]
-    fn eval<S: JetScalar<KW>>(&self, row: usize, vars: &[S; KW]) -> Result<S, String> {
+    fn row_vars<S: RuntimeJetScalar>(
+        &self,
+        row: usize,
+        seed: impl Fn(f64, usize, usize) -> S,
+    ) -> Vec<S> {
+        let p = self.base.row_primary_values(row);
+        let dimension = self.primary_dimension();
+        (0..dimension)
+            .map(|a| {
+                if a < SLS_ROW_K {
+                    seed(p[a], a, dimension)
+                } else {
+                    seed(self.betaw[a - SLS_ROW_K], a, dimension)
+                }
+            })
+            .collect()
+    }
+
+    #[inline]
+    fn eval<S: RuntimeJetScalar>(&self, row: usize, vars: &[S]) -> Result<S, String> {
         let kernel = self.base.row_nll_inputs(row)?.1;
         let r_u0_0 = self.b_u0_0.row(row).to_vec();
         let r_u0_1 = self.b_u0_1.row(row).to_vec();
@@ -868,9 +897,7 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
             Some((self.wiggle_off, e))
         }
     }
-}
 
-impl<const KW: usize> crate::row_kernel::RowKernel<KW> for SurvivalLsWiggleRowKernel<'_, KW> {
     fn n_rows(&self) -> usize {
         self.base.family.n
     }
@@ -879,41 +906,34 @@ impl<const KW: usize> crate::row_kernel::RowKernel<KW> for SurvivalLsWiggleRowKe
         self.wiggle_off + self.pw
     }
 
-    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; KW], [[f64; KW]; KW]), String> {
-        let vars: [Order2<KW>; KW] = self.row_vars(row, |x, a| Order2::variable(x, a));
-        let out = self.eval(row, &vars)?;
-        Ok((JetScalar::value(&out), out.g(), out.h()))
+    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> Vec<f64> {
+        let base = crate::row_kernel::RowKernel::jacobian_action(
+            &self.base,
+            row,
+            &d_beta[..self.wiggle_off],
+        );
+        base.into_iter()
+            .chain((0..self.pw).map(|b| d_beta[self.wiggle_off + b]))
+            .collect()
     }
 
-    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; KW] {
-        let base = self.base.jacobian_action(row, &d_beta[..self.wiggle_off]);
-        std::array::from_fn(|a| {
-            if a < SLS_ROW_K {
-                base[a]
-            } else {
-                d_beta[self.wiggle_off + (a - SLS_ROW_K)]
-            }
-        })
-    }
-
-    fn jacobian_transpose_action(&self, row: usize, v: &[f64; KW], out: &mut [f64]) {
-        let vbase: [f64; SLS_ROW_K] = std::array::from_fn(|a| v[a]);
-        self.base
-            .jacobian_transpose_action(row, &vbase, &mut out[..self.wiggle_off]);
-        for b in 0..self.pw {
-            out[self.wiggle_off + b] += v[SLS_ROW_K + b];
-        }
-    }
-
-    fn add_pullback_hessian(&self, row: usize, h: &[[f64; KW]; KW], target: &mut Array2<f64>) {
+    fn add_pullback_hessian(
+        &self,
+        row: usize,
+        h: &[f64],
+        row_weight: f64,
+        target: &mut Array2<f64>,
+    ) {
+        let dimension = self.primary_dimension();
+        assert_eq!(h.len(), dimension * dimension);
         let rows: Vec<Option<(usize, Array1<f64>)>> =
-            (0..KW).map(|ch| self.jrow(ch, row)).collect();
-        for a in 0..KW {
+            (0..dimension).map(|ch| self.jrow(ch, row)).collect();
+        for a in 0..dimension {
             let Some((off_a, ra)) = rows[a].as_ref() else {
                 continue;
             };
-            for b in 0..KW {
-                let hab = h[a][b];
+            for b in 0..dimension {
+                let hab = row_weight * h[a * dimension + b];
                 if hab == 0.0 {
                     continue;
                 }
@@ -934,90 +954,106 @@ impl<const KW: usize> crate::row_kernel::RowKernel<KW> for SurvivalLsWiggleRowKe
         }
     }
 
-    fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; KW]; KW], diag: &mut [f64]) {
-        let rows: Vec<Option<(usize, Array1<f64>)>> =
-            (0..KW).map(|ch| self.jrow(ch, row)).collect();
-        for a in 0..KW {
-            let Some((off_a, ra)) = rows[a].as_ref() else {
-                continue;
-            };
-            for b in 0..KW {
-                let hab = h[a][b];
-                if hab == 0.0 {
-                    continue;
-                }
-                let Some((off_b, rb)) = rows[b].as_ref() else {
-                    continue;
-                };
-                if off_a != off_b {
-                    continue;
-                }
-                for (k, (&va, &vb)) in ra.iter().zip(rb.iter()).enumerate() {
-                    diag[off_a + k] += hab * va * vb;
-                }
-            }
-        }
+    fn row_order2(&self, row: usize) -> Result<DynamicOrder2, String> {
+        let vars = self.row_vars(row, DynamicOrder2::variable);
+        self.eval(row, &vars)
     }
 
-    fn row_third_contracted(&self, row: usize, dir: &[f64; KW]) -> Result<[[f64; KW]; KW], String> {
-        let vars: [OneSeed<KW>; KW] =
-            self.row_vars(row, |x, a| OneSeed::seed_direction(x, a, dir[a]));
-        Ok(self.eval(row, &vars)?.contracted_third())
+    fn row_third_contracted(&self, row: usize, dir: &[f64]) -> Result<DynamicOneSeed, String> {
+        assert_eq!(dir.len(), self.primary_dimension());
+        let vars = self.row_vars(row, |x, a, dimension| {
+            DynamicOneSeed::seed_direction(x, a, dir[a], dimension)
+        });
+        self.eval(row, &vars)
     }
 
     fn row_fourth_contracted(
         &self,
         row: usize,
-        dir_u: &[f64; KW],
-        dir_v: &[f64; KW],
-    ) -> Result<[[f64; KW]; KW], String> {
-        let vars: [TwoSeed<KW>; KW] =
-            self.row_vars(row, |x, a| TwoSeed::seed(x, a, dir_u[a], dir_v[a]));
-        Ok(self.eval(row, &vars)?.contracted_fourth())
+        dir_u: &[f64],
+        dir_v: &[f64],
+    ) -> Result<DynamicTwoSeed, String> {
+        assert_eq!(dir_u.len(), self.primary_dimension());
+        assert_eq!(dir_v.len(), self.primary_dimension());
+        let vars = self.row_vars(row, |x, a, dimension| {
+            DynamicTwoSeed::seed(x, a, dir_u[a], dir_v[a], dimension)
+        });
+        self.eval(row, &vars)
+    }
+
+    fn hessian_dense(&self, rows: &crate::row_kernel::RowSet) -> Result<Array2<f64>, String> {
+        let p = self.n_coefficients();
+        rows.par_try_reduce_fold(
+            self.n_rows(),
+            || Array2::<f64>::zeros((p, p)),
+            |mut acc, row, weight| {
+                let out = self.row_order2(row)?;
+                self.add_pullback_hessian(row, out.h(), weight, &mut acc);
+                Ok(acc)
+            },
+            |a, b| Ok(a + b),
+        )
+    }
+
+    fn directional_derivative_dense(
+        &self,
+        rows: &crate::row_kernel::RowSet,
+        d_beta: &[f64],
+    ) -> Result<Array2<f64>, String> {
+        assert_eq!(d_beta.len(), self.n_coefficients());
+        let p = self.n_coefficients();
+        rows.par_try_reduce_fold(
+            self.n_rows(),
+            || Array2::<f64>::zeros((p, p)),
+            |mut acc, row, weight| {
+                let direction = self.jacobian_action(row, d_beta);
+                let out = self.row_third_contracted(row, &direction)?;
+                self.add_pullback_hessian(row, out.contracted_third(), weight, &mut acc);
+                Ok(acc)
+            },
+            |a, b| Ok(a + b),
+        )
+    }
+
+    fn second_directional_derivative_dense(
+        &self,
+        rows: &crate::row_kernel::RowSet,
+        d_beta_u: &[f64],
+        d_beta_v: &[f64],
+    ) -> Result<Array2<f64>, String> {
+        assert_eq!(d_beta_u.len(), self.n_coefficients());
+        assert_eq!(d_beta_v.len(), self.n_coefficients());
+        let p = self.n_coefficients();
+        rows.par_try_reduce_fold(
+            self.n_rows(),
+            || Array2::<f64>::zeros((p, p)),
+            |mut acc, row, weight| {
+                let direction_u = self.jacobian_action(row, d_beta_u);
+                let direction_v = self.jacobian_action(row, d_beta_v);
+                let out = self.row_fourth_contracted(row, &direction_u, &direction_v)?;
+                self.add_pullback_hessian(row, out.contracted_fourth(), weight, &mut acc);
+                Ok(acc)
+            },
+            |a, b| Ok(a + b),
+        )
     }
 }
 
-/// Dispatch the runtime wiggle width `pw` to a concrete `KW = SLS_ROW_K + pw`
-/// and assemble the link-wiggle joint Hessian through the single-source kernel.
+/// Assemble the link-wiggle joint Hessian through the runtime-sized packed row
+/// jet. The primary dimension is exactly `SLS_ROW_K + pw`; no arity dispatch is
+/// involved.
 pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
     family: &SurvivalLocationScaleFamily,
     q: &SurvivalJointQuantities,
     dynamic: &SurvivalDynamicGeometry,
     deriv_log_scale: f64,
 ) -> Result<Array2<f64>, String> {
-    use crate::row_kernel::{RowSet, build_row_kernel_cache, row_kernel_hessian_dense};
-    let pw = family
-        .x_link_wiggle
-        .as_ref()
-        .map(|d| d.ncols())
-        .ok_or("wiggle joint Hessian: no link-wiggle design")?;
-    macro_rules! run {
-        ($kw:literal) => {{
-            let kernel =
-                SurvivalLsWiggleRowKernel::<$kw>::new(family, q, dynamic, deriv_log_scale)?;
-            let rows = RowSet::All;
-            let cache = build_row_kernel_cache(&kernel, &rows)?;
-            Ok(row_kernel_hessian_dense(&kernel, &cache, &rows))
-        }};
-    }
-    match SLS_ROW_K + pw {
-        10 => run!(10),
-        11 => run!(11),
-        12 => run!(12),
-        13 => run!(13),
-        14 => run!(14),
-        15 => run!(15),
-        16 => run!(16),
-        17 => run!(17),
-        18 => run!(18),
-        19 => run!(19),
-        20 => run!(20),
-        other => Err(format!("link-wiggle joint Hessian: unsupported KW={other}")),
-    }
+    let kernel = SurvivalLsWiggleRowKernel::new(family, q, dynamic, deriv_log_scale)?;
+    kernel.hessian_dense(&crate::row_kernel::RowSet::All)
 }
 
-/// Dispatch the runtime wiggle width `pw` to a concrete `KW` and assemble the
-/// single-source link-wiggle FIRST directional derivative `Σ_c ℓ_{abc} dir_c =
+/// Assemble the single-source link-wiggle FIRST directional derivative
+/// `Σ_c ℓ_{abc} dir_c =
 /// (D_dir H)[a][b]` — the ε-Hessian channel of the §13 warp row NLL at the
 /// packed `OneSeed<KW>` directional scalar, pulled back into coefficient space
 /// by the SAME `JᵀHJ` the joint-Hessian path uses. Replaces the bespoke hand
@@ -1033,39 +1069,12 @@ pub(crate) fn survival_ls_wiggle_directional_derivative_dense(
     rows: &crate::row_kernel::RowSet,
     d_beta: &[f64],
 ) -> Result<Array2<f64>, String> {
-    use crate::row_kernel::row_kernel_directional_derivative;
-    let pw = family
-        .x_link_wiggle
-        .as_ref()
-        .map(|d| d.ncols())
-        .ok_or("wiggle directional derivative: no link-wiggle design")?;
-    macro_rules! run {
-        ($kw:literal) => {{
-            let kernel =
-                SurvivalLsWiggleRowKernel::<$kw>::new(family, q, dynamic, deriv_log_scale)?;
-            row_kernel_directional_derivative(&kernel, rows, d_beta)
-        }};
-    }
-    match SLS_ROW_K + pw {
-        10 => run!(10),
-        11 => run!(11),
-        12 => run!(12),
-        13 => run!(13),
-        14 => run!(14),
-        15 => run!(15),
-        16 => run!(16),
-        17 => run!(17),
-        18 => run!(18),
-        19 => run!(19),
-        20 => run!(20),
-        other => Err(format!(
-            "link-wiggle directional derivative: unsupported KW={other}"
-        )),
-    }
+    let kernel = SurvivalLsWiggleRowKernel::new(family, q, dynamic, deriv_log_scale)?;
+    kernel.directional_derivative_dense(rows, d_beta)
 }
 
-/// Dispatch the runtime wiggle width `pw` to a concrete `KW` and assemble the
-/// single-source link-wiggle SECOND directional derivative `Σ_cd ℓ_{abcd} u_c
+/// Assemble the single-source link-wiggle SECOND directional derivative
+/// `Σ_cd ℓ_{abcd} u_c
 /// v_d` — the ε,δ-Hessian channel of the §13 warp row NLL at the packed
 /// `TwoSeed<KW>` bidirectional scalar. Replaces the previous wiggle carve-out
 /// that returned `None` (no second-directional curvature for wiggle rows).
@@ -1078,35 +1087,8 @@ pub(crate) fn survival_ls_wiggle_second_directional_derivative_dense(
     d_beta_u: &[f64],
     d_beta_v: &[f64],
 ) -> Result<Array2<f64>, String> {
-    use crate::row_kernel::row_kernel_second_directional_derivative;
-    let pw = family
-        .x_link_wiggle
-        .as_ref()
-        .map(|d| d.ncols())
-        .ok_or("wiggle second directional derivative: no link-wiggle design")?;
-    macro_rules! run {
-        ($kw:literal) => {{
-            let kernel =
-                SurvivalLsWiggleRowKernel::<$kw>::new(family, q, dynamic, deriv_log_scale)?;
-            row_kernel_second_directional_derivative(&kernel, rows, d_beta_u, d_beta_v)
-        }};
-    }
-    match SLS_ROW_K + pw {
-        10 => run!(10),
-        11 => run!(11),
-        12 => run!(12),
-        13 => run!(13),
-        14 => run!(14),
-        15 => run!(15),
-        16 => run!(16),
-        17 => run!(17),
-        18 => run!(18),
-        19 => run!(19),
-        20 => run!(20),
-        other => Err(format!(
-            "link-wiggle second directional derivative: unsupported KW={other}"
-        )),
-    }
+    let kernel = SurvivalLsWiggleRowKernel::new(family, q, dynamic, deriv_log_scale)?;
+    kernel.second_directional_derivative_dense(rows, d_beta_u, d_beta_v)
 }
 
 /// Extract the unit-axis primary direction `J·e_a` from the per-row channel
@@ -1736,7 +1718,6 @@ impl SurvivalLocationScaleFamily {
     pub(crate) const BLOCK_LINK_WIGGLE: usize = 3;
     pub(crate) const EVALUATE_PARALLEL_ROW_THRESHOLD: usize = 1024;
 
-
     /// First directional derivatives require third qdot map derivatives when
     /// threshold/log-sigma derivative designs are present.
     #[inline]
@@ -1758,7 +1739,6 @@ impl SurvivalLocationScaleFamily {
         // beta-dependent-Jacobian rows still take the hand path below.
         self.x_link_wiggle.is_none()
     }
-
 
     pub(crate) fn survival_ls_row_kernel_rescaled<'a>(
         &'a self,

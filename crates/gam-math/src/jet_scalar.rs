@@ -196,11 +196,20 @@ pub trait JetScalar<const K: usize>: Copy {
 /// fixed-size scalar implementations below bridge to this trait as well, which
 /// lets one row program serve both the const-generic derivative oracles and the
 /// runtime-sized production backends without duplicating the expression.
-pub trait RuntimeJetScalar: Clone {
+pub trait RuntimeJetScalar<'arena>: Clone {
+    /// Storage arena used by runtime-backed scalars. Fixed derivative oracles
+    /// use the unit type because their storage is inline.
+    type Workspace: ?Sized;
+
     /// A constant in a `dimension`-primary algebra.
-    fn constant(c: f64, dimension: usize) -> Self;
+    fn constant(c: f64, dimension: usize, workspace: &'arena Self::Workspace) -> Self;
     /// A seeded variable in a `dimension`-primary algebra.
-    fn variable(x: f64, axis: usize, dimension: usize) -> Self;
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self;
     /// Number of primary derivative axes carried by this scalar.
     fn dimension(&self) -> usize;
     /// Value channel.
@@ -249,15 +258,24 @@ impl<S, const K: usize> FixedRuntimeJet<S, K> {
     }
 }
 
-impl<S: JetScalar<K>, const K: usize> RuntimeJetScalar for FixedRuntimeJet<S, K> {
-    fn constant(c: f64, dimension: usize) -> Self {
+impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena>
+    for FixedRuntimeJet<S, K>
+{
+    type Workspace = ();
+
+    fn constant(c: f64, dimension: usize, _workspace: &'arena Self::Workspace) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::constant(c),
         }
     }
 
-    fn variable(x: f64, axis: usize, dimension: usize) -> Self {
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        _workspace: &'arena Self::Workspace,
+    ) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::variable(x, axis),

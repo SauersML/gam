@@ -974,25 +974,9 @@ pub(crate) fn validatewiggle_block(
         );
     }
     let p = b.design.ncols();
-    // The link-wiggle joint Hessian / directional-derivative jets are assembled
-    // through a const-generic `SurvivalLsWiggleRowKernel::<KW>` whose arity
-    // `KW = SLS_ROW_K + pw` (`pw = p`) must be a compile-time literal picked from
-    // the monomorphization ladders in `row_kernel.rs`. Those ladders cover
-    // `pw ∈ 1..=SLS_MAX_LINK_WIGGLE_COLS`; a wider spline would otherwise route to
-    // the ladders' `unsupported KW` arm deep inside Newton-step Hessian assembly.
-    // Reject it here at spec validation with a precise, typed error naming the
-    // limit and the issue instead (#932 gap 5).
-    if p > super::SLS_MAX_LINK_WIGGLE_COLS {
+    if p == 0 {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
-            reason: format!(
-                "linkwiggle_block has {p} basis columns, but the const-generic \
-                 survival location-scale wiggle jet dispatch supports at most {} \
-                 (KW = {} + pw ≤ {}); widen the row_kernel.rs monomorphization \
-                 ladders or reduce the link-wiggle basis width (#932)",
-                super::SLS_MAX_LINK_WIGGLE_COLS,
-                super::SLS_ROW_K,
-                super::SLS_WIGGLE_KW_MAX,
-            ),
+            reason: "linkwiggle_block must contain at least one basis column".to_string(),
         });
     }
     if b.knots.len() < b.degree + 2 {
