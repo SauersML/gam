@@ -711,7 +711,7 @@ enum AdaptiveCenterDecision {
 
 fn adaptive_center_decision(
     current_centers: usize,
-    n_rows: usize,
+    ceiling_centers: usize,
     edf: f64,
     realized_width: usize,
     nullspace_dim: usize,
@@ -720,7 +720,7 @@ fn adaptive_center_decision(
     if !gam_terms::basis::basis_is_saturated(edf, realized_width, nullspace_dim, resolution_tol) {
         return AdaptiveCenterDecision::Certified;
     }
-    match gam_terms::basis::expanded_num_centers(current_centers, n_rows) {
+    match gam_terms::basis::expanded_num_centers(current_centers, ceiling_centers) {
         Some(proposed) => AdaptiveCenterDecision::Expand(proposed),
         None => AdaptiveCenterDecision::Exhausted,
     }
@@ -767,6 +767,20 @@ fn adaptive_spatial_candidates(
         if result.adaptive_spatial_terms[term_index]
             && let Some(current_centers) = result.adaptive_spatial_center_counts[term_index]
         {
+            let spatial_dimension = result.resolvedspec.smooth_terms[term_index]
+                .basis
+                .structural_feature_cols()
+                .len();
+            if spatial_dimension == 0 {
+                return Err(WorkflowError::IntegrationFailed {
+                    reason: format!(
+                        "adaptive spatial term '{}' has no structural feature columns",
+                        result.resolvedspec.smooth_terms[term_index].name,
+                    ),
+                });
+            }
+            let ceiling_centers =
+                gam_terms::basis::default_num_centers(n_rows, spatial_dimension);
             let global_range = (smooth_offset + realized.coeff_range.start)
                 ..(smooth_offset + realized.coeff_range.end);
             let edf = result
@@ -775,7 +789,7 @@ fn adaptive_spatial_candidates(
             let nullspace_dim = realized.wald_unpenalized_dim();
             match adaptive_center_decision(
                 current_centers,
-                n_rows,
+                ceiling_centers,
                 edf,
                 realized.coeff_range.len(),
                 nullspace_dim,
@@ -794,10 +808,10 @@ fn adaptive_spatial_candidates(
                     return Err(WorkflowError::SpatialUnderresolved {
                         term: result.resolvedspec.smooth_terms[term_index].name.clone(),
                         current_centers,
-                        attempted_centers: n_rows,
+                        attempted_centers: ceiling_centers,
                         reason: format!(
                             "term EDF {edf:.6} remains at its realized basis ceiling with all \
-                             {n_rows} row-supported centers already requested"
+                             {ceiling_centers} validated default centers already requested"
                         ),
                     });
                 }
@@ -824,7 +838,7 @@ mod adaptive_spatial_resolution_tests {
     }
 
     #[test]
-    fn saturated_basis_expands_geometrically_and_respects_row_support() {
+    fn saturated_basis_expands_geometrically_and_respects_validated_ceiling() {
         assert_eq!(
             adaptive_center_decision(8, 100, 10.0, 10, 2, 1.0e-6),
             AdaptiveCenterDecision::Expand(16)
@@ -836,7 +850,7 @@ mod adaptive_spatial_resolution_tests {
     }
 
     #[test]
-    fn saturated_basis_at_row_support_is_typed_exhaustion() {
+    fn saturated_basis_at_validated_ceiling_is_typed_exhaustion() {
         assert_eq!(
             adaptive_center_decision(100, 100, 10.0, 10, 2, 1.0e-6),
             AdaptiveCenterDecision::Exhausted

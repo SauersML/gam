@@ -476,16 +476,25 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d).min(modest).max(1)
 }
 
-/// Structural starting center count for saturation-driven spatial fitting.
+/// Low-rank starting center count for saturation-driven spatial fitting.
 ///
-/// A radial basis needs enough centers to own its affine null space (`d + 1`)
-/// plus one genuinely penalizable direction. Higher-order Duchon terms raise
-/// this term-independent floor with their exact polynomial dimension during
-/// materialization. Starting at that identifiable minimum removes sample-size
-/// heuristics from the estimator: resolution is added only when a converged
-/// larger-basis fit improves the model evidence.
+/// The structural minimum (`d + 1` polynomial directions plus one radial
+/// direction) is only enough to make the algebra identifiable. It is not an
+/// adequate pilot function space: structure orthogonal to that single radial
+/// direction is absorbed into the residual, so REML can legitimately shrink
+/// the direction and report EDF below its ceiling even when the surface is
+/// badly under-resolved (#1689). Start from the project's established
+/// thin-plate-style low-rank resolution `10 * 3^(d - 1)` instead. This is the
+/// same dimension rule already used by the automatic Duchon builder, capped by
+/// [`default_num_centers`] so the pilot never exceeds the validated production
+/// basis at small sample sizes.
 pub fn starting_num_centers(n: usize, d: usize) -> usize {
-    d.saturating_add(2).min(n).max(1)
+    let low_rank_resolution = 10usize
+        .saturating_mul(3usize.saturating_pow(d.saturating_sub(1).min(u32::MAX as usize) as u32));
+    low_rank_resolution
+        .min(default_num_centers(n, d))
+        .min(n)
+        .max(1)
 }
 
 /// Next evidence-backed center count for a saturated spatial basis, bounded by
@@ -2312,18 +2321,18 @@ mod saturation_escalation_tests {
     use super::*;
 
     #[test]
-    fn starting_count_is_the_identifiable_affine_plus_one_floor() {
-        assert_eq!(starting_num_centers(800, 2), 4);
-        assert_eq!(starting_num_centers(100_000, 1), 3);
-        assert_eq!(starting_num_centers(3, 5), 3);
+    fn starting_count_is_a_supported_low_rank_pilot_capped_by_default() {
+        assert_eq!(starting_num_centers(800, 2), 30);
+        assert_eq!(starting_num_centers(100_000, 1), 10);
+        assert_eq!(starting_num_centers(3, 5), default_num_centers(3, 5));
         assert_eq!(starting_num_centers(1, 2), 1);
     }
 
     #[test]
-    fn saturated_expansion_doubles_then_pins_at_observed_support() {
-        assert_eq!(expanded_num_centers(4, 800), Some(8));
-        assert_eq!(expanded_num_centers(512, 800), Some(800));
-        assert_eq!(expanded_num_centers(800, 800), None);
+    fn saturated_expansion_doubles_then_pins_at_validated_ceiling() {
+        assert_eq!(expanded_num_centers(30, 157), Some(60));
+        assert_eq!(expanded_num_centers(120, 157), Some(157));
+        assert_eq!(expanded_num_centers(157, 157), None);
         assert_eq!(
             expanded_num_centers(usize::MAX - 1, usize::MAX),
             Some(usize::MAX)
