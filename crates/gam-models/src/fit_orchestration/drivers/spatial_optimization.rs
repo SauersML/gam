@@ -4388,17 +4388,15 @@ fn wrap_local_build_as_realization(
     ) {
         (Some(rot), false, false) => {
             let q = &rot.rotation;
-            local.design = apply_smooth_transform_to_design(
-                local.design.clone(),
-                q,
-                &termspec.name,
-            )
-            .map_err(|e| {
-                format!(
-                    "joint-null absorption rotation failed for term '{}': {}",
-                    termspec.name, e
-                )
-            })?;
+            local.design =
+                apply_smooth_transform_to_design(local.design.clone(), q, &termspec.name).map_err(
+                    |e| {
+                        format!(
+                            "joint-null absorption rotation failed for term '{}': {}",
+                            termspec.name, e
+                        )
+                    },
+                )?;
             local.penalties = local
                 .penalties
                 .into_iter()

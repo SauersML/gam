@@ -8944,13 +8944,10 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             lb_local.is_some(),
             built.linear_constraints.is_some(),
         ) {
-        (Some(rot), false, false) => {
-            let q = &rot.rotation;
-            built.design = apply_smooth_transform_to_design(
-                built.design.clone(),
-                q,
-                &term.name,
-            )?;
+            (Some(rot), false, false) => {
+                let q = &rot.rotation;
+                built.design =
+                    apply_smooth_transform_to_design(built.design.clone(), q, &term.name)?;
                 built.penalties = built
                     .penalties
                     .into_iter()
