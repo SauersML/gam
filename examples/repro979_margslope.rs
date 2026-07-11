@@ -164,8 +164,8 @@ fn main() {
     match result {
         Ok(FitResult::BernoulliMarginalSlope(out)) => {
             eprintln!(
-                "[979-REPRO] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged={}",
-                out.fit.outer_iterations, out.fit.inner_cycles, out.fit.outer_converged
+                "[979-REPRO] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged=certified",
+                out.fit.outer_iterations, out.fit.inner_cycles
             );
         }
         Ok(_) => eprintln!("[979-REPRO] wrong FitResult variant"),

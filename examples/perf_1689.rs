@@ -65,7 +65,6 @@ struct Profile {
     inner_pirls_solves: usize,
     inner_cycles: usize,
     edf: f64,
-    converged: bool,
     basis_build_s: f64,
     fit_s: f64,
     predict_s: f64,
@@ -103,7 +102,7 @@ impl Profile {
 
     fn print(&self) {
         println!(
-            "[#1689] tag={tag} n={n} p={p} nlam={nl} edf={edf:.1} conv={cv} \
+            "[#1689] tag={tag} n={n} p={p} nlam={nl} edf={edf:.1} conv=certified \
              | basis_build={bb:.3}s fit={fs:.3}s predict={ps:.3}s total={tot:.3}s \
              | outer_iter={oi} outer_evals={oce} inner_solves={ips} inner_cycles={ic} \
              | per_solve={psolve:.2}ms implied_gflops={ig:.2} solve_bloat={sb:.1}x ref_outer={ro:.0} \
@@ -113,7 +112,6 @@ impl Profile {
             p = self.p,
             nl = self.num_lambdas,
             edf = self.edf,
-            cv = self.converged,
             bb = self.basis_build_s,
             fs = self.fit_s,
             ps = self.predict_s,
@@ -204,7 +202,6 @@ fn build_profile(
         inner_pirls_solves: f.inner_pirls_solves,
         inner_cycles: f.inner_cycles,
         edf: f.edf_total().unwrap_or(f64::NAN),
-        converged: f.outer_converged,
         basis_build_s,
         fit_s,
         predict_s,

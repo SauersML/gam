@@ -223,11 +223,10 @@ fn main() {
     };
     let elapsed = start.elapsed();
     eprintln!(
-        "[RIGID-PROFILE] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={}",
+        "[RIGID-PROFILE] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged=certified",
         n,
         elapsed.as_secs_f64(),
         fit.fit.outer_iterations,
         fit.fit.inner_cycles,
-        fit.fit.outer_converged,
     );
 }
