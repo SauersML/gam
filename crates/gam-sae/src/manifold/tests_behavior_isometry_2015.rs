@@ -124,6 +124,7 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
         z[[i, 0]] = theta.cos();
         z[[i, 1]] = theta.sin();
         z[[i, 2]] = 0.4 * (2.0 * theta).cos();
+        z[[i, 3]] = 0.4 * (2.0 * theta).sin();
         // Behavior winds through its own circle at angular position ψ(t).
         let psi = if uneven {
             theta + 0.8 * theta.sin()
@@ -270,6 +271,7 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
         z[[i, 0]] = theta.cos();
         z[[i, 1]] = theta.sin();
         z[[i, 2]] = 0.4 * (2.0 * theta).cos() + wiggle;
+        z[[i, 3]] = 0.4 * (2.0 * theta).sin();
         // Behavior winds through its own circle at angular position ψ(t): evenly
         // (scaled isometry) or unevenly (bent correspondence).
         let psi = if uneven {
