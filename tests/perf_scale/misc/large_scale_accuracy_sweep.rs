@@ -341,12 +341,22 @@ fn recovery_bc_anchored_left_endpoint_recovery() {
     let test_design = build_term_collection_design(test.view(), &fit.resolvedspec)
         .expect("rebuild anchored prediction design");
     let pred = test_design.design.apply(&fit.fit.beta);
+    let fit_pred = fit.design.design.apply(&fit.fit.beta);
+    let replay_max_abs = pred
+        .iter()
+        .zip(fit_pred.iter())
+        .map(|(replayed, fitted)| (replayed - fitted).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        replay_max_abs <= 1.0e-12,
+        "frozen anchored design changed training predictions: max |replay-fit|={replay_max_abs:.6e}"
+    );
     let mse = mean_squared_error(&pred, &truth_arr);
     let tol = 1.2 * noise_var;
     eprintln!(
         "[recovery-bc-anchored] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} \
          tol={tol:.5e} p={} edf_total={:.6} edf_by_block={:?} \
-         log_lambdas={:?} reml={:.6} outer_iters={}",
+         log_lambdas={:?} reml={:.6} outer_iters={} replay_max_abs={replay_max_abs:.3e}",
         fit.fit.beta.len(),
         fit.fit.edf_total().expect("Gaussian fit reports total EDF"),
         fit.fit.edf_by_block(),
