@@ -1122,6 +1122,14 @@ pub fn maybe_install_auto_outer_subsample(
         }
     };
     if phase_idx >= phase1_budget {
+        // Mark the exact phase explicitly. A raw counter equal to the budget
+        // can also mean "the last sampled evaluation just completed"; the
+        // post-budget sentinel lets the generic runner distinguish that state
+        // from a full-data evaluation that has already occurred.
+        phase_counter.fetch_max(
+            phase1_budget.saturating_add(1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
         if phase_idx == phase1_budget {
             log::info!(
                 "[{family_label} auto-subsample] Phase 1 budget exhausted after {} evals; \
@@ -2100,7 +2108,7 @@ mod tests {
         assert!(!schedule.enter_exact_phase());
         assert_eq!(
             phase_counter.load(std::sync::atomic::Ordering::SeqCst),
-            phase_budget
+            phase_budget + 1
         );
         assert!(
             maybe_install_auto_outer_subsample(

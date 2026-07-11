@@ -104,14 +104,14 @@ pub use gam_problem::ExactNewtonOuterCurvature;
 #[derive(Clone, Debug)]
 pub struct OuterDerivativePilotSchedule {
     phase_counter: Arc<AtomicUsize>,
-    exact_phase_start: usize,
+    sampled_phase_budget: usize,
 }
 
 impl OuterDerivativePilotSchedule {
-    pub fn new(phase_counter: Arc<AtomicUsize>, exact_phase_start: usize) -> Self {
+    pub fn new(phase_counter: Arc<AtomicUsize>, sampled_phase_budget: usize) -> Self {
         Self {
             phase_counter,
-            exact_phase_start,
+            sampled_phase_budget,
         }
     }
 
@@ -125,13 +125,18 @@ impl OuterDerivativePilotSchedule {
     /// needed.
     pub fn enter_exact_phase(&self) -> bool {
         let mut observed = self.phase_counter.load(Ordering::SeqCst);
+        // `0..=budget` records how many sampled derivative points have run.
+        // `budget + 1` is the unambiguous exact-phase sentinel. In particular,
+        // `observed == budget` still means the solver may have stopped exactly
+        // after its last sampled point, before any full-data evaluation.
+        let exact_phase_sentinel = self.sampled_phase_budget.saturating_add(1);
         loop {
-            if observed == 0 || observed >= self.exact_phase_start {
+            if observed == 0 || observed >= exact_phase_sentinel {
                 return false;
             }
             match self.phase_counter.compare_exchange(
                 observed,
-                self.exact_phase_start,
+                exact_phase_sentinel,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
