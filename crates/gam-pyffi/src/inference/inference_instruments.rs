@@ -1488,60 +1488,49 @@ fn gaussian_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> f64 {
     -loglik + 0.5 * 5.0 * nf.ln()
 }
 
-/// Adjudicate the representational SHAPE of a recovered atom's intrinsic 2-D
-/// coordinates (issue #977 / #907): race a smooth S¹ ring against a Euclidean
-/// Gaussian and the best k-cluster mixture rung, headlined by held-out
-/// predictive stacking — the EXACT `fit_mixture_rung` + `adjudicate_cross_class_
-/// race` machinery the in-tree gates and the production fit drive. Returns a dict
-/// with the winner name, per-candidate stacking weights, rank-aware evidences,
-/// the selected mixture order, and the circle's stacking margin over the best
-/// non-circle contender.
-///
-/// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
-/// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
-/// of the held-out density table.
-#[pyfunction]
-#[pyo3(signature = (coords, folds = 5, seed = 11, k_ladder = None))]
-pub(crate) fn adjudicate_atom_shape<'py>(
-    py: Python<'py>,
-    coords: numpy::PyReadonlyArray2<'py, f64>,
+#[derive(Debug, Clone)]
+struct AtomShapeRaceVerdict {
+    winner: String,
+    candidate_names: Vec<String>,
+    stacking_weights: Vec<f64>,
+    negative_log_evidence: Vec<f64>,
+    mixture_k: usize,
+    circle_margin: f64,
+    circle_wins: bool,
+    is_cross_class: bool,
+    headline: &'static str,
+}
+
+fn run_atom_shape_race(
+    coords: ArrayView2<'_, f64>,
     folds: usize,
     seed: u64,
-    k_ladder: Option<Vec<usize>>,
-) -> PyResult<Bound<'py, PyDict>> {
+    k_ladder: &[usize],
+) -> Result<AtomShapeRaceVerdict, String> {
     use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
-        AutoTopologyKind, CrossClassCandidate, Headline, MIXTURE_K_LADDER,
-        adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
+        AutoTopologyKind, CrossClassCandidate, Headline, adjudicate_cross_class_race,
+        fit_mixture_rung, mixture_density_provider,
     };
 
-    let coords_view = coords.as_array();
-    if coords_view.ncols() != 2 {
-        return Err(py_value_error(format!(
+    if coords.ncols() != 2 {
+        return Err(format!(
             "adjudicate_atom_shape: coords must be (n, 2); got {:?}",
-            coords_view.dim()
-        )));
-    }
-    if coords_view.nrows() < 4 {
-        return Err(py_value_error(
-            "adjudicate_atom_shape: need at least 4 rows to adjudicate".to_string(),
+            coords.dim()
         ));
     }
-    if !coords_view.iter().all(|v| v.is_finite()) {
-        return Err(py_value_error(
-            "adjudicate_atom_shape: coords must be finite".to_string(),
-        ));
+    if coords.nrows() < 4 {
+        return Err("adjudicate_atom_shape: need at least 4 rows to adjudicate".to_string());
     }
-    let owned = coords_view.to_owned();
+    if !coords.iter().all(|value| value.is_finite()) {
+        return Err("adjudicate_atom_shape: coords must be finite".to_string());
+    }
+    let owned = coords.to_owned();
     let n = owned.nrows();
-
-    let cfg = GaussianMixtureConfig::default();
-    let ladder: Vec<usize> = k_ladder.unwrap_or_else(|| MIXTURE_K_LADDER.to_vec());
-    let rung = fit_mixture_rung(owned.view(), &ladder, cfg).map_err(py_value_error)?;
-    let mixture_k = rung.winner().k;
-    let mixture_nle = rung.winner().negative_log_evidence;
-
+    let config = GaussianMixtureConfig::default();
+    let mixture = fit_mixture_rung(owned.view(), k_ladder, config)?;
+    let mixture_k = mixture.winner().k;
     let candidates = vec![
         CrossClassCandidate {
             kind: AutoTopologyKind::Circle,
@@ -1557,50 +1546,133 @@ pub(crate) fn adjudicate_atom_shape<'py>(
         },
         CrossClassCandidate {
             kind: AutoTopologyKind::Mixture { k: mixture_k },
-            negative_log_evidence: mixture_nle,
+            negative_log_evidence: mixture.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
-            density_provider: mixture_density_provider(owned.view(), mixture_k, cfg),
+            density_provider: mixture_density_provider(owned.view(), mixture_k, config),
         },
     ];
-
     let verdict =
-        adjudicate_cross_class_race(n, candidates, folds, seed, StackingConfig::default())
-            .map_err(py_value_error)?;
-
-    // Per-candidate stacking weights (present because the race mixes the
-    // discrete mixture with the smooth candidates → cross-class stacking).
-    let weights: Vec<f64> = verdict
+        adjudicate_cross_class_race(n, candidates, folds, seed, StackingConfig::default())?;
+    let stacking_weights = verdict
         .stacking
         .as_ref()
-        .map(|s| s.weights.to_vec())
+        .map(|stacking| stacking.weights.to_vec())
         .unwrap_or_default();
     let winner = verdict.candidate_names[verdict.winner_index].clone();
-    // Circle margin = circle stacking weight − best non-circle stacking weight.
-    let circle_margin = if weights.len() == 3 {
-        weights[0] - weights[1].max(weights[2])
+    let circle_margin = if stacking_weights.len() == 3 {
+        stacking_weights[0] - stacking_weights[1].max(stacking_weights[2])
     } else {
         f64::NAN
     };
-
-    let out = PyDict::new(py);
-    out.set_item("winner", &winner)?;
-    out.set_item("candidate_names", verdict.candidate_names.clone())?;
-    out.set_item("stacking_weights", weights)?;
-    out.set_item(
-        "negative_log_evidence",
-        verdict.negative_log_evidence.clone(),
-    )?;
-    out.set_item("mixture_k", mixture_k)?;
-    out.set_item("circle_margin", circle_margin)?;
-    out.set_item("circle_wins", winner.starts_with("circle"))?;
-    out.set_item("is_cross_class", verdict.is_cross_class)?;
-    out.set_item(
-        "headline",
-        match verdict.headline {
+    Ok(AtomShapeRaceVerdict {
+        circle_wins: winner.starts_with("circle"),
+        winner,
+        candidate_names: verdict.candidate_names,
+        stacking_weights,
+        negative_log_evidence: verdict.negative_log_evidence,
+        mixture_k,
+        circle_margin,
+        is_cross_class: verdict.is_cross_class,
+        headline: match verdict.headline {
             Headline::Stacking => "stacking",
             Headline::Evidence => "evidence",
         },
-    )?;
+    })
+}
+
+fn atom_shape_verdict_dict<'py>(
+    py: Python<'py>,
+    verdict: &AtomShapeRaceVerdict,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("winner", &verdict.winner)?;
+    out.set_item("candidate_names", &verdict.candidate_names)?;
+    out.set_item("stacking_weights", &verdict.stacking_weights)?;
+    out.set_item("negative_log_evidence", &verdict.negative_log_evidence)?;
+    out.set_item("mixture_k", verdict.mixture_k)?;
+    out.set_item("circle_margin", verdict.circle_margin)?;
+    out.set_item("circle_wins", verdict.circle_wins)?;
+    out.set_item("is_cross_class", verdict.is_cross_class)?;
+    out.set_item("headline", verdict.headline)?;
+    Ok(out)
+}
+
+/// Adjudicate the representational SHAPE of a recovered atom's intrinsic 2-D
+/// coordinates (issue #977 / #907): race a smooth S¹ ring against a Euclidean
+/// Gaussian and the best k-cluster mixture rung, headlined by held-out
+/// predictive stacking — the EXACT `fit_mixture_rung` + `adjudicate_cross_class_
+/// race` machinery the in-tree gates and the production fit drive. Returns a dict
+/// with the winner name, per-candidate stacking weights, rank-aware evidences,
+/// the selected mixture order, and the circle's stacking margin over the best
+/// non-circle contender.
+///
+/// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
+/// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
+/// of the held-out density table. By default, the identical race also runs on
+/// an independent per-dimension shuffle and a covariance-matched Gaussian null;
+/// `mean_l0` is then required and is emitted beside the resulting control
+/// false-circle floor, because a verdict rate without dictionary sparsity is
+/// not interpretable (#2262). Non-dictionary callers can explicitly disable
+/// `matched_controls` and receive no control-rate claim.
+#[pyfunction]
+#[pyo3(signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true))]
+pub(crate) fn adjudicate_atom_shape<'py>(
+    py: Python<'py>,
+    coords: numpy::PyReadonlyArray2<'py, f64>,
+    folds: usize,
+    seed: u64,
+    k_ladder: Option<Vec<usize>>,
+    mean_l0: Option<f64>,
+    matched_controls: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let coords_view = coords.as_array();
+    let ladder = k_ladder.unwrap_or_else(|| gam::solver::MIXTURE_K_LADDER.to_vec());
+    let observed =
+        run_atom_shape_race(coords_view, folds, seed, &ladder).map_err(py_value_error)?;
+    let out = atom_shape_verdict_dict(py, &observed)?;
+    out.set_item("dictionary_mean_l0", mean_l0)?;
+
+    if matched_controls {
+        let mean_l0 = mean_l0.ok_or_else(|| {
+            py_value_error(
+                "adjudicate_atom_shape: mean_l0 is required when matched_controls=True; a shape-verdict rate without dictionary sparsity is uninterpretable"
+                    .to_string(),
+            )
+        })?;
+        if !mean_l0.is_finite() || mean_l0 < 0.0 {
+            return Err(py_value_error(format!(
+                "adjudicate_atom_shape: mean_l0 must be finite and non-negative; got {mean_l0}"
+            )));
+        }
+        use gam::terms::sae::null_battery::{
+            covariance_matched_gaussian_null, per_dimension_shuffle_null,
+        };
+        let shuffled =
+            per_dimension_shuffle_null(coords_view, seed ^ 0xD1AE_510F).map_err(py_value_error)?;
+        let gaussian = covariance_matched_gaussian_null(coords_view, seed ^ 0xC0A4_71A1)
+            .map_err(py_value_error)?;
+        let shuffle_verdict =
+            run_atom_shape_race(shuffled.view(), folds, seed, &ladder).map_err(py_value_error)?;
+        let gaussian_verdict =
+            run_atom_shape_race(gaussian.view(), folds, seed, &ladder).map_err(py_value_error)?;
+        let controls = PyDict::new(py);
+        controls.set_item(
+            "per_dimension_shuffle",
+            atom_shape_verdict_dict(py, &shuffle_verdict)?,
+        )?;
+        controls.set_item(
+            "covariance_matched_gaussian",
+            atom_shape_verdict_dict(py, &gaussian_verdict)?,
+        )?;
+        let false_circle_floor = (usize::from(shuffle_verdict.circle_wins)
+            + usize::from(gaussian_verdict.circle_wins)) as f64
+            / 2.0;
+        out.set_item("matched_controls", controls)?;
+        out.set_item("control_false_circle_floor", false_circle_floor)?;
+    } else {
+        out.set_item("matched_controls", py.None())?;
+        out.set_item("control_false_circle_floor", py.None())?;
+    }
     Ok(out)
 }
 

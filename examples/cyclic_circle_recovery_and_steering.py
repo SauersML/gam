@@ -402,8 +402,12 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
     Z2, _basis2, ev2 = day_signal_chart(X, labels, template_ids, 2)
     coords2 = np.ascontiguousarray(Z2)
     try:
-        verdict = dict(gamfit_mod.adjudicate_atom_shape(coords2, folds=5,
-                                                        seed=seed + 11))
+        verdict = dict(gamfit_mod.adjudicate_atom_shape(
+            coords2,
+            folds=5,
+            seed=seed + 11,
+            matched_controls=False,
+        ))
         verdict.pop("negative_log_evidence", None)
     except Exception as exc:  # noqa: BLE001
         verdict = {"error": f"{type(exc).__name__}: {exc}"}

@@ -163,10 +163,12 @@ def manifold_fit(gamfit, z, *, K, atom_topology, atom_basis, d_atom, assignment,
     return fit, dt
 
 
-def adjudicate(gamfit, coords, seed):
+def adjudicate(gamfit, coords, seed, mean_l0):
     """Cross-class shape race through the Rust FFI (single evidence impl)."""
     if hasattr(gamfit, "adjudicate_atom_shape") and coords.shape[1] == 2:
-        return gamfit.adjudicate_atom_shape(np.ascontiguousarray(coords), folds=5, seed=seed)
+        return gamfit.adjudicate_atom_shape(
+            np.ascontiguousarray(coords), folds=5, seed=seed, mean_l0=mean_l0
+        )
     return {"winner": "n/a", "note": "adjudicate_atom_shape unavailable or d_atom!=2"}
 
 
@@ -314,8 +316,10 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
                 tau=None, n_harmonics=None, intrinsic_rank=None, seed=seed,
             )
             coords = np.asarray(fit.coords[0], dtype=float)
+            assignments = np.asarray(fit.assignments, dtype=float)
+            mean_l0 = float(np.count_nonzero(assignments, axis=1).mean())
             entry["reconstruction_r2"] = float(getattr(fit, "reconstruction_r2", _r2(z, np.asarray(fit.fitted))))
-            entry["shape_verdict"] = adjudicate(gamfit, coords, seed + 11)
+            entry["shape_verdict"] = adjudicate(gamfit, coords, seed + 11, mean_l0)
             if kinds:
                 entry["kind_binding_R"] = binding_by_attribute(coords, kinds)
             if roles:
