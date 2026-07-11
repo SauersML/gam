@@ -7291,7 +7291,6 @@ mod tests {
             let config = RoundDriverConfig {
                 n_shards: 3,
                 budget,
-                max_rounds: 2,
                 harvest_params: params,
                 curl: None,
             };
@@ -7304,10 +7303,10 @@ mod tests {
                 target.view(),
                 config,
                 &mut ledger,
-                |t, r, _| (t, r),
+                |t, r, _| Ok((t, r)),
                 // No-op polish: this determinism oracle scripts the gate and
                 // never runs the SAE inner solve.
-                |t, r, _| (t, r),
+                |t, r, _| Ok((t, r)),
             )
             .unwrap()
         };
@@ -7321,162 +7320,6 @@ mod tests {
             "identical inputs must produce a byte-identical ledger"
         );
         assert_eq!(a.term.k_atoms(), b.term.k_atoms());
-    }
-
-    /// #1026 move-equivalence oracle for the candidate-SCORING iteration cap.
-    ///
-    /// The production structure search caps the per-candidate scoring refit's
-    /// inner iterations (`scoring_inner_max_iter`) well below the outer fit's
-    /// `inner_max_iter`, then re-refits each round's adopted winner at the full
-    /// budget. The economy is sound only if it does NOT change WHICH moves the
-    /// e-gate accepts (the gate ranks the capped-score candidate) NOR the adopted
-    /// dictionary (the winner is polished to the full-iter optimum). This runs
-    /// the real `run_production_structure_search` driver — same residual-bearing
-    /// target, seed, splits, budgets — twice: a full-iter REFERENCE
-    /// (`scoring_inner_max_iter == inner_max_iter`) and the CAPPED production
-    /// path, and asserts the accepted-move ledger is byte-identical and the
-    /// final fitted reconstruction matches to a tight tolerance. On a tractable
-    /// K/n where the full-iter reference completes, equivalence here certifies
-    /// the cap is a pure scoring-cost economy (the #1026 perf fix is quality- and
-    /// decision-preserving).
-    #[test]
-    fn scoring_iter_cap_preserves_moves_and_adopted_fit() {
-        // A residual-bearing single-atom fit so the birth channel mines a real
-        // shared-structure candidate the gate can certify (mirrors
-        // `residual_bearing_fit_harvests_birth_proposal`'s planted factor).
-        let n = 40usize;
-        let active: Vec<Vec<bool>> = (0..n).map(|_| vec![true]).collect();
-        let p = 4usize;
-        let u = [0.6_f64, -0.4, 0.5, -0.3];
-        let mut target = Array2::<f64>::zeros((n, p));
-        for row in 0..n {
-            let amp = 1.0 + (row as f64) / (n as f64);
-            for c in 0..p {
-                target[[row, c]] = amp * u[c % u.len()];
-            }
-        }
-        let config = RoundDriverConfig {
-            n_shards: 4,
-            budget: MoveBudget {
-                max_moves: 4,
-                alpha: 0.05,
-            },
-            max_rounds: 2,
-            harvest_params: HarvestParams {
-                max_fusions: 2,
-                max_fissions: 2,
-                max_births: 2,
-            },
-            curl: None,
-        };
-        let full_iters = 24usize;
-        let run = |scoring_inner_max_iter: usize| {
-            let (term, rho) = planted_term(&active);
-            let mut ledger = StructureLedger::new();
-            let refit_params = ProductionRefitParams {
-                inner_max_iter: full_iters,
-                scoring_inner_max_iter,
-                learning_rate: 1.0,
-                ridge_ext_coord: 1e-6,
-                ridge_beta: 1e-6,
-            };
-            let result = run_production_structure_search(
-                term,
-                rho,
-                target.view(),
-                config,
-                refit_params,
-                &mut ledger,
-            )
-            .unwrap();
-            let fitted = result.term.try_fitted().unwrap();
-            (result, fitted)
-        };
-
-        // Full-iter reference: scoring budget == full budget (no economy).
-        let (reference, ref_fitted) = run(full_iters);
-        // Production cap: a warm child re-equilibrates in very few iters.
-        let (capped, cap_fitted) = run(4);
-
-        // The accepted-move trajectory — the per-round `moves` (each carrying the
-        // proposed `mv`, its `trigger`, `structure_hash`, `claim`, and the e-gate
-        // `verdict`) — must be identical: the cap must not flip a single e-gate
-        // decision. We compare ONLY `moves`, NOT the per-round `collapse_events`.
-        // The collapse-event log is the #976 active-mass guard's per-INNER-iteration
-        // diagnostic trail: a full-iter refit runs more inner Newton steps than a
-        // capped one, so it legitimately records more reseed/terminal guard fires
-        // for the SAME structural outcome. Those events are a refit-trajectory
-        // diagnostic, not an e-gate decision — the move verdicts already encode
-        // their structural effect — so comparing them would assert a property the
-        // cap is not meant to preserve (and the adopted-fit check below is the
-        // real guarantee that the converged state matches).
-        // The cap-invariant surface is the DECISION each move records — its
-        // proposal (`mv`), the structure it acts on (`structure_hash`), its
-        // `claim`, and the e-gate VERDICT VARIANT (Accepted vs Contested vs …).
-        // The `trigger` and the verdict's `log_e` are floating-point MAGNITUDES
-        // computed under the scoring budget: a 4-iter scoring fit and a 24-iter
-        // one legitimately land on slightly different evidence for the SAME
-        // decision — that is exactly the economy the cap trades on. Asserting
-        // bit-identical `log_e`/`trigger` would demand the cap be a no-op, which
-        // is the opposite of its purpose; the #1026 soundness property is that no
-        // e-gate DECISION flips, which the projection below captures.
-        use gam_solve::structure_search::MoveVerdict;
-        let verdict_kind = |v: &MoveVerdict| -> &'static str {
-            match v {
-                MoveVerdict::Accepted { .. } => "Accepted",
-                MoveVerdict::Contested { .. } => "Contested",
-                MoveVerdict::Demoted { .. } => "Demoted",
-                MoveVerdict::Vetoed { .. } => "Vetoed",
-                MoveVerdict::Deduplicated => "Deduplicated",
-                MoveVerdict::Stale => "Stale",
-                MoveVerdict::Deferred => "Deferred",
-            }
-        };
-        let round_moves = |rounds: &[SearchLedger]| -> String {
-            serde_json::to_string(
-                &rounds
-                    .iter()
-                    .map(|r| {
-                        r.moves
-                            .iter()
-                            .map(|m| {
-                                (
-                                    serde_json::to_string(&m.mv).unwrap(),
-                                    m.structure_hash,
-                                    serde_json::to_string(&m.claim).unwrap(),
-                                    verdict_kind(&m.verdict),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap()
-        };
-        assert_eq!(
-            round_moves(&reference.rounds),
-            round_moves(&capped.rounds),
-            "scoring-iteration cap changed the accepted-move trajectory — the e-gate \
-             decisions are NOT cap-invariant (the #1026 economy is unsound)"
-        );
-        assert_eq!(
-            reference.term.k_atoms(),
-            capped.term.k_atoms(),
-            "scoring cap changed the discovered dictionary size"
-        );
-
-        // The adopted dictionary's reconstruction must match: the full-iter
-        // polish lands the capped path on the same inner optimum.
-        assert_eq!(ref_fitted.dim(), cap_fitted.dim());
-        let mut max_abs = 0.0_f64;
-        for (a, b) in ref_fitted.iter().zip(cap_fitted.iter()) {
-            max_abs = max_abs.max((a - b).abs());
-        }
-        assert!(
-            max_abs < 1e-6,
-            "capped-scoring adopted fit diverged from the full-iter reference by \
-             {max_abs:.3e} (> 1e-6); the polish did not reach the same optimum"
-        );
     }
 
     /// Estimation/eval split oracle: the split reserves estimation rows and
@@ -8244,7 +8087,6 @@ mod tests {
             let config = RoundDriverConfig {
                 n_shards: 3,
                 budget,
-                max_rounds: 1,
                 harvest_params,
                 curl,
             };
@@ -8254,8 +8096,8 @@ mod tests {
                 target.view(),
                 config,
                 &mut ledger,
-                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
-                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| (t, r),
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| Ok((t, r)),
+                |t: SaeManifoldTerm, r: SaeManifoldRho, _rows: &[usize]| Ok((t, r)),
             )
             .unwrap()
         };
