@@ -46,102 +46,6 @@ from pathlib import Path
 
 import numpy as np
 
-# splitmix64-equivalent CV folding so the held-out density table is byte-
-# deterministic from an integer seed (mirrors the Rust harness convention).
-
-
-def _kfold_indices(n: int, folds: int, seed: int) -> list[tuple[np.ndarray, np.ndarray]]:
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n)
-    out = []
-    sizes = [(n // folds) + (1 if f < n % folds else 0) for f in range(folds)]
-    start = 0
-    for f in range(folds):
-        eval_idx = np.sort(perm[start : start + sizes[f]])
-        train_idx = np.sort(np.setdiff1d(perm, eval_idx, assume_unique=False))
-        out.append((train_idx, eval_idx))
-        start += sizes[f]
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Held-out predictive log-density providers on the recovered 2-D atom
-# coordinates. These are the SAME models the Rust cross-class race uses:
-#   ring   : radius ~ N(mu, s2) fit on train, uniform angle, +log(1/r) Jacobian.
-#   gauss  : full 2-D Gaussian (mean + 2x2 cov) fit on train.
-#   mixture: k-component isotropic Gaussian mixture (EM) fit on train.
-# Lower negative-log predictive density (higher held-out loglik) wins.
-# ---------------------------------------------------------------------------
-
-
-def _ring_heldout_loglik(coords: np.ndarray, train: np.ndarray, eval_: np.ndarray) -> np.ndarray:
-    c = coords - coords[train].mean(axis=0, keepdims=True)
-    r = np.sqrt((c[train] ** 2).sum(axis=1))
-    mean = float(r.mean())
-    var = max(float(r.var()), 1e-9)
-    re = np.sqrt((c[eval_] ** 2).sum(axis=1))
-    re = np.maximum(re, 1e-9)
-    log_norm = -0.5 * math.log(2.0 * math.pi * var)
-    log_angle = -math.log(2.0 * math.pi)
-    return log_norm - 0.5 * (re - mean) ** 2 / var + log_angle - np.log(re)
-
-
-def _gauss_heldout_loglik(coords: np.ndarray, train: np.ndarray, eval_: np.ndarray) -> np.ndarray:
-    mu = coords[train].mean(axis=0)
-    cov = np.cov(coords[train].T) + 1e-6 * np.eye(coords.shape[1])
-    det = np.linalg.det(cov)
-    inv = np.linalg.inv(cov)
-    d = coords[eval_] - mu
-    quad = np.einsum("ij,jk,ik->i", d, inv, d)
-    log_norm = -coords.shape[1] / 2.0 * math.log(2.0 * math.pi) - 0.5 * math.log(max(det, 1e-300))
-    return log_norm - 0.5 * quad
-
-
-def _mixture_heldout_loglik(
-    coords: np.ndarray, train: np.ndarray, eval_: np.ndarray, k: int, seed: int
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    Xtr = coords[train]
-    # k-means++ style init then a few EM iterations (isotropic, shared scale).
-    idx = rng.choice(len(Xtr), size=k, replace=False)
-    centers = Xtr[idx].copy()
-    for _ in range(25):
-        d2 = ((Xtr[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        resp = np.zeros((len(Xtr), k))
-        var = max(float(d2.min(axis=1).mean()), 1e-6)
-        logw = math.log(1.0 / k)
-        ll = -0.5 * d2 / var - coords.shape[1] / 2.0 * math.log(2.0 * math.pi * var) + logw
-        ll -= ll.max(axis=1, keepdims=True)
-        resp = np.exp(ll)
-        resp /= resp.sum(axis=1, keepdims=True)
-        nk = resp.sum(axis=0) + 1e-9
-        centers = (resp.T @ Xtr) / nk[:, None]
-    d2e = ((coords[eval_][:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-    var = max(float((((Xtr[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)).min(axis=1).mean()), 1e-6)
-    comp = -0.5 * d2e / var - coords.shape[1] / 2.0 * math.log(2.0 * math.pi * var) + math.log(1.0 / k)
-    m = comp.max(axis=1, keepdims=True)
-    return (m[:, 0] + np.log(np.exp(comp - m).sum(axis=1)))
-
-
-def adjudicate_shape(coords: np.ndarray, k_ladder=(2, 3, 5, 7, 9), folds: int = 5, seed: int = 11):
-    """Cross-validated held-out predictive-density race: circle vs Gaussian vs
-    the best k-cluster mixture. Returns total held-out loglik per candidate and
-    the winner — exactly the #907 cross-class discipline, run on the recovered
-    real-activation atom coordinates."""
-    splits = _kfold_indices(len(coords), folds, seed)
-    ring = gauss = 0.0
-    mix = {k: 0.0 for k in k_ladder}
-    for tr, ev in splits:
-        ring += float(_ring_heldout_loglik(coords, tr, ev).sum())
-        gauss += float(_gauss_heldout_loglik(coords, tr, ev).sum())
-        for k in k_ladder:
-            mix[k] += float(_mixture_heldout_loglik(coords, tr, ev, k, seed + k).sum())
-    best_k = max(mix, key=mix.get)
-    table = {"circle": ring, "euclidean": gauss, f"mixture_k{best_k}": mix[best_k]}
-    winner = max(table, key=table.get)
-    return winner, table, best_k
-
-
 # ---------------------------------------------------------------------------
 # Driver.
 # ---------------------------------------------------------------------------
@@ -180,6 +84,15 @@ def main() -> int:
     ap.add_argument("--data", type=str, default=None, help="dir with activations.npy + prompts.jsonl")
     ap.add_argument("--layer", type=int, default=25, help="residual-stream layer (L25 self/qualia, L44 color)")
     ap.add_argument("--n-iter", type=int, default=80)
+    ap.add_argument(
+        "--pca-dims",
+        type=int,
+        default=None,
+        help=(
+            "fit on this many leading activation PCs; by default use the "
+            "spectrum's participation-ratio effective rank"
+        ),
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--print-run-spec", action="store_true")
@@ -215,21 +128,49 @@ def main() -> int:
     else:
         print(f"BLOCKER: unexpected activations shape {acts.shape}", file=sys.stderr)
         return 5
-    # Center; project the 5120-d cloud to its top principal subspace so the
-    # atom fit and the shape race operate on the signal subspace (the fit
-    # itself handles p>>d, but the adjudication coordinates come from fit.coords,
-    # which the manifold fit recovers from the full cloud). We pass the full
-    # cloud to the fit and read its intrinsic coordinates back.
+    # Center and ACTUALLY project the 5120-d cloud to its leading signal
+    # subspace. The old example claimed this projection but passed the full
+    # matrix, turning a 635-row demo into a >900 s wide-p solve (#2267). The
+    # row-Gram eigendecomposition computes exact PCA scores without forming a
+    # 5120x5120 covariance matrix.
     z = z - z.mean(axis=0, keepdims=True)
-    n, p = z.shape
-    print(f"loaded real OLMo activations: n={n} prompts, p={p} dims, layer L{args.layer}")
+    n, input_p = z.shape
+    gram = z @ z.T
+    eigenvalues, eigenvectors = np.linalg.eigh(gram)
+    nonnegative = np.maximum(eigenvalues, 0.0)
+    spectral_mass = float(nonnegative.sum())
+    spectral_square_mass = float(nonnegative @ nonnegative)
+    effective_rank = spectral_mass * spectral_mass / max(
+        spectral_square_mass, np.finfo(float).tiny
+    )
+    pca_dims = (
+        int(args.pca_dims)
+        if args.pca_dims is not None
+        else max(2, int(math.ceil(effective_rank)))
+    )
+    if not 2 <= pca_dims <= min(n - 1, input_p):
+        print(
+            f"ERROR: --pca-dims must lie in [2, {min(n - 1, input_p)}]; got {pca_dims}",
+            file=sys.stderr,
+        )
+        return 6
+    order = np.argsort(eigenvalues)[::-1][:pca_dims]
+    positive = np.maximum(eigenvalues[order], 0.0)
+    explained = float(positive.sum() / max(spectral_mass, np.finfo(float).tiny))
+    z = np.ascontiguousarray(eigenvectors[:, order] * np.sqrt(positive)[None, :])
+    p = z.shape[1]
+    print(
+        f"loaded real OLMo activations: n={n} prompts, input_p={input_p}, "
+        f"effective_rank={effective_rank:.2f}, fit_p={p}, "
+        f"pca_ev={explained:.4f}, layer L{args.layer}"
+    )
 
     fit = gamfit.sae_manifold_fit(
         X=z,
         K=1,
         atom_basis="periodic",
         d_atom=2,
-        assignment="ibp_map",
+        assignment="softmax",
         n_iter=args.n_iter,
         learning_rate=0.04,
         random_state=args.seed,
@@ -243,43 +184,28 @@ def main() -> int:
     print(f"atom recovered: topology={topology}  reconstruction R^2={r2:.4f}  coords.shape={coords.shape}")
 
     # --- #907 shape adjudication on the REAL recovered coordinates -----------
-    # PRIMARY path: the Rust cross-class adjudicator through the gamfit FFI
-    # (gamfit.adjudicate_atom_shape) — the SAME evidence code the in-tree gates
-    # and the production fit drive. One evidence implementation, not two, so the
-    # real-LLM verdict is trustworthy. Falls back to the local Python replica
-    # only if an older wheel lacks the symbol (and says so loudly).
-    if hasattr(gamfit, "adjudicate_atom_shape"):
-        assignments = np.asarray(fit.assignments, dtype=float)
-        mean_l0 = float(np.count_nonzero(assignments, axis=1).mean())
-        v = gamfit.adjudicate_atom_shape(
-            np.ascontiguousarray(coords),
-            folds=5,
-            seed=args.seed + 11,
-            mean_l0=mean_l0,
-        )
-        winner = v["winner"]
-        best_k = v["mixture_k"]
-        margin = v["circular_margin"]
-        circle_wins = bool(v["circle_wins"])
-        table = dict(zip(v["candidate_names"], v["stacking_weights"]))
-        print("shape race via RUST FFI (gamfit.adjudicate_atom_shape), "
-              f"headline={v['headline']}, held-out stacking weights:")
-        for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
-            print(f"    {name:14s} weight={val:.4f}")
-        print(f"  VERDICT: {winner}  (circle stacking margin = {margin:+.4f})")
-    else:
-        print("WARNING: gamfit.adjudicate_atom_shape not in this wheel — "
-              "falling back to the Python evidence replica (rebuild the wheel "
-              "for the trustworthy single-implementation path).")
-        winner, table, best_k = adjudicate_shape(coords, seed=args.seed + 11)
-        margin = table.get("circle", -math.inf) - max(
-            v for kk, v in table.items() if kk != "circle"
-        )
-        print("shape race (held-out predictive loglik, higher wins):")
-        for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
-            print(f"    {name:14s} {val:14.3f}")
-        print(f"  VERDICT: {winner}  (circle margin over best non-circle = {margin:+.3f})")
-        circle_wins = winner == "circle"
+    # The current Rust adjudicator is required. It owns all four density
+    # classes, their certified fits, matched nulls, and cross-fit stacking.
+    assignments = np.asarray(fit.assignments, dtype=float)
+    mean_l0 = float(np.count_nonzero(assignments, axis=1).mean())
+    v = gamfit.adjudicate_atom_shape(
+        np.ascontiguousarray(coords),
+        folds=5,
+        seed=args.seed + 11,
+        mean_l0=mean_l0,
+    )
+    winner = v["winner"]
+    best_k = v["mixture_k"]
+    margin = v["circular_margin"]
+    circle_wins = bool(v["circle_wins"])
+    table = dict(zip(v["candidate_names"], v["stacking_weights"]))
+    print(
+        "shape race via RUST FFI (gamfit.adjudicate_atom_shape), "
+        f"headline={v['headline']}, held-out stacking weights:"
+    )
+    for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
+        print(f"    {name:18s} weight={val:.4f}")
+    print(f"  VERDICT: {winner}  (circular stacking margin = {margin:+.4f})")
 
     # --- #975 attribute carve: does an attribute bind the coordinate? --------
     # Color the recovered atlas by the prompt `kind` and report whether the
@@ -319,7 +245,9 @@ def main() -> int:
 
     verdict = {
         "n": n,
-        "p": p,
+        "input_p": input_p,
+        "fit_p": p,
+        "pca_explained_variance": explained,
         "layer": args.layer,
         "reconstruction_r2": r2,
         "atom_topology": str(topology),
