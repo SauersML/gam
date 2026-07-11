@@ -468,12 +468,14 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
         stk.train <- inla.stack(
           data = list(mag = train$mag),
           A = list(A.train, 1),
-          effects = list(c(s.index, list(intercept = 1)), list()),
+          effects = list(s.index,
+                         data.frame(intercept = rep(1, nrow(train)))),
           tag = "train")
         stk.test <- inla.stack(
           data = list(mag = rep(NA, nrow(test))),
           A = list(A.test, 1),
-          effects = list(c(s.index, list(intercept = 1)), list()),
+          effects = list(s.index,
+                         data.frame(intercept = rep(1, nrow(test)))),
           tag = "test")
         stk <- inla.stack(stk.train, stk.test)
         form <- mag ~ -1 + intercept + f(spatial, model = spde)
