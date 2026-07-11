@@ -31,7 +31,7 @@ def test_isometry_weight_changes_payload(monkeypatch):
     _no_row_block_probe(monkeypatch)
     common = dict(
         coord_sparsity="l1",
-        sparsity_weight=0.0,
+        sparsity_weight=1.0,
         scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
         block_orthogonality_weight=0.0,
@@ -63,7 +63,7 @@ def test_isometry_weight_zero_omits_descriptor(monkeypatch):
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
         coord_sparsity="l1",
-        sparsity_weight=0.0,
+        sparsity_weight=1.0,
         scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
         block_orthogonality_weight=0.0,
@@ -83,7 +83,7 @@ def test_decoder_incoherence_payload_builder_default_is_on_for_multi_atom(monkey
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
         coord_sparsity="l1",
-        sparsity_weight=0.0,
+        sparsity_weight=1.0,
         scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
         block_orthogonality_weight=0.0,
@@ -657,7 +657,7 @@ def test_per_atom_topologies_preserved():
 
 
 # ---------------------------------------------------------------------------
-# #609 — top_k must be within [1, k_atoms]; None disables it.
+# TopK support must be within [1, k_atoms].
 # ---------------------------------------------------------------------------
 def test_top_k_too_large_raises(monkeypatch):
     # Force the analytic-penalty payload (which would touch Rust) to a no-op so
@@ -665,7 +665,7 @@ def test_top_k_too_large_raises(monkeypatch):
     _no_row_block_probe(monkeypatch)
     x = np.random.default_rng(0).standard_normal((20, 3))
     with pytest.raises(ValueError, match=r"top_k must be in \[1, K=2\]"):
-        sae.sae_manifold_fit(X=x, K=2, top_k=5)
+        sae.sae_manifold_fit(X=x, K=2, assignment="topk", top_k=5)
 
 
 @pytest.mark.parametrize("invalid_top_k", [-3, 0])
@@ -673,7 +673,9 @@ def test_top_k_nonpositive_raises(monkeypatch, invalid_top_k):
     _no_row_block_probe(monkeypatch)
     x = np.random.default_rng(0).standard_normal((20, 3))
     with pytest.raises(ValueError, match=r"top_k must be in \[1, K=2\]"):
-        sae.sae_manifold_fit(X=x, K=2, top_k=invalid_top_k)
+        sae.sae_manifold_fit(
+            X=x, K=2, assignment="topk", top_k=invalid_top_k
+        )
 
 
 # ---------------------------------------------------------------------------

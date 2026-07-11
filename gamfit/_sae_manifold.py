@@ -183,7 +183,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     n_iter
         Maximum joint-solver iterations.
     sparsity_weight
-        Non-negative assignment sparsity strength.
+        Positive assignment-prior precision.
     coord_sparsity
         Coordinate-block sparsity penalty family. The default ``"scad"``
         enables adaptive non-convex sparsity. ``"l1"`` uses the assignment
@@ -204,7 +204,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Optional SCAD/MCP concavity parameter. Defaults are SCAD ``3.7`` and
         MCP ``2.5``. SCAD requires ``gamma > 2``; MCP requires ``gamma > 1``.
     smoothness_weight
-        Non-negative decoder smoothness weight.
+        Positive decoder smoothness precision.
         The penalty is ``0.5 * lambda * sum B.T @ S̃ @ B`` where ``S̃`` is the
         raw roughness Gram reparameterized by the decoder pullback metric
         (arc-length roughness), so it is gauge-invariant under reparameterizing
@@ -432,14 +432,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # atom_dim and are refused with a direct `ValueError` up front. The facade
     # stays thin and simply surfaces that engine decision rather than duplicating
     # the check here.
-    # Eager sparsity_weight validation (issue #184). The signature
-    # advertises `sparsity_weight: float = 1.0`; `0.0` is the canonical
-    # "no sparsity" baseline and must be accepted. Reject only negative,
-    # NaN, and infinite values here so the Rust kernel can apply its own
-    # log-domain floor.
-    if not np.isfinite(sparsity) or sparsity < 0.0:
+    # The native objective parameterizes these precisions in log space. Zero is
+    # not silently replaced by a numerical floor: callers must choose a proper
+    # positive precision.
+    if not np.isfinite(sparsity) or sparsity <= 0.0:
         raise ValueError(
-            f"sparsity_weight must be finite and non-negative; got {sparsity}"
+            f"sparsity_weight must be finite and positive; got {sparsity}"
+        )
+    if not np.isfinite(smoothness) or smoothness <= 0.0:
+        raise ValueError(
+            f"smoothness_weight must be finite and positive; got {smoothness}"
         )
     if coord_sparsity_kind == "scad":
         if not (np.isfinite(scad_mcp_gamma_value) and scad_mcp_gamma_value > 2.0):

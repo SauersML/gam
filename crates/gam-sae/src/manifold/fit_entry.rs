@@ -7,7 +7,7 @@
 //! outer alternation (including its Λ nursery→promotion births), the #977/#997
 //! evidence-guarded structure search, every post-fit diagnostic
 //! (shape-uncertainty bands, trust/fit reports, coordinate fidelity, …), and
-//! the #1231/#1232 hard top-k projection split. A binding only needs to assemble
+//! the coherent fitted-model diagnostics. A binding only needs to assemble
 //! the incoming arrays into a configured [`SaeManifoldTerm`] and typed
 //! [`SaeFitRequest`], execute [`run_sae_manifold_fit`] on its worker thread, and
 //! marshal the returned [`SaeFitReport`].
@@ -1080,8 +1080,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     let fitted = term.try_fitted_target_aware(z.view(), Some(&rho))?;
     term.record_fit_data_collapse_if_needed(z.view(), fitted.view(), assignments.view(), max_iter)?;
     let trust_diagnostics = term.trust_diagnostics_report(assignments.view())?;
-    // Assignment-support diagnostics (atom lens) must read the SAME assignments
-    // the payload exposes — after any hard top-k projection (#1232).
+    // Assignment-support diagnostics read the exact assignments used by the
+    // reconstruction and objective.
     let fit_diagnostics = term.fit_diagnostics_report(
         Some(&ard_variances),
         isometry_pin_active,

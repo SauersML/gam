@@ -335,7 +335,7 @@ fn latent_aux_prior_stats(
 /// The score is `−(data_fit + assignment_sparsity + smoothness + ard)` — the
 /// NEGATIVE penalized loss of the four loss components — NOT a REML / marginal
 /// likelihood: it omits the Hessian log-determinant, the Occam log-λ term, any
-/// extra analytic penalties, the co-training fold, the top-k projection effect,
+/// extra analytic penalties and the co-training fold,
 /// and hybrid-collapse effects. `primary_key` must therefore be an honest name
 /// (`"penalized_loss_score"` on the in-sample fit, `"oos_penalized_loss"` on the
 /// fixed-decoder OOS path). The full component breakdown is written under
@@ -1985,9 +1985,18 @@ fn stagewise_progress_py<'py>(
     out.set_item("births_rejected", event.births_rejected)?;
     out.set_item("ev", event.ev)?;
     out.set_item("factor_energy", event.factor_energy)?;
-    out.set_item("joint_reml_before", event.joint_reml_before)?;
-    out.set_item("joint_reml_after", event.joint_reml_after)?;
-    out.set_item("terminal_joint_reml", event.terminal_joint_reml)?;
+    out.set_item(
+        "joint_penalized_laml_before",
+        event.joint_penalized_laml_before,
+    )?;
+    out.set_item(
+        "joint_penalized_laml_after",
+        event.joint_penalized_laml_after,
+    )?;
+    out.set_item(
+        "terminal_joint_penalized_laml",
+        event.terminal_joint_penalized_laml,
+    )?;
     if event.checkpoint {
         out.set_item(
             "checkpoint",
@@ -2001,7 +2010,7 @@ fn stagewise_progress_py<'py>(
 
 /// SAC — Sequential Atom Composition entry. Grows a curved dictionary from a
 /// single K=1 seed atom by forward-stagewise births + backfitting, then reports
-/// the terminal frozen joint evidence. This is the productionised
+/// the terminal frozen joint penalized-LAML criterion. This is the productionised
 /// [`fit_stagewise`](gam::terms::sae::manifold::fit_stagewise) driver behind a
 /// thin FFI: the seed arrays are the K=1 slice of [`sae_manifold_fit`]'s
 /// precomputed-basis inputs (every array leads with a length-1 atom axis). The
@@ -2205,8 +2214,14 @@ fn sae_manifold_fit_stagewise<'py>(
         d.set_item("kind", stagewise_birth_kind_tag(rec.kind))?;
         d.set_item("delta_ev", rec.delta_ev)?;
         d.set_item("factor_energy", rec.factor_energy)?;
-        d.set_item("joint_reml_before", rec.joint_reml_before)?;
-        d.set_item("joint_reml_after", rec.joint_reml_after)?;
+        d.set_item(
+            "joint_penalized_laml_before",
+            rec.joint_penalized_laml_before,
+        )?;
+        d.set_item(
+            "joint_penalized_laml_after",
+            rec.joint_penalized_laml_after,
+        )?;
         d.set_item("accepted", rec.accepted)?;
         births_py.append(d)?;
     }
@@ -2230,7 +2245,10 @@ fn sae_manifold_fit_stagewise<'py>(
     out.set_item("births_accepted", report.births_accepted)?;
     out.set_item("births_rejected", report.births_rejected)?;
     out.set_item("stopped_reason", stopped_reason)?;
-    out.set_item("terminal_joint_reml", report.terminal_joint_reml)?;
+    out.set_item(
+        "terminal_joint_penalized_laml",
+        report.terminal_joint_penalized_laml,
+    )?;
     out.set_item("terminal_data_fit", report.terminal_joint_loss.data_fit)?;
     out.set_item(
         "ev_trace",
@@ -2402,7 +2420,7 @@ fn sae_manifold_fit_inner<'py>(
 
     // The typed gam-sae seed entry above owns construction and validation. Every
     // fit, structured-residual pass, evidence-guarded structure move,
-    // certificate, diagnostic, and top-k projection below belongs to gam-sae's
+    // certificate and diagnostic below belongs to gam-sae's
     // single typed orchestration entry (#2236).
     let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let request = gam::terms::sae::manifold::SaeFitRequest {

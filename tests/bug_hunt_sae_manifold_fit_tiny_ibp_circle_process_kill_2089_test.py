@@ -38,7 +38,6 @@ _REPRO = textwrap.dedent(
             d_atom=1,
             atom_topology="circle",
             assignment="ordered_beta_bernoulli",
-            top_k=3,
             n_iter=3,
             sparsity_weight=0.01,
             smoothness_weight=0.01,

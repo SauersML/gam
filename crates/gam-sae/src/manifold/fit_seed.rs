@@ -210,29 +210,20 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             return Err(format!("{name} must be finite and positive; got {value}"));
         }
     }
-    if !request.sparsity_strength.is_finite() || request.sparsity_strength < 0.0 {
+    if !request.sparsity_strength.is_finite() || request.sparsity_strength <= 0.0 {
         return Err(format!(
-            "sparsity_strength must be finite and non-negative; got {}",
+            "sparsity_strength must be finite and positive; got {}",
             request.sparsity_strength
         ));
     }
-    if !request.smoothness.is_finite() || request.smoothness < 0.0 {
+    if !request.smoothness.is_finite() || request.smoothness <= 0.0 {
         return Err(format!(
-            "smoothness must be finite and non-negative; got {}",
+            "smoothness must be finite and positive; got {}",
             request.smoothness
         ));
     }
-    const DISABLED_PENALTY_FLOOR: f64 = 1.0e-300;
-    let sparsity_strength = if request.sparsity_strength == 0.0 {
-        DISABLED_PENALTY_FLOOR
-    } else {
-        request.sparsity_strength
-    };
-    let smoothness = if request.smoothness == 0.0 {
-        DISABLED_PENALTY_FLOOR
-    } else {
-        request.smoothness
-    };
+    let sparsity_strength = request.sparsity_strength;
+    let smoothness = request.smoothness;
 
     let basis_values_shape = request.basis_values.shape();
     if basis_values_shape[0] != k_atoms || basis_values_shape[1] != n_obs {

@@ -65,7 +65,9 @@ def _planted_two_circles(n: int = 220, p: int = 6, seed: int = 0) -> np.ndarray:
 
 
 def _fit(x: np.ndarray) -> Any:
-    return gamfit.sae_manifold_fit(X=x, K=2, top_k=1, n_iter=6, random_state=0)
+    return gamfit.sae_manifold_fit(
+        X=x, K=2, assignment="topk", top_k=1, n_iter=6, random_state=0
+    )
 
 
 def _warm_start(fit: Any, n: int) -> tuple[np.ndarray, np.ndarray]:

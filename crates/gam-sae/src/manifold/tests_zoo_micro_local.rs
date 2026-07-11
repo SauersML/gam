@@ -91,7 +91,7 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
     let train = zoo_fixture("train_3000x48_f64le.bin", 3000, 48);
     let test = zoo_fixture("test_1500x48_f64le.bin", 1500, 48);
 
-    // The m12 arm: K=12, top_k routing via softmax at the production default
+    // The m12 arm: K=12 with the configured assignment model
     // temperature, circle topology, single PCA seed — the configuration whose
     // MSI runs exposed incumbent churn.
     let (mut objective, seed) = objective_and_seed(

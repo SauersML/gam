@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn sae_decoder_lsq_seed_honors_softmax_top_k_support_2132() {
+    fn sae_decoder_lsq_seed_honors_exact_topk_support() {
         use ndarray::array;
 
         let n = 4usize;
@@ -1113,8 +1113,7 @@ mod tests {
             }
         }
         let z = array![[1.0], [1.0], [-1.0], [-1.0]];
-        // Moderate logits keep the uncapped softmax genuinely dense. Projecting
-        // onto top-1 support must decouple the positive and negative rows.
+        // Top-1 routing decouples the positive and negative rows.
         let logits = array![[0.5, -0.5], [0.5, -0.5], [-0.5, 0.5], [-0.5, 0.5]];
 
         let decoder = sae_decoder_lsq_init(
@@ -1122,13 +1121,13 @@ mod tests {
             &[1, 1],
             z.view(),
             logits.view(),
-            "softmax",
+            "topk",
             1.0,
             1.0,
             0.0,
             Some(1),
         )
-        .expect("top-k softmax seed LSQ succeeds");
+        .expect("TopK seed LSQ succeeds");
         assert!(
             (decoder[[0, 0, 0]] - 1.0).abs() < 1.0e-3,
             "top_k=1 must fit atom 0 only on selected positive rows; got {}",

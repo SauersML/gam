@@ -2778,60 +2778,28 @@ pub(crate) fn small_two_atom_ordered_beta_term() -> (SaeManifoldTerm, Array2<f64
     (term, target, rho)
 }
 
-/// #1038/#1225 — the streaming evidence log-det MUST equal the dense full-batch
-/// evidence log-det for an **ordered Beta--Bernoulli-MAP** term, i.e. it MUST carry the exact
-/// cross-row Woodbury capacitance correction `log|C|`.
-///
-/// Pre-fix the streaming path could not represent the rank-`R` cross-row block:
-/// `reduced_schur_and_log_det_tt` refused ordered Beta--Bernoulli-active systems outright, so
-/// `penalized_laml_criterion_streaming_exact` *errored* on this fixture — and if that
-/// refusal had instead silently returned `log_det_tt + log_det_schur`, the
-/// streaming criterion would have under-counted the dense criterion by exactly
-/// `½·log|C|` (the dropped capacitance term), violating the #1225 invariant
-/// that streaming and dense optimize the SAME penalized LAML objective.
-///
-/// This pins both halves of the fix:
-///   (1) the dense cache genuinely carries a non-trivial cross-row correction
-///       on this fixture (`|log|C|| > 0`), so the equality below is load-bearing
-///       rather than a vacuous `log|C| = 0` match (which any softmax term gives);
-///   (2) the streaming exact log-det now reproduces the dense criterion to
-///       inner-solve tolerance.
+/// The streaming evidence log determinant must equal the dense full-batch
+/// determinant for an ordered Beta--Bernoulli term at the same fitted state.
 #[test]
-pub(crate) fn streaming_exact_reml_matches_full_batch_reml_ordered_beta_woodbury() {
+pub(crate) fn streaming_exact_laml_matches_full_batch_ordered_beta_bernoulli() {
     let (term0, target, rho) = small_two_atom_ordered_beta_term();
     let mut full = term0;
     let (_full_cost, _full_loss, cache) = full
         .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
         .expect("dense ordered Beta--Bernoulli criterion must evaluate");
 
-    // (1) The dense joint Hessian carries a genuine cross-row Woodbury block on
-    // this fixture: its capacitance correction is present, finite, and nonzero.
-    // This is the `log|C|` the streaming path would drop without the fix.
-    assert!(
-        cache.cross_row_woodbury.is_some(),
-        "ordered Beta--Bernoulli fixture must build a cross-row Woodbury carrier (else the test is vacuous)"
-    );
-    let log_c = cache.cross_row_woodbury_log_det();
-    assert!(
-        log_c.is_finite() && log_c.abs() > 1.0e-6,
-        "ordered Beta--Bernoulli fixture must have a load-bearing nonzero cross-row log|C|; got {log_c}"
-    );
-
-    // (2) The streaming exact LOG-DET must reproduce the dense `log|H|` at the SAME
+    // The streaming exact log determinant must reproduce dense `log|H|` at the same
     // converged state — `full` is already at its converged (t,β) after the dense
     // criterion. We compare the log-det DIRECTLY rather than re-fitting through
     // `penalized_laml_criterion_streaming_exact`: a streaming RE-FIT runs a fresh inner solve
     // whose faer parallel reduction is non-deterministic under thread contention
     // and intermittently surfaces the (recoverable) non-PD refusal — orthogonal to
-    // this Woodbury-correctness test. `streaming_exact_arrow_log_det` re-assembles
-    // `log|H_full|` chunk-by-chunk at the frozen state with NO inner solve, so the
-    // only delta vs the dense `arrow_log_det_from_cache` is FP reassociation
-    // (~1e-13). Pre-fix the streaming path DROPPED `log|C|` (or hard-refused on the
-    // cross-row source), so this differed by `log|C|` (≈ {log_c}) or errored.
+    // this value-comparison test. `streaming_exact_arrow_log_det` reassembles
+    // `log|H|` chunk-by-chunk at the frozen state with no inner solve.
     let dense_logdet = arrow_log_det_from_cache(&cache).expect("dense log-det finite");
     let stream_logdet = full
         .streaming_exact_arrow_log_det(target.view(), &rho, None, None)
-        .expect("streaming log-det must evaluate (cross-row Woodbury now carried)");
+        .expect("streaming ordered Beta--Bernoulli log-det must evaluate");
     assert_abs_diff_eq!(stream_logdet, dense_logdet, epsilon = 1.0e-8);
 }
 

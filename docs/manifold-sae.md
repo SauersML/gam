@@ -149,7 +149,7 @@ smoothing weights selected by the penalized-LAML objective. Each piece plays a d
   is selected by the assignment prior. The three supported kinds are
   `"softmax"` (default), `"ordered_beta_bernoulli"`, `"threshold_gate"`, and
   `"topk"`.
-  The ordered Beta--Bernoulli route uses posterior-mean relaxed indicators
+  The ordered Beta--Bernoulli route uses relaxed indicators
   `z_ik = σ(ℓ_ik/τ)` directly in reconstruction. Its independent column rates
   satisfy `π_k ~ Beta(a_k, 1)` with
   `a_k = μ_k/(1−μ_k)` and ordered means
@@ -162,8 +162,9 @@ smoothing weights selected by the penalized-LAML objective. Each piece plays a d
   reconstruction, so shrinkage is scored exactly once. `"softmax"` is a dense,
   simplex-normalized gate. `"threshold_gate"` is the smooth bounded gate
   `σ((ℓ−threshold)/τ)` with its exact logistic derivative; its threshold is
-  configured by `threshold_gate_threshold=`. `top_k=` optionally caps
-  the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
+  configured by `threshold_gate_threshold=`. `"topk"` is a distinct hard-support
+  model and requires `top_k=`; smooth assignment families reject that argument
+  and are never truncated. `tau=` sets the smooth-gate temperature.
 
   **Gumbel temperature schedules.** For the annealed gates, pass `schedule=`
   (a `GumbelTemperatureSchedule` or a mapping). Three constructors are

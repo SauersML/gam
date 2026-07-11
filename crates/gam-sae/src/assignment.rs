@@ -1346,83 +1346,6 @@ pub(crate) fn threshold_gate_row_into(
     }
 }
 
-pub(crate) struct ActiveAtomLogitJvp<'a> {
-    pub(crate) mode: AssignmentMode,
-    pub(crate) logit_k: f64,
-    pub(crate) a_k: f64,
-    pub(crate) decoded_k: ArrayView1<'a, f64>,
-    pub(crate) fitted: ArrayView1<'a, f64>,
-    pub(crate) compact_index: usize,
-    /// #1026 — when `true`, atom `k` is the ungated background tier: its gate is
-    /// the constant `1`, so its logit-JVP `da_k/dl_k` is identically zero (the
-    /// compact row is left untouched / zero).
-    pub(crate) ungated: bool,
-}
-
-/// Fill the single compact logit-JVP row for active atom `k`, using the
-/// per-mode assignment sensitivity `da_k/dl_k` contracted into the decoded /
-/// fitted-corrected output direction. This is the active-set analogue of
-/// [`fill_assignment_logit_jvp_rows`]: it reproduces that function's diagonal
-/// logit row exactly for the atom `k`, but writes into a compact position of a
-/// heterogeneous-`q` row block instead of the dense full-`K` Jacobian. `fitted`
-/// is the row's *active-set* reconstruction so the softmax cross term
-/// `(decoded_k − fitted)` is consistent with the curvature the compact block
-/// carries.
-pub(crate) fn fill_active_atom_logit_jvp(
-    input: ActiveAtomLogitJvp<'_>,
-    jac_compact: &mut Array2<f64>,
-) {
-    let ActiveAtomLogitJvp {
-        mode,
-        logit_k,
-        a_k,
-        decoded_k,
-        fitted,
-        compact_index,
-        ungated,
-    } = input;
-    let p = fitted.len();
-    // #1026 — an ungated atom's gate is constant, so its logit-JVP is zero; leave
-    // its compact row untouched (the buffer row is pre-zeroed by the caller).
-    if ungated {
-        return;
-    }
-    match mode {
-        AssignmentMode::Softmax { temperature, .. } => {
-            // da_k/dl_k contracted: a_k (decoded_k − fitted) / τ.
-            let inv_tau = 1.0 / temperature;
-            for out_col in 0..p {
-                jac_compact[[compact_index, out_col]] =
-                    a_k * (decoded_k[out_col] - fitted[out_col]) * inv_tau;
-            }
-        }
-        AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
-            // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`.
-            let inv_tau = 1.0 / temperature;
-            let dz = a_k * (1.0 - a_k) * inv_tau;
-            for out_col in 0..p {
-                jac_compact[[compact_index, out_col]] = dz * decoded_k[out_col];
-            }
-        }
-        AssignmentMode::ThresholdGate {
-            temperature,
-            threshold,
-        } => {
-            // Exact derivative of the smooth threshold-centered logistic gate.
-            let inv_tau = 1.0 / temperature;
-            let activation = gam_linalg::utils::stable_logistic((logit_k - threshold) * inv_tau);
-            let da = activation * (1.0 - activation) * inv_tau;
-            for out_col in 0..p {
-                jac_compact[[compact_index, out_col]] = da * decoded_k[out_col];
-            }
-        }
-        // Constant {0, 1} gate: zero logit-JVP (no free logit exists; TopK rows
-        // carry no logit slots in the compact layout, so this is unreachable —
-        // kept as the explicit zero for exhaustiveness).
-        AssignmentMode::TopK { .. } => {}
-    }
-}
-
 pub(crate) fn fill_assignment_logit_jvp_rows(
     mode: AssignmentMode,
     logits: ArrayView1<'_, f64>,
@@ -1862,12 +1785,9 @@ pub fn assignment_prior_grad_hdiag(
 
 /// #991-weighted [`assignment_prior_grad_hdiag`] — the per-(row, atom) logit
 /// gradient and Hessian diagonal of the assignment prior, each row scaled by its
-/// design weight `w_i`. Softmax/threshold gate are fully weighted (row-separable); the
-/// ordered Beta--Bernoulli prior is in the un-owned `ordered_beta_bernoulli.rs` penalty and is left unweighted, so a
-/// design-honesty subsample under ordered Beta--Bernoulli routing keeps its current (self-consistent)
-/// prior strength — closing that gap needs a per-row weight hook on
-/// `OrderedBetaBernoulliPenalty::{value, grad_target, hessian_diag, grad_rho,
-/// hessian_diag_logit_third_channels}`.
+/// design weight `w_i`. Softmax, threshold gate, and ordered Beta--Bernoulli
+/// modes all use the same row weights in value, gradient, curvature, and outer
+/// concentration derivatives.
 ///
 /// The assembly (`construction_arrow_schur_assembly`) consumes THIS gradient
 /// unchanged for `gt`; the softmax curvature written to `htt` is the per-row

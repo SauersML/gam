@@ -3,7 +3,7 @@
 //! [`run_sae_manifold_oos`] owns the complete inference operation: request
 //! validation, basis/evaluator reconstruction from the persisted dictionary,
 //! cold or warm coordinate and routing seeds, the fixed-decoder Arrow-Schur
-//! solve, optional hard top-k projection, collapse-aware reconstruction, and a
+//! solve, exact assignment reconstruction, collapse-aware reconstruction, and a
 //! typed report. Bindings only translate their wire representation into
 //! [`SaeOosRequest`] and serialize [`SaeOosReport`].
 

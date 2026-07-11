@@ -184,9 +184,8 @@ pub fn atom_two_lens(
         && metric.n_rows() == n
         && metric.p_out() == model.output_dim();
 
-    // Per-row assignment masses, computed once. When a hard top-k projection has
-    // been applied (#1232), the caller supplies the projected matrix so the lens
-    // matches the returned payload rather than the smooth optimization assignments.
+    // Per-row assignment masses, computed once. An explicit override must be the
+    // same assignment matrix used by the corresponding reconstruction.
     let assignments_owned;
     let assignments = match assignments_override {
         Some(view) => view,

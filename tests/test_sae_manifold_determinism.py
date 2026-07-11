@@ -128,8 +128,8 @@ def _synthetic_disjoint_top1(n: int = 300, p_block: int = 16, seed: int = 0) -> 
     return x
 
 
-def test_sae_fit_random_state_changes_output_top1_softmax_path():
-    """The disjoint top-1 softmax closed-form path must also honour
+def test_sae_fit_random_state_changes_output_topk_path():
+    """The disjoint TopK path must also honour
     ``random_state`` (issue #178): it built its init from an SVD and so was
     seed-independent before the fix."""
     x = _synthetic_disjoint_top1()
@@ -138,7 +138,7 @@ def test_sae_fit_random_state_changes_output_top1_softmax_path():
         K=2,
         atom_basis="periodic",
         d_atom=1,
-        assignment="softmax",
+        assignment="topk",
         top_k=1,
         n_iter=10,
         learning_rate=0.2,

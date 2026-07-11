@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from gamfit._sae_manifold import rust_module
 
@@ -167,3 +168,32 @@ def test_report_block_getters() -> None:
     payload = dict(golden)
     payload["cotrain"] = None
     assert ManifoldSAE(payload).cotrain is None
+
+
+def test_native_summary_and_description_length_use_the_fitted_artifact() -> None:
+    golden = _golden()
+    core = ManifoldSAE(golden)
+
+    summary = core.summary()
+    assert summary["K"] == len(golden["atoms"])
+    assert summary["atom_topology"] == golden["atom_topology"]
+    assert summary["penalized_loss_score"] == golden["penalized_loss_score"]
+    assert summary["penalized_laml_criterion"] == pytest.approx(
+        golden["penalized_laml_criterion"]
+    )
+    assert "reml_score" not in summary
+    assert "evidence" not in summary
+
+    description = core.description_length()
+    assert description is not None
+    assert description["n_tokens"] == len(golden["fitted"])
+    assert description["g_dict"] == len(golden["atoms"])
+    assert description["n_params"] == sum(
+        len(row)
+        for decoder in golden["decoder_blocks"]
+        for row in decoder
+    )
+    assert summary["bits_per_token"] == pytest.approx(
+        description["bits_per_token"]
+    )
+    assert summary["description_length"] == description

@@ -2848,7 +2848,7 @@ impl SaeManifoldTerm {
                 }
             }
             let mut derivative = Array2::<f64>::zeros((q, q));
-            if let Some((temperature, scale, penalty)) = softmax.as_ref() {
+            if let Some((_temperature, scale, penalty)) = softmax.as_ref() {
                 let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
                 match self.last_row_layout {
                     Some(_) => {}
@@ -3051,7 +3051,7 @@ impl SaeManifoldTerm {
                 }
             }
 
-            if let Some((temperature, scale, penalty)) = softmax.as_ref() {
+            if let Some((_temperature, scale, penalty)) = softmax.as_ref() {
                 let row_weight = row_loss_weights.map_or(1.0, |weights| weights[row]);
                 match self.last_row_layout {
                     Some(_) => {}

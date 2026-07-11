@@ -1493,9 +1493,8 @@ impl SaeManifoldTerm {
 
     /// Build the trust-diagnostics producer for the Python `diagnostics` block.
     ///
-    /// `assignments` is supplied by the payload assembly site so top-k projection,
-    /// when requested, is reflected in coverage/frequency and in the tangent
-    /// spectra. Each atom's support is read through [`SupportMeasure`] so the
+    /// `assignments` is the exact matrix used by reconstruction. Each atom's
+    /// support is read through [`SupportMeasure`] so the
     /// trust scores use the same occupancy/effective-N convention as coordinate
     /// fidelity, persistence, and rank charge.
     pub fn trust_diagnostics_report(
@@ -2945,9 +2944,8 @@ impl SaeManifoldTerm {
     /// (`Θ → 0`) sub-model. Empty when no report has been computed
     /// (`hybrid_split_report == None`, e.g. mid-fit) or no slot collapsed. The
     /// SINGLE source of the collapse policy — every reconstruction path (the
-    /// rho-keyed `try_fitted_with_rho`, the explicit-assignment
-    /// [`Self::reconstruct_from_assignments`] used by the top-k projection)
-    /// reads it so train, OOS, and top-k reconstructions decode collapsed slots
+    /// rho-keyed `try_fitted_with_rho` and the explicit-assignment
+    /// [`Self::reconstruct_from_assignments`]) reads it so every reconstruction decodes collapsed slots
     /// identically (#1228, #1233).
     pub(crate) fn hybrid_linear_image_map(
         &self,
@@ -3040,13 +3038,11 @@ impl SaeManifoldTerm {
     }
 
     /// Assemble the reconstruction `Σ_k a[i,k]·g_k(t_{ik})` from an EXPLICIT
-    /// per-row assignment matrix (e.g. a hard top-k projection of the fitted
-    /// soft assignments), honouring the #1026 hybrid collapse when `collapse` is
+    /// per-row assignment matrix, honouring the #1026 hybrid collapse when `collapse` is
     /// set: a verdict-linear `d = 1` slot decodes its straight sub-model image
     /// instead of its curved curve, exactly as the production `try_fitted` does.
-    /// This is the shared assembler the FFI top-k path uses so the projected
-    /// reconstruction composes with hybrid collapse (#1233) instead of
-    /// re-deriving the curved image by hand and silently bypassing the verdict.
+    /// This shared assembler prevents callers from re-deriving the curved image
+    /// by hand and silently bypassing the verdict.
     /// The atom coordinates (`t`) and decoded curves are the term's own fitted
     /// ones; only the assignment masses come from `assignments`. Because this
     /// entry point has no target, it explicitly refuses a collapse-rescued image;

@@ -1,6 +1,6 @@
 use super::*;
 
-/// Loss breakdown for diagnostics and evidence ranking.
+/// Penalized-loss breakdown for diagnostics.
 #[derive(Debug, Clone, Copy)]
 pub struct SaeManifoldLoss {
     pub data_fit: f64,
@@ -19,8 +19,8 @@ impl SaeManifoldLoss {
     /// ard)`. Larger is "less penalized loss", so penalized LAML wrappers that rank
     /// larger-is-better can sort on it — but this is **not** a REML / marginal
     /// likelihood: it omits the Hessian log-determinant, the Occam log-λ term,
-    /// any extra analytic penalties, the co-training fold, the top-k projection
-    /// effect, and hybrid-collapse effects (#1231). Callers must surface it under
+    /// any extra analytic penalties, the co-training fold, and hybrid-collapse
+    /// effects. Callers must surface it under
     /// an honest name (`penalized_loss_score`, or `oos_penalized_loss` on the
     /// fixed-decoder OOS path), never `reml_score`.
     pub const fn penalized_loss_score(&self) -> f64 {
