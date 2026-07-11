@@ -31,6 +31,7 @@
 #[cfg(test)]
 mod psi_gram_tensor_fast_path_tests {
     use super::*;
+    use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     use gam_terms::basis::{
         CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
         OneDimensionalBoundary, SpatialIdentifiability,

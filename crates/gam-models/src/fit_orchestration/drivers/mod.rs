@@ -141,6 +141,51 @@ pub struct FittedTermCollectionWithSpec {
 
 include!("design_construction.rs");
 include!("spatial_optimization.rs");
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    /// Test-only default-policy constructor. Production callers must supply the
+    /// fit's intrinsic resource policy through `new_with_policy`; keeping this
+    /// adapter inside the test-support module prevents a permissive constructor
+    /// from entering the library surface.
+    pub(super) trait SingleBlockExactJointDesignCacheTestExt<'d>: Sized {
+        fn new(
+            data: ArrayView2<'d, f64>,
+            spec: TermCollectionSpec,
+            design: TermCollectionDesign,
+            spatial_terms: Vec<usize>,
+            rho_dim: usize,
+            dims_per_term: Vec<usize>,
+        ) -> Result<Self, String>;
+    }
+
+    impl<'d> SingleBlockExactJointDesignCacheTestExt<'d>
+        for SingleBlockExactJointDesignCache<'d>
+    {
+        fn new(
+            data: ArrayView2<'d, f64>,
+            spec: TermCollectionSpec,
+            design: TermCollectionDesign,
+            spatial_terms: Vec<usize>,
+            rho_dim: usize,
+            dims_per_term: Vec<usize>,
+        ) -> Result<Self, String> {
+            let policy = gam_runtime::resource::ResourcePolicy::default_library();
+            Self::new_with_policy(
+                data,
+                spec,
+                design,
+                spatial_terms,
+                rho_dim,
+                dims_per_term,
+                &policy,
+            )
+        }
+    }
+}
+
 // #901 re-home: the end-to-end iso-κ joint REML outer-gradient FD oracles on
 // real Duchon/Matérn smooths. Authored in the pre-#1521 monolith, orphaned out
 // of the build by #1601 (its private driver deps live HERE post-carve, not in

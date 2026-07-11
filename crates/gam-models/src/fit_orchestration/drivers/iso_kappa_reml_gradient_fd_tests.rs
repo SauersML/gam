@@ -31,6 +31,7 @@
 #[cfg(test)]
 mod iso_kappa_reml_gradient_fd_tests {
     use super::*;
+    use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     use gam_terms::basis::{
         DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu,
         OneDimensionalBoundary, SpatialIdentifiability,

@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod design_assembly_constraint_tests {
     use super::*;
+    use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     // The bespoke basis spec types this fixture builds designs from. `CenterStrategy`
     // and `MaternIdentifiability` already arrive via `super::*` (the drivers'
     // explicit `gam_terms::basis` import), so re-listing them here would collide

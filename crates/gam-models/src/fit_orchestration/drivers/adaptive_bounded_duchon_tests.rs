@@ -16,6 +16,7 @@
 #[cfg(test)]
 mod adaptive_bounded_duchon_tests {
     use super::*;
+    use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     // Basis spec types this fixture builds adaptive/bounded designs from.
     // `CenterStrategy` and `MaternIdentifiability` already arrive via `super::*`
     // (the drivers' explicit `gam_terms::basis` import), so re-listing them would

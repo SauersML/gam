@@ -1240,27 +1240,6 @@ struct SingleBlockExactJointDesignCache<'d> {
 }
 
 impl<'d> SingleBlockExactJointDesignCache<'d> {
-    #[cfg(test)]
-    fn new(
-        data: ArrayView2<'d, f64>,
-        spec: TermCollectionSpec,
-        design: TermCollectionDesign,
-        spatial_terms: Vec<usize>,
-        rho_dim: usize,
-        dims_per_term: Vec<usize>,
-    ) -> Result<Self, String> {
-        let policy = gam_runtime::resource::ResourcePolicy::default_library();
-        Self::new_with_policy(
-            data,
-            spec,
-            design,
-            spatial_terms,
-            rho_dim,
-            dims_per_term,
-            &policy,
-        )
-    }
-
     fn new_with_policy(
         data: ArrayView2<'d, f64>,
         spec: TermCollectionSpec,
