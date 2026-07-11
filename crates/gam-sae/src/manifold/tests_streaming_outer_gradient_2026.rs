@@ -281,6 +281,27 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
         Derivative::Analytic,
         "dense SAE retains its exact joint-Hessian IFT gradient"
     );
+    let (representative_term, _, representative_rho) = small_two_atom_periodic_term();
+    assert_eq!(
+        matrix_free_assignment_gradient_coordinate(
+            plan,
+            &representative_term,
+            &representative_rho,
+        ),
+        representative_rho.sparse_flat_index(),
+        "a matrix-free non-IBP fit must promote its active sparsity strength into \
+         Hybrid-EFS's exact-gradient block"
+    );
+    assert_eq!(
+        matrix_free_assignment_gradient_coordinate(
+            dense_plan,
+            &representative_term,
+            &representative_rho,
+        ),
+        None,
+        "the dense route keeps the complete analytic gradient and must not split \
+         assignment strength into a hybrid-only block"
+    );
     // The admission gate must accept the plan (no 'working set exceeds budget'
     // hard error) precisely because the matrix-free lane is admitted.
     plan.admitted_or_error(n, border_dim, k)
@@ -397,6 +418,33 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
         "fixture must excite a nonzero assignment-strength trace"
     );
     assert_abs_diff_eq!(matrix_free, dense, epsilon = 1.0e-9);
+
+    // Decisive #2230 seam: combine that trace with the matrix-free theta-adjoint
+    // and exact-stationarity IFT response, then compare the COMPLETE sparse
+    // gradient against the dense production component assembler. This catches a
+    // partial implementation that wires only 0.5 tr(B^-1 dB/drho) while silently
+    // dropping -0.5 Gamma^T A^-1 dg/drho.
+    let loss = term.loss(target.view(), &rho).expect("softmax loss");
+    let dense_gradient = term
+        .analytic_outer_rho_gradient_components(target.view(), &rho, &loss, &cache, &solver)
+        .expect("dense complete outer gradient")
+        .gradient()[rho.sparse_flat_index().expect("softmax sparse coordinate")];
+    let matrix_free_gradient = term
+        .analytic_assignment_strength_gradient_matrix_free(
+            target.view(),
+            &rho,
+            &cache,
+            &system,
+            &probes,
+            &inverse_probes,
+        )
+        .expect("matrix-free complete assignment-strength gradient");
+    assert!(
+        dense_gradient.is_finite() && matrix_free_gradient.is_finite(),
+        "complete assignment gradients must be finite (dense={dense_gradient}, \
+         matrix_free={matrix_free_gradient})"
+    );
+    assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
 }
 
 /// End-to-end: the whitened streaming REML criterion (`reml_criterion_streaming_
