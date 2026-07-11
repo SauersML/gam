@@ -1971,7 +1971,7 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
     for row in 0..n {
         for atom in 0..k {
             let logit = logits[[row, atom]];
-            if !in_band(logit) {
+            if !crate::assignment::jumprelu_in_optimization_band(logit, threshold, temperature) {
                 continue;
             }
             let entry = term.assignment_prior_hdiag_derivative_entry(
