@@ -723,6 +723,10 @@ impl SaeManifoldOuterObjective {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Self {
+        // The objective owns the typed flat layout. Bind assignment-strength
+        // presence to the actual term so K=1 Softmax and hard TopK cannot enter
+        // as held/frozen rho coordinates through a manually constructed seed.
+        let init_rho = init_rho.for_assignment(term.assignment.mode);
         term.expected_evidence_gauge_deflated_directions = None;
         term.evidence_gauge_deflation_reanchors = 0;
         term.evidence_gauge_deflation_last_delta_sign = 0;
@@ -2935,8 +2939,8 @@ impl SaeManifoldOuterObjective {
                 .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: ARD traces: {e}"))?
         };
 
-        // Build the flat step vector in `to_flat` layout (#1556):
-        // [0]=log_lambda_sparse, [1..1+K]=per-atom log_lambda_smooth, then ARD.
+        // Build the flat step vector in `to_flat` layout (#1556): optional
+        // assignment strength, then per-atom log_lambda_smooth, then ARD.
         let mut steps = vec![0.0_f64; n_params];
         let mut fixed_point_coordinates = (0..n_params)
             .map(|index| {
@@ -2946,7 +2950,7 @@ impl SaeManifoldOuterObjective {
             })
             .collect::<Vec<_>>();
 
-        // λ_sparse (index 0): the ordered-IBP concentration α is the ONE sparsity
+        // λ_sparse (when present): the ordered-IBP concentration α is the ONE sparsity
         // prior with a closed-form empirical-Bayes marginal M-step (the
         // Beta–Bernoulli occupancy fixed point), so it gets a genuine
         // Fellner–Schall-analog step here — this is what UNFREEZES λ_sparse at
@@ -2955,31 +2959,38 @@ impl SaeManifoldOuterObjective {
         // pinned α) is non-quadratic with no FS fixed point and keeps the
         // historical zero step (`None` ⇒ 0.0). The step reads the fitted gates'
         // occupancy at this ρ and is trust-region bounded inside the helper.
-        let sparse_step = self
-            .term
-            .assignment
-            .ibp_eb_log_alpha_step(&rho)
-            .map_err(|e| {
-                format!("SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}")
-            })?;
-        match sparse_step {
-            Some(step) if step.is_finite() => {
-                steps[0] = step;
-                fixed_point_coordinates[0] = FixedPointCoordinateCertificate::covered(step, 1.0);
-            }
-            Some(_) => {
-                fixed_point_coordinates[0] = FixedPointCoordinateCertificate::uncovered(
-                    "IBP empirical-Bayes alpha equation returned a non-finite update",
-                );
-            }
-            None => {
-                fixed_point_coordinates[0] = FixedPointCoordinateCertificate::uncovered(
-                    "assignment sparsity coordinate has no root-equivalent fixed-point equation",
-                );
+        if let Some(sparse_index) = rho.sparse_flat_index() {
+            let sparse_step = self
+                .term
+                .assignment
+                .ibp_eb_log_alpha_step(&rho)
+                .map_err(|e| {
+                    format!(
+                        "SaeManifoldOuterObjective::efs_step: IBP empirical-Bayes α step: {e}"
+                    )
+                })?;
+            match sparse_step {
+                Some(step) if step.is_finite() => {
+                    steps[sparse_index] = step;
+                    fixed_point_coordinates[sparse_index] =
+                        FixedPointCoordinateCertificate::covered(step, 1.0);
+                }
+                Some(_) => {
+                    fixed_point_coordinates[sparse_index] =
+                        FixedPointCoordinateCertificate::uncovered(
+                            "IBP empirical-Bayes alpha equation returned a non-finite update",
+                        );
+                }
+                None => {
+                    fixed_point_coordinates[sparse_index] =
+                        FixedPointCoordinateCertificate::uncovered(
+                            "assignment sparsity coordinate has no root-equivalent fixed-point equation",
+                        );
+                }
             }
         }
 
-        // λ_smooth (indices 1..1+K): per-atom Wood-Fasiolo EFS multiplicative
+        // λ_smooth (layout-derived K-coordinate block): per-atom Wood-Fasiolo EFS multiplicative
         // update (#1556). The EFS fixed point is already per-coordinate, so each
         // atom `k` gets `λ_k_new = (rank_k − edof_k)/energy_k` written into its
         // own step slot. `rank_k = r_k·rank(S_k)`, `edof_k = tr_k(H⁻¹ M_k)`, and
@@ -3015,7 +3026,7 @@ impl SaeManifoldOuterObjective {
                 .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?
         };
         for atom_idx in 0..k_smooth {
-            let coordinate = 1 + atom_idx;
+            let coordinate = rho.smooth_flat_index(atom_idx);
             let lambda_k = lambda_smooth_vec[atom_idx];
             let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)
                 * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
@@ -3586,7 +3597,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is a typed `OuterGradientError`: it is not a usable derivative and must
         // terminate this evaluation instead of being hidden behind a plain inverse
         // or a differenced value path.
-        let grad_components = self
+        let mut gradient = self
             .term
             .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
@@ -3598,20 +3609,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     &solver,
                 )
             })
-            .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;
-        // #2253 stall probe (temporary): the four separable per-ρ gradient terms
-        // (explicit data-fit, ½tr(H⁻¹∂H/∂ρ) logdet trace, −occam, −½Γᵀθ̂_ρ adjoint).
-        // Compared against a finite-difference of `cost` reconstructed offline from
-        // the ρ trajectory, this localizes WHICH term desyncs from the criterion.
-        log::warn!(
-            "[2253-TERMS] rho={rho_v:?} explicit={ex:?} logdet_trace={lt:?} occam={oc:?} adjoint={adj:?}",
-            rho_v = rho.to_vec(),
-            ex = grad_components.explicit.to_vec(),
-            lt = grad_components.logdet_trace.to_vec(),
-            oc = grad_components.occam.to_vec(),
-            adj = grad_components.third_order_correction.to_vec(),
-        );
-        let mut gradient = grad_components.gradient();
+            .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?
+            .gradient();
         // #2231 Inc-B (stage 2) — ADD the block-relevance tail's explicit data +
         // change-of-variables channels `½·R̃_ℓ − n·p_ℓ/2`
         // ([`Self::block_log_lambda_gradient`]) to the components assembler's
