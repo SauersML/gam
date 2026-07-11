@@ -5397,23 +5397,6 @@ impl SaeManifoldTerm {
             // `snapshot` (reset-before-reapply after the first trial); a trial
             // whose step application or objective evaluation errors is INVALID
             // (`Ok(None)`), halving without consulting the Armijo test.
-            // #2015 measurement (temporary): full-step (α=step_size) objective, to
-            // read the Gauss-Newton overshoot factor. Applies the full step from
-            // the pre-step snapshot, measures, and restores to the snapshot so the
-            // line search below still starts from the unperturbed state.
-            let zz_full_obj = if descent_direction_ok {
-                self.restore_mutable_state(&snapshot)?;
-                let o = self
-                    .apply_newton_step(delta_ext_coord.view(), delta_beta.view(), step_size)
-                    .and_then(|()| {
-                        self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                    })
-                    .unwrap_or(f64::NAN);
-                self.restore_mutable_state(&snapshot)?;
-                o
-            } else {
-                f64::NAN
-            };
             let mut first_trial = true;
             let accepted_step = if descent_direction_ok {
                 backtracking_line_search::<_, String>(
@@ -5448,22 +5431,6 @@ impl SaeManifoldTerm {
                 None
             };
             let accepted = accepted_step.is_some();
-            if let Some(step) = &accepted_step {
-                let alpha = step.step;
-                let actual = pre_step_total - step.value;
-                let predicted = directional_decrease * (alpha - 0.5 * alpha * alpha);
-                let rho = if predicted != 0.0 {
-                    actual / predicted
-                } else {
-                    f64::NAN
-                };
-                let overshoot = zz_full_obj - pre_step_total;
-                log::debug!(
-                    "[zz2015dir] it={outer_iteration} g={:.4e} dN={:.4e} a={alpha:.4e} gTd={directional_decrease:.4e} act={actual:.4e} pred={predicted:.4e} rho={rho:.4e} fullobj_minus_pre={overshoot:.4e}",
-                    grad_norm_sq.sqrt(),
-                    step_norm_sq.sqrt(),
-                );
-            }
             if let Some(step) = accepted_step {
                 // A CLEAN acceptance (the trial at the warm start itself passed
                 // Armijo, no backtracking) means the overshoot evidence is gone —
