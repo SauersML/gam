@@ -103,66 +103,7 @@ fn wide_p_k4_in_regime() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
-/// PROBE 1 (decisive): ‖g‖ vs inner-iteration budget. Run the RAW inner solve
-/// (`run_joint_fit_arrow_schur_for_evidence`, which runs a bounded joint fit of
-/// exactly `budget` iterations — no criterion-side refinement/escalation) from a
-/// COLD seed for each budget, then read the exact KKT gradient norm straight off
-/// the reassembled Arrow–Schur system. Does ‖g‖ floor, or keep dropping?
-#[test]
-fn inner_gnorm_vs_budget_trajectory_2015() {
-    let (base, target, rho) = wide_p_k4_in_regime();
-    let lr = 0.4;
-    let ridge = 1.0e-6;
-
-    eprintln!(
-        "[2015-TRAJ] wide-p K=4 in-regime: n_obs={} p_out={} k={} beta_dim={} coord_dim={}",
-        base.n_obs(),
-        base.output_dim(),
-        base.k_atoms(),
-        base.beta_dim(),
-        base.n_obs() * base.k_atoms(),
-    );
-    eprintln!("[2015-TRAJ] budget | ‖g‖ (raw) | ‖Π⊥gauge g‖ (quotient) | fixed_point");
-
-    let budgets = [10usize, 20, 40, 80, 160, 320, 640, 1280];
-    let mut prev: Option<f64> = None;
-    for &budget in &budgets {
-        let mut term = base.clone();
-        let mut rho_fixed = rho.clone();
-        let outcome = term
-            .run_joint_fit_arrow_schur_for_evidence(
-                target.view(),
-                &mut rho_fixed,
-                None,
-                budget,
-                lr,
-                ridge,
-                ridge,
-            )
-            .expect("inner evidence fit must not hard-error");
-        let sys = term
-            .assemble_arrow_schur(target.view(), &rho_fixed, None)
-            .expect("reassemble at fitted iterate");
-        let gsq = SaeManifoldTerm::system_grad_norm_sq(&sys);
-        let g = gsq.sqrt();
-        let qg = term.quotient_gradient_norm_from_system(&sys, gsq, &rho_fixed.lambda_smooth_vec());
-        let delta = match prev {
-            Some(p) => format!("Δ={:+.3e}", g - p),
-            None => "Δ=—".to_string(),
-        };
-        eprintln!(
-            "[2015-TRAJ] {budget:>5} | {g:.6e} | {qg:.6e} | fp={} | {delta}",
-            outcome.fixed_point,
-        );
-        prev = Some(g);
-    }
-    eprintln!(
-        "[2015-TRAJ] VERDICT: read whether ‖g‖ keeps dropping (under-budgeted) or \
-         FLOORS (genuine wall)."
-    );
-}
-
-/// PROBE 2 (trap-immune): the assembled analytic inner gradient (`gt`/`gb`) vs a
+/// Trap-immune gate: the assembled analytic inner gradient (`gt`/`gb`) vs a
 /// DIRECT central-FD of `penalized_objective_total` at a well-converged iterate.
 /// No resolve is on the path, so an under-converged budget cannot fool this: it
 /// isolates a genuine inner-term desync from a solver-side non-stationarity.
