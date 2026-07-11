@@ -14,6 +14,29 @@ const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
 /// resolution.
 const ARD_SPREAD_FLOOR: f64 = 1.0e-12;
 
+/// Why one bounded joint-fit chunk returned. Ordinary fits may use the two
+/// heuristic exits; evidence is certified only by [`Self::NoStrictDecrease`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JointFitTermination {
+    Frozen,
+    Heuristic,
+    NoStrictDecrease,
+    IterationGrantExhausted,
+}
+
+struct JointFitOutcome {
+    loss: SaeManifoldLoss,
+    termination: JointFitTermination,
+    state_moved: bool,
+}
+
+pub(crate) struct EvidenceJointFitOutcome {
+    pub(crate) loss: SaeManifoldLoss,
+    /// A whole evidence-only re-entry started at the current state and found no
+    /// strict objective decrease, with no temperature/polish state transition.
+    pub(crate) fixed_point: bool,
+}
+
 /// Put one softmax-logit row in the reference-logit chart used by the joint
 /// solver. Kept row-local so Newton's disjoint row update can canonicalize in
 /// the same worker instead of making another serial `N × K` pass.
@@ -5034,6 +5057,7 @@ impl SaeManifoldTerm {
             ridge_beta,
             true,
         )
+        .map(|outcome| outcome.loss)
     }
 
     /// Evidence-gradient inner polish. The ordinary fit accepts the documented
@@ -5057,8 +5081,8 @@ impl SaeManifoldTerm {
         step_size: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<SaeManifoldLoss, String> {
-        self.run_joint_fit_arrow_schur_with_termination_policy(
+    ) -> Result<EvidenceJointFitOutcome, String> {
+        let outcome = self.run_joint_fit_arrow_schur_with_termination_policy(
             target,
             rho,
             analytic_penalties,
@@ -5067,7 +5091,21 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
             false,
-        )
+        )?;
+        if matches!(outcome.termination, JointFitTermination::Heuristic) {
+            return Err(
+                "SaeManifoldTerm::run_joint_fit_arrow_schur_for_evidence: heuristic \
+                 termination escaped the evidence policy"
+                    .to_string(),
+            );
+        }
+        Ok(EvidenceJointFitOutcome {
+            loss: outcome.loss,
+            fixed_point: matches!(
+                outcome.termination,
+                JointFitTermination::Frozen | JointFitTermination::NoStrictDecrease
+            ) && !outcome.state_moved,
+        })
     }
 
     fn run_joint_fit_arrow_schur_with_termination_policy(
@@ -5080,7 +5118,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         allow_heuristic_termination: bool,
-    ) -> Result<SaeManifoldLoss, String> {
+    ) -> Result<JointFitOutcome, String> {
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"
@@ -5138,7 +5176,11 @@ impl SaeManifoldTerm {
         // no-op and at worst reparametrize the frozen β — neither is wanted under
         // the freeze contract.
         if max_iter == 0 {
-            return self.loss(target, rho);
+            return self.loss(target, rho).map(|loss| JointFitOutcome {
+                loss,
+                termination: JointFitTermination::Frozen,
+                state_moved: false,
+            });
         }
         // #1117 root-cause fix — rank-revealing adaptive basis depth, applied
         // FIRST (before frame activation, the identifiability audit, and the
@@ -5367,8 +5409,16 @@ impl SaeManifoldTerm {
         // unchanged; only the trajectory to the same certified optimum is.
         let mut lm_ridge_t = ridge_ext_coord;
         let mut lm_ridge_b = ridge_beta;
+        let mut termination = JointFitTermination::IterationGrantExhausted;
+        let mut state_moved = false;
         for outer_iteration in 0..max_iter {
-            self.advance_temperature_schedule()?;
+            let temperature_before = self.assignment.mode.temperature();
+            if self
+                .advance_temperature_schedule()?
+                .is_some_and(|temperature| temperature.to_bits() != temperature_before.to_bits())
+            {
+                state_moved = true;
+            }
             // ρ (including the ARD precisions) is owned by the outer engine
             // (`SaeManifoldOuterObjective`) and held FIXED across this inner
             // (t, β) Newton solve. The inner loop solves the joint manifold +
@@ -5562,6 +5612,7 @@ impl SaeManifoldTerm {
             if allow_heuristic_termination
                 && (grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance)
             {
+                termination = JointFitTermination::Heuristic;
                 self.reclaim_arrow_assembly_workspace(&mut sys);
                 break;
             }
@@ -5633,6 +5684,14 @@ impl SaeManifoldTerm {
                 // keeps the invariant explicit.
                 self.restore_mutable_state(&snapshot)?;
                 self.reclaim_arrow_assembly_workspace(&mut sys);
+                if !allow_heuristic_termination {
+                    return Err(
+                        "SaeManifoldTerm::run_joint_fit_arrow_schur: evidence polish \
+                         encountered a non-finite pre-step objective"
+                            .to_string(),
+                    );
+                }
+                termination = JointFitTermination::Heuristic;
                 break;
             }
             // #2100/#1117 ordinary-fit objective-stagnation shortcut (see the
@@ -5660,6 +5719,7 @@ impl SaeManifoldTerm {
                         // objective-stall approximation. The pre-step state is
                         // unperturbed (the snapshot was taken from it), so no
                         // restore is needed.
+                        termination = JointFitTermination::Heuristic;
                         self.reclaim_arrow_assembly_workspace(&mut sys);
                         break;
                     }
@@ -5737,6 +5797,7 @@ impl SaeManifoldTerm {
             };
             let accepted = accepted_step.is_some();
             if let Some(step) = accepted_step {
+                state_moved = true;
                 // A CLEAN acceptance (the trial at the warm start itself passed
                 // Armijo, no backtracking) means the overshoot evidence is gone —
                 // reset to the caller's full `step_size` so one hard early
@@ -5837,6 +5898,13 @@ impl SaeManifoldTerm {
                         );
                         self.restore_mutable_state(&snapshot)?;
                         self.reclaim_arrow_assembly_workspace(&mut sys);
+                        if !allow_heuristic_termination {
+                            return Err(format!(
+                                "SaeManifoldTerm::run_joint_fit_arrow_schur: evidence \
+                                 proximal correction failed before a no-descent certificate: {err}"
+                            ));
+                        }
+                        termination = JointFitTermination::Heuristic;
                         break;
                     }
                 };
@@ -5852,8 +5920,10 @@ impl SaeManifoldTerm {
                     );
                     self.restore_mutable_state(&snapshot)?;
                     self.reclaim_arrow_assembly_workspace(&mut sys);
+                    termination = JointFitTermination::NoStrictDecrease;
                     break;
                 }
+                state_moved = true;
             }
             // Affine gauge canonicalization is a representation change, but the
             // decoder smoothness term is part of the optimized objective. Keep the
@@ -6064,6 +6134,7 @@ impl SaeManifoldTerm {
                 );
                 self.restore_mutable_state(best_state)?;
                 inner_incumbent_restored = true;
+                state_moved = true;
                 if self.frames_active() {
                     self.refresh_active_frames_from_data(target)
                         .map_err(|err| {
@@ -6164,6 +6235,7 @@ impl SaeManifoldTerm {
                     match round {
                         Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
                             best_objective = value;
+                            state_moved = true;
                         }
                         _ => {
                             self.restore_mutable_state(&snapshot)?;
@@ -6201,9 +6273,13 @@ impl SaeManifoldTerm {
         // explicitly (the idiomatic "use" that satisfies `unused_variables`);
         // faer's process-global parallelism is restored to its prior policy for
         // any work the outer engine runs after this inner fit returns.
-        let loss = self.loss(target, rho);
+        let loss = self.loss(target, rho)?;
         drop(faer_sequential_inner_fit);
-        loss
+        Ok(JointFitOutcome {
+            loss,
+            termination,
+            state_moved,
+        })
     }
 
     /// Allocate one zero `(M_k × M_k)` Gram accumulator per atom for the

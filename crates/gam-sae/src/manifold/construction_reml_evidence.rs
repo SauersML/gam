@@ -258,7 +258,7 @@ impl SaeManifoldTerm {
         //    at the first coarse-KKT-band hit: the value and its implicit
         //    derivative must describe the same differentiable root (#2253).
         let mut rho_fixed = rho.clone();
-        let mut loss = self.run_joint_fit_arrow_schur_for_evidence(
+        let initial_fit = self.run_joint_fit_arrow_schur_for_evidence(
             target,
             &mut rho_fixed,
             registry,
@@ -267,6 +267,8 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
+        let mut loss = initial_fit.loss;
+        let mut evidence_fixed_point = initial_fit.fixed_point;
 
         // 2. Drive the inner (t, β) solve to the KKT/step-converged optimum and
         //    take one final UNDAMPED factor there to obtain the joint Hessian
@@ -321,6 +323,7 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
             &mut loss,
+            &mut evidence_fixed_point,
             &options,
             refine_progress_extension,
         )?;
@@ -666,6 +669,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         loss: &mut SaeManifoldLoss,
+        evidence_fixed_point: &mut bool,
         options: &ArrowSolveOptions,
         refine_progress_extension: bool,
     ) -> Result<ArrowFactorCache, String> {
@@ -1009,7 +1013,7 @@ impl SaeManifoldTerm {
                     saw_refine_progress |=
                         Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                     previous_refine_grad_norm = Some(grad_norm);
-                    *loss = self.run_joint_fit_arrow_schur_for_evidence(
+                    let refine = self.run_joint_fit_arrow_schur_for_evidence(
                         target,
                         rho_fixed,
                         registry,
@@ -1018,6 +1022,8 @@ impl SaeManifoldTerm {
                         ridge_ext_coord,
                         ridge_beta,
                     )?;
+                    *loss = refine.loss;
+                    *evidence_fixed_point = refine.fixed_point;
                     total_inner_iter += refine_iter;
                     continue;
                 }
@@ -1107,7 +1113,7 @@ impl SaeManifoldTerm {
             saw_refine_progress |=
                 Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);
-            *loss = self.run_joint_fit_arrow_schur_for_evidence(
+            let refine = self.run_joint_fit_arrow_schur_for_evidence(
                 target,
                 rho_fixed,
                 registry,
@@ -1116,6 +1122,8 @@ impl SaeManifoldTerm {
                 ridge_ext_coord,
                 ridge_beta,
             )?;
+            *loss = refine.loss;
+            *evidence_fixed_point = refine.fixed_point;
             total_inner_iter += refine_iter;
             refine_rounds += 1;
             // #1051 — objective-stagnation fixed point. A whole refine round that
@@ -1850,7 +1858,7 @@ impl SaeManifoldTerm {
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         let mut rho_fixed = rho.clone();
-        let mut loss = self.run_joint_fit_arrow_schur_for_evidence(
+        let initial_fit = self.run_joint_fit_arrow_schur_for_evidence(
             target,
             &mut rho_fixed,
             registry,
@@ -1859,6 +1867,8 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
+        let mut loss = initial_fit.loss;
+        let mut evidence_fixed_point = initial_fit.fixed_point;
         // Drive the inner (t, β) state to the SAME KKT/step-converged optimum the
         // dense `reml_criterion_with_cache` reaches before factoring. At that
         // optimum the per-row `H_tt^(i)` blocks are PD, so the undamped
@@ -1887,6 +1897,7 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
             &mut loss,
+            &mut evidence_fixed_point,
             &options,
             true,
         )?;
