@@ -2984,12 +2984,8 @@ impl SaeManifoldTerm {
             return Ok(0.0);
         }
 
-        let mut ibp_channels = ibp_assignment_third_channels_weighted(
-            &self.assignment,
-            rho,
-            false,
-            row_weights,
-        )?;
+        let mut ibp_channels =
+            ibp_assignment_third_channels_weighted(&self.assignment, rho, false, row_weights)?;
         let learnable_alpha = matches!(
             self.assignment.mode,
             AssignmentMode::IBPMap {
@@ -3111,12 +3107,8 @@ impl SaeManifoldTerm {
                     .deflation_row_spectra
                     .get(row)
                     .and_then(Option::as_ref);
-                row_trace -= Self::deflation_block_correction(
-                    &inverse,
-                    &derivative,
-                    directions,
-                    spectrum,
-                );
+                row_trace -=
+                    Self::deflation_block_correction(&inverse, &derivative, directions, spectrum);
             }
             total_trace += row_trace;
         }
@@ -4081,12 +4073,7 @@ impl SaeManifoldTerm {
         // `solve` loop where the row-local Takahashi blocks are not valid.
         let fast_selected = joint_block && solver.plain_selected_inverse_available();
         let beta_inv = if joint_block {
-            Self::selected_inverse_beta_block(
-                solver,
-                cache,
-                fast_selected,
-                "logdet_theta_adjoint",
-            )?
+            Self::selected_inverse_beta_block(solver, cache, fast_selected, "logdet_theta_adjoint")?
         } else {
             Array2::<f64>::zeros((cache.k, cache.k))
         };
@@ -4500,8 +4487,8 @@ impl SaeManifoldTerm {
                 } else {
                     no_self_mass
                 };
-                col_coeff[site.atom] += site.raw_diag * raw_mass
-                    - site.no_self_diag_deflation_weight * no_self_mass;
+                col_coeff[site.atom] +=
+                    site.raw_diag * raw_mass - site.no_self_diag_deflation_weight * no_self_mass;
             }
             for site in &ibp_logit_sites {
                 let idx = site.row * k_atoms + site.atom;

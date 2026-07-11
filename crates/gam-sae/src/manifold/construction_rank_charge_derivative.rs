@@ -27,9 +27,7 @@ impl SaeManifoldTerm {
             AssignmentMode::Softmax { temperature, .. } => {
                 let a_atom = assignments[atom];
                 let a_wrt = assignments[wrt_atom];
-                a_atom
-                    * ((if atom == wrt_atom { 1.0 } else { 0.0 }) - a_wrt)
-                    / temperature
+                a_atom * ((if atom == wrt_atom { 1.0 } else { 0.0 }) - a_wrt) / temperature
             }
             AssignmentMode::IBPMap { temperature, .. } if atom == wrt_atom => {
                 let a = assignments[atom];
@@ -74,12 +72,7 @@ impl SaeManifoldTerm {
             );
         }
         let residual = self.reconstruction_residual(target, rho)?;
-        let dispersion = self.reconstruction_dispersion(
-            loss,
-            cache,
-            rho,
-            Some(residual.view()),
-        )?;
+        let dispersion = self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
         let n_eff = self.per_atom_effective_sample_size();
@@ -141,14 +134,10 @@ impl SaeManifoldTerm {
             let mut log_lambda_differential = 0.0_f64;
             if edf_is_interior {
                 let inv_s_inv = inverse.dot(&atom.smooth_penalty).dot(&inverse);
-                gram_differential =
-                    inv_s_inv * (0.5 * rank * log_n * lambda[atom_idx]);
-                let inv_g_inv_s = inverse
-                    .dot(gram)
-                    .dot(&inverse)
-                    .dot(&atom.smooth_penalty);
-                let edf_log_lambda = -lambda[atom_idx]
-                    * (0..m).map(|i| inv_g_inv_s[[i, i]]).sum::<f64>();
+                gram_differential = inv_s_inv * (0.5 * rank * log_n * lambda[atom_idx]);
+                let inv_g_inv_s = inverse.dot(gram).dot(&inverse).dot(&atom.smooth_penalty);
+                let edf_log_lambda =
+                    -lambda[atom_idx] * (0..m).map(|i| inv_g_inv_s[[i, i]]).sum::<f64>();
                 let raw_log_lambda = rho.log_lambda_smooth[atom_idx];
                 if SaeManifoldRho::clamped_log_strength(raw_log_lambda) == raw_log_lambda {
                     log_lambda_differential = 0.5 * rank * log_n * edf_log_lambda;
@@ -186,12 +175,8 @@ impl SaeManifoldTerm {
                             0.0
                         } else {
                             let phi = self.atoms[atom].basis_values.row(row);
-                            let dphi = self.atoms[atom]
-                                .basis_jacobian
-                                .slice(s![row, .., axis]);
-                            2.0 * a
-                                * a
-                                * dphi.dot(&atom_differentials[atom].gram.dot(&phi))
+                            let dphi = self.atoms[atom].basis_jacobian.slice(s![row, .., axis]);
+                            2.0 * a * a * dphi.dot(&atom_differentials[atom].gram.dot(&phi))
                         }
                     }
                     SaeLocalRowVar::Logit { atom: wrt_atom } => {
@@ -210,8 +195,7 @@ impl SaeManifoldTerm {
                             }
                             let a = assignments[atom];
                             let phi = self.atoms[atom].basis_values.row(row);
-                            let gram_quadratic =
-                                phi.dot(&atom_differentials[atom].gram.dot(&phi));
+                            let gram_quadratic = phi.dot(&atom_differentials[atom].gram.dot(&phi));
                             derivative += 2.0
                                 * a
                                 * da

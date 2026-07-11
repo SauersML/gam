@@ -672,12 +672,29 @@ impl SaeManifoldTerm {
                 "dense assignment-strength gradient requested for a rho with no sparse coordinate",
             )
         })?;
-        let logdet_trace = self
+        let joint_trace = self
             .assignment_log_strength_hessian_trace(rho, cache, solver)
             .map_err(OuterGradientError::internal)?;
-        let gamma = self
+        let coordinate_trace = self
+            .coordinate_block_assignment_log_strength_hessian_trace(rho, cache)
+            .map_err(OuterGradientError::internal)?;
+        let logdet_trace = joint_trace - coordinate_trace;
+        let loss = self
+            .loss(target, rho)
+            .map_err(OuterGradientError::internal)?;
+        let rank_charge = self
+            .hard_rank_charge_derivative(target, rho, &loss, cache)
+            .map_err(OuterGradientError::internal)?;
+        let mut gamma = self
             .logdet_theta_adjoint(rho, cache, solver)
             .map_err(OuterGradientError::internal)?;
+        let coordinate_gamma = self
+            .coordinate_block_logdet_theta_adjoint(rho, cache, solver)
+            .map_err(OuterGradientError::internal)?;
+        gamma.t -= &coordinate_gamma.t;
+        gamma.beta -= &coordinate_gamma.beta;
+        gamma.t.scaled_add(2.0, &rank_charge.theta.t);
+        gamma.beta.scaled_add(2.0, &rank_charge.theta.beta);
         let rhs = self
             .outer_rho_gradient_ift_rhs(rho, sparse_index, cache)
             .map_err(OuterGradientError::internal)?;
@@ -691,13 +708,7 @@ impl SaeManifoldTerm {
                     },
                 )
             })?;
-        self.combine_assignment_strength_gradient(
-            rho,
-            logdet_trace,
-            &gamma,
-            &response,
-            "dense",
-        )
+        self.combine_assignment_strength_gradient(rho, logdet_trace, &gamma, &response, "dense")
     }
 
     /// Exact non-IBP assignment-strength REML gradient on the matrix-free
@@ -725,17 +736,30 @@ impl SaeManifoldTerm {
                 "matrix-free assignment-strength gradient requested for a rho with no sparse coordinate",
             )
         })?;
-        let logdet_trace = self
-            .assignment_log_strength_hessian_trace_from_probes(
-                rho,
-                cache,
-                probes,
-                inverse_probes,
-            )
+        let joint_trace = self
+            .assignment_log_strength_hessian_trace_from_probes(rho, cache, probes, inverse_probes)
             .map_err(OuterGradientError::internal)?;
-        let gamma = self
+        let coordinate_trace = self
+            .coordinate_block_assignment_log_strength_hessian_trace(rho, cache)
+            .map_err(OuterGradientError::internal)?;
+        let logdet_trace = joint_trace - coordinate_trace;
+        let plain_solver = DeflatedArrowSolver::plain(cache);
+        let loss = self
+            .loss(target, rho)
+            .map_err(OuterGradientError::internal)?;
+        let rank_charge = self
+            .hard_rank_charge_derivative(target, rho, &loss, cache)
+            .map_err(OuterGradientError::internal)?;
+        let mut gamma = self
             .logdet_theta_adjoint_from_probes(rho, cache, probes, inverse_probes)
             .map_err(OuterGradientError::internal)?;
+        let coordinate_gamma = self
+            .coordinate_block_logdet_theta_adjoint(rho, cache, &plain_solver)
+            .map_err(OuterGradientError::internal)?;
+        gamma.t -= &coordinate_gamma.t;
+        gamma.beta -= &coordinate_gamma.beta;
+        gamma.t.scaled_add(2.0, &rank_charge.theta.t);
+        gamma.beta.scaled_add(2.0, &rank_charge.theta.beta);
         let rhs = self
             .outer_rho_gradient_ift_rhs(rho, sparse_index, cache)
             .map_err(OuterGradientError::internal)?;
@@ -815,6 +839,9 @@ impl SaeManifoldTerm {
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
+        let rank_charge = self
+            .hard_rank_charge_derivative(target, rho, loss, cache)
+            .map_err(OuterGradientError::internal)?;
 
         if let Some(sparse_index) = rho.sparse_flat_index() {
             explicit[sparse_index] =
@@ -828,7 +855,7 @@ impl SaeManifoldTerm {
             // likelihood and its Gauss--Newton blocks have no direct alpha
             // derivative. Structurally fixed assignments have no sparse index
             // and skip this channel entirely.
-            logdet_trace[sparse_index] = match inverse_probe_bundle {
+            let joint_trace = match inverse_probe_bundle {
                 Some((probes, sinv)) => self
                     .assignment_log_strength_hessian_trace_from_probes(rho, cache, probes, sinv)
                     .map_err(OuterGradientError::internal)?,
@@ -836,6 +863,10 @@ impl SaeManifoldTerm {
                     .assignment_log_strength_hessian_trace(rho, cache, solver)
                     .map_err(OuterGradientError::internal)?,
             };
+            let coordinate_trace = self
+                .coordinate_block_assignment_log_strength_hessian_trace(rho, cache)
+                .map_err(OuterGradientError::internal)?;
+            logdet_trace[sparse_index] = joint_trace - coordinate_trace;
         }
 
         // #1556: λ_smooth is per-atom, so the smoothness gradient block occupies
@@ -901,7 +932,7 @@ impl SaeManifoldTerm {
         // any row carrying gauge/rotation deflation (the plain-S⁻¹ bundle cannot
         // reconstruct the Daleckii–Krein correction), routing that fit to the dense
         // channel rather than silently dropping the correction.
-        let ard_trace = match inverse_probe_bundle {
+        let ard_joint_trace = match inverse_probe_bundle {
             Some((probes, sinv)) => self
                 .ard_log_precision_hessian_trace_from_probes(rho, cache, probes, sinv)
                 .map_err(|err| OuterGradientError::InternalInvariant {
@@ -916,6 +947,13 @@ impl SaeManifoldTerm {
                     reason: format!("analytic_outer_rho_gradient_components: {err}"),
                 })?,
         };
+        let ard_coordinate_trace = self
+            .coordinate_block_ard_log_precision_hessian_trace(rho, cache)
+            .map_err(|err| OuterGradientError::InternalInvariant {
+                reason: format!(
+                    "analytic_outer_rho_gradient_components: coordinate-block ARD trace: {err}"
+                ),
+            })?;
         // #1026 shared-ARD: `ard_flat_index` maps `(k, axis)` onto the flat outer
         // coordinate for BOTH parameterizations. In `Shared` mode several atoms
         // alias one axis coordinate `1+K+axis`, and the outer derivative there is
@@ -928,9 +966,14 @@ impl SaeManifoldTerm {
             for axis in 0..rho.log_ard[k].len() {
                 let idx = rho.ard_flat_index(k, axis);
                 explicit[idx] += ard_explicit[k][axis];
-                logdet_trace[idx] += ard_trace[k][axis];
+                logdet_trace[idx] += ard_joint_trace[k][axis] - ard_coordinate_trace[k][axis];
             }
         }
+
+        // The scalar criterion replaces `½ log|H_tt|` with the realised-rank
+        // charge. Its direct rho differential belongs alongside the explicit
+        // penalty channels and is present on every layout (dense or probes).
+        explicit += &rank_charge.direct_rho;
 
         // #2080: the envelope Γ = tr(H⁻¹ ∂H/∂θ) off the SAME shared selected-inverse
         // bundle (the all-or-nothing cluster's third channel) when present; the dense
@@ -944,7 +987,7 @@ impl SaeManifoldTerm {
         // (when that coordinate exists) plus the θ-adjoint's IBP-refused fits remain
         // solver-bound
         // — the last gaps before the routing flip (see the docstring).
-        let gamma = match inverse_probe_bundle {
+        let mut gamma = match inverse_probe_bundle {
             Some((probes, sinv)) => self
                 .logdet_theta_adjoint_from_probes(rho, cache, probes, sinv)
                 .map_err(OuterGradientError::internal)?,
@@ -952,6 +995,17 @@ impl SaeManifoldTerm {
                 .logdet_theta_adjoint(rho, cache, solver)
                 .map_err(OuterGradientError::internal)?,
         };
+        let coordinate_gamma = self
+            .coordinate_block_logdet_theta_adjoint(rho, cache, solver)
+            .map_err(OuterGradientError::internal)?;
+        gamma.t -= &coordinate_gamma.t;
+        gamma.beta -= &coordinate_gamma.beta;
+        // `½ Γ_joint·theta_hat - ½ Γ_tt·theta_hat + ∇R·theta_hat`
+        // is represented by one effective logdet adjoint
+        // `Γ_eff = Γ_joint - Γ_tt + 2∇R`, preserving the existing
+        // `-½ <Γ_eff, A^-1 g_rho>` contraction convention below.
+        gamma.t.scaled_add(2.0, &rank_charge.theta.t);
+        gamma.beta.scaled_add(2.0, &rank_charge.theta.beta);
         // #1418: the implicit-function correction is `−½·Γᵀ·θ̂_ρ` with
         // `θ̂_ρ = −A⁻¹ g_ρ` (the code contracts `−½·⟨Γ, A⁻¹ g_ρ⟩` with rhs `= +∂g/∂ρ`, i.e. `+½·Γᵀθ̂_ρ` of the response — the sign lives in the −0.5 factor), where `A = ∇²_θθ L` is the EXACT stationarity
         // Jacobian of the inner fit — data residual curvature, exact softmax
