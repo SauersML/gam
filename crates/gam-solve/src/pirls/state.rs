@@ -1,11 +1,11 @@
-use gam_terms::construction::ReparamResult;
+use crate::active_set::ConstraintKktDiagnostics;
 use crate::estimate::EstimationError;
 use gam_linalg::matrix::{
     DesignMatrix, PsdWeightsView, ReparamOperator, SignedWeightsView, SymmetricMatrix,
 };
-use crate::active_set::ConstraintKktDiagnostics;
-use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
 use gam_problem::LinearInequalityConstraints;
+use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
+use gam_terms::construction::ReparamResult;
 use ndarray::{ArcArray1, Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -305,40 +305,6 @@ impl PirlsStatus {
     #[inline]
     pub const fn is_converged(self) -> bool {
         matches!(self, PirlsStatus::Converged)
-    }
-
-    /// Whether the inner mode is a **certified valid minimum** — one carrying a
-    /// quantitative KKT stationarity certificate — that is acceptable for
-    /// minting a fit. Two statuses qualify:
-    ///
-    /// * `Converged` — the strict certificate (both the step-size floor and the
-    ///   projected-gradient KKT band were met).
-    /// * `StalledAtValidMinimum` — the iteration counter (or the LM step search)
-    ///   was exhausted, but the accepted iterate is still a genuine minimum: it
-    ///   is assigned *only* when [`PirlsState::near_stationary_kkt`] holds (the
-    ///   projected gradient is inside the 10×-widened KKT band) and the deviance
-    ///   plateaued or the step collapsed to its floor. It is not a bare label —
-    ///   it is the honest "valid minimum, but the strict step tolerance was not
-    ///   reached before the cap" terminal state, and every REML consumer (the
-    ///   Tweedie-φ / Gamma-shape freezing gates, the GPU dispatch wire) already
-    ///   treats it as equivalent to `Converged`.
-    ///
-    /// Every other terminal status (`MaxIterationsReached`,
-    /// `LmStepSearchExhausted`, `Unstable`) reports an honest non-convergence
-    /// with no valid-minimum certificate and does **not** qualify.
-    ///
-    /// This is the fit-minting gate shared by the standard/GAMLSS
-    /// `UnifiedFitResult` constructor and the negative-binomial joint (θ, ρ)
-    /// optimizer. It is deliberately distinct from [`Self::is_converged`], the
-    /// *strict* certificate (only `Converged`) required by survival fits — which
-    /// keep their own pre-gate that excludes `StalledAtValidMinimum` — and by
-    /// the outer REML driver's per-iteration progress checks.
-    #[inline]
-    pub const fn certifies_valid_minimum(self) -> bool {
-        matches!(
-            self,
-            PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
-        )
     }
 }
 
@@ -725,9 +691,9 @@ impl PirlsResult {
             constraint_kkt: self.constraint_kkt.clone(),
             linear_constraints_transformed: self.linear_constraints_transformed.clone(),
             reparam_result: self.reparam_result.clone(),
-            x_transformed: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-                ReparamOperator::new(x_original.clone(), qs_arc),
-            ))),
+            x_transformed: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                Arc::new(ReparamOperator::new(x_original.clone(), qs_arc)),
+            )),
             coordinate_frame: self.coordinate_frame,
             cache_compacted: false,
             min_penalized_deviance: self.min_penalized_deviance,

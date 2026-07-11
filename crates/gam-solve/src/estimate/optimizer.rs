@@ -1822,17 +1822,9 @@ where
                     && rho_residual.is_finite()
                     && rho_residual <= rho_bound);
             // The three coordinates of the joint (θ, ρ, β) optimum are certified
-            // independently: `rho_certificate_ok` (projected ρ-gradient) and
-            // `theta_certificate_ok` (θ-score Newton residual) below, and this
-            // gate for the inner β mode. `StalledAtValidMinimum` certifies the β
-            // mode: it is assigned only inside the near-stationary KKT band (see
-            // `PirlsStatus::certifies_valid_minimum`), so it is a genuine valid
-            // minimum, not a bare label. Requiring strict `Converged` here would
-            // reject an all-zero-count NB fit whose ρ- and θ-residuals are exactly
-            // 0 purely because the flat-at-η→−∞ likelihood plateaued at the
-            // iteration cap — breaking the locked #1515 contract that the fit must
-            // succeed.
-            let pirls_certificate_ok = pirls_res.status.certifies_valid_minimum();
+            // independently. The β coordinate must be strictly converged; a
+            // near-stationary stalled checkpoint is not a completed joint fit.
+            let pirls_certificate_ok = pirls_res.status.is_converged();
             let theta_certificate_ok = theta_residual.is_finite() && theta_residual <= theta_bound;
 
             let merit = (rho_residual / rho_bound)

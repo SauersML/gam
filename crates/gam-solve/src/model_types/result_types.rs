@@ -762,12 +762,11 @@ struct SerializedFitConvergenceEvidence {
 
 impl FitConvergenceEvidence {
     fn from_serialized(raw: SerializedFitConvergenceEvidence) -> Result<Self, String> {
-        // Revalidate on the same fit-minting certificate the live constructor
-        // uses (`certifies_valid_minimum`), so a saved `StalledAtValidMinimum`
-        // fit round-trips instead of failing to deserialize.
-        if !raw.inner_status.certifies_valid_minimum() {
+        // Deserialization cannot weaken the live fit-minting contract. A
+        // stalled checkpoint remains diagnostic state, not a fitted model.
+        if !raw.inner_status.is_converged() {
             return Err(format!(
-                "inner optimizer status {:?} is not a certified valid minimum",
+                "inner optimizer status {:?} is not converged",
                 raw.inner_status
             ));
         }
@@ -1296,18 +1295,10 @@ impl FitConvergenceEvidence {
     }
 
     fn try_from_parts(parts: &UnifiedFitResultParts) -> Result<Self, EstimationError> {
-        // Mint on any inner mode that carries a valid-minimum KKT certificate.
-        // `StalledAtValidMinimum` qualifies alongside `Converged`: it is assigned
-        // only when the projected gradient is inside the near-stationary KKT band
-        // (see `PirlsStatus::certifies_valid_minimum`), so it is a genuine minimum
-        // — an all-zero-count Poisson/NB fit, whose likelihood is flat as η→−∞,
-        // legitimately plateaus there rather than meeting the strict step
-        // tolerance before the iteration cap. Rejecting it would report a
-        // converged fit as "did not converge" (the actual falsehood) and would
-        // break the locked #1515 contract that such a fit must succeed. Survival
-        // keeps its own stricter pre-gate (`survival_pirls_status_is_certified`)
-        // applied before a survival fit ever reaches this constructor.
-        if !parts.pirls_status.certifies_valid_minimum() {
+        // Only strict inner convergence can mint a fit. Near-stationary stalled
+        // checkpoints remain useful diagnostics, but returning one as a model
+        // would conflate a widened KKT band with convergence.
+        if !parts.pirls_status.is_converged() {
             return Err(Self::assembly_error(
                 parts,
                 "outer evidence was not considered because the inner mode is uncertified"

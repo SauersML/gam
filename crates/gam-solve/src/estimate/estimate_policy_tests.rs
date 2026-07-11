@@ -737,28 +737,11 @@ fn unified_fit_constructor_rejects_nonconverged_outer_state() {
 }
 
 #[test]
-fn unified_fit_constructor_accepts_stalled_at_valid_minimum() {
-    // `StalledAtValidMinimum` is a certified valid minimum — it is assigned only
-    // when the projected gradient is inside the near-stationary KKT band — so it
-    // carries the quantitative inner-convergence evidence the constructor
-    // requires and must mint a fit alongside `Converged`. Rejecting it here
-    // reported a converged all-zero-count Poisson/NB fit as "did not converge"
-    // and broke the locked #1515 contract (see issue #2255).
-    let mut parts = decode_invariant_test_parts();
-    parts.pirls_status = crate::pirls::PirlsStatus::StalledAtValidMinimum;
-    let fit = UnifiedFitResult::try_from_parts(parts)
-        .expect("a certified valid minimum must mint a fit");
-    assert_eq!(
-        fit.convergence_evidence().inner_status(),
-        crate::pirls::PirlsStatus::StalledAtValidMinimum
-    );
-}
-
-#[test]
-fn unified_fit_constructor_rejects_uncertified_inner_state() {
-    // Terminal statuses with no valid-minimum certificate are genuine
-    // non-convergence and must never mint a fit.
+fn unified_fit_constructor_rejects_every_nonconverged_inner_state() {
+    // Every non-converged terminal state remains a checkpoint and must never
+    // mint a fit, including a near-stationary stalled state.
     for status in [
+        crate::pirls::PirlsStatus::StalledAtValidMinimum,
         crate::pirls::PirlsStatus::MaxIterationsReached,
         crate::pirls::PirlsStatus::LmStepSearchExhausted,
         crate::pirls::PirlsStatus::Unstable,
@@ -766,7 +749,7 @@ fn unified_fit_constructor_rejects_uncertified_inner_state() {
         let mut parts = decode_invariant_test_parts();
         parts.pirls_status = status;
         let error = UnifiedFitResult::try_from_parts(parts)
-            .expect_err("an uncertified inner state must be rejected");
+            .expect_err("a non-converged inner state must be rejected");
         assert!(
             matches!(error, EstimationError::FitDidNotConverge { .. }),
             "status {status:?} should surface FitDidNotConverge, got {error:?}"
