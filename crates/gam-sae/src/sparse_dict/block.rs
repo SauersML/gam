@@ -776,7 +776,7 @@ fn code_row(
 }
 
 // ---------------------------------------------------------------------------
-// γ refresh, frame refresh, revival, EV.
+// γ refresh, frame refresh, evidence-adjudicated births, EV.
 // ---------------------------------------------------------------------------
 
 /// Per-row un-scaled projection sum `p_i = Σ_{g∈S_i} x_i P_g` (the reconstruction
@@ -878,7 +878,8 @@ fn refresh_gamma(
 /// cross-moment `M_g = Σ_i r_{ig}ᵀ z_{ig}` (`P×b`). We accumulate `M_g` for every
 /// block, add a tiny ridge on its Gram for a thinly-used block, and polar it via
 /// [`GrassmannFrame::polar_update`]. Blocks that no row selected accumulate a zero
-/// `M_g` and keep their current frame in place (they are revived separately).
+/// `M_g` and keep their current frame in place (they may be proposed for birth
+/// separately).
 fn refresh_frames(
     x: ArrayView2<'_, f32>,
     codes: &[RowBlockCode],
@@ -966,7 +967,8 @@ fn refresh_frames(
             Err(_) => polar_failures += 1,
         }
         // A degenerate cross-moment (rank-deficient) leaves the block's current
-        // (already orthonormal) frame in place; revival handles a truly dead block.
+        // (already orthonormal) frame in place; birth arbitration handles a truly
+        // dead block.
     }
     polar_failures
 }
@@ -975,9 +977,9 @@ fn refresh_frames(
 ///
 /// Identify the `k_aux` **worst-utilised** blocks (fewest rows selected this
 /// epoch); any that are effectively dead (utilisation below one row) are reseeded.
-/// A revived block's `b` orthonormal rows are Gram–Schmidt orthonormalised from
+/// A candidate block's `b` orthonormal rows are Gram–Schmidt orthonormalised from
 /// the `b` worst-reconstructed residual ROWS (each dead block takes a distinct
-/// contiguous group of high-residual rows, so revived blocks do not duplicate).
+/// contiguous group of high-residual rows, so candidates do not duplicate).
 /// This is the block analogue of the atom lane's dead-feature resampling and of
 /// the AuxK auxiliary-reconstruction loss, but only CONSTRUCTS a genuine
 /// `St(b, P)` candidate spanning the directions the model most fails to explain.
@@ -1053,7 +1055,7 @@ fn dead_block_birth_proposals(
             .then(a.cmp(&c))
     });
 
-    let mut revived = Vec::new();
+    let mut proposals = Vec::new();
     let mut cursor = 0usize;
     for &g in candidates.iter() {
         // Take the next b distinct high-residual rows for this block's frame.
@@ -1073,12 +1075,12 @@ fn dead_block_birth_proposals(
             }
         }
         gram_schmidt_rows(&mut seed);
-        revived.push(BlockBirthProposal {
+        proposals.push(BlockBirthProposal {
             block: g,
             proposed_frame: seed,
         });
     }
-    revived
+    proposals
 }
 
 /// Held-in explained variance `1 − RSS/TSS` of the block reconstruction.
@@ -1775,7 +1777,7 @@ pub(super) fn block_birth_evidence_margin(
     let frame = decoder
         .slice(ndarray::s![block * b..block * b + b, ..])
         .mapv(f64::from);
-    let dispersion = candidate_rss / (n_rows * output_dim) as f64;
+    let dispersion = candidate_rss / (n_rows as f64 * output_dim as f64);
     let d_eff = match crate::manifold::realised_rank_charge_dof(
         code_gram,
         &frame,

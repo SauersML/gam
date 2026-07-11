@@ -81,7 +81,7 @@ pub struct BlockEpochStats {
     /// Whether one candidate frame is staged for exact candidate-vs-baseline
     /// adjudication on the next streamed pass.
     pub birth_pending: bool,
-    /// Dead blocks detected this epoch (fired for no row before revival).
+    /// Dead blocks detected this epoch (fired for no row before proposal).
     pub dead: usize,
     /// Refreshed shared tied scalar γ after this epoch.
     pub gamma: f32,
@@ -186,7 +186,7 @@ impl ResidualReservoir {
     }
 
     /// Rows ranked for birth proposals: descending residual energy, ties by ascending
-    /// global index — the one-shot `revive_dead_blocks` order.
+    /// global index — the one-shot `dead_block_birth_proposals` order.
     fn ranked(&self) -> Vec<&ResidRow> {
         let mut rows: Vec<&ResidRow> = self.heap.iter().collect();
         rows.sort_by(|a, b| {

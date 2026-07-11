@@ -202,11 +202,11 @@ fn warm_start_persists_across_epochs() {
 }
 
 #[test]
-fn revival_reseeds_dead_block_from_worst_residual_row() {
+fn evidence_birth_uses_worst_residual_row() {
     // Seed spans only the first two planted subspaces; the third block starts dead.
     // Streaming rows that live in the third subspace makes those rows the worst-
-    // reconstructed, and AuxK revival must reseed the dead block onto their residual
-    // (recovering the third subspace), not leave it dead.
+    // reconstructed, and the AuxK proposal must birth the dead block from their
+    // residual after exact evidence admission (recovering the third subspace).
     let (p, b, g) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, g, b);
     let x = planted_data(&planted, g, b, p, 150);
@@ -227,7 +227,7 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
 
     let mut state = BlockSparseStreamState::new(seed.view(), &cfg).expect("fit_begin");
     // Force the last block DEAD deterministically (its routing gate is then exactly 0
-    // for every row) so AuxK revival is exercised without relying on routing round-off
+    // for every row) so AuxK birth is exercised without relying on routing round-off
     // (a parallel-reduction change, #49c27a883, could otherwise bootstrap it).
     state.zero_block_for_test(g - 1);
     let mut saw_dead = false;
@@ -246,18 +246,18 @@ fn revival_reseeds_dead_block_from_worst_residual_row() {
     let live = art.block_utilization.iter().filter(|&&u| u > 0.0).count();
     assert_eq!(
         live, g,
-        "all {g} blocks must be live after revival (util>0)"
+        "all {g} blocks must be live after evidence-admitted birth (util>0)"
     );
     let ev = model_ev(x.view(), &art.decoder, art.gamma, g, b, art.block_topk);
     assert!(
         ev > 0.9,
-        "revival should let the fit reach all planted subspaces, EV={ev}"
+        "the admitted birth should let the fit reach all planted subspaces, EV={ev}"
     );
     // Revival machinery actually engaged at some point (dictionary started under-
     // populated and AuxK filled it).
     assert!(
         saw_dead,
-        "dictionary must pass through a dead-block state before revival"
+        "dictionary must pass through a dead-block state before birth"
     );
     assert!(
         saw_accepted_birth,

@@ -77,6 +77,17 @@ impl LegEndpoints {
     #[must_use]
     fn at(&self, s: f64) -> f64 {
         let s = s.clamp(0.0, 1.0);
+        // Endpoint waypoints are literal objective state, not merely values
+        // numerically close to it. The affine expression below can lose an
+        // endpoint bit through cancellation (for example, target +
+        // (entry - target) need not be bitwise-identical to entry), which
+        // breaks transactional restoration of the exact accepted waypoint.
+        if s.to_bits() == 0.0_f64.to_bits() {
+            return self.at_target;
+        }
+        if s.to_bits() == 1.0_f64.to_bits() {
+            return self.at_entry;
+        }
         self.at_target + s * (self.at_entry - self.at_target)
     }
 }
@@ -234,6 +245,15 @@ impl CoupledSchedules {
             "ContinuationPath: ρ entry/target dimension mismatch"
         );
         let s = s.clamp(0.0, 1.0);
+        // Preserve the literal box and target vectors at the two contract
+        // endpoints. Besides making the scalar and rho legs symmetric, this
+        // prevents affine-rounding from changing a bound bit at entry.
+        if s.to_bits() == 0.0_f64.to_bits() {
+            return self.rho_target.clone();
+        }
+        if s.to_bits() == 1.0_f64.to_bits() {
+            return self.rho_entry.clone();
+        }
         let mut out = self.rho_target.clone();
         for i in 0..out.len() {
             out[i] = self.rho_target[i] + s * (self.rho_entry[i] - self.rho_target[i]);
@@ -583,6 +603,37 @@ mod tests {
     }
 
     #[test]
+    fn literal_endpoint_bits_survive_without_affine_rounding() {
+        let scalar_entry =
+            ContinuationScalarState::new(2.0, vec![-0.0, 0.01]).expect("valid entry");
+        let scalar_target =
+            ContinuationScalarState::new(0.1, vec![1.0, 2.0]).expect("valid target");
+        let contract =
+            ContinuationScalarContract::new(scalar_entry.clone(), scalar_target.clone())
+                .expect("ordered scalar endpoints");
+        assert!(contract.at(1.0).bitwise_eq(&scalar_entry));
+        assert!(contract.at(0.0).bitwise_eq(&scalar_target));
+
+        let rho_entry = Array1::from_vec(vec![0.01, 0.02]);
+        let rho_target = Array1::from_vec(vec![-0.0, -0.1]);
+        let schedules = couple_schedules(rho_entry.clone(), rho_target.clone(), contract);
+        assert!(
+            schedules
+                .rho_target_at(1.0)
+                .iter()
+                .zip(rho_entry.iter())
+                .all(|(actual, literal)| actual.to_bits() == literal.to_bits())
+        );
+        assert!(
+            schedules
+                .rho_target_at(0.0)
+                .iter()
+                .zip(rho_target.iter())
+                .all(|(actual, literal)| actual.to_bits() == literal.to_bits())
+        );
+    }
+
+    #[test]
     fn entry_is_the_heavy_smoothing_regime() {
         let path = ContinuationPath::enter(schedules());
         assert_eq!(
@@ -591,11 +642,13 @@ mod tests {
             "entry must be s = 1 (heavy-smoothing regime)"
         );
         let targets = path.current_scalar_targets();
-        assert_eq!(targets.assignment_temperature.to_bits(), 2.0_f64.to_bits());
-        assert_eq!(targets.isometry_weights, vec![0.01, 0.02]);
+        assert!(targets.bitwise_eq(scalar_contract().entry()));
         // Log-ρ at s = 1 is the supplied legal upper-box endpoint.
         let rho = path.schedules.rho_target_at(path.s());
-        assert!((rho[0] - 5.0).abs() < 1e-12 && (rho[1] - 5.0).abs() < 1e-12);
+        assert!(
+            rho.iter()
+                .all(|entry| entry.to_bits() == 5.0_f64.to_bits())
+        );
     }
 
     #[test]
