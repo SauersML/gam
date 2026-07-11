@@ -5680,9 +5680,11 @@ impl SaeManifoldTerm {
                 && directional_decrease > 0.0
                 && directional_decrease > directional_decrease_floor;
             if !descent_direction_ok {
-                // The grad gate above is now unconditional and would have broken
-                // already if grad was small. This arm remains for routing a
-                // non-descent delta straight to proximal correction.
+                // The ordinary-fit coarse KKT gate above already breaks on a small
+                // gradient. Evidence polish intentionally bypasses that gate, so
+                // this arm is also its numerical fixed-point route: try the
+                // existing proximal correction once, then stop below when even
+                // that correction cannot produce a strict objective decrease.
             }
 
             // No Armijo bound is meaningful along a non-descent direction, so
