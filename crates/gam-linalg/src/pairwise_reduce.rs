@@ -319,7 +319,7 @@ where
 /// grouping depends on rayon's demand-driven splitting.
 pub fn par_pairwise_map_reduce<T, M, F>(n: usize, map: M, combine: F, identity: T) -> T
 where
-    T: Copy + Send,
+    T: Copy + Send + Sync,
     M: Fn(usize) -> T + Sync,
     F: Fn(T, T) -> T + Sync,
 {
@@ -328,7 +328,7 @@ where
 
 fn par_reduce_index_range<T, M, F>(lo: usize, hi: usize, map: &M, combine: &F, identity: T) -> T
 where
-    T: Copy + Send,
+    T: Copy + Send + Sync,
     M: Fn(usize) -> T + Sync,
     F: Fn(T, T) -> T + Sync,
 {

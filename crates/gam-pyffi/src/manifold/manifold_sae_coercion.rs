@@ -10,7 +10,6 @@ use crate::manifold::manifold_sae_payload::{
     AtomPayload, CrosscoderPayload, ManifoldSaePayload, SCHEMA_TAG,
 };
 use ndarray::{Array2, Array3, ArrayView2};
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
@@ -22,11 +21,6 @@ use serde_json::Value;
 pub(crate) use gam::terms::sae::atom_schema::canonical_assignment_kind;
 use gam::terms::sae::atom_schema::{
     flat_block_assignment, topologies_for_bases, topology_for_bases, validated_n_harmonics,
-};
-#[cfg(test)]
-use gam::terms::sae::atom_schema::{
-    basis_kind_for_topology, basis_to_topology, canonical_topology,
-    coordinate_periods_for_basis,
 };
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector
@@ -624,6 +618,10 @@ pub(crate) fn build_manifold_sae_payload(
 #[cfg(test)]
 mod manifold_sae_coercion_tests {
     use super::*;
+    use gam::terms::sae::atom_schema::{
+        basis_kind_for_topology, basis_to_topology, canonical_topology,
+        coordinate_periods_for_basis,
+    };
     use ndarray::array;
 
     #[test]
