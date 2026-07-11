@@ -27,10 +27,10 @@
 //!     Unlike the CLI in `main.rs`, this in-Rust path does NOT rescale `y` by its
 //!     sample std, so the fitted coefficients and reconstructed mu / sigma are
 //!     already in raw response units.
-//!   * gam's noise (sigma) link is `sigma = LOGB_SIGMA_FLOOR + exp(eta_scale)`
-//!     with `LOGB_SIGMA_FLOOR = 0.01` (see `families::sigma_link`), the same
-//!     soft floor mgcv's `gaulss(b=0.01)` uses; the location block carries role
-//!     `BlockRole::Location`, the log-sigma block role `BlockRole::Scale`.
+//!   * gam standardizes the response while fitting, then maps coefficients back
+//!     to raw units. Consequently the raw-unit noise link is
+//!     `sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale)`; the
+//!     response-relative soft floor is part of the saved fit contract.
 //!   * The spec's `linkwiggle(...)` term is a *binomial-only* link correction
 //!     (`reject_explicit_linkwiggle_for_nonbinomial` rejects it for a Gaussian
 //!     response); it is meaningless for a Gaussian location-scale fit, so the
@@ -114,7 +114,11 @@ fn gam_gaussian_location_scale_matches_gamlss() {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -151,7 +155,7 @@ fn gam_gaussian_location_scale_matches_gamlss() {
 
     // Rebuild the SAME frozen mean / log-sigma designs at the grid points and
     // apply each block's coefficients. mu = X_mean*beta_location;
-    // sigma = LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
+    // sigma = response_scale*LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
     let mean_design_grid = build_term_collection_design(grid.view(), &fit.meanspec_resolved)
         .expect("rebuild mean design at grid");
     let scale_design_grid = build_term_collection_design(grid.view(), &fit.noisespec_resolved)
@@ -161,7 +165,7 @@ fn gam_gaussian_location_scale_matches_gamlss() {
     let gam_eta_sigma: Vec<f64> = scale_design_grid.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
         .collect();
     let gam_log_sigma: Vec<f64> = gam_sigma.iter().map(|&s| s.ln()).collect();
 
@@ -417,7 +421,11 @@ fn gam_gaussian_location_scale_matches_gamlss_on_real_data() {
     };
     let result =
         fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -448,7 +456,7 @@ fn gam_gaussian_location_scale_matches_gamlss_on_real_data() {
     let gam_test_eta_sigma: Vec<f64> = scale_design_test.design.apply(&beta_scale).to_vec();
     let gam_test_sigma: Vec<f64> = gam_test_eta_sigma
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
         .collect();
     assert_eq!(gam_test_mu.len(), test_rows.len());
     assert_eq!(gam_test_sigma.len(), test_rows.len());

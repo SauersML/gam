@@ -46,9 +46,10 @@
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
 //!     through `FitRequest::GaussianLocationScale`; this in-Rust path does NOT
 //!     rescale `y`, so reconstructed mu/sigma are already in raw GAG units.
-//!   * sigma = `LOGB_SIGMA_FLOOR + exp(eta_scale)` with `LOGB_SIGMA_FLOOR = 0.01`
-//!     (`families::sigma_link`); the mean block carries `BlockRole::Location`,
-//!     the log-sigma block `BlockRole::Scale`.
+//!   * the response is standardized while fitting and returned coefficients are
+//!     mapped back to raw units, so prediction uses
+//!     `sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale)`; the mean
+//!     block carries `BlockRole::Location`, the log-sigma block `BlockRole::Scale`.
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
@@ -174,7 +175,11 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
     };
     let result =
         fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -212,7 +217,7 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
             .design
             .apply(&beta_scale)
             .iter()
-            .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+            .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
             .collect();
         (mu, sigma)
     };
