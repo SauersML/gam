@@ -1,0 +1,53 @@
+=== steer_delta / predicted_nats in steering.rs ===
+30://! predicted_nats = 0.5 * delta^T M_metric_row delta
+108:    pub predicted_nats: Option<f64>,
+122:    /// consumer can certify *why* `predicted_nats` is `None` when it is.
+218:    pub predicted_nats: Option<f64>,
+280:        predicted_nats: set.steer.predicted_nats,
+353:/// `predicted_nats` / `validity_radius` degrade to `None`.
+354:pub fn steer_delta(
+440:    let (predicted_nats, validity_radius) = if !behavior_available {
+466:        predicted_nats,
+=== steering_dosimetry test ===
+4://! # The planted oracle
+23://! ⇒ KL_analytic(Δ) = R² (1 − cos(2π Δ))            ← the closed-form oracle
+27://! reported `predicted_nats` must match `KL_analytic` for both small and large
+28://! moves. The separate `validity_radius` still flags where the local
+53:fn analytic_kl(delta: f64) -> f64 {
+59:fn planted_circle(t0: f64) -> (SaeManifoldTerm, RowMetric) {
+73:    assert_eq!(phi.dim(), (n, m));
+74:    assert_eq!(jet.dim(), (n, m, d));
+117:fn predicted_nats_match_analytic_kl_within_validity_radius() {
+126:    assert_eq!(plan.atom, 0);
+127:    assert_eq!(plan.atom_name, "circle");
+128:    assert_eq!(
+132:    assert!(
+138:    let nats = plan.predicted_nats.expect("behavioral dose available");
+140:    println!("small step: predicted_nats={nats:.8e} analytic_kl={kl:.8e}");
+142:    assert!(
+154:    assert!(
+160:    // The validity radius is reported and, for a step this small, covers the
+162:    let vr = plan.validity_radius.expect("validity radius available");
+163:    println!("validity_radius={vr:.5e} full_move={delta:.5e}");
+164:    assert!(
+166:        "tiny step must be fully within validity radius: vr={vr:.5e}, move={delta:.5e}"
+171:fn predicted_nats_remain_endpoint_kl_beyond_validity_radius() {
+177:    // applied endpoint chord. The validity radius must fall strictly inside the
+182:    let nats = plan.predicted_nats.expect("dose");
+184:    println!("large step: predicted_nats={nats:.6} analytic_kl={kl:.6}");
+187:    // agrees with the patched-forward quadratic oracle at any chord length.
+188:    assert!(
+193:    // The validity radius must flag the breakdown: strictly inside the full move.
+194:    let vr = plan.validity_radius.expect("vr");
+195:    println!("validity_radius={vr:.5} full_move={delta:.5}");
+196:    assert!(
+198:        "validity radius {vr:.5} must fall strictly inside the over-long move {delta:.5}"
+200:    assert!(vr > 0.0, "validity radius must be positive, got {vr}");
+204:fn euclidean_metric_yields_geometry_but_no_dose() {
+207:    // validity radius are *not available* (None), not zero.
+216:    assert_eq!(plan.metric_provenance, MetricProvenance::Euclidean);
+217:    assert!(
+218:        plan.predicted_nats.is_none(),
+221:    assert!(
+=== git last commit steering.rs ===
+1f73fff7c Checkpoint live workspace (periodic sweep of all in-flight lane edits)

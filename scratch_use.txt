@@ -1,0 +1,44 @@
+crates/gam-sae/src/coactivation_conditionality.rs:17:use crate::null_battery::ClaimNullCalibration;
+crates/gam-sae/src/coactivation_conditionality.rs:118:    pub null_calibration: Option<ClaimNullCalibration>,
+crates/gam-sae/src/coactivation_conditionality.rs:258:    let null_config = crate::null_battery::NullBatteryConfig {
+crates/gam-sae/src/coactivation_conditionality.rs:262:            crate::null_battery::NullKind::PhaseRandomized,
+crates/gam-sae/src/coactivation_conditionality.rs:263:            crate::null_battery::NullKind::RandomRotation,
+crates/gam-sae/src/coactivation_conditionality.rs:264:            crate::null_battery::NullKind::ArchitectureMatchedRandomWeight,
+crates/gam-sae/src/coactivation_conditionality.rs:266:        tail: crate::null_battery::Tail::Larger,
+crates/gam-sae/src/coactivation_conditionality.rs:268:    let nulls = crate::null_battery::run_null_battery(
+crates/gam-sae/src/coactivation_conditionality.rs:274:    let roc_config = crate::null_battery::SpikeInRocConfig::circle(
+crates/gam-sae/src/coactivation_conditionality.rs:280:        crate::null_battery::default_spike_in_roc_curve(observed.view(), &roc_config)?;
+crates/gam-sae/src/coactivation_conditionality.rs:281:    let calibrated = crate::null_battery::calibrated_roc_claim_report(
+crates/gam-sae/src/coactivation_conditionality.rs:289:        Some(crate::null_battery::ClaimNullCalibration::from_calibrated_roc(calibrated));
+crates/gam-sae/src/saebench_metrics.rs:10:use crate::null_battery::{NullKind, NullSummary, Tail, summarize_null_distribution};
+crates/gam-sae/src/lib.rs:33:pub mod null_battery;
+crates/gam-sae/src/manifold/pair_phase.rs:62://! ([`crate::null_battery::phase_randomized_surrogate`]): it re-randomises each
+crates/gam-sae/src/manifold/pair_phase.rs:109:use crate::null_battery::phase_randomized_surrogate;
+crates/gam-sae/src/manifold/persistence.rs:40:use crate::null_battery::ClaimNullCalibration;
+crates/gam-sae/src/manifold/persistence.rs:170:    pub null_calibration: Option<ClaimNullCalibration>,
+crates/gam-sae/src/sparse_dict/split_lr_fdr.rs:572:    fn null_battery_rank1_shell_fdr_controlled() {
+crates/gam-sae/src/inference/atlas_nerve.rs:14:use crate::null_battery::ClaimNullCalibration;
+crates/gam-sae/src/inference/atlas_nerve.rs:191:    pub null_calibration: Option<ClaimNullCalibration>,
+crates/gam-pyffi/src/latent/sae_spectral_ffi.rs:443:    calibration: Option<&gam::terms::sae::null_battery::ClaimNullCalibration>,
+crates/gam-pyffi/src/latent/sae_spectral_ffi.rs:1067:    calibration: Option<&gam::terms::sae::null_battery::ClaimNullCalibration>,
+crates/gam-pyffi/src/latent/sae_spectral_ffi.rs:1226:) -> Result<Option<gam::terms::sae::null_battery::ClaimNullCalibration>, String> {
+crates/gam-pyffi/src/latent/sae_spectral_ffi.rs:1227:    use gam::terms::sae::null_battery as nb;
+crates/gam-pyffi/src/latent/sae_spectral_ffi.rs:1280:    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)))
+=== circ corr defs ===
+crates/gam-sae/src/saebench_metrics.rs:39:                "orientation_quotiented_weighted_phase_lock_v1"
+crates/gam-sae/src/saebench_metrics.rs:162:    pub circular_correlation: f64,
+crates/gam-sae/src/saebench_metrics.rs:163:    /// Signed correlation before orientation is quotiented out.
+crates/gam-sae/src/saebench_metrics.rs:164:    pub signed_circular_correlation: f64,
+crates/gam-sae/src/saebench_metrics.rs:262:/// orientation-quotiented statistic used for the observed ledger is recomputed
+crates/gam-sae/src/saebench_metrics.rs:276:    let (circular_correlation, signed_circular_correlation, weight_sum) =
+crates/gam-sae/src/saebench_metrics.rs:289:        circular_correlation,
+crates/gam-sae/src/saebench_metrics.rs:301:            circular_correlation,
+crates/gam-sae/src/saebench_metrics.rs:302:            signed_circular_correlation,
+crates/gam-sae/src/saebench_metrics.rs:340:fn chart_correlation(
+crates/gam-sae/src/coactivation_conditionality.rs:1383:    fn weighted_correlation_influence_matches_leave_one_out_jackknife() {
+crates/gam-sae/src/coactivation_conditionality.rs:1595:    fn weighted_correlation_stat_excluding(
+crates/gam-sae/src/manifold/tests_graph_spectral_decode.rs:184:// orientation-quotiented circular correlation > 0.95 against the true angle.
+crates/gam-sae/src/manifold/tests_graph_spectral_decode.rs:229:        report.observed.circular_correlation > 0.95,
+crates/gam-sae/src/manifold/tests_graph_spectral_decode.rs:231:        report.observed.circular_correlation
+crates/gam-sae/src/manifold/tests_chart_angle_fidelity_2081.rs:326:fn selected_honest_chart_reads_angle_correlation_above_bar() {
+crates/gam-sae/src/manifold/tests_joint_vs_cascade_2131.rs:195:fn phase_correlation_is_invisible_to_energy_screen() {
