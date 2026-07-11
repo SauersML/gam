@@ -84,62 +84,6 @@ use crate::estimate::reml::continuation::{
 };
 use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
-/// Number of lockstep waypoints the path visits as `s` walks `1 → 0`. Each
-/// waypoint advances every leg one notch and runs one ρ-anneal spine pass.
-/// Chosen so the geometric schedules have room to descend an order of
-/// magnitude or two per leg without a single step that crosses the contraction
-/// boundary; the homotopy floor absorbs any waypoint that still over-reaches.
-pub const CONTINUATION_WAYPOINTS: usize = 8;
-
-/// Back-off fraction applied to `s` when a waypoint's inner solve struggles:
-/// `s ← min(1, s + REENTRY_BACKOFF)`. Re-entering a heavier regime and
-/// re-descending with a halved step is the *floor* behavior — there is no
-/// rejection alternative.
-///
-/// Exactly **one waypoint** of the lockstep grid (`1/CONTINUATION_WAYPOINTS`):
-/// a bounce off the homotopy floor re-enters the *previous* waypoint's heavier
-/// regime, the lightest regime already proven solvable on this walk. Combined
-/// with the halved re-descent step, a one-notch bounce costs ~2 walk legs
-/// (the re-entry plus one finer re-descent). The previous two-notch back-off
-/// (0.25) cost ~4 legs per bounce, which starved the bounded walk budget under
-/// repeated mass-floor bounces and left the K≥2 joint fit stranded mid-path —
-/// handed to the solver half-annealed, the routing-collapse signature.
-pub const REENTRY_BACKOFF: f64 = 1.0 / CONTINUATION_WAYPOINTS as f64;
-
-/// Total leg budget for one coupled walk (`rho_optimizer.rs` drives
-/// [`ContinuationPath::step`] at most this many times per seed). Two legs per
-/// waypoint: a clean walk uses `CONTINUATION_WAYPOINTS` descents, and each
-/// homotopy-floor bounce costs ~2 extra legs at the one-notch
-/// [`REENTRY_BACKOFF`] (the re-entry leg plus one finer re-descent leg), so a
-/// 2× budget tolerates ~`CONTINUATION_WAYPOINTS/2` bounces before the walk is
-/// cut off — enough for the expected near-cliff re-entries while keeping the
-/// total inner-solve count bounded. The previous 1.5× budget tolerated only
-/// ~1 two-notch bounce, so any mass-floor bounce ended the walk un-arrived.
-pub const CONTINUATION_WALK_BUDGET: usize = 2 * CONTINUATION_WAYPOINTS;
-
-/// Eval budget for one **warm** waypoint leg. A warm leg starts at the
-/// previous waypoint's converged state and walks one waypoint of ρ, so it
-/// needs a handful of evals, not the full cold spine: the coupled path's
-/// waypoints ARE the anneal. (Re-running the whole ρ₀→target spine per
-/// waypoint multiplies the walk's cost by the spine budget — the K=2 existence
-/// fixture burned 7 CPU-hours exactly that way before warm legs existed.)
-pub const WARM_LEG_EVAL_BUDGET: usize = 8;
-
-/// Hard ceiling on *budgeted* spine evals across one coupled walk — the #968
-/// termination guarantee made structural. A clean walk budgets
-/// `PATH_BUDGET + (CONTINUATION_WAYPOINTS − 1) · WARM_LEG_EVAL_BUDGET` (one
-/// cold entry spine, then warm legs); the ceiling leaves ~3× that for
-/// homotopy-floor bounces. At the ceiling the path **arrives with its best
-/// converged state** instead of spending another leg: a walk cannot spin.
-pub const WALK_EVAL_CEILING: usize =
-    3 * (PATH_BUDGET + CONTINUATION_WAYPOINTS * WARM_LEG_EVAL_BUDGET);
-
-/// Floor on the per-waypoint descent step in `s`. Below this the path is
-/// taking near-zero steps; it does not give up — it pins `s` at its current
-/// (heavier) regime and keeps re-descending from there. The floor is a
-/// *behavior*, never an exit.
-pub const S_STEP_FLOOR: f64 = 1.0 / 256.0;
-
 /// The endpoints of one coupled annealing leg, in path-parameter terms.
 /// `at_entry` is the value at `s = 1` (heavy-smoothing regime); `at_target`
 /// is the value at `s = 0` (real objective). Interpolation is in the leg's
@@ -547,23 +491,6 @@ impl PathRegime {
     }
 }
 
-/// Why the seed cascade asked the path to demote a seed to a heavier regime.
-/// Purely a diagnostic tag carried into the demotion ledger — every variant
-/// resolves to "re-enter the same seed at a heavier `s`", never to a rejection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PathDemotionReason {
-    /// A uniform structural diagnosis (rank / alias / active-set defect seen
-    /// consistently across seeds) that the legacy contract would have used to
-    /// short-circuit the cascade. For a continuation-entry objective it instead
-    /// demotes to a heavier regime and keeps evaluating.
-    UniformStructural,
-    /// The continuation pre-warm refused to reach a seed at the current regime
-    /// (a structural refusal of the seed's joint design). Demoted to a heavier
-    /// regime so the joint solver gets a feasible basin the current regime could
-    /// not reach.
-    PrewarmStructural,
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 //  The per-step outcome enum. Note: NO Reject / Failed / NoUsableSeed arm.
 // ─────────────────────────────────────────────────────────────────────────
@@ -609,10 +536,6 @@ pub(crate) enum ReentryReason {
     /// was recorded and the path re-enters a heavier regime to let τ re-diffuse
     /// the assignment before re-sharpening.
     MassFloorBreached(MassFloorBreach),
-    /// The descent step in `s` underflowed `S_STEP_FLOOR`; the path pins `s` at
-    /// the current heavier regime and keeps re-descending from there rather
-    /// than taking vanishing steps. Still not a rejection — the floor holds.
-    StepUnderflow,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

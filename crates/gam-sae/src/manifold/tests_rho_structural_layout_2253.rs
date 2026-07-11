@@ -224,20 +224,11 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
             "the K=1 derivative witness must stay outside the rank-zero veto"
         );
         let n_eff = term.per_atom_effective_sample_size();
-        let rank_charge: f64 = if term.soft_rank_charge() {
-            term.per_atom_soft_learning_coefficient(&rho, dispersion)
-                .expect("criterion component audit soft rank")
-                .iter()
-                .zip(n_eff.iter())
-                .map(|(&coefficient, &n)| coefficient * n.max(1.0).ln())
-                .sum()
-        } else {
-            rank_dof
-                .iter()
-                .zip(n_eff.iter())
-                .map(|(&dof, &n)| 0.5 * dof * n.max(1.0).ln())
-                .sum()
-        };
+        let rank_charge: f64 = rank_dof
+            .iter()
+            .zip(n_eff.iter())
+            .map(|(&dof, &n)| 0.5 * dof * n.max(1.0).ln())
+            .sum();
         let negative_occam = -term.reml_occam_term(&rho).expect("frozen Occam value");
         let reconstructed: f64 =
             data_and_priors + half_logdet - htt_half + rank_charge + negative_occam;
