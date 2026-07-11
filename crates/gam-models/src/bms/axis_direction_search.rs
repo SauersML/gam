@@ -890,11 +890,12 @@ impl BernoulliMarginalSlopeFamily {
             // identical to the serial single-buffer accumulation up to f.p.
             // reduction order, and removing the serial walk over all `n` rows.
             let row_chunk = bms_row_chunk_size(n);
-            let diagonal = (0..n.div_ceil(row_chunk))
-                .into_par_iter()
-                .try_fold(
-                    || Array1::<f64>::zeros(slices.total),
-                    |mut chunk_diag, chunk_idx| -> Result<_, String> {
+            let n_row_chunks = n.div_ceil(row_chunk);
+            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    n_row_chunks,
+                    |chunk_range| -> Result<_, String> {
+                        let mut chunk_diag = Array1::<f64>::zeros(slices.total);
+                        for chunk_idx in chunk_range {
                         let start = chunk_idx * row_chunk;
                         let end = (start + row_chunk).min(n);
                         for row in start..end {
@@ -936,16 +937,15 @@ impl BernoulliMarginalSlopeFamily {
                                 }
                             }
                         }
+                        }
                         Ok(chunk_diag)
                     },
-                )
-                .try_reduce(
-                    || Array1::<f64>::zeros(slices.total),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             return Ok(diagonal);
         }
 
@@ -971,12 +971,11 @@ impl BernoulliMarginalSlopeFamily {
             // row chunks. Each tile owns a disjoint row block, so the
             // accumulation is order-independent up to f.p. reduction; the
             // partials sum to the same diagonal the serial loop produced.
-            let diagonal = tiles
-                .tiles
-                .par_iter()
-                .try_fold(
-                    || Array1::<f64>::zeros(slices.total),
-                    |mut tile_diag, tile| -> Result<_, String> {
+            let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    tiles.tiles.len(),
+                    |tile_range| -> Result<_, String> {
+                        let mut tile_diag = Array1::<f64>::zeros(slices.total);
+                        for tile in &tiles.tiles[tile_range] {
                         let tile_rows = tile.rows.hess().nrows();
                         let h_rows_slice =
                             tile.rows.hess().as_slice().expect(
@@ -1052,28 +1051,28 @@ impl BernoulliMarginalSlopeFamily {
                                 }
                             }
                         }
+                        }
                         Ok(tile_diag)
                     },
-                )
-                .try_reduce(
-                    || Array1::<f64>::zeros(slices.total),
                     |mut left, right| -> Result<_, String> {
                         left += &right;
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
             return Ok(diagonal);
         }
 
         let row_chunk = bms_row_chunk_size(n);
-        let diagonal = (0..n.div_ceil(row_chunk))
-            .into_par_iter()
-            .try_fold(
-                || Array1::<f64>::zeros(slices.total),
-                |mut chunk_diag, chunk_idx| -> Result<_, String> {
+        let n_row_chunks = n.div_ceil(row_chunk);
+        let diagonal = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                n_row_chunks,
+                |chunk_range| -> Result<_, String> {
+                    let mut chunk_diag = Array1::<f64>::zeros(slices.total);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                    for chunk_idx in chunk_range {
                     let start = chunk_idx * row_chunk;
                     let end = (start + row_chunk).min(n);
-                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
                         // When the per-row primary Hessian is materialized at
@@ -1152,16 +1151,15 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                     }
+                    }
                     Ok(chunk_diag)
                 },
-            )
-            .try_reduce(
-                || Array1::<f64>::zeros(slices.total),
                 |mut left, right| -> Result<_, String> {
                     left += &right;
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(|| Array1::<f64>::zeros(slices.total));
         Ok(diagonal)
     }
 
@@ -1287,9 +1285,11 @@ impl BernoulliMarginalSlopeFamily {
                 })
                 .collect()
         };
-        let folded = weighted_rows
-            .par_iter()
-            .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+        let folded = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            weighted_rows.len(),
+            |index_range| -> Result<_, String> {
+                let mut acc = make_acc();
+                for wr in &weighted_rows[index_range] {
                 let row = wr.index;
                 let w = wr.weight;
                 let row_ctx = Self::row_ctx(cache, row);
@@ -1359,16 +1359,19 @@ impl BernoulliMarginalSlopeFamily {
                     );
                     slot.2.add_pullback(self, row, slices, primary, &third);
                 }
+                }
                 Ok(acc)
-            })
-            .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
+            },
+            |mut left, right| -> Result<_, String> {
                 for (l, r) in left.iter_mut().zip(right.into_iter()) {
                     l.0 += r.0;
                     l.1 += &r.1;
                     l.2.add(&r.2);
                 }
                 Ok(left)
-            })?;
+            },
+        )?
+        .unwrap_or_else(make_acc);
 
         let mut out = Vec::with_capacity(k);
         for (objective_psi, score_psi, block_acc) in folded.into_iter() {
@@ -1495,17 +1498,19 @@ impl BernoulliMarginalSlopeFamily {
 
         // Block-local accumulator path for second-order psi terms
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
-        let (objective_psi_psi, score_psi_psi, block_acc) = weighted_rows
-            .par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0f64,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(slices),
-                    )
-                },
-                |mut acc, wr| -> Result<_, String> {
+        let make_acc = || {
+            (
+                0.0f64,
+                Array1::<f64>::zeros(slices.total),
+                BernoulliBlockHessianAccumulator::new(slices),
+            )
+        };
+        let (objective_psi_psi, score_psi_psi, block_acc) =
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                weighted_rows.len(),
+                |index_range| -> Result<_, String> {
+                    let mut acc = make_acc();
+                    for wr in &weighted_rows[index_range] {
                     let row = wr.index;
                     let w = wr.weight;
                     {
@@ -1711,16 +1716,8 @@ impl BernoulliMarginalSlopeFamily {
                         }
                         acc.2.add_pullback(self, row, slices, primary, &third_ij);
                     }
+                    }
                     Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0f64,
-                        Array1::<f64>::zeros(slices.total),
-                        BernoulliBlockHessianAccumulator::new(slices),
-                    )
                 },
                 |mut left, right| -> Result<_, String> {
                     left.0 += right.0;
@@ -1728,7 +1725,8 @@ impl BernoulliMarginalSlopeFamily {
                     left.2.add(&right.2);
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(make_acc);
         // Per-row HT weighting was applied inside the closure (every
         // gradient / Hessian / third / fourth tensor scaled by `w` before
         // accumulation), so the unbiased estimator is already in
@@ -1897,19 +1895,20 @@ impl BernoulliMarginalSlopeFamily {
         // output row. The data rows are streamed ONCE; every output row reads the
         // same per-row primary grad/Hess and the same cached third/fourth jets.
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
-        let per_row = weighted_rows
-            .par_iter()
-            .try_fold(
-                || {
-                    (
-                        Array1::<f64>::zeros(psi_dim),
-                        Array2::<f64>::zeros((psi_dim, slices.total)),
-                        (0..psi_dim)
-                            .map(|_| BernoulliBlockHessianAccumulator::new(slices))
-                            .collect::<Vec<_>>(),
-                    )
-                },
-                |mut acc, wr| -> Result<_, String> {
+        let make_acc = || {
+            (
+                Array1::<f64>::zeros(psi_dim),
+                Array2::<f64>::zeros((psi_dim, slices.total)),
+                (0..psi_dim)
+                    .map(|_| BernoulliBlockHessianAccumulator::new(slices))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let per_row = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                weighted_rows.len(),
+                |index_range| -> Result<_, String> {
+                    let mut acc = make_acc();
+                    for wr in &weighted_rows[index_range] {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_ctx = Self::row_ctx(cache, row);
@@ -2154,18 +2153,8 @@ impl BernoulliMarginalSlopeFamily {
                             block_acc.add_pullback(self, row, slices, primary, &third_ij);
                         }
                     }
+                    }
                     Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        Array1::<f64>::zeros(psi_dim),
-                        Array2::<f64>::zeros((psi_dim, slices.total)),
-                        (0..psi_dim)
-                            .map(|_| BernoulliBlockHessianAccumulator::new(slices))
-                            .collect::<Vec<_>>(),
-                    )
                 },
                 |mut left, right| -> Result<_, String> {
                     left.0 += &right.0;
@@ -2175,7 +2164,8 @@ impl BernoulliMarginalSlopeFamily {
                     }
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(make_acc);
 
         let (objective, score, accs) = per_row;
         let hessian: Vec<DriftDerivResult> = accs

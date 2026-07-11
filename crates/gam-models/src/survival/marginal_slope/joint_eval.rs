@@ -1871,6 +1871,7 @@ impl SurvivalMarginalSlopeFamily {
                             }
                         }
                     }
+                    }
                     Ok(acc)
                 },
                 |mut a, b| -> Result<_, String> {
@@ -1916,17 +1917,19 @@ impl SurvivalMarginalSlopeFamily {
         let beta_logslope = &block_states[2].beta;
         let probit_scale = self.probit_frailty_scale();
         type PerZJointAcc = (f64, Array1<f64>, Array2<f64>);
-        let (ll, grad, hess): PerZJointAcc = (0..self.n)
-            .into_par_iter()
-            .try_fold(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(total),
-                        Array2::<f64>::zeros((total, total)),
-                    )
-                },
-                |mut acc, row| -> Result<_, String> {
+        let make_per_z_joint_acc = || -> PerZJointAcc {
+            (
+                0.0,
+                Array1::<f64>::zeros(total),
+                Array2::<f64>::zeros((total, total)),
+            )
+        };
+        let (ll, grad, hess): PerZJointAcc =
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                self.n,
+                |range| -> Result<_, String> {
+                    let mut acc = make_per_z_joint_acc();
+                    for row in range {
                     let q0 = self.design_entry.dot_row(row, beta_time)
                         + self.offset_entry[row]
                         + block_states[1].eta[row];
@@ -2007,16 +2010,8 @@ impl SurvivalMarginalSlopeFamily {
                             }
                         }
                     }
+                    }
                     Ok(acc)
-                },
-            )
-            .try_reduce(
-                || {
-                    (
-                        0.0,
-                        Array1::<f64>::zeros(total),
-                        Array2::<f64>::zeros((total, total)),
-                    )
                 },
                 |mut a, b| -> Result<_, String> {
                     a.0 += b.0;
@@ -2024,7 +2019,8 @@ impl SurvivalMarginalSlopeFamily {
                     a.2 += &b.2;
                     Ok(a)
                 },
-            )?;
+            )?
+            .unwrap_or_else(make_per_z_joint_acc);
         Ok((ll, grad, hess))
     }
 
@@ -2183,9 +2179,11 @@ impl SurvivalMarginalSlopeFamily {
             hess_time,
             hess_marginal,
             hess_logslope,
-        ): MixedAcc = (0..self.n)
-            .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+        ): MixedAcc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            self.n,
+            |range| -> Result<_, String> {
+                let mut acc = make_acc();
+                for row in range {
                     let (row_nll, f_pi, f_pipi) =
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     acc.0 -= row_nll;
@@ -2370,18 +2368,21 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
 
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4.add_assign(&b.4);
-                    a.5.add_assign(&b.5);
-                    a.6.add_assign(&b.6);
-                    Ok(a)
-                })?;
+                }
+                Ok(acc)
+            },
+            |mut a, b| -> Result<_, String> {
+                a.0 += b.0;
+                a.1 += &b.1;
+                a.2 += &b.2;
+                a.3 += &b.3;
+                a.4.add_assign(&b.4);
+                a.5.add_assign(&b.5);
+                a.6.add_assign(&b.6);
+                Ok(a)
+            },
+        )?
+        .unwrap_or_else(make_acc);
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -2591,9 +2592,11 @@ impl SurvivalMarginalSlopeFamily {
             acc_time,
             acc_marginal,
             acc_logslope,
-        ): SAcc = (0..self.n)
-            .into_par_iter()
-            .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+        ): SAcc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            self.n,
+            |range| -> Result<_, String> {
+                let mut acc = make_acc();
+                for row in range {
                     let (row_nll, f_pi, f_pipi) =
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
                     acc.0 -= row_nll;
@@ -2692,18 +2695,21 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
 
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut a, b| -> Result<_, String> {
-                    a.0 += b.0;
-                    a.1 += &b.1;
-                    a.2 += &b.2;
-                    a.3 += &b.3;
-                    a.4.add_values(&b.4.values);
-                    a.5.add_values(&b.5.values);
-                    a.6.add_values(&b.6.values);
-                    Ok(a)
-                })?;
+                }
+                Ok(acc)
+            },
+            |mut a, b| -> Result<_, String> {
+                a.0 += b.0;
+                a.1 += &b.1;
+                a.2 += &b.2;
+                a.3 += &b.3;
+                a.4.add_values(&b.4.values);
+                a.5.add_values(&b.5.values);
+                a.6.add_values(&b.6.values);
+                Ok(a)
+            },
+        )?
+        .unwrap_or_else(make_acc);
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
