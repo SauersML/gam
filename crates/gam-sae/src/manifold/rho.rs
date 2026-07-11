@@ -31,12 +31,50 @@ pub enum ArdSharing {
     Shared,
 }
 
+/// Whether assignment strength contributes an outer REML coordinate.
+///
+/// The stored [`SaeManifoldRho::log_lambda_sparse`] value remains available to
+/// the inner assignment prior, but the flat outer layout includes it only when
+/// the assignment family has a non-constant strength-dependent objective:
+///
+/// * [`Self::PenaltyWeight`] always carries the coordinate (IBP-MAP and
+///   threshold-gate priors).
+/// * [`Self::SoftmaxEntropy`] carries it only for `K > 1`. At `K = 1` the
+///   simplex assignment is identically one and its entropy is identically zero,
+///   so there is no parameter to optimize or certify.
+/// * [`Self::FixedSupport`] never carries it. Hard TopK sparsity is the support
+///   constraint itself and has no assignment-strength penalty.
+///
+/// Keeping this distinction in the typed rho layout prevents a structurally
+/// absent parameter from surviving as a held optimizer coordinate with a
+/// nonzero, uncertifiable gradient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignmentStrengthLayout {
+    PenaltyWeight,
+    SoftmaxEntropy,
+    FixedSupport,
+}
+
+impl AssignmentStrengthLayout {
+    fn has_outer_coordinate(self, k_atoms: usize) -> bool {
+        match self {
+            Self::PenaltyWeight => true,
+            Self::SoftmaxEntropy => k_atoms > 1,
+            Self::FixedSupport => false,
+        }
+    }
+}
+
 /// REML-selected continuous hyperparameters for SAE-manifold.
 #[derive(Debug, Clone)]
 pub struct SaeManifoldRho {
     /// `log(lambda_sparse)` for softmax entropy or JumpReLU gated L1, or the
     /// learnable `log(alpha)` offset for IBP-MAP assignment.
     pub log_lambda_sparse: f64,
+    /// Typed assignment-strength layout. This is assignment-family state, not
+    /// an optimizer mask: when the coordinate is structurally absent it is not
+    /// emitted by [`Self::to_flat`] and cannot appear in the objective gradient.
+    pub assignment_strength_layout: AssignmentStrengthLayout,
     /// Per-atom `log(lambda_smooth)` — one independent decoder-smoothness
     /// strength per atom `k` (length `K`, atom order). Atom `k`'s bending
     /// penalty `S_k` is scaled by `lambda_smooth[k] = exp(log_lambda_smooth[k])`,
@@ -89,6 +127,7 @@ impl SaeManifoldRho {
         let k = log_ard.len();
         Self {
             log_lambda_sparse,
+            assignment_strength_layout: AssignmentStrengthLayout::PenaltyWeight,
             log_lambda_smooth: vec![log_lambda_smooth; k],
             log_ard,
             ard_sharing: ArdSharing::PerAtom,
@@ -107,6 +146,7 @@ impl SaeManifoldRho {
     ) -> Self {
         Self {
             log_lambda_sparse,
+            assignment_strength_layout: AssignmentStrengthLayout::PenaltyWeight,
             log_lambda_smooth,
             log_ard,
             ard_sharing: ArdSharing::PerAtom,
@@ -127,6 +167,7 @@ impl SaeManifoldRho {
         let k = log_ard.len();
         Self {
             log_lambda_sparse,
+            assignment_strength_layout: AssignmentStrengthLayout::PenaltyWeight,
             log_lambda_smooth: vec![log_lambda_smooth; k],
             log_ard,
             ard_sharing: ArdSharing::Shared,
@@ -143,6 +184,53 @@ impl SaeManifoldRho {
     pub fn with_log_lambda_block(mut self, log_lambda_block: Vec<f64>) -> Self {
         self.log_lambda_block = log_lambda_block;
         self
+    }
+
+    /// Bind the flat assignment-strength layout to the term's assignment
+    /// family. The `K = 1` Softmax case and every hard-TopK case are structural
+    /// absences, not frozen coordinates.
+    #[must_use]
+    pub fn for_assignment(mut self, assignment_mode: AssignmentMode) -> Self {
+        self.assignment_strength_layout = match assignment_mode {
+            AssignmentMode::Softmax { .. } => AssignmentStrengthLayout::SoftmaxEntropy,
+            AssignmentMode::TopK { .. } => AssignmentStrengthLayout::FixedSupport,
+            AssignmentMode::IBPMap { .. } | AssignmentMode::ThresholdGate { .. } => {
+                AssignmentStrengthLayout::PenaltyWeight
+            }
+        };
+        self
+    }
+
+    /// Assignment-strength layout bound to this rho.
+    #[must_use]
+    pub fn assignment_strength_layout(&self) -> AssignmentStrengthLayout {
+        self.assignment_strength_layout
+    }
+
+    /// Flat index of `log_lambda_sparse`, or `None` when assignment strength is
+    /// structurally absent from the outer problem.
+    #[must_use]
+    pub fn sparse_flat_index(&self) -> Option<usize> {
+        self.assignment_strength_layout
+            .has_outer_coordinate(self.k_atoms())
+            .then_some(0)
+    }
+
+    /// First flat coordinate occupied by per-atom smoothness.
+    #[must_use]
+    pub fn smooth_flat_start(&self) -> usize {
+        usize::from(self.sparse_flat_index().is_some())
+    }
+
+    /// Flat coordinate for atom `atom`'s smoothness strength.
+    #[must_use]
+    pub fn smooth_flat_index(&self, atom: usize) -> usize {
+        assert!(
+            atom < self.k_atoms(),
+            "SaeManifoldRho::smooth_flat_index: atom {atom} outside K={}",
+            self.k_atoms()
+        );
+        self.smooth_flat_start() + atom
     }
 
     /// Number of crosscoder output blocks `L-1` carried as outer coordinates
@@ -189,12 +277,13 @@ impl SaeManifoldRho {
     #[must_use]
     pub fn ard_flat_index(&self, atom: usize, axis: usize) -> usize {
         let k = self.log_lambda_smooth.len();
+        let prefix = self.smooth_flat_start();
         match self.ard_sharing {
             ArdSharing::PerAtom => {
                 let base: usize = self.log_ard[..atom].iter().map(|a| a.len()).sum();
-                1 + k + base + axis
+                prefix + k + base + axis
             }
-            ArdSharing::Shared => 1 + k + axis,
+            ArdSharing::Shared => prefix + k + axis,
         }
     }
 
@@ -382,7 +471,9 @@ impl SaeManifoldRho {
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
     /// `OuterObjective` engine optimises over.
     ///
-    /// Layout: `[log_lambda_sparse, <K smooth>, <ARD>, <L-1 block>]`, where
+    /// Layout: `[<optional sparse>, <K smooth>, <ARD>, <L-1 block>]`, where
+    /// `<optional sparse>` contains `log_lambda_sparse` exactly when
+    /// [`Self::sparse_flat_index`] is `Some`, and is otherwise empty. The
     /// `<K smooth>` is the per-atom `log_lambda_smooth[k]` in atom order
     /// (`k in 0..K`), so the smoothness block carries `K` outer coordinates, not 1
     /// (#1556). The trailing `<L-1 block>` is the crosscoder per-block
@@ -404,17 +495,21 @@ impl SaeManifoldRho {
     /// [`Self::from_flat`] is the exact inverse and reads the same layout from
     /// `self` (its `log_ard` shape + `ard_sharing`).
     pub fn to_flat(&self) -> Array1<f64> {
+        let smooth_start = self.smooth_flat_start();
         match self.ard_sharing {
             ArdSharing::PerAtom => {
                 let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
                 let block_len = self.log_lambda_block.len();
-                let mut out = Array1::<f64>::zeros(1 + k + ard_len + block_len);
-                out[0] = self.log_lambda_sparse;
-                for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
-                    out[1 + atom] = v;
+                let mut out =
+                    Array1::<f64>::zeros(smooth_start + k + ard_len + block_len);
+                if let Some(index) = self.sparse_flat_index() {
+                    out[index] = self.log_lambda_sparse;
                 }
-                let mut cursor = 1 + k;
+                for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
+                    out[smooth_start + atom] = v;
+                }
+                let mut cursor = smooth_start + k;
                 for axis in &self.log_ard {
                     for &v in axis.iter() {
                         out[cursor] = v;
@@ -433,10 +528,13 @@ impl SaeManifoldRho {
                 let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
                 let block_len = self.log_lambda_block.len();
-                let mut out = Array1::<f64>::zeros(1 + k + max_d + block_len);
-                out[0] = self.log_lambda_sparse;
+                let mut out =
+                    Array1::<f64>::zeros(smooth_start + k + max_d + block_len);
+                if let Some(index) = self.sparse_flat_index() {
+                    out[index] = self.log_lambda_sparse;
+                }
                 for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
-                    out[1 + atom] = v;
+                    out[smooth_start + atom] = v;
                 }
                 // Per-axis shared value = mean over atoms owning that axis. The
                 // table is broadcast (all owners equal) under this mode, so the
@@ -451,12 +549,13 @@ impl SaeManifoldRho {
                             count += 1;
                         }
                     }
-                    out[1 + k + j] = if count > 0 { acc / count as f64 } else { 0.0 };
+                    out[smooth_start + k + j] =
+                        if count > 0 { acc / count as f64 } else { 0.0 };
                 }
                 // #2231 §2a — crosscoder block weights appended after the shared
                 // ARD block (empty ⇒ byte-identical).
                 for (b, &v) in self.log_lambda_block.iter().enumerate() {
-                    out[1 + k + max_d + b] = v;
+                    out[smooth_start + k + max_d + b] = v;
                 }
                 out
             }
@@ -475,6 +574,7 @@ impl SaeManifoldRho {
     /// values are BROADCAST back to every atom that owns that axis, rebuilding the
     /// full per-atom table the inner solve consumes.
     pub fn from_flat(&self, flat: ArrayView1<'_, f64>) -> SaeManifoldRho {
+        let smooth_start = self.smooth_flat_start();
         match self.ard_sharing {
             ArdSharing::PerAtom => {
                 let k = self.log_lambda_smooth.len();
@@ -482,14 +582,15 @@ impl SaeManifoldRho {
                 let block_len = self.log_lambda_block.len();
                 assert_eq!(
                     flat.len(),
-                    1 + k + ard_len + block_len,
-                    "SaeManifoldRho::from_flat: flat length {} != 1 + K + Σ d_k + (L-1) = {}",
+                    smooth_start + k + ard_len + block_len,
+                    "SaeManifoldRho::from_flat: flat length {} != sparse_dim + K + Σ d_k + (L-1) = {}",
                     flat.len(),
-                    1 + k + ard_len + block_len
+                    smooth_start + k + ard_len + block_len
                 );
-                let log_lambda_smooth: Vec<f64> = (0..k).map(|atom| flat[1 + atom]).collect();
+                let log_lambda_smooth: Vec<f64> =
+                    (0..k).map(|atom| flat[smooth_start + atom]).collect();
                 let mut log_ard = Vec::with_capacity(self.log_ard.len());
-                let mut cursor = 1 + k;
+                let mut cursor = smooth_start + k;
                 for axis in &self.log_ard {
                     let d = axis.len();
                     let mut block = Array1::<f64>::zeros(d);
@@ -502,7 +603,10 @@ impl SaeManifoldRho {
                 // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
                 let log_lambda_block: Vec<f64> = (0..block_len).map(|b| flat[cursor + b]).collect();
                 SaeManifoldRho {
-                    log_lambda_sparse: flat[0],
+                    log_lambda_sparse: self
+                        .sparse_flat_index()
+                        .map_or(self.log_lambda_sparse, |index| flat[index]),
+                    assignment_strength_layout: self.assignment_strength_layout,
                     log_lambda_smooth,
                     log_ard,
                     ard_sharing: ArdSharing::PerAtom,
@@ -515,12 +619,13 @@ impl SaeManifoldRho {
                 let block_len = self.log_lambda_block.len();
                 assert_eq!(
                     flat.len(),
-                    1 + k + max_d + block_len,
-                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != 1 + K + max_d + (L-1) = {}",
+                    smooth_start + k + max_d + block_len,
+                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != sparse_dim + K + max_d + (L-1) = {}",
                     flat.len(),
-                    1 + k + max_d + block_len
+                    smooth_start + k + max_d + block_len
                 );
-                let log_lambda_smooth: Vec<f64> = (0..k).map(|atom| flat[1 + atom]).collect();
+                let log_lambda_smooth: Vec<f64> =
+                    (0..k).map(|atom| flat[smooth_start + atom]).collect();
                 // Broadcast the shared per-axis strengths into each atom's block,
                 // preserving every atom's own `d_k` (a `d_k`-axis atom reads the
                 // first `d_k` shared values). This rebuilds the full per-atom
@@ -530,15 +635,20 @@ impl SaeManifoldRho {
                     let d = axis.len();
                     let mut block = Array1::<f64>::zeros(d);
                     for (j, slot) in block.iter_mut().enumerate() {
-                        *slot = flat[1 + k + j];
+                        *slot = flat[smooth_start + k + j];
                     }
                     log_ard.push(block);
                 }
                 // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
                 let log_lambda_block: Vec<f64> =
-                    (0..block_len).map(|b| flat[1 + k + max_d + b]).collect();
+                    (0..block_len)
+                        .map(|b| flat[smooth_start + k + max_d + b])
+                        .collect();
                 SaeManifoldRho {
-                    log_lambda_sparse: flat[0],
+                    log_lambda_sparse: self
+                        .sparse_flat_index()
+                        .map_or(self.log_lambda_sparse, |index| flat[index]),
+                    assignment_strength_layout: self.assignment_strength_layout,
                     log_lambda_smooth,
                     log_ard,
                     ard_sharing: ArdSharing::Shared,
