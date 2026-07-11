@@ -3680,7 +3680,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 .map(|(t, a)| t + a)
                 .collect();
             let ns = n_p.min(6);
-            log::warn!(
+            // #[cfg(test)]-only probe: eprintln (not log::warn, which the test
+            // harness drops with no logger) so `[2253-CHAN]` reaches the test output.
+            eprintln!(
                 "[2253-CHAN] rho={rv:?} logdet0={ld0:?} g_an={ga:?} fd_total={ft:?} \
                  explicit={ex:?} logdet_trace+adj={lc:?} fd_half_logdet={fl:?} occam={oc:?}",
                 rv = rho.to_vec(),
