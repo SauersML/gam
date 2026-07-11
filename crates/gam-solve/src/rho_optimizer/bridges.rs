@@ -2196,30 +2196,46 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
 /// constrained-stationary, which let the outer cost-stall guard certify a railed
 /// optimum as converged (the #1074 quakes-trend / #1082 / #1426 railing).
 #[inline]
+/// KKT-projected gradient VECTOR at a box-constrained point.
+///
+/// Zeros the infeasible (bound-multiplier) component on every axis pinned at a
+/// box bound, keeping only the feasible-descent part — the exact split
+/// [`projected_gradient_norm`] takes the norm of. Callers that need the
+/// direction (e.g. the curvature-scaled flat-valley Newton decrement in
+/// `certify_outer_optimality`) consume this; `projected_gradient_norm` is its
+/// Euclidean norm.
+pub(crate) fn project_gradient_vector(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    bounds: Option<&(Array1<f64>, Array1<f64>)>,
+) -> Array1<f64> {
+    match bounds {
+        Some((lower, upper)) => Array1::from_iter((0..gradient.len()).map(|i| {
+            let gi = gradient[i];
+            // Active lower bound: feasible moves are upward, so a positive g_i
+            // (its downward step `-g_i` exits the box) is the infeasible
+            // KKT-multiplier pull → drop it, keeping the feasible-descent
+            // negative part.
+            let gi = if x[i] <= lower[i] { gi.min(0.0) } else { gi };
+            // Active upper bound: feasible moves are downward, so a negative g_i
+            // (its upward step `-g_i` exits the box) is the infeasible pull →
+            // drop it, keeping the feasible-descent positive part.
+            if x[i] >= upper[i] { gi.max(0.0) } else { gi }
+        })),
+        None => gradient.clone(),
+    }
+}
+
 pub(crate) fn projected_gradient_norm(
     x: &Array1<f64>,
     gradient: &Array1<f64>,
     bounds: Option<&(Array1<f64>, Array1<f64>)>,
 ) -> f64 {
-    let sumsq = match bounds {
-        Some((lower, upper)) => (0..gradient.len())
-            .map(|i| {
-                let gi = gradient[i];
-                // Active lower bound: feasible moves are upward, so a positive
-                // g_i (its downward step `-g_i` exits the box) is the infeasible
-                // KKT-multiplier pull → drop it, keeping the feasible-descent
-                // negative part.
-                let gi = if x[i] <= lower[i] { gi.min(0.0) } else { gi };
-                // Active upper bound: feasible moves are downward, so a negative
-                // g_i (its upward step `-g_i` exits the box) is the infeasible
-                // pull → drop it, keeping the feasible-descent positive part.
-                let gi = if x[i] >= upper[i] { gi.max(0.0) } else { gi };
-                gi * gi
-            })
-            .sum::<f64>(),
-        None => gradient.iter().map(|v| v * v).sum::<f64>(),
-    };
-    sumsq.sqrt()
+    project_gradient_vector(x, gradient, bounds)
+        .iter()
+        .map(|v| v * v)
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[cfg(test)]

@@ -889,12 +889,16 @@ pub enum OuterConvergedVia {
     /// The bound-projected analytic gradient at the returned point cleared the
     /// solver's absolute/score-scaled stationarity tolerance.
     GradientStationary,
-    /// Criterion-flat certificate (#2241): the criterion stalled over the
+    /// Criterion-flat certificate (#2241/#2253): the criterion stalled over the
     /// cost-stall window and the residual projected gradient sits inside the
     /// flat certificate band — the score-relative stationarity bound
-    /// (`flat_valley_converged_grad_bound`) and/or the probe-noise-floor bound
-    /// measured from the stall window's own value scatter. `certificate_bound`
-    /// is the operative (widened) bound the residual actually cleared.
+    /// (`flat_valley_converged_grad_bound`), the probe-noise-floor bound
+    /// measured from the stall window's own value scatter, and/or the
+    /// curvature-scaled Newton-decrement bound (`newton_predicted_decrease`),
+    /// under which a residual above the gradient-magnitude bands is still
+    /// stationary when the second-order-predicted improvement `½·gᵀH⁻¹g` is below
+    /// the outer objective tolerance. `certificate_bound` is the operative
+    /// (widened) bound the residual actually cleared.
     CriterionFlat {
         residual_grad_norm: f64,
         certificate_bound: f64,
@@ -1073,6 +1077,103 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
         }
     }
     Some(true)
+}
+
+/// Second-order predicted objective decrease of a safeguarded Newton step at a
+/// flat-valley cost-stall exit (#2253/#2249/#2015).
+///
+/// On a flat-valley cost-stall exit the outer criterion has provably stopped
+/// improving (the cost-stall window fired), yet the re-measured projected
+/// gradient can sit modestly above the score-relative flat band on a
+/// weakly-identified small-n fit (measured: |Pg| ≈ 0.072 vs a score-relative
+/// band ≈ 0.053 on an n=84/p=64 K=1 circle). Whether that residual is genuine
+/// available descent is a SECOND-ORDER question. The improvement a safeguarded
+/// Newton step buys is the Newton decrement over two:
+///
+///     Δpred = ½ · gᵀ H⁻¹ g,
+///
+/// the textbook Newton stopping quantity (Boyd–Vandenberghe §9.5). When `Δpred`
+/// is below the outer objective tolerance, no step can reduce the criterion by
+/// more than that tolerance and the point is stationary at the resolution the
+/// criterion can be optimized — the mathematically correct "no further descent
+/// possible" criterion.
+///
+/// This is curvature-scaled, not a constant: because `H⁻¹` weights each gradient
+/// component by the inverse eigenvalue, a residual aligned with a NEAR-FLAT
+/// Hessian eigenvector (a linear ramp that DOES carry real descent) inflates
+/// `gᵀ H⁻¹ g` toward the roundoff-regularized `|g_flat|² / shift` and is
+/// REJECTED; only a residual that is small along the well-curved directions and
+/// nearly orthogonal to the flat ones certifies. An indefinite Hessian never
+/// reaches here — the certificate's curvature gate (`certificate_hessian_is_psd`)
+/// rejects a genuinely indefinite point independently, and this factorization
+/// returns `None` on a non-PSD shifted factor so the caller falls back to the
+/// gradient-only bound.
+///
+/// `hessian` and `grad` are the analytic outer Hessian and the KKT-PROJECTED
+/// gradient at the certified point. The shift `√ε · max|H_jj|` matches
+/// [`certificate_hessian_is_psd`] so the definiteness verdict and this decrement
+/// agree on the same regularized operator. Returns `None` when the shapes are
+/// malformed, an entry is non-finite, the shifted factor is not PD, or the
+/// resulting quadratic form is negative (impossible for a PD factor, guarded
+/// against roundoff).
+pub(crate) fn newton_predicted_decrease(
+    hessian: &Array2<f64>,
+    grad: &Array1<f64>,
+) -> Option<f64> {
+    let n = hessian.nrows();
+    if n == 0 || hessian.ncols() != n || grad.len() != n {
+        return None;
+    }
+    if hessian.iter().any(|v| !v.is_finite()) || grad.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+    let shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
+    // Lower Cholesky factor L of H + shift·I (same regularization the PSD probe
+    // uses), computed in place.
+    let mut l = hessian.clone();
+    for j in 0..n {
+        l[[j, j]] += shift;
+    }
+    for j in 0..n {
+        for k in 0..j {
+            let l_jk = l[[j, k]];
+            for i in j..n {
+                l[[i, j]] -= l[[i, k]] * l_jk;
+            }
+        }
+        let pivot = l[[j, j]];
+        if !(pivot > 0.0) || !pivot.is_finite() {
+            return None;
+        }
+        let inv_sqrt = 1.0 / pivot.sqrt();
+        for i in j..n {
+            l[[i, j]] *= inv_sqrt;
+        }
+    }
+    // Solve (L Lᵀ) d = g for d = H_s⁻¹ g: forward-substitute L y = g, then
+    // back-substitute Lᵀ d = y.
+    let mut y = grad.clone();
+    for j in 0..n {
+        let mut s = y[j];
+        for k in 0..j {
+            s -= l[[j, k]] * y[k];
+        }
+        y[j] = s / l[[j, j]];
+    }
+    let mut d = y;
+    for j in (0..n).rev() {
+        let mut s = d[j];
+        for k in (j + 1)..n {
+            s -= l[[k, j]] * d[k];
+        }
+        d[j] = s / l[[j, j]];
+    }
+    let quad = grad.dot(&d); // gᵀ H_s⁻¹ g ≥ 0 for a PD factor.
+    if !quad.is_finite() || quad < 0.0 {
+        return None;
+    }
+    Some(0.5 * quad)
 }
 
 /// Smoothing coordinates (leading ρ block) railed against the outer box.
@@ -1388,8 +1489,12 @@ pub(crate) fn certify_outer_optimality(
 
     let bounds = outer_bounds_template(config, layout.n_params);
     let grad_norm = evaluation.gradient.dot(&evaluation.gradient).sqrt();
-    let projected_grad_norm =
-        projected_gradient_norm(&result.rho, &evaluation.gradient, Some(&bounds));
+    // KKT-projected gradient VECTOR (not just its norm): the norm feeds the
+    // stationarity certificate below, and the vector feeds the curvature-scaled
+    // flat-valley Newton decrement (#2253/#2249/#2015) once the analytic Hessian
+    // is in hand.
+    let projected_gradient = project_gradient_vector(&result.rho, &evaluation.gradient, Some(&bounds));
+    let projected_grad_norm = projected_gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
     let solver_bound = outer_gradient_tolerance(config).threshold(evaluation.cost, grad_norm);
     let mut stationarity_bound = if matches!(
         result.operator_stop_reason,
@@ -1508,6 +1613,61 @@ pub(crate) fn certify_outer_optimality(
     } else {
         None
     };
+
+    // Curvature-scaled flat-valley stationarity (#2253/#2249/#2015). On a
+    // flat-valley cost-stall exit the criterion has provably stalled, but the
+    // re-measured projected gradient can sit modestly ABOVE the score-relative /
+    // probe-noise bands on a weakly-identified small-n fit even though NO step
+    // reduces the objective by more than the outer tolerance. Whether that
+    // residual is genuine descent is a second-order question the flat bands above
+    // cannot answer: they are gradient-magnitude tests, blind to how the local
+    // curvature maps a gradient to an objective change. The Newton decrement
+    // `½·gᵀH⁻¹g` (see `newton_predicted_decrease`) IS that map — the exact
+    // predicted improvement of a safeguarded second-order step. When it is below
+    // the outer objective tolerance, the point is stationary at the resolution
+    // the criterion can be optimized ("no further descent possible").
+    //
+    // Gated to a flat-valley cost-stall exit with a PSD analytic Hessian in hand,
+    // so it can NEVER touch a well-identified fit (which certifies via
+    // `solver_bound` and never enters this branch) and never certifies a point
+    // with real available descent (a gradient aligned with a near-flat Hessian
+    // direction inflates the decrement and is rejected; an indefinite Hessian is
+    // rejected by the curvature gate below). The derived widening is a genuine,
+    // direction-aware curvature-scaled GRADIENT bound — the largest ‖Pg‖ that, in
+    // this gradient's direction under this curvature, still predicts a decrease of
+    // exactly `objective_tol` — not a constant bump: because the decrement scales
+    // quadratically with ‖g‖ at fixed direction, that bound is
+    // `‖Pg‖·√(objective_tol/Δpred)`, which clears the actual ‖Pg‖ iff
+    // `Δpred ≤ objective_tol`.
+    if matches!(
+        result.operator_stop_reason,
+        Some(OperatorTrustRegionStopReason::CostStallFlatValley)
+    ) && let Some(hessian) = analytic_hessian.as_ref()
+        && let Some(predicted_decrease) =
+            newton_predicted_decrease(hessian, &projected_gradient)
+        && predicted_decrease.is_finite()
+        && predicted_decrease > 0.0
+    {
+        // The SAME relative cost floor the cost-stall guard used to declare the
+        // criterion stalled (run_plan.rs), so certification asserts nothing
+        // tighter than the loop already proved about this surface.
+        let objective_tol = config
+            .rel_cost_tolerance
+            .unwrap_or(config.tolerance * 1.0e-2)
+            .max(COST_STALL_REL_TOL_FLOOR)
+            * (1.0 + evaluation.cost.abs());
+        let curvature_grad_bound =
+            projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
+        if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
+            log::info!(
+                "[CERTIFICATE] {context}: curvature-scaled flat-valley bound {curvature_grad_bound:.3e} \
+                 (|Pg|={projected_grad_norm:.3e}, Newton ½gᵀH⁻¹g={predicted_decrease:.3e} ≤ tol {objective_tol:.3e}) \
+                 widened from gradient-band {stationarity_bound:.3e}"
+            );
+            stationarity_bound = curvature_grad_bound;
+        }
+    }
+
     let certificate = OuterCriterionCertificate {
         stationarity: OuterStationarityCertificate::AnalyticGradient {
             grad_norm,
