@@ -6272,19 +6272,12 @@ impl SaeManifoldTerm {
                 state_moved = true;
             }
             // Affine gauge canonicalization is a representation change, but the
-            // decoder smoothness term is part of the optimized objective. Keep the
-            // canonicalized state only when the same scalar used by the line search
-            // does not increase; otherwise REML would inspect an off-contract
-            // post-accept state whose gradient was never accepted.
-            let accepted_snapshot = self.snapshot_mutable_state();
-            let accepted_total =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-            self.canonicalize_affine_gauge_after_accept(Some(rho))?;
-            let canonical_total =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-            if !(canonical_total.is_finite() && canonical_total <= accepted_total) {
-                self.restore_mutable_state(&accepted_snapshot)?;
-            }
+            // decoder smoothness term is part of the optimized objective — a
+            // class-(c) objective-guarded transaction (kept move discarded: a
+            // pure representation change is not an evidence-map transition).
+            self.run_objective_guarded_hook(target, rho, analytic_penalties, 0.0, |term| {
+                term.canonicalize_affine_gauge_after_accept(Some(rho))
+            })?;
             // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
             // — the rejection paths `break` above), check every atom's support
             // and answer breaches with a bounded re-seed or a terminal
@@ -6417,43 +6410,24 @@ impl SaeManifoldTerm {
             // singular-value gauge, so rejection restores the complete
             // profiled state and evidence recurrence can observe a kept polar
             // update (#2253).
-            let pre_hook_obj =
-                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
-            let pre_hook_state = self.snapshot_mutable_state();
-            self.retract_unit_speed_charts_in_loop()?;
-            // #2015 — decoder-scaling-gauge fix: re-gauge any atom whose decoder
-            // has run off along the objective-flat `a_k·B_k` amplitude gauge (a
-            // dying atom's mass → 0, decoder → ∞) back onto the robust dictionary
-            // scale, so the KKT gradient (∝ Φᵀ B_k) does not explode at an
-            // objective-good iterate. Sits inside this hook's objective guard
-            // (`post_hook_obj <= pre_hook_obj` below), so a re-gauge that is not
-            // objective-preserving is reverted — the fix is only kept when it is
-            // the true flat-gauge move it is designed for.
-            self.fix_decoder_scale_gauge()?;
-            // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
-            // After the decoder `B` has been updated by the accepted (t, ΔC) step
-            // (lifted through the OLD frames in `apply_newton_step`), re-polar each
-            // ACTIVE atom's frame from the refreshed data evidence and re-project
-            // the decoder onto it, so the next assembly's C-block solve runs in an
-            // up-to-date frame. The refresh is a closed-form `O(p r²)` thin SVD per
-            // atom run OUTSIDE the border; the C-coordinates are held fixed during
-            // it (the block-coordinate split). Skipped entirely when no frame is
-            // active (the full-`B` path never touches this). One refresh per
-            // accepted outer iteration is a sensible cadence (the issue's
-            // streaming-polar fixed point).
-            if self.frames_active() {
-                self.refresh_active_frames_from_data(target)
-                    .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            }
-            let post_hook_obj = self
-                .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                .unwrap_or(f64::INFINITY);
-            if !(post_hook_obj.is_finite() && post_hook_obj <= pre_hook_obj) {
-                self.restore_mutable_state(&pre_hook_state)?;
-            } else if !self.matches_mutable_state(&pre_hook_state) {
-                // A kept unit-speed or polar-frame block update is a real
-                // transition of the evidence map. Without this bit the wrapper
-                // could report `fixed_point=true` after U moved invisibly.
+            // One class-(c) transaction for the whole re-gauge triple: the
+            // unit-speed retraction, the #2015 decoder-scale re-gauge (kept
+            // only when it is the true flat-gauge move it is designed for),
+            // and the #972/#977 frame re-polar (closed-form O(p r²) thin SVD
+            // per active atom, C-coordinates held fixed — skipped on the
+            // full-`B` path). A kept move is a real transition of the evidence
+            // map; without the bit the wrapper could report
+            // `fixed_point=true` after U moved invisibly (#2253).
+            if self.run_objective_guarded_hook(target, rho, analytic_penalties, 0.0, |term| {
+                term.retract_unit_speed_charts_in_loop()?;
+                term.fix_decoder_scale_gauge()?;
+                if term.frames_active() {
+                    term.refresh_active_frames_from_data(target).map_err(|err| {
+                        format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                    })?;
+                }
+                Ok(())
+            })? {
                 state_moved = true;
             }
             if let Ok(ev) = self.dictionary_reconstruction_ev(target, rho) {
@@ -6524,28 +6498,22 @@ impl SaeManifoldTerm {
                 inner_incumbent_restored = true;
                 state_moved = true;
                 if self.frames_active() {
-                    // #2230 — the post-restore frame re-polar is the SAME
-                    // non-monotone block-coordinate hook the in-loop pair
-                    // guards against (it can RAISE the penalized objective by
-                    // trading reconstruction residual for decoder smoothness).
-                    // Running it unguarded here perturbed the very incumbent
-                    // just restored for being the best objective. Guard it
-                    // identically: keep the re-polar only when the banked
-                    // objective does not increase, else return the incumbent
-                    // bit-for-bit.
-                    let pre_refresh_state = self.snapshot_mutable_state();
-                    self.refresh_active_frames_from_data(target)
-                        .map_err(|err| {
-                            format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
-                        })?;
-                    let post_refresh_obj = self
-                        .penalized_objective_total(target, rho, analytic_penalties, 1.0)
-                        .unwrap_or(f64::INFINITY);
-                    if !(post_refresh_obj.is_finite()
-                        && post_refresh_obj <= best_reconstruction_obj + obj_scale)
-                    {
-                        self.restore_mutable_state(&pre_refresh_state)?;
-                    }
+                    // #2230 — the post-restore frame re-polar is a class-(c)
+                    // transaction like the in-loop triple; unguarded it
+                    // perturbed the very incumbent just restored for being the
+                    // best objective. Same tolerance band as the restore
+                    // decision.
+                    self.run_objective_guarded_hook(
+                        target,
+                        rho,
+                        analytic_penalties,
+                        obj_scale,
+                        |term| {
+                            term.refresh_active_frames_from_data(target).map_err(|err| {
+                                format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                            })
+                        },
+                    )?;
                 }
             }
         }
@@ -6652,6 +6620,42 @@ impl SaeManifoldTerm {
             termination,
             state_moved,
         })
+    }
+
+    /// Class-(c) hook primitive — the OBJECTIVE-GUARDED TRANSACTION.
+    ///
+    /// Every representation re-gauge at an accepted-iterate boundary (affine
+    /// canonicalization, unit-speed retraction, scale re-gauge, frame
+    /// re-polar) must obey one contract: run the hook, and keep its result
+    /// ONLY when the penalized objective — the single scalar the line search
+    /// descends and the evidence ranks — does not increase past
+    /// `allowed_increase`; otherwise restore the pre-hook state bit-for-bit.
+    /// This was hand-rolled inline at three sites with drift between copies;
+    /// it is now one primitive. Returns whether a KEPT hook actually moved the
+    /// state (`false` when reverted or a no-op) so callers can maintain the
+    /// #2253 idempotence bookkeeping.
+    pub(crate) fn run_objective_guarded_hook<F>(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        allowed_increase: f64,
+        hook: F,
+    ) -> Result<bool, String>
+    where
+        F: FnOnce(&mut Self) -> Result<(), String>,
+    {
+        let pre_obj = self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+        let pre_state = self.snapshot_mutable_state();
+        hook(self)?;
+        let post_obj = self
+            .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+            .unwrap_or(f64::INFINITY);
+        if !(post_obj.is_finite() && post_obj <= pre_obj + allowed_increase) {
+            self.restore_mutable_state(&pre_state)?;
+            return Ok(false);
+        }
+        Ok(!self.matches_mutable_state(&pre_state))
     }
 
     /// Deterministic alternating block-sweep engine: decoder-LSQ →
