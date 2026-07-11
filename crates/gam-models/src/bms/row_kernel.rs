@@ -1101,7 +1101,7 @@ impl BernoulliRigidRowKernel {
                 }
                 Ok(acc)
             },
-            |mut left, right| {
+            |mut left, right| -> Result<BernoulliBlockHessianAccumulator, String> {
                 left.add(&right);
                 Ok(left)
             },
