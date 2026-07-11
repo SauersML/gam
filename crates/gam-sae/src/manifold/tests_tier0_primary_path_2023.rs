@@ -160,6 +160,7 @@ mod tests {
             promote_from_residual: false,
             run_structure_search: false,
             run_outer_rho_search: false,
+            structured_residual_passes: None,
             cancel: None,
         })
         .expect("primary fit runs")

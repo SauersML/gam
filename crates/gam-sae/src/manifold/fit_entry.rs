@@ -541,6 +541,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         promote_from_residual,
         run_structure_search,
         run_outer_rho_search,
+        structured_residual_passes,
         cancel,
     } = request;
     let (n_obs, p_out) = z.dim();
