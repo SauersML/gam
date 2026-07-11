@@ -3413,12 +3413,16 @@ fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
     }
 }
 
-/// Exact scale of the decoder data curvature relative to one unit of an
-/// atom's native smoothing penalty. The trace of `P⁺G` bounds the largest
-/// generalized eigenvalue of `(G, P)` on `range(P)`, so choosing
-/// `lambda >= tr(P⁺G)` makes the native penalty at least as strong as the
-/// likelihood on every penalized decoder direction. Null directions remain
-/// identified by the likelihood and are deliberately absent from this scale.
+/// Exact scale of the decoder data curvature relative to one unit of an atom's
+/// native smoothing penalty. This is the largest generalized eigenvalue of
+/// `(G, P)` on `range(P)`, computed as
+/// `lambda_max(P⁺¹ᐟ² G P⁺¹ᐟ²)`. Choosing `lambda` at this value is the
+/// *minimal* native penalty strength that is at least as strong as the
+/// likelihood on every penalized decoder direction. The former trace bound
+/// `tr(P⁺G)` had the same dominance property but summed the curvature of every
+/// mode, inflating the entry by up to the penalty rank and over-smoothing the
+/// fixed-rho corrector. Null directions remain identified by the likelihood and
+/// are deliberately absent from this scale.
 fn reactive_smooth_curvature_scale(
     term: &SaeManifoldTerm,
     assignments: &Array2<f64>,
@@ -3469,18 +3473,63 @@ fn reactive_smooth_curvature_scale(
         }
     }
 
-    let mut generalized_trace = 0.0_f64;
-    for row in 0..m {
-        for col in 0..m {
-            generalized_trace += penalty_pinv[[row, col]] * data_gram[[col, row]];
-        }
-    }
-    if !(generalized_trace.is_finite() && generalized_trace >= 0.0) {
+    // Form the PSD square root of P⁺ on exactly the retained penalty range.
+    // `block_penalty_rank_and_pinv` owns the rank tolerance; retaining the
+    // largest `rank` eigenpairs here reuses that decision without reviving tiny
+    // numerical eigenvalues in the null space.
+    let (pinv_eigenvalues, pinv_eigenvectors) = penalty_pinv
+        .eigh(Side::Lower)
+        .map_err(|error| format!("reactive rho domain P⁺ spectrum failed: {error}"))?;
+    if !pinv_eigenvalues.iter().all(|value| value.is_finite()) {
         return Err(format!(
-            "reactive rho domain: atom {atom_idx} generalized decoder curvature is invalid ({generalized_trace})"
+            "reactive rho domain: atom {atom_idx} P⁺ spectrum is non-finite"
         ));
     }
-    Ok((generalized_trace > 0.0).then_some(generalized_trace))
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&left, &right| {
+        pinv_eigenvalues[right]
+            .partial_cmp(&pinv_eigenvalues[left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut scaled_vectors = Array2::<f64>::zeros((m, m));
+    for &col in order.iter().take(rank) {
+        let eigenvalue = pinv_eigenvalues[col];
+        if !(eigenvalue.is_finite() && eigenvalue > 0.0) {
+            return Err(format!(
+                "reactive rho domain: atom {atom_idx} retained P⁺ eigenvalue is invalid ({eigenvalue})"
+            ));
+        }
+        let scale = eigenvalue.sqrt();
+        for row in 0..m {
+            scaled_vectors[[row, col]] = pinv_eigenvectors[[row, col]] * scale;
+        }
+    }
+    let pinv_sqrt = scaled_vectors.dot(&pinv_eigenvectors.t());
+    let mut standardized_curvature = pinv_sqrt.dot(&data_gram).dot(&pinv_sqrt);
+    for row in 0..m {
+        for col in 0..row {
+            let symmetric =
+                0.5 * (standardized_curvature[[row, col]] + standardized_curvature[[col, row]]);
+            standardized_curvature[[row, col]] = symmetric;
+            standardized_curvature[[col, row]] = symmetric;
+        }
+    }
+    let (generalized_eigenvalues, _) = standardized_curvature
+        .eigh(Side::Lower)
+        .map_err(|error| format!("reactive rho domain generalized spectrum failed: {error}"))?;
+    if !generalized_eigenvalues
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Err(format!(
+            "reactive rho domain: atom {atom_idx} generalized decoder spectrum is non-finite"
+        ));
+    }
+    let largest = generalized_eigenvalues
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
+    Ok((largest > 0.0).then_some(largest))
 }
 
 /// Exact observed Gauss--Newton scale of one Euclidean latent coordinate at the
@@ -3559,12 +3608,13 @@ fn reactive_ard_curvature_scale(
 /// is outside the SAE objective's structural domain: it drives the dictionary
 /// below the exact signal-free null floor before continuation can start. This
 /// contract instead uses the objective's literal entry assignments and native
-/// penalty geometry. Decoder smoothness is bounded by `tr(P⁺G)`; Euclidean
-/// ARD is bounded by its observed latent Gauss--Newton curvature. Periodic ARD
-/// stays at its literal target because the von-Mises Hessian changes sign and
-/// therefore cannot define a convexifying heavy-entry direction. Every bound is
-/// at least the literal target strength. No criterion probe or fitted-state trial
-/// participates in constructing the box.
+/// penalty geometry. Decoder smoothness is bounded by the exact largest
+/// generalized eigenvalue of `(G, P)`; Euclidean ARD is bounded by its observed
+/// latent Gauss--Newton curvature. Periodic ARD stays at its literal target
+/// because the von-Mises Hessian changes sign and therefore cannot define a
+/// convexifying heavy-entry direction. Every bound is at least the literal
+/// target strength. No criterion probe or fitted-state trial participates in
+/// constructing the box.
 fn reactive_rho_domain_upper(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,

@@ -291,33 +291,48 @@ fn freeze_contract_bypasses_the_bundle() {
 }
 
 /// (C) Anti-hysteresis: the envelope is a well-defined FUNCTION of ρ, so the
-/// production `eval_cost` value at a FIXED ρ is STABLE across re-evaluation — the
-/// exact property the hysteretic single-trajectory criterion lacked (its value
-/// depended on which basin the warm start last landed in, so re-evaluating the
-/// same ρ churned). The value lane never commits `self.term`, so the discovery
-/// trajectory is identical across visits and every saved member re-converges from
-/// its own already-at-ρ state, giving a reproducible envelope value.
+/// production `eval_cost` value at a FIXED LEGAL ρ is STABLE across re-evaluation
+/// — the exact property the hysteretic single-trajectory criterion lacked (its
+/// value depended on which basin the warm start last landed in, so re-evaluating
+/// the same ρ churned). Dense K≥2 objectives may require their typed reactive
+/// entry before the literal target has defined evidence; direct evaluation must
+/// therefore use the same objective-owned entry rho and scalar state the runner
+/// uses, rather than bypassing that domain contract. The value lane never commits
+/// `self.term`, so the discovery trajectory is identical across visits and every
+/// saved member re-converges from its own already-at-ρ state, giving a
+/// reproducible envelope value.
 ///
 /// (The complementary invariant — admitting a basin can only LOWER the envelope —
 /// is the bundle's own algebra, unit-tested in `basin_bundle.rs`
 /// [`admitting_a_better_basin_lowers_the_envelope_and_switches_argmin`] and
 /// [`envelope_is_continuous_across_the_basin_crossing`].)
 #[test]
-fn fixed_rho_envelope_value_is_stable_across_re_evaluation() {
+fn fixed_legal_rho_envelope_value_is_stable_across_re_evaluation() {
     let n = 96;
     let p = 48;
     let k = 2;
-    let (mut objective, _z, seed) = two_circle_objective(n, p, k, 2, 8);
+    let (mut objective, _z, _seed) = two_circle_objective(n, p, k, 2, 8);
+    let legal_rho = OuterObjective::outer_domain_upper_bound(&objective)
+        .expect("objective legal rho construction must succeed")
+        .expect("dense K=2 objective must advertise a legal rho entry");
+    let scalar_contract = OuterObjective::reactive_domain_scalar_contract(&objective)
+        .expect("reactive scalar contract construction must succeed")
+        .expect("dense K=2 objective must advertise a reactive scalar entry");
+    OuterObjective::install_reactive_domain_scalar_state(
+        &mut objective,
+        scalar_contract.entry(),
+    )
+    .expect("objective must install its own legal scalar entry");
 
     let c1 = objective
-        .eval_cost(&seed)
-        .expect("first seed-ρ envelope eval must succeed");
+        .eval_cost(&legal_rho)
+        .expect("first legal-ρ envelope eval must succeed");
     let c2 = objective
-        .eval_cost(&seed)
-        .expect("second seed-ρ envelope eval must succeed");
+        .eval_cost(&legal_rho)
+        .expect("second legal-ρ envelope eval must succeed");
     let c3 = objective
-        .eval_cost(&seed)
-        .expect("third seed-ρ envelope eval must succeed");
+        .eval_cost(&legal_rho)
+        .expect("third legal-ρ envelope eval must succeed");
     let telemetry = objective.probe_telemetry();
 
     // The envelope value at a fixed ρ is reproducible to within the inner
