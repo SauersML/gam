@@ -26,12 +26,39 @@ use crate::manifold::{
     TwoBlockRemlControls, atom_behavior_isometry, reconstruction_explained_variance,
 };
 
-/// Numerically stable softmax — the planted behavior law.
-fn softmax(logits: &[f64]) -> Vec<f64> {
-    let m = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let exps: Vec<f64> = logits.iter().map(|&l| (l - m).exp()).collect();
-    let sum: f64 = exps.iter().sum();
-    exps.into_iter().map(|e| e / sum).collect()
+/// A probability law whose square-root half-density traces an exact circle.
+///
+/// `SphereTangentEmbedding` fits the normalized mean half-density as its
+/// basepoint and projects orthogonally to it. The four fixed vectors below are
+/// orthonormal, with `e1/e2/e3` tangent to the positive basepoint `b`. Hence
+///
+/// `q(t) = radial(t)b + radius(cos ψ e1 + sin ψ e2) + residual(t)e3`
+///
+/// has unit norm and strictly positive coordinates, and `p = q⊙q` embeds back
+/// to the declared tangent circle. For the REML fixture only, `residual_amp`
+/// adds an order-9 orthogonal component outside the fitted harmonic basis: it
+/// keeps the behavior RSS positive (so λ_y is identifiable) while the fitted
+/// decoder remains the clean constant-speed circle.
+fn sphere_circle_probabilities(
+    angle: f64,
+    base_angle: f64,
+    residual_amp: f64,
+) -> [f64; 4] {
+    let inv_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
+    let b = [0.5_f64; 4];
+    let e1 = [inv_sqrt_two, -inv_sqrt_two, 0.0, 0.0];
+    let e2 = [0.5, 0.5, -0.5, -0.5];
+    let e3 = [0.0, 0.0, inv_sqrt_two, -inv_sqrt_two];
+    let radius = 0.25_f64;
+    let residual = residual_amp * (9.0 * base_angle).sin();
+    let radial = (1.0 - radius * radius - residual * residual).sqrt();
+    let (cos_angle, sin_angle) = (angle.cos(), angle.sin());
+    std::array::from_fn(|token| {
+        let q = radial * b[token]
+            + radius * (cos_angle * e1[token] + sin_angle * e2[token])
+            + residual * e3[token];
+        q * q
+    })
 }
 
 /// K=1 periodic (circle) atom at the augmented output width, cold decoders.
@@ -103,7 +130,7 @@ fn fitted_defect(uneven: bool) -> (f64, f64, f64) {
         } else {
             theta
         };
-        let law = softmax(&[0.7 * psi.cos(), 0.7 * psi.sin(), 0.2, 0.0]);
+        let law = sphere_circle_probabilities(psi, theta, 0.0);
         for j in 0..vocab {
             probs[[i, j]] = law[j];
         }
@@ -185,7 +212,7 @@ fn isometry_defect_separates_isometric_from_broken() {
     // The scaled-isometric atom reports a small defect: the two induced metrics
     // are proportional along the shared coordinate.
     assert!(
-        defect_iso < 0.15,
+        defect_iso < 0.05,
         "scaled-isometric atom should report a low defect, got {defect_iso}"
     );
     // The broken atom's behavior winds ~9× faster/slower across the circle, so its
@@ -247,7 +274,7 @@ fn reml_fitted_defect(uneven: bool) -> (f64, bool, bool, f64) {
         } else {
             theta
         };
-        let law = softmax(&[0.7 * psi.cos(), 0.7 * psi.sin(), 0.2, 0.0]);
+        let law = sphere_circle_probabilities(psi, theta, 0.05);
         for j in 0..vocab {
             probs[[i, j]] = law[j];
         }
@@ -372,7 +399,7 @@ fn reml_selected_coupling_then_isometry_defect_separates() {
 
     // The defect, measured on the REML-coupled fit, still separates the cases.
     assert!(
-        defect_iso < 0.15,
+        defect_iso < 0.05,
         "scaled-isometric atom should report a low defect on the REML fit, got {defect_iso}"
     );
     assert!(
