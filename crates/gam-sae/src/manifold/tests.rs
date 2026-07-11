@@ -3525,7 +3525,6 @@ fn analytic_outer_gradient_with_bundle_matches_dense_assembly() {
             &cache,
             &solver,
             Some((&probes, &sinv)),
-            None,
         )
         .unwrap();
 
