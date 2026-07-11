@@ -17,6 +17,7 @@ use super::dispersion_family::{
     DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
 };
 use super::test_support::dispersion_tweedie_nll_generic;
+use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 
 /// Dense `Tower4<2>` Tweedie row NLL oracle: the #932 all-channels instantiation
 /// of the single-source [`dispersion_tweedie_nll_generic`] that production runs
@@ -36,6 +37,7 @@ fn dispersion_tweedie_nll_tower(
 use crate::wiggle::{
     initializewiggle_knots_from_seed, monotone_wiggle_internal_degree, split_wiggle_penalty_orders,
 };
+use gam_data::encode_recordswith_inferred_schema;
 use gam_terms::basis::{
     CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
     create_basis,
@@ -4956,12 +4958,9 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
     };
 
     // x uniform on [-3, 3] (matches the released repro grid).
-    let mut data = Array2::<f64>::zeros((n, 1));
     let mut xs = Vec::with_capacity(n);
-    for i in 0..n {
-        let x = -3.0 + 6.0 * next_unit();
-        data[[i, 0]] = x;
-        xs.push(x);
+    for _ in 0..n {
+        xs.push(-3.0 + 6.0 * next_unit());
     }
     let true_mean: Vec<f64> = xs.iter().map(|&x| 1.0 + 0.7 * x + x.sin()).collect();
     // Constant true scale: the data are homoscedastic (het = 0).
@@ -4970,46 +4969,37 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
         let z = standard_normal_quantile(next_unit()).expect("finite probit draw");
         true_mean[i] + true_sigma * z
     }));
-    let weights = Array1::from_elem(n, 1.0);
-
-    let constant_scale_fit = fit_gaussian_location_scale_terms(
-        data.view(),
-        GaussianLocationScaleTermSpec {
-            y: y.clone(),
-            weights: weights.clone(),
-            meanspec: simple_matern_term_collection(&[0], 0.6),
-            log_sigmaspec: empty_term_collection(),
-            mean_offset: Array1::zeros(n),
-            log_sigma_offset: Array1::zeros(n),
+    // Exercise the exact released formula path named by the regression report.
+    // The old fixture substituted the spatial Matérn smoke helper for `s(x)`;
+    // its three-penalty, five-column mean collapsed even when the scale block was
+    // constant, so it did not isolate a location-scale failure. This dataset and
+    // formula now pass through the same thin-plate materialization, joint fit,
+    // and raw-response rescaling users invoke.
+    let headers = vec!["x".to_string(), "y".to_string()];
+    let rows = xs
+        .iter()
+        .zip(y.iter())
+        .map(|(&x, &y)| csv::StringRecord::from(vec![format!("{x:.17e}"), format!("{y:.17e}")]))
+        .collect();
+    let dataset =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode homoscedastic fixture");
+    let result = fit_from_formula(
+        "y ~ s(x, bs='tp')",
+        &dataset,
+        &FitConfig {
+            family: Some("gaussian".to_string()),
+            noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+            ..FitConfig::default()
         },
-        &spatial_fit_smoke_options(),
-        &spatial_kappa_options(),
     )
-    .expect("gaussian location-scale constant-noise homoscedastic diagnostic fit");
-
-    let spec = GaussianLocationScaleTermSpec {
-        y,
-        weights,
-        // `TermCollectionSpec` contributes the ordinary formula intercept as a
-        // separate unpenalized block. The Matérn smooth itself is centered, so
-        // `include_intercept` must remain false to avoid duplicating that null
-        // direction inside the smooth.
-        meanspec: simple_matern_term_collection(&[0], 0.6),
-        log_sigmaspec: simple_matern_term_collection(&[0], 0.6),
-        mean_offset: Array1::zeros(n),
-        log_sigma_offset: Array1::zeros(n),
+    .expect("gaussian location-scale smooth-noise homoscedastic formula fit");
+    let FitResult::GaussianLocationScale(fit) = result else {
+        panic!("homoscedastic noise formula must route to Gaussian location-scale");
     };
-    let fit = fit_gaussian_location_scale_terms(
-        data.view(),
-        spec,
-        &spatial_fit_smoke_options(),
-        &spatial_kappa_options(),
-    )
-    .expect("gaussian location-scale smooth-noise homoscedastic fit");
 
     // The mean block (BLOCK_MU = 0) carries identity-link η = predicted mean
     // (mean_offset is zero), so its state η is the fitted mean directly.
-    let mean_eta = &fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+    let mean_eta = &fit.fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
     assert_eq!(mean_eta.len(), n);
     let mut sq_err = 0.0;
     for i in 0..n {
@@ -5017,47 +5007,6 @@ pub(crate) fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean()
         sq_err += d * d;
     }
     let mean_rmse = (sq_err / n as f64).sqrt();
-
-    let constant_scale_mean =
-        &constant_scale_fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
-    let constant_scale_mean_rmse = (constant_scale_mean
-        .iter()
-        .zip(&true_mean)
-        .map(|(fitted, truth)| (fitted - truth).powi(2))
-        .sum::<f64>()
-        / n as f64)
-        .sqrt();
-
-    let log_sigma_eta = &fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
-    let mean_min = mean_eta.iter().copied().fold(f64::INFINITY, f64::min);
-    let mean_max = mean_eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let scale_mean = log_sigma_eta.iter().sum::<f64>() / n as f64;
-    let scale_sd = (log_sigma_eta
-        .iter()
-        .map(|value| (value - scale_mean).powi(2))
-        .sum::<f64>()
-        / n as f64)
-        .sqrt();
-    let scale_min = log_sigma_eta.iter().copied().fold(f64::INFINITY, f64::min);
-    let scale_max = log_sigma_eta
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    eprintln!(
-        "#365 homoscedastic diagnostic: rmse={mean_rmse:.6} constant_scale_rmse={constant_scale_mean_rmse:.6} mean_range=[{mean_min:.6}, {mean_max:.6}] log_sigma_eta_mean={scale_mean:.6} log_sigma_eta_sd={scale_sd:.6} log_sigma_eta_range=[{scale_min:.6}, {scale_max:.6}] mean_cols={} scale_cols={} mean_penalties={} scale_penalties={} log_lambdas={:?} blocks={:?} outer_iters={} outer_grad={:?} reml={:.6} constant_scale_log_lambdas={:?} constant_scale_blocks={:?} constant_scale_reml={:.6}",
-        fit.mean_design.design.ncols(),
-        fit.noise_design.design.ncols(),
-        fit.mean_design.penalties.len(),
-        fit.noise_design.penalties.len(),
-        fit.fit.log_lambdas,
-        fit.fit.blocks,
-        fit.fit.outer_iterations,
-        fit.fit.outer_gradient_norm,
-        fit.fit.reml_score,
-        constant_scale_fit.fit.log_lambdas,
-        constant_scale_fit.fit.blocks,
-        constant_scale_fit.fit.reml_score,
-    );
 
     // A correctly converged mean tracks the truth to well within the noise
     // scale; the #365 collapse-to-grand-mean failure produces RMSE ~1.5.
