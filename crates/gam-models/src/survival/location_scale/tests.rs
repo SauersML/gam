@@ -6700,8 +6700,8 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
                     }
                 }};
             }
-            assert_eq!(9 + pw, 13, "fixture's clamped cubic basis width changed");
-            run_kw!(13);
+            assert_eq!(9 + pw, 12, "fixture's clamped cubic basis width changed");
+            run_kw!(12);
         }
 
         // #932: the production single-source §13 wiggle joint Hessian
