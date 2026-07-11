@@ -186,11 +186,22 @@ fn inner_gradient_matches_penalized_objective_fd_2015() {
     .expect("inner evidence fit must not hard-error");
     let rho = rho_fixed;
 
+    // Align the base's frozen intrinsic bending Gram S̃ with what
+    // `assemble_arrow_schur` freezes at entry (the #673 lagged-diffusivity
+    // chokepoint): the assembled `gt` does NOT differentiate through S̃'s
+    // coord-dependence, and `refresh_basis` (used on every perturbation clone
+    // below) leaves `atom.smooth_penalty` untouched, so the coord FD correctly
+    // differentiates the SAME frozen-Gram objective `gt` prices — provided base
+    // is refreshed once here. Skipping this injects a spurious ~λ(S̃−I)B coord
+    // desync that is a fixture artifact, not a term bug (see `sae_fd_check_case`).
+    let mut base = term;
+    for atom in &mut base.atoms {
+        atom.refresh_intrinsic_smooth_penalty();
+    }
     // Freeze the transient collinearity gates on the base and re-install them on
     // every perturbation clone (the custom `Clone` resets them to `None`), exactly
     // as the optimizer's snapshot/restore does — otherwise the FD silently omits
     // the frozen-gate repulsion/barrier gradients `gb` legitimately carries.
-    let mut base = term;
     base.refresh_decoder_repulsion_gate();
     base.refresh_barrier_coactivation_gate();
     let base = base;
