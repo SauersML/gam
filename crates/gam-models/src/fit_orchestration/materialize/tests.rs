@@ -993,8 +993,7 @@ fn matern_is_excluded_from_generic_adaptive_center_growth() {
     let FitRequest::Standard(raw_request) = raw.request else {
         panic!("expected standard Matérn request");
     };
-    let SmoothBasisSpec::Matern { spec: raw_spec, .. } =
-        &raw_request.spec.smooth_terms[0].basis
+    let SmoothBasisSpec::Matern { spec: raw_spec, .. } = &raw_request.spec.smooth_terms[0].basis
     else {
         panic!("expected Matérn basis");
     };
