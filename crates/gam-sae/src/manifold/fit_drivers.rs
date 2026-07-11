@@ -5353,9 +5353,25 @@ impl SaeManifoldTerm {
         // joint solve runs in the factored coordinate space.
         self.ensure_decoder_frames_active_for_current_decoder()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-        // #976 Layer-1 guard ledger is per joint fit: each inner solve gets a
-        // fresh re-seed budget and reports only its own breaches.
-        self.collapse_events.clear();
+        // #976 Layer-1 guard ledger is per joint fit for ORDINARY fits: each
+        // standalone inner solve gets a fresh re-seed budget and reports only
+        // its own breaches. EVIDENCE lanes (`allow_heuristic_termination ==
+        // false`) are different: `converge_inner_for_undamped_logdet` re-enters
+        // this driver once per refine round (16–64 rounds per criterion
+        // evaluation), and clearing here handed every round a fresh per-atom
+        // reseed budget — so an atom sitting near its collapse threshold was
+        // reseeded roughly once per round, each reseed an unguarded state jump
+        // that spikes ‖g‖ at an objective-good iterate (the measured 2.887e8
+        // gradient spike in `tests_inner_budget_trajectory_2015`), breaking
+        // `refine_round_made_progress`'s monotone-decrease requirement and
+        // collapsing the 64× progress budget back to base. The evidence ledger
+        // is therefore PER CRITERION EVALUATION: cleared once at the
+        // `reml_criterion*` entry, persistent across refine re-entries, so the
+        // per-atom budget (`SAE_ATOM_COLLAPSE_RESEED_BUDGET`) genuinely bounds
+        // reseeds over the whole converge-to-KKT drive.
+        if allow_heuristic_termination {
+            self.collapse_events.clear();
+        }
         // #1003 — run the active-mass guard at ENTRY (iteration 0), before the
         // pre-fit identifiability audit. A cold seed can hand the fit an atom
         // whose gates are vacuous on every row (the outer seed cascade sweeps
@@ -6083,15 +6099,37 @@ impl SaeManifoldTerm {
             // CollapseEvent. Runs post-acceptance so it never perturbs a
             // line-search trial, and any re-seed is simply the next
             // iteration's starting state.
-            self.enforce_active_mass_guard(outer_iteration, Some(rho))?;
-            // #976 Layer-1 guard 3b (decoder arm): the gate-mass guard above is
-            // blind to a dictionary whose gates stay spread but whose decoders
-            // have all collapsed to ≈0 (the real-data K>1 failure that drives
-            // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
-            // that has fallen far behind its peers and reseed it onto the
-            // residual; a strict no-op for K=1.
-            self.enforce_decoder_norm_guard(target, outer_iteration, rho, Some(&target_col_stats))?;
-            self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
+            //
+            // QUIESCENCE near stationarity: a reseed is a rescue for a
+            // collapsed basin the line search cannot escape; near a KKT root it
+            // is never a rescue — it is a deliberate state jump that spikes ‖g‖
+            // at an objective-good iterate (the measured 2.887e8 gradient spike
+            // in `tests_inner_budget_trajectory_2015`), invalidates the #2253
+            // idempotence certificate, and breaks the evidence refine loop's
+            // monotone-‖g‖ progress accounting. Once the joint KKT residual is
+            // within one order of magnitude of the acceptance band the guards
+            // stand down; a genuinely collapsed dictionary never gets there (a
+            // vanished atom leaves a live data-fit gradient), so the rescue
+            // path is untouched exactly where it is needed.
+            let kkt_quiescent = grad_norm_sq.is_finite()
+                && grad_norm_sq.sqrt()
+                    <= 10.0 * SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.inner_iterate_scale();
+            if !kkt_quiescent {
+                self.enforce_active_mass_guard(outer_iteration, Some(rho))?;
+                // #976 Layer-1 guard 3b (decoder arm): the gate-mass guard above is
+                // blind to a dictionary whose gates stay spread but whose decoders
+                // have all collapsed to ≈0 (the real-data K>1 failure that drives
+                // EV→0 and the `0 → K·n` evidence-deflation abort). Catch a decoder
+                // that has fallen far behind its peers and reseed it onto the
+                // residual; a strict no-op for K=1.
+                self.enforce_decoder_norm_guard(
+                    target,
+                    outer_iteration,
+                    rho,
+                    Some(&target_col_stats),
+                )?;
+                self.enforce_structural_coherence_guard(target, outer_iteration, rho)?;
+            }
             // #2089 defense-in-depth: never grind a hopeless fit (and never let a
             // CPU watchdog SIGKILL the host while it does). When the co-collapse
             // multi-start budget is fully spent yet the dictionary is STILL at or

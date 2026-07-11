@@ -113,6 +113,13 @@ impl SaeManifoldTerm {
         refine_progress_extension: bool,
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss), String> {
+        // #976 evidence-ledger scope: one criterion evaluation = one per-atom
+        // reseed budget. The joint-fit driver no longer clears the ledger on
+        // evidence re-entries (each refine round used to get a fresh budget and
+        // could fire an unguarded reseed once per round — the ‖g‖-spike /
+        // progress-budget-collapse pathology), so the criterion entry owns the
+        // clear.
+        self.collapse_events.clear();
         let plan = self.streaming_plan().admitted_or_error(
             self.n_obs(),
             self.output_dim(),
@@ -193,6 +200,11 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        // #976 evidence-ledger scope (see `reml_criterion_with_refine_policy_
+        // and_lane`): direct cache-lane callers also get a fresh per-evaluation
+        // reseed budget here; the double clear when routed through the value
+        // entry is an idempotent no-op.
+        self.collapse_events.clear();
         let admission_plan = self.streaming_plan().admitted_or_error(
             self.n_obs(),
             self.output_dim(),
