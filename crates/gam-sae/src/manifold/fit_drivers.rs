@@ -5754,21 +5754,22 @@ impl SaeManifoldTerm {
         // coupling + KKT gate) instead of as the bulk workhorse. The
         // max_iter == 0 freeze already returned above.
         //
-        // DISCOVERY LANES ONLY (#2253 idempotence): the evidence refine loop
-        // re-enters this driver in small chunks, and an ENTRY sweep runs after
-        // the entry hooks (basis refresh, guards, per-assembly gate freezes),
-        // whose ε-level state drift lets each re-entry harvest one more strict
-        // ε-decrease — a fresh state move on every re-entry, so the inner map
-        // never recurs exactly and the fit is refused as non-idempotent
-        // (measured: tier-0 K=2 fixtures, KKT band entered, refused at 512).
-        // Evidence lanes get the POST-loop sweep below instead, which runs at
-        // the walk's own fixed point and reverts there (idempotent — the
-        // historically green polish position); the frames-aware LSQ reset that
-        // killed the wide-p divergence lives in the helper and therefore
-        // applies at the post-loop position identically.
-        if allow_heuristic_termination
-            && self.sweep_blocks_to_objective_fixed_point(target, rho, analytic_penalties, true)?
-        {
+        // BOTH LANES sweep at entry, with LANE-DEPENDENT commit floors (see
+        // `sweep_blocks_to_objective_fixed_point`): the measured A/B pair
+        // proved the entry sweep is BOTH the wide-p divergence kill (a blown
+        // or cold entry state's decoder-LSQ decrease is O(objective); removing
+        // the entry sweep restored the ‖g‖≈3e27 baseline blow-up bit-for-bit)
+        // AND, at the fine floor, the #2253 idempotence breaker on evidence
+        // re-entries (per-assembly gate-freeze drift lets each re-entry
+        // harvest a fresh ε-decrease ⇒ refused as non-idempotent at 512). The
+        // evidence lane therefore commits only MATERIAL decreases
+        // (STALL_FRACTION of scale): the rescue passes, the harvest cannot.
+        if self.sweep_blocks_to_objective_fixed_point(
+            target,
+            rho,
+            analytic_penalties,
+            allow_heuristic_termination,
+        )? {
             state_moved = true;
         }
         for outer_iteration in 0..max_iter {
@@ -6700,31 +6701,42 @@ impl SaeManifoldTerm {
     /// do in O(1) exact block solves what the majorized joint Newton needs
     /// O(10²–10³) linear-rate iterations for. Returns whether any round was
     /// committed.
-    /// `gate_ownership_stage` — whether the logit-block ownership rounds run.
-    /// The #2082 anchor is a CONSTANT nudge (±1 temperature unit toward the
-    /// owning atom), not a fixed-point iteration: every invocation that finds
-    /// a strict decrease moves the state again, so it is non-idempotent BY
-    /// DESIGN. On EVIDENCE lanes (`allow_heuristic_termination == false`) the
-    /// #2253 idempotence certificate demands that a re-entry at the converged
-    /// state recur exactly — an anchor commit there is a fresh strict move on
-    /// every re-entry and the fit is refused as a non-idempotent inner map
-    /// (measured: KKT band entered, refused after 512 granted iterations on
-    /// the tier-0 K=2 fixtures). Gate ownership is DISCOVERY, certification
-    /// is exact: ordinary fits get the EM gate stage, evidence lanes get the
-    /// pure (t, B) sweeps, whose loop-until-no-strict-decrease IS idempotent
-    /// (at the fixed point the next round reverts and reports no move).
+    /// `discovery_lane` — two lane-dependent behaviors, both consequences of
+    /// the #2253 idempotence certificate (a re-entry at the converged state
+    /// must recur EXACTLY on evidence lanes):
+    ///
+    /// 1. The logit-block ownership rounds run on discovery lanes only. The
+    ///    #2082 anchor is a CONSTANT nudge, not a fixed-point iteration —
+    ///    non-idempotent by design.
+    /// 2. The commit floor is MATERIAL on evidence lanes
+    ///    (`SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION` = 1e-4 of scale)
+    ///    versus fine on discovery lanes (`…_STALL_REL_TOL` = 1e-8). Measured
+    ///    A/B pair behind this: a cold or blown entry state's decoder-LSQ
+    ///    clears the material floor by orders of magnitude (the wide-p
+    ///    ‖g‖≈3e27 divergence kill NEEDS the entry sweep — removing it
+    ///    restored the baseline blow-up bit-for-bit), while the ε-level
+    ///    objective drift injected per evidence re-entry by the entry hooks'
+    ///    per-assembly gate freezes harvests only ~1e-8·scale decreases —
+    ///    each a fresh state move that made the inner map non-idempotent
+    ///    (tier-0 K=2 fixtures refused at 512 granted iterations). The
+    ///    material floor admits the rescue and rejects the harvest.
     pub(crate) fn sweep_blocks_to_objective_fixed_point(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-        gate_ownership_stage: bool,
+        discovery_lane: bool,
     ) -> Result<bool, String> {
         let mut best_objective =
             self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
         if !best_objective.is_finite() {
             return Ok(false);
         }
+        let floor_rel = if discovery_lane {
+            SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+        } else {
+            SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION
+        };
         let frames = self.frames_active();
         let mut moved = false;
         loop {
@@ -6759,8 +6771,7 @@ impl SaeManifoldTerm {
             // any loss scale. Anything else (already-converged decoder, a
             // round that traded data-fit for penalty, or a refit/projection
             // failure) restores the pre-round state and stops.
-            let accept_floor =
-                SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + best_objective.abs());
+            let accept_floor = floor_rel * (1.0 + best_objective.abs());
             match round {
                 Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
                     best_objective = value;
@@ -6784,8 +6795,8 @@ impl SaeManifoldTerm {
         // heuristic, and the bound (2) exists only because each committed
         // anchor changes the ownership pattern it would recompute — two dry
         // rounds prove the pattern is stable. Discovery lanes only (see the
-        // `gate_ownership_stage` doc): evidence re-entries must be idempotent.
-        for _ in 0..(if gate_ownership_stage { 2 } else { 0 }) {
+        // `discovery_lane` doc): evidence re-entries must be idempotent.
+        for _ in 0..(if discovery_lane { 2 } else { 0 }) {
             let snapshot = self.snapshot_mutable_state();
             let round = self
                 .anchor_logits_to_residual_ownership(target)
@@ -6808,8 +6819,7 @@ impl SaeManifoldTerm {
                 .and_then(|()| {
                     self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
                 });
-            let accept_floor =
-                SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + best_objective.abs());
+            let accept_floor = floor_rel * (1.0 + best_objective.abs());
             match round {
                 Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
                     best_objective = value;
