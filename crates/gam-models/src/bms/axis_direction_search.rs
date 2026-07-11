@@ -2257,11 +2257,11 @@ impl BernoulliMarginalSlopeFamily {
         self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
-        let block_acc = weighted_rows
-            .par_iter()
-            .try_fold(
-                || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, wr| -> Result<_, String> {
+        let block_acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                weighted_rows.len(),
+                |index_range| -> Result<_, String> {
+                    let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                    for wr in &weighted_rows[index_range] {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_dir =
@@ -2324,16 +2324,15 @@ impl BernoulliMarginalSlopeFamily {
                         third_action.mapv_inplace(|v| v * w);
                     }
                     acc.add_pullback(self, row, slices, primary, &third_action);
+                    }
                     Ok(acc)
                 },
-            )
-            .try_reduce(
-                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut left, right| -> Result<_, String> {
                     left.add(&right);
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         Ok(Some(block_acc.to_dense(slices)))
     }
 
@@ -2399,11 +2398,11 @@ impl BernoulliMarginalSlopeFamily {
         self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
-        let block_acc = weighted_rows
-            .par_iter()
-            .try_fold(
-                || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, wr| -> Result<_, String> {
+        let block_acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                weighted_rows.len(),
+                |index_range| -> Result<_, String> {
+                    let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                    for wr in &weighted_rows[index_range] {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_dir =
@@ -2466,16 +2465,15 @@ impl BernoulliMarginalSlopeFamily {
                         third_action.mapv_inplace(|v| v * w);
                     }
                     acc.add_pullback(self, row, slices, primary, &third_action);
+                    }
                     Ok(acc)
                 },
-            )
-            .try_reduce(
-                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut left, right| -> Result<_, String> {
                     left.add(&right);
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         Ok(Some(
             Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
         ))
@@ -2514,11 +2512,11 @@ impl BernoulliMarginalSlopeFamily {
 
         // ── Rigid closed-form: 3rd-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
-            let block_acc = weighted_rows
-                .par_iter()
-                .try_fold(
-                    || BernoulliBlockHessianAccumulator::new(slices),
-                    |mut acc, wr| -> Result<_, String> {
+            let block_acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    weighted_rows.len(),
+                    |index_range| -> Result<_, String> {
+                        let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                        for wr in &weighted_rows[index_range] {
                         let row = wr.index;
                         let w = wr.weight;
                         let marginal_eta = block_states[0].eta[row];
@@ -2532,16 +2530,15 @@ impl BernoulliMarginalSlopeFamily {
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
                         let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
                         acc.add_pullback_rigid_2x2(self, row, &t, w);
+                        }
                         Ok(acc)
                     },
-                )
-                .try_reduce(
-                    || BernoulliBlockHessianAccumulator::new(slices),
                     |mut left, right| {
                         left.add(&right);
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
             return Ok(Some(block_acc.to_dense(slices)));
         }
 
@@ -2550,11 +2547,11 @@ impl BernoulliMarginalSlopeFamily {
         // recomputing them per row on every operator application (gam#683).
         self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
 
-        let block_acc = weighted_rows
-            .par_iter()
-            .try_fold(
-                || BernoulliBlockHessianAccumulator::new(slices),
-                |mut acc, wr| -> Result<_, String> {
+        let block_acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                weighted_rows.len(),
+                |index_range| -> Result<_, String> {
+                    let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                    for wr in &weighted_rows[index_range] {
                     let row = wr.index;
                     let w = wr.weight;
                     let row_dir =
@@ -2571,16 +2568,15 @@ impl BernoulliMarginalSlopeFamily {
                         third.mapv_inplace(|v| v * w);
                     }
                     acc.add_pullback(self, row, slices, primary, &third);
+                    }
                     Ok(acc)
                 },
-            )
-            .try_reduce(
-                || BernoulliBlockHessianAccumulator::new(slices),
                 |mut left, right| -> Result<_, String> {
                     left.add(&right);
                     Ok(left)
                 },
-            )?;
+            )?
+            .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
         Ok(Some(block_acc.to_dense(slices)))
     }
 
@@ -2603,11 +2599,11 @@ impl BernoulliMarginalSlopeFamily {
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
 
         if !self.effective_flex_active(block_states)? {
-            let block_acc = weighted_rows
-                .par_iter()
-                .try_fold(
-                    || BernoulliBlockHessianAccumulator::new(slices),
-                    |mut acc, wr| -> Result<_, String> {
+            let block_acc = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    weighted_rows.len(),
+                    |index_range| -> Result<_, String> {
+                        let mut acc = BernoulliBlockHessianAccumulator::new(slices);
+                        for wr in &weighted_rows[index_range] {
                         let row = wr.index;
                         let w = wr.weight;
                         let marginal_eta = block_states[0].eta[row];
@@ -2621,16 +2617,15 @@ impl BernoulliMarginalSlopeFamily {
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
                         let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
                         acc.add_pullback_rigid_2x2(self, row, &t, w);
+                        }
                         Ok(acc)
                     },
-                )
-                .try_reduce(
-                    || BernoulliBlockHessianAccumulator::new(slices),
                     |mut left, right| -> Result<_, String> {
                         left.add(&right);
                         Ok(left)
                     },
-                )?;
+                )?
+                .unwrap_or_else(|| BernoulliBlockHessianAccumulator::new(slices));
             return Ok(Some(
                 Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
             ));
