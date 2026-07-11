@@ -1057,7 +1057,10 @@ fn steer_plan_to_pydict(
     out.set_item("t_to", plan.t_to)?;
     out.set_item("amplitude", plan.amplitude)?;
     out.set_item("metric_row", plan.metric_row)?;
-    out.set_item("delta", plan.delta.into_pyarray(py))?;
+    // Keep the plan payload value-semantic: unlike a numpy array, a plain
+    // vector has deterministic Python equality, so repeated steering of the
+    // immutable fitted model yields directly comparable dictionaries.
+    out.set_item("delta", plan.delta.to_vec())?;
     out.set_item("predicted_nats", plan.predicted_nats)?;
     out.set_item("validity_radius", plan.validity_radius)?;
     out.set_item("off_manifold_norm", plan.off_manifold_norm)?;
