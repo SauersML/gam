@@ -231,8 +231,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
                 .sum()
         };
         let negative_occam = -term.reml_occam_term(&rho).expect("frozen Occam value");
-        let reconstructed =
-            data_and_priors + half_logdet - htt_half + rank_charge + negative_occam;
+        let reconstructed = data_and_priors + half_logdet - htt_half + rank_charge + negative_occam;
         let roundoff = 64.0 * f64::EPSILON * (1.0 + criterion.abs().max(reconstructed.abs()));
         assert!(
             (criterion - reconstructed).abs() <= roundoff,
@@ -307,27 +306,17 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     // state probe starts from the same accepted center state; no cold-seed map
     // or prior directional probe is allowed to contaminate the response.
     let converged_state_at = |rho_flat: &Array1<f64>| {
-        let mut term = frozen_anchor_term.clone();
-        let rho = frozen_baseline_rho.from_flat(rho_flat.view());
-        let (cost, _, _) = term
-            .reml_criterion_with_cache(
-                frozen_target.view(),
-                &rho,
-                frozen_registry.as_ref(),
-                40,
-                frozen_learning_rate,
-                frozen_ridge_ext_coord,
-                frozen_ridge_beta,
-            )
-            .expect("accepted-branch state-response probe must converge");
+        let (parts, term) = criterion_parts_at(rho_flat, 40);
         let t = term.assignment.flatten_ext_coords();
         let beta = term
             .flatten_factored_border()
             .expect("accepted-branch factored border");
-        (cost, t, beta)
+        (parts, t, beta)
     };
-    let (state_plus_cost, state_plus_t, state_plus_beta) = converged_state_at(&plus);
-    let (state_minus_cost, state_minus_t, state_minus_beta) = converged_state_at(&minus);
+    let (state_plus_parts, state_plus_t, state_plus_beta) = converged_state_at(&plus);
+    let (state_minus_parts, state_minus_t, state_minus_beta) = converged_state_at(&minus);
+    let state_plus_cost = state_plus_parts.0;
+    let state_minus_cost = state_minus_parts.0;
     let theta_fd = SaeArrowVector {
         t: (&state_plus_t - &state_minus_t) / (2.0 * h),
         beta: (&state_plus_beta - &state_minus_beta) / (2.0 * h),
@@ -381,6 +370,8 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let mut frozen_coordinate_fd = Array1::<f64>::zeros(base.len());
     let mut frozen_data_and_priors_fd = Array1::<f64>::zeros(base.len());
     let mut frozen_half_logdet_fd = Array1::<f64>::zeros(base.len());
+    let mut frozen_htt_half_fd = Array1::<f64>::zeros(base.len());
+    let mut frozen_rank_charge_fd = Array1::<f64>::zeros(base.len());
     let mut frozen_occam_fd = Array1::<f64>::zeros(base.len());
     for coordinate in 0..base.len() {
         let mut axis = Array1::<f64>::zeros(base.len());
@@ -400,8 +391,15 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         frozen_data_and_priors_fd[coordinate] =
             (frozen_axis_plus.1 - frozen_axis_minus.1) / (2.0 * h);
         frozen_half_logdet_fd[coordinate] = (frozen_axis_plus.2 - frozen_axis_minus.2) / (2.0 * h);
-        frozen_occam_fd[coordinate] = (frozen_axis_plus.3 - frozen_axis_minus.3) / (2.0 * h);
+        frozen_htt_half_fd[coordinate] = (frozen_axis_plus.3 - frozen_axis_minus.3) / (2.0 * h);
+        frozen_rank_charge_fd[coordinate] = (frozen_axis_plus.4 - frozen_axis_minus.4) / (2.0 * h);
+        frozen_occam_fd[coordinate] = (frozen_axis_plus.5 - frozen_axis_minus.5) / (2.0 * h);
     }
+    let response_data_and_priors_fd = (state_plus_parts.1 - state_minus_parts.1) / (2.0 * h);
+    let response_half_logdet_fd = (state_plus_parts.2 - state_minus_parts.2) / (2.0 * h);
+    let response_htt_half_fd = (state_plus_parts.3 - state_minus_parts.3) / (2.0 * h);
+    let response_rank_charge_fd = (state_plus_parts.4 - state_minus_parts.4) / (2.0 * h);
+    let response_occam_fd = (state_plus_parts.5 - state_minus_parts.5) / (2.0 * h);
     let scale = analytic.abs().max(finite_difference.abs()).max(1.0);
     assert!(
         (analytic - finite_difference).abs() <= 5.0e-3 * scale,
@@ -411,10 +409,15 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
          frozen_coordinate_fd={frozen_coordinate_fd:?}, \
          frozen_data_and_priors_fd={frozen_data_and_priors_fd:?}, \
          frozen_half_logdet_fd={frozen_half_logdet_fd:?}, \
+         frozen_htt_half_fd={frozen_htt_half_fd:?}, \
+         frozen_rank_charge_fd={frozen_rank_charge_fd:?}, \
          frozen_occam_fd={frozen_occam_fd:?}, \
          explicit={:?}, trace={:?}, occam={:?}, adjoint={:?}, \
          plain_trace={:?}, solver_gauges={}, deflated_row_directions={deflated_row_directions}, \
          frozen_fd={frozen_finite_difference:.9e}, \
+         response_split=(data_and_priors={response_data_and_priors_fd:.9e}, \
+         half_logdet={response_half_logdet_fd:.9e}, htt_half={response_htt_half_fd:.9e}, \
+         rank_charge={response_rank_charge_fd:.9e}, occam={response_occam_fd:.9e}), \
          actual_implicit_logdet={actual_implicit_logdet:.9e}, \
          predicted_implicit_logdet={predicted_implicit_logdet:.9e}, \
          theta_fd_norm={theta_fd_norm:.9e}, solved_response_norm={solved_response_norm:.9e}, \
