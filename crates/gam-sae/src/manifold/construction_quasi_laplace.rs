@@ -1529,11 +1529,26 @@ impl SaeManifoldTerm {
             let solver = match self.outer_gradient_arrow_solver(&cache, lambda_smooth) {
                 Ok(solver) => solver,
                 Err(err) => {
+                    // The quotient solver applies the OUTER-GRADIENT refusal
+                    // standard: a near-singular joint Hessian whose flatness it
+                    // cannot attribute to the gauge orbit is typed
+                    // `NonIdentifiable`, because the ρ-derivative genuinely
+                    // requires that attribution. The polish has a strictly
+                    // weaker requirement — the solver is only the
+                    // PRECONDITIONER for the exact-pencil GMRES, and step
+                    // acceptance is guarded downstream by the gradient-norm
+                    // contraction + objective-band test. Refusing the whole
+                    // terminal Newton phase because the preconditioner refused
+                    // is what parked stalled fits 1.3× above the KKT tolerance
+                    // (tier-0: ‖g‖ 8.0e-5 vs tol 6.1e-5, refused at budget).
+                    // Fall back to the plain undeflated factor: a weaker
+                    // preconditioner can only slow GMRES, never corrupt an
+                    // accepted step.
                     log::debug!(
-                        "terminal Newton bail: outer-gradient quotient solver at \
-                         ‖g‖={grad_norm:.6e}: {err:?}"
+                        "terminal Newton: quotient solver refused at ‖g‖={grad_norm:.6e} \
+                         ({err:?}); falling back to the plain factor preconditioner"
                     );
-                    break;
+                    DeflatedArrowSolver::plain(&cache)
                 }
             };
             // Newton step on the exact Hessian: A Δ = −g on the gauge quotient.
